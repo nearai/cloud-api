@@ -199,6 +199,18 @@ async fn test_fallback_patch_is_owner_only_and_mixed_patch_is_atomic() {
         assert_eq!(patch_response.status_code(), 403);
     }
 
+    let legacy_bypass = server
+        .put(&format!("/v1/organizations/{}", org.id))
+        .add_header("Authorization", format!("Bearer {admin_session}"))
+        .json(&json!({
+            "settings": {
+                "system_prompt": "must not be written",
+                "fallback_enabled": false
+            }
+        }))
+        .await;
+    assert_eq!(legacy_bypass.status_code(), 403);
+
     let unchanged = server
         .get(&format!("/v1/organizations/{}/settings", org.id))
         .add_header("Authorization", format!("Bearer {owner_access_token}"))
@@ -209,6 +221,48 @@ async fn test_fallback_patch_is_owner_only_and_mixed_patch_is_atomic() {
         Some("original")
     );
     assert!(unchanged.settings.fallback_enabled);
+}
+
+#[tokio::test]
+async fn test_concurrent_settings_patches_preserve_distinct_keys() {
+    let server = setup_test_server().await;
+    let org = create_org(&server).await;
+    let owner_token = get_access_token_from_refresh_token(&server, get_session_id()).await;
+    let settings_path = format!("/v1/organizations/{}/settings", org.id);
+    let admin_path = format!("/v1/admin/organizations/{}/fallback", org.id);
+
+    for iteration in 0..10 {
+        let reset = server
+            .patch(&settings_path)
+            .add_header("Authorization", format!("Bearer {owner_token}"))
+            .json(&json!({ "system_prompt": null, "fallback_enabled": true }))
+            .await;
+        assert_eq!(reset.status_code(), 200);
+
+        let prompt = format!("concurrent prompt {iteration}");
+        let owner_patch = server
+            .patch(&settings_path)
+            .add_header("Authorization", format!("Bearer {owner_token}"))
+            .json(&json!({ "system_prompt": prompt }));
+        let admin_patch = server
+            .patch(&admin_path)
+            .add_header("Authorization", format!("Bearer {}", get_session_id()))
+            .json(&json!({ "enabled": false }));
+        let (owner_response, admin_response) = tokio::join!(owner_patch, admin_patch);
+        assert_eq!(owner_response.status_code(), 200);
+        assert_eq!(admin_response.status_code(), 200);
+
+        let current = server
+            .get(&settings_path)
+            .add_header("Authorization", format!("Bearer {owner_token}"))
+            .await
+            .json::<OrganizationSettingsResponse>();
+        assert_eq!(
+            current.settings.system_prompt.as_deref(),
+            Some(prompt.as_str())
+        );
+        assert!(!current.settings.fallback_enabled);
+    }
 }
 
 #[tokio::test]

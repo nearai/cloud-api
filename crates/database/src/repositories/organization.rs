@@ -625,6 +625,86 @@ impl OrganizationRepository for PgOrganizationRepository {
             .map_err(RepositoryError::DataConversionError)
     }
 
+    async fn patch_settings(
+        &self,
+        id: Uuid,
+        patch: PatchOrganizationSettings,
+    ) -> Result<Organization, RepositoryError> {
+        let has_system_prompt = patch.system_prompt.is_some();
+        let system_prompt = patch.system_prompt.flatten();
+        let has_fallback_enabled = patch.fallback_enabled.is_some();
+        let fallback_enabled = patch.fallback_enabled.flatten();
+
+        // Apply both supported keys in one statement. PostgreSQL takes the row
+        // lock for the UPDATE, so concurrent patches to different keys always
+        // start from the latest committed settings instead of overwriting one
+        // another with stale read-modify-write snapshots.
+        let row = retry_db!("patch_organization_settings", {
+            let client = self
+                .pool
+                .get()
+                .await
+                .context("Failed to get database connection")
+                .map_err(RepositoryError::PoolError)?;
+
+            client
+                .query_opt(
+                    r#"
+                    WITH current_settings AS (
+                        SELECT CASE
+                            WHEN jsonb_typeof(settings) = 'object' THEN settings
+                            ELSE '{}'::jsonb
+                        END AS value
+                        FROM organizations
+                        WHERE id = $1 AND is_active = true
+                        FOR UPDATE
+                    ), prompt_patched AS (
+                        SELECT CASE
+                            WHEN $2::boolean AND $3::text IS NULL
+                                THEN value - 'system_prompt'
+                            WHEN $2::boolean
+                                THEN jsonb_set(value, '{system_prompt}', to_jsonb($3::text), true)
+                            ELSE value
+                        END AS value
+                        FROM current_settings
+                    ), fully_patched AS (
+                        SELECT CASE
+                            WHEN $4::boolean AND $5::boolean IS NULL
+                                THEN value - 'fallback_enabled'
+                            WHEN $4::boolean
+                                THEN jsonb_set(value, '{fallback_enabled}', to_jsonb($5::boolean), true)
+                            ELSE value
+                        END AS value
+                        FROM prompt_patched
+                    )
+                    UPDATE organizations AS organization
+                    SET settings = fully_patched.value,
+                        updated_at = NOW()
+                    FROM fully_patched
+                    WHERE organization.id = $1 AND organization.is_active = true
+                    RETURNING organization.*
+                    "#,
+                    &[
+                        &id,
+                        &has_system_prompt,
+                        &system_prompt,
+                        &has_fallback_enabled,
+                        &fallback_enabled,
+                    ],
+                )
+                .await
+                .map_err(map_db_error)
+        })?
+        .ok_or_else(|| RepositoryError::NotFound(id.to_string()))?;
+
+        let db_org = self
+            .row_to_db_organization(row)
+            .map_err(RepositoryError::DataConversionError)?;
+        self.db_to_domain_organization(db_org)
+            .await
+            .map_err(RepositoryError::DataConversionError)
+    }
+
     async fn delete_if_no_staking_farm_source(
         &self,
         id: Uuid,

@@ -336,6 +336,14 @@ pub trait OrganizationRepository: Send + Sync {
         request: UpdateOrganizationRequest,
     ) -> Result<Organization, RepositoryError>;
 
+    /// Atomically applies the organization-settings fields present in `patch`.
+    /// Omitted fields are preserved and explicit nulls remove their JSON keys.
+    async fn patch_settings(
+        &self,
+        id: Uuid,
+        patch: PatchOrganizationSettings,
+    ) -> Result<Organization, RepositoryError>;
+
     /// Soft-deletes an active organization only if it has no staking farm source.
     ///
     /// The staking-source check is deliberately status-agnostic: the org-to-wallet

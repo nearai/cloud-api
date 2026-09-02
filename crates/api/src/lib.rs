@@ -746,12 +746,27 @@ pub(crate) const CHUTES_SUPPORTED_FEATURES: &[&str] = &["tools", "json_mode"];
 async fn ensure_chutes_catalog_row(
     models_repo: &database::repositories::ModelRepository,
     model_name: &str,
-) {
+) -> services::inference_provider_pool::ProviderPoolRole {
+    use services::inference_provider_pool::ProviderPoolRole;
+
+    let role_for_existing = |model: &database::models::Model| {
+        // A catalog row owned by another provider configuration means this
+        // out-of-band provider is a fallback even if the configured primary is
+        // temporarily undiscoverable. Rows created for this provider itself are
+        // genuine standalone primaries.
+        if model.inference_url.is_some() || model.provider_type != "chutes" {
+            ProviderPoolRole::Fallback
+        } else {
+            ProviderPoolRole::Primary
+        }
+    };
+
     // Use the *unfiltered* lookup (not get_active_model_by_name): a deliberately
     // disabled row (is_active=false) must be respected, not silently re-activated
     // and clobbered by the seed path below.
     match models_repo.get_by_internal_name(model_name).await {
         Ok(Some(existing)) => {
+            let role = role_for_existing(&existing);
             // Already in the catalog — respect operator configuration verbatim.
             // Surface a warning if the metadata contradicts attested serving so
             // a misconfigured row (e.g. attestation_supported=false) is visible.
@@ -786,6 +801,7 @@ async fn ensure_chutes_catalog_row(
             } else {
                 tracing::info!(model = %model_name, "Chutes model already in catalog");
             }
+            role
         }
         Ok(None) => {
             // Friendly display name = last path segment; owner = leading segment.
@@ -856,12 +872,17 @@ async fn ensure_chutes_catalog_row(
                          template) before activating, and clear `supported_features` via the \
                          same PATCH if it doesn't"
                     );
+                    ProviderPoolRole::Primary
                 }
                 Ok(None) => {
                     tracing::info!(
                         model = %model_name,
                         "Chutes catalog row already present (created concurrently); left untouched"
                     );
+                    match models_repo.get_by_internal_name(model_name).await {
+                        Ok(Some(existing)) => role_for_existing(&existing),
+                        _ => ProviderPoolRole::Fallback,
+                    }
                 }
                 Err(e) => {
                     tracing::error!(
@@ -869,6 +890,7 @@ async fn ensure_chutes_catalog_row(
                         "Failed to seed Chutes catalog row; requests for this model will 404 \
                          until a row exists (create it via PATCH /v1/admin/models)"
                     );
+                    ProviderPoolRole::Fallback
                 }
             }
         }
@@ -877,6 +899,10 @@ async fn ensure_chutes_catalog_row(
                 model = %model_name, error = %e,
                 "Could not check catalog for Chutes model; skipping auto-seed"
             );
+            // Unknown catalog state is fail-closed for organizations that
+            // disable fallback. A later restart/registration can establish a
+            // standalone primary role once the catalog is readable again.
+            ProviderPoolRole::Fallback
         }
     }
 }
@@ -1000,22 +1026,23 @@ pub async fn init_inference_providers(
                             // data plane resolves the model (and usage bills against a
                             // real id). If NEAR already serves this id, its row is left
                             // untouched and we just add Chutes as a fallback provider.
-                            ensure_chutes_catalog_row(&models_repo, &entry.canonical_id).await;
-                            // Pinned SECONDARY: pushed onto the canonical id's provider
-                            // list (coexists with NEAR's own providers) and excluded from
-                            // discovery's stale-removal/overwrite. Tier ordering puts NEAR
-                            // first and Chutes as fallback; a Chutes-only id has just this
-                            // provider, so it serves as primary.
-                            pool.register_pinned_secondary_provider(
+                            let role =
+                                ensure_chutes_catalog_row(&models_repo, &entry.canonical_id).await;
+                            // Register the stable role from catalog configuration,
+                            // independently of whether discovery happened to find a live
+                            // primary during this startup.
+                            pool.register_pinned_provider(
                                 entry.canonical_id.clone(),
                                 Arc::new(provider),
                                 entry.max_context_tokens,
+                                role,
                             )
                             .await;
                             tracing::info!(
                                 canonical = %entry.canonical_id,
                                 chute_slug = %entry.chute_slug,
-                                "Registered Chutes attested provider (fallback tier)"
+                                role = ?role,
+                                "Registered Chutes attested provider"
                             );
                         }
                         Err(e) => {

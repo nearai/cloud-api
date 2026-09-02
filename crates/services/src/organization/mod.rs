@@ -172,6 +172,25 @@ impl OrganizationServiceImpl {
             }
         }
 
+        // The legacy organization update endpoint accepts the complete settings
+        // object. Prevent it from becoming an owner-only fallback-policy bypass:
+        // admins may preserve the raw override while changing unrelated fields,
+        // but may not add, remove, or alter it.
+        let requested_fallback_change = settings.as_ref().and_then(|new_settings| {
+            let current = org.settings.get("fallback_enabled");
+            let requested = new_settings.get("fallback_enabled");
+            (current != requested).then(|| {
+                requested
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(true)
+            })
+        });
+        if requested_fallback_change.is_some() && org.owner_id != user_id {
+            return Err(OrganizationError::Unauthorized(
+                "Only organization owners can manage fallback".to_string(),
+            ));
+        }
+
         let request = UpdateOrganizationRequest {
             name,
             description,
@@ -179,10 +198,23 @@ impl OrganizationServiceImpl {
             settings,
         };
 
-        self.repository
+        let updated = self
+            .repository
             .update(id.0, request)
             .await
-            .map_err(Self::map_repository_error)
+            .map_err(Self::map_repository_error)?;
+
+        if let Some(fallback_enabled) = requested_fallback_change {
+            tracing::info!(
+                organization_id = %id,
+                actor_id = %user_id,
+                actor_type = "organization_owner",
+                fallback_enabled,
+                "Organization fallback setting changed"
+            );
+        }
+
+        Ok(updated)
     }
 
     /// Delete an organization (owner only, private helper)
@@ -1509,54 +1541,14 @@ impl OrganizationServiceImpl {
             ));
         }
 
-        let org = self.get_organization_impl(organization_id.clone()).await?;
         if patch.system_prompt.is_none() && patch.fallback_enabled.is_none() {
+            let org = self.get_organization_impl(organization_id).await?;
             return Ok(Self::settings_from_organization(&org));
-        }
-
-        let mut settings = if org.settings.is_object() {
-            org.settings.clone()
-        } else {
-            serde_json::json!({})
-        };
-        let settings_object = settings
-            .as_object_mut()
-            .expect("organization settings were initialized as an object");
-
-        if let Some(system_prompt) = patch.system_prompt {
-            match system_prompt {
-                Some(prompt) => {
-                    settings_object.insert("system_prompt".to_string(), serde_json::json!(prompt));
-                }
-                None => {
-                    settings_object.remove("system_prompt");
-                }
-            }
-        }
-
-        if let Some(fallback_enabled) = patch.fallback_enabled {
-            match fallback_enabled {
-                Some(enabled) => {
-                    settings_object
-                        .insert("fallback_enabled".to_string(), serde_json::json!(enabled));
-                }
-                None => {
-                    settings_object.remove("fallback_enabled");
-                }
-            }
         }
 
         let updated = self
             .repository
-            .update(
-                organization_id.0,
-                UpdateOrganizationRequest {
-                    name: None,
-                    description: None,
-                    rate_limit: None,
-                    settings: Some(settings),
-                },
-            )
+            .patch_settings(organization_id.0, patch)
             .await
             .map_err(Self::map_repository_error)?;
 
@@ -1578,34 +1570,19 @@ impl OrganizationServiceImpl {
         organization_id: OrganizationId,
         fallback_enabled: bool,
     ) -> Result<bool, OrganizationError> {
-        let org = self.get_organization_impl(organization_id.clone()).await?;
-        let mut settings = if org.settings.is_object() {
-            org.settings
-        } else {
-            serde_json::json!({})
-        };
-        settings
-            .as_object_mut()
-            .expect("organization settings were initialized as an object")
-            .insert(
-                "fallback_enabled".to_string(),
-                serde_json::json!(fallback_enabled),
-            );
-
-        self.repository
-            .update(
+        let updated = self
+            .repository
+            .patch_settings(
                 organization_id.0,
-                UpdateOrganizationRequest {
-                    name: None,
-                    description: None,
-                    rate_limit: None,
-                    settings: Some(settings),
+                ports::PatchOrganizationSettings {
+                    system_prompt: None,
+                    fallback_enabled: Some(Some(fallback_enabled)),
                 },
             )
             .await
             .map_err(Self::map_repository_error)?;
 
-        Ok(fallback_enabled)
+        Ok(updated.fallback_enabled())
     }
 }
 
@@ -2034,6 +2011,47 @@ mod tests {
             }
             if let Some(settings) = request.settings {
                 org.settings = settings;
+            }
+            org.updated_at = chrono::Utc::now();
+            Ok(org.clone())
+        }
+
+        async fn patch_settings(
+            &self,
+            id: Uuid,
+            patch: ports::PatchOrganizationSettings,
+        ) -> Result<Organization, RepositoryError> {
+            *self.update_calls.lock().unwrap() += 1;
+            let mut org = self.org.lock().unwrap();
+            if org.id.0 != id {
+                return Err(RepositoryError::NotFound(id.to_string()));
+            }
+            if !org.settings.is_object() {
+                org.settings = serde_json::json!({});
+            }
+            let settings = org
+                .settings
+                .as_object_mut()
+                .expect("settings initialized as object");
+            if let Some(system_prompt) = patch.system_prompt {
+                match system_prompt {
+                    Some(value) => {
+                        settings.insert("system_prompt".to_string(), serde_json::json!(value));
+                    }
+                    None => {
+                        settings.remove("system_prompt");
+                    }
+                }
+            }
+            if let Some(fallback_enabled) = patch.fallback_enabled {
+                match fallback_enabled {
+                    Some(value) => {
+                        settings.insert("fallback_enabled".to_string(), serde_json::json!(value));
+                    }
+                    None => {
+                        settings.remove("fallback_enabled");
+                    }
+                }
             }
             org.updated_at = chrono::Utc::now();
             Ok(org.clone())
@@ -2484,7 +2502,11 @@ mod tests {
                 id: organization_id.clone(),
                 name: "Settings Org".to_string(),
                 description: None,
-                owner_id: user_id.clone(),
+                owner_id: if role == MemberRole::Owner {
+                    user_id.clone()
+                } else {
+                    UserId(Uuid::new_v4())
+                },
                 settings,
                 is_active: true,
                 created_at: now,
@@ -2628,6 +2650,45 @@ mod tests {
                 serde_json::json!({ "system_prompt": "original" })
             );
         }
+    }
+
+    #[tokio::test]
+    async fn legacy_organization_update_cannot_bypass_owner_only_fallback_policy() {
+        let (service, repo, organization_id, user_id) = make_settings_service(
+            MemberRole::Admin,
+            serde_json::json!({ "fallback_enabled": false, "other": 1 }),
+        );
+
+        let error = service
+            .update_organization(
+                organization_id.clone(),
+                user_id.clone(),
+                None,
+                None,
+                None,
+                Some(serde_json::json!({ "other": 2 })),
+            )
+            .await
+            .expect_err("admin cannot remove the fallback override");
+        assert!(matches!(error, OrganizationError::Unauthorized(_)));
+        assert_eq!(*repo.update_calls.lock().unwrap(), 0);
+
+        let updated = service
+            .update_organization(
+                organization_id,
+                user_id,
+                None,
+                None,
+                None,
+                Some(serde_json::json!({
+                    "fallback_enabled": false,
+                    "other": 2
+                })),
+            )
+            .await
+            .expect("admin may preserve fallback while updating unrelated settings");
+        assert_eq!(updated.settings["fallback_enabled"], false);
+        assert_eq!(updated.settings["other"], 2);
     }
 
     #[tokio::test]

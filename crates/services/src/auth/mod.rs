@@ -952,6 +952,13 @@ mod tests {
         ) -> Result<Organization, RepositoryError> {
             unimplemented!()
         }
+        async fn patch_settings(
+            &self,
+            _: Uuid,
+            _: crate::organization::PatchOrganizationSettings,
+        ) -> Result<Organization, RepositoryError> {
+            unimplemented!()
+        }
         async fn delete_if_no_staking_farm_source(
             &self,
             _: Uuid,

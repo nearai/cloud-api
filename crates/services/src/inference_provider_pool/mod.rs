@@ -668,10 +668,20 @@ pub struct InferenceProviderPool {
     /// is the only layer that knows which trust tier served a request and whether
     /// it was a fallback, so the per-tier / fallback counter is emitted from here.
     metrics_service: std::sync::OnceLock<Arc<dyn crate::metrics::MetricsServiceTrait>>,
-    /// Model ids that have been observed with both a primary provider and a
-    /// provider explicitly registered as a fallback. This classification is
-    /// retained if the primary fleet temporarily disappears.
-    models_with_registered_fallback: Arc<std::sync::RwLock<std::collections::HashSet<String>>>,
+    /// Providers explicitly registered as fallbacks, keyed by model id. This
+    /// role is configuration metadata rather than an inference from whichever
+    /// providers happen to be live, so it survives primary discovery failures
+    /// and temporary primary-fleet disappearance.
+    fallback_providers: Arc<std::sync::RwLock<HashMap<String, Vec<Arc<InferenceProviderTrait>>>>>,
+}
+
+/// Stable routing role assigned when an out-of-band provider is registered.
+/// A primary remains usable on its own; a fallback can be excluded by an
+/// organization's request policy even before any primary is live.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProviderPoolRole {
+    Primary,
+    Fallback,
 }
 
 /// Backend verifier that creates verified reqwest clients by connecting to a backend,
@@ -944,9 +954,7 @@ impl InferenceProviderPool {
             pinned_models: Arc::new(std::sync::RwLock::new(std::collections::HashSet::new())),
             pinned_providers: Arc::new(std::sync::RwLock::new(HashMap::new())),
             metrics_service: std::sync::OnceLock::new(),
-            models_with_registered_fallback: Arc::new(std::sync::RwLock::new(
-                std::collections::HashSet::new(),
-            )),
+            fallback_providers: Arc::new(std::sync::RwLock::new(HashMap::new())),
         }
     }
 
@@ -959,51 +967,12 @@ impl InferenceProviderPool {
         let _ = self.metrics_service.set(metrics);
     }
 
-    fn note_primary_and_fallback_model(
-        &self,
-        model_id: &str,
-        providers: &[Arc<InferenceProviderTrait>],
-    ) {
-        let pinned = self
-            .pinned_providers
-            .read()
-            .unwrap_or_else(|e| e.into_inner());
-        let Some(pinned_for_model) = pinned.get(model_id) else {
-            return;
-        };
-        let is_pinned = |candidate: &Arc<InferenceProviderTrait>| {
-            pinned_for_model
-                .iter()
-                .any(|provider| Arc::ptr_eq(candidate, provider))
-        };
-        let has_registered_fallback = providers.iter().any(is_pinned);
-        let has_primary = providers.iter().any(|p| !is_pinned(p));
-        drop(pinned);
-        if has_registered_fallback && has_primary {
-            self.models_with_registered_fallback
-                .write()
-                .unwrap_or_else(|e| e.into_inner())
-                .insert(model_id.to_string());
-        }
-    }
-
     fn is_registered_fallback_provider(
         &self,
         model_id: &str,
         provider: &Arc<InferenceProviderTrait>,
     ) -> bool {
-        if !self
-            .models_with_registered_fallback
-            .read()
-            .unwrap_or_else(|e| e.into_inner())
-            .contains(model_id)
-        {
-            // A provider registered through the secondary path is still the
-            // primary when the model has never had another provider.
-            return false;
-        }
-
-        self.pinned_providers
+        self.fallback_providers
             .read()
             .unwrap_or_else(|e| e.into_inner())
             .get(model_id)
@@ -1034,10 +1003,10 @@ impl InferenceProviderPool {
         }
         tier != inference_providers::ProviderTier::Near
             && self
-                .models_with_registered_fallback
+                .fallback_providers
                 .read()
                 .unwrap_or_else(|e| e.into_inner())
-                .contains(model_id)
+                .contains_key(model_id)
     }
 
     /// Load external providers (OpenAI, Anthropic, Gemini, etc.) into provider_mappings.
@@ -1217,19 +1186,12 @@ impl InferenceProviderPool {
         }
     }
 
-    /// Register a pinned (out-of-band, e.g. config-Chutes) provider as a **secondary**
-    /// under a model name that may also be served by DB-discovered (e.g. NEAR)
-    /// providers — **pushing** onto the existing list rather than replacing it (a
-    /// Chutes-only id ends up with just this provider, so it serves as primary). This
-    /// is the sole pinned-registration path used in production.
-    ///
-    /// Used for the Chutes fallback tier: a NEAR-served canonical id keeps its own
-    /// attested fleet as primary and gains Chutes as fallback. The provider is
-    /// recorded in [`Self::pinned_providers`] so each discovery refresh re-attaches it
-    /// after rebuilding the NEAR backends (never dropped/overwritten), and its name is
-    /// added to [`Self::pinned_models`] so the discovery guards never evict it. Tier
-    /// ordering (NEAR before Attested3p) is applied at selection time, so the push
-    /// order here does not matter.
+    /// Registers an out-of-band provider with an explicit, provider-neutral
+    /// routing role. The provider is recorded in [`Self::pinned_providers`] so
+    /// each discovery refresh re-attaches it after rebuilding discovered
+    /// backends, and its name is added to [`Self::pinned_models`] so refresh
+    /// guards never evict it. The configured role remains stable even while a
+    /// primary provider is absent.
     ///
     /// Unlike [`Self::register_provider`], this does NOT run signing-key attestation
     /// discovery (a wasted round trip for Chutes, which has no signing-address pubkey
@@ -1237,15 +1199,16 @@ impl InferenceProviderPool {
     /// `pubkey_to_providers`. A pubkey-routed (E2EE) request — selected via
     /// `model_pub_key` — therefore gets NO Chutes fallback by design: Chutes has no
     /// per-response signing key, its integrity is the ML-KEM AEAD channel itself.
-    pub async fn register_pinned_secondary_provider(
+    pub async fn register_pinned_provider(
         &self,
         model_id: String,
         provider: Arc<InferenceProviderTrait>,
         max_context_tokens: Option<u32>,
+        role: ProviderPoolRole,
     ) {
         let ptr = Arc::as_ptr(&provider) as *const () as usize;
-        // Declared context window (e.g. the `@<n>` suffix in CHUTES_MODELS) so
-        // context-length routing knows whether this fallback can take a long
+        // Declared context window (e.g. a configured model suffix) so
+        // context-length routing knows whether this provider can take a long
         // request. `None` = no declared limit (never filtered by size).
         if let Some(ctx) = max_context_tokens {
             let mut states = self
@@ -1274,6 +1237,30 @@ impl InferenceProviderPool {
                 entry.push(provider.clone());
             }
         }
+        if role == ProviderPoolRole::Fallback {
+            let mut fallback_providers = self
+                .fallback_providers
+                .write()
+                .unwrap_or_else(|e| e.into_inner());
+            let entry = fallback_providers.entry(model_id.clone()).or_default();
+            if !entry
+                .iter()
+                .any(|p| Arc::as_ptr(p) as *const () as usize == ptr)
+            {
+                entry.push(provider.clone());
+            }
+        } else {
+            let mut fallback_providers = self
+                .fallback_providers
+                .write()
+                .unwrap_or_else(|e| e.into_inner());
+            if let Some(entry) = fallback_providers.get_mut(&model_id) {
+                entry.retain(|candidate| !Arc::ptr_eq(candidate, &provider));
+                if entry.is_empty() {
+                    fallback_providers.remove(&model_id);
+                }
+            }
+        }
         let mut mappings = self.provider_mappings.write().await;
         let entry = mappings
             .model_to_providers
@@ -1286,7 +1273,24 @@ impl InferenceProviderPool {
         {
             entry.push(provider);
         }
-        self.note_primary_and_fallback_model(&model_id, entry);
+    }
+
+    /// Backward-compatible convenience for callers that explicitly register a
+    /// pinned fallback. Standalone providers should use
+    /// [`Self::register_pinned_provider`] with [`ProviderPoolRole::Primary`].
+    pub async fn register_pinned_secondary_provider(
+        &self,
+        model_id: String,
+        provider: Arc<InferenceProviderTrait>,
+        max_context_tokens: Option<u32>,
+    ) {
+        self.register_pinned_provider(
+            model_id,
+            provider,
+            max_context_tokens,
+            ProviderPoolRole::Fallback,
+        )
+        .await;
     }
 
     /// Whether `model_name` is currently registered as a **pinned** (out-of-band)
@@ -5134,7 +5138,6 @@ impl InferenceProviderPool {
             for (model_name, providers) in
                 Self::merge_discovered_and_pinned(model_providers, &pinned_providers)
             {
-                self.note_primary_and_fallback_model(&model_name, &providers);
                 mappings.model_to_providers.insert(model_name, providers);
             }
 
@@ -10275,7 +10278,7 @@ mod tests {
             .respond_with(ResponseTemplate::new("served-by-primary-chutes"))
             .await;
 
-        pool.register_pinned_secondary_provider(model_id.clone(), chutes, None)
+        pool.register_pinned_provider(model_id.clone(), chutes, None, ProviderPoolRole::Primary)
             .await;
 
         let served = pool
@@ -10358,6 +10361,49 @@ mod tests {
             .expect("default policy should allow the registered fallback");
         assert!(fallback.last_chat_params().await.is_some());
         assert!(enabled.provider_attribution.served_via_fallback);
+    }
+
+    #[tokio::test]
+    async fn disabled_policy_excludes_configured_fallback_before_primary_discovery() {
+        use inference_providers::mock::MockProvider;
+        use inference_providers::ProviderTier;
+
+        let pool = InferenceProviderPool::new(None, ExternalProvidersConfig::default());
+        let model_id = "policy/primary-not-discovered".to_string();
+        let fallback = Arc::new(MockProvider::new_accept_all().with_tier(ProviderTier::Attested3p));
+
+        // Registration order must not define the role. Startup can register a
+        // configured fallback before its primary is successfully discovered.
+        pool.register_pinned_provider(
+            model_id.clone(),
+            fallback.clone() as Arc<InferenceProviderTrait>,
+            None,
+            ProviderPoolRole::Fallback,
+        )
+        .await;
+
+        let disabled = pool
+            .get_providers_with_fallback(
+                &model_id,
+                None,
+                &ChatRoutingHints {
+                    fallback_disabled: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("configured model remains known");
+        assert!(disabled.is_empty());
+
+        let enabled = pool
+            .get_providers_with_fallback(&model_id, None, &ChatRoutingHints::default())
+            .await
+            .expect("configured fallback remains available when permitted");
+        assert_eq!(enabled.len(), 1);
+        assert!(Arc::ptr_eq(
+            &enabled[0],
+            &(fallback as Arc<InferenceProviderTrait>)
+        ));
     }
 
     #[tokio::test]
@@ -10536,10 +10582,11 @@ mod tests {
             .respond_with(ResponseTemplate::new("served-by-only-provider"))
             .await;
         single_pool
-            .register_pinned_secondary_provider(
+            .register_pinned_provider(
                 single_model.clone(),
                 only_provider.clone() as Arc<InferenceProviderTrait>,
                 None,
+                ProviderPoolRole::Primary,
             )
             .await;
 

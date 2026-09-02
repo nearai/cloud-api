@@ -44,7 +44,9 @@ pub struct InfraSummary {
     pub total_allocated_gpus: i64,
     /// Current projected fleet GPU burn per hour.
     pub hourly_gpu_burn_usd: f64,
-    /// Current allocation grouped by the model label emitted by DCGM.
+    /// Current allocation grouped by the model label emitted by DCGM. A GPU
+    /// carrying multiple labels can appear in multiple groups; the fleet total
+    /// remains separately deduplicated by physical UUID.
     pub model_gpu_allocations: Vec<ModelGpuAllocation>,
     /// True when current GPU allocation is unavailable or served from cache.
     pub gpu_data_stale: bool,
@@ -80,6 +82,13 @@ struct PrometheusSeries {
 #[derive(Debug, Deserialize)]
 struct PrometheusMetric {
     model: Option<String>,
+    nearai_aggregate: Option<String>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct GpuAllocationSnapshot {
+    model_gpu_allocations: Vec<ModelGpuAllocation>,
+    total_allocated_gpus: i64,
 }
 
 struct Cached {
@@ -161,7 +170,7 @@ impl InfraService {
         let gpu_allocations_future = async {
             match self.prometheus_url.as_deref() {
                 Some(url) => match self.fetch_gpu_allocations(url).await {
-                    Ok(allocations) => (Some(allocations), false),
+                    Ok(snapshot) => (Some(snapshot), false),
                     Err(e) => {
                         tracing::warn!("infra Prometheus fetch failed: {e}");
                         (None, true)
@@ -170,12 +179,22 @@ impl InfraService {
                 None => (None, true),
             }
         };
-        let ((hosts, host_stale), (gpu_allocations, gpu_data_stale)) =
+        let ((hosts, host_stale), (gpu_snapshot, gpu_data_stale)) =
             tokio::join!(hosts_future, gpu_allocations_future);
+
+        let (gpu_allocations, total_allocated_gpus) = gpu_snapshot
+            .map(|snapshot| {
+                (
+                    snapshot.model_gpu_allocations,
+                    snapshot.total_allocated_gpus,
+                )
+            })
+            .unwrap_or_default();
 
         let mut summary = self.summarize(
             hosts.unwrap_or_default(),
-            gpu_allocations.unwrap_or_default(),
+            gpu_allocations,
+            total_allocated_gpus,
             host_stale,
             gpu_data_stale,
         );
@@ -209,6 +228,7 @@ impl InfraService {
         &self,
         hosts: Vec<HostInfo>,
         model_gpu_allocations: Vec<ModelGpuAllocation>,
+        total_allocated_gpus: i64,
         stale: bool,
         gpu_data_stale: bool,
     ) -> InfraSummary {
@@ -216,10 +236,6 @@ impl InfraService {
         let active_hosts = hosts.iter().filter(|h| !h.models.is_empty()).count() as i64;
         let idle_hosts = total_hosts - active_hosts;
         let monthly_burn_usd = total_hosts as f64 * self.cost_per_host_usd_month;
-        let total_allocated_gpus = model_gpu_allocations
-            .iter()
-            .map(|allocation| allocation.allocated_gpus)
-            .sum();
         InfraSummary {
             total_hosts,
             active_hosts,
@@ -251,10 +267,11 @@ impl InfraService {
         Ok(parse_machines(&body))
     }
 
-    async fn fetch_gpu_allocations(&self, url: &str) -> Result<Vec<ModelGpuAllocation>, String> {
+    async fn fetch_gpu_allocations(&self, url: &str) -> Result<GpuAllocationSnapshot, String> {
         let env = escape_promql_label_value(&self.prometheus_environment);
+        let metric = format!("DCGM_FI_DEV_GPU_UTIL{{env=\"{env}\"}}");
         let query = format!(
-            "count by (model) (topk by (host_machine, UUID) (1, count by (model, host_machine, UUID) (DCGM_FI_DEV_GPU_UTIL{{env=\"{env}\"}})))"
+            "count by (model) (count by (model, host_machine, UUID) ({metric})) or label_replace(count(count by (host_machine, UUID) ({metric})), \"nearai_aggregate\", \"fleet_total\", \"\", \"\")"
         );
         let endpoint = format!("{}/api/v1/query", url.trim_end_matches('/'));
         let mut request = self.client.get(endpoint).query(&[("query", query)]);
@@ -277,7 +294,17 @@ fn escape_promql_label_value(value: &str) -> String {
         .replace('"', "\\\"")
 }
 
-fn parse_prometheus_allocations(body: &str) -> Result<Vec<ModelGpuAllocation>, String> {
+fn parse_gpu_count(raw: &str, series_name: &str) -> Result<i64, String> {
+    let value = raw
+        .parse::<f64>()
+        .map_err(|_| format!("non-numeric GPU count for {series_name}"))?;
+    if !value.is_finite() || value < 0.0 || value.fract() != 0.0 || value > i64::MAX as f64 {
+        return Err(format!("invalid GPU count for {series_name}"));
+    }
+    Ok(value as i64)
+}
+
+fn parse_prometheus_allocations(body: &str) -> Result<GpuAllocationSnapshot, String> {
     let response: PrometheusResponse = serde_json::from_str(body).map_err(|e| e.to_string())?;
     if response.status != "success" {
         return Err(response
@@ -288,33 +315,32 @@ fn parse_prometheus_allocations(body: &str) -> Result<Vec<ModelGpuAllocation>, S
         .data
         .ok_or_else(|| "Prometheus response missing data".to_string())?;
     let mut allocations = Vec::new();
-    let mut invalid_series = 0;
+    let mut total_allocated_gpus = None;
     for series in data.result {
-        let Some(model_name) = series.metric.model.filter(|value| !value.is_empty()) else {
-            continue;
-        };
-        let Ok(value) = series.value.1.parse::<f64>() else {
-            invalid_series += 1;
-            tracing::warn!(model = %model_name, "skipping non-numeric GPU allocation series");
-            continue;
-        };
-        if !value.is_finite() || value < 0.0 || value.fract() != 0.0 || value > i64::MAX as f64 {
-            invalid_series += 1;
-            tracing::warn!(model = %model_name, value, "skipping invalid GPU allocation series");
+        if series.metric.nearai_aggregate.as_deref() == Some("fleet_total") {
+            if total_allocated_gpus.is_some() {
+                return Err("Prometheus response contained duplicate fleet totals".to_string());
+            }
+            total_allocated_gpus = Some(parse_gpu_count(&series.value.1, "fleet total")?);
             continue;
         }
+        let model_name = series
+            .metric
+            .model
+            .filter(|value| !value.is_empty())
+            .unwrap_or_else(|| "__unattributed__".to_string());
+        let allocated_gpus = parse_gpu_count(&series.value.1, &format!("model {model_name}"))?;
         allocations.push(ModelGpuAllocation {
             model_name,
-            allocated_gpus: value as i64,
+            allocated_gpus,
         });
     }
-    if invalid_series > 0 {
-        return Err(format!(
-            "Prometheus response contained {invalid_series} invalid GPU allocation series"
-        ));
-    }
     allocations.sort_by(|a, b| a.model_name.cmp(&b.model_name));
-    Ok(allocations)
+    Ok(GpuAllocationSnapshot {
+        model_gpu_allocations: allocations,
+        total_allocated_gpus: total_allocated_gpus
+            .ok_or_else(|| "Prometheus response missing fleet total".to_string())?,
+    })
 }
 
 /// Parse the YAML-ish machines listing into hosts.
@@ -400,7 +426,7 @@ mod tests {
                 allocated_gpus: 1,
             },
         ];
-        let s = svc.summarize(hosts, allocations, false, false);
+        let s = svc.summarize(hosts, allocations, 5, false, false);
         assert_eq!(s.total_hosts, 2);
         assert_eq!(s.active_hosts, 1);
         assert_eq!(s.idle_hosts, 1);
@@ -418,13 +444,14 @@ mod tests {
                 "resultType": "vector",
                 "result": [
                     {"metric": {"model": "shared"}, "value": [1788380000.0, "1"]},
-                    {"metric": {"model": "z-ai/glm-5.2"}, "value": [1788380000.0, "8"]}
+                    {"metric": {"model": "z-ai/glm-5.2"}, "value": [1788380000.0, "8"]},
+                    {"metric": {"nearai_aggregate": "fleet_total"}, "value": [1788380000.0, "9"]}
                 ]
             }
         }"#;
-        let allocations = parse_prometheus_allocations(body).expect("valid Prometheus response");
+        let snapshot = parse_prometheus_allocations(body).expect("valid Prometheus response");
         assert_eq!(
-            allocations,
+            snapshot.model_gpu_allocations,
             vec![
                 ModelGpuAllocation {
                     model_name: "shared".into(),
@@ -436,6 +463,7 @@ mod tests {
                 },
             ]
         );
+        assert_eq!(snapshot.total_allocated_gpus, 9);
     }
 
     #[test]
@@ -446,7 +474,8 @@ mod tests {
                 "resultType": "vector",
                 "result": [
                     {"metric": {"model": "broken"}, "value": [1788380000.0, "1.5"]},
-                    {"metric": {"model": "valid"}, "value": [1788380000.0, "2"]}
+                    {"metric": {"model": "valid"}, "value": [1788380000.0, "2"]},
+                    {"metric": {"nearai_aggregate": "fleet_total"}, "value": [1788380000.0, "3"]}
                 ]
             }
         }"#;
@@ -460,7 +489,8 @@ mod tests {
             "data": {
                 "resultType": "vector",
                 "result": [
-                    {"metric": {"model": "broken"}, "value": [1788380000.0, "NaN"]}
+                    {"metric": {"model": "broken"}, "value": [1788380000.0, "NaN"]},
+                    {"metric": {"nearai_aggregate": "fleet_total"}, "value": [1788380000.0, "1"]}
                 ]
             }
         }"#;

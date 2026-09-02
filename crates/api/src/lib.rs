@@ -2151,14 +2151,15 @@ pub fn build_admin_routes(
         get_admin_organization_balance, get_billing_summary, get_infra_summary,
         get_model_consumption_timeseries, get_model_history, get_model_revenue, get_org_revenue,
         get_organization as get_admin_organization, get_organization_concurrent_limit,
-        get_organization_limits_history, get_organization_metrics, get_organization_timeseries,
-        get_performance_timeseries, get_platform_metrics, get_platform_timeseries,
-        get_revenue_density, list_admin_access_tokens, list_aml_allowlist, list_aml_reports,
-        list_invitation_email_deliveries, list_model_pricing_changes,
+        get_organization_fallback, get_organization_limits_history, get_organization_metrics,
+        get_organization_timeseries, get_performance_timeseries, get_platform_metrics,
+        get_platform_timeseries, get_revenue_density, list_admin_access_tokens, list_aml_allowlist,
+        list_aml_reports, list_invitation_email_deliveries, list_model_pricing_changes,
         list_models as admin_list_models, list_organization_members, list_organizations,
         list_users, preview_model_deprecation, preview_model_pricing_changes,
         resend_invitation_email, update_aml_report_status, update_organization_concurrent_limit,
-        update_organization_limits, update_service, upsert_aml_allowlist_entry, AdminAppState,
+        update_organization_fallback, update_organization_limits, update_service,
+        upsert_aml_allowlist_entry, AdminAppState,
     };
     use crate::routes::staking_farm::{
         get_admin_organization_staking_farm, sync_admin_organization_staking_farm,
@@ -2310,6 +2311,10 @@ pub fn build_admin_routes(
             "/admin/organizations/{org_id}/concurrent-limit",
             axum::routing::patch(update_organization_concurrent_limit)
                 .get(get_organization_concurrent_limit),
+        )
+        .route(
+            "/admin/organizations/{org_id}/fallback",
+            axum::routing::get(get_organization_fallback).patch(update_organization_fallback),
         )
         .route(
             "/admin/organizations/{org_id}/metrics",

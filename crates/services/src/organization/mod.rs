@@ -1445,6 +1445,168 @@ impl OrganizationServiceImpl {
             error: email_attempt.error,
         })
     }
+
+    fn settings_from_organization(org: &Organization) -> ports::OrganizationSettings {
+        ports::OrganizationSettings {
+            system_prompt: org
+                .settings
+                .get("system_prompt")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string),
+            fallback_enabled: org.fallback_enabled(),
+        }
+    }
+
+    async fn get_organization_settings_impl(
+        &self,
+        organization_id: OrganizationId,
+        user_id: UserId,
+    ) -> Result<ports::OrganizationSettings, OrganizationError> {
+        let is_member = self
+            .repository
+            .get_member(organization_id.0, user_id.0)
+            .await
+            .map_err(Self::map_repository_error)?
+            .is_some();
+
+        if !is_member {
+            return Err(OrganizationError::Unauthorized(
+                "User is not a member of this organization".to_string(),
+            ));
+        }
+
+        let org = self.get_organization_impl(organization_id).await?;
+        Ok(Self::settings_from_organization(&org))
+    }
+
+    async fn patch_organization_settings_impl(
+        &self,
+        organization_id: OrganizationId,
+        user_id: UserId,
+        patch: ports::PatchOrganizationSettings,
+    ) -> Result<ports::OrganizationSettings, OrganizationError> {
+        let member = self
+            .repository
+            .get_member(organization_id.0, user_id.0)
+            .await
+            .map_err(Self::map_repository_error)?
+            .ok_or_else(|| {
+                OrganizationError::Unauthorized(
+                    "User is not a member of this organization".to_string(),
+                )
+            })?;
+
+        // Authorize every requested field before applying any of them. This
+        // keeps mixed-field PATCH requests all-or-nothing at the service layer.
+        if patch.system_prompt.is_some() && !member.role.can_manage_organization() {
+            return Err(OrganizationError::Unauthorized(
+                "Insufficient permissions to manage organization settings".to_string(),
+            ));
+        }
+        if patch.fallback_enabled.is_some() && member.role != MemberRole::Owner {
+            return Err(OrganizationError::Unauthorized(
+                "Only organization owners can manage fallback".to_string(),
+            ));
+        }
+
+        let org = self.get_organization_impl(organization_id.clone()).await?;
+        if patch.system_prompt.is_none() && patch.fallback_enabled.is_none() {
+            return Ok(Self::settings_from_organization(&org));
+        }
+
+        let mut settings = if org.settings.is_object() {
+            org.settings.clone()
+        } else {
+            serde_json::json!({})
+        };
+        let settings_object = settings
+            .as_object_mut()
+            .expect("organization settings were initialized as an object");
+
+        if let Some(system_prompt) = patch.system_prompt {
+            match system_prompt {
+                Some(prompt) => {
+                    settings_object.insert("system_prompt".to_string(), serde_json::json!(prompt));
+                }
+                None => {
+                    settings_object.remove("system_prompt");
+                }
+            }
+        }
+
+        if let Some(fallback_enabled) = patch.fallback_enabled {
+            match fallback_enabled {
+                Some(enabled) => {
+                    settings_object
+                        .insert("fallback_enabled".to_string(), serde_json::json!(enabled));
+                }
+                None => {
+                    settings_object.remove("fallback_enabled");
+                }
+            }
+        }
+
+        let updated = self
+            .repository
+            .update(
+                organization_id.0,
+                UpdateOrganizationRequest {
+                    name: None,
+                    description: None,
+                    rate_limit: None,
+                    settings: Some(settings),
+                },
+            )
+            .await
+            .map_err(Self::map_repository_error)?;
+
+        Ok(Self::settings_from_organization(&updated))
+    }
+
+    async fn get_fallback_enabled_for_admin_impl(
+        &self,
+        organization_id: OrganizationId,
+    ) -> Result<bool, OrganizationError> {
+        Ok(self
+            .get_organization_impl(organization_id)
+            .await?
+            .fallback_enabled())
+    }
+
+    async fn update_fallback_enabled_for_admin_impl(
+        &self,
+        organization_id: OrganizationId,
+        fallback_enabled: bool,
+    ) -> Result<bool, OrganizationError> {
+        let org = self.get_organization_impl(organization_id.clone()).await?;
+        let mut settings = if org.settings.is_object() {
+            org.settings
+        } else {
+            serde_json::json!({})
+        };
+        settings
+            .as_object_mut()
+            .expect("organization settings were initialized as an object")
+            .insert(
+                "fallback_enabled".to_string(),
+                serde_json::json!(fallback_enabled),
+            );
+
+        self.repository
+            .update(
+                organization_id.0,
+                UpdateOrganizationRequest {
+                    name: None,
+                    description: None,
+                    rate_limit: None,
+                    settings: Some(settings),
+                },
+            )
+            .await
+            .map_err(Self::map_repository_error)?;
+
+        Ok(fallback_enabled)
+    }
 }
 
 // Implement the trait for the service
@@ -1736,35 +1898,51 @@ impl OrganizationServiceTrait for OrganizationServiceImpl {
         self.resend_invitation_email_impl(invitation_id).await
     }
 
+    async fn get_organization_settings(
+        &self,
+        organization_id: OrganizationId,
+        user_id: UserId,
+    ) -> Result<ports::OrganizationSettings, OrganizationError> {
+        self.get_organization_settings_impl(organization_id, user_id)
+            .await
+    }
+
+    async fn patch_organization_settings(
+        &self,
+        organization_id: OrganizationId,
+        user_id: UserId,
+        patch: ports::PatchOrganizationSettings,
+    ) -> Result<ports::OrganizationSettings, OrganizationError> {
+        self.patch_organization_settings_impl(organization_id, user_id, patch)
+            .await
+    }
+
+    async fn get_fallback_enabled_for_admin(
+        &self,
+        organization_id: OrganizationId,
+    ) -> Result<bool, OrganizationError> {
+        self.get_fallback_enabled_for_admin_impl(organization_id)
+            .await
+    }
+
+    async fn update_fallback_enabled_for_admin(
+        &self,
+        organization_id: OrganizationId,
+        fallback_enabled: bool,
+    ) -> Result<bool, OrganizationError> {
+        self.update_fallback_enabled_for_admin_impl(organization_id, fallback_enabled)
+            .await
+    }
+
     async fn get_system_prompt(
         &self,
         organization_id: OrganizationId,
         user_id: UserId,
     ) -> Result<Option<String>, OrganizationError> {
-        // Check if user is a member of the organization
-        let is_member = self
-            .repository
-            .get_member(organization_id.0, user_id.0)
-            .await
-            .map_err(Self::map_repository_error)?
-            .is_some();
-
-        if !is_member {
-            return Err(OrganizationError::Unauthorized(
-                "User is not a member of this organization".to_string(),
-            ));
-        }
-
-        // Get organization and extract system prompt from settings
-        let org = self.get_organization_impl(organization_id).await?;
-
-        let system_prompt = org
-            .settings
-            .get("system_prompt")
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string());
-
-        Ok(system_prompt)
+        Ok(self
+            .get_organization_settings_impl(organization_id, user_id)
+            .await?
+            .system_prompt)
     }
 
     async fn update_system_prompt(
@@ -1773,65 +1951,17 @@ impl OrganizationServiceTrait for OrganizationServiceImpl {
         user_id: UserId,
         system_prompt: Option<String>,
     ) -> Result<Option<String>, OrganizationError> {
-        // Check if user has permission to manage the organization
-        let member = self
-            .repository
-            .get_member(organization_id.0, user_id.0)
-            .await
-            .map_err(Self::map_repository_error)?;
-
-        let role = match member {
-            Some(m) => m.role,
-            None => {
-                return Err(OrganizationError::Unauthorized(
-                    "User is not a member of this organization".to_string(),
-                ))
-            }
-        };
-
-        if !role.can_manage_organization() {
-            return Err(OrganizationError::Unauthorized(
-                "Insufficient permissions to manage organization settings".to_string(),
-            ));
-        }
-
-        // Get current organization
-        let org = self.get_organization_impl(organization_id.clone()).await?;
-
-        // Update settings with new system prompt
-        let mut settings = if org.settings.is_object() {
-            org.settings.clone()
-        } else {
-            // Initialize as empty object if not already an object
-            serde_json::json!({})
-        };
-
-        if let Some(ref prompt) = system_prompt {
-            // Set system prompt if provided
-            if let Some(obj) = settings.as_object_mut() {
-                obj.insert("system_prompt".to_string(), serde_json::json!(prompt));
-            }
-        } else {
-            // Remove system prompt if None
-            if let Some(obj) = settings.as_object_mut() {
-                obj.remove("system_prompt");
-            }
-        }
-
-        // Update organization with new settings
-        let request = UpdateOrganizationRequest {
-            name: None,
-            description: None,
-            rate_limit: None,
-            settings: Some(settings),
-        };
-
-        self.repository
-            .update(organization_id.0, request)
-            .await
-            .map_err(Self::map_repository_error)?;
-
-        Ok(system_prompt)
+        Ok(self
+            .patch_organization_settings_impl(
+                organization_id,
+                user_id,
+                ports::PatchOrganizationSettings {
+                    system_prompt: Some(system_prompt),
+                    fallback_enabled: None,
+                },
+            )
+            .await?
+            .system_prompt)
     }
 }
 
@@ -1844,8 +1974,9 @@ mod tests {
     use uuid::Uuid;
 
     struct StubOrgRepo {
-        org: Organization,
+        org: Mutex<Organization>,
         member: Option<OrganizationMember>,
+        update_calls: Mutex<usize>,
         delete_result: DeleteOrganizationResult,
         delete_if_no_staking_farm_source_calls: Mutex<usize>,
     }
@@ -1860,8 +1991,11 @@ mod tests {
             unimplemented!()
         }
 
-        async fn get_by_id(&self, _: Uuid) -> Result<Option<Organization>, RepositoryError> {
-            Ok(Some(self.org.clone()))
+        async fn get_by_id(&self, id: Uuid) -> Result<Option<Organization>, RepositoryError> {
+            let org = self.org.lock().unwrap();
+            // Legacy tests use nil as a wildcard against this stub. Non-nil ids
+            // still exercise real not-found behavior for the settings API.
+            Ok((id.is_nil() || org.id.0 == id).then(|| org.clone()))
         }
 
         async fn get_by_name(&self, _: &str) -> Result<Option<Organization>, RepositoryError> {
@@ -1884,10 +2018,25 @@ mod tests {
 
         async fn update(
             &self,
-            _: Uuid,
-            _: UpdateOrganizationRequest,
+            id: Uuid,
+            request: UpdateOrganizationRequest,
         ) -> Result<Organization, RepositoryError> {
-            unimplemented!()
+            *self.update_calls.lock().unwrap() += 1;
+            let mut org = self.org.lock().unwrap();
+            if org.id.0 != id {
+                return Err(RepositoryError::NotFound(id.to_string()));
+            }
+            if let Some(name) = request.name {
+                org.name = name;
+            }
+            if let Some(description) = request.description {
+                org.description = Some(description);
+            }
+            if let Some(settings) = request.settings {
+                org.settings = settings;
+            }
+            org.updated_at = chrono::Utc::now();
+            Ok(org.clone())
         }
 
         async fn delete_if_no_staking_farm_source(
@@ -2303,8 +2452,9 @@ mod tests {
         });
         let service = OrganizationServiceImpl::new_with_email_sender(
             Arc::new(StubOrgRepo {
-                org,
+                org: Mutex::new(org),
                 member,
+                update_calls: Mutex::new(0),
                 delete_result: DeleteOrganizationResult::Deleted,
                 delete_if_no_staking_farm_source_calls: Mutex::new(0),
             }) as Arc<dyn OrganizationRepository>,
@@ -2317,12 +2467,197 @@ mod tests {
         (service, invitation_repo, email_sender, user_repo)
     }
 
+    fn make_settings_service(
+        role: MemberRole,
+        settings: serde_json::Value,
+    ) -> (
+        OrganizationServiceImpl,
+        Arc<StubOrgRepo>,
+        OrganizationId,
+        UserId,
+    ) {
+        let organization_id = OrganizationId(Uuid::new_v4());
+        let user_id = UserId(Uuid::new_v4());
+        let now = chrono::Utc::now();
+        let org_repo = Arc::new(StubOrgRepo {
+            org: Mutex::new(Organization {
+                id: organization_id.clone(),
+                name: "Settings Org".to_string(),
+                description: None,
+                owner_id: user_id.clone(),
+                settings,
+                is_active: true,
+                created_at: now,
+                updated_at: now,
+            }),
+            member: Some(OrganizationMember {
+                organization_id: organization_id.clone(),
+                user_id: user_id.clone(),
+                role,
+                joined_at: now,
+            }),
+            update_calls: Mutex::new(0),
+            delete_result: DeleteOrganizationResult::Deleted,
+            delete_if_no_staking_farm_source_calls: Mutex::new(0),
+        });
+        let user_repo = Arc::new(StubUserRepo {
+            inviter: User {
+                id: user_id.clone(),
+                email: "settings@example.com".to_string(),
+                username: "settings".to_string(),
+                display_name: Some("Settings User".to_string()),
+                avatar_url: None,
+                auth_provider: "test".to_string(),
+                provider_user_id: "settings-user".to_string(),
+                role: UserRole::User,
+                is_active: true,
+                last_login: None,
+                created_at: now,
+                updated_at: now,
+                tokens_revoked_at: None,
+            },
+            get_by_id_calls: Mutex::new(0),
+        });
+        let invitation_repo = Arc::new(StubInvitationRepo {
+            records: Mutex::new(Vec::new()),
+        });
+        let service = OrganizationServiceImpl::new(
+            org_repo.clone() as Arc<dyn OrganizationRepository>,
+            user_repo as Arc<dyn UserRepository>,
+            invitation_repo as Arc<dyn OrganizationInvitationRepository>,
+        );
+
+        (service, org_repo, organization_id, user_id)
+    }
+
+    #[tokio::test]
+    async fn owner_can_set_and_reset_fallback_without_losing_other_settings() {
+        let (service, repo, organization_id, user_id) = make_settings_service(
+            MemberRole::Owner,
+            serde_json::json!({
+                "system_prompt": "Keep this",
+                "unrelated": { "preserved": true }
+            }),
+        );
+
+        let defaults = service
+            .get_organization_settings(organization_id.clone(), user_id.clone())
+            .await
+            .expect("owner can read settings");
+        assert!(defaults.fallback_enabled);
+        assert_eq!(defaults.system_prompt.as_deref(), Some("Keep this"));
+
+        let disabled = service
+            .patch_organization_settings(
+                organization_id.clone(),
+                user_id.clone(),
+                ports::PatchOrganizationSettings {
+                    system_prompt: None,
+                    fallback_enabled: Some(Some(false)),
+                },
+            )
+            .await
+            .expect("owner can disable fallback");
+        assert!(!disabled.fallback_enabled);
+
+        let stored = repo.org.lock().unwrap().settings.clone();
+        assert_eq!(stored["system_prompt"], "Keep this");
+        assert_eq!(
+            stored["unrelated"],
+            serde_json::json!({ "preserved": true })
+        );
+        assert_eq!(stored["fallback_enabled"], false);
+
+        let enabled = service
+            .patch_organization_settings(
+                organization_id.clone(),
+                user_id.clone(),
+                ports::PatchOrganizationSettings {
+                    system_prompt: None,
+                    fallback_enabled: Some(Some(true)),
+                },
+            )
+            .await
+            .expect("owner can explicitly enable fallback");
+        assert!(enabled.fallback_enabled);
+
+        let reset = service
+            .patch_organization_settings(
+                organization_id,
+                user_id,
+                ports::PatchOrganizationSettings {
+                    system_prompt: None,
+                    fallback_enabled: Some(None),
+                },
+            )
+            .await
+            .expect("owner can reset fallback to its default");
+        assert!(reset.fallback_enabled);
+        assert!(
+            repo.org
+                .lock()
+                .unwrap()
+                .settings
+                .get("fallback_enabled")
+                .is_none(),
+            "null reset should remove the JSON override"
+        );
+    }
+
+    #[tokio::test]
+    async fn fallback_patch_is_owner_only_and_mixed_patch_is_atomic() {
+        for role in [MemberRole::Admin, MemberRole::Member] {
+            let (service, repo, organization_id, user_id) =
+                make_settings_service(role, serde_json::json!({ "system_prompt": "original" }));
+
+            let error = service
+                .patch_organization_settings(
+                    organization_id,
+                    user_id,
+                    ports::PatchOrganizationSettings {
+                        system_prompt: Some(Some("must not be written".to_string())),
+                        fallback_enabled: Some(Some(false)),
+                    },
+                )
+                .await
+                .expect_err("non-owners cannot change fallback");
+            assert!(matches!(error, OrganizationError::Unauthorized(_)));
+            assert_eq!(*repo.update_calls.lock().unwrap(), 0);
+            assert_eq!(
+                repo.org.lock().unwrap().settings,
+                serde_json::json!({ "system_prompt": "original" })
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn platform_admin_helpers_update_effective_fallback_and_reject_unknown_orgs() {
+        let (service, repo, organization_id, _user_id) =
+            make_settings_service(MemberRole::Member, serde_json::json!({ "other": 1 }));
+
+        assert!(service
+            .get_fallback_enabled_for_admin(organization_id.clone())
+            .await
+            .expect("missing override defaults to enabled"));
+        assert!(!service
+            .update_fallback_enabled_for_admin(organization_id.clone(), false)
+            .await
+            .expect("platform admin can disable fallback"));
+        assert_eq!(repo.org.lock().unwrap().settings["other"], 1);
+
+        let error = service
+            .get_fallback_enabled_for_admin(OrganizationId(Uuid::new_v4()))
+            .await
+            .expect_err("unknown organization should be rejected");
+        assert!(matches!(error, OrganizationError::NotFound));
+    }
+
     #[tokio::test]
     async fn delete_organization_blocks_staking_wallet_bound_org_without_deleting() {
         let owner_id = UserId(Uuid::new_v4());
         let org_id = OrganizationId(Uuid::new_v4());
         let org_repo = Arc::new(StubOrgRepo {
-            org: Organization {
+            org: Mutex::new(Organization {
                 id: org_id.clone(),
                 name: "Staking Bound Org".to_string(),
                 description: None,
@@ -2331,8 +2666,9 @@ mod tests {
                 is_active: true,
                 created_at: chrono::Utc::now(),
                 updated_at: chrono::Utc::now(),
-            },
+            }),
             member: None,
+            update_calls: Mutex::new(0),
             delete_result: DeleteOrganizationResult::StakingWalletBound,
             delete_if_no_staking_farm_source_calls: Mutex::new(0),
         });

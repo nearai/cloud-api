@@ -401,14 +401,17 @@ pub async fn get_organization_settings(
 
     let user_id = crate::conversions::authenticated_user_to_user_id(user);
 
-    let system_prompt = app_state
+    let settings = app_state
         .organization_service
-        .get_system_prompt(organization_id, user_id)
+        .get_organization_settings(organization_id, user_id)
         .await
         .map_err(crate::routes::common::map_organization_error)?;
 
     Ok(Json(OrganizationSettingsResponse {
-        settings: OrganizationSettings { system_prompt },
+        settings: OrganizationSettings {
+            system_prompt: settings.system_prompt,
+            fallback_enabled: settings.fallback_enabled,
+        },
     }))
 }
 
@@ -455,26 +458,37 @@ pub async fn patch_organization_settings(
     }
 
     let user_id = crate::conversions::authenticated_user_to_user_id(user);
+    let organization_uuid = organization_id.0;
+    let actor_id = user_id.0;
+    let fallback_was_requested = request.fallback_enabled.is_some();
+    let settings = app_state
+        .organization_service
+        .patch_organization_settings(
+            organization_id,
+            user_id,
+            services::organization::PatchOrganizationSettings {
+                system_prompt: request.system_prompt,
+                fallback_enabled: request.fallback_enabled,
+            },
+        )
+        .await
+        .map_err(crate::routes::common::map_organization_error)?;
 
-    // Handle system_prompt based on request state
-    let system_prompt = match request.system_prompt {
-        // Field not provided in request - get current value (read-only check)
-        None => app_state
-            .organization_service
-            .get_system_prompt(organization_id, user_id)
-            .await
-            .map_err(crate::routes::common::map_organization_error)?,
-
-        // Field provided (either null to delete or value to set)
-        Some(new_value) => app_state
-            .organization_service
-            .update_system_prompt(organization_id, user_id, new_value)
-            .await
-            .map_err(crate::routes::common::map_organization_error)?,
-    };
+    if fallback_was_requested {
+        tracing::info!(
+            organization_id = %organization_uuid,
+            actor_id = %actor_id,
+            actor_type = "organization_owner",
+            fallback_enabled = settings.fallback_enabled,
+            "Organization fallback setting changed"
+        );
+    }
 
     Ok(Json(OrganizationSettingsResponse {
-        settings: OrganizationSettings { system_prompt },
+        settings: OrganizationSettings {
+            system_prompt: settings.system_prompt,
+            fallback_enabled: settings.fallback_enabled,
+        },
     }))
 }
 
@@ -931,6 +945,38 @@ mod tests {
             &self,
             _: Uuid,
         ) -> Result<InvitationEmailResendResult, OrganizationError> {
+            unimplemented!()
+        }
+
+        async fn get_organization_settings(
+            &self,
+            _: OrganizationId,
+            _: UserId,
+        ) -> Result<services::organization::OrganizationSettings, OrganizationError> {
+            unimplemented!()
+        }
+
+        async fn patch_organization_settings(
+            &self,
+            _: OrganizationId,
+            _: UserId,
+            _: services::organization::PatchOrganizationSettings,
+        ) -> Result<services::organization::OrganizationSettings, OrganizationError> {
+            unimplemented!()
+        }
+
+        async fn get_fallback_enabled_for_admin(
+            &self,
+            _: OrganizationId,
+        ) -> Result<bool, OrganizationError> {
+            unimplemented!()
+        }
+
+        async fn update_fallback_enabled_for_admin(
+            &self,
+            _: OrganizationId,
+            _: bool,
+        ) -> Result<bool, OrganizationError> {
             unimplemented!()
         }
 

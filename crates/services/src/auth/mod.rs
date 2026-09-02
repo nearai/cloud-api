@@ -1298,6 +1298,34 @@ mod tests {
         ) -> Result<InvitationEmailResendResult, OrganizationError> {
             unimplemented!()
         }
+        async fn get_organization_settings(
+            &self,
+            _: OrganizationId,
+            _: UserId,
+        ) -> Result<crate::organization::OrganizationSettings, OrganizationError> {
+            unimplemented!()
+        }
+        async fn patch_organization_settings(
+            &self,
+            _: OrganizationId,
+            _: UserId,
+            _: crate::organization::PatchOrganizationSettings,
+        ) -> Result<crate::organization::OrganizationSettings, OrganizationError> {
+            unimplemented!()
+        }
+        async fn get_fallback_enabled_for_admin(
+            &self,
+            _: OrganizationId,
+        ) -> Result<bool, OrganizationError> {
+            unimplemented!()
+        }
+        async fn update_fallback_enabled_for_admin(
+            &self,
+            _: OrganizationId,
+            _: bool,
+        ) -> Result<bool, OrganizationError> {
+            unimplemented!()
+        }
         async fn get_system_prompt(
             &self,
             _: OrganizationId,

@@ -33,6 +33,31 @@ pub struct Organization {
     pub updated_at: DateTime<Utc>,
 }
 
+impl Organization {
+    /// Effective organization fallback policy. Missing or malformed legacy
+    /// values preserve the platform's existing fallback-enabled behavior.
+    pub fn fallback_enabled(&self) -> bool {
+        self.settings
+            .get("fallback_enabled")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(true)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct OrganizationSettings {
+    pub system_prompt: Option<String>,
+    pub fallback_enabled: bool,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct PatchOrganizationSettings {
+    /// None = omitted, Some(None) = clear, Some(Some(value)) = set.
+    pub system_prompt: Option<Option<String>>,
+    /// None = omitted, Some(None) = restore the default, Some(Some(value)) = set.
+    pub fallback_enabled: Option<Option<bool>>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OrganizationWithRole {
     pub organization: Organization,
@@ -669,6 +694,34 @@ pub trait OrganizationServiceTrait: Send + Sync {
         &self,
         invitation_id: Uuid,
     ) -> Result<InvitationEmailResendResult, OrganizationError>;
+
+    /// Get the effective organization settings for an organization member.
+    async fn get_organization_settings(
+        &self,
+        organization_id: OrganizationId,
+        user_id: UserId,
+    ) -> Result<OrganizationSettings, OrganizationError>;
+
+    /// Atomically patch organization settings with field-specific authorization.
+    async fn patch_organization_settings(
+        &self,
+        organization_id: OrganizationId,
+        user_id: UserId,
+        patch: PatchOrganizationSettings,
+    ) -> Result<OrganizationSettings, OrganizationError>;
+
+    /// Get the effective fallback policy from an admin-authenticated call path.
+    async fn get_fallback_enabled_for_admin(
+        &self,
+        organization_id: OrganizationId,
+    ) -> Result<bool, OrganizationError>;
+
+    /// Set the fallback policy from an admin-authenticated call path.
+    async fn update_fallback_enabled_for_admin(
+        &self,
+        organization_id: OrganizationId,
+        fallback_enabled: bool,
+    ) -> Result<bool, OrganizationError>;
 
     /// Get organization system prompt
     async fn get_system_prompt(

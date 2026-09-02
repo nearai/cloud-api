@@ -494,6 +494,11 @@ impl InfraConfig {
                     .to_string(),
             );
         }
+        if let Some(environment) = prometheus_environment.as_deref() {
+            if !matches!(environment, "prod" | "staging") {
+                return Err("INFRA_PROMETHEUS_ENV must be prod or staging".to_string());
+            }
+        }
 
         Ok(Self {
             machines_url: env::var("INFRA_MACHINES_URL")
@@ -1445,6 +1450,10 @@ mod tests {
         std::env::set_var("INFRA_PROMETHEUS_ENV", "staging");
         let config = InfraConfig::from_env().unwrap();
         assert_eq!(config.prometheus_environment, "staging");
+
+        std::env::set_var("INFRA_PROMETHEUS_ENV", "production");
+        let error = InfraConfig::from_env().unwrap_err();
+        assert!(error.contains("prod or staging"));
         clear_infra_env();
     }
 

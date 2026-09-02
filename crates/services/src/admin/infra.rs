@@ -254,7 +254,7 @@ impl InfraService {
     async fn fetch_gpu_allocations(&self, url: &str) -> Result<Vec<ModelGpuAllocation>, String> {
         let env = escape_promql_label_value(&self.prometheus_environment);
         let query = format!(
-            "count by (model) (count by (model, host_machine, UUID) (DCGM_FI_DEV_GPU_UTIL{{env=\"{env}\"}}))"
+            "count by (model) (topk by (host_machine, UUID) (1, count by (model, host_machine, UUID) (DCGM_FI_DEV_GPU_UTIL{{env=\"{env}\"}})))"
         );
         let endpoint = format!("{}/api/v1/query", url.trim_end_matches('/'));
         let mut request = self.client.get(endpoint).query(&[("query", query)]);
@@ -308,8 +308,10 @@ fn parse_prometheus_allocations(body: &str) -> Result<Vec<ModelGpuAllocation>, S
             allocated_gpus: value as i64,
         });
     }
-    if allocations.is_empty() && invalid_series > 0 {
-        return Err("Prometheus response contained no valid GPU allocations".to_string());
+    if invalid_series > 0 {
+        return Err(format!(
+            "Prometheus response contained {invalid_series} invalid GPU allocation series"
+        ));
     }
     allocations.sort_by(|a, b| a.model_name.cmp(&b.model_name));
     Ok(allocations)
@@ -437,7 +439,7 @@ mod tests {
     }
 
     #[test]
-    fn skips_invalid_gpu_counts_when_valid_series_remain() {
+    fn rejects_partial_gpu_snapshots() {
         let body = r#"{
             "status": "success",
             "data": {
@@ -448,13 +450,7 @@ mod tests {
                 ]
             }
         }"#;
-        assert_eq!(
-            parse_prometheus_allocations(body).unwrap(),
-            vec![ModelGpuAllocation {
-                model_name: "valid".into(),
-                allocated_gpus: 2,
-            }]
-        );
+        assert!(parse_prometheus_allocations(body).is_err());
     }
 
     #[test]

@@ -754,11 +754,11 @@ async fn ensure_chutes_catalog_row(
         // out-of-band provider is a fallback even if the configured primary is
         // temporarily undiscoverable. Rows created for this provider itself are
         // genuine standalone primaries.
-        if model.inference_url.is_some() || model.provider_type != "chutes" {
-            ProviderPoolRole::Fallback
-        } else {
-            ProviderPoolRole::Primary
-        }
+        ProviderPoolRole::from_catalog(
+            inference_providers::ProviderSource::Chutes,
+            &model.provider_type,
+            model.inference_url.is_some(),
+        )
     };
 
     // Use the *unfiltered* lookup (not get_active_model_by_name): a deliberately

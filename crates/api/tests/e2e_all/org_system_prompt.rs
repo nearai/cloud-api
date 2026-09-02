@@ -3,6 +3,8 @@
 use crate::common::*;
 use api::models::{OrganizationFallbackResponse, OrganizationSettingsResponse};
 use serde_json::json;
+use services::common::RepositoryError;
+use services::organization::{OrganizationRepository, UpdateOrganizationRequest};
 
 /// Test complete CRUD lifecycle with three-state PATCH semantics
 #[tokio::test]
@@ -263,6 +265,49 @@ async fn test_concurrent_settings_patches_preserve_distinct_keys() {
         );
         assert!(!current.settings.fallback_enabled);
     }
+}
+
+#[tokio::test]
+async fn test_legacy_full_settings_update_rejects_stale_fallback_snapshot() {
+    let (server, database) = setup_test_server_with_database().await;
+    let org = create_org(&server).await;
+    let owner_token = get_access_token_from_refresh_token(&server, get_session_id()).await;
+    let org_id = uuid::Uuid::parse_str(&org.id).unwrap();
+
+    let disabled = server
+        .patch(&format!("/v1/organizations/{}/settings", org.id))
+        .add_header("Authorization", format!("Bearer {owner_token}"))
+        .json(&json!({ "fallback_enabled": false }))
+        .await;
+    assert_eq!(disabled.status_code(), 200);
+
+    // This is the repository operation a legacy admin request would issue
+    // after it had read the former `true` override. The atomic guard must stop
+    // that stale full-settings object from restoring the owner's old policy.
+    let repository = database::repositories::PgOrganizationRepository::new(database.pool().clone());
+    let stale = repository
+        .update(
+            org_id,
+            UpdateOrganizationRequest {
+                name: None,
+                description: None,
+                rate_limit: None,
+                settings: Some(json!({
+                    "fallback_enabled": true,
+                    "unrelated": "stale admin update"
+                })),
+            },
+            Some(Some(json!(true))),
+        )
+        .await;
+    assert!(matches!(stale, Err(RepositoryError::TransactionConflict)));
+
+    let current = server
+        .get(&format!("/v1/organizations/{}/settings", org.id))
+        .add_header("Authorization", format!("Bearer {owner_token}"))
+        .await
+        .json::<OrganizationSettingsResponse>();
+    assert!(!current.settings.fallback_enabled);
 }
 
 #[tokio::test]

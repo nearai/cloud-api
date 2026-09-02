@@ -684,6 +684,23 @@ pub enum ProviderPoolRole {
     Fallback,
 }
 
+impl ProviderPoolRole {
+    /// Derive an out-of-band provider's stable role from catalog ownership.
+    /// A separate inference URL is always a primary fleet; otherwise the
+    /// provider owning the catalog row is directly usable as the primary.
+    pub fn from_catalog(
+        provider_source: inference_providers::ProviderSource,
+        catalog_provider_type: &str,
+        has_inference_url: bool,
+    ) -> Self {
+        if has_inference_url || provider_source.as_str() != catalog_provider_type {
+            Self::Fallback
+        } else {
+            Self::Primary
+        }
+    }
+}
+
 /// Backend verifier that creates verified reqwest clients by connecting to a backend,
 /// fetching its attestation report, and verifying the TDX quote + GPU evidence.
 /// Used by `nearai::Provider` for lazy bucket client creation.
@@ -1272,6 +1289,51 @@ impl InferenceProviderPool {
             .any(|p| Arc::as_ptr(p) as *const () as usize == ptr)
         {
             entry.push(provider);
+        }
+    }
+
+    /// Reclassify every pinned provider for a model from the current catalog
+    /// routing configuration. An inference URL represents a separate primary
+    /// fleet; without one, a pinned provider is primary only when its concrete
+    /// provider source owns the catalog row.
+    ///
+    /// This is called after live admin catalog updates so request policy does
+    /// not retain the role that happened to be assigned at process startup.
+    pub fn refresh_pinned_provider_roles_from_catalog(
+        &self,
+        model_id: &str,
+        catalog_provider_type: &str,
+        has_inference_url: bool,
+    ) {
+        let pinned = self
+            .pinned_providers
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(model_id)
+            .cloned()
+            .unwrap_or_default();
+        if pinned.is_empty() {
+            return;
+        }
+
+        let mut fallback_providers = self
+            .fallback_providers
+            .write()
+            .unwrap_or_else(|e| e.into_inner());
+        let fallbacks = pinned
+            .into_iter()
+            .filter(|provider| {
+                ProviderPoolRole::from_catalog(
+                    provider.provider_source(),
+                    catalog_provider_type,
+                    has_inference_url,
+                ) == ProviderPoolRole::Fallback
+            })
+            .collect::<Vec<_>>();
+        if fallbacks.is_empty() {
+            fallback_providers.remove(model_id);
+        } else {
+            fallback_providers.insert(model_id.to_string(), fallbacks);
         }
     }
 
@@ -10303,6 +10365,68 @@ mod tests {
             !served.provider_attribution.served_via_fallback,
             "a true Chutes-only model should not be labeled as NEAR fallback"
         );
+    }
+
+    #[tokio::test]
+    async fn live_catalog_changes_refresh_pinned_provider_policy_role() {
+        use inference_providers::mock::MockProvider;
+        use inference_providers::{ProviderSource, ProviderTier};
+
+        let pool = InferenceProviderPool::new(None, ExternalProvidersConfig::default());
+        let model_id = "policy/live-catalog-role".to_string();
+        let pinned = Arc::new(
+            MockProvider::new_accept_all()
+                .with_tier(ProviderTier::Attested3p)
+                .with_provider_source(ProviderSource::Chutes),
+        );
+        let pinned_provider = pinned as Arc<InferenceProviderTrait>;
+
+        pool.register_pinned_provider(
+            model_id.clone(),
+            pinned_provider.clone(),
+            None,
+            ProviderPoolRole::Primary,
+        )
+        .await;
+
+        let disabled = ChatRoutingHints {
+            fallback_disabled: true,
+            ..Default::default()
+        };
+        let standalone = pool
+            .get_providers_with_fallback(&model_id, None, &disabled)
+            .await
+            .expect("registered model");
+        assert_eq!(standalone.len(), 1);
+        assert!(Arc::ptr_eq(&standalone[0], &pinned_provider));
+
+        pool.refresh_pinned_provider_roles_from_catalog(&model_id, "chutes", true);
+        let paired = pool
+            .get_providers_with_fallback(&model_id, None, &disabled)
+            .await
+            .expect("registered model");
+        assert!(
+            paired.is_empty(),
+            "an inference URL makes the pin a fallback"
+        );
+
+        pool.refresh_pinned_provider_roles_from_catalog(&model_id, "vllm", false);
+        let provider_owned_elsewhere = pool
+            .get_providers_with_fallback(&model_id, None, &disabled)
+            .await
+            .expect("registered model");
+        assert!(
+            provider_owned_elsewhere.is_empty(),
+            "a different catalog provider type keeps the pin classified as fallback"
+        );
+
+        pool.refresh_pinned_provider_roles_from_catalog(&model_id, "chutes", false);
+        let standalone_again = pool
+            .get_providers_with_fallback(&model_id, None, &disabled)
+            .await
+            .expect("registered model");
+        assert_eq!(standalone_again.len(), 1);
+        assert!(Arc::ptr_eq(&standalone_again[0], &pinned_provider));
     }
 
     #[tokio::test]

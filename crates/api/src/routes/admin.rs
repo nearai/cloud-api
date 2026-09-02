@@ -842,6 +842,20 @@ pub async fn batch_upsert_models(
             }
         })?;
 
+    // A pinned provider's primary/fallback role is catalog configuration, not
+    // startup state. Refresh it from each merged row before changing the live
+    // discovered providers so fallback-disabled requests cannot enter a stale
+    // role window after an admin routing update.
+    for (model_name, model) in &updated_models {
+        app_state
+            .inference_provider_pool
+            .refresh_pinned_provider_roles_from_catalog(
+                model_name,
+                &model.provider_type,
+                model.inference_url.is_some(),
+            );
+    }
+
     // Update providers at runtime so changes take effect without server restart.
     // Unregister first, then re-register — this handles type transitions
     // (e.g., inference_url → external) and deactivations cleanly.

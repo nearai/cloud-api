@@ -275,7 +275,10 @@ impl PgOrganizationRepository {
         &self,
         id: Uuid,
         request: DbUpdateOrganizationRequest,
+        expected_fallback_override: Option<Option<serde_json::Value>>,
     ) -> Result<DbOrganization, RepositoryError> {
+        let guard_fallback_override = expected_fallback_override.is_some();
+        let expected_fallback_override = expected_fallback_override.flatten();
         let row = retry_db!("update_organization", {
             let client = self
                 .pool
@@ -285,7 +288,7 @@ impl PgOrganizationRepository {
                 .map_err(RepositoryError::PoolError)?;
 
             client
-                .query_one(
+                .query_opt(
                     r#"
             UPDATE organizations
             SET name = COALESCE($2, name),
@@ -293,7 +296,13 @@ impl PgOrganizationRepository {
                 rate_limit = COALESCE($4, rate_limit),
                 settings = COALESCE($5, settings),
                 updated_at = NOW()
-            WHERE id = $1 AND is_active = true
+            WHERE id = $1
+              AND is_active = true
+              AND (
+                  NOT $6::boolean
+                  OR settings -> 'fallback_enabled'
+                     IS NOT DISTINCT FROM $7::jsonb
+              )
             RETURNING *
             "#,
                     &[
@@ -302,11 +311,14 @@ impl PgOrganizationRepository {
                         &request.description,
                         &request.rate_limit,
                         &request.settings,
+                        &guard_fallback_override,
+                        &expected_fallback_override,
                     ],
                 )
                 .await
                 .map_err(map_db_error)
-        })?;
+        })?
+        .ok_or(RepositoryError::TransactionConflict)?;
 
         debug!("Updated organization: {}", id);
         self.row_to_db_organization(row)
@@ -611,6 +623,7 @@ impl OrganizationRepository for PgOrganizationRepository {
         &self,
         id: Uuid,
         request: UpdateOrganizationRequest,
+        expected_fallback_override: Option<Option<serde_json::Value>>,
     ) -> Result<Organization, RepositoryError> {
         let db_request = DbUpdateOrganizationRequest {
             name: request.name,
@@ -619,7 +632,9 @@ impl OrganizationRepository for PgOrganizationRepository {
             settings: request.settings,
         };
 
-        let db_org = self.update_internal(id, db_request).await?;
+        let db_org = self
+            .update_internal(id, db_request, expected_fallback_override)
+            .await?;
         self.db_to_domain_organization(db_org)
             .await
             .map_err(RepositoryError::DataConversionError)

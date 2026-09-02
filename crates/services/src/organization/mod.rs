@@ -146,22 +146,32 @@ impl OrganizationServiceImpl {
         rate_limit: Option<i32>,
         settings: Option<serde_json::Value>,
     ) -> Result<Organization, OrganizationError> {
-        // Check if user has permission
+        // Check if user has permission and retain the concrete role. More than
+        // one membership may carry the owner role, so `owner_id` alone is not
+        // sufficient for owner-only settings.
         let org = self.get_organization_impl(id.clone()).await?;
-        if org.owner_id != user_id {
-            // Check if user is admin
-            if let Ok(Some(member)) = self.repository.get_member(id.0, user_id.0).await {
-                if member.role != MemberRole::Owner && member.role != MemberRole::Admin {
+        let role = if org.owner_id == user_id {
+            MemberRole::Owner
+        } else {
+            match self.repository.get_member(id.0, user_id.0).await {
+                Ok(Some(member))
+                    if member.role == MemberRole::Owner || member.role == MemberRole::Admin =>
+                {
+                    member.role
+                }
+                Ok(Some(_)) => {
                     return Err(OrganizationError::Unauthorized(
                         "Only owners and admins can update organization".to_string(),
                     ));
                 }
-            } else {
-                return Err(OrganizationError::Unauthorized(
-                    "User is not a member of this organization".to_string(),
-                ));
+                _ => {
+                    return Err(OrganizationError::Unauthorized(
+                        "User is not a member of this organization".to_string(),
+                    ));
+                }
             }
-        }
+        };
+        let is_owner = role == MemberRole::Owner;
 
         // Validate name if provided
         if let Some(ref n) = name {
@@ -185,11 +195,18 @@ impl OrganizationServiceImpl {
                     .unwrap_or(true)
             })
         });
-        if requested_fallback_change.is_some() && org.owner_id != user_id {
+        if requested_fallback_change.is_some() && !is_owner {
             return Err(OrganizationError::Unauthorized(
                 "Only organization owners can manage fallback".to_string(),
             ));
         }
+
+        // An admin may submit a full settings object that preserves the value
+        // observed above. Guard the repository update with that exact raw JSON
+        // value: if an owner changes the override concurrently, the stale admin
+        // write cannot restore it. Owners are intentionally unguarded.
+        let expected_fallback_override = (!is_owner && settings.is_some())
+            .then(|| org.settings.get("fallback_enabled").cloned());
 
         let request = UpdateOrganizationRequest {
             name,
@@ -200,7 +217,7 @@ impl OrganizationServiceImpl {
 
         let updated = self
             .repository
-            .update(id.0, request)
+            .update(id.0, request, expected_fallback_override)
             .await
             .map_err(Self::map_repository_error)?;
 
@@ -1997,11 +2014,17 @@ mod tests {
             &self,
             id: Uuid,
             request: UpdateOrganizationRequest,
+            expected_fallback_override: Option<Option<serde_json::Value>>,
         ) -> Result<Organization, RepositoryError> {
             *self.update_calls.lock().unwrap() += 1;
             let mut org = self.org.lock().unwrap();
             if org.id.0 != id {
                 return Err(RepositoryError::NotFound(id.to_string()));
+            }
+            if let Some(expected) = expected_fallback_override {
+                if org.settings.get("fallback_enabled").cloned() != expected {
+                    return Err(RepositoryError::TransactionConflict);
+                }
             }
             if let Some(name) = request.name {
                 org.name = name;

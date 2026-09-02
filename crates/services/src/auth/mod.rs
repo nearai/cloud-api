@@ -949,6 +949,7 @@ mod tests {
             &self,
             _: Uuid,
             _: UpdateOrganizationRequest,
+            _: Option<Option<serde_json::Value>>,
         ) -> Result<Organization, RepositoryError> {
             unimplemented!()
         }

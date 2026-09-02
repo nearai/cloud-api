@@ -330,10 +330,13 @@ pub trait OrganizationRepository: Send + Sync {
         user_id: Uuid,
     ) -> Result<Option<OrganizationMember>, RepositoryError>;
 
+    /// When `expected_fallback_override` is present, update only if the row
+    /// still has that exact raw `fallback_enabled` override.
     async fn update(
         &self,
         id: Uuid,
         request: UpdateOrganizationRequest,
+        expected_fallback_override: Option<Option<serde_json::Value>>,
     ) -> Result<Organization, RepositoryError>;
 
     /// Atomically applies the organization-settings fields present in `patch`.

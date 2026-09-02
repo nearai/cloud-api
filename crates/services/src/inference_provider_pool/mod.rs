@@ -160,6 +160,8 @@ fn record_provider_attempt(
 /// stream return or growing the stash unbounded (issue #701).
 const MAX_LEADING_CONTROL_EVENTS: usize = 32;
 
+const MAX_LOGGED_ERROR_DETAIL: usize = 200;
+
 /// EMA α for TTFT during warmup (first TTFT_WARMUP_SAMPLES observations).
 const TTFT_EWMA_ALPHA_WARMUP: f64 = 0.5;
 /// EMA α for TTFT after warmup (stable tracking).
@@ -2190,6 +2192,30 @@ impl InferenceProviderPool {
                 _ => "http_other",
             },
             E::RequestFailed(_) => "request_failed",
+        }
+    }
+
+    pub fn safe_error_detail(error: &inference_providers::CompletionError) -> String {
+        use inference_providers::CompletionError as E;
+
+        match error {
+            E::HttpError {
+                status_code,
+                is_external,
+                ..
+            } => format!("upstream http {status_code} (external={is_external})"),
+            E::Timeout {
+                operation,
+                timeout_seconds,
+            } => format!("timed out after {timeout_seconds}s during {operation}"),
+            other => {
+                let mut detail = Self::sanitize_error_message(&other.to_string());
+                if let Some((cut, _)) = detail.char_indices().nth(MAX_LOGGED_ERROR_DETAIL) {
+                    detail.truncate(cut);
+                    detail.push_str("...[truncated]");
+                }
+                detail
+            }
         }
     }
 

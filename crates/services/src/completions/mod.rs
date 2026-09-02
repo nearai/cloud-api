@@ -195,9 +195,7 @@ where
             .last_token_time
             .map(|last| last.elapsed().as_millis() as u64);
         let error_detail = self.last_error.as_ref().map(|error| {
-            super::inference_provider_pool::InferenceProviderPool::sanitize_error_message(
-                &error.to_string(),
-            )
+            super::inference_provider_pool::InferenceProviderPool::safe_error_detail(error)
         });
 
         // Create span with context BEFORE any early returns so all error logs have context
@@ -211,6 +209,21 @@ where
             %inference_type
         )
         .entered();
+
+        if error_detail.is_some() {
+            tracing::warn!(
+                %request_id,
+                %organization_id,
+                %model_id,
+                model = %self.model_name,
+                chat_id = self.last_chat_id.as_deref(),
+                error_detail = error_detail.as_deref(),
+                stream_completed = self.stream_completed,
+                total_duration_ms,
+                ms_since_last_token,
+                "Stream failed"
+            );
+        }
 
         let (
             input_tokens,
@@ -238,38 +251,37 @@ where
                 // keeps polling, so the stream still ends "normally"
                 // (stream_completed == true) after e.g. a backend queue abort before
                 // the first token. That is a provider error, not a mystery.
-                if !self.stream_completed || self.last_error.is_some() {
-                    tracing::warn!(%request_id, %organization_id, %model_id,
-                        model = %self.model_name,
-                        stream_completed = self.stream_completed,
-                        stream_error = self.last_error.is_some(),
-                        error_detail = error_detail.as_deref(),
-                        total_duration_ms,
-                        ms_since_last_token,
-                        "Stream interrupted before usage stats or chat_id received (client disconnect or provider error)");
-                } else {
-                    tracing::error!(%request_id, %organization_id, %model_id,
-                        model = %self.model_name,
-                        total_duration_ms,
-                        "Stream completed but no usage stats and no chat_id available");
+                if self.last_error.is_none() {
+                    if !self.stream_completed {
+                        tracing::warn!(%request_id, %organization_id, %model_id,
+                            model = %self.model_name,
+                            total_duration_ms,
+                            ms_since_last_token,
+                            "Stream interrupted before usage stats or chat_id received \
+                             (client disconnect)");
+                    } else {
+                        tracing::error!(%request_id, %organization_id, %model_id,
+                            model = %self.model_name,
+                            total_duration_ms,
+                            "Stream completed but no usage stats and no chat_id available");
+                    }
                 }
                 return;
             }
             (None, Some(chat_id)) => {
-                if !self.stream_completed || self.last_error.is_some() {
-                    tracing::warn!(%request_id, %chat_id, %organization_id, %model_id,
-                        model = %self.model_name,
-                        stream_completed = self.stream_completed,
-                        stream_error = self.last_error.is_some(),
-                        error_detail = error_detail.as_deref(),
-                        total_duration_ms,
-                        ms_since_last_token,
-                        "Stream interrupted before usage stats received (client disconnect or provider error)");
-                } else {
-                    tracing::error!(%request_id, %chat_id, %organization_id, %model_id,
-                        model = %self.model_name,
-                        total_duration_ms,
-                        "Stream completed but no usage stats available");
+                if self.last_error.is_none() {
+                    if !self.stream_completed {
+                        tracing::warn!(%request_id, %chat_id, %organization_id, %model_id,
+                            model = %self.model_name,
+                            total_duration_ms,
+                            ms_since_last_token,
+                            "Stream interrupted before usage stats received (client disconnect)");
+                    } else {
+                        tracing::error!(%request_id, %chat_id, %organization_id, %model_id,
+                            model = %self.model_name,
+                            total_duration_ms,
+                            "Stream completed but no usage stats available");
+                    }
                 }
                 return;
             }
@@ -525,6 +537,8 @@ where
                             // carry no tokens: pass them through untouched so
                             // the route can forward their raw bytes, but keep
                             // them out of TTFT/ITL metrics and chat tracking.
+                            self.idle_armed = false;
+
                             if event.chunk.is_none() {
                                 return Poll::Ready(Some(Ok(event.clone())));
                             }
@@ -578,7 +592,6 @@ where
                                     }
                                 }
                             }
-                            self.idle_armed = false;
                             return Poll::Ready(Some(Ok(event.clone())));
                         }
                         Poll::Ready(None) => {
@@ -626,6 +639,7 @@ where
                             };
                             self.idle_armed = false;
                             self.last_error = Some(timeout.clone());
+                            self.state = StreamState::Done;
                             return Poll::Ready(Some(Err(timeout)));
                         }
                     }
@@ -1712,15 +1726,26 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
         };
 
         // Get the LLM stream
-        let attributed_stream = match self
+        let provider_call = self
             .inference_provider_pool
             .chat_completion_stream_with_attribution(
                 chat_params,
                 request.body_hash.clone(),
                 routing_hints,
-            )
-            .await
-        {
+            );
+        let provider_result = match self.stream_idle_timeouts {
+            Some(timeouts) => tokio::time::timeout(timeouts.first_token, provider_call)
+                .await
+                .unwrap_or_else(|_| {
+                    Err(inference_providers::CompletionError::Timeout {
+                        operation: "prefill".to_string(),
+                        timeout_seconds: timeouts.first_token.as_secs(),
+                    })
+                }),
+            None => provider_call.await,
+        };
+
+        let attributed_stream = match provider_result {
             Ok(pair) => pair,
             Err(e) => {
                 // Guard will decrement counter on drop
@@ -3193,7 +3218,19 @@ mod tests {
         last_chat_id: Option<String>,
         last_error: Option<inference_providers::CompletionError>,
     ) -> serde_json::Value {
-        let needle = if last_chat_id.is_some() {
+        stream_drop_event(request_id, last_token_time, last_chat_id, last_error, None)
+    }
+
+    fn stream_drop_event(
+        request_id: Uuid,
+        last_token_time: Option<Instant>,
+        last_chat_id: Option<String>,
+        last_error: Option<inference_providers::CompletionError>,
+        last_usage_stats: Option<inference_providers::TokenUsage>,
+    ) -> serde_json::Value {
+        let needle = if last_error.is_some() {
+            "Stream failed"
+        } else if last_chat_id.is_some() {
             "Stream interrupted before usage stats received"
         } else {
             "Stream interrupted before usage stats or chat_id received"
@@ -3235,7 +3272,7 @@ mod tests {
                 idle_armed: false,
                 metric_tags: vec![],
                 concurrent_counter: None,
-                last_usage_stats: None,
+                last_usage_stats,
                 last_chat_id,
                 stream_completed: false,
                 response_id: None,
@@ -3294,10 +3331,6 @@ mod tests {
             let event =
                 interrupted_stream_event(Uuid::new_v4(), None, chat_id, Some(failure.clone()));
 
-            assert_eq!(
-                event["fields"]["stream_error"],
-                serde_json::Value::Bool(true)
-            );
             let detail = event["fields"]["error_detail"]
                 .as_str()
                 .expect("the error is in scope here and must not be reduced to a boolean");
@@ -3460,6 +3493,103 @@ mod tests {
             "a 200s prefill is inside the 300s first-token budget and must survive; \
              applying the 90s between-token budget before the first token would kill it"
         );
+    }
+
+    fn control_event() -> SSEEvent {
+        SSEEvent {
+            raw_bytes: Bytes::from(": keepalive\n\n"),
+            raw_passthrough: true,
+            chunk: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn a_failure_after_usage_arrives_still_reports_duration() {
+        let event = stream_drop_event(
+            Uuid::new_v4(),
+            Some(Instant::now()),
+            Some("chat-billing".to_string()),
+            Some(inference_providers::CompletionError::Timeout {
+                operation: "generation".to_string(),
+                timeout_seconds: 90,
+            }),
+            Some(inference_providers::TokenUsage::new(12, 34)),
+        );
+
+        assert!(
+            event["fields"]["total_duration_ms"].is_u64(),
+            "providers that report usage continuously set it on the first chunk, so a later \
+             failure reaches the billing arm and would otherwise record no duration at all"
+        );
+        assert!(event["fields"]["error_detail"].is_string());
+    }
+
+    #[test]
+    fn an_upstream_http_error_never_carries_its_message_into_logs() {
+        let detail =
+            super::super::inference_provider_pool::InferenceProviderPool::safe_error_detail(
+                &inference_providers::CompletionError::HttpError {
+                    status_code: 400,
+                    message: "Invalid content in message: my private prompt".to_string(),
+                    is_external: true,
+                },
+            );
+
+        assert!(
+            !detail.contains("my private prompt"),
+            "the SSE parser copies an upstream error.message verbatim, so it can echo \
+             customer input and must never reach a log line"
+        );
+        assert!(detail.contains("400"));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_timed_out_stream_ends_instead_of_firing_again() {
+        let inner = stream::iter(vec![Ok(token_event())]).chain(stream::pending());
+        let mut watched = Box::pin(watched_stream(
+            inner,
+            Some(StreamIdleTimeouts {
+                first_token: Duration::from_secs(300),
+                between_tokens: Duration::from_secs(90),
+            }),
+        ));
+
+        assert!(matches!(watched.next().await, Some(Ok(_))));
+        assert!(matches!(watched.next().await, Some(Err(_))));
+
+        assert!(
+            watched.next().await.is_none(),
+            "the route keeps polling after an error, so a synthesized timeout must end \
+             the stream rather than re-arm and fire every budget forever"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn keepalives_keep_a_live_stream_alive() {
+        let inner = Box::pin(stream::iter(vec![Ok(token_event())]).chain(stream::unfold(
+            (),
+            |()| async {
+                tokio::time::sleep(Duration::from_secs(60)).await;
+                Some((Ok(control_event()), ()))
+            },
+        )));
+        let mut watched = Box::pin(watched_stream(
+            inner,
+            Some(StreamIdleTimeouts {
+                first_token: Duration::from_secs(300),
+                between_tokens: Duration::from_secs(90),
+            }),
+        ));
+
+        assert!(matches!(watched.next().await, Some(Ok(_))));
+
+        for _ in 0..4 {
+            assert!(
+                matches!(watched.next().await, Some(Ok(_))),
+                "a control frame arriving inside the budget proves the upstream is alive \
+                 and must clear the idle deadline"
+            );
+        }
     }
 
     #[tokio::test(start_paused = true)]

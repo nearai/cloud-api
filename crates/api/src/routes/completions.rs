@@ -321,7 +321,7 @@ fn completion_stream_error_category(e: &inference_providers::CompletionError) ->
 }
 
 fn sanitized_stream_error(e: &inference_providers::CompletionError) -> String {
-    services::inference_provider_pool::InferenceProviderPool::sanitize_error_message(&e.to_string())
+    services::inference_provider_pool::InferenceProviderPool::safe_error_detail(e)
 }
 
 /// Returns an OpenAI-compatible `error.type` for a stream-level completion error.

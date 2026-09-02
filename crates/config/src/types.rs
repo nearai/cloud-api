@@ -482,21 +482,29 @@ impl std::fmt::Debug for InfraConfig {
 
 impl InfraConfig {
     pub fn from_env() -> Result<Self, String> {
+        let prometheus_url = env::var("INFRA_PROMETHEUS_URL")
+            .ok()
+            .filter(|s| !s.is_empty());
+        let prometheus_environment = env::var("INFRA_PROMETHEUS_ENV")
+            .ok()
+            .filter(|s| !s.is_empty());
+        if prometheus_url.is_some() && prometheus_environment.is_none() {
+            return Err(
+                "INFRA_PROMETHEUS_ENV must be set when INFRA_PROMETHEUS_URL is configured"
+                    .to_string(),
+            );
+        }
+
         Ok(Self {
             machines_url: env::var("INFRA_MACHINES_URL")
                 .ok()
                 .filter(|s| !s.is_empty()),
             cost_per_host_usd_month: parse_nonnegative_finite_env("INFRA_COST_PER_HOST_USD_MONTH")?,
-            prometheus_url: env::var("INFRA_PROMETHEUS_URL")
-                .ok()
-                .filter(|s| !s.is_empty()),
+            prometheus_url,
             prometheus_bearer_token: env::var("INFRA_PROMETHEUS_BEARER_TOKEN")
                 .ok()
                 .filter(|s| !s.is_empty()),
-            prometheus_environment: env::var("INFRA_PROMETHEUS_ENV")
-                .ok()
-                .filter(|s| !s.is_empty())
-                .unwrap_or_else(|| "prod".to_string()),
+            prometheus_environment: prometheus_environment.unwrap_or_default(),
             cost_per_gpu_hour_usd: parse_nonnegative_finite_env("INFRA_COST_PER_GPU_HOUR_USD")?,
         })
     }
@@ -1423,6 +1431,20 @@ mod tests {
         std::env::set_var("INFRA_COST_PER_GPU_HOUR_USD", "2");
         let config = InfraConfig::from_env().unwrap();
         assert_eq!(config.cost_per_gpu_hour_usd, 2.0);
+        clear_infra_env();
+    }
+
+    #[test]
+    #[serial]
+    fn infra_config_requires_environment_with_prometheus_url() {
+        clear_infra_env();
+        std::env::set_var("INFRA_PROMETHEUS_URL", "https://prometheus.example");
+        let error = InfraConfig::from_env().unwrap_err();
+        assert!(error.contains("INFRA_PROMETHEUS_ENV"));
+
+        std::env::set_var("INFRA_PROMETHEUS_ENV", "staging");
+        let config = InfraConfig::from_env().unwrap();
+        assert_eq!(config.prometheus_environment, "staging");
         clear_infra_env();
     }
 

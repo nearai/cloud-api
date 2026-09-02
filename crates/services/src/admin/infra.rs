@@ -10,7 +10,7 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::time::{Duration, Instant};
-use tokio::sync::RwLock;
+use tokio::sync::{Mutex, RwLock};
 use utoipa::ToSchema;
 
 /// How long a fetched inventory stays fresh before we refetch.
@@ -98,6 +98,7 @@ pub struct InfraService {
     cost_per_gpu_hour_usd: f64,
     client: reqwest::Client,
     cache: RwLock<Option<Cached>>,
+    refresh_lock: Mutex<()>,
 }
 
 impl InfraService {
@@ -122,6 +123,7 @@ impl InfraService {
             cost_per_gpu_hour_usd,
             client,
             cache: RwLock::new(None),
+            refresh_lock: Mutex::new(()),
         }
     }
 
@@ -134,27 +136,42 @@ impl InfraService {
             }
         }
 
-        let (hosts, host_stale) = match self.machines_url.as_deref() {
-            Some(url) => match self.fetch_machines(url).await {
-                Ok(hosts) => (Some(hosts), false),
-                Err(e) => {
-                    tracing::warn!("infra inventory fetch failed: {e}");
-                    (None, true)
-                }
-            },
-            None => (None, true),
-        };
+        // Only one request refreshes an expired snapshot. Other requests wait
+        // and then reuse its result, preventing an older failed refresh from
+        // overwriting newer values or freshness flags.
+        let _refresh_guard = self.refresh_lock.lock().await;
+        if let Some(cached) = self.cache.read().await.as_ref() {
+            if cached.at.elapsed() < CACHE_TTL {
+                return cached.summary.clone();
+            }
+        }
 
-        let (gpu_allocations, gpu_data_stale) = match self.prometheus_url.as_deref() {
-            Some(url) => match self.fetch_gpu_allocations(url).await {
-                Ok(allocations) => (Some(allocations), false),
-                Err(e) => {
-                    tracing::warn!("infra Prometheus fetch failed: {e}");
-                    (None, true)
-                }
-            },
-            None => (None, true),
+        let hosts_future = async {
+            match self.machines_url.as_deref() {
+                Some(url) => match self.fetch_machines(url).await {
+                    Ok(hosts) => (Some(hosts), false),
+                    Err(e) => {
+                        tracing::warn!("infra inventory fetch failed: {e}");
+                        (None, true)
+                    }
+                },
+                None => (None, true),
+            }
         };
+        let gpu_allocations_future = async {
+            match self.prometheus_url.as_deref() {
+                Some(url) => match self.fetch_gpu_allocations(url).await {
+                    Ok(allocations) => (Some(allocations), false),
+                    Err(e) => {
+                        tracing::warn!("infra Prometheus fetch failed: {e}");
+                        (None, true)
+                    }
+                },
+                None => (None, true),
+            }
+        };
+        let ((hosts, host_stale), (gpu_allocations, gpu_data_stale)) =
+            tokio::join!(hosts_future, gpu_allocations_future);
 
         let mut summary = self.summarize(
             hosts.unwrap_or_default(),
@@ -271,18 +288,28 @@ fn parse_prometheus_allocations(body: &str) -> Result<Vec<ModelGpuAllocation>, S
         .data
         .ok_or_else(|| "Prometheus response missing data".to_string())?;
     let mut allocations = Vec::new();
+    let mut invalid_series = 0;
     for series in data.result {
         let Some(model_name) = series.metric.model.filter(|value| !value.is_empty()) else {
             continue;
         };
-        let value = series.value.1.parse::<f64>().map_err(|e| e.to_string())?;
+        let Ok(value) = series.value.1.parse::<f64>() else {
+            invalid_series += 1;
+            tracing::warn!(model = %model_name, "skipping non-numeric GPU allocation series");
+            continue;
+        };
         if !value.is_finite() || value < 0.0 || value.fract() != 0.0 || value > i64::MAX as f64 {
-            return Err(format!("invalid GPU count for model {model_name}"));
+            invalid_series += 1;
+            tracing::warn!(model = %model_name, value, "skipping invalid GPU allocation series");
+            continue;
         }
         allocations.push(ModelGpuAllocation {
             model_name,
             allocated_gpus: value as i64,
         });
+    }
+    if allocations.is_empty() && invalid_series > 0 {
+        return Err("Prometheus response contained no valid GPU allocations".to_string());
     }
     allocations.sort_by(|a, b| a.model_name.cmp(&b.model_name));
     Ok(allocations)
@@ -410,13 +437,34 @@ mod tests {
     }
 
     #[test]
-    fn rejects_fractional_gpu_counts() {
+    fn skips_invalid_gpu_counts_when_valid_series_remain() {
         let body = r#"{
             "status": "success",
             "data": {
                 "resultType": "vector",
                 "result": [
-                    {"metric": {"model": "broken"}, "value": [1788380000.0, "1.5"]}
+                    {"metric": {"model": "broken"}, "value": [1788380000.0, "1.5"]},
+                    {"metric": {"model": "valid"}, "value": [1788380000.0, "2"]}
+                ]
+            }
+        }"#;
+        assert_eq!(
+            parse_prometheus_allocations(body).unwrap(),
+            vec![ModelGpuAllocation {
+                model_name: "valid".into(),
+                allocated_gpus: 2,
+            }]
+        );
+    }
+
+    #[test]
+    fn rejects_gpu_snapshot_when_every_labeled_series_is_invalid() {
+        let body = r#"{
+            "status": "success",
+            "data": {
+                "resultType": "vector",
+                "result": [
+                    {"metric": {"model": "broken"}, "value": [1788380000.0, "NaN"]}
                 ]
             }
         }"#;

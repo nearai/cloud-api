@@ -424,14 +424,27 @@ pub async fn init_domain_services_with_pool(
         as Arc<dyn services::completions::ports::OrganizationConcurrentLimitRepository>;
 
     // Create completion service with usage tracking (needs usage_service)
-    let completion_service = Arc::new(services::CompletionServiceImpl::new(
+    let mut completion_service_impl = services::CompletionServiceImpl::new(
         inference_provider_pool.clone(),
         attestation_service.clone(),
         usage_service.clone(),
         metrics_service.clone(),
         models_repo.clone() as Arc<dyn services::models::ModelsRepository>,
         org_limit_repository,
-    ));
+    );
+    if config.stream_watchdog.enabled {
+        completion_service_impl = completion_service_impl.with_stream_idle_timeouts(
+            services::completions::StreamIdleTimeouts {
+                first_token: std::time::Duration::from_secs(
+                    config.stream_watchdog.first_token_seconds,
+                ),
+                between_tokens: std::time::Duration::from_secs(
+                    config.stream_watchdog.between_tokens_seconds,
+                ),
+            },
+        );
+    }
+    let completion_service = Arc::new(completion_service_impl);
 
     let brave_search_provider =
         Arc::new(services::responses::tools::brave::BraveWebSearchProvider::new());
@@ -2759,6 +2772,7 @@ mod tests {
             staking_farm: config::StakingFarmConfig::default(),
             aml: config::AmlConfig::default(),
             usage_reporting: config::UsageReportingConfig::default(),
+            stream_watchdog: config::StreamWatchdogConfig::default(),
             ita: config::ItaAttestationConfig::default(),
         };
 
@@ -2869,6 +2883,7 @@ mod tests {
             staking_farm: config::StakingFarmConfig::default(),
             aml: config::AmlConfig::default(),
             usage_reporting: config::UsageReportingConfig::default(),
+            stream_watchdog: config::StreamWatchdogConfig::default(),
             ita: config::ItaAttestationConfig::default(),
         };
 

@@ -27,6 +27,7 @@ pub struct ApiConfig {
     pub staking_farm: StakingFarmConfig,
     pub aml: AmlConfig,
     pub usage_reporting: UsageReportingConfig,
+    pub stream_watchdog: StreamWatchdogConfig,
     pub ita: ItaAttestationConfig,
 }
 
@@ -61,6 +62,7 @@ impl ApiConfig {
             aml: AmlConfig::from_env()?,
             ita: ItaAttestationConfig::from_env()?,
             usage_reporting: UsageReportingConfig::from_env()?,
+            stream_watchdog: StreamWatchdogConfig::from_env()?,
         })
     }
 }
@@ -283,6 +285,57 @@ fn parse_optional_i32_env(key: &str, default: Option<i32>) -> Result<Option<i32>
                 .map_err(|_| format!("{key} must be an integer, 'none', or 'disabled'"))
         }
         Err(_) => Ok(default),
+    }
+}
+
+/// Idle bounds that fail a stream producing no data, off unless an operator
+/// enables it. The first-token bound is separate because a large context can
+/// prefill for minutes before any token appears.
+#[derive(Debug, Clone)]
+pub struct StreamWatchdogConfig {
+    pub enabled: bool,
+    pub first_token_seconds: u64,
+    pub between_tokens_seconds: u64,
+}
+
+impl Default for StreamWatchdogConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            first_token_seconds: 300,
+            between_tokens_seconds: 90,
+        }
+    }
+}
+
+impl StreamWatchdogConfig {
+    pub fn from_env() -> Result<Self, String> {
+        let defaults = Self::default();
+        let config = Self {
+            enabled: parse_bool_env("STREAM_WATCHDOG_ENABLED", defaults.enabled)?,
+            first_token_seconds: parse_u64_env(
+                "STREAM_WATCHDOG_FIRST_TOKEN_SECONDS",
+                defaults.first_token_seconds,
+            )?,
+            between_tokens_seconds: parse_u64_env(
+                "STREAM_WATCHDOG_BETWEEN_TOKENS_SECONDS",
+                defaults.between_tokens_seconds,
+            )?,
+        };
+
+        if config.first_token_seconds == 0 || config.between_tokens_seconds == 0 {
+            return Err("stream watchdog timeouts must be greater than zero".to_string());
+        }
+        if config.first_token_seconds > 3_600 || config.between_tokens_seconds > 3_600 {
+            return Err("stream watchdog timeouts must not exceed 3600".to_string());
+        }
+        if config.first_token_seconds < config.between_tokens_seconds {
+            return Err("STREAM_WATCHDOG_FIRST_TOKEN_SECONDS must not be below \
+                 STREAM_WATCHDOG_BETWEEN_TOKENS_SECONDS"
+                .to_string());
+        }
+
+        Ok(config)
     }
 }
 
@@ -1230,6 +1283,87 @@ mod tests {
             config.database_statement_timeout()
                 < std::time::Duration::from_secs(config.request_timeout_seconds)
         );
+    }
+
+    struct StreamWatchdogEnvGuard {
+        values: [(&'static str, Option<OsString>); 3],
+    }
+
+    impl StreamWatchdogEnvGuard {
+        const KEYS: [&'static str; 3] = [
+            "STREAM_WATCHDOG_ENABLED",
+            "STREAM_WATCHDOG_FIRST_TOKEN_SECONDS",
+            "STREAM_WATCHDOG_BETWEEN_TOKENS_SECONDS",
+        ];
+
+        fn cleared() -> Self {
+            let guard = Self {
+                values: Self::KEYS.map(|key| (key, std::env::var_os(key))),
+            };
+            for key in Self::KEYS {
+                std::env::remove_var(key);
+            }
+            guard
+        }
+    }
+
+    impl Drop for StreamWatchdogEnvGuard {
+        fn drop(&mut self) {
+            for (key, value) in &mut self.values {
+                match value.take() {
+                    Some(value) => std::env::set_var(*key, value),
+                    None => std::env::remove_var(*key),
+                }
+            }
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn stream_watchdog_is_off_by_default_with_a_longer_first_token_bound() {
+        let _env = StreamWatchdogEnvGuard::cleared();
+
+        let config = StreamWatchdogConfig::from_env().unwrap();
+
+        assert!(!config.enabled);
+        assert_eq!(config.first_token_seconds, 300);
+        assert_eq!(config.between_tokens_seconds, 90);
+        assert!(config.first_token_seconds >= config.between_tokens_seconds);
+    }
+
+    #[test]
+    #[serial]
+    fn stream_watchdog_rejects_a_first_token_bound_below_the_between_token_bound() {
+        let _env = StreamWatchdogEnvGuard::cleared();
+        std::env::set_var("STREAM_WATCHDOG_FIRST_TOKEN_SECONDS", "30");
+        std::env::set_var("STREAM_WATCHDOG_BETWEEN_TOKENS_SECONDS", "90");
+
+        let error = StreamWatchdogConfig::from_env().unwrap_err();
+
+        assert!(error.contains("STREAM_WATCHDOG_FIRST_TOKEN_SECONDS"));
+        assert!(error.contains("STREAM_WATCHDOG_BETWEEN_TOKENS_SECONDS"));
+    }
+
+    #[test]
+    #[serial]
+    fn stream_watchdog_rejects_a_zero_bound_that_would_fail_every_stream() {
+        let _env = StreamWatchdogEnvGuard::cleared();
+        std::env::set_var("STREAM_WATCHDOG_BETWEEN_TOKENS_SECONDS", "0");
+
+        let error = StreamWatchdogConfig::from_env().unwrap_err();
+
+        assert!(error.contains("greater than zero"));
+    }
+
+    #[test]
+    #[serial]
+    fn stream_watchdog_rejects_a_bound_beyond_an_hour() {
+        let _env = StreamWatchdogEnvGuard::cleared();
+        std::env::set_var("STREAM_WATCHDOG_FIRST_TOKEN_SECONDS", "3601");
+
+        let error = StreamWatchdogConfig::from_env().unwrap_err();
+
+        assert!(error.contains("3600"));
     }
 
     #[test]

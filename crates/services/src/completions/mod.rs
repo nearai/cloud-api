@@ -96,6 +96,9 @@ where
     last_token_time: Option<Instant>,
     /// Accumulated inter-token latency for average calculation
     total_itl_ms: f64,
+    idle_timeouts: Option<StreamIdleTimeouts>,
+    idle_timer: Option<Pin<Box<tokio::time::Sleep>>>,
+    idle_armed: bool,
     // Pre-allocated low-cardinality metric tags (for Datadog/OTLP)
     metric_tags: Vec<String>,
     concurrent_counter: Option<Arc<AtomicU32>>,
@@ -486,6 +489,26 @@ where
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct StreamIdleTimeouts {
+    pub first_token: Duration,
+    pub between_tokens: Duration,
+}
+
+impl<S> InterceptStream<S>
+where
+    S: Stream<Item = Result<SSEEvent, inference_providers::CompletionError>> + Unpin,
+{
+    fn idle_budget(&self) -> Option<Duration> {
+        let timeouts = self.idle_timeouts?;
+        Some(if self.first_token_received {
+            timeouts.between_tokens
+        } else {
+            timeouts.first_token
+        })
+    }
+}
+
 impl<S> Stream for InterceptStream<S>
 where
     S: Stream<Item = Result<SSEEvent, inference_providers::CompletionError>> + Unpin,
@@ -555,6 +578,7 @@ where
                                     }
                                 }
                             }
+                            self.idle_armed = false;
                             return Poll::Ready(Some(Ok(event.clone())));
                         }
                         Poll::Ready(None) => {
@@ -569,7 +593,41 @@ where
                             self.last_error = Some(err.clone());
                             return Poll::Ready(Some(Err(err.clone())));
                         }
-                        Poll::Pending => return Poll::Pending,
+                        Poll::Pending => {
+                            let Some(budget) = self.idle_budget() else {
+                                return Poll::Pending;
+                            };
+                            if !self.idle_armed {
+                                let deadline = tokio::time::Instant::now() + budget;
+                                match &mut self.idle_timer {
+                                    Some(timer) => timer.as_mut().reset(deadline),
+                                    None => {
+                                        self.idle_timer =
+                                            Some(Box::pin(tokio::time::sleep_until(deadline)));
+                                    }
+                                }
+                                self.idle_armed = true;
+                            }
+                            let timer = self
+                                .idle_timer
+                                .as_mut()
+                                .expect("idle timer is created when the stream arms");
+                            if timer.as_mut().poll(cx).is_pending() {
+                                return Poll::Pending;
+                            }
+                            let stalled_during = if self.first_token_received {
+                                "generation"
+                            } else {
+                                "prefill"
+                            };
+                            let timeout = inference_providers::CompletionError::Timeout {
+                                operation: stalled_during.to_string(),
+                                timeout_seconds: budget.as_secs(),
+                            };
+                            self.idle_armed = false;
+                            self.last_error = Some(timeout.clone());
+                            return Poll::Ready(Some(Err(timeout)));
+                        }
                     }
                 }
                 StreamState::Finalizing(ref mut future) => match future.as_mut().poll(cx) {
@@ -642,6 +700,7 @@ pub struct CompletionServiceImpl {
     org_concurrent_limits: Cache<Uuid, u32>,
     /// Repository for fetching organization concurrent limits
     organization_limit_repository: Arc<dyn ports::OrganizationConcurrentLimitRepository>,
+    stream_idle_timeouts: Option<StreamIdleTimeouts>,
 }
 
 /// TTL for organization concurrent limit cache (5 minutes)
@@ -757,7 +816,13 @@ impl CompletionServiceImpl {
             concurrent_limit: DEFAULT_CONCURRENT_LIMIT,
             org_concurrent_limits,
             organization_limit_repository,
+            stream_idle_timeouts: None,
         }
+    }
+
+    pub fn with_stream_idle_timeouts(mut self, timeouts: StreamIdleTimeouts) -> Self {
+        self.stream_idle_timeouts = Some(timeouts);
+        self
     }
 
     /// Extract tools and tool_choice from the extra HashMap if present and
@@ -1477,6 +1542,9 @@ impl CompletionServiceImpl {
             ttft_ms: None,
             token_count: 0,
             last_token_time: None,
+            idle_timeouts: self.stream_idle_timeouts,
+            idle_timer: None,
+            idle_armed: false,
             total_itl_ms: 0.0,
             metric_tags,
             concurrent_counter,
@@ -2376,6 +2444,9 @@ mod tests {
             token_count: 0,
             last_token_time: None,
             total_itl_ms: 0.0,
+            idle_timeouts: None,
+            idle_timer: None,
+            idle_armed: false,
             metric_tags,
             concurrent_counter: None,
             last_usage_stats: None,
@@ -2548,6 +2619,9 @@ mod tests {
             token_count: 0,
             last_token_time: None,
             total_itl_ms: 0.0,
+            idle_timeouts: None,
+            idle_timer: None,
+            idle_armed: false,
             metric_tags: CompletionServiceImpl::create_metric_tags("test-model"),
             concurrent_counter: None,
             last_usage_stats: None,
@@ -2701,6 +2775,9 @@ mod tests {
             token_count: 0,
             last_token_time: None,
             total_itl_ms: 0.0,
+            idle_timeouts: None,
+            idle_timer: None,
+            idle_armed: false,
             metric_tags,
             concurrent_counter: None,
             last_usage_stats: None,
@@ -2828,6 +2905,9 @@ mod tests {
             token_count: 0,
             last_token_time: None,
             total_itl_ms: 0.0,
+            idle_timeouts: None,
+            idle_timer: None,
+            idle_armed: false,
             metric_tags,
             concurrent_counter: None,
             last_usage_stats: None,
@@ -3038,6 +3118,9 @@ mod tests {
                 token_count: 0,
                 last_token_time: None,
                 total_itl_ms: 0.0,
+                idle_timeouts: None,
+                idle_timer: None,
+                idle_armed: false,
                 metric_tags: vec![],
                 concurrent_counter: Some(counter.clone()),
                 last_usage_stats: None,
@@ -3104,8 +3187,6 @@ mod tests {
         }
     }
 
-    /// Mirrors production's `with_current_span(false)` / `with_span_list(false)`
-    /// (`crates/api/src/main.rs`), which discard anything carried only by a span.
     fn interrupted_stream_event(
         request_id: Uuid,
         last_token_time: Option<Instant>,
@@ -3149,6 +3230,9 @@ mod tests {
                 token_count: 0,
                 last_token_time,
                 total_itl_ms: 0.0,
+                idle_timeouts: None,
+                idle_timer: None,
+                idle_armed: false,
                 metric_tags: vec![],
                 concurrent_counter: None,
                 last_usage_stats: None,
@@ -3188,7 +3272,6 @@ mod tests {
         );
     }
 
-    /// A second arm runs once a chat_id has arrived; both must carry the fields.
     #[tokio::test]
     async fn an_interrupted_stream_holding_a_chat_id_logs_the_same_fields() {
         let request_id = Uuid::new_v4();
@@ -3201,8 +3284,6 @@ mod tests {
         assert!(event["fields"]["total_duration_ms"].is_u64());
     }
 
-    /// `stream_error` only says an error existed, and the upstream text it carries
-    /// can hold a client URL, so both arms must report it and both must redact.
     #[tokio::test]
     async fn an_interrupted_stream_reports_the_error_it_holds() {
         let failure = inference_providers::CompletionError::CompletionError(
@@ -3242,8 +3323,6 @@ mod tests {
         );
     }
 
-    /// Omitted rather than zeroed, so "died before the first token" stays distinct
-    /// and the field stays numeric for queries.
     #[tokio::test]
     async fn interrupted_stream_separates_no_token_from_a_measured_gap() {
         let before_any_token = interrupted_stream_event(Uuid::new_v4(), None, None, None);
@@ -3259,6 +3338,141 @@ mod tests {
             after_a_token["fields"]["ms_since_last_token"].is_u64(),
             "a delivered token must produce a numeric gap, got {}",
             after_a_token["fields"]["ms_since_last_token"]
+        );
+    }
+
+    fn watched_stream<S>(inner: S, timeouts: Option<StreamIdleTimeouts>) -> InterceptStream<S>
+    where
+        S: Stream<Item = Result<SSEEvent, inference_providers::CompletionError>> + Unpin,
+    {
+        InterceptStream {
+            inner,
+            attestation_service: Arc::new(MockAttestationService),
+            usage_service: Arc::new(MockUsageService),
+            metrics_service: Arc::new(CapturingMetricsService::new()),
+            request_id: Uuid::new_v4(),
+            organization_id: Uuid::new_v4(),
+            workspace_id: Uuid::new_v4(),
+            api_key_id: Uuid::new_v4(),
+            model_id: Uuid::new_v4(),
+            model_name: "test-model".to_string(),
+            inference_type: crate::usage::ports::InferenceType::ChatCompletionStream,
+            service_start_time: Instant::now(),
+            provider_start_time: Instant::now(),
+            first_token_received: false,
+            first_token_time: None,
+            ttft_ms: None,
+            token_count: 0,
+            last_token_time: None,
+            total_itl_ms: 0.0,
+            idle_timeouts: timeouts,
+            idle_timer: None,
+            idle_armed: false,
+            metric_tags: vec![],
+            concurrent_counter: None,
+            last_usage_stats: None,
+            last_chat_id: None,
+            stream_completed: false,
+            response_id: None,
+            last_finish_reason: None,
+            last_error: None,
+            state: StreamState::Streaming,
+            attestation_supported: true,
+            store_provider_chat_signature: true,
+            provider_attribution: crate::usage::ProviderAttribution::default(),
+            cache_write_cost_per_token: None,
+            requested_service_tier: None,
+            provider_service_tier: None,
+            latency_reporter: None,
+        }
+    }
+
+    fn token_event() -> SSEEvent {
+        SSEEvent {
+            raw_bytes: Bytes::from("data: ..."),
+            raw_passthrough: true,
+            chunk: Some(StreamChunk::Chat(ChatCompletionChunk {
+                id: "chat-watchdog".to_string(),
+                object: "chat.completion.chunk".to_string(),
+                created: 1234567890,
+                model: "test-model".to_string(),
+                choices: vec![],
+                usage: None,
+                service_tier: None,
+                prompt_token_ids: None,
+                system_fingerprint: None,
+                modality: None,
+                extra: Default::default(),
+            })),
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_stalled_stream_fails_with_a_typed_timeout() {
+        let inner = stream::iter(vec![Ok(token_event())]).chain(stream::pending());
+        let mut watched = Box::pin(watched_stream(
+            inner,
+            Some(StreamIdleTimeouts {
+                first_token: Duration::from_secs(300),
+                between_tokens: Duration::from_secs(90),
+            }),
+        ));
+
+        assert!(
+            matches!(watched.next().await, Some(Ok(_))),
+            "the first token must reach the client before the watchdog is relevant"
+        );
+
+        match watched.next().await {
+            Some(Err(inference_providers::CompletionError::Timeout {
+                operation,
+                timeout_seconds,
+            })) => {
+                assert_eq!(
+                    operation, "generation",
+                    "a stall after the first token is a generation stall, not a prefill one"
+                );
+                assert_eq!(
+                    timeout_seconds, 90,
+                    "the between-token budget applies once a token has arrived"
+                );
+            }
+            other => panic!("a silent upstream must surface as a typed timeout, got {other:?}"),
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_slow_prefill_is_not_mistaken_for_a_stall() {
+        let inner = stream::once(Box::pin(async {
+            tokio::time::sleep(Duration::from_secs(200)).await;
+            Ok(token_event())
+        }));
+        let mut watched = Box::pin(watched_stream(
+            inner,
+            Some(StreamIdleTimeouts {
+                first_token: Duration::from_secs(300),
+                between_tokens: Duration::from_secs(90),
+            }),
+        ));
+
+        assert!(
+            matches!(watched.next().await, Some(Ok(_))),
+            "a 200s prefill is inside the 300s first-token budget and must survive; \
+             applying the 90s between-token budget before the first token would kill it"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_unwatched_stream_is_never_timed_out() {
+        let inner = stream::iter(vec![Ok(token_event())]).chain(stream::pending());
+        let mut watched = Box::pin(watched_stream(inner, None));
+
+        assert!(matches!(watched.next().await, Some(Ok(_))));
+
+        let parked = tokio::time::timeout(Duration::from_secs(7_200), watched.next()).await;
+        assert!(
+            parked.is_err(),
+            "with no thresholds configured the stream must stay parked rather than fail"
         );
     }
 

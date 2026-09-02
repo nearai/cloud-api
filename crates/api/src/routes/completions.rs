@@ -320,7 +320,6 @@ fn completion_stream_error_category(e: &inference_providers::CompletionError) ->
     }
 }
 
-/// Upstream messages are copied verbatim into `HttpError` and can carry a client URL.
 fn sanitized_stream_error(e: &inference_providers::CompletionError) -> String {
     services::inference_provider_pool::InferenceProviderPool::sanitize_error_message(&e.to_string())
 }

@@ -75,7 +75,7 @@ impl ApiConfig {
             cors: CorsConfig::default(),
             external_providers: ExternalProvidersConfig::from_env(),
             github_dispatch: GitHubDispatchConfig::from_env()?,
-            infra: InfraConfig::from_env(),
+            infra: InfraConfig::from_env()?,
             aml: AmlConfig::from_env()?,
             ita: ItaAttestationConfig::from_env()?,
             usage_reporting: UsageReportingConfig::from_env()?,
@@ -448,7 +448,7 @@ impl StakingFarmConfig {
 ///
 /// Values are environment-specific and supplied via deployment env. When a
 /// source is unset, the corresponding infra-summary data is marked stale.
-#[derive(Debug, Clone, Default)]
+#[derive(Clone, Default)]
 pub struct InfraConfig {
     /// Internal host-inventory endpoint. `None` when unset.
     pub machines_url: Option<String>,
@@ -464,16 +464,29 @@ pub struct InfraConfig {
     pub cost_per_gpu_hour_usd: f64,
 }
 
+impl std::fmt::Debug for InfraConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("InfraConfig")
+            .field("machines_url", &self.machines_url)
+            .field("cost_per_host_usd_month", &self.cost_per_host_usd_month)
+            .field("prometheus_url", &self.prometheus_url)
+            .field(
+                "prometheus_bearer_token",
+                &self.prometheus_bearer_token.as_ref().map(|_| "<redacted>"),
+            )
+            .field("prometheus_environment", &self.prometheus_environment)
+            .field("cost_per_gpu_hour_usd", &self.cost_per_gpu_hour_usd)
+            .finish()
+    }
+}
+
 impl InfraConfig {
-    pub fn from_env() -> Self {
-        Self {
+    pub fn from_env() -> Result<Self, String> {
+        Ok(Self {
             machines_url: env::var("INFRA_MACHINES_URL")
                 .ok()
                 .filter(|s| !s.is_empty()),
-            cost_per_host_usd_month: env::var("INFRA_COST_PER_HOST_USD_MONTH")
-                .ok()
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(0.0),
+            cost_per_host_usd_month: parse_nonnegative_finite_env("INFRA_COST_PER_HOST_USD_MONTH")?,
             prometheus_url: env::var("INFRA_PROMETHEUS_URL")
                 .ok()
                 .filter(|s| !s.is_empty()),
@@ -484,12 +497,22 @@ impl InfraConfig {
                 .ok()
                 .filter(|s| !s.is_empty())
                 .unwrap_or_else(|| "prod".to_string()),
-            cost_per_gpu_hour_usd: env::var("INFRA_COST_PER_GPU_HOUR_USD")
-                .ok()
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(0.0),
-        }
+            cost_per_gpu_hour_usd: parse_nonnegative_finite_env("INFRA_COST_PER_GPU_HOUR_USD")?,
+        })
     }
+}
+
+fn parse_nonnegative_finite_env(key: &str) -> Result<f64, String> {
+    let Some(raw) = env::var(key).ok() else {
+        return Ok(0.0);
+    };
+    let value = raw
+        .parse::<f64>()
+        .map_err(|_| format!("{key} must be a nonnegative finite number"))?;
+    if !value.is_finite() || value < 0.0 {
+        return Err(format!("{key} must be a nonnegative finite number"));
+    }
+    Ok(value)
 }
 
 pub(crate) fn parse_bool_env(key: &str, default: bool) -> Result<bool, String> {
@@ -1360,6 +1383,47 @@ mod tests {
         ] {
             std::env::remove_var(key);
         }
+    }
+
+    fn clear_infra_env() {
+        for key in [
+            "INFRA_MACHINES_URL",
+            "INFRA_COST_PER_HOST_USD_MONTH",
+            "INFRA_PROMETHEUS_URL",
+            "INFRA_PROMETHEUS_BEARER_TOKEN",
+            "INFRA_PROMETHEUS_ENV",
+            "INFRA_COST_PER_GPU_HOUR_USD",
+        ] {
+            std::env::remove_var(key);
+        }
+    }
+
+    #[test]
+    fn infra_config_debug_redacts_prometheus_bearer_token() {
+        let config = InfraConfig {
+            prometheus_bearer_token: Some("grafana-secret-token".to_string()),
+            ..InfraConfig::default()
+        };
+
+        let debug = format!("{config:?}");
+        assert!(debug.contains("<redacted>"));
+        assert!(!debug.contains("grafana-secret-token"));
+    }
+
+    #[test]
+    #[serial]
+    fn infra_config_rejects_invalid_gpu_rates() {
+        clear_infra_env();
+        for invalid in ["-2", "NaN", "inf", "not-a-number"] {
+            std::env::set_var("INFRA_COST_PER_GPU_HOUR_USD", invalid);
+            let error = InfraConfig::from_env().unwrap_err();
+            assert!(error.contains("INFRA_COST_PER_GPU_HOUR_USD"));
+        }
+
+        std::env::set_var("INFRA_COST_PER_GPU_HOUR_USD", "2");
+        let config = InfraConfig::from_env().unwrap();
+        assert_eq!(config.cost_per_gpu_hour_usd, 2.0);
+        clear_infra_env();
     }
 
     #[test]

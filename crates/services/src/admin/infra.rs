@@ -134,13 +134,6 @@ impl InfraService {
             }
         }
 
-        let previous = self
-            .cache
-            .read()
-            .await
-            .as_ref()
-            .map(|cached| cached.summary.clone());
-
         let (hosts, host_stale) = match self.machines_url.as_deref() {
             Some(url) => match self.fetch_machines(url).await {
                 Ok(hosts) => (Some(hosts), false),
@@ -170,22 +163,23 @@ impl InfraService {
             gpu_data_stale,
         );
 
-        if let Some(previous) = previous {
+        let mut guard = self.cache.write().await;
+        if let Some(previous) = guard.as_ref().map(|cached| &cached.summary) {
             if host_stale {
                 summary.total_hosts = previous.total_hosts;
                 summary.active_hosts = previous.active_hosts;
                 summary.idle_hosts = previous.idle_hosts;
                 summary.monthly_burn_usd = previous.monthly_burn_usd;
                 summary.daily_burn_usd = previous.daily_burn_usd;
+                summary.fetched_at = previous.fetched_at;
             }
             if gpu_data_stale {
                 summary.total_allocated_gpus = previous.total_allocated_gpus;
                 summary.hourly_gpu_burn_usd = previous.hourly_gpu_burn_usd;
-                summary.model_gpu_allocations = previous.model_gpu_allocations;
+                summary.model_gpu_allocations = previous.model_gpu_allocations.clone();
             }
         }
 
-        let mut guard = self.cache.write().await;
         *guard = Some(Cached {
             summary: summary.clone(),
             at: Instant::now(),

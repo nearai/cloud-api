@@ -1,5 +1,6 @@
 pub mod consts;
 pub mod conversions;
+pub mod database_encryption;
 pub mod middleware;
 pub mod models;
 pub mod ohttp_gateway;
@@ -319,6 +320,21 @@ pub async fn init_domain_services_with_pool(
     inference_provider_pool: Arc<services::inference_provider_pool::InferenceProviderPool>,
     metrics_service: Arc<dyn services::metrics::MetricsServiceTrait>,
 ) -> DomainServices {
+    let database_encryption_key = database::field_encryption::parse_key(
+        &config.database_encryption_key,
+    )
+    .unwrap_or_else(|_| {
+        panic!("configured database encryption key is invalid");
+    });
+    database::field_encryption::validate_key_id(&config.database_encryption_key_id)
+        .unwrap_or_else(|_| panic!("configured database encryption key id is invalid"));
+    database.pool().set_encryption_key(database_encryption_key);
+    database
+        .pool()
+        .set_encryption_key_id(config.database_encryption_key_id.clone());
+    database
+        .pool()
+        .set_encryption_write_enabled(config.database_encryption_write_enabled);
     // Give the provider pool the metrics sink so it can emit the per-tier /
     // fallback counter (cloud_api.provider.requests) from the one layer that
     // knows which trust tier served each request.
@@ -2203,14 +2219,27 @@ pub fn build_admin_routes(
         usage_service: services.usage_service,
         staking_farm_service: services.staking_farm_service,
         aml_service: services.aml_service,
-        config,
+        config: config.clone(),
         admin_access_token_repository,
         inference_provider_pool: services.inference_provider_pool,
         github_dispatcher,
         infra_service,
     };
 
-    Router::new()
+    let database_encryption_state = crate::database_encryption::DatabaseEncryptionState::new(
+        database.pool().clone(),
+        &config.database_encryption_key,
+        &config.database_encryption_key_id,
+    )
+    .map_err(|_| {
+        tracing::error!(
+            error_class = "invalid_database_encryption_key",
+            "Database encryption admin routes are disabled"
+        );
+    })
+    .ok();
+
+    let admin_routes = Router::new()
         .route(
             "/admin/models",
             axum::routing::get(admin_list_models).patch(batch_upsert_models),
@@ -2368,7 +2397,39 @@ pub fn build_admin_routes(
             "/admin/access-tokens/{token_id}",
             axum::routing::delete(delete_admin_access_token),
         )
-        .with_state(admin_app_state)
+        .with_state(admin_app_state);
+
+    let admin_routes = if let Some(database_encryption_state) = database_encryption_state {
+        database_encryption_state.recover_jobs();
+        admin_routes.merge(
+            Router::new()
+                .route(
+                    "/admin/database-encryption/scan",
+                    axum::routing::post(crate::database_encryption::scan),
+                )
+                .route(
+                    "/admin/database-encryption/jobs",
+                    axum::routing::post(crate::database_encryption::create_job),
+                )
+                .route(
+                    "/admin/database-encryption/jobs/{id}",
+                    axum::routing::get(crate::database_encryption::get_job),
+                )
+                .route(
+                    "/admin/database-encryption/jobs/{id}/cancel",
+                    axum::routing::post(crate::database_encryption::cancel_job),
+                )
+                .route(
+                    "/admin/database-encryption/verify",
+                    axum::routing::post(crate::database_encryption::verify),
+                )
+                .layer(axum::Extension(database_encryption_state)),
+        )
+    } else {
+        admin_routes
+    };
+
+    admin_routes
         // Admin middleware handles both authentication and authorization
         .layer(from_fn_with_state(
             auth_state_middleware.clone(),
@@ -2752,6 +2813,10 @@ mod tests {
                 refresh_interval: 30,
                 mock: false,
             },
+            database_encryption_key:
+                "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789".to_string(),
+            database_encryption_key_id: "test-db-v1".to_string(),
+            database_encryption_write_enabled: false,
             s3: config::S3Config {
                 mock: true,
                 bucket: "test-bucket".to_string(),
@@ -2863,6 +2928,10 @@ mod tests {
                 refresh_interval: 30,
                 mock: false,
             },
+            database_encryption_key:
+                "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789".to_string(),
+            database_encryption_key_id: "test-db-v1".to_string(),
+            database_encryption_write_enabled: false,
             s3: config::S3Config {
                 mock: true,
                 bucket: "test-bucket".to_string(),

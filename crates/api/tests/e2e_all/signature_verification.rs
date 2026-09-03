@@ -773,61 +773,6 @@ async fn test_dropping_alias_stream_releases_signature_routing_pin() {
 }
 
 #[tokio::test]
-async fn test_dropping_legacy_stream_releases_signature_routing_pin() {
-    use http_body_util::BodyExt;
-    use tower::ServiceExt;
-
-    let (server, router, _pool, mock, _database) = setup_test_server_with_pool_and_router().await;
-    setup_qwen_model(&server).await;
-    let org = setup_org_with_credits(&server, 10_000_000_000i64).await;
-    let api_key = get_api_key_for_org(&server, org.id).await;
-
-    let request = axum::http::Request::builder()
-        .method("POST")
-        .uri("/v1/completions")
-        .header("Authorization", format!("Bearer {api_key}"))
-        .header("Content-Type", "application/json")
-        .body(axum::body::Body::from(
-            serde_json::json!({
-                "model": E2E_QWEN_MODEL_NAME,
-                "prompt": "Respond with two words.",
-                "stream": true,
-                "nonce": 906
-            })
-            .to_string(),
-        ))
-        .expect("request should build");
-    let response = router
-        .oneshot(request)
-        .await
-        .expect("router should serve the streaming request");
-    assert_eq!(response.status(), axum::http::StatusCode::OK);
-
-    let mut body = response.into_body();
-    let frame = body
-        .frame()
-        .await
-        .expect("stream should yield a first frame")
-        .expect("first frame should not error");
-    let first_bytes = frame.data_ref().expect("first frame should contain data");
-    let first_response = String::from_utf8(first_bytes.to_vec()).expect("SSE should be UTF-8");
-    let chat_id = first_stream_chat_id(&first_response);
-
-    drop(body);
-    tokio::time::timeout(std::time::Duration::from_secs(1), async {
-        loop {
-            if mock.unpinned_chat_ids() == vec![chat_id.clone()] {
-                return;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        }
-    })
-    .await
-    .expect("cancelling a legacy stream should release its signature routing pin");
-    assert_eq!(mock.unpinned_chat_ids(), vec![chat_id]);
-}
-
-#[tokio::test]
 async fn test_streaming_chat_completion_signature_verification() {
     let server = setup_test_server().await;
     setup_qwen_model(&server).await;
@@ -1161,7 +1106,7 @@ async fn test_streaming_chat_default_stream_signature_stored_before_done_emitted
     use http_body_util::BodyExt;
     use tower::ServiceExt;
 
-    let (server, router) = setup_test_server_and_router().await;
+    let (server, router, _pool, mock, _database) = setup_test_server_with_pool_and_router().await;
     setup_qwen_model(&server).await;
     let org = setup_org_with_credits(&server, 10000000000i64).await;
     let api_key = get_api_key_for_org(&server, org.id).await;
@@ -1304,4 +1249,9 @@ async fn test_streaming_chat_default_stream_signature_stored_before_done_emitted
             );
         }
     }
+    assert_eq!(
+        mock.unpinned_chat_ids(),
+        vec![chat_id],
+        "the completion layer must release the provider pin before gateway signing"
+    );
 }

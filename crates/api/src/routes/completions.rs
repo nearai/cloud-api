@@ -18,7 +18,6 @@ use axum::{
     response::{IntoResponse, Json as ResponseJson, Response},
 };
 use futures::stream::StreamExt;
-use services::attestation::ports::AttestationServiceTrait;
 use services::auto_redact::{self, AutoRedactError, RedactionMap, StreamUnredact};
 use services::common::encryption_headers as service_encryption_headers;
 use services::completions::{
@@ -49,82 +48,9 @@ const STREAM_SIGNATURE_STORE_TIMEOUT_SECS: u64 = 5;
 // the remaining stream (including the buffered control events) flow through.
 const MAX_LEADING_CONTROL_EVENTS: usize = 32;
 
-/// Releases the provider-routing signature pin if a response body is dropped
-/// before its normal end-of-stream finalization runs.
-struct StreamSignaturePinGuard {
-    attestation_service: Arc<dyn AttestationServiceTrait>,
-    chat_id: Option<String>,
-    armed: Arc<std::sync::atomic::AtomicBool>,
-}
-
-impl Drop for StreamSignaturePinGuard {
-    fn drop(&mut self) {
-        let Some(chat_id) = self.chat_id.clone() else {
-            return;
-        };
-        if !self.armed.swap(false, std::sync::atomic::Ordering::AcqRel) {
-            return;
-        }
-
-        let attestation_service = self.attestation_service.clone();
-        let handle = match tokio::runtime::Handle::try_current() {
-            Ok(handle) => handle,
-            Err(_) => {
-                tracing::error!(%chat_id, "Cannot release signature routing pin: no Tokio runtime available");
-                return;
-            }
-        };
-        std::mem::drop(handle.spawn(async move {
-            attestation_service
-                .release_chat_signature_pin(&chat_id)
-                .await;
-            tracing::debug!(%chat_id, "Released signature routing pin after stream cancellation");
-        }));
-    }
-}
-
 // A deferred upstream terminal contains only `data: [DONE]` and, when the
 // lossless parser emits it separately, its blank SSE separator.
 const MAX_HELD_PROVIDER_TERMINAL_BYTES: usize = MAX_PROVIDER_DONE_EVENT_BYTES;
-
-/// Releases the provider-routing signature pin if a response body is dropped
-/// before its normal finalization path owns the release.
-struct StreamSignaturePinGuard {
-    attestation_service: Arc<dyn AttestationServiceTrait>,
-    chat_id: Option<String>,
-    armed: Arc<std::sync::atomic::AtomicBool>,
-}
-
-impl Drop for StreamSignaturePinGuard {
-    fn drop(&mut self) {
-        let Some(chat_id) = self.chat_id.clone() else {
-            return;
-        };
-        if !self.armed.swap(false, std::sync::atomic::Ordering::AcqRel) {
-            return;
-        }
-
-        let attestation_service = self.attestation_service.clone();
-        let spawn_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let handle = match tokio::runtime::Handle::try_current() {
-                Ok(handle) => handle,
-                Err(_) => {
-                    tracing::error!(%chat_id, "Cannot release signature routing pin: no Tokio runtime available");
-                    return;
-                }
-            };
-            std::mem::drop(handle.spawn(async move {
-                attestation_service
-                    .release_chat_signature_pin(&chat_id)
-                    .await;
-                tracing::debug!(%chat_id, "Released signature routing pin after stream cancellation");
-            }));
-        }));
-        if spawn_result.is_err() {
-            tracing::error!("Could not schedule signature routing-pin cleanup during shutdown");
-        }
-    }
-}
 
 /// Insert validated E2EE headers into a provider `extra` HashMap.
 fn insert_encryption_headers(
@@ -1793,14 +1719,6 @@ async fn chat_completions_inner(
                 let public_signature_hasher_for_chain = public_signature_hasher.clone();
                 let public_signature_chat_id_for_chain = public_signature_chat_id.clone();
                 let attestation_service_for_chain = app_state.attestation_service.clone();
-                let stream_signature_pin_armed =
-                    Arc::new(std::sync::atomic::AtomicBool::new(stream_chat_id.is_some()));
-                let stream_signature_pin_armed_for_chain = stream_signature_pin_armed.clone();
-                let stream_signature_pin_guard = StreamSignaturePinGuard {
-                    attestation_service: app_state.attestation_service.clone(),
-                    chat_id: stream_chat_id.clone(),
-                    armed: stream_signature_pin_armed,
-                };
 
                 // Re-attach any stashed leading control events, then convert
                 // to a raw bytes stream.
@@ -2169,7 +2087,6 @@ async fn chat_completions_inner(
                             let organization_id = api_key.organization.id.0;
                             let model_name = request.model.clone();
                             let request_hash = request_hash.clone();
-                            let stream_signature_pin_armed = stream_signature_pin_armed_for_chain;
                             async move {
                                 let mut combined: Vec<u8> = Vec::new();
                                 let error_count_final =
@@ -2254,18 +2171,11 @@ async fn chat_completions_inner(
                                 }
 
                                 if gateway_signature_enabled {
-                                    // The provider-signature fetch is skipped for
-                                    // gateway-signed streams
-                                    // (skip_provider_chat_signature), so its
-                                    // post-fetch unpin never runs. The attestation
-                                    // service owns the store+unpin lifecycle
-                                    // (mirroring store_chat_signature_from_provider):
-                                    // it releases the signature-fetch routing pin
-                                    // whether the store succeeds, fails, or times
-                                    // out, so the provider's chat_id → backend map
-                                    // does not grow unboundedly. Clone the chat_id
-                                    // in its own statement so the mutex guard is
-                                    // not held across the service awaits.
+                                    // The completion stream releases its
+                                    // provider-signature routing pin before this
+                                    // tail runs. Gateway signing only covers the
+                                    // final public bytes and therefore does not
+                                    // need that pinned provider connection.
                                     let chat_id =
                                         public_signature_chat_id_for_chain.lock().await.clone();
                                     if error_count_final == 0 {
@@ -2277,20 +2187,30 @@ async fn chat_completions_inner(
                                         };
 
                                         if let Some(chat_id) = chat_id {
-                                            if let Err(e) = attestation_service_for_chain
-                                                .store_chat_signature_and_unpin(
+                                            match tokio::time::timeout(
+                                                Duration::from_secs(
+                                                    STREAM_SIGNATURE_STORE_TIMEOUT_SECS,
+                                                ),
+                                                attestation_service_for_chain.store_chat_signature(
                                                     &chat_id,
                                                     request_hash.clone(),
                                                     response_hash,
-                                                )
-                                                .await
+                                                ),
+                                            )
+                                            .await
                                             {
-                                                tracing::error!(
+                                                Ok(Ok(())) => {}
+                                                Ok(Err(error)) => tracing::error!(
                                                     %organization_id,
                                                     model = %model_name,
-                                                    error = %e,
+                                                    error = %error,
                                                     "Failed to store public stream chat signature"
-                                                );
+                                                ),
+                                                Err(_) => tracing::error!(
+                                                    %organization_id,
+                                                    model = %model_name,
+                                                    "Timed out storing public stream chat signature"
+                                                ),
                                             }
                                         } else {
                                             tracing::warn!(
@@ -2299,13 +2219,6 @@ async fn chat_completions_inner(
                                                 "Cannot store public stream chat signature: no chat_id observed"
                                             );
                                         }
-                                    } else if let Some(chat_id) = chat_id {
-                                        // Errored stream: nothing to sign, but the
-                                        // signature-fetch routing pin still has to
-                                        // be dropped.
-                                        attestation_service_for_chain
-                                            .release_chat_signature_pin(&chat_id)
-                                            .await;
                                     }
                                 } else if synthesized_done
                                     && may_need_synthesized_done_gateway_signature
@@ -2356,22 +2269,7 @@ async fn chat_completions_inner(
                                             "Cannot store synthesized-done stream signature: no chat_id observed"
                                         );
                                     }
-                                } else if public_response_rewritten {
-                                    if let Some(chat_id) =
-                                        public_signature_chat_id_for_chain.lock().await.clone()
-                                    {
-                                        attestation_service_for_chain
-                                            .release_chat_signature_pin(&chat_id)
-                                            .await;
-                                    }
                                 }
-
-                                // The tail owns all normal signature finalization and
-                                // explicit-release paths. If the body is dropped before
-                                // this point, the response-body guard releases the pin.
-                                stream_signature_pin_armed
-                                    .store(false, std::sync::atomic::Ordering::Release);
-
                                 if combined.is_empty() {
                                     // Avoid emitting an empty body frame.
                                     None
@@ -2381,12 +2279,7 @@ async fn chat_completions_inner(
                             }
                         })
                         .filter_map(std::future::ready),
-                    )
-                    .map(move |item| {
-                        // Keep cleanup alive while Axum owns the response body.
-                        let _ = &stream_signature_pin_guard;
-                        item
-                    });
+                    );
 
                 // Look up which trust tier served this stream. The pool stores a
                 // chat_id → provider mapping when the first chunk arrives; we read
@@ -2885,14 +2778,6 @@ async fn completions_inner(
                         |canonical| alias_warning_message(&request.model, canonical),
                     )));
                 let pending_warning = alias_warning_pending.clone();
-                let stream_signature_pin_armed =
-                    Arc::new(std::sync::atomic::AtomicBool::new(stream_chat_id.is_some()));
-                let stream_signature_pin_armed_for_chain = stream_signature_pin_armed.clone();
-                let stream_signature_pin_guard = StreamSignaturePinGuard {
-                    attestation_service: app_state.attestation_service.clone(),
-                    chat_id: stream_chat_id.clone(),
-                    armed: stream_signature_pin_armed,
-                };
                 let public_signature_hasher_for_chunks = public_signature_hasher.clone();
                 let public_signature_chat_id_for_chunks = public_signature_chat_id.clone();
                 let stream_error_count_for_chunks = stream_error_count.clone();
@@ -2979,7 +2864,6 @@ async fn completions_inner(
                         let stream_error_count = stream_error_count.clone();
                         let request_hash = request_hash.clone();
                         let model_name = request.model.clone();
-                        let stream_signature_pin_armed = stream_signature_pin_armed_for_chain;
                         async move {
                             let done = Bytes::from_static(b"data: [DONE]\n\n");
                             let chat_id = public_signature_chat_id.lock().await.clone();
@@ -2994,20 +2878,28 @@ async fn completions_inner(
                                     hex::encode(hasher.clone().finalize())
                                 };
                                 if let Some(chat_id) = chat_id {
-                                    if let Err(error) = attestation_service
-                                        .store_chat_signature_and_unpin(
+                                    match tokio::time::timeout(
+                                        Duration::from_secs(STREAM_SIGNATURE_STORE_TIMEOUT_SECS),
+                                        attestation_service.store_chat_signature(
                                             &chat_id,
                                             request_hash,
                                             response_hash,
-                                        )
-                                        .await
+                                        ),
+                                    )
+                                    .await
                                     {
-                                        tracing::error!(
+                                        Ok(Ok(())) => {}
+                                        Ok(Err(error)) => tracing::error!(
                                             %organization_id,
                                             model = %model_name,
                                             error = %error,
                                             "Failed to store legacy completion stream signature"
-                                        );
+                                        ),
+                                        Err(_) => tracing::error!(
+                                            %organization_id,
+                                            model = %model_name,
+                                            "Timed out storing legacy completion stream signature"
+                                        ),
                                     }
                                 } else {
                                     tracing::warn!(
@@ -3016,28 +2908,11 @@ async fn completions_inner(
                                         "Cannot store legacy completion stream signature: no chat_id observed"
                                     );
                                 }
-                            } else if let Some(chat_id) = chat_id {
-                                // The service did not fetch a provider signature for this
-                                // transformed response, so release its routing pin here.
-                                attestation_service
-                                    .release_chat_signature_pin(&chat_id)
-                                    .await;
                             }
-
-                            // The legacy tail owns normal finalization. A dropped
-                            // response body before it is polled is cleaned up by
-                            // the response-body guard.
-                            stream_signature_pin_armed
-                                .store(false, std::sync::atomic::Ordering::Release);
 
                             Ok::<Bytes, Infallible>(done)
                         }
-                    }))
-                    .map(move |item| {
-                        // Keep cleanup alive while Axum owns the response body.
-                        let _ = &stream_signature_pin_guard;
-                        item
-                    });
+                    }));
 
                 let mut response_builder = Response::builder()
                     .status(StatusCode::OK)

@@ -156,15 +156,10 @@ impl<S> InterceptStream<S>
 where
     S: Stream<Item = Result<SSEEvent, inference_providers::CompletionError>> + Unpin,
 {
-    /// Store attestation signature before sending [DONE] to client.
-    /// This runs in the hot path to ensure signature is available when client receives [DONE].
-    /// Skipped for external providers that don't support TEE attestation.
+    /// Finalize attestation handling before the route sends `[DONE]` to the client.
+    /// This stores a provider signature when supported, otherwise releases the
+    /// provider-routing pin without publishing a signature.
     fn create_signature_future(&self) -> FinalizeFuture {
-        // Skip attestation for external providers (OpenAI, Anthropic, Gemini, etc.)
-        if !self.attestation_supported || !self.store_provider_chat_signature {
-            return Box::pin(async {});
-        }
-
         let organization_id = self.organization_id;
         let model_id = self.model_id;
 
@@ -177,6 +172,22 @@ where
         };
 
         let attestation_service = self.attestation_service.clone();
+
+        // The provider pool pins every streamed chat that has a chat id, even
+        // when the authoritative model record says it is non-attested. There is
+        // no signature to store in that case, but the normal EOF path still
+        // owns releasing the pin.
+        if !self.attestation_supported {
+            return Box::pin(async move {
+                attestation_service
+                    .release_chat_signature_pin(&chat_id)
+                    .await;
+            });
+        }
+
+        if !self.store_provider_chat_signature {
+            return Box::pin(async {});
+        }
 
         // A provider signature only verifies the exact upstream stream. Do
         // not publish one if the stream reported an error or if the route
@@ -209,6 +220,13 @@ where
                         "Timeout storing chat signature after {}s",
                         FINALIZE_TIMEOUT_SECS
                     );
+                    // The provider-store implementation normally unpins after
+                    // it completes. A timeout cancels that future before its
+                    // cleanup runs, so this finalization path must release the
+                    // routing pin itself.
+                    attestation_service
+                        .release_chat_signature_pin(&chat_id)
+                        .await;
                 }
             }
         })

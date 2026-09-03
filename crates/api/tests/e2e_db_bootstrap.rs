@@ -23,7 +23,6 @@ async fn bootstrap_e2e_database() {
     );
 
     let mut nextest_env = OpenOptions::new()
-        .write(true)
         .append(true)
         .open(&nextest_env_path)
         .expect("open nextest's environment file");

@@ -582,12 +582,14 @@ fn message_content_to_value(content: &Option<MessageContent>) -> serde_json::Val
 }
 
 // Convert HTTP ChatCompletionRequest to service CompletionRequest
+#[allow(clippy::too_many_arguments)]
 fn convert_chat_request_to_service(
     request: &ChatCompletionRequest,
     user_id: Uuid,
     api_key_id: String,
     organization_id: Uuid,
     workspace_id: Uuid,
+    fallback_enabled: bool,
     body_hash: RequestBodyHash,
     request_id: Uuid,
 ) -> ServiceCompletionRequest {
@@ -648,6 +650,7 @@ fn convert_chat_request_to_service(
         api_key_id,
         organization_id,
         workspace_id,
+        fallback_enabled,
         metadata: None,
         store: None,
         body_hash: body_hash.hash.clone(),
@@ -1243,6 +1246,7 @@ fn convert_text_request_to_service(
     api_key_id: String,
     organization_id: Uuid,
     workspace_id: Uuid,
+    fallback_enabled: bool,
     body_hash: RequestBodyHash,
     request_id: Uuid,
 ) -> ServiceCompletionRequest {
@@ -1285,6 +1289,7 @@ fn convert_text_request_to_service(
         api_key_id,
         organization_id,
         workspace_id,
+        fallback_enabled,
         metadata: None,
         store: None,
         body_hash: body_hash.hash.clone(),
@@ -1406,6 +1411,7 @@ async fn chat_completions_inner(
         api_key.api_key.id.0.clone(),
         api_key.organization.id.0,
         api_key.workspace.id.0,
+        api_key.organization.fallback_enabled(),
         body_hash,
         request_id,
     );
@@ -2378,6 +2384,7 @@ async fn completions_inner(
         api_key.api_key.id.0.clone(),
         api_key.organization.id.0,
         api_key.workspace.id.0,
+        api_key.organization.fallback_enabled(),
         body_hash,
         request_id,
     );
@@ -4234,6 +4241,7 @@ mod tests {
             "key".to_string(),
             Uuid::nil(),
             Uuid::nil(),
+            true,
             body_hash,
             Uuid::nil(),
         );

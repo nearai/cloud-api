@@ -2710,6 +2710,8 @@ pub struct UpdateOrganizationMemberRequest {
 pub struct OrganizationSettings {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub system_prompt: Option<String>,
+    /// Whether requests may use providers configured as fallbacks.
+    pub fallback_enabled: bool,
 }
 
 /// Wrapper type to distinguish between "field not provided" and "field explicitly set to null"
@@ -2739,6 +2741,10 @@ pub struct PatchOrganizationSettingsRequest {
     #[serde(default, deserialize_with = "deserialize_nullable")]
     #[schema(value_type = Option<String>)]
     pub system_prompt: Nullable<String>,
+    /// Enable/disable configured fallback providers. Null restores the default.
+    #[serde(default, deserialize_with = "deserialize_nullable")]
+    #[schema(value_type = Option<bool>)]
+    pub fallback_enabled: Nullable<bool>,
 }
 
 impl PatchOrganizationSettingsRequest {
@@ -2754,6 +2760,21 @@ impl PatchOrganizationSettingsRequest {
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub struct OrganizationSettingsResponse {
     pub settings: OrganizationSettings,
+}
+
+/// Admin request to update an organization's fallback policy.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct UpdateOrganizationFallbackRequest {
+    pub enabled: bool,
+}
+
+/// Effective fallback policy returned by admin organization endpoints.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct OrganizationFallbackResponse {
+    pub organization_id: uuid::Uuid,
+    pub enabled: bool,
 }
 
 /// Result of a single invitation attempt

@@ -6,7 +6,45 @@
 
 use crate::common::*;
 use api::models::BatchUpdateModelApiRequest;
+use services::inference_provider_pool::ChatRoutingHints;
 use std::sync::Arc;
+
+fn chat_params(model: &str) -> inference_providers::ChatCompletionParams {
+    inference_providers::ChatCompletionParams {
+        model: model.to_string(),
+        messages: vec![inference_providers::ChatMessage {
+            role: inference_providers::MessageRole::User,
+            content: Some(serde_json::Value::String("hello".to_string())),
+            name: None,
+            tool_call_id: None,
+            tool_calls: None,
+        }],
+        max_tokens: None,
+        temperature: None,
+        top_p: None,
+        stop: None,
+        stream: Some(false),
+        tools: None,
+        max_completion_tokens: None,
+        n: None,
+        frequency_penalty: None,
+        presence_penalty: None,
+        logit_bias: None,
+        logprobs: None,
+        top_logprobs: None,
+        user: None,
+        seed: None,
+        tool_choice: None,
+        parallel_tool_calls: None,
+        metadata: None,
+        store: None,
+        stream_options: None,
+        service_tier: None,
+        modalities: None,
+        original_request: None,
+        extra: std::collections::HashMap::new(),
+    }
+}
 
 /// Blocking #1 (round-9): a PATCH with `provider_type: "chutes"` previously hit
 /// the admin handler's unregister loop (`has_type_change`) and removed the pinned
@@ -15,16 +53,24 @@ use std::sync::Arc;
 /// restart. The `is_pinned` guard must keep the pinned provider registered.
 #[tokio::test]
 async fn admin_patch_with_provider_type_keeps_pinned_provider() {
+    use inference_providers::mock::{MockProvider, RequestMatcher, ResponseTemplate};
+    use inference_providers::{ProviderSource, ProviderTier};
+
     let (server, pool, _mock, _db) = setup_test_server_with_pool().await;
     let model = format!("zai-org/GLM-5.1-TEE-pin-{}", uuid::Uuid::new_v4());
 
     // Register a pinned provider exactly as init_inference_providers does for Chutes.
-    pool.register_pinned_secondary_provider(
-        model.clone(),
-        Arc::new(inference_providers::mock::MockProvider::new()),
-        None,
-    )
-    .await;
+    let pinned = Arc::new(
+        MockProvider::new_accept_all()
+            .with_tier(ProviderTier::Attested3p)
+            .with_provider_source(ProviderSource::Chutes),
+    );
+    pinned
+        .when(RequestMatcher::Any)
+        .respond_with(ResponseTemplate::new("served-by-live-primary"))
+        .await;
+    pool.register_pinned_secondary_provider(model.clone(), pinned.clone(), None)
+        .await;
     assert!(pool.has_provider(&model).await);
     assert!(pool.is_pinned(&model));
 
@@ -51,6 +97,19 @@ async fn admin_patch_with_provider_type_keeps_pinned_provider() {
         "pinned Chutes provider must survive an admin PATCH carrying provider_type"
     );
     assert!(pool.is_pinned(&model));
+
+    let served = pool
+        .chat_completion_with_attribution_and_hints(
+            chat_params(&model),
+            "live-catalog-role".to_string(),
+            ChatRoutingHints {
+                fallback_disabled: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("the live catalog update must reclassify the standalone pin as primary");
+    assert!(String::from_utf8_lossy(&served.response.raw_bytes).contains("served-by-live-primary"));
 }
 
 /// Blocking #2 (round-9): `ensure_chutes_catalog_row` uses `seed_model_if_absent`

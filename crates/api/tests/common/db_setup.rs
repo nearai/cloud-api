@@ -8,8 +8,10 @@ use tokio_postgres::NoTls;
 use tracing::{debug, info, warn};
 
 use super::{
-    E2E_QWEN_CACHE_MODEL_NAME, E2E_QWEN_CACHE_READ_COST_WITH_CACHE, E2E_QWEN_INPUT_COST_PER_TOKEN,
-    E2E_QWEN_MODEL_NAME, E2E_QWEN_OUTPUT_COST_PER_TOKEN,
+    E2E_DEEPSEEK_MODEL_NAME, E2E_GLM_MODEL_NAME, E2E_PRIVACY_FILTER_MODEL_NAME,
+    E2E_QWEN_CACHE_MODEL_NAME, E2E_QWEN_CACHE_READ_COST_WITH_CACHE, E2E_QWEN_IMAGE_MODEL_NAME,
+    E2E_QWEN_INPUT_COST_PER_TOKEN, E2E_QWEN_MODEL_NAME, E2E_QWEN_OMNI_MODEL_NAME,
+    E2E_QWEN_OUTPUT_COST_PER_TOKEN, E2E_QWEN_RERANKER_MODEL_NAME,
 };
 
 static SHARED_DB_READY: OnceCell<()> = OnceCell::const_new();
@@ -46,6 +48,128 @@ pub fn get_test_db_name() -> String {
 /// Fixed key for the PostgreSQL advisory lock that serializes DB bootstrap
 /// across test binaries. Chosen arbitrarily, just needs to be consistent.
 const BOOTSTRAP_LOCK_KEY: i64 = 0x0e2e_b007_57a9;
+
+#[derive(Clone, Copy)]
+struct SharedModelFixture {
+    model_name: &'static str,
+    display_name: &'static str,
+    description: &'static str,
+    input_cost_per_token: i64,
+    output_cost_per_token: i64,
+    cost_per_image: i64,
+    cache_read_cost_per_token: Option<i64>,
+    context_length: i32,
+    max_output_length: i32,
+    verifiable: bool,
+    allow_free: bool,
+}
+
+const SHARED_MODEL_FIXTURES: [SharedModelFixture; 8] = [
+    SharedModelFixture {
+        model_name: E2E_QWEN_MODEL_NAME,
+        display_name: "E2E Qwen fixture",
+        description: "Deterministic E2E model fixture",
+        input_cost_per_token: E2E_QWEN_INPUT_COST_PER_TOKEN,
+        output_cost_per_token: E2E_QWEN_OUTPUT_COST_PER_TOKEN,
+        cost_per_image: 0,
+        cache_read_cost_per_token: None,
+        context_length: 128_000,
+        max_output_length: 1_024,
+        verifiable: true,
+        allow_free: false,
+    },
+    SharedModelFixture {
+        model_name: E2E_QWEN_CACHE_MODEL_NAME,
+        display_name: "E2E Qwen fixture",
+        description: "Deterministic E2E model fixture",
+        input_cost_per_token: E2E_QWEN_INPUT_COST_PER_TOKEN,
+        output_cost_per_token: E2E_QWEN_OUTPUT_COST_PER_TOKEN,
+        cost_per_image: 0,
+        cache_read_cost_per_token: Some(E2E_QWEN_CACHE_READ_COST_WITH_CACHE),
+        context_length: 128_000,
+        max_output_length: 1_024,
+        verifiable: true,
+        allow_free: false,
+    },
+    SharedModelFixture {
+        model_name: E2E_PRIVACY_FILTER_MODEL_NAME,
+        display_name: "Privacy Filter",
+        description: "PII span detection (token classification)",
+        input_cost_per_token: 1_000_000,
+        output_cost_per_token: 0,
+        cost_per_image: 0,
+        cache_read_cost_per_token: None,
+        context_length: 512,
+        max_output_length: 1_024,
+        verifiable: false,
+        allow_free: true,
+    },
+    SharedModelFixture {
+        model_name: E2E_GLM_MODEL_NAME,
+        display_name: "GLM-4.6",
+        description: "GLM 4.6 model for testing",
+        input_cost_per_token: 1_000_000,
+        output_cost_per_token: 2_000_000,
+        cost_per_image: 0,
+        cache_read_cost_per_token: None,
+        context_length: 128_000,
+        max_output_length: 1_024,
+        verifiable: true,
+        allow_free: false,
+    },
+    SharedModelFixture {
+        model_name: E2E_DEEPSEEK_MODEL_NAME,
+        display_name: "DeepSeek V3.1",
+        description: "DeepSeek V3.1 model with encryption support",
+        input_cost_per_token: 1_000_000,
+        output_cost_per_token: 2_000_000,
+        cost_per_image: 0,
+        cache_read_cost_per_token: None,
+        context_length: 128_000,
+        max_output_length: 1_024,
+        verifiable: true,
+        allow_free: false,
+    },
+    SharedModelFixture {
+        model_name: E2E_QWEN_OMNI_MODEL_NAME,
+        display_name: "Qwen3-Omni 30B",
+        description: "Qwen3-Omni model with audio input/output support",
+        input_cost_per_token: 1_500_000,
+        output_cost_per_token: 3_000_000,
+        cost_per_image: 0,
+        cache_read_cost_per_token: None,
+        context_length: 128_000,
+        max_output_length: 1_024,
+        verifiable: true,
+        allow_free: false,
+    },
+    SharedModelFixture {
+        model_name: E2E_QWEN_IMAGE_MODEL_NAME,
+        display_name: "Qwen-Image",
+        description: "Qwen Image generation model",
+        input_cost_per_token: 0,
+        output_cost_per_token: 0,
+        cost_per_image: 40_000_000,
+        cache_read_cost_per_token: None,
+        context_length: 4_096,
+        max_output_length: 1_024,
+        verifiable: true,
+        allow_free: false,
+    },
+    SharedModelFixture {
+        model_name: E2E_QWEN_RERANKER_MODEL_NAME,
+        display_name: "Qwen3 Reranker",
+        description: "Qwen3 document reranking model",
+        input_cost_per_token: 1_000_000,
+        output_cost_per_token: 0,
+        cost_per_image: 0,
+        cache_read_cost_per_token: None,
+        context_length: 32_768,
+        max_output_length: 1_024,
+        verifiable: false,
+        allow_free: false,
+    },
+];
 
 pub fn nextest_bootstrap_marker() -> Option<String> {
     if env::var("NEXTEST").ok().as_deref() != Some("1") {
@@ -258,15 +382,11 @@ async fn seed_shared_test_fixtures(database: &Database) -> Result<()> {
     // These high-traffic catalog fixtures are immutable during ordinary E2E
     // tests. Seed them once before nextest starts instead of making every test
     // PATCH the same model row. Tests that exercise alternate model metadata
-    // use separate names so they cannot contaminate either baseline.
-    for (model_name, cache_read_cost) in [
-        (E2E_QWEN_MODEL_NAME, None),
-        (
-            E2E_QWEN_CACHE_MODEL_NAME,
-            Some(E2E_QWEN_CACHE_READ_COST_WITH_CACHE),
-        ),
-    ] {
-        let model_name = model_name.to_string();
+    // use separate names so they cannot contaminate these baselines.
+    for fixture in SHARED_MODEL_FIXTURES {
+        let model_name = fixture.model_name.to_string();
+        let display_name = fixture.display_name.to_string();
+        let description = fixture.description.to_string();
         let seeded_model = client
             .query_one(
                 "INSERT INTO models (
@@ -280,8 +400,7 @@ async fn seed_shared_test_fixtures(database: &Database) -> Result<()> {
                     supported_features, datacenters, is_ready, deprecation_date,
                     openrouter_slug, attestation_policy
                  ) VALUES (
-                    $1, 'E2E Qwen fixture', 'Deterministic E2E model fixture',
-                    $2, $3, 0, $4, NULL, 128000, 1024, TRUE, TRUE, FALSE,
+                    $1, $2, $3, $4, $5, $6, $7, NULL, $8, $9, $10, TRUE, $11,
                     'nearai', 'vllm', NULL, TRUE, NULL, NULL, NULL, NULL, NULL,
                     ARRAY[]::TEXT[], ARRAY[]::TEXT[], NULL, NULL, NULL, NULL,
                     'near_only'
@@ -319,9 +438,16 @@ async fn seed_shared_test_fixtures(database: &Database) -> Result<()> {
                  RETURNING id",
                 &[
                     &model_name,
-                    &E2E_QWEN_INPUT_COST_PER_TOKEN,
-                    &E2E_QWEN_OUTPUT_COST_PER_TOKEN,
-                    &cache_read_cost,
+                    &display_name,
+                    &description,
+                    &fixture.input_cost_per_token,
+                    &fixture.output_cost_per_token,
+                    &fixture.cost_per_image,
+                    &fixture.cache_read_cost_per_token,
+                    &fixture.context_length,
+                    &fixture.max_output_length,
+                    &fixture.verifiable,
+                    &fixture.allow_free,
                 ],
             )
             .await

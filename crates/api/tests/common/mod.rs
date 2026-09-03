@@ -52,6 +52,12 @@ pub(super) const E2E_APP_BUILD_OPTIONS: AppBuildOptions = AppBuildOptions {
 /// Cost verification in usage tests should use the matching helper so pricing stays in sync.
 pub const E2E_QWEN_MODEL_NAME: &str = "Qwen/Qwen3-30B-A3B-Instruct-2507";
 pub const E2E_QWEN_CACHE_MODEL_NAME: &str = "Qwen/Qwen3-30B-A3B-Instruct-2507-e2e-cache-pricing";
+pub const E2E_PRIVACY_FILTER_MODEL_NAME: &str = "openai/privacy-filter";
+pub const E2E_GLM_MODEL_NAME: &str = "zai-org/GLM-4.6";
+pub const E2E_DEEPSEEK_MODEL_NAME: &str = "deepseek-ai/DeepSeek-V3.1";
+pub const E2E_QWEN_OMNI_MODEL_NAME: &str = "Qwen/Qwen3-Omni-30B-A3B-Instruct";
+pub const E2E_QWEN_IMAGE_MODEL_NAME: &str = "Qwen/Qwen-Image-2512";
+pub const E2E_QWEN_RERANKER_MODEL_NAME: &str = "Qwen/Qwen3-Reranker-0.6B";
 pub const E2E_QWEN_INPUT_COST_PER_TOKEN: i64 = 1_000_000;
 pub const E2E_QWEN_OUTPUT_COST_PER_TOKEN: i64 = 2_000_000;
 /// Cache-read cost when setup_qwen_model is used (cache pricing disabled).
@@ -809,39 +815,9 @@ pub async fn create_org_and_api_key(
     (api_key_resp.key.clone().unwrap(), api_key_resp)
 }
 
-/// Register the shared privacy-filter catalog row with one deterministic payload.
-/// Tests may safely call this concurrently because every caller writes identical values.
-pub async fn setup_privacy_filter_model(server: &axum_test::TestServer) {
-    let mut batch = BatchUpdateModelApiRequest::new();
-    batch.insert(
-        "openai/privacy-filter".to_string(),
-        serde_json::from_value(serde_json::json!({
-            "inputCostPerToken": {
-                "amount": 1_000_000,
-                "currency": "USD"
-            },
-            "outputCostPerToken": {
-                "amount": 0,
-                "currency": "USD"
-            },
-            "costPerImage": {
-                "amount": 0,
-                "currency": "USD"
-            },
-            "modelDisplayName": "Privacy Filter",
-            "modelDescription": "PII span detection (token classification)",
-            "contextLength": 512,
-            "maxOutputLength": 1024,
-            "verifiable": false,
-            "isActive": true,
-            "allowFree": true
-        }))
-        .expect("privacy-filter test model request should deserialize"),
-    );
-    let updated = admin_batch_upsert_models(server, batch, get_session_id()).await;
-    assert_eq!(updated.len(), 1, "Should have updated 1 model");
-    tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
-}
+/// The privacy-filter fixture is seeded before nextest starts. Keep this helper
+/// for call-site readability without rewriting the shared model row per test.
+pub async fn setup_privacy_filter_model(_server: &axum_test::TestServer) {}
 
 /// Return the standard Qwen fixture seeded before nextest starts.
 ///
@@ -885,30 +861,8 @@ pub fn e2e_qwen_model_pricing_with_cache() -> ModelPricing {
     }
 }
 
-pub async fn setup_glm_model(server: &axum_test::TestServer) -> String {
-    let mut batch = BatchUpdateModelApiRequest::new();
-    batch.insert(
-        "zai-org/GLM-4.6".to_string(),
-        serde_json::from_value(serde_json::json!({
-            "inputCostPerToken": {
-                "amount": 1000000,
-                "currency": "USD"
-            },
-            "outputCostPerToken": {
-                "amount": 2000000,
-                "currency": "USD"
-            },
-            "modelDisplayName": "GLM-4.6",
-            "modelDescription": "GLM 4.6 model for testing",
-            "contextLength": 128000,
-            "maxOutputLength": 1024,
-            "verifiable": true,
-            "isActive": true
-        }))
-        .unwrap(),
-    );
-    admin_batch_upsert_models(server, batch, get_session_id()).await;
-    "zai-org/GLM-4.6".to_string()
+pub async fn setup_glm_model(_server: &axum_test::TestServer) -> String {
+    E2E_GLM_MODEL_NAME.to_string()
 }
 
 /// Get or create web_search platform service via admin API (for E2E tests).
@@ -948,132 +902,24 @@ pub async fn get_or_create_web_search_service(
     get_resp.json::<api::models::ServiceResponse>()
 }
 
-pub async fn setup_deepseek_model(server: &axum_test::TestServer) -> String {
-    let mut batch = BatchUpdateModelApiRequest::new();
-    batch.insert(
-        "deepseek-ai/DeepSeek-V3.1".to_string(),
-        serde_json::from_value(serde_json::json!({
-            "inputCostPerToken": {
-                "amount": 1000000,
-                "currency": "USD"
-            },
-            "outputCostPerToken": {
-                "amount": 2000000,
-                "currency": "USD"
-            },
-            "modelDisplayName": "DeepSeek V3.1",
-            "modelDescription": "DeepSeek V3.1 model with encryption support",
-            "contextLength": 128000,
-            "maxOutputLength": 1024,
-            "verifiable": true,
-            "isActive": true
-        }))
-        .unwrap(),
-    );
-    let updated = admin_batch_upsert_models(server, batch, get_session_id()).await;
-    assert_eq!(updated.len(), 1, "Should have updated 1 model");
-    // Ensure mock provider registers model before test proceeds
-    tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
-    "deepseek-ai/DeepSeek-V3.1".to_string()
+pub async fn setup_deepseek_model(_server: &axum_test::TestServer) -> String {
+    E2E_DEEPSEEK_MODEL_NAME.to_string()
 }
 
-pub async fn setup_qwen_omni_model(server: &axum_test::TestServer) -> String {
-    let mut batch = BatchUpdateModelApiRequest::new();
-    batch.insert(
-        "Qwen/Qwen3-Omni-30B-A3B-Instruct".to_string(),
-        serde_json::from_value(serde_json::json!({
-            "inputCostPerToken": {
-                "amount": 1500000,
-                "currency": "USD"
-            },
-            "outputCostPerToken": {
-                "amount": 3000000,
-                "currency": "USD"
-            },
-            "modelDisplayName": "Qwen3-Omni 30B",
-            "modelDescription": "Qwen3-Omni model with audio input/output support",
-            "contextLength": 128000,
-            "maxOutputLength": 1024,
-            "verifiable": true,
-            "isActive": true
-        }))
-        .unwrap(),
-    );
-    let updated = admin_batch_upsert_models(server, batch, get_session_id()).await;
-    assert_eq!(updated.len(), 1, "Should have updated 1 model");
-    tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
-    "Qwen/Qwen3-Omni-30B-A3B-Instruct".to_string()
+pub async fn setup_qwen_omni_model(_server: &axum_test::TestServer) -> String {
+    E2E_QWEN_OMNI_MODEL_NAME.to_string()
 }
 
-pub async fn setup_qwen_image_model(server: &axum_test::TestServer) -> String {
-    let mut batch = BatchUpdateModelApiRequest::new();
-    batch.insert(
-        "Qwen/Qwen-Image-2512".to_string(),
-        serde_json::from_value(serde_json::json!({
-            "inputCostPerToken": {
-                "amount": 0,
-                "currency": "USD"
-            },
-            "outputCostPerToken": {
-                "amount": 0,
-                "currency": "USD"
-            },
-            "costPerImage": {
-                "amount": 40000000,
-                "currency": "USD"
-            },
-            "modelDisplayName": "Qwen-Image",
-            "modelDescription": "Qwen Image generation model",
-            "contextLength": 4096,
-            "maxOutputLength": 1024,
-            "verifiable": true,
-            "isActive": true
-        }))
-        .unwrap(),
-    );
-    let updated = admin_batch_upsert_models(server, batch, get_session_id()).await;
-    assert_eq!(updated.len(), 1, "Should have updated 1 model");
-    tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
-    "Qwen/Qwen-Image-2512".to_string()
+pub async fn setup_qwen_image_model(_server: &axum_test::TestServer) -> String {
+    E2E_QWEN_IMAGE_MODEL_NAME.to_string()
 }
 
-pub async fn setup_qwen_reranker_model(server: &axum_test::TestServer) -> String {
-    // Score and rerank routes share the same provider model. Keep their fixture
-    // writes identical so concurrent tests cannot toggle pricing, context, or
-    // verification metadata underneath one another.
-    setup_rerank_model(server).await
+pub async fn setup_qwen_reranker_model(_server: &axum_test::TestServer) -> String {
+    E2E_QWEN_RERANKER_MODEL_NAME.to_string()
 }
 
-pub async fn setup_rerank_model(server: &axum_test::TestServer) -> String {
-    let mut batch = BatchUpdateModelApiRequest::new();
-    batch.insert(
-        "Qwen/Qwen3-Reranker-0.6B".to_string(),
-        serde_json::from_value(serde_json::json!({
-            "inputCostPerToken": {
-                "amount": 1000000,
-                "currency": "USD"
-            },
-            "outputCostPerToken": {
-                "amount": 0,
-                "currency": "USD"
-            },
-            "costPerImage": {
-                "amount": 0,
-                "currency": "USD"
-            },
-            "modelDisplayName": "Qwen3 Reranker",
-            "modelDescription": "Qwen3 document reranking model",
-            "contextLength": 32768,
-            "maxOutputLength": 1024,
-            "verifiable": false,
-            "isActive": true
-        }))
-        .unwrap(),
-    );
-    let updated = admin_batch_upsert_models(server, batch, get_session_id()).await;
-    assert_eq!(updated.len(), 1, "Should have updated 1 model");
-    tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
-    "Qwen/Qwen3-Reranker-0.6B".to_string()
+pub async fn setup_rerank_model(_server: &axum_test::TestServer) -> String {
+    E2E_QWEN_RERANKER_MODEL_NAME.to_string()
 }
 
 /// Generate a minimal valid WAV audio file as base64

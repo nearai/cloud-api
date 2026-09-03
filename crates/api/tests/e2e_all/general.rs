@@ -17,14 +17,19 @@ const ALIAS_CONSISTENCY_MODEL: &str = "Qwen/Qwen3-30B-A3B-Instruct-2507-e2e-alia
 #[tokio::test]
 async fn test_models_api() {
     let server = setup_test_server().await;
-    setup_qwen_model(&server).await;
+    let model_name = setup_qwen_model(&server).await;
     let (api_key, _) = create_org_and_api_key(&server).await;
     let response = list_models(&server, api_key).await;
 
     assert!(!response.data.is_empty());
 
-    // Verify pricing and context_length are present (HuggingFace integration)
-    let model = response.data.first().unwrap();
+    // Verify the fixture we arranged, not whichever active model sorts first
+    // in a shared database.
+    let model = response
+        .data
+        .iter()
+        .find(|model| model.id == model_name)
+        .expect("Qwen fixture should be present in the public model list");
     assert!(model.pricing.is_some(), "Model should have pricing");
     let pricing = model.pricing.as_ref().unwrap();
     assert!(pricing.input > 0.0, "Input price should be positive");

@@ -39,12 +39,6 @@ test-group = "e2e-db"
 filter = 'package(api) & binary(e2e_all) & (test(/^database_encryption::/) | test(/^reporting_usage::usage_export::usage_export_database_timeout_returns_504_and_stops_query$/) | test(/^reporting_usage::usage_summary::usage_summary_database_timeout_returns_504$/))'
 threads-required = "num-test-threads"
 
-# A few specialized fixtures still mutate fixed image/privacy/rerank model
-# rows. Keep the assertions that depend on those exact values isolated.
-[[profile.default.overrides]]
-filter = 'package(api) & binary(e2e_all) & (test(/^usage_recording::test_record_image_generation_usage$/) | test(/^privacy_classify::test_privacy_classify_costs_deducted$/) | test(/^privacy_redact::test_privacy_redact_costs_deducted$/) | test(/^rerank::test_rerank_costs_deducted_correctly$/))'
-threads-required = "num-test-threads"
-
 # The scheduler claims from a database-global due queue rather than one batch,
 # so producers of due rows and scheduler passes cannot safely overlap.
 [[profile.default.overrides]]

@@ -63,11 +63,16 @@ test: test-unit test-integration
 
 test-unit:
 	@echo "Running unit tests..."
-	cargo test --lib --bins
+	cargo nextest run --lib --bins
 
 test-integration:
 	@echo "Running integration/e2e tests..."
-	cargo test --test '*'
+	PGHOST="$${PGHOST:-$${DATABASE_HOST:-localhost}}" \
+	PGPORT="$${PGPORT:-$${DATABASE_PORT:-5432}}" \
+	PGDATABASE="$${PGDATABASE:-$${DATABASE_NAME:-platform_api}}" \
+	PGUSER="$${PGUSER:-$${DATABASE_USERNAME:-postgres}}" \
+	PGPASSWORD="$${PGPASSWORD:-$${DATABASE_PASSWORD:-postgres}}" \
+	cargo nextest run --test '*'
 
 lint:
 	@echo "Running clippy linter (strict mode)..."

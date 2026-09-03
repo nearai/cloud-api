@@ -6,17 +6,30 @@ use api::models::BatchUpdateModelApiRequest;
 use database::DEFAULT_MODEL_OWNED_BY;
 use inference_providers::{models::ChatCompletionChunk, StreamChunk};
 
+const HIGH_CONTEXT_COMPLETION_MODEL: &str =
+    "Qwen/Qwen3-30B-A3B-Instruct-2507-e2e-high-context-completion";
+const HIGH_CONTEXT_STREAMING_MODEL: &str =
+    "Qwen/Qwen3-30B-A3B-Instruct-2507-e2e-high-context-streaming";
+const ALIASES_GPT_MODEL: &str = "nearai/gpt-oss-120b-e2e-aliases";
+const ALIASES_QWEN_MODEL: &str = "Qwen/Qwen3-30B-A3B-Instruct-2507-e2e-aliases";
+const ALIAS_CONSISTENCY_MODEL: &str = "Qwen/Qwen3-30B-A3B-Instruct-2507-e2e-alias-consistency";
+
 #[tokio::test]
 async fn test_models_api() {
     let server = setup_test_server().await;
-    setup_qwen_model(&server).await;
+    let model_name = setup_qwen_model(&server).await;
     let (api_key, _) = create_org_and_api_key(&server).await;
     let response = list_models(&server, api_key).await;
 
     assert!(!response.data.is_empty());
 
-    // Verify pricing and context_length are present (HuggingFace integration)
-    let model = response.data.first().unwrap();
+    // Verify the fixture we arranged, not whichever active model sorts first
+    // in a shared database.
+    let model = response
+        .data
+        .iter()
+        .find(|model| model.id == model_name)
+        .expect("Qwen fixture should be present in the public model list");
     assert!(model.pricing.is_some(), "Model should have pricing");
     let pricing = model.pricing.as_ref().unwrap();
     assert!(pricing.input > 0.0, "Input price should be positive");
@@ -155,11 +168,29 @@ async fn test_chat_completions_api() {
 async fn test_admin_update_model() {
     let server = setup_test_server().await;
 
-    // Setup and upsert Qwen model (using session token with admin domain email)
-    let model_name = setup_qwen_model(&server).await;
+    // Exercise the admin upsert itself with a test-specific row rather than
+    // mutating the suite-wide inference fixture.
+    let model_name = "TestOrg/AdminUpdateModel";
+    let mut batch = BatchUpdateModelApiRequest::new();
+    batch.insert(
+        model_name.to_string(),
+        serde_json::from_value(serde_json::json!({
+            "inputCostPerToken": { "amount": 1000000, "currency": "USD" },
+            "outputCostPerToken": { "amount": 2000000, "currency": "USD" },
+            "modelDisplayName": "Updated Model Name",
+            "modelDescription": "Updated model description",
+            "contextLength": 128000,
+            "maxOutputLength": 1024,
+            "verifiable": true,
+            "isActive": true
+        }))
+        .expect("admin update model fixture should deserialize"),
+    );
+    let updated = admin_batch_upsert_models(&server, batch, get_session_id()).await;
+    assert_eq!(updated.len(), 1, "Should have updated 1 model");
 
     // Verify the model was upserted with correct properties
-    assert_eq!("Qwen/Qwen3-30B-A3B-Instruct-2507", model_name);
+    assert_eq!("TestOrg/AdminUpdateModel", model_name);
 
     // Retrieve the model to verify the update
     let response = server
@@ -175,7 +206,7 @@ async fn test_admin_update_model() {
     assert_eq!(200, response.status_code());
     let retrieved_model = response.json::<api::models::ModelWithPricing>();
 
-    assert_eq!("Qwen/Qwen3-30B-A3B-Instruct-2507", retrieved_model.model_id);
+    assert_eq!(model_name, retrieved_model.model_id);
     assert_eq!(
         "Updated Model Name",
         retrieved_model.metadata.model_display_name
@@ -1598,10 +1629,11 @@ async fn test_high_context_length_completion() {
     let org = setup_org_with_credits(&server, 100000000000i64).await; // $100.00 USD
     println!("Created organization: {}", org.id);
 
-    // Upsert Qwen3-30B model with high context length capability (260k)
+    // Use a test-specific catalog row so this metadata variant cannot mutate
+    // the standard Qwen fixture while other nextest processes are using it.
     let mut batch = BatchUpdateModelApiRequest::new();
     batch.insert(
-        "Qwen/Qwen3-30B-A3B-Instruct-2507".to_string(),
+        HIGH_CONTEXT_COMPLETION_MODEL.to_string(),
         serde_json::from_value(serde_json::json!({
             "inputCostPerToken": {
                 "amount": 1000000,  // $0.000001 per token
@@ -1645,7 +1677,7 @@ async fn test_high_context_length_completion() {
         .post("/v1/chat/completions")
         .add_header("Authorization", format!("Bearer {api_key}"))
         .json(&serde_json::json!({
-            "model": "Qwen/Qwen3-30B-A3B-Instruct-2507",
+            "model": HIGH_CONTEXT_COMPLETION_MODEL,
             "messages": [
                 {
                     "role": "user",
@@ -1717,10 +1749,11 @@ async fn test_high_context_streaming() {
     let server = setup_test_server().await;
     let org = setup_org_with_credits(&server, 100000000000i64).await; // $100.00 USD
 
-    // Upsert Qwen3-30B model with high context length capability (260k)
+    // Keep the streaming variant independent from the non-streaming test as
+    // well as from the suite-wide standard Qwen fixture.
     let mut batch = BatchUpdateModelApiRequest::new();
     batch.insert(
-        "Qwen/Qwen3-30B-A3B-Instruct-2507".to_string(),
+        HIGH_CONTEXT_STREAMING_MODEL.to_string(),
         serde_json::from_value(serde_json::json!({
             "inputCostPerToken": {
                 "amount": 1000000,
@@ -1759,7 +1792,7 @@ async fn test_high_context_streaming() {
         .post("/v1/chat/completions")
         .add_header("Authorization", format!("Bearer {api_key}"))
         .json(&serde_json::json!({
-            "model": "Qwen/Qwen3-30B-A3B-Instruct-2507",
+            "model": HIGH_CONTEXT_STREAMING_MODEL,
             "messages": [
                 {
                     "role": "user",
@@ -1840,15 +1873,14 @@ async fn test_model_aliases() {
     println!("Created organization: {}", org.id);
 
     // Set up canonical models with aliases
-    // Discovery returns these canonical names from vLLM:
-    // - "nearai/gpt-oss-120b" (canonical)
-    // - "Qwen/Qwen3-30B-A3B-Instruct-2507" (canonical)
+    // Both catalog rows and aliases are test-specific so reruns cannot alter
+    // models used by unrelated tests.
 
     let mut batch = BatchUpdateModelApiRequest::new();
 
-    // Model 1: nearai/gpt-oss-120b (canonical) with aliases
+    // Model 1: GPT-style canonical name with a friendly alias.
     batch.insert(
-        "nearai/gpt-oss-120b".to_string(),
+        ALIASES_GPT_MODEL.to_string(),
         serde_json::from_value(serde_json::json!({
             "inputCostPerToken": {
                 "amount": 1000000,  // $0.000001 per token
@@ -1865,15 +1897,15 @@ async fn test_model_aliases() {
             "verifiable": true,
             "isActive": true,
             "aliases": [
-                "gpt-oss-120b",  // Friendly alias
+                "gpt-oss-120b-e2e-aliases",  // Friendly alias
             ]
         }))
         .unwrap(),
     );
 
-    // Model 2: Qwen/Qwen3-30B-A3B-Instruct-2507 (canonical with messy name) with clean alias
+    // Model 2: Qwen-style canonical name with a clean alias.
     batch.insert(
-        "Qwen/Qwen3-30B-A3B-Instruct-2507".to_string(),
+        ALIASES_QWEN_MODEL.to_string(),
         serde_json::from_value(serde_json::json!({
             "inputCostPerToken": {
                 "amount": 500000,
@@ -1890,7 +1922,7 @@ async fn test_model_aliases() {
             "verifiable": false,
             "isActive": true,
             "aliases": [
-                "deepseek/deepseek-v3.1"  // Clean alias
+                "deepseek/deepseek-v3.1-e2e-aliases"  // Clean alias
             ]
         }))
         .unwrap(),
@@ -1909,7 +1941,7 @@ async fn test_model_aliases() {
         .post("/v1/chat/completions")
         .add_header("Authorization", format!("Bearer {api_key}"))
         .json(&serde_json::json!({
-            "model": "gpt-oss-120b",  // Using ALIAS
+            "model": "gpt-oss-120b-e2e-aliases",  // Using ALIAS
             "messages": [
                 {
                     "role": "user",
@@ -1945,7 +1977,7 @@ async fn test_model_aliases() {
         .post("/v1/chat/completions")
         .add_header("Authorization", format!("Bearer {api_key}"))
         .json(&serde_json::json!({
-            "model": "nearai/gpt-oss-120b",  // Using CANONICAL name
+            "model": ALIASES_GPT_MODEL,  // Using CANONICAL name
             "messages": [
                 {
                     "role": "user",
@@ -1975,7 +2007,7 @@ async fn test_model_aliases() {
         .post("/v1/chat/completions")
         .add_header("Authorization", format!("Bearer {api_key}"))
         .json(&serde_json::json!({
-            "model": "deepseek/deepseek-v3.1",  // Clean alias
+            "model": "deepseek/deepseek-v3.1-e2e-aliases",  // Clean alias
             "messages": [
                 {
                     "role": "user",
@@ -2019,8 +2051,7 @@ async fn test_model_aliases() {
 
         // Verify model is a canonical model name
         assert!(
-            entry.model == "nearai/gpt-oss-120b"
-                || entry.model == "Qwen/Qwen3-30B-A3B-Instruct-2507",
+            entry.model == ALIASES_GPT_MODEL || entry.model == ALIASES_QWEN_MODEL,
             "Usage should be tracked with canonical model name, got: {}",
             entry.model
         );
@@ -2044,7 +2075,7 @@ async fn test_model_alias_consistency() {
     // Set up model with multiple aliases
     let mut batch = BatchUpdateModelApiRequest::new();
     batch.insert(
-        "Qwen/Qwen3-30B-A3B-Instruct-2507".to_string(),
+        ALIAS_CONSISTENCY_MODEL.to_string(),
         serde_json::from_value(serde_json::json!({
             "inputCostPerToken": {
                 "amount": 800000,
@@ -2061,8 +2092,8 @@ async fn test_model_alias_consistency() {
             "verifiable": true,
             "isActive": true,
             "aliases": [
-                "qwen/qwen3-30b-a3b-instruct-2507",  // Lowercase clean alias
-                "qwen3-30b"                           // Short alias
+                "qwen/qwen3-30b-a3b-instruct-2507-e2e-alias-consistency",
+                "qwen3-30b-e2e-alias-consistency"
             ]
         }))
         .unwrap(),
@@ -2080,7 +2111,7 @@ async fn test_model_alias_consistency() {
         .post("/v1/chat/completions")
         .add_header("Authorization", format!("Bearer {api_key}"))
         .json(&serde_json::json!({
-            "model": "qwen/qwen3-30b-a3b-instruct-2507",  // First alias
+            "model": "qwen/qwen3-30b-a3b-instruct-2507-e2e-alias-consistency",
             "messages": [{"role": "user", "content": "Hi"}],
             "stream": false,
             "max_tokens": 10
@@ -2105,7 +2136,7 @@ async fn test_model_alias_consistency() {
         .post("/v1/chat/completions")
         .add_header("Authorization", format!("Bearer {api_key}"))
         .json(&serde_json::json!({
-            "model": "qwen3-30b",  // Second alias
+            "model": "qwen3-30b-e2e-alias-consistency",
             "messages": [{"role": "user", "content": "Hi"}],
             "stream": false,
             "max_tokens": 10
@@ -2141,7 +2172,7 @@ async fn test_model_alias_consistency() {
         .post("/v1/chat/completions")
         .add_header("Authorization", format!("Bearer {api_key}"))
         .json(&serde_json::json!({
-            "model": "Qwen/Qwen3-30B-A3B-Instruct-2507",  // Canonical name
+            "model": ALIAS_CONSISTENCY_MODEL,
             "messages": [{"role": "user", "content": "Hello"}],
             "stream": false,
             "max_tokens": 10
@@ -3039,17 +3070,24 @@ async fn test_admin_list_users_with_organizations() {
 
 #[tokio::test]
 async fn test_admin_list_users_with_organizations_no_spend_limit() {
-    let server = setup_test_server().await;
+    let (server, database) = setup_test_server_with_database().await;
+    let (unique_session, test_user_email) = setup_unique_test_session(&database).await;
 
     // Get access token from refresh token
-    let access_token = get_access_token_from_refresh_token(&server, get_session_id()).await;
+    let access_token = get_access_token_from_refresh_token(&server, unique_session.clone()).await;
 
-    // Create an organization WITHOUT setting spend limit
-    let org = create_org(&server).await;
+    // Create an organization WITHOUT setting spend limit for a user owned by
+    // this test. The shared admin user can already own organizations from
+    // earlier tests or prior local runs, and this endpoint returns only the
+    // earliest organization for each user.
+    let org = create_org_with_session(&server, &unique_session).await;
 
-    // List users with organizations
+    // Search for the unique user instead of assuming it appears in the newest
+    // 50 rows of a database that is intentionally reused across E2E runs.
     let response = server
-        .get("/v1/admin/users?limit=50&offset=0&include_organizations=true")
+        .get(&format!(
+            "/v1/admin/users?limit=10&offset=0&include_organizations=true&search={test_user_email}"
+        ))
         .add_header("Authorization", format!("Bearer {access_token}"))
         .await;
 
@@ -3057,43 +3095,41 @@ async fn test_admin_list_users_with_organizations_no_spend_limit() {
 
     let users_response = response.json::<api::models::ListUsersResponse>();
 
-    // Find the mock user
-    let mock_user = users_response
-        .users
-        .iter()
-        .find(|u| u.email == "admin@test.com")
-        .expect("Should find mock user");
+    assert_eq!(users_response.total, 1);
+    assert_eq!(users_response.users.len(), 1);
+    let test_user = &users_response.users[0];
+    assert_eq!(test_user.email, test_user_email);
 
-    // Verify user has organizations
-    if let Some(organizations) = &mock_user.organizations {
-        if let Some(org_detail) = organizations.iter().find(|o| o.id == org.id) {
-            // Organization should be present but spend_limit should be None
-            assert!(
-                org_detail.spend_limit.is_none(),
-                "Organization without spend limit should have None"
-            );
-            assert_eq!(org_detail.id, org.id);
-            assert!(!org_detail.name.is_empty());
+    let organizations = test_user
+        .organizations
+        .as_ref()
+        .expect("unique test user should include its organization");
+    assert_eq!(organizations.len(), 1);
+    let org_detail = &organizations[0];
+    assert_eq!(org_detail.id, org.id);
+    assert!(!org_detail.name.is_empty());
+    assert!(
+        org_detail.spend_limit.is_none(),
+        "Organization without spend limit should have None"
+    );
 
-            // Verify current_usage is present with zero values (new org, no API calls)
-            if let Some(usage) = &org_detail.current_usage {
-                assert_eq!(usage.total_spent, 0, "New org should have zero total_spent");
-                assert_eq!(
-                    usage.total_spent_display, "$0.00",
-                    "Display should show $0.00"
-                );
-                assert_eq!(
-                    usage.total_requests, 0,
-                    "New org should have zero total_requests"
-                );
-                assert_eq!(
-                    usage.total_tokens, 0,
-                    "New org should have zero total_tokens"
-                );
-                println!("   - Current usage: {usage:?}");
-            }
-        }
-    }
+    let usage = org_detail
+        .current_usage
+        .as_ref()
+        .expect("organization should include current usage");
+    assert_eq!(usage.total_spent, 0, "New org should have zero total_spent");
+    assert_eq!(
+        usage.total_spent_display, "$0.00",
+        "Display should show $0.00"
+    );
+    assert_eq!(
+        usage.total_requests, 0,
+        "New org should have zero total_requests"
+    );
+    assert_eq!(
+        usage.total_tokens, 0,
+        "New org should have zero total_tokens"
+    );
 
     println!("✅ Admin list users correctly handles organizations without spend limits");
 }
@@ -3134,42 +3170,55 @@ async fn test_admin_list_users_with_organization_usage() {
         "Chat completion should succeed"
     );
 
-    // Wait for async usage recording to complete
-    tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
-
-    // List users with organizations and verify usage is tracked
-    let response = server
-        .get("/v1/admin/users?limit=50&offset=0&include_organizations=true")
-        .add_header("Authorization", format!("Bearer {}", &unique_session))
-        .await;
-
-    assert_eq!(response.status_code(), 200);
-
-    let users_response = response.json::<api::models::ListUsersResponse>();
-
-    // Find the test user we created
-    let mock_user = users_response
-        .users
-        .iter()
-        .find(|u| u.email == test_user_email)
-        .expect("Should find the test user we created");
+    // Usage recording is asynchronous. Poll the uniquely scoped row with a
+    // deadline instead of relying on a fixed sleep that becomes flaky under
+    // CI load.
+    let users_path = format!(
+        "/v1/admin/users?limit=10&offset=0&include_organizations=true&search={test_user_email}"
+    );
+    let users_response = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            let response = server
+                .get(&users_path)
+                .add_header("Authorization", format!("Bearer {}", &unique_session))
+                .await;
+            assert_eq!(response.status_code(), 200);
+            let users = response.json::<api::models::ListUsersResponse>();
+            let usage_recorded = users
+                .users
+                .first()
+                .and_then(|user| user.organizations.as_ref())
+                .and_then(|organizations| organizations.first())
+                .and_then(|organization| organization.current_usage.as_ref())
+                .is_some_and(|usage| {
+                    usage.total_spent > 0 && usage.total_requests > 0 && usage.total_tokens > 0
+                });
+            if usage_recorded {
+                break users;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("organization usage should be recorded within 5 seconds");
+    assert_eq!(users_response.total, 1);
+    assert_eq!(users_response.users.len(), 1);
+    let test_user = &users_response.users[0];
+    assert_eq!(test_user.email, test_user_email);
 
     // Verify user has at least one organization returned (admin list returns earliest org only)
-    let organizations = mock_user
+    let organizations = test_user
         .organizations
         .as_ref()
         .expect("User should have organizations");
-
-    assert!(
-        !organizations.is_empty(),
-        "User should have at least one organization in admin list"
-    );
+    assert_eq!(organizations.len(), 1);
 
     // Get the first (and only, due to DISTINCT ON) organization
     // Note: admin list returns the earliest organization per user
     let org_detail = &organizations[0];
 
     // Verify the organization has the expected structure
+    assert_eq!(org_detail.id, org.id);
     assert!(
         org_detail.spend_limit.is_some(),
         "Organization should have a spend limit"
@@ -3181,21 +3230,20 @@ async fn test_admin_list_users_with_organization_usage() {
         .as_ref()
         .expect("Organization should have current_usage");
 
-    // The returned organization should have usage data (from this test's API call)
-    // Note: If other tests created organizations before this one, we might get
-    // a different organization due to DISTINCT ON returning earliest, but it should
-    // still have valid usage structure even if spent is 0
+    // The search is scoped to this test's unique user and organization, so the
+    // usage must reflect the inference request above rather than merely having
+    // the right response shape.
     assert!(
-        usage.total_spent >= 0,
-        "Organization usage should have valid total_spent"
+        usage.total_spent > 0,
+        "Organization usage should include inference spend"
     );
     assert!(
-        usage.total_requests >= 0,
-        "Organization usage should have valid total_requests"
+        usage.total_requests > 0,
+        "Organization usage should include the inference request"
     );
     assert!(
-        usage.total_tokens >= 0,
-        "Organization usage should have valid total_tokens"
+        usage.total_tokens > 0,
+        "Organization usage should include inference tokens"
     );
     assert!(
         !usage.total_spent_display.is_empty(),
@@ -3210,66 +3258,77 @@ async fn test_admin_list_users_with_organization_usage() {
     );
     println!("   - Total requests: {}", usage.total_requests);
     println!("   - Total tokens: {}", usage.total_tokens);
-
-    // Note: The admin list endpoint returns only the earliest organization per user
-    // due to DISTINCT ON. If other tests ran first and created organizations, we'll
-    // get their organization here. The important thing is to verify the endpoint
-    // works and returns organization usage data.
-
-    // For this test's verification, find our created organization in the response
-    // (though it might not be the first one returned)
-    if org_detail.id == org.id {
-        // We got our organization back - verify it has our usage data
-        assert!(
-            usage.total_spent > 0,
-            "Our organization should have non-zero total_spent from the API call we made"
-        );
-        println!(
-            "   ✅ Verified our created organization {} has correct usage tracking",
-            org.id
-        );
-    } else {
-        // We got a different organization (from an earlier test)
-        // Still verify the endpoint is working and returning proper usage data
-        println!(
-            "   ℹ️  Note: Got organization {} instead of {}, but endpoint structure is valid",
-            org_detail.id, org.id
-        );
-    }
 }
 
 #[tokio::test]
 async fn test_admin_list_users_pagination() {
-    let server = setup_test_server().await;
+    let (server, database) = setup_test_server_with_database().await;
 
     // Get access token from refresh token
     let access_token = get_access_token_from_refresh_token(&server, get_session_id()).await;
 
+    // Page through a cohort owned by this test. An unfiltered listing changes as
+    // other nextest processes create users, so totals and offset boundaries are
+    // not a stable pagination assertion on the shared E2E database.
+    let cohort = format!("pagination-{}", uuid::Uuid::new_v4().simple());
+    let client = database
+        .pool()
+        .get()
+        .await
+        .expect("Failed to get database connection");
+    let mut expected_ids = std::collections::HashSet::new();
+    for index in 0_i64..4 {
+        let user_id = uuid::Uuid::new_v4();
+        let email = format!("{cohort}-{index}@test.com");
+        let username = format!("{cohort}-{index}");
+        let provider_user_id = format!("mock-{user_id}");
+        client
+            .execute(
+                r#"
+                INSERT INTO users (
+                    id, email, username, display_name, avatar_url,
+                    auth_provider, provider_user_id, created_at, updated_at
+                )
+                VALUES (
+                    $1, $2, $3, 'Pagination Test User', NULL,
+                    'mock', $4,
+                    NOW() - ($5::bigint * INTERVAL '1 second'),
+                    NOW() - ($5::bigint * INTERVAL '1 second')
+                )
+                "#,
+                &[&user_id, &email, &username, &provider_user_id, &index],
+            )
+            .await
+            .expect("Failed to create pagination test user");
+        expected_ids.insert(user_id.to_string());
+    }
+    drop(client);
+
     // List first page
     let response1 = server
-        .get("/v1/admin/users?limit=2&offset=0")
+        .get(&format!("/v1/admin/users?limit=2&offset=0&search={cohort}"))
         .add_header("Authorization", format!("Bearer {access_token}"))
         .await;
 
     assert_eq!(response1.status_code(), 200);
     let page1 = response1.json::<api::models::ListUsersResponse>();
 
-    assert!(
-        page1.users.len() <= 2,
-        "First page should have at most 2 users"
-    );
+    assert_eq!(page1.users.len(), 2);
+    assert_eq!(page1.total, 4);
     assert_eq!(page1.limit, 2);
     assert_eq!(page1.offset, 0);
 
     // List second page
     let response2 = server
-        .get("/v1/admin/users?limit=2&offset=2")
+        .get(&format!("/v1/admin/users?limit=2&offset=2&search={cohort}"))
         .add_header("Authorization", format!("Bearer {access_token}"))
         .await;
 
     assert_eq!(response2.status_code(), 200);
     let page2 = response2.json::<api::models::ListUsersResponse>();
 
+    assert_eq!(page2.users.len(), 2);
+    assert_eq!(page2.total, 4);
     assert_eq!(page2.limit, 2);
     assert_eq!(page2.offset, 2);
 
@@ -3280,16 +3339,22 @@ async fn test_admin_list_users_pagination() {
     );
 
     // Verify no duplicate users between pages
-    let page1_ids: std::collections::HashSet<&str> =
-        page1.users.iter().map(|u| u.id.as_str()).collect();
-    let page2_ids: std::collections::HashSet<&str> =
-        page2.users.iter().map(|u| u.id.as_str()).collect();
+    let page1_ids: std::collections::HashSet<String> =
+        page1.users.iter().map(|u| u.id.clone()).collect();
+    let page2_ids: std::collections::HashSet<String> =
+        page2.users.iter().map(|u| u.id.clone()).collect();
 
-    let intersection: Vec<&str> = page1_ids.intersection(&page2_ids).copied().collect();
+    let intersection: Vec<&String> = page1_ids.intersection(&page2_ids).collect();
     assert!(
         intersection.is_empty(),
         "Pages should not have duplicate users"
     );
+
+    let returned_ids = page1_ids
+        .union(&page2_ids)
+        .cloned()
+        .collect::<std::collections::HashSet<_>>();
+    assert_eq!(returned_ids, expected_ids);
 
     println!("✅ Admin list users pagination works correctly");
 }

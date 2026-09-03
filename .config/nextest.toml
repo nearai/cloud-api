@@ -1,19 +1,50 @@
 # Nextest configuration for faster parallel tests
 # See https://nexte.st/book/configuration.html
 
+nextest-version = "0.9.98"
+experimental = ["setup-scripts"]
+
+[scripts.setup.e2e-db-bootstrap]
+command = ["cargo", "test", "--test", "e2e_all", "--", "--ignored", "--exact", "bootstrap_e2e_database", "--nocapture"]
+# The binary is already built by nextest, but leave enough headroom for database
+# creation and migrations on a busy self-hosted runner while retaining a hard cap.
+slow-timeout = { period = "60s", terminate-after = 5 }
+capture-stdout = true
+capture-stderr = true
+
 [profile.default]
-# Run more tests in parallel - safe since each test has isolated database
+# Tests isolate their rows with UUID-scoped organizations, workspaces, and keys.
 test-threads = "num-cpus"
+
+# The default 100 ms handle-drain window is too short for this multi-process E2E
+# workload on a busy runner. Allow a small grace period, but turn any process
+# that still holds output handles afterwards into a real test failure.
+leak-timeout = { period = "500ms", result = "fail" }
 
 # Longer timeout for e2e tests
 slow-timeout = { period = "60s", terminate-after = 2 }
 
-# Cap e2e/integration tests to 16 parallel threads to avoid PostgreSQL
-# connection exhaustion. Each test uses ~4 pool connections (no admin
-# connections), so 16 * 4 = 64, well under PG's default max_connections = 100.
+# Keep enough PostgreSQL headroom for the service connection, migrations, and
+# other jobs that may share a self-hosted runner. Each test pool is capped at 4.
 [test-groups.e2e-db]
-max-threads = 16
+max-threads = 4
 
 [[profile.default.overrides]]
-filter = "package(api) & binary(/^e2e/)"
+filter = "package(api) & binary(e2e_all)"
 test-group = "e2e-db"
+
+# These tests intentionally touch database-wide state (DDL, broad encryption
+# scans, or ACCESS EXCLUSIVE locks), so they must not overlap any other test.
+[[profile.default.overrides]]
+filter = 'package(api) & binary(e2e_all) & (test(/^database_encryption::/) | test(/^reporting_usage::usage_export::usage_export_database_timeout_returns_504_and_stops_query$/) | test(/^reporting_usage::usage_summary::usage_summary_database_timeout_returns_504$/))'
+threads-required = "num-test-threads"
+
+# The scheduler claims from a database-global due queue rather than one batch,
+# so producers of due rows and scheduler passes cannot safely overlap.
+[[profile.default.overrides]]
+filter = 'package(api) & binary(e2e_all) & test(/^admin_pricing_changes::test_(retry_of_persisted_batch_skips_lead_time_validation|scheduler_applies_due_changes|concurrent_schedulers_apply_each_change_once)$/)'
+threads-required = "num-test-threads"
+
+[[profile.default.scripts]]
+filter = "package(api) & binary(e2e_all)"
+setup = "e2e-db-bootstrap"

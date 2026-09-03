@@ -46,6 +46,8 @@ and exercising chat completions with `curl` — see
 ### Prerequisites for Testing
 
 - PostgreSQL database running
+- The PostgreSQL user must be able to create the dedicated test database
+- [`cargo-nextest`](https://nexte.st/docs/installation/pre-built-binaries/) 0.9.98 or newer (`cargo install cargo-nextest --locked`)
 - Database must be accessible with the credentials specified in test configuration
 
 ### Run Tests
@@ -65,6 +67,8 @@ make test
 
 Tests use the same environment variables as the main application (from `env.example`).
 If environment variables are not set, tests use sensible defaults for local testing.
+The nextest setup script creates and migrates `TEST_DATABASE_NAME` once before the
+E2E processes start.
 
 #### Option 1: Using Docker (Recommended)
 ```bash
@@ -82,6 +86,7 @@ make test-integration
 DATABASE_HOST=localhost \
 DATABASE_PORT=5432 \
 DATABASE_NAME=platform_api \
+TEST_DATABASE_NAME=platform_api_e2e \
 DATABASE_USERNAME=postgres \
 DATABASE_PASSWORD=postgres \
 make test-integration
@@ -92,12 +97,16 @@ Set these environment variables before running tests:
 ```bash
 export DATABASE_HOST=localhost
 export DATABASE_PORT=5432
-export DATABASE_NAME=platform_api_test  # Use a dedicated test database
+export DATABASE_NAME=platform_api  # Database-crate integration tests
+export TEST_DATABASE_NAME=platform_api_e2e  # Use a dedicated test database
 export DATABASE_USERNAME=your_username
 export DATABASE_PASSWORD=your_password
-export DATABASE_MAX_CONNECTIONS=5
 export DATABASE_TLS_ENABLED=false
 ```
+
+`make test-integration` maps these connection values to the `PG*` variables
+used by database-crate integration tests. Explicit `PGHOST`, `PGPORT`,
+`PGDATABASE`, `PGUSER`, and `PGPASSWORD` values take precedence.
 
 #### Option 3: Using .env file
 Copy `env.example` to `.env` and configure your test database:
@@ -106,6 +115,9 @@ cp env.example .env
 # Edit .env with your database credentials
 make test-integration
 ```
+
+The E2E helpers load `.env`; for non-default database-crate credentials, also
+export the variables shown in Option 2 before running the Make target.
 
 ### vLLM Integration Tests
 
@@ -118,7 +130,7 @@ export VLLM_API_KEY=your_vllm_api_key_here  # Optional
 export VLLM_TEST_TIMEOUT_SECS=30  # Optional
 
 # Run vLLM integration tests
-cargo test --test integration_tests
+cargo nextest run --test integration_tests
 ```
 
 If not set, tests will use default values but may fail if vLLM is not running at the default URL.

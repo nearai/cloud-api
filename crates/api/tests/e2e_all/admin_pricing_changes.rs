@@ -1,7 +1,9 @@
 // E2E tests for /v1/admin/models/pricing-changes (scheduled pricing changes)
 
 use crate::common::*;
-use api::models::BatchUpdateModelApiRequest;
+use api::models::{
+    BatchUpdateModelApiRequest, ListPricingChangesResponse, ScheduledPricingChangeDto,
+};
 use std::sync::Arc;
 
 fn minimal_model_upsert() -> serde_json::Value {
@@ -66,14 +68,52 @@ async fn post_pricing_changes(
         .await
 }
 
-async fn list_pricing_changes(server: &axum_test::TestServer, query: &str) -> serde_json::Value {
-    let resp = server
-        .get(&format!("/v1/admin/models/pricing-changes{query}"))
-        .add_header("Authorization", format!("Bearer {}", get_session_id()))
-        .add_header("User-Agent", MOCK_USER_AGENT)
-        .await;
-    assert_eq!(resp.status_code(), 200, "list failed: {}", resp.text());
-    serde_json::from_str(&resp.text()).unwrap()
+/// Read every observable page for one pricing-change status.
+///
+/// Concurrent scheduler tests can change `total` between requests, so collect
+/// and deduplicate a forward scan rather than requiring a global snapshot.
+async fn list_all_pricing_changes(
+    server: &axum_test::TestServer,
+    status: &str,
+) -> Vec<ScheduledPricingChangeDto> {
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        let mut changes = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        let mut offset = 0_i64;
+
+        loop {
+            let response = server
+                .get(&format!(
+                    "/v1/admin/models/pricing-changes?status={status}&limit=1000&offset={offset}"
+                ))
+                .add_header("Authorization", format!("Bearer {}", get_session_id()))
+                .add_header("User-Agent", MOCK_USER_AGENT)
+                .await;
+            assert_eq!(
+                response.status_code(),
+                200,
+                "pricing-change list failed: {}",
+                response.text()
+            );
+            let page = response.json::<ListPricingChangesResponse>();
+            let page_len = page.changes.len() as i64;
+
+            for change in page.changes {
+                if seen.insert(change.id.clone()) {
+                    changes.push(change);
+                }
+            }
+
+            offset += page_len;
+            if offset >= page.total || page_len == 0 {
+                break;
+            }
+        }
+
+        changes
+    })
+    .await
+    .expect("pricing-change pagination should finish within 5 seconds")
 }
 
 /// Minimal `ModelsServiceTrait` stub for driving the scheduler in tests;
@@ -172,28 +212,31 @@ async fn test_confirm_schedules_batch_and_lists_pending() {
         assert_eq!(change["oldPricing"]["inputCostPerToken"]["amount"], 1_000);
     }
 
-    let listed = list_pricing_changes(&server, "?status=pending&limit=500").await;
-    let listed_models: Vec<&str> = listed["changes"]
-        .as_array()
-        .unwrap()
+    let listed = list_all_pricing_changes(&server, "pending").await;
+    let listed_models: Vec<&str> = listed
         .iter()
-        .map(|c| c["modelId"].as_str().unwrap())
+        .map(|change| change.model_id.as_str())
         .collect();
     assert!(listed_models.contains(&model_a.as_str()));
     assert!(listed_models.contains(&model_b.as_str()));
 
-    let a = listed["changes"]
-        .as_array()
-        .unwrap()
+    let a = listed
         .iter()
-        .find(|c| c["modelId"] == model_a.as_str())
+        .find(|change| change.model_id == model_a)
         .unwrap();
-    assert_eq!(a["newPricing"]["inputCostPerToken"]["amount"], 1_500);
+    assert_eq!(
+        a.new_pricing
+            .input_cost_per_token
+            .as_ref()
+            .expect("input pricing should be present")
+            .amount,
+        1_500
+    );
     assert!(
-        a["newPricing"]["outputCostPerToken"].is_null(),
+        a.new_pricing.output_cost_per_token.is_none(),
         "untouched fields must be omitted from newPricing"
     );
-    assert_eq!(a["effectiveAt"], "2030-01-01T00:00:00Z");
+    assert_eq!(a.effective_at, "2030-01-01T00:00:00Z");
 }
 
 #[tokio::test]
@@ -555,44 +598,38 @@ async fn test_scheduler_applies_due_changes() {
     // Not due yet: a scheduler pass must not touch it.
     let scheduler = make_scheduler(&database);
     scheduler.run_once().await.unwrap();
-    let listed = list_pricing_changes(&server, "?status=pending&limit=500").await;
-    assert!(listed["changes"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .any(|c| c["modelId"] == model.as_str()));
+    let listed = list_all_pricing_changes(&server, "pending").await;
+    assert!(listed.iter().any(|change| change.model_id == model));
 
     // Make it due and run a pass.
     backdate_batch(&database, &batch_id).await;
     scheduler.run_once().await.unwrap();
 
     // The schedule row is applied...
-    let listed = list_pricing_changes(&server, "?status=applied&limit=500").await;
-    let applied = listed["changes"]
-        .as_array()
-        .unwrap()
+    let listed = list_all_pricing_changes(&server, "applied").await;
+    let applied = listed
         .iter()
-        .find(|c| c["modelId"] == model.as_str())
+        .find(|change| change.model_id == model)
         .expect("change should be applied");
-    assert!(applied["appliedAt"].is_string());
+    assert!(applied.applied_at.is_some());
 
     // ...the live model pricing switched...
-    let models_resp = server
-        .get("/v1/admin/models?limit=500&include_inactive=true")
-        .add_header("Authorization", format!("Bearer {}", get_session_id()))
-        .add_header("User-Agent", MOCK_USER_AGENT)
-        .await;
-    let models: serde_json::Value = serde_json::from_str(&models_resp.text()).unwrap();
-    let updated = models["models"]
-        .as_array()
-        .unwrap()
+    let models = list_all_admin_models(&server, true).await;
+    let updated = models
         .iter()
-        .find(|m| m["modelId"] == model.as_str())
+        .find(|m| m.model_id == model)
         .expect("model should exist");
-    assert_eq!(updated["inputCostPerToken"]["amount"], 1_500);
-    assert_eq!(updated["cacheReadCostPerToken"]["amount"], 250);
-    assert_eq!(updated["outputCostPerToken"]["amount"], 4_000);
-    assert_eq!(updated["textPricing"], scheduled_text_pricing());
+    assert_eq!(updated.input_cost_per_token.amount, 1_500);
+    assert_eq!(
+        updated
+            .cache_read_cost_per_token
+            .as_ref()
+            .expect("cache pricing should be set")
+            .amount,
+        250
+    );
+    assert_eq!(updated.output_cost_per_token.amount, 4_000);
+    assert_eq!(updated.text_pricing, Some(scheduled_text_pricing()));
 
     // ...and model history records the batch in its change reason.
     let history_resp = server
@@ -617,7 +654,7 @@ async fn test_scheduler_applies_due_changes() {
     );
 
     // An applied change can no longer be cancelled.
-    let change_id = applied["id"].as_str().unwrap();
+    let change_id = applied.id.clone();
     let cancel = server
         .delete(&format!("/v1/admin/models/pricing-changes/{change_id}"))
         .add_header("Authorization", format!("Bearer {}", get_session_id()))
@@ -636,18 +673,14 @@ async fn test_scheduler_applies_due_changes() {
             "UPDATE scheduled_model_pricing_changes
              SET status = 'pending', applied_at = NULL
              WHERE id = $1",
-            &[&uuid::Uuid::parse_str(change_id).unwrap()],
+            &[&uuid::Uuid::parse_str(&change_id).unwrap()],
         )
         .await
         .unwrap();
     scheduler.run_once().await.unwrap();
 
-    let listed = list_pricing_changes(&server, "?status=applied&limit=500").await;
-    assert!(listed["changes"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .any(|c| c["id"] == change_id));
+    let listed = list_all_pricing_changes(&server, "applied").await;
+    assert!(listed.iter().any(|change| change.id == change_id));
     let history_resp = server
         .get(&format!("/v1/admin/models/{model}/history"))
         .add_header("Authorization", format!("Bearer {}", get_session_id()))
@@ -695,14 +728,10 @@ async fn test_concurrent_schedulers_apply_each_change_once() {
     a.unwrap();
     b.unwrap();
 
-    let listed = list_pricing_changes(&server, "?status=applied&limit=500").await;
+    let listed = list_all_pricing_changes(&server, "applied").await;
     for model in &models {
         assert!(
-            listed["changes"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .any(|c| c["modelId"] == model.as_str()),
+            listed.iter().any(|change| change.model_id == *model),
             "{model} should be applied"
         );
 
@@ -805,12 +834,8 @@ async fn test_preview_counts_and_consolidated_delivery_rows() {
     }
 
     // Preview must not have persisted anything.
-    let listed = list_pricing_changes(&server, "?status=pending&limit=500").await;
-    assert!(!listed["changes"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .any(|c| c["modelId"] == model_a.as_str()));
+    let listed = list_all_pricing_changes(&server, "pending").await;
+    assert!(!listed.iter().any(|change| change.model_id == model_a));
 
     // Confirm: ONE consolidated delivery row per (user, org) listing BOTH models.
     let confirm = post_pricing_changes(&server, "confirm", changes).await;

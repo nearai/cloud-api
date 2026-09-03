@@ -114,6 +114,22 @@ pub struct DomainServices {
         Arc<dyn services::service_usage::ServiceUsageServiceTrait + Send + Sync>,
 }
 
+/// Controls process-level background work started while the application router
+/// is built. Production uses [`Default`]; tests can disable workers whose
+/// behavior is unrelated to the request under test.
+#[derive(Clone, Copy, Debug)]
+pub struct AppBuildOptions {
+    pub start_database_encryption_recovery: bool,
+}
+
+impl Default for AppBuildOptions {
+    fn default() -> Self {
+        Self {
+            start_database_encryption_recovery: true,
+        }
+    }
+}
+
 /// Initialize database connection and run migrations
 pub async fn init_database(db_config: &config::DatabaseConfig) -> Arc<Database> {
     let database = Arc::new(
@@ -1106,8 +1122,14 @@ pub async fn init_inference_providers_with_mocks(
     // Register providers for models commonly used in tests
     let test_models = vec![
         "Qwen/Qwen3-30B-A3B-Instruct-2507".to_string(),
+        "Qwen/Qwen3-30B-A3B-Instruct-2507-e2e-cache-pricing".to_string(),
+        "Qwen/Qwen3-30B-A3B-Instruct-2507-e2e-high-context-completion".to_string(),
+        "Qwen/Qwen3-30B-A3B-Instruct-2507-e2e-high-context-streaming".to_string(),
+        "Qwen/Qwen3-30B-A3B-Instruct-2507-e2e-aliases".to_string(),
+        "Qwen/Qwen3-30B-A3B-Instruct-2507-e2e-alias-consistency".to_string(),
         "zai-org/GLM-4.6".to_string(),
         "nearai/gpt-oss-120b".to_string(),
+        "nearai/gpt-oss-120b-e2e-aliases".to_string(),
         "dphn/Dolphin-Mistral-24B-Venice-Edition".to_string(),
         "deepseek-ai/DeepSeek-V3.1".to_string(),
         "Qwen/Qwen3-Omni-30B-A3B-Instruct".to_string(),
@@ -1167,6 +1189,23 @@ pub fn build_app_with_config(
     auth_components: AuthComponents,
     domain_services: DomainServices,
     config: Arc<ApiConfig>,
+) -> Router {
+    build_app_with_config_and_options(
+        database,
+        auth_components,
+        domain_services,
+        config,
+        AppBuildOptions::default(),
+    )
+}
+
+/// Build the complete application router with explicit process-level behavior.
+pub fn build_app_with_config_and_options(
+    database: Arc<Database>,
+    auth_components: AuthComponents,
+    domain_services: DomainServices,
+    config: Arc<ApiConfig>,
+    build_options: AppBuildOptions,
 ) -> Router {
     // Create analytics service (shared between user and admin routes)
     let analytics_repository = Arc::new(database::repositories::PgAnalyticsRepository::new(
@@ -1319,10 +1358,11 @@ pub fn build_app_with_config(
 
     let services_routes = build_services_routes(database.pool().clone());
 
-    let admin_routes = build_admin_routes(
+    let admin_routes = build_admin_routes_with_options(
         database.clone(),
         &auth_components.auth_state_middleware,
         config.clone(),
+        build_options,
         AdminRouteServices {
             inference_provider_pool: app_state.inference_provider_pool.clone(),
             analytics_service,
@@ -2170,6 +2210,22 @@ pub fn build_admin_routes(
     config: Arc<ApiConfig>,
     services: AdminRouteServices,
 ) -> Router {
+    build_admin_routes_with_options(
+        database,
+        auth_state_middleware,
+        config,
+        AppBuildOptions::default(),
+        services,
+    )
+}
+
+fn build_admin_routes_with_options(
+    database: Arc<Database>,
+    auth_state_middleware: &AuthState,
+    config: Arc<ApiConfig>,
+    build_options: AppBuildOptions,
+    services: AdminRouteServices,
+) -> Router {
     use crate::middleware::admin_middleware;
     use crate::routes::admin::{
         batch_upsert_models, cancel_model_pricing_change, confirm_model_deprecation,
@@ -2423,7 +2479,9 @@ pub fn build_admin_routes(
         .with_state(admin_app_state);
 
     let admin_routes = if let Some(database_encryption_state) = database_encryption_state {
-        database_encryption_state.recover_jobs();
+        if build_options.start_database_encryption_recovery {
+            database_encryption_state.recover_jobs();
+        }
         admin_routes.merge(
             Router::new()
                 .route(

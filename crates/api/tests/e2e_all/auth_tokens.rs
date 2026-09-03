@@ -152,8 +152,9 @@ async fn test_list_refresh_tokens_without_auth() {
 
 #[tokio::test]
 async fn test_revoke_all_tokens() {
-    let server = setup_test_server().await;
-    let access_token = get_access_token_from_refresh_token(&server, get_session_id()).await;
+    let (server, database) = setup_test_server_with_database().await;
+    let (session_id, _email) = setup_unique_test_session(&database).await;
+    let access_token = get_access_token_from_refresh_token(&server, session_id).await;
 
     let response = server
         .delete("/v1/users/me/tokens")

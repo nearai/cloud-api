@@ -6375,31 +6375,39 @@ pub async fn privacy_classify(
                 .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
         }
         Err(e) => {
-            let (status_code, error_type, message) = match e {
+            let (status_code, error_type, message, retry_after) = match e {
                 services::completions::ports::CompletionError::RateLimitExceeded(msg) => {
                     tracing::warn!("Concurrent request limit exceeded for privacy classify");
-                    (StatusCode::TOO_MANY_REQUESTS, "rate_limit_error", msg)
+                    (StatusCode::TOO_MANY_REQUESTS, "rate_limit_error", msg, true)
                 }
                 services::completions::ports::CompletionError::ProviderError {
                     status_code,
                     message,
                 } => {
-                    tracing::error!(
-                        upstream_status = status_code,
-                        detail = %message,
-                        "Privacy classify provider error"
-                    );
                     let http_status = StatusCode::from_u16(status_code)
                         .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
-                    (
-                        http_status,
-                        "server_error",
-                        "Privacy classify request failed. Please try again later.".to_string(),
-                    )
+                    if http_status.is_client_error() {
+                        tracing::warn!(
+                            upstream_status = status_code,
+                            "Privacy classify provider error"
+                        );
+                        (http_status, "invalid_request_error", message, false)
+                    } else {
+                        tracing::error!(
+                            upstream_status = status_code,
+                            "Privacy classify provider error"
+                        );
+                        (
+                            http_status,
+                            "server_error",
+                            "Privacy classify request failed. Please try again later.".to_string(),
+                            false,
+                        )
+                    }
                 }
                 services::completions::ports::CompletionError::InvalidModel(msg) => {
                     tracing::warn!("Privacy classify model not found");
-                    (StatusCode::NOT_FOUND, "not_found_error", msg)
+                    (StatusCode::NOT_FOUND, "not_found_error", msg, false)
                 }
                 services::completions::ports::CompletionError::ServiceOverloaded(_) => {
                     tracing::warn!("Privacy classify service overloaded");
@@ -6407,6 +6415,7 @@ pub async fn privacy_classify(
                         crate::routes::common::status_overloaded(),
                         "service_overloaded",
                         "All inference backends are overloaded. Please retry with exponential backoff.".to_string(),
+                        true,
                     )
                 }
                 _ => {
@@ -6415,15 +6424,22 @@ pub async fn privacy_classify(
                         StatusCode::INTERNAL_SERVER_ERROR,
                         "server_error",
                         "Privacy classify request failed".to_string(),
+                        false,
                     )
                 }
             };
 
-            (
+            let mut response = (
                 status_code,
                 ResponseJson(ErrorResponse::new(message, error_type.to_string())),
             )
-                .into_response()
+                .into_response();
+            if retry_after {
+                response
+                    .headers_mut()
+                    .insert(header::RETRY_AFTER, header::HeaderValue::from_static("1"));
+            }
+            response
         }
     }
 }
@@ -6677,31 +6693,39 @@ pub async fn privacy_redact(
     {
         Ok(b) => b,
         Err(e) => {
-            let (status_code, error_type, message) = match e {
+            let (status_code, error_type, message, retry_after) = match e {
                 services::completions::ports::CompletionError::RateLimitExceeded(msg) => {
                     tracing::warn!("Concurrent request limit exceeded for privacy redact");
-                    (StatusCode::TOO_MANY_REQUESTS, "rate_limit_error", msg)
+                    (StatusCode::TOO_MANY_REQUESTS, "rate_limit_error", msg, true)
                 }
                 services::completions::ports::CompletionError::ProviderError {
                     status_code,
                     message,
                 } => {
-                    tracing::error!(
-                        upstream_status = status_code,
-                        detail = %message,
-                        "Privacy redact provider error"
-                    );
                     let http_status = StatusCode::from_u16(status_code)
                         .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
-                    (
-                        http_status,
-                        "server_error",
-                        "Privacy redact request failed. Please try again later.".to_string(),
-                    )
+                    if http_status.is_client_error() {
+                        tracing::warn!(
+                            upstream_status = status_code,
+                            "Privacy redact provider error"
+                        );
+                        (http_status, "invalid_request_error", message, false)
+                    } else {
+                        tracing::error!(
+                            upstream_status = status_code,
+                            "Privacy redact provider error"
+                        );
+                        (
+                            http_status,
+                            "server_error",
+                            "Privacy redact request failed. Please try again later.".to_string(),
+                            false,
+                        )
+                    }
                 }
                 services::completions::ports::CompletionError::InvalidModel(msg) => {
                     tracing::warn!("Privacy redact model not found");
-                    (StatusCode::NOT_FOUND, "not_found_error", msg)
+                    (StatusCode::NOT_FOUND, "not_found_error", msg, false)
                 }
                 services::completions::ports::CompletionError::ServiceOverloaded(_) => {
                     tracing::warn!("Privacy redact service overloaded");
@@ -6709,6 +6733,7 @@ pub async fn privacy_redact(
                         StatusCode::SERVICE_UNAVAILABLE,
                         "service_overloaded",
                         "The service is temporarily overloaded. Please retry with exponential backoff.".to_string(),
+                        true,
                     )
                 }
                 _ => {
@@ -6717,14 +6742,21 @@ pub async fn privacy_redact(
                         StatusCode::INTERNAL_SERVER_ERROR,
                         "server_error",
                         "Privacy redact request failed".to_string(),
+                        false,
                     )
                 }
             };
-            return (
+            let mut response = (
                 status_code,
                 ResponseJson(ErrorResponse::new(message, error_type.to_string())),
             )
                 .into_response();
+            if retry_after {
+                response
+                    .headers_mut()
+                    .insert(header::RETRY_AFTER, header::HeaderValue::from_static("1"));
+            }
+            return response;
         }
     };
 

@@ -1883,7 +1883,7 @@ pub enum EmbeddingError {
     HttpError { status_code: u16, message: String },
 }
 
-#[derive(Debug, thiserror::Error)]
+#[derive(Debug, Clone, thiserror::Error)]
 pub enum PrivacyClassifyError {
     #[error("Privacy classify request failed: {0}")]
     RequestFailed(String),

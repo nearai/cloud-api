@@ -4088,21 +4088,22 @@ impl InferenceProviderPool {
         // Final user-facing error: only the status code escapes; no
         // upstream response body. (`sanitize_error_message` would still
         // include the body via Display, so we route around it.)
-        let error_msg = last_error
-            .as_ref()
-            .map(|e| match e {
-                inference_providers::PrivacyClassifyError::HttpError { status_code, .. } => {
-                    format!("PII detector returned HTTP {status_code}")
+        Err(match last_error {
+            Some(inference_providers::PrivacyClassifyError::HttpError { status_code, .. }) => {
+                inference_providers::PrivacyClassifyError::HttpError {
+                    status_code,
+                    message: format!("PII detector returned HTTP {status_code}"),
                 }
-                inference_providers::PrivacyClassifyError::RequestFailed(_) => {
-                    "PII detector unreachable".to_string()
-                }
-            })
-            .unwrap_or_else(|| "No providers available for privacy classify".to_string());
-
-        Err(inference_providers::PrivacyClassifyError::RequestFailed(
-            error_msg,
-        ))
+            }
+            Some(inference_providers::PrivacyClassifyError::RequestFailed(_)) => {
+                inference_providers::PrivacyClassifyError::RequestFailed(
+                    "PII detector unreachable".to_string(),
+                )
+            }
+            None => inference_providers::PrivacyClassifyError::RequestFailed(
+                "No providers available for privacy classify".to_string(),
+            ),
+        })
     }
 
     pub async fn score(
@@ -7877,6 +7878,49 @@ mod tests {
         pool.register_provider(model_id.clone(), mock_provider)
             .await;
         (pool, model_id)
+    }
+
+    #[tokio::test]
+    async fn privacy_classify_preserves_http_status_and_discards_response_body() {
+        // Given: a provider error whose message contains an unsafe upstream body.
+        const UPSTREAM_BODY_SENTINEL: &str =
+            "UPSTREAM_PRIVACY_BODY_SENTINEL::alice@example.com::123-45-6789";
+        let pool = InferenceProviderPool::new(None, ExternalProvidersConfig::default());
+        let mock_provider = Arc::new(inference_providers::mock::MockProvider::new());
+        mock_provider
+            .set_privacy_classify_error_override(Some(
+                inference_providers::PrivacyClassifyError::HttpError {
+                    status_code: 413,
+                    message: UPSTREAM_BODY_SENTINEL.to_string(),
+                },
+            ))
+            .await;
+        let model_id = "openai/privacy-filter";
+        pool.register_provider(model_id.to_string(), mock_provider)
+            .await;
+
+        // When: the pool exhausts its privacy providers.
+        let result = pool
+            .privacy_classify(
+                model_id,
+                bytes::Bytes::from_static(b"{}"),
+                std::collections::HashMap::new(),
+            )
+            .await;
+
+        // Then: only the typed status and a synthesized message escape.
+        match result {
+            Err(inference_providers::PrivacyClassifyError::HttpError {
+                status_code,
+                message,
+            }) => {
+                assert_eq!(status_code, 413);
+                assert_eq!(message, "PII detector returned HTTP 413");
+                assert!(!message.contains(UPSTREAM_BODY_SENTINEL));
+            }
+            Err(other) => panic!("Expected sanitized HttpError, got {other:?}"),
+            Ok(_) => panic!("Expected privacy classify to fail"),
+        }
     }
 
     #[tokio::test]

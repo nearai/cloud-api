@@ -6,6 +6,7 @@
 
 use crate::common::*;
 use api::models::{BatchUpdateModelApiRequest, ErrorResponse};
+use axum::http::header::RETRY_AFTER;
 
 async fn setup_privacy_filter_model(server: &axum_test::TestServer) -> String {
     let mut batch = BatchUpdateModelApiRequest::new();
@@ -376,4 +377,48 @@ async fn test_privacy_redact_costs_deducted() {
         delta, 10_000_000,
         "Privacy redact should bill 10 tokens × 1_000_000 = 10_000_000",
     );
+}
+
+#[tokio::test]
+async fn test_privacy_redact_upstream_429_returns_rate_limit_with_retry_after() {
+    // Given: an upstream privacy provider that rejects the request with a
+    // body containing data that must never leave the provider boundary.
+    const UPSTREAM_BODY_SENTINEL: &str =
+        "UPSTREAM_PRIVACY_BODY_SENTINEL::alice@example.com::123-45-6789";
+    let (server, _pool, mock_provider, _db) = setup_test_server_with_pool().await;
+    setup_privacy_filter_model(&server).await;
+    let org = setup_org_with_credits(&server, 10_000_000_000i64).await;
+    let api_key = get_api_key_for_org(&server, org.id).await;
+    mock_provider
+        .set_privacy_classify_error_override(Some(
+            inference_providers::PrivacyClassifyError::HttpError {
+                status_code: 429,
+                message: UPSTREAM_BODY_SENTINEL.to_string(),
+            },
+        ))
+        .await;
+
+    // When: a client calls the real redact route.
+    let response = server
+        .post("/v1/privacy/redact")
+        .add_header("Authorization", format!("Bearer {api_key}"))
+        .add_header("User-Agent", MOCK_USER_AGENT)
+        .json(&serde_json::json!({
+            "model": "openai/privacy-filter",
+            "input": "Redact this text"
+        }))
+        .await;
+
+    // Then: retry semantics are explicit and the upstream body is absent.
+    assert_eq!(response.status_code(), 429);
+    assert_eq!(
+        response
+            .headers()
+            .get(RETRY_AFTER)
+            .and_then(|value| value.to_str().ok()),
+        Some("1")
+    );
+    let error: ErrorResponse = response.json();
+    assert_eq!(error.error.r#type, "rate_limit_error");
+    assert!(!error.error.message.contains(UPSTREAM_BODY_SENTINEL));
 }

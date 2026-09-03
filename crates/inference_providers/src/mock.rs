@@ -657,6 +657,8 @@ struct MockConfig {
     embedding_error_override: Option<EmbeddingError>,
     /// When set, all audio transcription calls return this error instead of a response.
     audio_transcription_error_override: Option<AudioTranscriptionError>,
+    /// When set, all privacy classify calls return this error instead of a response.
+    privacy_classify_error_override: Option<PrivacyClassifyError>,
 }
 
 /// Builder for configuring a single expectation
@@ -730,6 +732,7 @@ impl MockProvider {
                 stream_error_override: None,
                 embedding_error_override: None,
                 audio_transcription_error_override: None,
+                privacy_classify_error_override: None,
             })),
             last_chat_params: Arc::new(Mutex::new(None)),
             fail_attestation: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -755,6 +758,7 @@ impl MockProvider {
                 stream_error_override: None,
                 embedding_error_override: None,
                 audio_transcription_error_override: None,
+                privacy_classify_error_override: None,
             })),
             last_chat_params: Arc::new(Mutex::new(None)),
             fail_attestation: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -778,6 +782,7 @@ impl MockProvider {
                 stream_error_override: None,
                 embedding_error_override: None,
                 audio_transcription_error_override: None,
+                privacy_classify_error_override: None,
             })),
             last_chat_params: Arc::new(Mutex::new(None)),
             fail_attestation: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -899,6 +904,12 @@ impl MockProvider {
     ) {
         let mut config = self.config.lock().await;
         config.audio_transcription_error_override = error;
+    }
+
+    /// Override the privacy classify response with an error. Pass `None` to clear.
+    pub async fn set_privacy_classify_error_override(&self, error: Option<PrivacyClassifyError>) {
+        let mut config = self.config.lock().await;
+        config.privacy_classify_error_override = error;
     }
 
     /// Generate a completion ID
@@ -1450,6 +1461,13 @@ impl crate::InferenceProvider for MockProvider {
         body: bytes::Bytes,
         _extra: std::collections::HashMap<String, serde_json::Value>,
     ) -> Result<bytes::Bytes, PrivacyClassifyError> {
+        {
+            let config = self.config.lock().await;
+            if let Some(ref error) = config.privacy_classify_error_override {
+                return Err(error.clone());
+            }
+        }
+
         // Echo the requested model so round-trip assertions in tests are meaningful.
         let parsed: serde_json::Value =
             serde_json::from_slice(&body).unwrap_or(serde_json::Value::Null);

@@ -119,4 +119,45 @@ async fn bootstrap_e2e_database() {
         common::db_setup::E2E_DATABASE_BOOTSTRAPPED_ENV,
     )
     .expect("record completed e2e database bootstrap for test processes");
+
+    // reqwest honors host-level proxy variables. Ensure local fake HTTP
+    // services remain local without discarding a developer's other exclusions.
+    let no_proxy = no_proxy_with_loopback();
+    assert!(
+        !no_proxy.contains('\r') && !no_proxy.contains('\n'),
+        "NO_PROXY cannot contain a line break"
+    );
+    writeln!(nextest_env, "NO_PROXY={no_proxy}")
+        .expect("record NO_PROXY for nextest test processes");
+    writeln!(nextest_env, "no_proxy={no_proxy}")
+        .expect("record no_proxy for nextest test processes");
+}
+
+fn no_proxy_with_loopback() -> String {
+    let mut entries = Vec::new();
+    for key in ["NO_PROXY", "no_proxy"] {
+        let Ok(existing) = std::env::var(key) else {
+            continue;
+        };
+        for entry in existing.split(',').map(str::trim) {
+            if !entry.is_empty()
+                && !entries
+                    .iter()
+                    .any(|known: &String| known.eq_ignore_ascii_case(entry))
+            {
+                entries.push(entry.to_string());
+            }
+        }
+    }
+
+    for loopback in ["localhost", "127.0.0.1", "::1"] {
+        if !entries
+            .iter()
+            .any(|entry| entry.eq_ignore_ascii_case(loopback))
+        {
+            entries.push(loopback.to_string());
+        }
+    }
+
+    entries.join(",")
 }

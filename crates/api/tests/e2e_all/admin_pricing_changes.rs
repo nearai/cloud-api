@@ -68,68 +68,52 @@ async fn post_pricing_changes(
         .await
 }
 
-/// Read one status' complete pricing-change list from the shared E2E database.
+/// Read every observable page for one pricing-change status.
 ///
-/// Long-lived local databases can contain more rows than one API page, while
-/// other nextest processes may add rows between page requests. Retry unless
-/// every page reports the same total and the assembled result has exactly that
-/// many distinct IDs.
+/// Concurrent scheduler tests can change `total` between requests, so collect
+/// and deduplicate a forward scan rather than requiring a global snapshot.
 async fn list_all_pricing_changes(
     server: &axum_test::TestServer,
     status: &str,
 ) -> Vec<ScheduledPricingChangeDto> {
     tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        let mut changes = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        let mut offset = 0_i64;
+
         loop {
-            let mut changes = Vec::new();
-            let mut offset = 0_i64;
-            let mut expected_total = None;
-            let mut stable = true;
+            let response = server
+                .get(&format!(
+                    "/v1/admin/models/pricing-changes?status={status}&limit=1000&offset={offset}"
+                ))
+                .add_header("Authorization", format!("Bearer {}", get_session_id()))
+                .add_header("User-Agent", MOCK_USER_AGENT)
+                .await;
+            assert_eq!(
+                response.status_code(),
+                200,
+                "pricing-change list failed: {}",
+                response.text()
+            );
+            let page = response.json::<ListPricingChangesResponse>();
+            let page_len = page.changes.len() as i64;
 
-            loop {
-                let response = server
-                    .get(&format!(
-                        "/v1/admin/models/pricing-changes?status={status}&limit=1000&offset={offset}"
-                    ))
-                    .add_header("Authorization", format!("Bearer {}", get_session_id()))
-                    .add_header("User-Agent", MOCK_USER_AGENT)
-                    .await;
-                assert_eq!(
-                    response.status_code(),
-                    200,
-                    "pricing-change list failed: {}",
-                    response.text()
-                );
-                let page = response.json::<ListPricingChangesResponse>();
-
-                if expected_total.is_some_and(|total| total != page.total) {
-                    stable = false;
-                    break;
-                }
-                expected_total = Some(page.total);
-
-                let page_len = page.changes.len() as i64;
-                changes.extend(page.changes);
-                offset += page_len;
-                if offset >= page.total || page_len == 0 {
-                    break;
+            for change in page.changes {
+                if seen.insert(change.id.clone()) {
+                    changes.push(change);
                 }
             }
 
-            let expected_total = expected_total.unwrap_or_default();
-            let unique_count = changes
-                .iter()
-                .map(|change| change.id.as_str())
-                .collect::<std::collections::HashSet<_>>()
-                .len();
-            if stable && changes.len() as i64 == expected_total && unique_count == changes.len() {
-                break changes;
+            offset += page_len;
+            if offset >= page.total || page_len == 0 {
+                break;
             }
-
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         }
+
+        changes
     })
     .await
-    .expect("pricing-change listing should stabilize within 5 seconds")
+    .expect("pricing-change pagination should finish within 5 seconds")
 }
 
 /// Minimal `ModelsServiceTrait` stub for driving the scheduler in tests;

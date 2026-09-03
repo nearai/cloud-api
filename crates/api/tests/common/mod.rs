@@ -1229,64 +1229,48 @@ pub async fn list_models(
     response.json::<api::models::ModelsResponse>()
 }
 
-/// Read a complete, internally consistent admin model listing from the shared
-/// E2E database. Tests must not assume the catalog stays below a fixed page
-/// size: local nextest runs intentionally reuse the database, and other test
-/// processes can add models while pages are being read.
+/// Read every observable admin model page from the shared E2E database.
+///
+/// Concurrent tests can change `total` between requests, so this deliberately
+/// deduplicates a single forward scan instead of waiting for a global snapshot.
+/// Callers only inspect test-owned model IDs, making the union race-safe.
 pub async fn list_all_admin_models(
     server: &axum_test::TestServer,
     include_inactive: bool,
 ) -> Vec<api::models::AdminModelWithPricing> {
     tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        let mut models = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        let mut offset = 0_i64;
+
         loop {
-            let mut models = Vec::new();
-            let mut offset = 0_i64;
-            let mut expected_total = None;
-            let mut stable = true;
+            let response = server
+                .get(&format!(
+                    "/v1/admin/models?limit=1000&offset={offset}&include_inactive={include_inactive}"
+                ))
+                .add_header("Authorization", format!("Bearer {}", get_session_id()))
+                .add_header("User-Agent", MOCK_USER_AGENT)
+                .await;
+            assert_eq!(response.status_code(), 200, "{}", response.text());
+            let page = response.json::<api::models::AdminModelListResponse>();
+            let page_len = page.models.len() as i64;
 
-            loop {
-                let response = server
-                    .get(&format!(
-                        "/v1/admin/models?limit=1000&offset={offset}&include_inactive={include_inactive}"
-                    ))
-                    .add_header("Authorization", format!("Bearer {}", get_session_id()))
-                    .add_header("User-Agent", MOCK_USER_AGENT)
-                    .await;
-                assert_eq!(response.status_code(), 200, "{}", response.text());
-                let page = response.json::<api::models::AdminModelListResponse>();
-
-                if expected_total.is_some_and(|total| total != page.total) {
-                    stable = false;
-                    break;
-                }
-                expected_total = Some(page.total);
-
-                let page_len = page.models.len() as i64;
-                models.extend(page.models);
-                offset += page_len;
-                if offset >= page.total || page_len == 0 {
-                    break;
+            for model in page.models {
+                if seen.insert(model.model_id.clone()) {
+                    models.push(model);
                 }
             }
 
-            let expected_total = expected_total.unwrap_or_default();
-            let unique_count = models
-                .iter()
-                .map(|model| model.model_id.as_str())
-                .collect::<std::collections::HashSet<_>>()
-                .len();
-            if stable
-                && models.len() as i64 == expected_total
-                && unique_count == models.len()
-            {
-                break models;
+            offset += page_len;
+            if offset >= page.total || page_len == 0 {
+                break;
             }
-
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         }
+
+        models
     })
     .await
-    .expect("admin model listing should stabilize within 5 seconds")
+    .expect("admin model pagination should finish within 5 seconds")
 }
 
 pub fn compute_sha256(data: &str) -> String {

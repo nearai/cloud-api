@@ -82,6 +82,10 @@ impl Drop for StreamSignaturePinGuard {
     }
 }
 
+// A deferred upstream terminal contains only `data: [DONE]` and, when the
+// lossless parser emits it separately, its blank SSE separator.
+const MAX_HELD_PROVIDER_TERMINAL_BYTES: usize = 64;
+
 /// Insert validated E2EE headers into a provider `extra` HashMap.
 fn insert_encryption_headers(
     encryption_headers: &crate::routes::common::EncryptionHeaders,
@@ -518,6 +522,18 @@ fn synthesized_done_requires_gateway_signature(
     // E2EE response bytes are opaque to the gateway. Keep their signature
     // behavior independent of whether an upstream happens to omit `[DONE]`.
     model_attestation_supported == Some(true) && !e2ee_active
+}
+
+fn defer_upstream_terminal(
+    gateway_signature_enabled: bool,
+    public_response_rewritten: bool,
+    rewrite_public_stream_usage: bool,
+    strip_intermediate_usage: bool,
+) -> bool {
+    !gateway_signature_enabled
+        && !public_response_rewritten
+        && !rewrite_public_stream_usage
+        && !strip_intermediate_usage
 }
 
 #[cfg(test)]
@@ -1590,13 +1606,17 @@ async fn chat_completions_inner(
     // returning one that cannot verify.
     service_request.skip_provider_chat_signature =
         usage_mode.gateway_signature_enabled || public_response_rewritten;
-    // For an otherwise raw, provider-signed stream, hold the upstream terminal
-    // suffix until the completion service reaches EOF and persists the
-    // signature. This makes the signature available when the client observes
-    // the original `[DONE]` bytes.
-    let provider_signature_enabled = model_attestation_supported == Some(true)
-        && !service_request.skip_provider_chat_signature
-        && !public_response_rewritten;
+    // Defer an upstream terminator whenever this route would otherwise relay it
+    // unchanged. The completion service owns the authoritative model lookup, so
+    // it decides whether finalization stores a provider signature or is a no-op.
+    // That keeps the signature available before clients observe `[DONE]` even
+    // when the route-level model metadata cache is unavailable or stale.
+    let defer_upstream_terminal = defer_upstream_terminal(
+        gateway_signature_enabled,
+        public_response_rewritten,
+        rewrite_public_stream_usage,
+        strip_intermediate_usage,
+    );
     let redaction_map = Arc::new(redaction_map);
 
     // Check if streaming is requested
@@ -1682,12 +1702,10 @@ async fn chat_completions_inner(
 
                 // Set when the upstream's own `data: [DONE]` terminator was
                 // observed, so the end-of-stream tail doesn't append a
-                // gateway-minted one. A provider-signed stream may hold its
-                // original terminal bytes until signature finalization.
+                // gateway-minted one. The original terminal bytes may be held
+                // until completion-service finalization finishes.
                 let upstream_done_forwarded = Arc::new(std::sync::atomic::AtomicBool::new(false));
                 let upstream_done_for_chain = upstream_done_forwarded.clone();
-                let hold_provider_terminal_suffix =
-                    provider_signature_enabled && !gateway_signature_enabled;
                 let holding_provider_terminal_suffix =
                     Arc::new(std::sync::atomic::AtomicBool::new(false));
                 let holding_provider_terminal_suffix_for_chain =
@@ -1746,7 +1764,7 @@ async fn chat_completions_inner(
                         let rewrite_public_stream_usage = rewrite_public_stream_usage;
                         let strip_intermediate_usage = strip_intermediate_usage;
                         let gateway_signature_enabled = gateway_signature_enabled;
-                        let hold_provider_terminal_suffix = hold_provider_terminal_suffix;
+                        let defer_upstream_terminal = defer_upstream_terminal;
                         let holding_provider_terminal_suffix =
                             holding_provider_terminal_suffix.clone();
                         let held_provider_terminal_bytes = held_provider_terminal_bytes.clone();
@@ -1760,6 +1778,53 @@ async fn chat_completions_inner(
                                     if holding_provider_terminal_suffix
                                         .load(std::sync::atomic::Ordering::Relaxed)
                                     {
+                                        let is_separator = event.chunk.is_none()
+                                            && !event.raw_bytes.is_empty()
+                                            && event
+                                                .raw_bytes
+                                                .iter()
+                                                .all(|byte| matches!(*byte, b'\r' | b'\n'));
+                                        let mut held = held_provider_terminal_bytes.lock().await;
+                                        if is_separator
+                                            && held.len() + event.raw_bytes.len()
+                                                <= MAX_HELD_PROVIDER_TERMINAL_BYTES
+                                        {
+                                            held.extend_from_slice(&event.raw_bytes);
+                                            return None;
+                                        }
+
+                                        held.clear();
+                                        drop(held);
+                                        holding_provider_terminal_suffix.store(
+                                            false,
+                                            std::sync::atomic::Ordering::Relaxed,
+                                        );
+                                        let error = inference_providers::CompletionError::CompletionError(
+                                            "Malformed SSE stream after [DONE]".into(),
+                                        );
+                                        let count = error_count_inner.fetch_add(
+                                            1,
+                                            std::sync::atomic::Ordering::Relaxed,
+                                        );
+                                        if count == 0 {
+                                            tracing::error!(
+                                                %organization_id,
+                                                model = %model_for_err,
+                                                "Completion stream emitted bytes after its terminal marker"
+                                            );
+                                        }
+                                        return Some(Ok::<Bytes, Infallible>(sse_error_frame(&error)));
+                                    }
+
+                                    if event.is_done_marker() && defer_upstream_terminal {
+                                        upstream_done.store(
+                                            true,
+                                            std::sync::atomic::Ordering::Relaxed,
+                                        );
+                                        holding_provider_terminal_suffix.store(
+                                            true,
+                                            std::sync::atomic::Ordering::Relaxed,
+                                        );
                                         held_provider_terminal_bytes
                                             .lock()
                                             .await
@@ -1810,17 +1875,6 @@ async fn chat_completions_inner(
                                             }
                                             upstream_done
                                                 .store(true, std::sync::atomic::Ordering::Relaxed);
-                                            if hold_provider_terminal_suffix {
-                                                holding_provider_terminal_suffix.store(
-                                                    true,
-                                                    std::sync::atomic::Ordering::Relaxed,
-                                                );
-                                                held_provider_terminal_bytes
-                                                    .lock()
-                                                    .await
-                                                    .extend_from_slice(&event.raw_bytes);
-                                                return None;
-                                            }
                                         }
                                         if hash_client_visible_stream {
                                             public_signature_hasher
@@ -2109,7 +2163,8 @@ async fn chat_completions_inner(
                                     .load(std::sync::atomic::Ordering::Relaxed);
                                 if synthesized_done {
                                     combined.extend_from_slice(b"data: [DONE]\n\n");
-                                } else if hold_provider_terminal_suffix
+                                } else if error_count_final == 0
+                                    && defer_upstream_terminal
                                     && holding_provider_terminal_suffix_for_chain
                                         .load(std::sync::atomic::Ordering::Relaxed)
                                 {
@@ -3670,6 +3725,15 @@ mod tests {
             false
         ));
         assert!(!synthesized_done_requires_gateway_signature(None, false));
+    }
+
+    #[test]
+    fn raw_streams_defer_their_terminal_without_model_metadata() {
+        assert!(defer_upstream_terminal(false, false, false, false));
+        assert!(!defer_upstream_terminal(true, false, false, false));
+        assert!(!defer_upstream_terminal(false, true, false, false));
+        assert!(!defer_upstream_terminal(false, false, true, false));
+        assert!(!defer_upstream_terminal(false, false, false, true));
     }
 
     #[test]

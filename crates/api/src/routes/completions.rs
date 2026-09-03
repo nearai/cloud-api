@@ -511,6 +511,15 @@ fn auto_redact_requires_gateway_signature(
     auto_redact_enabled && model_attestation_supported.unwrap_or(false)
 }
 
+fn synthesized_done_requires_gateway_signature(
+    model_attestation_supported: Option<bool>,
+    e2ee_active: bool,
+) -> bool {
+    // E2EE response bytes are opaque to the gateway. Keep their signature
+    // behavior independent of whether an upstream happens to omit `[DONE]`.
+    model_attestation_supported == Some(true) && !e2ee_active
+}
+
 #[cfg(test)]
 fn prepare_chat_stream_chunk_for_client(
     chunk: &mut inference_providers::models::ChatCompletionChunk,
@@ -1571,7 +1580,8 @@ async fn chat_completions_inner(
     // if its provider omitted `[DONE]`, the route appends one for the client.
     // Hash attested streams as they are emitted so that tail path can decide
     // whether the final client-visible bytes need a Gateway signature.
-    let may_need_synthesized_done_gateway_signature = model_attestation_supported == Some(true);
+    let may_need_synthesized_done_gateway_signature =
+        synthesized_done_requires_gateway_signature(model_attestation_supported, e2ee_active);
     let hash_client_visible_stream =
         gateway_signature_enabled || may_need_synthesized_done_gateway_signature;
     // Never publish a provider signature over bytes that auto-redact or alias
@@ -3591,6 +3601,23 @@ mod tests {
         assert!(!auto_redact_requires_gateway_signature(false, Some(true)));
         assert!(!auto_redact_requires_gateway_signature(true, Some(false)));
         assert!(!auto_redact_requires_gateway_signature(true, None));
+    }
+
+    #[test]
+    fn synthesized_done_does_not_change_e2ee_signature_kind() {
+        assert!(synthesized_done_requires_gateway_signature(
+            Some(true),
+            false
+        ));
+        assert!(!synthesized_done_requires_gateway_signature(
+            Some(true),
+            true
+        ));
+        assert!(!synthesized_done_requires_gateway_signature(
+            Some(false),
+            false
+        ));
+        assert!(!synthesized_done_requires_gateway_signature(None, false));
     }
 
     #[test]

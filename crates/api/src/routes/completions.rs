@@ -24,6 +24,7 @@ use services::common::encryption_headers as service_encryption_headers;
 use services::completions::{
     hash_inference_id_to_uuid,
     ports::{CompletionMessage, CompletionRequest as ServiceCompletionRequest},
+    MAX_PROVIDER_DONE_EVENT_BYTES,
 };
 use sha2::{Digest, Sha256};
 use std::convert::Infallible;
@@ -84,7 +85,7 @@ impl Drop for StreamSignaturePinGuard {
 
 // A deferred upstream terminal contains only `data: [DONE]` and, when the
 // lossless parser emits it separately, its blank SSE separator.
-const MAX_HELD_PROVIDER_TERMINAL_BYTES: usize = 64;
+const MAX_HELD_PROVIDER_TERMINAL_BYTES: usize = MAX_PROVIDER_DONE_EVENT_BYTES;
 
 /// Insert validated E2EE headers into a provider `extra` HashMap.
 fn insert_encryption_headers(
@@ -534,6 +535,21 @@ fn defer_upstream_terminal(
         && !public_response_rewritten
         && !rewrite_public_stream_usage
         && !strip_intermediate_usage
+}
+
+/// Append bytes held until provider-signature finalization without exceeding
+/// the small terminal suffix bound. Returns false without mutating `held` if
+/// the new bytes would exceed the cap.
+fn try_append_held_provider_terminal_bytes(held: &mut Vec<u8>, bytes: &[u8]) -> bool {
+    let Some(total_len) = held.len().checked_add(bytes.len()) else {
+        return false;
+    };
+    if total_len > MAX_HELD_PROVIDER_TERMINAL_BYTES {
+        return false;
+    }
+
+    held.extend_from_slice(bytes);
+    true
 }
 
 #[cfg(test)]
@@ -1786,10 +1802,11 @@ async fn chat_completions_inner(
                                                 .all(|byte| matches!(*byte, b'\r' | b'\n'));
                                         let mut held = held_provider_terminal_bytes.lock().await;
                                         if is_separator
-                                            && held.len() + event.raw_bytes.len()
-                                                <= MAX_HELD_PROVIDER_TERMINAL_BYTES
+                                            && try_append_held_provider_terminal_bytes(
+                                                &mut held,
+                                                &event.raw_bytes,
+                                            )
                                         {
-                                            held.extend_from_slice(&event.raw_bytes);
                                             return None;
                                         }
 
@@ -1821,15 +1838,35 @@ async fn chat_completions_inner(
                                             true,
                                             std::sync::atomic::Ordering::Relaxed,
                                         );
-                                        holding_provider_terminal_suffix.store(
-                                            true,
+                                        let mut held = held_provider_terminal_bytes.lock().await;
+                                        if try_append_held_provider_terminal_bytes(
+                                            &mut held,
+                                            &event.raw_bytes,
+                                        ) {
+                                            holding_provider_terminal_suffix.store(
+                                                true,
+                                                std::sync::atomic::Ordering::Relaxed,
+                                            );
+                                            return None;
+                                        }
+
+                                        held.clear();
+                                        drop(held);
+                                        let error = inference_providers::CompletionError::CompletionError(
+                                            "Malformed SSE stream after [DONE]".into(),
+                                        );
+                                        let count = error_count_inner.fetch_add(
+                                            1,
                                             std::sync::atomic::Ordering::Relaxed,
                                         );
-                                        held_provider_terminal_bytes
-                                            .lock()
-                                            .await
-                                            .extend_from_slice(&event.raw_bytes);
-                                        return None;
+                                        if count == 0 {
+                                            tracing::error!(
+                                                %organization_id,
+                                                model = %model_for_err,
+                                                "Completion stream terminal marker exceeded the held suffix limit"
+                                            );
+                                        }
+                                        return Some(Ok::<Bytes, Infallible>(sse_error_frame(&error)));
                                     }
                                     // Byte-exact passthrough (issue #701): when no public
                                     // chunk rewriting is active, forward the upstream wire
@@ -3734,6 +3771,28 @@ mod tests {
         assert!(!defer_upstream_terminal(false, true, false, false));
         assert!(!defer_upstream_terminal(false, false, true, false));
         assert!(!defer_upstream_terminal(false, false, false, true));
+    }
+
+    #[test]
+    fn oversized_padded_done_marker_is_not_held() {
+        let padding = " ".repeat(MAX_HELD_PROVIDER_TERMINAL_BYTES);
+        let event = inference_providers::SSEEvent {
+            raw_bytes: Bytes::from(format!("data: [DONE]{padding}\n")),
+            chunk: None,
+            raw_passthrough: true,
+        };
+        assert!(
+            event.is_done_marker(),
+            "whitespace-padded marker is still DONE"
+        );
+        assert!(event.raw_bytes.len() > MAX_HELD_PROVIDER_TERMINAL_BYTES);
+
+        let mut held = Vec::new();
+        assert!(
+            !try_append_held_provider_terminal_bytes(&mut held, &event.raw_bytes),
+            "the initial terminal frame must obey the held suffix limit"
+        );
+        assert!(held.is_empty(), "rejected bytes must not be retained");
     }
 
     #[test]

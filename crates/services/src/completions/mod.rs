@@ -23,6 +23,10 @@ use std::time::{Duration, Instant};
 use tracing::Instrument;
 
 const FINALIZE_TIMEOUT_SECS: u64 = 5;
+/// A raw provider terminal marker is only expected to contain `data: [DONE]`
+/// plus its SSE line ending. Bound it before accepting it as a signed terminal
+/// event so malformed padding cannot be retained or signed.
+pub const MAX_PROVIDER_DONE_EVENT_BYTES: usize = 64;
 const DEEPSEEK_V4_FLASH_MODEL: &str = "deepseek-ai/DeepSeek-V4-Flash";
 
 type FinalizeFuture = Pin<Box<dyn Future<Output = ()> + Send>>;
@@ -512,6 +516,14 @@ where
                 match Pin::new(&mut self.inner).poll_next(cx) {
                     Poll::Ready(Some(Ok(event))) => {
                         if event.is_done_marker() {
+                            if event.raw_bytes.len() > MAX_PROVIDER_DONE_EVENT_BYTES {
+                                let error = inference_providers::CompletionError::CompletionError(
+                                    "Malformed SSE stream: [DONE] marker is too large".into(),
+                                );
+                                self.last_error = Some(error.clone());
+                                self.begin_finalizing();
+                                return Poll::Ready(Some(Err(error)));
+                            }
                             self.saw_upstream_done_marker = true;
                             if sse_event_has_terminating_separator(&event) {
                                 self.begin_finalizing();
@@ -2452,6 +2464,27 @@ mod tests {
                 if message == expected_error
         ));
         assert!(stream.stream_completed);
+        assert!(stream.last_error.is_some());
+        assert!(matches!(&stream.state, StreamState::Done));
+    }
+
+    #[tokio::test]
+    async fn oversized_done_marker_is_rejected_before_signature_finalization() {
+        let padding = " ".repeat(MAX_PROVIDER_DONE_EVENT_BYTES);
+        let mut stream = terminal_test_stream(vec![Ok(SSEEvent {
+            raw_bytes: Bytes::from(format!("data: [DONE]{padding}\n")),
+            chunk: None,
+            raw_passthrough: true,
+        })]);
+
+        let events = stream.by_ref().collect::<Vec<_>>().await;
+
+        assert!(matches!(
+            &events[..],
+            [Err(inference_providers::CompletionError::CompletionError(message))]
+                if message == "Malformed SSE stream: [DONE] marker is too large"
+        ));
+        assert!(!stream.saw_upstream_done_marker);
         assert!(stream.last_error.is_some());
         assert!(matches!(&stream.state, StreamState::Done));
     }

@@ -1,9 +1,11 @@
 use crate::models::{UpdateModelPricingRequest, UpdateOrganizationLimitsDbRequest};
 use crate::pool::DbPool;
+use crate::repositories::utils::map_db_error;
 use crate::repositories::{
     ModelAliasRepository, ModelRepository, OrganizationLimitsRepository, ServiceRepository,
     UserRepository,
 };
+use crate::retry_db;
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use services::admin::{
@@ -16,6 +18,7 @@ use services::admin::{
     ScheduledPricingChangeInsert, ScheduledPricingChangeStatus, UpdateModelAdminRequest, UserInfo,
     UserOrganizationInfo,
 };
+use services::common::RepositoryError;
 use services::service_usage::ports::ServiceUnit;
 use std::sync::Arc;
 use uuid::Uuid;
@@ -1465,17 +1468,27 @@ impl AdminRepository for AdminCompositeRepository {
         organization_id: Uuid,
         concurrent_limit: Option<u32>,
     ) -> Result<()> {
-        let client = self.pool.get().await?;
-
         // Convert u32 to i32 for PostgreSQL INTEGER type
         let db_limit: Option<i32> = concurrent_limit.map(|v| v as i32);
 
-        let rows_updated = client
-            .execute(
-                "UPDATE organizations SET rate_limit = $1, updated_at = NOW() WHERE id = $2 AND is_active = true",
-                &[&db_limit, &organization_id],
-            )
-            .await?;
+        // This is an idempotent assignment, so it is safe to retry with a new
+        // pooled connection if the runner drops a connection mid-request.
+        let rows_updated = retry_db!("update_organization_concurrent_limit", {
+            let client = self
+                .pool
+                .get()
+                .await
+                .context("Failed to get database connection")
+                .map_err(RepositoryError::PoolError)?;
+
+            client
+                .execute(
+                    "UPDATE organizations SET rate_limit = $1, updated_at = NOW() WHERE id = $2 AND is_active = true",
+                    &[&db_limit, &organization_id],
+                )
+                .await
+                .map_err(map_db_error)
+        })?;
 
         if rows_updated == 0 {
             anyhow::bail!("Organization not found or inactive: {}", organization_id);
@@ -1488,14 +1501,22 @@ impl AdminRepository for AdminCompositeRepository {
         &self,
         organization_id: Uuid,
     ) -> Result<Option<u32>> {
-        let client = self.pool.get().await?;
+        let row = retry_db!("get_admin_organization_concurrent_limit", {
+            let client = self
+                .pool
+                .get()
+                .await
+                .context("Failed to get database connection")
+                .map_err(RepositoryError::PoolError)?;
 
-        let row = client
-            .query_opt(
-                "SELECT rate_limit FROM organizations WHERE id = $1 AND is_active = true",
-                &[&organization_id],
-            )
-            .await?;
+            client
+                .query_opt(
+                    "SELECT rate_limit FROM organizations WHERE id = $1 AND is_active = true",
+                    &[&organization_id],
+                )
+                .await
+                .map_err(map_db_error)
+        })?;
 
         match row {
             Some(r) => {

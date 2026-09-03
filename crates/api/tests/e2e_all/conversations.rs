@@ -1964,7 +1964,7 @@ async fn test_response_previous_next_relationships_streaming() {
 #[tokio::test]
 async fn test_conversation_items_include_response_metadata() {
     let server = setup_test_server().await;
-    setup_qwen_model(&server).await;
+    let model_name = setup_qwen_model(&server).await;
     let org = setup_org_with_credits(&server, 10000000000i64).await; // $10.00 USD
     let api_key = get_api_key_for_org(&server, org.id).await;
 
@@ -1980,7 +1980,7 @@ async fn test_conversation_items_include_response_metadata() {
             "temperature": 0.7,
             "max_output_tokens": 100,
             "stream": false,
-            "model": "Qwen/Qwen3-30B-A3B-Instruct-2507",
+            "model": &model_name,
             "conversation": conversation.id
         }))
         .await;
@@ -1998,7 +1998,7 @@ async fn test_conversation_items_include_response_metadata() {
             "temperature": 0.7,
             "max_output_tokens": 100,
             "stream": false,
-            "model": "Qwen/Qwen3-30B-A3B-Instruct-2507",
+            "model": &model_name,
             "previous_response_id": parent_response.id
         }))
         .await;
@@ -3301,15 +3301,12 @@ async fn test_conversation_unauthorized_access() {
 #[tokio::test]
 async fn test_conversation_items_include_model() {
     let server = setup_test_server().await;
-    setup_qwen_model(&server).await;
+    let model_name = setup_qwen_model(&server).await;
     let org = setup_org_with_credits(&server, 10000000000i64).await; // $10.00 USD
     let api_key = get_api_key_for_org(&server, org.id).await;
 
     // Create a conversation
     let conversation = create_conversation(&server, api_key.clone()).await;
-
-    // Use a specific model
-    let model_name = "Qwen/Qwen3-30B-A3B-Instruct-2507";
 
     // Create a response with the specific model
     let response = server
@@ -3320,7 +3317,7 @@ async fn test_conversation_items_include_model() {
             "temperature": 0.7,
             "max_output_tokens": 100,
             "stream": false,
-            "model": model_name,
+            "model": &model_name,
             "conversation": conversation.id
         }))
         .await;
@@ -3351,7 +3348,7 @@ async fn test_conversation_items_include_model() {
                 // Verify model field is populated and matches the model used for the response
                 assert!(!model.is_empty(), "Model field should not be empty");
                 assert_eq!(
-                    model, model_name,
+                    model, &model_name,
                     "Model field should match the model used for the response"
                 );
             }
@@ -3359,7 +3356,7 @@ async fn test_conversation_items_include_model() {
                 println!("  ToolCall item {id}: model={model}");
                 assert!(!model.is_empty(), "Model field should not be empty");
                 assert_eq!(
-                    model, model_name,
+                    model, &model_name,
                     "Model field should match the model used for the response"
                 );
             }
@@ -3367,7 +3364,7 @@ async fn test_conversation_items_include_model() {
                 println!("  WebSearchCall item {id}: model={model}");
                 assert!(!model.is_empty(), "Model field should not be empty");
                 assert_eq!(
-                    model, model_name,
+                    model, &model_name,
                     "Model field should match the model used for the response"
                 );
             }
@@ -3375,7 +3372,7 @@ async fn test_conversation_items_include_model() {
                 println!("  Reasoning item {id}: model={model}");
                 assert!(!model.is_empty(), "Model field should not be empty");
                 assert_eq!(
-                    model, model_name,
+                    model, &model_name,
                     "Model field should match the model used for the response"
                 );
             }
@@ -3383,7 +3380,7 @@ async fn test_conversation_items_include_model() {
                 println!("  FunctionCall item {id}: model={model}");
                 assert!(!model.is_empty(), "Model field should not be empty");
                 assert_eq!(
-                    model, model_name,
+                    model, &model_name,
                     "Model field should match the model used for the response"
                 );
             }
@@ -3494,15 +3491,12 @@ async fn test_conversation_items_model_with_streaming() {
 #[tokio::test]
 async fn test_backfilled_items_include_model() {
     let server = setup_test_server().await;
-    setup_qwen_model(&server).await;
+    let model_name = setup_qwen_model(&server).await;
     let org = setup_org_with_credits(&server, 10000000000i64).await; // $10.00 USD
     let api_key = get_api_key_for_org(&server, org.id).await;
 
     // Create a conversation
     let conversation = create_conversation(&server, api_key.clone()).await;
-
-    // Use a specific model for backfilling
-    let model_name = "Qwen/Qwen3-30B-A3B-Instruct-2507";
 
     // Backfill some conversation items (this creates items directly without a response)
     let create_items_response = server
@@ -3537,7 +3531,7 @@ async fn test_backfilled_items_include_model() {
             "temperature": 0.7,
             "max_output_tokens": 100,
             "stream": false,
-            "model": model_name,
+            "model": &model_name,
             "conversation": conversation.id
         }))
         .await;

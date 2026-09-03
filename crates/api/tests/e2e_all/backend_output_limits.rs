@@ -192,7 +192,11 @@ async fn backend_output_limits_six_model_regression() {
         assert_openrouter_output(row, case.expected);
     }
 
-    let list_json = get_json(&server, "/v1/model/list?limit=500").await;
+    // Fetch the complete catalog rather than assuming a reused local E2E
+    // database contains fewer than an arbitrary 500 models. `/v1/models`
+    // above is unpaginated and exposes the same active catalog.
+    let list_path = format!("/v1/model/list?limit={}", openrouter_rows.len());
+    let list_json = get_json(&server, &list_path).await;
     let list_rows = list_json["models"]
         .as_array()
         .expect("/v1/model/list models should be an array");

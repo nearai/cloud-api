@@ -68,6 +68,10 @@ pub fn apply_with(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    };
     use std::time::Duration;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
@@ -144,6 +148,8 @@ mod tests {
 
         // Detected on the server side and reported via this oneshot.
         let (ping_tx, ping_rx) = tokio::sync::oneshot::channel::<()>();
+        let client_is_idle = Arc::new(AtomicBool::new(false));
+        let server_client_is_idle = Arc::clone(&client_is_idle);
 
         let server = tokio::spawn(async move {
             let (mut s, _) = listener.accept().await.expect("accept");
@@ -173,7 +179,7 @@ mod tests {
             //    minimal 200 response, then watch for PING.
             let mut ping_tx = Some(ping_tx);
             loop {
-                let Some((ty, _flags, stream_id, _payload)) = read_frame(&mut s).await else {
+                let Some((ty, flags, stream_id, payload)) = read_frame(&mut s).await else {
                     return;
                 };
                 match ty {
@@ -197,10 +203,25 @@ mod tests {
                         s.flush().await.expect("flush");
                     }
                     FRAME_TYPE_PING => {
-                        if let Some(tx) = ping_tx.take() {
-                            let _ = tx.send(());
+                        // ACK first so the fixture behaves like a live HTTP/2 peer.
+                        // In particular, a PING can arrive while the initial request
+                        // is still active if the test runner is heavily loaded.
+                        if flags & 0x1 == 0 {
+                            let mut ack = Vec::new();
+                            write_frame_header(&mut ack, payload.len(), FRAME_TYPE_PING, 0x1, 0);
+                            ack.extend_from_slice(&payload);
+                            s.write_all(&ack).await.expect("write PING ACK");
+                            s.flush().await.expect("flush PING ACK");
+
+                            // Only a PING observed after the response body has been
+                            // fully drained proves keepalive runs with zero streams.
+                            if server_client_is_idle.load(Ordering::Acquire) {
+                                if let Some(tx) = ping_tx.take() {
+                                    let _ = tx.send(());
+                                }
+                                return;
+                            }
                         }
-                        // Don't ACK — we just need to know one arrived.
                     }
                     FRAME_TYPE_SETTINGS | FRAME_TYPE_WINDOW_UPDATE => {
                         // ignore
@@ -213,9 +234,11 @@ mod tests {
         // Build a bucket-style client with very short PING interval (100ms) so the
         // test runs synchronously. http2_prior_knowledge avoids needing TLS.
         let client = apply_with(
-            reqwest::Client::builder().http2_prior_knowledge(),
+            reqwest::Client::builder()
+                .http2_prior_knowledge()
+                .no_proxy(),
             Duration::from_millis(100),
-            Duration::from_secs(2),
+            Duration::from_secs(10),
             Duration::from_secs(30),
         )
         .build()
@@ -223,21 +246,29 @@ mod tests {
 
         // Send one request to establish the H2 connection, then go idle.
         let url = format!("http://{addr}/");
-        let resp = tokio::time::timeout(Duration::from_secs(5), client.get(&url).send())
+        let resp = tokio::time::timeout(Duration::from_secs(10), client.get(&url).send())
             .await
             .expect("request did not time out")
             .expect("request succeeded");
         assert_eq!(resp.status(), 200);
-        // Drop the response so the stream is fully closed → connection has 0 streams.
-        drop(resp);
+        // Drain the body so the stream is fully closed → connection has 0 streams.
+        let body = tokio::time::timeout(Duration::from_secs(10), resp.bytes())
+            .await
+            .expect("response body did not time out")
+            .expect("response body succeeded");
+        assert!(body.is_empty());
+        client_is_idle.store(true, Ordering::Release);
 
         // With while_idle=true, a PING must arrive within ~3 intervals.
         // Without it, this would time out.
-        tokio::time::timeout(Duration::from_secs(5), ping_rx)
+        tokio::time::timeout(Duration::from_secs(10), ping_rx)
             .await
-            .expect("PING frame did not arrive within 5s — http2_keep_alive_while_idle may be off")
+            .expect("PING frame did not arrive within 10s — http2_keep_alive_while_idle may be off")
             .expect("ping channel closed");
 
-        server.abort();
+        tokio::time::timeout(Duration::from_secs(10), server)
+            .await
+            .expect("server fixture did not stop")
+            .expect("server fixture failed");
     }
 }

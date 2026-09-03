@@ -83,3 +83,7 @@ async-trait = "0.1"
 [[test]]
 name = "e2e_all"
 path = "tests/e2e_all/main.rs"
+
+[[test]]
+name = "e2e_db_bootstrap"
+path = "tests/e2e_db_bootstrap.rs"

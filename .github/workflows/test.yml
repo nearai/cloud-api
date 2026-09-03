@@ -163,9 +163,10 @@ jobs:
   # End-to-end tests. All e2e tests are compiled into a single binary
   # (tests/e2e_all/) for faster linking. Isolation comes from UUID-scoped
   # orgs/workspaces/keys on a shared database, not separate databases.
-  # nextest concurrency is capped by .config/nextest.toml (e2e-db group
-  # max-threads = 16; 16 * 4 pool conns = 64 < PG default max_connections
-  # = 100), so no ALTER SYSTEM / restart step is needed.
+  # A nextest setup script creates/migrates that database exactly once, then
+  # e2e concurrency is capped by .config/nextest.toml at 8 active tests. Most
+  # pools are capped at 4 connections; even tests with a second pool leave
+  # PostgreSQL headroom for runner-side services.
   e2e-test:
     name: E2E tests
     needs: changes

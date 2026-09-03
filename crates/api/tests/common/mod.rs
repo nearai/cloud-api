@@ -10,12 +10,14 @@ pub mod fake_ita;
 pub mod ita_evidence;
 pub mod ita_server;
 
+pub use db_setup::MOCK_USER_ID;
 pub use ita_evidence::setup_test_server_with_config_and_ita_model_evidence;
 pub use ita_server::{setup_ita_server, setup_ita_server_with_env_policy, ItaServerMode};
 
 use api::{
-    build_app_with_config, init_auth_services,
+    build_app_with_config_and_options, init_auth_services,
     models::{BatchUpdateModelApiRequest, CreateServiceRequest},
+    AppBuildOptions,
 };
 use async_trait::async_trait;
 use base64::Engine;
@@ -39,7 +41,12 @@ use k256::ecdsa::{RecoveryId, Signature as EcdsaSignature, VerifyingKey};
 #[cfg(test)]
 use sha3::Keccak256;
 
-pub const MOCK_USER_ID: &str = "11111111-1111-1111-1111-111111111111";
+pub(super) const E2E_APP_BUILD_OPTIONS: AppBuildOptions = AppBuildOptions {
+    // Individual encryption jobs still start from their request handler. Only
+    // startup recovery is disabled so unrelated tests do not all scan and race
+    // over the same global job queue.
+    start_database_encryption_recovery: false,
+};
 
 /// Shared pricing constants for e2e tests that use setup_qwen_model / setup_qwen_model_with_cache_pricing.
 /// Cost verification in usage tests should use the matching helper so pricing stays in sync.
@@ -105,19 +112,19 @@ pub fn test_config() -> ApiConfig {
             refresh_interval: 30,
             mock: false,
         },
-        database_encryption_key: std::env::var("DB_ENCRYPTION_KEY").unwrap_or_else(|_| {
-            "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789".to_string()
-        }),
+        // Test-only deterministic keys keep local .env values from changing
+        // mock-storage and database-encryption behavior across processes.
+        database_encryption_key: "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789"
+            .to_string(),
         database_encryption_key_id: "e2e-db-v1".to_string(),
         // Preserve encrypted-write coverage in E2E tests; production defaults off.
         database_encryption_write_enabled: true,
         s3: config::S3Config {
             mock: true,
-            bucket: std::env::var("AWS_S3_BUCKET").unwrap_or_else(|_| "test-bucket".to_string()),
-            region: std::env::var("AWS_S3_REGION").unwrap_or_else(|_| "us-east-1".to_string()),
-            encryption_key: std::env::var("S3_ENCRYPTION_KEY").unwrap_or_else(|_| {
-                "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".to_string()
-            }),
+            bucket: "test-bucket".to_string(),
+            region: "us-east-1".to_string(),
+            encryption_key: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+                .to_string(),
         },
         invitation_email: config::InvitationEmailConfig::default(),
         otlp: config::OtlpConfig {
@@ -197,11 +204,12 @@ async fn build_test_server_components(
     )
     .await;
 
-    let app = build_app_with_config(
+    let app = build_app_with_config_and_options(
         database.clone(),
         auth_components,
         domain_services,
         Arc::new(config),
+        E2E_APP_BUILD_OPTIONS,
     );
     let server = axum_test::TestServer::new(app.clone());
 
@@ -232,11 +240,12 @@ async fn build_test_server_components_with_real_providers(
     )
     .await;
 
-    let app = build_app_with_config(
+    let app = build_app_with_config_and_options(
         database.clone(),
         auth_components,
         domain_services,
         Arc::new(config),
+        E2E_APP_BUILD_OPTIONS,
     );
     let server = axum_test::TestServer::new(app);
 
@@ -342,11 +351,12 @@ async fn build_test_server_components_with_search_providers(
     )
     .await;
 
-    let app = build_app_with_config(
+    let app = build_app_with_config_and_options(
         database.clone(),
         auth_components,
         domain_services,
         Arc::new(config),
+        E2E_APP_BUILD_OPTIONS,
     );
     (axum_test::TestServer::new(app), mock_provider)
 }
@@ -550,11 +560,12 @@ pub async fn setup_test_server_with_mcp_factory(
     )
     .await;
 
-    let app = build_app_with_config(
+    let app = build_app_with_config_and_options(
         infra.database.clone(),
         auth_components,
         domain_services,
         Arc::new(infra.config),
+        E2E_APP_BUILD_OPTIONS,
     );
     let server = axum_test::TestServer::new(app);
 
@@ -592,23 +603,13 @@ pub async fn setup_unique_test_session(database: &Arc<Database>) -> (String, Str
 pub async fn assert_mock_user_in_db(database: &Arc<Database>) {
     let pool = database.pool();
     let client = pool.get().await.expect("Failed to get database connection");
-
-    let _ = client.execute(
-        "INSERT INTO users (id, email, username, display_name, avatar_url, auth_provider, provider_user_id, created_at, updated_at)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, NOW(), NOW())
-         ON CONFLICT (id) DO UPDATE SET email = EXCLUDED.email",
-        &[
-            &uuid::Uuid::parse_str(MOCK_USER_ID).unwrap(),
-            &"admin@test.com", // Using test.com domain for admin access
-            &"testuser",
-            &Some("Test User".to_string()),
-            &Some("https://example.com/avatar.jpg".to_string()),
-            &"mock",
-            &"mock_123",
-        ],
-    ).await.expect("Failed to create mock user");
-
-    tracing::debug!("Mock user created/exists in database: {}", MOCK_USER_ID);
+    let user_id = uuid::Uuid::parse_str(MOCK_USER_ID).expect("fixed mock user ID must be valid");
+    let email: String = client
+        .query_one("SELECT email FROM users WHERE id = $1", &[&user_id])
+        .await
+        .expect("shared mock user must be seeded by the e2e database bootstrap")
+        .get(0);
+    assert_eq!(email, "admin@test.com", "shared mock user email changed");
 }
 
 pub async fn create_org(server: &axum_test::TestServer) -> api::models::OrganizationResponse {
@@ -807,6 +808,40 @@ pub async fn create_org_and_api_key(
     (api_key_resp.key.clone().unwrap(), api_key_resp)
 }
 
+/// Register the shared privacy-filter catalog row with one deterministic payload.
+/// Tests may safely call this concurrently because every caller writes identical values.
+pub async fn setup_privacy_filter_model(server: &axum_test::TestServer) {
+    let mut batch = BatchUpdateModelApiRequest::new();
+    batch.insert(
+        "openai/privacy-filter".to_string(),
+        serde_json::from_value(serde_json::json!({
+            "inputCostPerToken": {
+                "amount": 1_000_000,
+                "currency": "USD"
+            },
+            "outputCostPerToken": {
+                "amount": 0,
+                "currency": "USD"
+            },
+            "costPerImage": {
+                "amount": 0,
+                "currency": "USD"
+            },
+            "modelDisplayName": "Privacy Filter",
+            "modelDescription": "PII span detection (token classification)",
+            "contextLength": 512,
+            "maxOutputLength": 1024,
+            "verifiable": false,
+            "isActive": true,
+            "allowFree": true
+        }))
+        .expect("privacy-filter test model request should deserialize"),
+    );
+    let updated = admin_batch_upsert_models(server, batch, get_session_id()).await;
+    assert_eq!(updated.len(), 1, "Should have updated 1 model");
+    tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
+}
+
 pub async fn setup_qwen_model(server: &axum_test::TestServer) -> String {
     let mut batch = BatchUpdateModelApiRequest::new();
     batch.insert(
@@ -825,7 +860,12 @@ pub async fn setup_qwen_model(server: &axum_test::TestServer) -> String {
             "contextLength": 128000,
             "maxOutputLength": 1024,
             "verifiable": true,
-            "isActive": true
+            "isActive": true,
+            // Clear state left by tests that intentionally exercise optional
+            // pricing and aliases on this legacy shared fixture.
+            "cacheReadCostPerToken": null,
+            "textPricing": null,
+            "aliases": []
         }))
         .unwrap(),
     );
@@ -868,7 +908,9 @@ pub async fn setup_qwen_model_with_cache_pricing(server: &axum_test::TestServer)
             "contextLength": 128000,
             "maxOutputLength": 1024,
             "verifiable": true,
-            "isActive": true
+            "isActive": true,
+            "textPricing": null,
+            "aliases": []
         }))
         .unwrap(),
     );
@@ -1075,31 +1117,10 @@ pub async fn setup_qwen_image_model(server: &axum_test::TestServer) -> String {
 }
 
 pub async fn setup_qwen_reranker_model(server: &axum_test::TestServer) -> String {
-    let mut batch = BatchUpdateModelApiRequest::new();
-    batch.insert(
-        "Qwen/Qwen3-Reranker-0.6B".to_string(),
-        serde_json::from_value(serde_json::json!({
-            "inputCostPerToken": {
-                "amount": 100000,
-                "currency": "USD"
-            },
-            "outputCostPerToken": {
-                "amount": 0,
-                "currency": "USD"
-            },
-            "modelDisplayName": "Qwen3-Reranker 0.6B",
-            "modelDescription": "Qwen3 Text Similarity Scoring (Reranker) model",
-            "contextLength": 8192,
-            "maxOutputLength": 1024,
-            "verifiable": true,
-            "isActive": true
-        }))
-        .unwrap(),
-    );
-    let updated = admin_batch_upsert_models(server, batch, get_session_id()).await;
-    assert_eq!(updated.len(), 1, "Should have updated 1 model");
-    tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
-    "Qwen/Qwen3-Reranker-0.6B".to_string()
+    // Score and rerank routes share the same provider model. Keep their fixture
+    // writes identical so concurrent tests cannot toggle pricing, context, or
+    // verification metadata underneath one another.
+    setup_rerank_model(server).await
 }
 
 pub async fn setup_rerank_model(server: &axum_test::TestServer) -> String {
@@ -1206,6 +1227,66 @@ pub async fn list_models(
         .await;
     assert_eq!(response.status_code(), 200);
     response.json::<api::models::ModelsResponse>()
+}
+
+/// Read a complete, internally consistent admin model listing from the shared
+/// E2E database. Tests must not assume the catalog stays below a fixed page
+/// size: local nextest runs intentionally reuse the database, and other test
+/// processes can add models while pages are being read.
+pub async fn list_all_admin_models(
+    server: &axum_test::TestServer,
+    include_inactive: bool,
+) -> Vec<api::models::AdminModelWithPricing> {
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            let mut models = Vec::new();
+            let mut offset = 0_i64;
+            let mut expected_total = None;
+            let mut stable = true;
+
+            loop {
+                let response = server
+                    .get(&format!(
+                        "/v1/admin/models?limit=1000&offset={offset}&include_inactive={include_inactive}"
+                    ))
+                    .add_header("Authorization", format!("Bearer {}", get_session_id()))
+                    .add_header("User-Agent", MOCK_USER_AGENT)
+                    .await;
+                assert_eq!(response.status_code(), 200, "{}", response.text());
+                let page = response.json::<api::models::AdminModelListResponse>();
+
+                if expected_total.is_some_and(|total| total != page.total) {
+                    stable = false;
+                    break;
+                }
+                expected_total = Some(page.total);
+
+                let page_len = page.models.len() as i64;
+                models.extend(page.models);
+                offset += page_len;
+                if offset >= page.total || page_len == 0 {
+                    break;
+                }
+            }
+
+            let expected_total = expected_total.unwrap_or_default();
+            let unique_count = models
+                .iter()
+                .map(|model| model.model_id.as_str())
+                .collect::<std::collections::HashSet<_>>()
+                .len();
+            if stable
+                && models.len() as i64 == expected_total
+                && unique_count == models.len()
+            {
+                break models;
+            }
+
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("admin model listing should stabilize within 5 seconds")
 }
 
 pub fn compute_sha256(data: &str) -> String {

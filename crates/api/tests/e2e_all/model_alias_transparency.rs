@@ -7,22 +7,36 @@
 use crate::common::*;
 use api::models::BatchUpdateModelApiRequest;
 
-/// Create a synthetic model and deprecate it in favor of the e2e Qwen mock
-/// model, returning the deprecated (alias) name. This reproduces the exact
-/// production path from issue #573: `POST /v1/admin/models/deprecate`
-/// registers the old name as an alias of the successor.
-async fn setup_deprecated_alias(server: &axum_test::TestServer) -> String {
-    setup_qwen_model(server).await;
-
-    let old = format!("test-alias-old/Old-Model-{}", uuid::Uuid::new_v4());
+/// Create a unique canonical model and deprecate a unique synthetic model in
+/// its favor. Both names are per-test so another test resetting aliases on a
+/// shared model cannot remove this fixture between setup and the assertion.
+async fn setup_deprecated_alias() -> (axum_test::TestServer, String, String) {
+    let (server, inference_pool, mock_provider, _) = setup_test_server_with_pool().await;
+    let suffix = uuid::Uuid::new_v4();
+    let canonical = format!("test-alias-successor/Model-{suffix}");
+    let old = format!("test-alias-old/Old-Model-{suffix}");
     let mut batch = BatchUpdateModelApiRequest::new();
+    batch.insert(
+        canonical.clone(),
+        serde_json::from_value(serde_json::json!({
+            "inputCostPerToken":  { "amount": 1_000_000, "currency": "USD" },
+            "outputCostPerToken": { "amount": 2_000_000, "currency": "USD" },
+            "modelDisplayName":   "Alias Transparency Successor",
+            "modelDescription":   "Per-test successor for alias transparency e2e",
+            "contextLength":      128000,
+            "maxOutputLength": 1024,
+            "verifiable":         true,
+            "isActive":           true,
+        }))
+        .unwrap(),
+    );
     batch.insert(
         old.clone(),
         serde_json::from_value(serde_json::json!({
             "inputCostPerToken":  { "amount": 1_000_000, "currency": "USD" },
             "outputCostPerToken": { "amount": 2_000_000, "currency": "USD" },
             "modelDisplayName":   "Alias Transparency Test Model",
-            "modelDescription":   "Synthetic model deprecated onto Qwen for e2e",
+            "modelDescription":   "Synthetic model deprecated onto a per-test successor",
             "contextLength":      4096,
             "maxOutputLength": 1024,
             "verifiable":         false,
@@ -30,7 +44,14 @@ async fn setup_deprecated_alias(server: &axum_test::TestServer) -> String {
         }))
         .unwrap(),
     );
-    admin_batch_upsert_models(server, batch, get_session_id()).await;
+    admin_batch_upsert_models(&server, batch, get_session_id()).await;
+
+    let mock_provider_trait: std::sync::Arc<
+        dyn inference_providers::InferenceProvider + Send + Sync,
+    > = mock_provider;
+    inference_pool
+        .register_provider(canonical.clone(), mock_provider_trait)
+        .await;
 
     let resp = server
         .post("/v1/admin/models/deprecate")
@@ -38,7 +59,7 @@ async fn setup_deprecated_alias(server: &axum_test::TestServer) -> String {
         .add_header("User-Agent", MOCK_USER_AGENT)
         .json(&serde_json::json!({
             "modelId": old,
-            "successorModelId": E2E_QWEN_MODEL_NAME,
+            "successorModelId": canonical,
             "changeReason": "alias transparency e2e"
         }))
         .await;
@@ -48,7 +69,7 @@ async fn setup_deprecated_alias(server: &axum_test::TestServer) -> String {
         "deprecation should succeed: {}",
         resp.text()
     );
-    old
+    (server, old, canonical)
 }
 
 fn chat_body(model: &str, stream: bool) -> serde_json::Value {
@@ -62,8 +83,7 @@ fn chat_body(model: &str, stream: bool) -> serde_json::Value {
 
 #[tokio::test]
 async fn test_aliased_request_warns_non_streaming() {
-    let server = setup_test_server().await;
-    let alias = setup_deprecated_alias(&server).await;
+    let (server, alias, canonical) = setup_deprecated_alias().await;
     let org = setup_org_with_credits(&server, 10_000_000_000i64).await;
     let api_key = get_api_key_for_org(&server, org.id).await;
 
@@ -82,24 +102,23 @@ async fn test_aliased_request_warns_non_streaming() {
         .to_str()
         .unwrap()
         .to_string();
-    assert_eq!(header, format!("{alias} -> {E2E_QWEN_MODEL_NAME}"));
+    assert_eq!(header, format!("{alias} -> {canonical}"));
 
     // Body carries the canonical model and a top-level warning
     let body: serde_json::Value = response.json();
-    assert_eq!(body["model"], E2E_QWEN_MODEL_NAME);
+    assert_eq!(body["model"], canonical);
     let warning = body["warning"]
         .as_str()
         .expect("aliased response must carry a top-level warning");
     assert!(
-        warning.contains(&alias) && warning.contains(E2E_QWEN_MODEL_NAME),
+        warning.contains(&alias) && warning.contains(&canonical),
         "warning should name both alias and canonical model: {warning}"
     );
 }
 
 #[tokio::test]
 async fn test_aliased_request_warns_streaming_first_chunk() {
-    let server = setup_test_server().await;
-    let alias = setup_deprecated_alias(&server).await;
+    let (server, alias, canonical) = setup_deprecated_alias().await;
     let org = setup_org_with_credits(&server, 10_000_000_000i64).await;
     let api_key = get_api_key_for_org(&server, org.id).await;
 
@@ -117,7 +136,7 @@ async fn test_aliased_request_warns_streaming_first_chunk() {
         .to_str()
         .unwrap()
         .to_string();
-    assert_eq!(header, format!("{alias} -> {E2E_QWEN_MODEL_NAME}"));
+    assert_eq!(header, format!("{alias} -> {canonical}"));
 
     // Only the FIRST data chunk carries the warning
     let text = response.text();
@@ -132,10 +151,10 @@ async fn test_aliased_request_warns_streaming_first_chunk() {
         .as_str()
         .expect("first chunk of aliased stream must carry a warning");
     assert!(
-        warning.contains(&alias) && warning.contains(E2E_QWEN_MODEL_NAME),
+        warning.contains(&alias) && warning.contains(&canonical),
         "warning should name both alias and canonical model: {warning}"
     );
-    assert_eq!(first["model"], E2E_QWEN_MODEL_NAME);
+    assert_eq!(first["model"], canonical);
 
     for chunk in data_chunks {
         assert!(
@@ -147,8 +166,7 @@ async fn test_aliased_request_warns_streaming_first_chunk() {
 
 #[tokio::test]
 async fn test_no_aliasing_header_rejects_aliased_request() {
-    let server = setup_test_server().await;
-    let alias = setup_deprecated_alias(&server).await;
+    let (server, alias, canonical) = setup_deprecated_alias().await;
     let org = setup_org_with_credits(&server, 10_000_000_000i64).await;
     let api_key = get_api_key_for_org(&server, org.id).await;
 
@@ -167,7 +185,7 @@ async fn test_no_aliasing_header_rejects_aliased_request() {
         );
         let body = response.text();
         assert!(
-            body.contains("model_alias_rejected") && body.contains(E2E_QWEN_MODEL_NAME),
+            body.contains("model_alias_rejected") && body.contains(&canonical),
             "rejection should carry the code and canonical name: {body}"
         );
     }
@@ -415,8 +433,7 @@ async fn test_alias_equal_to_upstream_override_still_warns() {
 /// responses, x-no-aliasing rejection.
 #[tokio::test]
 async fn test_legacy_completions_alias_contract() {
-    let server = setup_test_server().await;
-    let alias = setup_deprecated_alias(&server).await;
+    let (server, alias, canonical) = setup_deprecated_alias().await;
     let org = setup_org_with_credits(&server, 10_000_000_000i64).await;
     let api_key = get_api_key_for_org(&server, org.id).await;
 
@@ -443,12 +460,12 @@ async fn test_legacy_completions_alias_contract() {
         .to_str()
         .unwrap()
         .to_string();
-    assert_eq!(header, format!("{alias} -> {E2E_QWEN_MODEL_NAME}"));
+    assert_eq!(header, format!("{alias} -> {canonical}"));
     let json: serde_json::Value = response.json();
     let warning = json["warning"]
         .as_str()
         .expect("aliased legacy completion must carry a warning");
-    assert!(warning.contains(&alias) && warning.contains(E2E_QWEN_MODEL_NAME));
+    assert!(warning.contains(&alias) && warning.contains(&canonical));
 
     // Streaming: header + warning on first chunk only
     let response = server
@@ -484,26 +501,33 @@ async fn test_legacy_completions_alias_contract() {
     assert!(strict.text().contains("model_alias_rejected"));
 
     // Canonical request stays unannotated
-    let canonical = server
+    let canonical_response = server
         .post("/v1/completions")
         .add_header("Authorization", format!("Bearer {api_key}"))
         .json(&serde_json::json!({
-            "model": E2E_QWEN_MODEL_NAME,
+            "model": canonical,
             "prompt": "Say hello",
             "stream": false,
             "max_tokens": 16
         }))
         .await;
-    assert_eq!(canonical.status_code(), 200, "{}", canonical.text());
-    assert!(canonical.headers().get("x-model-alias-resolved").is_none());
-    let json: serde_json::Value = canonical.json();
+    assert_eq!(
+        canonical_response.status_code(),
+        200,
+        "{}",
+        canonical_response.text()
+    );
+    assert!(canonical_response
+        .headers()
+        .get("x-model-alias-resolved")
+        .is_none());
+    let json: serde_json::Value = canonical_response.json();
     assert!(json.get("warning").is_none());
 }
 
 #[tokio::test]
 async fn test_attestation_report_announces_alias() {
-    let server = setup_test_server().await;
-    let alias = setup_deprecated_alias(&server).await;
+    let (server, alias, canonical) = setup_deprecated_alias().await;
     let org = setup_org_with_credits(&server, 10_000_000_000i64).await;
     let api_key = get_api_key_for_org(&server, org.id).await;
 
@@ -522,14 +546,13 @@ async fn test_attestation_report_announces_alias() {
             .to_str()
             .unwrap()
             .to_string();
-        assert_eq!(header, format!("{alias} -> {E2E_QWEN_MODEL_NAME}"));
+        assert_eq!(header, format!("{alias} -> {canonical}"));
     }
 }
 
 #[tokio::test]
 async fn test_attestation_report_no_aliasing_rejects() {
-    let server = setup_test_server().await;
-    let alias = setup_deprecated_alias(&server).await;
+    let (server, alias, canonical) = setup_deprecated_alias().await;
     let org = setup_org_with_credits(&server, 10_000_000_000i64).await;
     let api_key = get_api_key_for_org(&server, org.id).await;
 
@@ -546,7 +569,7 @@ async fn test_attestation_report_no_aliasing_rejects() {
         response.text()
     );
     assert!(
-        response.text().contains(E2E_QWEN_MODEL_NAME),
+        response.text().contains(&canonical),
         "rejection should name the canonical model: {}",
         response.text()
     );

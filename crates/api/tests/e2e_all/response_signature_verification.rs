@@ -290,6 +290,7 @@ async fn test_streaming_response_signature_verification() {
 #[tokio::test]
 async fn test_non_streaming_response_signature_verification() {
     let server = setup_test_server().await;
+    setup_qwen_model(&server).await;
     let org = setup_org_with_credits(&server, 10000000000i64).await;
     let api_key = get_api_key_for_org(&server, org.id).await;
     let model_name = "Qwen/Qwen3-30B-A3B-Instruct-2507";

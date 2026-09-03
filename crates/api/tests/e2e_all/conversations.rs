@@ -1964,6 +1964,7 @@ async fn test_response_previous_next_relationships_streaming() {
 #[tokio::test]
 async fn test_conversation_items_include_response_metadata() {
     let server = setup_test_server().await;
+    setup_qwen_model(&server).await;
     let org = setup_org_with_credits(&server, 10000000000i64).await; // $10.00 USD
     let api_key = get_api_key_for_org(&server, org.id).await;
 
@@ -3300,6 +3301,7 @@ async fn test_conversation_unauthorized_access() {
 #[tokio::test]
 async fn test_conversation_items_include_model() {
     let server = setup_test_server().await;
+    setup_qwen_model(&server).await;
     let org = setup_org_with_credits(&server, 10000000000i64).await; // $10.00 USD
     let api_key = get_api_key_for_org(&server, org.id).await;
 
@@ -3492,6 +3494,7 @@ async fn test_conversation_items_model_with_streaming() {
 #[tokio::test]
 async fn test_backfilled_items_include_model() {
     let server = setup_test_server().await;
+    setup_qwen_model(&server).await;
     let org = setup_org_with_credits(&server, 10000000000i64).await; // $10.00 USD
     let api_key = get_api_key_for_org(&server, org.id).await;
 

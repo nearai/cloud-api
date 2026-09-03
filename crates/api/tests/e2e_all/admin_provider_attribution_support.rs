@@ -189,9 +189,13 @@ pub(super) fn model_provider_breakdown<'a>(
 }
 
 pub(super) fn isolated_provider_usage_window() -> ProviderUsageWindow {
-    let offset_minutes = (uuid::Uuid::new_v4().as_u128() % 1_000_000) as i64 * 10;
+    // Spread windows over twenty years at microsecond precision. The previous
+    // one-million-slot scheme eventually collided with rows retained by repeated
+    // local runs, making otherwise isolated exact-count assertions share data.
+    const WINDOW_SPAN_MICROS: u128 = 20 * 365 * 24 * 60 * 60 * 1_000_000;
+    let offset_micros = (uuid::Uuid::new_v4().as_u128() % WINDOW_SPAN_MICROS) as i64;
     let start = chrono::Utc::now()
         + chrono::Duration::days(3650)
-        + chrono::Duration::minutes(offset_minutes);
+        + chrono::Duration::microseconds(offset_micros);
     (start, start + chrono::Duration::minutes(5))
 }

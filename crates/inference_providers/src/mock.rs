@@ -903,20 +903,16 @@ impl MockProvider {
 
     /// Generate a completion ID
     fn generate_id(&self) -> String {
-        use std::collections::hash_map::DefaultHasher;
-        use std::hash::{Hash, Hasher};
-        let mut hasher = DefaultHasher::new();
-        std::time::SystemTime::now().hash(&mut hasher);
-        format!("cmpl-{:x}", hasher.finish())
+        format!("cmpl-{}", uuid::Uuid::new_v4())
     }
 
     /// Generate a chat completion ID
     fn generate_chat_id(&self) -> String {
-        use std::collections::hash_map::DefaultHasher;
-        use std::hash::{Hash, Hasher};
-        let mut hasher = DefaultHasher::new();
-        std::time::SystemTime::now().hash(&mut hasher);
-        format!("chatcmpl-{:x}", hasher.finish())
+        // These IDs are persisted in the shared E2E database. A timestamp hash
+        // can collide when separate nextest processes generate responses in
+        // the same clock tick, allowing one test to overwrite another test's
+        // signature row. UUIDs keep mock responses isolated across processes.
+        format!("chatcmpl-{}", uuid::Uuid::new_v4())
     }
 
     /// Wire-format encoding for streamed mock chat chunks, as an upstream

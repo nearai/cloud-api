@@ -354,7 +354,7 @@ async fn test_admin_get_platform_metrics_with_usage() {
         .add_header("Authorization", format!("Bearer {api_key}"))
         .add_header("User-Agent", MOCK_USER_AGENT)
         .json(&serde_json::json!({
-            "model": model_name,
+            "model": &model_name,
             "messages": [{"role": "user", "content": "Hello platform!"}],
             "stream": false,
             "max_tokens": 20
@@ -960,8 +960,9 @@ async fn test_admin_platform_model_revenue() {
     assert_eq!(response.status_code(), 200);
     tokio::time::sleep(tokio::time::Duration::from_millis(1000)).await;
 
+    let model_revenue_url = format!("/v1/admin/platform/model-revenue?model_search={model_name}");
     let response = server
-        .get("/v1/admin/platform/model-revenue")
+        .get(&model_revenue_url)
         .add_header("Authorization", format!("Bearer {}", get_session_id()))
         .add_header("User-Agent", MOCK_USER_AGENT)
         .await;
@@ -983,8 +984,10 @@ async fn test_admin_platform_model_revenue() {
     assert!(report.total >= 1, "the used model should appear");
 
     // Pagination: limit=1 returns at most one row but the full total.
+    let paged_url =
+        format!("/v1/admin/platform/model-revenue?limit=1&sort=requests&model_search={model_name}");
     let paged = server
-        .get("/v1/admin/platform/model-revenue?limit=1&sort=requests")
+        .get(&paged_url)
         .add_header("Authorization", format!("Bearer {}", get_session_id()))
         .add_header("User-Agent", MOCK_USER_AGENT)
         .await;
@@ -1177,12 +1180,35 @@ async fn test_admin_platform_model_revenue_offset_beyond_total() {
         }))
         .await;
     assert_eq!(resp.status_code(), 200);
-    tokio::time::sleep(tokio::time::Duration::from_millis(1000)).await;
+
+    let model_revenue_path =
+        format!("/v1/admin/platform/model-revenue?limit=10&offset=0&model_search={model_name}");
+    let initial_report = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            let response = server
+                .get(&model_revenue_path)
+                .add_header("Authorization", format!("Bearer {}", get_session_id()))
+                .add_header("User-Agent", MOCK_USER_AGENT)
+                .await;
+            assert_eq!(response.status_code(), 200);
+            let report: ModelRevenueReport =
+                serde_json::from_str(&response.text()).expect("parse ModelRevenueReport");
+            if report.total >= 1 {
+                break report;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("model revenue should be recorded within 5 seconds");
 
     // A page past the end must still report the true total with empty data
     // (regression: COUNT(*) OVER read from the first row returned 0 here).
     let resp = server
-        .get("/v1/admin/platform/model-revenue?limit=10&offset=10000")
+        .get(&format!(
+            "/v1/admin/platform/model-revenue?limit=10&offset={}&model_search={model_name}",
+            initial_report.total
+        ))
         .add_header("Authorization", format!("Bearer {}", get_session_id()))
         .add_header("User-Agent", MOCK_USER_AGENT)
         .await;
@@ -1190,8 +1216,8 @@ async fn test_admin_platform_model_revenue_offset_beyond_total() {
     let report: ModelRevenueReport =
         serde_json::from_str(&resp.text()).expect("parse ModelRevenueReport");
     assert!(report.data.is_empty(), "page beyond end should be empty");
-    assert!(
-        report.total >= 1,
+    assert_eq!(
+        report.total, initial_report.total,
         "total must reflect matches, not the empty page"
     );
 

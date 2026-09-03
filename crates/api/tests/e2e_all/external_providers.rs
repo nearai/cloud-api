@@ -142,19 +142,10 @@ async fn test_admin_configure_external_openai_model() {
 
     let model_name = setup_external_openai_model(&server).await;
 
-    // Verify the model was created correctly via admin list endpoint
-    let response = server
-        .get("/v1/admin/models?limit=100")
-        .add_header("Authorization", format!("Bearer {}", get_session_id()))
-        .add_header("User-Agent", MOCK_USER_AGENT)
-        .await;
-
-    assert_eq!(response.status_code(), 200);
-    let list_response: api::models::AdminModelListResponse = response.json();
-
-    // Find our model in the list
-    let model = list_response
-        .models
+    // Find our model in the complete listing; a reused E2E database can contain
+    // far more than one fixed-size page of models.
+    let models = list_all_admin_models(&server, false).await;
+    let model = models
         .iter()
         .find(|m| m.model_id == model_name)
         .expect("Model should be in list");
@@ -179,18 +170,9 @@ async fn test_admin_configure_external_anthropic_model() {
 
     let model_name = setup_external_anthropic_model(&server).await;
 
-    // Verify the model configuration via list endpoint
-    let response = server
-        .get("/v1/admin/models?limit=100")
-        .add_header("Authorization", format!("Bearer {}", get_session_id()))
-        .add_header("User-Agent", MOCK_USER_AGENT)
-        .await;
-
-    assert_eq!(response.status_code(), 200);
-    let list_response: api::models::AdminModelListResponse = response.json();
-
-    let model = list_response
-        .models
+    // Verify the model configuration via the complete list.
+    let models = list_all_admin_models(&server, false).await;
+    let model = models
         .iter()
         .find(|m| m.model_id == model_name)
         .expect("Model should be in list");
@@ -210,18 +192,9 @@ async fn test_admin_configure_external_gemini_model() {
 
     let model_name = setup_external_gemini_model(&server).await;
 
-    // Verify the model configuration via list endpoint
-    let response = server
-        .get("/v1/admin/models?limit=100")
-        .add_header("Authorization", format!("Bearer {}", get_session_id()))
-        .add_header("User-Agent", MOCK_USER_AGENT)
-        .await;
-
-    assert_eq!(response.status_code(), 200);
-    let list_response: api::models::AdminModelListResponse = response.json();
-
-    let model = list_response
-        .models
+    // Verify the model configuration via the complete list.
+    let models = list_all_admin_models(&server, false).await;
+    let model = models
         .iter()
         .find(|m| m.model_id == model_name)
         .expect("Model should be in list");

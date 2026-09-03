@@ -690,6 +690,7 @@ pub struct MockProvider {
     last_chat_params: Arc<Mutex<Option<ChatCompletionParams>>>,
     /// When true, get_attestation_report returns an error (simulates blocked/broken backend)
     fail_attestation: Arc<std::sync::atomic::AtomicBool>,
+    privacy_classify_call_count: Arc<std::sync::atomic::AtomicUsize>,
     /// Trust tier reported by [`InferenceProvider::tier`]; defaults to
     /// `NonAttested`. Set via [`MockProvider::with_tier`] to exercise tiered
     /// provider selection (e.g. a `Near` primary with an `Attested3p` fallback).
@@ -736,6 +737,7 @@ impl MockProvider {
             })),
             last_chat_params: Arc::new(Mutex::new(None)),
             fail_attestation: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            privacy_classify_call_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             tier: crate::ProviderTier::NonAttested,
             provider_source: crate::ProviderSource::External,
             supports_streaming: true,
@@ -762,6 +764,7 @@ impl MockProvider {
             })),
             last_chat_params: Arc::new(Mutex::new(None)),
             fail_attestation: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            privacy_classify_call_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             tier: crate::ProviderTier::NonAttested,
             provider_source: crate::ProviderSource::External,
             supports_streaming: true,
@@ -786,6 +789,7 @@ impl MockProvider {
             })),
             last_chat_params: Arc::new(Mutex::new(None)),
             fail_attestation: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            privacy_classify_call_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             tier: crate::ProviderTier::NonAttested,
             provider_source: crate::ProviderSource::External,
             supports_streaming: true,
@@ -910,6 +914,12 @@ impl MockProvider {
     pub async fn set_privacy_classify_error_override(&self, error: Option<PrivacyClassifyError>) {
         let mut config = self.config.lock().await;
         config.privacy_classify_error_override = error;
+    }
+
+    /// Return how many privacy classification calls this mock received.
+    pub fn privacy_classify_call_count(&self) -> usize {
+        self.privacy_classify_call_count
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Generate a completion ID
@@ -1461,6 +1471,8 @@ impl crate::InferenceProvider for MockProvider {
         body: bytes::Bytes,
         _extra: std::collections::HashMap<String, serde_json::Value>,
     ) -> Result<bytes::Bytes, PrivacyClassifyError> {
+        self.privacy_classify_call_count
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         {
             let config = self.config.lock().await;
             if let Some(ref error) = config.privacy_classify_error_override {

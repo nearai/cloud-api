@@ -416,9 +416,173 @@ async fn test_privacy_redact_upstream_429_returns_rate_limit_with_retry_after() 
             .headers()
             .get(RETRY_AFTER)
             .and_then(|value| value.to_str().ok()),
-        Some("1")
+        Some("2")
     );
     let error: ErrorResponse = response.json();
     assert_eq!(error.error.r#type, "rate_limit_error");
+    assert!(!error.error.message.contains(UPSTREAM_BODY_SENTINEL));
+}
+
+#[tokio::test]
+async fn test_privacy_redact_upstream_413_returns_invalid_request() {
+    // Given: an oversized upstream response whose body contains unsafe data.
+    const UPSTREAM_BODY_SENTINEL: &str =
+        "UPSTREAM_PRIVACY_BODY_SENTINEL::alice@example.com::123-45-6789";
+    let (server, _pool, mock_provider, _db) = setup_test_server_with_pool().await;
+    setup_privacy_filter_model(&server).await;
+    let org = setup_org_with_credits(&server, 10_000_000_000i64).await;
+    let api_key = get_api_key_for_org(&server, org.id).await;
+    mock_provider
+        .set_privacy_classify_error_override(Some(
+            inference_providers::PrivacyClassifyError::HttpError {
+                status_code: 413,
+                message: UPSTREAM_BODY_SENTINEL.to_string(),
+            },
+        ))
+        .await;
+
+    // When: a client calls the real redact route.
+    let response = server
+        .post("/v1/privacy/redact")
+        .add_header("Authorization", format!("Bearer {api_key}"))
+        .add_header("User-Agent", MOCK_USER_AGENT)
+        .json(&serde_json::json!({
+            "model": "openai/privacy-filter",
+            "input": "Redact this text"
+        }))
+        .await;
+
+    // Then: the client receives the status-only invalid-request error.
+    assert_eq!(response.status_code(), 413);
+    let error: ErrorResponse = response.json();
+    assert_eq!(error.error.r#type, "invalid_request_error");
+    assert_eq!(error.error.message, "PII detector returned HTTP 413");
+    assert!(!error.error.message.contains(UPSTREAM_BODY_SENTINEL));
+}
+
+#[tokio::test]
+async fn test_privacy_redact_upstream_500_returns_502_without_upstream_body() {
+    // Given: an upstream server failure whose body contains unsafe data.
+    const UPSTREAM_BODY_SENTINEL: &str =
+        "UPSTREAM_PRIVACY_BODY_SENTINEL::alice@example.com::123-45-6789";
+    let (server, _pool, mock_provider, _db) = setup_test_server_with_pool().await;
+    setup_privacy_filter_model(&server).await;
+    let org = setup_org_with_credits(&server, 10_000_000_000i64).await;
+    let api_key = get_api_key_for_org(&server, org.id).await;
+    mock_provider
+        .set_privacy_classify_error_override(Some(
+            inference_providers::PrivacyClassifyError::HttpError {
+                status_code: 500,
+                message: UPSTREAM_BODY_SENTINEL.to_string(),
+            },
+        ))
+        .await;
+
+    // When: a client calls the real redact route.
+    let response = server
+        .post("/v1/privacy/redact")
+        .add_header("Authorization", format!("Bearer {api_key}"))
+        .add_header("User-Agent", MOCK_USER_AGENT)
+        .json(&serde_json::json!({
+            "model": "openai/privacy-filter",
+            "input": "Redact this text"
+        }))
+        .await;
+
+    // Then: the server failure remains generic and the body stays private.
+    assert_eq!(response.status_code(), 502);
+    let error: ErrorResponse = response.json();
+    assert_eq!(error.error.r#type, "server_error");
+    assert_eq!(
+        error.error.message,
+        "Privacy redact request failed. Please try again later."
+    );
+    assert!(!error.error.message.contains(UPSTREAM_BODY_SENTINEL));
+}
+
+#[tokio::test]
+async fn test_privacy_redact_upstream_407_returns_generic_server_error() {
+    // Given: an upstream proxy-auth failure whose body contains unsafe data.
+    const UPSTREAM_BODY_SENTINEL: &str =
+        "UPSTREAM_PRIVACY_BODY_SENTINEL::alice@example.com::123-45-6789";
+    let (server, _pool, mock_provider, _db) = setup_test_server_with_pool().await;
+    setup_privacy_filter_model(&server).await;
+    let org = setup_org_with_credits(&server, 10_000_000_000i64).await;
+    let api_key = get_api_key_for_org(&server, org.id).await;
+    mock_provider
+        .set_privacy_classify_error_override(Some(
+            inference_providers::PrivacyClassifyError::HttpError {
+                status_code: 407,
+                message: UPSTREAM_BODY_SENTINEL.to_string(),
+            },
+        ))
+        .await;
+
+    // When: a client calls the real redact route.
+    let response = server
+        .post("/v1/privacy/redact")
+        .add_header("Authorization", format!("Bearer {api_key}"))
+        .add_header("User-Agent", MOCK_USER_AGENT)
+        .json(&serde_json::json!({
+            "model": "openai/privacy-filter",
+            "input": "Redact this text"
+        }))
+        .await;
+
+    // Then: the infrastructure fault is masked as a generic server error.
+    assert_eq!(response.status_code(), 500);
+    let error: ErrorResponse = response.json();
+    assert_eq!(error.error.r#type, "server_error");
+    assert_eq!(
+        error.error.message,
+        "Privacy redact request failed. Please try again later."
+    );
+    assert!(!error.error.message.contains(UPSTREAM_BODY_SENTINEL));
+}
+
+#[tokio::test]
+async fn test_privacy_redact_upstream_503_returns_overloaded_with_default_retry_after() {
+    // Given: an overloaded upstream whose body contains unsafe data.
+    const UPSTREAM_BODY_SENTINEL: &str =
+        "UPSTREAM_PRIVACY_BODY_SENTINEL::alice@example.com::123-45-6789";
+    let (server, _pool, mock_provider, _db) = setup_test_server_with_pool().await;
+    setup_privacy_filter_model(&server).await;
+    let org = setup_org_with_credits(&server, 10_000_000_000i64).await;
+    let api_key = get_api_key_for_org(&server, org.id).await;
+    mock_provider
+        .set_privacy_classify_error_override(Some(
+            inference_providers::PrivacyClassifyError::HttpError {
+                status_code: 503,
+                message: UPSTREAM_BODY_SENTINEL.to_string(),
+            },
+        ))
+        .await;
+
+    // When: a client calls the real redact route.
+    let response = server
+        .post("/v1/privacy/redact")
+        .add_header("Authorization", format!("Bearer {api_key}"))
+        .add_header("User-Agent", MOCK_USER_AGENT)
+        .json(&serde_json::json!({
+            "model": "openai/privacy-filter",
+            "input": "Redact this text"
+        }))
+        .await;
+
+    // Then: overload uses the canonical 429 response and middleware backoff.
+    assert_eq!(response.status_code(), 429);
+    assert_eq!(
+        response
+            .headers()
+            .get(RETRY_AFTER)
+            .and_then(|value| value.to_str().ok()),
+        Some("2")
+    );
+    let error: ErrorResponse = response.json();
+    assert_eq!(error.error.r#type, "service_overloaded");
+    assert_eq!(
+        error.error.message,
+        "All inference backends are overloaded. Please retry with exponential backoff."
+    );
     assert!(!error.error.message.contains(UPSTREAM_BODY_SENTINEL));
 }

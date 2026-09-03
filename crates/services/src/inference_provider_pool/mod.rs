@@ -4070,6 +4070,25 @@ impl InferenceProviderPool {
                     return Ok(response);
                 }
                 Err(e) => {
+                    let retryable_error = match e {
+                        inference_providers::PrivacyClassifyError::HttpError {
+                            status_code,
+                            ..
+                        } if (400..=499).contains(&status_code)
+                            && !matches!(status_code, 408 | 429) =>
+                        {
+                            return Err(inference_providers::PrivacyClassifyError::HttpError {
+                                status_code,
+                                message: format!("PII detector returned HTTP {status_code}"),
+                            });
+                        }
+                        error @ inference_providers::PrivacyClassifyError::HttpError { .. } => {
+                            error
+                        }
+                        error @ inference_providers::PrivacyClassifyError::RequestFailed(_) => {
+                            error
+                        }
+                    };
                     // Privacy-filter error messages may embed the upstream
                     // response body (HttpError carries the verbatim text).
                     // A misbehaving filter that echoes its input would
@@ -4077,10 +4096,10 @@ impl InferenceProviderPool {
                     // Log only the category + status code.
                     tracing::warn!(
                         model = %model,
-                        error_category = %Self::privacy_classify_error_category(&e),
+                        error_category = %Self::privacy_classify_error_category(&retryable_error),
                         "Privacy classify failed with provider, trying next"
                     );
-                    last_error = Some(e);
+                    last_error = Some(retryable_error);
                 }
             }
         }
@@ -7921,6 +7940,66 @@ mod tests {
             Err(other) => panic!("Expected sanitized HttpError, got {other:?}"),
             Ok(_) => panic!("Expected privacy classify to fail"),
         }
+    }
+
+    #[tokio::test]
+    async fn privacy_classify_non_retryable_client_error_short_circuits_later_providers() {
+        // Given: provider A rejects the request as too large, while provider B
+        // would replace that actionable status with a transport failure.
+        const FIRST_UPSTREAM_BODY_SENTINEL: &str =
+            "FIRST_UPSTREAM_PRIVACY_BODY_SENTINEL::alice@example.com";
+        const SECOND_UPSTREAM_BODY_SENTINEL: &str =
+            "SECOND_UPSTREAM_PRIVACY_BODY_SENTINEL::123-45-6789";
+        let pool = InferenceProviderPool::new(None, ExternalProvidersConfig::default());
+        let first_provider = Arc::new(inference_providers::mock::MockProvider::new());
+        first_provider
+            .set_privacy_classify_error_override(Some(
+                inference_providers::PrivacyClassifyError::HttpError {
+                    status_code: 413,
+                    message: FIRST_UPSTREAM_BODY_SENTINEL.to_string(),
+                },
+            ))
+            .await;
+        let second_provider = Arc::new(inference_providers::mock::MockProvider::new());
+        second_provider
+            .set_privacy_classify_error_override(Some(
+                inference_providers::PrivacyClassifyError::RequestFailed(
+                    SECOND_UPSTREAM_BODY_SENTINEL.to_string(),
+                ),
+            ))
+            .await;
+        let model_id = "openai/privacy-filter";
+        pool.register_providers(vec![
+            (model_id.to_string(), first_provider.clone()),
+            (model_id.to_string(), second_provider.clone()),
+        ])
+        .await;
+
+        // When: privacy classification tries the ordered provider set.
+        let result = pool
+            .privacy_classify(
+                model_id,
+                bytes::Bytes::from_static(b"{}"),
+                std::collections::HashMap::new(),
+            )
+            .await;
+
+        // Then: the first non-retryable status wins without consulting provider B.
+        match result {
+            Err(inference_providers::PrivacyClassifyError::HttpError {
+                status_code,
+                message,
+            }) => {
+                assert_eq!(status_code, 413);
+                assert_eq!(message, "PII detector returned HTTP 413");
+                assert!(!message.contains(FIRST_UPSTREAM_BODY_SENTINEL));
+                assert!(!message.contains(SECOND_UPSTREAM_BODY_SENTINEL));
+            }
+            Err(other) => panic!("Expected sanitized HttpError, got {other:?}"),
+            Ok(_) => panic!("Expected privacy classify to fail"),
+        }
+        assert_eq!(first_provider.privacy_classify_call_count(), 1);
+        assert_eq!(second_provider.privacy_classify_call_count(), 0);
     }
 
     #[tokio::test]

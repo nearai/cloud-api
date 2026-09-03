@@ -282,7 +282,7 @@ async fn test_privacy_classify_upstream_429_returns_rate_limit_with_retry_after(
             .headers()
             .get(RETRY_AFTER)
             .and_then(|value| value.to_str().ok()),
-        Some("1")
+        Some("2")
     );
     let error: ErrorResponse = response.json();
     assert_eq!(error.error.r#type, "rate_limit_error");
@@ -359,5 +359,86 @@ async fn test_privacy_classify_upstream_500_returns_502_without_upstream_body() 
     assert_eq!(response.status_code(), 502);
     let error: ErrorResponse = response.json();
     assert_eq!(error.error.r#type, "server_error");
+    assert_eq!(
+        error.error.message,
+        "Privacy classify request failed. Please try again later."
+    );
+    assert!(!error.error.message.contains(UPSTREAM_BODY_SENTINEL));
+}
+
+#[tokio::test]
+async fn test_privacy_classify_upstream_404_uses_not_found_mapping() {
+    // Given: an upstream routing failure whose body contains unsafe data.
+    const UPSTREAM_BODY_SENTINEL: &str =
+        "UPSTREAM_PRIVACY_BODY_SENTINEL::alice@example.com::123-45-6789";
+    let (server, _pool, mock_provider, _db) = setup_test_server_with_pool().await;
+    setup_privacy_filter_model(&server).await;
+    let org = setup_org_with_credits(&server, 10_000_000_000i64).await;
+    let api_key = get_api_key_for_org(&server, org.id).await;
+    mock_provider
+        .set_privacy_classify_error_override(Some(
+            inference_providers::PrivacyClassifyError::HttpError {
+                status_code: 404,
+                message: UPSTREAM_BODY_SENTINEL.to_string(),
+            },
+        ))
+        .await;
+
+    // When: a client calls the real classify route.
+    let response = server
+        .post("/v1/privacy/classify")
+        .add_header("Authorization", format!("Bearer {api_key}"))
+        .add_header("User-Agent", MOCK_USER_AGENT)
+        .json(&serde_json::json!({
+            "model": "openai/privacy-filter",
+            "input": "Classify this text"
+        }))
+        .await;
+
+    // Then: the routing failure uses the shared not-found classification.
+    assert_eq!(response.status_code(), 404);
+    let error: ErrorResponse = response.json();
+    assert_eq!(error.error.r#type, "not_found_error");
+    assert_eq!(error.error.message, "PII detector returned HTTP 404");
+    assert!(!error.error.message.contains(UPSTREAM_BODY_SENTINEL));
+}
+
+#[tokio::test]
+async fn test_privacy_classify_upstream_302_returns_generic_bad_gateway() {
+    // Given: an invalid upstream redirect whose body contains unsafe data.
+    const UPSTREAM_BODY_SENTINEL: &str =
+        "UPSTREAM_PRIVACY_BODY_SENTINEL::alice@example.com::123-45-6789";
+    let (server, _pool, mock_provider, _db) = setup_test_server_with_pool().await;
+    setup_privacy_filter_model(&server).await;
+    let org = setup_org_with_credits(&server, 10_000_000_000i64).await;
+    let api_key = get_api_key_for_org(&server, org.id).await;
+    mock_provider
+        .set_privacy_classify_error_override(Some(
+            inference_providers::PrivacyClassifyError::HttpError {
+                status_code: 302,
+                message: UPSTREAM_BODY_SENTINEL.to_string(),
+            },
+        ))
+        .await;
+
+    // When: a client calls the real classify route.
+    let response = server
+        .post("/v1/privacy/classify")
+        .add_header("Authorization", format!("Bearer {api_key}"))
+        .add_header("User-Agent", MOCK_USER_AGENT)
+        .json(&serde_json::json!({
+            "model": "openai/privacy-filter",
+            "input": "Classify this text"
+        }))
+        .await;
+
+    // Then: the redirect is masked as a generic gateway failure.
+    assert_eq!(response.status_code(), 502);
+    let error: ErrorResponse = response.json();
+    assert_eq!(error.error.r#type, "server_error");
+    assert_eq!(
+        error.error.message,
+        "Privacy classify request failed. Please try again later."
+    );
     assert!(!error.error.message.contains(UPSTREAM_BODY_SENTINEL));
 }

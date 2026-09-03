@@ -2169,10 +2169,6 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
                         status_code: 502,
                         message,
                     },
-                    413 => ports::CompletionError::ProviderError {
-                        status_code: 413,
-                        message,
-                    },
                     other => ports::CompletionError::ProviderError {
                         status_code: other,
                         message,

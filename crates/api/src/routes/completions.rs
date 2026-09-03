@@ -3838,8 +3838,14 @@ mod tests {
 
     #[test]
     fn test_classify_provider_error_404_surfaces_message() {
-        let (status, error_type, message) =
-            classify_provider_error(404, "model 'foo' not found".to_string());
+        let (status, error_type, message) = classify_provider_error(
+            404,
+            "model 'foo' not found".to_string(),
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Embeddings request failed. Please try again later.",
+            ),
+        );
         assert_eq!(status, StatusCode::NOT_FOUND);
         assert_eq!(error_type, "not_found_error");
         assert_eq!(message, "model 'foo' not found");
@@ -3847,8 +3853,14 @@ mod tests {
 
     #[test]
     fn test_classify_provider_error_429_surfaces_message() {
-        let (status, error_type, message) =
-            classify_provider_error(429, "too many concurrent requests".to_string());
+        let (status, error_type, message) = classify_provider_error(
+            429,
+            "too many concurrent requests".to_string(),
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Embeddings request failed. Please try again later.",
+            ),
+        );
         assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
         assert_eq!(error_type, "rate_limit_error");
         assert_eq!(message, "too many concurrent requests");
@@ -3859,6 +3871,10 @@ mod tests {
         let (status, error_type, message) = classify_provider_error(
             400,
             "dimensions is not supported for this model".to_string(),
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Embeddings request failed. Please try again later.",
+            ),
         );
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert_eq!(error_type, "invalid_request_error");
@@ -3867,8 +3883,14 @@ mod tests {
 
     #[test]
     fn test_classify_provider_error_422_preserves_upstream_status() {
-        let (status, error_type, message) =
-            classify_provider_error(422, "validation failed".to_string());
+        let (status, error_type, message) = classify_provider_error(
+            422,
+            "validation failed".to_string(),
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Embeddings request failed. Please try again later.",
+            ),
+        );
         assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
         assert_eq!(error_type, "invalid_request_error");
         assert_eq!(message, "validation failed");
@@ -3878,8 +3900,14 @@ mod tests {
     fn test_classify_provider_error_401_masked_as_5xx() {
         // 401 from upstream means *our* credentials are wrong — the client
         // did nothing to cause it, so we must not echo the auth error.
-        let (status, error_type, message) =
-            classify_provider_error(401, "Invalid API key 'sk-***'".to_string());
+        let (status, error_type, message) = classify_provider_error(
+            401,
+            "Invalid API key 'sk-***'".to_string(),
+            (
+                StatusCode::BAD_GATEWAY,
+                "Privacy classify request failed. Please try again later.",
+            ),
+        );
         assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
         assert_eq!(error_type, "server_error");
         assert!(
@@ -3891,8 +3919,14 @@ mod tests {
 
     #[test]
     fn test_classify_provider_error_403_masked_as_5xx() {
-        let (status, error_type, message) =
-            classify_provider_error(403, "Forbidden: backend ACL denied".to_string());
+        let (status, error_type, message) = classify_provider_error(
+            403,
+            "Forbidden: backend ACL denied".to_string(),
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Embeddings request failed. Please try again later.",
+            ),
+        );
         assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
         assert_eq!(error_type, "server_error");
         assert_eq!(
@@ -3903,8 +3937,14 @@ mod tests {
 
     #[test]
     fn test_classify_provider_error_407_masked_as_5xx() {
-        let (status, error_type, _) =
-            classify_provider_error(407, "proxy auth required".to_string());
+        let (status, error_type, _) = classify_provider_error(
+            407,
+            "proxy auth required".to_string(),
+            (
+                StatusCode::BAD_GATEWAY,
+                "Privacy redact request failed. Please try again later.",
+            ),
+        );
         assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
         assert_eq!(error_type, "server_error");
     }
@@ -3915,11 +3955,63 @@ mod tests {
         let (status, error_type, message) = classify_provider_error(
             502,
             "RuntimeError: traceback...internal-host:9000".to_string(),
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Embeddings request failed. Please try again later.",
+            ),
         );
         assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
         assert_eq!(error_type, "server_error");
         assert!(!message.contains("traceback"));
         assert!(!message.contains("internal-host"));
+    }
+
+    #[test]
+    fn test_classify_provider_error_non_4xx_uses_caller_fallback() {
+        // Given: a provider redirect and the privacy endpoint's generic contract.
+        let upstream_message = "redirected to internal-host".to_string();
+
+        // When: the shared classifier handles the non-4xx response.
+        let (status, error_type, message) = classify_provider_error(
+            302,
+            upstream_message,
+            (
+                StatusCode::BAD_GATEWAY,
+                "Privacy classify request failed. Please try again later.",
+            ),
+        );
+
+        // Then: the caller-selected gateway response masks upstream details.
+        assert_eq!(status, StatusCode::BAD_GATEWAY);
+        assert_eq!(error_type, "server_error");
+        assert_eq!(
+            message,
+            "Privacy classify request failed. Please try again later."
+        );
+    }
+
+    #[test]
+    fn test_classify_provider_error_internal_server_error_stays_500() {
+        // Given: the service layer has already masked upstream credentials as 500.
+        let upstream_message = "The model is currently unavailable".to_string();
+
+        // When: a privacy caller otherwise uses 502 for generic failures.
+        let (status, error_type, message) = classify_provider_error(
+            500,
+            upstream_message,
+            (
+                StatusCode::BAD_GATEWAY,
+                "Privacy classify request failed. Please try again later.",
+            ),
+        );
+
+        // Then: the credential/configuration failure remains a generic 500.
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(error_type, "server_error");
+        assert_eq!(
+            message,
+            "Privacy classify request failed. Please try again later."
+        );
     }
 
     #[test]
@@ -5782,22 +5874,18 @@ struct EmbeddingsResponseDoc {
 /// - Other 4xx → preserve upstream status with `invalid_request_error`. The
 ///   upstream message is surfaced so the user can see *why* their request was
 ///   rejected (e.g. "dimensions is not supported for this model").
-/// - 5xx (and anything else) → 500 server_error with a generic message. The
-///   upstream body may contain stack traces or internal details we don't want
-///   to leak.
+/// - 500 → generic 500, preserving service-layer masking for upstream auth faults.
+/// - Other 5xx (and anything else) → the caller's generic server-error response.
+///   The upstream body may contain stack traces or internal details we don't
+///   want to leak.
 fn classify_provider_error(
     upstream_status: u16,
     upstream_message: String,
+    generic_response: (StatusCode, &str),
 ) -> (StatusCode, &'static str, String) {
-    let generic = || {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "server_error",
-            "Embeddings request failed. Please try again later.".to_string(),
-        )
-    };
+    let generic = |status| (status, "server_error", generic_response.1.to_string());
     match upstream_status {
-        401 | 403 | 407 => generic(),
+        401 | 403 | 407 => generic(StatusCode::INTERNAL_SERVER_ERROR),
         404 => (StatusCode::NOT_FOUND, "not_found_error", upstream_message),
         429 => (
             StatusCode::TOO_MANY_REQUESTS,
@@ -5808,7 +5896,8 @@ fn classify_provider_error(
             let http_status = StatusCode::from_u16(s).unwrap_or(StatusCode::BAD_REQUEST);
             (http_status, "invalid_request_error", upstream_message)
         }
-        _ => generic(),
+        500 => generic(StatusCode::INTERNAL_SERVER_ERROR),
+        _ => generic(generic_response.0),
     }
 }
 
@@ -6054,7 +6143,14 @@ pub async fn embeddings(
                     // upstream URL on connection failures, where `status_code` is
                     // synthetic) — without it the log can't distinguish a backend
                     // 5xx from an unreachable SNI.
-                    let classified = classify_provider_error(status_code, message.clone());
+                    let classified = classify_provider_error(
+                        status_code,
+                        message.clone(),
+                        (
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            "Embeddings request failed. Please try again later.",
+                        ),
+                    );
                     if classified.0.is_client_error() {
                         tracing::warn!(
                             model = %model_name,
@@ -6375,39 +6471,42 @@ pub async fn privacy_classify(
                 .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
         }
         Err(e) => {
-            let (status_code, error_type, message, retry_after) = match e {
+            let (status_code, error_type, message) = match e {
                 services::completions::ports::CompletionError::RateLimitExceeded(msg) => {
                     tracing::warn!("Concurrent request limit exceeded for privacy classify");
-                    (StatusCode::TOO_MANY_REQUESTS, "rate_limit_error", msg, true)
+                    (StatusCode::TOO_MANY_REQUESTS, "rate_limit_error", msg)
                 }
                 services::completions::ports::CompletionError::ProviderError {
                     status_code,
                     message,
                 } => {
-                    let http_status = StatusCode::from_u16(status_code)
-                        .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
-                    if http_status.is_client_error() {
+                    // The provider pool replaces every upstream body with a
+                    // status-derived message before it reaches this handler,
+                    // which makes forwarding classified client errors safe.
+                    let classified = classify_provider_error(
+                        status_code,
+                        message,
+                        (
+                            StatusCode::BAD_GATEWAY,
+                            "Privacy classify request failed. Please try again later.",
+                        ),
+                    );
+                    if classified.0.is_client_error() {
                         tracing::warn!(
                             upstream_status = status_code,
                             "Privacy classify provider error"
                         );
-                        (http_status, "invalid_request_error", message, false)
                     } else {
                         tracing::error!(
                             upstream_status = status_code,
                             "Privacy classify provider error"
                         );
-                        (
-                            http_status,
-                            "server_error",
-                            "Privacy classify request failed. Please try again later.".to_string(),
-                            false,
-                        )
                     }
+                    classified
                 }
                 services::completions::ports::CompletionError::InvalidModel(msg) => {
                     tracing::warn!("Privacy classify model not found");
-                    (StatusCode::NOT_FOUND, "not_found_error", msg, false)
+                    (StatusCode::NOT_FOUND, "not_found_error", msg)
                 }
                 services::completions::ports::CompletionError::ServiceOverloaded(_) => {
                     tracing::warn!("Privacy classify service overloaded");
@@ -6415,7 +6514,6 @@ pub async fn privacy_classify(
                         crate::routes::common::status_overloaded(),
                         "service_overloaded",
                         "All inference backends are overloaded. Please retry with exponential backoff.".to_string(),
-                        true,
                     )
                 }
                 _ => {
@@ -6424,22 +6522,15 @@ pub async fn privacy_classify(
                         StatusCode::INTERNAL_SERVER_ERROR,
                         "server_error",
                         "Privacy classify request failed".to_string(),
-                        false,
                     )
                 }
             };
 
-            let mut response = (
+            (
                 status_code,
                 ResponseJson(ErrorResponse::new(message, error_type.to_string())),
             )
-                .into_response();
-            if retry_after {
-                response
-                    .headers_mut()
-                    .insert(header::RETRY_AFTER, header::HeaderValue::from_static("1"));
-            }
-            response
+                .into_response()
         }
     }
 }
@@ -6693,47 +6784,49 @@ pub async fn privacy_redact(
     {
         Ok(b) => b,
         Err(e) => {
-            let (status_code, error_type, message, retry_after) = match e {
+            let (status_code, error_type, message) = match e {
                 services::completions::ports::CompletionError::RateLimitExceeded(msg) => {
                     tracing::warn!("Concurrent request limit exceeded for privacy redact");
-                    (StatusCode::TOO_MANY_REQUESTS, "rate_limit_error", msg, true)
+                    (StatusCode::TOO_MANY_REQUESTS, "rate_limit_error", msg)
                 }
                 services::completions::ports::CompletionError::ProviderError {
                     status_code,
                     message,
                 } => {
-                    let http_status = StatusCode::from_u16(status_code)
-                        .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
-                    if http_status.is_client_error() {
+                    // The provider pool replaces every upstream body with a
+                    // status-derived message before it reaches this handler,
+                    // which makes forwarding classified client errors safe.
+                    let classified = classify_provider_error(
+                        status_code,
+                        message,
+                        (
+                            StatusCode::BAD_GATEWAY,
+                            "Privacy redact request failed. Please try again later.",
+                        ),
+                    );
+                    if classified.0.is_client_error() {
                         tracing::warn!(
                             upstream_status = status_code,
                             "Privacy redact provider error"
                         );
-                        (http_status, "invalid_request_error", message, false)
                     } else {
                         tracing::error!(
                             upstream_status = status_code,
                             "Privacy redact provider error"
                         );
-                        (
-                            http_status,
-                            "server_error",
-                            "Privacy redact request failed. Please try again later.".to_string(),
-                            false,
-                        )
                     }
+                    classified
                 }
                 services::completions::ports::CompletionError::InvalidModel(msg) => {
                     tracing::warn!("Privacy redact model not found");
-                    (StatusCode::NOT_FOUND, "not_found_error", msg, false)
+                    (StatusCode::NOT_FOUND, "not_found_error", msg)
                 }
                 services::completions::ports::CompletionError::ServiceOverloaded(_) => {
                     tracing::warn!("Privacy redact service overloaded");
                     (
-                        StatusCode::SERVICE_UNAVAILABLE,
+                        crate::routes::common::status_overloaded(),
                         "service_overloaded",
-                        "The service is temporarily overloaded. Please retry with exponential backoff.".to_string(),
-                        true,
+                        "All inference backends are overloaded. Please retry with exponential backoff.".to_string(),
                     )
                 }
                 _ => {
@@ -6742,21 +6835,14 @@ pub async fn privacy_redact(
                         StatusCode::INTERNAL_SERVER_ERROR,
                         "server_error",
                         "Privacy redact request failed".to_string(),
-                        false,
                     )
                 }
             };
-            let mut response = (
+            return (
                 status_code,
                 ResponseJson(ErrorResponse::new(message, error_type.to_string())),
             )
                 .into_response();
-            if retry_after {
-                response
-                    .headers_mut()
-                    .insert(header::RETRY_AFTER, header::HeaderValue::from_static("1"));
-            }
-            return response;
         }
     };
 

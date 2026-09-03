@@ -33,7 +33,7 @@ type FinalizeFuture = Pin<Box<dyn Future<Output = ()> + Send>>;
 
 enum StreamState {
     Streaming,
-    AwaitingDoneSeparator,
+    AwaitingDoneSeparator { marker_len: usize },
     Finalizing(FinalizeFuture),
     Done,
 }
@@ -528,7 +528,9 @@ where
                             if sse_event_has_terminating_separator(&event) {
                                 self.begin_finalizing();
                             } else {
-                                self.state = StreamState::AwaitingDoneSeparator;
+                                self.state = StreamState::AwaitingDoneSeparator {
+                                    marker_len: event.raw_bytes.len(),
+                                };
                             }
                             return Poll::Ready(Some(Ok(event)));
                         }
@@ -602,9 +604,19 @@ where
                 continue;
             }
 
-            if matches!(&self.state, StreamState::AwaitingDoneSeparator) {
+            if let StreamState::AwaitingDoneSeparator { marker_len } = &self.state {
+                let marker_len = *marker_len;
                 match Pin::new(&mut self.inner).poll_next(cx) {
                     Poll::Ready(Some(Ok(event))) if is_sse_event_separator(&event) => {
+                        let terminal_len = marker_len.checked_add(event.raw_bytes.len());
+                        if terminal_len.is_none_or(|len| len > MAX_PROVIDER_DONE_EVENT_BYTES) {
+                            let error = inference_providers::CompletionError::CompletionError(
+                                "Malformed SSE stream: [DONE] marker is too large".into(),
+                            );
+                            self.last_error = Some(error.clone());
+                            self.begin_finalizing();
+                            return Poll::Ready(Some(Err(error)));
+                        }
                         self.begin_finalizing();
                         return Poll::Ready(Some(Ok(event)));
                     }
@@ -2485,6 +2497,34 @@ mod tests {
                 if message == "Malformed SSE stream: [DONE] marker is too large"
         ));
         assert!(!stream.saw_upstream_done_marker);
+        assert!(stream.last_error.is_some());
+        assert!(matches!(&stream.state, StreamState::Done));
+    }
+
+    #[tokio::test]
+    async fn oversized_done_marker_with_separate_separator_is_rejected() {
+        let marker_prefix = b"data: [DONE]\n";
+        let padding = " ".repeat(MAX_PROVIDER_DONE_EVENT_BYTES - marker_prefix.len());
+        let marker = Bytes::from(format!("data: [DONE]{padding}\n"));
+        assert_eq!(marker.len(), MAX_PROVIDER_DONE_EVENT_BYTES);
+
+        let mut stream = terminal_test_stream(vec![
+            Ok(SSEEvent {
+                raw_bytes: marker,
+                chunk: None,
+                raw_passthrough: true,
+            }),
+            Ok(terminal_control_event(b"\n")),
+        ]);
+
+        let events = stream.by_ref().collect::<Vec<_>>().await;
+
+        assert!(matches!(
+            &events[..],
+            [Ok(_), Err(inference_providers::CompletionError::CompletionError(message))]
+                if message == "Malformed SSE stream: [DONE] marker is too large"
+        ));
+        assert!(stream.saw_upstream_done_marker);
         assert!(stream.last_error.is_some());
         assert!(matches!(&stream.state, StreamState::Done));
     }

@@ -300,6 +300,34 @@ async fn test_privacy_redact_accepts_valid_threshold() {
 }
 
 #[tokio::test]
+async fn test_privacy_redact_body_just_under_size_limit() {
+    let server = setup_test_server().await;
+
+    setup_privacy_filter_model(&server).await;
+    let org = setup_org_with_credits(&server, 10_000_000_000i64).await;
+    let api_key = get_api_key_for_org(&server, org.id).await;
+
+    // Leave room for the JSON envelope so the full body stays just under 1 MB.
+    let input = "x".repeat(1024 * 1024 - 1024);
+
+    let response = server
+        .post("/v1/privacy/redact")
+        .add_header("Authorization", format!("Bearer {api_key}"))
+        .add_header("User-Agent", MOCK_USER_AGENT)
+        .json(&serde_json::json!({
+            "model": "openai/privacy-filter",
+            "input": input,
+        }))
+        .await;
+
+    assert_ne!(
+        response.status_code(),
+        413,
+        "Should not reject body just under the 1 MB cap"
+    );
+}
+
+#[tokio::test]
 async fn test_privacy_redact_body_size_limit() {
     let server = setup_test_server().await;
 
@@ -307,8 +335,8 @@ async fn test_privacy_redact_body_size_limit() {
     let org = setup_org_with_credits(&server, 10_000_000_000i64).await;
     let api_key = get_api_key_for_org(&server, org.id).await;
 
-    // ~300 KB payload, above the 256 KB per-route cap.
-    let oversized_input = "x".repeat(300 * 1024);
+    // 1 MB + 64 KB payload, above the 1 MB per-route cap.
+    let oversized_input = "x".repeat(1024 * 1024 + 64 * 1024);
 
     let response = server
         .post("/v1/privacy/redact")
@@ -323,7 +351,7 @@ async fn test_privacy_redact_body_size_limit() {
     assert_eq!(
         response.status_code(),
         413,
-        "Should reject body larger than 256 KB cap"
+        "Should reject body larger than the 1 MB cap"
     );
 }
 

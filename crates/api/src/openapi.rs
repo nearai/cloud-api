@@ -170,6 +170,8 @@ use utoipa::{Modify, OpenApi};
         crate::routes::admin::delete_aml_allowlist_entry,
         crate::routes::admin::update_organization_concurrent_limit,
         crate::routes::admin::get_organization_concurrent_limit,
+        crate::routes::admin::get_organization_fallback,
+        crate::routes::admin::update_organization_fallback,
         crate::routes::admin::get_organization_metrics,
         crate::routes::admin::get_platform_metrics,
         crate::routes::admin::get_organization_timeseries,
@@ -283,6 +285,7 @@ use utoipa::{Modify, OpenApi};
             // Organization concurrent limit models (Admin)
             UpdateOrganizationConcurrentLimitRequest, UpdateOrganizationConcurrentLimitResponse,
             GetOrganizationConcurrentLimitResponse,
+            UpdateOrganizationFallbackRequest, OrganizationFallbackResponse,
             // Invitation email delivery models (Admin)
             AdminInvitationEmailDeliveryResponse, ListAdminInvitationEmailDeliveriesResponse,
             AdminInvitationEmailResendResultResponse,

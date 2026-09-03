@@ -1618,6 +1618,7 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
         let routing_hints = super::inference_provider_pool::ChatRoutingHints {
             prefix_hash: Some(compute_prefix_hash(&chat_params.messages)),
             estimated_tokens: Some(estimate_input_tokens(&chat_params.messages)),
+            fallback_disabled: !request.fallback_enabled,
         };
 
         // Get the LLM stream
@@ -1807,7 +1808,14 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
         let provider_start_time = Instant::now();
         let result = self
             .inference_provider_pool
-            .chat_completion_with_attribution(chat_params, request.body_hash.clone())
+            .chat_completion_with_attribution_and_hints(
+                chat_params,
+                request.body_hash.clone(),
+                super::inference_provider_pool::ChatRoutingHints {
+                    fallback_disabled: !request.fallback_enabled,
+                    ..Default::default()
+                },
+            )
             .await;
 
         let attributed_response = match result {

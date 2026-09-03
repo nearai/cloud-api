@@ -48,9 +48,10 @@ pub(super) const E2E_APP_BUILD_OPTIONS: AppBuildOptions = AppBuildOptions {
     start_database_encryption_recovery: false,
 };
 
-/// Shared pricing constants for e2e tests that use setup_qwen_model / setup_qwen_model_with_cache_pricing.
+/// Shared pricing constants for E2E tests that use the Qwen bootstrap fixtures.
 /// Cost verification in usage tests should use the matching helper so pricing stays in sync.
 pub const E2E_QWEN_MODEL_NAME: &str = "Qwen/Qwen3-30B-A3B-Instruct-2507";
+pub const E2E_QWEN_CACHE_MODEL_NAME: &str = "Qwen/Qwen3-30B-A3B-Instruct-2507-e2e-cache-pricing";
 pub const E2E_QWEN_INPUT_COST_PER_TOKEN: i64 = 1_000_000;
 pub const E2E_QWEN_OUTPUT_COST_PER_TOKEN: i64 = 2_000_000;
 /// Cache-read cost when setup_qwen_model is used (cache pricing disabled).
@@ -842,100 +843,20 @@ pub async fn setup_privacy_filter_model(server: &axum_test::TestServer) {
     tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
 }
 
-pub async fn setup_qwen_model(server: &axum_test::TestServer) -> String {
-    let mut batch = BatchUpdateModelApiRequest::new();
-    batch.insert(
-        E2E_QWEN_MODEL_NAME.to_string(),
-        serde_json::from_value(serde_json::json!({
-            "inputCostPerToken": {
-                "amount": E2E_QWEN_INPUT_COST_PER_TOKEN,
-                "currency": "USD"
-            },
-            "outputCostPerToken": {
-                "amount": E2E_QWEN_OUTPUT_COST_PER_TOKEN,
-                "currency": "USD"
-            },
-            "modelDisplayName": "Updated Model Name",
-            "modelDescription": "Updated model description",
-            "contextLength": 128000,
-            "maxOutputLength": 1024,
-            "verifiable": true,
-            "isActive": true,
-            // Clear state left by tests that intentionally exercise optional
-            // pricing and aliases on this legacy shared fixture.
-            "cacheReadCostPerToken": null,
-            "textPricing": null,
-            "aliases": []
-        }))
-        .unwrap(),
-    );
-    let updated = admin_batch_upsert_models(server, batch, get_session_id()).await;
-    assert_eq!(updated.len(), 1, "Should have updated 1 model");
-    assert_eq!(
-        updated[0].input_cost_per_token.amount, E2E_QWEN_INPUT_COST_PER_TOKEN,
-        "Input cost per token should match E2E_QWEN_INPUT_COST_PER_TOKEN"
-    );
-    assert_eq!(
-        updated[0].output_cost_per_token.amount, E2E_QWEN_OUTPUT_COST_PER_TOKEN,
-        "Output cost per token should match E2E_QWEN_OUTPUT_COST_PER_TOKEN"
-    );
-    // Ensure mock provider registers model before test proceeds
-    tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
+/// Return the standard Qwen fixture seeded before nextest starts.
+///
+/// This intentionally performs no per-test admin write. More than a hundred
+/// tests use this model, and repeatedly updating one shared catalog row made
+/// that row a lock/connection hotspot under nextest. Direct `cargo test` runs
+/// use the same bootstrap path, so the fixture is present there as well.
+pub async fn setup_qwen_model(_server: &axum_test::TestServer) -> String {
     E2E_QWEN_MODEL_NAME.to_string()
 }
 
 /// Setup Qwen chat model with cache-read pricing enabled for testing.
 /// Uses E2E_QWEN_* constants; cost assertions should use e2e_qwen_model_pricing_with_cache().
-pub async fn setup_qwen_model_with_cache_pricing(server: &axum_test::TestServer) -> String {
-    let mut batch = BatchUpdateModelApiRequest::new();
-    batch.insert(
-        E2E_QWEN_MODEL_NAME.to_string(),
-        serde_json::from_value(serde_json::json!({
-            "inputCostPerToken": {
-                "amount": E2E_QWEN_INPUT_COST_PER_TOKEN,
-                "currency": "USD"
-            },
-            "outputCostPerToken": {
-                "amount": E2E_QWEN_OUTPUT_COST_PER_TOKEN,
-                "currency": "USD"
-            },
-            "cacheReadCostPerToken": {
-                "amount": E2E_QWEN_CACHE_READ_COST_WITH_CACHE,
-                "currency": "USD"
-            },
-            "modelDisplayName": "Updated Model Name",
-            "modelDescription": "Updated model description",
-            "contextLength": 128000,
-            "maxOutputLength": 1024,
-            "verifiable": true,
-            "isActive": true,
-            "textPricing": null,
-            "aliases": []
-        }))
-        .unwrap(),
-    );
-    let updated = admin_batch_upsert_models(server, batch, get_session_id()).await;
-    assert_eq!(updated.len(), 1, "Should have updated 1 model");
-    assert_eq!(
-        updated[0].input_cost_per_token.amount, E2E_QWEN_INPUT_COST_PER_TOKEN,
-        "Input cost per token should match E2E_QWEN_INPUT_COST_PER_TOKEN"
-    );
-    assert_eq!(
-        updated[0].output_cost_per_token.amount, E2E_QWEN_OUTPUT_COST_PER_TOKEN,
-        "Output cost per token should match E2E_QWEN_OUTPUT_COST_PER_TOKEN"
-    );
-    assert_eq!(
-        updated[0]
-            .cache_read_cost_per_token
-            .as_ref()
-            .expect("cache-read pricing must be present when configured")
-            .amount,
-        E2E_QWEN_CACHE_READ_COST_WITH_CACHE,
-        "Cache-read cost per token should match E2E_QWEN_CACHE_READ_COST_WITH_CACHE"
-    );
-    // Ensure mock provider registers model before test proceeds
-    tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
-    E2E_QWEN_MODEL_NAME.to_string()
+pub async fn setup_qwen_model_with_cache_pricing(_server: &axum_test::TestServer) -> String {
+    E2E_QWEN_CACHE_MODEL_NAME.to_string()
 }
 
 /// ModelPricing matching setup_qwen_model (no cache-read pricing). Use in cost assertions.
@@ -955,7 +876,7 @@ pub fn e2e_qwen_model_pricing_no_cache() -> ModelPricing {
 pub fn e2e_qwen_model_pricing_with_cache() -> ModelPricing {
     ModelPricing {
         id: uuid::Uuid::nil(),
-        model_name: E2E_QWEN_MODEL_NAME.to_string(),
+        model_name: E2E_QWEN_CACHE_MODEL_NAME.to_string(),
         input_cost_per_token: E2E_QWEN_INPUT_COST_PER_TOKEN,
         output_cost_per_token: E2E_QWEN_OUTPUT_COST_PER_TOKEN,
         cost_per_image: 0,

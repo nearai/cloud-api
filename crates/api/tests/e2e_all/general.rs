@@ -6,6 +6,14 @@ use api::models::BatchUpdateModelApiRequest;
 use database::DEFAULT_MODEL_OWNED_BY;
 use inference_providers::{models::ChatCompletionChunk, StreamChunk};
 
+const HIGH_CONTEXT_COMPLETION_MODEL: &str =
+    "Qwen/Qwen3-30B-A3B-Instruct-2507-e2e-high-context-completion";
+const HIGH_CONTEXT_STREAMING_MODEL: &str =
+    "Qwen/Qwen3-30B-A3B-Instruct-2507-e2e-high-context-streaming";
+const ALIASES_GPT_MODEL: &str = "nearai/gpt-oss-120b-e2e-aliases";
+const ALIASES_QWEN_MODEL: &str = "Qwen/Qwen3-30B-A3B-Instruct-2507-e2e-aliases";
+const ALIAS_CONSISTENCY_MODEL: &str = "Qwen/Qwen3-30B-A3B-Instruct-2507-e2e-alias-consistency";
+
 #[tokio::test]
 async fn test_models_api() {
     let server = setup_test_server().await;
@@ -155,11 +163,29 @@ async fn test_chat_completions_api() {
 async fn test_admin_update_model() {
     let server = setup_test_server().await;
 
-    // Setup and upsert Qwen model (using session token with admin domain email)
-    let model_name = setup_qwen_model(&server).await;
+    // Exercise the admin upsert itself with a test-specific row rather than
+    // mutating the suite-wide inference fixture.
+    let model_name = "TestOrg/AdminUpdateModel";
+    let mut batch = BatchUpdateModelApiRequest::new();
+    batch.insert(
+        model_name.to_string(),
+        serde_json::from_value(serde_json::json!({
+            "inputCostPerToken": { "amount": 1000000, "currency": "USD" },
+            "outputCostPerToken": { "amount": 2000000, "currency": "USD" },
+            "modelDisplayName": "Updated Model Name",
+            "modelDescription": "Updated model description",
+            "contextLength": 128000,
+            "maxOutputLength": 1024,
+            "verifiable": true,
+            "isActive": true
+        }))
+        .expect("admin update model fixture should deserialize"),
+    );
+    let updated = admin_batch_upsert_models(&server, batch, get_session_id()).await;
+    assert_eq!(updated.len(), 1, "Should have updated 1 model");
 
     // Verify the model was upserted with correct properties
-    assert_eq!("Qwen/Qwen3-30B-A3B-Instruct-2507", model_name);
+    assert_eq!("TestOrg/AdminUpdateModel", model_name);
 
     // Retrieve the model to verify the update
     let response = server
@@ -175,7 +201,7 @@ async fn test_admin_update_model() {
     assert_eq!(200, response.status_code());
     let retrieved_model = response.json::<api::models::ModelWithPricing>();
 
-    assert_eq!("Qwen/Qwen3-30B-A3B-Instruct-2507", retrieved_model.model_id);
+    assert_eq!(model_name, retrieved_model.model_id);
     assert_eq!(
         "Updated Model Name",
         retrieved_model.metadata.model_display_name
@@ -1598,10 +1624,11 @@ async fn test_high_context_length_completion() {
     let org = setup_org_with_credits(&server, 100000000000i64).await; // $100.00 USD
     println!("Created organization: {}", org.id);
 
-    // Upsert Qwen3-30B model with high context length capability (260k)
+    // Use a test-specific catalog row so this metadata variant cannot mutate
+    // the standard Qwen fixture while other nextest processes are using it.
     let mut batch = BatchUpdateModelApiRequest::new();
     batch.insert(
-        "Qwen/Qwen3-30B-A3B-Instruct-2507".to_string(),
+        HIGH_CONTEXT_COMPLETION_MODEL.to_string(),
         serde_json::from_value(serde_json::json!({
             "inputCostPerToken": {
                 "amount": 1000000,  // $0.000001 per token
@@ -1645,7 +1672,7 @@ async fn test_high_context_length_completion() {
         .post("/v1/chat/completions")
         .add_header("Authorization", format!("Bearer {api_key}"))
         .json(&serde_json::json!({
-            "model": "Qwen/Qwen3-30B-A3B-Instruct-2507",
+            "model": HIGH_CONTEXT_COMPLETION_MODEL,
             "messages": [
                 {
                     "role": "user",
@@ -1717,10 +1744,11 @@ async fn test_high_context_streaming() {
     let server = setup_test_server().await;
     let org = setup_org_with_credits(&server, 100000000000i64).await; // $100.00 USD
 
-    // Upsert Qwen3-30B model with high context length capability (260k)
+    // Keep the streaming variant independent from the non-streaming test as
+    // well as from the suite-wide standard Qwen fixture.
     let mut batch = BatchUpdateModelApiRequest::new();
     batch.insert(
-        "Qwen/Qwen3-30B-A3B-Instruct-2507".to_string(),
+        HIGH_CONTEXT_STREAMING_MODEL.to_string(),
         serde_json::from_value(serde_json::json!({
             "inputCostPerToken": {
                 "amount": 1000000,
@@ -1759,7 +1787,7 @@ async fn test_high_context_streaming() {
         .post("/v1/chat/completions")
         .add_header("Authorization", format!("Bearer {api_key}"))
         .json(&serde_json::json!({
-            "model": "Qwen/Qwen3-30B-A3B-Instruct-2507",
+            "model": HIGH_CONTEXT_STREAMING_MODEL,
             "messages": [
                 {
                     "role": "user",
@@ -1840,15 +1868,14 @@ async fn test_model_aliases() {
     println!("Created organization: {}", org.id);
 
     // Set up canonical models with aliases
-    // Discovery returns these canonical names from vLLM:
-    // - "nearai/gpt-oss-120b" (canonical)
-    // - "Qwen/Qwen3-30B-A3B-Instruct-2507" (canonical)
+    // Both catalog rows and aliases are test-specific so reruns cannot alter
+    // models used by unrelated tests.
 
     let mut batch = BatchUpdateModelApiRequest::new();
 
-    // Model 1: nearai/gpt-oss-120b (canonical) with aliases
+    // Model 1: GPT-style canonical name with a friendly alias.
     batch.insert(
-        "nearai/gpt-oss-120b".to_string(),
+        ALIASES_GPT_MODEL.to_string(),
         serde_json::from_value(serde_json::json!({
             "inputCostPerToken": {
                 "amount": 1000000,  // $0.000001 per token
@@ -1865,15 +1892,15 @@ async fn test_model_aliases() {
             "verifiable": true,
             "isActive": true,
             "aliases": [
-                "gpt-oss-120b",  // Friendly alias
+                "gpt-oss-120b-e2e-aliases",  // Friendly alias
             ]
         }))
         .unwrap(),
     );
 
-    // Model 2: Qwen/Qwen3-30B-A3B-Instruct-2507 (canonical with messy name) with clean alias
+    // Model 2: Qwen-style canonical name with a clean alias.
     batch.insert(
-        "Qwen/Qwen3-30B-A3B-Instruct-2507".to_string(),
+        ALIASES_QWEN_MODEL.to_string(),
         serde_json::from_value(serde_json::json!({
             "inputCostPerToken": {
                 "amount": 500000,
@@ -1890,7 +1917,7 @@ async fn test_model_aliases() {
             "verifiable": false,
             "isActive": true,
             "aliases": [
-                "deepseek/deepseek-v3.1"  // Clean alias
+                "deepseek/deepseek-v3.1-e2e-aliases"  // Clean alias
             ]
         }))
         .unwrap(),
@@ -1909,7 +1936,7 @@ async fn test_model_aliases() {
         .post("/v1/chat/completions")
         .add_header("Authorization", format!("Bearer {api_key}"))
         .json(&serde_json::json!({
-            "model": "gpt-oss-120b",  // Using ALIAS
+            "model": "gpt-oss-120b-e2e-aliases",  // Using ALIAS
             "messages": [
                 {
                     "role": "user",
@@ -1945,7 +1972,7 @@ async fn test_model_aliases() {
         .post("/v1/chat/completions")
         .add_header("Authorization", format!("Bearer {api_key}"))
         .json(&serde_json::json!({
-            "model": "nearai/gpt-oss-120b",  // Using CANONICAL name
+            "model": ALIASES_GPT_MODEL,  // Using CANONICAL name
             "messages": [
                 {
                     "role": "user",
@@ -1975,7 +2002,7 @@ async fn test_model_aliases() {
         .post("/v1/chat/completions")
         .add_header("Authorization", format!("Bearer {api_key}"))
         .json(&serde_json::json!({
-            "model": "deepseek/deepseek-v3.1",  // Clean alias
+            "model": "deepseek/deepseek-v3.1-e2e-aliases",  // Clean alias
             "messages": [
                 {
                     "role": "user",
@@ -2019,8 +2046,7 @@ async fn test_model_aliases() {
 
         // Verify model is a canonical model name
         assert!(
-            entry.model == "nearai/gpt-oss-120b"
-                || entry.model == "Qwen/Qwen3-30B-A3B-Instruct-2507",
+            entry.model == ALIASES_GPT_MODEL || entry.model == ALIASES_QWEN_MODEL,
             "Usage should be tracked with canonical model name, got: {}",
             entry.model
         );
@@ -2044,7 +2070,7 @@ async fn test_model_alias_consistency() {
     // Set up model with multiple aliases
     let mut batch = BatchUpdateModelApiRequest::new();
     batch.insert(
-        "Qwen/Qwen3-30B-A3B-Instruct-2507".to_string(),
+        ALIAS_CONSISTENCY_MODEL.to_string(),
         serde_json::from_value(serde_json::json!({
             "inputCostPerToken": {
                 "amount": 800000,
@@ -2061,8 +2087,8 @@ async fn test_model_alias_consistency() {
             "verifiable": true,
             "isActive": true,
             "aliases": [
-                "qwen/qwen3-30b-a3b-instruct-2507",  // Lowercase clean alias
-                "qwen3-30b"                           // Short alias
+                "qwen/qwen3-30b-a3b-instruct-2507-e2e-alias-consistency",
+                "qwen3-30b-e2e-alias-consistency"
             ]
         }))
         .unwrap(),
@@ -2080,7 +2106,7 @@ async fn test_model_alias_consistency() {
         .post("/v1/chat/completions")
         .add_header("Authorization", format!("Bearer {api_key}"))
         .json(&serde_json::json!({
-            "model": "qwen/qwen3-30b-a3b-instruct-2507",  // First alias
+            "model": "qwen/qwen3-30b-a3b-instruct-2507-e2e-alias-consistency",
             "messages": [{"role": "user", "content": "Hi"}],
             "stream": false,
             "max_tokens": 10
@@ -2105,7 +2131,7 @@ async fn test_model_alias_consistency() {
         .post("/v1/chat/completions")
         .add_header("Authorization", format!("Bearer {api_key}"))
         .json(&serde_json::json!({
-            "model": "qwen3-30b",  // Second alias
+            "model": "qwen3-30b-e2e-alias-consistency",
             "messages": [{"role": "user", "content": "Hi"}],
             "stream": false,
             "max_tokens": 10
@@ -2141,7 +2167,7 @@ async fn test_model_alias_consistency() {
         .post("/v1/chat/completions")
         .add_header("Authorization", format!("Bearer {api_key}"))
         .json(&serde_json::json!({
-            "model": "Qwen/Qwen3-30B-A3B-Instruct-2507",  // Canonical name
+            "model": ALIAS_CONSISTENCY_MODEL,
             "messages": [{"role": "user", "content": "Hello"}],
             "stream": false,
             "max_tokens": 10

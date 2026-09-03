@@ -7,6 +7,11 @@ use tokio::sync::OnceCell;
 use tokio_postgres::NoTls;
 use tracing::{debug, info, warn};
 
+use super::{
+    E2E_QWEN_CACHE_MODEL_NAME, E2E_QWEN_CACHE_READ_COST_WITH_CACHE, E2E_QWEN_INPUT_COST_PER_TOKEN,
+    E2E_QWEN_MODEL_NAME, E2E_QWEN_OUTPUT_COST_PER_TOKEN,
+};
+
 static SHARED_DB_READY: OnceCell<()> = OnceCell::const_new();
 
 /// Set by the nextest setup script after the shared database has been prepared.
@@ -250,6 +255,87 @@ async fn seed_shared_test_fixtures(database: &Database) -> Result<()> {
         "the shared e2e mock user was not restored to its deterministic state"
     );
 
+    // These high-traffic catalog fixtures are immutable during ordinary E2E
+    // tests. Seed them once before nextest starts instead of making every test
+    // PATCH the same model row. Tests that exercise alternate model metadata
+    // use separate names so they cannot contaminate either baseline.
+    for (model_name, cache_read_cost) in [
+        (E2E_QWEN_MODEL_NAME, None),
+        (
+            E2E_QWEN_CACHE_MODEL_NAME,
+            Some(E2E_QWEN_CACHE_READ_COST_WITH_CACHE),
+        ),
+    ] {
+        let model_name = model_name.to_string();
+        let seeded_model = client
+            .query_one(
+                "INSERT INTO models (
+                    model_name, model_display_name, model_description,
+                    input_cost_per_token, output_cost_per_token, cost_per_image,
+                    cache_read_cost_per_token, text_pricing, context_length,
+                    max_output_length, verifiable, is_active, allow_free, owned_by,
+                    provider_type, provider_config, attestation_supported,
+                    input_modalities, output_modalities, inference_url,
+                    hugging_face_id, quantization, supported_sampling_parameters,
+                    supported_features, datacenters, is_ready, deprecation_date,
+                    openrouter_slug, attestation_policy
+                 ) VALUES (
+                    $1, 'E2E Qwen fixture', 'Deterministic E2E model fixture',
+                    $2, $3, 0, $4, NULL, 128000, 1024, TRUE, TRUE, FALSE,
+                    'nearai', 'vllm', NULL, TRUE, NULL, NULL, NULL, NULL, NULL,
+                    ARRAY[]::TEXT[], ARRAY[]::TEXT[], NULL, NULL, NULL, NULL,
+                    'near_only'
+                 )
+                 ON CONFLICT (model_name) DO UPDATE SET
+                    model_display_name = EXCLUDED.model_display_name,
+                    model_description = EXCLUDED.model_description,
+                    input_cost_per_token = EXCLUDED.input_cost_per_token,
+                    output_cost_per_token = EXCLUDED.output_cost_per_token,
+                    cost_per_image = EXCLUDED.cost_per_image,
+                    cache_read_cost_per_token = EXCLUDED.cache_read_cost_per_token,
+                    text_pricing = EXCLUDED.text_pricing,
+                    context_length = EXCLUDED.context_length,
+                    max_output_length = EXCLUDED.max_output_length,
+                    verifiable = EXCLUDED.verifiable,
+                    is_active = EXCLUDED.is_active,
+                    allow_free = EXCLUDED.allow_free,
+                    owned_by = EXCLUDED.owned_by,
+                    provider_type = EXCLUDED.provider_type,
+                    provider_config = EXCLUDED.provider_config,
+                    attestation_supported = EXCLUDED.attestation_supported,
+                    input_modalities = EXCLUDED.input_modalities,
+                    output_modalities = EXCLUDED.output_modalities,
+                    inference_url = EXCLUDED.inference_url,
+                    hugging_face_id = EXCLUDED.hugging_face_id,
+                    quantization = EXCLUDED.quantization,
+                    supported_sampling_parameters = EXCLUDED.supported_sampling_parameters,
+                    supported_features = EXCLUDED.supported_features,
+                    datacenters = EXCLUDED.datacenters,
+                    is_ready = EXCLUDED.is_ready,
+                    deprecation_date = EXCLUDED.deprecation_date,
+                    openrouter_slug = EXCLUDED.openrouter_slug,
+                    attestation_policy = EXCLUDED.attestation_policy,
+                    updated_at = NOW()
+                 RETURNING id",
+                &[
+                    &model_name,
+                    &E2E_QWEN_INPUT_COST_PER_TOKEN,
+                    &E2E_QWEN_OUTPUT_COST_PER_TOKEN,
+                    &cache_read_cost,
+                ],
+            )
+            .await
+            .with_context(|| format!("seed shared E2E model fixture '{model_name}'"))?;
+        let model_id: uuid::Uuid = seeded_model.get(0);
+        client
+            .execute(
+                "DELETE FROM model_aliases WHERE canonical_model_id = $1",
+                &[&model_id],
+            )
+            .await
+            .with_context(|| format!("clear aliases for shared E2E model '{model_name}'"))?;
+    }
+
     Ok(())
 }
 
@@ -308,6 +394,14 @@ pub async fn create_test_pool() -> database::pool::DbPool {
     pg_config.user = Some(db_user());
     pg_config.password = Some(db_password());
     pg_config.application_name = Some(format!("cloud-api-e2e-{}", uuid::Uuid::new_v4().simple()));
+    pg_config.connect_timeout = Some(Duration::from_secs(10));
+    pg_config.keepalives = Some(true);
+    pg_config.keepalives_idle = Some(Duration::from_secs(5));
+    pg_config.options = Some(
+        "-c statement_timeout=30000 -c lock_timeout=10000 \
+         -c idle_in_transaction_session_timeout=30000"
+            .to_string(),
+    );
     // The E2E runner creates many short-lived processes through Docker's
     // published PostgreSQL port. Verify pooled connections before reuse so a
     // hard-closed socket is discarded instead of failing the test's next SQL.
@@ -325,11 +419,23 @@ pub async fn create_test_pool() -> database::pool::DbPool {
         ..Default::default()
     });
 
-    pg_config
-        .create_pool(
-            Some(deadpool_postgres::Runtime::Tokio1),
-            tokio_postgres::NoTls,
-        )
+    // On Linux, bound how long unacknowledged test traffic may remain stuck in
+    // the TCP stack. This complements server-side statement/lock timeouts for
+    // the Docker-published PostgreSQL path used by CI.
+    let mut tokio_pg_config = pg_config
+        .get_pg_config()
+        .expect("Failed to create test PostgreSQL configuration");
+    tokio_pg_config.tcp_user_timeout(Duration::from_secs(10));
+    let manager = deadpool_postgres::Manager::from_config(
+        tokio_pg_config,
+        tokio_postgres::NoTls,
+        pg_config.get_manager_config(),
+    );
+
+    deadpool_postgres::Pool::builder(manager)
+        .config(pg_config.get_pool_config())
+        .runtime(deadpool_postgres::Runtime::Tokio1)
+        .build()
         .expect("Failed to create test connection pool")
         .into()
 }

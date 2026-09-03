@@ -16,7 +16,7 @@ capture-stderr = true
 # Tests isolate their rows with UUID-scoped organizations, workspaces, and keys.
 test-threads = "num-cpus"
 
-# The default 100 ms handle-drain window is too short for this 8-process E2E
+# The default 100 ms handle-drain window is too short for this multi-process E2E
 # workload on a busy runner. Allow a small grace period, but turn any process
 # that still holds output handles afterwards into a real test failure.
 leak-timeout = { period = "500ms", result = "fail" }
@@ -27,7 +27,7 @@ slow-timeout = { period = "60s", terminate-after = 2 }
 # Keep enough PostgreSQL headroom for the service connection, migrations, and
 # other jobs that may share a self-hosted runner. Each test pool is capped at 4.
 [test-groups.e2e-db]
-max-threads = 8
+max-threads = 4
 
 [[profile.default.overrides]]
 filter = "package(api) & binary(e2e_all)"
@@ -39,10 +39,10 @@ test-group = "e2e-db"
 filter = 'package(api) & binary(e2e_all) & (test(/^database_encryption::/) | test(/^reporting_usage::usage_export::usage_export_database_timeout_returns_504_and_stops_query$/) | test(/^reporting_usage::usage_summary::usage_summary_database_timeout_returns_504$/))'
 threads-required = "num-test-threads"
 
-# A few legacy fixtures still mutate fixed model rows. Keep the assertions that
-# depend on those exact values isolated until those fixtures use unique models.
+# A few specialized fixtures still mutate fixed image/privacy/rerank model
+# rows. Keep the assertions that depend on those exact values isolated.
 [[profile.default.overrides]]
-filter = 'package(api) & binary(e2e_all) & (test(/^general::test_(high_context_(length_completion|streaming)|model_alias(es|_consistency))$/) | test(/^usage_responses::test_responses_(non_stream|stream)_records_cache_usage_in_history$/) | test(/^usage_recording::test_(record_chat_completion_usage_(with_cached_tokens|cache_read_capped_to_input)|record_image_generation_usage)$/) | test(/^privacy_classify::test_privacy_classify_costs_deducted$/) | test(/^privacy_redact::test_privacy_redact_costs_deducted$/) | test(/^rerank::test_rerank_costs_deducted_correctly$/))'
+filter = 'package(api) & binary(e2e_all) & (test(/^usage_recording::test_record_image_generation_usage$/) | test(/^privacy_classify::test_privacy_classify_costs_deducted$/) | test(/^privacy_redact::test_privacy_redact_costs_deducted$/) | test(/^rerank::test_rerank_costs_deducted_correctly$/))'
 threads-required = "num-test-threads"
 
 # The scheduler claims from a database-global due queue rather than one batch,

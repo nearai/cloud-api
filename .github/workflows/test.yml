@@ -164,7 +164,7 @@ jobs:
   # (tests/e2e_all/) for faster linking. Isolation comes from UUID-scoped
   # orgs/workspaces/keys on a shared database, not separate databases.
   # A nextest setup script creates/migrates that database exactly once, then
-  # e2e concurrency is capped by .config/nextest.toml at 8 active tests. Most
+  # e2e concurrency is capped by .config/nextest.toml at 4 active tests. Most
   # pools are capped at 4 connections; even tests with a second pool leave
   # PostgreSQL headroom for runner-side services.
   e2e-test:

@@ -376,6 +376,36 @@ async fn release_chat_signature_pin_unpins_without_storing() {
 }
 
 #[tokio::test]
+async fn unsupported_provider_releases_pin_without_storing_a_signature() {
+    let chat_id = "chatcmpl-lifecycle-unsupported-provider";
+    let pool = Arc::new(InferenceProviderPool::new(
+        None,
+        ExternalProvidersConfig::default(),
+    ));
+    let provider = Arc::new(MockProvider::new().with_chat_signature_support(false));
+    pool.store_chat_id_mapping(chat_id.to_string(), provider.clone())
+        .await;
+    let repository = RecordingRepository::default();
+    let service = lifecycle_service(Arc::new(repository.clone()), pool);
+
+    let result = service.store_chat_signature_from_provider(chat_id).await;
+
+    assert!(
+        result.is_ok(),
+        "unsupported providers should not fail completion"
+    );
+    assert!(
+        repository.stored().is_empty(),
+        "unsupported providers must not synthesize a provider signature"
+    );
+    assert_eq!(
+        provider.unpinned_chat_ids(),
+        vec![chat_id.to_string()],
+        "the signature-fetch routing pin must be released exactly once"
+    );
+}
+
+#[tokio::test]
 async fn release_chat_signature_pin_is_a_noop_without_a_mapping() {
     let pool = Arc::new(InferenceProviderPool::new(
         None,

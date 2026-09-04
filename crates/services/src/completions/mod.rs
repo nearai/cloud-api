@@ -23,14 +23,32 @@ use std::time::{Duration, Instant};
 use tracing::Instrument;
 
 const FINALIZE_TIMEOUT_SECS: u64 = 5;
+/// A raw provider terminal marker is only expected to contain `data: [DONE]`
+/// plus its SSE line ending. Bound it before accepting it as a signed terminal
+/// event so malformed padding cannot be retained or signed.
+pub const MAX_PROVIDER_DONE_EVENT_BYTES: usize = 64;
 const DEEPSEEK_V4_FLASH_MODEL: &str = "deepseek-ai/DeepSeek-V4-Flash";
 
 type FinalizeFuture = Pin<Box<dyn Future<Output = ()> + Send>>;
 
 enum StreamState {
     Streaming,
+    AwaitingDoneSeparator { marker_len: usize },
     Finalizing(FinalizeFuture),
     Done,
+}
+
+fn sse_event_has_terminating_separator(event: &SSEEvent) -> bool {
+    event.raw_bytes.ends_with(b"\n\n") || event.raw_bytes.ends_with(b"\r\n\r\n")
+}
+
+fn is_sse_event_separator(event: &SSEEvent) -> bool {
+    event.chunk.is_none()
+        && !event.raw_bytes.is_empty()
+        && event
+            .raw_bytes
+            .iter()
+            .all(|byte| matches!(*byte, b'\r' | b'\n'))
 }
 
 /// Hash inference ID to UUID deterministically using MD5 (v5)
@@ -106,10 +124,14 @@ where
     last_usage_stats: Option<inference_providers::TokenUsage>,
     /// Last chat ID from streaming chunks (for attestation and inference_id)
     last_chat_id: Option<String>,
-    /// Flag indicating the stream completed normally (received None from inner stream).
+    /// Flag indicating the stream reached a terminal SSE marker or inner EOF.
     /// If false when Drop is called, the stream was interrupted — either the client
     /// disconnected mid-stream or the provider returned an error (check `last_error`).
     stream_completed: bool,
+    /// Whether the upstream sent its own SSE `[DONE]` marker. When false,
+    /// the API route may append one and the provider signature does not cover
+    /// the complete public stream.
+    saw_upstream_done_marker: bool,
     /// Response ID when called from Responses API (for usage tracking FK)
     response_id: Option<ResponseId>,
     /// Last finish_reason from provider (e.g., "stop", "length", "tool_calls")
@@ -137,15 +159,10 @@ impl<S> InterceptStream<S>
 where
     S: Stream<Item = Result<SSEEvent, inference_providers::CompletionError>> + Unpin,
 {
-    /// Store attestation signature before sending [DONE] to client.
-    /// This runs in the hot path to ensure signature is available when client receives [DONE].
-    /// Skipped for external providers that don't support TEE attestation.
+    /// Finalize attestation handling before the route sends `[DONE]` to the client.
+    /// This stores a provider signature when supported, otherwise releases the
+    /// provider-routing pin without publishing a signature.
     fn create_signature_future(&self) -> FinalizeFuture {
-        // Skip attestation for external providers (OpenAI, Anthropic, Gemini, etc.)
-        if !self.attestation_supported || !self.store_provider_chat_signature {
-            return Box::pin(async {});
-        }
-
         let organization_id = self.organization_id;
         let model_id = self.model_id;
 
@@ -158,6 +175,44 @@ where
         };
 
         let attestation_service = self.attestation_service.clone();
+
+        // The provider pool pins every streamed chat that has a chat id, even
+        // when the authoritative model record says it is non-attested. There is
+        // no signature to store in that case, but the normal EOF path still
+        // owns releasing the pin.
+        if !self.attestation_supported {
+            return Box::pin(async move {
+                attestation_service
+                    .release_chat_signature_pin(&chat_id)
+                    .await;
+            });
+        }
+
+        if !self.store_provider_chat_signature {
+            // A route which rewrites the public stream may create a Gateway
+            // signature after it has the final public bytes. That signature
+            // does not need the provider's dedicated TLS connection, so the
+            // completion layer still owns releasing this provider-signature
+            // routing pin before it reports normal stream completion.
+            return Box::pin(async move {
+                attestation_service
+                    .release_chat_signature_pin(&chat_id)
+                    .await;
+            });
+        }
+
+        // A provider signature only verifies the exact upstream stream. Do
+        // not publish one if the stream reported an error or if the route
+        // will synthesize its terminator. The route may create a Gateway
+        // signature for a clean synthesized terminator; either way this
+        // releases the routing pin.
+        if self.last_error.is_some() || !self.saw_upstream_done_marker {
+            return Box::pin(async move {
+                attestation_service
+                    .release_chat_signature_pin(&chat_id)
+                    .await;
+            });
+        }
 
         Box::pin(async move {
             match tokio::time::timeout(
@@ -177,27 +232,22 @@ where
                         "Timeout storing chat signature after {}s",
                         FINALIZE_TIMEOUT_SECS
                     );
+                    // The provider-store implementation normally unpins after
+                    // it completes. A timeout cancels that future before its
+                    // cleanup runs, so this finalization path must release the
+                    // routing pin itself.
+                    attestation_service
+                        .release_chat_signature_pin(&chat_id)
+                        .await;
                 }
             }
         })
     }
 
-    fn create_pin_release_future(&self) -> FinalizeFuture {
-        if !self.attestation_supported || !self.store_provider_chat_signature {
-            return Box::pin(async {});
-        }
-
-        let chat_id = match &self.last_chat_id {
-            Some(id) => id.clone(),
-            None => return Box::pin(async {}),
-        };
-
-        let attestation_service = self.attestation_service.clone();
-        Box::pin(async move {
-            attestation_service
-                .release_chat_signature_pin(&chat_id)
-                .await;
-        })
+    fn begin_finalizing(&mut self) {
+        self.stream_completed = true;
+        let signature_future = self.create_signature_future();
+        self.state = StreamState::Finalizing(signature_future);
     }
 
     /// Record usage and metrics. Called from Drop to ensure it always runs.
@@ -547,132 +597,186 @@ where
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         loop {
-            match &mut self.state {
-                StreamState::Streaming => {
-                    match Pin::new(&mut self.inner).poll_next(cx) {
-                        Poll::Ready(Some(Ok(ref event))) => {
-                            // Control events (blank lines, comments, [DONE])
-                            // carry no tokens: pass them through untouched so
-                            // the route can forward their raw bytes, but keep
-                            // them out of TTFT/ITL metrics and chat tracking.
-                            self.idle_armed = false;
+            if matches!(&self.state, StreamState::Streaming) {
+                match Pin::new(&mut self.inner).poll_next(cx) {
+                    Poll::Ready(Some(Ok(event))) => {
+                        self.idle_armed = false;
 
-                            if event.chunk.is_none() {
-                                return Poll::Ready(Some(Ok(event.clone())));
-                            }
-
-                            let now = Instant::now();
-
-                            if !self.first_token_received {
-                                self.first_token_received = true;
-                                self.first_token_time = Some(now);
-                                let backend_ttft = now.duration_since(self.provider_start_time);
-                                let e2e_ttft = now.duration_since(self.service_start_time);
-                                self.ttft_ms = Some(e2e_ttft.as_millis() as i32);
-                                self.last_token_time = Some(now);
-                                let tags_str: Vec<&str> =
-                                    self.metric_tags.iter().map(|s| s.as_str()).collect();
-                                self.metrics_service.record_latency(
-                                    METRIC_LATENCY_TTFT,
-                                    backend_ttft,
-                                    &tags_str,
+                        if event.is_done_marker() {
+                            if event.raw_bytes.len() > MAX_PROVIDER_DONE_EVENT_BYTES {
+                                let error = inference_providers::CompletionError::CompletionError(
+                                    "Malformed SSE stream: [DONE] marker is too large".into(),
                                 );
-                                self.metrics_service.record_latency(
-                                    METRIC_LATENCY_TTFT_TOTAL,
-                                    e2e_ttft,
-                                    &tags_str,
-                                );
-                            } else if let Some(last_time) = self.last_token_time {
-                                // Calculate inter-token latency
-                                let itl = now.duration_since(last_time);
-                                self.total_itl_ms += itl.as_secs_f64() * 1000.0;
-                                self.token_count += 1;
-                                self.last_token_time = Some(now);
+                                self.last_error = Some(error.clone());
+                                self.begin_finalizing();
+                                return Poll::Ready(Some(Err(error)));
                             }
-
-                            if let Some(StreamChunk::Chat(ref chat_chunk)) = event.chunk {
-                                // Track chat_id for attestation (updated on each chunk)
-                                self.last_chat_id = Some(chat_chunk.id.clone());
-
-                                // Track usage stats (updated on each chunk that has usage)
-                                if let Some(usage) = &chat_chunk.usage {
-                                    self.last_usage_stats = Some(usage.clone());
-                                }
-
-                                if let Some(service_tier) = &chat_chunk.service_tier {
-                                    self.provider_service_tier = Some(service_tier.clone());
-                                }
-
-                                // Track finish_reason from the final chunk (only set once at end)
-                                if let Some(choice) = chat_chunk.choices.first() {
-                                    if let Some(ref reason) = choice.finish_reason {
-                                        self.last_finish_reason = Some(reason.clone());
-                                    }
-                                }
-                            }
-                            return Poll::Ready(Some(Ok(event.clone())));
-                        }
-                        Poll::Ready(None) => {
-                            self.stream_completed = true;
-                            let signature_future = self.create_signature_future();
-                            self.state = StreamState::Finalizing(signature_future);
-                        }
-                        Poll::Ready(Some(Err(ref err))) => {
-                            // Capture error for stop_reason in usage recording (handled in Drop)
-                            // Note: We intentionally skip Finalizing state (attestation) for errors
-                            // because partial completions cannot be verified by clients
-                            self.idle_armed = false;
-                            self.last_error = Some(err.clone());
-                            return Poll::Ready(Some(Err(err.clone())));
-                        }
-                        Poll::Pending => {
-                            let Some(budget) = self.idle_budget() else {
-                                return Poll::Pending;
-                            };
-                            if !self.idle_armed {
-                                let deadline = tokio::time::Instant::now() + budget;
-                                match &mut self.idle_timer {
-                                    Some(timer) => timer.as_mut().reset(deadline),
-                                    None => {
-                                        self.idle_timer =
-                                            Some(Box::pin(tokio::time::sleep_until(deadline)));
-                                    }
-                                }
-                                self.idle_armed = true;
-                            }
-                            let timer = self
-                                .idle_timer
-                                .as_mut()
-                                .expect("idle timer is created when the stream arms");
-                            if timer.as_mut().poll(cx).is_pending() {
-                                return Poll::Pending;
-                            }
-                            let stalled_during = if self.first_token_received {
-                                "generation"
+                            self.saw_upstream_done_marker = true;
+                            if sse_event_has_terminating_separator(&event) {
+                                self.begin_finalizing();
                             } else {
-                                "prefill"
-                            };
-                            let timeout = inference_providers::CompletionError::Timeout {
-                                operation: stalled_during.to_string(),
-                                timeout_seconds: budget.as_secs(),
-                            };
-                            self.idle_armed = false;
-                            self.last_error = Some(timeout.clone());
-                            let release_future = self.create_pin_release_future();
-                            self.state = StreamState::Finalizing(release_future);
-                            return Poll::Ready(Some(Err(timeout)));
+                                self.state = StreamState::AwaitingDoneSeparator {
+                                    marker_len: event.raw_bytes.len(),
+                                };
+                            }
+                            return Poll::Ready(Some(Ok(event)));
                         }
+
+                        // Control events (blank lines, comments) carry no tokens: pass them
+                        // through untouched so the route can forward their raw bytes, but keep
+                        // them out of TTFT/ITL metrics and chat tracking.
+                        if event.chunk.is_none() {
+                            return Poll::Ready(Some(Ok(event)));
+                        }
+
+                        let now = Instant::now();
+
+                        if !self.first_token_received {
+                            self.first_token_received = true;
+                            self.first_token_time = Some(now);
+                            let backend_ttft = now.duration_since(self.provider_start_time);
+                            let e2e_ttft = now.duration_since(self.service_start_time);
+                            self.ttft_ms = Some(e2e_ttft.as_millis() as i32);
+                            self.last_token_time = Some(now);
+                            let tags_str: Vec<&str> =
+                                self.metric_tags.iter().map(|s| s.as_str()).collect();
+                            self.metrics_service.record_latency(
+                                METRIC_LATENCY_TTFT,
+                                backend_ttft,
+                                &tags_str,
+                            );
+                            self.metrics_service.record_latency(
+                                METRIC_LATENCY_TTFT_TOTAL,
+                                e2e_ttft,
+                                &tags_str,
+                            );
+                        } else if let Some(last_time) = self.last_token_time {
+                            // Calculate inter-token latency.
+                            let itl = now.duration_since(last_time);
+                            self.total_itl_ms += itl.as_secs_f64() * 1000.0;
+                            self.token_count += 1;
+                            self.last_token_time = Some(now);
+                        }
+
+                        if let Some(StreamChunk::Chat(ref chat_chunk)) = event.chunk {
+                            // Track chat_id for attestation (updated on each chunk).
+                            self.last_chat_id = Some(chat_chunk.id.clone());
+
+                            // Track usage stats (updated on each chunk that has usage).
+                            if let Some(usage) = &chat_chunk.usage {
+                                self.last_usage_stats = Some(usage.clone());
+                            }
+
+                            if let Some(service_tier) = &chat_chunk.service_tier {
+                                self.provider_service_tier = Some(service_tier.clone());
+                            }
+
+                            // Track finish_reason from the final chunk (only set once at end).
+                            if let Some(choice) = chat_chunk.choices.first() {
+                                if let Some(ref reason) = choice.finish_reason {
+                                    self.last_finish_reason = Some(reason.clone());
+                                }
+                            }
+                        }
+                        return Poll::Ready(Some(Ok(event)));
+                    }
+                    Poll::Ready(None) => self.begin_finalizing(),
+                    Poll::Ready(Some(Err(err))) => {
+                        // Capture error for stop_reason in usage recording (handled in Drop).
+                        self.idle_armed = false;
+                        self.last_error = Some(err.clone());
+                        return Poll::Ready(Some(Err(err)));
+                    }
+                    Poll::Pending => {
+                        let Some(budget) = self.idle_budget() else {
+                            return Poll::Pending;
+                        };
+                        if !self.idle_armed {
+                            let deadline = tokio::time::Instant::now() + budget;
+                            match &mut self.idle_timer {
+                                Some(timer) => timer.as_mut().reset(deadline),
+                                None => {
+                                    self.idle_timer =
+                                        Some(Box::pin(tokio::time::sleep_until(deadline)));
+                                }
+                            }
+                            self.idle_armed = true;
+                        }
+                        let timer = self
+                            .idle_timer
+                            .as_mut()
+                            .expect("idle timer is created when the stream arms");
+                        if timer.as_mut().poll(cx).is_pending() {
+                            return Poll::Pending;
+                        }
+                        let stalled_during = if self.first_token_received {
+                            "generation"
+                        } else {
+                            "prefill"
+                        };
+                        let timeout = inference_providers::CompletionError::Timeout {
+                            operation: stalled_during.to_string(),
+                            timeout_seconds: budget.as_secs(),
+                        };
+                        self.idle_armed = false;
+                        self.last_error = Some(timeout.clone());
+                        self.begin_finalizing();
+                        return Poll::Ready(Some(Err(timeout)));
                     }
                 }
-                StreamState::Finalizing(ref mut future) => match future.as_mut().poll(cx) {
+                continue;
+            }
+
+            if let StreamState::AwaitingDoneSeparator { marker_len } = &self.state {
+                let marker_len = *marker_len;
+                match Pin::new(&mut self.inner).poll_next(cx) {
+                    Poll::Ready(Some(Ok(event))) if is_sse_event_separator(&event) => {
+                        let terminal_len = marker_len.checked_add(event.raw_bytes.len());
+                        if terminal_len.is_none_or(|len| len > MAX_PROVIDER_DONE_EVENT_BYTES) {
+                            let error = inference_providers::CompletionError::CompletionError(
+                                "Malformed SSE stream: [DONE] marker is too large".into(),
+                            );
+                            self.last_error = Some(error.clone());
+                            self.begin_finalizing();
+                            return Poll::Ready(Some(Err(error)));
+                        }
+                        self.begin_finalizing();
+                        return Poll::Ready(Some(Ok(event)));
+                    }
+                    Poll::Ready(None) => {
+                        // Preserve the upstream's exact terminal bytes even if it omitted the
+                        // optional blank separator after the marker.
+                        self.begin_finalizing();
+                    }
+                    Poll::Ready(Some(Ok(_))) => {
+                        let error = inference_providers::CompletionError::CompletionError(
+                            "Malformed SSE stream: expected a blank line after [DONE]".into(),
+                        );
+                        self.last_error = Some(error.clone());
+                        self.begin_finalizing();
+                        return Poll::Ready(Some(Err(error)));
+                    }
+                    Poll::Ready(Some(Err(err))) => {
+                        self.last_error = Some(err.clone());
+                        self.begin_finalizing();
+                        return Poll::Ready(Some(Err(err)));
+                    }
+                    Poll::Pending => return Poll::Pending,
+                }
+                continue;
+            }
+
+            if let StreamState::Finalizing(future) = &mut self.state {
+                match future.as_mut().poll(cx) {
                     Poll::Ready(()) => {
                         self.state = StreamState::Done;
                         return Poll::Ready(None);
                     }
                     Poll::Pending => return Poll::Pending,
-                },
-                StreamState::Done => return Poll::Ready(None),
+                }
             }
+
+            return Poll::Ready(None);
         }
     }
 }
@@ -685,6 +789,41 @@ where
         // Decrement concurrent counter if present
         if let Some(counter) = &self.concurrent_counter {
             counter.fetch_sub(1, Ordering::Release);
+        }
+
+        // Every successful finalization path reaches `StreamState::Done` only
+        // after it has stored a provider signature or explicitly released the
+        // provider-signature routing pin. If the stream is dropped first (for
+        // example because an HTTP client disconnects, an upstream error is
+        // forwarded, or the finalization future is cancelled), release the
+        // pin here. This is intentionally owned by the completion stream:
+        // `/v1/responses` consumes this stream internally and only exposes a
+        // different response id to its caller, so an HTTP-route guard cannot
+        // reliably clean up the provider chat id.
+        if !matches!(&self.state, StreamState::Done) {
+            if let Some(chat_id) = self.last_chat_id.clone() {
+                let attestation_service = self.attestation_service.clone();
+                let spawn_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    let handle = match tokio::runtime::Handle::try_current() {
+                        Ok(handle) => handle,
+                        Err(_) => {
+                            tracing::error!(%chat_id, "Cannot release signature routing pin: no Tokio runtime available");
+                            return;
+                        }
+                    };
+                    std::mem::drop(handle.spawn(async move {
+                        attestation_service
+                            .release_chat_signature_pin(&chat_id)
+                            .await;
+                        tracing::debug!(%chat_id, "Released signature routing pin after interrupted stream");
+                    }));
+                }));
+                if spawn_result.is_err() {
+                    tracing::error!(
+                        "Could not schedule signature routing-pin cleanup during shutdown"
+                    );
+                }
+            }
         }
 
         // Always record usage in Drop (async, fire-and-forget)
@@ -1585,6 +1724,7 @@ impl CompletionServiceImpl {
             last_usage_stats: None,
             last_chat_id: None,
             stream_completed: false,
+            saw_upstream_done_marker: false,
             response_id,
             last_finish_reason: None,
             last_error: None,
@@ -1743,6 +1883,7 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
         let routing_hints = super::inference_provider_pool::ChatRoutingHints {
             prefix_hash: Some(compute_prefix_hash(&chat_params.messages)),
             estimated_tokens: Some(estimate_input_tokens(&chat_params.messages)),
+            fallback_disabled: !request.fallback_enabled,
         };
 
         // Get the LLM stream
@@ -1935,7 +2076,14 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
         let provider_start_time = Instant::now();
         let result = self
             .inference_provider_pool
-            .chat_completion_with_attribution(chat_params, request.body_hash.clone())
+            .chat_completion_with_attribution_and_hints(
+                chat_params,
+                request.body_hash.clone(),
+                super::inference_provider_pool::ChatRoutingHints {
+                    fallback_disabled: !request.fallback_enabled,
+                    ..Default::default()
+                },
+            )
             .await;
 
         let attributed_response = match result {
@@ -1958,8 +2106,10 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
         let backend_latency = provider_start_time.elapsed();
         let queue_time = provider_start_time.duration_since(service_start_time);
 
-        // Store attestation signature (only for models that support TEE attestation)
-        if model.attestation_supported {
+        // Store a model-side signature only when the API route returns the
+        // provider's exact bytes. Routes that rewrite the public response
+        // store a Gateway signature after the final bytes are available.
+        if model.attestation_supported && !request.skip_provider_chat_signature {
             let attestation_service = self.attestation_service.clone();
             let chat_id = response_with_bytes.response.id.clone();
             let model_name = model.model_name.clone();
@@ -2394,6 +2544,165 @@ mod tests {
     use inference_providers::models::{ChatChoice, ChatCompletionChunk, FinishReason, TokenUsage};
     use std::time::Duration;
 
+    fn terminal_test_stream(
+        events: Vec<Result<SSEEvent, inference_providers::CompletionError>>,
+    ) -> InterceptStream<
+        impl Stream<Item = Result<SSEEvent, inference_providers::CompletionError>> + Unpin,
+    > {
+        let now = Instant::now();
+        InterceptStream {
+            inner: stream::iter(events),
+            attestation_service: Arc::new(MockAttestationService),
+            usage_service: Arc::new(MockUsageService),
+            metrics_service: Arc::new(CapturingMetricsService::new()),
+            request_id: Uuid::new_v4(),
+            organization_id: Uuid::new_v4(),
+            workspace_id: Uuid::new_v4(),
+            api_key_id: Uuid::new_v4(),
+            model_id: Uuid::new_v4(),
+            model_name: "test-model".to_string(),
+            inference_type: crate::usage::ports::InferenceType::ChatCompletionStream,
+            service_start_time: now,
+            provider_start_time: now,
+            first_token_received: false,
+            first_token_time: None,
+            ttft_ms: None,
+            token_count: 0,
+            last_token_time: None,
+            total_itl_ms: 0.0,
+            idle_timeouts: None,
+            idle_timer: None,
+            idle_armed: false,
+            metric_tags: CompletionServiceImpl::create_metric_tags("test-model"),
+            concurrent_counter: None,
+            last_usage_stats: None,
+            last_chat_id: None,
+            stream_completed: false,
+            saw_upstream_done_marker: false,
+            response_id: None,
+            last_finish_reason: None,
+            last_error: None,
+            state: StreamState::Streaming,
+            attestation_supported: false,
+            store_provider_chat_signature: true,
+            provider_attribution: crate::usage::ProviderAttribution::default(),
+            cache_write_cost_per_token: None,
+            requested_service_tier: None,
+            provider_service_tier: None,
+            latency_reporter: None,
+        }
+    }
+
+    fn terminal_control_event(raw_bytes: &'static [u8]) -> SSEEvent {
+        SSEEvent {
+            raw_bytes: Bytes::from_static(raw_bytes),
+            chunk: None,
+            raw_passthrough: true,
+        }
+    }
+
+    #[tokio::test]
+    async fn complete_done_marker_stops_polling_the_upstream() {
+        let trailing_error = inference_providers::CompletionError::CompletionError(
+            "must not be observed after [DONE]".to_string(),
+        );
+        let mut stream = terminal_test_stream(vec![
+            Ok(terminal_control_event(b"data: [DONE]\n")),
+            Ok(terminal_control_event(b"\n")),
+            Err(trailing_error),
+        ]);
+
+        let events = stream.by_ref().collect::<Vec<_>>().await;
+        let forwarded = events
+            .into_iter()
+            .map(|event| event.expect("terminal events should be forwarded"))
+            .map(|event| event.raw_bytes.to_vec())
+            .collect::<Vec<_>>();
+
+        assert_eq!(forwarded, vec![b"data: [DONE]\n".to_vec(), b"\n".to_vec()]);
+        assert!(stream.stream_completed);
+        assert!(stream.last_error.is_none());
+        assert!(matches!(&stream.state, StreamState::Done));
+    }
+
+    #[tokio::test]
+    async fn incomplete_done_marker_releases_without_publishing_a_signature() {
+        let expected_error = "upstream disconnected before the terminal separator";
+        let mut stream = terminal_test_stream(vec![
+            Ok(terminal_control_event(b"data: [DONE]\n")),
+            Err(inference_providers::CompletionError::CompletionError(
+                expected_error.to_string(),
+            )),
+        ]);
+
+        let events = stream.by_ref().collect::<Vec<_>>().await;
+        assert_eq!(events.len(), 2);
+        assert_eq!(
+            events[0]
+                .as_ref()
+                .expect("marker should be forwarded")
+                .raw_bytes,
+            Bytes::from_static(b"data: [DONE]\n")
+        );
+        assert!(matches!(
+            &events[1],
+            Err(inference_providers::CompletionError::CompletionError(message))
+                if message == expected_error
+        ));
+        assert!(stream.stream_completed);
+        assert!(stream.last_error.is_some());
+        assert!(matches!(&stream.state, StreamState::Done));
+    }
+
+    #[tokio::test]
+    async fn oversized_done_marker_is_rejected_before_signature_finalization() {
+        let padding = " ".repeat(MAX_PROVIDER_DONE_EVENT_BYTES);
+        let mut stream = terminal_test_stream(vec![Ok(SSEEvent {
+            raw_bytes: Bytes::from(format!("data: [DONE]{padding}\n")),
+            chunk: None,
+            raw_passthrough: true,
+        })]);
+
+        let events = stream.by_ref().collect::<Vec<_>>().await;
+
+        assert!(matches!(
+            &events[..],
+            [Err(inference_providers::CompletionError::CompletionError(message))]
+                if message == "Malformed SSE stream: [DONE] marker is too large"
+        ));
+        assert!(!stream.saw_upstream_done_marker);
+        assert!(stream.last_error.is_some());
+        assert!(matches!(&stream.state, StreamState::Done));
+    }
+
+    #[tokio::test]
+    async fn oversized_done_marker_with_separate_separator_is_rejected() {
+        let marker_prefix = b"data: [DONE]\n";
+        let padding = " ".repeat(MAX_PROVIDER_DONE_EVENT_BYTES - marker_prefix.len());
+        let marker = Bytes::from(format!("data: [DONE]{padding}\n"));
+        assert_eq!(marker.len(), MAX_PROVIDER_DONE_EVENT_BYTES);
+
+        let mut stream = terminal_test_stream(vec![
+            Ok(SSEEvent {
+                raw_bytes: marker,
+                chunk: None,
+                raw_passthrough: true,
+            }),
+            Ok(terminal_control_event(b"\n")),
+        ]);
+
+        let events = stream.by_ref().collect::<Vec<_>>().await;
+
+        assert!(matches!(
+            &events[..],
+            [Ok(_), Err(inference_providers::CompletionError::CompletionError(message))]
+                if message == "Malformed SSE stream: [DONE] marker is too large"
+        ));
+        assert!(stream.saw_upstream_done_marker);
+        assert!(stream.last_error.is_some());
+        assert!(matches!(&stream.state, StreamState::Done));
+    }
+
     #[tokio::test]
     async fn test_intercept_stream_metrics() {
         let metrics_service = Arc::new(CapturingMetricsService::new());
@@ -2489,6 +2798,7 @@ mod tests {
             last_usage_stats: None,
             last_chat_id: None,
             stream_completed: false,
+            saw_upstream_done_marker: false,
             response_id: None,
             last_finish_reason: None,
             last_error: None,
@@ -2664,6 +2974,7 @@ mod tests {
             last_usage_stats: None,
             last_chat_id: None,
             stream_completed: false,
+            saw_upstream_done_marker: false,
             response_id: None,
             last_finish_reason: None,
             last_error: None,
@@ -2820,6 +3131,7 @@ mod tests {
             last_usage_stats: None,
             last_chat_id: None,
             stream_completed: false,
+            saw_upstream_done_marker: false,
             response_id: None,
             last_finish_reason: None,
             last_error: None,
@@ -2950,6 +3262,7 @@ mod tests {
             last_usage_stats: None,
             last_chat_id: None,
             stream_completed: false,
+            saw_upstream_done_marker: false,
             response_id: None,
             last_finish_reason: None,
             last_error: None,
@@ -3163,6 +3476,7 @@ mod tests {
                 last_usage_stats: None,
                 last_chat_id: None,
                 stream_completed: false,
+                saw_upstream_done_marker: false,
                 response_id: None,
                 last_finish_reason: None,
                 last_error: None,
@@ -3287,6 +3601,7 @@ mod tests {
                 last_usage_stats,
                 last_chat_id,
                 stream_completed: false,
+                saw_upstream_done_marker: false,
                 response_id: None,
                 last_finish_reason: None,
                 last_error,
@@ -3515,6 +3830,7 @@ mod tests {
             last_usage_stats: None,
             last_chat_id: None,
             stream_completed: false,
+            saw_upstream_done_marker: false,
             response_id: None,
             last_finish_reason: None,
             last_error: None,

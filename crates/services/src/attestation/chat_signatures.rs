@@ -65,6 +65,11 @@ impl AttestationService {
             })?;
 
         if !provider.supports_chat_signatures() {
+            // The pool pins the serving connection before it knows whether the
+            // selected provider exposes per-response signatures. Providers
+            // such as Chutes deliberately do not, but their normal completion
+            // path must still drain that pin.
+            provider.unpin_chat_connection(chat_id);
             return Ok(());
         }
 
@@ -155,10 +160,11 @@ impl AttestationService {
             .await
     }
 
-    /// Store the gateway signature for a stream and then release the
-    /// provider-pool signature-fetch routing pin, mirroring the lifecycle
-    /// ownership of `store_chat_signature_from_provider_impl` (which unpins
-    /// after the provider fetch). The store is bounded by
+    /// Store a gateway signature and then release the provider-pool
+    /// signature-fetch routing pin, mirroring the lifecycle ownership of
+    /// `store_chat_signature_from_provider_impl` (which unpins after the
+    /// provider fetch). This is used by non-streaming response-rewrite paths;
+    /// streaming cleanup is owned by `InterceptStream`. The store is bounded by
     /// [`STREAM_SIGNATURE_STORE_TIMEOUT`] *inside* this method so the unpin
     /// runs even when the store hangs — an outer timeout would drop the
     /// future and leak the pin.
@@ -184,9 +190,8 @@ impl AttestationService {
     }
 
     /// Release the provider-pool signature-fetch routing pin for `chat_id`.
-    /// Called on gateway-signed streams (where the provider signature fetch —
-    /// and its post-fetch unpin — is skipped) and on errored streams that
-    /// store nothing.
+    /// Called by non-streaming response-rewrite paths and by completion-stream
+    /// finalization when no provider signature is stored.
     pub(in crate::attestation) async fn release_chat_signature_pin_impl(&self, chat_id: &str) {
         if let Some(provider) = self
             .inference_provider_pool

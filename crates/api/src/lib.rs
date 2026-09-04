@@ -759,12 +759,27 @@ pub(crate) const CHUTES_SUPPORTED_FEATURES: &[&str] = &["tools", "json_mode"];
 async fn ensure_chutes_catalog_row(
     models_repo: &database::repositories::ModelRepository,
     model_name: &str,
-) {
+) -> services::inference_provider_pool::ProviderPoolRole {
+    use services::inference_provider_pool::ProviderPoolRole;
+
+    let role_for_existing = |model: &database::models::Model| {
+        // A catalog row owned by another provider configuration means this
+        // out-of-band provider is a fallback even if the configured primary is
+        // temporarily undiscoverable. Rows created for this provider itself are
+        // genuine standalone primaries.
+        ProviderPoolRole::from_catalog(
+            inference_providers::ProviderSource::Chutes,
+            &model.provider_type,
+            model.inference_url.is_some(),
+        )
+    };
+
     // Use the *unfiltered* lookup (not get_active_model_by_name): a deliberately
     // disabled row (is_active=false) must be respected, not silently re-activated
     // and clobbered by the seed path below.
     match models_repo.get_by_internal_name(model_name).await {
         Ok(Some(existing)) => {
+            let role = role_for_existing(&existing);
             // Already in the catalog — respect operator configuration verbatim.
             // Surface a warning if the metadata contradicts attested serving so
             // a misconfigured row (e.g. attestation_supported=false) is visible.
@@ -799,6 +814,7 @@ async fn ensure_chutes_catalog_row(
             } else {
                 tracing::info!(model = %model_name, "Chutes model already in catalog");
             }
+            role
         }
         Ok(None) => {
             // Friendly display name = last path segment; owner = leading segment.
@@ -869,12 +885,17 @@ async fn ensure_chutes_catalog_row(
                          template) before activating, and clear `supported_features` via the \
                          same PATCH if it doesn't"
                     );
+                    ProviderPoolRole::Primary
                 }
                 Ok(None) => {
                     tracing::info!(
                         model = %model_name,
                         "Chutes catalog row already present (created concurrently); left untouched"
                     );
+                    match models_repo.get_by_internal_name(model_name).await {
+                        Ok(Some(existing)) => role_for_existing(&existing),
+                        _ => ProviderPoolRole::Fallback,
+                    }
                 }
                 Err(e) => {
                     tracing::error!(
@@ -882,6 +903,7 @@ async fn ensure_chutes_catalog_row(
                         "Failed to seed Chutes catalog row; requests for this model will 404 \
                          until a row exists (create it via PATCH /v1/admin/models)"
                     );
+                    ProviderPoolRole::Fallback
                 }
             }
         }
@@ -890,6 +912,10 @@ async fn ensure_chutes_catalog_row(
                 model = %model_name, error = %e,
                 "Could not check catalog for Chutes model; skipping auto-seed"
             );
+            // Unknown catalog state is fail-closed for organizations that
+            // disable fallback. A later restart/registration can establish a
+            // standalone primary role once the catalog is readable again.
+            ProviderPoolRole::Fallback
         }
     }
 }
@@ -1013,22 +1039,23 @@ pub async fn init_inference_providers(
                             // data plane resolves the model (and usage bills against a
                             // real id). If NEAR already serves this id, its row is left
                             // untouched and we just add Chutes as a fallback provider.
-                            ensure_chutes_catalog_row(&models_repo, &entry.canonical_id).await;
-                            // Pinned SECONDARY: pushed onto the canonical id's provider
-                            // list (coexists with NEAR's own providers) and excluded from
-                            // discovery's stale-removal/overwrite. Tier ordering puts NEAR
-                            // first and Chutes as fallback; a Chutes-only id has just this
-                            // provider, so it serves as primary.
-                            pool.register_pinned_secondary_provider(
+                            let role =
+                                ensure_chutes_catalog_row(&models_repo, &entry.canonical_id).await;
+                            // Register the stable role from catalog configuration,
+                            // independently of whether discovery happened to find a live
+                            // primary during this startup.
+                            pool.register_pinned_provider(
                                 entry.canonical_id.clone(),
                                 Arc::new(provider),
                                 entry.max_context_tokens,
+                                role,
                             )
                             .await;
                             tracing::info!(
                                 canonical = %entry.canonical_id,
                                 chute_slug = %entry.chute_slug,
-                                "Registered Chutes attested provider (fallback tier)"
+                                role = ?role,
+                                "Registered Chutes attested provider"
                             );
                         }
                         Err(e) => {
@@ -2164,14 +2191,15 @@ pub fn build_admin_routes(
         get_admin_organization_balance, get_billing_summary, get_infra_summary,
         get_model_consumption_timeseries, get_model_history, get_model_revenue, get_org_revenue,
         get_organization as get_admin_organization, get_organization_concurrent_limit,
-        get_organization_limits_history, get_organization_metrics, get_organization_timeseries,
-        get_performance_timeseries, get_platform_metrics, get_platform_timeseries,
-        get_revenue_density, list_admin_access_tokens, list_aml_allowlist, list_aml_reports,
-        list_invitation_email_deliveries, list_model_pricing_changes,
+        get_organization_fallback, get_organization_limits_history, get_organization_metrics,
+        get_organization_timeseries, get_performance_timeseries, get_platform_metrics,
+        get_platform_timeseries, get_revenue_density, list_admin_access_tokens, list_aml_allowlist,
+        list_aml_reports, list_invitation_email_deliveries, list_model_pricing_changes,
         list_models as admin_list_models, list_organization_members, list_organizations,
         list_users, preview_model_deprecation, preview_model_pricing_changes,
         resend_invitation_email, update_aml_report_status, update_organization_concurrent_limit,
-        update_organization_limits, update_service, upsert_aml_allowlist_entry, AdminAppState,
+        update_organization_fallback, update_organization_limits, update_service,
+        upsert_aml_allowlist_entry, AdminAppState,
     };
     use crate::routes::staking_farm::{
         get_admin_organization_staking_farm, sync_admin_organization_staking_farm,
@@ -2209,6 +2237,10 @@ pub fn build_admin_routes(
     let infra_service = Arc::new(services::admin::InfraService::new(
         config.infra.machines_url.clone(),
         config.infra.cost_per_host_usd_month,
+        config.infra.prometheus_url.clone(),
+        config.infra.prometheus_bearer_token.clone(),
+        config.infra.prometheus_environment.clone(),
+        config.infra.cost_per_gpu_hour_usd,
     ));
 
     let admin_app_state = AdminAppState {
@@ -2319,6 +2351,10 @@ pub fn build_admin_routes(
             "/admin/organizations/{org_id}/concurrent-limit",
             axum::routing::patch(update_organization_concurrent_limit)
                 .get(get_organization_concurrent_limit),
+        )
+        .route(
+            "/admin/organizations/{org_id}/fallback",
+            axum::routing::get(get_organization_fallback).patch(update_organization_fallback),
         )
         .route(
             "/admin/organizations/{org_id}/metrics",

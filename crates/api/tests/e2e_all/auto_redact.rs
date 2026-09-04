@@ -6,6 +6,7 @@
 
 use crate::common::*;
 use api::models::BatchUpdateModelApiRequest;
+use bytes::Bytes;
 
 /// Pull `choices[0].message.content` out of a chat completion response as
 /// a `&str`. Returns empty string if the path isn't there — tests assert
@@ -97,18 +98,22 @@ async fn auto_redact_header_redacts_prompt_and_restores_response() {
         ))
         .await;
 
+    let request_body = serde_json::json!({
+        "model": E2E_QWEN_MODEL_NAME,
+        "messages": [{
+            "role": "user",
+            "content": "Please reach out to alice@example.com"
+        }],
+    });
+    let request_json = serde_json::to_string(&request_body).expect("request should serialize");
+
     let resp = server
         .post("/v1/chat/completions")
         .add_header("Authorization", format!("Bearer {api_key}"))
         .add_header("User-Agent", MOCK_USER_AGENT)
         .add_header("x-auto-redact", "on")
-        .json(&serde_json::json!({
-            "model": E2E_QWEN_MODEL_NAME,
-            "messages": [{
-                "role": "user",
-                "content": "Please reach out to alice@example.com"
-            }],
-        }))
+        .content_type("application/json")
+        .bytes(Bytes::from(request_json.clone()))
         .await;
     assert_eq!(resp.status_code(), 200);
 
@@ -128,7 +133,9 @@ async fn auto_redact_header_redacts_prompt_and_restores_response() {
     );
 
     // Client must see the original PII in the response.
-    let body: serde_json::Value = resp.json();
+    let response_text = resp.text();
+    let body: serde_json::Value =
+        serde_json::from_str(&response_text).expect("chat response should be JSON");
     let content = extract_choice_text(&body);
     assert!(
         content.contains("alice@example.com"),
@@ -137,6 +144,31 @@ async fn auto_redact_header_redacts_prompt_and_restores_response() {
     assert!(
         !content.contains("redacted1@example.com"),
         "placeholder should have been swapped back; got {content}"
+    );
+
+    let chat_id = body["id"]
+        .as_str()
+        .expect("chat response should have an id");
+    let signature_response = server
+        .get(format!("/v1/signature/{chat_id}?signing_algo=ecdsa").as_str())
+        .add_header("Authorization", format!("Bearer {api_key}"))
+        .await;
+    assert_eq!(
+        signature_response.status_code(),
+        200,
+        "gateway signature should be available: {}",
+        signature_response.text()
+    );
+    let signature = signature_response.json::<serde_json::Value>();
+    assert_eq!(signature["signature_kind"], "gateway");
+    assert_eq!(
+        signature["text"],
+        format!(
+            "{}:{}",
+            compute_sha256(&request_json),
+            compute_sha256(&response_text)
+        ),
+        "gateway signature must bind the exact request and response bytes returned to the client"
     );
 }
 
@@ -189,7 +221,7 @@ async fn auto_redact_body_field_equivalent_to_header() {
 }
 
 #[tokio::test]
-async fn auto_redact_streaming_splits_placeholder_across_chunks() {
+async fn auto_redact_continuous_stream_uses_gateway_signature() {
     let (server, _pool, mock_provider, _db) = setup_test_server_with_pool().await;
     setup_qwen_model(&server).await;
     setup_privacy_filter_model(&server).await;
@@ -206,21 +238,30 @@ async fn auto_redact_streaming_splits_placeholder_across_chunks() {
         ))
         .await;
 
+    // Continuous usage preserves the provider's stream bytes unless another
+    // route feature rewrites them. Auto-redact does rewrite them, which is the
+    // regression covered by #892.
+    let request_body = serde_json::json!({
+        "model": E2E_QWEN_MODEL_NAME,
+        "messages": [{ "role": "user", "content": "email alice@example.com" }],
+        "stream": true,
+        "stream_options": { "continuous_usage_stats": true },
+    });
+    let request_json = serde_json::to_string(&request_body).expect("request should serialize");
+
     let resp = server
         .post("/v1/chat/completions")
         .add_header("Authorization", format!("Bearer {api_key}"))
         .add_header("User-Agent", MOCK_USER_AGENT)
         .add_header("x-auto-redact", "on")
-        .json(&serde_json::json!({
-            "model": E2E_QWEN_MODEL_NAME,
-            "messages": [{ "role": "user", "content": "email alice@example.com" }],
-            "stream": true,
-        }))
+        .content_type("application/json")
+        .bytes(Bytes::from(request_json.clone()))
         .await;
     assert_eq!(resp.status_code(), 200);
 
     // Concatenate all `delta.content` from the SSE stream.
     let body_text = resp.text();
+    let mut chat_id = None::<String>;
     let mut assembled = String::new();
     for line in body_text.lines() {
         let payload = match line.strip_prefix("data: ") {
@@ -233,6 +274,12 @@ async fn auto_redact_streaming_splits_placeholder_across_chunks() {
         let Ok(chunk) = serde_json::from_str::<serde_json::Value>(payload) else {
             continue;
         };
+        if chat_id.is_none() {
+            chat_id = chunk
+                .get("id")
+                .and_then(|id| id.as_str())
+                .map(ToOwned::to_owned);
+        }
         if let Some(choices) = chunk.get("choices").and_then(|c| c.as_array()) {
             for ch in choices {
                 if let Some(content) = ch
@@ -253,6 +300,29 @@ async fn auto_redact_streaming_splits_placeholder_across_chunks() {
     assert!(
         !assembled.contains("redacted1@example.com"),
         "no placeholder should leak to client; got: {assembled:?}"
+    );
+
+    let chat_id = chat_id.expect("stream should include a chat id");
+    let signature_response = server
+        .get(format!("/v1/signature/{chat_id}?signing_algo=ecdsa").as_str())
+        .add_header("Authorization", format!("Bearer {api_key}"))
+        .await;
+    assert_eq!(
+        signature_response.status_code(),
+        200,
+        "gateway signature should be available: {}",
+        signature_response.text()
+    );
+    let signature = signature_response.json::<serde_json::Value>();
+    assert_eq!(signature["signature_kind"], "gateway");
+    assert_eq!(
+        signature["text"],
+        format!(
+            "{}:{}",
+            compute_sha256(&request_json),
+            compute_sha256(&body_text)
+        ),
+        "gateway signature must bind the exact request and SSE response bytes returned to the client"
     );
 }
 

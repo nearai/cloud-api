@@ -4,7 +4,10 @@ use crate::common::*;
 
 use api::models::BatchUpdateModelApiRequest;
 use bytes::Bytes;
-use inference_providers::StreamChunk;
+use inference_providers::{mock::MockProvider, InferenceProvider, StreamChunk};
+use std::sync::Arc;
+
+const NON_ATTESTED_STREAM_MODEL_NAME: &str = "nearai/test-non-attested-stream";
 
 fn first_stream_chat_id(response_text: &str) -> String {
     response_text
@@ -337,17 +340,31 @@ async fn test_raw_provider_signature_is_available_when_done_is_emitted() {
 
 #[tokio::test]
 async fn test_non_attested_stream_releases_signature_routing_pin_on_normal_eof() {
-    let (server, _router, _pool, mock, _database) = setup_test_server_with_pool_and_router().await;
-    setup_qwen_model(&server).await;
+    let (server, _router, pool, _mock, _database) = setup_test_server_with_pool_and_router().await;
+    let mock = Arc::new(MockProvider::new_accept_all());
+    let provider: Arc<dyn InferenceProvider + Send + Sync> = mock.clone();
+    pool.register_provider(NON_ATTESTED_STREAM_MODEL_NAME.to_string(), provider)
+        .await;
 
-    // Keep the same mock-backed model but disable attestation in the
-    // authoritative record. The provider still creates its routing pin, so
-    // `InterceptStream` must release it without attempting a signature fetch.
+    // Use an isolated model rather than mutating the shared Qwen fixture: E2E
+    // tests share a database and may run concurrently. The provider still
+    // creates its routing pin, so `InterceptStream` must release it without
+    // attempting a signature fetch.
     let mut batch = BatchUpdateModelApiRequest::new();
     batch.insert(
-        E2E_QWEN_MODEL_NAME.to_string(),
-        serde_json::from_value(serde_json::json!({ "attestationSupported": false }))
-            .expect("partial model update should deserialize"),
+        NON_ATTESTED_STREAM_MODEL_NAME.to_string(),
+        serde_json::from_value(serde_json::json!({
+            "inputCostPerToken": { "amount": 1_000_000, "currency": "USD" },
+            "outputCostPerToken": { "amount": 2_000_000, "currency": "USD" },
+            "modelDisplayName": "Non-attested stream fixture",
+            "modelDescription": "Isolated signature-routing-pin test model",
+            "contextLength": 128000,
+            "maxOutputLength": 1024,
+            "verifiable": true,
+            "isActive": true,
+            "attestationSupported": false
+        }))
+        .expect("test model fixture should deserialize"),
     );
     let updated = admin_batch_upsert_models(&server, batch, get_session_id()).await;
     assert!(!updated[0].metadata.attestation_supported);
@@ -361,7 +378,7 @@ async fn test_non_attested_stream_releases_signature_routing_pin_on_normal_eof()
         .content_type("application/json")
         .bytes(Bytes::from(
             serde_json::json!({
-                "model": E2E_QWEN_MODEL_NAME,
+                "model": NON_ATTESTED_STREAM_MODEL_NAME,
                 "messages": [{ "role": "user", "content": "Respond with two words." }],
                 "stream": true,
                 "stream_options": { "continuous_usage_stats": true },

@@ -156,15 +156,10 @@ impl<S> InterceptStream<S>
 where
     S: Stream<Item = Result<SSEEvent, inference_providers::CompletionError>> + Unpin,
 {
-    /// Store attestation signature before sending [DONE] to client.
-    /// This runs in the hot path to ensure signature is available when client receives [DONE].
-    /// Skipped for external providers that don't support TEE attestation.
+    /// Finalize attestation handling before the route sends `[DONE]` to the client.
+    /// This stores a provider signature when supported, otherwise releases the
+    /// provider-routing pin without publishing a signature.
     fn create_signature_future(&self) -> FinalizeFuture {
-        // Skip attestation for external providers (OpenAI, Anthropic, Gemini, etc.)
-        if !self.attestation_supported || !self.store_provider_chat_signature {
-            return Box::pin(async {});
-        }
-
         let organization_id = self.organization_id;
         let model_id = self.model_id;
 
@@ -177,6 +172,31 @@ where
         };
 
         let attestation_service = self.attestation_service.clone();
+
+        // The provider pool pins every streamed chat that has a chat id, even
+        // when the authoritative model record says it is non-attested. There is
+        // no signature to store in that case, but the normal EOF path still
+        // owns releasing the pin.
+        if !self.attestation_supported {
+            return Box::pin(async move {
+                attestation_service
+                    .release_chat_signature_pin(&chat_id)
+                    .await;
+            });
+        }
+
+        if !self.store_provider_chat_signature {
+            // A route which rewrites the public stream may create a Gateway
+            // signature after it has the final public bytes. That signature
+            // does not need the provider's dedicated TLS connection, so the
+            // completion layer still owns releasing this provider-signature
+            // routing pin before it reports normal stream completion.
+            return Box::pin(async move {
+                attestation_service
+                    .release_chat_signature_pin(&chat_id)
+                    .await;
+            });
+        }
 
         // A provider signature only verifies the exact upstream stream. Do
         // not publish one if the stream reported an error or if the route
@@ -209,6 +229,13 @@ where
                         "Timeout storing chat signature after {}s",
                         FINALIZE_TIMEOUT_SECS
                     );
+                    // The provider-store implementation normally unpins after
+                    // it completes. A timeout cancels that future before its
+                    // cleanup runs, so this finalization path must release the
+                    // routing pin itself.
+                    attestation_service
+                        .release_chat_signature_pin(&chat_id)
+                        .await;
                 }
             }
         })
@@ -666,6 +693,41 @@ where
         // Decrement concurrent counter if present
         if let Some(counter) = &self.concurrent_counter {
             counter.fetch_sub(1, Ordering::Release);
+        }
+
+        // Every successful finalization path reaches `StreamState::Done` only
+        // after it has stored a provider signature or explicitly released the
+        // provider-signature routing pin. If the stream is dropped first (for
+        // example because an HTTP client disconnects, an upstream error is
+        // forwarded, or the finalization future is cancelled), release the
+        // pin here. This is intentionally owned by the completion stream:
+        // `/v1/responses` consumes this stream internally and only exposes a
+        // different response id to its caller, so an HTTP-route guard cannot
+        // reliably clean up the provider chat id.
+        if !matches!(&self.state, StreamState::Done) {
+            if let Some(chat_id) = self.last_chat_id.clone() {
+                let attestation_service = self.attestation_service.clone();
+                let spawn_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    let handle = match tokio::runtime::Handle::try_current() {
+                        Ok(handle) => handle,
+                        Err(_) => {
+                            tracing::error!(%chat_id, "Cannot release signature routing pin: no Tokio runtime available");
+                            return;
+                        }
+                    };
+                    std::mem::drop(handle.spawn(async move {
+                        attestation_service
+                            .release_chat_signature_pin(&chat_id)
+                            .await;
+                        tracing::debug!(%chat_id, "Released signature routing pin after interrupted stream");
+                    }));
+                }));
+                if spawn_result.is_err() {
+                    tracing::error!(
+                        "Could not schedule signature routing-pin cleanup during shutdown"
+                    );
+                }
+            }
         }
 
         // Always record usage in Drop (async, fire-and-forget)

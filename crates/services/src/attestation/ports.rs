@@ -35,11 +35,9 @@ pub trait AttestationServiceTrait: Send + Sync {
 
     /// Store a gateway chat signature and then release the provider-pool
     /// signature-fetch routing pin for `chat_id`, mirroring the lifecycle
-    /// ownership of [`Self::store_chat_signature_from_provider`]: the pin is
-    /// released whether the store succeeds, fails, or times out, so the
-    /// provider's chat_id → backend map cannot grow unboundedly on
-    /// gateway-signed streams (where the provider signature fetch — and its
-    /// post-fetch unpin — is skipped).
+    /// ownership of [`Self::store_chat_signature_from_provider`]. This is for
+    /// callers that own both operations, such as non-streaming response
+    /// rewrites; stream lifecycle cleanup is owned by `InterceptStream`.
     async fn store_chat_signature_and_unpin(
         &self,
         chat_id: &str,

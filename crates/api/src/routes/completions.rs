@@ -6846,13 +6846,28 @@ pub async fn privacy_redact(
         }
     };
 
-    // Apply spans locally. `apply_detected_spans` only does in-process work
-    // (JSON parse + UTF-8 boundary checks), so only `Internal` can fire here
-    // — handle every variant uniformly as a 500.
-    let redacted = match services::auto_redact::apply_detected_spans(&texts, &response_bytes) {
-        Ok(r) => r,
-        Err(e) => {
-            tracing::error!(error = %e, "Privacy redact apply failed");
+    // Applying provider-controlled spans performs repeated full-input collision scans
+    // and placeholder bookkeeping, so keep that CPU-bound work off the async runtime.
+    let apply_result = tokio::task::spawn_blocking(move || {
+        let redacted = services::auto_redact::apply_detected_spans(&texts, &response_bytes);
+        (texts, response_bytes, redacted)
+    })
+    .await;
+    let (texts, response_bytes, redacted) = match apply_result {
+        Ok((texts, response_bytes, Ok(redacted))) => (texts, response_bytes, redacted),
+        Ok((_, _, Err(error))) => {
+            tracing::error!(%error, "Privacy redact apply failed");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                ResponseJson(ErrorResponse::new(
+                    "Failed to apply redactions".to_string(),
+                    "server_error".to_string(),
+                )),
+            )
+                .into_response();
+        }
+        Err(error) => {
+            tracing::error!(%error, "Privacy redact apply task failed");
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 ResponseJson(ErrorResponse::new(

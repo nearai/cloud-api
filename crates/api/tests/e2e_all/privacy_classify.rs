@@ -186,10 +186,10 @@ async fn test_privacy_classify_body_just_under_size_limit() {
         }))
         .await;
 
-    assert_ne!(
+    assert_eq!(
         response.status_code(),
-        413,
-        "Should not reject body just under the 1 MB cap"
+        200,
+        "Body just under the 1 MB cap should succeed"
     );
 }
 

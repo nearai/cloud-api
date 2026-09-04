@@ -24,6 +24,7 @@ use services::common::encryption_headers as service_encryption_headers;
 use services::completions::{
     hash_inference_id_to_uuid,
     ports::{CompletionMessage, CompletionRequest as ServiceCompletionRequest},
+    MAX_PROVIDER_DONE_EVENT_BYTES,
 };
 use sha2::{Digest, Sha256};
 use std::convert::Infallible;
@@ -81,6 +82,10 @@ impl Drop for StreamSignaturePinGuard {
         }));
     }
 }
+
+// A deferred upstream terminal contains only `data: [DONE]` and, when the
+// lossless parser emits it separately, its blank SSE separator.
+const MAX_HELD_PROVIDER_TERMINAL_BYTES: usize = MAX_PROVIDER_DONE_EVENT_BYTES;
 
 /// Insert validated E2EE headers into a provider `extra` HashMap.
 fn insert_encryption_headers(
@@ -518,6 +523,33 @@ fn synthesized_done_requires_gateway_signature(
     // E2EE response bytes are opaque to the gateway. Keep their signature
     // behavior independent of whether an upstream happens to omit `[DONE]`.
     model_attestation_supported == Some(true) && !e2ee_active
+}
+
+fn defer_upstream_terminal(
+    gateway_signature_enabled: bool,
+    public_response_rewritten: bool,
+    rewrite_public_stream_usage: bool,
+    strip_intermediate_usage: bool,
+) -> bool {
+    !gateway_signature_enabled
+        && !public_response_rewritten
+        && !rewrite_public_stream_usage
+        && !strip_intermediate_usage
+}
+
+/// Append bytes held until provider-signature finalization without exceeding
+/// the small terminal suffix bound. Returns false without mutating `held` if
+/// the new bytes would exceed the cap.
+fn try_append_held_provider_terminal_bytes(held: &mut Vec<u8>, bytes: &[u8]) -> bool {
+    let Some(total_len) = held.len().checked_add(bytes.len()) else {
+        return false;
+    };
+    if total_len > MAX_HELD_PROVIDER_TERMINAL_BYTES {
+        return false;
+    }
+
+    held.extend_from_slice(bytes);
+    true
 }
 
 #[cfg(test)]
@@ -1590,6 +1622,17 @@ async fn chat_completions_inner(
     // returning one that cannot verify.
     service_request.skip_provider_chat_signature =
         usage_mode.gateway_signature_enabled || public_response_rewritten;
+    // Defer an upstream terminator whenever this route would otherwise relay it
+    // unchanged. The completion service owns the authoritative model lookup, so
+    // it decides whether finalization stores a provider signature or is a no-op.
+    // That keeps the signature available before clients observe `[DONE]` even
+    // when the route-level model metadata cache is unavailable or stale.
+    let defer_upstream_terminal = defer_upstream_terminal(
+        gateway_signature_enabled,
+        public_response_rewritten,
+        rewrite_public_stream_usage,
+        strip_intermediate_usage,
+    );
     let redaction_map = Arc::new(redaction_map);
 
     // Check if streaming is requested
@@ -1674,10 +1717,18 @@ async fn chat_completions_inner(
                 let organization_id = api_key.organization.id.0;
 
                 // Set when the upstream's own `data: [DONE]` terminator was
-                // forwarded verbatim, so the end-of-stream tail doesn't
-                // append a second, gateway-minted one.
+                // observed, so the end-of-stream tail doesn't append a
+                // gateway-minted one. The original terminal bytes may be held
+                // until completion-service finalization finishes.
                 let upstream_done_forwarded = Arc::new(std::sync::atomic::AtomicBool::new(false));
                 let upstream_done_for_chain = upstream_done_forwarded.clone();
+                let holding_provider_terminal_suffix =
+                    Arc::new(std::sync::atomic::AtomicBool::new(false));
+                let holding_provider_terminal_suffix_for_chain =
+                    holding_provider_terminal_suffix.clone();
+                let held_provider_terminal_bytes =
+                    Arc::new(tokio::sync::Mutex::new(Vec::<u8>::new()));
+                let held_provider_terminal_bytes_for_chain = held_provider_terminal_bytes.clone();
 
                 // Per-stream un-redact state, keyed by choice index so n>1
                 // completions don't cross-contaminate sliding tails. When
@@ -1729,6 +1780,10 @@ async fn chat_completions_inner(
                         let rewrite_public_stream_usage = rewrite_public_stream_usage;
                         let strip_intermediate_usage = strip_intermediate_usage;
                         let gateway_signature_enabled = gateway_signature_enabled;
+                        let defer_upstream_terminal = defer_upstream_terminal;
+                        let holding_provider_terminal_suffix =
+                            holding_provider_terminal_suffix.clone();
+                        let held_provider_terminal_bytes = held_provider_terminal_bytes.clone();
                         let hash_client_visible_stream = hash_client_visible_stream;
                         let public_signature_hasher = public_signature_hasher.clone();
                         let public_signature_chat_id = public_signature_chat_id.clone();
@@ -1736,6 +1791,83 @@ async fn chat_completions_inner(
                         async move {
                             match result {
                                 Ok(event) => {
+                                    if holding_provider_terminal_suffix
+                                        .load(std::sync::atomic::Ordering::Relaxed)
+                                    {
+                                        let is_separator = event.chunk.is_none()
+                                            && !event.raw_bytes.is_empty()
+                                            && event
+                                                .raw_bytes
+                                                .iter()
+                                                .all(|byte| matches!(*byte, b'\r' | b'\n'));
+                                        let mut held = held_provider_terminal_bytes.lock().await;
+                                        if is_separator
+                                            && try_append_held_provider_terminal_bytes(
+                                                &mut held,
+                                                &event.raw_bytes,
+                                            )
+                                        {
+                                            return None;
+                                        }
+
+                                        held.clear();
+                                        drop(held);
+                                        holding_provider_terminal_suffix.store(
+                                            false,
+                                            std::sync::atomic::Ordering::Relaxed,
+                                        );
+                                        let error = inference_providers::CompletionError::CompletionError(
+                                            "Malformed SSE stream after [DONE]".into(),
+                                        );
+                                        let count = error_count_inner.fetch_add(
+                                            1,
+                                            std::sync::atomic::Ordering::Relaxed,
+                                        );
+                                        if count == 0 {
+                                            tracing::error!(
+                                                %organization_id,
+                                                model = %model_for_err,
+                                                "Completion stream emitted bytes after its terminal marker"
+                                            );
+                                        }
+                                        return Some(Ok::<Bytes, Infallible>(sse_error_frame(&error)));
+                                    }
+
+                                    if event.is_done_marker() && defer_upstream_terminal {
+                                        upstream_done.store(
+                                            true,
+                                            std::sync::atomic::Ordering::Relaxed,
+                                        );
+                                        let mut held = held_provider_terminal_bytes.lock().await;
+                                        if try_append_held_provider_terminal_bytes(
+                                            &mut held,
+                                            &event.raw_bytes,
+                                        ) {
+                                            holding_provider_terminal_suffix.store(
+                                                true,
+                                                std::sync::atomic::Ordering::Relaxed,
+                                            );
+                                            return None;
+                                        }
+
+                                        held.clear();
+                                        drop(held);
+                                        let error = inference_providers::CompletionError::CompletionError(
+                                            "Malformed SSE stream after [DONE]".into(),
+                                        );
+                                        let count = error_count_inner.fetch_add(
+                                            1,
+                                            std::sync::atomic::Ordering::Relaxed,
+                                        );
+                                        if count == 0 {
+                                            tracing::error!(
+                                                %organization_id,
+                                                model = %model_for_err,
+                                                "Completion stream terminal marker exceeded the held suffix limit"
+                                            );
+                                        }
+                                        return Some(Ok::<Bytes, Infallible>(sse_error_frame(&error)));
+                                    }
                                     // Byte-exact passthrough (issue #701): when no public
                                     // chunk rewriting is active, forward the upstream wire
                                     // bytes untouched. Explicit include_usage shaping needs
@@ -2068,6 +2200,18 @@ async fn chat_completions_inner(
                                     .load(std::sync::atomic::Ordering::Relaxed);
                                 if synthesized_done {
                                     combined.extend_from_slice(b"data: [DONE]\n\n");
+                                } else if error_count_final == 0
+                                    && defer_upstream_terminal
+                                    && holding_provider_terminal_suffix_for_chain
+                                        .load(std::sync::atomic::Ordering::Relaxed)
+                                {
+                                    let held = {
+                                        let mut bytes = held_provider_terminal_bytes_for_chain
+                                            .lock()
+                                            .await;
+                                        std::mem::take(&mut *bytes)
+                                    };
+                                    combined.extend_from_slice(&held);
                                 }
 
                                 if gateway_signature_enabled {
@@ -3618,6 +3762,37 @@ mod tests {
             false
         ));
         assert!(!synthesized_done_requires_gateway_signature(None, false));
+    }
+
+    #[test]
+    fn raw_streams_defer_their_terminal_without_model_metadata() {
+        assert!(defer_upstream_terminal(false, false, false, false));
+        assert!(!defer_upstream_terminal(true, false, false, false));
+        assert!(!defer_upstream_terminal(false, true, false, false));
+        assert!(!defer_upstream_terminal(false, false, true, false));
+        assert!(!defer_upstream_terminal(false, false, false, true));
+    }
+
+    #[test]
+    fn oversized_padded_done_marker_is_not_held() {
+        let padding = " ".repeat(MAX_HELD_PROVIDER_TERMINAL_BYTES);
+        let event = inference_providers::SSEEvent {
+            raw_bytes: Bytes::from(format!("data: [DONE]{padding}\n")),
+            chunk: None,
+            raw_passthrough: true,
+        };
+        assert!(
+            event.is_done_marker(),
+            "whitespace-padded marker is still DONE"
+        );
+        assert!(event.raw_bytes.len() > MAX_HELD_PROVIDER_TERMINAL_BYTES);
+
+        let mut held = Vec::new();
+        assert!(
+            !try_append_held_provider_terminal_bytes(&mut held, &event.raw_bytes),
+            "the initial terminal frame must obey the held suffix limit"
+        );
+        assert!(held.is_empty(), "rejected bytes must not be retained");
     }
 
     #[test]

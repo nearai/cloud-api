@@ -23,14 +23,32 @@ use std::time::{Duration, Instant};
 use tracing::Instrument;
 
 const FINALIZE_TIMEOUT_SECS: u64 = 5;
+/// A raw provider terminal marker is only expected to contain `data: [DONE]`
+/// plus its SSE line ending. Bound it before accepting it as a signed terminal
+/// event so malformed padding cannot be retained or signed.
+pub const MAX_PROVIDER_DONE_EVENT_BYTES: usize = 64;
 const DEEPSEEK_V4_FLASH_MODEL: &str = "deepseek-ai/DeepSeek-V4-Flash";
 
 type FinalizeFuture = Pin<Box<dyn Future<Output = ()> + Send>>;
 
 enum StreamState {
     Streaming,
+    AwaitingDoneSeparator { marker_len: usize },
     Finalizing(FinalizeFuture),
     Done,
+}
+
+fn sse_event_has_terminating_separator(event: &SSEEvent) -> bool {
+    event.raw_bytes.ends_with(b"\n\n") || event.raw_bytes.ends_with(b"\r\n\r\n")
+}
+
+fn is_sse_event_separator(event: &SSEEvent) -> bool {
+    event.chunk.is_none()
+        && !event.raw_bytes.is_empty()
+        && event
+            .raw_bytes
+            .iter()
+            .all(|byte| matches!(*byte, b'\r' | b'\n'))
 }
 
 /// Hash inference ID to UUID deterministically using MD5 (v5)
@@ -103,7 +121,7 @@ where
     last_usage_stats: Option<inference_providers::TokenUsage>,
     /// Last chat ID from streaming chunks (for attestation and inference_id)
     last_chat_id: Option<String>,
-    /// Flag indicating the stream completed normally (received None from inner stream).
+    /// Flag indicating the stream reached a terminal SSE marker or inner EOF.
     /// If false when Drop is called, the stream was interrupted — either the client
     /// disconnected mid-stream or the provider returned an error (check `last_error`).
     stream_completed: bool,
@@ -194,6 +212,12 @@ where
                 }
             }
         })
+    }
+
+    fn begin_finalizing(&mut self) {
+        self.stream_completed = true;
+        let signature_future = self.create_signature_future();
+        self.state = StreamState::Finalizing(signature_future);
     }
 
     /// Record usage and metrics. Called from Drop to ensure it always runs.
@@ -488,96 +512,148 @@ where
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         loop {
-            match &mut self.state {
-                StreamState::Streaming => {
-                    match Pin::new(&mut self.inner).poll_next(cx) {
-                        Poll::Ready(Some(Ok(ref event))) => {
-                            if event.is_done_marker() {
-                                self.saw_upstream_done_marker = true;
-                            }
-                            // Control events (blank lines, comments, [DONE])
-                            // carry no tokens: pass them through untouched so
-                            // the route can forward their raw bytes, but keep
-                            // them out of TTFT/ITL metrics and chat tracking.
-                            if event.chunk.is_none() {
-                                return Poll::Ready(Some(Ok(event.clone())));
-                            }
-
-                            let now = Instant::now();
-
-                            if !self.first_token_received {
-                                self.first_token_received = true;
-                                self.first_token_time = Some(now);
-                                let backend_ttft = now.duration_since(self.provider_start_time);
-                                let e2e_ttft = now.duration_since(self.service_start_time);
-                                self.ttft_ms = Some(e2e_ttft.as_millis() as i32);
-                                self.last_token_time = Some(now);
-                                let tags_str: Vec<&str> =
-                                    self.metric_tags.iter().map(|s| s.as_str()).collect();
-                                self.metrics_service.record_latency(
-                                    METRIC_LATENCY_TTFT,
-                                    backend_ttft,
-                                    &tags_str,
+            if matches!(&self.state, StreamState::Streaming) {
+                match Pin::new(&mut self.inner).poll_next(cx) {
+                    Poll::Ready(Some(Ok(event))) => {
+                        if event.is_done_marker() {
+                            if event.raw_bytes.len() > MAX_PROVIDER_DONE_EVENT_BYTES {
+                                let error = inference_providers::CompletionError::CompletionError(
+                                    "Malformed SSE stream: [DONE] marker is too large".into(),
                                 );
-                                self.metrics_service.record_latency(
-                                    METRIC_LATENCY_TTFT_TOTAL,
-                                    e2e_ttft,
-                                    &tags_str,
-                                );
-                            } else if let Some(last_time) = self.last_token_time {
-                                // Calculate inter-token latency
-                                let itl = now.duration_since(last_time);
-                                self.total_itl_ms += itl.as_secs_f64() * 1000.0;
-                                self.token_count += 1;
-                                self.last_token_time = Some(now);
+                                self.last_error = Some(error.clone());
+                                self.begin_finalizing();
+                                return Poll::Ready(Some(Err(error)));
+                            }
+                            self.saw_upstream_done_marker = true;
+                            if sse_event_has_terminating_separator(&event) {
+                                self.begin_finalizing();
+                            } else {
+                                self.state = StreamState::AwaitingDoneSeparator {
+                                    marker_len: event.raw_bytes.len(),
+                                };
+                            }
+                            return Poll::Ready(Some(Ok(event)));
+                        }
+
+                        // Control events (blank lines, comments) carry no tokens: pass them
+                        // through untouched so the route can forward their raw bytes, but keep
+                        // them out of TTFT/ITL metrics and chat tracking.
+                        if event.chunk.is_none() {
+                            return Poll::Ready(Some(Ok(event)));
+                        }
+
+                        let now = Instant::now();
+
+                        if !self.first_token_received {
+                            self.first_token_received = true;
+                            self.first_token_time = Some(now);
+                            let backend_ttft = now.duration_since(self.provider_start_time);
+                            let e2e_ttft = now.duration_since(self.service_start_time);
+                            self.ttft_ms = Some(e2e_ttft.as_millis() as i32);
+                            self.last_token_time = Some(now);
+                            let tags_str: Vec<&str> =
+                                self.metric_tags.iter().map(|s| s.as_str()).collect();
+                            self.metrics_service.record_latency(
+                                METRIC_LATENCY_TTFT,
+                                backend_ttft,
+                                &tags_str,
+                            );
+                            self.metrics_service.record_latency(
+                                METRIC_LATENCY_TTFT_TOTAL,
+                                e2e_ttft,
+                                &tags_str,
+                            );
+                        } else if let Some(last_time) = self.last_token_time {
+                            // Calculate inter-token latency.
+                            let itl = now.duration_since(last_time);
+                            self.total_itl_ms += itl.as_secs_f64() * 1000.0;
+                            self.token_count += 1;
+                            self.last_token_time = Some(now);
+                        }
+
+                        if let Some(StreamChunk::Chat(ref chat_chunk)) = event.chunk {
+                            // Track chat_id for attestation (updated on each chunk).
+                            self.last_chat_id = Some(chat_chunk.id.clone());
+
+                            // Track usage stats (updated on each chunk that has usage).
+                            if let Some(usage) = &chat_chunk.usage {
+                                self.last_usage_stats = Some(usage.clone());
                             }
 
-                            if let Some(StreamChunk::Chat(ref chat_chunk)) = event.chunk {
-                                // Track chat_id for attestation (updated on each chunk)
-                                self.last_chat_id = Some(chat_chunk.id.clone());
+                            if let Some(service_tier) = &chat_chunk.service_tier {
+                                self.provider_service_tier = Some(service_tier.clone());
+                            }
 
-                                // Track usage stats (updated on each chunk that has usage)
-                                if let Some(usage) = &chat_chunk.usage {
-                                    self.last_usage_stats = Some(usage.clone());
-                                }
-
-                                if let Some(service_tier) = &chat_chunk.service_tier {
-                                    self.provider_service_tier = Some(service_tier.clone());
-                                }
-
-                                // Track finish_reason from the final chunk (only set once at end)
-                                if let Some(choice) = chat_chunk.choices.first() {
-                                    if let Some(ref reason) = choice.finish_reason {
-                                        self.last_finish_reason = Some(reason.clone());
-                                    }
+                            // Track finish_reason from the final chunk (only set once at end).
+                            if let Some(choice) = chat_chunk.choices.first() {
+                                if let Some(ref reason) = choice.finish_reason {
+                                    self.last_finish_reason = Some(reason.clone());
                                 }
                             }
-                            return Poll::Ready(Some(Ok(event.clone())));
                         }
-                        Poll::Ready(None) => {
-                            self.stream_completed = true;
-                            let signature_future = self.create_signature_future();
-                            self.state = StreamState::Finalizing(signature_future);
-                        }
-                        Poll::Ready(Some(Err(ref err))) => {
-                            // Capture error for stop_reason in usage recording (handled in Drop)
-                            // Note: We intentionally skip Finalizing state (attestation) for errors
-                            // because partial completions cannot be verified by clients
-                            self.last_error = Some(err.clone());
-                            return Poll::Ready(Some(Err(err.clone())));
-                        }
-                        Poll::Pending => return Poll::Pending,
+                        return Poll::Ready(Some(Ok(event)));
                     }
+                    Poll::Ready(None) => self.begin_finalizing(),
+                    Poll::Ready(Some(Err(err))) => {
+                        // Capture error for stop_reason in usage recording (handled in Drop).
+                        self.last_error = Some(err.clone());
+                        return Poll::Ready(Some(Err(err)));
+                    }
+                    Poll::Pending => return Poll::Pending,
                 }
-                StreamState::Finalizing(ref mut future) => match future.as_mut().poll(cx) {
+                continue;
+            }
+
+            if let StreamState::AwaitingDoneSeparator { marker_len } = &self.state {
+                let marker_len = *marker_len;
+                match Pin::new(&mut self.inner).poll_next(cx) {
+                    Poll::Ready(Some(Ok(event))) if is_sse_event_separator(&event) => {
+                        let terminal_len = marker_len.checked_add(event.raw_bytes.len());
+                        if terminal_len.is_none_or(|len| len > MAX_PROVIDER_DONE_EVENT_BYTES) {
+                            let error = inference_providers::CompletionError::CompletionError(
+                                "Malformed SSE stream: [DONE] marker is too large".into(),
+                            );
+                            self.last_error = Some(error.clone());
+                            self.begin_finalizing();
+                            return Poll::Ready(Some(Err(error)));
+                        }
+                        self.begin_finalizing();
+                        return Poll::Ready(Some(Ok(event)));
+                    }
+                    Poll::Ready(None) => {
+                        // Preserve the upstream's exact terminal bytes even if it omitted the
+                        // optional blank separator after the marker.
+                        self.begin_finalizing();
+                    }
+                    Poll::Ready(Some(Ok(_))) => {
+                        let error = inference_providers::CompletionError::CompletionError(
+                            "Malformed SSE stream: expected a blank line after [DONE]".into(),
+                        );
+                        self.last_error = Some(error.clone());
+                        self.begin_finalizing();
+                        return Poll::Ready(Some(Err(error)));
+                    }
+                    Poll::Ready(Some(Err(err))) => {
+                        self.last_error = Some(err.clone());
+                        self.begin_finalizing();
+                        return Poll::Ready(Some(Err(err)));
+                    }
+                    Poll::Pending => return Poll::Pending,
+                }
+                continue;
+            }
+
+            if let StreamState::Finalizing(future) = &mut self.state {
+                match future.as_mut().poll(cx) {
                     Poll::Ready(()) => {
                         self.state = StreamState::Done;
                         return Poll::Ready(None);
                     }
                     Poll::Pending => return Poll::Pending,
-                },
-                StreamState::Done => return Poll::Ready(None),
+                }
             }
+
+            return Poll::Ready(None);
         }
     }
 }
@@ -2296,6 +2372,162 @@ mod tests {
     use futures::{stream, StreamExt};
     use inference_providers::models::{ChatChoice, ChatCompletionChunk, FinishReason, TokenUsage};
     use std::time::Duration;
+
+    fn terminal_test_stream(
+        events: Vec<Result<SSEEvent, inference_providers::CompletionError>>,
+    ) -> InterceptStream<
+        impl Stream<Item = Result<SSEEvent, inference_providers::CompletionError>> + Unpin,
+    > {
+        let now = Instant::now();
+        InterceptStream {
+            inner: stream::iter(events),
+            attestation_service: Arc::new(MockAttestationService),
+            usage_service: Arc::new(MockUsageService),
+            metrics_service: Arc::new(CapturingMetricsService::new()),
+            request_id: Uuid::new_v4(),
+            organization_id: Uuid::new_v4(),
+            workspace_id: Uuid::new_v4(),
+            api_key_id: Uuid::new_v4(),
+            model_id: Uuid::new_v4(),
+            model_name: "test-model".to_string(),
+            inference_type: crate::usage::ports::InferenceType::ChatCompletionStream,
+            service_start_time: now,
+            provider_start_time: now,
+            first_token_received: false,
+            first_token_time: None,
+            ttft_ms: None,
+            token_count: 0,
+            last_token_time: None,
+            total_itl_ms: 0.0,
+            metric_tags: CompletionServiceImpl::create_metric_tags("test-model"),
+            concurrent_counter: None,
+            last_usage_stats: None,
+            last_chat_id: None,
+            stream_completed: false,
+            saw_upstream_done_marker: false,
+            response_id: None,
+            last_finish_reason: None,
+            last_error: None,
+            state: StreamState::Streaming,
+            attestation_supported: false,
+            store_provider_chat_signature: true,
+            provider_attribution: crate::usage::ProviderAttribution::default(),
+            cache_write_cost_per_token: None,
+            requested_service_tier: None,
+            provider_service_tier: None,
+            latency_reporter: None,
+        }
+    }
+
+    fn terminal_control_event(raw_bytes: &'static [u8]) -> SSEEvent {
+        SSEEvent {
+            raw_bytes: Bytes::from_static(raw_bytes),
+            chunk: None,
+            raw_passthrough: true,
+        }
+    }
+
+    #[tokio::test]
+    async fn complete_done_marker_stops_polling_the_upstream() {
+        let trailing_error = inference_providers::CompletionError::CompletionError(
+            "must not be observed after [DONE]".to_string(),
+        );
+        let mut stream = terminal_test_stream(vec![
+            Ok(terminal_control_event(b"data: [DONE]\n")),
+            Ok(terminal_control_event(b"\n")),
+            Err(trailing_error),
+        ]);
+
+        let events = stream.by_ref().collect::<Vec<_>>().await;
+        let forwarded = events
+            .into_iter()
+            .map(|event| event.expect("terminal events should be forwarded"))
+            .map(|event| event.raw_bytes.to_vec())
+            .collect::<Vec<_>>();
+
+        assert_eq!(forwarded, vec![b"data: [DONE]\n".to_vec(), b"\n".to_vec()]);
+        assert!(stream.stream_completed);
+        assert!(stream.last_error.is_none());
+        assert!(matches!(&stream.state, StreamState::Done));
+    }
+
+    #[tokio::test]
+    async fn incomplete_done_marker_releases_without_publishing_a_signature() {
+        let expected_error = "upstream disconnected before the terminal separator";
+        let mut stream = terminal_test_stream(vec![
+            Ok(terminal_control_event(b"data: [DONE]\n")),
+            Err(inference_providers::CompletionError::CompletionError(
+                expected_error.to_string(),
+            )),
+        ]);
+
+        let events = stream.by_ref().collect::<Vec<_>>().await;
+        assert_eq!(events.len(), 2);
+        assert_eq!(
+            events[0]
+                .as_ref()
+                .expect("marker should be forwarded")
+                .raw_bytes,
+            Bytes::from_static(b"data: [DONE]\n")
+        );
+        assert!(matches!(
+            &events[1],
+            Err(inference_providers::CompletionError::CompletionError(message))
+                if message == expected_error
+        ));
+        assert!(stream.stream_completed);
+        assert!(stream.last_error.is_some());
+        assert!(matches!(&stream.state, StreamState::Done));
+    }
+
+    #[tokio::test]
+    async fn oversized_done_marker_is_rejected_before_signature_finalization() {
+        let padding = " ".repeat(MAX_PROVIDER_DONE_EVENT_BYTES);
+        let mut stream = terminal_test_stream(vec![Ok(SSEEvent {
+            raw_bytes: Bytes::from(format!("data: [DONE]{padding}\n")),
+            chunk: None,
+            raw_passthrough: true,
+        })]);
+
+        let events = stream.by_ref().collect::<Vec<_>>().await;
+
+        assert!(matches!(
+            &events[..],
+            [Err(inference_providers::CompletionError::CompletionError(message))]
+                if message == "Malformed SSE stream: [DONE] marker is too large"
+        ));
+        assert!(!stream.saw_upstream_done_marker);
+        assert!(stream.last_error.is_some());
+        assert!(matches!(&stream.state, StreamState::Done));
+    }
+
+    #[tokio::test]
+    async fn oversized_done_marker_with_separate_separator_is_rejected() {
+        let marker_prefix = b"data: [DONE]\n";
+        let padding = " ".repeat(MAX_PROVIDER_DONE_EVENT_BYTES - marker_prefix.len());
+        let marker = Bytes::from(format!("data: [DONE]{padding}\n"));
+        assert_eq!(marker.len(), MAX_PROVIDER_DONE_EVENT_BYTES);
+
+        let mut stream = terminal_test_stream(vec![
+            Ok(SSEEvent {
+                raw_bytes: marker,
+                chunk: None,
+                raw_passthrough: true,
+            }),
+            Ok(terminal_control_event(b"\n")),
+        ]);
+
+        let events = stream.by_ref().collect::<Vec<_>>().await;
+
+        assert!(matches!(
+            &events[..],
+            [Ok(_), Err(inference_providers::CompletionError::CompletionError(message))]
+                if message == "Malformed SSE stream: [DONE] marker is too large"
+        ));
+        assert!(stream.saw_upstream_done_marker);
+        assert!(stream.last_error.is_some());
+        assert!(matches!(&stream.state, StreamState::Done));
+    }
 
     #[tokio::test]
     async fn test_intercept_stream_metrics() {

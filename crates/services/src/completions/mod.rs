@@ -160,12 +160,12 @@ where
 
         let attestation_service = self.attestation_service.clone();
 
-        // For a clean upstream EOF, a provider signature only verifies the
-        // exact upstream stream. If the route will synthesize a terminator,
-        // do not publish it as a signature for the client response. The route
-        // may create a Gateway signature for that synthesized terminator;
-        // either way this releases the routing pin.
-        if self.last_error.is_none() && !self.saw_upstream_done_marker {
+        // A provider signature only verifies the exact upstream stream. Do
+        // not publish one if the stream reported an error or if the route
+        // will synthesize its terminator. The route may create a Gateway
+        // signature for a clean synthesized terminator; either way this
+        // releases the routing pin.
+        if self.last_error.is_some() || !self.saw_upstream_done_marker {
             return Box::pin(async move {
                 attestation_service
                     .release_chat_signature_pin(&chat_id)

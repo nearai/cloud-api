@@ -29,6 +29,27 @@ pub const METRIC_SIGNATURE_CREATION_DURATION: &str = "cloud_api.signature.creati
 pub const METRIC_ATTESTATION_REPORT_CACHE: &str = "cloud_api.attestation.report_cache";
 pub const TAG_RESULT: &str = "result";
 
+// No organization tag: that breakdown comes from the concurrency_leases table,
+// so it costs no metric cardinality.
+pub const METRIC_CONCURRENCY_ADMITTED: &str = "cloud_api.concurrency.admitted";
+pub const METRIC_CONCURRENCY_REJECTED: &str = "cloud_api.concurrency.rejected";
+pub const METRIC_CONCURRENCY_DEGRADED: &str = "cloud_api.concurrency.degraded";
+pub const METRIC_CONCURRENCY_WOULD_REJECT: &str = "cloud_api.concurrency.would_reject";
+
+// What the lease store adds to the inference hot path, and the health of the
+// background loops that keep leases accurate.
+pub const METRIC_CONCURRENCY_ADMISSION_LATENCY: &str = "cloud_api.concurrency.admission_latency";
+pub const METRIC_CONCURRENCY_IN_FLIGHT: &str = "cloud_api.concurrency.in_flight";
+pub const METRIC_CONCURRENCY_RENEW_FAILED: &str = "cloud_api.concurrency.renew_failed";
+pub const METRIC_CONCURRENCY_RECLAIMED: &str = "cloud_api.concurrency.reclaimed";
+pub const METRIC_CONCURRENCY_RELEASE_DROPPED: &str = "cloud_api.concurrency.release_dropped";
+pub const METRIC_CONCURRENCY_SWEEP_FAILED: &str = "cloud_api.concurrency.sweep_failed";
+
+// Whether admission was decided fleet-wide or by this replica alone.
+pub const TAG_SCOPE: &str = "scope";
+pub const SCOPE_FLEET: &str = "fleet";
+pub const SCOPE_REPLICA: &str = "replica";
+
 // Usage/engagement metrics
 pub const METRIC_REQUEST_COUNT: &str = "cloud_api.request.count";
 pub const METRIC_TOKENS_INPUT: &str = "cloud_api.tokens.input";

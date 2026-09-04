@@ -3,10 +3,7 @@ use crate::UserId;
 use async_trait::async_trait;
 use inference_providers::StreamingResult;
 use serde::{Deserialize, Serialize};
-use std::sync::{
-    atomic::{AtomicU32, Ordering},
-    Arc,
-};
+use std::time::Duration;
 use uuid::Uuid;
 
 /// Default concurrent request limit per organization per model
@@ -16,20 +13,25 @@ pub const DEFAULT_CONCURRENT_LIMIT: u32 = 64;
 ///
 /// Routes that bypass the typed completion request path can hold this guard
 /// until their upstream response body completes or is dropped.
-#[derive(Debug)]
 pub struct ConcurrentRequestGuard {
-    counter: Arc<AtomicU32>,
+    slot: super::ConcurrentSlot,
+}
+
+impl std::fmt::Debug for ConcurrentRequestGuard {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("ConcurrentRequestGuard")
+    }
 }
 
 impl ConcurrentRequestGuard {
-    pub(crate) fn new(counter: Arc<AtomicU32>) -> Self {
-        Self { counter }
+    pub(crate) fn new(slot: super::ConcurrentSlot) -> Self {
+        Self { slot }
     }
 }
 
 impl Drop for ConcurrentRequestGuard {
     fn drop(&mut self) {
-        self.counter.fetch_sub(1, Ordering::Release);
+        self.slot.release();
     }
 }
 
@@ -160,6 +162,56 @@ pub trait OrganizationConcurrentLimitRepository: Send + Sync {
     /// Get the concurrent request limit for an organization
     /// Returns None if no custom limit is set (use default)
     async fn get_concurrent_limit(&self, org_id: Uuid) -> Result<Option<u32>, anyhow::Error>;
+}
+
+/// Both variants carry the limit that was applied, so the caller can remember
+/// it for the degraded path without a second lookup.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LeaseOutcome {
+    Admitted { limit: u32 },
+    AtLimit { limit: u32, in_flight: i64 },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HeldLease {
+    pub id: Uuid,
+    pub organization_id: Uuid,
+    pub model_id: Uuid,
+}
+
+/// Holds the shared in-flight count so replicas admit against one limit
+/// rather than one each.
+#[async_trait]
+pub trait ConcurrencyLeaseRepository: Send + Sync {
+    /// Record a lease if the organization is below its limit for the model.
+    async fn try_acquire(
+        &self,
+        lease_id: Uuid,
+        organization_id: Uuid,
+        model_id: Uuid,
+        instance_id: &str,
+        default_limit: u32,
+        ttl: Duration,
+    ) -> Result<LeaseOutcome, anyhow::Error>;
+
+    /// Give back leases whose requests have finished.
+    async fn release(&self, lease_ids: &[Uuid]) -> Result<(), anyhow::Error>;
+
+    /// Extend leases the store already has, returning the ids still there.
+    /// Updates in place so a lease released mid-call stays deleted.
+    async fn renew(&self, lease_ids: &[Uuid], ttl: Duration) -> Result<Vec<Uuid>, anyhow::Error>;
+
+    /// Write leases the store does not have yet, from requests admitted while
+    /// it was unreachable.
+    async fn persist(
+        &self,
+        leases: &[HeldLease],
+        instance_id: &str,
+        ttl: Duration,
+    ) -> Result<(), anyhow::Error>;
+
+    /// Remove leases whose holder stopped renewing them.
+    async fn sweep_expired(&self) -> Result<u64, anyhow::Error>;
 }
 
 #[async_trait]

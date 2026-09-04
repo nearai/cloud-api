@@ -440,14 +440,30 @@ pub async fn init_domain_services_with_pool(
         as Arc<dyn services::completions::ports::OrganizationConcurrentLimitRepository>;
 
     // Create completion service with usage tracking (needs usage_service)
-    let completion_service = Arc::new(services::CompletionServiceImpl::new(
+    let mut completion_service_impl = services::CompletionServiceImpl::new(
         inference_provider_pool.clone(),
         attestation_service.clone(),
         usage_service.clone(),
         metrics_service.clone(),
         models_repo.clone() as Arc<dyn services::models::ModelsRepository>,
         org_limit_repository,
-    ));
+    );
+
+    if config.fleet_concurrency.mode != config::FleetConcurrencyMode::Off {
+        let lease_repository = Arc::new(
+            database::repositories::concurrency_lease::PostgresConcurrencyLeaseRepository::new(
+                database.pool().clone(),
+            ),
+        );
+        completion_service_impl = completion_service_impl.with_fleet_concurrency(
+            lease_repository,
+            config.fleet_concurrency.instance_id.clone(),
+            std::time::Duration::from_secs(config.fleet_concurrency.lease_ttl_seconds),
+            config.fleet_concurrency.mode == config::FleetConcurrencyMode::Enforce,
+        );
+    }
+
+    let completion_service = Arc::new(completion_service_impl);
 
     let brave_search_provider =
         Arc::new(services::responses::tools::brave::BraveWebSearchProvider::new());
@@ -2861,6 +2877,7 @@ mod tests {
             aml: config::AmlConfig::default(),
             usage_reporting: config::UsageReportingConfig::default(),
             ita: config::ItaAttestationConfig::default(),
+            fleet_concurrency: config::FleetConcurrencyConfig::default(),
         };
 
         // Initialize services
@@ -2975,6 +2992,7 @@ mod tests {
             aml: config::AmlConfig::default(),
             usage_reporting: config::UsageReportingConfig::default(),
             ita: config::ItaAttestationConfig::default(),
+            fleet_concurrency: config::FleetConcurrencyConfig::default(),
         };
 
         let auth_components = init_auth_services(database.clone(), &config);

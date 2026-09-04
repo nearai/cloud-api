@@ -21,7 +21,7 @@ use bytes::Bytes;
 use futures_util::stream;
 use sha2::{Digest, Sha256};
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::{Mutex, RwLock};
 
 /// Lightweight PII detector used only by [`MockProvider::privacy_classify_raw`]
@@ -239,6 +239,7 @@ pub struct ResponseTemplate {
     /// request's model param — simulates external backends that answer with
     /// their upstream model name (`provider_config.model_name` overrides).
     model_override: Option<String>,
+    hold: Option<Duration>,
 }
 
 impl ResponseTemplate {
@@ -254,7 +255,14 @@ impl ResponseTemplate {
             cache_write_tokens: None,
             service_tier_override: None,
             model_override: None,
+            hold: None,
         }
+    }
+
+    /// Hold the request in flight for `duration` before responding.
+    pub fn with_hold(mut self, duration: Duration) -> Self {
+        self.hold = Some(duration);
+        self
     }
 
     /// Echo `model` in responses instead of the request's model param
@@ -1097,6 +1105,10 @@ impl crate::InferenceProvider for MockProvider {
                 .unwrap_or_else(|| config.default_response.clone())
         };
 
+        if let Some(hold) = response_template.hold {
+            tokio::time::sleep(hold).await;
+        }
+
         // Calculate input tokens from messages (rough estimate: 1 word ≈ 1 token)
         let input_tokens: i32 = params
             .messages
@@ -1223,6 +1235,10 @@ impl crate::InferenceProvider for MockProvider {
                 .map(|exp| exp.response.clone())
                 .unwrap_or_else(|| config.default_response.clone())
         };
+
+        if let Some(hold) = response_template.hold {
+            tokio::time::sleep(hold).await;
+        }
 
         // Calculate input tokens from messages (rough estimate: 1 word ≈ 1 token)
         let input_tokens: i32 = params

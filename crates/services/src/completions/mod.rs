@@ -10,8 +10,10 @@ use crate::usage::{
 };
 use inference_providers::{ChatMessage, MessageRole, SSEEvent, StreamChunk, StreamingResult};
 use moka::future::Cache;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
+use tokio::sync::mpsc;
 use uuid::Uuid;
 
 // Create a new stream that intercepts messages, but passes the original ones through
@@ -116,7 +118,7 @@ where
     total_itl_ms: f64,
     // Pre-allocated low-cardinality metric tags (for Datadog/OTLP)
     metric_tags: Vec<String>,
-    concurrent_counter: Option<Arc<AtomicU32>>,
+    concurrent_slot: Option<ConcurrentSlot>,
     /// Last received usage stats from streaming chunks
     last_usage_stats: Option<inference_providers::TokenUsage>,
     /// Last chat ID from streaming chunks (for attestation and inference_id)
@@ -690,9 +692,8 @@ where
     S: Stream<Item = Result<SSEEvent, inference_providers::CompletionError>> + Unpin,
 {
     fn drop(&mut self) {
-        // Decrement concurrent counter if present
-        if let Some(counter) = &self.concurrent_counter {
-            counter.fetch_sub(1, Ordering::Release);
+        if let Some(slot) = &self.concurrent_slot {
+            slot.release();
         }
 
         // Every successful finalization path reaches `StreamState::Done` only
@@ -735,32 +736,84 @@ where
     }
 }
 
+/// Deliberately not `Clone`: releasing two copies would decrement the local
+/// counter twice, and an underflow there is what locks an organization out.
+pub(crate) enum ConcurrentSlot {
+    Local(Arc<AtomicU32>),
+    Lease {
+        id: Uuid,
+        organization_id: Uuid,
+        model_id: Uuid,
+        held: Arc<HeldLeases>,
+        release: mpsc::Sender<Uuid>,
+    },
+    Shadowed {
+        lease: Box<ConcurrentSlot>,
+        local: Arc<AtomicU32>,
+    },
+}
+
+impl ConcurrentSlot {
+    fn release_local(counter: &Arc<AtomicU32>) {
+        // Saturating: an underflow here would read as a permanently
+        // full counter and lock the organization out of the model.
+        let _ = counter.fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+            Some(current.saturating_sub(1))
+        });
+    }
+
+    fn release(&self) {
+        match self {
+            Self::Local(counter) => Self::release_local(counter),
+            Self::Shadowed { lease, local } => {
+                lease.release();
+                Self::release_local(local);
+            }
+            Self::Lease {
+                id,
+                organization_id,
+                model_id,
+                held,
+                release,
+            } => {
+                held.remove(*organization_id, *model_id, *id);
+                if release.try_send(*id).is_err() {
+                    held.record_dropped_release();
+                    tracing::error!(
+                        lease_id = %id,
+                        "Could not queue a concurrency lease release; it will hold \
+                         capacity until it expires"
+                    );
+                }
+            }
+        }
+    }
+}
+
 /// RAII guard for concurrent request slots.
 /// Automatically releases the slot when dropped, ensuring proper cleanup even if the request panics.
-/// Use `disarm()` to take ownership of the counter without decrementing (e.g., to transfer it
-/// to an `InterceptStream` that will handle decrement on drop).
+/// Use `disarm()` to take ownership of the slot without releasing it (e.g., to transfer it
+/// to an `InterceptStream` that will handle release on drop).
 struct ConcurrentSlotGuard {
-    counter: Option<Arc<std::sync::atomic::AtomicU32>>,
+    slot: Option<ConcurrentSlot>,
 }
 
 impl ConcurrentSlotGuard {
-    fn new(counter: Arc<AtomicU32>) -> Self {
-        Self {
-            counter: Some(counter),
-        }
+    fn new(slot: ConcurrentSlot) -> Self {
+        Self { slot: Some(slot) }
     }
 
-    /// Disarm the guard and return the counter without decrementing.
-    /// Used when transferring counter ownership to `InterceptStream`.
-    fn disarm(&mut self) -> Option<Arc<AtomicU32>> {
-        self.counter.take()
+    /// Disarm the guard and return the slot without releasing it.
+    /// Used when transferring slot ownership to `InterceptStream`.
+    fn disarm(&mut self) -> Option<ConcurrentSlot> {
+        self.slot.take()
     }
 }
 
 impl Drop for ConcurrentSlotGuard {
     fn drop(&mut self) {
-        if let Some(counter) = &self.counter {
-            counter.fetch_sub(1, Ordering::Release);
+        if let Some(slot) = &self.slot {
+            slot.release();
         }
     }
 }
@@ -775,12 +828,177 @@ pub struct CompletionServiceImpl {
     concurrent_limit: u32,
     /// Cache for per-organization concurrent limits (5-minute TTL)
     org_concurrent_limits: Cache<Uuid, u32>,
+    last_known_limits: Cache<Uuid, u32>,
     /// Repository for fetching organization concurrent limits
     organization_limit_repository: Arc<dyn ports::OrganizationConcurrentLimitRepository>,
+    fleet_concurrency: Option<FleetConcurrency>,
+}
+
+enum LeaseAdmission {
+    AtLimit(ports::CompletionError),
+    /// Over the fleet limit while shadowing, so the per-process limit decides.
+    Shadowed,
+    /// The lease store could not answer, so admission falls back to the
+    /// per-process limit rather than rejecting the request.
+    Unavailable(anyhow::Error),
+}
+
+/// Leases this replica holds. Read by renewal, release, and degraded
+/// admission, which is what keeps the degraded path off live leases.
+#[derive(Default)]
+pub(crate) struct HeldLeases {
+    by_model: std::sync::Mutex<HashMap<(Uuid, Uuid), HashMap<Uuid, LeaseState>>>,
+    dropped_releases: std::sync::atomic::AtomicU64,
+}
+
+/// Whether the store already has the row. Renewal updates stored leases and
+/// inserts pending ones, so it can never recreate a released row.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum LeaseState {
+    Stored,
+    PendingWrite,
+}
+
+impl HeldLeases {
+    fn insert(&self, organization_id: Uuid, model_id: Uuid, lease_id: Uuid, state: LeaseState) {
+        let mut guard = self.by_model.lock().unwrap_or_else(|e| e.into_inner());
+        guard
+            .entry((organization_id, model_id))
+            .or_default()
+            .insert(lease_id, state);
+    }
+
+    /// Ids no longer held are skipped, so a lease released mid-write is not
+    /// resurrected in the registry either.
+    fn mark_stored(&self, leases: &[ports::HeldLease]) {
+        let mut guard = self.by_model.lock().unwrap_or_else(|e| e.into_inner());
+        for lease in leases {
+            if let Some(ids) = guard.get_mut(&(lease.organization_id, lease.model_id)) {
+                if let Some(state) = ids.get_mut(&lease.id) {
+                    *state = LeaseState::Stored;
+                }
+            }
+        }
+    }
+
+    fn record_dropped_release(&self) {
+        self.dropped_releases
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    fn take_dropped_releases(&self) -> u64 {
+        self.dropped_releases
+            .swap(0, std::sync::atomic::Ordering::Relaxed)
+    }
+
+    fn remove(&self, organization_id: Uuid, model_id: Uuid, lease_id: Uuid) {
+        let mut guard = self.by_model.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(ids) = guard.get_mut(&(organization_id, model_id)) {
+            ids.remove(&lease_id);
+            if ids.is_empty() {
+                guard.remove(&(organization_id, model_id));
+            }
+        }
+    }
+
+    #[cfg(test)]
+    fn count(&self, organization_id: Uuid, model_id: Uuid) -> usize {
+        let guard = self.by_model.lock().unwrap_or_else(|e| e.into_inner());
+        guard
+            .get(&(organization_id, model_id))
+            .map_or(0, |ids| ids.len())
+    }
+
+    /// Decides and inserts under one lock, so two degraded admissions cannot
+    /// both observe the same count and both proceed.
+    fn insert_below(
+        &self,
+        organization_id: Uuid,
+        model_id: Uuid,
+        lease_id: Uuid,
+        limit: usize,
+    ) -> Result<(), usize> {
+        let mut guard = self.by_model.lock().unwrap_or_else(|e| e.into_inner());
+        let ids = guard.entry((organization_id, model_id)).or_default();
+        if ids.len() >= limit {
+            return Err(ids.len());
+        }
+        ids.insert(lease_id, LeaseState::PendingWrite);
+        Ok(())
+    }
+
+    /// Held leases split by whether the store already has them.
+    fn snapshot(&self) -> (Vec<ports::HeldLease>, Vec<ports::HeldLease>) {
+        let guard = self.by_model.lock().unwrap_or_else(|e| e.into_inner());
+        let mut stored = Vec::new();
+        let mut pending = Vec::new();
+        for ((organization_id, model_id), ids) in guard.iter() {
+            for (id, state) in ids {
+                let lease = ports::HeldLease {
+                    id: *id,
+                    organization_id: *organization_id,
+                    model_id: *model_id,
+                };
+                match state {
+                    LeaseState::Stored => stored.push(lease),
+                    LeaseState::PendingWrite => pending.push(lease),
+                }
+            }
+        }
+        (stored, pending)
+    }
+
+    fn held_ids(&self) -> HashSet<Uuid> {
+        let guard = self.by_model.lock().unwrap_or_else(|e| e.into_inner());
+        guard.values().flat_map(|ids| ids.keys()).copied().collect()
+    }
+}
+
+struct FleetConcurrency {
+    repository: Arc<dyn ports::ConcurrencyLeaseRepository>,
+    held: Arc<HeldLeases>,
+    release: mpsc::Sender<Uuid>,
+    instance_id: String,
+    ttl: Duration,
+    enforcing: bool,
+}
+
+/// Renewals attempted within one lease TTL. Three gives two spare attempts
+/// before a live request's lease could lapse.
+const LEASE_RENEWALS_PER_TTL: u32 = 3;
+
+/// Bounded so a stalled lease store cannot let this queue grow without limit.
+/// A dropped release costs one lease until its TTL, which the sweeper reclaims.
+const RELEASE_QUEUE_DEPTH: usize = 8192;
+
+/// Each of these loops silently stops enforcing something if it exits, so a
+/// death is reported rather than discarded.
+fn supervise(task: &'static str, handle: tokio::task::JoinHandle<()>) {
+    tokio::spawn(async move {
+        match handle.await {
+            Ok(()) => {
+                tracing::warn!(task = task, "Fleet concurrency task stopped")
+            }
+            Err(error) => tracing::error!(
+                task = task,
+                error = %error,
+                "Fleet concurrency task died; limits are no longer maintained"
+            ),
+        }
+    });
 }
 
 /// TTL for organization concurrent limit cache (5 minutes)
 const ORG_LIMIT_CACHE_TTL_SECS: u64 = 300;
+
+/// How long a limit that was actually read stays usable as a fallback (24h).
+const LAST_KNOWN_LIMIT_TTL_SECS: u64 = 86_400;
+
+/// The background loops have no model in scope, but leaving these untagged
+/// would make prod and staging indistinguishable.
+fn background_tags() -> Vec<String> {
+    vec![format!("{}:{}", TAG_ENVIRONMENT, get_environment())]
+}
 
 /// TTL for concurrent count cache entries (10 minutes).
 /// Safety net: if a counter gets stuck (e.g., due to a panic or proxy not propagating
@@ -891,8 +1109,185 @@ impl CompletionServiceImpl {
             concurrent_counts,
             concurrent_limit: DEFAULT_CONCURRENT_LIMIT,
             org_concurrent_limits,
+            last_known_limits: Cache::builder()
+                .time_to_live(Duration::from_secs(LAST_KNOWN_LIMIT_TTL_SECS))
+                .max_capacity(10_000)
+                .build(),
             organization_limit_repository,
+            fleet_concurrency: None,
         }
+    }
+
+    /// Released leases are deleted by a background task because `Drop` is
+    /// synchronous and the delete is not.
+    pub fn with_fleet_concurrency(
+        mut self,
+        repository: Arc<dyn ports::ConcurrencyLeaseRepository>,
+        instance_id: String,
+        ttl: Duration,
+        enforcing: bool,
+    ) -> Self {
+        let (release, mut released) = mpsc::channel::<Uuid>(RELEASE_QUEUE_DEPTH);
+        let releaser = repository.clone();
+
+        let drain = tokio::spawn(async move {
+            let mut batch = Vec::new();
+            while released.recv_many(&mut batch, 128).await > 0 {
+                if let Err(error) = releaser.release(&batch).await {
+                    tracing::warn!(
+                        released = batch.len(),
+                        error = %error,
+                        "Failed to release concurrency leases; they will expire instead"
+                    );
+                }
+                batch.clear();
+            }
+        });
+
+        supervise("release", drain);
+
+        let held = Arc::new(HeldLeases::default());
+
+        let renewer = repository.clone();
+        let renewing = held.clone();
+        let renew_instance = instance_id.clone();
+        let renew_every = ttl / LEASE_RENEWALS_PER_TTL;
+        let renew_metrics = self.metrics_service.clone();
+        let renew_task = tokio::spawn(async move {
+            let owned_tags = background_tags();
+            let tags: Vec<&str> = owned_tags.iter().map(|tag| tag.as_str()).collect();
+            let mut ticker = tokio::time::interval(renew_every);
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                ticker.tick().await;
+                let (stored, pending) = renewing.snapshot();
+
+                let stored_ids: Vec<Uuid> = stored.iter().map(|lease| lease.id).collect();
+                let mut pending = pending;
+                match renewer.renew(&stored_ids, ttl).await {
+                    Ok(renewed) => {
+                        // A missing row was swept after renewal stalled past the TTL.
+                        // Re-storing only what is still held avoids reviving a release.
+                        let renewed: HashSet<Uuid> = renewed.into_iter().collect();
+                        let held = renewing.held_ids();
+                        let lost: Vec<ports::HeldLease> = stored
+                            .into_iter()
+                            .filter(|lease| {
+                                !renewed.contains(&lease.id) && held.contains(&lease.id)
+                            })
+                            .collect();
+                        if !lost.is_empty() {
+                            tracing::warn!(
+                                leases = lost.len(),
+                                "Re-storing held leases that expired before renewal"
+                            );
+                            pending.extend(lost);
+                        }
+                    }
+                    Err(error) => {
+                        renew_metrics.record_count(METRIC_CONCURRENCY_RENEW_FAILED, 1, &tags);
+                        tracing::warn!(
+                            leases = stored_ids.len(),
+                            error = %error,
+                            "Failed to renew concurrency leases; in-flight requests continue"
+                        )
+                    }
+                }
+                // A histogram, not a counter: this is the current depth, and a
+                // counter would sum successive readings into a meaningless total.
+                renew_metrics.record_histogram(
+                    METRIC_CONCURRENCY_IN_FLIGHT,
+                    renewing.held_ids().len() as f64,
+                    &tags,
+                );
+                let dropped = renewing.take_dropped_releases();
+                if dropped > 0 {
+                    renew_metrics.record_count(
+                        METRIC_CONCURRENCY_RELEASE_DROPPED,
+                        dropped as i64,
+                        &tags,
+                    );
+                }
+
+                if pending.is_empty() {
+                    continue;
+                }
+                if let Err(error) = renewer.persist(&pending, &renew_instance, ttl).await {
+                    tracing::warn!(
+                        leases = pending.len(),
+                        error = %error,
+                        "Failed to store leases admitted while the lease store was down"
+                    );
+                    continue;
+                }
+                renewing.mark_stored(&pending);
+
+                // A pending lease released during the insert is written with no
+                // holder, so nothing would renew or release it again.
+                let held = renewing.held_ids();
+                let orphaned: Vec<Uuid> = pending
+                    .iter()
+                    .map(|lease| lease.id)
+                    .filter(|id| !held.contains(id))
+                    .collect();
+                if !orphaned.is_empty() {
+                    if let Err(error) = renewer.release(&orphaned).await {
+                        tracing::warn!(
+                            leases = orphaned.len(),
+                            error = %error,
+                            "Failed to drop leases released while being stored; they will expire"
+                        );
+                    }
+                }
+            }
+        });
+
+        supervise("renew", renew_task);
+
+        let sweeper = repository.clone();
+        let sweep_metrics = self.metrics_service.clone();
+        let sweep_task = tokio::spawn(async move {
+            let owned_tags = background_tags();
+            let tags: Vec<&str> = owned_tags.iter().map(|tag| tag.as_str()).collect();
+            let mut ticker = tokio::time::interval(ttl);
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                ticker.tick().await;
+                match sweeper.sweep_expired().await {
+                    Ok(0) => {}
+                    Ok(removed) => {
+                        sweep_metrics.record_count(
+                            METRIC_CONCURRENCY_RECLAIMED,
+                            removed as i64,
+                            &tags,
+                        );
+                        tracing::info!(
+                            removed = removed,
+                            "Reclaimed concurrency leases whose holder stopped renewing"
+                        )
+                    }
+                    Err(error) => {
+                        sweep_metrics.record_count(METRIC_CONCURRENCY_SWEEP_FAILED, 1, &tags);
+                        tracing::warn!(
+                            error = %error,
+                            "Failed to sweep expired concurrency leases"
+                        )
+                    }
+                }
+            }
+        });
+
+        supervise("sweep", sweep_task);
+
+        self.fleet_concurrency = Some(FleetConcurrency {
+            repository,
+            held,
+            release,
+            instance_id,
+            ttl,
+            enforcing,
+        });
+        self
     }
 
     /// Extract tools and tool_choice from the extra HashMap if present and
@@ -1052,22 +1447,42 @@ impl CompletionServiceImpl {
         let default_limit = self.concurrent_limit;
         let repo = self.organization_limit_repository.clone();
 
-        self.org_concurrent_limits
-            .get_with(organization_id, async move {
+        // optionally_get_with does not cache a None, so a failed lookup falls back
+        // for this request only instead of pinning the default for the whole TTL.
+        let limit = self
+            .org_concurrent_limits
+            .optionally_get_with(organization_id, async move {
                 match repo.get_concurrent_limit(organization_id).await {
-                    Ok(Some(limit)) if limit > 0 => limit,
-                    Ok(_) => default_limit, // Use default if NULL or 0
+                    Ok(Some(limit)) if limit > 0 => Some(limit),
+                    Ok(_) => Some(default_limit), // Use default if NULL or 0
                     Err(e) => {
                         tracing::warn!(
                             organization_id = %organization_id,
                             error = %e,
                             "Failed to fetch org concurrent limit, using default"
                         );
-                        default_limit
+                        None
                     }
                 }
             })
-            .await
+            .await;
+
+        match limit {
+            Some(limit) => {
+                self.last_known_limits.insert(organization_id, limit).await;
+                limit
+            }
+            None => self
+                .last_known_org_concurrent_limit(organization_id)
+                .await
+                .unwrap_or(default_limit),
+        }
+    }
+
+    /// Outlives the lookup cache: an outage longer than that TTL would otherwise
+    /// leave the degraded path widening the cap to the global default.
+    async fn last_known_org_concurrent_limit(&self, organization_id: Uuid) -> Option<u32> {
+        self.last_known_limits.get(&organization_id).await
     }
 
     /// Create low-cardinality metric tags for a request
@@ -1441,6 +1856,13 @@ impl CompletionServiceImpl {
             .record_count(METRIC_REQUEST_ERRORS, 1, &tags_str);
     }
 
+    fn record_concurrency(&self, metric: &str, model_name: &str, scope: &str) {
+        let mut tags = Self::create_metric_tags(model_name);
+        tags.push(format!("{}:{}", TAG_SCOPE, scope));
+        let tags: Vec<&str> = tags.iter().map(|tag| tag.as_str()).collect();
+        self.metrics_service.record_count(metric, 1, &tags);
+    }
+
     /// Convert completion messages to chat messages for inference providers
     fn prepare_chat_messages(messages: &[ports::CompletionMessage]) -> Vec<ChatMessage> {
         messages
@@ -1477,6 +1899,137 @@ impl CompletionServiceImpl {
                 }
             })
             .collect()
+    }
+
+    /// Counts this replica's own leases, so a store outage degrades to the
+    /// per-process behaviour instead of admitting on top of live leases.
+    async fn admit_from_held_leases(
+        &self,
+        fleet: &FleetConcurrency,
+        organization_id: Uuid,
+        model_id: Uuid,
+        model_name: &str,
+    ) -> Result<ConcurrentSlot, ports::CompletionError> {
+        let limit = self
+            .last_known_org_concurrent_limit(organization_id)
+            .await
+            .unwrap_or(self.concurrent_limit);
+        let lease_id = Uuid::new_v4();
+
+        match fleet
+            .held
+            .insert_below(organization_id, model_id, lease_id, limit as usize)
+        {
+            Ok(()) => {
+                self.record_concurrency(METRIC_CONCURRENCY_ADMITTED, model_name, SCOPE_REPLICA);
+                Ok(ConcurrentSlot::Lease {
+                    id: lease_id,
+                    organization_id,
+                    model_id,
+                    held: fleet.held.clone(),
+                    release: fleet.release.clone(),
+                })
+            }
+            Err(in_flight) => {
+                self.record_concurrency(METRIC_CONCURRENCY_REJECTED, model_name, SCOPE_REPLICA);
+                tracing::warn!(
+                    organization_id = %organization_id,
+                    model_id = %model_id,
+                    model_name = %model_name,
+                    current_count = in_flight,
+                    limit = limit,
+                    "Organization concurrent request limit exceeded for model on this replica"
+                );
+                let message = format!(
+                    "Concurrent request limit exceeded for model {model_name}. Organization limit: {limit} concurrent requests per model."
+                );
+                self.record_error(
+                    &ports::CompletionError::RateLimitExceeded(message.clone()),
+                    Some(model_name),
+                );
+                Err(ports::CompletionError::RateLimitExceeded(message))
+            }
+        }
+    }
+
+    async fn try_acquire_lease(
+        &self,
+        fleet: &FleetConcurrency,
+        organization_id: Uuid,
+        model_id: Uuid,
+        model_name: &str,
+    ) -> Result<ConcurrentSlot, LeaseAdmission> {
+        let lease_id = Uuid::new_v4();
+        let started = Instant::now();
+        let outcome = fleet
+            .repository
+            .try_acquire(
+                lease_id,
+                organization_id,
+                model_id,
+                &fleet.instance_id,
+                self.concurrent_limit,
+                fleet.ttl,
+            )
+            .await
+            .map_err(LeaseAdmission::Unavailable)?;
+        self.metrics_service.record_latency(
+            METRIC_CONCURRENCY_ADMISSION_LATENCY,
+            started.elapsed(),
+            &Self::create_metric_tags(model_name)
+                .iter()
+                .map(|tag| tag.as_str())
+                .collect::<Vec<_>>(),
+        );
+
+        match outcome {
+            ports::LeaseOutcome::Admitted { limit } => {
+                // The fleet path reads the limit inside the admission statement,
+                // so this is the only place the degraded path can learn it.
+                self.last_known_limits.insert(organization_id, limit).await;
+                self.record_concurrency(METRIC_CONCURRENCY_ADMITTED, model_name, SCOPE_FLEET);
+                fleet
+                    .held
+                    .insert(organization_id, model_id, lease_id, LeaseState::Stored);
+                Ok(ConcurrentSlot::Lease {
+                    id: lease_id,
+                    organization_id,
+                    model_id,
+                    held: fleet.held.clone(),
+                    release: fleet.release.clone(),
+                })
+            }
+            ports::LeaseOutcome::AtLimit { limit, in_flight } => {
+                self.last_known_limits.insert(organization_id, limit).await;
+                if !fleet.enforcing {
+                    self.record_concurrency(
+                        METRIC_CONCURRENCY_WOULD_REJECT,
+                        model_name,
+                        SCOPE_FLEET,
+                    );
+                    return Err(LeaseAdmission::Shadowed);
+                }
+                self.record_concurrency(METRIC_CONCURRENCY_REJECTED, model_name, SCOPE_FLEET);
+                tracing::warn!(
+                    organization_id = %organization_id,
+                    model_id = %model_id,
+                    model_name = %model_name,
+                    current_count = in_flight,
+                    limit = limit,
+                    "Organization concurrent request limit exceeded for model across the fleet"
+                );
+                let message = format!(
+                    "Concurrent request limit exceeded for model {model_name}. Organization limit: {limit} concurrent requests per model."
+                );
+                self.record_error(
+                    &ports::CompletionError::RateLimitExceeded(message.clone()),
+                    Some(model_name),
+                );
+                Err(LeaseAdmission::AtLimit(
+                    ports::CompletionError::RateLimitExceeded(message),
+                ))
+            }
+        }
     }
 
     fn normalize_profiled_service_tier(
@@ -1518,7 +2071,35 @@ impl CompletionServiceImpl {
         organization_id: Uuid,
         model_id: Uuid,
         model_name: &str,
-    ) -> Result<Arc<AtomicU32>, ports::CompletionError> {
+    ) -> Result<ConcurrentSlot, ports::CompletionError> {
+        let mut shadow_lease: Option<ConcurrentSlot> = None;
+
+        if let Some(fleet) = &self.fleet_concurrency {
+            match self
+                .try_acquire_lease(fleet, organization_id, model_id, model_name)
+                .await
+            {
+                Ok(slot) if fleet.enforcing => return Ok(slot),
+                Ok(slot) => shadow_lease = Some(slot),
+                Err(LeaseAdmission::AtLimit(error)) => return Err(error),
+                Err(LeaseAdmission::Shadowed) => {}
+                Err(LeaseAdmission::Unavailable(error)) => {
+                    self.record_concurrency(METRIC_CONCURRENCY_DEGRADED, model_name, SCOPE_REPLICA);
+                    tracing::warn!(
+                        organization_id = %organization_id,
+                        model_id = %model_id,
+                        error = %error,
+                        "Fleet concurrency unavailable, falling back to this replica's leases"
+                    );
+                    if fleet.enforcing {
+                        return self
+                            .admit_from_held_leases(fleet, organization_id, model_id, model_name)
+                            .await;
+                    }
+                }
+            }
+        }
+
         // Get the dynamic limit for this organization (cached with 5-min TTL)
         let limit = self.get_org_concurrent_limit(organization_id).await;
 
@@ -1548,13 +2129,22 @@ impl CompletionServiceImpl {
                     &ports::CompletionError::RateLimitExceeded(msg.clone()),
                     Some(model_name),
                 );
+                if let Some(lease) = shadow_lease {
+                    lease.release();
+                }
                 return Err(ports::CompletionError::RateLimitExceeded(msg));
             }
             if counter
                 .compare_exchange_weak(current, current + 1, Ordering::AcqRel, Ordering::Acquire)
                 .is_ok()
             {
-                return Ok(counter);
+                return Ok(match shadow_lease.take() {
+                    Some(lease) => ConcurrentSlot::Shadowed {
+                        lease: Box::new(lease),
+                        local: counter,
+                    },
+                    None => ConcurrentSlot::Local(counter),
+                });
             }
         }
     }
@@ -1573,7 +2163,7 @@ impl CompletionServiceImpl {
         inference_type: crate::usage::ports::InferenceType,
         service_start_time: Instant,
         provider_start_time: Instant,
-        concurrent_counter: Option<Arc<AtomicU32>>,
+        concurrent_slot: Option<ConcurrentSlot>,
         response_id: Option<ResponseId>,
         attestation_supported: bool,
         store_provider_chat_signature: bool,
@@ -1614,7 +2204,7 @@ impl CompletionServiceImpl {
             last_token_time: None,
             total_itl_ms: 0.0,
             metric_tags,
-            concurrent_counter,
+            concurrent_slot,
             last_usage_stats: None,
             last_chat_id: None,
             stream_completed: false,
@@ -1755,13 +2345,13 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
         }
         Self::apply_deepseek_v4_flash_thinking_compat(canonical_name, &mut chat_params);
 
-        let counter = self
+        let slot = self
             .try_acquire_concurrent_slot(organization_id, model.id, canonical_name)
             .await?;
 
         // RAII guard protects against panics during stream creation.
         // On success, disarm and transfer counter ownership to InterceptStream.
-        let mut guard = ConcurrentSlotGuard::new(counter);
+        let mut guard = ConcurrentSlotGuard::new(slot);
 
         Self::reject_e2ee_if_unsupported(
             model.attestation_supported,
@@ -1949,12 +2539,12 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
         Self::apply_deepseek_v4_flash_thinking_compat(canonical_name, &mut chat_params);
 
         let organization_id = request.organization_id;
-        let counter = self
+        let slot = self
             .try_acquire_concurrent_slot(organization_id, model.id, canonical_name)
             .await?;
 
         // RAII guard ensures slot is released on drop (panic, error, or success)
-        let _guard = ConcurrentSlotGuard::new(counter);
+        let _guard = ConcurrentSlotGuard::new(slot);
 
         Self::reject_e2ee_if_unsupported(
             model.attestation_supported,
@@ -2142,12 +2732,12 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
         request_hash: String,
     ) -> Result<inference_providers::AudioTranscriptionResponse, ports::CompletionError> {
         // Acquire concurrent request slot to enforce organization limits
-        let counter = self
+        let slot = self
             .try_acquire_concurrent_slot(organization_id, model_id, model_name)
             .await?;
 
         // RAII guard ensures slot is released on drop (panic, error, or success)
-        let _guard = ConcurrentSlotGuard::new(counter);
+        let _guard = ConcurrentSlotGuard::new(slot);
 
         // Call inference provider pool with timeout protection
         let timeout_duration = std::time::Duration::from_secs(120); // 2 minute timeout for audio
@@ -2206,12 +2796,12 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
         params: inference_providers::RerankParams,
     ) -> Result<inference_providers::RerankResponse, ports::CompletionError> {
         // Acquire concurrent request slot to enforce organization limits
-        let counter = self
+        let slot = self
             .try_acquire_concurrent_slot(organization_id, model_id, model_name)
             .await?;
 
         // Create RAII guard to ensure slot is released on drop (panic, error, or success)
-        let _guard = ConcurrentSlotGuard::new(counter);
+        let _guard = ConcurrentSlotGuard::new(slot);
 
         // Call inference provider pool
         // The guard will automatically release the slot when this function returns or panics
@@ -2258,10 +2848,10 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
         body: bytes::Bytes,
         extra: std::collections::HashMap<String, serde_json::Value>,
     ) -> Result<bytes::Bytes, ports::CompletionError> {
-        let counter = self
+        let slot = self
             .try_acquire_concurrent_slot(organization_id, model_id, model_name)
             .await?;
-        let _guard = ConcurrentSlotGuard::new(counter);
+        let _guard = ConcurrentSlotGuard::new(slot);
 
         self.inference_provider_pool
             .embeddings(model_name, body, extra)
@@ -2306,10 +2896,10 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
         body: bytes::Bytes,
         extra: std::collections::HashMap<String, serde_json::Value>,
     ) -> Result<bytes::Bytes, ports::CompletionError> {
-        let counter = self
+        let slot = self
             .try_acquire_concurrent_slot(organization_id, model_id, model_name)
             .await?;
-        let _guard = ConcurrentSlotGuard::new(counter);
+        let _guard = ConcurrentSlotGuard::new(slot);
 
         self.inference_provider_pool
             .privacy_classify(model_name, body, extra)
@@ -2355,12 +2945,12 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
         params: inference_providers::ScoreParams,
     ) -> Result<inference_providers::ScoreResponse, ports::CompletionError> {
         // Acquire concurrent request slot to enforce organization limits
-        let counter = self
+        let slot = self
             .try_acquire_concurrent_slot(organization_id, model_id, model_name)
             .await?;
 
         // Create RAII guard to ensure slot is released on drop (panic, error, or success)
-        let _guard = ConcurrentSlotGuard::new(counter);
+        let _guard = ConcurrentSlotGuard::new(slot);
 
         // Call inference provider pool
         // The guard will automatically release the slot when this function returns or panics
@@ -2423,7 +3013,125 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
 pub use ports::*;
 
 #[cfg(test)]
+mod fleet_concurrency_tests;
+
+#[cfg(test)]
 mod provider_attribution_tests;
+
+#[cfg(test)]
+mod held_lease_tests {
+    use super::*;
+
+    fn ids() -> (Uuid, Uuid) {
+        (Uuid::new_v4(), Uuid::new_v4())
+    }
+
+    #[test]
+    fn insert_below_refuses_at_the_limit() {
+        let (org, model) = ids();
+        let held = HeldLeases::default();
+
+        assert!(held.insert_below(org, model, Uuid::new_v4(), 2).is_ok());
+        assert!(held.insert_below(org, model, Uuid::new_v4(), 2).is_ok());
+        assert_eq!(held.insert_below(org, model, Uuid::new_v4(), 2), Err(2));
+        assert_eq!(held.count(org, model), 2);
+    }
+
+    #[test]
+    fn models_are_counted_separately() {
+        let (org, model) = ids();
+        let other_model = Uuid::new_v4();
+        let held = HeldLeases::default();
+
+        assert!(held.insert_below(org, model, Uuid::new_v4(), 1).is_ok());
+        assert!(held
+            .insert_below(org, other_model, Uuid::new_v4(), 1)
+            .is_ok());
+        assert_eq!(held.count(org, model), 1);
+        assert_eq!(held.count(org, other_model), 1);
+    }
+
+    #[test]
+    fn releasing_frees_exactly_one_slot() {
+        let (org, model) = ids();
+        let held = HeldLeases::default();
+        let first = Uuid::new_v4();
+
+        assert!(held.insert_below(org, model, first, 1).is_ok());
+        assert!(held.insert_below(org, model, Uuid::new_v4(), 1).is_err());
+
+        held.remove(org, model, first);
+        assert_eq!(held.count(org, model), 0);
+        assert!(held.insert_below(org, model, Uuid::new_v4(), 1).is_ok());
+    }
+
+    #[test]
+    fn removing_an_unknown_lease_does_not_free_a_slot() {
+        let (org, model) = ids();
+        let held = HeldLeases::default();
+
+        assert!(held.insert_below(org, model, Uuid::new_v4(), 1).is_ok());
+        held.remove(org, model, Uuid::new_v4());
+        assert_eq!(held.count(org, model), 1);
+    }
+
+    #[test]
+    fn new_leases_are_pending_until_marked_stored() {
+        let (org, model) = ids();
+        let held = HeldLeases::default();
+        let lease_id = Uuid::new_v4();
+
+        held.insert(org, model, lease_id, LeaseState::PendingWrite);
+        let (stored, pending) = held.snapshot();
+        assert!(stored.is_empty());
+        assert_eq!(pending.len(), 1);
+
+        held.mark_stored(&pending);
+        let (stored, pending) = held.snapshot();
+        assert_eq!(stored.len(), 1);
+        assert!(pending.is_empty());
+    }
+
+    #[test]
+    fn a_lease_released_before_being_marked_is_not_resurrected() {
+        let (org, model) = ids();
+        let held = HeldLeases::default();
+        let lease_id = Uuid::new_v4();
+
+        held.insert(org, model, lease_id, LeaseState::PendingWrite);
+        let (_, pending) = held.snapshot();
+
+        held.remove(org, model, lease_id);
+        held.mark_stored(&pending);
+
+        assert_eq!(held.count(org, model), 0);
+        assert!(held.held_ids().is_empty());
+    }
+
+    #[test]
+    fn concurrent_admissions_cannot_exceed_the_limit() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let (org, model) = ids();
+        let held = Arc::new(HeldLeases::default());
+        let admitted = Arc::new(AtomicUsize::new(0));
+
+        std::thread::scope(|scope| {
+            for _ in 0..32 {
+                let held = held.clone();
+                let admitted = admitted.clone();
+                scope.spawn(move || {
+                    if held.insert_below(org, model, Uuid::new_v4(), 4).is_ok() {
+                        admitted.fetch_add(1, Ordering::Relaxed);
+                    }
+                });
+            }
+        });
+
+        assert_eq!(admitted.load(Ordering::Relaxed), 4);
+        assert_eq!(held.count(org, model), 4);
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -2462,7 +3170,7 @@ mod tests {
             last_token_time: None,
             total_itl_ms: 0.0,
             metric_tags: CompletionServiceImpl::create_metric_tags("test-model"),
-            concurrent_counter: None,
+            concurrent_slot: None,
             last_usage_stats: None,
             last_chat_id: None,
             stream_completed: false,
@@ -2679,7 +3387,7 @@ mod tests {
             last_token_time: None,
             total_itl_ms: 0.0,
             metric_tags,
-            concurrent_counter: None,
+            concurrent_slot: None,
             last_usage_stats: None,
             last_chat_id: None,
             stream_completed: false,
@@ -2852,7 +3560,7 @@ mod tests {
             last_token_time: None,
             total_itl_ms: 0.0,
             metric_tags: CompletionServiceImpl::create_metric_tags("test-model"),
-            concurrent_counter: None,
+            concurrent_slot: None,
             last_usage_stats: None,
             last_chat_id: None,
             stream_completed: false,
@@ -3006,7 +3714,7 @@ mod tests {
             last_token_time: None,
             total_itl_ms: 0.0,
             metric_tags,
-            concurrent_counter: None,
+            concurrent_slot: None,
             last_usage_stats: None,
             last_chat_id: None,
             stream_completed: false,
@@ -3134,7 +3842,7 @@ mod tests {
             last_token_time: None,
             total_itl_ms: 0.0,
             metric_tags,
-            concurrent_counter: None,
+            concurrent_slot: None,
             last_usage_stats: None,
             last_chat_id: None,
             stream_completed: false,
@@ -3345,7 +4053,7 @@ mod tests {
                 last_token_time: None,
                 total_itl_ms: 0.0,
                 metric_tags: vec![],
-                concurrent_counter: Some(counter.clone()),
+                concurrent_slot: Some(ConcurrentSlot::Local(counter.clone())),
                 last_usage_stats: None,
                 last_chat_id: None,
                 stream_completed: false,

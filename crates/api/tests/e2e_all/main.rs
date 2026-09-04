@@ -43,6 +43,7 @@ mod external_providers;
 mod feature_requests;
 mod files;
 mod first_stream_event;
+mod fleet_concurrency;
 mod function_tools;
 mod general;
 mod glm52_tier_routing;

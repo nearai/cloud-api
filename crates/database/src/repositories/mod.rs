@@ -4,6 +4,7 @@ pub mod aml;
 pub mod analytics;
 pub mod api_key;
 pub mod attestation;
+pub mod concurrency_lease;
 pub mod conversation;
 pub mod feature_request;
 pub mod file;

@@ -653,6 +653,9 @@ struct MockConfig {
     error_override: Option<CompletionError>,
     /// When set, all chat completion streams are created successfully and then yield this error.
     stream_error_override: Option<CompletionError>,
+    /// When set, all chat completion streams are created successfully and then never
+    /// yield an event, modelling an upstream that returns headers and goes silent.
+    stream_stall_override: bool,
     /// When set, all embeddings calls return this error instead of generating a response
     embedding_error_override: Option<EmbeddingError>,
     /// When set, all audio transcription calls return this error instead of a response.
@@ -728,6 +731,7 @@ impl MockProvider {
                 default_response: ResponseTemplate::new("1. 2. 3."),
                 error_override: None,
                 stream_error_override: None,
+                stream_stall_override: false,
                 embedding_error_override: None,
                 audio_transcription_error_override: None,
             })),
@@ -753,6 +757,7 @@ impl MockProvider {
                 default_response: ResponseTemplate::new("1. 2. 3."),
                 error_override: None,
                 stream_error_override: None,
+                stream_stall_override: false,
                 embedding_error_override: None,
                 audio_transcription_error_override: None,
             })),
@@ -776,6 +781,7 @@ impl MockProvider {
                 default_response: ResponseTemplate::new("1. 2. 3."),
                 error_override: None,
                 stream_error_override: None,
+                stream_stall_override: false,
                 embedding_error_override: None,
                 audio_transcription_error_override: None,
             })),
@@ -882,6 +888,13 @@ impl MockProvider {
     pub async fn set_stream_error_override(&self, error: Option<CompletionError>) {
         let mut config = self.config.lock().await;
         config.stream_error_override = error;
+    }
+
+    /// Set a stream stall override — when set, chat completion stream creation succeeds
+    /// and the returned stream never yields an event.
+    pub async fn set_stream_stall_override(&self, stalled: bool) {
+        let mut config = self.config.lock().await;
+        config.stream_stall_override = stalled;
     }
 
     /// Override the embeddings response with an error (useful for testing error paths).
@@ -1069,6 +1082,9 @@ impl crate::InferenceProvider for MockProvider {
             if let Some(ref error) = config.stream_error_override {
                 let stream = stream::iter(vec![Err(error.clone())]);
                 return Ok(Box::pin(stream));
+            }
+            if config.stream_stall_override {
+                return Ok(Box::pin(stream::pending()));
             }
             config
                 .expectations

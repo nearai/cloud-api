@@ -182,6 +182,24 @@ where
         })
     }
 
+    fn create_pin_release_future(&self) -> FinalizeFuture {
+        if !self.attestation_supported || !self.store_provider_chat_signature {
+            return Box::pin(async {});
+        }
+
+        let chat_id = match &self.last_chat_id {
+            Some(id) => id.clone(),
+            None => return Box::pin(async {}),
+        };
+
+        let attestation_service = self.attestation_service.clone();
+        Box::pin(async move {
+            attestation_service
+                .release_chat_signature_pin(&chat_id)
+                .await;
+        })
+    }
+
     /// Record usage and metrics. Called from Drop to ensure it always runs.
     fn record_usage_and_metrics(&self) {
         let request_id = self.request_id;
@@ -603,6 +621,7 @@ where
                             // Capture error for stop_reason in usage recording (handled in Drop)
                             // Note: We intentionally skip Finalizing state (attestation) for errors
                             // because partial completions cannot be verified by clients
+                            self.idle_armed = false;
                             self.last_error = Some(err.clone());
                             return Poll::Ready(Some(Err(err.clone())));
                         }
@@ -639,7 +658,8 @@ where
                             };
                             self.idle_armed = false;
                             self.last_error = Some(timeout.clone());
-                            self.state = StreamState::Done;
+                            let release_future = self.create_pin_release_future();
+                            self.state = StreamState::Finalizing(release_future);
                             return Poll::Ready(Some(Err(timeout)));
                         }
                     }
@@ -1726,24 +1746,16 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
         };
 
         // Get the LLM stream
-        let provider_call = self
+        let provider_result = self
             .inference_provider_pool
             .chat_completion_stream_with_attribution(
                 chat_params,
                 request.body_hash.clone(),
                 routing_hints,
-            );
-        let provider_result = match self.stream_idle_timeouts {
-            Some(timeouts) => tokio::time::timeout(timeouts.first_token, provider_call)
-                .await
-                .unwrap_or_else(|_| {
-                    Err(inference_providers::CompletionError::Timeout {
-                        operation: "prefill".to_string(),
-                        timeout_seconds: timeouts.first_token.as_secs(),
-                    })
-                }),
-            None => provider_call.await,
-        };
+                self.stream_idle_timeouts
+                    .map(|timeouts| timeouts.first_token),
+            )
+            .await;
 
         let attributed_stream = match provider_result {
             Ok(pair) => pair,
@@ -3374,6 +3386,103 @@ mod tests {
         );
     }
 
+    #[derive(Default)]
+    struct PinRecordingAttestationService {
+        released: std::sync::Mutex<Vec<String>>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::attestation::ports::AttestationServiceTrait for PinRecordingAttestationService {
+        async fn get_chat_signature(
+            &self,
+            _chat_id: &str,
+            _signing_algo: Option<String>,
+        ) -> Result<
+            crate::attestation::models::SignatureLookupResult,
+            crate::attestation::AttestationError,
+        > {
+            Err(crate::attestation::AttestationError::InternalError(
+                "not used".to_string(),
+            ))
+        }
+
+        async fn store_chat_signature_from_provider(
+            &self,
+            _chat_id: &str,
+        ) -> Result<(), crate::attestation::AttestationError> {
+            Ok(())
+        }
+
+        async fn store_chat_signature(
+            &self,
+            _chat_id: &str,
+            _request_hash: String,
+            _response_hash: String,
+        ) -> Result<(), crate::attestation::AttestationError> {
+            Ok(())
+        }
+
+        async fn release_chat_signature_pin(&self, chat_id: &str) {
+            self.released
+                .lock()
+                .expect("released mutex should not poison")
+                .push(chat_id.to_string());
+        }
+
+        async fn store_response_signature(
+            &self,
+            _response_id: &str,
+            _request_hash: String,
+            _response_hash: String,
+        ) -> Result<(), crate::attestation::AttestationError> {
+            Ok(())
+        }
+
+        async fn get_attestation_report(
+            &self,
+            model: Option<String>,
+            signing_algo: Option<String>,
+            nonce: Option<String>,
+            signing_address: Option<String>,
+            include_tls_fingerprint: bool,
+            provider_filter: Option<inference_providers::ProviderTier>,
+        ) -> Result<
+            crate::attestation::models::AttestationReport,
+            crate::attestation::AttestationError,
+        > {
+            MockAttestationService
+                .get_attestation_report(
+                    model,
+                    signing_algo,
+                    nonce,
+                    signing_address,
+                    include_tls_fingerprint,
+                    provider_filter,
+                )
+                .await
+        }
+
+        async fn get_ita_attestation_token(
+            &self,
+            query: crate::attestation::ita::ItaTokenQuery,
+        ) -> Result<crate::attestation::ita::ItaTokenResponse, crate::attestation::AttestationError>
+        {
+            MockAttestationService
+                .get_ita_attestation_token(query)
+                .await
+        }
+
+        async fn verify_vpc_signature(
+            &self,
+            timestamp: i64,
+            signature: String,
+        ) -> Result<bool, crate::attestation::AttestationError> {
+            MockAttestationService
+                .verify_vpc_signature(timestamp, signature)
+                .await
+        }
+    }
+
     fn watched_stream<S>(inner: S, timeouts: Option<StreamIdleTimeouts>) -> InterceptStream<S>
     where
         S: Stream<Item = Result<SSEEvent, inference_providers::CompletionError>> + Unpin,
@@ -3492,6 +3601,86 @@ mod tests {
             matches!(watched.next().await, Some(Ok(_))),
             "a 200s prefill is inside the 300s first-token budget and must survive; \
              applying the 90s between-token budget before the first token would kill it"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_upstream_error_restarts_the_idle_budget() {
+        let inner = stream::once(Box::pin(async { Ok(token_event()) }))
+            .chain(stream::once(Box::pin(async {
+                tokio::time::sleep(Duration::from_secs(60)).await;
+                Err(inference_providers::CompletionError::CompletionError(
+                    "upstream failed".to_string(),
+                ))
+            })))
+            .chain(stream::pending());
+        let mut watched = Box::pin(watched_stream(
+            inner,
+            Some(StreamIdleTimeouts {
+                first_token: Duration::from_secs(300),
+                between_tokens: Duration::from_secs(90),
+            }),
+        ));
+
+        let started = tokio::time::Instant::now();
+        assert!(matches!(watched.next().await, Some(Ok(_))));
+        assert!(matches!(
+            watched.next().await,
+            Some(Err(inference_providers::CompletionError::CompletionError(
+                _
+            )))
+        ));
+
+        match watched.next().await {
+            Some(Err(inference_providers::CompletionError::Timeout { .. })) => {
+                let elapsed = started.elapsed();
+                assert!(
+                    elapsed >= Duration::from_secs(150),
+                    "the budget must restart when the error arrives at 60s, giving a timeout at \
+                     150s; a deadline still measured from the last token fires at 90s, cutting \
+                     the budget to the 30s that happened to remain. Fired at {elapsed:?}"
+                );
+            }
+            other => panic!(
+                "expected the watchdog to fire on the silence after the error, got {other:?}"
+            ),
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_watchdog_timeout_releases_the_signature_routing_pin() {
+        let attestation = Arc::new(PinRecordingAttestationService::default());
+        let inner = stream::iter(vec![Ok(token_event())]).chain(stream::pending());
+        let mut watched = watched_stream(
+            inner,
+            Some(StreamIdleTimeouts {
+                first_token: Duration::from_secs(300),
+                between_tokens: Duration::from_secs(90),
+            }),
+        );
+        watched.attestation_service = attestation.clone();
+        let mut watched = Box::pin(watched);
+
+        assert!(matches!(watched.next().await, Some(Ok(_))));
+        assert!(matches!(
+            watched.next().await,
+            Some(Err(inference_providers::CompletionError::Timeout { .. }))
+        ));
+        assert!(watched.next().await.is_none());
+
+        std::mem::forget(watched);
+
+        let released = attestation
+            .released
+            .lock()
+            .expect("released mutex should not poison")
+            .clone();
+        assert_eq!(
+            released,
+            vec!["chat-watchdog".to_string()],
+            "a stream the watchdog tears down has no signature to fetch, so the routing pin must \
+             be released explicitly; leaving it held grows the provider's chat_id map for the \
+             life of the process"
         );
     }
 

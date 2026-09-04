@@ -107,6 +107,10 @@ where
     /// If false when Drop is called, the stream was interrupted — either the client
     /// disconnected mid-stream or the provider returned an error (check `last_error`).
     stream_completed: bool,
+    /// Whether the upstream sent its own SSE `[DONE]` marker. When false,
+    /// the API route may append one and the provider signature does not cover
+    /// the complete public stream.
+    saw_upstream_done_marker: bool,
     /// Response ID when called from Responses API (for usage tracking FK)
     response_id: Option<ResponseId>,
     /// Last finish_reason from provider (e.g., "stop", "length", "tool_calls")
@@ -155,6 +159,19 @@ where
         };
 
         let attestation_service = self.attestation_service.clone();
+
+        // For a clean upstream EOF, a provider signature only verifies the
+        // exact upstream stream. If the route will synthesize a terminator,
+        // do not publish it as a signature for the client response. The route
+        // may create a Gateway signature for that synthesized terminator;
+        // either way this releases the routing pin.
+        if self.last_error.is_none() && !self.saw_upstream_done_marker {
+            return Box::pin(async move {
+                attestation_service
+                    .release_chat_signature_pin(&chat_id)
+                    .await;
+            });
+        }
 
         Box::pin(async move {
             match tokio::time::timeout(
@@ -475,6 +492,9 @@ where
                 StreamState::Streaming => {
                     match Pin::new(&mut self.inner).poll_next(cx) {
                         Poll::Ready(Some(Ok(ref event))) => {
+                            if event.is_done_marker() {
+                                self.saw_upstream_done_marker = true;
+                            }
                             // Control events (blank lines, comments, [DONE])
                             // carry no tokens: pass them through untouched so
                             // the route can forward their raw bytes, but keep
@@ -1460,6 +1480,7 @@ impl CompletionServiceImpl {
             last_usage_stats: None,
             last_chat_id: None,
             stream_completed: false,
+            saw_upstream_done_marker: false,
             response_id,
             last_finish_reason: None,
             last_error: None,
@@ -2368,6 +2389,7 @@ mod tests {
             last_usage_stats: None,
             last_chat_id: None,
             stream_completed: false,
+            saw_upstream_done_marker: false,
             response_id: None,
             last_finish_reason: None,
             last_error: None,
@@ -2540,6 +2562,7 @@ mod tests {
             last_usage_stats: None,
             last_chat_id: None,
             stream_completed: false,
+            saw_upstream_done_marker: false,
             response_id: None,
             last_finish_reason: None,
             last_error: None,
@@ -2693,6 +2716,7 @@ mod tests {
             last_usage_stats: None,
             last_chat_id: None,
             stream_completed: false,
+            saw_upstream_done_marker: false,
             response_id: None,
             last_finish_reason: None,
             last_error: None,
@@ -2820,6 +2844,7 @@ mod tests {
             last_usage_stats: None,
             last_chat_id: None,
             stream_completed: false,
+            saw_upstream_done_marker: false,
             response_id: None,
             last_finish_reason: None,
             last_error: None,
@@ -3030,6 +3055,7 @@ mod tests {
                 last_usage_stats: None,
                 last_chat_id: None,
                 stream_completed: false,
+                saw_upstream_done_marker: false,
                 response_id: None,
                 last_finish_reason: None,
                 last_error: None,

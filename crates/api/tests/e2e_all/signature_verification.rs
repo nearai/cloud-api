@@ -24,6 +24,232 @@ fn first_stream_chat_id(response_text: &str) -> String {
 // ============================================
 
 #[tokio::test]
+async fn test_raw_stream_without_upstream_done_uses_gateway_signature() {
+    use http_body_util::BodyExt;
+    use tower::ServiceExt;
+
+    let (server, router, _pool, mock, _database) = setup_test_server_with_pool_and_router().await;
+    setup_qwen_model(&server).await;
+    let org = setup_org_with_credits(&server, 10_000_000_000i64).await;
+    let api_key = get_api_key_for_org(&server, org.id).await;
+
+    // Keep all generated chunks but suppress the mock's terminal `[DONE]`.
+    // This models a clean upstream EOF for which Cloud API must mint the
+    // client-visible terminator itself.
+    mock.set_default_response(
+        inference_providers::mock::ResponseTemplate::new("one two")
+            .with_disconnect_after(usize::MAX),
+    )
+    .await;
+
+    let request_body = serde_json::json!({
+        "model": E2E_QWEN_MODEL_NAME,
+        "messages": [{ "role": "user", "content": "Respond with two words." }],
+        "stream": true,
+        "stream_options": { "continuous_usage_stats": true },
+        "nonce": 901
+    });
+    let request_json = serde_json::to_string(&request_body).expect("request should serialize");
+    let request = axum::http::Request::builder()
+        .method("POST")
+        .uri("/v1/chat/completions")
+        .header("Authorization", format!("Bearer {api_key}"))
+        .header("Content-Type", "application/json")
+        .body(axum::body::Body::from(request_json.clone()))
+        .expect("request should build");
+    let response = router
+        .clone()
+        .oneshot(request)
+        .await
+        .expect("router should serve the streaming request");
+    assert_eq!(response.status(), axum::http::StatusCode::OK);
+
+    let mut body = response.into_body();
+    let mut received = Vec::new();
+    let mut saw_done = false;
+    while let Some(frame) = body.frame().await {
+        let frame = frame.expect("stream frame should not error");
+        let Some(data) = frame.data_ref() else {
+            continue;
+        };
+        received.extend_from_slice(data);
+        if String::from_utf8_lossy(&received).contains("data: [DONE]") {
+            saw_done = true;
+            break;
+        }
+    }
+    let response_text = String::from_utf8(received).expect("SSE body should be UTF-8");
+    assert!(saw_done, "Cloud API should append [DONE]: {response_text}");
+    assert!(response_text.ends_with("data: [DONE]\n\n"));
+    let chat_id = first_stream_chat_id(&response_text);
+
+    // The write must finish before the synthesized marker reaches the client.
+    let signature_request = axum::http::Request::builder()
+        .method("GET")
+        .uri(format!("/v1/signature/{chat_id}?signing_algo=ecdsa"))
+        .header("Authorization", format!("Bearer {api_key}"))
+        .body(axum::body::Body::empty())
+        .expect("signature request should build");
+    let signature_response = router
+        .clone()
+        .oneshot(signature_request)
+        .await
+        .expect("router should serve signature request");
+    let signature_status = signature_response.status();
+    let signature_bytes = signature_response
+        .into_body()
+        .collect()
+        .await
+        .expect("signature body should collect")
+        .to_bytes();
+    assert_eq!(
+        signature_status,
+        axum::http::StatusCode::OK,
+        "Gateway signature must be available with [DONE]: {}",
+        String::from_utf8_lossy(&signature_bytes)
+    );
+    let signature: serde_json::Value =
+        serde_json::from_slice(&signature_bytes).expect("signature response should be JSON");
+    assert_eq!(signature["signature_kind"], "gateway");
+    assert_eq!(
+        signature["text"],
+        format!(
+            "{}:{}",
+            compute_sha256(&request_json),
+            compute_sha256(&response_text)
+        )
+    );
+    assert_eq!(mock.unpinned_chat_ids(), vec![chat_id]);
+
+    while let Some(frame) = body.frame().await {
+        let frame = frame.expect("trailing frame should not error");
+        if let Some(data) = frame.data_ref() {
+            assert!(
+                data.is_empty(),
+                "no bytes may follow [DONE]: {:?}",
+                String::from_utf8_lossy(data)
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn test_e2ee_raw_stream_without_upstream_done_does_not_create_gateway_signature() {
+    use http_body_util::BodyExt;
+    use tower::ServiceExt;
+
+    let (server, router, _pool, mock, _database) = setup_test_server_with_pool_and_router().await;
+    setup_qwen_model(&server).await;
+    let org = setup_org_with_credits(&server, 10_000_000_000i64).await;
+    let api_key = get_api_key_for_org(&server, org.id).await;
+
+    mock.set_default_response(
+        inference_providers::mock::ResponseTemplate::new("one two")
+            .with_disconnect_after(usize::MAX),
+    )
+    .await;
+
+    let request_body = serde_json::json!({
+        "model": E2E_QWEN_MODEL_NAME,
+        "messages": [{ "role": "user", "content": "Respond with two words." }],
+        "stream": true,
+        "stream_options": { "continuous_usage_stats": true },
+        "nonce": 903
+    });
+    let request_json = serde_json::to_string(&request_body).expect("request should serialize");
+    let request = axum::http::Request::builder()
+        .method("POST")
+        .uri("/v1/chat/completions")
+        .header("Authorization", format!("Bearer {api_key}"))
+        .header("Content-Type", "application/json")
+        .header("X-Signing-Algo", "ecdsa")
+        .body(axum::body::Body::from(request_json))
+        .expect("request should build");
+    let response = router
+        .clone()
+        .oneshot(request)
+        .await
+        .expect("router should serve the streaming request");
+    assert_eq!(response.status(), axum::http::StatusCode::OK);
+
+    let response_bytes = response
+        .into_body()
+        .collect()
+        .await
+        .expect("stream body should collect")
+        .to_bytes();
+    let response_text =
+        String::from_utf8(response_bytes.to_vec()).expect("SSE body should be UTF-8");
+    assert!(response_text.ends_with("data: [DONE]\n\n"));
+    let chat_id = first_stream_chat_id(&response_text);
+
+    let signature_request = axum::http::Request::builder()
+        .method("GET")
+        .uri(format!("/v1/signature/{chat_id}?signing_algo=ecdsa"))
+        .header("Authorization", format!("Bearer {api_key}"))
+        .body(axum::body::Body::empty())
+        .expect("signature request should build");
+    let signature_response = router
+        .oneshot(signature_request)
+        .await
+        .expect("router should serve signature request");
+    assert_eq!(
+        signature_response.status(),
+        axum::http::StatusCode::NOT_FOUND,
+        "E2EE streams without an upstream [DONE] must not switch to a gateway signature"
+    );
+    assert_eq!(mock.unpinned_chat_ids(), vec![chat_id]);
+}
+
+#[tokio::test]
+async fn test_raw_stream_with_upstream_done_retains_provider_signature() {
+    let (server, _router, _pool, _mock, _database) = setup_test_server_with_pool_and_router().await;
+    setup_qwen_model(&server).await;
+    let org = setup_org_with_credits(&server, 10_000_000_000i64).await;
+    let api_key = get_api_key_for_org(&server, org.id).await;
+
+    let request_body = serde_json::json!({
+        "model": E2E_QWEN_MODEL_NAME,
+        "messages": [{ "role": "user", "content": "Respond with two words." }],
+        "stream": true,
+        "stream_options": { "continuous_usage_stats": true },
+        "nonce": 902
+    });
+    let request_json = serde_json::to_string(&request_body).expect("request should serialize");
+    let response = server
+        .post("/v1/chat/completions")
+        .add_header("Authorization", format!("Bearer {api_key}"))
+        .content_type("application/json")
+        .bytes(Bytes::from(request_json.clone()))
+        .await;
+    assert_eq!(response.status_code(), 200, "{}", response.text());
+
+    let response_text = response.text();
+    assert!(response_text.ends_with("data: [DONE]\n\n"));
+    let chat_id = first_stream_chat_id(&response_text);
+    let signature_response = server
+        .get(format!("/v1/signature/{chat_id}?signing_algo=ecdsa").as_str())
+        .add_header("Authorization", format!("Bearer {api_key}"))
+        .await;
+    assert_eq!(
+        signature_response.status_code(),
+        200,
+        "provider signature should be available: {}",
+        signature_response.text()
+    );
+    let signature = signature_response.json::<serde_json::Value>();
+    assert_eq!(signature["signature_kind"], "provider_tee");
+    assert_eq!(
+        signature["text"],
+        format!(
+            "{}:{}",
+            compute_sha256(&request_json),
+            compute_sha256(&response_text)
+        )
+    );
+}
+
+#[tokio::test]
 async fn test_legacy_completion_gateway_signature_hashes_public_json() {
     let server = setup_test_server().await;
     setup_qwen_model(&server).await;

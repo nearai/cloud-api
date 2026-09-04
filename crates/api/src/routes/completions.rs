@@ -465,6 +465,13 @@ fn chat_stream_usage_mode(
     }
 }
 
+fn auto_redact_requires_gateway_signature(
+    auto_redact_enabled: bool,
+    model_attestation_supported: Option<bool>,
+) -> bool {
+    auto_redact_enabled && model_attestation_supported.unwrap_or(false)
+}
+
 #[cfg(test)]
 fn prepare_chat_stream_chunk_for_client(
     chunk: &mut inference_providers::models::ChatCompletionChunk,
@@ -1447,29 +1454,24 @@ async fn chat_completions_inner(
         .resolve_alias_cached(&request.model)
         .await;
     let resolved_model_name = alias_canonical.as_deref().unwrap_or(&request.model);
-    let model_attestation_supported = if request.stream == Some(true) {
-        match app_state.models_service.get_models_with_pricing().await {
-            Ok(models) => models
-                .iter()
-                .find(|model| model.model_name == resolved_model_name)
-                .map(|model| model.attestation_supported),
-            Err(error) => {
-                tracing::warn!(
-                    model = %request.model,
-                    error = %error,
-                    "Failed to read cached model metadata for stream usage shaping; preserving raw passthrough"
-                );
-                None
-            }
+    let model_attestation_supported = match app_state.models_service.get_models_with_pricing().await
+    {
+        Ok(models) => models
+            .iter()
+            .find(|model| model.model_name == resolved_model_name)
+            .map(|model| model.attestation_supported),
+        Err(error) => {
+            tracing::warn!(
+                model = %request.model,
+                error = %error,
+                "Failed to read cached model metadata for attestation signing decisions"
+            );
+            None
         }
-    } else {
-        None
     };
     let usage_mode = chat_stream_usage_mode(&request, model_attestation_supported, e2ee_active);
     let rewrite_public_stream_usage = usage_mode.rewrite_public_stream_usage;
-    let gateway_signature_enabled = usage_mode.gateway_signature_enabled;
     let strip_intermediate_usage = usage_mode.strip_intermediate_usage;
-    service_request.skip_provider_chat_signature = gateway_signature_enabled;
 
     // Auto-redact (opt-in via x-auto-redact header or auto_redact body field).
     // On success this may rewrite service_request.messages to substitute
@@ -1516,6 +1518,19 @@ async fn chat_completions_inner(
         // Anthropic wire adapter bypass that mutation with the original body.
         service_request.original_request = None;
     }
+
+    // Auto-redact re-serializes response bytes after restoring the original
+    // values. A provider signature covers the pre-redaction bytes, so an
+    // attested response must use a Gateway signature over the bytes returned
+    // to the client instead.
+    let gateway_signature_enabled = usage_mode.gateway_signature_enabled
+        || auto_redact_requires_gateway_signature(auto_redact_enabled, model_attestation_supported);
+    // Never publish a provider signature over bytes that auto-redact changes.
+    // If metadata is unavailable, we cannot safely create a Gateway signature
+    // either, but omitting a signature is still better than returning one that
+    // cannot verify.
+    service_request.skip_provider_chat_signature =
+        usage_mode.gateway_signature_enabled || auto_redact_enabled;
     let redaction_map = Arc::new(redaction_map);
 
     // Check if streaming is requested
@@ -1733,7 +1748,7 @@ async fn chat_completions_inner(
                                                 ));
                                             }
                                         }
-                                        if gateway_signature_enabled {
+                                        if gateway_signature_enabled || auto_redact_enabled {
                                             let mut chat_id = public_signature_chat_id.lock().await;
                                             if chat_id.is_none() {
                                                 *chat_id = Some(chat.id.clone());
@@ -2004,6 +2019,14 @@ async fn chat_completions_inner(
                                             .release_chat_signature_pin(&chat_id)
                                             .await;
                                     }
+                                } else if auto_redact_enabled {
+                                    if let Some(chat_id) =
+                                        public_signature_chat_id_for_chain.lock().await.clone()
+                                    {
+                                        attestation_service_for_chain
+                                            .release_chat_signature_pin(&chat_id)
+                                            .await;
+                                    }
                                 }
 
                                 if combined.is_empty() {
@@ -2114,6 +2137,10 @@ async fn chat_completions_inner(
                         Ok(b) => b,
                         Err(e) => {
                             tracing::error!(error = %e, "failed to re-serialize unredacted chat response");
+                            app_state
+                                .attestation_service
+                                .release_chat_signature_pin(&response_with_bytes.response.id)
+                                .await;
                             return (
                                 StatusCode::INTERNAL_SERVER_ERROR,
                                 ResponseJson(ErrorResponse::new(
@@ -2147,6 +2174,32 @@ async fn chat_completions_inner(
                     .unwrap_or(body_bytes),
                     _ => body_bytes,
                 };
+
+                if auto_redact_enabled {
+                    if gateway_signature_enabled {
+                        let response_hash = hex::encode(Sha256::digest(&body_bytes));
+                        if let Err(error) = app_state
+                            .attestation_service
+                            .store_chat_signature_and_unpin(
+                                &response_with_bytes.response.id,
+                                request_hash.clone(),
+                                response_hash,
+                            )
+                            .await
+                        {
+                            tracing::error!(
+                                chat_id = %response_with_bytes.response.id,
+                                error = %error,
+                                "Failed to store auto-redacted chat completion signature"
+                            );
+                        }
+                    } else {
+                        app_state
+                            .attestation_service
+                            .release_chat_signature_pin(&response_with_bytes.response.id)
+                            .await;
+                    }
+                }
 
                 let mut response_builder = Response::builder()
                     .status(StatusCode::OK)
@@ -3225,6 +3278,14 @@ mod tests {
         );
 
         assert!(chat_stream_continuous_usage_requested(&request));
+    }
+
+    #[test]
+    fn auto_redact_requires_gateway_signature_for_attested_models() {
+        assert!(auto_redact_requires_gateway_signature(true, Some(true)));
+        assert!(!auto_redact_requires_gateway_signature(false, Some(true)));
+        assert!(!auto_redact_requires_gateway_signature(true, Some(false)));
+        assert!(!auto_redact_requires_gateway_signature(true, None));
     }
 
     #[test]

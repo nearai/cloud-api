@@ -1838,8 +1838,10 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
         let backend_latency = provider_start_time.elapsed();
         let queue_time = provider_start_time.duration_since(service_start_time);
 
-        // Store attestation signature (only for models that support TEE attestation)
-        if model.attestation_supported {
+        // Store a model-side signature only when the API route returns the
+        // provider's exact bytes. Routes that rewrite the public response
+        // store a Gateway signature after the final bytes are available.
+        if model.attestation_supported && !request.skip_provider_chat_signature {
             let attestation_service = self.attestation_service.clone();
             let chat_id = response_with_bytes.response.id.clone();
             let model_name = model.model_name.clone();

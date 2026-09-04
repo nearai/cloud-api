@@ -18,6 +18,7 @@ use axum::{
     response::{IntoResponse, Json as ResponseJson, Response},
 };
 use futures::stream::StreamExt;
+use services::attestation::ports::AttestationServiceTrait;
 use services::auto_redact::{self, AutoRedactError, RedactionMap, StreamUnredact};
 use services::common::encryption_headers as service_encryption_headers;
 use services::completions::{
@@ -42,6 +43,40 @@ const USAGE_RECORDING_TIMEOUT_SECS: u64 = 5;
 // unbounded. Past the cap we proceed without an Inference-Id header and let
 // the remaining stream (including the buffered control events) flow through.
 const MAX_LEADING_CONTROL_EVENTS: usize = 32;
+
+/// Releases the provider-routing signature pin if a response body is dropped
+/// before its normal end-of-stream finalization runs.
+struct StreamSignaturePinGuard {
+    attestation_service: Arc<dyn AttestationServiceTrait>,
+    chat_id: Option<String>,
+    armed: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl Drop for StreamSignaturePinGuard {
+    fn drop(&mut self) {
+        let Some(chat_id) = self.chat_id.clone() else {
+            return;
+        };
+        if !self.armed.swap(false, std::sync::atomic::Ordering::AcqRel) {
+            return;
+        }
+
+        let attestation_service = self.attestation_service.clone();
+        let handle = match tokio::runtime::Handle::try_current() {
+            Ok(handle) => handle,
+            Err(_) => {
+                tracing::error!(%chat_id, "Cannot release signature routing pin: no Tokio runtime available");
+                return;
+            }
+        };
+        std::mem::drop(handle.spawn(async move {
+            attestation_service
+                .release_chat_signature_pin(&chat_id)
+                .await;
+            tracing::debug!(%chat_id, "Released signature routing pin after stream cancellation");
+        }));
+    }
+}
 
 /// Insert validated E2EE headers into a provider `extra` HashMap.
 fn insert_encryption_headers(
@@ -1519,18 +1554,20 @@ async fn chat_completions_inner(
         service_request.original_request = None;
     }
 
-    // Auto-redact re-serializes response bytes after restoring the original
-    // values. A provider signature covers the pre-redaction bytes, so an
-    // attested response must use a Gateway signature over the bytes returned
-    // to the client instead.
+    // Auto-redact and alias handling can change the bytes returned to the
+    // client. A provider signature covers the upstream request and response,
+    // so it cannot verify those public bytes.
+    let alias_requires_gateway_signature =
+        alias_canonical.is_some() && model_attestation_supported.unwrap_or(false);
     let gateway_signature_enabled = usage_mode.gateway_signature_enabled
-        || auto_redact_requires_gateway_signature(auto_redact_enabled, model_attestation_supported);
-    // Never publish a provider signature over bytes that auto-redact changes.
-    // If metadata is unavailable, we cannot safely create a Gateway signature
-    // either, but omitting a signature is still better than returning one that
-    // cannot verify.
+        || auto_redact_requires_gateway_signature(auto_redact_enabled, model_attestation_supported)
+        || alias_requires_gateway_signature;
+    let public_response_rewritten = auto_redact_enabled || alias_canonical.is_some();
+    // If model metadata is unavailable, we cannot safely mint a Gateway
+    // signature. Do not fall back to a provider signature over different
+    // public bytes.
     service_request.skip_provider_chat_signature =
-        usage_mode.gateway_signature_enabled || auto_redact_enabled;
+        usage_mode.gateway_signature_enabled || public_response_rewritten;
     let redaction_map = Arc::new(redaction_map);
 
     // Check if streaming is requested
@@ -1639,10 +1676,19 @@ async fn chat_completions_inner(
                 ));
                 let final_stream_usage_for_chain = final_stream_usage.clone();
                 let public_signature_hasher = Arc::new(tokio::sync::Mutex::new(Sha256::new()));
-                let public_signature_chat_id = Arc::new(tokio::sync::Mutex::new(None::<String>));
+                let public_signature_chat_id =
+                    Arc::new(tokio::sync::Mutex::new(stream_chat_id.clone()));
                 let public_signature_hasher_for_chain = public_signature_hasher.clone();
                 let public_signature_chat_id_for_chain = public_signature_chat_id.clone();
                 let attestation_service_for_chain = app_state.attestation_service.clone();
+                let stream_signature_pin_armed =
+                    Arc::new(std::sync::atomic::AtomicBool::new(stream_chat_id.is_some()));
+                let stream_signature_pin_armed_for_chain = stream_signature_pin_armed.clone();
+                let stream_signature_pin_guard = StreamSignaturePinGuard {
+                    attestation_service: app_state.attestation_service.clone(),
+                    chat_id: stream_chat_id.clone(),
+                    armed: stream_signature_pin_armed,
+                };
 
                 // Re-attach any stashed leading control events, then convert
                 // to a raw bytes stream.
@@ -1709,7 +1755,8 @@ async fn chat_completions_inner(
                                     // store.
                                     let Some(mut chunk) = event.chunk else {
                                         if event.is_done_marker() {
-                                            if auto_redact_enabled
+                                            if gateway_signature_enabled
+                                                || auto_redact_enabled
                                                 || rewrite_public_stream_usage
                                                 || strip_intermediate_usage
                                             {
@@ -1748,7 +1795,7 @@ async fn chat_completions_inner(
                                                 ));
                                             }
                                         }
-                                        if gateway_signature_enabled || auto_redact_enabled {
+                                        if gateway_signature_enabled || public_response_rewritten {
                                             let mut chat_id = public_signature_chat_id.lock().await;
                                             if chat_id.is_none() {
                                                 *chat_id = Some(chat.id.clone());
@@ -1894,6 +1941,7 @@ async fn chat_completions_inner(
                             let organization_id = api_key.organization.id.0;
                             let model_name = request.model.clone();
                             let request_hash = request_hash.clone();
+                            let stream_signature_pin_armed = stream_signature_pin_armed_for_chain;
                             async move {
                                 let mut combined: Vec<u8> = Vec::new();
                                 let error_count_final =
@@ -2019,7 +2067,7 @@ async fn chat_completions_inner(
                                             .release_chat_signature_pin(&chat_id)
                                             .await;
                                     }
-                                } else if auto_redact_enabled {
+                                } else if public_response_rewritten {
                                     if let Some(chat_id) =
                                         public_signature_chat_id_for_chain.lock().await.clone()
                                     {
@@ -2028,6 +2076,12 @@ async fn chat_completions_inner(
                                             .await;
                                     }
                                 }
+
+                                // The tail owns all normal signature finalization and
+                                // explicit-release paths. If the body is dropped before
+                                // this point, the response-body guard releases the pin.
+                                stream_signature_pin_armed
+                                    .store(false, std::sync::atomic::Ordering::Release);
 
                                 if combined.is_empty() {
                                     // Avoid emitting an empty body frame.
@@ -2038,7 +2092,12 @@ async fn chat_completions_inner(
                             }
                         })
                         .filter_map(std::future::ready),
-                    );
+                    )
+                    .map(move |item| {
+                        // Keep cleanup alive while Axum owns the response body.
+                        let _ = &stream_signature_pin_guard;
+                        item
+                    });
 
                 // Look up which trust tier served this stream. The pool stores a
                 // chat_id → provider mapping when the first chunk arrives; we read
@@ -2175,7 +2234,7 @@ async fn chat_completions_inner(
                     _ => body_bytes,
                 };
 
-                if auto_redact_enabled {
+                if public_response_rewritten {
                     if gateway_signature_enabled {
                         let response_hash = hex::encode(Sha256::digest(&body_bytes));
                         if let Err(error) = app_state
@@ -2190,7 +2249,7 @@ async fn chat_completions_inner(
                             tracing::error!(
                                 chat_id = %response_with_bytes.response.id,
                                 error = %error,
-                                "Failed to store auto-redacted chat completion signature"
+                                "Failed to store public chat completion signature"
                             );
                         }
                     } else {
@@ -2341,6 +2400,8 @@ async fn completions_inner(
     request: CompletionRequest,
     request_id: Uuid,
 ) -> axum::response::Response {
+    let request_hash = body_hash.hash.clone();
+
     // Reject E2E encryption: validate for parity (an invalid version still 400s
     // the same way chat does), then refuse if any encryption header is present.
     let encryption_headers = match crate::routes::common::validate_encryption_headers(&headers) {
@@ -2430,7 +2491,24 @@ async fn completions_inner(
         .resolve_alias_cached(&request.model)
         .await;
 
-    let service_request = convert_text_request_to_service(
+    let resolved_model_name = alias_canonical.as_deref().unwrap_or(&request.model);
+    let legacy_gateway_signature_enabled =
+        match app_state.models_service.get_models_with_pricing().await {
+            Ok(models) => models
+                .iter()
+                .find(|model| model.model_name == resolved_model_name)
+                .is_some_and(|model| model.attestation_supported),
+            Err(error) => {
+                tracing::warn!(
+                    model = %request.model,
+                    error = %error,
+                    "Failed to read cached model metadata for legacy completion signing"
+                );
+                false
+            }
+        };
+
+    let mut service_request = convert_text_request_to_service(
         &request,
         prompt,
         api_key.api_key.created_by_user_id.0,
@@ -2441,6 +2519,10 @@ async fn completions_inner(
         body_hash,
         request_id,
     );
+    // This endpoint always converts the provider's chat-completion payload
+    // into the legacy completion format, so a provider signature cannot
+    // verify the bytes returned to the client.
+    service_request.skip_provider_chat_signature = true;
 
     if request.stream == Some(true) {
         match app_state
@@ -2501,6 +2583,11 @@ async fn completions_inner(
 
                 let organization_id = api_key.organization.id.0;
                 let model_for_err = request.model.clone();
+                let public_signature_hasher = Arc::new(tokio::sync::Mutex::new(Sha256::new()));
+                let public_signature_chat_id =
+                    Arc::new(tokio::sync::Mutex::new(stream_chat_id.clone()));
+                let stream_error_count = Arc::new(std::sync::atomic::AtomicU32::new(0));
+                let attestation_service = app_state.attestation_service.clone();
 
                 // Warning to inject into the first streamed chunk of an
                 // alias-served response (issue #573).
@@ -2509,62 +2596,159 @@ async fn completions_inner(
                         |canonical| alias_warning_message(&request.model, canonical),
                     )));
                 let pending_warning = alias_warning_pending.clone();
+                let stream_signature_pin_armed =
+                    Arc::new(std::sync::atomic::AtomicBool::new(stream_chat_id.is_some()));
+                let stream_signature_pin_armed_for_chain = stream_signature_pin_armed.clone();
+                let stream_signature_pin_guard = StreamSignaturePinGuard {
+                    attestation_service: app_state.attestation_service.clone(),
+                    chat_id: stream_chat_id.clone(),
+                    armed: stream_signature_pin_armed,
+                };
+                let public_signature_hasher_for_chunks = public_signature_hasher.clone();
+                let public_signature_chat_id_for_chunks = public_signature_chat_id.clone();
+                let stream_error_count_for_chunks = stream_error_count.clone();
 
                 let byte_stream = peekable_stream
                     .filter_map(move |result| {
                         let model_for_err = model_for_err.clone();
                         let pending_warning = pending_warning.clone();
-                        std::future::ready(match result {
-                            // Control lines (blank/comment/[DONE]) carry no
-                            // parsed payload — skip; the gateway appends its
-                            // own [DONE] terminator below. This route reshapes
-                            // chat chunks into text-completion format, so it
-                            // always re-serializes (no byte passthrough).
-                            Ok(event) => event.chunk.map(|chunk| {
-                                let text_chunk = chat_chunk_to_text_chunk(chunk);
-                                // The first chunk of an alias-served response
-                                // gets a top-level "warning" (issue #573).
-                                let alias_warning =
-                                    pending_warning.lock().ok().and_then(|mut g| g.take());
-                                let json_data = match alias_warning {
-                                    Some(warning) => {
-                                        serde_json::to_value(&text_chunk).map(|mut v| {
-                                            if let Some(obj) = v.as_object_mut() {
-                                                obj.insert(
-                                                    "warning".to_string(),
-                                                    serde_json::Value::String(warning),
-                                                );
-                                            }
-                                            v.to_string()
-                                        })
+                        let public_signature_hasher = public_signature_hasher_for_chunks.clone();
+                        let public_signature_chat_id = public_signature_chat_id_for_chunks.clone();
+                        let stream_error_count = stream_error_count_for_chunks.clone();
+                        async move {
+                            match result {
+                                // Control lines (blank/comment/[DONE]) carry no
+                                // parsed payload — skip; the gateway appends its
+                                // own [DONE] terminator below. This route reshapes
+                                // chat chunks into text-completion format, so it
+                                // always re-serializes (no byte passthrough).
+                                Ok(event) => {
+                                    let chunk = event.chunk?;
+                                    let chat_id = match &chunk {
+                                        inference_providers::StreamChunk::Chat(chunk) => {
+                                            chunk.id.clone()
+                                        }
+                                        inference_providers::StreamChunk::Text(chunk) => {
+                                            chunk.id.clone()
+                                        }
+                                    };
+                                    let mut stored_chat_id = public_signature_chat_id.lock().await;
+                                    if stored_chat_id.is_none() {
+                                        *stored_chat_id = Some(chat_id);
                                     }
-                                    None => serde_json::to_string(&text_chunk),
+                                    drop(stored_chat_id);
+
+                                    let text_chunk = chat_chunk_to_text_chunk(chunk);
+                                    // The first chunk of an alias-served response
+                                    // gets a top-level "warning" (issue #573).
+                                    let alias_warning =
+                                        pending_warning.lock().ok().and_then(|mut g| g.take());
+                                    let json_data = match alias_warning {
+                                        Some(warning) => {
+                                            serde_json::to_value(&text_chunk).map(|mut v| {
+                                                if let Some(obj) = v.as_object_mut() {
+                                                    obj.insert(
+                                                        "warning".to_string(),
+                                                        serde_json::Value::String(warning),
+                                                    );
+                                                }
+                                                v.to_string()
+                                            })
+                                        }
+                                        None => serde_json::to_string(&text_chunk),
+                                    }
+                                    .unwrap_or_else(|e| {
+                                        tracing::error!(
+                                            %organization_id,
+                                            "Failed to serialize text completion chunk: {e}"
+                                        );
+                                        "{}".to_string()
+                                    });
+                                    let bytes = Bytes::from(format!("data: {json_data}\n\n"));
+                                    if legacy_gateway_signature_enabled {
+                                        public_signature_hasher.lock().await.update(&bytes);
+                                    }
+                                    Some(Ok::<Bytes, Infallible>(bytes))
                                 }
-                                .unwrap_or_else(|e| {
+                                Err(e) => {
+                                    stream_error_count
+                                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                                     tracing::error!(
                                         %organization_id,
-                                        "Failed to serialize text completion chunk: {e}"
+                                        model = %model_for_err,
+                                        error_type = %completion_stream_error_category(&e),
+                                        "Text completion stream error"
                                     );
-                                    "{}".to_string()
-                                });
-                                Ok::<Bytes, Infallible>(Bytes::from(format!(
-                                    "data: {json_data}\n\n"
-                                )))
-                            }),
-                            Err(e) => {
-                                tracing::error!(
-                                    %organization_id,
-                                    model = %model_for_err,
-                                    error_type = %completion_stream_error_category(&e),
-                                    "Text completion stream error"
-                                );
-                                Some(Ok::<Bytes, Infallible>(sse_error_frame(&e)))
+                                    Some(Ok::<Bytes, Infallible>(sse_error_frame(&e)))
+                                }
                             }
-                        })
+                        }
                     })
-                    .chain(futures::stream::once(async move {
-                        Ok::<Bytes, Infallible>(Bytes::from_static(b"data: [DONE]\n\n"))
-                    }));
+                    .chain(futures::stream::once({
+                        let public_signature_hasher = public_signature_hasher.clone();
+                        let public_signature_chat_id = public_signature_chat_id.clone();
+                        let stream_error_count = stream_error_count.clone();
+                        let request_hash = request_hash.clone();
+                        let model_name = request.model.clone();
+                        let stream_signature_pin_armed = stream_signature_pin_armed_for_chain;
+                        async move {
+                            let done = Bytes::from_static(b"data: [DONE]\n\n");
+                            let chat_id = public_signature_chat_id.lock().await.clone();
+                            let stream_errored = stream_error_count
+                                .load(std::sync::atomic::Ordering::Relaxed)
+                                > 0;
+
+                            if legacy_gateway_signature_enabled && !stream_errored {
+                                let response_hash = {
+                                    let mut hasher = public_signature_hasher.lock().await;
+                                    hasher.update(&done);
+                                    hex::encode(hasher.clone().finalize())
+                                };
+                                if let Some(chat_id) = chat_id {
+                                    if let Err(error) = attestation_service
+                                        .store_chat_signature_and_unpin(
+                                            &chat_id,
+                                            request_hash,
+                                            response_hash,
+                                        )
+                                        .await
+                                    {
+                                        tracing::error!(
+                                            %organization_id,
+                                            model = %model_name,
+                                            error = %error,
+                                            "Failed to store legacy completion stream signature"
+                                        );
+                                    }
+                                } else {
+                                    tracing::warn!(
+                                        %organization_id,
+                                        model = %model_name,
+                                        "Cannot store legacy completion stream signature: no chat_id observed"
+                                    );
+                                }
+                            } else if let Some(chat_id) = chat_id {
+                                // The service did not fetch a provider signature for this
+                                // transformed response, so release its routing pin here.
+                                attestation_service
+                                    .release_chat_signature_pin(&chat_id)
+                                    .await;
+                            }
+
+                            // The legacy tail owns normal finalization. A dropped
+                            // response body before it is polled is cleaned up by
+                            // the response-body guard.
+                            stream_signature_pin_armed
+                                .store(false, std::sync::atomic::Ordering::Release);
+
+                            Ok::<Bytes, Infallible>(done)
+                        }
+                    }))
+                    .map(move |item| {
+                        // Keep cleanup alive while Axum owns the response body.
+                        let _ = &stream_signature_pin_guard;
+                        item
+                    });
 
                 let mut response_builder = Response::builder()
                     .status(StatusCode::OK)
@@ -2619,13 +2803,18 @@ async fn completions_inner(
             .await
         {
             Ok(response_with_bytes) => {
-                let inference_id = hash_inference_id_to_uuid(&response_with_bytes.response.id);
+                let chat_id = response_with_bytes.response.id.clone();
+                let inference_id = hash_inference_id_to_uuid(&chat_id);
                 let completion = chat_response_to_text_response(response_with_bytes.response);
 
                 let body_bytes = match serde_json::to_vec(&completion) {
                     Ok(b) => b,
                     Err(e) => {
                         tracing::error!(error = %e, "failed to serialize text completion response");
+                        app_state
+                            .attestation_service
+                            .release_chat_signature_pin(&chat_id)
+                            .await;
                         return (
                             StatusCode::INTERNAL_SERVER_ERROR,
                             ResponseJson(ErrorResponse::new(
@@ -2648,6 +2837,26 @@ async fn completions_inner(
                     .unwrap_or(body_bytes),
                     None => body_bytes,
                 };
+
+                if legacy_gateway_signature_enabled {
+                    let response_hash = hex::encode(Sha256::digest(&body_bytes));
+                    if let Err(error) = app_state
+                        .attestation_service
+                        .store_chat_signature_and_unpin(&chat_id, request_hash, response_hash)
+                        .await
+                    {
+                        tracing::error!(
+                            chat_id = %chat_id,
+                            error = %error,
+                            "Failed to store legacy completion signature"
+                        );
+                    }
+                } else {
+                    app_state
+                        .attestation_service
+                        .release_chat_signature_pin(&chat_id)
+                        .await;
+                }
 
                 let mut response_builder = Response::builder()
                     .status(StatusCode::OK)

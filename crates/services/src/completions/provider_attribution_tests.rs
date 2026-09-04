@@ -101,6 +101,7 @@ fn completion_request(model: &str) -> ports::CompletionRequest {
         api_key_id: Uuid::new_v4().to_string(),
         organization_id: Uuid::new_v4(),
         workspace_id: Uuid::new_v4(),
+        fallback_enabled: true,
         metadata: None,
         store: None,
         body_hash: "test-body-hash".to_string(),

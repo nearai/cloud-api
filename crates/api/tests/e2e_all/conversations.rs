@@ -5,6 +5,7 @@ use crate::common::*;
 use api::models::{
     ConversationContentPart, ConversationItem, ResponseOutputContent, ResponseOutputItem,
 };
+use uuid::Uuid;
 
 // Helper functions for conversation and response tests
 async fn create_conversation(
@@ -273,7 +274,7 @@ async fn test_response_stream_fails_with_failed_event_when_inference_fails_at_st
 
     let item_rows = client
         .query(
-            "SELECT item FROM response_items WHERE conversation_id = $1 ORDER BY created_at ASC",
+            "SELECT id, item FROM response_items WHERE conversation_id = $1 ORDER BY created_at ASC",
             &[&conv_uuid],
         )
         .await
@@ -281,7 +282,19 @@ async fn test_response_stream_fails_with_failed_event_when_inference_fails_at_st
     let assistant_items: Vec<serde_json::Value> = item_rows
         .into_iter()
         .filter_map(|row| {
-            let item: serde_json::Value = row.get("item");
+            let id: uuid::Uuid = row.get("id");
+            let mut item: serde_json::Value = row.get("item");
+            if let Some(key) = pool.encryption_key() {
+                item = database::field_encryption::decrypt_json_if_encrypted_with_key_id(
+                    &key,
+                    &pool.encryption_key_id(),
+                    "response_items",
+                    "item",
+                    id,
+                    item,
+                )
+                .expect("decrypt response item");
+            }
             if item.get("role").and_then(|v| v.as_str()) == Some("assistant") {
                 Some(item)
             } else {
@@ -2463,7 +2476,7 @@ async fn test_clone_conversation() {
 
 #[tokio::test]
 async fn test_clone_conversation_with_responses_and_items() {
-    let server = setup_test_server().await;
+    let (server, database) = setup_test_server_with_database().await;
     let model_id = setup_qwen_model(&server).await;
     let org = setup_org_with_credits(&server, 10000000000i64).await; // $10.00 USD
     let api_key = get_api_key_for_org(&server, org.id).await;
@@ -2505,6 +2518,21 @@ async fn test_clone_conversation_with_responses_and_items() {
     .await;
     println!("Created response 2: {}", response2.id);
 
+    let confidential_response = server
+        .post("/v1/responses")
+        .add_header("Authorization", format!("Bearer {api_key}"))
+        .json(&serde_json::json!({
+            "conversation": {"id": original_conv.id},
+            "input": "Response with confidential fields",
+            "instructions": "private system instruction",
+            "metadata": {"private": "response metadata"},
+            "max_output_tokens": 50,
+            "stream": false,
+            "model": model_id
+        }))
+        .await;
+    assert_eq!(confidential_response.status_code(), 200);
+
     // Get original conversation items count
     let original_items =
         list_conversation_items(&server, original_conv.id.clone(), api_key.clone()).await;
@@ -2532,6 +2560,50 @@ async fn test_clone_conversation_with_responses_and_items() {
         cloned_conv.metadata.get("title").and_then(|v| v.as_str()),
         Some("Original Conversation with Messages (Copy)")
     );
+
+    let original_uuid = uuid::Uuid::parse_str(
+        original_conv
+            .id
+            .strip_prefix("conv_")
+            .unwrap_or(&original_conv.id),
+    )
+    .expect("original conversation UUID");
+    let cloned_uuid = uuid::Uuid::parse_str(
+        cloned_conv
+            .id
+            .strip_prefix("conv_")
+            .unwrap_or(&cloned_conv.id),
+    )
+    .expect("cloned conversation UUID");
+    let client = database.pool().get().await.expect("database connection");
+    for conversation_id in [original_uuid, cloned_uuid] {
+        let metadata: serde_json::Value = client
+            .query_one(
+                "SELECT metadata FROM conversations WHERE id=$1",
+                &[&conversation_id],
+            )
+            .await
+            .expect("stored conversation metadata")
+            .get(0);
+        assert_eq!(metadata[database::field_encryption::MARKER], true);
+
+        let response_row = client
+            .query_one(
+                "SELECT instructions,metadata FROM responses WHERE conversation_id=$1 AND instructions IS NOT NULL LIMIT 1",
+                &[&conversation_id],
+            )
+            .await
+            .expect("stored confidential response fields");
+        assert!(response_row
+            .get::<_, String>("instructions")
+            .contains(database::field_encryption::MARKER));
+        assert_eq!(
+            response_row.get::<_, serde_json::Value>("metadata")
+                [database::field_encryption::MARKER],
+            true
+        );
+    }
+    drop(client);
 
     // Get cloned conversation items
     let cloned_items =
@@ -3066,7 +3138,7 @@ async fn test_conversation_metadata_limits() {
 
 #[tokio::test]
 async fn test_create_and_clone_conversation_return_root_response_id() {
-    let server = setup_test_server().await;
+    let (server, database) = setup_test_server_with_database().await;
     let (api_key, _) = create_org_and_api_key(&server).await;
 
     // Create conversation: response metadata must include root_response_id for first-turn parallel responses
@@ -3091,6 +3163,20 @@ async fn test_create_and_clone_conversation_return_root_response_id() {
         root_id
     );
 
+    // Simulate a root written by an old replica after V0076 has run: the legacy
+    // metadata marker exists, but the new structural flag retains its default.
+    let root_uuid =
+        Uuid::parse_str(root_id.trim_start_matches("resp_")).expect("root response UUID");
+    let client = database.pool().get().await.expect("database connection");
+    client
+        .execute(
+            "UPDATE responses SET metadata='{\"root_response\":true}'::jsonb, is_root_response=FALSE WHERE id=$1",
+            &[&root_uuid],
+        )
+        .await
+        .expect("simulate root created by an old replica");
+    drop(client);
+
     // Clone conversation: response metadata must include root_response_id (cloned conversation has its own root)
     let clone_response = server
         .post(format!("/v1/conversations/{}/clone", created.id).as_str())
@@ -3110,6 +3196,22 @@ async fn test_create_and_clone_conversation_return_root_response_id() {
     assert_ne!(
         cloned_root_id, root_id,
         "cloned conversation must have a different root_response_id than the original"
+    );
+
+    let cloned_conversation_uuid =
+        Uuid::parse_str(cloned.id.trim_start_matches("conv_")).expect("cloned conversation UUID");
+    let client = database.pool().get().await.expect("database connection");
+    let structural_roots: i64 = client
+        .query_one(
+            "SELECT COUNT(*) FROM responses WHERE conversation_id=$1 AND is_root_response",
+            &[&cloned_conversation_uuid],
+        )
+        .await
+        .expect("count cloned structural roots")
+        .get(0);
+    assert_eq!(
+        structural_roots, 1,
+        "the cloned legacy root must be repaired instead of duplicated"
     );
     println!(
         "✅ Clone conversation returns root_response_id: {}",

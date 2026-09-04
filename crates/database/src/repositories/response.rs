@@ -19,8 +19,84 @@ impl PgResponseRepository {
         Self { pool }
     }
 
+    fn encrypt_text(&self, id: Uuid, column: &str, value: Option<&str>) -> Result<Option<String>> {
+        value
+            .map(|value| match self.pool.encryption_write_context() {
+                Some((key, key_id)) => crate::field_encryption::encrypt_with_key_id(
+                    &key,
+                    &key_id,
+                    "responses",
+                    column,
+                    id,
+                    value,
+                ),
+                None => Ok(value.to_string()),
+            })
+            .transpose()
+    }
+
+    fn decrypt_text(
+        &self,
+        id: Uuid,
+        column: &str,
+        value: Option<String>,
+    ) -> Result<Option<String>> {
+        value
+            .map(|value| match self.pool.encryption_context() {
+                Some((key, key_id)) => crate::field_encryption::decrypt_if_encrypted_with_key_id(
+                    &key,
+                    &key_id,
+                    "responses",
+                    column,
+                    id,
+                    value,
+                ),
+                None => Ok(value),
+            })
+            .transpose()
+    }
+
+    fn encrypt_metadata(&self, id: Uuid, value: &serde_json::Value) -> Result<serde_json::Value> {
+        match self.pool.encryption_write_context() {
+            Some((key, key_id)) => crate::field_encryption::encrypt_json_with_key_id(
+                &key,
+                &key_id,
+                "responses",
+                "metadata",
+                id,
+                value,
+            ),
+            None => Ok(value.clone()),
+        }
+    }
+
+    fn decrypt_metadata(
+        &self,
+        id: Uuid,
+        value: Option<serde_json::Value>,
+    ) -> Result<Option<serde_json::Value>> {
+        value
+            .map(|value| match self.pool.encryption_context() {
+                Some((key, key_id)) => {
+                    crate::field_encryption::decrypt_json_if_encrypted_with_key_id(
+                        &key,
+                        &key_id,
+                        "responses",
+                        "metadata",
+                        id,
+                        value,
+                    )
+                }
+                None => Ok(value),
+            })
+            .transpose()
+    }
+
     /// Fetch the ID of the structural root response for a conversation, if it exists.
-    /// Root rows are identified by metadata->>'root_response' = 'true'.
+    ///
+    /// During a rolling deployment an old replica can still create a root using
+    /// only the legacy metadata marker. Find that row and repair its dedicated
+    /// flag before any new replica attempts to insert another root.
     async fn fetch_root_id_opt(
         &self,
         conversation_uuid: Uuid,
@@ -37,12 +113,28 @@ impl PgResponseRepository {
             client
                 .query_opt(
                     r#"
-                    SELECT id
-                    FROM responses
-                    WHERE conversation_id = $1
-                      AND workspace_id = $2
-                      AND metadata->>'root_response' = 'true'
-                    ORDER BY created_at ASC
+                    WITH candidate AS (
+                        SELECT id
+                        FROM responses
+                        WHERE conversation_id = $1
+                          AND workspace_id = $2
+                          AND (
+                              is_root_response
+                              OR metadata->>'root_response' = 'true'
+                          )
+                        ORDER BY is_root_response DESC, created_at ASC
+                        LIMIT 1
+                    ), repaired AS (
+                        UPDATE responses AS response
+                        SET is_root_response = TRUE
+                        FROM candidate
+                        WHERE response.id = candidate.id
+                          AND NOT response.is_root_response
+                        RETURNING response.id
+                    )
+                    SELECT id FROM repaired
+                    UNION ALL
+                    SELECT id FROM candidate
                     LIMIT 1
                     "#,
                     &[&conversation_uuid, &workspace_id.0],
@@ -85,6 +177,10 @@ impl PgResponseRepository {
         let metadata_json = serde_json::json!({
             "root_response": true
         });
+        let root_id = Uuid::new_v4();
+        let stored_metadata = self
+            .encrypt_metadata(root_id, &metadata_json)
+            .map_err(RepositoryError::DataConversionError)?;
         let next_response_ids_json = serde_json::json!([]);
 
         let inserted_row_opt = retry_db!("insert_conversation_root", {
@@ -102,16 +198,17 @@ impl PgResponseRepository {
                 .query_opt(
                     r#"
                     INSERT INTO responses (
-                        workspace_id, api_key_id, model, status, instructions, conversation_id,
-                        previous_response_id, next_response_ids, usage, metadata,
+                        id, workspace_id, api_key_id, model, status, instructions, conversation_id,
+                        previous_response_id, next_response_ids, usage, metadata, is_root_response,
                         created_at, updated_at
                     )
-                    VALUES ($1, $2, $3, $4, NULL, $5, NULL, $6, $7, $8, $9, $9)
-                    ON CONFLICT (conversation_id) WHERE metadata->>'root_response' = 'true'
+                    VALUES ($1, $2, $3, $4, $5, NULL, $6, NULL, $7, $8, $9, TRUE, $10, $10)
+                    ON CONFLICT (conversation_id) WHERE is_root_response
                     DO NOTHING
                     RETURNING id
                     "#,
                     &[
+                        &root_id,
                         &workspace_id.0,
                         api_key_id,
                         &model,
@@ -119,16 +216,18 @@ impl PgResponseRepository {
                         &conversation_uuid,
                         &next_response_ids_json,
                         &usage_json,
-                        &metadata_json,
+                        &stored_metadata,
                         &now,
                     ],
                 )
                 .await
                 .map_err(map_db_error)
-        })?;
+        });
 
-        if let Some(row) = inserted_row_opt {
-            return Ok(row.get("id"));
+        match inserted_row_opt {
+            Ok(Some(row)) => return Ok(row.get("id")),
+            Ok(None) | Err(RepositoryError::AlreadyExists) => {}
+            Err(error) => return Err(error),
         }
 
         // Another request created the root concurrently; fetch and return it.
@@ -300,6 +399,12 @@ impl ResponseRepositoryTrait for PgResponseRepository {
             "total_tokens": 0
         });
         let metadata_json = request.metadata.unwrap_or_else(|| serde_json::json!({}));
+        let stored_instructions = self.encrypt_text(
+            response_uuid,
+            "instructions",
+            request.instructions.as_deref(),
+        )?;
+        let stored_metadata = self.encrypt_metadata(response_uuid, &metadata_json)?;
         let next_response_ids_json = serde_json::json!([]);
 
         // Insert response and update previous response in a single retry_db! block
@@ -330,12 +435,12 @@ impl ResponseRepositoryTrait for PgResponseRepository {
                         &api_key_id,
                         &request.model,
                         &status,
-                        &request.instructions,
+                        &stored_instructions,
                         &conversation_uuid,
                         &previous_response_uuid,
                         &next_response_ids_json,
                         &usage_json,
-                        &metadata_json,
+                        &stored_metadata,
                         &now,
                         &now,
                     ],
@@ -478,9 +583,10 @@ impl ResponseRepositoryTrait for PgResponseRepository {
         let created_at: DateTime<Utc> = row.get("created_at");
         let conversation_uuid: Option<Uuid> = row.get("conversation_id");
         let usage_json: Option<serde_json::Value> = row.get("usage");
-        let metadata_json: Option<serde_json::Value> = row.get("metadata");
+        let metadata_json = self.decrypt_metadata(response_uuid, row.get("metadata"))?;
         let model: String = row.get("model");
-        let instructions: Option<String> = row.get("instructions");
+        let instructions =
+            self.decrypt_text(response_uuid, "instructions", row.get("instructions"))?;
         let previous_response_uuid: Option<Uuid> = row.get("previous_response_id");
         let next_response_ids_json: Option<serde_json::Value> = row.get("next_response_ids");
 
@@ -658,8 +764,8 @@ impl ResponseRepositoryTrait for PgResponseRepository {
         };
 
         // Parse metadata
-        let metadata_value: Option<serde_json::Value> = row.get(10);
-        let metadata = metadata_value;
+        let metadata = self.decrypt_metadata(response_uuid, row.get(10))?;
+        let instructions = self.decrypt_text(response_uuid, "instructions", row.get(5))?;
 
         // Parse status
         let status_str: String = row.get(4);
@@ -680,7 +786,7 @@ impl ResponseRepositoryTrait for PgResponseRepository {
             conversation: conversation_ref,
             error: None,
             incomplete_details: None,
-            instructions: row.get(5),
+            instructions,
             max_output_tokens: None, // Not stored in DB
             max_tool_calls: None,    // Not stored in DB
             model: row.get(3),
@@ -784,7 +890,7 @@ impl ResponseRepositoryTrait for PgResponseRepository {
                     FROM responses
                     WHERE conversation_id = $1
                       AND workspace_id = $2
-                      AND COALESCE((metadata->>'root_response')::boolean, false) = false
+                      AND NOT is_root_response
                     ORDER BY created_at DESC
                     LIMIT 1
                     "#,
@@ -812,9 +918,10 @@ impl ResponseRepositoryTrait for PgResponseRepository {
         let created_at: DateTime<Utc> = row.get("created_at");
         let conversation_uuid: Option<Uuid> = row.get("conversation_id");
         let usage_json: Option<serde_json::Value> = row.get("usage");
-        let metadata_json: Option<serde_json::Value> = row.get("metadata");
+        let metadata_json = self.decrypt_metadata(response_uuid, row.get("metadata"))?;
         let model: String = row.get("model");
-        let instructions: Option<String> = row.get("instructions");
+        let instructions =
+            self.decrypt_text(response_uuid, "instructions", row.get("instructions"))?;
         let previous_response_uuid: Option<Uuid> = row.get("previous_response_id");
         let next_response_ids_json: Option<serde_json::Value> = row.get("next_response_ids");
 

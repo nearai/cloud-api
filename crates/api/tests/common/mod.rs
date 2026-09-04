@@ -105,6 +105,12 @@ pub fn test_config() -> ApiConfig {
             refresh_interval: 30,
             mock: false,
         },
+        database_encryption_key: std::env::var("DB_ENCRYPTION_KEY").unwrap_or_else(|_| {
+            "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789".to_string()
+        }),
+        database_encryption_key_id: "e2e-db-v1".to_string(),
+        // Preserve encrypted-write coverage in E2E tests; production defaults off.
+        database_encryption_write_enabled: true,
         s3: config::S3Config {
             mock: true,
             bucket: std::env::var("AWS_S3_BUCKET").unwrap_or_else(|_| "test-bucket".to_string()),
@@ -501,6 +507,27 @@ pub async fn setup_test_server_and_router() -> (axum_test::TestServer, axum::Rou
     let (server, _pool, _mock, router) =
         build_test_server_components(infra.database.clone(), infra.config).await;
     (server, router)
+}
+
+/// Like [`setup_test_server_with_pool`], with the underlying router for tests
+/// that need both mock-provider control and frame-by-frame response polling.
+pub async fn setup_test_server_with_pool_and_router() -> (
+    axum_test::TestServer,
+    axum::Router,
+    std::sync::Arc<services::inference_provider_pool::InferenceProviderPool>,
+    std::sync::Arc<inference_providers::mock::MockProvider>,
+    Arc<Database>,
+) {
+    let infra = setup_test_infrastructure().await;
+    let (server, inference_provider_pool, mock_provider, router) =
+        build_test_server_components(infra.database.clone(), infra.config).await;
+    (
+        server,
+        router,
+        inference_provider_pool,
+        mock_provider,
+        infra.database,
+    )
 }
 
 pub async fn setup_test_server_real_providers() -> (

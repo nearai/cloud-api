@@ -114,6 +114,9 @@ where
     last_token_time: Option<Instant>,
     /// Accumulated inter-token latency for average calculation
     total_itl_ms: f64,
+    idle_timeouts: Option<StreamIdleTimeouts>,
+    idle_timer: Option<Pin<Box<tokio::time::Sleep>>>,
+    idle_armed: bool,
     // Pre-allocated low-cardinality metric tags (for Datadog/OTLP)
     metric_tags: Vec<String>,
     concurrent_counter: Option<Arc<AtomicU32>>,
@@ -255,6 +258,13 @@ where
         let api_key_id = self.api_key_id;
         let model_id = self.model_id;
         let inference_type = self.inference_type;
+        let total_duration_ms = self.service_start_time.elapsed().as_millis() as u64;
+        let ms_since_last_token = self
+            .last_token_time
+            .map(|last| last.elapsed().as_millis() as u64);
+        let error_detail = self.last_error.as_ref().map(|error| {
+            super::inference_provider_pool::InferenceProviderPool::safe_error_detail(error)
+        });
 
         // Create span with context BEFORE any early returns so all error logs have context
         let _span = tracing::error_span!(
@@ -267,6 +277,21 @@ where
             %inference_type
         )
         .entered();
+
+        if error_detail.is_some() {
+            tracing::warn!(
+                %request_id,
+                %organization_id,
+                %model_id,
+                model = %self.model_name,
+                chat_id = self.last_chat_id.as_deref(),
+                error_detail = error_detail.as_deref(),
+                stream_completed = self.stream_completed,
+                total_duration_ms,
+                ms_since_last_token,
+                "Stream failed"
+            );
+        }
 
         let (
             input_tokens,
@@ -294,36 +319,49 @@ where
                 // keeps polling, so the stream still ends "normally"
                 // (stream_completed == true) after e.g. a backend queue abort before
                 // the first token. That is a provider error, not a mystery.
-                if !self.stream_completed || self.last_error.is_some() {
-                    tracing::warn!(%organization_id, %model_id, model = %self.model_name,
-                        stream_completed = self.stream_completed,
-                        stream_error = self.last_error.is_some(),
-                        "Stream interrupted before usage stats or chat_id received (client disconnect or provider error)");
-                } else {
-                    tracing::error!(%organization_id, %model_id, model = %self.model_name,
-                        "Stream completed but no usage stats and no chat_id available");
+                if self.last_error.is_none() {
+                    if !self.stream_completed {
+                        tracing::warn!(%request_id, %organization_id, %model_id,
+                            model = %self.model_name,
+                            total_duration_ms,
+                            ms_since_last_token,
+                            "Stream interrupted before usage stats or chat_id received \
+                             (client disconnect)");
+                    } else {
+                        tracing::error!(%request_id, %organization_id, %model_id,
+                            model = %self.model_name,
+                            total_duration_ms,
+                            "Stream completed but no usage stats and no chat_id available");
+                    }
                 }
                 return;
             }
             (None, Some(chat_id)) => {
-                if !self.stream_completed || self.last_error.is_some() {
-                    tracing::warn!(%chat_id, %organization_id, %model_id, model = %self.model_name,
-                        stream_completed = self.stream_completed,
-                        stream_error = self.last_error.is_some(),
-                        "Stream interrupted before usage stats received (client disconnect or provider error)");
-                } else {
-                    tracing::error!(%chat_id, %organization_id, %model_id, model = %self.model_name,
-                        "Stream completed but no usage stats available");
+                if self.last_error.is_none() {
+                    if !self.stream_completed {
+                        tracing::warn!(%request_id, %chat_id, %organization_id, %model_id,
+                            model = %self.model_name,
+                            total_duration_ms,
+                            ms_since_last_token,
+                            "Stream interrupted before usage stats received (client disconnect)");
+                    } else {
+                        tracing::error!(%request_id, %chat_id, %organization_id, %model_id,
+                            model = %self.model_name,
+                            total_duration_ms,
+                            "Stream completed but no usage stats available");
+                    }
                 }
                 return;
             }
             (Some(usage), None) => {
                 tracing::error!(
+                    %request_id,
                     prompt_tokens = usage.prompt_tokens,
                     completion_tokens = usage.completion_tokens,
                     %organization_id,
                     %model_id,
                     model = %self.model_name,
+                    total_duration_ms,
                     "Stream ended but no chat_id available"
                 );
                 return;
@@ -339,7 +377,7 @@ where
         let handle = match tokio::runtime::Handle::try_current() {
             Ok(h) => h,
             Err(_) => {
-                tracing::error!("Cannot record usage: no Tokio runtime available");
+                tracing::error!(%request_id, "Cannot record usage: no Tokio runtime available");
                 return;
             }
         };
@@ -531,6 +569,26 @@ where
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct StreamIdleTimeouts {
+    pub first_token: Duration,
+    pub between_tokens: Duration,
+}
+
+impl<S> InterceptStream<S>
+where
+    S: Stream<Item = Result<SSEEvent, inference_providers::CompletionError>> + Unpin,
+{
+    fn idle_budget(&self) -> Option<Duration> {
+        let timeouts = self.idle_timeouts?;
+        Some(if self.first_token_received {
+            timeouts.between_tokens
+        } else {
+            timeouts.first_token
+        })
+    }
+}
+
 impl<S> Stream for InterceptStream<S>
 where
     S: Stream<Item = Result<SSEEvent, inference_providers::CompletionError>> + Unpin,
@@ -542,6 +600,8 @@ where
             if matches!(&self.state, StreamState::Streaming) {
                 match Pin::new(&mut self.inner).poll_next(cx) {
                     Poll::Ready(Some(Ok(event))) => {
+                        self.idle_armed = false;
+
                         if event.is_done_marker() {
                             if event.raw_bytes.len() > MAX_PROVIDER_DONE_EVENT_BYTES {
                                 let error = inference_providers::CompletionError::CompletionError(
@@ -623,10 +683,46 @@ where
                     Poll::Ready(None) => self.begin_finalizing(),
                     Poll::Ready(Some(Err(err))) => {
                         // Capture error for stop_reason in usage recording (handled in Drop).
+                        self.idle_armed = false;
                         self.last_error = Some(err.clone());
                         return Poll::Ready(Some(Err(err)));
                     }
-                    Poll::Pending => return Poll::Pending,
+                    Poll::Pending => {
+                        let Some(budget) = self.idle_budget() else {
+                            return Poll::Pending;
+                        };
+                        if !self.idle_armed {
+                            let deadline = tokio::time::Instant::now() + budget;
+                            match &mut self.idle_timer {
+                                Some(timer) => timer.as_mut().reset(deadline),
+                                None => {
+                                    self.idle_timer =
+                                        Some(Box::pin(tokio::time::sleep_until(deadline)));
+                                }
+                            }
+                            self.idle_armed = true;
+                        }
+                        let timer = self
+                            .idle_timer
+                            .as_mut()
+                            .expect("idle timer is created when the stream arms");
+                        if timer.as_mut().poll(cx).is_pending() {
+                            return Poll::Pending;
+                        }
+                        let stalled_during = if self.first_token_received {
+                            "generation"
+                        } else {
+                            "prefill"
+                        };
+                        let timeout = inference_providers::CompletionError::Timeout {
+                            operation: stalled_during.to_string(),
+                            timeout_seconds: budget.as_secs(),
+                        };
+                        self.idle_armed = false;
+                        self.last_error = Some(timeout.clone());
+                        self.begin_finalizing();
+                        return Poll::Ready(Some(Err(timeout)));
+                    }
                 }
                 continue;
             }
@@ -665,7 +761,31 @@ where
                         self.begin_finalizing();
                         return Poll::Ready(Some(Err(err)));
                     }
-                    Poll::Pending => return Poll::Pending,
+                    Poll::Pending => {
+                        let Some(budget) = self.idle_budget() else {
+                            return Poll::Pending;
+                        };
+                        if !self.idle_armed {
+                            let deadline = tokio::time::Instant::now() + budget;
+                            match &mut self.idle_timer {
+                                Some(timer) => timer.as_mut().reset(deadline),
+                                None => {
+                                    self.idle_timer =
+                                        Some(Box::pin(tokio::time::sleep_until(deadline)));
+                                }
+                            }
+                            self.idle_armed = true;
+                        }
+                        let timer = self
+                            .idle_timer
+                            .as_mut()
+                            .expect("idle timer is created when the stream arms");
+                        if timer.as_mut().poll(cx).is_pending() {
+                            return Poll::Pending;
+                        }
+                        self.idle_armed = false;
+                        self.begin_finalizing();
+                    }
                 }
                 continue;
             }
@@ -777,6 +897,7 @@ pub struct CompletionServiceImpl {
     org_concurrent_limits: Cache<Uuid, u32>,
     /// Repository for fetching organization concurrent limits
     organization_limit_repository: Arc<dyn ports::OrganizationConcurrentLimitRepository>,
+    stream_idle_timeouts: Option<StreamIdleTimeouts>,
 }
 
 /// TTL for organization concurrent limit cache (5 minutes)
@@ -850,7 +971,7 @@ impl CompletionServiceImpl {
         workspace_id: Uuid,
     ) {
         extra.insert(
-            "x_request_id".to_string(),
+            inference_providers::attested::nearai::tracing_headers::REQUEST_ID.to_string(),
             serde_json::Value::String(request_id.to_string()),
         );
         extra.insert(
@@ -892,7 +1013,13 @@ impl CompletionServiceImpl {
             concurrent_limit: DEFAULT_CONCURRENT_LIMIT,
             org_concurrent_limits,
             organization_limit_repository,
+            stream_idle_timeouts: None,
         }
+    }
+
+    pub fn with_stream_idle_timeouts(mut self, timeouts: StreamIdleTimeouts) -> Self {
+        self.stream_idle_timeouts = Some(timeouts);
+        self
     }
 
     /// Extract tools and tool_choice from the extra HashMap if present and
@@ -1612,6 +1739,9 @@ impl CompletionServiceImpl {
             ttft_ms: None,
             token_count: 0,
             last_token_time: None,
+            idle_timeouts: self.stream_idle_timeouts,
+            idle_timer: None,
+            idle_armed: false,
             total_itl_ms: 0.0,
             metric_tags,
             concurrent_counter,
@@ -1781,15 +1911,18 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
         };
 
         // Get the LLM stream
-        let attributed_stream = match self
+        let provider_result = self
             .inference_provider_pool
             .chat_completion_stream_with_attribution(
                 chat_params,
                 request.body_hash.clone(),
                 routing_hints,
+                self.stream_idle_timeouts
+                    .map(|timeouts| timeouts.first_token),
             )
-            .await
-        {
+            .await;
+
+        let attributed_stream = match provider_result {
             Ok(pair) => pair,
             Err(e) => {
                 // Guard will decrement counter on drop
@@ -2461,6 +2594,9 @@ mod tests {
             token_count: 0,
             last_token_time: None,
             total_itl_ms: 0.0,
+            idle_timeouts: None,
+            idle_timer: None,
+            idle_armed: false,
             metric_tags: CompletionServiceImpl::create_metric_tags("test-model"),
             concurrent_counter: None,
             last_usage_stats: None,
@@ -2678,6 +2814,9 @@ mod tests {
             token_count: 0,
             last_token_time: None,
             total_itl_ms: 0.0,
+            idle_timeouts: None,
+            idle_timer: None,
+            idle_armed: false,
             metric_tags,
             concurrent_counter: None,
             last_usage_stats: None,
@@ -2851,6 +2990,9 @@ mod tests {
             token_count: 0,
             last_token_time: None,
             total_itl_ms: 0.0,
+            idle_timeouts: None,
+            idle_timer: None,
+            idle_armed: false,
             metric_tags: CompletionServiceImpl::create_metric_tags("test-model"),
             concurrent_counter: None,
             last_usage_stats: None,
@@ -3005,6 +3147,9 @@ mod tests {
             token_count: 0,
             last_token_time: None,
             total_itl_ms: 0.0,
+            idle_timeouts: None,
+            idle_timer: None,
+            idle_armed: false,
             metric_tags,
             concurrent_counter: None,
             last_usage_stats: None,
@@ -3133,6 +3278,9 @@ mod tests {
             token_count: 0,
             last_token_time: None,
             total_itl_ms: 0.0,
+            idle_timeouts: None,
+            idle_timer: None,
+            idle_armed: false,
             metric_tags,
             concurrent_counter: None,
             last_usage_stats: None,
@@ -3344,6 +3492,9 @@ mod tests {
                 token_count: 0,
                 last_token_time: None,
                 total_itl_ms: 0.0,
+                idle_timeouts: None,
+                idle_timer: None,
+                idle_armed: false,
                 metric_tags: vec![],
                 concurrent_counter: Some(counter.clone()),
                 last_usage_stats: None,
@@ -3370,6 +3521,646 @@ mod tests {
             counter.load(Ordering::Relaxed),
             0,
             "Counter should be 0 after stream dropped"
+        );
+    }
+
+    #[derive(Clone, Default)]
+    struct CapturedLogs(Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for CapturedLogs {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CapturedLogs {
+        type Writer = Self;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    impl CapturedLogs {
+        fn event_containing(&self, needle: &str) -> serde_json::Value {
+            let raw = self.0.lock().unwrap().clone();
+            String::from_utf8(raw)
+                .expect("log output is utf8")
+                .lines()
+                .map(|line| serde_json::from_str::<serde_json::Value>(line).expect("json log line"))
+                .find(|event| {
+                    event["fields"]["message"]
+                        .as_str()
+                        .is_some_and(|message| message.contains(needle))
+                })
+                .unwrap_or_else(|| panic!("no log event containing {needle}"))
+        }
+    }
+
+    fn interrupted_stream_event(
+        request_id: Uuid,
+        last_token_time: Option<Instant>,
+        last_chat_id: Option<String>,
+        last_error: Option<inference_providers::CompletionError>,
+    ) -> serde_json::Value {
+        stream_drop_event(request_id, last_token_time, last_chat_id, last_error, None)
+    }
+
+    fn stream_drop_event(
+        request_id: Uuid,
+        last_token_time: Option<Instant>,
+        last_chat_id: Option<String>,
+        last_error: Option<inference_providers::CompletionError>,
+        last_usage_stats: Option<inference_providers::TokenUsage>,
+    ) -> serde_json::Value {
+        let needle = if last_error.is_some() {
+            "Stream failed"
+        } else if last_chat_id.is_some() {
+            "Stream interrupted before usage stats received"
+        } else {
+            "Stream interrupted before usage stats or chat_id received"
+        };
+        let logs = CapturedLogs::default();
+        let subscriber = tracing_subscriber::fmt()
+            .json()
+            .with_current_span(false)
+            .with_span_list(false)
+            .with_max_level(tracing::Level::WARN)
+            .with_writer(logs.clone())
+            .finish();
+
+        tracing::subscriber::with_default(subscriber, || {
+            let _interrupted = InterceptStream {
+                inner: stream::iter::<Vec<Result<SSEEvent, inference_providers::CompletionError>>>(
+                    vec![],
+                ),
+                attestation_service: Arc::new(MockAttestationService),
+                usage_service: Arc::new(MockUsageService),
+                metrics_service: Arc::new(CapturingMetricsService::new()),
+                request_id,
+                organization_id: Uuid::new_v4(),
+                workspace_id: Uuid::new_v4(),
+                api_key_id: Uuid::new_v4(),
+                model_id: Uuid::new_v4(),
+                model_name: "test-model".to_string(),
+                inference_type: crate::usage::ports::InferenceType::ChatCompletionStream,
+                service_start_time: Instant::now(),
+                provider_start_time: Instant::now(),
+                first_token_received: last_token_time.is_some(),
+                first_token_time: last_token_time,
+                ttft_ms: None,
+                token_count: 0,
+                last_token_time,
+                total_itl_ms: 0.0,
+                idle_timeouts: None,
+                idle_timer: None,
+                idle_armed: false,
+                metric_tags: vec![],
+                concurrent_counter: None,
+                last_usage_stats,
+                last_chat_id,
+                stream_completed: false,
+                saw_upstream_done_marker: false,
+                response_id: None,
+                last_finish_reason: None,
+                last_error,
+                state: StreamState::Streaming,
+                attestation_supported: true,
+                store_provider_chat_signature: true,
+                provider_attribution: crate::usage::ProviderAttribution::default(),
+                cache_write_cost_per_token: None,
+                requested_service_tier: None,
+                provider_service_tier: None,
+                latency_reporter: None,
+            };
+        });
+
+        logs.event_containing(needle)
+    }
+
+    #[tokio::test]
+    async fn interrupted_stream_logs_request_id_and_total_duration() {
+        let request_id = Uuid::new_v4();
+        let event = interrupted_stream_event(request_id, None, None, None);
+
+        assert_eq!(
+            event["fields"]["request_id"],
+            serde_json::Value::String(request_id.to_string()),
+            "without this field the record cannot be joined to any other log line"
+        );
+        assert!(
+            event["fields"]["total_duration_ms"].is_u64(),
+            "duration must be numeric, got {}",
+            event["fields"]["total_duration_ms"]
+        );
+    }
+
+    #[tokio::test]
+    async fn an_interrupted_stream_holding_a_chat_id_logs_the_same_fields() {
+        let request_id = Uuid::new_v4();
+        let event = interrupted_stream_event(request_id, None, Some("chat-abc".to_string()), None);
+
+        assert_eq!(
+            event["fields"]["request_id"],
+            serde_json::Value::String(request_id.to_string())
+        );
+        assert!(event["fields"]["total_duration_ms"].is_u64());
+    }
+
+    #[tokio::test]
+    async fn an_interrupted_stream_reports_the_error_it_holds() {
+        let failure = inference_providers::CompletionError::CompletionError(
+            "Error fetching image https://records.example.com/scan.png?sig=abc: 403".to_string(),
+        );
+
+        for chat_id in [None, Some("chat-abc".to_string())] {
+            let event =
+                interrupted_stream_event(Uuid::new_v4(), None, chat_id, Some(failure.clone()));
+
+            let detail = event["fields"]["error_detail"]
+                .as_str()
+                .expect("the error is in scope here and must not be reduced to a boolean");
+            assert!(
+                detail.contains("[URL_REDACTED]"),
+                "a client-supplied URL must not reach the logs, got {detail}"
+            );
+            assert!(
+                !detail.contains("records.example.com"),
+                "redaction must remove the host as well, got {detail}"
+            );
+            assert!(
+                detail.contains("Error fetching image"),
+                "redaction must keep the diagnostic text, got {detail}"
+            );
+        }
+
+        let clean = interrupted_stream_event(Uuid::new_v4(), None, None, None);
+        assert_eq!(
+            clean["fields"]["error_detail"],
+            serde_json::Value::Null,
+            "a client disconnect carries no error, so the field must be absent"
+        );
+    }
+
+    #[tokio::test]
+    async fn interrupted_stream_separates_no_token_from_a_measured_gap() {
+        let before_any_token = interrupted_stream_event(Uuid::new_v4(), None, None, None);
+        assert_eq!(
+            before_any_token["fields"]["ms_since_last_token"],
+            serde_json::Value::Null,
+            "no token arrived, so the field must be absent rather than zero or a string"
+        );
+
+        let after_a_token =
+            interrupted_stream_event(Uuid::new_v4(), Some(Instant::now()), None, None);
+        assert!(
+            after_a_token["fields"]["ms_since_last_token"].is_u64(),
+            "a delivered token must produce a numeric gap, got {}",
+            after_a_token["fields"]["ms_since_last_token"]
+        );
+    }
+
+    #[derive(Default)]
+    struct PinRecordingAttestationService {
+        released: std::sync::Mutex<Vec<String>>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::attestation::ports::AttestationServiceTrait for PinRecordingAttestationService {
+        async fn get_chat_signature(
+            &self,
+            _chat_id: &str,
+            _signing_algo: Option<String>,
+        ) -> Result<
+            crate::attestation::models::SignatureLookupResult,
+            crate::attestation::AttestationError,
+        > {
+            Err(crate::attestation::AttestationError::InternalError(
+                "not used".to_string(),
+            ))
+        }
+
+        async fn store_chat_signature_from_provider(
+            &self,
+            _chat_id: &str,
+        ) -> Result<(), crate::attestation::AttestationError> {
+            Ok(())
+        }
+
+        async fn store_chat_signature(
+            &self,
+            _chat_id: &str,
+            _request_hash: String,
+            _response_hash: String,
+        ) -> Result<(), crate::attestation::AttestationError> {
+            Ok(())
+        }
+
+        async fn release_chat_signature_pin(&self, chat_id: &str) {
+            self.released
+                .lock()
+                .expect("released mutex should not poison")
+                .push(chat_id.to_string());
+        }
+
+        async fn store_response_signature(
+            &self,
+            _response_id: &str,
+            _request_hash: String,
+            _response_hash: String,
+        ) -> Result<(), crate::attestation::AttestationError> {
+            Ok(())
+        }
+
+        async fn get_attestation_report(
+            &self,
+            model: Option<String>,
+            signing_algo: Option<String>,
+            nonce: Option<String>,
+            signing_address: Option<String>,
+            include_tls_fingerprint: bool,
+            provider_filter: Option<inference_providers::ProviderTier>,
+        ) -> Result<
+            crate::attestation::models::AttestationReport,
+            crate::attestation::AttestationError,
+        > {
+            MockAttestationService
+                .get_attestation_report(
+                    model,
+                    signing_algo,
+                    nonce,
+                    signing_address,
+                    include_tls_fingerprint,
+                    provider_filter,
+                )
+                .await
+        }
+
+        async fn get_ita_attestation_token(
+            &self,
+            query: crate::attestation::ita::ItaTokenQuery,
+        ) -> Result<crate::attestation::ita::ItaTokenResponse, crate::attestation::AttestationError>
+        {
+            MockAttestationService
+                .get_ita_attestation_token(query)
+                .await
+        }
+
+        async fn verify_vpc_signature(
+            &self,
+            timestamp: i64,
+            signature: String,
+        ) -> Result<bool, crate::attestation::AttestationError> {
+            MockAttestationService
+                .verify_vpc_signature(timestamp, signature)
+                .await
+        }
+    }
+
+    fn watched_stream<S>(inner: S, timeouts: Option<StreamIdleTimeouts>) -> InterceptStream<S>
+    where
+        S: Stream<Item = Result<SSEEvent, inference_providers::CompletionError>> + Unpin,
+    {
+        InterceptStream {
+            inner,
+            attestation_service: Arc::new(MockAttestationService),
+            usage_service: Arc::new(MockUsageService),
+            metrics_service: Arc::new(CapturingMetricsService::new()),
+            request_id: Uuid::new_v4(),
+            organization_id: Uuid::new_v4(),
+            workspace_id: Uuid::new_v4(),
+            api_key_id: Uuid::new_v4(),
+            model_id: Uuid::new_v4(),
+            model_name: "test-model".to_string(),
+            inference_type: crate::usage::ports::InferenceType::ChatCompletionStream,
+            service_start_time: Instant::now(),
+            provider_start_time: Instant::now(),
+            first_token_received: false,
+            first_token_time: None,
+            ttft_ms: None,
+            token_count: 0,
+            last_token_time: None,
+            total_itl_ms: 0.0,
+            idle_timeouts: timeouts,
+            idle_timer: None,
+            idle_armed: false,
+            metric_tags: vec![],
+            concurrent_counter: None,
+            last_usage_stats: None,
+            last_chat_id: None,
+            stream_completed: false,
+            saw_upstream_done_marker: false,
+            response_id: None,
+            last_finish_reason: None,
+            last_error: None,
+            state: StreamState::Streaming,
+            attestation_supported: true,
+            store_provider_chat_signature: true,
+            provider_attribution: crate::usage::ProviderAttribution::default(),
+            cache_write_cost_per_token: None,
+            requested_service_tier: None,
+            provider_service_tier: None,
+            latency_reporter: None,
+        }
+    }
+
+    fn token_event() -> SSEEvent {
+        SSEEvent {
+            raw_bytes: Bytes::from("data: ..."),
+            raw_passthrough: true,
+            chunk: Some(StreamChunk::Chat(ChatCompletionChunk {
+                id: "chat-watchdog".to_string(),
+                object: "chat.completion.chunk".to_string(),
+                created: 1234567890,
+                model: "test-model".to_string(),
+                choices: vec![],
+                usage: None,
+                service_tier: None,
+                prompt_token_ids: None,
+                system_fingerprint: None,
+                modality: None,
+                extra: Default::default(),
+            })),
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_stalled_stream_fails_with_a_typed_timeout() {
+        let inner = stream::iter(vec![Ok(token_event())]).chain(stream::pending());
+        let mut watched = Box::pin(watched_stream(
+            inner,
+            Some(StreamIdleTimeouts {
+                first_token: Duration::from_secs(300),
+                between_tokens: Duration::from_secs(90),
+            }),
+        ));
+
+        assert!(
+            matches!(watched.next().await, Some(Ok(_))),
+            "the first token must reach the client before the watchdog is relevant"
+        );
+
+        match watched.next().await {
+            Some(Err(inference_providers::CompletionError::Timeout {
+                operation,
+                timeout_seconds,
+            })) => {
+                assert_eq!(
+                    operation, "generation",
+                    "a stall after the first token is a generation stall, not a prefill one"
+                );
+                assert_eq!(
+                    timeout_seconds, 90,
+                    "the between-token budget applies once a token has arrived"
+                );
+            }
+            other => panic!("a silent upstream must surface as a typed timeout, got {other:?}"),
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_slow_prefill_is_not_mistaken_for_a_stall() {
+        let inner = stream::once(Box::pin(async {
+            tokio::time::sleep(Duration::from_secs(200)).await;
+            Ok(token_event())
+        }));
+        let mut watched = Box::pin(watched_stream(
+            inner,
+            Some(StreamIdleTimeouts {
+                first_token: Duration::from_secs(300),
+                between_tokens: Duration::from_secs(90),
+            }),
+        ));
+
+        assert!(
+            matches!(watched.next().await, Some(Ok(_))),
+            "a 200s prefill is inside the 300s first-token budget and must survive; \
+             applying the 90s between-token budget before the first token would kill it"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_upstream_error_restarts_the_idle_budget() {
+        let inner = stream::once(Box::pin(async { Ok(token_event()) }))
+            .chain(stream::once(Box::pin(async {
+                tokio::time::sleep(Duration::from_secs(60)).await;
+                Err(inference_providers::CompletionError::CompletionError(
+                    "upstream failed".to_string(),
+                ))
+            })))
+            .chain(stream::pending());
+        let mut watched = Box::pin(watched_stream(
+            inner,
+            Some(StreamIdleTimeouts {
+                first_token: Duration::from_secs(300),
+                between_tokens: Duration::from_secs(90),
+            }),
+        ));
+
+        let started = tokio::time::Instant::now();
+        assert!(matches!(watched.next().await, Some(Ok(_))));
+        assert!(matches!(
+            watched.next().await,
+            Some(Err(inference_providers::CompletionError::CompletionError(
+                _
+            )))
+        ));
+
+        match watched.next().await {
+            Some(Err(inference_providers::CompletionError::Timeout { .. })) => {
+                let elapsed = started.elapsed();
+                assert!(
+                    elapsed >= Duration::from_secs(150),
+                    "the budget must restart when the error arrives at 60s, giving a timeout at \
+                     150s; a deadline still measured from the last token fires at 90s, cutting \
+                     the budget to the 30s that happened to remain. Fired at {elapsed:?}"
+                );
+            }
+            other => panic!(
+                "expected the watchdog to fire on the silence after the error, got {other:?}"
+            ),
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_watchdog_timeout_releases_the_signature_routing_pin() {
+        let attestation = Arc::new(PinRecordingAttestationService::default());
+        let inner = stream::iter(vec![Ok(token_event())]).chain(stream::pending());
+        let mut watched = watched_stream(
+            inner,
+            Some(StreamIdleTimeouts {
+                first_token: Duration::from_secs(300),
+                between_tokens: Duration::from_secs(90),
+            }),
+        );
+        watched.attestation_service = attestation.clone();
+        let mut watched = Box::pin(watched);
+
+        assert!(matches!(watched.next().await, Some(Ok(_))));
+        assert!(matches!(
+            watched.next().await,
+            Some(Err(inference_providers::CompletionError::Timeout { .. }))
+        ));
+        assert!(watched.next().await.is_none());
+
+        std::mem::forget(watched);
+
+        let released = attestation
+            .released
+            .lock()
+            .expect("released mutex should not poison")
+            .clone();
+        assert_eq!(
+            released,
+            vec!["chat-watchdog".to_string()],
+            "a stream the watchdog tears down has no signature to fetch, so the routing pin must \
+             be released explicitly; leaving it held grows the provider's chat_id map for the \
+             life of the process"
+        );
+    }
+
+    fn control_event() -> SSEEvent {
+        SSEEvent {
+            raw_bytes: Bytes::from(": keepalive\n\n"),
+            raw_passthrough: true,
+            chunk: None,
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_stall_after_the_done_marker_ends_the_stream_cleanly() {
+        let inner = stream::iter(vec![
+            Ok(token_event()),
+            Ok(terminal_control_event(b"data: [DONE]\n")),
+        ])
+        .chain(stream::pending());
+        let mut watched = Box::pin(watched_stream(
+            inner,
+            Some(StreamIdleTimeouts {
+                first_token: Duration::from_secs(300),
+                between_tokens: Duration::from_secs(90),
+            }),
+        ));
+
+        assert!(matches!(watched.next().await, Some(Ok(_))));
+        assert!(matches!(watched.next().await, Some(Ok(_))));
+        assert!(
+            watched.next().await.is_none(),
+            "an upstream that sends [DONE] and then holds the connection open must not \
+             pin the stream until the L4 reaper collects it"
+        );
+        assert!(
+            watched.last_error.is_none(),
+            "the answer is complete once the marker lands, so waiting out the optional \
+             blank line must not be reported as a failed stream"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failure_after_usage_arrives_still_reports_duration() {
+        let event = stream_drop_event(
+            Uuid::new_v4(),
+            Some(Instant::now()),
+            Some("chat-billing".to_string()),
+            Some(inference_providers::CompletionError::Timeout {
+                operation: "generation".to_string(),
+                timeout_seconds: 90,
+            }),
+            Some(inference_providers::TokenUsage::new(12, 34)),
+        );
+
+        assert!(
+            event["fields"]["total_duration_ms"].is_u64(),
+            "providers that report usage continuously set it on the first chunk, so a later \
+             failure reaches the billing arm and would otherwise record no duration at all"
+        );
+        assert!(event["fields"]["error_detail"].is_string());
+    }
+
+    #[test]
+    fn an_upstream_http_error_never_carries_its_message_into_logs() {
+        let detail =
+            super::super::inference_provider_pool::InferenceProviderPool::safe_error_detail(
+                &inference_providers::CompletionError::HttpError {
+                    status_code: 400,
+                    message: "Invalid content in message: my private prompt".to_string(),
+                    is_external: true,
+                },
+            );
+
+        assert!(
+            !detail.contains("my private prompt"),
+            "the SSE parser copies an upstream error.message verbatim, so it can echo \
+             customer input and must never reach a log line"
+        );
+        assert!(detail.contains("400"));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_timed_out_stream_ends_instead_of_firing_again() {
+        let inner = stream::iter(vec![Ok(token_event())]).chain(stream::pending());
+        let mut watched = Box::pin(watched_stream(
+            inner,
+            Some(StreamIdleTimeouts {
+                first_token: Duration::from_secs(300),
+                between_tokens: Duration::from_secs(90),
+            }),
+        ));
+
+        assert!(matches!(watched.next().await, Some(Ok(_))));
+        assert!(matches!(watched.next().await, Some(Err(_))));
+
+        assert!(
+            watched.next().await.is_none(),
+            "the route keeps polling after an error, so a synthesized timeout must end \
+             the stream rather than re-arm and fire every budget forever"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn keepalives_keep_a_live_stream_alive() {
+        let inner = Box::pin(stream::iter(vec![Ok(token_event())]).chain(stream::unfold(
+            (),
+            |()| async {
+                tokio::time::sleep(Duration::from_secs(60)).await;
+                Some((Ok(control_event()), ()))
+            },
+        )));
+        let mut watched = Box::pin(watched_stream(
+            inner,
+            Some(StreamIdleTimeouts {
+                first_token: Duration::from_secs(300),
+                between_tokens: Duration::from_secs(90),
+            }),
+        ));
+
+        assert!(matches!(watched.next().await, Some(Ok(_))));
+
+        for _ in 0..4 {
+            assert!(
+                matches!(watched.next().await, Some(Ok(_))),
+                "a control frame arriving inside the budget proves the upstream is alive \
+                 and must clear the idle deadline"
+            );
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_unwatched_stream_is_never_timed_out() {
+        let inner = stream::iter(vec![Ok(token_event())]).chain(stream::pending());
+        let mut watched = Box::pin(watched_stream(inner, None));
+
+        assert!(matches!(watched.next().await, Some(Ok(_))));
+
+        let parked = tokio::time::timeout(Duration::from_secs(7_200), watched.next()).await;
+        assert!(
+            parked.is_err(),
+            "with no thresholds configured the stream must stay parked rather than fail"
         );
     }
 

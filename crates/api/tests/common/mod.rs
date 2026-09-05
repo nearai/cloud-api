@@ -136,6 +136,7 @@ pub fn test_config() -> ApiConfig {
             enabled: true,
             ..config::UsageReportingConfig::default()
         },
+        stream_watchdog: config::StreamWatchdogConfig::default(),
         ita: config::ItaAttestationConfig::default(),
     }
 }

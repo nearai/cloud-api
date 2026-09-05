@@ -329,6 +329,10 @@ fn completion_stream_error_category(e: &inference_providers::CompletionError) ->
     }
 }
 
+fn sanitized_stream_error(e: &inference_providers::CompletionError) -> String {
+    services::inference_provider_pool::InferenceProviderPool::safe_error_detail(e)
+}
+
 /// Returns an OpenAI-compatible `error.type` for a stream-level completion error.
 /// Used in the `data: {"error":{...}}` SSE frame so clients can branch on the type.
 ///
@@ -2062,10 +2066,13 @@ async fn chat_completions_inner(
                                     let count = error_count_inner
                                         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                                     if count == 0 {
+                                        let error_detail = sanitized_stream_error(&e);
                                         tracing::error!(
+                                            %request_id,
                                             %organization_id,
                                             model = %model_for_err,
                                             error_type = %completion_stream_error_category(&e),
+                                            %error_detail,
                                             "Completion stream error"
                                         );
                                     }
@@ -2847,10 +2854,13 @@ async fn completions_inner(
                                 Err(e) => {
                                     stream_error_count
                                         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                    let error_detail = sanitized_stream_error(&e);
                                     tracing::error!(
+                                        %request_id,
                                         %organization_id,
                                         model = %model_for_err,
                                         error_type = %completion_stream_error_category(&e),
+                                        %error_detail,
                                         "Text completion stream error"
                                     );
                                     Some(Ok::<Bytes, Infallible>(sse_error_frame(&e)))

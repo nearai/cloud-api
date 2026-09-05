@@ -701,6 +701,10 @@ pub struct MockProvider {
     /// `true`. Set via [`MockProvider::with_client_e2ee_support`] to exercise the
     /// client-E2EE-capability filter (e.g. a Chutes-like fallback that rejects it).
     supports_client_e2ee: bool,
+    /// Value reported by [`InferenceProvider::supports_chat_signatures`]; defaults
+    /// to `true`. Set via [`MockProvider::with_chat_signature_support`] to model a
+    /// provider whose response integrity does not use per-response signatures.
+    supports_chat_signatures: bool,
     /// Chat ids passed to [`InferenceProvider::unpin_chat_connection`], in call
     /// order. Lets lifecycle tests assert the signature-fetch routing pin was
     /// released. `std::sync::Mutex` because the trait method is synchronous.
@@ -737,6 +741,7 @@ impl MockProvider {
             provider_source: crate::ProviderSource::External,
             supports_streaming: true,
             supports_client_e2ee: true,
+            supports_chat_signatures: true,
             unpinned_chat_ids: Arc::new(std::sync::Mutex::new(Vec::new())),
         }
     }
@@ -762,6 +767,7 @@ impl MockProvider {
             provider_source: crate::ProviderSource::External,
             supports_streaming: true,
             supports_client_e2ee: true,
+            supports_chat_signatures: true,
             unpinned_chat_ids: Arc::new(std::sync::Mutex::new(Vec::new())),
         }
     }
@@ -785,6 +791,7 @@ impl MockProvider {
             provider_source: crate::ProviderSource::External,
             supports_streaming: true,
             supports_client_e2ee: true,
+            supports_chat_signatures: true,
             unpinned_chat_ids: Arc::new(std::sync::Mutex::new(Vec::new())),
         }
     }
@@ -813,6 +820,14 @@ impl MockProvider {
     /// exercise the client-E2EE-capability filter (a Chutes-like fallback).
     pub fn with_client_e2ee_support(mut self, supported: bool) -> Self {
         self.supports_client_e2ee = supported;
+        self
+    }
+
+    /// Set whether this mock exposes per-response chat signatures (default
+    /// `true`). Used to exercise the lifecycle for providers such as Chutes,
+    /// which use a different integrity mechanism.
+    pub fn with_chat_signature_support(mut self, supported: bool) -> Self {
+        self.supports_chat_signatures = supported;
         self
     }
 
@@ -1029,6 +1044,10 @@ impl crate::InferenceProvider for MockProvider {
 
     fn supports_client_e2ee(&self) -> bool {
         self.supports_client_e2ee
+    }
+
+    fn supports_chat_signatures(&self) -> bool {
+        self.supports_chat_signatures
     }
 
     fn unpin_chat_connection(&self, chat_id: &str) {

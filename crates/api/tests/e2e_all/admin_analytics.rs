@@ -892,6 +892,10 @@ async fn test_admin_platform_metrics_splits_reconcile() {
         (0.0..=1.0).contains(&m.provider_error_or_timeout_rate),
         "provider_error_or_timeout_rate in [0,1]"
     );
+    assert!(
+        (0.0..=1.0).contains(&m.incomplete_stream_rate),
+        "incomplete_stream_rate in [0,1]"
+    );
 
     println!("✅ Platform metrics verifiable split reconciles to total");
 }

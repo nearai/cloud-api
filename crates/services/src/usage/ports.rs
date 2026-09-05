@@ -81,6 +81,8 @@ impl std::str::FromStr for InferenceType {
 pub enum StopReason {
     /// Stream completed normally (model emitted stop token)
     Completed,
+    /// Stream ended without the provider ever declaring a finish reason
+    Incomplete,
     /// Hit max tokens limit
     Length,
     /// Content was filtered by safety systems
@@ -106,6 +108,7 @@ impl StopReason {
     pub fn as_str(&self) -> &str {
         match self {
             StopReason::Completed => "completed",
+            StopReason::Incomplete => "incomplete",
             StopReason::Length => "length",
             StopReason::ContentFilter => "content_filter",
             StopReason::ClientDisconnect => "client_disconnect",
@@ -122,6 +125,7 @@ impl StopReason {
     pub fn parse(s: &str) -> Self {
         match s {
             "completed" => StopReason::Completed,
+            "incomplete" => StopReason::Incomplete,
             "length" => StopReason::Length,
             "content_filter" => StopReason::ContentFilter,
             "client_disconnect" => StopReason::ClientDisconnect,
@@ -152,6 +156,20 @@ impl StopReason {
             inference_providers::FinishReason::Length => StopReason::Length,
             inference_providers::FinishReason::ContentFilter => StopReason::ContentFilter,
             inference_providers::FinishReason::ToolCalls => StopReason::ToolCalls,
+        }
+    }
+
+    /// Resolve why a finished stream ended, from the signals the interceptor observed
+    pub fn for_stream_outcome(
+        error: Option<&inference_providers::CompletionError>,
+        stream_completed: bool,
+        finish_reason: Option<&inference_providers::FinishReason>,
+    ) -> Self {
+        match (error, stream_completed, finish_reason) {
+            (Some(err), _, _) => Self::from_completion_error(err),
+            (None, false, _) => StopReason::ClientDisconnect,
+            (None, true, Some(reason)) => Self::from_provider_finish_reason(reason),
+            (None, true, None) => StopReason::Incomplete,
         }
     }
 
@@ -747,3 +765,55 @@ impl std::fmt::Display for UsageError {
 }
 
 impl std::error::Error for UsageError {}
+
+#[cfg(test)]
+mod tests {
+    use super::StopReason;
+    use inference_providers::{CompletionError, FinishReason};
+
+    #[test]
+    fn stream_without_a_finish_reason_is_incomplete() {
+        assert_eq!(
+            StopReason::for_stream_outcome(None, true, None),
+            StopReason::Incomplete
+        );
+    }
+
+    #[test]
+    fn declared_finish_reason_maps_to_the_provider_value() {
+        assert_eq!(
+            StopReason::for_stream_outcome(None, true, Some(&FinishReason::Stop)),
+            StopReason::Stop
+        );
+        assert_eq!(
+            StopReason::for_stream_outcome(None, true, Some(&FinishReason::Length)),
+            StopReason::Length
+        );
+    }
+
+    #[test]
+    fn unfinished_stream_is_a_disconnect() {
+        assert_eq!(
+            StopReason::for_stream_outcome(None, false, None),
+            StopReason::ClientDisconnect
+        );
+    }
+
+    #[test]
+    fn error_outranks_disconnect_and_incomplete() {
+        let error = CompletionError::Timeout {
+            operation: "stream".to_string(),
+            timeout_seconds: 30,
+        };
+        assert_eq!(
+            StopReason::for_stream_outcome(Some(&error), false, None),
+            StopReason::Timeout
+        );
+    }
+
+    #[test]
+    fn incomplete_round_trips_through_its_database_string() {
+        assert_eq!(StopReason::Incomplete.as_str(), "incomplete");
+        assert_eq!(StopReason::parse("incomplete"), StopReason::Incomplete);
+    }
+}

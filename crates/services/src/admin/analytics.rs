@@ -124,6 +124,8 @@ pub struct PlatformMetrics {
     // --- Reliability ---
     /// Share of requests whose stop_reason ∈ {provider_error, timeout}, 0.0–1.0
     pub provider_error_or_timeout_rate: f64,
+    /// Share of requests whose stop_reason is incomplete, 0.0-1.0
+    pub incomplete_stream_rate: f64,
     /// 95th percentile time-to-first-token across the platform (ms)
     pub p95_ttft_ms: Option<f64>,
     pub provider_usage: PlatformProviderUsage,
@@ -458,7 +460,7 @@ pub struct PerformancePoint {
     pub p95_ttft_ms: Option<f64>,
     /// 99th-percentile TTFT, ms (streaming requests only; None if no samples)
     pub p99_ttft_ms: Option<f64>,
-    /// stop_reason IN ('provider_error','timeout') / requests WHERE stop_reason IS NOT NULL.
+    /// stop_reason IN ('provider_error','timeout','incomplete') / requests WHERE stop_reason IS NOT NULL.
     /// Excludes pre-V0037 rows (stop_reason IS NULL) from both numerator and denominator.
     pub error_rate: Option<f64>,
 }

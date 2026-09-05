@@ -176,14 +176,11 @@ async fn test_response_items_saved_on_disconnect() {
 
     let main_usage = main_request_usage.unwrap();
 
-    // Note: The mock's with_disconnect_after() truncates the stream but it still ends normally
-    // (returns None), so from our perspective it's a "completed" stream. A true client disconnect
-    // would occur if the client dropped the connection before consuming all chunks, which would
-    // cause stream_completed to remain false when Drop is called.
     assert_eq!(
         main_usage.stop_reason.as_deref(),
-        Some("completed"),
-        "Stop reason should be 'completed' for stream that ended normally. Found: {:?}",
+        Some("incomplete"),
+        "A stream truncated mid-answer declares no finish reason, so it must not \
+         be recorded as a clean completion. Found: {:?}",
         main_usage.stop_reason
     );
 

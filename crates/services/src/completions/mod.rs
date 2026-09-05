@@ -761,7 +761,31 @@ where
                         self.begin_finalizing();
                         return Poll::Ready(Some(Err(err)));
                     }
-                    Poll::Pending => return Poll::Pending,
+                    Poll::Pending => {
+                        let Some(budget) = self.idle_budget() else {
+                            return Poll::Pending;
+                        };
+                        if !self.idle_armed {
+                            let deadline = tokio::time::Instant::now() + budget;
+                            match &mut self.idle_timer {
+                                Some(timer) => timer.as_mut().reset(deadline),
+                                None => {
+                                    self.idle_timer =
+                                        Some(Box::pin(tokio::time::sleep_until(deadline)));
+                                }
+                            }
+                            self.idle_armed = true;
+                        }
+                        let timer = self
+                            .idle_timer
+                            .as_mut()
+                            .expect("idle timer is created when the stream arms");
+                        if timer.as_mut().poll(cx).is_pending() {
+                            return Poll::Pending;
+                        }
+                        self.idle_armed = false;
+                        self.begin_finalizing();
+                    }
                 }
                 continue;
             }
@@ -4006,6 +4030,35 @@ mod tests {
             raw_passthrough: true,
             chunk: None,
         }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_stall_after_the_done_marker_ends_the_stream_cleanly() {
+        let inner = stream::iter(vec![
+            Ok(token_event()),
+            Ok(terminal_control_event(b"data: [DONE]\n")),
+        ])
+        .chain(stream::pending());
+        let mut watched = Box::pin(watched_stream(
+            inner,
+            Some(StreamIdleTimeouts {
+                first_token: Duration::from_secs(300),
+                between_tokens: Duration::from_secs(90),
+            }),
+        ));
+
+        assert!(matches!(watched.next().await, Some(Ok(_))));
+        assert!(matches!(watched.next().await, Some(Ok(_))));
+        assert!(
+            watched.next().await.is_none(),
+            "an upstream that sends [DONE] and then holds the connection open must not \
+             pin the stream until the L4 reaper collects it"
+        );
+        assert!(
+            watched.last_error.is_none(),
+            "the answer is complete once the marker lands, so waiting out the optional \
+             blank line must not be reported as a failed stream"
+        );
     }
 
     #[tokio::test]

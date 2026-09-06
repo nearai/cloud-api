@@ -1017,48 +1017,223 @@ pub async fn list_models(
     response.json::<api::models::ModelsResponse>()
 }
 
-/// Read every observable admin model page from the shared E2E database.
+/// One page returned by an OFFSET-based test listing endpoint.
+pub struct OffsetPage<T> {
+    pub items: Vec<T>,
+    pub total: i64,
+}
+
+/// Reconcile OFFSET scans until two complete snapshots have the same IDs.
 ///
-/// Concurrent tests can change `total` between requests, so this deliberately
-/// deduplicates a single forward scan instead of waiting for a global snapshot.
-/// Callers only inspect test-owned model IDs, making the union race-safe.
+/// A concurrent removal from an already-read page shifts a later row before the
+/// next offset. Restarting incomplete scans and requiring two equal snapshots
+/// prevents that row from being silently skipped. Each pass owns its items so a
+/// row removed between passes cannot leak into the returned snapshot.
+pub async fn collect_stable_offset_pages<Item, Key, Fetch, FetchFuture, KeyFor>(
+    page_size: i64,
+    timeout: std::time::Duration,
+    mut fetch_page: Fetch,
+    key_for: KeyFor,
+) -> Result<Vec<Item>, tokio::time::error::Elapsed>
+where
+    Key: Eq + std::hash::Hash,
+    Fetch: FnMut(i64, i64) -> FetchFuture,
+    FetchFuture: std::future::Future<Output = OffsetPage<Item>>,
+    KeyFor: Fn(&Item) -> Key,
+{
+    assert!(page_size > 0, "pagination page size must be positive");
+
+    tokio::time::timeout(timeout, async move {
+        let mut previous_keys = None;
+
+        loop {
+            let mut items = Vec::new();
+            let mut keys = std::collections::HashSet::new();
+            let mut offset = 0_i64;
+            let mut pass_total = None;
+            let mut complete = true;
+
+            loop {
+                let page = fetch_page(offset, page_size).await;
+                let page_len = page.items.len() as i64;
+
+                if page.total < 0 || page_len > page_size {
+                    complete = false;
+                    break;
+                }
+
+                match pass_total {
+                    Some(expected_total) if expected_total != page.total => {
+                        complete = false;
+                        break;
+                    }
+                    None => pass_total = Some(page.total),
+                    Some(_) => {}
+                }
+
+                for item in page.items {
+                    if keys.insert(key_for(&item)) {
+                        items.push(item);
+                    }
+                }
+
+                let Some(next_offset) = offset.checked_add(page_len) else {
+                    complete = false;
+                    break;
+                };
+                if next_offset > page.total {
+                    complete = false;
+                    break;
+                }
+                if next_offset == page.total {
+                    break;
+                }
+                if page_len == 0 || page_len < page_size {
+                    complete = false;
+                    break;
+                }
+
+                offset = next_offset;
+            }
+
+            let expected_total = pass_total.unwrap_or_default();
+            if !complete || items.len() as i64 != expected_total {
+                previous_keys = None;
+                tokio::task::yield_now().await;
+                continue;
+            }
+
+            if previous_keys.as_ref() == Some(&keys) {
+                return items;
+            }
+
+            previous_keys = Some(keys);
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+}
+
+/// Read one stable admin model snapshot from the shared E2E database.
+///
+/// Concurrent tests can add or deactivate models between page requests. Two
+/// matching complete scans make assertions on test-owned model IDs independent
+/// of those transient offset shifts.
 pub async fn list_all_admin_models(
     server: &axum_test::TestServer,
     include_inactive: bool,
 ) -> Vec<api::models::AdminModelWithPricing> {
-    tokio::time::timeout(std::time::Duration::from_secs(5), async {
-        let mut models = Vec::new();
-        let mut seen = std::collections::HashSet::new();
-        let mut offset = 0_i64;
-
-        loop {
+    collect_stable_offset_pages(
+        1000,
+        std::time::Duration::from_secs(10),
+        |offset, limit| async move {
             let response = server
                 .get(&format!(
-                    "/v1/admin/models?limit=1000&offset={offset}&include_inactive={include_inactive}"
+                    "/v1/admin/models?limit={limit}&offset={offset}&include_inactive={include_inactive}"
                 ))
                 .add_header("Authorization", format!("Bearer {}", get_session_id()))
                 .add_header("User-Agent", MOCK_USER_AGENT)
                 .await;
             assert_eq!(response.status_code(), 200, "{}", response.text());
             let page = response.json::<api::models::AdminModelListResponse>();
-            let page_len = page.models.len() as i64;
-
-            for model in page.models {
-                if seen.insert(model.model_id.clone()) {
-                    models.push(model);
-                }
+            assert_eq!(page.limit, limit, "admin model page limit changed");
+            assert_eq!(page.offset, offset, "admin model page offset changed");
+            OffsetPage {
+                items: page.models,
+                total: page.total,
             }
-
-            offset += page_len;
-            if offset >= page.total || page_len == 0 {
-                break;
-            }
-        }
-
-        models
-    })
+        },
+        |model| model.model_id.clone(),
+    )
     .await
-    .expect("admin model pagination should finish within 5 seconds")
+    .expect("admin model pagination should converge within 10 seconds")
+}
+
+#[cfg(test)]
+mod stable_offset_pagination_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    #[tokio::test]
+    async fn restarts_after_removal_shifts_a_row_before_the_next_offset() {
+        let rows = Arc::new(Mutex::new(vec!["a", "b", "c"]));
+        let mutate_after_first_page = Arc::new(AtomicBool::new(true));
+
+        let snapshot = collect_stable_offset_pages(
+            2,
+            std::time::Duration::from_secs(1),
+            {
+                let rows = Arc::clone(&rows);
+                let mutate_after_first_page = Arc::clone(&mutate_after_first_page);
+                move |offset, limit| {
+                    let rows = Arc::clone(&rows);
+                    let mutate_after_first_page = Arc::clone(&mutate_after_first_page);
+                    async move {
+                        let mut rows = rows.lock().unwrap();
+                        let total = rows.len() as i64;
+                        let items = rows
+                            .iter()
+                            .skip(offset as usize)
+                            .take(limit as usize)
+                            .copied()
+                            .collect();
+
+                        if offset == 0 && mutate_after_first_page.swap(false, Ordering::SeqCst) {
+                            rows.remove(0);
+                        }
+
+                        OffsetPage { items, total }
+                    }
+                }
+            },
+            |item| *item,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(snapshot, vec!["b", "c"]);
+    }
+
+    #[tokio::test]
+    async fn reconciles_equal_totals_after_a_delete_and_insert() {
+        let rows = Arc::new(Mutex::new(vec!["a", "b", "c"]));
+        let mutate_after_first_page = Arc::new(AtomicBool::new(true));
+
+        let snapshot = collect_stable_offset_pages(
+            2,
+            std::time::Duration::from_secs(1),
+            {
+                let rows = Arc::clone(&rows);
+                let mutate_after_first_page = Arc::clone(&mutate_after_first_page);
+                move |offset, limit| {
+                    let rows = Arc::clone(&rows);
+                    let mutate_after_first_page = Arc::clone(&mutate_after_first_page);
+                    async move {
+                        let mut rows = rows.lock().unwrap();
+                        let total = rows.len() as i64;
+                        let items = rows
+                            .iter()
+                            .skip(offset as usize)
+                            .take(limit as usize)
+                            .copied()
+                            .collect();
+
+                        if offset == 0 && mutate_after_first_page.swap(false, Ordering::SeqCst) {
+                            rows.remove(0);
+                            rows.push("d");
+                        }
+
+                        OffsetPage { items, total }
+                    }
+                }
+            },
+            |item| *item,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(snapshot, vec!["b", "c", "d"]);
+    }
 }
 
 pub fn compute_sha256(data: &str) -> String {

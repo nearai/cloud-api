@@ -206,7 +206,7 @@ mod tests {
                         // ACK first so the fixture behaves like a live HTTP/2 peer.
                         // In particular, a PING can arrive while the initial request
                         // is still active if the test runner is heavily loaded.
-                        if flags & 0x1 == 0 {
+                        if (flags & 0x1) == 0 {
                             let mut ack = Vec::new();
                             write_frame_header(&mut ack, payload.len(), FRAME_TYPE_PING, 0x1, 0);
                             ack.extend_from_slice(&payload);
@@ -238,7 +238,7 @@ mod tests {
                 .http2_prior_knowledge()
                 .no_proxy(),
             Duration::from_millis(100),
-            Duration::from_secs(10),
+            Duration::from_secs(2),
             Duration::from_secs(30),
         )
         .build()

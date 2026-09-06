@@ -168,12 +168,13 @@ async fn test_chat_completions_api() {
 async fn test_admin_update_model() {
     let server = setup_test_server().await;
 
-    // Exercise the admin upsert itself with a test-specific row rather than
-    // mutating the suite-wide inference fixture.
-    let model_name = "TestOrg/AdminUpdateModel";
+    // Exercise the admin upsert with a new test-owned row on every run. This
+    // keeps the omitted `ownedBy` field on the insert path, where its default
+    // behavior is defined, and avoids state inherited from a reused database.
+    let model_name = format!("TestOrg/AdminUpdateModel-{}", uuid::Uuid::new_v4());
     let mut batch = BatchUpdateModelApiRequest::new();
     batch.insert(
-        model_name.to_string(),
+        model_name.clone(),
         serde_json::from_value(serde_json::json!({
             "inputCostPerToken": { "amount": 1000000, "currency": "USD" },
             "outputCostPerToken": { "amount": 2000000, "currency": "USD" },
@@ -188,9 +189,6 @@ async fn test_admin_update_model() {
     );
     let updated = admin_batch_upsert_models(&server, batch, get_session_id()).await;
     assert_eq!(updated.len(), 1, "Should have updated 1 model");
-
-    // Verify the model was upserted with correct properties
-    assert_eq!("TestOrg/AdminUpdateModel", model_name);
 
     // Retrieve the model to verify the update
     let response = server

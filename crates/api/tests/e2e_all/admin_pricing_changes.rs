@@ -68,23 +68,21 @@ async fn post_pricing_changes(
         .await
 }
 
-/// Read every observable page for one pricing-change status.
+/// Read one stable snapshot for a pricing-change status.
 ///
-/// Concurrent scheduler tests can change `total` between requests, so collect
-/// and deduplicate a forward scan rather than requiring a global snapshot.
+/// Confirm, cancel, and scheduler tests can move rows into or out of this
+/// status between page requests, so reconcile two complete OFFSET scans.
 async fn list_all_pricing_changes(
     server: &axum_test::TestServer,
     status: &str,
 ) -> Vec<ScheduledPricingChangeDto> {
-    tokio::time::timeout(std::time::Duration::from_secs(5), async {
-        let mut changes = Vec::new();
-        let mut seen = std::collections::HashSet::new();
-        let mut offset = 0_i64;
-
-        loop {
+    collect_stable_offset_pages(
+        1000,
+        std::time::Duration::from_secs(10),
+        |offset, limit| async move {
             let response = server
                 .get(&format!(
-                    "/v1/admin/models/pricing-changes?status={status}&limit=1000&offset={offset}"
+                    "/v1/admin/models/pricing-changes?status={status}&limit={limit}&offset={offset}"
                 ))
                 .add_header("Authorization", format!("Bearer {}", get_session_id()))
                 .add_header("User-Agent", MOCK_USER_AGENT)
@@ -96,24 +94,15 @@ async fn list_all_pricing_changes(
                 response.text()
             );
             let page = response.json::<ListPricingChangesResponse>();
-            let page_len = page.changes.len() as i64;
-
-            for change in page.changes {
-                if seen.insert(change.id.clone()) {
-                    changes.push(change);
-                }
+            OffsetPage {
+                items: page.changes,
+                total: page.total,
             }
-
-            offset += page_len;
-            if offset >= page.total || page_len == 0 {
-                break;
-            }
-        }
-
-        changes
-    })
+        },
+        |change| change.id.clone(),
+    )
     .await
-    .expect("pricing-change pagination should finish within 5 seconds")
+    .expect("pricing-change pagination should converge within 10 seconds")
 }
 
 /// Minimal `ModelsServiceTrait` stub for driving the scheduler in tests;

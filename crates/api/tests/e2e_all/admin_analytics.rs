@@ -1,10 +1,87 @@
 // E2E tests for admin analytics endpoints
 
 use crate::common::*;
+use api::models::BatchUpdateModelApiRequest;
 use services::admin::{
     BillingSummary, InfraSummary, ModelRevenueReport, OrgRevenueReport, OrganizationMetrics,
     PlatformMetrics, PlatformTimeSeriesMetrics, TimeSeriesMetrics,
 };
+
+async fn setup_isolated_model_revenue_models(
+    model_count: usize,
+) -> (axum_test::TestServer, String, Vec<String>) {
+    assert!(model_count > 0, "model revenue fixture needs a model");
+
+    let (server, pool, mock_provider, _database) = setup_test_server_with_pool().await;
+    let cohort = format!(
+        "test-admin-analytics/model-revenue-{}",
+        uuid::Uuid::new_v4().simple()
+    );
+    let model_names = (0..model_count)
+        .map(|index| format!("{cohort}/model-{index}"))
+        .collect::<Vec<_>>();
+    let mut batch = BatchUpdateModelApiRequest::new();
+
+    for (index, model_name) in model_names.iter().enumerate() {
+        let price_multiplier = i64::try_from(index + 1).expect("model index should fit in i64");
+        batch.insert(
+            model_name.clone(),
+            serde_json::from_value(serde_json::json!({
+                "inputCostPerToken": {
+                    "amount": 1_000_000 * price_multiplier,
+                    "currency": "USD"
+                },
+                "outputCostPerToken": {
+                    "amount": 2_000_000 * price_multiplier,
+                    "currency": "USD"
+                },
+                "modelDisplayName": format!("Model revenue fixture {index}"),
+                "modelDescription": "Isolated admin analytics model revenue fixture",
+                "contextLength": 128_000,
+                "maxOutputLength": 1_024,
+                "verifiable": false,
+                "isActive": true
+            }))
+            .expect("model revenue fixture should deserialize"),
+        );
+    }
+
+    let updated = admin_batch_upsert_models(&server, batch, get_session_id()).await;
+    assert_eq!(updated.len(), model_names.len());
+
+    let provider: std::sync::Arc<dyn inference_providers::InferenceProvider + Send + Sync> =
+        mock_provider;
+    for model_name in &model_names {
+        pool.register_provider(model_name.clone(), provider.clone())
+            .await;
+    }
+
+    (server, cohort, model_names)
+}
+
+async fn record_model_revenue_usage(
+    server: &axum_test::TestServer,
+    api_key: &str,
+    model_name: &str,
+) {
+    let response = server
+        .post("/v1/chat/completions")
+        .add_header("Authorization", format!("Bearer {api_key}"))
+        .add_header("User-Agent", MOCK_USER_AGENT)
+        .json(&serde_json::json!({
+            "model": model_name,
+            "messages": [{"role": "user", "content": "model revenue fixture"}],
+            "stream": false,
+            "max_tokens": 20
+        }))
+        .await;
+    assert_eq!(
+        response.status_code(),
+        200,
+        "model revenue fixture completion should succeed: {}",
+        response.text()
+    );
+}
 
 // ============================================
 // Organization Metrics Tests
@@ -941,26 +1018,17 @@ async fn test_admin_platform_billing_summary() {
 
 #[tokio::test]
 async fn test_admin_platform_model_revenue() {
-    let server = setup_test_server().await;
+    let (server, model_search, model_names) = setup_isolated_model_revenue_models(2).await;
+    let lower_revenue_model = &model_names[0];
+    let higher_revenue_model = &model_names[1];
     let org = setup_org_with_credits(&server, 10000000000i64).await;
     let api_key = get_api_key_for_org(&server, org.id.clone()).await;
-    let model_name = setup_qwen_model(&server).await;
 
-    let response = server
-        .post("/v1/chat/completions")
-        .add_header("Authorization", format!("Bearer {api_key}"))
-        .add_header("User-Agent", MOCK_USER_AGENT)
-        .json(&serde_json::json!({
-            "model": model_name,
-            "messages": [{"role": "user", "content": "Hi model revenue!"}],
-            "stream": false,
-            "max_tokens": 20
-        }))
-        .await;
-    assert_eq!(response.status_code(), 200);
-    tokio::time::sleep(tokio::time::Duration::from_millis(1000)).await;
+    record_model_revenue_usage(&server, &api_key, lower_revenue_model).await;
+    record_model_revenue_usage(&server, &api_key, higher_revenue_model).await;
+    record_model_revenue_usage(&server, &api_key, higher_revenue_model).await;
 
-    let model_revenue_url = format!("/v1/admin/platform/model-revenue?model_search={model_name}");
+    let model_revenue_url = format!("/v1/admin/platform/model-revenue?model_search={model_search}");
     let response = server
         .get(&model_revenue_url)
         .add_header("Authorization", format!("Bearer {}", get_session_id()))
@@ -970,7 +1038,11 @@ async fn test_admin_platform_model_revenue() {
     let report: ModelRevenueReport =
         serde_json::from_str(&response.text()).expect("parse ModelRevenueReport");
 
-    // Sorted by revenue desc; total >= rows returned.
+    assert_eq!(report.total, 2);
+    assert_eq!(report.data.len(), 2);
+
+    // The second model has higher per-token prices and twice as many requests,
+    // so revenue ordering is deterministic within this test-owned cohort.
     let eps = 1e-6;
     let mut prev = f64::INFINITY;
     for m in &report.data {
@@ -980,12 +1052,19 @@ async fn test_admin_platform_model_revenue() {
         );
         prev = m.consumed_cost_usd;
     }
-    assert!(report.total >= report.data.len() as i64);
-    assert!(report.total >= 1, "the used model should appear");
+    assert_eq!(report.data[0].model_name, *higher_revenue_model);
+    assert_eq!(report.data[0].requests, 2);
+    assert_eq!(report.data[1].model_name, *lower_revenue_model);
+    assert_eq!(report.data[1].requests, 1);
+    assert!(
+        report.data[0].consumed_cost_usd > report.data[1].consumed_cost_usd,
+        "higher-priced model with more requests should lead revenue ordering"
+    );
 
-    // Pagination: limit=1 returns at most one row but the full total.
-    let paged_url =
-        format!("/v1/admin/platform/model-revenue?limit=1&sort=requests&model_search={model_name}");
+    // Pagination: limit=1 returns the request-count leader and the full total.
+    let paged_url = format!(
+        "/v1/admin/platform/model-revenue?limit=1&sort=requests&model_search={model_search}"
+    );
     let paged = server
         .get(&paged_url)
         .add_header("Authorization", format!("Bearer {}", get_session_id()))
@@ -994,9 +1073,11 @@ async fn test_admin_platform_model_revenue() {
     assert_eq!(paged.status_code(), 200);
     let paged: ModelRevenueReport =
         serde_json::from_str(&paged.text()).expect("parse ModelRevenueReport");
-    assert!(paged.data.len() <= 1);
+    assert_eq!(paged.data.len(), 1);
     assert_eq!(paged.limit, 1);
-    assert_eq!(paged.total, report.total);
+    assert_eq!(paged.total, 2);
+    assert_eq!(paged.data[0].model_name, *higher_revenue_model);
+    assert_eq!(paged.data[0].requests, 2);
 
     println!("✅ Platform model-revenue works, sorts, and paginates");
 }
@@ -1163,26 +1244,15 @@ async fn test_admin_platform_analytics_input_validation() {
 
 #[tokio::test]
 async fn test_admin_platform_model_revenue_offset_beyond_total() {
-    let server = setup_test_server().await;
+    let (server, model_search, model_names) = setup_isolated_model_revenue_models(1).await;
+    let model_name = &model_names[0];
     let org = setup_org_with_credits(&server, 10000000000i64).await;
     let api_key = get_api_key_for_org(&server, org.id.clone()).await;
-    let model_name = setup_qwen_model(&server).await;
 
-    let resp = server
-        .post("/v1/chat/completions")
-        .add_header("Authorization", format!("Bearer {api_key}"))
-        .add_header("User-Agent", MOCK_USER_AGENT)
-        .json(&serde_json::json!({
-            "model": model_name,
-            "messages": [{"role": "user", "content": "offset test"}],
-            "stream": false,
-            "max_tokens": 20
-        }))
-        .await;
-    assert_eq!(resp.status_code(), 200);
+    record_model_revenue_usage(&server, &api_key, model_name).await;
 
     let model_revenue_path =
-        format!("/v1/admin/platform/model-revenue?limit=10&offset=0&model_search={model_name}");
+        format!("/v1/admin/platform/model-revenue?limit=10&offset=0&model_search={model_search}");
     let initial_report = tokio::time::timeout(std::time::Duration::from_secs(5), async {
         loop {
             let response = server
@@ -1193,7 +1263,7 @@ async fn test_admin_platform_model_revenue_offset_beyond_total() {
             assert_eq!(response.status_code(), 200);
             let report: ModelRevenueReport =
                 serde_json::from_str(&response.text()).expect("parse ModelRevenueReport");
-            if report.total >= 1 {
+            if report.total == 1 {
                 break report;
             }
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
@@ -1201,12 +1271,14 @@ async fn test_admin_platform_model_revenue_offset_beyond_total() {
     })
     .await
     .expect("model revenue should be recorded within 5 seconds");
+    assert_eq!(initial_report.data.len(), 1);
+    assert_eq!(initial_report.data[0].model_name, *model_name);
 
     // A page past the end must still report the true total with empty data
     // (regression: COUNT(*) OVER read from the first row returned 0 here).
     let resp = server
         .get(&format!(
-            "/v1/admin/platform/model-revenue?limit=10&offset={}&model_search={model_name}",
+            "/v1/admin/platform/model-revenue?limit=10&offset={}&model_search={model_search}",
             initial_report.total
         ))
         .add_header("Authorization", format!("Bearer {}", get_session_id()))
@@ -1216,10 +1288,7 @@ async fn test_admin_platform_model_revenue_offset_beyond_total() {
     let report: ModelRevenueReport =
         serde_json::from_str(&resp.text()).expect("parse ModelRevenueReport");
     assert!(report.data.is_empty(), "page beyond end should be empty");
-    assert_eq!(
-        report.total, initial_report.total,
-        "total must reflect matches, not the empty page"
-    );
+    assert_eq!(report.total, 1, "total must reflect the matching model");
 
     println!("✅ model-revenue reports correct total on an out-of-range page");
 }

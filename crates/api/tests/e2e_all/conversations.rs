@@ -164,6 +164,62 @@ async fn all_conversation_mutations_except_delete_remain_gone_after_authenticati
 }
 
 #[tokio::test]
+async fn chat_completions_with_json_schema_remains_available_in_stage_i() {
+    use crate::common::mock_prompts;
+    use inference_providers::mock::{RequestMatcher, ResponseTemplate};
+
+    let (server, _pool, mock, _db) = setup_test_server_with_pool().await;
+    setup_qwen_model(&server).await;
+    let org = setup_org_with_credits(&server, 10_000_000_000i64).await;
+    let api_key = get_api_key_for_org(&server, org.id).await;
+
+    let user_message = "Generate a user profile";
+    let expected_prompt = mock_prompts::build_simple_prompt(user_message);
+    let expected_json = r#"{"name": "Alice Johnson", "age": 28, "email": "alice@example.com"}"#;
+    mock.when(RequestMatcher::ExactPrompt(expected_prompt))
+        .respond_with(ResponseTemplate::new(expected_json))
+        .await;
+
+    let response = server
+        .post("/v1/chat/completions")
+        .add_header("Authorization", format!("Bearer {api_key}"))
+        .json(&serde_json::json!({
+            "model": "Qwen/Qwen3-30B-A3B-Instruct-2507",
+            "messages": [{"role": "user", "content": user_message}],
+            "response_format": {
+                "type": "json_schema",
+                "json_schema": {
+                    "name": "user_profile",
+                    "schema": {
+                        "type": "object",
+                        "properties": {
+                            "name": {"type": "string"},
+                            "age": {"type": "integer"},
+                            "email": {"type": "string"}
+                        },
+                        "required": ["name", "age", "email"]
+                    },
+                    "strict": true
+                }
+            }
+        }))
+        .await;
+
+    assert_eq!(response.status_code(), 200, "{}", response.text());
+    let completion = response.json::<serde_json::Value>();
+    let content = completion["choices"][0]["message"]["content"]
+        .as_str()
+        .expect("expected completion content");
+    assert_eq!(content, expected_json);
+
+    let json: serde_json::Value =
+        serde_json::from_str(content).expect("completion content must be valid JSON");
+    assert_eq!(json["name"], "Alice Johnson");
+    assert_eq!(json["age"], 28);
+    assert_eq!(json["email"], "alice@example.com");
+}
+
+#[tokio::test]
 async fn openapi_advertises_temporary_migration_routes_and_only_allowed_deletions() {
     let server = setup_test_server().await;
     let response = server.get("/api-docs/openapi.json").await;

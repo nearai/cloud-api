@@ -39,14 +39,28 @@ impl WorkspaceRepository {
                 .context("Failed to get database connection")
                 .map_err(RepositoryError::PoolError)?;
 
+            // The membership check happens in the service layer, in a separate
+            // statement. Lock the active organization here as well: an unlocked
+            // EXISTS can read the pre-delete version under READ COMMITTED while
+            // deletion holds an uncommitted FOR UPDATE lock. Waiting on FOR SHARE
+            // makes this statement recheck the active flag after that deletion
+            // commits, so it cannot leave an active workspace under a deleted org.
+            // The foreign key alone does not catch it because the soft-deleted
+            // parent row still exists.
             client
-                .query_one(
+                .query_opt(
                     r#"
                 INSERT INTO workspaces (
                     id, name, description, organization_id,
                     created_by_user_id, created_at, updated_at, is_active
                 )
-                VALUES ($1, $2, $3, $4, $5, $6, $7, true)
+                SELECT $1, $2, $3, $4, $5, $6, $7, true
+                WHERE EXISTS (
+                    SELECT 1
+                    FROM organizations
+                    WHERE id = $4 AND is_active = true
+                    FOR SHARE
+                )
                 RETURNING *
                 "#,
                     &[
@@ -61,6 +75,10 @@ impl WorkspaceRepository {
                 )
                 .await
                 .map_err(map_db_error)
+        })?;
+
+        let row = row.ok_or_else(|| {
+            RepositoryError::NotFound("active organization for new workspace".to_string())
         })?;
 
         debug!(
@@ -575,10 +593,13 @@ impl services::workspace::ports::WorkspaceRepository for WorkspaceRepository {
                     r#"
                     SELECT w.*
                     FROM workspaces w
+                    INNER JOIN organizations o
+                        ON w.organization_id = o.id
                     INNER JOIN organization_members om
                         ON w.organization_id = om.organization_id
                     WHERE om.user_id = $1
                       AND w.is_active = true
+                      AND o.is_active = true
                     ORDER BY w.created_at ASC
                     LIMIT $2
                     "#,

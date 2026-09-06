@@ -90,6 +90,8 @@ pub struct CompletionRequest {
     pub api_key_id: String, // For usage tracking (ID only, no name)
     pub organization_id: Uuid,
     pub workspace_id: Uuid,
+    /// Whether providers explicitly registered as fallbacks may be used.
+    pub fallback_enabled: bool,
     pub metadata: Option<serde_json::Value>,
     /// Whether to store the output (required for metadata to be sent to OpenAI)
     pub store: Option<bool>,

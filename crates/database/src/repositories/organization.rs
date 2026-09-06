@@ -275,7 +275,10 @@ impl PgOrganizationRepository {
         &self,
         id: Uuid,
         request: DbUpdateOrganizationRequest,
+        expected_fallback_override: Option<Option<serde_json::Value>>,
     ) -> Result<DbOrganization, RepositoryError> {
+        let guard_fallback_override = expected_fallback_override.is_some();
+        let expected_fallback_override = expected_fallback_override.flatten();
         let row = retry_db!("update_organization", {
             let client = self
                 .pool
@@ -285,7 +288,7 @@ impl PgOrganizationRepository {
                 .map_err(RepositoryError::PoolError)?;
 
             client
-                .query_one(
+                .query_opt(
                     r#"
             UPDATE organizations
             SET name = COALESCE($2, name),
@@ -293,7 +296,13 @@ impl PgOrganizationRepository {
                 rate_limit = COALESCE($4, rate_limit),
                 settings = COALESCE($5, settings),
                 updated_at = NOW()
-            WHERE id = $1 AND is_active = true
+            WHERE id = $1
+              AND is_active = true
+              AND (
+                  NOT $6::boolean
+                  OR settings -> 'fallback_enabled'
+                     IS NOT DISTINCT FROM $7::jsonb
+              )
             RETURNING *
             "#,
                     &[
@@ -302,37 +311,18 @@ impl PgOrganizationRepository {
                         &request.description,
                         &request.rate_limit,
                         &request.settings,
+                        &guard_fallback_override,
+                        &expected_fallback_override,
                     ],
                 )
                 .await
                 .map_err(map_db_error)
-        })?;
+        })?
+        .ok_or(RepositoryError::TransactionConflict)?;
 
         debug!("Updated organization: {}", id);
         self.row_to_db_organization(row)
             .map_err(RepositoryError::DataConversionError)
-    }
-
-    /// Delete an organization (soft delete)
-    pub async fn delete(&self, id: Uuid) -> Result<bool> {
-        let rows_affected = retry_db!("delete_organization", {
-            let client = self
-                .pool
-                .get()
-                .await
-                .context("Failed to get database connection")
-                .map_err(RepositoryError::PoolError)?;
-
-            client
-                .execute(
-                    "UPDATE organizations SET is_active = false WHERE id = $1 AND is_active = true",
-                    &[&id],
-                )
-                .await
-                .map_err(map_db_error)
-        })?;
-
-        Ok(rows_affected > 0)
     }
 
     /// Add a member to an organization - internal method
@@ -633,6 +623,7 @@ impl OrganizationRepository for PgOrganizationRepository {
         &self,
         id: Uuid,
         request: UpdateOrganizationRequest,
+        expected_fallback_override: Option<Option<serde_json::Value>>,
     ) -> Result<Organization, RepositoryError> {
         let db_request = DbUpdateOrganizationRequest {
             name: request.name,
@@ -641,7 +632,89 @@ impl OrganizationRepository for PgOrganizationRepository {
             settings: request.settings,
         };
 
-        let db_org = self.update_internal(id, db_request).await?;
+        let db_org = self
+            .update_internal(id, db_request, expected_fallback_override)
+            .await?;
+        self.db_to_domain_organization(db_org)
+            .await
+            .map_err(RepositoryError::DataConversionError)
+    }
+
+    async fn patch_settings(
+        &self,
+        id: Uuid,
+        patch: PatchOrganizationSettings,
+    ) -> Result<Organization, RepositoryError> {
+        let has_system_prompt = patch.system_prompt.is_some();
+        let system_prompt = patch.system_prompt.flatten();
+        let has_fallback_enabled = patch.fallback_enabled.is_some();
+        let fallback_enabled = patch.fallback_enabled.flatten();
+
+        // Apply both supported keys in one statement. PostgreSQL takes the row
+        // lock for the UPDATE, so concurrent patches to different keys always
+        // start from the latest committed settings instead of overwriting one
+        // another with stale read-modify-write snapshots.
+        let row = retry_db!("patch_organization_settings", {
+            let client = self
+                .pool
+                .get()
+                .await
+                .context("Failed to get database connection")
+                .map_err(RepositoryError::PoolError)?;
+
+            client
+                .query_opt(
+                    r#"
+                    WITH current_settings AS (
+                        SELECT CASE
+                            WHEN jsonb_typeof(settings) = 'object' THEN settings
+                            ELSE '{}'::jsonb
+                        END AS value
+                        FROM organizations
+                        WHERE id = $1 AND is_active = true
+                        FOR UPDATE
+                    ), prompt_patched AS (
+                        SELECT CASE
+                            WHEN $2::boolean AND $3::text IS NULL
+                                THEN value - 'system_prompt'
+                            WHEN $2::boolean
+                                THEN jsonb_set(value, '{system_prompt}', to_jsonb($3::text), true)
+                            ELSE value
+                        END AS value
+                        FROM current_settings
+                    ), fully_patched AS (
+                        SELECT CASE
+                            WHEN $4::boolean AND $5::boolean IS NULL
+                                THEN value - 'fallback_enabled'
+                            WHEN $4::boolean
+                                THEN jsonb_set(value, '{fallback_enabled}', to_jsonb($5::boolean), true)
+                            ELSE value
+                        END AS value
+                        FROM prompt_patched
+                    )
+                    UPDATE organizations AS organization
+                    SET settings = fully_patched.value,
+                        updated_at = NOW()
+                    FROM fully_patched
+                    WHERE organization.id = $1 AND organization.is_active = true
+                    RETURNING organization.*
+                    "#,
+                    &[
+                        &id,
+                        &has_system_prompt,
+                        &system_prompt,
+                        &has_fallback_enabled,
+                        &fallback_enabled,
+                    ],
+                )
+                .await
+                .map_err(map_db_error)
+        })?
+        .ok_or_else(|| RepositoryError::NotFound(id.to_string()))?;
+
+        let db_org = self
+            .row_to_db_organization(row)
+            .map_err(RepositoryError::DataConversionError)?;
         self.db_to_domain_organization(db_org)
             .await
             .map_err(RepositoryError::DataConversionError)
@@ -696,6 +769,59 @@ impl OrganizationRepository for PgOrganizationRepository {
                         )
                         .await
                         .map_err(map_db_error)?;
+
+                    if rows_affected > 0 {
+                        // Deactivating only the organization row leaves its workspaces and
+                        // API keys marked active while every lookup for them joins
+                        // `organizations` with `is_active = true` and fails. Those rows are
+                        // dead but still advertised: `/v1/users/me` kept listing the
+                        // workspaces, so clients that pick the current org from that list
+                        // pinned themselves to a deleted org. Cascade in the same
+                        // transaction so the deletion is all-or-nothing and `is_active`
+                        // stays truthful at every level.
+                        // `deleted_at` as well as `is_active`: a normal revoke sets
+                        // `deleted_at` (see `ApiKeyRepository::revoke`) and the listing
+                        // queries key off it, so setting only `is_active` would leave
+                        // these rows reading as "not deleted, merely inactive".
+                        transaction
+                            .execute(
+                                r#"
+                                UPDATE api_keys
+                                SET is_active = false,
+                                    deleted_at = COALESCE(deleted_at, NOW())
+                                WHERE (is_active = true OR deleted_at IS NULL)
+                                  AND workspace_id IN (
+                                      SELECT id FROM workspaces WHERE organization_id = $1
+                                  )
+                                "#,
+                                &[&id],
+                            )
+                            .await
+                            .map_err(map_db_error)?;
+
+                        // Reporting-token validation also requires an active organization,
+                        // but revoke the persisted rows so credential state remains truthful
+                        // and a deleted org cannot regain access through a future validation
+                        // path. No `revoked_by_user_id`: this is a system revocation, not a
+                        // user's.
+                        transaction
+                            .execute(
+                                "UPDATE organization_reporting_tokens SET revoked_at = NOW() \
+                                 WHERE organization_id = $1 AND revoked_at IS NULL",
+                                &[&id],
+                            )
+                            .await
+                            .map_err(map_db_error)?;
+
+                        transaction
+                            .execute(
+                                "UPDATE workspaces SET is_active = false, updated_at = NOW() \
+                                 WHERE organization_id = $1 AND is_active = true",
+                                &[&id],
+                            )
+                            .await
+                            .map_err(map_db_error)?;
+                    }
 
                     transaction.commit().await.map_err(map_db_error)?;
 

@@ -203,15 +203,17 @@ impl WorkspaceServiceTrait for WorkspaceServiceImpl {
         organization_id: OrganizationId,
         requester_id: UserId,
     ) -> Result<Workspace, WorkspaceError> {
-        // Check if user is a member of the organization
+        // Check if user is a member of the organization. A deleted org reads as
+        // not-found here, which is a 404 — not an internal error.
         let is_member = self
             .organization_service
             .is_member(organization_id.clone(), requester_id.clone())
             .await
-            .map_err(|e| {
-                WorkspaceError::InternalError(format!(
-                    "Failed to check organization membership: {e}"
-                ))
+            .map_err(|e| match e {
+                crate::organization::OrganizationError::NotFound => WorkspaceError::NotFound,
+                other => WorkspaceError::InternalError(format!(
+                    "Failed to check organization membership: {other}"
+                )),
             })?;
 
         if !is_member {
@@ -220,11 +222,15 @@ impl WorkspaceServiceTrait for WorkspaceServiceImpl {
             ));
         }
 
-        // Create the workspace
+        // Create the workspace. A `NotFound` here means the org was deleted between
+        // the membership check and the insert — report it as such, not as a 500.
         self.workspace_repository
             .create(name, description, organization_id, requester_id)
             .await
-            .map_err(Self::map_repository_error)
+            .map_err(|e| match e {
+                RepositoryError::NotFound(_) => WorkspaceError::NotFound,
+                other => Self::map_repository_error(other),
+            })
     }
 
     async fn create_api_key(&self, request: CreateApiKeyRequest) -> Result<ApiKey, WorkspaceError> {
@@ -243,11 +249,17 @@ impl WorkspaceServiceTrait for WorkspaceServiceImpl {
             ));
         }
 
-        // Create the API key
+        // Create the API key. A `NotFound` here means the workspace or its org was
+        // deleted between the permission check and the insert.
         self.api_key_repository
             .create(request)
             .await
-            .map_err(|e| WorkspaceError::InternalError(format!("Failed to create API key: {e}")))
+            .map_err(|e| match e {
+                RepositoryError::NotFound(_) => WorkspaceError::NotFound,
+                other => {
+                    WorkspaceError::InternalError(format!("Failed to create API key: {other}"))
+                }
+            })
     }
 
     async fn list_api_keys_paginated(

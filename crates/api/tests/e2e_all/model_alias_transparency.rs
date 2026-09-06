@@ -6,6 +6,7 @@
 
 use crate::common::*;
 use api::models::BatchUpdateModelApiRequest;
+use bytes::Bytes;
 
 /// Create a synthetic model and deprecate it in favor of the e2e Qwen mock
 /// model, returning the deprecated (alias) name. This reproduces the exact
@@ -67,10 +68,13 @@ async fn test_aliased_request_warns_non_streaming() {
     let org = setup_org_with_credits(&server, 10_000_000_000i64).await;
     let api_key = get_api_key_for_org(&server, org.id).await;
 
+    let request_body = chat_body(&alias, false);
+    let request_json = serde_json::to_string(&request_body).expect("request should serialize");
     let response = server
         .post("/v1/chat/completions")
         .add_header("Authorization", format!("Bearer {api_key}"))
-        .json(&chat_body(&alias, false))
+        .content_type("application/json")
+        .bytes(Bytes::from(request_json.clone()))
         .await;
     assert_eq!(response.status_code(), 200, "{}", response.text());
 
@@ -85,7 +89,9 @@ async fn test_aliased_request_warns_non_streaming() {
     assert_eq!(header, format!("{alias} -> {E2E_QWEN_MODEL_NAME}"));
 
     // Body carries the canonical model and a top-level warning
-    let body: serde_json::Value = response.json();
+    let response_text = response.text();
+    let body: serde_json::Value =
+        serde_json::from_str(&response_text).expect("chat response should be JSON");
     assert_eq!(body["model"], E2E_QWEN_MODEL_NAME);
     let warning = body["warning"]
         .as_str()
@@ -94,21 +100,55 @@ async fn test_aliased_request_warns_non_streaming() {
         warning.contains(&alias) && warning.contains(E2E_QWEN_MODEL_NAME),
         "warning should name both alias and canonical model: {warning}"
     );
+
+    let chat_id = body["id"].as_str().expect("response should have an id");
+    let signature_response = server
+        .get(format!("/v1/signature/{chat_id}?signing_algo=ecdsa").as_str())
+        .add_header("Authorization", format!("Bearer {api_key}"))
+        .await;
+    assert_eq!(
+        signature_response.status_code(),
+        200,
+        "gateway signature should be available: {}",
+        signature_response.text()
+    );
+    let signature = signature_response.json::<serde_json::Value>();
+    assert_eq!(signature["signature_kind"], "gateway");
+    assert_eq!(
+        signature["text"],
+        format!(
+            "{}:{}",
+            compute_sha256(&request_json),
+            compute_sha256(&response_text)
+        )
+    );
 }
 
 #[tokio::test]
 async fn test_aliased_request_warns_streaming_first_chunk() {
-    let server = setup_test_server().await;
+    use http_body_util::BodyExt;
+    use tower::ServiceExt;
+
+    let (server, router) = setup_test_server_and_router().await;
     let alias = setup_deprecated_alias(&server).await;
     let org = setup_org_with_credits(&server, 10_000_000_000i64).await;
     let api_key = get_api_key_for_org(&server, org.id).await;
 
-    let response = server
-        .post("/v1/chat/completions")
-        .add_header("Authorization", format!("Bearer {api_key}"))
-        .json(&chat_body(&alias, true))
-        .await;
-    assert_eq!(response.status_code(), 200, "{}", response.text());
+    let mut request_body = chat_body(&alias, true);
+    request_body["stream_options"] = serde_json::json!({
+        "continuous_usage_stats": true
+    });
+    let request_json = serde_json::to_string(&request_body).expect("request should serialize");
+    let request = axum::http::Request::builder()
+        .method("POST")
+        .uri("/v1/chat/completions")
+        .header("Authorization", format!("Bearer {api_key}"))
+        .header("Content-Type", "application/json")
+        .body(axum::body::Body::from(request_json.clone()))
+        .expect("request should build");
+    let response = router.clone().oneshot(request).await;
+    let response = response.expect("router should serve the streaming request");
+    assert_eq!(response.status(), axum::http::StatusCode::OK);
 
     let header = response
         .headers()
@@ -119,8 +159,27 @@ async fn test_aliased_request_warns_streaming_first_chunk() {
         .to_string();
     assert_eq!(header, format!("{alias} -> {E2E_QWEN_MODEL_NAME}"));
 
-    // Only the FIRST data chunk carries the warning
-    let text = response.text();
+    // Stop as soon as [DONE] is observed. The signature must already be
+    // available at this point; polling further frames would hide a race in
+    // which the route stores the signature after exposing the terminator.
+    let mut body = response.into_body();
+    let mut received = Vec::new();
+    let mut saw_done = false;
+    while let Some(frame) = body.frame().await {
+        let frame = frame.expect("stream frame should not error");
+        let Some(data) = frame.data_ref() else {
+            continue;
+        };
+        received.extend_from_slice(data);
+        if String::from_utf8_lossy(&received).contains("data: [DONE]") {
+            saw_done = true;
+            break;
+        }
+    }
+    let text = String::from_utf8(received).expect("SSE body should be UTF-8");
+    assert!(saw_done, "stream should end with [DONE]: {text}");
+
+    // Only the FIRST data chunk carries the warning.
     let mut data_chunks = text
         .lines()
         .filter_map(|l| l.strip_prefix("data: "))
@@ -128,6 +187,10 @@ async fn test_aliased_request_warns_streaming_first_chunk() {
         .map(|d| serde_json::from_str::<serde_json::Value>(d).expect("chunk should parse"));
 
     let first = data_chunks.next().expect("stream should have chunks");
+    let chat_id = first["id"]
+        .as_str()
+        .expect("first stream chunk should have an id")
+        .to_string();
     let warning = first["warning"]
         .as_str()
         .expect("first chunk of aliased stream must carry a warning");
@@ -142,6 +205,50 @@ async fn test_aliased_request_warns_streaming_first_chunk() {
             chunk.get("warning").is_none(),
             "only the first chunk should carry the warning, got: {chunk}"
         );
+    }
+
+    let signature_request = axum::http::Request::builder()
+        .method("GET")
+        .uri(format!("/v1/signature/{chat_id}?signing_algo=ecdsa"))
+        .header("Authorization", format!("Bearer {api_key}"))
+        .body(axum::body::Body::empty())
+        .expect("signature request should build");
+    let signature_response = router.clone().oneshot(signature_request).await;
+    let signature_response = signature_response.expect("router should serve signature request");
+    let signature_status = signature_response.status();
+    let signature_bytes = signature_response
+        .into_body()
+        .collect()
+        .await
+        .expect("signature body should collect")
+        .to_bytes();
+    assert_eq!(
+        signature_status,
+        axum::http::StatusCode::OK,
+        "gateway signature should be available: {}",
+        String::from_utf8_lossy(&signature_bytes)
+    );
+    let signature: serde_json::Value =
+        serde_json::from_slice(&signature_bytes).expect("signature response should be JSON");
+    assert_eq!(signature["signature_kind"], "gateway");
+    assert_eq!(
+        signature["text"],
+        format!(
+            "{}:{}",
+            compute_sha256(&request_json),
+            compute_sha256(&text)
+        )
+    );
+
+    while let Some(frame) = body.frame().await {
+        let frame = frame.expect("trailing frame should not error");
+        if let Some(data) = frame.data_ref() {
+            assert!(
+                data.is_empty(),
+                "no bytes may follow [DONE]: {:?}",
+                String::from_utf8_lossy(data)
+            );
+        }
     }
 }
 

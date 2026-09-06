@@ -1,17 +1,16 @@
 //! Infrastructure / fleet burn summary.
 //!
-//! Fetches the live GPU-host inventory from an internal endpoint (reachable only
-//! server-side, not from the browser), counts active vs idle hosts, and derives the
-//! monthly/daily burn rate from a configurable cost-per-host. Results are cached for a
-//! few minutes; if the inventory is unreachable we return the last-known value (or a
-//! zero fallback) flagged `stale = true` so the dashboard never hard-fails.
+//! Fetches the live GPU-host inventory and current per-model GPU allocation from
+//! internal observability endpoints (reachable only server-side, not from the
+//! browser). Results are cached for a few minutes; unavailable sources use the
+//! last-known value (or an empty fallback) and are explicitly marked stale.
 //!
 //! No customer data is involved — only host IPs, model identifiers, and counts.
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::time::{Duration, Instant};
-use tokio::sync::RwLock;
+use tokio::sync::{Mutex, RwLock};
 use utoipa::ToSchema;
 
 /// How long a fetched inventory stays fresh before we refetch.
@@ -39,9 +38,57 @@ pub struct InfraSummary {
     pub cost_per_host_usd_month: f64,
     pub monthly_burn_usd: f64,
     pub daily_burn_usd: f64,
+    /// Planning rate for one allocated physical GPU-hour.
+    pub cost_per_gpu_hour_usd: f64,
+    /// Current distinct physical GPUs allocated to a model workload.
+    pub total_allocated_gpus: i64,
+    /// Current projected fleet GPU burn per hour.
+    pub hourly_gpu_burn_usd: f64,
+    /// Current allocation grouped by the model label emitted by DCGM. A GPU
+    /// carrying multiple labels can appear in multiple groups; the fleet total
+    /// remains separately deduplicated by physical UUID.
+    pub model_gpu_allocations: Vec<ModelGpuAllocation>,
+    /// True when current GPU allocation is unavailable or served from cache.
+    pub gpu_data_stale: bool,
     pub fetched_at: DateTime<Utc>,
     /// True when this is last-known / fallback data because the live fetch failed.
     pub stale: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
+pub struct ModelGpuAllocation {
+    pub model_name: String,
+    pub allocated_gpus: i64,
+}
+
+#[derive(Debug, Deserialize)]
+struct PrometheusResponse {
+    status: String,
+    data: Option<PrometheusData>,
+    error: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct PrometheusData {
+    result: Vec<PrometheusSeries>,
+}
+
+#[derive(Debug, Deserialize)]
+struct PrometheusSeries {
+    metric: PrometheusMetric,
+    value: (f64, String),
+}
+
+#[derive(Debug, Deserialize)]
+struct PrometheusMetric {
+    model: Option<String>,
+    nearai_aggregate: Option<String>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct GpuAllocationSnapshot {
+    model_gpu_allocations: Vec<ModelGpuAllocation>,
+    total_allocated_gpus: i64,
 }
 
 struct Cached {
@@ -54,12 +101,24 @@ pub struct InfraService {
     /// Internal host-inventory endpoint. `None` disables the live fetch.
     machines_url: Option<String>,
     cost_per_host_usd_month: f64,
+    prometheus_url: Option<String>,
+    prometheus_bearer_token: Option<String>,
+    prometheus_environment: String,
+    cost_per_gpu_hour_usd: f64,
     client: reqwest::Client,
     cache: RwLock<Option<Cached>>,
+    refresh_lock: Mutex<()>,
 }
 
 impl InfraService {
-    pub fn new(machines_url: Option<String>, cost_per_host_usd_month: f64) -> Self {
+    pub fn new(
+        machines_url: Option<String>,
+        cost_per_host_usd_month: f64,
+        prometheus_url: Option<String>,
+        prometheus_bearer_token: Option<String>,
+        prometheus_environment: String,
+        cost_per_gpu_hour_usd: f64,
+    ) -> Self {
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(5))
             .build()
@@ -67,18 +126,18 @@ impl InfraService {
         Self {
             machines_url,
             cost_per_host_usd_month,
+            prometheus_url,
+            prometheus_bearer_token,
+            prometheus_environment,
+            cost_per_gpu_hour_usd,
             client,
             cache: RwLock::new(None),
+            refresh_lock: Mutex::new(()),
         }
     }
 
     /// Return the fleet burn summary, using the cache when fresh.
     pub async fn get_infra_summary(&self) -> InfraSummary {
-        // Not configured (no inventory endpoint): report no fleet data.
-        let Some(url) = self.machines_url.clone() else {
-            return self.summarize(Vec::new(), true);
-        };
-
         // Fast path: fresh cache.
         if let Some(cached) = self.cache.read().await.as_ref() {
             if cached.at.elapsed() < CACHE_TTL {
@@ -86,41 +145,93 @@ impl InfraService {
             }
         }
 
-        match self.fetch(&url).await {
-            Ok(hosts) => {
-                let summary = self.summarize(hosts, false);
-                let mut guard = self.cache.write().await;
-                *guard = Some(Cached {
-                    summary: summary.clone(),
-                    at: Instant::now(),
-                });
-                summary
-            }
-            Err(e) => {
-                tracing::warn!("infra inventory fetch failed: {e}");
-                // Serve last-known data marked stale, else a zero fallback — and
-                // re-cache it with a fresh timestamp so a down endpoint isn't retried
-                // (a 5s fetch) on every request; it degrades for the TTL window.
-                let mut guard = self.cache.write().await;
-                let fallback = match guard.as_ref() {
-                    Some(cached) => {
-                        let mut summary = cached.summary.clone();
-                        summary.stale = true;
-                        summary
-                    }
-                    None => self.summarize(Vec::new(), true),
-                };
-                *guard = Some(Cached {
-                    summary: fallback.clone(),
-                    at: Instant::now(),
-                });
-                fallback
+        // Only one request refreshes an expired snapshot. Other requests wait
+        // and then reuse its result, preventing an older failed refresh from
+        // overwriting newer values or freshness flags.
+        let _refresh_guard = self.refresh_lock.lock().await;
+        if let Some(cached) = self.cache.read().await.as_ref() {
+            if cached.at.elapsed() < CACHE_TTL {
+                return cached.summary.clone();
             }
         }
+
+        let hosts_future = async {
+            match self.machines_url.as_deref() {
+                Some(url) => match self.fetch_machines(url).await {
+                    Ok(hosts) => (Some(hosts), false),
+                    Err(e) => {
+                        tracing::warn!("infra inventory fetch failed: {e}");
+                        (None, true)
+                    }
+                },
+                None => (None, true),
+            }
+        };
+        let gpu_allocations_future = async {
+            match self.prometheus_url.as_deref() {
+                Some(url) => match self.fetch_gpu_allocations(url).await {
+                    Ok(snapshot) => (Some(snapshot), false),
+                    Err(e) => {
+                        tracing::warn!("infra Prometheus fetch failed: {e}");
+                        (None, true)
+                    }
+                },
+                None => (None, true),
+            }
+        };
+        let ((hosts, host_stale), (gpu_snapshot, gpu_data_stale)) =
+            tokio::join!(hosts_future, gpu_allocations_future);
+
+        let (gpu_allocations, total_allocated_gpus) = gpu_snapshot
+            .map(|snapshot| {
+                (
+                    snapshot.model_gpu_allocations,
+                    snapshot.total_allocated_gpus,
+                )
+            })
+            .unwrap_or_default();
+
+        let mut summary = self.summarize(
+            hosts.unwrap_or_default(),
+            gpu_allocations,
+            total_allocated_gpus,
+            host_stale,
+            gpu_data_stale,
+        );
+
+        let mut guard = self.cache.write().await;
+        if let Some(previous) = guard.as_ref().map(|cached| &cached.summary) {
+            if host_stale {
+                summary.total_hosts = previous.total_hosts;
+                summary.active_hosts = previous.active_hosts;
+                summary.idle_hosts = previous.idle_hosts;
+                summary.monthly_burn_usd = previous.monthly_burn_usd;
+                summary.daily_burn_usd = previous.daily_burn_usd;
+                summary.fetched_at = previous.fetched_at;
+            }
+            if gpu_data_stale {
+                summary.total_allocated_gpus = previous.total_allocated_gpus;
+                summary.hourly_gpu_burn_usd = previous.hourly_gpu_burn_usd;
+                summary.model_gpu_allocations = previous.model_gpu_allocations.clone();
+            }
+        }
+
+        *guard = Some(Cached {
+            summary: summary.clone(),
+            at: Instant::now(),
+        });
+        summary
     }
 
     /// Build a summary from a parsed host list.
-    fn summarize(&self, hosts: Vec<HostInfo>, stale: bool) -> InfraSummary {
+    fn summarize(
+        &self,
+        hosts: Vec<HostInfo>,
+        model_gpu_allocations: Vec<ModelGpuAllocation>,
+        total_allocated_gpus: i64,
+        stale: bool,
+        gpu_data_stale: bool,
+    ) -> InfraSummary {
         let total_hosts = hosts.len() as i64;
         let active_hosts = hosts.iter().filter(|h| !h.models.is_empty()).count() as i64;
         let idle_hosts = total_hosts - active_hosts;
@@ -132,12 +243,17 @@ impl InfraService {
             cost_per_host_usd_month: self.cost_per_host_usd_month,
             monthly_burn_usd,
             daily_burn_usd: monthly_burn_usd / 30.4,
+            cost_per_gpu_hour_usd: self.cost_per_gpu_hour_usd,
+            total_allocated_gpus,
+            hourly_gpu_burn_usd: total_allocated_gpus as f64 * self.cost_per_gpu_hour_usd,
+            model_gpu_allocations,
+            gpu_data_stale,
             fetched_at: Utc::now(),
             stale,
         }
     }
 
-    async fn fetch(&self, url: &str) -> Result<Vec<HostInfo>, String> {
+    async fn fetch_machines(&self, url: &str) -> Result<Vec<HostInfo>, String> {
         let resp = self
             .client
             .get(url)
@@ -150,6 +266,81 @@ impl InfraService {
         let body = resp.text().await.map_err(|e| e.to_string())?;
         Ok(parse_machines(&body))
     }
+
+    async fn fetch_gpu_allocations(&self, url: &str) -> Result<GpuAllocationSnapshot, String> {
+        let env = escape_promql_label_value(&self.prometheus_environment);
+        let metric = format!("DCGM_FI_DEV_GPU_UTIL{{env=\"{env}\"}}");
+        let query = format!(
+            "count by (model) (count by (model, host_machine, UUID) ({metric})) or label_replace(count(count by (host_machine, UUID) ({metric})), \"nearai_aggregate\", \"fleet_total\", \"\", \"\")"
+        );
+        let endpoint = format!("{}/api/v1/query", url.trim_end_matches('/'));
+        let mut request = self.client.get(endpoint).query(&[("query", query)]);
+        if let Some(token) = self.prometheus_bearer_token.as_deref() {
+            request = request.bearer_auth(token);
+        }
+        let response = request.send().await.map_err(|e| e.to_string())?;
+        if !response.status().is_success() {
+            return Err(format!("status {}", response.status()));
+        }
+        let body = response.text().await.map_err(|e| e.to_string())?;
+        parse_prometheus_allocations(&body)
+    }
+}
+
+fn escape_promql_label_value(value: &str) -> String {
+    value
+        .replace('\\', "\\\\")
+        .replace('\n', "\\n")
+        .replace('"', "\\\"")
+}
+
+fn parse_gpu_count(raw: &str, series_name: &str) -> Result<i64, String> {
+    let value = raw
+        .parse::<f64>()
+        .map_err(|_| format!("non-numeric GPU count for {series_name}"))?;
+    if !value.is_finite() || value < 0.0 || value.fract() != 0.0 || value > i64::MAX as f64 {
+        return Err(format!("invalid GPU count for {series_name}"));
+    }
+    Ok(value as i64)
+}
+
+fn parse_prometheus_allocations(body: &str) -> Result<GpuAllocationSnapshot, String> {
+    let response: PrometheusResponse = serde_json::from_str(body).map_err(|e| e.to_string())?;
+    if response.status != "success" {
+        return Err(response
+            .error
+            .unwrap_or_else(|| "Prometheus query failed".to_string()));
+    }
+    let data = response
+        .data
+        .ok_or_else(|| "Prometheus response missing data".to_string())?;
+    let mut allocations = Vec::new();
+    let mut total_allocated_gpus = None;
+    for series in data.result {
+        if series.metric.nearai_aggregate.as_deref() == Some("fleet_total") {
+            if total_allocated_gpus.is_some() {
+                return Err("Prometheus response contained duplicate fleet totals".to_string());
+            }
+            total_allocated_gpus = Some(parse_gpu_count(&series.value.1, "fleet total")?);
+            continue;
+        }
+        let model_name = series
+            .metric
+            .model
+            .filter(|value| !value.is_empty())
+            .unwrap_or_else(|| "__unattributed__".to_string());
+        let allocated_gpus = parse_gpu_count(&series.value.1, &format!("model {model_name}"))?;
+        allocations.push(ModelGpuAllocation {
+            model_name,
+            allocated_gpus,
+        });
+    }
+    allocations.sort_by(|a, b| a.model_name.cmp(&b.model_name));
+    Ok(GpuAllocationSnapshot {
+        model_gpu_allocations: allocations,
+        total_allocated_gpus: total_allocated_gpus
+            .ok_or_else(|| "Prometheus response missing fleet total".to_string())?,
+    })
 }
 
 /// Parse the YAML-ish machines listing into hosts.
@@ -207,7 +398,14 @@ mod tests {
     #[test]
     fn summarize_counts_and_burn() {
         // Arbitrary non-real cost for the math check only.
-        let svc = InfraService::new(Some("http://unused".to_string()), 1000.0);
+        let svc = InfraService::new(
+            Some("http://unused".to_string()),
+            1000.0,
+            None,
+            None,
+            "prod".to_string(),
+            2.0,
+        );
         let hosts = vec![
             HostInfo {
                 host: "a".into(),
@@ -218,10 +416,84 @@ mod tests {
                 models: vec![],
             },
         ];
-        let s = svc.summarize(hosts, false);
+        let allocations = vec![
+            ModelGpuAllocation {
+                model_name: "model-a".into(),
+                allocated_gpus: 4,
+            },
+            ModelGpuAllocation {
+                model_name: "shared".into(),
+                allocated_gpus: 1,
+            },
+        ];
+        let s = svc.summarize(hosts, allocations, 5, false, false);
         assert_eq!(s.total_hosts, 2);
         assert_eq!(s.active_hosts, 1);
         assert_eq!(s.idle_hosts, 1);
         assert_eq!(s.monthly_burn_usd, 2000.0);
+        assert_eq!(s.total_allocated_gpus, 5);
+        assert_eq!(s.hourly_gpu_burn_usd, 10.0);
+        assert!(!s.gpu_data_stale);
+    }
+
+    #[test]
+    fn parses_prometheus_model_allocations() {
+        let body = r#"{
+            "status": "success",
+            "data": {
+                "resultType": "vector",
+                "result": [
+                    {"metric": {"model": "shared"}, "value": [1788380000.0, "1"]},
+                    {"metric": {"model": "z-ai/glm-5.2"}, "value": [1788380000.0, "8"]},
+                    {"metric": {"nearai_aggregate": "fleet_total"}, "value": [1788380000.0, "9"]}
+                ]
+            }
+        }"#;
+        let snapshot = parse_prometheus_allocations(body).expect("valid Prometheus response");
+        assert_eq!(
+            snapshot.model_gpu_allocations,
+            vec![
+                ModelGpuAllocation {
+                    model_name: "shared".into(),
+                    allocated_gpus: 1,
+                },
+                ModelGpuAllocation {
+                    model_name: "z-ai/glm-5.2".into(),
+                    allocated_gpus: 8,
+                },
+            ]
+        );
+        assert_eq!(snapshot.total_allocated_gpus, 9);
+    }
+
+    #[test]
+    fn rejects_partial_gpu_snapshots() {
+        let body = r#"{
+            "status": "success",
+            "data": {
+                "resultType": "vector",
+                "result": [
+                    {"metric": {"model": "broken"}, "value": [1788380000.0, "1.5"]},
+                    {"metric": {"model": "valid"}, "value": [1788380000.0, "2"]},
+                    {"metric": {"nearai_aggregate": "fleet_total"}, "value": [1788380000.0, "3"]}
+                ]
+            }
+        }"#;
+        assert!(parse_prometheus_allocations(body).is_err());
+    }
+
+    #[test]
+    fn rejects_gpu_snapshot_when_every_labeled_series_is_invalid() {
+        let body = r#"{
+            "status": "success",
+            "data": {
+                "resultType": "vector",
+                "result": [
+                    {"metric": {"model": "broken"}, "value": [1788380000.0, "NaN"]},
+                    {"metric": {"nearai_aggregate": "fleet_total"}, "value": [1788380000.0, "1"]}
+                ]
+            }
+        }"#;
+        assert!(parse_prometheus_allocations(body).is_err());
     }
 }

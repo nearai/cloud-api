@@ -16,6 +16,7 @@ tokio-stream = "0.1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 tokio = { version = "1", features = ["full"] }
+tokio-postgres = "0.7.18"
 anyhow = "1.0"
 config = { path = "../config" }
 database = { path = "../database" }
@@ -73,7 +74,6 @@ dotenvy = "0.15.7"
 k256 = { version = "0.13", features = ["ecdsa", "arithmetic"] }
 sha3 = "0.12"
 hmac = "0.13"
-tokio-postgres = "0.7.18"
 deadpool-postgres = { version = "0.14", features = ["rt_tokio_1"] }
 ed25519-dalek = { version = "2.1", features = ["rand_core"] }
 rand = "0.10"

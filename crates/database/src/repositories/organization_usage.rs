@@ -582,8 +582,8 @@ impl OrganizationUsageRepository {
     }
 
     /// Get costs by inference IDs (for HuggingFace billing integration)
-    /// Returns costs for all requested inference_ids that belong to the organization
-    /// Missing inference_ids will have cost = 0
+    /// Returns one entry per requested inference_id that was found for the
+    /// organization; callers decide how to represent the missing ones.
     pub async fn get_costs_by_inference_ids(
         &self,
         organization_id: Uuid,
@@ -614,8 +614,9 @@ impl OrganizationUsageRepository {
                 .map_err(map_db_error)
         })?;
 
-        // Build map of found costs
-        let mut found_costs: HashMap<Uuid, i64> = rows
+        // Collapse into one entry per inference_id (retried requests can
+        // share an id; preserve the pre-existing last-row-wins behavior).
+        let found_costs: HashMap<Uuid, i64> = rows
             .iter()
             .filter_map(|row| {
                 let inference_id: Option<Uuid> = row.get("inference_id");
@@ -624,16 +625,14 @@ impl OrganizationUsageRepository {
             })
             .collect();
 
-        // Return all requested IDs, with 0 for missing ones
-        Ok(inference_ids
+        Ok(found_costs
             .into_iter()
-            .map(|id| {
-                let cost_nano_usd = found_costs.remove(&id).unwrap_or(0);
-                services::usage::InferenceCost {
-                    inference_id: id,
+            .map(
+                |(inference_id, cost_nano_usd)| services::usage::InferenceCost {
+                    inference_id,
                     cost_nano_usd,
-                }
-            })
+                },
+            )
             .collect())
     }
 }

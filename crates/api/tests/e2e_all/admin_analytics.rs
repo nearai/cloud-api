@@ -1096,6 +1096,12 @@ async fn test_admin_platform_infra_summary_graceful() {
         infra.stale && infra.total_hosts == 0,
         "unconfigured fleet should be stale with 0 hosts"
     );
+    assert!(
+        infra.gpu_data_stale
+            && infra.total_allocated_gpus == 0
+            && infra.model_gpu_allocations.is_empty(),
+        "unconfigured Prometheus should be stale with no claimed GPU allocation"
+    );
 
     println!("✅ Platform infra summary degrades gracefully");
 }

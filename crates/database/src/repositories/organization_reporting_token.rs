@@ -47,14 +47,24 @@ impl OrganizationReportingTokenRepository {
                 .context("Failed to get database connection")
                 .map_err(RepositoryError::PoolError)?;
 
+            // The request authorization check is separate from this insert. Take
+            // a shared lock on the active organization so an organization delete
+            // holding FOR UPDATE either cascades this token after it commits, or
+            // makes this statement recheck as inactive and insert no token.
             client
-                .query_one(
+                .query_opt(
                     r#"
                     INSERT INTO organization_reporting_tokens (
                         id, organization_id, name, token_hash, token_prefix,
                         created_by_user_id, expires_at
                     )
-                    VALUES ($1, $2, $3, $4, $5, $6, $7)
+                    SELECT $1, $2, $3, $4, $5, $6, $7
+                    WHERE EXISTS (
+                        SELECT 1
+                        FROM organizations
+                        WHERE id = $2 AND is_active = true
+                        FOR SHARE
+                    )
                     RETURNING *
                     "#,
                     &[
@@ -69,6 +79,9 @@ impl OrganizationReportingTokenRepository {
                 )
                 .await
                 .map_err(map_db_error)
+        })?
+        .ok_or_else(|| {
+            RepositoryError::NotFound("active organization for new reporting token".to_string())
         })?;
 
         let db_token = OrganizationReportingTokenRow::from_row(row)
@@ -88,15 +101,17 @@ impl OrganizationReportingTokenRepository {
         }
 
         const SELECT_VALID_TOKEN: &str = r#"
-            SELECT *,
+            SELECT t.*,
                    COALESCE(
-                       last_used_at >= NOW() - INTERVAL '15 minutes',
+                       t.last_used_at >= NOW() - INTERVAL '15 minutes',
                        FALSE
                    ) AS last_used_at_is_fresh
-            FROM organization_reporting_tokens
-            WHERE token_hash = $1
-              AND revoked_at IS NULL
-              AND (expires_at IS NULL OR expires_at > NOW())
+            FROM organization_reporting_tokens t
+            JOIN organizations o ON o.id = t.organization_id
+            WHERE t.token_hash = $1
+              AND t.revoked_at IS NULL
+              AND (t.expires_at IS NULL OR t.expires_at > NOW())
+              AND o.is_active = true
         "#;
 
         let token_hash = hash_reporting_token(raw_token);
@@ -118,14 +133,20 @@ impl OrganizationReportingTokenRepository {
                 Some(_) => match client
                     .query_opt(
                         r#"
-                    UPDATE organization_reporting_tokens
+                    UPDATE organization_reporting_tokens AS t
                     SET last_used_at = NOW()
-                    WHERE token_hash = $1
-                      AND revoked_at IS NULL
-                      AND (expires_at IS NULL OR expires_at > NOW())
+                    WHERE t.token_hash = $1
+                      AND t.revoked_at IS NULL
+                      AND (t.expires_at IS NULL OR t.expires_at > NOW())
                       AND (
-                          last_used_at IS NULL
-                          OR last_used_at < NOW() - INTERVAL '15 minutes'
+                          t.last_used_at IS NULL
+                          OR t.last_used_at < NOW() - INTERVAL '15 minutes'
+                      )
+                      AND EXISTS (
+                          SELECT 1
+                          FROM organizations o
+                          WHERE o.id = t.organization_id
+                            AND o.is_active = true
                       )
                     RETURNING *
                     "#,

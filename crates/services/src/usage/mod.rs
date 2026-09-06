@@ -927,12 +927,14 @@ impl UsageServiceTrait for UsageServiceImpl {
         Ok((logs, total))
     }
 
-    /// Get costs by inference IDs (for HuggingFace billing integration)
+    /// Get costs by inference IDs (for HuggingFace billing integration).
+    /// Returns entries for the found inference IDs only.
     async fn get_costs_by_inference_ids(
         &self,
         organization_id: Uuid,
         inference_ids: Vec<Uuid>,
     ) -> Result<Vec<InferenceCost>, UsageError> {
+        let requested = inference_ids.clone();
         let results = self
             .usage_repository
             .get_costs_by_inference_ids(organization_id, inference_ids)
@@ -941,10 +943,16 @@ impl UsageServiceTrait for UsageServiceImpl {
                 UsageError::InternalError(format!("Failed to get costs by inference IDs: {e}"))
             })?;
 
-        // Log count of inference IDs that were not found (cost = 0)
-        let not_found_count = results.iter().filter(|ic| ic.cost_nano_usd == 0).count();
+        // Callers routinely probe with IDs that may not exist (wrong header,
+        // recent request not yet recorded), so a miss is expected traffic,
+        // not a server error. Count by membership: the repository returns one
+        // entry per distinct found ID, so a length comparison would report
+        // phantom misses for duplicated request IDs.
+        let found: std::collections::HashSet<Uuid> =
+            results.iter().map(|cost| cost.inference_id).collect();
+        let not_found_count = requested.iter().filter(|id| !found.contains(id)).count();
         if not_found_count > 0 {
-            tracing::error!(
+            tracing::debug!(
                 "Inference IDs not found in usage log: count={}",
                 not_found_count
             );

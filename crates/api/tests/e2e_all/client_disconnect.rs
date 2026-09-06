@@ -63,6 +63,15 @@ async fn chat_completion_signature_returns_stream_disconnected_on_client_disconn
         )
         .await
         .expect("Failed to delete signature");
+    drop(client);
+
+    // The deliberately disconnected request can close the database connection
+    // asynchronously, so reacquire it before preparing the fallback assertion.
+    let client = database
+        .pool()
+        .get()
+        .await
+        .expect("Failed to get database connection");
     client
         .execute(
             "UPDATE organization_usage_log SET stop_reason = 'client_disconnect' WHERE provider_request_id = $1",

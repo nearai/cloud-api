@@ -14,7 +14,7 @@ pub use analytics::{
 };
 pub mod infra;
 pub mod pricing_scheduler;
-pub use infra::{InfraService, InfraSummary};
+pub use infra::{InfraService, InfraSummary, ModelGpuAllocation};
 pub use ports::{PlatformServiceInfo, *};
 pub use pricing_scheduler::ModelPricingScheduler;
 use std::sync::Arc;

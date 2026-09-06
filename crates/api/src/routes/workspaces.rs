@@ -286,6 +286,16 @@ pub async fn create_workspace(
                 )),
             ))
         }
+        Err(services::workspace::WorkspaceError::NotFound) => {
+            debug!("Organization not found while creating workspace");
+            Err((
+                StatusCode::NOT_FOUND,
+                Json(ErrorResponse::new(
+                    "Organization not found".to_string(),
+                    "not_found".to_string(),
+                )),
+            ))
+        }
         Err(services::workspace::WorkspaceError::InvalidParams(msg)) => {
             debug!("Invalid workspace parameters: {}", msg);
             Err((

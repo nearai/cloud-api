@@ -16,12 +16,14 @@ use crate::models::{
     ListOrganizationsAdminResponse, ListPricingChangesResponse, ListUsersResponse, MemberRole,
     ModelArchitecture, ModelDeprecationConfirmResponse, ModelDeprecationPreviewResponse,
     ModelDeprecationRequest, ModelHistoryEntry, ModelHistoryResponse, ModelMetadata,
-    ModelWithPricing, OrgLimitsHistoryEntry, OrgLimitsHistoryResponse, OrganizationUsage,
-    PricingChangeBatchRequest, PricingChangeConfirmResponse, PricingChangeModelPreviewDto,
-    PricingChangePreviewResponse, PricingFieldUpdates, PricingFields, ScheduledPricingChangeDto,
-    SpendLimit, UpdateAmlReportStatusRequest, UpdateOrganizationConcurrentLimitRequest,
-    UpdateOrganizationConcurrentLimitResponse, UpdateOrganizationLimitsRequest,
-    UpdateOrganizationLimitsResponse, UpdateServiceRequest, UpsertAmlAllowlistEntryRequest,
+    ModelWithPricing, OrgLimitsHistoryEntry, OrgLimitsHistoryResponse,
+    OrganizationFallbackResponse, OrganizationUsage, PricingChangeBatchRequest,
+    PricingChangeConfirmResponse, PricingChangeModelPreviewDto, PricingChangePreviewResponse,
+    PricingFieldUpdates, PricingFields, ScheduledPricingChangeDto, SpendLimit,
+    UpdateAmlReportStatusRequest, UpdateOrganizationConcurrentLimitRequest,
+    UpdateOrganizationConcurrentLimitResponse, UpdateOrganizationFallbackRequest,
+    UpdateOrganizationLimitsRequest, UpdateOrganizationLimitsResponse, UpdateServiceRequest,
+    UpsertAmlAllowlistEntryRequest,
 };
 use crate::routes::common::format_amount;
 use crate::routes::usage::{compute_organization_balance_response, OrganizationBalanceResponse};
@@ -839,6 +841,20 @@ pub async fn batch_upsert_models(
                 ),
             }
         })?;
+
+    // A pinned provider's primary/fallback role is catalog configuration, not
+    // startup state. Refresh it from each merged row before changing the live
+    // discovered providers so fallback-disabled requests cannot enter a stale
+    // role window after an admin routing update.
+    for (model_name, model) in &updated_models {
+        app_state
+            .inference_provider_pool
+            .refresh_pinned_provider_roles_from_catalog(
+                model_name,
+                &model.provider_type,
+                model.inference_url.is_some(),
+            );
+    }
 
     // Update providers at runtime so changes take effect without server restart.
     // Unregister first, then re-register — this handles type transitions
@@ -2610,6 +2626,79 @@ pub async fn list_organizations(
     };
 
     Ok(ResponseJson(response))
+}
+
+/// Get an organization's effective fallback policy (Admin only).
+#[utoipa::path(
+    get,
+    path = "/v1/admin/organizations/{org_id}/fallback",
+    tag = "Admin",
+    params(("org_id" = Uuid, Path, description = "Organization ID")),
+    responses(
+        (status = 200, description = "Fallback policy retrieved", body = OrganizationFallbackResponse),
+        (status = 401, description = "Unauthorized", body = ErrorResponse),
+        (status = 404, description = "Organization not found", body = ErrorResponse)
+    ),
+    security(("session_token" = []))
+)]
+pub async fn get_organization_fallback(
+    State(app_state): State<AdminAppState>,
+    Extension(_admin_user): Extension<AdminUser>,
+    Path(org_id): Path<Uuid>,
+) -> Result<ResponseJson<OrganizationFallbackResponse>, (StatusCode, ResponseJson<ErrorResponse>)> {
+    let enabled = app_state
+        .organization_service
+        .get_fallback_enabled_for_admin(services::organization::OrganizationId(org_id))
+        .await
+        .map_err(crate::routes::common::map_organization_error)?;
+
+    Ok(ResponseJson(OrganizationFallbackResponse {
+        organization_id: org_id,
+        enabled,
+    }))
+}
+
+/// Update an organization's fallback policy (Admin only).
+#[utoipa::path(
+    patch,
+    path = "/v1/admin/organizations/{org_id}/fallback",
+    tag = "Admin",
+    params(("org_id" = Uuid, Path, description = "Organization ID")),
+    request_body = UpdateOrganizationFallbackRequest,
+    responses(
+        (status = 200, description = "Fallback policy updated", body = OrganizationFallbackResponse),
+        (status = 401, description = "Unauthorized", body = ErrorResponse),
+        (status = 404, description = "Organization not found", body = ErrorResponse)
+    ),
+    security(("session_token" = []))
+)]
+pub async fn update_organization_fallback(
+    State(app_state): State<AdminAppState>,
+    Extension(admin_user): Extension<AdminUser>,
+    Path(org_id): Path<Uuid>,
+    Json(request): Json<UpdateOrganizationFallbackRequest>,
+) -> Result<ResponseJson<OrganizationFallbackResponse>, (StatusCode, ResponseJson<ErrorResponse>)> {
+    let enabled = app_state
+        .organization_service
+        .update_fallback_enabled_for_admin(
+            services::organization::OrganizationId(org_id),
+            request.enabled,
+        )
+        .await
+        .map_err(crate::routes::common::map_organization_error)?;
+
+    tracing::info!(
+        organization_id = %org_id,
+        actor_id = %admin_user.0.id,
+        actor_type = "platform_admin",
+        fallback_enabled = enabled,
+        "Organization fallback setting changed"
+    );
+
+    Ok(ResponseJson(OrganizationFallbackResponse {
+        organization_id: org_id,
+        enabled,
+    }))
 }
 
 /// Get a single organization by id (Admin only)

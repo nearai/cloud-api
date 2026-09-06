@@ -7,6 +7,61 @@ use crate::common::*;
 // ============================================
 
 #[tokio::test]
+async fn test_responses_upstream_stream_error_releases_signature_routing_pin() {
+    let (server, _pool, mock, _database) = setup_test_server_with_pool().await;
+    setup_qwen_model(&server).await;
+    let org = setup_org_with_credits(&server, 10_000_000_000i64).await;
+    let api_key = get_api_key_for_org(&server, org.id).await;
+
+    // The Responses worker stops consuming the completion stream as soon as it
+    // receives this error. Its `InterceptStream` must therefore release the
+    // provider-pool pin from Drop rather than relying on a chat-route body guard.
+    mock.set_default_response(
+        inference_providers::mock::ResponseTemplate::new("partial output").with_stream_error_after(
+            1,
+            inference_providers::CompletionError::HttpError {
+                status_code: 503,
+                message: "responses upstream stream failed".to_string(),
+                is_external: false,
+            },
+        ),
+    )
+    .await;
+
+    let response = server
+        .post("/v1/responses")
+        .add_header("Authorization", format!("Bearer {api_key}"))
+        .json(&serde_json::json!({
+            "model": E2E_QWEN_MODEL_NAME,
+            "input": "Respond with two words.",
+            "stream": true,
+        }))
+        .await;
+    assert_eq!(response.status_code(), 200, "{}", response.text());
+
+    // Drain the public Responses stream so its worker observes the upstream
+    // failure and drops the internal completion stream.
+    let _response_text = response.text();
+
+    let unpinned = tokio::time::timeout(std::time::Duration::from_secs(1), async {
+        loop {
+            let unpinned = mock.unpinned_chat_ids();
+            if unpinned.len() == 1 {
+                return unpinned;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("Responses stream errors must release their signature routing pin");
+
+    assert!(
+        unpinned[0].starts_with("chatcmpl-"),
+        "the released pin must belong to the internal completion: {unpinned:?}"
+    );
+}
+
+#[tokio::test]
 async fn test_streaming_response_signature_verification() {
     let server = setup_test_server().await;
     setup_qwen_model(&server).await;

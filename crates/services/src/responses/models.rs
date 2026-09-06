@@ -1152,13 +1152,11 @@ pub struct OutputTokensDetails {
 
 /// Input message roles that become a provider-visible system message.
 ///
-/// This list must mirror the role mapping in
+/// This list mirrors the role mapping in
 /// `crate::completions::Service::to_chat_messages`, which is what actually
-/// turns a message role into `MessageRole::System`. The match there is
-/// exact and lowercase, so this comparison is too: an input role of
-/// `"Developer"` maps to `MessageRole::User` and reaches no provider as a
-/// system message, so treating it as one here would refuse a request that
-/// works.
+/// turns a message role into `MessageRole::System`. The match there is exact
+/// and lowercase, so this comparison is too: an input role of `"Developer"`
+/// maps to `MessageRole::User` and reaches no provider as a system message.
 const SYSTEM_LEVEL_INPUT_ROLES: &[&str] = &["system", "developer"];
 
 /// Whether `role` becomes a system message in the provider payload.
@@ -1219,12 +1217,9 @@ impl CreateResponseRequest {
             }
         }
 
-        // Validate input message metadata sizes and roles
+        // Validate input message metadata sizes
         if let Some(ResponseInput::Items(items)) = &self.input {
-            let replays_history =
-                self.conversation.is_some() || self.previous_response_id.is_some();
-            let mut saw_non_system_item = false;
-            for (index, item) in items.iter().enumerate() {
+            for item in items {
                 if let ResponseInputItem::Message {
                     metadata: Some(meta),
                     ..
@@ -1236,55 +1231,6 @@ impl CreateResponseRequest {
                         return Err(format!(
                             "message metadata is too large (max {} bytes when serialized)",
                             MAX_METADATA_SIZE_BYTES
-                        ));
-                    }
-                }
-
-                // A system-level `input` message cannot be forwarded in place:
-                // the payload already opens with the system message
-                // `load_conversation_context` prepends, and providers reject a
-                // system message that is not first ("System message must be at
-                // the beginning."). That rejection currently arrives only after
-                // the SSE stream has been committed with a 200, where clients
-                // cannot tell it apart from a mid-stream disconnect.
-                //
-                // Such a message is folded into that leading system message
-                // when it precedes all other content, which is the shape agent
-                // clients send. Anywhere else the fold would reorder what the
-                // model is told, so it is refused here instead - at admission,
-                // where the error is still a real 400.
-                let Some(role) = item.role() else {
-                    saw_non_system_item = true;
-                    continue;
-                };
-                if !is_system_level_input_role(role) {
-                    saw_non_system_item = true;
-                    continue;
-                }
-                if saw_non_system_item {
-                    return Err(format!(
-                        "System message must be at the beginning. Input item at index {index} \
-                         has role '{role}' but follows other content, so it cannot be moved \
-                         ahead of the system message the service prepends. Send system-level \
-                         content in the top-level `instructions` field instead."
-                    ));
-                }
-                if replays_history {
-                    return Err(format!(
-                        "System message must be at the beginning. Input item at index {index} \
-                         has role '{role}', and the history named by `conversation` or \
-                         `previous_response_id` is replayed ahead of it. Send system-level \
-                         content in the top-level `instructions` field instead."
-                    ));
-                }
-                if let Some(ResponseContent::Parts(parts)) = item.content() {
-                    if parts
-                        .iter()
-                        .any(|part| matches!(part, ResponseContentPart::InputImage { .. }))
-                    {
-                        return Err(format!(
-                            "Input item at index {index} has role '{role}' and image content. \
-                             System-level messages must be text."
                         ));
                     }
                 }
@@ -1368,8 +1314,8 @@ mod tests {
     #[test]
     fn test_validate_accepts_leading_developer_message() {
         // The Codex CLI shape: a top-level `instructions` string plus a
-        // `developer` message ahead of every user turn. Nothing precedes it,
-        // so it is folded into the leading system message rather than refused.
+        // `developer` message ahead of every user turn. Nothing precedes it, so
+        // `load_conversation_context` folds it into the leading system message.
         let request = request_with_input(json!([
             {"role": "developer", "content": "Repository guidelines."},
             {"role": "user", "content": "Fix the build."},
@@ -1379,25 +1325,24 @@ mod tests {
         assert!(request.validate().is_ok());
     }
 
+    // The three shapes below cannot be folded without reordering what the model
+    // is told, so they are forwarded to the provider unchanged. Whether such a
+    // payload is acceptable is the provider's judgement and backends differ, so
+    // admission does not refuse them: that would generalize one template's
+    // constraint into a gateway-wide rule.
+
     #[test]
-    fn test_validate_rejects_system_message_after_other_content() {
+    fn test_validate_accepts_system_message_after_other_content() {
         let request = request_with_input(json!([
             {"role": "user", "content": "Hello."},
             {"role": "system", "content": "Be concise."},
         ]));
 
-        let error = request
-            .validate()
-            .expect_err("a system message after user content must be rejected");
-        assert!(
-            error.starts_with("System message must be at the beginning."),
-            "unexpected error: {error}"
-        );
-        assert!(error.contains("index 1"), "unexpected error: {error}");
+        assert!(request.validate().is_ok());
     }
 
     #[test]
-    fn test_validate_rejects_leading_system_message_when_history_is_replayed() {
+    fn test_validate_accepts_leading_system_message_when_history_is_replayed() {
         let request = request_from(json!({
             "model": "Qwen/Qwen3.6-35B-A3B-FP8",
             "previous_response_id": "resp_00000000-0000-0000-0000-000000000000",
@@ -1407,17 +1352,11 @@ mod tests {
             ],
         }));
 
-        let error = request
-            .validate()
-            .expect_err("replayed history precedes the input, so the fold is unsafe");
-        assert!(
-            error.contains("previous_response_id"),
-            "unexpected error: {error}"
-        );
+        assert!(request.validate().is_ok());
     }
 
     #[test]
-    fn test_validate_rejects_leading_system_message_with_image_content() {
+    fn test_validate_accepts_leading_system_message_with_image_content() {
         let request = request_with_input(json!([
             {
                 "role": "developer",
@@ -1426,16 +1365,13 @@ mod tests {
             {"role": "user", "content": "Describe it."},
         ]));
 
-        let error = request
-            .validate()
-            .expect_err("image content cannot be folded into a text system message");
-        assert!(error.contains("must be text"), "unexpected error: {error}");
+        assert!(request.validate().is_ok());
     }
 
     #[test]
     fn test_validate_accepts_unmapped_role_spelling_anywhere() {
         // `to_chat_messages` matches roles exactly, so "Developer" becomes a
-        // user message and never produces a system message to misplace.
+        // user message and never produces a system message at all.
         let request = request_with_input(json!([
             {"role": "user", "content": "Hello."},
             {"role": "Developer", "content": "Be concise."},

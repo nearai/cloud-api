@@ -2644,12 +2644,21 @@ impl ResponseServiceImpl {
                                 // all other content is folded into the leading
                                 // system message instead of being forwarded in
                                 // place: the payload already opens with the
-                                // system message prepended above, and providers
-                                // reject a system message that is not first.
-                                // `CreateResponseRequest::validate` refuses at
-                                // admission any such message that cannot be
-                                // folded this way, so the fold never reorders
-                                // what the model is told.
+                                // system message prepended above, and some
+                                // providers reject a system message that is not
+                                // first. Folding only where nothing precedes
+                                // the message keeps the order the caller asked
+                                // for.
+                                //
+                                // Every other shape - a system-level message
+                                // after other content, one behind replayed
+                                // conversation history, one whose content is
+                                // not plain text - is forwarded unchanged.
+                                // Whether such a payload is acceptable is the
+                                // provider's judgement, and backends differ:
+                                // refusing it here would generalize one
+                                // template's constraint into a gateway-wide
+                                // rule and break callers it works for today.
                                 let mut folded = false;
                                 if models::is_system_level_input_role(role)
                                     && messages.iter().all(|message| message.role == "system")

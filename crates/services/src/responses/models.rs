@@ -1150,12 +1150,21 @@ pub struct OutputTokensDetails {
 // Validation implementations
 // ============================================
 
-/// Input message roles that a provider treats as a system message.
+/// Input message roles that become a provider-visible system message.
 ///
-/// `build_messages` forwards the role of every `input` message verbatim, and
-/// always prepends its own system message, so any of these roles inside
-/// `input` produces a non-leading system message in the provider payload.
+/// This list must mirror the role mapping in
+/// `crate::completions::Service::to_chat_messages`, which is what actually
+/// turns a message role into `MessageRole::System`. The match there is
+/// exact and lowercase, so this comparison is too: an input role of
+/// `"Developer"` maps to `MessageRole::User` and reaches no provider as a
+/// system message, so treating it as one here would refuse a request that
+/// works.
 const SYSTEM_LEVEL_INPUT_ROLES: &[&str] = &["system", "developer"];
+
+/// Whether `role` becomes a system message in the provider payload.
+pub fn is_system_level_input_role(role: &str) -> bool {
+    SYSTEM_LEVEL_INPUT_ROLES.contains(&role)
+}
 
 impl CreateResponseRequest {
     pub fn validate(&self) -> Result<(), String> {
@@ -1212,6 +1221,9 @@ impl CreateResponseRequest {
 
         // Validate input message metadata sizes and roles
         if let Some(ResponseInput::Items(items)) = &self.input {
+            let replays_history =
+                self.conversation.is_some() || self.previous_response_id.is_some();
+            let mut saw_non_system_item = false;
             for (index, item) in items.iter().enumerate() {
                 if let ResponseInputItem::Message {
                     metadata: Some(meta),
@@ -1228,21 +1240,51 @@ impl CreateResponseRequest {
                     }
                 }
 
-                // The provider payload always opens with a system message
-                // synthesized from `instructions` (or from the default language
-                // and time context), so a system-level message inside `input`
-                // can never be the first message and providers reject the whole
-                // request with "System message must be at the beginning.".
-                // Without this check the rejection only arrives once the SSE
-                // stream has been committed with a 200, where clients cannot
-                // tell it apart from a mid-stream disconnect.
-                if let Some(role) = item.role() {
-                    if SYSTEM_LEVEL_INPUT_ROLES.contains(&role) {
+                // A system-level `input` message cannot be forwarded in place:
+                // the payload already opens with the system message
+                // `load_conversation_context` prepends, and providers reject a
+                // system message that is not first ("System message must be at
+                // the beginning."). That rejection currently arrives only after
+                // the SSE stream has been committed with a 200, where clients
+                // cannot tell it apart from a mid-stream disconnect.
+                //
+                // Such a message is folded into that leading system message
+                // when it precedes all other content, which is the shape agent
+                // clients send. Anywhere else the fold would reorder what the
+                // model is told, so it is refused here instead - at admission,
+                // where the error is still a real 400.
+                let Some(role) = item.role() else {
+                    saw_non_system_item = true;
+                    continue;
+                };
+                if !is_system_level_input_role(role) {
+                    saw_non_system_item = true;
+                    continue;
+                }
+                if saw_non_system_item {
+                    return Err(format!(
+                        "System message must be at the beginning. Input item at index {index} \
+                         has role '{role}' but follows other content, so it cannot be moved \
+                         ahead of the system message the service prepends. Send system-level \
+                         content in the top-level `instructions` field instead."
+                    ));
+                }
+                if replays_history {
+                    return Err(format!(
+                        "System message must be at the beginning. Input item at index {index} \
+                         has role '{role}', and the history named by `conversation` or \
+                         `previous_response_id` is replayed ahead of it. Send system-level \
+                         content in the top-level `instructions` field instead."
+                    ));
+                }
+                if let Some(ResponseContent::Parts(parts)) = item.content() {
+                    if parts
+                        .iter()
+                        .any(|part| matches!(part, ResponseContentPart::InputImage { .. }))
+                    {
                         return Err(format!(
-                            "System message must be at the beginning. Input item at index {index} \
-                             has role '{role}', which is placed after the system message derived \
-                             from `instructions`. Send system-level content in the top-level \
-                             `instructions` field instead."
+                            "Input item at index {index} has role '{role}' and image content. \
+                             System-level messages must be text."
                         ));
                     }
                 }
@@ -1311,39 +1353,34 @@ mod tests {
     use serde_json::json;
 
     fn request_with_input(input: serde_json::Value) -> CreateResponseRequest {
-        serde_json::from_value(json!({
+        request_from(json!({
             "model": "Qwen/Qwen3.6-35B-A3B-FP8",
             "instructions": "You are a coding agent.",
             "stream": true,
             "input": input,
         }))
-        .expect("request should deserialize")
+    }
+
+    fn request_from(body: serde_json::Value) -> CreateResponseRequest {
+        serde_json::from_value(body).expect("request should deserialize")
     }
 
     #[test]
-    fn test_validate_rejects_developer_role_input_message() {
-        // The Codex CLI sends `instructions` plus a leading `developer`
-        // message. Both become system messages, so the provider rejects the
-        // request; this must be a 400 at admission, not a mid-stream failure.
+    fn test_validate_accepts_leading_developer_message() {
+        // The Codex CLI shape: a top-level `instructions` string plus a
+        // `developer` message ahead of every user turn. Nothing precedes it,
+        // so it is folded into the leading system message rather than refused.
         let request = request_with_input(json!([
             {"role": "developer", "content": "Repository guidelines."},
             {"role": "user", "content": "Fix the build."},
             {"role": "user", "content": "Then run the tests."},
         ]));
 
-        let error = request
-            .validate()
-            .expect_err("developer-role input message must be rejected");
-        assert!(
-            error.starts_with("System message must be at the beginning."),
-            "unexpected error: {error}"
-        );
-        assert!(error.contains("index 0"), "unexpected error: {error}");
-        assert!(error.contains("developer"), "unexpected error: {error}");
+        assert!(request.validate().is_ok());
     }
 
     #[test]
-    fn test_validate_rejects_system_role_input_message() {
+    fn test_validate_rejects_system_message_after_other_content() {
         let request = request_with_input(json!([
             {"role": "user", "content": "Hello."},
             {"role": "system", "content": "Be concise."},
@@ -1351,8 +1388,60 @@ mod tests {
 
         let error = request
             .validate()
-            .expect_err("system-role input message must be rejected");
+            .expect_err("a system message after user content must be rejected");
+        assert!(
+            error.starts_with("System message must be at the beginning."),
+            "unexpected error: {error}"
+        );
         assert!(error.contains("index 1"), "unexpected error: {error}");
+    }
+
+    #[test]
+    fn test_validate_rejects_leading_system_message_when_history_is_replayed() {
+        let request = request_from(json!({
+            "model": "Qwen/Qwen3.6-35B-A3B-FP8",
+            "previous_response_id": "resp_00000000-0000-0000-0000-000000000000",
+            "input": [
+                {"role": "developer", "content": "Repository guidelines."},
+                {"role": "user", "content": "Fix the build."},
+            ],
+        }));
+
+        let error = request
+            .validate()
+            .expect_err("replayed history precedes the input, so the fold is unsafe");
+        assert!(
+            error.contains("previous_response_id"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn test_validate_rejects_leading_system_message_with_image_content() {
+        let request = request_with_input(json!([
+            {
+                "role": "developer",
+                "content": [{"type": "input_image", "image_url": "https://example.com/a.png"}],
+            },
+            {"role": "user", "content": "Describe it."},
+        ]));
+
+        let error = request
+            .validate()
+            .expect_err("image content cannot be folded into a text system message");
+        assert!(error.contains("must be text"), "unexpected error: {error}");
+    }
+
+    #[test]
+    fn test_validate_accepts_unmapped_role_spelling_anywhere() {
+        // `to_chat_messages` matches roles exactly, so "Developer" becomes a
+        // user message and never produces a system message to misplace.
+        let request = request_with_input(json!([
+            {"role": "user", "content": "Hello."},
+            {"role": "Developer", "content": "Be concise."},
+        ]));
+
+        assert!(request.validate().is_ok());
     }
 
     #[test]

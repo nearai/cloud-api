@@ -2640,12 +2640,42 @@ impl ResponseServiceImpl {
                                         .await?
                                     }
                                 };
-                                messages.push(CompletionMessage {
-                                    role: role.clone(),
-                                    content,
-                                    tool_call_id: None,
-                                    tool_calls: None,
-                                });
+                                // A system-level input message that precedes
+                                // all other content is folded into the leading
+                                // system message instead of being forwarded in
+                                // place: the payload already opens with the
+                                // system message prepended above, and providers
+                                // reject a system message that is not first.
+                                // `CreateResponseRequest::validate` refuses at
+                                // admission any such message that cannot be
+                                // folded this way, so the fold never reorders
+                                // what the model is told.
+                                let mut folded = false;
+                                if models::is_system_level_input_role(role)
+                                    && messages.iter().all(|message| message.role == "system")
+                                {
+                                    if let (
+                                        serde_json::Value::String(text),
+                                        Some(CompletionMessage {
+                                            content: serde_json::Value::String(leading),
+                                            ..
+                                        }),
+                                    ) = (&content, messages.last_mut())
+                                    {
+                                        leading.push_str("\n\n");
+                                        leading.push_str(text);
+                                        folded = true;
+                                    }
+                                }
+
+                                if !folded {
+                                    messages.push(CompletionMessage {
+                                        role: role.clone(),
+                                        content,
+                                        tool_call_id: None,
+                                        tool_calls: None,
+                                    });
+                                }
                             }
                             models::ResponseInputItem::FunctionCallOutput { .. } => {
                                 if fco_idx < function_output_messages.len() {

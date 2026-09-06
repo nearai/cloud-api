@@ -1150,6 +1150,13 @@ pub struct OutputTokensDetails {
 // Validation implementations
 // ============================================
 
+/// Input message roles that a provider treats as a system message.
+///
+/// `build_messages` forwards the role of every `input` message verbatim, and
+/// always prepends its own system message, so any of these roles inside
+/// `input` produces a non-leading system message in the provider payload.
+const SYSTEM_LEVEL_INPUT_ROLES: &[&str] = &["system", "developer"];
+
 impl CreateResponseRequest {
     pub fn validate(&self) -> Result<(), String> {
         use crate::common::MAX_METADATA_SIZE_BYTES;
@@ -1203,9 +1210,9 @@ impl CreateResponseRequest {
             }
         }
 
-        // Validate input message metadata sizes
+        // Validate input message metadata sizes and roles
         if let Some(ResponseInput::Items(items)) = &self.input {
-            for item in items {
+            for (index, item) in items.iter().enumerate() {
                 if let ResponseInputItem::Message {
                     metadata: Some(meta),
                     ..
@@ -1217,6 +1224,25 @@ impl CreateResponseRequest {
                         return Err(format!(
                             "message metadata is too large (max {} bytes when serialized)",
                             MAX_METADATA_SIZE_BYTES
+                        ));
+                    }
+                }
+
+                // The provider payload always opens with a system message
+                // synthesized from `instructions` (or from the default language
+                // and time context), so a system-level message inside `input`
+                // can never be the first message and providers reject the whole
+                // request with "System message must be at the beginning.".
+                // Without this check the rejection only arrives once the SSE
+                // stream has been committed with a 200, where clients cannot
+                // tell it apart from a mid-stream disconnect.
+                if let Some(role) = item.role() {
+                    if SYSTEM_LEVEL_INPUT_ROLES.contains(&role) {
+                        return Err(format!(
+                            "System message must be at the beginning. Input item at index {index} \
+                             has role '{role}', which is placed after the system message derived \
+                             from `instructions`. Send system-level content in the top-level \
+                             `instructions` field instead."
                         ));
                     }
                 }
@@ -1283,6 +1309,62 @@ impl Usage {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    fn request_with_input(input: serde_json::Value) -> CreateResponseRequest {
+        serde_json::from_value(json!({
+            "model": "Qwen/Qwen3.6-35B-A3B-FP8",
+            "instructions": "You are a coding agent.",
+            "stream": true,
+            "input": input,
+        }))
+        .expect("request should deserialize")
+    }
+
+    #[test]
+    fn test_validate_rejects_developer_role_input_message() {
+        // The Codex CLI sends `instructions` plus a leading `developer`
+        // message. Both become system messages, so the provider rejects the
+        // request; this must be a 400 at admission, not a mid-stream failure.
+        let request = request_with_input(json!([
+            {"role": "developer", "content": "Repository guidelines."},
+            {"role": "user", "content": "Fix the build."},
+            {"role": "user", "content": "Then run the tests."},
+        ]));
+
+        let error = request
+            .validate()
+            .expect_err("developer-role input message must be rejected");
+        assert!(
+            error.starts_with("System message must be at the beginning."),
+            "unexpected error: {error}"
+        );
+        assert!(error.contains("index 0"), "unexpected error: {error}");
+        assert!(error.contains("developer"), "unexpected error: {error}");
+    }
+
+    #[test]
+    fn test_validate_rejects_system_role_input_message() {
+        let request = request_with_input(json!([
+            {"role": "user", "content": "Hello."},
+            {"role": "system", "content": "Be concise."},
+        ]));
+
+        let error = request
+            .validate()
+            .expect_err("system-role input message must be rejected");
+        assert!(error.contains("index 1"), "unexpected error: {error}");
+    }
+
+    #[test]
+    fn test_validate_accepts_user_and_assistant_input_messages() {
+        let request = request_with_input(json!([
+            {"role": "user", "content": "Hello."},
+            {"role": "assistant", "content": "Hi."},
+            {"role": "user", "content": "Bye."},
+        ]));
+
+        assert!(request.validate().is_ok());
+    }
 
     #[test]
     fn test_response_status_serializes_in_progress_with_underscore() {

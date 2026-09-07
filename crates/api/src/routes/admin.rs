@@ -2952,7 +2952,8 @@ pub async fn list_organization_members(
         (status = 500, description = "Internal server error", body = ErrorResponse)
     ),
     security(
-        ("session_token" = [])
+        ("session_token" = []),
+        ("admin_access_token" = [])
     )
 )]
 pub async fn update_organization_member_role(
@@ -3001,6 +3002,7 @@ pub async fn update_organization_member_role(
         })?;
 
     let old_role = update.previous_role.to_string();
+    let role_changed = old_role != role_label;
 
     tracing::info!(
         organization_id = %org_id,
@@ -3008,6 +3010,7 @@ pub async fn update_organization_member_role(
         admin_user_id = %admin_user.0.id,
         old_role,
         new_role = role_label,
+        role_changed,
         "System administrator updated organization member role"
     );
 

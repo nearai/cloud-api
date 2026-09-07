@@ -2593,11 +2593,22 @@ mod tests {
 
         // Check that security schemes are configured
         assert!(components.security_schemes.contains_key("session_token"));
+        assert!(components
+            .security_schemes
+            .contains_key("admin_access_token"));
         assert!(components.security_schemes.contains_key("refresh_token"));
         assert!(components.security_schemes.contains_key("api_key"));
         assert!(components.security_schemes.contains_key("reporting_token"));
 
         let spec_json = serde_json::to_value(&spec).unwrap();
+        assert_eq!(
+            spec_json["paths"]["/v1/admin/organizations/{org_id}/members/{user_id}"]["put"]
+                ["security"],
+            serde_json::json!([
+                { "session_token": [] },
+                { "admin_access_token": [] }
+            ])
+        );
         assert_reporting_path_security(
             &spec_json,
             "/v1/organizations/{org_id}/reporting-tokens",

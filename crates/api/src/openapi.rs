@@ -395,6 +395,18 @@ impl Modify for SecurityAddon {
                         .build(),
                 ),
             );
+            components.add_security_scheme(
+                "admin_access_token",
+                SecurityScheme::Http(
+                    HttpBuilder::new()
+                        .scheme(HttpAuthScheme::Bearer)
+                        .bearer_format("admin_access_token")
+                        .description(Some(
+                            "Administrator access token (Authorization: Bearer adm_<token>)",
+                        ))
+                        .build(),
+                ),
+            );
             // Refresh Token authentication - only for creating access tokens
             components.add_security_scheme(
                 "refresh_token",

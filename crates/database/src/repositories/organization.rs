@@ -1073,28 +1073,36 @@ impl OrganizationRepository for PgOrganizationRepository {
             let row = if previous_role == new_role {
                 current
             } else if new_role == "owner" {
-                let current_owner = transaction
-                    .query_opt(
+                let current_owner_rows = transaction
+                    .query(
                         "SELECT user_id FROM organization_members
-                         WHERE organization_id = $1 AND role = 'owner'
+                         WHERE organization_id = $1
+                           AND role = 'owner'
+                           AND user_id <> $2
+                         ORDER BY user_id
                          FOR UPDATE",
-                        &[&org_id],
+                        &[&org_id, &user_id],
                     )
                     .await
-                    .map_err(map_db_error)?
-                    .ok_or_else(|| {
-                        RepositoryError::DataConversionError(anyhow::anyhow!(
-                            "Organization has no owner: {org_id}"
-                        ))
-                    })?;
-                let current_owner_id: Uuid = current_owner.get("user_id");
+                    .map_err(map_db_error)?;
+                if current_owner_rows.is_empty() {
+                    return Err(RepositoryError::DataConversionError(anyhow::anyhow!(
+                        "Organization has no owner: {org_id}"
+                    )));
+                }
+                let current_owner_ids = current_owner_rows
+                    .iter()
+                    .map(|owner| owner.get::<_, Uuid>("user_id"))
+                    .collect::<Vec<_>>();
 
                 transaction
                     .execute(
                         "UPDATE organization_members
                          SET role = 'admin'
-                         WHERE organization_id = $1 AND user_id = $2",
-                        &[&org_id, &current_owner_id],
+                         WHERE organization_id = $1
+                           AND role = 'owner'
+                           AND user_id = ANY($2)",
+                        &[&org_id, &current_owner_ids],
                     )
                     .await
                     .map_err(map_db_error)?;
@@ -1118,13 +1126,15 @@ impl OrganizationRepository for PgOrganizationRepository {
                              changed_by_user_id,
                              previous_role,
                              new_role
-                         ) VALUES
-                             ($1, $2, $3, 'owner', 'admin'),
-                             ($1, $4, $3, $5, 'owner')",
+                         )
+                         SELECT $1, prior_owner.user_id, $2, 'owner', 'admin'
+                         FROM UNNEST($3::uuid[]) AS prior_owner(user_id)
+                         UNION ALL
+                         SELECT $1, $4, $2, $5, 'owner'",
                         &[
                             &org_id,
-                            &current_owner_id,
                             &changed_by_user_id,
+                            &current_owner_ids,
                             &user_id,
                             &previous_role,
                         ],
@@ -1184,8 +1194,13 @@ impl OrganizationRepository for PgOrganizationRepository {
         })
     }
 
-    async fn remove_member(&self, org_id: Uuid, user_id: Uuid) -> Result<bool, RepositoryError> {
-        let rows_affected = retry_db!("remove_member", {
+    async fn remove_member(
+        &self,
+        org_id: Uuid,
+        user_id: Uuid,
+        requester_user_id: Uuid,
+    ) -> Result<RemoveOrganizationMemberResult, RepositoryError> {
+        retry_db!("remove_member", {
             let mut client = self
                 .pool
                 .get()
@@ -1206,7 +1221,23 @@ impl OrganizationRepository for PgOrganizationRepository {
                 .map_err(map_db_error)?;
             if organization.is_none() {
                 transaction.rollback().await.map_err(map_db_error)?;
-                return Ok(0);
+                return Ok(RemoveOrganizationMemberResult::NotFound);
+            }
+
+            if requester_user_id != user_id {
+                let requester_role = transaction
+                    .query_opt(
+                        "SELECT role FROM organization_members
+                         WHERE organization_id = $1 AND user_id = $2",
+                        &[&org_id, &requester_user_id],
+                    )
+                    .await
+                    .map_err(map_db_error)?
+                    .map(|row| row.get::<_, String>("role"));
+                if !matches!(requester_role.as_deref(), Some("owner" | "admin")) {
+                    transaction.rollback().await.map_err(map_db_error)?;
+                    return Ok(RemoveOrganizationMemberResult::Unauthorized);
+                }
             }
 
             let member = transaction
@@ -1220,7 +1251,7 @@ impl OrganizationRepository for PgOrganizationRepository {
                 .map_err(map_db_error)?;
             let Some(member) = member else {
                 transaction.rollback().await.map_err(map_db_error)?;
-                return Ok(0);
+                return Ok(RemoveOrganizationMemberResult::NotFound);
             };
 
             if member.get::<_, String>("role") == "owner" {
@@ -1235,9 +1266,7 @@ impl OrganizationRepository for PgOrganizationRepository {
                     .get::<_, i64>(0);
                 if owner_count <= 1 {
                     transaction.rollback().await.map_err(map_db_error)?;
-                    return Err(RepositoryError::ValidationFailed(
-                        "Cannot remove the last owner from organization".to_string(),
-                    ));
+                    return Ok(RemoveOrganizationMemberResult::LastOwner);
                 }
             }
 
@@ -1249,10 +1278,12 @@ impl OrganizationRepository for PgOrganizationRepository {
                 .await
                 .map_err(map_db_error)?;
             transaction.commit().await.map_err(map_db_error)?;
-            Ok(rows_affected)
-        })?;
-
-        Ok(rows_affected > 0)
+            Ok(if rows_affected > 0 {
+                RemoveOrganizationMemberResult::Removed
+            } else {
+                RemoveOrganizationMemberResult::NotFound
+            })
+        })
     }
 
     async fn list_members_paginated(

@@ -916,6 +916,7 @@ async fn test_ownership_transfer_racing_target_removal_preserves_owner() {
                 &repository,
                 organization_id,
                 target_id,
+                owner_id,
             )
             .await
         })
@@ -944,14 +945,14 @@ async fn test_ownership_transfer_racing_target_removal_preserves_owner() {
         .await
         .expect("Failed to commit ownership transfer");
 
-    let removal_error = removal_task
+    let removal_result = removal_task
         .await
         .expect("Removal task should not panic")
-        .expect_err("New owner must not be removed");
-    assert!(matches!(
-        removal_error,
-        services::common::RepositoryError::ValidationFailed(_)
-    ));
+        .expect("Removal authorization check should complete");
+    assert_eq!(
+        removal_result,
+        services::organization::RemoveOrganizationMemberResult::LastOwner
+    );
 
     let row = database
         .pool()
@@ -969,6 +970,130 @@ async fn test_ownership_transfer_racing_target_removal_preserves_owner() {
         .expect("New owner membership should remain");
     assert_eq!(row.get::<_, String>("role"), "owner");
     assert_eq!(row.get::<_, i64>("owner_count"), 1);
+}
+
+#[tokio::test]
+async fn test_member_removal_racing_requester_demotion_rechecks_authorization() {
+    let (_server, database) = setup_test_server_with_database().await;
+    let organization_id = uuid::Uuid::new_v4();
+    let owner_id = uuid::Uuid::new_v4();
+    let requester_id = uuid::Uuid::new_v4();
+    let target_id = uuid::Uuid::new_v4();
+
+    let mut blocker = database
+        .pool()
+        .get()
+        .await
+        .expect("Failed to get database connection");
+    for (user_id, label) in [
+        (owner_id, "removal-owner"),
+        (requester_id, "removal-requester"),
+        (target_id, "removal-target"),
+    ] {
+        blocker
+            .execute(
+                "INSERT INTO users (id, email, username, auth_provider, provider_user_id, is_active, created_at, updated_at)
+                 VALUES ($1, $2, $3, 'mock', $4, true, NOW(), NOW())",
+                &[
+                    &user_id,
+                    &format!("{label}-{user_id}@example.com"),
+                    &format!("{label}-{user_id}"),
+                    &format!("{label}-provider-{user_id}"),
+                ],
+            )
+            .await
+            .expect("Failed to insert user");
+    }
+    blocker
+        .execute(
+            "INSERT INTO organizations (id, name, is_active, created_at, updated_at)
+             VALUES ($1, $2, true, NOW(), NOW())",
+            &[
+                &organization_id,
+                &format!("removal-auth-race-{organization_id}"),
+            ],
+        )
+        .await
+        .expect("Failed to insert organization");
+    blocker
+        .execute(
+            "INSERT INTO organization_members (organization_id, user_id, role)
+             VALUES ($1, $2, 'owner'), ($1, $3, 'admin'), ($1, $4, 'member')",
+            &[&organization_id, &owner_id, &requester_id, &target_id],
+        )
+        .await
+        .expect("Failed to insert memberships");
+
+    let transaction = blocker
+        .transaction()
+        .await
+        .expect("Failed to begin blocking transaction");
+    transaction
+        .query_one(
+            "SELECT id FROM organizations WHERE id = $1 FOR UPDATE",
+            &[&organization_id],
+        )
+        .await
+        .expect("Failed to lock organization");
+
+    let removal_task = {
+        let pool = database.pool().clone();
+        tokio::spawn(async move {
+            let repository = database::repositories::PgOrganizationRepository::new(pool);
+            services::organization::OrganizationRepository::remove_member(
+                &repository,
+                organization_id,
+                target_id,
+                requester_id,
+            )
+            .await
+        })
+    };
+
+    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+    assert!(
+        !removal_task.is_finished(),
+        "member removal should wait for the role-change transaction"
+    );
+
+    transaction
+        .execute(
+            "UPDATE organization_members SET role = 'member'
+             WHERE organization_id = $1 AND user_id = $2",
+            &[&organization_id, &requester_id],
+        )
+        .await
+        .expect("Failed to demote requester");
+    transaction
+        .commit()
+        .await
+        .expect("Failed to commit requester demotion");
+
+    let removal_result = removal_task
+        .await
+        .expect("Removal task should not panic")
+        .expect("Removal authorization check should complete");
+    assert_eq!(
+        removal_result,
+        services::organization::RemoveOrganizationMemberResult::Unauthorized
+    );
+
+    let target_exists = database
+        .pool()
+        .get()
+        .await
+        .expect("Failed to get verification connection")
+        .query_one(
+            "SELECT EXISTS (
+                 SELECT 1 FROM organization_members
+                 WHERE organization_id = $1 AND user_id = $2
+             ) AS target_exists",
+            &[&organization_id, &target_id],
+        )
+        .await
+        .expect("Failed to verify target membership")
+        .get::<_, bool>("target_exists");
+    assert!(target_exists);
 }
 
 #[tokio::test]

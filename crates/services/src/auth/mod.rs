@@ -995,7 +995,12 @@ mod tests {
         ) -> Result<crate::organization::OrganizationMemberRoleUpdate, RepositoryError> {
             unimplemented!()
         }
-        async fn remove_member(&self, _: Uuid, _: Uuid) -> Result<bool, RepositoryError> {
+        async fn remove_member(
+            &self,
+            _: Uuid,
+            _: Uuid,
+            _: Uuid,
+        ) -> Result<crate::organization::RemoveOrganizationMemberResult, RepositoryError> {
             unimplemented!()
         }
         async fn list_members_paginated(

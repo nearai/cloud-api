@@ -187,6 +187,14 @@ pub enum DeleteOrganizationResult {
     StakingWalletBound,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RemoveOrganizationMemberResult {
+    Removed,
+    NotFound,
+    Unauthorized,
+    LastOwner,
+}
+
 /// Organization member with full user information
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OrganizationMemberWithUser {
@@ -395,7 +403,12 @@ pub trait OrganizationRepository: Send + Sync {
         changed_by_user_id: Uuid,
     ) -> Result<OrganizationMemberRoleUpdate, RepositoryError>;
 
-    async fn remove_member(&self, org_id: Uuid, user_id: Uuid) -> Result<bool, RepositoryError>;
+    async fn remove_member(
+        &self,
+        org_id: Uuid,
+        user_id: Uuid,
+        requester_user_id: Uuid,
+    ) -> Result<RemoveOrganizationMemberResult, RepositoryError>;
 
     async fn list_members_paginated(
         &self,

@@ -29,7 +29,7 @@ struct InvitationEmailAttempt {
 }
 
 const OWNER_INVITATION_DISABLED: &str =
-    "Ownership can only be transferred to an existing organization admin";
+    "Ownership can only be transferred to an existing organization member";
 
 impl OrganizationServiceImpl {
     pub fn new(
@@ -357,6 +357,29 @@ impl OrganizationServiceImpl {
             })
     }
 
+    async fn remove_member_with_revalidated_authorization(
+        &self,
+        organization_id: OrganizationId,
+        requester_id: UserId,
+        member_id: UserId,
+    ) -> Result<bool, OrganizationError> {
+        match self
+            .repository
+            .remove_member(organization_id.0, member_id.0, requester_id.0)
+            .await
+            .map_err(Self::map_repository_error)?
+        {
+            RemoveOrganizationMemberResult::Removed => Ok(true),
+            RemoveOrganizationMemberResult::NotFound => Ok(false),
+            RemoveOrganizationMemberResult::Unauthorized => Err(OrganizationError::Unauthorized(
+                "Insufficient permissions to remove member".to_string(),
+            )),
+            RemoveOrganizationMemberResult::LastOwner => Err(OrganizationError::InvalidParams(
+                "Cannot remove the last owner from organization".to_string(),
+            )),
+        }
+    }
+
     /// Remove a member from an organization (private helper)
     async fn remove_member_impl(
         &self,
@@ -393,10 +416,8 @@ impl OrganizationServiceImpl {
             }
         }
 
-        self.repository
-            .remove_member(organization_id.0, member_id.0)
+        self.remove_member_with_revalidated_authorization(organization_id, requester_id, member_id)
             .await
-            .map_err(Self::map_repository_error)
     }
 
     /// Update a member's role (private helper)
@@ -804,10 +825,10 @@ impl OrganizationServiceImpl {
             ));
         }
 
-        self.repository
-            .remove_member(organization_id.0, member_id.0)
+        // Last-owner and requester-role checks are repeated while holding the
+        // same organization lock as ownership transfers and role changes.
+        self.remove_member_with_revalidated_authorization(organization_id, requester_id, member_id)
             .await
-            .map_err(Self::map_repository_error)
     }
 
     async fn send_invitation_email(
@@ -2172,7 +2193,12 @@ mod tests {
             unimplemented!()
         }
 
-        async fn remove_member(&self, _: Uuid, _: Uuid) -> Result<bool, RepositoryError> {
+        async fn remove_member(
+            &self,
+            _: Uuid,
+            _: Uuid,
+            _: Uuid,
+        ) -> Result<RemoveOrganizationMemberResult, RepositoryError> {
             unimplemented!()
         }
 
@@ -2975,7 +3001,7 @@ mod tests {
         assert!(!response.results[0].success);
         assert_eq!(
             response.results[0].error.as_deref(),
-            Some(OWNER_INVITATION_DISABLED)
+            Some("Ownership can only be transferred to an existing organization member")
         );
         assert!(response.results[1].success);
         assert!(response.results[2].success);
@@ -3013,7 +3039,7 @@ mod tests {
         assert_eq!(response.failed, 1);
         assert_eq!(
             response.results[0].error.as_deref(),
-            Some(OWNER_INVITATION_DISABLED)
+            Some("Ownership can only be transferred to an existing organization member")
         );
         assert!(invitation_repo.records.lock().unwrap().is_empty());
     }
@@ -3053,7 +3079,7 @@ mod tests {
         assert!(matches!(
             error,
             OrganizationError::InvalidParams(message)
-                if message == OWNER_INVITATION_DISABLED
+                if message == "Ownership can only be transferred to an existing organization member"
         ));
     }
 

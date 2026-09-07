@@ -458,13 +458,31 @@ async fn test_admin_updates_member_role_and_protects_owners() {
         .await;
     assert_eq!(owner_response.status_code(), 400);
 
-    let promote_response = server
+    let missing_member_response = server
+        .put(
+            format!(
+                "/v1/admin/organizations/{organization_id}/members/{}",
+                uuid::Uuid::new_v4()
+            )
+            .as_str(),
+        )
+        .add_header("Authorization", format!("Bearer {}", get_session_id()))
+        .add_header("User-Agent", MOCK_USER_AGENT)
+        .json(&serde_json::json!({ "role": "admin" }))
+        .await;
+    assert_eq!(missing_member_response.status_code(), 404);
+
+    let no_op_response = server
         .put(format!("/v1/admin/organizations/{organization_id}/members/{member_id}").as_str())
         .add_header("Authorization", format!("Bearer {}", get_session_id()))
         .add_header("User-Agent", MOCK_USER_AGENT)
-        .json(&serde_json::json!({ "role": "owner" }))
+        .json(&serde_json::json!({ "role": "member" }))
         .await;
-    assert_eq!(promote_response.status_code(), 400);
+    assert_eq!(no_op_response.status_code(), 200);
+    assert_eq!(
+        no_op_response.json::<OrganizationMemberResponse>().role,
+        MemberRole::Member
+    );
 
     let client = database
         .pool()
@@ -498,7 +516,7 @@ async fn test_admin_updates_member_role_and_protects_owners() {
 }
 
 #[tokio::test]
-async fn test_admin_transfers_organization_ownership_to_admin() {
+async fn test_admin_transfers_organization_ownership_to_member() {
     let (server, database) = setup_test_server_with_database().await;
     let organization_id = uuid::Uuid::new_v4();
     let owner_id = uuid::Uuid::new_v4();
@@ -552,7 +570,7 @@ async fn test_admin_transfers_organization_ownership_to_admin() {
     }
 
     let response = server
-        .put(format!("/v1/admin/organizations/{organization_id}/members/{admin_id}").as_str())
+        .put(format!("/v1/admin/organizations/{organization_id}/members/{member_id}").as_str())
         .add_header("Authorization", format!("Bearer {}", get_session_id()))
         .add_header("User-Agent", MOCK_USER_AGENT)
         .json(&serde_json::json!({ "role": "owner" }))
@@ -593,8 +611,8 @@ async fn test_admin_transfers_organization_ownership_to_admin() {
     assert_eq!(
         roles
             .iter()
-            .find(|row| row.get::<_, uuid::Uuid>("user_id") == admin_id)
-            .expect("Promoted admin should remain a member")
+            .find(|row| row.get::<_, uuid::Uuid>("user_id") == member_id)
+            .expect("Promoted member should remain a member")
             .get::<_, String>("role"),
         "owner"
     );
@@ -628,16 +646,16 @@ async fn test_admin_transfers_organization_ownership_to_admin() {
     assert_eq!(previous_owner_audit.get::<_, String>("new_role"), "admin");
     let new_owner_audit = audit_rows
         .iter()
-        .find(|row| row.get::<_, uuid::Uuid>("member_user_id") == admin_id)
+        .find(|row| row.get::<_, uuid::Uuid>("member_user_id") == member_id)
         .expect("New owner change should be audited");
-    assert_eq!(new_owner_audit.get::<_, String>("previous_role"), "admin");
+    assert_eq!(new_owner_audit.get::<_, String>("previous_role"), "member");
     assert_eq!(new_owner_audit.get::<_, String>("new_role"), "owner");
 
     drop(client);
 
     let new_owner_response = server
         .patch(format!("/v1/organizations/{organization_id}/settings").as_str())
-        .add_header("Authorization", format!("Bearer rt_{admin_id}"))
+        .add_header("Authorization", format!("Bearer rt_{member_id}"))
         .json(&serde_json::json!({ "fallback_enabled": false }))
         .await;
     assert_eq!(
@@ -659,19 +677,22 @@ async fn test_admin_transfers_organization_ownership_to_admin() {
         previous_owner_response.text()
     );
 
-    for (user_id, expected_role) in [(admin_id, MemberRole::Owner), (owner_id, MemberRole::Admin)] {
+    for (user_id, expected_role) in [
+        (member_id, MemberRole::Owner),
+        (owner_id, MemberRole::Admin),
+    ] {
         let response = server
             .get(format!("/v1/organizations/{organization_id}").as_str())
             .add_header("Authorization", format!("Bearer rt_{user_id}"))
             .await;
         assert_eq!(response.status_code(), 200, "{}", response.text());
         let organization = response.json::<api::models::OrganizationResponse>();
-        assert_eq!(organization.owner_id, admin_id.to_string());
+        assert_eq!(organization.owner_id, member_id.to_string());
         assert_eq!(organization.role, expected_role);
     }
 
     let previous_owner_role_update = server
-        .put(format!("/v1/organizations/{organization_id}/members/{member_id}").as_str())
+        .put(format!("/v1/organizations/{organization_id}/members/{admin_id}").as_str())
         .add_header("Authorization", format!("Bearer rt_{owner_id}"))
         .json(&serde_json::json!({ "role": "admin" }))
         .await;
@@ -683,9 +704,9 @@ async fn test_admin_transfers_organization_ownership_to_admin() {
     );
 
     let new_owner_role_update = server
-        .put(format!("/v1/organizations/{organization_id}/members/{member_id}").as_str())
-        .add_header("Authorization", format!("Bearer rt_{admin_id}"))
-        .json(&serde_json::json!({ "role": "admin" }))
+        .put(format!("/v1/organizations/{organization_id}/members/{admin_id}").as_str())
+        .add_header("Authorization", format!("Bearer rt_{member_id}"))
+        .json(&serde_json::json!({ "role": "member" }))
         .await;
     assert_eq!(
         new_owner_role_update.status_code(),
@@ -707,7 +728,7 @@ async fn test_admin_transfers_organization_ownership_to_admin() {
 
     let new_owner_delete = server
         .delete(format!("/v1/organizations/{organization_id}").as_str())
-        .add_header("Authorization", format!("Bearer rt_{admin_id}"))
+        .add_header("Authorization", format!("Bearer rt_{member_id}"))
         .await;
     assert_eq!(
         new_owner_delete.status_code(),
@@ -826,4 +847,245 @@ async fn test_admin_member_role_updates_reject_non_admin_users() {
         .json(&serde_json::json!({ "role": "admin" }))
         .await;
     assert_eq!(response.status_code(), 403);
+}
+
+#[tokio::test]
+async fn test_ownership_transfer_racing_target_removal_preserves_owner() {
+    let (_server, database) = setup_test_server_with_database().await;
+    let organization_id = uuid::Uuid::new_v4();
+    let owner_id = uuid::Uuid::new_v4();
+    let target_id = uuid::Uuid::new_v4();
+
+    let mut blocker = database
+        .pool()
+        .get()
+        .await
+        .expect("Failed to get database connection");
+    blocker
+        .execute(
+            "INSERT INTO users (id, email, username, auth_provider, provider_user_id, is_active, created_at, updated_at)
+             VALUES ($1, $2, $3, 'mock', $4, true, NOW(), NOW()),
+                    ($5, $6, $7, 'mock', $8, true, NOW(), NOW())",
+            &[
+                &owner_id,
+                &format!("race-owner-{owner_id}@example.com"),
+                &format!("race-owner-{owner_id}"),
+                &format!("race-owner-provider-{owner_id}"),
+                &target_id,
+                &format!("race-target-{target_id}@example.com"),
+                &format!("race-target-{target_id}"),
+                &format!("race-target-provider-{target_id}"),
+            ],
+        )
+        .await
+        .expect("Failed to insert users");
+    blocker
+        .execute(
+            "INSERT INTO organizations (id, name, is_active, created_at, updated_at)
+             VALUES ($1, $2, true, NOW(), NOW())",
+            &[&organization_id, &format!("removal-race-{organization_id}")],
+        )
+        .await
+        .expect("Failed to insert organization");
+    blocker
+        .execute(
+            "INSERT INTO organization_members (organization_id, user_id, role)
+             VALUES ($1, $2, 'owner'), ($1, $3, 'admin')",
+            &[&organization_id, &owner_id, &target_id],
+        )
+        .await
+        .expect("Failed to insert memberships");
+
+    let transaction = blocker
+        .transaction()
+        .await
+        .expect("Failed to begin blocking transaction");
+    transaction
+        .query_one(
+            "SELECT id FROM organizations WHERE id = $1 FOR UPDATE",
+            &[&organization_id],
+        )
+        .await
+        .expect("Failed to lock organization");
+
+    let removal_task = {
+        let pool = database.pool().clone();
+        tokio::spawn(async move {
+            let repository = database::repositories::PgOrganizationRepository::new(pool);
+            services::organization::OrganizationRepository::remove_member(
+                &repository,
+                organization_id,
+                target_id,
+            )
+            .await
+        })
+    };
+
+    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+    assert!(
+        !removal_task.is_finished(),
+        "member removal should wait for the ownership transaction"
+    );
+
+    transaction
+        .execute(
+            "UPDATE organization_members SET role = CASE
+                 WHEN user_id = $2 THEN 'admin'
+                 WHEN user_id = $3 THEN 'owner'
+                 ELSE role
+             END
+             WHERE organization_id = $1 AND user_id IN ($2, $3)",
+            &[&organization_id, &owner_id, &target_id],
+        )
+        .await
+        .expect("Failed to transfer ownership");
+    transaction
+        .commit()
+        .await
+        .expect("Failed to commit ownership transfer");
+
+    let removal_error = removal_task
+        .await
+        .expect("Removal task should not panic")
+        .expect_err("New owner must not be removed");
+    assert!(matches!(
+        removal_error,
+        services::common::RepositoryError::ValidationFailed(_)
+    ));
+
+    let row = database
+        .pool()
+        .get()
+        .await
+        .expect("Failed to get verification connection")
+        .query_one(
+            "SELECT role, (SELECT COUNT(*) FROM organization_members
+                           WHERE organization_id = $1 AND role = 'owner') AS owner_count
+             FROM organization_members
+             WHERE organization_id = $1 AND user_id = $2",
+            &[&organization_id, &target_id],
+        )
+        .await
+        .expect("New owner membership should remain");
+    assert_eq!(row.get::<_, String>("role"), "owner");
+    assert_eq!(row.get::<_, i64>("owner_count"), 1);
+}
+
+#[tokio::test]
+async fn test_ownership_transfer_racing_old_owner_delete_rechecks_authorization() {
+    let (_server, database) = setup_test_server_with_database().await;
+    let organization_id = uuid::Uuid::new_v4();
+    let owner_id = uuid::Uuid::new_v4();
+    let new_owner_id = uuid::Uuid::new_v4();
+
+    let mut blocker = database
+        .pool()
+        .get()
+        .await
+        .expect("Failed to get database connection");
+    blocker
+        .execute(
+            "INSERT INTO users (id, email, username, auth_provider, provider_user_id, is_active, created_at, updated_at)
+             VALUES ($1, $2, $3, 'mock', $4, true, NOW(), NOW()),
+                    ($5, $6, $7, 'mock', $8, true, NOW(), NOW())",
+            &[
+                &owner_id,
+                &format!("delete-race-owner-{owner_id}@example.com"),
+                &format!("delete-race-owner-{owner_id}"),
+                &format!("delete-race-owner-provider-{owner_id}"),
+                &new_owner_id,
+                &format!("delete-race-target-{new_owner_id}@example.com"),
+                &format!("delete-race-target-{new_owner_id}"),
+                &format!("delete-race-target-provider-{new_owner_id}"),
+            ],
+        )
+        .await
+        .expect("Failed to insert users");
+    blocker
+        .execute(
+            "INSERT INTO organizations (id, name, is_active, created_at, updated_at)
+             VALUES ($1, $2, true, NOW(), NOW())",
+            &[&organization_id, &format!("delete-race-{organization_id}")],
+        )
+        .await
+        .expect("Failed to insert organization");
+    blocker
+        .execute(
+            "INSERT INTO organization_members (organization_id, user_id, role)
+             VALUES ($1, $2, 'owner'), ($1, $3, 'member')",
+            &[&organization_id, &owner_id, &new_owner_id],
+        )
+        .await
+        .expect("Failed to insert memberships");
+
+    let transaction = blocker
+        .transaction()
+        .await
+        .expect("Failed to begin blocking transaction");
+    transaction
+        .query_one(
+            "SELECT id FROM organizations WHERE id = $1 FOR UPDATE",
+            &[&organization_id],
+        )
+        .await
+        .expect("Failed to lock organization");
+
+    let deletion_task = {
+        let pool = database.pool().clone();
+        tokio::spawn(async move {
+            let repository = database::repositories::PgOrganizationRepository::new(pool);
+            services::organization::OrganizationRepository::delete_if_no_staking_farm_source(
+                &repository,
+                organization_id,
+                owner_id,
+            )
+            .await
+        })
+    };
+
+    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+    assert!(
+        !deletion_task.is_finished(),
+        "organization deletion should wait for the ownership transaction"
+    );
+
+    transaction
+        .execute(
+            "UPDATE organization_members SET role = CASE
+                 WHEN user_id = $2 THEN 'admin'
+                 WHEN user_id = $3 THEN 'owner'
+                 ELSE role
+             END
+             WHERE organization_id = $1 AND user_id IN ($2, $3)",
+            &[&organization_id, &owner_id, &new_owner_id],
+        )
+        .await
+        .expect("Failed to transfer ownership");
+    transaction
+        .commit()
+        .await
+        .expect("Failed to commit ownership transfer");
+
+    let deletion_result = deletion_task
+        .await
+        .expect("Deletion task should not panic")
+        .expect("Deletion authorization check should complete");
+    assert_eq!(
+        deletion_result,
+        services::organization::DeleteOrganizationResult::Unauthorized
+    );
+
+    let is_active = database
+        .pool()
+        .get()
+        .await
+        .expect("Failed to get verification connection")
+        .query_one(
+            "SELECT is_active FROM organizations WHERE id = $1",
+            &[&organization_id],
+        )
+        .await
+        .expect("Organization should remain")
+        .get::<_, bool>("is_active");
+    assert!(is_active);
 }

@@ -950,6 +950,7 @@ mod tests {
             _: Uuid,
             _: UpdateOrganizationRequest,
             _: Option<Option<serde_json::Value>>,
+            _: Uuid,
         ) -> Result<Organization, RepositoryError> {
             unimplemented!()
         }
@@ -957,11 +958,13 @@ mod tests {
             &self,
             _: Uuid,
             _: crate::organization::PatchOrganizationSettings,
+            _: Option<Uuid>,
         ) -> Result<Organization, RepositoryError> {
             unimplemented!()
         }
         async fn delete_if_no_staking_farm_source(
             &self,
+            _: Uuid,
             _: Uuid,
         ) -> Result<DeleteOrganizationResult, RepositoryError> {
             unimplemented!()
@@ -979,6 +982,7 @@ mod tests {
             _: Uuid,
             _: Uuid,
             _: UpdateOrganizationMemberRequest,
+            _: Uuid,
         ) -> Result<OrganizationMember, RepositoryError> {
             unimplemented!()
         }

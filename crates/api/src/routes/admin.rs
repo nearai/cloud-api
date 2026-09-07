@@ -2932,7 +2932,7 @@ pub async fn list_organization_members(
 /// Update an organization member role as a system administrator.
 ///
 /// Assigning the owner role transfers ownership from the current owner to an
-/// existing organization admin. The previous owner is demoted to admin.
+/// existing organization member. The previous owner is demoted to admin.
 #[utoipa::path(
     put,
     path = "/v1/admin/organizations/{org_id}/members/{user_id}",
@@ -2962,7 +2962,6 @@ pub async fn update_organization_member_role(
     Json(request): Json<UpdateOrganizationMemberRequest>,
 ) -> Result<ResponseJson<OrganizationMemberResponse>, (StatusCode, ResponseJson<ErrorResponse>)> {
     let new_role = api_role_to_services_role(request.role);
-    let role_label = new_role.to_string();
     let update = app_state
         .organization_service
         .update_member_role_for_admin(
@@ -3000,16 +2999,10 @@ pub async fn update_organization_member_role(
             }
         })?;
 
-    let old_role = update.previous_role.to_string();
-    let role_changed = old_role != role_label;
-
     tracing::info!(
         organization_id = %org_id,
         member_user_id = %user_id,
         admin_user_id = %admin_user.0.id,
-        old_role,
-        new_role = role_label,
-        role_changed,
         "System administrator updated organization member role"
     );
 

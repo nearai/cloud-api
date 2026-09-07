@@ -3,8 +3,8 @@ CREATE TABLE organization_member_role_audit_log (
     organization_id UUID NOT NULL REFERENCES organizations(id),
     member_user_id UUID NOT NULL REFERENCES users(id),
     changed_by_user_id UUID NOT NULL REFERENCES users(id),
-    previous_role VARCHAR(20) NOT NULL CHECK (previous_role IN ('admin', 'member')),
-    new_role VARCHAR(20) NOT NULL CHECK (new_role IN ('admin', 'member')),
+    previous_role VARCHAR(20) NOT NULL CHECK (previous_role IN ('owner', 'admin', 'member')),
+    new_role VARCHAR(20) NOT NULL CHECK (new_role IN ('owner', 'admin', 'member')),
     changed_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 

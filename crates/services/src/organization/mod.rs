@@ -219,9 +219,14 @@ impl OrganizationServiceImpl {
 
         let updated = self
             .repository
-            .update(id.0, request, expected_fallback_override)
+            .update(id.0, request, expected_fallback_override, user_id.0)
             .await
-            .map_err(Self::map_repository_error)?;
+            .map_err(|error| match error {
+                RepositoryError::ValidationFailed(message) => {
+                    OrganizationError::Unauthorized(message)
+                }
+                error => Self::map_repository_error(error),
+            })?;
 
         if let Some(fallback_enabled) = requested_fallback_change {
             tracing::info!(
@@ -252,12 +257,15 @@ impl OrganizationServiceImpl {
 
         match self
             .repository
-            .delete_if_no_staking_farm_source(id.0)
+            .delete_if_no_staking_farm_source(id.0, user_id.0)
             .await
             .map_err(Self::map_repository_error)?
         {
             DeleteOrganizationResult::Deleted => Ok(true),
             DeleteOrganizationResult::NotFound => Ok(false),
+            DeleteOrganizationResult::Unauthorized => Err(OrganizationError::Unauthorized(
+                "Only the owner can delete an organization".to_string(),
+            )),
             DeleteOrganizationResult::StakingWalletBound => {
                 Err(OrganizationError::StakingWalletBound)
             }
@@ -426,7 +434,7 @@ impl OrganizationServiceImpl {
         let request = UpdateOrganizationMemberRequest { role: new_role };
 
         self.repository
-            .update_member(organization_id.0, member_id.0, request)
+            .update_member(organization_id.0, member_id.0, request, requester_id.0)
             .await
             .map_err(Self::map_repository_error)
     }
@@ -771,29 +779,6 @@ impl OrganizationServiceImpl {
         requester_id: UserId,
         member_id: UserId,
     ) -> Result<bool, OrganizationError> {
-        // Check if removing last owner
-        let members = self
-            .repository
-            .list_members_paginated(organization_id.0, 1, 0)
-            .await
-            .map_err(Self::map_repository_error)?;
-
-        let owner_count = members
-            .iter()
-            .filter(|m| matches!(m.role, MemberRole::Owner))
-            .count();
-
-        if owner_count == 1 {
-            // Check if the member being removed is an owner
-            if let Some(member) = members.iter().find(|m| m.user_id == member_id) {
-                if matches!(member.role, MemberRole::Owner) {
-                    return Err(OrganizationError::InvalidParams(
-                        "Cannot remove the last owner from organization".to_string(),
-                    ));
-                }
-            }
-        }
-
         // Allow members to remove themselves (leave organization)
         let can_remove = if requester_id == member_id {
             true
@@ -1610,9 +1595,14 @@ impl OrganizationServiceImpl {
 
         let updated = self
             .repository
-            .patch_settings(organization_id.0, patch)
+            .patch_settings(organization_id.0, patch, Some(user_id.0))
             .await
-            .map_err(Self::map_repository_error)?;
+            .map_err(|error| match error {
+                RepositoryError::ValidationFailed(message) => {
+                    OrganizationError::Unauthorized(message)
+                }
+                error => Self::map_repository_error(error),
+            })?;
 
         Ok(Self::settings_from_organization(&updated))
     }
@@ -1640,6 +1630,7 @@ impl OrganizationServiceImpl {
                     system_prompt: None,
                     fallback_enabled: Some(Some(fallback_enabled)),
                 },
+                None,
             )
             .await
             .map_err(Self::map_repository_error)?;
@@ -2076,6 +2067,7 @@ mod tests {
             id: Uuid,
             request: UpdateOrganizationRequest,
             expected_fallback_override: Option<Option<serde_json::Value>>,
+            _: Uuid,
         ) -> Result<Organization, RepositoryError> {
             *self.update_calls.lock().unwrap() += 1;
             let mut org = self.org.lock().unwrap();
@@ -2104,6 +2096,7 @@ mod tests {
             &self,
             id: Uuid,
             patch: ports::PatchOrganizationSettings,
+            _: Option<Uuid>,
         ) -> Result<Organization, RepositoryError> {
             *self.update_calls.lock().unwrap() += 1;
             let mut org = self.org.lock().unwrap();
@@ -2144,6 +2137,7 @@ mod tests {
         async fn delete_if_no_staking_farm_source(
             &self,
             _: Uuid,
+            _: Uuid,
         ) -> Result<DeleteOrganizationResult, RepositoryError> {
             *self.delete_if_no_staking_farm_source_calls.lock().unwrap() += 1;
             Ok(self.delete_result)
@@ -2163,6 +2157,7 @@ mod tests {
             _: Uuid,
             _: Uuid,
             _: UpdateOrganizationMemberRequest,
+            _: Uuid,
         ) -> Result<OrganizationMember, RepositoryError> {
             unimplemented!()
         }

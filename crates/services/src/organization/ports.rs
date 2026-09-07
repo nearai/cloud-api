@@ -183,6 +183,7 @@ pub struct UpdateOrganizationMemberRequest {
 pub enum DeleteOrganizationResult {
     Deleted,
     NotFound,
+    Unauthorized,
     StakingWalletBound,
 }
 
@@ -343,14 +344,17 @@ pub trait OrganizationRepository: Send + Sync {
         id: Uuid,
         request: UpdateOrganizationRequest,
         expected_fallback_override: Option<Option<serde_json::Value>>,
+        actor_user_id: Uuid,
     ) -> Result<Organization, RepositoryError>;
 
     /// Atomically applies the organization-settings fields present in `patch`.
     /// Omitted fields are preserved and explicit nulls remove their JSON keys.
+    /// `actor_user_id = None` is reserved for system-administrator operations.
     async fn patch_settings(
         &self,
         id: Uuid,
         patch: PatchOrganizationSettings,
+        actor_user_id: Option<Uuid>,
     ) -> Result<Organization, RepositoryError>;
 
     /// Soft-deletes an active organization only if it has no staking farm source.
@@ -362,6 +366,7 @@ pub trait OrganizationRepository: Send + Sync {
     async fn delete_if_no_staking_farm_source(
         &self,
         id: Uuid,
+        owner_user_id: Uuid,
     ) -> Result<DeleteOrganizationResult, RepositoryError>;
 
     async fn add_member(
@@ -376,10 +381,11 @@ pub trait OrganizationRepository: Send + Sync {
         org_id: Uuid,
         user_id: Uuid,
         request: UpdateOrganizationMemberRequest,
+        requester_user_id: Uuid,
     ) -> Result<OrganizationMember, RepositoryError>;
 
     /// Atomically update a member role and record the system administrator
-    /// responsible for the change. Promoting an admin to owner transfers
+    /// responsible for the change. Promoting an existing member to owner transfers
     /// ownership and demotes the previous owner to admin.
     async fn update_member_role_with_audit(
         &self,

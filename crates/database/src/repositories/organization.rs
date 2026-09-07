@@ -615,6 +615,28 @@ impl OrganizationRepository for PgOrganizationRepository {
         Ok(row.map(|row| row.get("name")))
     }
 
+    async fn has_owner(&self, organization_id: Uuid) -> Result<bool, RepositoryError> {
+        let row = retry_db!("organization_has_owner", {
+            let client = self
+                .pool
+                .get()
+                .await
+                .context("Failed to get database connection")
+                .map_err(RepositoryError::PoolError)?;
+            client
+                .query_one(
+                    "SELECT EXISTS (
+                         SELECT 1 FROM organization_members
+                         WHERE organization_id = $1 AND role = 'owner'
+                     )",
+                    &[&organization_id],
+                )
+                .await
+                .map_err(map_db_error)
+        })?;
+        Ok(row.get(0))
+    }
+
     async fn get_by_name(&self, name: &str) -> Result<Option<Organization>, RepositoryError> {
         match self.get_by_name_internal(name).await? {
             Some(db_org) => Ok(Some(
@@ -660,6 +682,7 @@ impl OrganizationRepository for PgOrganizationRepository {
                          FROM organization_members member
                          JOIN users user_account ON user_account.id = member.user_id
                          WHERE member.organization_id = $1
+                           AND user_account.is_active = true
                            AND LOWER(user_account.email) = LOWER($2)
                      )",
                     &[&organization_id, &email],

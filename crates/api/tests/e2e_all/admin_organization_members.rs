@@ -177,10 +177,21 @@ async fn test_admin_list_organization_members_empty_org() {
         .await;
     assert_eq!(
         invite_response.status_code(),
-        200,
-        "System admin should be able to invite into an active member-less org: {}",
+        400,
+        "Inviting into an ownerless org should fail before creating invitations: {}",
         invite_response.text()
     );
+    assert!(invite_response.text().contains("Organization has no owner"));
+    let client = database.pool().get().await.unwrap();
+    let count: i64 = client
+        .query_one(
+            "SELECT COUNT(*) FROM organization_invitations WHERE organization_id = $1",
+            &[&empty_org_id],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(count, 0);
 
     println!("✅ Admin list organization members returns 200/empty for an active member-less org");
 }
@@ -682,4 +693,137 @@ async fn test_admin_member_writes_reject_non_admin_users() {
         .json(&serde_json::json!({ "role": "admin" }))
         .await;
     assert_eq!(update_response.status_code(), 403);
+}
+
+#[tokio::test]
+async fn test_admin_rejects_invitation_when_members_exist_without_owner() {
+    let (server, database) = setup_test_server_with_database().await;
+    let org = create_org(&server).await;
+    let org_id = uuid::Uuid::parse_str(&org.id).unwrap();
+    let client = database.pool().get().await.unwrap();
+    client
+        .execute(
+            "UPDATE organization_members SET role = 'admin' WHERE organization_id = $1",
+            &[&org_id],
+        )
+        .await
+        .unwrap();
+    let response = server
+        .post(format!("/v1/admin/organizations/{org_id}/members/invite-by-email").as_str())
+        .add_header("Authorization", format!("Bearer {}", get_session_id()))
+        .add_header("User-Agent", MOCK_USER_AGENT)
+        .json(&serde_json::json!({
+            "invitations": [{"email": "ownerless@example.com", "role": "member"}]
+        }))
+        .await;
+    assert_eq!(response.status_code(), 400);
+    assert!(response.text().contains("Organization has no owner"));
+    let count: i64 = client
+        .query_one(
+            "SELECT COUNT(*) FROM organization_invitations WHERE organization_id = $1",
+            &[&org_id],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(count, 0);
+}
+
+#[tokio::test]
+async fn test_admin_invitation_ignores_inactive_members_but_checks_active_same_email() {
+    let (server, database) = setup_test_server_with_database().await;
+    let org = create_org(&server).await;
+    let org_id = uuid::Uuid::parse_str(&org.id).unwrap();
+    let inactive_id = uuid::Uuid::new_v4();
+    let active_id = uuid::Uuid::new_v4();
+    let email = format!("inactive-{inactive_id}@example.com");
+    let client = database.pool().get().await.unwrap();
+    for (id, address, active) in [
+        (inactive_id, email.clone(), false),
+        (active_id, email.to_uppercase(), true),
+    ] {
+        client.execute(
+            "INSERT INTO users (id, email, username, auth_provider, provider_user_id, is_active)
+             VALUES ($1, $2, $3, 'mock', $3, $4)",
+            &[&id, &address, &id.to_string(), &active],
+        ).await.unwrap();
+    }
+    client.execute(
+        "INSERT INTO organization_members (organization_id, user_id, role) VALUES ($1, $2, 'member')",
+        &[&org_id, &inactive_id],
+    ).await.unwrap();
+
+    for active_is_member in [false, true] {
+        if active_is_member {
+            client.execute(
+                "INSERT INTO organization_members (organization_id, user_id, role) VALUES ($1, $2, 'member')",
+                &[&org_id, &active_id],
+            ).await.unwrap();
+        }
+        let response = server
+            .post(format!("/v1/admin/organizations/{org_id}/members/invite-by-email").as_str())
+            .add_header("Authorization", format!("Bearer {}", get_session_id()))
+            .add_header("User-Agent", MOCK_USER_AGENT)
+            .json(&serde_json::json!({
+                "invitations": [{"email": email, "role": "member"}]
+            }))
+            .await;
+        assert_eq!(response.status_code(), 200, "{}", response.text());
+        let body = response.json::<InviteOrganizationMemberByEmailResponse>();
+        if active_is_member {
+            assert_eq!((body.successful, body.failed), (0, 1));
+            assert_eq!(
+                body.results[0].error.as_deref(),
+                Some("User is already a member")
+            );
+        } else {
+            assert_eq!((body.successful, body.failed), (1, 0));
+        }
+    }
+    let active: bool = client
+        .query_one("SELECT is_active FROM users WHERE id = $1", &[&inactive_id])
+        .await
+        .unwrap()
+        .get(0);
+    assert!(!active, "Inviting does not reactivate the old account");
+}
+
+#[tokio::test]
+async fn test_admin_invitation_duplicate_batch_creates_only_one_record() {
+    let (server, database) = setup_test_server_with_database().await;
+    for admin_prefix in ["/v1/admin", "/v1"] {
+        let org = create_org(&server).await;
+        let org_id = uuid::Uuid::parse_str(&org.id).unwrap();
+        let response = server
+            .post(format!("{admin_prefix}/organizations/{org_id}/members/invite-by-email").as_str())
+            .add_header("Authorization", format!("Bearer {}", get_session_id()))
+            .add_header("User-Agent", MOCK_USER_AGENT)
+            .json(&serde_json::json!({"invitations": [
+                {"email": "Duplicate@Example.com", "role": "member"},
+                {"email": "duplicate@example.com", "role": "admin"}
+            ]}))
+            .await;
+        assert_eq!(response.status_code(), 200, "{}", response.text());
+        let body = response.json::<InviteOrganizationMemberByEmailResponse>();
+        assert_eq!((body.total, body.successful, body.failed), (2, 1, 1));
+        assert_eq!(
+            body.results[1].error.as_deref(),
+            Some("Duplicate email in invitation batch")
+        );
+        let client = database.pool().get().await.unwrap();
+        let rows = client
+            .query(
+                "SELECT role, status FROM organization_invitations WHERE organization_id = $1",
+                &[&org_id],
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            rows.len(),
+            1,
+            "Duplicate must not expire and replace the first invitation"
+        );
+        assert_eq!(rows[0].get::<_, String>("role"), "member");
+        assert_eq!(rows[0].get::<_, String>("status"), "pending");
+    }
 }

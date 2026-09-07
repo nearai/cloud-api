@@ -3524,12 +3524,24 @@ mod tests {
         );
     }
 
+    // Callsite interest is cached process-wide, so a warn first reached by a
+    // drop test with no subscriber stays dead for every later thread-local one.
+    static ACTIVE_CAPTURE: std::sync::Mutex<Option<CapturedLogs>> = std::sync::Mutex::new(None);
+
     #[derive(Clone, Default)]
     struct CapturedLogs(Arc<std::sync::Mutex<Vec<u8>>>);
 
-    impl std::io::Write for CapturedLogs {
+    struct CaptureWriter;
+
+    impl std::io::Write for CaptureWriter {
         fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-            self.0.lock().unwrap().extend_from_slice(buf);
+            let active = ACTIVE_CAPTURE.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(logs) = active.as_ref() {
+                logs.0
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .extend_from_slice(buf);
+            }
             Ok(buf.len())
         }
 
@@ -3538,28 +3550,41 @@ mod tests {
         }
     }
 
-    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CapturedLogs {
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CaptureWriter {
         type Writer = Self;
 
         fn make_writer(&'a self) -> Self::Writer {
-            self.clone()
+            CaptureWriter
         }
     }
 
-    impl CapturedLogs {
-        fn event_containing(&self, needle: &str) -> serde_json::Value {
-            let raw = self.0.lock().unwrap().clone();
-            String::from_utf8(raw)
-                .expect("log output is utf8")
-                .lines()
-                .map(|line| serde_json::from_str::<serde_json::Value>(line).expect("json log line"))
-                .find(|event| {
-                    event["fields"]["message"]
-                        .as_str()
-                        .is_some_and(|message| message.contains(needle))
-                })
-                .unwrap_or_else(|| panic!("no log event containing {needle}"))
-        }
+    fn capture_logs_for(request_id: Uuid, emit: impl FnOnce()) -> Vec<serde_json::Value> {
+        static CAPTURING: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        static INSTALLED: std::sync::Once = std::sync::Once::new();
+        INSTALLED.call_once(|| {
+            let subscriber = tracing_subscriber::fmt()
+                .json()
+                .with_current_span(false)
+                .with_span_list(false)
+                .with_max_level(tracing::Level::WARN)
+                .with_writer(CaptureWriter)
+                .finish();
+            let _ = tracing::subscriber::set_global_default(subscriber);
+        });
+
+        let _serialized = CAPTURING.lock().unwrap_or_else(|e| e.into_inner());
+        let logs = CapturedLogs::default();
+        *ACTIVE_CAPTURE.lock().unwrap_or_else(|e| e.into_inner()) = Some(logs.clone());
+        emit();
+        *ACTIVE_CAPTURE.lock().unwrap_or_else(|e| e.into_inner()) = None;
+
+        let raw = logs.0.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        String::from_utf8(raw)
+            .expect("log output is utf8")
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).expect("json log line"))
+            .filter(|event| event["fields"]["request_id"] == request_id.to_string())
+            .collect()
     }
 
     fn interrupted_stream_event(
@@ -3585,16 +3610,7 @@ mod tests {
         } else {
             "Stream interrupted before usage stats or chat_id received"
         };
-        let logs = CapturedLogs::default();
-        let subscriber = tracing_subscriber::fmt()
-            .json()
-            .with_current_span(false)
-            .with_span_list(false)
-            .with_max_level(tracing::Level::WARN)
-            .with_writer(logs.clone())
-            .finish();
-
-        tracing::subscriber::with_default(subscriber, || {
+        let events = capture_logs_for(request_id, || {
             let _interrupted = InterceptStream {
                 inner: stream::iter::<Vec<Result<SSEEvent, inference_providers::CompletionError>>>(
                     vec![],
@@ -3640,7 +3656,14 @@ mod tests {
             };
         });
 
-        logs.event_containing(needle)
+        events
+            .into_iter()
+            .find(|event| {
+                event["fields"]["message"]
+                    .as_str()
+                    .is_some_and(|message| message.contains(needle))
+            })
+            .unwrap_or_else(|| panic!("no log event containing {needle}"))
     }
 
     #[tokio::test]

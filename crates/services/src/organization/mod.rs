@@ -5,7 +5,7 @@ use crate::email::{EmailDeliveryOutcome, EmailSender, InvitationEmail, NoopEmail
 use anyhow::Result;
 use async_trait::async_trait;
 pub use ports::*;
-use std::sync::Arc;
+use std::{collections::HashSet, sync::Arc};
 
 pub struct OrganizationServiceImpl {
     repository: Arc<dyn OrganizationRepository>,
@@ -801,7 +801,7 @@ impl OrganizationServiceImpl {
 
     async fn send_invitation_email(
         &self,
-        org: &Organization,
+        organization_name: &str,
         invitation: &ports::OrganizationInvitation,
         sender_details: &InvitationSenderDetails,
     ) -> InvitationEmailAttempt {
@@ -830,7 +830,7 @@ impl OrganizationServiceImpl {
 
         let email = InvitationEmail {
             recipient_email: invitation.email.clone(),
-            organization_name: org.name.clone(),
+            organization_name: organization_name.to_string(),
             role: invitation.role.to_string(),
             inviter_name: sender_details.name.clone(),
             inviter_email: sender_details.email.clone(),
@@ -972,9 +972,75 @@ impl OrganizationServiceImpl {
             .get_invitation_requester_role(&organization_id, &requester_id, &org)
             .await?;
 
+        self.create_invitations_with_role_impl(
+            org.id,
+            org.name,
+            requester_id,
+            requester_role,
+            invitations,
+            expires_in_hours,
+        )
+        .await
+    }
+
+    async fn create_invitations_for_admin_impl(
+        &self,
+        organization_id: OrganizationId,
+        requester_id: UserId,
+        invitations: Vec<(String, MemberRole)>,
+        expires_in_hours: i64,
+    ) -> Result<BatchInvitationResponse, OrganizationError> {
+        if invitations
+            .iter()
+            .any(|(_, role)| matches!(role, MemberRole::Owner))
+        {
+            return Err(OrganizationError::InvalidParams(
+                "Organization ownership cannot be assigned through member invitations".to_string(),
+            ));
+        }
+
+        let organization_name = self
+            .repository
+            .get_active_name_by_id(organization_id.0)
+            .await
+            .map_err(Self::map_repository_error)?
+            .ok_or(OrganizationError::NotFound)?;
+        if !self
+            .repository
+            .has_owner(organization_id.0)
+            .await
+            .map_err(Self::map_repository_error)?
+        {
+            return Err(OrganizationError::InvalidParams(
+                "Organization has no owner; restore ownership before inviting members".to_string(),
+            ));
+        }
+        // The route has already authorized the system administrator. Reuse the
+        // Admin invitation policy (Admin/Member only), without requiring an org membership.
+        self.create_invitations_with_role_impl(
+            organization_id,
+            organization_name,
+            requester_id,
+            MemberRole::Admin,
+            invitations,
+            expires_in_hours,
+        )
+        .await
+    }
+
+    async fn create_invitations_with_role_impl(
+        &self,
+        organization_id: OrganizationId,
+        organization_name: String,
+        requester_id: UserId,
+        requester_role: MemberRole,
+        invitations: Vec<(String, MemberRole)>,
+        expires_in_hours: i64,
+    ) -> Result<BatchInvitationResponse, OrganizationError> {
         let mut results = Vec::new();
         let mut successful = 0;
         let mut failed = 0;
+        let mut seen_emails = HashSet::new();
         let sender_details = if self.invitations_url.is_some() {
             self.load_invitation_sender_details(&requester_id).await
         } else {
@@ -982,6 +1048,19 @@ impl OrganizationServiceImpl {
         };
 
         for (email, role) in invitations {
+            let email = email.trim().to_lowercase();
+            if !seen_emails.insert(email.clone()) {
+                failed += 1;
+                results.push(ports::InvitationResult {
+                    email,
+                    success: false,
+                    member: None,
+                    error: Some("Duplicate email in invitation batch".to_string()),
+                    email_sent: false,
+                    email_error: None,
+                });
+                continue;
+            }
             if !requester_role.can_invite_as(&role) {
                 failed += 1;
                 results.push(ports::InvitationResult {
@@ -997,19 +1076,35 @@ impl OrganizationServiceImpl {
                 continue;
             }
 
-            // Check if user is already a member
-            if let Ok(Some(user)) = self.user_repository.get_by_email(&email).await {
-                if let Ok(Some(_)) = self
-                    .repository
-                    .get_member(organization_id.0, user.id.0)
-                    .await
-                {
+            match self
+                .repository
+                .has_member_with_email(organization_id.0, &email)
+                .await
+            {
+                Ok(true) => {
                     failed += 1;
                     results.push(ports::InvitationResult {
                         email,
                         success: false,
                         member: None,
                         error: Some("User is already a member".to_string()),
+                        email_sent: false,
+                        email_error: None,
+                    });
+                    continue;
+                }
+                Ok(false) => {}
+                Err(error) => {
+                    tracing::warn!(
+                        organization_id = %organization_id.0,
+                        "Failed to check existing organization membership: {error}"
+                    );
+                    failed += 1;
+                    results.push(ports::InvitationResult {
+                        email,
+                        success: false,
+                        member: None,
+                        error: Some("Failed to verify existing membership".to_string()),
                         email_sent: false,
                         email_error: None,
                     });
@@ -1031,7 +1126,7 @@ impl OrganizationServiceImpl {
             {
                 Ok(invitation) => {
                     let email_attempt = self
-                        .send_invitation_email(&org, &invitation, &sender_details)
+                        .send_invitation_email(&organization_name, &invitation, &sender_details)
                         .await;
                     successful += 1;
                     results.push(ports::InvitationResult {
@@ -1049,7 +1144,16 @@ impl OrganizationServiceImpl {
                         email,
                         success: false,
                         member: None,
-                        error: Some(format!("Failed to create invitation: {e}")),
+                        error: Some(
+                            if matches!(
+                                e.downcast_ref::<RepositoryError>(),
+                                Some(RepositoryError::AlreadyExists)
+                            ) {
+                                "An invitation is already pending for this email; refresh the invitation list".to_string()
+                            } else {
+                                format!("Failed to create invitation: {e}")
+                            },
+                        ),
                         email_sent: false,
                         email_error: None,
                     });
@@ -1155,7 +1259,7 @@ impl OrganizationServiceImpl {
             .ok_or(OrganizationError::NotFound)?;
 
         // Verify the invitation belongs to this user
-        if invitation.email.to_lowercase() != user_email.to_lowercase() {
+        if invitation.email.trim().to_lowercase() != user_email.trim().to_lowercase() {
             return Err(OrganizationError::Unauthorized(
                 "Invitation does not belong to this user".to_string(),
             ));
@@ -1237,7 +1341,7 @@ impl OrganizationServiceImpl {
             .ok_or(OrganizationError::NotFound)?;
 
         // Verify the invitation belongs to this user
-        if invitation.email.to_lowercase() != user_email.to_lowercase() {
+        if invitation.email.trim().to_lowercase() != user_email.trim().to_lowercase() {
             return Err(OrganizationError::Unauthorized(
                 "Invitation does not belong to this user".to_string(),
             ));
@@ -1450,14 +1554,17 @@ impl OrganizationServiceImpl {
             ));
         }
 
-        let org = self
-            .get_organization_impl(invitation.organization_id.clone())
-            .await?;
+        let organization_name = self
+            .repository
+            .get_active_name_by_id(invitation.organization_id.0)
+            .await
+            .map_err(Self::map_repository_error)?
+            .ok_or(OrganizationError::NotFound)?;
         let sender_details = self
             .load_invitation_sender_details(&invitation.invited_by_user_id)
             .await;
         let email_attempt = self
-            .send_invitation_email(&org, &invitation, &sender_details)
+            .send_invitation_email(&organization_name, &invitation, &sender_details)
             .await;
 
         let updated_invitation = match email_attempt.updated_invitation {
@@ -1812,6 +1919,22 @@ impl OrganizationServiceTrait for OrganizationServiceImpl {
             .await
     }
 
+    async fn create_invitations_for_admin(
+        &self,
+        organization_id: OrganizationId,
+        requester_id: UserId,
+        invitations: Vec<(String, MemberRole)>,
+        expires_in_hours: i64,
+    ) -> Result<BatchInvitationResponse, OrganizationError> {
+        self.create_invitations_for_admin_impl(
+            organization_id,
+            requester_id,
+            invitations,
+            expires_in_hours,
+        )
+        .await
+    }
+
     async fn list_user_invitations(
         &self,
         email: &str,
@@ -1992,6 +2115,16 @@ mod tests {
             Ok((id.is_nil() || org.id.0 == id).then(|| org.clone()))
         }
 
+        async fn get_active_name_by_id(&self, id: Uuid) -> Result<Option<String>, RepositoryError> {
+            let org = self.org.lock().unwrap();
+            Ok((org.is_active && org.id.0 == id).then(|| org.name.clone()))
+        }
+
+        async fn has_owner(&self, id: Uuid) -> Result<bool, RepositoryError> {
+            let org = self.org.lock().unwrap();
+            Ok(org.id.0 == id)
+        }
+
         async fn get_by_name(&self, _: &str) -> Result<Option<Organization>, RepositoryError> {
             unimplemented!()
         }
@@ -2008,6 +2141,10 @@ mod tests {
                     member.organization_id.0 == organization_id && member.user_id.0 == user_id
                 })
                 .cloned())
+        }
+
+        async fn has_member_with_email(&self, _: Uuid, _: &str) -> Result<bool, RepositoryError> {
+            Ok(false)
         }
 
         async fn update(
@@ -2090,11 +2227,16 @@ mod tests {
 
         async fn add_member(
             &self,
-            _: Uuid,
-            _: AddOrganizationMemberRequest,
+            organization_id: Uuid,
+            request: AddOrganizationMemberRequest,
             _: Uuid,
         ) -> Result<OrganizationMember, RepositoryError> {
-            unimplemented!()
+            Ok(OrganizationMember {
+                organization_id: OrganizationId(organization_id),
+                user_id: UserId(request.user_id),
+                role: request.role,
+                joined_at: chrono::Utc::now(),
+            })
         }
 
         async fn update_member(
@@ -2223,6 +2365,7 @@ mod tests {
     }
 
     struct StubInvitationRepo {
+        create_conflict: Mutex<bool>,
         records: Mutex<Vec<OrganizationInvitation>>,
     }
 
@@ -2269,6 +2412,9 @@ mod tests {
             request: CreateInvitationRequest,
             invited_by: Uuid,
         ) -> anyhow::Result<OrganizationInvitation> {
+            if *self.create_conflict.lock().unwrap() {
+                return Err(RepositoryError::AlreadyExists.into());
+            }
             let invitation = OrganizationInvitation {
                 id: Uuid::new_v4(),
                 organization_id: OrganizationId(org_id),
@@ -2481,6 +2627,7 @@ mod tests {
             tokens_revoked_at: None,
         };
         let invitation_repo = Arc::new(StubInvitationRepo {
+            create_conflict: Mutex::new(false),
             records: Mutex::new(Vec::new()),
         });
         let email_sender = Arc::new(StubEmailSender {
@@ -2564,6 +2711,7 @@ mod tests {
             get_by_id_calls: Mutex::new(0),
         });
         let invitation_repo = Arc::new(StubInvitationRepo {
+            create_conflict: Mutex::new(false),
             records: Mutex::new(Vec::new()),
         });
         let service = OrganizationServiceImpl::new(
@@ -2775,6 +2923,7 @@ mod tests {
             get_by_id_calls: Mutex::new(0),
         });
         let invitation_repo = Arc::new(StubInvitationRepo {
+            create_conflict: Mutex::new(false),
             records: Mutex::new(Vec::new()),
         });
         let service = OrganizationServiceImpl::new(
@@ -2817,7 +2966,7 @@ mod tests {
             .create_invitations(
                 org.id,
                 org.owner_id,
-                vec![("invitee@example.com".to_string(), MemberRole::Admin)],
+                vec![(" Invitee@Example.COM ".to_string(), MemberRole::Admin)],
                 168,
             )
             .await
@@ -2831,9 +2980,190 @@ mod tests {
             &["invitee@example.com".to_string()]
         );
         let stored = invitation_repo.records.lock().unwrap()[0].clone();
+        assert_eq!(stored.email, "invitee@example.com");
         assert_eq!(stored.email_status, InvitationEmailStatus::Sent);
         assert_eq!(stored.email_message_id.as_deref(), Some("resend-email-id"));
         assert_eq!(*user_repo.get_by_id_calls.lock().unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn duplicate_invitation_emails_send_once_and_preserve_first_role() {
+        for system_admin in [false, true] {
+            let (service, invitation_repo, email_sender, user_repo) = make_service(
+                Ok(EmailDeliveryOutcome::Sent { message_id: None }),
+                Some("https://cloud.example.com/dashboard/invitations".to_string()),
+            );
+            let org = service
+                .repository
+                .get_by_id(Uuid::nil())
+                .await
+                .unwrap()
+                .unwrap();
+            let batch = vec![
+                (" Invitee@Example.com ".to_string(), MemberRole::Member),
+                ("invitee@example.com".to_string(), MemberRole::Admin),
+            ];
+            let response = if system_admin {
+                service
+                    .create_invitations_for_admin(org.id, org.owner_id, batch, 168)
+                    .await
+            } else {
+                service
+                    .create_invitations(org.id, org.owner_id, batch, 168)
+                    .await
+            }
+            .unwrap();
+            assert_eq!(
+                (response.total, response.successful, response.failed),
+                (2, 1, 1)
+            );
+            assert_eq!(
+                response.results[1].error.as_deref(),
+                Some("Duplicate email in invitation batch")
+            );
+            assert!(!response.results[1].email_sent);
+            let records = invitation_repo.records.lock().unwrap();
+            assert_eq!(records.len(), 1);
+            assert_eq!(records[0].role, MemberRole::Member);
+            assert_eq!(records[0].status, InvitationStatus::Pending);
+            assert_eq!(
+                email_sender.sent_to.lock().unwrap().as_slice(),
+                &["invitee@example.com"]
+            );
+            assert_eq!(*user_repo.get_by_id_calls.lock().unwrap(), 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn invitation_conflict_returns_actionable_error_without_sending_email() {
+        let (service, invitation_repo, email_sender, _) = make_service(
+            Ok(EmailDeliveryOutcome::Sent { message_id: None }),
+            Some("https://cloud.example.com/dashboard/invitations".to_string()),
+        );
+        let org = service
+            .repository
+            .get_by_id(Uuid::nil())
+            .await
+            .unwrap()
+            .unwrap();
+        *invitation_repo.create_conflict.lock().unwrap() = true;
+        let response = service
+            .create_invitations_for_admin(
+                org.id,
+                org.owner_id,
+                vec![("invitee@example.com".to_string(), MemberRole::Member)],
+                168,
+            )
+            .await
+            .unwrap();
+        assert_eq!((response.successful, response.failed), (0, 1));
+        assert_eq!(
+            response.results[0].error.as_deref(),
+            Some("An invitation is already pending for this email; refresh the invitation list")
+        );
+        assert!(invitation_repo.records.lock().unwrap().is_empty());
+        assert!(email_sender.sent_to.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn invitation_responses_normalize_legacy_email_and_reject_other_users() {
+        for accept in [false, true] {
+            let (service, invitation_repo, _, _) =
+                make_service(Ok(EmailDeliveryOutcome::Skipped), None);
+            let org = service
+                .repository
+                .get_by_id(Uuid::nil())
+                .await
+                .unwrap()
+                .unwrap();
+            // Seed the repository directly to represent pre-normalization invitations.
+            let invitation = invitation_repo
+                .create(
+                    org.id.0,
+                    CreateInvitationRequest {
+                        email: " Invitee@Example.COM ".to_string(),
+                        role: MemberRole::Admin,
+                        expires_in_hours: 168,
+                    },
+                    org.owner_id.0,
+                )
+                .await
+                .unwrap();
+            let user_id = UserId(Uuid::new_v4());
+            let wrong_user = if accept {
+                service
+                    .accept_invitation(invitation.id, user_id.clone(), "other@example.com")
+                    .await
+                    .map(|_| ())
+            } else {
+                service
+                    .decline_invitation(invitation.id, "other@example.com")
+                    .await
+            };
+            assert!(matches!(
+                wrong_user,
+                Err(OrganizationError::Unauthorized(_))
+            ));
+            assert_eq!(
+                invitation_repo.latest(invitation.id).status,
+                InvitationStatus::Pending
+            );
+            if accept {
+                let member = service
+                    .accept_invitation(invitation.id, user_id, "  invitee@EXAMPLE.com ")
+                    .await
+                    .unwrap();
+                assert_eq!(member.role, MemberRole::Admin);
+                assert_eq!(
+                    invitation_repo.latest(invitation.id).status,
+                    InvitationStatus::Accepted
+                );
+            } else {
+                service
+                    .decline_invitation(invitation.id, "  invitee@EXAMPLE.com ")
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    invitation_repo.latest(invitation.id).status,
+                    InvitationStatus::Declined
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn accepted_invitation_preserves_assigned_role() {
+        let (service, invitation_repo, _, _) =
+            make_service(Ok(EmailDeliveryOutcome::Skipped), None);
+        let org = service
+            .repository
+            .get_by_id(Uuid::nil())
+            .await
+            .unwrap()
+            .unwrap();
+
+        let response = service
+            .create_invitations(
+                org.id,
+                org.owner_id,
+                vec![("invitee@example.com".to_string(), MemberRole::Admin)],
+                168,
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.successful, 1);
+
+        let invitation_id = invitation_repo.records.lock().unwrap()[0].id;
+        let member = service
+            .accept_invitation(invitation_id, UserId(Uuid::new_v4()), "Invitee@Example.com")
+            .await
+            .unwrap();
+
+        assert_eq!(member.role, MemberRole::Admin);
+        assert_eq!(
+            invitation_repo.latest(invitation_id).status,
+            InvitationStatus::Accepted
+        );
     }
 
     #[tokio::test]

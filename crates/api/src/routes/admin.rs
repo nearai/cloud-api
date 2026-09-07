@@ -1,6 +1,7 @@
 use crate::conversions::{
     api_invitation_email_status_to_services, api_invitation_status_to_services,
-    services_invitation_email_delivery_to_api, services_invitation_resend_result_to_api,
+    api_role_to_services_role, services_invitation_email_delivery_to_api,
+    services_invitation_resend_result_to_api, services_invitation_result_to_api,
 };
 use crate::middleware::AdminUser;
 use crate::models::{
@@ -11,6 +12,7 @@ use crate::models::{
     CreateAdminAccessTokenRequest, CreateServiceRequest, CreditType, DecimalPrice,
     DecimalPriceRequest, DeleteAdminAccessTokenRequest, DeleteModelRequest, DeprecateModelRequest,
     DeprecateModelResponse, ErrorResponse, GetOrganizationConcurrentLimitResponse,
+    InviteOrganizationMemberByEmailRequest, InviteOrganizationMemberByEmailResponse,
     ListAdminAmlAllowlistResponse, ListAdminAmlReportsResponse,
     ListAdminInvitationEmailDeliveriesResponse, ListAdminOrganizationMembersResponse,
     ListOrganizationsAdminResponse, ListPricingChangesResponse, ListUsersResponse, MemberRole,
@@ -38,7 +40,7 @@ use chrono::{DateTime, Duration, Timelike, Utc};
 use config::ApiConfig;
 use services::admin::{AdminService, AnalyticsService, UpdateModelAdminRequest};
 use services::aml::{AmlAllowlistEntry, AmlError, AmlReport};
-use services::auth::AuthServiceTrait;
+use services::auth::{AuthServiceTrait, UserId};
 use services::github_dispatch::GitHubDispatcher;
 use services::usage::UsageServiceTrait;
 use std::sync::Arc;
@@ -2925,6 +2927,109 @@ pub async fn list_organization_members(
         total,
         limit: params.limit,
         offset: params.offset,
+    }))
+}
+
+/// Invite organization members as a system administrator
+#[utoipa::path(
+    post,
+    path = "/v1/admin/organizations/{org_id}/members/invite-by-email",
+    tag = "Admin",
+    params(
+        ("org_id" = Uuid, Path, description = "Organization ID")
+    ),
+    request_body = InviteOrganizationMemberByEmailRequest,
+    responses(
+        (status = 200, description = "Invitation results", body = InviteOrganizationMemberByEmailResponse),
+        (status = 400, description = "Invalid request", body = ErrorResponse),
+        (status = 401, description = "Unauthorized", body = ErrorResponse),
+        (status = 403, description = "System administrator privileges required", body = ErrorResponse),
+        (status = 404, description = "Organization not found", body = ErrorResponse),
+        (status = 500, description = "Internal server error", body = ErrorResponse)
+    ),
+    security(
+        ("session_token" = [])
+    )
+)]
+pub async fn invite_organization_members(
+    State(app_state): State<AdminAppState>,
+    Extension(admin_user): Extension<AdminUser>,
+    Path(org_id): Path<Uuid>,
+    Json(request): Json<InviteOrganizationMemberByEmailRequest>,
+) -> Result<
+    ResponseJson<InviteOrganizationMemberByEmailResponse>,
+    (StatusCode, ResponseJson<ErrorResponse>),
+> {
+    if let Err(message) = request.validate() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            ResponseJson(ErrorResponse::new(message, "invalid_request".to_string())),
+        ));
+    }
+
+    let invitation_count = request.invitations.len();
+    let invitations = request
+        .invitations
+        .into_iter()
+        .map(|invitation| (invitation.email, api_role_to_services_role(invitation.role)))
+        .collect();
+
+    const DEFAULT_EXPIRATION_HOURS: i64 = 168;
+    let result = app_state
+        .organization_service
+        .create_invitations_for_admin(
+            services::organization::OrganizationId(org_id),
+            UserId(admin_user.0.id),
+            invitations,
+            DEFAULT_EXPIRATION_HOURS,
+        )
+        .await
+        .map_err(|error| match error {
+            services::organization::OrganizationError::NotFound => (
+                StatusCode::NOT_FOUND,
+                ResponseJson(ErrorResponse::new(
+                    "Organization not found".to_string(),
+                    "not_found".to_string(),
+                )),
+            ),
+            services::organization::OrganizationError::InvalidParams(message) => (
+                StatusCode::BAD_REQUEST,
+                ResponseJson(ErrorResponse::new(message, "invalid_request".to_string())),
+            ),
+            services::organization::OrganizationError::Unauthorized(message) => (
+                StatusCode::FORBIDDEN,
+                ResponseJson(ErrorResponse::new(message, "forbidden".to_string())),
+            ),
+            error => {
+                error!("Failed to create organization invitations: {:?}", error);
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    ResponseJson(ErrorResponse::new(
+                        "Failed to create organization invitations".to_string(),
+                        "internal_server_error".to_string(),
+                    )),
+                )
+            }
+        })?;
+
+    tracing::info!(
+        organization_id = %org_id,
+        admin_user_id = %admin_user.0.id,
+        invitation_count,
+        successful = result.successful,
+        failed = result.failed,
+        "System administrator created organization invitations"
+    );
+
+    Ok(ResponseJson(InviteOrganizationMemberByEmailResponse {
+        results: result
+            .results
+            .into_iter()
+            .map(services_invitation_result_to_api)
+            .collect(),
+        total: result.total,
+        successful: result.successful,
+        failed: result.failed,
     }))
 }
 

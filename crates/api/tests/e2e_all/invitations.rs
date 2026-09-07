@@ -115,7 +115,7 @@ async fn test_cancel_invitation_short_path() {
 }
 
 #[tokio::test]
-async fn test_user_invitations_include_organization_name() {
+async fn test_user_invitations_match_email_case_insensitively_and_include_organization_name() {
     let (server, database) = setup_test_server_with_database().await;
     let org_name = format!("Invitation Org {}", uuid::Uuid::new_v4());
 
@@ -157,7 +157,7 @@ async fn test_user_invitations_include_organization_name() {
             &[
                 &invitation_id,
                 &organization_id,
-                &"admin@test.com",
+                &"Admin@Test.com",
                 &"member",
                 &invited_by_user_id,
                 &"pending",
@@ -183,7 +183,7 @@ async fn test_user_invitations_include_organization_name() {
         .expect("authenticated user should have a pending invitation for the created organization");
 
     assert_eq!(invitation.organization_name, org.name);
-    assert_eq!(invitation.invitation.email, "admin@test.com");
+    assert_eq!(invitation.invitation.email, "Admin@Test.com");
     assert_eq!(
         invitation.invited_by_display_name,
         Some("Test User".to_string())

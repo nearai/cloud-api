@@ -414,9 +414,9 @@ async fn test_system_prompt_isolation() {
     );
 }
 
-/// Test that system prompt is applied in conversation responses
+/// Test that system prompt is applied to a stateless Responses request.
 #[tokio::test]
-async fn test_system_prompt_integration_with_responses() {
+async fn test_system_prompt_integration_with_stateless_responses() {
     let server = setup_test_server().await;
     let org = setup_org_with_credits(&server, 10000000000i64).await;
     let api_key = get_api_key_for_org(&server, org.id.clone()).await;
@@ -434,15 +434,6 @@ async fn test_system_prompt_integration_with_responses() {
         }))
         .await;
 
-    // Create conversation and response
-    let conversation = server
-        .post("/v1/conversations")
-        .add_header("Authorization", format!("Bearer {api_key}"))
-        .add_header("User-Agent", MOCK_USER_AGENT)
-        .json(&json!({ "metadata": { "source": "test" } }))
-        .await
-        .json::<api::models::ConversationObject>();
-
     let response = server
         .post("/v1/responses")
         .add_header("Authorization", format!("Bearer {api_key}"))
@@ -450,7 +441,7 @@ async fn test_system_prompt_integration_with_responses() {
         .json(&json!({
             "model": "Qwen/Qwen3-30B-A3B-Instruct-2507",
             "input": "Hello",
-            "conversation": conversation.id,
+            "store": false,
             "stream": false
         }))
         .await;

@@ -1,678 +1,315 @@
-//! E2E tests for external function tools in the responses API.
-//!
-//! This test simulates a realistic multi-turn conversation with external function tools:
-//! 1. First request: LLM requests function call, response is incomplete with FunctionCall output
-//! 2. Second request: Client provides function output, LLM produces final response
-//!
-//! Unlike MCP tools (server-executed), function tools are executed by the client externally.
-//! The API returns FunctionCall items and pauses until the client submits FunctionCallOutput.
+//! E2E coverage for client-managed function tools on stateless Responses.
 
 use crate::common::*;
+use inference_providers::{
+    mock::{RequestMatcher, ResponseTemplate, ToolCall},
+    MessageRole,
+};
+use std::sync::Arc;
 
-/// Test a single function call flow:
-/// 1. Client sends request with function tool definition
-/// 2. LLM calls the function → response is incomplete with FunctionCall in output
-/// 3. Client sends FunctionCallOutput with the result
-/// 4. LLM produces final response → response is complete
 #[tokio::test]
-async fn test_function_tool_single_call() {
-    let (server, _, mock, _) = setup_test_server_with_pool().await;
-    setup_qwen_model(&server).await;
+async fn stateless_function_call_is_replayed_by_the_client_without_server_history() {
+    let (server, _pool, mock, _database) = setup_test_server_with_pool().await;
+    let model = setup_qwen_model(&server).await;
     let org = setup_org_with_credits(&server, 10_000_000_000i64).await;
     let api_key = get_api_key_for_org(&server, org.id).await;
 
-    // Create conversation
-    let conv_resp = server
-        .post("/v1/conversations")
-        .add_header("Authorization", format!("Bearer {api_key}"))
-        .json(&serde_json::json!({"name": "Function Tool Test"}))
-        .await;
-    assert_eq!(conv_resp.status_code(), 201);
-    let conversation = conv_resp.json::<api::models::ConversationObject>();
-
-    // Define a function tool
-    let function_tool = serde_json::json!({
-        "type": "function",
-        "name": "get_weather",
-        "description": "Get the current weather for a location",
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "location": {
-                    "type": "string",
-                    "description": "The city name"
-                }
-            },
-            "required": ["location"]
-        }
-    });
-
-    // ========================================
-    // Turn 1: LLM requests function call
-    // ========================================
-    println!("Turn 1: LLM requests function call...");
-
-    let turn1_user = "What's the weather in Tokyo?";
-
-    // Mock the LLM to request a tool call
-    use crate::common::mock_prompts;
-    let turn1_prompt = mock_prompts::build_prompt(turn1_user);
-    mock.when(inference_providers::mock::RequestMatcher::ExactPrompt(
-        turn1_prompt,
-    ))
+    let prompt = "What is the weather in Shanghai?";
+    mock.when(RequestMatcher::PromptWithTools {
+        prompt: mock_prompts::build_prompt(prompt),
+        tool_names: vec!["get_weather".to_string()],
+    })
     .respond_with(
-        inference_providers::mock::ResponseTemplate::new("").with_tool_calls(vec![
-            inference_providers::mock::ToolCall::new("get_weather", r#"{"location": "Tokyo"}"#),
-        ]),
+        ResponseTemplate::new("").with_tool_calls(vec![ToolCall::new(
+            "get_weather",
+            r#"{"location":"Shanghai"}"#,
+        )
+        .with_thought_signature("gemini-thought-signature")]),
     )
     .await;
-
-    let resp1 = server
-        .post("/v1/responses")
-        .add_header("Authorization", format!("Bearer {api_key}"))
-        .json(&serde_json::json!({
-            "model": "Qwen/Qwen3-30B-A3B-Instruct-2507",
-            "conversation": {"id": conversation.id},
-            "input": turn1_user,
-            "stream": false,
-            "tools": [function_tool.clone()]
-        }))
-        .await;
-
-    assert_eq!(resp1.status_code(), 200, "Turn 1 failed: {}", resp1.text());
-    let resp1_obj = resp1.json::<api::models::ResponseObject>();
-
-    // Response should be incomplete - waiting for function output
-    assert_eq!(
-        resp1_obj.status,
-        api::models::ResponseStatus::Incomplete,
-        "Turn 1 should be incomplete (waiting for function output)"
-    );
-
-    // Extract FunctionCall from output
-    let function_call = resp1_obj
-        .output
-        .iter()
-        .find_map(|item| {
-            if let api::models::ResponseOutputItem::FunctionCall {
-                call_id,
-                name,
-                arguments,
-                ..
-            } = item
-            {
-                Some((call_id.clone(), name.clone(), arguments.clone()))
-            } else {
-                None
-            }
-        })
-        .expect("Turn 1 should return FunctionCall");
-
-    let (call_id, tool_name, arguments) = function_call;
-    assert_eq!(tool_name, "get_weather");
-    assert!(arguments.contains("Tokyo"));
-    println!(
-        "  ✓ Received FunctionCall: call_id={}, name={}, arguments={}",
-        call_id, tool_name, arguments
-    );
-
-    // ========================================
-    // Turn 2: Client provides function output
-    // ========================================
-    println!("Turn 2: Client provides function output...");
-
-    let function_output = r#"{"temperature": 22, "conditions": "partly cloudy", "humidity": 65}"#;
-
-    // Mock the LLM response after receiving tool result
-    let turn2_with_tool_result_prompt =
-        mock_prompts::build_prompt(&format!("{} {}", turn1_user, function_output));
-    mock.when(inference_providers::mock::RequestMatcher::ExactPrompt(
-        turn2_with_tool_result_prompt,
-    ))
-    .respond_with(inference_providers::mock::ResponseTemplate::new(
-        "The current weather in Tokyo is 22°C with partly cloudy skies and 65% humidity. It's a pleasant day!",
+    mock.set_default_response(ResponseTemplate::new(
+        "The temperature in Shanghai is 22°C.",
     ))
     .await;
 
-    let resp2 = server
-        .post("/v1/responses")
-        .add_header("Authorization", format!("Bearer {api_key}"))
-        .json(&serde_json::json!({
-            "model": "Qwen/Qwen3-30B-A3B-Instruct-2507",
-            "conversation": {"id": conversation.id},
-            "previous_response_id": resp1_obj.id,
-            "input": [{
-                "type": "function_call_output",
-                "call_id": call_id,
-                "output": function_output
-            }],
-            "stream": false,
-            "tools": [function_tool.clone()]
-        }))
-        .await;
-
-    assert_eq!(resp2.status_code(), 200, "Turn 2 failed: {}", resp2.text());
-    let resp2_obj = resp2.json::<api::models::ResponseObject>();
-
-    // Response should be complete
-    assert_eq!(
-        resp2_obj.status,
-        api::models::ResponseStatus::Completed,
-        "Turn 2 should be completed"
-    );
-
-    // Verify the final response contains the weather information
-    let final_message = resp2_obj
-        .output
-        .iter()
-        .find(|item| matches!(item, api::models::ResponseOutputItem::Message { .. }));
-    assert!(
-        final_message.is_some(),
-        "Turn 2 should have a message output. Got: {:?}",
-        resp2_obj.output
-    );
-
-    // Extract text from the message content
-    let text =
-        if let api::models::ResponseOutputItem::Message { content, .. } = final_message.unwrap() {
-            assert!(!content.is_empty(), "message content should not be empty");
-            match &content[0] {
-                api::models::ResponseOutputContent::OutputText { text, .. } => text.clone(),
-                _ => panic!("Expected OutputText content"),
-            }
-        } else {
-            panic!("Expected Message variant");
-        };
-
-    assert!(
-        text.contains("Tokyo") || text.contains("22") || text.contains("cloudy"),
-        "Final response should reference weather. Got: {}",
-        text
-    );
-    println!("  ✓ LLM produced final response: {}", text);
-    println!("\n✅ Function tool single call test passed!");
-}
-
-/// Test parallel function calls:
-/// 1. LLM requests multiple function calls at once
-/// 2. Client provides all function outputs in one request
-/// 3. LLM produces final response
-#[tokio::test]
-async fn test_function_tool_parallel_calls() {
-    let (server, _, mock, _) = setup_test_server_with_pool().await;
-    setup_qwen_model(&server).await;
-    let org = setup_org_with_credits(&server, 10_000_000_000i64).await;
-    let api_key = get_api_key_for_org(&server, org.id).await;
-
-    // Create conversation
-    let conv_resp = server
-        .post("/v1/conversations")
-        .add_header("Authorization", format!("Bearer {api_key}"))
-        .json(&serde_json::json!({"name": "Parallel Function Tool Test"}))
-        .await;
-    assert_eq!(conv_resp.status_code(), 201);
-    let conversation = conv_resp.json::<api::models::ConversationObject>();
-
-    // Define function tools
-    let weather_tool = serde_json::json!({
+    let tools = serde_json::json!([{
         "type": "function",
         "name": "get_weather",
-        "description": "Get the current weather for a location",
+        "description": "Get the current weather for a location.",
         "parameters": {
             "type": "object",
-            "properties": {
-                "location": {"type": "string"}
-            },
+            "properties": {"location": {"type": "string"}},
             "required": ["location"]
         }
-    });
+    }]);
 
-    let time_tool = serde_json::json!({
-        "type": "function",
-        "name": "get_time",
-        "description": "Get the current time for a timezone",
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "timezone": {"type": "string"}
-            },
-            "required": ["timezone"]
-        }
-    });
-
-    // ========================================
-    // Turn 1: LLM requests multiple function calls
-    // ========================================
-    println!("Turn 1: LLM requests multiple function calls...");
-
-    let turn1_user = "What's the weather and current time in New York?";
-
-    use crate::common::mock_prompts;
-    let turn1_prompt = mock_prompts::build_prompt(turn1_user);
-    mock.when(inference_providers::mock::RequestMatcher::ExactPrompt(
-        turn1_prompt,
-    ))
-    .respond_with(
-        inference_providers::mock::ResponseTemplate::new("").with_tool_calls(vec![
-            inference_providers::mock::ToolCall::new("get_weather", r#"{"location": "New York"}"#),
-            inference_providers::mock::ToolCall::new(
-                "get_time",
-                r#"{"timezone": "America/New_York"}"#,
-            ),
-        ]),
-    )
-    .await;
-
-    let resp1 = server
+    // First turn: Cloud returns a requested function call, but does not run it.
+    let first = server
         .post("/v1/responses")
         .add_header("Authorization", format!("Bearer {api_key}"))
         .json(&serde_json::json!({
-            "model": "Qwen/Qwen3-30B-A3B-Instruct-2507",
-            "conversation": {"id": conversation.id},
-            "input": turn1_user,
+            "model": model,
+            "input": prompt,
+            "store": false,
             "stream": false,
-            "tools": [weather_tool.clone(), time_tool.clone()]
+            "tools": tools,
         }))
         .await;
-
-    assert_eq!(resp1.status_code(), 200, "Turn 1 failed: {}", resp1.text());
-    let resp1_obj = resp1.json::<api::models::ResponseObject>();
-
-    // Response should be incomplete
     assert_eq!(
-        resp1_obj.status,
-        api::models::ResponseStatus::Incomplete,
-        "Turn 1 should be incomplete"
+        first.status_code(),
+        200,
+        "first turn failed: {}",
+        first.text()
     );
-
-    // Extract all FunctionCalls from output
-    let function_calls: Vec<_> = resp1_obj
-        .output
-        .iter()
-        .filter_map(|item| {
-            if let api::models::ResponseOutputItem::FunctionCall {
-                call_id,
-                name,
-                arguments,
-                ..
-            } = item
-            {
-                Some((call_id.clone(), name.clone(), arguments.clone()))
-            } else {
-                None
-            }
-        })
-        .collect();
-
+    let first = first.json::<serde_json::Value>();
+    assert_eq!(first["status"], "incomplete");
     assert_eq!(
-        function_calls.len(),
-        2,
-        "Should have 2 FunctionCalls, got: {:?}",
-        function_calls
+        first["incomplete_details"]["reason"],
+        "function_call_required"
     );
-    println!("  ✓ Received {} FunctionCalls", function_calls.len());
-
-    // Find the call_ids for each function
-    let weather_call = function_calls
+    assert_eq!(
+        mock.chat_completion_call_count(),
+        1,
+        "a client-managed function call must not trigger a follow-up completion"
+    );
+    let function_call = first["output"]
+        .as_array()
+        .expect("first response has output")
         .iter()
-        .find(|(_, name, _)| name == "get_weather")
-        .expect("Should have get_weather call");
-    let time_call = function_calls
-        .iter()
-        .find(|(_, name, _)| name == "get_time")
-        .expect("Should have get_time call");
-
-    println!(
-        "    - get_weather: call_id={}, args={}",
-        weather_call.0, weather_call.2
-    );
-    println!(
-        "    - get_time: call_id={}, args={}",
-        time_call.0, time_call.2
+        .find(|item| item["type"] == "function_call")
+        .expect("first response returns a function_call")
+        .clone();
+    let call_id = function_call["call_id"]
+        .as_str()
+        .expect("function call has call_id")
+        .to_string();
+    assert_eq!(
+        function_call["thought_signature"],
+        "gemini-thought-signature"
     );
 
-    // ========================================
-    // Turn 2: Client provides all function outputs
-    // ========================================
-    println!("Turn 2: Client provides all function outputs...");
-
-    let weather_output = r#"{"temperature": 18, "conditions": "sunny"}"#;
-    let time_output = r#"{"time": "2:30 PM", "date": "2024-01-15"}"#;
-
-    // Mock the LLM response after receiving both tool results
-    let turn2_with_tool_results_prompt = mock_prompts::build_prompt(&format!(
-        "{} {} {}",
-        turn1_user, weather_output, time_output
-    ));
-    mock.when(inference_providers::mock::RequestMatcher::ExactPrompt(
-        turn2_with_tool_results_prompt,
-    ))
-    .respond_with(inference_providers::mock::ResponseTemplate::new(
-        "In New York, it's currently 2:30 PM on January 15th. The weather is sunny with a temperature of 18°C.",
-    ))
-    .await;
-
-    let resp2 = server
+    // The caller executes the function and sends both the returned call item
+    // and its result in a new stateless request. No response ID is referenced.
+    let second = server
         .post("/v1/responses")
         .add_header("Authorization", format!("Bearer {api_key}"))
         .json(&serde_json::json!({
-            "model": "Qwen/Qwen3-30B-A3B-Instruct-2507",
-            "conversation": {"id": conversation.id},
-            "previous_response_id": resp1_obj.id,
+            "model": model,
+            "store": false,
+            "stream": false,
             "input": [
+                {"role": "user", "content": prompt},
+                {
+                    "type": "message",
+                    "id": "msg_first_turn",
+                    "status": "completed",
+                    "role": "assistant",
+                    "content": [{
+                        "type": "output_text",
+                        "text": "I will look that up.",
+                        "annotations": [],
+                        "logprobs": []
+                    }]
+                },
+                function_call,
                 {
                     "type": "function_call_output",
-                    "call_id": weather_call.0,
-                    "output": weather_output
+                    "call_id": call_id,
+                    "output": "{\"temperature_c\":22}"
+                }
+            ],
+            "tools": tools,
+        }))
+        .await;
+    assert_eq!(
+        second.status_code(),
+        200,
+        "second turn failed: {}",
+        second.text()
+    );
+    let second = second.json::<serde_json::Value>();
+    assert_eq!(second["status"], "completed");
+
+    // The provider receives the raw assistant output text and replayed custom
+    // tool call in one assistant turn, followed by the client-produced tool
+    // result. Cloud did not execute the custom function.
+    let params = mock
+        .last_chat_params()
+        .await
+        .expect("second request reached provider");
+    let assistant = params
+        .messages
+        .iter()
+        .find(|message| {
+            message.role == MessageRole::Assistant && message.tool_calls.as_ref().is_some()
+        })
+        .expect("provider received replayed assistant tool call");
+    assert_eq!(
+        assistant.content.as_ref(),
+        Some(&serde_json::json!("I will look that up.")),
+        "assistant output text and its function call must remain one provider turn"
+    );
+    let tool_calls = assistant.tool_calls.as_ref().expect("tool calls present");
+    assert_eq!(tool_calls.len(), 1);
+    assert_eq!(tool_calls[0].id.as_deref(), Some(call_id.as_str()));
+    assert_eq!(tool_calls[0].function.name.as_deref(), Some("get_weather"));
+    assert_eq!(
+        tool_calls[0].thought_signature.as_deref(),
+        Some("gemini-thought-signature")
+    );
+
+    let tool_result = params
+        .messages
+        .iter()
+        .find(|message| message.role == MessageRole::Tool)
+        .expect("provider received client-produced tool result");
+    assert_eq!(tool_result.tool_call_id.as_deref(), Some(call_id.as_str()));
+    assert_eq!(
+        tool_result.content.as_ref(),
+        Some(&serde_json::json!("{\"temperature_c\":22}"))
+    );
+    assert_eq!(
+        mock.chat_completion_call_count(),
+        2,
+        "each client request should result in exactly one completion"
+    );
+}
+
+#[tokio::test]
+async fn stateless_response_without_tools_completes_after_one_completion() {
+    let (server, _pool, mock, _database) = setup_test_server_with_pool().await;
+    let model = setup_qwen_model(&server).await;
+    let org = setup_org_with_credits(&server, 10_000_000_000i64).await;
+    let api_key = get_api_key_for_org(&server, org.id).await;
+
+    mock.set_default_response(ResponseTemplate::new("A normal answer."))
+        .await;
+
+    let response = server
+        .post("/v1/responses")
+        .add_header("Authorization", format!("Bearer {api_key}"))
+        .json(&serde_json::json!({
+            "model": model,
+            "input": "Say hello.",
+            "store": false,
+            "stream": false,
+        }))
+        .await;
+
+    assert_eq!(
+        response.status_code(),
+        200,
+        "response failed: {}",
+        response.text()
+    );
+    let response = response.json::<serde_json::Value>();
+    assert_eq!(response["status"], "completed");
+    assert_eq!(response["tools"], serde_json::json!([]));
+    assert_eq!(mock.chat_completion_call_count(), 1);
+}
+
+#[tokio::test]
+async fn stateless_custom_web_search_function_is_not_executed_as_a_builtin_tool() {
+    // Install a working built-in web-search provider. If the custom function
+    // below were accidentally claimed by the built-in executor, this response
+    // would continue after server-side search rather than pause for the client.
+    let (server, _database, mock) = setup_test_server_with_search_providers(
+        Arc::new(MockWebSearchProvider::default_results()),
+        None,
+    )
+    .await;
+    let model = setup_qwen_model(&server).await;
+    let org = setup_org_with_credits(&server, 10_000_000_000i64).await;
+    let api_key = get_api_key_for_org(&server, org.id).await;
+
+    let prompt = "Search the web for the current weather in Shanghai.";
+    mock.when(RequestMatcher::PromptWithTools {
+        prompt: mock_prompts::build_prompt(prompt),
+        tool_names: vec!["web_search".to_string()],
+    })
+    .respond_with(
+        ResponseTemplate::new("").with_tool_calls(vec![ToolCall::new(
+            "web_search",
+            r#"{"query":"Shanghai weather"}"#,
+        )]),
+    )
+    .await;
+
+    let response = server
+        .post("/v1/responses")
+        .add_header("Authorization", format!("Bearer {api_key}"))
+        .json(&serde_json::json!({
+            "model": model,
+            "input": prompt,
+            "store": false,
+            "stream": false,
+            "tools": [{
+                "type": "function",
+                "name": "web_search",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"query": {"type": "string"}},
+                    "required": ["query"]
+                }
+            }]
+        }))
+        .await;
+
+    assert_eq!(
+        response.status_code(),
+        200,
+        "response failed: {}",
+        response.text()
+    );
+    let response = response.json::<serde_json::Value>();
+    assert_eq!(response["status"], "incomplete");
+    assert_eq!(
+        response["incomplete_details"]["reason"],
+        "function_call_required"
+    );
+    assert!(response["output"]
+        .as_array()
+        .expect("response has output")
+        .iter()
+        .any(|item| item["type"] == "function_call" && item["name"] == "web_search"));
+}
+
+#[tokio::test]
+async fn stateless_mcp_tools_are_rejected_before_provider_work() {
+    let (server, _pool, mock, _database) = setup_test_server_with_pool().await;
+    let model = setup_qwen_model(&server).await;
+    let org = setup_org_with_credits(&server, 10_000_000_000i64).await;
+    let api_key = get_api_key_for_org(&server, org.id).await;
+
+    let response = server
+        .post("/v1/responses")
+        .add_header("Authorization", format!("Bearer {api_key}"))
+        .json(&serde_json::json!({
+            "model": model,
+            "input": "What is the weather?",
+            "store": false,
+            "stream": false,
+            "tools": [
+                {
+                    "type": "function",
+                    "name": "weather:get_weather",
+                    "parameters": {"type": "object"}
                 },
                 {
-                    "type": "function_call_output",
-                    "call_id": time_call.0,
-                    "output": time_output
+                    "type": "mcp",
+                    "server_label": "weather",
+                    "server_url": "https://example.com/mcp",
+                    "require_approval": "never"
                 }
-            ],
-            "stream": false,
-            "tools": [weather_tool.clone(), time_tool.clone()]
+            ]
         }))
         .await;
 
-    assert_eq!(resp2.status_code(), 200, "Turn 2 failed: {}", resp2.text());
-    let resp2_obj = resp2.json::<api::models::ResponseObject>();
-
-    // Response should be complete
-    assert_eq!(
-        resp2_obj.status,
-        api::models::ResponseStatus::Completed,
-        "Turn 2 should be completed"
-    );
-
-    // Verify the final response
-    let final_message = resp2_obj
-        .output
-        .iter()
-        .find(|item| matches!(item, api::models::ResponseOutputItem::Message { .. }));
+    assert_eq!(response.status_code(), 400, "response: {}", response.text());
+    let error = response.json::<api::models::ErrorResponse>();
+    assert_eq!(error.error.r#type, "invalid_request_error");
     assert!(
-        final_message.is_some(),
-        "Turn 2 should have a message output"
+        mock.last_chat_params().await.is_none(),
+        "MCP should be rejected before provider work"
     );
-
-    let text =
-        if let api::models::ResponseOutputItem::Message { content, .. } = final_message.unwrap() {
-            match &content[0] {
-                api::models::ResponseOutputContent::OutputText { text, .. } => text.clone(),
-                _ => panic!("Expected OutputText content"),
-            }
-        } else {
-            panic!("Expected Message variant");
-        };
-
-    assert!(
-        text.contains("New York") || text.contains("2:30") || text.contains("18"),
-        "Final response should reference location, time, or weather. Got: {}",
-        text
-    );
-    println!("  ✓ LLM produced final response: {}", text);
-    println!("\n✅ Function tool parallel calls test passed!");
-}
-
-/// Regression test: FunctionCallOutput + Message in same input must preserve order.
-/// Tool results must immediately follow the assistant message with tool_calls;
-/// a user message in between violates the LLM provider contract.
-/// With the fix: [assistant+tool_calls, tool_result, user_message]
-/// Bug: [assistant+tool_calls, user_message, tool_result] - wrong
-#[tokio::test]
-async fn test_function_output_and_message_ordering() {
-    let (server, _, mock, _) = setup_test_server_with_pool().await;
-    setup_qwen_model(&server).await;
-    let org = setup_org_with_credits(&server, 10_000_000_000i64).await;
-    let api_key = get_api_key_for_org(&server, org.id).await;
-
-    let conv_resp = server
-        .post("/v1/conversations")
-        .add_header("Authorization", format!("Bearer {api_key}"))
-        .json(&serde_json::json!({"name": "Function Output + Message Ordering Test"}))
-        .await;
-    assert_eq!(conv_resp.status_code(), 201);
-    let conversation = conv_resp.json::<api::models::ConversationObject>();
-
-    let function_tool = serde_json::json!({
-        "type": "function",
-        "name": "get_weather",
-        "description": "Get weather",
-        "parameters": {"type": "object", "properties": {"location": {"type": "string"}}, "required": ["location"]}
-    });
-
-    // Turn 1: LLM requests function call
-    let turn1_user = "What's the weather in Paris?";
-    use crate::common::mock_prompts;
-    mock.when(inference_providers::mock::RequestMatcher::ExactPrompt(
-        mock_prompts::build_prompt(turn1_user),
-    ))
-    .respond_with(
-        inference_providers::mock::ResponseTemplate::new("").with_tool_calls(vec![
-            inference_providers::mock::ToolCall::new("get_weather", r#"{"location": "Paris"}"#),
-        ]),
-    )
-    .await;
-
-    let resp1 = server
-        .post("/v1/responses")
-        .add_header("Authorization", format!("Bearer {api_key}"))
-        .json(&serde_json::json!({
-            "model": "Qwen/Qwen3-30B-A3B-Instruct-2507",
-            "conversation": {"id": conversation.id},
-            "input": turn1_user,
-            "stream": false,
-            "tools": [function_tool.clone()]
-        }))
-        .await;
-
-    assert_eq!(resp1.status_code(), 200, "Turn 1 failed: {}", resp1.text());
-    let resp1_obj = resp1.json::<api::models::ResponseObject>();
-    assert_eq!(
-        resp1_obj.status,
-        api::models::ResponseStatus::Incomplete,
-        "Turn 1 should be incomplete"
-    );
-
-    let function_call = resp1_obj
-        .output
-        .iter()
-        .find_map(|item| {
-            if let api::models::ResponseOutputItem::FunctionCall { call_id, .. } = item {
-                Some(call_id.clone())
-            } else {
-                None
-            }
-        })
-        .expect("Turn 1 should return FunctionCall");
-
-    let function_output = r#"{"temperature": 15, "conditions": "cloudy"}"#;
-    let follow_up_message = "Thanks! Is it going to rain tomorrow?";
-
-    // Correct order: tool_result before user message (LLM provider contract)
-    // build_prompt concatenates text in message order: turn1, tool_output, follow_up
-    let expected_prompt = mock_prompts::build_prompt(&format!(
-        "{} {} {}",
-        turn1_user, function_output, follow_up_message
-    ));
-    mock.when(inference_providers::mock::RequestMatcher::ExactPrompt(
-        expected_prompt,
-    ))
-    .respond_with(inference_providers::mock::ResponseTemplate::new(
-        "Based on the current cloudy conditions, there's a 60% chance of rain tomorrow.",
-    ))
-    .await;
-
-    // Turn 2: BOTH FunctionCallOutput AND Message - order matters
-    let resp2 = server
-        .post("/v1/responses")
-        .add_header("Authorization", format!("Bearer {api_key}"))
-        .json(&serde_json::json!({
-            "model": "Qwen/Qwen3-30B-A3B-Instruct-2507",
-            "conversation": {"id": conversation.id},
-            "previous_response_id": resp1_obj.id,
-            "input": [
-                {"type": "function_call_output", "call_id": function_call, "output": function_output},
-                {"type": "message", "role": "user", "content": follow_up_message}
-            ],
-            "stream": false,
-            "tools": [function_tool.clone()]
-        }))
-        .await;
-
-    assert_eq!(resp2.status_code(), 200, "Turn 2 failed: {}", resp2.text());
-    let resp2_obj = resp2.json::<api::models::ResponseObject>();
-    assert_eq!(
-        resp2_obj.status,
-        api::models::ResponseStatus::Completed,
-        "Turn 2 should complete - wrong message ordering may cause provider errors"
-    );
-
-    let final_message = resp2_obj
-        .output
-        .iter()
-        .find(|item| matches!(item, api::models::ResponseOutputItem::Message { .. }));
-    assert!(final_message.is_some(), "Turn 2 should have message output");
-    println!("✅ FunctionCallOutput + Message ordering test passed!");
-}
-
-/// Test function tool with no previous_response_id (first turn with function output).
-/// This tests the edge case where a client might try to submit function output
-/// without a previous response context.
-#[tokio::test]
-async fn test_function_output_without_previous_response_fails() {
-    let (server, _, _, _) = setup_test_server_with_pool().await;
-    setup_qwen_model(&server).await;
-    let org = setup_org_with_credits(&server, 10_000_000_000i64).await;
-    let api_key = get_api_key_for_org(&server, org.id).await;
-
-    // Create conversation
-    let conv_resp = server
-        .post("/v1/conversations")
-        .add_header("Authorization", format!("Bearer {api_key}"))
-        .json(&serde_json::json!({"name": "Invalid Function Output Test"}))
-        .await;
-    assert_eq!(conv_resp.status_code(), 201);
-    let conversation = conv_resp.json::<api::models::ConversationObject>();
-
-    // Try to submit function output without a previous response
-    let resp = server
-        .post("/v1/responses")
-        .add_header("Authorization", format!("Bearer {api_key}"))
-        .json(&serde_json::json!({
-            "model": "Qwen/Qwen3-30B-A3B-Instruct-2507",
-            "conversation": {"id": conversation.id},
-            "input": [{
-                "type": "function_call_output",
-                "call_id": "fc_nonexistent",
-                "output": "some result"
-            }],
-            "stream": false
-        }))
-        .await;
-
-    // This should fail because there's no previous FunctionCall to match
-    // The exact error depends on implementation, but it should not succeed
-    let status = resp.status_code();
-    println!(
-        "Response status when submitting orphan function output: {}",
-        status
-    );
-
-    // Either 400 (bad request) or 404 (function call not found) is acceptable
-    assert!(
-        status == 400 || status == 404,
-        "Should reject orphan function output with 400 or 404, got: {}",
-        status
-    );
-
-    println!("✅ Orphan function output correctly rejected!");
-}
-
-/// Test that function tools and MCP tools can coexist in the same request.
-/// The LLM might call a function tool, which should pause for client execution.
-#[tokio::test]
-async fn test_function_tool_coexists_with_builtin_tools() {
-    let (server, _, mock, _) = setup_test_server_with_pool().await;
-    setup_qwen_model(&server).await;
-    let org = setup_org_with_credits(&server, 10_000_000_000i64).await;
-    let api_key = get_api_key_for_org(&server, org.id).await;
-
-    // Create conversation
-    let conv_resp = server
-        .post("/v1/conversations")
-        .add_header("Authorization", format!("Bearer {api_key}"))
-        .json(&serde_json::json!({"name": "Mixed Tools Test"}))
-        .await;
-    assert_eq!(conv_resp.status_code(), 201);
-    let conversation = conv_resp.json::<api::models::ConversationObject>();
-
-    // Define a custom function tool
-    let custom_tool = serde_json::json!({
-        "type": "function",
-        "name": "search_database",
-        "description": "Search the internal database",
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "query": {"type": "string"}
-            },
-            "required": ["query"]
-        }
-    });
-
-    // LLM calls the custom function
-    let turn1_user = "Search for user records with email containing 'test'";
-
-    use crate::common::mock_prompts;
-    let turn1_prompt = mock_prompts::build_prompt(turn1_user);
-    mock.when(inference_providers::mock::RequestMatcher::ExactPrompt(
-        turn1_prompt,
-    ))
-    .respond_with(
-        inference_providers::mock::ResponseTemplate::new("").with_tool_calls(vec![
-            inference_providers::mock::ToolCall::new(
-                "search_database",
-                r#"{"query": "email:*test*"}"#,
-            ),
-        ]),
-    )
-    .await;
-
-    let resp1 = server
-        .post("/v1/responses")
-        .add_header("Authorization", format!("Bearer {api_key}"))
-        .json(&serde_json::json!({
-            "model": "Qwen/Qwen3-30B-A3B-Instruct-2507",
-            "conversation": {"id": conversation.id},
-            "input": turn1_user,
-            "stream": false,
-            "tools": [custom_tool.clone()]
-        }))
-        .await;
-
-    assert_eq!(resp1.status_code(), 200, "Turn 1 failed: {}", resp1.text());
-    let resp1_obj = resp1.json::<api::models::ResponseObject>();
-
-    // Should be incomplete waiting for function output
-    assert_eq!(
-        resp1_obj.status,
-        api::models::ResponseStatus::Incomplete,
-        "Should be incomplete waiting for function output"
-    );
-
-    // Verify we got a FunctionCall for our custom tool
-    let has_function_call = resp1_obj.output.iter().any(|item| {
-        matches!(
-            item,
-            api::models::ResponseOutputItem::FunctionCall { name, .. } if name == "search_database"
-        )
-    });
-    assert!(
-        has_function_call,
-        "Should have FunctionCall for search_database"
-    );
-
-    println!("✅ Custom function tool works alongside other tools!");
 }

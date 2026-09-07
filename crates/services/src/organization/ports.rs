@@ -380,6 +380,16 @@ pub trait OrganizationRepository: Send + Sync {
         request: UpdateOrganizationMemberRequest,
     ) -> Result<OrganizationMember, RepositoryError>;
 
+    /// Atomically update a non-owner member role and record the system administrator
+    /// responsible for the change.
+    async fn update_member_role_with_audit(
+        &self,
+        org_id: Uuid,
+        user_id: Uuid,
+        request: UpdateOrganizationMemberRequest,
+        changed_by_user_id: Uuid,
+    ) -> Result<OrganizationMemberRoleUpdate, RepositoryError>;
+
     async fn remove_member(&self, org_id: Uuid, user_id: Uuid) -> Result<bool, RepositoryError>;
 
     async fn list_members_paginated(
@@ -641,6 +651,7 @@ pub trait OrganizationServiceTrait: Send + Sync {
         organization_id: OrganizationId,
         member_id: UserId,
         new_role: MemberRole,
+        changed_by_user_id: UserId,
     ) -> Result<OrganizationMemberRoleUpdate, OrganizationError>;
 
     /// Remove member with last owner protection

@@ -893,6 +893,103 @@ impl OrganizationRepository for PgOrganizationRepository {
             .map_err(RepositoryError::DataConversionError)
     }
 
+    async fn update_member_role_with_audit(
+        &self,
+        org_id: Uuid,
+        user_id: Uuid,
+        request: UpdateOrganizationMemberRequest,
+        changed_by_user_id: Uuid,
+    ) -> Result<OrganizationMemberRoleUpdate, RepositoryError> {
+        let new_role = self
+            .domain_to_db_role(request.role)
+            .to_string()
+            .to_lowercase();
+        if new_role == "owner" {
+            return Err(RepositoryError::ValidationFailed(
+                "Organization ownership cannot be assigned through member role updates".to_string(),
+            ));
+        }
+
+        let (row, previous_role) = retry_db!("update_member_role_with_audit", {
+            let mut client = self
+                .pool
+                .get()
+                .await
+                .context("Failed to get database connection")
+                .map_err(RepositoryError::PoolError)?;
+            let transaction = client.transaction().await.map_err(map_db_error)?;
+
+            let current = transaction
+                .query_opt(
+                    "SELECT * FROM organization_members
+                     WHERE organization_id = $1 AND user_id = $2
+                     FOR UPDATE",
+                    &[&org_id, &user_id],
+                )
+                .await
+                .map_err(map_db_error)?
+                .ok_or_else(|| RepositoryError::NotFound("organization member".to_string()))?;
+            let previous_role: String = current.get("role");
+            if previous_role == "owner" {
+                return Err(RepositoryError::ValidationFailed(
+                    "The organization owner's role cannot be changed".to_string(),
+                ));
+            }
+
+            let row = if previous_role == new_role {
+                current
+            } else {
+                let row = transaction
+                    .query_one(
+                        "UPDATE organization_members
+                         SET role = $3
+                         WHERE organization_id = $1 AND user_id = $2
+                         RETURNING *",
+                        &[&org_id, &user_id, &new_role],
+                    )
+                    .await
+                    .map_err(map_db_error)?;
+
+                transaction
+                    .execute(
+                        "INSERT INTO organization_member_role_audit_log (
+                             organization_id,
+                             member_user_id,
+                             changed_by_user_id,
+                             previous_role,
+                             new_role
+                         ) VALUES ($1, $2, $3, $4, $5)",
+                        &[
+                            &org_id,
+                            &user_id,
+                            &changed_by_user_id,
+                            &previous_role,
+                            &new_role,
+                        ],
+                    )
+                    .await
+                    .map_err(map_db_error)?;
+                row
+            };
+
+            transaction.commit().await.map_err(map_db_error)?;
+            Ok((row, previous_role))
+        })?;
+
+        let previous_role = self
+            .role_str_to_domain_role(&previous_role)
+            .map_err(RepositoryError::DataConversionError)?;
+        let member = self
+            .row_to_db_org_member(row)
+            .and_then(|member| self.db_to_domain_member(member))
+            .map_err(RepositoryError::DataConversionError)?;
+
+        Ok(OrganizationMemberRoleUpdate {
+            member,
+            previous_role,
+        })
+    }
+
     async fn remove_member(&self, org_id: Uuid, user_id: Uuid) -> Result<bool, RepositoryError> {
         let rows_affected = retry_db!("remove_member", {
             let client = self

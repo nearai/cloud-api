@@ -465,6 +465,36 @@ async fn test_admin_updates_member_role_and_protects_owners() {
         .json(&serde_json::json!({ "role": "owner" }))
         .await;
     assert_eq!(promote_response.status_code(), 400);
+
+    let client = database
+        .pool()
+        .get()
+        .await
+        .expect("Failed to get database connection");
+    let audit_rows = client
+        .query(
+            "SELECT member_user_id, changed_by_user_id, previous_role, new_role
+             FROM organization_member_role_audit_log
+             WHERE organization_id = $1
+             ORDER BY changed_at, id",
+            &[&organization_id],
+        )
+        .await
+        .expect("Failed to query member role audit log");
+    assert_eq!(audit_rows.len(), 2, "Only successful changes are audited");
+    let system_admin_id =
+        uuid::Uuid::parse_str(MOCK_USER_ID).expect("mock user id should be a uuid");
+    for row in &audit_rows {
+        assert_eq!(row.get::<_, uuid::Uuid>("member_user_id"), member_id);
+        assert_eq!(
+            row.get::<_, uuid::Uuid>("changed_by_user_id"),
+            system_admin_id
+        );
+    }
+    assert_eq!(audit_rows[0].get::<_, String>("previous_role"), "member");
+    assert_eq!(audit_rows[0].get::<_, String>("new_role"), "admin");
+    assert_eq!(audit_rows[1].get::<_, String>("previous_role"), "admin");
+    assert_eq!(audit_rows[1].get::<_, String>("new_role"), "member");
 }
 
 #[tokio::test]

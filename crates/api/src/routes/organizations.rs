@@ -864,6 +864,7 @@ mod tests {
             _: OrganizationId,
             _: UserId,
             _: MemberRole,
+            _: UserId,
         ) -> Result<services::organization::OrganizationMemberRoleUpdate, OrganizationError>
         {
             unimplemented!()

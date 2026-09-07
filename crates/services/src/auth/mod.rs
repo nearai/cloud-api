@@ -985,6 +985,15 @@ mod tests {
         ) -> Result<OrganizationMember, RepositoryError> {
             unimplemented!()
         }
+        async fn update_member_role_with_audit(
+            &self,
+            _: Uuid,
+            _: Uuid,
+            _: UpdateOrganizationMemberRequest,
+            _: Uuid,
+        ) -> Result<crate::organization::OrganizationMemberRoleUpdate, RepositoryError> {
+            unimplemented!()
+        }
         async fn remove_member(&self, _: Uuid, _: Uuid) -> Result<bool, RepositoryError> {
             unimplemented!()
         }
@@ -1236,6 +1245,7 @@ mod tests {
             _: OrganizationId,
             _: UserId,
             _: MemberRole,
+            _: UserId,
         ) -> Result<crate::organization::OrganizationMemberRoleUpdate, OrganizationError> {
             unimplemented!()
         }

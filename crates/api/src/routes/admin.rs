@@ -2965,6 +2965,7 @@ pub async fn update_organization_member_role(
             services::organization::OrganizationId(org_id),
             UserId(user_id),
             new_role,
+            UserId(admin_user.0.id),
         )
         .await
         .map_err(|error| match error {

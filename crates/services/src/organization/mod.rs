@@ -743,6 +743,7 @@ impl OrganizationServiceImpl {
         organization_id: OrganizationId,
         member_id: UserId,
         new_role: MemberRole,
+        changed_by_user_id: UserId,
     ) -> Result<ports::OrganizationMemberRoleUpdate, OrganizationError> {
         if matches!(new_role, MemberRole::Owner) {
             return Err(OrganizationError::InvalidParams(
@@ -755,34 +756,21 @@ impl OrganizationServiceImpl {
             .await
             .map_err(Self::map_repository_error)?
             .ok_or(OrganizationError::NotFound)?;
-        let member = self
-            .repository
-            .get_member(organization_id.0, member_id.0)
-            .await
-            .map_err(Self::map_repository_error)?
-            .ok_or(OrganizationError::NotFound)?;
-
-        if matches!(member.role, MemberRole::Owner) {
-            return Err(OrganizationError::InvalidParams(
-                "The organization owner's role cannot be changed".to_string(),
-            ));
-        }
-
-        let previous_role = member.role;
-        let member = self
-            .repository
-            .update_member(
+        self.repository
+            .update_member_role_with_audit(
                 organization_id.0,
                 member_id.0,
                 UpdateOrganizationMemberRequest { role: new_role },
+                changed_by_user_id.0,
             )
             .await
-            .map_err(Self::map_repository_error)?;
-
-        Ok(ports::OrganizationMemberRoleUpdate {
-            member,
-            previous_role,
-        })
+            .map_err(|error| match error {
+                RepositoryError::NotFound(_) => OrganizationError::NotFound,
+                RepositoryError::ValidationFailed(message) => {
+                    OrganizationError::InvalidParams(message)
+                }
+                error => Self::map_repository_error(error),
+            })
     }
 
     /// Remove member with last owner protection (private helper)
@@ -1843,9 +1831,15 @@ impl OrganizationServiceTrait for OrganizationServiceImpl {
         organization_id: OrganizationId,
         member_id: UserId,
         new_role: MemberRole,
+        changed_by_user_id: UserId,
     ) -> Result<ports::OrganizationMemberRoleUpdate, OrganizationError> {
-        self.update_member_role_for_admin_impl(organization_id, member_id, new_role)
-            .await
+        self.update_member_role_for_admin_impl(
+            organization_id,
+            member_id,
+            new_role,
+            changed_by_user_id,
+        )
+        .await
     }
 
     async fn remove_member_validated(
@@ -2165,6 +2159,16 @@ mod tests {
             _: Uuid,
             _: UpdateOrganizationMemberRequest,
         ) -> Result<OrganizationMember, RepositoryError> {
+            unimplemented!()
+        }
+
+        async fn update_member_role_with_audit(
+            &self,
+            _: Uuid,
+            _: Uuid,
+            _: UpdateOrganizationMemberRequest,
+            _: Uuid,
+        ) -> Result<OrganizationMemberRoleUpdate, RepositoryError> {
             unimplemented!()
         }
 

@@ -185,6 +185,8 @@ use utoipa::{Modify, OpenApi};
         crate::routes::admin::list_users,
         crate::routes::admin::get_organization,
         crate::routes::admin::list_organization_members,
+        crate::routes::admin::invite_organization_members,
+        crate::routes::admin::update_organization_member_role,
         crate::routes::admin::create_admin_access_token,
         crate::routes::admin::list_admin_access_tokens,
         crate::routes::admin::delete_admin_access_token,

@@ -935,6 +935,9 @@ mod tests {
         async fn get_by_id(&self, _: Uuid) -> Result<Option<Organization>, RepositoryError> {
             unimplemented!()
         }
+        async fn get_active_name_by_id(&self, _: Uuid) -> Result<Option<String>, RepositoryError> {
+            unimplemented!()
+        }
         async fn get_by_name(&self, _: &str) -> Result<Option<Organization>, RepositoryError> {
             unimplemented!()
         }
@@ -943,6 +946,9 @@ mod tests {
             _: Uuid,
             _: Uuid,
         ) -> Result<Option<OrganizationMember>, RepositoryError> {
+            unimplemented!()
+        }
+        async fn has_member_with_email(&self, _: Uuid, _: &str) -> Result<bool, RepositoryError> {
             unimplemented!()
         }
         async fn update(
@@ -1228,6 +1234,14 @@ mod tests {
         ) -> Result<OrganizationMember, OrganizationError> {
             unimplemented!()
         }
+        async fn update_member_role_for_admin(
+            &self,
+            _: OrganizationId,
+            _: UserId,
+            _: MemberRole,
+        ) -> Result<crate::organization::OrganizationMemberRoleUpdate, OrganizationError> {
+            unimplemented!()
+        }
         async fn remove_member_validated(
             &self,
             _: OrganizationId,
@@ -1237,6 +1251,15 @@ mod tests {
             unimplemented!()
         }
         async fn create_invitations(
+            &self,
+            _: OrganizationId,
+            _: UserId,
+            _: Vec<(String, MemberRole)>,
+            _: i64,
+        ) -> Result<BatchInvitationResponse, OrganizationError> {
+            unimplemented!()
+        }
+        async fn create_invitations_for_admin(
             &self,
             _: OrganizationId,
             _: UserId,

@@ -72,6 +72,12 @@ pub struct OrganizationMember {
     pub joined_at: DateTime<Utc>,
 }
 
+#[derive(Debug, Clone)]
+pub struct OrganizationMemberRoleUpdate {
+    pub member: OrganizationMember,
+    pub previous_role: MemberRole,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "lowercase")]
 pub enum MemberRole {
@@ -322,6 +328,8 @@ pub trait OrganizationRepository: Send + Sync {
 
     async fn get_by_id(&self, id: Uuid) -> Result<Option<Organization>, RepositoryError>;
 
+    async fn get_active_name_by_id(&self, id: Uuid) -> Result<Option<String>, RepositoryError>;
+
     async fn get_by_name(&self, name: &str) -> Result<Option<Organization>, RepositoryError>;
 
     async fn get_member(
@@ -329,6 +337,12 @@ pub trait OrganizationRepository: Send + Sync {
         organization_id: Uuid,
         user_id: Uuid,
     ) -> Result<Option<OrganizationMember>, RepositoryError>;
+
+    async fn has_member_with_email(
+        &self,
+        organization_id: Uuid,
+        email: &str,
+    ) -> Result<bool, RepositoryError>;
 
     /// When `expected_fallback_override` is present, update only if the row
     /// still has that exact raw `fallback_enabled` override.
@@ -624,6 +638,14 @@ pub trait OrganizationServiceTrait: Send + Sync {
         new_role: MemberRole,
     ) -> Result<OrganizationMember, OrganizationError>;
 
+    /// Update a member role after system-admin authorization has been verified.
+    async fn update_member_role_for_admin(
+        &self,
+        organization_id: OrganizationId,
+        member_id: UserId,
+        new_role: MemberRole,
+    ) -> Result<OrganizationMemberRoleUpdate, OrganizationError>;
+
     /// Remove member with last owner protection
     async fn remove_member_validated(
         &self,
@@ -634,6 +656,15 @@ pub trait OrganizationServiceTrait: Send + Sync {
 
     /// Create invitations for users (supports unregistered users)
     async fn create_invitations(
+        &self,
+        organization_id: OrganizationId,
+        requester_id: UserId,
+        invitations: Vec<(String, MemberRole)>,
+        expires_in_hours: i64,
+    ) -> Result<BatchInvitationResponse, OrganizationError>;
+
+    /// Create invitations after system-admin authorization has been verified.
+    async fn create_invitations_for_admin(
         &self,
         organization_id: OrganizationId,
         requester_id: UserId,

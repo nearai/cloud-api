@@ -738,6 +738,53 @@ impl OrganizationServiceImpl {
             .await
     }
 
+    async fn update_member_role_for_admin_impl(
+        &self,
+        organization_id: OrganizationId,
+        member_id: UserId,
+        new_role: MemberRole,
+    ) -> Result<ports::OrganizationMemberRoleUpdate, OrganizationError> {
+        if matches!(new_role, MemberRole::Owner) {
+            return Err(OrganizationError::InvalidParams(
+                "Organization ownership cannot be assigned through member role updates".to_string(),
+            ));
+        }
+
+        self.repository
+            .get_active_name_by_id(organization_id.0)
+            .await
+            .map_err(Self::map_repository_error)?
+            .ok_or(OrganizationError::NotFound)?;
+        let member = self
+            .repository
+            .get_member(organization_id.0, member_id.0)
+            .await
+            .map_err(Self::map_repository_error)?
+            .ok_or(OrganizationError::NotFound)?;
+
+        if matches!(member.role, MemberRole::Owner) {
+            return Err(OrganizationError::InvalidParams(
+                "The organization owner's role cannot be changed".to_string(),
+            ));
+        }
+
+        let previous_role = member.role;
+        let member = self
+            .repository
+            .update_member(
+                organization_id.0,
+                member_id.0,
+                UpdateOrganizationMemberRequest { role: new_role },
+            )
+            .await
+            .map_err(Self::map_repository_error)?;
+
+        Ok(ports::OrganizationMemberRoleUpdate {
+            member,
+            previous_role,
+        })
+    }
+
     /// Remove member with last owner protection (private helper)
     async fn remove_member_validated_impl(
         &self,
@@ -1791,6 +1838,16 @@ impl OrganizationServiceTrait for OrganizationServiceImpl {
             .await
     }
 
+    async fn update_member_role_for_admin(
+        &self,
+        organization_id: OrganizationId,
+        member_id: UserId,
+        new_role: MemberRole,
+    ) -> Result<ports::OrganizationMemberRoleUpdate, OrganizationError> {
+        self.update_member_role_for_admin_impl(organization_id, member_id, new_role)
+            .await
+    }
+
     async fn remove_member_validated(
         &self,
         organization_id: OrganizationId,
@@ -1990,6 +2047,11 @@ mod tests {
             // Legacy tests use nil as a wildcard against this stub. Non-nil ids
             // still exercise real not-found behavior for the settings API.
             Ok((id.is_nil() || org.id.0 == id).then(|| org.clone()))
+        }
+
+        async fn get_active_name_by_id(&self, id: Uuid) -> Result<Option<String>, RepositoryError> {
+            let org = self.org.lock().unwrap();
+            Ok((id.is_nil() || org.id.0 == id).then(|| org.name.clone()))
         }
 
         async fn get_by_name(&self, _: &str) -> Result<Option<Organization>, RepositoryError> {

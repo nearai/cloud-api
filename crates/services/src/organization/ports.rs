@@ -72,6 +72,12 @@ pub struct OrganizationMember {
     pub joined_at: DateTime<Utc>,
 }
 
+#[derive(Debug, Clone)]
+pub struct OrganizationMemberRoleUpdate {
+    pub member: OrganizationMember,
+    pub previous_role: MemberRole,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "lowercase")]
 pub enum MemberRole {
@@ -321,6 +327,8 @@ pub trait OrganizationRepository: Send + Sync {
     ) -> Result<Organization, RepositoryError>;
 
     async fn get_by_id(&self, id: Uuid) -> Result<Option<Organization>, RepositoryError>;
+
+    async fn get_active_name_by_id(&self, id: Uuid) -> Result<Option<String>, RepositoryError>;
 
     async fn get_by_name(&self, name: &str) -> Result<Option<Organization>, RepositoryError>;
 
@@ -623,6 +631,14 @@ pub trait OrganizationServiceTrait: Send + Sync {
         member_id: UserId,
         new_role: MemberRole,
     ) -> Result<OrganizationMember, OrganizationError>;
+
+    /// Update a member role after system-admin authorization has been verified.
+    async fn update_member_role_for_admin(
+        &self,
+        organization_id: OrganizationId,
+        member_id: UserId,
+        new_role: MemberRole,
+    ) -> Result<OrganizationMemberRoleUpdate, OrganizationError>;
 
     /// Remove member with last owner protection
     async fn remove_member_validated(

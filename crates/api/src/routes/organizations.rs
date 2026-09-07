@@ -859,6 +859,16 @@ mod tests {
             unimplemented!()
         }
 
+        async fn update_member_role_for_admin(
+            &self,
+            _: OrganizationId,
+            _: UserId,
+            _: MemberRole,
+        ) -> Result<services::organization::OrganizationMemberRoleUpdate, OrganizationError>
+        {
+            unimplemented!()
+        }
+
         async fn remove_member_validated(
             &self,
             _: OrganizationId,

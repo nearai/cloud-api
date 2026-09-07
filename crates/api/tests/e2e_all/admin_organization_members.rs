@@ -2,7 +2,7 @@
 // (GET /v1/admin/organizations/{org_id}/members)
 
 use crate::common::*;
-use api::models::{ListAdminOrganizationMembersResponse, MemberRole};
+use api::models::{ListAdminOrganizationMembersResponse, MemberRole, OrganizationMemberResponse};
 
 #[tokio::test]
 async fn test_admin_list_organization_members_includes_owner() {
@@ -377,4 +377,123 @@ async fn test_admin_list_organization_members_unauthorized() {
     );
 
     println!("✅ Admin list organization members correctly requires authentication");
+}
+
+#[tokio::test]
+async fn test_admin_updates_member_role_and_protects_owners() {
+    let (server, database) = setup_test_server_with_database().await;
+    let organization_id = uuid::Uuid::new_v4();
+    let owner_id = uuid::Uuid::new_v4();
+    let member_id = uuid::Uuid::new_v4();
+
+    {
+        let client = database
+            .pool()
+            .get()
+            .await
+            .expect("Failed to get database connection");
+        for (user_id, label) in [(owner_id, "owner"), (member_id, "member")] {
+            client
+                .execute(
+                    "INSERT INTO users (id, email, username, auth_provider, provider_user_id, is_active, created_at, updated_at)
+                     VALUES ($1, $2, $3, 'mock', $4, true, NOW(), NOW())",
+                    &[
+                        &user_id,
+                        &format!("{label}-{user_id}@example.com"),
+                        &format!("{label}-{user_id}"),
+                        &format!("{label}-provider-{user_id}"),
+                    ],
+                )
+                .await
+                .expect("Failed to insert user");
+        }
+        client
+            .execute(
+                "INSERT INTO organizations (id, name, is_active, created_at, updated_at)
+                 VALUES ($1, $2, true, NOW(), NOW())",
+                &[&organization_id, &format!("admin-role-{organization_id}")],
+            )
+            .await
+            .expect("Failed to insert organization");
+        client
+            .execute(
+                "INSERT INTO organization_members (organization_id, user_id, role)
+                 VALUES ($1, $2, 'owner'), ($1, $3, 'member')",
+                &[&organization_id, &owner_id, &member_id],
+            )
+            .await
+            .expect("Failed to insert organization members");
+    }
+
+    let update_response = server
+        .put(format!("/v1/admin/organizations/{organization_id}/members/{member_id}").as_str())
+        .add_header("Authorization", format!("Bearer {}", get_session_id()))
+        .add_header("User-Agent", MOCK_USER_AGENT)
+        .json(&serde_json::json!({ "role": "admin" }))
+        .await;
+    assert_eq!(
+        update_response.status_code(),
+        200,
+        "System admin should update a member role: {}",
+        update_response.text()
+    );
+    let member = update_response.json::<OrganizationMemberResponse>();
+    assert_eq!(member.role, MemberRole::Admin);
+
+    let demote_response = server
+        .put(format!("/v1/admin/organizations/{organization_id}/members/{member_id}").as_str())
+        .add_header("Authorization", format!("Bearer {}", get_session_id()))
+        .add_header("User-Agent", MOCK_USER_AGENT)
+        .json(&serde_json::json!({ "role": "member" }))
+        .await;
+    assert_eq!(demote_response.status_code(), 200);
+    let demoted_member = demote_response.json::<OrganizationMemberResponse>();
+    assert_eq!(demoted_member.role, MemberRole::Member);
+
+    let owner_response = server
+        .put(format!("/v1/admin/organizations/{organization_id}/members/{owner_id}").as_str())
+        .add_header("Authorization", format!("Bearer {}", get_session_id()))
+        .add_header("User-Agent", MOCK_USER_AGENT)
+        .json(&serde_json::json!({ "role": "member" }))
+        .await;
+    assert_eq!(owner_response.status_code(), 400);
+
+    let promote_response = server
+        .put(format!("/v1/admin/organizations/{organization_id}/members/{member_id}").as_str())
+        .add_header("Authorization", format!("Bearer {}", get_session_id()))
+        .add_header("User-Agent", MOCK_USER_AGENT)
+        .json(&serde_json::json!({ "role": "owner" }))
+        .await;
+    assert_eq!(promote_response.status_code(), 400);
+}
+
+#[tokio::test]
+async fn test_admin_member_role_updates_require_authentication() {
+    let organization_id = uuid::Uuid::new_v4();
+    let user_id = uuid::Uuid::new_v4();
+    let server = setup_test_server().await;
+
+    let response = server
+        .put(format!("/v1/admin/organizations/{organization_id}/members/{user_id}").as_str())
+        .json(&serde_json::json!({ "role": "admin" }))
+        .await;
+    assert_eq!(response.status_code(), 401);
+}
+
+#[tokio::test]
+async fn test_admin_member_role_updates_reject_non_admin_users() {
+    let server = setup_test_server_with_config(|config| {
+        config.auth.admin_domains = vec!["example.org".to_string()];
+    })
+    .await;
+    let organization_id = uuid::Uuid::new_v4();
+    let user_id = uuid::Uuid::new_v4();
+
+    let response = server
+        .put(format!("/v1/admin/organizations/{organization_id}/members/{user_id}").as_str())
+        .add_header("Authorization", format!("Bearer {}", get_session_id()))
+        .add_header("User-Agent", MOCK_USER_AGENT)
+        .json(&serde_json::json!({ "role": "admin" }))
+        .await;
+    assert_eq!(response.status_code(), 403);
 }

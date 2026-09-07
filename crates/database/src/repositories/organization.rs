@@ -594,29 +594,6 @@ impl OrganizationRepository for PgOrganizationRepository {
         }
     }
 
-    async fn active_exists_by_id(&self, id: Uuid) -> Result<bool, RepositoryError> {
-        let row = retry_db!("active_organization_exists_by_id", {
-            let client = self
-                .pool
-                .get()
-                .await
-                .context("Failed to get database connection")
-                .map_err(RepositoryError::PoolError)?;
-
-            client
-                .query_one(
-                    "SELECT EXISTS (
-                         SELECT 1 FROM organizations WHERE id = $1 AND is_active = true
-                     )",
-                    &[&id],
-                )
-                .await
-                .map_err(map_db_error)
-        })?;
-
-        Ok(row.get(0))
-    }
-
     async fn get_by_name(&self, name: &str) -> Result<Option<Organization>, RepositoryError> {
         match self.get_by_name_internal(name).await? {
             Some(db_org) => Ok(Some(
@@ -906,11 +883,6 @@ impl OrganizationRepository for PgOrganizationRepository {
             .domain_to_db_role(request.role)
             .to_string()
             .to_lowercase();
-        if new_role == "owner" {
-            return Err(RepositoryError::ValidationFailed(
-                "Organization ownership cannot be assigned through member role updates".to_string(),
-            ));
-        }
 
         let (row, previous_role) = retry_db!("update_member_role_with_audit", {
             let mut client = self
@@ -920,6 +892,17 @@ impl OrganizationRepository for PgOrganizationRepository {
                 .context("Failed to get database connection")
                 .map_err(RepositoryError::PoolError)?;
             let transaction = client.transaction().await.map_err(map_db_error)?;
+
+            transaction
+                .query_opt(
+                    "SELECT id FROM organizations
+                     WHERE id = $1 AND is_active = true
+                     FOR UPDATE",
+                    &[&org_id],
+                )
+                .await
+                .map_err(map_db_error)?
+                .ok_or_else(|| RepositoryError::NotFound("organization".to_string()))?;
 
             let current = transaction
                 .query_opt(
@@ -932,7 +915,7 @@ impl OrganizationRepository for PgOrganizationRepository {
                 .map_err(map_db_error)?
                 .ok_or_else(|| RepositoryError::NotFound("organization member".to_string()))?;
             let previous_role: String = current.get("role");
-            if previous_role == "owner" {
+            if previous_role == "owner" && previous_role != new_role {
                 return Err(RepositoryError::ValidationFailed(
                     "The organization owner's role cannot be changed".to_string(),
                 ));
@@ -940,6 +923,66 @@ impl OrganizationRepository for PgOrganizationRepository {
 
             let row = if previous_role == new_role {
                 current
+            } else if new_role == "owner" {
+                if previous_role != "admin" {
+                    return Err(RepositoryError::ValidationFailed(
+                        "Only organization admins can be promoted to owner".to_string(),
+                    ));
+                }
+
+                let current_owner = transaction
+                    .query_opt(
+                        "SELECT user_id FROM organization_members
+                         WHERE organization_id = $1 AND role = 'owner'
+                         FOR UPDATE",
+                        &[&org_id],
+                    )
+                    .await
+                    .map_err(map_db_error)?
+                    .ok_or_else(|| {
+                        RepositoryError::DataConversionError(anyhow::anyhow!(
+                            "Organization has no owner: {org_id}"
+                        ))
+                    })?;
+                let current_owner_id: Uuid = current_owner.get("user_id");
+
+                transaction
+                    .execute(
+                        "UPDATE organization_members
+                         SET role = 'admin'
+                         WHERE organization_id = $1 AND user_id = $2",
+                        &[&org_id, &current_owner_id],
+                    )
+                    .await
+                    .map_err(map_db_error)?;
+
+                let row = transaction
+                    .query_one(
+                        "UPDATE organization_members
+                         SET role = 'owner'
+                         WHERE organization_id = $1 AND user_id = $2
+                         RETURNING *",
+                        &[&org_id, &user_id],
+                    )
+                    .await
+                    .map_err(map_db_error)?;
+
+                transaction
+                    .execute(
+                        "INSERT INTO organization_member_role_audit_log (
+                             organization_id,
+                             member_user_id,
+                             changed_by_user_id,
+                             previous_role,
+                             new_role
+                         ) VALUES
+                             ($1, $2, $3, 'owner', 'admin'),
+                             ($1, $4, $3, 'admin', 'owner')",
+                        &[&org_id, &current_owner_id, &changed_by_user_id, &user_id],
+                    )
+                    .await
+                    .map_err(map_db_error)?;
+                row
             } else {
                 let row = transaction
                     .query_one(

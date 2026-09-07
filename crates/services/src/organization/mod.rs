@@ -28,6 +28,9 @@ struct InvitationEmailAttempt {
     updated_invitation: Option<ports::OrganizationInvitation>,
 }
 
+const OWNER_INVITATION_DISABLED: &str =
+    "Ownership can only be transferred to an existing organization admin";
+
 impl OrganizationServiceImpl {
     pub fn new(
         repository: Arc<dyn OrganizationRepository>,
@@ -146,9 +149,8 @@ impl OrganizationServiceImpl {
         rate_limit: Option<i32>,
         settings: Option<serde_json::Value>,
     ) -> Result<Organization, OrganizationError> {
-        // Check if user has permission and retain the concrete role. More than
-        // one membership may carry the owner role, so `owner_id` alone is not
-        // sufficient for owner-only settings.
+        // Check permission while retaining the concrete role for owner-only
+        // settings below.
         let org = self.get_organization_impl(id.clone()).await?;
         let role = if org.owner_id == user_id {
             MemberRole::Owner
@@ -745,20 +747,6 @@ impl OrganizationServiceImpl {
         new_role: MemberRole,
         changed_by_user_id: UserId,
     ) -> Result<ports::OrganizationMemberRoleUpdate, OrganizationError> {
-        if matches!(new_role, MemberRole::Owner) {
-            return Err(OrganizationError::InvalidParams(
-                "Organization ownership cannot be assigned through member role updates".to_string(),
-            ));
-        }
-
-        if !self
-            .repository
-            .active_exists_by_id(organization_id.0)
-            .await
-            .map_err(Self::map_repository_error)?
-        {
-            return Err(OrganizationError::NotFound);
-        }
         self.repository
             .update_member_role_with_audit(
                 organization_id.0,
@@ -1020,6 +1008,19 @@ impl OrganizationServiceImpl {
         };
 
         for (email, role) in invitations {
+            if role == MemberRole::Owner {
+                failed += 1;
+                results.push(ports::InvitationResult {
+                    email,
+                    success: false,
+                    member: None,
+                    error: Some(OWNER_INVITATION_DISABLED.to_string()),
+                    email_sent: false,
+                    email_error: None,
+                });
+                continue;
+            }
+
             if !requester_role.can_invite_as(&role) {
                 failed += 1;
                 results.push(ports::InvitationResult {
@@ -1214,6 +1215,12 @@ impl OrganizationServiceImpl {
                 .await;
             return Err(OrganizationError::InvalidParams(
                 "Invitation has expired".to_string(),
+            ));
+        }
+
+        if invitation.role == MemberRole::Owner {
+            return Err(OrganizationError::InvalidParams(
+                OWNER_INVITATION_DISABLED.to_string(),
             ));
         }
 
@@ -2044,11 +2051,6 @@ mod tests {
             // Legacy tests use nil as a wildcard against this stub. Non-nil ids
             // still exercise real not-found behavior for the settings API.
             Ok((id.is_nil() || org.id.0 == id).then(|| org.clone()))
-        }
-
-        async fn active_exists_by_id(&self, id: Uuid) -> Result<bool, RepositoryError> {
-            let org = self.org.lock().unwrap();
-            Ok(org.is_active && (id.is_nil() || org.id.0 == id))
         }
 
         async fn get_by_name(&self, _: &str) -> Result<Option<Organization>, RepositoryError> {
@@ -2978,7 +2980,7 @@ mod tests {
         assert!(!response.results[0].success);
         assert_eq!(
             response.results[0].error.as_deref(),
-            Some("Insufficient permissions to invite members as owner")
+            Some(OWNER_INVITATION_DISABLED)
         );
         assert!(response.results[1].success);
         assert!(response.results[2].success);
@@ -2989,6 +2991,75 @@ mod tests {
         assert!(records.iter().all(|invitation| {
             invitation.role == MemberRole::Admin || invitation.role == MemberRole::Member
         }));
+    }
+
+    #[tokio::test]
+    async fn create_invitations_rejects_owner_role_for_owner() {
+        let (service, invitation_repo, _, _) =
+            make_service(Ok(EmailDeliveryOutcome::Skipped), None);
+        let org = service
+            .repository
+            .get_by_id(Uuid::nil())
+            .await
+            .unwrap()
+            .unwrap();
+
+        let response = service
+            .create_invitations(
+                org.id,
+                org.owner_id,
+                vec![("new-owner@example.com".to_string(), MemberRole::Owner)],
+                168,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.successful, 0);
+        assert_eq!(response.failed, 1);
+        assert_eq!(
+            response.results[0].error.as_deref(),
+            Some(OWNER_INVITATION_DISABLED)
+        );
+        assert!(invitation_repo.records.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn accept_invitation_rejects_historical_owner_invitation() {
+        let (service, invitation_repo, _, user_repo) =
+            make_service(Ok(EmailDeliveryOutcome::Skipped), None);
+        let org = service
+            .repository
+            .get_by_id(Uuid::nil())
+            .await
+            .unwrap()
+            .unwrap();
+        let invitation = invitation_repo
+            .create(
+                org.id.0,
+                CreateInvitationRequest {
+                    email: user_repo.inviter.email.clone(),
+                    role: MemberRole::Owner,
+                    expires_in_hours: 168,
+                },
+                org.owner_id.0,
+            )
+            .await
+            .unwrap();
+
+        let error = service
+            .accept_invitation(
+                invitation.id,
+                user_repo.inviter.id.clone(),
+                &user_repo.inviter.email,
+            )
+            .await
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            OrganizationError::InvalidParams(message)
+                if message == OWNER_INVITATION_DISABLED
+        ));
     }
 
     #[tokio::test]

@@ -498,6 +498,226 @@ async fn test_admin_updates_member_role_and_protects_owners() {
 }
 
 #[tokio::test]
+async fn test_admin_transfers_organization_ownership_to_admin() {
+    let (server, database) = setup_test_server_with_database().await;
+    let organization_id = uuid::Uuid::new_v4();
+    let owner_id = uuid::Uuid::new_v4();
+    let admin_id = uuid::Uuid::new_v4();
+    let member_id = uuid::Uuid::new_v4();
+
+    {
+        let client = database
+            .pool()
+            .get()
+            .await
+            .expect("Failed to get database connection");
+        for (user_id, label) in [
+            (owner_id, "owner"),
+            (admin_id, "admin"),
+            (member_id, "member"),
+        ] {
+            client
+                .execute(
+                    "INSERT INTO users (id, email, username, auth_provider, provider_user_id, is_active, created_at, updated_at)
+                     VALUES ($1, $2, $3, 'mock', $4, true, NOW(), NOW())",
+                    &[
+                        &user_id,
+                        &format!("{label}-{user_id}@example.com"),
+                        &format!("{label}-{user_id}"),
+                        &format!("{label}-provider-{user_id}"),
+                    ],
+                )
+                .await
+                .expect("Failed to insert user");
+        }
+        client
+            .execute(
+                "INSERT INTO organizations (id, name, is_active, created_at, updated_at)
+                 VALUES ($1, $2, true, NOW(), NOW())",
+                &[
+                    &organization_id,
+                    &format!("ownership-transfer-{organization_id}"),
+                ],
+            )
+            .await
+            .expect("Failed to insert organization");
+        client
+            .execute(
+                "INSERT INTO organization_members (organization_id, user_id, role)
+                 VALUES ($1, $2, 'owner'), ($1, $3, 'admin'), ($1, $4, 'member')",
+                &[&organization_id, &owner_id, &admin_id, &member_id],
+            )
+            .await
+            .expect("Failed to insert organization members");
+    }
+
+    let response = server
+        .put(format!("/v1/admin/organizations/{organization_id}/members/{admin_id}").as_str())
+        .add_header("Authorization", format!("Bearer {}", get_session_id()))
+        .add_header("User-Agent", MOCK_USER_AGENT)
+        .json(&serde_json::json!({ "role": "owner" }))
+        .await;
+    assert_eq!(
+        response.status_code(),
+        200,
+        "System admin should transfer ownership: {}",
+        response.text()
+    );
+    assert_eq!(
+        response.json::<OrganizationMemberResponse>().role,
+        MemberRole::Owner
+    );
+
+    let client = database
+        .pool()
+        .get()
+        .await
+        .expect("Failed to get database connection");
+    let roles = client
+        .query(
+            "SELECT user_id, role FROM organization_members
+             WHERE organization_id = $1",
+            &[&organization_id],
+        )
+        .await
+        .expect("Failed to query organization members");
+    assert_eq!(roles.len(), 3);
+    assert_eq!(
+        roles
+            .iter()
+            .find(|row| row.get::<_, uuid::Uuid>("user_id") == owner_id)
+            .expect("Previous owner should remain a member")
+            .get::<_, String>("role"),
+        "admin"
+    );
+    assert_eq!(
+        roles
+            .iter()
+            .find(|row| row.get::<_, uuid::Uuid>("user_id") == admin_id)
+            .expect("Promoted admin should remain a member")
+            .get::<_, String>("role"),
+        "owner"
+    );
+
+    let audit_rows = client
+        .query(
+            "SELECT member_user_id, changed_by_user_id, previous_role, new_role
+             FROM organization_member_role_audit_log
+             WHERE organization_id = $1",
+            &[&organization_id],
+        )
+        .await
+        .expect("Failed to query ownership transfer audit log");
+    assert_eq!(audit_rows.len(), 2);
+    let system_admin_id =
+        uuid::Uuid::parse_str(MOCK_USER_ID).expect("mock user id should be a uuid");
+    for row in &audit_rows {
+        assert_eq!(
+            row.get::<_, uuid::Uuid>("changed_by_user_id"),
+            system_admin_id
+        );
+    }
+    let previous_owner_audit = audit_rows
+        .iter()
+        .find(|row| row.get::<_, uuid::Uuid>("member_user_id") == owner_id)
+        .expect("Previous owner change should be audited");
+    assert_eq!(
+        previous_owner_audit.get::<_, String>("previous_role"),
+        "owner"
+    );
+    assert_eq!(previous_owner_audit.get::<_, String>("new_role"), "admin");
+    let new_owner_audit = audit_rows
+        .iter()
+        .find(|row| row.get::<_, uuid::Uuid>("member_user_id") == admin_id)
+        .expect("New owner change should be audited");
+    assert_eq!(new_owner_audit.get::<_, String>("previous_role"), "admin");
+    assert_eq!(new_owner_audit.get::<_, String>("new_role"), "owner");
+
+    drop(client);
+
+    let new_owner_response = server
+        .patch(format!("/v1/organizations/{organization_id}/settings").as_str())
+        .add_header("Authorization", format!("Bearer rt_{admin_id}"))
+        .json(&serde_json::json!({ "fallback_enabled": false }))
+        .await;
+    assert_eq!(
+        new_owner_response.status_code(),
+        200,
+        "New owner should immediately receive owner-only permissions: {}",
+        new_owner_response.text()
+    );
+
+    let previous_owner_response = server
+        .patch(format!("/v1/organizations/{organization_id}/settings").as_str())
+        .add_header("Authorization", format!("Bearer rt_{owner_id}"))
+        .json(&serde_json::json!({ "fallback_enabled": true }))
+        .await;
+    assert_eq!(
+        previous_owner_response.status_code(),
+        403,
+        "Previous owner should immediately lose owner-only permissions: {}",
+        previous_owner_response.text()
+    );
+
+    for (user_id, expected_role) in [(admin_id, MemberRole::Owner), (owner_id, MemberRole::Admin)] {
+        let response = server
+            .get(format!("/v1/organizations/{organization_id}").as_str())
+            .add_header("Authorization", format!("Bearer rt_{user_id}"))
+            .await;
+        assert_eq!(response.status_code(), 200, "{}", response.text());
+        let organization = response.json::<api::models::OrganizationResponse>();
+        assert_eq!(organization.owner_id, admin_id.to_string());
+        assert_eq!(organization.role, expected_role);
+    }
+
+    let previous_owner_role_update = server
+        .put(format!("/v1/organizations/{organization_id}/members/{member_id}").as_str())
+        .add_header("Authorization", format!("Bearer rt_{owner_id}"))
+        .json(&serde_json::json!({ "role": "admin" }))
+        .await;
+    assert_eq!(
+        previous_owner_role_update.status_code(),
+        403,
+        "Previous owner should not retain owner-only role management: {}",
+        previous_owner_role_update.text()
+    );
+
+    let new_owner_role_update = server
+        .put(format!("/v1/organizations/{organization_id}/members/{member_id}").as_str())
+        .add_header("Authorization", format!("Bearer rt_{admin_id}"))
+        .json(&serde_json::json!({ "role": "admin" }))
+        .await;
+    assert_eq!(
+        new_owner_role_update.status_code(),
+        200,
+        "New owner should be able to manage member roles: {}",
+        new_owner_role_update.text()
+    );
+
+    let previous_owner_delete = server
+        .delete(format!("/v1/organizations/{organization_id}").as_str())
+        .add_header("Authorization", format!("Bearer rt_{owner_id}"))
+        .await;
+    assert_eq!(
+        previous_owner_delete.status_code(),
+        403,
+        "Previous owner should not retain organization deletion permission: {}",
+        previous_owner_delete.text()
+    );
+
+    let new_owner_delete = server
+        .delete(format!("/v1/organizations/{organization_id}").as_str())
+        .add_header("Authorization", format!("Bearer rt_{admin_id}"))
+        .await;
+    assert_eq!(
+        new_owner_delete.status_code(),
+        200,
+        "New owner should be able to delete the organization: {}",
+        new_owner_delete.text()
+    );
+}
+
+#[tokio::test]
 async fn test_admin_member_role_updates_reject_unknown_and_inactive_organizations() {
     let (server, database) = setup_test_server_with_database().await;
     let inactive_organization_id = uuid::Uuid::new_v4();

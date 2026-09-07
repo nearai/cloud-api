@@ -328,9 +328,6 @@ pub trait OrganizationRepository: Send + Sync {
 
     async fn get_by_id(&self, id: Uuid) -> Result<Option<Organization>, RepositoryError>;
 
-    /// Check active organization existence without resolving owner membership.
-    async fn active_exists_by_id(&self, id: Uuid) -> Result<bool, RepositoryError>;
-
     async fn get_by_name(&self, name: &str) -> Result<Option<Organization>, RepositoryError>;
 
     async fn get_member(
@@ -381,8 +378,9 @@ pub trait OrganizationRepository: Send + Sync {
         request: UpdateOrganizationMemberRequest,
     ) -> Result<OrganizationMember, RepositoryError>;
 
-    /// Atomically update a non-owner member role and record the system administrator
-    /// responsible for the change.
+    /// Atomically update a member role and record the system administrator
+    /// responsible for the change. Promoting an admin to owner transfers
+    /// ownership and demotes the previous owner to admin.
     async fn update_member_role_with_audit(
         &self,
         org_id: Uuid,

@@ -2929,7 +2929,10 @@ pub async fn list_organization_members(
     }))
 }
 
-/// Update an organization member role as a system administrator
+/// Update an organization member role as a system administrator.
+///
+/// Assigning the owner role transfers ownership from the current owner to an
+/// existing organization admin. The previous owner is demoted to admin.
 #[utoipa::path(
     put,
     path = "/v1/admin/organizations/{org_id}/members/{user_id}",

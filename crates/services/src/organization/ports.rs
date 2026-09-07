@@ -633,6 +633,9 @@ pub trait OrganizationServiceTrait: Send + Sync {
     ) -> Result<OrganizationMember, OrganizationError>;
 
     /// Update a member role after system-admin authorization has been verified.
+    /// The caller MUST enforce system-admin authorization (the API uses
+    /// `admin_middleware` and the `AdminUser` extension). This method does not
+    /// check the caller's organization membership or system-admin privileges.
     async fn update_member_role_for_admin(
         &self,
         organization_id: OrganizationId,

@@ -28,6 +28,9 @@ struct InvitationEmailAttempt {
     updated_invitation: Option<ports::OrganizationInvitation>,
 }
 
+const OWNER_INVITATION_DISABLED: &str =
+    "Ownership can only be transferred to an existing organization member";
+
 impl OrganizationServiceImpl {
     pub fn new(
         repository: Arc<dyn OrganizationRepository>,
@@ -146,9 +149,8 @@ impl OrganizationServiceImpl {
         rate_limit: Option<i32>,
         settings: Option<serde_json::Value>,
     ) -> Result<Organization, OrganizationError> {
-        // Check if user has permission and retain the concrete role. More than
-        // one membership may carry the owner role, so `owner_id` alone is not
-        // sufficient for owner-only settings.
+        // Check permission while retaining the concrete role for owner-only
+        // settings below.
         let org = self.get_organization_impl(id.clone()).await?;
         let role = if org.owner_id == user_id {
             MemberRole::Owner
@@ -217,9 +219,14 @@ impl OrganizationServiceImpl {
 
         let updated = self
             .repository
-            .update(id.0, request, expected_fallback_override)
+            .update(id.0, request, expected_fallback_override, user_id.0)
             .await
-            .map_err(Self::map_repository_error)?;
+            .map_err(|error| match error {
+                RepositoryError::ValidationFailed(message) => {
+                    OrganizationError::Unauthorized(message)
+                }
+                error => Self::map_repository_error(error),
+            })?;
 
         if let Some(fallback_enabled) = requested_fallback_change {
             tracing::info!(
@@ -250,12 +257,15 @@ impl OrganizationServiceImpl {
 
         match self
             .repository
-            .delete_if_no_staking_farm_source(id.0)
+            .delete_if_no_staking_farm_source(id.0, user_id.0)
             .await
             .map_err(Self::map_repository_error)?
         {
             DeleteOrganizationResult::Deleted => Ok(true),
             DeleteOrganizationResult::NotFound => Ok(false),
+            DeleteOrganizationResult::Unauthorized => Err(OrganizationError::Unauthorized(
+                "Only the owner can delete an organization".to_string(),
+            )),
             DeleteOrganizationResult::StakingWalletBound => {
                 Err(OrganizationError::StakingWalletBound)
             }
@@ -347,6 +357,29 @@ impl OrganizationServiceImpl {
             })
     }
 
+    async fn remove_member_with_revalidated_authorization(
+        &self,
+        organization_id: OrganizationId,
+        requester_id: UserId,
+        member_id: UserId,
+    ) -> Result<bool, OrganizationError> {
+        match self
+            .repository
+            .remove_member(organization_id.0, member_id.0, requester_id.0)
+            .await
+            .map_err(Self::map_repository_error)?
+        {
+            RemoveOrganizationMemberResult::Removed => Ok(true),
+            RemoveOrganizationMemberResult::NotFound => Ok(false),
+            RemoveOrganizationMemberResult::Unauthorized => Err(OrganizationError::Unauthorized(
+                "Insufficient permissions to remove member".to_string(),
+            )),
+            RemoveOrganizationMemberResult::LastOwner => Err(OrganizationError::InvalidParams(
+                "Cannot remove the last owner from organization".to_string(),
+            )),
+        }
+    }
+
     /// Remove a member from an organization (private helper)
     async fn remove_member_impl(
         &self,
@@ -383,10 +416,8 @@ impl OrganizationServiceImpl {
             }
         }
 
-        self.repository
-            .remove_member(organization_id.0, member_id.0)
+        self.remove_member_with_revalidated_authorization(organization_id, requester_id, member_id)
             .await
-            .map_err(Self::map_repository_error)
     }
 
     /// Update a member's role (private helper)
@@ -424,7 +455,7 @@ impl OrganizationServiceImpl {
         let request = UpdateOrganizationMemberRequest { role: new_role };
 
         self.repository
-            .update_member(organization_id.0, member_id.0, request)
+            .update_member(organization_id.0, member_id.0, request, requester_id.0)
             .await
             .map_err(Self::map_repository_error)
     }
@@ -738,6 +769,30 @@ impl OrganizationServiceImpl {
             .await
     }
 
+    async fn update_member_role_for_admin_impl(
+        &self,
+        organization_id: OrganizationId,
+        member_id: UserId,
+        new_role: MemberRole,
+        changed_by_user_id: UserId,
+    ) -> Result<ports::OrganizationMemberRoleUpdate, OrganizationError> {
+        self.repository
+            .update_member_role_with_audit(
+                organization_id.0,
+                member_id.0,
+                UpdateOrganizationMemberRequest { role: new_role },
+                changed_by_user_id.0,
+            )
+            .await
+            .map_err(|error| match error {
+                RepositoryError::NotFound(_) => OrganizationError::NotFound,
+                RepositoryError::ValidationFailed(message) => {
+                    OrganizationError::InvalidParams(message)
+                }
+                error => Self::map_repository_error(error),
+            })
+    }
+
     /// Remove member with last owner protection (private helper)
     async fn remove_member_validated_impl(
         &self,
@@ -745,29 +800,6 @@ impl OrganizationServiceImpl {
         requester_id: UserId,
         member_id: UserId,
     ) -> Result<bool, OrganizationError> {
-        // Check if removing last owner
-        let members = self
-            .repository
-            .list_members_paginated(organization_id.0, 1, 0)
-            .await
-            .map_err(Self::map_repository_error)?;
-
-        let owner_count = members
-            .iter()
-            .filter(|m| matches!(m.role, MemberRole::Owner))
-            .count();
-
-        if owner_count == 1 {
-            // Check if the member being removed is an owner
-            if let Some(member) = members.iter().find(|m| m.user_id == member_id) {
-                if matches!(member.role, MemberRole::Owner) {
-                    return Err(OrganizationError::InvalidParams(
-                        "Cannot remove the last owner from organization".to_string(),
-                    ));
-                }
-            }
-        }
-
         // Allow members to remove themselves (leave organization)
         let can_remove = if requester_id == member_id {
             true
@@ -793,10 +825,10 @@ impl OrganizationServiceImpl {
             ));
         }
 
-        self.repository
-            .remove_member(organization_id.0, member_id.0)
+        // Last-owner and requester-role checks are repeated while holding the
+        // same organization lock as ownership transfers and role changes.
+        self.remove_member_with_revalidated_authorization(organization_id, requester_id, member_id)
             .await
-            .map_err(Self::map_repository_error)
     }
 
     async fn send_invitation_email(
@@ -982,6 +1014,19 @@ impl OrganizationServiceImpl {
         };
 
         for (email, role) in invitations {
+            if role == MemberRole::Owner {
+                failed += 1;
+                results.push(ports::InvitationResult {
+                    email,
+                    success: false,
+                    member: None,
+                    error: Some(OWNER_INVITATION_DISABLED.to_string()),
+                    email_sent: false,
+                    email_error: None,
+                });
+                continue;
+            }
+
             if !requester_role.can_invite_as(&role) {
                 failed += 1;
                 results.push(ports::InvitationResult {
@@ -1176,6 +1221,12 @@ impl OrganizationServiceImpl {
                 .await;
             return Err(OrganizationError::InvalidParams(
                 "Invitation has expired".to_string(),
+            ));
+        }
+
+        if invitation.role == MemberRole::Owner {
+            return Err(OrganizationError::InvalidParams(
+                OWNER_INVITATION_DISABLED.to_string(),
             ));
         }
 
@@ -1565,9 +1616,14 @@ impl OrganizationServiceImpl {
 
         let updated = self
             .repository
-            .patch_settings(organization_id.0, patch)
+            .patch_settings(organization_id.0, patch, Some(user_id.0))
             .await
-            .map_err(Self::map_repository_error)?;
+            .map_err(|error| match error {
+                RepositoryError::ValidationFailed(message) => {
+                    OrganizationError::Unauthorized(message)
+                }
+                error => Self::map_repository_error(error),
+            })?;
 
         Ok(Self::settings_from_organization(&updated))
     }
@@ -1595,6 +1651,7 @@ impl OrganizationServiceImpl {
                     system_prompt: None,
                     fallback_enabled: Some(Some(fallback_enabled)),
                 },
+                None,
             )
             .await
             .map_err(Self::map_repository_error)?;
@@ -1789,6 +1846,22 @@ impl OrganizationServiceTrait for OrganizationServiceImpl {
     ) -> Result<OrganizationMember, OrganizationError> {
         self.update_member_role_validated_impl(organization_id, requester_id, member_id, new_role)
             .await
+    }
+
+    async fn update_member_role_for_admin(
+        &self,
+        organization_id: OrganizationId,
+        member_id: UserId,
+        new_role: MemberRole,
+        changed_by_user_id: UserId,
+    ) -> Result<ports::OrganizationMemberRoleUpdate, OrganizationError> {
+        self.update_member_role_for_admin_impl(
+            organization_id,
+            member_id,
+            new_role,
+            changed_by_user_id,
+        )
+        .await
     }
 
     async fn remove_member_validated(
@@ -2015,6 +2088,7 @@ mod tests {
             id: Uuid,
             request: UpdateOrganizationRequest,
             expected_fallback_override: Option<Option<serde_json::Value>>,
+            _: Uuid,
         ) -> Result<Organization, RepositoryError> {
             *self.update_calls.lock().unwrap() += 1;
             let mut org = self.org.lock().unwrap();
@@ -2043,6 +2117,7 @@ mod tests {
             &self,
             id: Uuid,
             patch: ports::PatchOrganizationSettings,
+            _: Option<Uuid>,
         ) -> Result<Organization, RepositoryError> {
             *self.update_calls.lock().unwrap() += 1;
             let mut org = self.org.lock().unwrap();
@@ -2083,6 +2158,7 @@ mod tests {
         async fn delete_if_no_staking_farm_source(
             &self,
             _: Uuid,
+            _: Uuid,
         ) -> Result<DeleteOrganizationResult, RepositoryError> {
             *self.delete_if_no_staking_farm_source_calls.lock().unwrap() += 1;
             Ok(self.delete_result)
@@ -2102,11 +2178,27 @@ mod tests {
             _: Uuid,
             _: Uuid,
             _: UpdateOrganizationMemberRequest,
+            _: Uuid,
         ) -> Result<OrganizationMember, RepositoryError> {
             unimplemented!()
         }
 
-        async fn remove_member(&self, _: Uuid, _: Uuid) -> Result<bool, RepositoryError> {
+        async fn update_member_role_with_audit(
+            &self,
+            _: Uuid,
+            _: Uuid,
+            _: UpdateOrganizationMemberRequest,
+            _: Uuid,
+        ) -> Result<OrganizationMemberRoleUpdate, RepositoryError> {
+            unimplemented!()
+        }
+
+        async fn remove_member(
+            &self,
+            _: Uuid,
+            _: Uuid,
+            _: Uuid,
+        ) -> Result<RemoveOrganizationMemberResult, RepositoryError> {
             unimplemented!()
         }
 
@@ -2909,7 +3001,7 @@ mod tests {
         assert!(!response.results[0].success);
         assert_eq!(
             response.results[0].error.as_deref(),
-            Some("Insufficient permissions to invite members as owner")
+            Some("Ownership can only be transferred to an existing organization member")
         );
         assert!(response.results[1].success);
         assert!(response.results[2].success);
@@ -2920,6 +3012,75 @@ mod tests {
         assert!(records.iter().all(|invitation| {
             invitation.role == MemberRole::Admin || invitation.role == MemberRole::Member
         }));
+    }
+
+    #[tokio::test]
+    async fn create_invitations_rejects_owner_role_for_owner() {
+        let (service, invitation_repo, _, _) =
+            make_service(Ok(EmailDeliveryOutcome::Skipped), None);
+        let org = service
+            .repository
+            .get_by_id(Uuid::nil())
+            .await
+            .unwrap()
+            .unwrap();
+
+        let response = service
+            .create_invitations(
+                org.id,
+                org.owner_id,
+                vec![("new-owner@example.com".to_string(), MemberRole::Owner)],
+                168,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.successful, 0);
+        assert_eq!(response.failed, 1);
+        assert_eq!(
+            response.results[0].error.as_deref(),
+            Some("Ownership can only be transferred to an existing organization member")
+        );
+        assert!(invitation_repo.records.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn accept_invitation_rejects_historical_owner_invitation() {
+        let (service, invitation_repo, _, user_repo) =
+            make_service(Ok(EmailDeliveryOutcome::Skipped), None);
+        let org = service
+            .repository
+            .get_by_id(Uuid::nil())
+            .await
+            .unwrap()
+            .unwrap();
+        let invitation = invitation_repo
+            .create(
+                org.id.0,
+                CreateInvitationRequest {
+                    email: user_repo.inviter.email.clone(),
+                    role: MemberRole::Owner,
+                    expires_in_hours: 168,
+                },
+                org.owner_id.0,
+            )
+            .await
+            .unwrap();
+
+        let error = service
+            .accept_invitation(
+                invitation.id,
+                user_repo.inviter.id.clone(),
+                &user_repo.inviter.email,
+            )
+            .await
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            OrganizationError::InvalidParams(message)
+                if message == "Ownership can only be transferred to an existing organization member"
+        ));
     }
 
     #[tokio::test]

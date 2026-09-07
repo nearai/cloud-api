@@ -149,6 +149,7 @@ const APPROVED: &[ApprovedGroup] = &[
     ApprovedGroup { table: "oauth_states", columns: &["state", "provider", "pkce_verifier", "frontend_callback"], reason: "Short-lived OAuth handshake state required for indexed callback lookup and PKCE completion" },
     ApprovedGroup { table: "organization_invitations", columns: &["email", "role", "status", "token", "email_status", "email_last_error", "email_message_id"], reason: "Invitation workflow data required for indexed acceptance and delivery operations; tokens are short-lived" },
     ApprovedGroup { table: "organization_limits_history", columns: &["changed_by", "change_reason", "changed_by_user_email", "credit_type", "source", "currency"], reason: "Restricted billing and limits audit history" },
+    ApprovedGroup { table: "organization_member_role_audit_log", columns: &["previous_role", "new_role"], reason: "Restricted administrator member-role audit history" },
     ApprovedGroup { table: "organization_members", columns: &["role"], reason: "Queryable authorization role" },
     ApprovedGroup { table: "organization_reporting_tokens", columns: &["name", "token_hash", "token_prefix"], reason: "Reporting credentials are one-way hashed; name and prefix are display metadata" },
     ApprovedGroup { table: "organization_staking_farm_sources", columns: &["near_account_id", "network_id", "contract_id", "farm_product_id", "farm_price_id", "status", "sync_status", "last_sync_error", "active_positions"], reason: "Public-chain identifiers and restricted staking synchronization state" },

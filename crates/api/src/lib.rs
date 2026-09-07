@@ -2185,8 +2185,8 @@ pub fn build_admin_routes(
         list_models as admin_list_models, list_organization_members, list_organizations,
         list_users, preview_model_deprecation, preview_model_pricing_changes,
         resend_invitation_email, update_aml_report_status, update_organization_concurrent_limit,
-        update_organization_fallback, update_organization_limits, update_service,
-        upsert_aml_allowlist_entry, AdminAppState,
+        update_organization_fallback, update_organization_limits, update_organization_member_role,
+        update_service, upsert_aml_allowlist_entry, AdminAppState,
     };
     use crate::routes::staking_farm::{
         get_admin_organization_staking_farm, sync_admin_organization_staking_farm,
@@ -2407,6 +2407,10 @@ pub fn build_admin_routes(
         .route(
             "/admin/organizations/{org_id}/members",
             axum::routing::get(list_organization_members),
+        )
+        .route(
+            "/admin/organizations/{org_id}/members/{user_id}",
+            axum::routing::put(update_organization_member_role),
         )
         .route(
             "/admin/access-tokens",

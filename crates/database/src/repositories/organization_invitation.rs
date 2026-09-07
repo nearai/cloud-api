@@ -195,11 +195,7 @@ impl OrganizationInvitationRepository for PgOrganizationInvitationRepository {
                 .context("Failed to get database connection")
                 .map_err(RepositoryError::PoolError)?;
 
-            let transaction = client
-                .transaction()
-                .await
-                .context("Failed to start transaction")
-                .map_err(RepositoryError::DatabaseError)?;
+            let transaction = client.transaction().await.map_err(map_db_error)?;
 
             transaction
                 .execute(

@@ -2943,6 +2943,7 @@ pub async fn list_organization_members(
         (status = 200, description = "Invitation results", body = InviteOrganizationMemberByEmailResponse),
         (status = 400, description = "Invalid request", body = ErrorResponse),
         (status = 401, description = "Unauthorized", body = ErrorResponse),
+        (status = 403, description = "System administrator privileges required", body = ErrorResponse),
         (status = 404, description = "Organization not found", body = ErrorResponse),
         (status = 500, description = "Internal server error", body = ErrorResponse)
     ),

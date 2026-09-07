@@ -324,6 +324,9 @@ pub trait OrganizationRepository: Send + Sync {
 
     async fn get_active_name_by_id(&self, id: Uuid) -> Result<Option<String>, RepositoryError>;
 
+    /// Whether an owner membership exists, independently of the owner's account status.
+    async fn has_owner(&self, organization_id: Uuid) -> Result<bool, RepositoryError>;
+
     async fn get_by_name(&self, name: &str) -> Result<Option<Organization>, RepositoryError>;
 
     async fn get_member(
@@ -332,6 +335,7 @@ pub trait OrganizationRepository: Send + Sync {
         user_id: Uuid,
     ) -> Result<Option<OrganizationMember>, RepositoryError>;
 
+    /// Check active accounts with a case-insensitive email match.
     async fn has_member_with_email(
         &self,
         organization_id: Uuid,
@@ -650,6 +654,9 @@ pub trait OrganizationServiceTrait: Send + Sync {
     ) -> Result<BatchInvitationResponse, OrganizationError>;
 
     /// Create invitations after system-admin authorization has been verified.
+    /// The caller MUST enforce system-admin authorization (the API uses
+    /// `admin_middleware` and the `AdminUser` extension). The requester need not
+    /// belong to the organization; this method does not authenticate them.
     async fn create_invitations_for_admin(
         &self,
         organization_id: OrganizationId,

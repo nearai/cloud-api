@@ -938,6 +938,9 @@ mod tests {
         async fn get_active_name_by_id(&self, _: Uuid) -> Result<Option<String>, RepositoryError> {
             unimplemented!()
         }
+        async fn has_owner(&self, _: Uuid) -> Result<bool, RepositoryError> {
+            unimplemented!()
+        }
         async fn get_by_name(&self, _: &str) -> Result<Option<Organization>, RepositoryError> {
             unimplemented!()
         }

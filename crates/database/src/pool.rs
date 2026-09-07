@@ -4,10 +4,8 @@ use std::fs::File;
 use std::io::BufReader;
 use tracing::{debug, info};
 
-/// NOTE: Direct pool creation is deprecated. Use ClusterManager with Patroni discovery instead.
-/// This module now only provides utility functions for TLS pool creation used by ClusterManager.
-///
-/// Create pool using rustls with either custom certificate or platform verifier
+/// Create a certificate- and hostname-verifying TLS pool for direct endpoints,
+/// using either an explicit PEM trust bundle or the platform verifier.
 pub fn create_pool_with_rustls(cfg: Config, cert_path: Option<&str>) -> anyhow::Result<Pool> {
     use tokio_postgres_rustls::MakeRustlsConnect;
 

@@ -69,12 +69,17 @@ impl Database {
         }
     }
 
-    /// Create a new database service from configuration with Patroni discovery
+    /// Create a database service using direct connectivity or Patroni discovery.
     pub async fn from_config(config: &config::DatabaseConfig) -> Result<Self> {
         // If mock flag is set, use mock database
         if config.mock {
             info!("Using mock database for testing");
             return create_mock_database().await;
+        }
+
+        if config.connection_mode == config::DatabaseConnectionMode::Direct {
+            info!("Initializing database with a direct PostgreSQL endpoint");
+            return Self::from_direct_postgres_config(config).await;
         }
 
         // For tests, use simple postgres connection without Patroni
@@ -154,6 +159,16 @@ impl Database {
     /// Run database migrations
     pub async fn run_migrations(&self) -> Result<()> {
         migrations::run(&self.pool).await
+    }
+
+    async fn from_direct_postgres_config(config: &config::DatabaseConfig) -> Result<Self> {
+        let pg_config = direct_pool_config(config)?;
+        let pool = if config.tls_enabled {
+            crate::pool::create_pool_with_rustls(pg_config, config.tls_ca_cert_path.as_deref())?
+        } else {
+            pg_config.create_pool(Some(Runtime::Tokio1), tokio_postgres::NoTls)?
+        };
+        Ok(Self::new(DbPool::new(pool)))
     }
 
     /// Get a reference to the connection pool
@@ -239,5 +254,103 @@ impl Database {
         };
 
         Ok(Self::new(DbPool::new(pool)))
+    }
+}
+
+fn direct_pool_config(config: &config::DatabaseConfig) -> Result<deadpool_postgres::Config> {
+    let host = config
+        .host
+        .as_deref()
+        .filter(|host| !host.trim().is_empty())
+        .ok_or_else(|| anyhow::anyhow!("DATABASE_HOST is required in direct mode"))?;
+    anyhow::ensure!(
+        config.max_connections > 0,
+        "DATABASE_MAX_CONNECTIONS must be positive"
+    );
+    anyhow::ensure!(
+        config.tls_enabled || config.tls_ca_cert_path.is_none(),
+        "DATABASE_TLS_CA_CERT_PATH requires DATABASE_TLS_ENABLED=true"
+    );
+    let mut pg = deadpool_postgres::Config::new();
+    pg.host = Some(host.to_owned());
+    pg.port = Some(config.port);
+    pg.dbname = Some(config.database.clone());
+    pg.user = Some(config.username.clone());
+    pg.password = Some(config.password.clone());
+    pg.pool = Some(deadpool_postgres::PoolConfig::new(config.max_connections));
+    pg.ssl_mode = Some(if config.tls_enabled {
+        deadpool_postgres::SslMode::Require
+    } else {
+        deadpool_postgres::SslMode::Disable
+    });
+    pg.connect_timeout = Some(Duration::from_secs(10));
+    Ok(pg)
+}
+
+#[cfg(test)]
+mod direct_connection_tests {
+    use super::*;
+
+    fn config() -> config::DatabaseConfig {
+        config::DatabaseConfig {
+            connection_mode: config::DatabaseConnectionMode::Direct,
+            primary_app_id: String::new(),
+            gateway_subdomain: String::new(),
+            host: Some("example.us-east-1.rds.amazonaws.com".into()),
+            port: 5432,
+            database: "postgres".into(),
+            username: "application".into(),
+            password: "test-only".into(),
+            max_connections: 7,
+            tls_enabled: true,
+            tls_ca_cert_path: None,
+            refresh_interval: 30,
+            mock: false,
+        }
+    }
+
+    #[test]
+    fn direct_pool_requires_tls_and_honors_connection_settings() {
+        let source = config();
+        let pool = direct_pool_config(&source).unwrap();
+        assert_eq!(pool.host, source.host);
+        assert_eq!(pool.port, Some(5432));
+        assert_eq!(pool.dbname.as_deref(), Some("postgres"));
+        assert_eq!(pool.user.as_deref(), Some("application"));
+        assert_eq!(pool.pool.unwrap().max_size, 7);
+        assert!(matches!(
+            pool.ssl_mode,
+            Some(deadpool_postgres::SslMode::Require)
+        ));
+    }
+
+    #[test]
+    fn invalid_direct_configuration_fails_closed() {
+        let mut source = config();
+        source.host = None;
+        assert!(direct_pool_config(&source).is_err());
+        source.host = Some(" ".into());
+        assert!(direct_pool_config(&source).is_err());
+        source.host = Some("localhost".into());
+        source.max_connections = 0;
+        assert!(direct_pool_config(&source).is_err());
+        source.max_connections = 1;
+        source.tls_enabled = false;
+        source.tls_ca_cert_path = Some("ca.pem".into());
+        assert!(direct_pool_config(&source).is_err());
+    }
+
+    #[tokio::test]
+    async fn direct_mode_bypasses_patroni_and_requires_configured_ca() {
+        let mut source = config();
+        source.tls_ca_cert_path = Some("/nonexistent-cloud-api-test-ca.pem".into());
+        let error = Database::from_config(&source).await.err().unwrap();
+        assert!(error
+            .to_string()
+            .contains("Failed to open certificate file"));
+        source.tls_ca_cert_path = None;
+        source.tls_enabled = false;
+        let database = Database::from_config(&source).await.unwrap();
+        assert!(database.cluster_manager().is_none());
     }
 }

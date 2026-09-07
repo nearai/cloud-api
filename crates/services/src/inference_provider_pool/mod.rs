@@ -167,6 +167,35 @@ fn reinsert_pubkey_pin(params: &mut ChatCompletionParams, pub_key: Option<&str>)
     }
 }
 
+fn release_pending_route(provider: &Arc<InferenceProviderTrait>, request_hash: &str) {
+    provider.pin_chat_connection(request_hash, "");
+    provider.unpin_chat_connection("");
+}
+
+async fn peek_is_control(
+    peekable: &mut inference_providers::PeekableStreamingResult,
+    idle_budget: Option<Duration>,
+) -> Result<bool, Duration> {
+    let peeked = match idle_budget {
+        Some(budget) => tokio::time::timeout(budget, peekable.peek())
+            .await
+            .map_err(|_elapsed| budget)?,
+        None => peekable.peek().await,
+    };
+    Ok(matches!(peeked, Some(Ok(event)) if event.chunk.is_none()))
+}
+
+fn reattach_leading_control(
+    leading_control: Vec<Result<inference_providers::SSEEvent, CompletionError>>,
+    peekable: inference_providers::PeekableStreamingResult,
+) -> StreamingResult {
+    if leading_control.is_empty() {
+        return Box::pin(peekable);
+    }
+    use futures::StreamExt as _;
+    Box::pin(futures::stream::iter(leading_control).chain(peekable))
+}
+
 fn record_backend_key_divergence(
     metrics: Option<&dyn crate::metrics::MetricsServiceTrait>,
     model_name: &str,
@@ -3592,7 +3621,8 @@ impl InferenceProviderPool {
             .stream)
     }
 
-    /// `first_event_timeout` bounds the wait for the first stream event only.
+    /// `first_event_timeout` is a per-attempt idle budget: it bounds the wait for
+    /// the provider call and for each subsequent read up to the first stream event.
     /// Widening it to span provider selection caps the retry loop and starves
     /// fallback, which the per-attempt TTFB guards already cover.
     pub async fn chat_completion_stream_with_attribution(
@@ -3649,61 +3679,53 @@ impl InferenceProviderPool {
                     let forwarded_request_id = forwarded_request_id.clone();
                     let model_id = model_id.clone();
                     async move {
-                        let stream = provider
-                            .chat_completion_stream(params, request_hash.clone())
-                            .await?;
+                        let fail_prefill = |budget: Duration| {
+                            release_pending_route(&provider, &request_hash);
+                            tracing::warn!(
+                                model = %model_id,
+                                request_id = forwarded_request_id.as_deref(),
+                                timeout_seconds = budget.as_secs(),
+                                "Upstream accepted the request and then produced no \
+                                 stream event before the prefill deadline"
+                            );
+                            CompletionError::Timeout {
+                                operation: "prefill".to_string(),
+                                timeout_seconds: budget.as_secs(),
+                            }
+                        };
+                        // The NEAR AI index route peeks the first payload before returning,
+                        // so headers-then-silence hangs here, not in the drain below.
+                        let open_stream =
+                            provider.chat_completion_stream(params, request_hash.clone());
+                        let stream = match first_event_timeout {
+                            Some(budget) => tokio::time::timeout(budget, open_stream)
+                                .await
+                                .map_err(|_elapsed| fail_prefill(budget))?,
+                            None => open_stream.await,
+                        }?;
                         let mut peekable = StreamingResultExt::peekable(stream);
                         let mut leading_control = Vec::new();
                         use futures::StreamExt as _;
-                        let await_first_event = async {
-                            while leading_control.len() < MAX_LEADING_CONTROL_EVENTS
-                                && matches!(peekable.peek().await, Some(Ok(event)) if event.chunk.is_none())
-                            {
-                                if let Some(event) = peekable.next().await {
-                                    leading_control.push(event);
-                                }
-                            }
-                            peekable
-                                .peek()
+                        while leading_control.len() < MAX_LEADING_CONTROL_EVENTS
+                            && peek_is_control(&mut peekable, first_event_timeout)
                                 .await
-                                .and_then(|first| first.as_ref().err().cloned())
-                        };
-                        let first_error = match first_event_timeout {
-                            Some(budget) => {
-                                match tokio::time::timeout(budget, await_first_event).await {
-                                    Ok(first_error) => first_error,
-                                    Err(_elapsed) => {
-                                        provider.pin_chat_connection(&request_hash, "");
-                                        provider.unpin_chat_connection("");
-                                        tracing::warn!(
-                                            model = %model_id,
-                                            request_id = forwarded_request_id.as_deref(),
-                                            timeout_seconds = budget.as_secs(),
-                                            "Upstream accepted the request and then produced no \
-                                             stream event before the prefill deadline"
-                                        );
-                                        return Err(CompletionError::Timeout {
-                                            operation: "prefill".to_string(),
-                                            timeout_seconds: budget.as_secs(),
-                                        });
-                                    }
-                                }
+                                .map_err(fail_prefill)?
+                        {
+                            if let Some(event) = peekable.next().await {
+                                leading_control.push(event);
                             }
-                            None => await_first_event.await,
-                        };
+                        }
+                        let first_error = peekable
+                            .peek()
+                            .await
+                            .and_then(|first| first.as_ref().err().cloned());
                         if let Some(error) = first_error {
                             if Self::classify_retry_decision(&error).starts_with("retryable_") {
-                                provider.pin_chat_connection(&request_hash, "");
-                                provider.unpin_chat_connection("");
+                                release_pending_route(&provider, &request_hash);
                                 return Err(error);
                             }
                         }
-                        let primed: StreamingResult = if leading_control.is_empty() {
-                            Box::pin(peekable)
-                        } else {
-                            Box::pin(futures::stream::iter(leading_control).chain(peekable))
-                        };
-                        Ok(primed)
+                        Ok(reattach_leading_control(leading_control, peekable))
                     }
                 },
             )
@@ -3751,14 +3773,12 @@ impl InferenceProviderPool {
         let mut leading_control: Vec<Result<inference_providers::SSEEvent, CompletionError>> =
             Vec::new();
         let peek_first_event = async {
+            use futures::StreamExt as _;
+            while leading_control.len() < MAX_LEADING_CONTROL_EVENTS
+                && peek_is_control(&mut peekable, None).await == Ok(true)
             {
-                use futures::StreamExt as _;
-                while leading_control.len() < MAX_LEADING_CONTROL_EVENTS
-                    && matches!(peekable.peek().await, Some(Ok(event)) if event.chunk.is_none())
-                {
-                    if let Some(ev) = peekable.next().await {
-                        leading_control.push(ev);
-                    }
+                if let Some(ev) = peekable.next().await {
+                    leading_control.push(ev);
                 }
             }
 
@@ -3787,20 +3807,13 @@ impl InferenceProviderPool {
         let first_error = peek_first_event.await;
         if !pinned {
             // Clean up orphaned pending client when peek fails or yields no chat_id
-            provider.pin_chat_connection(&request_hash, "");
-            provider.unpin_chat_connection("");
+            release_pending_route(&provider, &request_hash);
         }
         if let Some(error) = first_error {
             return Err(error);
         }
-        let stream: StreamingResult = if leading_control.is_empty() {
-            Box::pin(peekable)
-        } else {
-            use futures::StreamExt as _;
-            Box::pin(futures::stream::iter(leading_control).chain(peekable))
-        };
         Ok(AttributedChatCompletionStream {
-            stream,
+            stream: reattach_leading_control(leading_control, peekable),
             provider_attribution,
             latency_reporter,
         })
@@ -9049,6 +9062,118 @@ mod tests {
             "the deadline covers the wait for the first event, not provider selection; capping \
              the whole call lets a slow retry round consume it and starves fallback"
         );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_provider_that_peeks_before_returning_is_still_bounded() {
+        use inference_providers::mock::MockProvider;
+
+        let pool = InferenceProviderPool::new(None, ExternalProvidersConfig::default());
+        let model_id = "peeking/model".to_string();
+        let provider = Arc::new(MockProvider::new_accept_all());
+        provider.set_call_stall_override(true).await;
+        pool.register_provider(model_id.clone(), provider).await;
+
+        let started = tokio::time::Instant::now();
+        let result = pool
+            .chat_completion_stream_with_attribution(
+                fallback_params(&model_id),
+                "h".to_string(),
+                ChatRoutingHints::default(),
+                Some(Duration::from_secs(300)),
+            )
+            .await;
+
+        match result {
+            Err(CompletionError::Timeout {
+                operation,
+                timeout_seconds,
+            }) => {
+                assert_eq!(operation, "prefill");
+                assert_eq!(timeout_seconds, 300);
+                assert!(started.elapsed() >= Duration::from_secs(300));
+            }
+            Err(other) => panic!(
+                "a provider that waits for the first upstream payload inside its own call must \
+                 still hit the prefill deadline, got {other:?}"
+            ),
+            Ok(_) => panic!("a provider call that never returns must not produce a usable stream"),
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn upstream_keepalives_extend_the_first_event_deadline() {
+        use inference_providers::mock::{MockProvider, RequestMatcher, ResponseTemplate};
+
+        let pool = InferenceProviderPool::new(None, ExternalProvidersConfig::default());
+        let model_id = "keepalive/model".to_string();
+        let provider = Arc::new(MockProvider::new_accept_all());
+        provider
+            .when(RequestMatcher::Any)
+            .respond_with(ResponseTemplate::new("answered after a long prefill"))
+            .await;
+        provider
+            .set_control_prelude_override(Some((5, Duration::from_secs(200))))
+            .await;
+        pool.register_provider(model_id.clone(), provider).await;
+
+        let served = pool
+            .chat_completion_stream_with_attribution(
+                fallback_params(&model_id),
+                "h".to_string(),
+                ChatRoutingHints::default(),
+                Some(Duration::from_secs(300)),
+            )
+            .await;
+
+        assert!(
+            served.is_ok(),
+            "an upstream sending keepalives every 200s must survive a 300s deadline; the budget \
+             is idle time between reads, not total time to the first data chunk"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_keepalive_gap_past_the_deadline_still_times_out() {
+        use inference_providers::mock::{MockProvider, RequestMatcher, ResponseTemplate};
+
+        let pool = InferenceProviderPool::new(None, ExternalProvidersConfig::default());
+        let model_id = "slow-keepalive/model".to_string();
+        let provider = Arc::new(MockProvider::new_accept_all());
+        provider
+            .when(RequestMatcher::Any)
+            .respond_with(ResponseTemplate::new("answered too late"))
+            .await;
+        provider
+            .set_control_prelude_override(Some((1, Duration::from_secs(400))))
+            .await;
+        pool.register_provider(model_id.clone(), provider).await;
+
+        let result = pool
+            .chat_completion_stream_with_attribution(
+                fallback_params(&model_id),
+                "h".to_string(),
+                ChatRoutingHints::default(),
+                Some(Duration::from_secs(300)),
+            )
+            .await;
+
+        match result {
+            Err(CompletionError::Timeout {
+                operation,
+                timeout_seconds,
+            }) => {
+                assert_eq!(operation, "prefill");
+                assert_eq!(timeout_seconds, 300);
+            }
+            Err(other) => panic!(
+                "a single 400s gap exceeds the 300s idle budget and must surface as a prefill \
+                 timeout, got {other:?}"
+            ),
+            Ok(_) => panic!(
+                "resetting the deadline on each read must not remove the bound on any one read"
+            ),
+        }
     }
 
     fn fallback_params(model: &str) -> inference_providers::ChatCompletionParams {

@@ -21,7 +21,7 @@ use bytes::Bytes;
 use futures_util::stream;
 use sha2::{Digest, Sha256};
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::{Mutex, RwLock};
 
 /// Lightweight PII detector used only by [`MockProvider::privacy_classify_raw`]
@@ -651,11 +651,13 @@ struct MockConfig {
     default_response: ResponseTemplate,
     /// When set, all chat completion calls return this error instead of generating a response
     error_override: Option<CompletionError>,
+    call_stall_override: bool,
     /// When set, all chat completion streams are created successfully and then yield this error.
     stream_error_override: Option<CompletionError>,
     /// When set, all chat completion streams are created successfully and then never
     /// yield an event, modelling an upstream that returns headers and goes silent.
     stream_stall_override: bool,
+    control_prelude_override: Option<(usize, Duration)>,
     /// When set, all embeddings calls return this error instead of generating a response
     embedding_error_override: Option<EmbeddingError>,
     /// When set, all audio transcription calls return this error instead of a response.
@@ -734,8 +736,10 @@ impl MockProvider {
                 expectations: Vec::new(),
                 default_response: ResponseTemplate::new("1. 2. 3."),
                 error_override: None,
+                call_stall_override: false,
                 stream_error_override: None,
                 stream_stall_override: false,
+                control_prelude_override: None,
                 embedding_error_override: None,
                 audio_transcription_error_override: None,
             })),
@@ -761,8 +765,10 @@ impl MockProvider {
                 expectations: Vec::new(),
                 default_response: ResponseTemplate::new("1. 2. 3."),
                 error_override: None,
+                call_stall_override: false,
                 stream_error_override: None,
                 stream_stall_override: false,
+                control_prelude_override: None,
                 embedding_error_override: None,
                 audio_transcription_error_override: None,
             })),
@@ -786,8 +792,10 @@ impl MockProvider {
                 expectations: Vec::new(),
                 default_response: ResponseTemplate::new("1. 2. 3."),
                 error_override: None,
+                call_stall_override: false,
                 stream_error_override: None,
                 stream_stall_override: false,
+                control_prelude_override: None,
                 embedding_error_override: None,
                 audio_transcription_error_override: None,
             })),
@@ -910,6 +918,20 @@ impl MockProvider {
     pub async fn set_stream_stall_override(&self, stalled: bool) {
         let mut config = self.config.lock().await;
         config.stream_stall_override = stalled;
+    }
+
+    /// Set a call stall override: chat completion stream creation never returns,
+    /// as on a provider that peeks the first upstream payload before returning.
+    pub async fn set_call_stall_override(&self, stalled: bool) {
+        let mut config = self.config.lock().await;
+        config.call_stall_override = stalled;
+    }
+
+    /// Emit `count` keepalive control events, one per `interval`, ahead of the
+    /// response chunks.
+    pub async fn set_control_prelude_override(&self, prelude: Option<(usize, Duration)>) {
+        let mut config = self.config.lock().await;
+        config.control_prelude_override = prelude;
     }
 
     /// Override the embeddings response with an error (useful for testing error paths).
@@ -1093,10 +1115,14 @@ impl crate::InferenceProvider for MockProvider {
         }
 
         // Check for matching expectation (and error override)
-        let response_template = {
+        let (response_template, control_prelude) = {
             let config = self.config.lock().await;
             if let Some(ref error) = config.error_override {
                 return Err(error.clone());
+            }
+            if config.call_stall_override {
+                drop(config);
+                return std::future::pending().await;
             }
             if let Some(ref error) = config.stream_error_override {
                 let stream = stream::iter(vec![Err(error.clone())]);
@@ -1105,12 +1131,13 @@ impl crate::InferenceProvider for MockProvider {
             if config.stream_stall_override {
                 return Ok(Box::pin(stream::pending()));
             }
-            config
+            let template = config
                 .expectations
                 .iter()
                 .find(|exp| exp.matcher.matches(&params))
                 .map(|exp| exp.response.clone())
-                .unwrap_or_else(|| config.default_response.clone())
+                .unwrap_or_else(|| config.default_response.clone());
+            (template, config.control_prelude_override)
         };
 
         // Calculate input tokens from messages (rough estimate: 1 word ≈ 1 token)
@@ -1203,7 +1230,22 @@ impl crate::InferenceProvider for MockProvider {
                 .chain(stream_error.into_iter().map(Err)),
         );
 
-        Ok(Box::pin(stream))
+        let Some((count, interval)) = control_prelude else {
+            return Ok(Box::pin(stream));
+        };
+        let prelude = stream::unfold(count, move |remaining| async move {
+            if remaining == 0 {
+                return None;
+            }
+            tokio::time::sleep(interval).await;
+            let event = SSEEvent {
+                raw_bytes: Bytes::from_static(b": keepalive\n\n"),
+                chunk: None,
+                raw_passthrough: true,
+            };
+            Some((Ok(event), remaining - 1))
+        });
+        Ok(Box::pin(futures_util::StreamExt::chain(prelude, stream)))
     }
 
     async fn chat_completion(

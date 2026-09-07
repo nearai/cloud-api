@@ -2952,8 +2952,7 @@ pub async fn list_organization_members(
         (status = 500, description = "Internal server error", body = ErrorResponse)
     ),
     security(
-        ("session_token" = []),
-        ("admin_access_token" = [])
+        ("session_token" = [])
     )
 )]
 pub async fn update_organization_member_role(

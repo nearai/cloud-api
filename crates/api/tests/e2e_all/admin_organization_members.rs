@@ -498,6 +498,86 @@ async fn test_admin_updates_member_role_and_protects_owners() {
 }
 
 #[tokio::test]
+async fn test_admin_member_role_updates_reject_unknown_and_inactive_organizations() {
+    let (server, database) = setup_test_server_with_database().await;
+    let inactive_organization_id = uuid::Uuid::new_v4();
+    let member_id = uuid::Uuid::new_v4();
+
+    {
+        let client = database
+            .pool()
+            .get()
+            .await
+            .expect("Failed to get database connection");
+        client
+            .execute(
+                "INSERT INTO users (id, email, username, auth_provider, provider_user_id, is_active, created_at, updated_at)
+                 VALUES ($1, $2, $3, 'mock', $4, true, NOW(), NOW())",
+                &[
+                    &member_id,
+                    &format!("inactive-org-member-{member_id}@example.com"),
+                    &format!("inactive-org-member-{member_id}"),
+                    &format!("inactive-org-member-provider-{member_id}"),
+                ],
+            )
+            .await
+            .expect("Failed to insert member user");
+        client
+            .execute(
+                "INSERT INTO organizations (id, name, is_active, created_at, updated_at)
+                 VALUES ($1, $2, false, NOW(), NOW())",
+                &[
+                    &inactive_organization_id,
+                    &format!("inactive-admin-role-{inactive_organization_id}"),
+                ],
+            )
+            .await
+            .expect("Failed to insert inactive organization");
+        client
+            .execute(
+                "INSERT INTO organization_members (organization_id, user_id, role)
+                 VALUES ($1, $2, 'member')",
+                &[&inactive_organization_id, &member_id],
+            )
+            .await
+            .expect("Failed to insert inactive organization member");
+    }
+
+    for organization_id in [inactive_organization_id, uuid::Uuid::new_v4()] {
+        let response = server
+            .put(format!("/v1/admin/organizations/{organization_id}/members/{member_id}").as_str())
+            .add_header("Authorization", format!("Bearer {}", get_session_id()))
+            .add_header("User-Agent", MOCK_USER_AGENT)
+            .json(&serde_json::json!({ "role": "admin" }))
+            .await;
+        assert_eq!(
+            response.status_code(),
+            404,
+            "Inactive and unknown organizations should reject role updates"
+        );
+    }
+}
+
+#[tokio::test]
+async fn test_admin_member_role_updates_reject_malformed_role() {
+    let server = setup_test_server().await;
+    let response = server
+        .put(
+            format!(
+                "/v1/admin/organizations/{}/members/{}",
+                uuid::Uuid::new_v4(),
+                uuid::Uuid::new_v4()
+            )
+            .as_str(),
+        )
+        .add_header("Authorization", format!("Bearer {}", get_session_id()))
+        .add_header("User-Agent", MOCK_USER_AGENT)
+        .json(&serde_json::json!({ "role": "administrator" }))
+        .await;
+    assert_eq!(response.status_code(), 422);
+}
+
+#[tokio::test]
 async fn test_admin_member_role_updates_require_authentication() {
     let organization_id = uuid::Uuid::new_v4();
     let user_id = uuid::Uuid::new_v4();

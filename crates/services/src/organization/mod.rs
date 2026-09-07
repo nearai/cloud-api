@@ -751,11 +751,14 @@ impl OrganizationServiceImpl {
             ));
         }
 
-        self.repository
-            .get_active_name_by_id(organization_id.0)
+        if !self
+            .repository
+            .active_exists_by_id(organization_id.0)
             .await
             .map_err(Self::map_repository_error)?
-            .ok_or(OrganizationError::NotFound)?;
+        {
+            return Err(OrganizationError::NotFound);
+        }
         self.repository
             .update_member_role_with_audit(
                 organization_id.0,
@@ -2043,9 +2046,9 @@ mod tests {
             Ok((id.is_nil() || org.id.0 == id).then(|| org.clone()))
         }
 
-        async fn get_active_name_by_id(&self, id: Uuid) -> Result<Option<String>, RepositoryError> {
+        async fn active_exists_by_id(&self, id: Uuid) -> Result<bool, RepositoryError> {
             let org = self.org.lock().unwrap();
-            Ok((id.is_nil() || org.id.0 == id).then(|| org.name.clone()))
+            Ok(org.is_active && (id.is_nil() || org.id.0 == id))
         }
 
         async fn get_by_name(&self, _: &str) -> Result<Option<Organization>, RepositoryError> {

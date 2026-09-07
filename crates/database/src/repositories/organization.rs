@@ -594,8 +594,8 @@ impl OrganizationRepository for PgOrganizationRepository {
         }
     }
 
-    async fn get_active_name_by_id(&self, id: Uuid) -> Result<Option<String>, RepositoryError> {
-        let row = retry_db!("get_active_organization_name_by_id", {
+    async fn active_exists_by_id(&self, id: Uuid) -> Result<bool, RepositoryError> {
+        let row = retry_db!("active_organization_exists_by_id", {
             let client = self
                 .pool
                 .get()
@@ -604,15 +604,17 @@ impl OrganizationRepository for PgOrganizationRepository {
                 .map_err(RepositoryError::PoolError)?;
 
             client
-                .query_opt(
-                    "SELECT name FROM organizations WHERE id = $1 AND is_active = true",
+                .query_one(
+                    "SELECT EXISTS (
+                         SELECT 1 FROM organizations WHERE id = $1 AND is_active = true
+                     )",
                     &[&id],
                 )
                 .await
                 .map_err(map_db_error)
         })?;
 
-        Ok(row.map(|row| row.get("name")))
+        Ok(row.get(0))
     }
 
     async fn get_by_name(&self, name: &str) -> Result<Option<Organization>, RepositoryError> {

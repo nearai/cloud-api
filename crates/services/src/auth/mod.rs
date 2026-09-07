@@ -935,7 +935,7 @@ mod tests {
         async fn get_by_id(&self, _: Uuid) -> Result<Option<Organization>, RepositoryError> {
             unimplemented!()
         }
-        async fn get_active_name_by_id(&self, _: Uuid) -> Result<Option<String>, RepositoryError> {
+        async fn active_exists_by_id(&self, _: Uuid) -> Result<bool, RepositoryError> {
             unimplemented!()
         }
         async fn get_by_name(&self, _: &str) -> Result<Option<Organization>, RepositoryError> {

@@ -328,7 +328,8 @@ pub trait OrganizationRepository: Send + Sync {
 
     async fn get_by_id(&self, id: Uuid) -> Result<Option<Organization>, RepositoryError>;
 
-    async fn get_active_name_by_id(&self, id: Uuid) -> Result<Option<String>, RepositoryError>;
+    /// Check active organization existence without resolving owner membership.
+    async fn active_exists_by_id(&self, id: Uuid) -> Result<bool, RepositoryError>;
 
     async fn get_by_name(&self, name: &str) -> Result<Option<Organization>, RepositoryError>;
 

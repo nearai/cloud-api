@@ -212,6 +212,79 @@ async fn system_message_behind_replayed_history_is_forwarded_unchanged() {
     );
 }
 
+/// With an organization system prompt configured, `load_conversation_context`
+/// used to emit it as its own system message and the request context as a
+/// second one, so the provider received `system(org), system(instructions +
+/// developer), user(...)` — a system message at index 1, which the live Qwen
+/// result on this PR shows is rejected. The organization prompt, the request
+/// context and the foldable leading input message are coalesced into a single
+/// leading system message so that supported configuration stops reproducing
+/// the reported failure.
+#[tokio::test]
+async fn org_prompt_and_leading_developer_message_coalesce_into_one_system_message() {
+    // Given
+    let (server, _pool, mock, _db) = setup_test_server_with_pool().await;
+    let model = setup_qwen_model(&server).await;
+    let org = setup_org_with_credits(&server, 10_000_000_000i64).await;
+    let api_key = get_api_key_for_org(&server, org.id.clone()).await;
+    let access_token = get_access_token_from_refresh_token(&server, get_session_id()).await;
+
+    let settings = server
+        .patch(&format!("/v1/organizations/{}/settings", org.id))
+        .add_header("Authorization", format!("Bearer {access_token}"))
+        .json(&serde_json::json!({"system_prompt": "Follow the house style."}))
+        .await;
+    assert_eq!(settings.status_code(), 200, "{}", settings.text());
+
+    // When
+    let response = server
+        .post("/v1/responses")
+        .add_header("Authorization", format!("Bearer {api_key}"))
+        .json(&serde_json::json!({
+            "model": model,
+            "instructions": "You are a coding agent.",
+            "input": [
+                {"role": "developer", "content": "Repository guidelines."},
+                {"role": "user", "content": "Fix the build."}
+            ],
+            "stream": false,
+            "max_output_tokens": 10
+        }))
+        .await;
+
+    // Then
+    assert_eq!(response.status_code(), 200, "{}", response.text());
+
+    let params = mock
+        .last_chat_params()
+        .await
+        .expect("the provider should have been called");
+    assert_eq!(
+        system_message_count(&params),
+        1,
+        "the organization prompt must not be a second system message: {:?}",
+        params.messages
+    );
+    assert_eq!(params.messages[0].role, MessageRole::System);
+
+    // All three sources are present, in the order they were emitted in before
+    // they were coalesced.
+    let system_text = message_text(&params.messages[0]);
+    let org_at = system_text
+        .find("Follow the house style.")
+        .expect("organization prompt should be present");
+    let instructions_at = system_text
+        .find("You are a coding agent.")
+        .expect("instructions should be present");
+    let developer_at = system_text
+        .find("Repository guidelines.")
+        .expect("developer content should be present");
+    assert!(
+        org_at < instructions_at && instructions_at < developer_at,
+        "order must be organization prompt, request context, folded input: {system_text}"
+    );
+}
+
 #[tokio::test]
 async fn user_only_input_is_still_accepted() {
     // Given

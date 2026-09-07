@@ -1,7 +1,8 @@
 # Connecting cloud-api to RDS PostgreSQL
 
 Set `DATABASE_CONNECTION_MODE=direct` to bypass Patroni discovery. The default
-is `patroni`; existing deployments and the legacy `postgres-test` test path are
+is `patroni`. Values must be lowercase without surrounding whitespace;
+existing deployments and the legacy `postgres-test` test path are
 unchanged. In direct mode, database initialization does not require
 `POSTGRES_PRIMARY_APP_ID` or `GATEWAY_SUBDOMAIN` (other application features may
 still need gateway configuration).
@@ -31,12 +32,18 @@ do not assume it includes the RDS CA. Missing/invalid CA files fail closed.
 Use the actual RDS endpoint, not an IP or an alias absent from its certificate.
 See [AWS TLS guidance](https://docs.aws.amazon.com/AmazonRDS/latest/UserGuide/PostgreSQL.Concepts.General.SSL.html)
 and the [regional CA bundle](https://truststore.pki.rds.amazonaws.com/us-east-1/us-east-1-bundle.pem).
-Plaintext is available only by explicitly setting `DATABASE_TLS_ENABLED=false`
-(for local development); do not use it for RDS. The old insecure test/Patroni
+Direct mode rejects `DATABASE_TLS_ENABLED=false`, including for localhost.
+Local plaintext tests can continue to use the legacy `postgres-test` path.
+The old insecure test/Patroni
 TLS behavior is not changed by this patch.
 
 This mode uses one pool for application reads and writes against the configured
-writer endpoint. It does not discover RDS read replicas. On failover, existing
+writer endpoint. Hostname padding is trimmed; empty database/user names are rejected.
+Pool wait, creation and recycling have explicit timeouts of 5, 10 and 5 seconds,
+respectively, in addition to the 10-second socket connection timeout. Recycled
+connections run a verification query before checkout. These are per-operation
+bounds, not an overall request/query deadline, and are not currently configurable.
+It does not discover RDS read replicas. On failover, existing
 connections can break; new connections resolve the endpoint again. Validate
 application retry behavior; this does not guarantee interruption-free failover.
 

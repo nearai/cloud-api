@@ -163,11 +163,8 @@ impl Database {
 
     async fn from_direct_postgres_config(config: &config::DatabaseConfig) -> Result<Self> {
         let pg_config = direct_pool_config(config)?;
-        let pool = if config.tls_enabled {
-            crate::pool::create_pool_with_rustls(pg_config, config.tls_ca_cert_path.as_deref())?
-        } else {
-            pg_config.create_pool(Some(Runtime::Tokio1), tokio_postgres::NoTls)?
-        };
+        let pool =
+            crate::pool::create_pool_with_rustls(pg_config, config.tls_ca_cert_path.as_deref())?;
         Ok(Self::new(DbPool::new(pool)))
     }
 
@@ -261,15 +258,24 @@ fn direct_pool_config(config: &config::DatabaseConfig) -> Result<deadpool_postgr
     let host = config
         .host
         .as_deref()
-        .filter(|host| !host.trim().is_empty())
+        .map(str::trim)
+        .filter(|host| !host.is_empty())
         .ok_or_else(|| anyhow::anyhow!("DATABASE_HOST is required in direct mode"))?;
     anyhow::ensure!(
         config.max_connections > 0,
         "DATABASE_MAX_CONNECTIONS must be positive"
     );
     anyhow::ensure!(
-        config.tls_enabled || config.tls_ca_cert_path.is_none(),
-        "DATABASE_TLS_CA_CERT_PATH requires DATABASE_TLS_ENABLED=true"
+        config.tls_enabled,
+        "Direct database mode requires DATABASE_TLS_ENABLED=true"
+    );
+    anyhow::ensure!(
+        !config.database.trim().is_empty(),
+        "DATABASE_NAME cannot be empty in direct mode"
+    );
+    anyhow::ensure!(
+        !config.username.trim().is_empty(),
+        "DATABASE_USERNAME cannot be empty in direct mode"
     );
     let mut pg = deadpool_postgres::Config::new();
     pg.host = Some(host.to_owned());
@@ -277,12 +283,19 @@ fn direct_pool_config(config: &config::DatabaseConfig) -> Result<deadpool_postgr
     pg.dbname = Some(config.database.clone());
     pg.user = Some(config.username.clone());
     pg.password = Some(config.password.clone());
-    pg.pool = Some(deadpool_postgres::PoolConfig::new(config.max_connections));
-    pg.ssl_mode = Some(if config.tls_enabled {
-        deadpool_postgres::SslMode::Require
-    } else {
-        deadpool_postgres::SslMode::Disable
+    pg.pool = Some(deadpool_postgres::PoolConfig {
+        max_size: config.max_connections,
+        timeouts: deadpool_postgres::Timeouts {
+            wait: Some(Duration::from_secs(5)),
+            create: Some(Duration::from_secs(10)),
+            recycle: Some(Duration::from_secs(5)),
+        },
+        queue_mode: deadpool::managed::QueueMode::Fifo,
     });
+    pg.manager = Some(deadpool_postgres::ManagerConfig {
+        recycling_method: deadpool_postgres::RecyclingMethod::Verified,
+    });
+    pg.ssl_mode = Some(deadpool_postgres::SslMode::Require);
     pg.connect_timeout = Some(Duration::from_secs(10));
     Ok(pg)
 }
@@ -317,11 +330,49 @@ mod direct_connection_tests {
         assert_eq!(pool.port, Some(5432));
         assert_eq!(pool.dbname.as_deref(), Some("postgres"));
         assert_eq!(pool.user.as_deref(), Some("application"));
-        assert_eq!(pool.pool.unwrap().max_size, 7);
+        let settings = pool.pool.unwrap();
+        assert_eq!(settings.max_size, 7);
+        assert_eq!(settings.timeouts.wait, Some(Duration::from_secs(5)));
+        assert_eq!(settings.timeouts.create, Some(Duration::from_secs(10)));
+        assert_eq!(settings.timeouts.recycle, Some(Duration::from_secs(5)));
+        assert!(matches!(
+            pool.manager.unwrap().recycling_method,
+            deadpool_postgres::RecyclingMethod::Verified
+        ));
         assert!(matches!(
             pool.ssl_mode,
             Some(deadpool_postgres::SslMode::Require)
         ));
+    }
+
+    #[test]
+    fn direct_host_is_normalized_and_identifiers_are_validated() {
+        let mut source = config();
+        source.host = Some(" \texample.us-east-1.rds.amazonaws.com\n".into());
+        assert_eq!(
+            direct_pool_config(&source).unwrap().host.as_deref(),
+            Some("example.us-east-1.rds.amazonaws.com")
+        );
+        for value in ["", " \t\n"] {
+            source.database = value.into();
+            assert!(direct_pool_config(&source)
+                .unwrap_err()
+                .to_string()
+                .contains("DATABASE_NAME"));
+            source.database = "postgres".into();
+            source.username = value.into();
+            assert!(direct_pool_config(&source)
+                .unwrap_err()
+                .to_string()
+                .contains("DATABASE_USERNAME"));
+            source.username = "application".into();
+        }
+        // Quoted SQL identifiers may intentionally contain spaces; do not trim them.
+        source.database = " database ".into();
+        source.username = " user ".into();
+        let pool = direct_pool_config(&source).unwrap();
+        assert_eq!(pool.dbname, source.database.into());
+        assert_eq!(pool.user, source.username.into());
     }
 
     #[test]
@@ -341,6 +392,30 @@ mod direct_connection_tests {
     }
 
     #[tokio::test]
+    async fn direct_pool_creation_times_out_if_server_stalls_after_tcp_accept() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut source = config();
+        source.host = Some("127.0.0.1".into());
+        source.port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(async move {
+            let (_socket, _) = listener.accept().await.unwrap();
+            std::future::pending::<()>().await;
+        });
+        let mut pg = direct_pool_config(&source).unwrap();
+        // Shorten only the test deadline, not the production configuration.
+        pg.pool.as_mut().unwrap().timeouts.create = Some(Duration::from_millis(100));
+        let pool = crate::pool::create_pool_with_rustls(pg, None).unwrap();
+        let result = tokio::time::timeout(Duration::from_secs(3), pool.get()).await;
+        server.abort();
+        assert!(matches!(
+            result.unwrap(),
+            Err(deadpool_postgres::PoolError::Timeout(
+                deadpool::managed::TimeoutType::Create
+            ))
+        ));
+    }
+
+    #[tokio::test]
     async fn direct_mode_bypasses_patroni_and_requires_configured_ca() {
         let mut source = config();
         source.tls_ca_cert_path = Some("/nonexistent-cloud-api-test-ca.pem".into());
@@ -350,7 +425,14 @@ mod direct_connection_tests {
             .contains("Failed to open certificate file"));
         source.tls_ca_cert_path = None;
         source.tls_enabled = false;
-        let database = Database::from_config(&source).await.unwrap();
-        assert!(database.cluster_manager().is_none());
+        for host in [
+            "example.us-east-1.rds.amazonaws.com",
+            "localhost",
+            "127.0.0.1",
+        ] {
+            source.host = Some(host.into());
+            let error = Database::from_config(&source).await.err().unwrap();
+            assert!(error.to_string().contains("DATABASE_TLS_ENABLED=true"));
+        }
     }
 }

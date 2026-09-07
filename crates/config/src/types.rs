@@ -678,7 +678,7 @@ impl std::str::FromStr for DatabaseConnectionMode {
         match value {
             "patroni" => Ok(Self::Patroni),
             "direct" => Ok(Self::Direct),
-            _ => Err("DATABASE_CONNECTION_MODE must be patroni or direct".into()),
+            _ => Err("DATABASE_CONNECTION_MODE must be exactly 'patroni' or 'direct' (lowercase, no surrounding whitespace)".into()),
         }
     }
 }
@@ -1224,6 +1224,22 @@ mod tests {
     use super::*;
     use serial_test::serial;
     use std::ffi::OsString;
+
+    #[test]
+    fn database_connection_mode_requires_exact_values() {
+        for value in ["DIRECT", "direct ", " patroni", ""] {
+            let error = value.parse::<DatabaseConnectionMode>().unwrap_err();
+            assert!(error.contains("lowercase, no surrounding whitespace"));
+        }
+        assert_eq!(
+            "direct".parse::<DatabaseConnectionMode>().unwrap(),
+            DatabaseConnectionMode::Direct
+        );
+        assert_eq!(
+            "patroni".parse::<DatabaseConnectionMode>().unwrap(),
+            DatabaseConnectionMode::Patroni
+        );
+    }
 
     #[test]
     #[serial]

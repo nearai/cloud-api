@@ -2,7 +2,7 @@
 # See https://nexte.st/book/configuration.html
 
 [profile.default]
-# Run more tests in parallel - safe since each test has isolated database
+# Most tests use UUID-scoped fixtures in a shared database, not isolated databases.
 test-threads = "num-cpus"
 
 # Longer timeout for e2e tests
@@ -13,6 +13,14 @@ slow-timeout = { period = "60s", terminate-after = 2 }
 # connections), so 16 * 4 = 64, well under PG's default max_connections = 100.
 [test-groups.e2e-db]
 max-threads = 16
+
+[[profile.default.overrides]]
+filter = "package(api) & binary(e2e_all) & test(/^database_encryption::/)"
+# Encryption jobs scan/update whole columns across all organizations. UUID
+# fixtures do not isolate them from other tests (including the dry-run check).
+# Reserve the entire run's capacity, not merely a separate serial test group.
+threads-required = "num-test-threads"
+test-group = "e2e-db"
 
 [[profile.default.overrides]]
 filter = "package(api) & binary(/^e2e/)"

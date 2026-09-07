@@ -297,7 +297,9 @@ impl PgOrganizationRepository {
                 .await
                 .map_err(map_db_error)?
                 .ok_or_else(|| RepositoryError::NotFound(id.to_string()))?;
-            let current_settings: serde_json::Value = locked_organization.get("settings");
+            let current_settings = locked_organization
+                .get::<_, Option<serde_json::Value>>("settings")
+                .unwrap_or_else(|| serde_json::json!({}));
 
             let actor_role = transaction
                 .query_opt(

@@ -179,7 +179,6 @@ impl OrganizationInvitationRepository for PgOrganizationInvitationRepository {
         request: CreateInvitationRequest,
         invited_by: Uuid,
     ) -> Result<ServicesInvitation> {
-        let token = Self::generate_token();
         let role = self.domain_to_db_role(request.role);
         let expires_at = Utc::now() + Duration::hours(request.expires_in_hours);
 
@@ -189,26 +188,33 @@ impl OrganizationInvitationRepository for PgOrganizationInvitationRepository {
         );
 
         let row = retry_db!("create_organization_invitation", {
-            let client = self
+            let mut client = self
                 .pool
                 .get()
                 .await
                 .context("Failed to get database connection")
                 .map_err(RepositoryError::PoolError)?;
 
-            // First, cancel any existing pending invitations for this email+org
-            client
+            let transaction = client
+                .transaction()
+                .await
+                .context("Failed to start transaction")
+                .map_err(RepositoryError::DatabaseError)?;
+
+            transaction
                 .execute(
                     "UPDATE organization_invitations
                      SET status = 'expired'
-                     WHERE organization_id = $1 AND email = $2 AND status = 'pending'",
+                     WHERE organization_id = $1
+                       AND LOWER(email) = LOWER($2)
+                       AND status = 'pending'",
                     &[&org_id, &request.email],
                 )
                 .await
                 .map_err(map_db_error)?;
 
-            // Create new invitation
-            client
+            let token = Self::generate_token();
+            let row = transaction
                 .query_one(
                     "INSERT INTO organization_invitations
                      (organization_id, email, role, invited_by_user_id, token, expires_at)
@@ -226,7 +232,10 @@ impl OrganizationInvitationRepository for PgOrganizationInvitationRepository {
                     ],
                 )
                 .await
-                .map_err(map_db_error)
+                .map_err(map_db_error)?;
+
+            transaction.commit().await.map_err(map_db_error)?;
+            Ok(row)
         })?;
 
         let db_inv = self.row_to_db_invitation(&row)?;
@@ -371,7 +380,7 @@ impl OrganizationInvitationRepository for PgOrganizationInvitationRepository {
                             created_at, expires_at, responded_at, email_status, email_sent_at,
                             email_last_error, email_message_id
                          FROM organization_invitations
-                         WHERE email = $1 AND status = $2
+                         WHERE LOWER(email) = LOWER($1) AND status = $2
                          ORDER BY created_at DESC",
                         &[&email, &db_status.to_string()],
                     )
@@ -384,7 +393,7 @@ impl OrganizationInvitationRepository for PgOrganizationInvitationRepository {
                             created_at, expires_at, responded_at, email_status, email_sent_at,
                             email_last_error, email_message_id
                          FROM organization_invitations
-                         WHERE email = $1
+                         WHERE LOWER(email) = LOWER($1)
                          ORDER BY created_at DESC",
                         &[&email],
                     )
@@ -428,7 +437,7 @@ impl OrganizationInvitationRepository for PgOrganizationInvitationRepository {
                          FROM organization_invitations i
                          JOIN organizations o ON o.id = i.organization_id
                          LEFT JOIN users u ON u.id = i.invited_by_user_id
-                         WHERE i.email = $1 AND i.status = $2
+                         WHERE LOWER(i.email) = LOWER($1) AND i.status = $2
                          ORDER BY i.created_at DESC",
                         &[&email, &db_status.to_string()],
                     )
@@ -445,7 +454,7 @@ impl OrganizationInvitationRepository for PgOrganizationInvitationRepository {
                          FROM organization_invitations i
                          JOIN organizations o ON o.id = i.organization_id
                          LEFT JOIN users u ON u.id = i.invited_by_user_id
-                         WHERE i.email = $1
+                         WHERE LOWER(i.email) = LOWER($1)
                          ORDER BY i.created_at DESC",
                         &[&email],
                     )

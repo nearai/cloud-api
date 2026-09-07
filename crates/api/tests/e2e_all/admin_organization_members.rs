@@ -2,7 +2,9 @@
 // (GET /v1/admin/organizations/{org_id}/members)
 
 use crate::common::*;
-use api::models::{ListAdminOrganizationMembersResponse, MemberRole};
+use api::models::{
+    InviteOrganizationMemberByEmailResponse, ListAdminOrganizationMembersResponse, MemberRole,
+};
 
 #[tokio::test]
 async fn test_admin_list_organization_members_includes_owner() {
@@ -162,6 +164,21 @@ async fn test_admin_list_organization_members_empty_org() {
     assert!(
         body.members.is_empty(),
         "Empty org should return an empty member list"
+    );
+
+    let invite_response = server
+        .post(format!("/v1/admin/organizations/{empty_org_id}/members/invite-by-email").as_str())
+        .add_header("Authorization", format!("Bearer {}", get_session_id()))
+        .add_header("User-Agent", MOCK_USER_AGENT)
+        .json(&serde_json::json!({
+            "invitations": [{ "email": "first-member@example.com", "role": "admin" }]
+        }))
+        .await;
+    assert_eq!(
+        invite_response.status_code(),
+        200,
+        "System admin should be able to invite into an active member-less org: {}",
+        invite_response.text()
     );
 
     println!("✅ Admin list organization members returns 200/empty for an active member-less org");
@@ -377,4 +394,233 @@ async fn test_admin_list_organization_members_unauthorized() {
     );
 
     println!("✅ Admin list organization members correctly requires authentication");
+}
+
+#[tokio::test]
+async fn test_admin_invites_member_without_organization_membership() {
+    let (server, database) = setup_test_server_with_database().await;
+    let organization_id = uuid::Uuid::new_v4();
+    let owner_id = uuid::Uuid::new_v4();
+    let invited_email = format!("invite-{organization_id}@example.com");
+
+    {
+        let client = database
+            .pool()
+            .get()
+            .await
+            .expect("Failed to get database connection");
+        client
+            .execute(
+                "INSERT INTO users (id, email, username, auth_provider, provider_user_id, is_active, created_at, updated_at)
+                 VALUES ($1, $2, $3, 'mock', $4, true, NOW(), NOW())",
+                &[
+                    &owner_id,
+                    &format!("owner-{owner_id}@example.com"),
+                    &format!("owner-{owner_id}"),
+                    &format!("owner-provider-{owner_id}"),
+                ],
+            )
+            .await
+            .expect("Failed to insert organization owner");
+        client
+            .execute(
+                "INSERT INTO organizations (id, name, is_active, created_at, updated_at)
+                 VALUES ($1, $2, true, NOW(), NOW())",
+                &[&organization_id, &format!("admin-invite-{organization_id}")],
+            )
+            .await
+            .expect("Failed to insert organization");
+        client
+            .execute(
+                "INSERT INTO organization_members (organization_id, user_id, role)
+                 VALUES ($1, $2, 'owner')",
+                &[&organization_id, &owner_id],
+            )
+            .await
+            .expect("Failed to insert organization owner membership");
+    }
+
+    let response = server
+        .post(format!("/v1/admin/organizations/{organization_id}/members/invite-by-email").as_str())
+        .add_header("Authorization", format!("Bearer {}", get_session_id()))
+        .add_header("User-Agent", MOCK_USER_AGENT)
+        .json(&serde_json::json!({
+            "invitations": [{ "email": invited_email.to_uppercase(), "role": "admin" }]
+        }))
+        .await;
+
+    assert_eq!(
+        response.status_code(),
+        200,
+        "System admin should be able to invite without org membership: {}",
+        response.text()
+    );
+    let body = response.json::<InviteOrganizationMemberByEmailResponse>();
+    assert_eq!(body.successful, 1);
+    assert_eq!(body.failed, 0);
+
+    let client = database
+        .pool()
+        .get()
+        .await
+        .expect("Failed to get database connection");
+    let row = client
+        .query_one(
+            "SELECT role, invited_by_user_id, status
+             FROM organization_invitations
+             WHERE organization_id = $1 AND email = $2",
+            &[&organization_id, &invited_email],
+        )
+        .await
+        .expect("Invitation should be persisted");
+    assert_eq!(row.get::<_, String>("role"), "admin");
+    assert_eq!(
+        row.get::<_, uuid::Uuid>("invited_by_user_id").to_string(),
+        MOCK_USER_ID
+    );
+    assert_eq!(row.get::<_, String>("status"), "pending");
+
+    for email in [invited_email.clone(), invited_email.to_uppercase()] {
+        let repeated_response = server
+            .post(
+                format!("/v1/admin/organizations/{organization_id}/members/invite-by-email")
+                    .as_str(),
+            )
+            .add_header("Authorization", format!("Bearer {}", get_session_id()))
+            .add_header("User-Agent", MOCK_USER_AGENT)
+            .json(&serde_json::json!({
+                "invitations": [{ "email": email, "role": "admin" }]
+            }))
+            .await;
+        assert_eq!(
+            repeated_response.status_code(),
+            200,
+            "Repeated invitation should succeed: {}",
+            repeated_response.text()
+        );
+    }
+
+    let status_counts = client
+        .query_one(
+            "SELECT
+                 COUNT(*) FILTER (WHERE status = 'pending') AS pending_count,
+                 COUNT(*) FILTER (WHERE status = 'expired') AS expired_count
+             FROM organization_invitations
+             WHERE organization_id = $1 AND LOWER(email) = LOWER($2)",
+            &[&organization_id, &invited_email],
+        )
+        .await
+        .expect("Invitation history should be queryable");
+    assert_eq!(status_counts.get::<_, i64>("pending_count"), 1);
+    assert_eq!(status_counts.get::<_, i64>("expired_count"), 2);
+
+    let owner_invite_response = server
+        .post(format!("/v1/admin/organizations/{organization_id}/members/invite-by-email").as_str())
+        .add_header("Authorization", format!("Bearer {}", get_session_id()))
+        .add_header("User-Agent", MOCK_USER_AGENT)
+        .json(&serde_json::json!({
+            "invitations": [{ "email": "owner-invite@example.com", "role": "owner" }]
+        }))
+        .await;
+    assert_eq!(owner_invite_response.status_code(), 400);
+}
+
+#[tokio::test]
+async fn test_admin_rejects_inviting_an_existing_member() {
+    let (server, database) = setup_test_server_with_database().await;
+    let organization_id = uuid::Uuid::new_v4();
+    let owner_id = uuid::Uuid::new_v4();
+    let member_id = uuid::Uuid::new_v4();
+
+    {
+        let client = database
+            .pool()
+            .get()
+            .await
+            .expect("Failed to get database connection");
+        for (user_id, label) in [(owner_id, "owner"), (member_id, "member")] {
+            client
+                .execute(
+                    "INSERT INTO users (id, email, username, auth_provider, provider_user_id, is_active, created_at, updated_at)
+                     VALUES ($1, $2, $3, 'mock', $4, true, NOW(), NOW())",
+                    &[
+                        &user_id,
+                        &format!("{label}-{user_id}@example.com"),
+                        &format!("{label}-{user_id}"),
+                        &format!("{label}-provider-{user_id}"),
+                    ],
+                )
+                .await
+                .expect("Failed to insert user");
+        }
+        client
+            .execute(
+                "INSERT INTO organizations (id, name, is_active, created_at, updated_at)
+                 VALUES ($1, $2, true, NOW(), NOW())",
+                &[&organization_id, &format!("admin-role-{organization_id}")],
+            )
+            .await
+            .expect("Failed to insert organization");
+        client
+            .execute(
+                "INSERT INTO organization_members (organization_id, user_id, role)
+                 VALUES ($1, $2, 'owner'), ($1, $3, 'member')",
+                &[&organization_id, &owner_id, &member_id],
+            )
+            .await
+            .expect("Failed to insert organization members");
+    }
+
+    let existing_member_invite = server
+        .post(format!("/v1/admin/organizations/{organization_id}/members/invite-by-email").as_str())
+        .add_header("Authorization", format!("Bearer {}", get_session_id()))
+        .add_header("User-Agent", MOCK_USER_AGENT)
+        .json(&serde_json::json!({
+            "invitations": [{
+                "email": format!("member-{member_id}@example.com").to_uppercase(),
+                "role": "member"
+            }]
+        }))
+        .await;
+    assert_eq!(existing_member_invite.status_code(), 200);
+    let existing_member_result =
+        existing_member_invite.json::<InviteOrganizationMemberByEmailResponse>();
+    assert_eq!(existing_member_result.successful, 0);
+    assert_eq!(existing_member_result.failed, 1);
+    assert_eq!(
+        existing_member_result.results[0].error.as_deref(),
+        Some("User is already a member")
+    );
+}
+
+#[tokio::test]
+async fn test_admin_member_invites_require_authentication() {
+    let organization_id = uuid::Uuid::new_v4();
+    let server = setup_test_server().await;
+
+    let invite_response = server
+        .post(format!("/v1/admin/organizations/{organization_id}/members/invite-by-email").as_str())
+        .json(&serde_json::json!({
+            "invitations": [{ "email": "unauthorized@example.com", "role": "member" }]
+        }))
+        .await;
+    assert_eq!(invite_response.status_code(), 401);
+}
+
+#[tokio::test]
+async fn test_admin_member_invites_reject_non_admin_users() {
+    let server = setup_test_server_with_config(|config| {
+        config.auth.admin_domains = vec!["example.org".to_string()];
+    })
+    .await;
+    let organization_id = uuid::Uuid::new_v4();
+    let invite_response = server
+        .post(format!("/v1/admin/organizations/{organization_id}/members/invite-by-email").as_str())
+        .add_header("Authorization", format!("Bearer {}", get_session_id()))
+        .add_header("User-Agent", MOCK_USER_AGENT)
+        .json(&serde_json::json!({
+            "invitations": [{ "email": "forbidden@example.com", "role": "member" }]
+        }))
+        .await;
+    assert_eq!(invite_response.status_code(), 403);
 }

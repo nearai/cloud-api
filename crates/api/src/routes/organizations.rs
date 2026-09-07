@@ -878,6 +878,16 @@ mod tests {
             unimplemented!()
         }
 
+        async fn create_invitations_for_admin(
+            &self,
+            _: OrganizationId,
+            _: UserId,
+            _: Vec<(String, MemberRole)>,
+            _: i64,
+        ) -> Result<BatchInvitationResponse, OrganizationError> {
+            unimplemented!()
+        }
+
         async fn list_user_invitations(
             &self,
             _: &str,

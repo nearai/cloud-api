@@ -2180,8 +2180,9 @@ pub fn build_admin_routes(
         get_organization as get_admin_organization, get_organization_concurrent_limit,
         get_organization_fallback, get_organization_limits_history, get_organization_metrics,
         get_organization_timeseries, get_performance_timeseries, get_platform_metrics,
-        get_platform_timeseries, get_revenue_density, list_admin_access_tokens, list_aml_allowlist,
-        list_aml_reports, list_invitation_email_deliveries, list_model_pricing_changes,
+        get_platform_timeseries, get_revenue_density, invite_organization_members,
+        list_admin_access_tokens, list_aml_allowlist, list_aml_reports,
+        list_invitation_email_deliveries, list_model_pricing_changes,
         list_models as admin_list_models, list_organization_members, list_organizations,
         list_users, preview_model_deprecation, preview_model_pricing_changes,
         resend_invitation_email, update_aml_report_status, update_organization_concurrent_limit,
@@ -2407,6 +2408,10 @@ pub fn build_admin_routes(
         .route(
             "/admin/organizations/{org_id}/members",
             axum::routing::get(list_organization_members),
+        )
+        .route(
+            "/admin/organizations/{org_id}/members/invite-by-email",
+            axum::routing::post(invite_organization_members),
         )
         .route(
             "/admin/access-tokens",

@@ -1127,10 +1127,10 @@ impl OrganizationRepository for PgOrganizationRepository {
                              previous_role,
                              new_role
                          )
-                         SELECT $1, prior_owner.user_id, $2, 'owner', 'admin'
+                         SELECT $1::uuid, prior_owner.user_id, $2::uuid, 'owner', 'admin'
                          FROM UNNEST($3::uuid[]) AS prior_owner(user_id)
                          UNION ALL
-                         SELECT $1, $4, $2, $5, 'owner'",
+                         SELECT $1::uuid, $4::uuid, $2::uuid, $5, 'owner'",
                         &[
                             &org_id,
                             &changed_by_user_id,

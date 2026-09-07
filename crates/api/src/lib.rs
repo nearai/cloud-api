@@ -2838,6 +2838,7 @@ mod tests {
                 require_session_bound_access_tokens: false,
             },
             database: config::DatabaseConfig {
+                connection_mode: config::DatabaseConnectionMode::Patroni,
                 primary_app_id: "postgres-patroni-1".to_string(),
                 gateway_subdomain: "cvm1.near.ai".to_string(),
                 host: None,
@@ -2907,6 +2908,7 @@ mod tests {
     async fn test_with_custom_database() {
         // Create custom database config for testing
         let db_config = config::DatabaseConfig {
+            connection_mode: config::DatabaseConnectionMode::Patroni,
             primary_app_id: "postgres-patroni-1".to_string(),
             gateway_subdomain: "cvm1.near.ai".to_string(),
             port: 5432,
@@ -2952,6 +2954,7 @@ mod tests {
                 require_session_bound_access_tokens: false,
             },
             database: config::DatabaseConfig {
+                connection_mode: config::DatabaseConnectionMode::Patroni,
                 primary_app_id: "postgres-patroni-1".to_string(),
                 gateway_subdomain: "cvm1.near.ai".to_string(),
                 host: None,

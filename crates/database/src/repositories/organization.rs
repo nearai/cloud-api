@@ -316,6 +316,12 @@ impl PgOrganizationRepository {
                 ));
             }
 
+            if let Some(expected) = expected_fallback_override.as_ref() {
+                if current_settings.get("fallback_enabled") != expected.as_ref() {
+                    return Err(RepositoryError::TransactionConflict);
+                }
+            }
+
             let fallback_changed = request.settings.as_ref().is_some_and(|settings| {
                 current_settings.get("fallback_enabled") != settings.get("fallback_enabled")
             });
@@ -323,11 +329,6 @@ impl PgOrganizationRepository {
                 return Err(RepositoryError::ValidationFailed(
                     "Only organization owners can manage fallback".to_string(),
                 ));
-            }
-            if let Some(expected) = expected_fallback_override.as_ref() {
-                if current_settings.get("fallback_enabled") != expected.as_ref() {
-                    return Err(RepositoryError::TransactionConflict);
-                }
             }
 
             let row = transaction

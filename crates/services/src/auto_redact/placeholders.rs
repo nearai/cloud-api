@@ -16,7 +16,7 @@
 //! - Minting refuses any dummy that already appears as a substring of
 //!   the request input (collision avoidance).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 /// Maximum byte length of any placeholder we mint. Bounds the streaming
 /// unredact tail buffer. Formats today (with ordinals up to ~10^6):
@@ -57,6 +57,8 @@ pub struct RedactionMap {
     /// Sorted by descending dummy length so un-redact substitutes
     /// longest first (avoids one dummy being a prefix of another).
     entries: Vec<(String, String)>,
+    /// Fast lookup for dummies already minted by this request.
+    minted_dummies: HashSet<String>,
     /// Fast lookup for dedup: same `(category, original)` reuses dummy.
     original_to_dummy: HashMap<(String, String), String>,
     /// Per-category ordinal counter, monotonic for stable test output.
@@ -83,10 +85,10 @@ impl RedactionMap {
     }
 
     /// Return the existing dummy for `(category, original)` or mint a
-    /// fresh one. `would_collide(d)` is called for each candidate dummy
-    /// and must return true if `d` appears anywhere in the request
-    /// (haystack) the caller wants us to avoid. The minted ordinal is
-    /// advanced until a non-colliding candidate is found.
+    /// fresh one. For candidates that were not already minted,
+    /// `would_collide(d)` must return true if `d` appears anywhere in the
+    /// request (haystack) the caller wants us to avoid. The minted ordinal
+    /// is advanced until a non-colliding candidate is found.
     pub fn lookup_or_mint(
         &mut self,
         category: &str,
@@ -108,7 +110,7 @@ impl RedactionMap {
             // haystack check makes the round-trip invariant safe:
             // no original PII string can contain a minted dummy, so
             // un-redact's longest-first substring replace is correct.
-            if would_collide(&candidate) || self.entries.iter().any(|(d, _)| d == &candidate) {
+            if self.minted_dummies.contains(&candidate) || would_collide(&candidate) {
                 continue;
             }
             break candidate;
@@ -120,6 +122,7 @@ impl RedactionMap {
         let pos = self.entries.partition_point(|(d, _)| d.len() > dummy.len());
         self.entries
             .insert(pos, (dummy.clone(), original.to_string()));
+        self.minted_dummies.insert(dummy.clone());
         self.original_to_dummy.insert(key, dummy.clone());
         dummy
     }
@@ -173,6 +176,7 @@ fn json_escape_inner(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::Cell;
 
     fn never_collides(_: &str) -> bool {
         false
@@ -216,6 +220,25 @@ mod tests {
             m.lookup_or_mint("secret", "sk_abc", never_collides),
             "redacted_secret_000001"
         );
+    }
+
+    #[test]
+    fn minted_dummy_collision_skips_haystack_scan() {
+        // Given: two unknown categories that share the generic dummy namespace.
+        let mut map = RedactionMap::new();
+        let first = map.lookup_or_mint("unknown_a", "first", never_collides);
+        let collision_checks = Cell::new(0);
+
+        // When: the second category retries past the dummy minted by the first.
+        let second = map.lookup_or_mint("unknown_b", "second", |_| {
+            collision_checks.set(collision_checks.get() + 1);
+            false
+        });
+
+        // Then: only the new candidate requires a full haystack collision scan.
+        assert_eq!(first, "redacted_pii_1");
+        assert_eq!(second, "redacted_pii_2");
+        assert_eq!(collision_checks.get(), 1);
     }
 
     #[test]

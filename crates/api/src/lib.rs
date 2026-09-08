@@ -70,9 +70,9 @@ use utoipa::OpenApi;
 // Audio transcription file size limit (25 MB for OpenAI Whisper API compatibility)
 const AUDIO_TRANSCRIPTION_MAX_BODY_SIZE: usize = 25 * 1024 * 1024; // 25 MB
 
-// Privacy classify input is text only, model context is small (e.g. 512 tokens).
-// Cap at 256 KB so the route doesn't inherit the 25 MB audio-transcription limit.
-const PRIVACY_CLASSIFY_MAX_BODY_SIZE: usize = 256 * 1024; // 256 KB
+// The privacy model's context window is 128k tokens. A 1 MB cap covers it for
+// typical text while keeping this route well below the 25 MB router default.
+const PRIVACY_CLASSIFY_MAX_BODY_SIZE: usize = 1024 * 1024; // 1 MB
 
 // OHTTP outer body is the HPKE-encrypted inner BHTTP request. Set to 32 MB to
 // cover audio-transcription payloads (≤25 MB) plus HPKE overhead, while
@@ -1591,7 +1591,7 @@ pub fn build_completion_routes(
     };
 
     // Text-based inference routes (chat/completions, image generation, audio transcription, rerank, score).
-    // The shared 25 MiB cap accommodates inline multimodal JSON payloads.
+    // The shared 25 MiB cap executes before body hashing and accommodates inline multimodal JSON payloads.
     let text_inference_routes = Router::new()
         .route("/chat/completions", post(chat_completions))
         .route("/completions", post(completions))
@@ -1600,19 +1600,6 @@ pub fn build_completion_routes(
         .route("/rerank", post(rerank))
         .route("/embeddings", post(embeddings))
         .route("/score", post(score))
-        // Override the router-level audio limit (25 MB) for privacy/classify: this is a
-        // text-only endpoint, so a 256 KB cap is more appropriate.
-        .route(
-            "/privacy/classify",
-            post(privacy_classify).layer(DefaultBodyLimit::max(PRIVACY_CLASSIFY_MAX_BODY_SIZE)),
-        )
-        // /privacy/redact runs a classify call under the hood, so the same
-        // 256 KB cap applies.
-        .route(
-            "/privacy/redact",
-            post(privacy_redact).layer(DefaultBodyLimit::max(PRIVACY_CLASSIFY_MAX_BODY_SIZE)),
-        )
-        .layer(DefaultBodyLimit::max(AUDIO_TRANSCRIPTION_MAX_BODY_SIZE))
         .with_state(app_state.clone())
         .layer(from_fn_with_state(
             usage_state.clone(),
@@ -1626,12 +1613,34 @@ pub fn build_completion_routes(
             auth_state_middleware.clone(),
             middleware::auth::auth_middleware_with_workspace_context,
         ))
-        .layer(from_fn(middleware::body_hash_middleware));
+        .layer(from_fn(middleware::body_hash_middleware))
+        .layer(DefaultBodyLimit::max(AUDIO_TRANSCRIPTION_MAX_BODY_SIZE));
+
+    // Privacy routes use their existing 1 MiB cap before body hashing while retaining
+    // the same body-hash, auth, rate-limit, and usage execution order.
+    let privacy_routes = Router::new()
+        .route("/privacy/classify", post(privacy_classify))
+        .route("/privacy/redact", post(privacy_redact))
+        .with_state(app_state.clone())
+        .layer(from_fn_with_state(
+            usage_state.clone(),
+            middleware::usage_check_middleware,
+        ))
+        .layer(from_fn_with_state(
+            rate_limit_state.clone(),
+            middleware::api_key_rate_limit_middleware,
+        ))
+        .layer(from_fn_with_state(
+            auth_state_middleware.clone(),
+            middleware::auth::auth_middleware_with_workspace_context,
+        ))
+        .layer(from_fn(middleware::body_hash_middleware))
+        .layer(DefaultBodyLimit::max(PRIVACY_CLASSIFY_MAX_BODY_SIZE));
 
     // File-based inference routes (image edits)
     // Apply 512 MB limit only to endpoints that accept file uploads
-    // IMPORTANT: body_hash_middleware is placed AFTER auth to prevent buffering
-    // unauthenticated requests. Auth failures prevent memory exhaustion DoS attacks.
+    // Keep the existing body-hash-before-auth execution order unchanged; the size
+    // limit executes first so the body-hash middleware cannot buffer beyond 512 MiB.
     let file_inference_routes = Router::new()
         .route("/images/edits", post(image_edits))
         .with_state(app_state.clone())
@@ -1661,6 +1670,7 @@ pub fn build_completion_routes(
 
     Router::new()
         .merge(text_inference_routes)
+        .merge(privacy_routes)
         .merge(file_inference_routes)
         .merge(metadata_routes)
         .merge(anthropic_routes)

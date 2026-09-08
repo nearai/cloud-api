@@ -129,6 +129,7 @@ fn admin_provider_attribution_preserves_existing_response_fields() {
         non_verifiable_consumed_usd: 4.5,
         non_verifiable_requests: 5,
         provider_error_or_timeout_rate: 0.25,
+        incomplete_stream_rate: 0.1,
         p95_ttft_ms: Some(123.0),
         provider_usage: PlatformProviderUsage {
             fallback: ProviderUsageTotals {

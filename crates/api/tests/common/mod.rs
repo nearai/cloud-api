@@ -103,6 +103,7 @@ pub fn test_config() -> ApiConfig {
             require_session_bound_access_tokens: false,
         },
         database: config::DatabaseConfig {
+            connection_mode: config::DatabaseConnectionMode::Patroni,
             primary_app_id: "postgres-test".to_string(),
             gateway_subdomain: "cvm1.near.ai".to_string(),
             port: std::env::var("DATABASE_PORT")

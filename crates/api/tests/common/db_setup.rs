@@ -266,6 +266,7 @@ async fn bootstrap_shared_db_once() -> Result<()> {
     // Run migrations while still holding the advisory lock so direct cargo
     // invocations cannot race on refinery's schema history table.
     let db_config = config::DatabaseConfig {
+        connection_mode: config::DatabaseConnectionMode::Patroni,
         primary_app_id: "postgres-test".to_string(),
         gateway_subdomain: "cvm1.near.ai".to_string(),
         port,

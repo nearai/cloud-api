@@ -4207,9 +4207,9 @@ pub async fn get_model_consumption_timeseries(
 /// `ttft_sample_count` field in each bucket exposes the denominator so callers can
 /// compute coverage fraction (`ttft_sample_count / requests`).
 ///
-/// **Error rate** = `stop_reason IN ('provider_error','timeout')` / requests with a
-/// recorded `stop_reason`. Pre-V0037 rows (stop_reason IS NULL) are excluded from both
-/// numerator and denominator.
+/// **Error rate** = `stop_reason IN ('provider_error','timeout','incomplete')` / requests
+/// with a recorded `stop_reason`. Pre-V0037 rows (stop_reason IS NULL) are excluded from
+/// both numerator and denominator.
 #[utoipa::path(
     get,
     path = "/v1/admin/platform/performance-timeseries",

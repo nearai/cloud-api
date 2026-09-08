@@ -429,17 +429,11 @@ where
             handle_clone.block_on(
                 async move {
                     let result = tokio::time::timeout(Duration::from_secs(2), async move {
-                        let stop_reason = if let Some(ref err) = last_error {
-                            Some(crate::usage::StopReason::from_completion_error(err))
-                        } else if !stream_completed {
-                            Some(crate::usage::StopReason::ClientDisconnect)
-                        } else if let Some(ref finish_reason) = last_finish_reason {
-                            Some(crate::usage::StopReason::from_provider_finish_reason(
-                                finish_reason,
-                            ))
-                        } else {
-                            Some(crate::usage::StopReason::Completed)
-                        };
+                        let stop_reason = Some(crate::usage::StopReason::for_stream_outcome(
+                            last_error.as_ref(),
+                            stream_completed,
+                            last_finish_reason.as_ref(),
+                        ));
 
                         if usage_service
                             .record_usage(RecordUsageServiceRequest {
@@ -2084,7 +2078,7 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
             .first()
             .and_then(|c| c.finish_reason.as_ref())
             .map(|reason| crate::usage::StopReason::from_finish_reason(reason))
-            .unwrap_or(crate::usage::StopReason::Completed);
+            .unwrap_or(crate::usage::StopReason::Incomplete);
 
         usage_service
             .record_usage(RecordUsageServiceRequest {

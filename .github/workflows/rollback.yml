@@ -58,7 +58,7 @@ jobs:
         uses: actions/checkout@v7
 
       - name: Log in to Docker registry
-        uses: docker/login-action@3864d6aed8ff134b2ed894ce00c87695c709c870
+        uses: docker/login-action@0a596b2e7a325f0cedf8e9bd21ab002cbd3c9241
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ vars.DOCKER_REGISTRY_USER }}

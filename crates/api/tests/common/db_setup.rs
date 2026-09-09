@@ -84,6 +84,7 @@ async fn ensure_shared_db() {
             // Run migrations while still holding the advisory lock so refinery's
             // schema_history table creation doesn't race across binaries.
             let db_config = config::DatabaseConfig {
+                connection_mode: config::DatabaseConnectionMode::Patroni,
                 primary_app_id: "postgres-test".to_string(),
                 gateway_subdomain: "cvm1.near.ai".to_string(),
                 port,

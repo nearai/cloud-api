@@ -1,5 +1,6 @@
 //! Session-authorized, audience-bound admission credentials and their public keys.
 use crate::middleware::{auth_middleware, AuthState, AuthenticatedUser};
+use crate::models::ErrorResponse;
 use axum::{
     extract::{Request, State},
     http::{header, StatusCode},
@@ -81,7 +82,13 @@ pub async fn session_bound_auth(
                 .flatten()
         });
     if claims.and_then(|claims| claims.sid).is_none() {
-        return private_response(StatusCode::UNAUTHORIZED);
+        return private_response((
+            StatusCode::UNAUTHORIZED,
+            Json(ErrorResponse::new(
+                "Invalid or expired access token".into(),
+                "unauthorized".into(),
+            )),
+        ));
     }
     // The established middleware checks this session's owner, expiry and live
     // database presence, plus global user revocation, before inserting the user.

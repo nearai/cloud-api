@@ -117,12 +117,14 @@ async fn valid_session_issues_verifiable_proof_and_revocation_stops_issuance() {
         "sk-not-a-session",
         "invalid",
     ] {
-        server
+        let denied = server
             .post("/v1/auth/admission-proof")
             .add_header("Authorization", format!("Bearer {forbidden}"))
             .json(&request())
-            .await
-            .assert_status_unauthorized();
+            .await;
+        denied.assert_status_unauthorized();
+        assert_eq!(denied.header("cache-control"), "no-store");
+        assert_eq!(denied.json::<Value>()["error"]["type"], "unauthorized");
     }
     server
         .get("/v1/users/me")
@@ -152,12 +154,14 @@ async fn valid_session_issues_verifiable_proof_and_revocation_stops_issuance() {
         .add_header("User-Agent", UA)
         .await
         .assert_status_ok();
-    server
+    let revoked = server
         .post("/v1/auth/admission-proof")
         .add_header("Authorization", format!("Bearer {}", tokens.access_token))
         .json(&request())
-        .await
-        .assert_status_unauthorized();
+        .await;
+    revoked.assert_status_unauthorized();
+    assert_eq!(revoked.header("cache-control"), "no-store");
+    assert_eq!(revoked.json::<Value>()["error"]["type"], "unauthorized");
     // Ordinary API compatibility stays enabled; admission enforces its own
     // live-session requirement even after this user's session is logged out.
     server
@@ -191,11 +195,13 @@ async fn unconfigured_issuer_remains_unavailable() {
         .get("/v1/auth/admission-proof/jwks")
         .await
         .assert_status(axum::http::StatusCode::SERVICE_UNAVAILABLE);
-    server
+    let missing = server
         .post("/v1/auth/admission-proof")
         .json(&request())
-        .await
-        .assert_status_unauthorized();
+        .await;
+    missing.assert_status_unauthorized();
+    assert_eq!(missing.header("cache-control"), "no-store");
+    assert_eq!(missing.json::<Value>()["error"]["type"], "unauthorized");
     let spec = serde_json::to_value(<api::openapi::ApiDoc as utoipa::OpenApi>::openapi()).unwrap();
     assert_eq!(
         spec["paths"]["/v1/auth/admission-proof"]["post"]["security"],

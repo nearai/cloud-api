@@ -1,4 +1,3 @@
-// INTEGRATION: register `pub mod admission;` in crates/services/src/auth/mod.rs.
 //! Audience-bound Commons proofs. These credentials confer no Cloud management authority.
 //! Verifiers must pin issuer, audience, algorithm and type, check time, compare the
 //! signed device key and nonce with their challenge, and consume that challenge once.
@@ -403,6 +402,24 @@ mod tests {
             original.sub,
             claims(&next.issue(&other, &req, 1000).unwrap().assertion).sub
         );
+    }
+
+    #[test]
+    fn rolling_rotation_prepublishes_both_keys_before_changing_signer() {
+        let old_key = *SigningKey::from_bytes(&[1; 32]).verifying_key().as_bytes();
+        let new_key = *SigningKey::from_bytes(&[2; 32]).verifying_key().as_bytes();
+        let before = issuer(1, vec![new_key]);
+        let after = issuer(2, vec![old_key]);
+        let identity = user();
+        let old = before.issue(&identity, &request(), 1000).unwrap().assertion;
+        let new = after.issue(&identity, &request(), 1001).unwrap().assertion;
+        for published in [before.jwks(), after.jwks()] {
+            assert_eq!(published.keys.len(), 2);
+            for token in [&old, &new] {
+                assert!(published.keys.iter().any(|key| verify(token, key)));
+            }
+        }
+        assert_eq!(claims(&old).sub, claims(&new).sub);
     }
 
     #[test]

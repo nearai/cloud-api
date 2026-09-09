@@ -927,7 +927,36 @@ async fn test_admin_platform_timeseries() {
 #[tokio::test]
 async fn test_admin_platform_billing_summary() {
     let server = setup_test_server().await;
-    let _org = setup_org_with_credits(&server, 5000000000i64).await; // $5.00
+
+    let before_metrics_response = server
+        .get("/v1/admin/platform/metrics")
+        .add_header("Authorization", format!("Bearer {}", get_session_id()))
+        .add_header("User-Agent", MOCK_USER_AGENT)
+        .await;
+    assert_eq!(before_metrics_response.status_code(), 200);
+    let before_metrics: PlatformMetrics = serde_json::from_str(&before_metrics_response.text())
+        .expect("parse initial PlatformMetrics");
+
+    let before_response = server
+        .get("/v1/admin/platform/billing-summary")
+        .add_header("Authorization", format!("Bearer {}", get_session_id()))
+        .add_header("User-Agent", MOCK_USER_AGENT)
+        .await;
+    assert_eq!(before_response.status_code(), 200);
+    let before: BillingSummary =
+        serde_json::from_str(&before_response.text()).expect("parse initial BillingSummary");
+
+    let org = create_org(&server).await;
+    add_credits_with_type(
+        &server,
+        &org.id,
+        "postpay",
+        Some("contract"),
+        10_000_000_000_000_000,
+        "USD",
+        &get_session_id(),
+    )
+    .await;
 
     let response = server
         .get("/v1/admin/platform/billing-summary")
@@ -939,6 +968,29 @@ async fn test_admin_platform_billing_summary() {
     assert!(b.active_paid_credit_limit_usd >= 0.0);
     assert!(b.active_grant_credit_limit_usd >= 0.0);
     assert!(b.total_consumed_usd >= 0.0);
+    assert_eq!(
+        b.paying_org_count,
+        before.paying_org_count + 1,
+        "a postpay-only contract customer is a paying organization"
+    );
+    assert_eq!(
+        b.active_paid_credit_limit_usd, before.active_paid_credit_limit_usd,
+        "a postpay safety ceiling is not prepaid credit"
+    );
+
+    let metrics_response = server
+        .get("/v1/admin/platform/metrics")
+        .add_header("Authorization", format!("Bearer {}", get_session_id()))
+        .add_header("User-Agent", MOCK_USER_AGENT)
+        .await;
+    assert_eq!(metrics_response.status_code(), 200);
+    let metrics: PlatformMetrics =
+        serde_json::from_str(&metrics_response.text()).expect("parse PlatformMetrics");
+    assert_eq!(
+        metrics.paying_organizations,
+        before_metrics.paying_organizations + 1,
+        "platform metrics should count a postpay-only contract customer as paying"
+    );
 
     println!("✅ Platform billing summary works");
 }
@@ -1005,7 +1057,17 @@ async fn test_admin_platform_model_revenue() {
 #[tokio::test]
 async fn test_admin_platform_org_revenue() {
     let server = setup_test_server().await;
-    let org = setup_org_with_credits(&server, 10000000000i64).await;
+    let org = create_org(&server).await;
+    add_credits_with_type(
+        &server,
+        &org.id,
+        "postpay",
+        Some("contract"),
+        10_000_000_000_000_000,
+        "USD",
+        &get_session_id(),
+    )
+    .await;
     let api_key = get_api_key_for_org(&server, org.id.clone()).await;
     let model_name = setup_qwen_model(&server).await;
 
@@ -1060,6 +1122,10 @@ async fn test_admin_platform_org_revenue() {
         .find(|o| o.organization_id.to_string() == org.id)
         .expect("org with usage should be attributed");
     assert!(found.requests >= 1, "attributed org should have requests");
+    assert!(
+        found.is_paying,
+        "a postpay-only contract customer should be classified as paying"
+    );
 
     let eps = 1e-6;
     let mut prev = f64::INFINITY;

@@ -4166,19 +4166,21 @@ impl CreditType {
     }
 }
 
-#[cfg(test)]
-mod credit_type_tests {
-    use super::CreditType;
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error("unsupported credit type")]
+pub struct ParseCreditTypeError;
 
-    #[test]
-    fn postpay_serializes_and_accepts_supported_casing() {
-        let lower: CreditType = serde_json::from_str("\"postpay\"").unwrap();
-        let upper: CreditType = serde_json::from_str("\"POSTPAY\"").unwrap();
+impl std::str::FromStr for CreditType {
+    type Err = ParseCreditTypeError;
 
-        assert_eq!(lower, CreditType::Postpay);
-        assert_eq!(upper, CreditType::Postpay);
-        assert_eq!(lower.as_str(), "postpay");
-        assert_eq!(serde_json::to_string(&lower).unwrap(), "\"postpay\"");
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value.to_ascii_lowercase().as_str() {
+            "grant" => Ok(Self::Grant),
+            "payment" => Ok(Self::Payment),
+            "staking_farm" => Ok(Self::StakingFarm),
+            "postpay" => Ok(Self::Postpay),
+            _ => Err(ParseCreditTypeError),
+        }
     }
 }
 
@@ -5442,4 +5444,26 @@ pub struct ScoreUsage {
     /// Prompt tokens details
     #[serde(skip_serializing_if = "Option::is_none")]
     pub prompt_tokens_details: Option<serde_json::Value>,
+}
+
+#[cfg(test)]
+mod credit_type_tests {
+    use super::CreditType;
+
+    #[test]
+    fn postpay_serializes_and_accepts_supported_casing() {
+        let lower: CreditType = serde_json::from_str("\"postpay\"").unwrap();
+        let upper: CreditType = serde_json::from_str("\"POSTPAY\"").unwrap();
+
+        assert_eq!(lower, CreditType::Postpay);
+        assert_eq!(upper, CreditType::Postpay);
+        assert_eq!(lower.as_str(), "postpay");
+        assert_eq!(serde_json::to_string(&lower).unwrap(), "\"postpay\"");
+    }
+
+    #[test]
+    fn credit_type_from_str_rejects_unknown_values() {
+        assert_eq!("POSTPAY".parse(), Ok(CreditType::Postpay));
+        assert!("unexpected".parse::<CreditType>().is_err());
+    }
 }

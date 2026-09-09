@@ -730,16 +730,29 @@ async fn test_dropping_alias_stream_releases_signature_routing_pin() {
     use http_body_util::BodyExt;
     use tower::ServiceExt;
 
-    let (server, router, _pool, mock, _database) = setup_test_server_with_pool_and_router().await;
-    setup_qwen_model(&server).await;
+    let (server, router, pool, mock, _database) = setup_test_server_with_pool_and_router().await;
+    let model_name = format!("test-signature-routing-pin/Model-{}", uuid::Uuid::new_v4());
     let alias = format!("test-signature-alias-{}", uuid::Uuid::new_v4());
     let mut batch = BatchUpdateModelApiRequest::new();
     batch.insert(
-        E2E_QWEN_MODEL_NAME.to_string(),
-        serde_json::from_value(serde_json::json!({ "aliases": [alias] }))
-            .expect("alias update should deserialize"),
+        model_name.clone(),
+        serde_json::from_value(serde_json::json!({
+            "inputCostPerToken": { "amount": 1_000_000, "currency": "USD" },
+            "outputCostPerToken": { "amount": 2_000_000, "currency": "USD" },
+            "modelDisplayName": "Signature routing pin fixture",
+            "modelDescription": "Isolated alias-stream cancellation test model",
+            "contextLength": 128000,
+            "maxOutputLength": 1024,
+            "verifiable": true,
+            "isActive": true,
+            "attestationSupported": true,
+            "aliases": [alias.clone()]
+        }))
+        .expect("alias model should deserialize"),
     );
     admin_batch_upsert_models(&server, batch, get_session_id()).await;
+    let provider: Arc<dyn InferenceProvider + Send + Sync> = mock.clone();
+    pool.register_provider(model_name, provider).await;
     let org = setup_org_with_credits(&server, 10_000_000_000i64).await;
     let api_key = get_api_key_for_org(&server, org.id).await;
 

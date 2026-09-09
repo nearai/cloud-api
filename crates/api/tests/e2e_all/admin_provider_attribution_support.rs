@@ -188,10 +188,52 @@ pub(super) fn model_provider_breakdown<'a>(
         })
 }
 
-pub(super) fn isolated_provider_usage_window() -> ProviderUsageWindow {
-    let offset_minutes = (uuid::Uuid::new_v4().as_u128() % 1_000_000) as i64 * 10;
-    let start = chrono::Utc::now()
-        + chrono::Duration::days(3650)
-        + chrono::Duration::minutes(offset_minutes);
-    (start, start + chrono::Duration::minutes(5))
+pub(super) async fn isolated_provider_usage_window(
+    fixture: &PlatformProviderUsageFixture,
+) -> ProviderUsageWindow {
+    // Allocate compact, non-overlapping slots from PostgreSQL's cluster-wide
+    // transaction counter. A random start at microsecond precision is not enough:
+    // two distinct starts can still make the queried time ranges overlap.
+    //
+    // The occupancy check also handles a restored database, transaction-ID wrap,
+    // and rows retained from older versions of this test helper.
+    const MAX_ATTEMPTS: usize = 64;
+    const SLOT_COUNT: i64 = 1_000_000_000;
+    const SLOT_SECONDS: i64 = 10;
+    const WINDOW_SECONDS: i64 = 8;
+    let base = chrono::DateTime::parse_from_rfc3339("2400-01-01T00:00:00Z")
+        .expect("provider usage window base is valid")
+        .with_timezone(&chrono::Utc);
+    let client = fixture.database.pool().get().await.expect("db connection");
+
+    for _ in 0..MAX_ATTEMPTS {
+        let allocation_id: i64 = client
+            .query_one("SELECT txid_current()", &[])
+            .await
+            .expect("allocate provider usage window")
+            .get(0);
+        let slot = allocation_id.rem_euclid(SLOT_COUNT);
+        let start = base + chrono::Duration::seconds(slot * SLOT_SECONDS);
+        let end = start + chrono::Duration::seconds(WINDOW_SECONDS);
+        let occupied: bool = client
+            .query_one(
+                r#"
+                SELECT EXISTS (
+                    SELECT 1
+                    FROM organization_usage_log
+                    WHERE created_at >= $1 AND created_at < $2
+                )
+                "#,
+                &[&start, &end],
+            )
+            .await
+            .expect("check provider usage window occupancy")
+            .get(0);
+
+        if !occupied {
+            return (start, end);
+        }
+    }
+
+    panic!("failed to allocate an empty provider usage window after {MAX_ATTEMPTS} attempts")
 }

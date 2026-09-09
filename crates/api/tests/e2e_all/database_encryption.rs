@@ -167,12 +167,15 @@ async fn execute_job_honors_max_rows_across_batches() {
         .await
         .expect("API key")
         .get(0);
-    client
-        .execute("DELETE FROM files", &[])
-        .await
-        .expect("clear seeded files for max_rows ordering");
     let file_id = Uuid::from_u128(1);
     let untouched_file_id = Uuid::from_u128(2);
+    client
+        .execute(
+            "DELETE FROM files WHERE id IN ($1, $2)",
+            &[&file_id, &untouched_file_id],
+        )
+        .await
+        .expect("reset reserved max_rows file fixtures");
     client
         .execute(
             "INSERT INTO files(id,filename,bytes,content_type,purpose,storage_key,workspace_id,uploaded_by_api_key_id) VALUES($1,'legacy secret.txt',1,'text/plain','assistants','legacy/key',$2,$3)",
@@ -677,6 +680,16 @@ async fn cancellation_is_observed_while_a_multi_batch_job_waits_on_a_row() {
         .get(0);
     let first_id = Uuid::from_u128(1);
     let second_id = Uuid::from_u128(2);
+    // IDs 1 and 2 make these rows the first two rows in the database-wide
+    // scan. Reset them explicitly because the shared E2E database is reused
+    // across test processes and local nextest runs.
+    client
+        .execute(
+            "DELETE FROM files WHERE id IN ($1, $2)",
+            &[&first_id, &second_id],
+        )
+        .await
+        .expect("reset reserved cancellation file fixtures");
     for (id, filename) in [
         (first_id, "cancel-first.txt"),
         (second_id, "cancel-second.txt"),
@@ -760,6 +773,15 @@ async fn recovery_resumes_the_cursor_and_duplicate_workers_do_not_double_process
         .get(0);
     let first_id = Uuid::from_u128(1);
     let second_id = Uuid::from_u128(2);
+    // Keep the deterministic IDs used by the persisted cursor, but make the
+    // fixture idempotent when the same dedicated E2E database is reused.
+    client
+        .execute(
+            "DELETE FROM responses WHERE id IN ($1, $2)",
+            &[&first_id, &second_id],
+        )
+        .await
+        .expect("reset reserved recovery response fixtures");
     for (id, metadata) in [
         (first_id, serde_json::json!({"legacy": "first"})),
         (second_id, serde_json::json!({"legacy": "second"})),
@@ -813,16 +835,26 @@ async fn recovery_resumes_the_cursor_and_duplicate_workers_do_not_double_process
         .pool()
         .encryption_key()
         .expect("database encryption key");
-    let state = api::database_encryption::DatabaseEncryptionState::new(
+    let first_recovery_state = api::database_encryption::DatabaseEncryptionState::new(
         database.pool().clone(),
         &hex::encode(key),
         &database.pool().encryption_key_id(),
     )
     .expect("database encryption state")
     .with_recovery_interval(std::time::Duration::from_millis(20));
-    state.recover_jobs();
+    let second_recovery_state = api::database_encryption::DatabaseEncryptionState::new(
+        database.pool().clone(),
+        &hex::encode(key),
+        &database.pool().encryption_key_id(),
+    )
+    .expect("second database encryption state")
+    .with_recovery_interval(std::time::Duration::from_millis(20));
+    first_recovery_state.recover_jobs();
     wait_for_database_encryption_job_status(&server, &job_id.to_string(), "running").await;
-    state.recover_jobs();
+    // Model two application instances recovering the same persisted job. A
+    // second call on one state is intentionally a no-op, so it would not cover
+    // duplicate-worker coordination.
+    second_recovery_state.recover_jobs();
     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     transaction.commit().await.expect("unlock resumed row");
 

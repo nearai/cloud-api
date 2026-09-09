@@ -134,6 +134,7 @@ const APPROVED: &[ApprovedGroup] = &[
     ApprovedGroup { table: "aml_reports", columns: &["flow", "provider", "account_id", "address_type", "risk_level", "report_id", "reason", "result_json"], reason: "Queryable compliance evidence with access restricted to AML/admin workflows" },
     ApprovedGroup { table: "api_keys", columns: &["key_hash", "name", "key_prefix"], reason: "API credentials are one-way hashed; name and prefix are query/display metadata" },
     ApprovedGroup { table: "chat_signatures", columns: &["chat_id", "text", "signature", "signing_address", "signing_algo", "signature_kind"], reason: "Publicly verifiable signature material required for lookup and verification" },
+    ApprovedGroup { table: "concurrency_leases", columns: &["instance_id"], reason: "Operator-assigned replica identity for fleet-wide concurrency accounting" },
     ApprovedGroup { table: "database_encryption_jobs", columns: &["mode", "status", "scope", "actions", "cursor", "progress", "last_error_class", "last_error_message"], reason: "Non-customer operational migration state with redacted diagnostics" },
     ApprovedGroup { table: "feature_request_targets", columns: &["kind", "key", "title", "status"], reason: "Product catalog and workflow state" },
     ApprovedGroup { table: "feature_request_votes", columns: &["note", "source"], reason: "User-submitted product feedback intentionally available to administrators" },

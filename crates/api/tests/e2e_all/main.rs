@@ -20,6 +20,7 @@ mod admin_provider_attribution_platform;
 mod admin_provider_attribution_support;
 mod admin_schema_compatibility;
 mod admin_services;
+mod admission_proof;
 mod api_keys;
 mod attestation_auth;
 mod audio_image;

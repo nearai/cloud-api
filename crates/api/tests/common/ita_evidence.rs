@@ -32,7 +32,7 @@ where
     mutate(&mut infra.config);
 
     assert_mock_user_in_db(&infra.database).await;
-    let auth_components = init_auth_services(infra.database.clone(), &infra.config);
+    let auth_components = init_auth_services(infra.database.clone(), &infra.config).unwrap();
     let (inference_provider_pool, mock_provider) =
         api::init_inference_providers_with_mocks(&infra.config).await;
     let ita_provider: Arc<dyn inference_providers::InferenceProvider + Send + Sync> =

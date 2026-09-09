@@ -44,6 +44,8 @@ use utoipa::{Modify, OpenApi};
         (name = "Services", description = "Public platform services (e.g. web_search pricing)"),
     ),
     paths(
+        crate::routes::admission::issue_proof,
+        crate::routes::admission::public_keys,
         // Chat completion endpoints (most important for users)
         crate::routes::completions::chat_completions,
         crate::routes::completions::image_generations,
@@ -202,6 +204,10 @@ use utoipa::{Modify, OpenApi};
     ),
     components(
         schemas(
+            services::auth::admission::AdmissionRequest,
+            services::auth::admission::AdmissionAssertion,
+            services::auth::admission::AdmissionJwk,
+            services::auth::admission::AdmissionJwks,
             // Health check models
             crate::routes::health::HealthResponse,
             // Core API models

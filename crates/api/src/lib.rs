@@ -82,6 +82,7 @@ const OHTTP_MAX_BODY_SIZE: usize = 32 * 1024 * 1024; // 32 MB
 /// Service initialization components
 #[derive(Clone)]
 pub struct AuthComponents {
+    pub admission_issuer: routes::admission::AdmissionState,
     pub auth_service: Arc<dyn AuthServiceTrait>,
     pub oauth_manager: Arc<OAuthManager>,
     pub state_store: StateStore,
@@ -169,7 +170,12 @@ pub async fn init_database(db_config: &config::DatabaseConfig) -> Arc<Database> 
 }
 
 /// Initialize authentication services and middleware
-pub fn init_auth_services(database: Arc<Database>, config: &ApiConfig) -> AuthComponents {
+pub fn init_auth_services(
+    database: Arc<Database>,
+    config: &ApiConfig,
+) -> anyhow::Result<AuthComponents> {
+    let admission_issuer =
+        routes::admission::configured_issuer(config.auth.admission_proof.as_ref())?;
     // Create organization-related repositories first (needed for organization_service)
     let organization_repo = Arc::new(PgOrganizationRepository::new(database.pool().clone()));
     let user_repository = Arc::new(UserRepository::new(database.pool().clone()))
@@ -271,14 +277,15 @@ pub fn init_auth_services(database: Arc<Database>, config: &ApiConfig) -> AuthCo
         config.auth.near.clone(),
     ));
 
-    AuthComponents {
+    Ok(AuthComponents {
+        admission_issuer,
         auth_service,
         oauth_manager: oauth_manager_arc,
         state_store,
         auth_state_middleware,
         organization_service,
         near_auth_service,
-    }
+    })
 }
 
 /// Create OAuth manager from configuration
@@ -1572,6 +1579,18 @@ pub fn build_auth_routes(
         .route("/near", post(routes::auth::near_login))
         .with_state(near_auth_state);
 
+    let admission_router = Router::new()
+        .route(
+            "/admission-proof",
+            post(routes::admission::issue_proof).layer(from_fn_with_state(
+                auth_state_middleware.clone(),
+                routes::admission::session_bound_auth,
+            )),
+        )
+        .route("/admission-proof/jwks", get(routes::admission::public_keys))
+        .layer(DefaultBodyLimit::max(2048))
+        .with_state(auth_components.admission_issuer.clone());
+
     Router::new()
         .route("/login", get(login_page))
         .route("/github", get(github_login))
@@ -1596,6 +1615,7 @@ pub fn build_auth_routes(
             )),
         )
         .merge(near_router)
+        .merge(admission_router)
         .with_state(auth_state)
 }
 
@@ -2876,6 +2896,7 @@ mod tests {
                 url: "http://localhost:8000".to_string(),
             },
             auth: config::AuthConfig {
+                admission_proof: None,
                 mock: true,
                 encoding_key: "mock_encoding_key".to_string(),
                 github: None,
@@ -2928,7 +2949,7 @@ mod tests {
 
         // Initialize services
         let database = init_database(&config.database).await;
-        let auth_components = init_auth_services(database.clone(), &config);
+        let auth_components = init_auth_services(database.clone(), &config).unwrap();
         let metrics_service = Arc::new(services::metrics::MockMetricsService)
             as Arc<dyn services::metrics::MetricsServiceTrait>;
         let domain_services = init_domain_services(
@@ -2992,6 +3013,7 @@ mod tests {
                 url: "http://localhost:8000".to_string(),
             },
             auth: config::AuthConfig {
+                admission_proof: None,
                 mock: true,
                 encoding_key: "mock_encoding_key".to_string(),
                 github: None,
@@ -3042,7 +3064,7 @@ mod tests {
             ita: config::ItaAttestationConfig::default(),
         };
 
-        let auth_components = init_auth_services(database.clone(), &config);
+        let auth_components = init_auth_services(database.clone(), &config).unwrap();
         let metrics_service = Arc::new(services::metrics::MockMetricsService)
             as Arc<dyn services::metrics::MetricsServiceTrait>;
         let domain_services = init_domain_services(

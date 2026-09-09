@@ -1,4 +1,5 @@
 pub mod admin;
+pub mod admission;
 pub mod anthropic;
 pub mod api;
 pub mod attestation;

@@ -876,6 +876,7 @@ pub struct DomainConfig {
 // Simplified Authentication Configuration
 #[derive(Debug, Clone, Default)]
 pub struct AuthConfig {
+    pub admission_proof: Option<crate::AdmissionProofConfig>,
     pub mock: bool,
     pub encoding_key: String,
     pub github: Option<GitHubOAuthConfig>,
@@ -949,6 +950,7 @@ impl AuthConfig {
                 .unwrap_or(false),
             encoding_key: env::var("AUTH_ENCODING_KEY")
                 .expect("AUTH_ENCODING_KEY environment variable is required"),
+            admission_proof: crate::AdmissionProofConfig::from_env()?,
             github,
             google,
             near,
@@ -1432,6 +1434,7 @@ mod tests {
     #[test]
     fn test_is_admin_email() {
         let config = AuthConfig {
+            admission_proof: None,
             mock: false,
             encoding_key: "mock_encoding_key".to_string(),
             github: None,
@@ -1456,6 +1459,7 @@ mod tests {
     #[test]
     fn test_is_admin_email_empty_config() {
         let config = AuthConfig {
+            admission_proof: None,
             mock: false,
             encoding_key: "mock_encoding_key".to_string(),
             github: None,

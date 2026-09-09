@@ -27,7 +27,13 @@ async fn main() {
             .await
             .expect("Usage reporting index prerequisites are not satisfied");
     }
-    let auth_components = init_auth_services(database.clone(), &config);
+    let auth_components = match init_auth_services(database.clone(), &config) {
+        Ok(components) => components,
+        Err(error) => {
+            tracing::error!(%error, "Authentication configuration is invalid");
+            std::process::exit(1);
+        }
+    };
 
     // Initialize OpenTelemetry pipeline
     let exporter = MetricExporter::builder()

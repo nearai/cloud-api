@@ -94,6 +94,7 @@ pub fn test_config() -> ApiConfig {
                 .unwrap_or_else(|_| "http://localhost:8000".to_string()),
         },
         auth: config::AuthConfig {
+            admission_proof: None,
             mock: true,
             encoding_key: "mock_encoding_key".to_string(),
             github: None,
@@ -197,7 +198,7 @@ async fn build_test_server_components(
     // Create mock user in database for foreign key constraints
     assert_mock_user_in_db(&database).await;
 
-    let auth_components = init_auth_services(database.clone(), &config);
+    let auth_components = init_auth_services(database.clone(), &config).unwrap();
 
     // Use mock inference providers instead of real VLLM to avoid flakiness
     let (inference_provider_pool, mock_provider) =
@@ -234,7 +235,7 @@ async fn build_test_server_components_with_real_providers(
     // Create mock user in database for foreign key constraints
     assert_mock_user_in_db(&database).await;
 
-    let auth_components = init_auth_services(database.clone(), &config);
+    let auth_components = init_auth_services(database.clone(), &config).unwrap();
 
     // Use real inference providers from database
     let inference_provider_pool = api::init_inference_providers(database.clone(), &config).await;
@@ -343,7 +344,7 @@ async fn build_test_server_components_with_search_providers(
 ) {
     assert_mock_user_in_db(&database).await;
 
-    let auth_components = init_auth_services(database.clone(), &config);
+    let auth_components = init_auth_services(database.clone(), &config).unwrap();
 
     let (inference_provider_pool, mock_provider) =
         api::init_inference_providers_with_mocks(&config).await;
@@ -573,7 +574,7 @@ pub async fn setup_test_server_with_mcp_factory(
 
     assert_mock_user_in_db(&infra.database).await;
 
-    let auth_components = init_auth_services(infra.database.clone(), &infra.config);
+    let auth_components = init_auth_services(infra.database.clone(), &infra.config).unwrap();
 
     let (inference_provider_pool, mock_provider) =
         api::init_inference_providers_with_mocks(&infra.config).await;

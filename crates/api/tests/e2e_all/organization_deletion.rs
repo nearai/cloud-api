@@ -204,7 +204,7 @@ async fn test_cached_api_key_is_rejected_after_organization_deletion() {
 
     let mut config = test_config();
     config.auth.mock = false;
-    let auth_components = api::init_auth_services(database.clone(), &config);
+    let auth_components = api::init_auth_services(database.clone(), &config).unwrap();
     let auth_server = axum_test::TestServer::new(
         axum::Router::new()
             .route(
@@ -745,7 +745,7 @@ async fn signup_new_user(database: &std::sync::Arc<database::Database>) -> (Stri
 
     let mut config = test_config();
     config.auth.mock = false;
-    let auth_components = api::init_auth_services(database.clone(), &config);
+    let auth_components = api::init_auth_services(database.clone(), &config).unwrap();
 
     let unique = uuid::Uuid::new_v4();
     let user = auth_components

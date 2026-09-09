@@ -717,8 +717,28 @@ fn is_owner_name(s: &str) -> bool {
 }
 
 /// Database configuration
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum DatabaseConnectionMode {
+    #[default]
+    Patroni,
+    Direct,
+}
+
+impl std::str::FromStr for DatabaseConnectionMode {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "patroni" => Ok(Self::Patroni),
+            "direct" => Ok(Self::Direct),
+            _ => Err("DATABASE_CONNECTION_MODE must be exactly 'patroni' or 'direct' (lowercase, no surrounding whitespace)".into()),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct DatabaseConfig {
+    pub connection_mode: DatabaseConnectionMode,
     pub primary_app_id: String,
     pub gateway_subdomain: String,
     pub host: Option<String>,
@@ -727,11 +747,11 @@ pub struct DatabaseConfig {
     pub username: String,
     pub password: String,
     pub max_connections: usize,
-    /// Enable TLS for database connections (required for remote databases like DigitalOcean)
-    /// Uses native-tls with system certificate store for verification
+    /// Enable TLS. Direct mode requires encryption and verifies certificates/hostname.
+    /// Legacy Patroni/test mode retains its existing native-tls behavior.
     pub tls_enabled: bool,
     /// Path to a custom CA certificate file (optional)
-    /// If provided, this certificate will be added to the trust store
+    /// Direct mode uses this PEM bundle as its trust roots instead of platform trust.
     pub tls_ca_cert_path: Option<String>,
     /// Interval in seconds for refreshing cluster state
     pub refresh_interval: u64,
@@ -755,12 +775,32 @@ impl DatabaseConfig {
         if password.is_empty() {
             return Err("Database password cannot be empty".to_string());
         }
+        let connection_mode = env::var("DATABASE_CONNECTION_MODE")
+            .unwrap_or_else(|_| "patroni".into())
+            .parse::<DatabaseConnectionMode>()?;
+        let host = env::var("DATABASE_HOST").ok();
+        if connection_mode == DatabaseConnectionMode::Direct
+            && host.as_deref().is_none_or(|host| host.trim().is_empty())
+        {
+            return Err("DATABASE_HOST is required in direct mode".into());
+        }
         Ok(Self {
-            primary_app_id: env::var("POSTGRES_PRIMARY_APP_ID")
-                .map_err(|_| "POSTGRES_PRIMARY_APP_ID not set".to_string())?,
-            gateway_subdomain: env::var("GATEWAY_SUBDOMAIN")
-                .map_err(|_| "GATEWAY_SUBDOMAIN not set".to_string())?,
-            host: env::var("DATABASE_HOST").ok(),
+            connection_mode,
+            primary_app_id: env::var("POSTGRES_PRIMARY_APP_ID").or_else(|_| {
+                if connection_mode == DatabaseConnectionMode::Direct {
+                    Ok(String::new())
+                } else {
+                    Err("POSTGRES_PRIMARY_APP_ID not set".to_string())
+                }
+            })?,
+            gateway_subdomain: env::var("GATEWAY_SUBDOMAIN").or_else(|_| {
+                if connection_mode == DatabaseConnectionMode::Direct {
+                    Ok(String::new())
+                } else {
+                    Err("GATEWAY_SUBDOMAIN not set".to_string())
+                }
+            })?,
+            host,
             port: env::var("DATABASE_PORT")
                 .unwrap_or_else(|_| "5432".to_string())
                 .parse()
@@ -1237,6 +1277,83 @@ mod tests {
     use super::*;
     use serial_test::serial;
     use std::ffi::OsString;
+
+    #[test]
+    fn database_connection_mode_requires_exact_values() {
+        for value in ["DIRECT", "direct ", " patroni", ""] {
+            let error = value.parse::<DatabaseConnectionMode>().unwrap_err();
+            assert!(error.contains("lowercase, no surrounding whitespace"));
+        }
+        assert_eq!(
+            "direct".parse::<DatabaseConnectionMode>().unwrap(),
+            DatabaseConnectionMode::Direct
+        );
+        assert_eq!(
+            "patroni".parse::<DatabaseConnectionMode>().unwrap(),
+            DatabaseConnectionMode::Patroni
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn database_connection_mode_environment() {
+        let keys = [
+            "DATABASE_CONNECTION_MODE",
+            "DATABASE_HOST",
+            "DATABASE_PORT",
+            "DATABASE_NAME",
+            "DATABASE_USERNAME",
+            "DATABASE_PASSWORD",
+            "DATABASE_PASSWORD_FILE",
+            "DATABASE_MAX_CONNECTIONS",
+            "DATABASE_TLS_ENABLED",
+            "DATABASE_TLS_CA_CERT_PATH",
+            "DATABASE_REFRESH_INTERVAL",
+            "POSTGRES_PRIMARY_APP_ID",
+            "GATEWAY_SUBDOMAIN",
+        ];
+        struct Restore(Vec<(&'static str, Option<OsString>)>);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                for (key, value) in &self.0 {
+                    match value {
+                        Some(value) => env::set_var(key, value),
+                        None => env::remove_var(key),
+                    }
+                }
+            }
+        }
+        let _restore = Restore(keys.iter().map(|key| (*key, env::var_os(key))).collect());
+        for key in keys {
+            env::remove_var(key);
+        }
+        env::set_var("DATABASE_PASSWORD", "test-only");
+        env::set_var("DATABASE_NAME", "postgres");
+        env::set_var("DATABASE_USERNAME", "app");
+        assert!(DatabaseConfig::from_env()
+            .unwrap_err()
+            .contains("POSTGRES_PRIMARY_APP_ID"));
+        env::set_var("POSTGRES_PRIMARY_APP_ID", "existing-patroni");
+        env::set_var("GATEWAY_SUBDOMAIN", "example.test");
+        assert_eq!(
+            DatabaseConfig::from_env().unwrap().connection_mode,
+            DatabaseConnectionMode::Patroni
+        );
+        env::remove_var("POSTGRES_PRIMARY_APP_ID");
+        env::remove_var("GATEWAY_SUBDOMAIN");
+        env::set_var("DATABASE_CONNECTION_MODE", "direct");
+        assert!(DatabaseConfig::from_env()
+            .unwrap_err()
+            .contains("DATABASE_HOST"));
+        env::set_var("DATABASE_HOST", "example.rds.amazonaws.com");
+        let config = DatabaseConfig::from_env().unwrap();
+        assert_eq!(config.connection_mode, DatabaseConnectionMode::Direct);
+        assert!(config.tls_enabled);
+        env::set_var("DATABASE_CONNECTION_MODE", "typo");
+        assert!(DatabaseConfig::from_env()
+            .unwrap_err()
+            .contains("DATABASE_CONNECTION_MODE"));
+    }
 
     struct TelemetryEnvGuard {
         values: [(&'static str, Option<OsString>); 3],

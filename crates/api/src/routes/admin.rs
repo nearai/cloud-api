@@ -1,6 +1,7 @@
 use crate::conversions::{
     api_invitation_email_status_to_services, api_invitation_status_to_services,
-    services_invitation_email_delivery_to_api, services_invitation_resend_result_to_api,
+    api_role_to_services_role, services_invitation_email_delivery_to_api,
+    services_invitation_resend_result_to_api, services_member_to_api_member,
 };
 use crate::middleware::AdminUser;
 use crate::models::{
@@ -17,13 +18,13 @@ use crate::models::{
     ModelArchitecture, ModelDeprecationConfirmResponse, ModelDeprecationPreviewResponse,
     ModelDeprecationRequest, ModelHistoryEntry, ModelHistoryResponse, ModelMetadata,
     ModelWithPricing, OrgLimitsHistoryEntry, OrgLimitsHistoryResponse,
-    OrganizationFallbackResponse, OrganizationUsage, PricingChangeBatchRequest,
-    PricingChangeConfirmResponse, PricingChangeModelPreviewDto, PricingChangePreviewResponse,
-    PricingFieldUpdates, PricingFields, ScheduledPricingChangeDto, SpendLimit,
-    UpdateAmlReportStatusRequest, UpdateOrganizationConcurrentLimitRequest,
+    OrganizationFallbackResponse, OrganizationMemberResponse, OrganizationUsage,
+    PricingChangeBatchRequest, PricingChangeConfirmResponse, PricingChangeModelPreviewDto,
+    PricingChangePreviewResponse, PricingFieldUpdates, PricingFields, ScheduledPricingChangeDto,
+    SpendLimit, UpdateAmlReportStatusRequest, UpdateOrganizationConcurrentLimitRequest,
     UpdateOrganizationConcurrentLimitResponse, UpdateOrganizationFallbackRequest,
-    UpdateOrganizationLimitsRequest, UpdateOrganizationLimitsResponse, UpdateServiceRequest,
-    UpsertAmlAllowlistEntryRequest,
+    UpdateOrganizationLimitsRequest, UpdateOrganizationLimitsResponse,
+    UpdateOrganizationMemberRequest, UpdateServiceRequest, UpsertAmlAllowlistEntryRequest,
 };
 use crate::routes::common::format_amount;
 use crate::routes::usage::{compute_organization_balance_response, OrganizationBalanceResponse};
@@ -38,7 +39,7 @@ use chrono::{DateTime, Duration, Timelike, Utc};
 use config::ApiConfig;
 use services::admin::{AdminService, AnalyticsService, UpdateModelAdminRequest};
 use services::aml::{AmlAllowlistEntry, AmlError, AmlReport};
-use services::auth::AuthServiceTrait;
+use services::auth::{AuthServiceTrait, UserId};
 use services::github_dispatch::GitHubDispatcher;
 use services::usage::UsageServiceTrait;
 use std::sync::Arc;
@@ -2928,6 +2929,86 @@ pub async fn list_organization_members(
     }))
 }
 
+/// Update an organization member role as a system administrator.
+///
+/// Assigning the owner role transfers ownership from the current owner to an
+/// existing organization member. The previous owner is demoted to admin.
+#[utoipa::path(
+    put,
+    path = "/v1/admin/organizations/{org_id}/members/{user_id}",
+    tag = "Admin",
+    params(
+        ("org_id" = Uuid, Path, description = "Organization ID"),
+        ("user_id" = Uuid, Path, description = "User ID")
+    ),
+    request_body = UpdateOrganizationMemberRequest,
+    responses(
+        (status = 200, description = "Member role updated", body = OrganizationMemberResponse),
+        (status = 400, description = "Invalid request", body = ErrorResponse),
+        (status = 401, description = "Unauthorized", body = ErrorResponse),
+        (status = 403, description = "System administrator privileges required", body = ErrorResponse),
+        (status = 404, description = "Organization or member not found", body = ErrorResponse),
+        (status = 422, description = "Malformed request body", body = ErrorResponse),
+        (status = 500, description = "Internal server error", body = ErrorResponse)
+    ),
+    security(
+        ("session_token" = [])
+    )
+)]
+pub async fn update_organization_member_role(
+    State(app_state): State<AdminAppState>,
+    Extension(admin_user): Extension<AdminUser>,
+    Path((org_id, user_id)): Path<(Uuid, Uuid)>,
+    Json(request): Json<UpdateOrganizationMemberRequest>,
+) -> Result<ResponseJson<OrganizationMemberResponse>, (StatusCode, ResponseJson<ErrorResponse>)> {
+    let new_role = api_role_to_services_role(request.role);
+    let update = app_state
+        .organization_service
+        .update_member_role_for_admin(
+            services::organization::OrganizationId(org_id),
+            UserId(user_id),
+            new_role,
+            UserId(admin_user.0.id),
+        )
+        .await
+        .map_err(|error| match error {
+            services::organization::OrganizationError::NotFound => (
+                StatusCode::NOT_FOUND,
+                ResponseJson(ErrorResponse::new(
+                    "Organization or member not found".to_string(),
+                    "not_found".to_string(),
+                )),
+            ),
+            services::organization::OrganizationError::InvalidParams(message) => (
+                StatusCode::BAD_REQUEST,
+                ResponseJson(ErrorResponse::new(message, "invalid_request".to_string())),
+            ),
+            services::organization::OrganizationError::Unauthorized(message) => (
+                StatusCode::FORBIDDEN,
+                ResponseJson(ErrorResponse::new(message, "forbidden".to_string())),
+            ),
+            error => {
+                error!("Failed to update organization member role: {:?}", error);
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    ResponseJson(ErrorResponse::new(
+                        "Failed to update organization member role".to_string(),
+                        "internal_server_error".to_string(),
+                    )),
+                )
+            }
+        })?;
+
+    tracing::info!(
+        organization_id = %org_id,
+        member_user_id = %user_id,
+        admin_user_id = %admin_user.0.id,
+        "System administrator updated organization member role"
+    );
+
+    Ok(ResponseJson(services_member_to_api_member(update.member)))
+}
+
 /// List organization invitation email deliveries (Admin only)
 ///
 /// Returns delivery metadata for organization invitation emails without exposing invitation tokens.
@@ -4126,9 +4207,9 @@ pub async fn get_model_consumption_timeseries(
 /// `ttft_sample_count` field in each bucket exposes the denominator so callers can
 /// compute coverage fraction (`ttft_sample_count / requests`).
 ///
-/// **Error rate** = `stop_reason IN ('provider_error','timeout')` / requests with a
-/// recorded `stop_reason`. Pre-V0037 rows (stop_reason IS NULL) are excluded from both
-/// numerator and denominator.
+/// **Error rate** = `stop_reason IN ('provider_error','timeout','incomplete')` / requests
+/// with a recorded `stop_reason`. Pre-V0037 rows (stop_reason IS NULL) are excluded from
+/// both numerator and denominator.
 #[utoipa::path(
     get,
     path = "/v1/admin/platform/performance-timeseries",

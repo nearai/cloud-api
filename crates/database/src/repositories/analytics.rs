@@ -296,7 +296,8 @@ impl AnalyticsRepository for PgAnalyticsRepository {
                     COALESCE(SUM(ul.total_cost) FILTER (WHERE NOT COALESCE(m.verifiable, false)), 0)::bigint as external_nano,
                     COUNT(*) FILTER (WHERE NOT COALESCE(m.verifiable, false))::bigint as external_requests,
                     COUNT(*) FILTER (WHERE ul.stop_reason IN ('provider_error', 'timeout'))::bigint as error_count,
-                    PERCENTILE_CONT(0.95) WITHIN GROUP (ORDER BY ul.ttft_ms)::double precision as p95_ttft_ms
+                    PERCENTILE_CONT(0.95) WITHIN GROUP (ORDER BY ul.ttft_ms)::double precision as p95_ttft_ms,
+                    COUNT(*) FILTER (WHERE ul.stop_reason = 'incomplete')::bigint as incomplete_count
                 FROM organization_usage_log ul
                 LEFT JOIN models m ON m.id = ul.model_id
                 WHERE ul.created_at >= $1 AND ul.created_at < $2
@@ -317,8 +318,14 @@ impl AnalyticsRepository for PgAnalyticsRepository {
         let non_verifiable_requests: i64 = summary_row.get(8);
         let error_count: i64 = summary_row.get(9);
         let p95_ttft_ms: Option<f64> = summary_row.get(10);
+        let incomplete_count: i64 = summary_row.get(11);
         let provider_error_or_timeout_rate = if total_requests > 0 {
             error_count as f64 / total_requests as f64
+        } else {
+            0.0
+        };
+        let incomplete_stream_rate = if total_requests > 0 {
+            incomplete_count as f64 / total_requests as f64
         } else {
             0.0
         };
@@ -404,6 +411,7 @@ impl AnalyticsRepository for PgAnalyticsRepository {
             non_verifiable_consumed_usd,
             non_verifiable_requests,
             provider_error_or_timeout_rate,
+            incomplete_stream_rate,
             p95_ttft_ms,
             provider_usage,
             top_models,
@@ -1046,7 +1054,7 @@ impl AnalyticsRepository for PgAnalyticsRepository {
                 PERCENTILE_CONT(0.99) WITHIN GROUP (ORDER BY ul.ttft_ms)::double precision AS p99_ttft_ms,
                 CASE
                     WHEN COUNT(*) FILTER (WHERE ul.stop_reason IS NOT NULL) = 0 THEN NULL
-                    ELSE COUNT(*) FILTER (WHERE ul.stop_reason IN ('provider_error', 'timeout'))::float8
+                    ELSE COUNT(*) FILTER (WHERE ul.stop_reason IN ('provider_error', 'timeout', 'incomplete'))::float8
                          / COUNT(*) FILTER (WHERE ul.stop_reason IS NOT NULL)::float8
                 END AS error_rate
             FROM organization_usage_log ul

@@ -4129,6 +4129,7 @@ pub struct ModelHistoryResponse {
 /// - grant: Free credits provided by the platform
 /// - payment: Credits purchased by the organization
 /// - staking_farm: House of Stake farm reward units converted into credits
+/// - postpay: Contract billing safety ceiling; usage is invoiced separately
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, ToSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum CreditType {
@@ -4138,6 +4139,8 @@ pub enum CreditType {
     Payment,
     #[serde(rename = "staking_farm", alias = "STAKING_FARM")]
     StakingFarm,
+    #[serde(alias = "POSTPAY")]
+    Postpay,
 }
 
 impl std::fmt::Display for CreditType {
@@ -4146,6 +4149,7 @@ impl std::fmt::Display for CreditType {
             CreditType::Grant => write!(f, "grant"),
             CreditType::Payment => write!(f, "payment"),
             CreditType::StakingFarm => write!(f, "staking_farm"),
+            CreditType::Postpay => write!(f, "postpay"),
         }
     }
 }
@@ -4157,7 +4161,24 @@ impl CreditType {
             CreditType::Grant => "grant",
             CreditType::Payment => "payment",
             CreditType::StakingFarm => "staking_farm",
+            CreditType::Postpay => "postpay",
         }
+    }
+}
+
+#[cfg(test)]
+mod credit_type_tests {
+    use super::CreditType;
+
+    #[test]
+    fn postpay_serializes_and_accepts_supported_casing() {
+        let lower: CreditType = serde_json::from_str("\"postpay\"").unwrap();
+        let upper: CreditType = serde_json::from_str("\"POSTPAY\"").unwrap();
+
+        assert_eq!(lower, CreditType::Postpay);
+        assert_eq!(upper, CreditType::Postpay);
+        assert_eq!(lower.as_str(), "postpay");
+        assert_eq!(serde_json::to_string(&lower).unwrap(), "\"postpay\"");
     }
 }
 

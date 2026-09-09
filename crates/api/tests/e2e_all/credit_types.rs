@@ -51,6 +51,13 @@ async fn test_add_credits_variations() {
             "USD",
         ),
         (
+            "postpay",
+            Some("contract"),
+            10_000_000_000_000_000i64,
+            "USD",
+            "USD",
+        ),
+        (
             "payment",
             Some("hot-pay"),
             100_000_000_000i64,
@@ -214,6 +221,16 @@ async fn test_balance_response_includes_credit_limit_breakdown() {
         &get_session_id(),
     )
     .await;
+    add_credits_with_type(
+        &server,
+        &org.id,
+        "postpay",
+        Some("contract"),
+        10_000_000_000_000_000,
+        "USD",
+        &get_session_id(),
+    )
+    .await;
 
     let response = server
         .get(format!("/v1/organizations/{}/usage/balance", org.id).as_str())
@@ -223,8 +240,8 @@ async fn test_balance_response_includes_credit_limit_breakdown() {
     assert_eq!(response.status_code(), 200);
     let balance = response.json::<api::routes::usage::OrganizationBalanceResponse>();
 
-    assert_eq!(balance.spend_limit, Some(80_000_000_000));
-    assert_eq!(balance.credit_limits.len(), 3);
+    assert_eq!(balance.spend_limit, Some(10_000_080_000_000_000));
+    assert_eq!(balance.credit_limits.len(), 4);
     assert!(balance.credit_limits.iter().any(|limit| {
         limit.credit_type == "payment"
             && limit.source.as_deref() == Some("stripe+hot-pay")
@@ -234,6 +251,11 @@ async fn test_balance_response_includes_credit_limit_breakdown() {
         limit.credit_type == "staking_farm"
             && limit.source.as_deref() == Some("house-of-stake")
             && limit.amount == 20_000_000_000
+    }));
+    assert!(balance.credit_limits.iter().any(|limit| {
+        limit.credit_type == "postpay"
+            && limit.source.as_deref() == Some("contract")
+            && limit.amount == 10_000_000_000_000_000
     }));
 }
 

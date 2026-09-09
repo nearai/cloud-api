@@ -1443,6 +1443,7 @@ pub async fn update_organization_limits(
         "grant" => CreditType::Grant,
         "payment" => CreditType::Payment,
         "staking_farm" => CreditType::StakingFarm,
+        "postpay" => CreditType::Postpay,
         _ => CreditType::Payment, // Default fallback (should not happen)
     };
 
@@ -1556,6 +1557,7 @@ pub async fn get_organization_limits_history(
                 "grant" => CreditType::Grant,
                 "payment" => CreditType::Payment,
                 "staking_farm" => CreditType::StakingFarm,
+                "postpay" => CreditType::Postpay,
                 _ => CreditType::Payment,
             };
             OrgLimitsHistoryEntry {

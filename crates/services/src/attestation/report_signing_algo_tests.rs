@@ -13,6 +13,12 @@
 //! `MockProvider::get_attestation_report` mirrors the production shapes: a
 //! 128-hex (64-byte) key for `Some("ecdsa")` and for `None`, a 64-hex (32-byte)
 //! key for `Some("ed25519")` — so it reproduces the bug without extra mocking.
+//!
+//! Both report paths are covered: most tests here build the service with
+//! `report_cache: None` and therefore assert on the algo forwarded down the
+//! cache-BYPASS arm, while `cached_ed25519_request_is_not_served_a_poisoned_ecdsa_report`
+//! enables the cache (`service_with_mock_provider_cached`) and reproduces the
+//! actual production symptom — cache poisoning of the shared `a=ed25519` entry.
 
 use std::sync::Arc;
 
@@ -153,8 +159,8 @@ impl GatewayQuoteCollector for StubGatewayQuoteCollector {
 }
 
 /// Service wired to a pool holding a single `MockProvider` for `TEST_MODEL`.
-/// `report_cache: None` so every call takes the cache-bypass path and the
-/// assertions are about the forwarded algo, not about cache behaviour.
+/// `report_cache: None` so every call takes the cache-bypass path; the cached
+/// path has its own service and test (`service_with_mock_provider_cached`).
 async fn service_with_mock_provider() -> AttestationService {
     let pool = Arc::new(InferenceProviderPool::new(
         None,
@@ -186,12 +192,33 @@ async fn service_with_mock_provider() -> AttestationService {
     }
 }
 
-async fn report_for(signing_algo: Option<&str>) -> AttestationReport {
-    service_with_mock_provider()
-        .await
+/// Same wiring as [`service_with_mock_provider`], but with the no-nonce report
+/// cache ENABLED, mirroring how production builds it in `lifecycle.rs`
+/// (`max_capacity(1024)` + a TTL from env). The TTL is deliberately generous so
+/// the test asserts on cache *content*, never on the clock.
+async fn service_with_mock_provider_cached() -> AttestationService {
+    AttestationService {
+        report_cache: Some(
+            moka::future::Cache::builder()
+                .max_capacity(1024)
+                .time_to_live(std::time::Duration::from_secs(60))
+                .build(),
+        ),
+        ..service_with_mock_provider().await
+    }
+}
+
+/// Nonce-LESS report request against an existing service, so successive calls
+/// share one service — and therefore one report cache.
+async fn report_from(
+    service: &AttestationService,
+    signing_algo: Option<&str>,
+) -> AttestationReport {
+    service
         .get_attestation_report_impl(
             Some(TEST_MODEL.to_string()),
             signing_algo.map(str::to_string),
+            // No nonce: only nonce-less requests are cacheable at all.
             None,
             None,
             false,
@@ -199,6 +226,10 @@ async fn report_for(signing_algo: Option<&str>) -> AttestationReport {
         )
         .await
         .expect("attestation report build should succeed")
+}
+
+async fn report_for(signing_algo: Option<&str>) -> AttestationReport {
+    report_from(&service_with_mock_provider().await, signing_algo).await
 }
 
 fn model_signing_public_key(report: &AttestationReport) -> String {
@@ -257,4 +288,55 @@ async fn uppercase_signing_algo_is_normalized_before_forwarding() {
 
     assert_eq!(key.len(), ED25519_PUBKEY_HEX_LEN, "got {key}");
     assert_eq!(report.gateway_attestation.signing_algo, "ed25519");
+}
+
+#[tokio::test]
+async fn cached_ed25519_request_is_not_served_a_poisoned_ecdsa_report() {
+    // The production symptom the cache-bypass tests above cannot reproduce:
+    // a nonce-less request that OMITS `signing_algo` populates the shared
+    // `a=ed25519` cache entry, and every explicit `signing_algo=ed25519`
+    // request inside the TTL is then served that same entry. Before the fix
+    // the first call stored a report carrying the model's ECDSA key there, so
+    // the second call got a 64-byte key where E2EE expected 32.
+    //
+    // It also pins the correct half of the invariant: an omitted algo and an
+    // explicit `ed25519` both normalize to `a=ed25519` and are *supposed* to
+    // share one cache entry — the fix is to store the right report under that
+    // key, not to split the key.
+    let service = service_with_mock_provider_cached().await;
+
+    // Miss: builds the report and populates the `a=ed25519` entry.
+    let omitted = report_from(&service, None).await;
+    // Hit: same normalized cache key, so this is served the entry above.
+    let explicit = report_from(&service, Some("ed25519")).await;
+
+    // Proof the second call really came from the first call's entry rather than
+    // a fresh build: a nonce-less build generates a random gateway nonce, so two
+    // independent builds could not agree on it. Asserted first so the poisoning
+    // assertion below is known to be about a cache HIT.
+    assert_eq!(
+        omitted.gateway_attestation.request_nonce, explicit.gateway_attestation.request_nonce,
+        "omitted and explicit-ed25519 nonce-less requests must share one cache entry"
+    );
+
+    // The poisoning assertion: an explicit ed25519 request served from the
+    // entry a `None` request populated must still carry the Ed25519 model key.
+    let explicit_key = model_signing_public_key(&explicit);
+    assert_eq!(
+        explicit_key.len(),
+        ED25519_PUBKEY_HEX_LEN,
+        "explicit signing_algo=ed25519 served from the cache entry populated by an \
+         algo-less request must be the Ed25519 model key (64 hex chars), got {} hex chars: {explicit_key}",
+        explicit_key.len()
+    );
+    assert_eq!(explicit.gateway_attestation.signing_algo, "ed25519");
+
+    // ...and so must the algo-less request that populated it.
+    let omitted_key = model_signing_public_key(&omitted);
+    assert_eq!(
+        omitted_key.len(),
+        ED25519_PUBKEY_HEX_LEN,
+        "omitting signing_algo must cache the Ed25519 model key (64 hex chars), got {} hex chars: {omitted_key}",
+        omitted_key.len()
+    );
 }

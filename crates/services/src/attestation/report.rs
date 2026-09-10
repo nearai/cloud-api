@@ -197,8 +197,7 @@ impl AttestationService {
             // inference backend; the gateway quote is a local dstack Unix-socket call.
             let model_fut = {
                 let pool = &self.inference_provider_pool;
-                // Cloned because `algo` is still borrowed above
-                // (`get_signing_address_hex`) and moved into `gateway_fut` below.
+                // Cloned because `algo` itself is moved into `gateway_fut` below.
                 let algo_for_model = algo.clone();
                 async move {
                     if let Some(canonical) = resolved_canonical {

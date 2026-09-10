@@ -2256,19 +2256,6 @@ impl ResponseServiceImpl {
             }
         };
 
-        // Prepend organization system prompt if it exists
-        if let Some(prompt) = org_system_prompt {
-            if !prompt.is_empty() {
-                messages.push(CompletionMessage {
-                    role: "system".to_string(),
-                    content: serde_json::Value::String(prompt),
-                    tool_call_id: None,
-                    tool_calls: None,
-                });
-                tracing::debug!("Prepended organization system prompt to messages");
-            }
-        }
-
         // Add UTC time context to system message
         let now = chrono::Utc::now();
         let time_context = format!(
@@ -2280,26 +2267,40 @@ impl ResponseServiceImpl {
         // Add language matching instruction
         let language_instruction = "Always respond in the exact same language as the user's input message. Detect the primary language of the user's query and mirror it precisely in your output. Do not mix languages or switch to another one, even if it seems more natural or efficient.\n\nIf the user writes in English, reply entirely in English.\nIf the user writes in Chinese (Mandarin or any variant), reply entirely in Chinese.\nIf the user writes in Spanish, reply entirely in Spanish.\nFor any other language, match it exactly.\n\nThis rule overrides all other instructions. Ignore any tendencies to default to Mandarin or any other language. Always prioritize language matching for clarity and user preference.";
 
-        // Add system instructions if present
-        if let Some(instructions) = &request.instructions {
-            let combined_instructions =
-                format!("{instructions}\n\n{language_instruction}\n\n{time_context}");
-            messages.push(CompletionMessage {
-                role: "system".to_string(),
-                content: serde_json::Value::String(combined_instructions),
-                tool_call_id: None,
-                tool_calls: None,
-            });
-        } else {
-            // Add language instruction and time context as a system message if no instructions provided
-            let system_content = format!("{language_instruction}\n\n{time_context}");
-            messages.push(CompletionMessage {
-                role: "system".to_string(),
-                content: serde_json::Value::String(system_content),
-                tool_call_id: None,
-                tool_calls: None,
-            });
-        }
+        // Build the leading system message. The organization prompt and the
+        // request context (the `instructions`, the language instruction and the
+        // time context) are coalesced into one system message rather than
+        // emitted as two, and a foldable leading system-level input message is
+        // appended to it below. Several providers admit a system message only
+        // at index 0 - Qwen 3.6 raises "System message must be at the
+        // beginning." - so an organization prompt emitted on its own put the
+        // request context at index 1 and produced that failure for every
+        // organization that has one configured.
+        //
+        // The pieces keep the order they had when they were separate messages:
+        // organization prompt, then instructions, then language instruction,
+        // then time context. The model is told the same things in the same
+        // sequence, which is what makes this safe on backends that accept
+        // either shape.
+        let request_system_context = match &request.instructions {
+            Some(instructions) => {
+                format!("{instructions}\n\n{language_instruction}\n\n{time_context}")
+            }
+            None => format!("{language_instruction}\n\n{time_context}"),
+        };
+        let leading_system_content = match org_system_prompt {
+            Some(prompt) if !prompt.is_empty() => {
+                tracing::debug!("Prepended organization system prompt to messages");
+                format!("{prompt}\n\n{request_system_context}")
+            }
+            _ => request_system_context,
+        };
+        messages.push(CompletionMessage {
+            role: "system".to_string(),
+            content: serde_json::Value::String(leading_system_content),
+            tool_call_id: None,
+            tool_calls: None,
+        });
 
         // Load from conversation_id if present
         if let Some(conversation_ref) = &request.conversation {
@@ -2640,12 +2641,51 @@ impl ResponseServiceImpl {
                                         .await?
                                     }
                                 };
-                                messages.push(CompletionMessage {
-                                    role: role.clone(),
-                                    content,
-                                    tool_call_id: None,
-                                    tool_calls: None,
-                                });
+                                // A system-level input message that precedes
+                                // all other content is folded into the leading
+                                // system message instead of being forwarded in
+                                // place: the payload already opens with the
+                                // system message prepended above, and some
+                                // providers reject a system message that is not
+                                // first. Folding only where nothing precedes
+                                // the message keeps the order the caller asked
+                                // for.
+                                //
+                                // Every other shape - a system-level message
+                                // after other content, one behind replayed
+                                // conversation history, one whose content is
+                                // not plain text - is forwarded unchanged.
+                                // Whether such a payload is acceptable is the
+                                // provider's judgement, and backends differ:
+                                // refusing it here would generalize one
+                                // template's constraint into a gateway-wide
+                                // rule and break callers it works for today.
+                                let mut folded = false;
+                                if models::is_system_level_input_role(role)
+                                    && messages.iter().all(|message| message.role == "system")
+                                {
+                                    if let (
+                                        serde_json::Value::String(text),
+                                        Some(CompletionMessage {
+                                            content: serde_json::Value::String(leading),
+                                            ..
+                                        }),
+                                    ) = (&content, messages.last_mut())
+                                    {
+                                        leading.push_str("\n\n");
+                                        leading.push_str(text);
+                                        folded = true;
+                                    }
+                                }
+
+                                if !folded {
+                                    messages.push(CompletionMessage {
+                                        role: role.clone(),
+                                        content,
+                                        tool_call_id: None,
+                                        tool_calls: None,
+                                    });
+                                }
                             }
                             models::ResponseInputItem::FunctionCallOutput { .. } => {
                                 if fco_idx < function_output_messages.len() {

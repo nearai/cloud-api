@@ -1150,6 +1150,20 @@ pub struct OutputTokensDetails {
 // Validation implementations
 // ============================================
 
+/// Input message roles that become a provider-visible system message.
+///
+/// This list mirrors the role mapping in
+/// `crate::completions::Service::to_chat_messages`, which is what actually
+/// turns a message role into `MessageRole::System`. The match there is exact
+/// and lowercase, so this comparison is too: an input role of `"Developer"`
+/// maps to `MessageRole::User` and reaches no provider as a system message.
+const SYSTEM_LEVEL_INPUT_ROLES: &[&str] = &["system", "developer"];
+
+/// Whether `role` becomes a system message in the provider payload.
+pub fn is_system_level_input_role(role: &str) -> bool {
+    SYSTEM_LEVEL_INPUT_ROLES.contains(&role)
+}
+
 impl CreateResponseRequest {
     pub fn validate(&self) -> Result<(), String> {
         use crate::common::MAX_METADATA_SIZE_BYTES;
@@ -1283,6 +1297,99 @@ impl Usage {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    fn request_with_input(input: serde_json::Value) -> CreateResponseRequest {
+        request_from(json!({
+            "model": "Qwen/Qwen3.6-35B-A3B-FP8",
+            "instructions": "You are a coding agent.",
+            "stream": true,
+            "input": input,
+        }))
+    }
+
+    fn request_from(body: serde_json::Value) -> CreateResponseRequest {
+        serde_json::from_value(body).expect("request should deserialize")
+    }
+
+    #[test]
+    fn test_validate_accepts_leading_developer_message() {
+        // The Codex CLI shape: a top-level `instructions` string plus a
+        // `developer` message ahead of every user turn. Nothing precedes it, so
+        // `load_conversation_context` folds it into the leading system message.
+        let request = request_with_input(json!([
+            {"role": "developer", "content": "Repository guidelines."},
+            {"role": "user", "content": "Fix the build."},
+            {"role": "user", "content": "Then run the tests."},
+        ]));
+
+        assert!(request.validate().is_ok());
+    }
+
+    // The three shapes below cannot be folded without reordering what the model
+    // is told, so they are forwarded to the provider unchanged. Whether such a
+    // payload is acceptable is the provider's judgement and backends differ, so
+    // admission does not refuse them: that would generalize one template's
+    // constraint into a gateway-wide rule.
+
+    #[test]
+    fn test_validate_accepts_system_message_after_other_content() {
+        let request = request_with_input(json!([
+            {"role": "user", "content": "Hello."},
+            {"role": "system", "content": "Be concise."},
+        ]));
+
+        assert!(request.validate().is_ok());
+    }
+
+    #[test]
+    fn test_validate_accepts_leading_system_message_when_history_is_replayed() {
+        let request = request_from(json!({
+            "model": "Qwen/Qwen3.6-35B-A3B-FP8",
+            "previous_response_id": "resp_00000000-0000-0000-0000-000000000000",
+            "input": [
+                {"role": "developer", "content": "Repository guidelines."},
+                {"role": "user", "content": "Fix the build."},
+            ],
+        }));
+
+        assert!(request.validate().is_ok());
+    }
+
+    #[test]
+    fn test_validate_accepts_leading_system_message_with_image_content() {
+        let request = request_with_input(json!([
+            {
+                "role": "developer",
+                "content": [{"type": "input_image", "image_url": "https://example.com/a.png"}],
+            },
+            {"role": "user", "content": "Describe it."},
+        ]));
+
+        assert!(request.validate().is_ok());
+    }
+
+    #[test]
+    fn test_validate_accepts_unmapped_role_spelling_anywhere() {
+        // `to_chat_messages` matches roles exactly, so "Developer" becomes a
+        // user message and never produces a system message at all.
+        let request = request_with_input(json!([
+            {"role": "user", "content": "Hello."},
+            {"role": "Developer", "content": "Be concise."},
+        ]));
+
+        assert!(request.validate().is_ok());
+    }
+
+    #[test]
+    fn test_validate_accepts_user_and_assistant_input_messages() {
+        let request = request_with_input(json!([
+            {"role": "user", "content": "Hello."},
+            {"role": "assistant", "content": "Hi."},
+            {"role": "user", "content": "Bye."},
+        ]));
+
+        assert!(request.validate().is_ok());
+    }
 
     #[test]
     fn test_response_status_serializes_in_progress_with_underscore() {

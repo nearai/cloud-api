@@ -253,3 +253,47 @@ async fn test_model_without_declared_modalities_is_not_gated() {
         .await;
     assert_eq!(response.status_code(), 200, "{}", response.text());
 }
+
+/// The engine's admission rejection (`--max-queued-requests` overflow) arrives
+/// on a stream as a first SSE event `data: {"error": {..., "code": 503}}`.
+/// After cloud-api's own backend fallback is exhausted it must surface as a
+/// real HTTP 429 (`service_overloaded`, with `Retry-After`) before any SSE
+/// bytes — never a 200 that fails mid-stream and never a 5xx, which an
+/// aggregator would score as downtime rather than back-pressure.
+#[tokio::test]
+async fn test_streaming_queue_full_surfaces_as_429_before_sse() {
+    let (server, mock, model, api_key) = setup().await;
+    mock.set_stream_error_override(Some(inference_providers::CompletionError::HttpError {
+        status_code: 503,
+        message: "The request queue is full.".to_string(),
+        is_external: false,
+    }))
+    .await;
+    let response = server
+        .post("/v1/chat/completions")
+        .add_header("Authorization", format!("Bearer {api_key}"))
+        .json(&serde_json::json!({
+            "model": model,
+            "messages": [{"role": "user", "content": "hi"}],
+            "stream": true,
+            "max_tokens": 8
+        }))
+        .await;
+    assert_eq!(response.status_code(), 429, "{}", response.text());
+    assert_eq!(
+        response
+            .headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok()),
+        Some("application/json"),
+        "the rejection must be a JSON error, not an SSE body"
+    );
+    let retry_after = response
+        .headers()
+        .get(axum::http::header::RETRY_AFTER)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.parse::<u64>().ok());
+    assert!(retry_after.is_some_and(|s| s > 0), "Retry-After missing");
+    let body = response.json::<serde_json::Value>();
+    assert_eq!(body["error"]["type"], "service_overloaded");
+}

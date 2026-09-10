@@ -46,6 +46,23 @@ use std::sync::Arc;
 use tracing::{debug, error, warn, Instrument};
 use uuid::Uuid;
 
+fn parse_stored_credit_type(
+    value: &str,
+) -> Result<CreditType, (StatusCode, ResponseJson<ErrorResponse>)> {
+    value.parse().map_err(|_| {
+        // Do not silently relabel unknown database values as purchased credits.
+        // The value itself is intentionally omitted from logs.
+        error!("Unsupported credit type returned by admin service");
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            ResponseJson(ErrorResponse::new(
+                "Failed to read organization limits".to_string(),
+                "internal_server_error".to_string(),
+            )),
+        )
+    })
+}
+
 /// OpenRouter's fixed `supported_sampling_parameters` vocabulary. Values written
 /// via the admin API are validated against this list, and any pinned/seeded
 /// catalog row (e.g. the Chutes seed in `crate::ensure_chutes_catalog_row`) must
@@ -1439,12 +1456,7 @@ pub async fn update_organization_limits(
         })?;
 
     // Convert service response to API response
-    let credit_type_enum = match updated_limits.credit_type.to_lowercase().as_str() {
-        "grant" => CreditType::Grant,
-        "payment" => CreditType::Payment,
-        "staking_farm" => CreditType::StakingFarm,
-        _ => CreditType::Payment, // Default fallback (should not happen)
-    };
+    let credit_type_enum = parse_stored_credit_type(&updated_limits.credit_type)?;
 
     let response = UpdateOrganizationLimitsResponse {
         organization_id: updated_limits.organization_id.to_string(),
@@ -1552,13 +1564,8 @@ pub async fn get_organization_limits_history(
     let entries: Vec<OrgLimitsHistoryEntry> = history
         .into_iter()
         .map(|h| {
-            let credit_type_enum = match h.credit_type.to_lowercase().as_str() {
-                "grant" => CreditType::Grant,
-                "payment" => CreditType::Payment,
-                "staking_farm" => CreditType::StakingFarm,
-                _ => CreditType::Payment,
-            };
-            OrgLimitsHistoryEntry {
+            let credit_type_enum = parse_stored_credit_type(&h.credit_type)?;
+            Ok(OrgLimitsHistoryEntry {
                 id: h.id.to_string(),
                 organization_id: h.organization_id.to_string(),
                 credit_type: credit_type_enum,
@@ -1575,9 +1582,9 @@ pub async fn get_organization_limits_history(
                 changed_by_user_id: h.changed_by_user_id.map(|id| id.to_string()),
                 changed_by_user_email: h.changed_by_user_email,
                 created_at: h.created_at.to_rfc3339(),
-            }
+            })
         })
-        .collect();
+        .collect::<Result<Vec<_>, (StatusCode, ResponseJson<ErrorResponse>)>>()?;
 
     let response = OrgLimitsHistoryResponse {
         history: entries,

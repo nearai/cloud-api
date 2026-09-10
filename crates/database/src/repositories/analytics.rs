@@ -266,7 +266,8 @@ impl AnalyticsRepository for PgAnalyticsRepository {
                     (SELECT COUNT(DISTINCT olh.organization_id)
                         FROM organization_limits_history olh
                         JOIN organizations o ON o.id = olh.organization_id AND o.is_active = true
-                        WHERE olh.credit_type IN ('payment', 'postpay')
+                        WHERE (olh.credit_type = 'payment'
+                            OR (olh.credit_type = 'postpay' AND olh.spend_limit > 0))
                             AND olh.effective_until IS NULL)::bigint as paying_organizations
                 "#,
                 &[&start, &end],
@@ -633,7 +634,10 @@ impl AnalyticsRepository for PgAnalyticsRepository {
                 SELECT
                     COALESCE(SUM(olh.spend_limit) FILTER (WHERE olh.credit_type = 'payment'), 0)::bigint as paid_limit,
                     COALESCE(SUM(olh.spend_limit) FILTER (WHERE olh.credit_type = 'grant'), 0)::bigint as grant_limit,
-                    COUNT(DISTINCT olh.organization_id) FILTER (WHERE olh.credit_type IN ('payment', 'postpay'))::bigint as paying_orgs,
+                    COUNT(DISTINCT olh.organization_id) FILTER (
+                        WHERE olh.credit_type = 'payment'
+                            OR (olh.credit_type = 'postpay' AND olh.spend_limit > 0)
+                    )::bigint as paying_orgs,
                     COUNT(DISTINCT olh.organization_id) FILTER (WHERE olh.credit_type = 'grant')::bigint as granted_orgs
                 FROM organization_limits_history olh
                 JOIN organizations o ON o.id = olh.organization_id AND o.is_active = true
@@ -854,7 +858,9 @@ impl AnalyticsRepository for PgAnalyticsRepository {
             WITH paying AS (
                 SELECT DISTINCT organization_id
                 FROM organization_limits_history
-                WHERE credit_type IN ('payment', 'postpay') AND effective_until IS NULL
+                WHERE (credit_type = 'payment'
+                    OR (credit_type = 'postpay' AND spend_limit > 0))
+                    AND effective_until IS NULL
             )
             SELECT
                 o.id as organization_id,

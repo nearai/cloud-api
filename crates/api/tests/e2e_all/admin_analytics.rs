@@ -1069,6 +1069,43 @@ async fn test_admin_platform_billing_summary() {
         "platform metrics should count a postpay-only contract customer as paying"
     );
 
+    add_credits_with_type(
+        &server,
+        &org.id,
+        "postpay",
+        Some("contract"),
+        0,
+        "USD",
+        &get_session_id(),
+    )
+    .await;
+
+    let disabled_summary_response = server
+        .get("/v1/admin/platform/billing-summary")
+        .add_header("Authorization", format!("Bearer {}", get_session_id()))
+        .add_header("User-Agent", MOCK_USER_AGENT)
+        .await;
+    assert_eq!(disabled_summary_response.status_code(), 200);
+    let disabled_summary: BillingSummary = serde_json::from_str(&disabled_summary_response.text())
+        .expect("parse BillingSummary after disabling postpay");
+    assert_eq!(
+        disabled_summary.paying_org_count, before.paying_org_count,
+        "a zero postpay limit disables contract billing and must not count as paying"
+    );
+
+    let disabled_metrics_response = server
+        .get("/v1/admin/platform/metrics")
+        .add_header("Authorization", format!("Bearer {}", get_session_id()))
+        .add_header("User-Agent", MOCK_USER_AGENT)
+        .await;
+    assert_eq!(disabled_metrics_response.status_code(), 200);
+    let disabled_metrics: PlatformMetrics = serde_json::from_str(&disabled_metrics_response.text())
+        .expect("parse PlatformMetrics after disabling postpay");
+    assert_eq!(
+        disabled_metrics.paying_organizations, before_metrics.paying_organizations,
+        "a zero postpay limit must not count as a paying organization"
+    );
+
     println!("✅ Platform billing summary works");
 }
 
@@ -1209,6 +1246,42 @@ async fn test_admin_platform_org_revenue() {
     assert!(
         found.is_paying,
         "a postpay-only contract customer should be classified as paying"
+    );
+
+    add_credits_with_type(
+        &server,
+        &org.id,
+        "postpay",
+        Some("contract"),
+        0,
+        "USD",
+        &get_session_id(),
+    )
+    .await;
+    let disabled_query_end = (chrono::Utc::now() + chrono::Duration::seconds(5))
+        .to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+    let disabled_response = server
+        .get(
+            format!(
+                "/v1/admin/platform/org-revenue?start={query_start}&end={disabled_query_end}&search={}&sort=requests",
+                org.name
+            )
+            .as_str(),
+        )
+        .add_header("Authorization", format!("Bearer {}", get_session_id()))
+        .add_header("User-Agent", MOCK_USER_AGENT)
+        .await;
+    assert_eq!(disabled_response.status_code(), 200);
+    let disabled_report: OrgRevenueReport = serde_json::from_str(&disabled_response.text())
+        .expect("parse OrgRevenueReport after disabling postpay");
+    let disabled_org = disabled_report
+        .data
+        .iter()
+        .find(|o| o.organization_id.to_string() == org.id)
+        .expect("org with prior usage should remain in revenue report");
+    assert!(
+        !disabled_org.is_paying,
+        "a zero postpay limit must classify the organization as non-paying"
     );
 
     let eps = 1e-6;

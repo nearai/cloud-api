@@ -2112,6 +2112,11 @@ pub fn build_internal_routes(app_state: AppState) -> Router {
 }
 
 pub fn build_model_routes(models_service: Arc<dyn ModelsServiceTrait>) -> Router {
+    let openrouter_routes = Router::new()
+        .route("/openrouter/models", get(crate::routes::openrouter::models))
+        .with_state(crate::routes::openrouter::OpenRouterState::from_env(
+            models_service.clone(),
+        ));
     let models_app_state = ModelsAppState { models_service };
 
     Router::new()
@@ -2119,6 +2124,7 @@ pub fn build_model_routes(models_service: Arc<dyn ModelsServiceTrait>) -> Router
         .route("/model/list", get(list_models))
         .route("/model/{model_name}", get(get_model_by_name))
         .with_state(models_app_state)
+        .merge(openrouter_routes)
         // Public, anonymous, identical-for-all-clients responses that change
         // only when an admin updates the model catalog. 30s fresh window plus
         // 120s stale-while-revalidate lets CDNs/browsers serve cached copies

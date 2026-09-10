@@ -429,6 +429,13 @@ pub trait InferenceProvider {
     /// that participate in model-proxy rotation (vLLM) override it.
     fn set_backend_count(&self, _count: usize) {}
 
+    /// Update the provider's pubkey-to-backend-index map from discovery so a
+    /// model-pubkey-pinned request reaches a backend holding the private key.
+    /// An empty map means no restriction. Call this after `set_backend_count`,
+    /// because a count change clears stale index bindings. Rotation providers
+    /// override this default no-op.
+    fn set_backend_keys(&self, _map: std::collections::HashMap<String, Vec<usize>>) {}
+
     /// Exact input-token count via the backend's tokenizer (`POST /v1/tokenize`,
     /// proxied to the engine's native tokenize endpoint). The pool calls this
     /// only when a cheap byte-based estimate lands near a context-capacity

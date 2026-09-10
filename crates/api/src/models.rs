@@ -2710,6 +2710,8 @@ pub struct UpdateOrganizationMemberRequest {
 pub struct OrganizationSettings {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub system_prompt: Option<String>,
+    /// Whether requests may use providers configured as fallbacks.
+    pub fallback_enabled: bool,
 }
 
 /// Wrapper type to distinguish between "field not provided" and "field explicitly set to null"
@@ -2739,6 +2741,10 @@ pub struct PatchOrganizationSettingsRequest {
     #[serde(default, deserialize_with = "deserialize_nullable")]
     #[schema(value_type = Option<String>)]
     pub system_prompt: Nullable<String>,
+    /// Enable/disable configured fallback providers. Null restores the default.
+    #[serde(default, deserialize_with = "deserialize_nullable")]
+    #[schema(value_type = Option<bool>)]
+    pub fallback_enabled: Nullable<bool>,
 }
 
 impl PatchOrganizationSettingsRequest {
@@ -2754,6 +2760,21 @@ impl PatchOrganizationSettingsRequest {
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub struct OrganizationSettingsResponse {
     pub settings: OrganizationSettings,
+}
+
+/// Admin request to update an organization's fallback policy.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct UpdateOrganizationFallbackRequest {
+    pub enabled: bool,
+}
+
+/// Effective fallback policy returned by admin organization endpoints.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct OrganizationFallbackResponse {
+    pub organization_id: uuid::Uuid,
+    pub enabled: bool,
 }
 
 /// Result of a single invitation attempt
@@ -4108,6 +4129,7 @@ pub struct ModelHistoryResponse {
 /// - grant: Free credits provided by the platform
 /// - payment: Credits purchased by the organization
 /// - staking_farm: House of Stake farm reward units converted into credits
+/// - postpay: Contract billing safety ceiling; usage is invoiced separately
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, ToSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum CreditType {
@@ -4117,6 +4139,8 @@ pub enum CreditType {
     Payment,
     #[serde(rename = "staking_farm", alias = "STAKING_FARM")]
     StakingFarm,
+    #[serde(alias = "POSTPAY")]
+    Postpay,
 }
 
 impl std::fmt::Display for CreditType {
@@ -4125,6 +4149,7 @@ impl std::fmt::Display for CreditType {
             CreditType::Grant => write!(f, "grant"),
             CreditType::Payment => write!(f, "payment"),
             CreditType::StakingFarm => write!(f, "staking_farm"),
+            CreditType::Postpay => write!(f, "postpay"),
         }
     }
 }
@@ -4136,6 +4161,25 @@ impl CreditType {
             CreditType::Grant => "grant",
             CreditType::Payment => "payment",
             CreditType::StakingFarm => "staking_farm",
+            CreditType::Postpay => "postpay",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error("unsupported credit type")]
+pub struct ParseCreditTypeError;
+
+impl std::str::FromStr for CreditType {
+    type Err = ParseCreditTypeError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value.to_ascii_lowercase().as_str() {
+            "grant" => Ok(Self::Grant),
+            "payment" => Ok(Self::Payment),
+            "staking_farm" => Ok(Self::StakingFarm),
+            "postpay" => Ok(Self::Postpay),
+            _ => Err(ParseCreditTypeError),
         }
     }
 }
@@ -5400,4 +5444,26 @@ pub struct ScoreUsage {
     /// Prompt tokens details
     #[serde(skip_serializing_if = "Option::is_none")]
     pub prompt_tokens_details: Option<serde_json::Value>,
+}
+
+#[cfg(test)]
+mod credit_type_tests {
+    use super::CreditType;
+
+    #[test]
+    fn postpay_serializes_and_accepts_supported_casing() {
+        let lower: CreditType = serde_json::from_str("\"postpay\"").unwrap();
+        let upper: CreditType = serde_json::from_str("\"POSTPAY\"").unwrap();
+
+        assert_eq!(lower, CreditType::Postpay);
+        assert_eq!(upper, CreditType::Postpay);
+        assert_eq!(lower.as_str(), "postpay");
+        assert_eq!(serde_json::to_string(&lower).unwrap(), "\"postpay\"");
+    }
+
+    #[test]
+    fn credit_type_from_str_rejects_unknown_values() {
+        assert_eq!("POSTPAY".parse(), Ok(CreditType::Postpay));
+        assert!("unexpected".parse::<CreditType>().is_err());
+    }
 }

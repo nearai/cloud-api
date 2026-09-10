@@ -27,6 +27,9 @@ fn admin_provider_attribution_openapi_schema_exports() {
     let model_revenue_entry = schemas
         .get("ModelRevenueEntry")
         .expect("ModelRevenueEntry schema should be exported");
+    let infra_summary = schemas
+        .get("InfraSummary")
+        .expect("InfraSummary schema should be exported");
 
     // Then: provider-attribution schemas are present on admin-only surfaces.
     for schema_name in [
@@ -59,6 +62,22 @@ fn admin_provider_attribution_openapi_schema_exports() {
         assert!(
             model_revenue_properties.contains_key(field),
             "ModelRevenueEntry should expose {field}"
+        );
+    }
+    assert!(schemas.contains_key("ModelGpuAllocation"));
+    let infra_summary_properties = infra_summary["properties"]
+        .as_object()
+        .expect("InfraSummary should expose properties");
+    for field in [
+        "cost_per_gpu_hour_usd",
+        "total_allocated_gpus",
+        "hourly_gpu_burn_usd",
+        "model_gpu_allocations",
+        "gpu_data_stale",
+    ] {
+        assert!(
+            infra_summary_properties.contains_key(field),
+            "InfraSummary should expose {field}"
         );
     }
 
@@ -110,6 +129,7 @@ fn admin_provider_attribution_preserves_existing_response_fields() {
         non_verifiable_consumed_usd: 4.5,
         non_verifiable_requests: 5,
         provider_error_or_timeout_rate: 0.25,
+        incomplete_stream_rate: 0.1,
         p95_ttft_ms: Some(123.0),
         provider_usage: PlatformProviderUsage {
             fallback: ProviderUsageTotals {

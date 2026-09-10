@@ -17,6 +17,14 @@ pub struct ApiConfig {
     pub dstack_client: DstackClientConfig,
     pub auth: AuthConfig,
     pub database: DatabaseConfig,
+    /// Dedicated AES-256 key for confidential database fields. This must not
+    /// reuse the object-storage encryption key.
+    pub database_encryption_key: String,
+    /// Identifier embedded in and validated against every database envelope.
+    pub database_encryption_key_id: String,
+    /// Enables encryption for newly written confidential database fields.
+    /// Defaults off so dual-read support can be deployed fleet-wide first.
+    pub database_encryption_write_enabled: bool,
     pub s3: S3Config,
     pub invitation_email: InvitationEmailConfig,
     pub otlp: OtlpConfig,
@@ -51,13 +59,23 @@ impl ApiConfig {
             staking_farm: StakingFarmConfig::from_env(&auth.near),
             auth,
             database: DatabaseConfig::from_env()?,
+            database_encryption_key: read_required_secret_env(
+                "DB_ENCRYPTION_KEY_FILE",
+                "DB_ENCRYPTION_KEY",
+            )?,
+            database_encryption_key_id: non_empty_env("DB_ENCRYPTION_KEY_ID")
+                .unwrap_or_else(|| "db-v1".to_string()),
+            database_encryption_write_enabled: parse_bool_env(
+                "DB_ENCRYPTION_WRITE_ENABLED",
+                false,
+            )?,
             s3: S3Config::from_env()?,
             invitation_email: InvitationEmailConfig::from_env()?,
             otlp: OtlpConfig::from_env()?,
             cors: CorsConfig::default(),
             external_providers: ExternalProvidersConfig::from_env(),
             github_dispatch: GitHubDispatchConfig::from_env()?,
-            infra: InfraConfig::from_env(),
+            infra: InfraConfig::from_env()?,
             aml: AmlConfig::from_env()?,
             ita: ItaAttestationConfig::from_env()?,
             usage_reporting: UsageReportingConfig::from_env()?,
@@ -428,29 +446,86 @@ impl StakingFarmConfig {
 
 /// Configuration for the executive "Stats" dashboard's infra burn metric.
 ///
-/// Both values are environment-specific and intentionally have NO hardcoded
-/// defaults — they are provided via deployment secrets/env only. When unset,
-/// the infra-summary endpoint reports no fleet data (stale).
-#[derive(Debug, Clone, Default)]
+/// Values are environment-specific and supplied via deployment env. When a
+/// source is unset, the corresponding infra-summary data is marked stale.
+#[derive(Clone, Default)]
 pub struct InfraConfig {
     /// Internal host-inventory endpoint. `None` when unset.
     pub machines_url: Option<String>,
     /// Flat planning cost per GPU host per month (USD). `0.0` when unset.
     pub cost_per_host_usd_month: f64,
+    /// Prometheus-compatible base URL used for current GPU allocation.
+    pub prometheus_url: Option<String>,
+    /// Optional bearer token for the Prometheus-compatible endpoint.
+    pub prometheus_bearer_token: Option<String>,
+    /// Environment label selected from DCGM metrics.
+    pub prometheus_environment: String,
+    /// Flat planning cost per allocated physical GPU-hour (USD).
+    pub cost_per_gpu_hour_usd: f64,
+}
+
+impl std::fmt::Debug for InfraConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("InfraConfig")
+            .field("machines_url", &self.machines_url)
+            .field("cost_per_host_usd_month", &self.cost_per_host_usd_month)
+            .field("prometheus_url", &self.prometheus_url)
+            .field(
+                "prometheus_bearer_token",
+                &self.prometheus_bearer_token.as_ref().map(|_| "<redacted>"),
+            )
+            .field("prometheus_environment", &self.prometheus_environment)
+            .field("cost_per_gpu_hour_usd", &self.cost_per_gpu_hour_usd)
+            .finish()
+    }
 }
 
 impl InfraConfig {
-    pub fn from_env() -> Self {
-        Self {
+    pub fn from_env() -> Result<Self, String> {
+        let prometheus_url = env::var("INFRA_PROMETHEUS_URL")
+            .ok()
+            .filter(|s| !s.is_empty());
+        let prometheus_environment = env::var("INFRA_PROMETHEUS_ENV")
+            .ok()
+            .filter(|s| !s.is_empty());
+        if prometheus_url.is_some() && prometheus_environment.is_none() {
+            return Err(
+                "INFRA_PROMETHEUS_ENV must be set when INFRA_PROMETHEUS_URL is configured"
+                    .to_string(),
+            );
+        }
+        if let Some(environment) = prometheus_environment.as_deref() {
+            if !matches!(environment, "prod" | "staging") {
+                return Err("INFRA_PROMETHEUS_ENV must be prod or staging".to_string());
+            }
+        }
+
+        Ok(Self {
             machines_url: env::var("INFRA_MACHINES_URL")
                 .ok()
                 .filter(|s| !s.is_empty()),
-            cost_per_host_usd_month: env::var("INFRA_COST_PER_HOST_USD_MONTH")
+            cost_per_host_usd_month: parse_nonnegative_finite_env("INFRA_COST_PER_HOST_USD_MONTH")?,
+            prometheus_url,
+            prometheus_bearer_token: env::var("INFRA_PROMETHEUS_BEARER_TOKEN")
                 .ok()
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(0.0),
-        }
+                .filter(|s| !s.is_empty()),
+            prometheus_environment: prometheus_environment.unwrap_or_default(),
+            cost_per_gpu_hour_usd: parse_nonnegative_finite_env("INFRA_COST_PER_GPU_HOUR_USD")?,
+        })
     }
+}
+
+fn parse_nonnegative_finite_env(key: &str) -> Result<f64, String> {
+    let Some(raw) = env::var(key).ok() else {
+        return Ok(0.0);
+    };
+    let value = raw
+        .parse::<f64>()
+        .map_err(|_| format!("{key} must be a nonnegative finite number"))?;
+    if !value.is_finite() || value < 0.0 {
+        return Err(format!("{key} must be a nonnegative finite number"));
+    }
+    Ok(value)
 }
 
 pub(crate) fn parse_bool_env(key: &str, default: bool) -> Result<bool, String> {
@@ -589,8 +664,28 @@ fn is_owner_name(s: &str) -> bool {
 }
 
 /// Database configuration
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum DatabaseConnectionMode {
+    #[default]
+    Patroni,
+    Direct,
+}
+
+impl std::str::FromStr for DatabaseConnectionMode {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "patroni" => Ok(Self::Patroni),
+            "direct" => Ok(Self::Direct),
+            _ => Err("DATABASE_CONNECTION_MODE must be exactly 'patroni' or 'direct' (lowercase, no surrounding whitespace)".into()),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct DatabaseConfig {
+    pub connection_mode: DatabaseConnectionMode,
     pub primary_app_id: String,
     pub gateway_subdomain: String,
     pub host: Option<String>,
@@ -599,11 +694,11 @@ pub struct DatabaseConfig {
     pub username: String,
     pub password: String,
     pub max_connections: usize,
-    /// Enable TLS for database connections (required for remote databases like DigitalOcean)
-    /// Uses native-tls with system certificate store for verification
+    /// Enable TLS. Direct mode requires encryption and verifies certificates/hostname.
+    /// Legacy Patroni/test mode retains its existing native-tls behavior.
     pub tls_enabled: bool,
     /// Path to a custom CA certificate file (optional)
-    /// If provided, this certificate will be added to the trust store
+    /// Direct mode uses this PEM bundle as its trust roots instead of platform trust.
     pub tls_ca_cert_path: Option<String>,
     /// Interval in seconds for refreshing cluster state
     pub refresh_interval: u64,
@@ -627,12 +722,32 @@ impl DatabaseConfig {
         if password.is_empty() {
             return Err("Database password cannot be empty".to_string());
         }
+        let connection_mode = env::var("DATABASE_CONNECTION_MODE")
+            .unwrap_or_else(|_| "patroni".into())
+            .parse::<DatabaseConnectionMode>()?;
+        let host = env::var("DATABASE_HOST").ok();
+        if connection_mode == DatabaseConnectionMode::Direct
+            && host.as_deref().is_none_or(|host| host.trim().is_empty())
+        {
+            return Err("DATABASE_HOST is required in direct mode".into());
+        }
         Ok(Self {
-            primary_app_id: env::var("POSTGRES_PRIMARY_APP_ID")
-                .map_err(|_| "POSTGRES_PRIMARY_APP_ID not set".to_string())?,
-            gateway_subdomain: env::var("GATEWAY_SUBDOMAIN")
-                .map_err(|_| "GATEWAY_SUBDOMAIN not set".to_string())?,
-            host: env::var("DATABASE_HOST").ok(),
+            connection_mode,
+            primary_app_id: env::var("POSTGRES_PRIMARY_APP_ID").or_else(|_| {
+                if connection_mode == DatabaseConnectionMode::Direct {
+                    Ok(String::new())
+                } else {
+                    Err("POSTGRES_PRIMARY_APP_ID not set".to_string())
+                }
+            })?,
+            gateway_subdomain: env::var("GATEWAY_SUBDOMAIN").or_else(|_| {
+                if connection_mode == DatabaseConnectionMode::Direct {
+                    Ok(String::new())
+                } else {
+                    Err("GATEWAY_SUBDOMAIN not set".to_string())
+                }
+            })?,
+            host,
             port: env::var("DATABASE_PORT")
                 .unwrap_or_else(|_| "5432".to_string())
                 .parse()
@@ -1066,6 +1181,11 @@ fn read_optional_secret_env(file_key: &str, value_key: &str) -> Result<Option<St
     read_optional_non_empty_file_env(file_key, Some(value_key))
 }
 
+fn read_required_secret_env(file_key: &str, value_key: &str) -> Result<String, String> {
+    read_optional_secret_env(file_key, value_key)?
+        .ok_or_else(|| format!("Either {file_key} or {value_key} environment variable must be set"))
+}
+
 pub(crate) fn read_optional_secret_env_absent_empty(
     file_key: &str,
     value_key: &str,
@@ -1104,6 +1224,83 @@ mod tests {
     use super::*;
     use serial_test::serial;
     use std::ffi::OsString;
+
+    #[test]
+    fn database_connection_mode_requires_exact_values() {
+        for value in ["DIRECT", "direct ", " patroni", ""] {
+            let error = value.parse::<DatabaseConnectionMode>().unwrap_err();
+            assert!(error.contains("lowercase, no surrounding whitespace"));
+        }
+        assert_eq!(
+            "direct".parse::<DatabaseConnectionMode>().unwrap(),
+            DatabaseConnectionMode::Direct
+        );
+        assert_eq!(
+            "patroni".parse::<DatabaseConnectionMode>().unwrap(),
+            DatabaseConnectionMode::Patroni
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn database_connection_mode_environment() {
+        let keys = [
+            "DATABASE_CONNECTION_MODE",
+            "DATABASE_HOST",
+            "DATABASE_PORT",
+            "DATABASE_NAME",
+            "DATABASE_USERNAME",
+            "DATABASE_PASSWORD",
+            "DATABASE_PASSWORD_FILE",
+            "DATABASE_MAX_CONNECTIONS",
+            "DATABASE_TLS_ENABLED",
+            "DATABASE_TLS_CA_CERT_PATH",
+            "DATABASE_REFRESH_INTERVAL",
+            "POSTGRES_PRIMARY_APP_ID",
+            "GATEWAY_SUBDOMAIN",
+        ];
+        struct Restore(Vec<(&'static str, Option<OsString>)>);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                for (key, value) in &self.0 {
+                    match value {
+                        Some(value) => env::set_var(key, value),
+                        None => env::remove_var(key),
+                    }
+                }
+            }
+        }
+        let _restore = Restore(keys.iter().map(|key| (*key, env::var_os(key))).collect());
+        for key in keys {
+            env::remove_var(key);
+        }
+        env::set_var("DATABASE_PASSWORD", "test-only");
+        env::set_var("DATABASE_NAME", "postgres");
+        env::set_var("DATABASE_USERNAME", "app");
+        assert!(DatabaseConfig::from_env()
+            .unwrap_err()
+            .contains("POSTGRES_PRIMARY_APP_ID"));
+        env::set_var("POSTGRES_PRIMARY_APP_ID", "existing-patroni");
+        env::set_var("GATEWAY_SUBDOMAIN", "example.test");
+        assert_eq!(
+            DatabaseConfig::from_env().unwrap().connection_mode,
+            DatabaseConnectionMode::Patroni
+        );
+        env::remove_var("POSTGRES_PRIMARY_APP_ID");
+        env::remove_var("GATEWAY_SUBDOMAIN");
+        env::set_var("DATABASE_CONNECTION_MODE", "direct");
+        assert!(DatabaseConfig::from_env()
+            .unwrap_err()
+            .contains("DATABASE_HOST"));
+        env::set_var("DATABASE_HOST", "example.rds.amazonaws.com");
+        let config = DatabaseConfig::from_env().unwrap();
+        assert_eq!(config.connection_mode, DatabaseConnectionMode::Direct);
+        assert!(config.tls_enabled);
+        env::set_var("DATABASE_CONNECTION_MODE", "typo");
+        assert!(DatabaseConfig::from_env()
+            .unwrap_err()
+            .contains("DATABASE_CONNECTION_MODE"));
+    }
 
     struct TelemetryEnvGuard {
         values: [(&'static str, Option<OsString>); 3],
@@ -1316,6 +1513,65 @@ mod tests {
         ] {
             std::env::remove_var(key);
         }
+    }
+
+    fn clear_infra_env() {
+        for key in [
+            "INFRA_MACHINES_URL",
+            "INFRA_COST_PER_HOST_USD_MONTH",
+            "INFRA_PROMETHEUS_URL",
+            "INFRA_PROMETHEUS_BEARER_TOKEN",
+            "INFRA_PROMETHEUS_ENV",
+            "INFRA_COST_PER_GPU_HOUR_USD",
+        ] {
+            std::env::remove_var(key);
+        }
+    }
+
+    #[test]
+    fn infra_config_debug_redacts_prometheus_bearer_token() {
+        let config = InfraConfig {
+            prometheus_bearer_token: Some("grafana-secret-token".to_string()),
+            ..InfraConfig::default()
+        };
+
+        let debug = format!("{config:?}");
+        assert!(debug.contains("<redacted>"));
+        assert!(!debug.contains("grafana-secret-token"));
+    }
+
+    #[test]
+    #[serial]
+    fn infra_config_rejects_invalid_gpu_rates() {
+        clear_infra_env();
+        for invalid in ["-2", "NaN", "inf", "not-a-number"] {
+            std::env::set_var("INFRA_COST_PER_GPU_HOUR_USD", invalid);
+            let error = InfraConfig::from_env().unwrap_err();
+            assert!(error.contains("INFRA_COST_PER_GPU_HOUR_USD"));
+        }
+
+        std::env::set_var("INFRA_COST_PER_GPU_HOUR_USD", "2");
+        let config = InfraConfig::from_env().unwrap();
+        assert_eq!(config.cost_per_gpu_hour_usd, 2.0);
+        clear_infra_env();
+    }
+
+    #[test]
+    #[serial]
+    fn infra_config_requires_environment_with_prometheus_url() {
+        clear_infra_env();
+        std::env::set_var("INFRA_PROMETHEUS_URL", "https://prometheus.example");
+        let error = InfraConfig::from_env().unwrap_err();
+        assert!(error.contains("INFRA_PROMETHEUS_ENV"));
+
+        std::env::set_var("INFRA_PROMETHEUS_ENV", "staging");
+        let config = InfraConfig::from_env().unwrap();
+        assert_eq!(config.prometheus_environment, "staging");
+
+        std::env::set_var("INFRA_PROMETHEUS_ENV", "production");
+        let error = InfraConfig::from_env().unwrap_err();
+        assert!(error.contains("prod or staging"));
+        clear_infra_env();
     }
 
     #[test]

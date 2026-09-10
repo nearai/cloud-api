@@ -48,19 +48,23 @@ pub use backend::BackendConfig as ExternalBackendConfig;
 pub use gemini::GeminiBackend;
 pub use openai_compatible::OpenAiCompatibleBackend;
 
-/// Strip cloud-api internal tracing keys from `extra` before forwarding params
-/// to external providers.
+/// Strip cloud-api internal keys from `extra` before forwarding params to
+/// external providers.
 ///
-/// These keys (`x_request_id`, `x_org_id`, `x_workspace_id`) are injected by the
-/// completion service so the vLLM provider can forward them as HTTP headers.
-/// External providers use `#[serde(flatten)]` on `extra`, so any remaining keys
-/// are serialised as top-level JSON body fields — unknown fields that strict
+/// The tracing keys are injected by the completion service so the vLLM provider
+/// can forward them as HTTP headers. The model pubkey is routing-only. External
+/// providers use `#[serde(flatten)]` on `extra`, so any remaining keys are
+/// serialised as top-level JSON body fields — unknown fields that strict
 /// providers (Anthropic, Gemini) may reject with a 400/422.
-fn strip_internal_tracing_keys(extra: &mut std::collections::HashMap<String, serde_json::Value>) {
-    use crate::attested::nearai::tracing_headers;
+fn strip_internal_keys(extra: &mut std::collections::HashMap<String, serde_json::Value>) {
+    use crate::attested::nearai::{encryption_headers, tracing_headers};
     extra.remove(tracing_headers::REQUEST_ID);
     extra.remove(tracing_headers::ORG_ID);
     extra.remove(tracing_headers::WORKSPACE_ID);
+    // Routing-only pin re-inserted by the pool for NEAR backend-key affinity. A
+    // pinned request should never select an external provider, but strip it here
+    // so that guarantee is not load-bearing for request correctness.
+    extra.remove(encryption_headers::MODEL_PUB_KEY);
 }
 
 fn merge_json_defaults(target: &mut serde_json::Value, defaults: &serde_json::Value) {
@@ -295,7 +299,7 @@ impl InferenceProvider for ExternalProvider {
         mut params: ChatCompletionParams,
         _request_hash: String,
     ) -> Result<StreamingResult, CompletionError> {
-        strip_internal_tracing_keys(&mut params.extra);
+        strip_internal_keys(&mut params.extra);
         self.inject_extra_request_body(&mut params.extra);
         self.backend
             .chat_completion_stream(&self.config, &self.model_name, params)
@@ -308,7 +312,7 @@ impl InferenceProvider for ExternalProvider {
         mut params: ChatCompletionParams,
         _request_hash: String,
     ) -> Result<ChatCompletionResponseWithBytes, CompletionError> {
-        strip_internal_tracing_keys(&mut params.extra);
+        strip_internal_keys(&mut params.extra);
         self.inject_extra_request_body(&mut params.extra);
         self.backend
             .chat_completion(&self.config, &self.model_name, params)
@@ -458,6 +462,52 @@ impl InferenceProvider for ExternalProvider {
 mod tests {
     use super::*;
     use std::collections::HashMap;
+
+    #[test]
+    fn strip_internal_keys_removes_routing_pin_and_tracing_keys() {
+        use crate::attested::nearai::{encryption_headers as eh, tracing_headers as th};
+
+        // Given: request extras contain tracing metadata, the routing-only pin,
+        // and the client-E2EE fields external providers already receive.
+        let mut extra = HashMap::new();
+        for key in [
+            th::REQUEST_ID,
+            th::ORG_ID,
+            th::WORKSPACE_ID,
+            eh::MODEL_PUB_KEY,
+            eh::SIGNING_ALGO,
+            eh::CLIENT_PUB_KEY,
+            eh::ENCRYPTION_VERSION,
+            eh::ENCRYPT_ALL_FIELDS,
+        ] {
+            extra.insert(key.to_string(), serde_json::json!("value"));
+        }
+
+        // When: external-provider internal keys are stripped.
+        strip_internal_keys(&mut extra);
+
+        // Then: tracing metadata and the routing pin are removed, while the
+        // pre-existing client-E2EE fields remain unchanged.
+        for key in [
+            th::REQUEST_ID,
+            th::ORG_ID,
+            th::WORKSPACE_ID,
+            eh::MODEL_PUB_KEY,
+        ] {
+            assert!(
+                !extra.contains_key(key),
+                "internal key {key} must be stripped"
+            );
+        }
+        for key in [
+            eh::SIGNING_ALGO,
+            eh::CLIENT_PUB_KEY,
+            eh::ENCRYPTION_VERSION,
+            eh::ENCRYPT_ALL_FIELDS,
+        ] {
+            assert_eq!(extra.get(key), Some(&serde_json::json!("value")));
+        }
+    }
 
     // ==================== ProviderConfig Deserialization Tests ====================
 

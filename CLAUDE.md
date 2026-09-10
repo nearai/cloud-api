@@ -98,19 +98,19 @@ cargo fmt
 ### Testing
 ```bash
 # Run unit tests (library and binary tests only)
-cargo test --lib --bins
+cargo nextest run --lib --bins
 
-# Run ALL e2e tests (requires PostgreSQL running)
-cargo test --test e2e_test
+# Run all database-backed e2e tests (requires PostgreSQL running)
+cargo nextest run --test e2e_all
 
-# Run a single e2e test file
-cargo test --test e2e_conversations
+# Run one e2e test exactly
+cargo nextest run --test e2e_all -E 'test(/^module_name::test_name$/)'
 
 # Run vLLM integration tests (requires vLLM server)
-cargo test --test integration_tests
+cargo nextest run --test integration_tests
 
 # Run a specific test by name
-cargo test test_create_conversation
+cargo nextest run test_create_conversation
 ```
 
 ### Database Setup for Tests
@@ -122,8 +122,8 @@ docker run --name test-postgres \
   -p 5432:5432 \
   -d postgres:latest
 
-# Then run tests
-cargo test --test e2e_test
+# Then run tests against a database dedicated to this checkout
+TEST_DATABASE_NAME=platform_api_e2e_local cargo nextest run --test e2e_all
 ```
 
 ## Architecture
@@ -306,11 +306,37 @@ Comprehensive C4 diagrams and flows: `docs/architecture/c4-diagrams.md`
 6. Update `crates/services/src/lib.rs` to export new service
 
 ### Testing E2E Flows
-- E2E tests in `crates/api/tests/`
+- E2E tests are modules in `crates/api/tests/e2e_all/`, compiled into one `e2e_all` binary
 - Common test utilities in `crates/api/tests/common/mod.rs`
 - Test helpers: `setup_test_server()`, `create_org()`, `get_api_key_for_org()`
-- Each test runs against a real PostgreSQL database
-- Tests create isolated data (unique UUIDs, random names)
+- Run database-backed E2E tests through `cargo nextest run --test e2e_all` so the
+  suite bootstrap, concurrency limits, and serialized overrides in
+  `.config/nextest.toml` apply.
+- Nextest processes share one real PostgreSQL database. Treat database state as
+  mutable between requests, independent of test order, and potentially retained
+  from an earlier run. Concurrent nextest invocations must use different,
+  disposable `TEST_DATABASE_NAME` values.
+- Keep bootstrapped shared fixtures immutable and use them only when the test
+  does not depend on exclusive history or state. Tests that create or mutate
+  users, organizations, workspaces, keys, models, aliases, jobs, schedules, or
+  usage must use UUID-scoped resources and assert through test-owned IDs, names,
+  or filters. Register test-owned model names with the mock provider pool when
+  exercising inference.
+- Scope queries and assertions to a stable, test-owned cohort. Across separate
+  requests, global totals, ordering, and offset boundaries may change. Prefer
+  direct lookup or keyset/cursor pagination; when an API only supports offset
+  pagination over mutable rows, restart and reconcile bounded scans until two
+  consecutive snapshots converge. Deduplication alone does not prevent skipped
+  rows after concurrent deletion.
+- Add tests that change database-wide state (including DDL, global queues or
+  schedulers, and broad scans or updates) to a serialized override in
+  `.config/nextest.toml`. Keep E2E concurrency and per-test pool limits within
+  PostgreSQL capacity, including secondary pools and background workers.
+- Stabilize asynchronous behavior with deadline-bounded polling of the exact
+  observable outcome. Use isolation and deterministic synchronization for test
+  reliability. Reserve bounded retries for idempotent database readiness or
+  bootstrap work before test processes start; keep test requests, assertions,
+  and nextest execution single-attempt so races remain visible.
 
 ### Database Migrations
 - SQL files in `crates/database/src/migrations/sql/`

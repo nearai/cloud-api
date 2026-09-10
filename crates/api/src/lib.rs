@@ -1,5 +1,6 @@
 pub mod consts;
 pub mod conversions;
+pub mod database_encryption;
 pub mod middleware;
 pub mod models;
 pub mod ohttp_gateway;
@@ -111,6 +112,22 @@ pub struct DomainServices {
     pub web_search_provider: Arc<dyn services::responses::tools::WebSearchProviderTrait>,
     pub service_usage_service:
         Arc<dyn services::service_usage::ServiceUsageServiceTrait + Send + Sync>,
+}
+
+/// Controls process-level background work started while the application router
+/// is built. Production uses [`Default`]; tests can disable workers whose
+/// behavior is unrelated to the request under test.
+#[derive(Clone, Copy, Debug)]
+pub struct AppBuildOptions {
+    pub start_database_encryption_recovery: bool,
+}
+
+impl Default for AppBuildOptions {
+    fn default() -> Self {
+        Self {
+            start_database_encryption_recovery: true,
+        }
+    }
 }
 
 /// Initialize database connection and run migrations
@@ -319,6 +336,21 @@ pub async fn init_domain_services_with_pool(
     inference_provider_pool: Arc<services::inference_provider_pool::InferenceProviderPool>,
     metrics_service: Arc<dyn services::metrics::MetricsServiceTrait>,
 ) -> DomainServices {
+    let database_encryption_key = database::field_encryption::parse_key(
+        &config.database_encryption_key,
+    )
+    .unwrap_or_else(|_| {
+        panic!("configured database encryption key is invalid");
+    });
+    database::field_encryption::validate_key_id(&config.database_encryption_key_id)
+        .unwrap_or_else(|_| panic!("configured database encryption key id is invalid"));
+    database.pool().set_encryption_key(database_encryption_key);
+    database
+        .pool()
+        .set_encryption_key_id(config.database_encryption_key_id.clone());
+    database
+        .pool()
+        .set_encryption_write_enabled(config.database_encryption_write_enabled);
     // Give the provider pool the metrics sink so it can emit the per-tier /
     // fallback counter (cloud_api.provider.requests) from the one layer that
     // knows which trust tier served each request.
@@ -730,12 +762,27 @@ pub(crate) const CHUTES_SUPPORTED_FEATURES: &[&str] = &["tools", "json_mode"];
 async fn ensure_chutes_catalog_row(
     models_repo: &database::repositories::ModelRepository,
     model_name: &str,
-) {
+) -> services::inference_provider_pool::ProviderPoolRole {
+    use services::inference_provider_pool::ProviderPoolRole;
+
+    let role_for_existing = |model: &database::models::Model| {
+        // A catalog row owned by another provider configuration means this
+        // out-of-band provider is a fallback even if the configured primary is
+        // temporarily undiscoverable. Rows created for this provider itself are
+        // genuine standalone primaries.
+        ProviderPoolRole::from_catalog(
+            inference_providers::ProviderSource::Chutes,
+            &model.provider_type,
+            model.inference_url.is_some(),
+        )
+    };
+
     // Use the *unfiltered* lookup (not get_active_model_by_name): a deliberately
     // disabled row (is_active=false) must be respected, not silently re-activated
     // and clobbered by the seed path below.
     match models_repo.get_by_internal_name(model_name).await {
         Ok(Some(existing)) => {
+            let role = role_for_existing(&existing);
             // Already in the catalog — respect operator configuration verbatim.
             // Surface a warning if the metadata contradicts attested serving so
             // a misconfigured row (e.g. attestation_supported=false) is visible.
@@ -770,6 +817,7 @@ async fn ensure_chutes_catalog_row(
             } else {
                 tracing::info!(model = %model_name, "Chutes model already in catalog");
             }
+            role
         }
         Ok(None) => {
             // Friendly display name = last path segment; owner = leading segment.
@@ -840,12 +888,17 @@ async fn ensure_chutes_catalog_row(
                          template) before activating, and clear `supported_features` via the \
                          same PATCH if it doesn't"
                     );
+                    ProviderPoolRole::Primary
                 }
                 Ok(None) => {
                     tracing::info!(
                         model = %model_name,
                         "Chutes catalog row already present (created concurrently); left untouched"
                     );
+                    match models_repo.get_by_internal_name(model_name).await {
+                        Ok(Some(existing)) => role_for_existing(&existing),
+                        _ => ProviderPoolRole::Fallback,
+                    }
                 }
                 Err(e) => {
                     tracing::error!(
@@ -853,6 +906,7 @@ async fn ensure_chutes_catalog_row(
                         "Failed to seed Chutes catalog row; requests for this model will 404 \
                          until a row exists (create it via PATCH /v1/admin/models)"
                     );
+                    ProviderPoolRole::Fallback
                 }
             }
         }
@@ -861,6 +915,10 @@ async fn ensure_chutes_catalog_row(
                 model = %model_name, error = %e,
                 "Could not check catalog for Chutes model; skipping auto-seed"
             );
+            // Unknown catalog state is fail-closed for organizations that
+            // disable fallback. A later restart/registration can establish a
+            // standalone primary role once the catalog is readable again.
+            ProviderPoolRole::Fallback
         }
     }
 }
@@ -984,22 +1042,23 @@ pub async fn init_inference_providers(
                             // data plane resolves the model (and usage bills against a
                             // real id). If NEAR already serves this id, its row is left
                             // untouched and we just add Chutes as a fallback provider.
-                            ensure_chutes_catalog_row(&models_repo, &entry.canonical_id).await;
-                            // Pinned SECONDARY: pushed onto the canonical id's provider
-                            // list (coexists with NEAR's own providers) and excluded from
-                            // discovery's stale-removal/overwrite. Tier ordering puts NEAR
-                            // first and Chutes as fallback; a Chutes-only id has just this
-                            // provider, so it serves as primary.
-                            pool.register_pinned_secondary_provider(
+                            let role =
+                                ensure_chutes_catalog_row(&models_repo, &entry.canonical_id).await;
+                            // Register the stable role from catalog configuration,
+                            // independently of whether discovery happened to find a live
+                            // primary during this startup.
+                            pool.register_pinned_provider(
                                 entry.canonical_id.clone(),
                                 Arc::new(provider),
                                 entry.max_context_tokens,
+                                role,
                             )
                             .await;
                             tracing::info!(
                                 canonical = %entry.canonical_id,
                                 chute_slug = %entry.chute_slug,
-                                "Registered Chutes attested provider (fallback tier)"
+                                role = ?role,
+                                "Registered Chutes attested provider"
                             );
                         }
                         Err(e) => {
@@ -1063,8 +1122,14 @@ pub async fn init_inference_providers_with_mocks(
     // Register providers for models commonly used in tests
     let test_models = vec![
         "Qwen/Qwen3-30B-A3B-Instruct-2507".to_string(),
+        "Qwen/Qwen3-30B-A3B-Instruct-2507-e2e-cache-pricing".to_string(),
+        "Qwen/Qwen3-30B-A3B-Instruct-2507-e2e-high-context-completion".to_string(),
+        "Qwen/Qwen3-30B-A3B-Instruct-2507-e2e-high-context-streaming".to_string(),
+        "Qwen/Qwen3-30B-A3B-Instruct-2507-e2e-aliases".to_string(),
+        "Qwen/Qwen3-30B-A3B-Instruct-2507-e2e-alias-consistency".to_string(),
         "zai-org/GLM-4.6".to_string(),
         "nearai/gpt-oss-120b".to_string(),
+        "nearai/gpt-oss-120b-e2e-aliases".to_string(),
         "dphn/Dolphin-Mistral-24B-Venice-Edition".to_string(),
         "deepseek-ai/DeepSeek-V3.1".to_string(),
         "Qwen/Qwen3-Omni-30B-A3B-Instruct".to_string(),
@@ -1124,6 +1189,23 @@ pub fn build_app_with_config(
     auth_components: AuthComponents,
     domain_services: DomainServices,
     config: Arc<ApiConfig>,
+) -> Router {
+    build_app_with_config_and_options(
+        database,
+        auth_components,
+        domain_services,
+        config,
+        AppBuildOptions::default(),
+    )
+}
+
+/// Build the complete application router with explicit process-level behavior.
+pub fn build_app_with_config_and_options(
+    database: Arc<Database>,
+    auth_components: AuthComponents,
+    domain_services: DomainServices,
+    config: Arc<ApiConfig>,
+    build_options: AppBuildOptions,
 ) -> Router {
     // Create analytics service (shared between user and admin routes)
     let analytics_repository = Arc::new(database::repositories::PgAnalyticsRepository::new(
@@ -1276,10 +1358,11 @@ pub fn build_app_with_config(
 
     let services_routes = build_services_routes(database.pool().clone());
 
-    let admin_routes = build_admin_routes(
+    let admin_routes = build_admin_routes_with_options(
         database.clone(),
         &auth_components.auth_state_middleware,
         config.clone(),
+        build_options,
         AdminRouteServices {
             inference_provider_pool: app_state.inference_provider_pool.clone(),
             analytics_service,
@@ -2127,6 +2210,22 @@ pub fn build_admin_routes(
     config: Arc<ApiConfig>,
     services: AdminRouteServices,
 ) -> Router {
+    build_admin_routes_with_options(
+        database,
+        auth_state_middleware,
+        config,
+        AppBuildOptions::default(),
+        services,
+    )
+}
+
+fn build_admin_routes_with_options(
+    database: Arc<Database>,
+    auth_state_middleware: &AuthState,
+    config: Arc<ApiConfig>,
+    build_options: AppBuildOptions,
+    services: AdminRouteServices,
+) -> Router {
     use crate::middleware::admin_middleware;
     use crate::routes::admin::{
         batch_upsert_models, cancel_model_pricing_change, confirm_model_deprecation,
@@ -2135,14 +2234,15 @@ pub fn build_admin_routes(
         get_admin_organization_balance, get_billing_summary, get_infra_summary,
         get_model_consumption_timeseries, get_model_history, get_model_revenue, get_org_revenue,
         get_organization as get_admin_organization, get_organization_concurrent_limit,
-        get_organization_limits_history, get_organization_metrics, get_organization_timeseries,
-        get_performance_timeseries, get_platform_metrics, get_platform_timeseries,
-        get_revenue_density, list_admin_access_tokens, list_aml_allowlist, list_aml_reports,
-        list_invitation_email_deliveries, list_model_pricing_changes,
+        get_organization_fallback, get_organization_limits_history, get_organization_metrics,
+        get_organization_timeseries, get_performance_timeseries, get_platform_metrics,
+        get_platform_timeseries, get_revenue_density, list_admin_access_tokens, list_aml_allowlist,
+        list_aml_reports, list_invitation_email_deliveries, list_model_pricing_changes,
         list_models as admin_list_models, list_organization_members, list_organizations,
         list_users, preview_model_deprecation, preview_model_pricing_changes,
         resend_invitation_email, update_aml_report_status, update_organization_concurrent_limit,
-        update_organization_limits, update_service, upsert_aml_allowlist_entry, AdminAppState,
+        update_organization_fallback, update_organization_limits, update_organization_member_role,
+        update_service, upsert_aml_allowlist_entry, AdminAppState,
     };
     use crate::routes::staking_farm::{
         get_admin_organization_staking_farm, sync_admin_organization_staking_farm,
@@ -2180,6 +2280,10 @@ pub fn build_admin_routes(
     let infra_service = Arc::new(services::admin::InfraService::new(
         config.infra.machines_url.clone(),
         config.infra.cost_per_host_usd_month,
+        config.infra.prometheus_url.clone(),
+        config.infra.prometheus_bearer_token.clone(),
+        config.infra.prometheus_environment.clone(),
+        config.infra.cost_per_gpu_hour_usd,
     ));
 
     let admin_app_state = AdminAppState {
@@ -2190,14 +2294,27 @@ pub fn build_admin_routes(
         usage_service: services.usage_service,
         staking_farm_service: services.staking_farm_service,
         aml_service: services.aml_service,
-        config,
+        config: config.clone(),
         admin_access_token_repository,
         inference_provider_pool: services.inference_provider_pool,
         github_dispatcher,
         infra_service,
     };
 
-    Router::new()
+    let database_encryption_state = crate::database_encryption::DatabaseEncryptionState::new(
+        database.pool().clone(),
+        &config.database_encryption_key,
+        &config.database_encryption_key_id,
+    )
+    .map_err(|_| {
+        tracing::error!(
+            error_class = "invalid_database_encryption_key",
+            "Database encryption admin routes are disabled"
+        );
+    })
+    .ok();
+
+    let admin_routes = Router::new()
         .route(
             "/admin/models",
             axum::routing::get(admin_list_models).patch(batch_upsert_models),
@@ -2279,6 +2396,10 @@ pub fn build_admin_routes(
                 .get(get_organization_concurrent_limit),
         )
         .route(
+            "/admin/organizations/{org_id}/fallback",
+            axum::routing::get(get_organization_fallback).patch(update_organization_fallback),
+        )
+        .route(
             "/admin/organizations/{org_id}/metrics",
             axum::routing::get(get_organization_metrics),
         )
@@ -2344,6 +2465,10 @@ pub fn build_admin_routes(
             axum::routing::get(list_organization_members),
         )
         .route(
+            "/admin/organizations/{org_id}/members/{user_id}",
+            axum::routing::put(update_organization_member_role),
+        )
+        .route(
             "/admin/access-tokens",
             axum::routing::post(create_admin_access_token),
         )
@@ -2355,7 +2480,41 @@ pub fn build_admin_routes(
             "/admin/access-tokens/{token_id}",
             axum::routing::delete(delete_admin_access_token),
         )
-        .with_state(admin_app_state)
+        .with_state(admin_app_state);
+
+    let admin_routes = if let Some(database_encryption_state) = database_encryption_state {
+        if build_options.start_database_encryption_recovery {
+            database_encryption_state.recover_jobs();
+        }
+        admin_routes.merge(
+            Router::new()
+                .route(
+                    "/admin/database-encryption/scan",
+                    axum::routing::post(crate::database_encryption::scan),
+                )
+                .route(
+                    "/admin/database-encryption/jobs",
+                    axum::routing::post(crate::database_encryption::create_job),
+                )
+                .route(
+                    "/admin/database-encryption/jobs/{id}",
+                    axum::routing::get(crate::database_encryption::get_job),
+                )
+                .route(
+                    "/admin/database-encryption/jobs/{id}/cancel",
+                    axum::routing::post(crate::database_encryption::cancel_job),
+                )
+                .route(
+                    "/admin/database-encryption/verify",
+                    axum::routing::post(crate::database_encryption::verify),
+                )
+                .layer(axum::Extension(database_encryption_state)),
+        )
+    } else {
+        admin_routes
+    };
+
+    admin_routes
         // Admin middleware handles both authentication and authorization
         .layer(from_fn_with_state(
             auth_state_middleware.clone(),
@@ -2726,6 +2885,7 @@ mod tests {
                 require_session_bound_access_tokens: false,
             },
             database: config::DatabaseConfig {
+                connection_mode: config::DatabaseConnectionMode::Patroni,
                 primary_app_id: "postgres-patroni-1".to_string(),
                 gateway_subdomain: "cvm1.near.ai".to_string(),
                 host: None,
@@ -2739,6 +2899,10 @@ mod tests {
                 refresh_interval: 30,
                 mock: false,
             },
+            database_encryption_key:
+                "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789".to_string(),
+            database_encryption_key_id: "test-db-v1".to_string(),
+            database_encryption_write_enabled: false,
             s3: config::S3Config {
                 mock: true,
                 bucket: "test-bucket".to_string(),
@@ -2791,6 +2955,7 @@ mod tests {
     async fn test_with_custom_database() {
         // Create custom database config for testing
         let db_config = config::DatabaseConfig {
+            connection_mode: config::DatabaseConnectionMode::Patroni,
             primary_app_id: "postgres-patroni-1".to_string(),
             gateway_subdomain: "cvm1.near.ai".to_string(),
             port: 5432,
@@ -2836,6 +3001,7 @@ mod tests {
                 require_session_bound_access_tokens: false,
             },
             database: config::DatabaseConfig {
+                connection_mode: config::DatabaseConnectionMode::Patroni,
                 primary_app_id: "postgres-patroni-1".to_string(),
                 gateway_subdomain: "cvm1.near.ai".to_string(),
                 host: None,
@@ -2849,6 +3015,10 @@ mod tests {
                 refresh_interval: 30,
                 mock: false,
             },
+            database_encryption_key:
+                "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789".to_string(),
+            database_encryption_key_id: "test-db-v1".to_string(),
+            database_encryption_write_enabled: false,
             s3: config::S3Config {
                 mock: true,
                 bucket: "test-bucket".to_string(),

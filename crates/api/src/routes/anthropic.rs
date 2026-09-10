@@ -343,7 +343,7 @@ impl Stream for NativeUsageStream {
             return Poll::Ready(Some(item));
         }
         if this.inner_done {
-            this.finish_billing(StopReason::Completed);
+            this.finish_billing(StopReason::Incomplete);
             return Poll::Ready(None);
         }
         match this.inner.as_mut().poll_next(cx) {
@@ -356,7 +356,7 @@ impl Stream for NativeUsageStream {
                 Poll::Ready(Some(Err(error)))
             }
             Poll::Ready(None) => {
-                this.finish_billing(StopReason::Completed);
+                this.finish_billing(StopReason::Incomplete);
                 Poll::Ready(None)
             }
             Poll::Pending => Poll::Pending,
@@ -963,7 +963,7 @@ async fn build_upstream_response(
                 );
             }
         };
-        let reason = usage.stop_reason.clone().unwrap_or(StopReason::Completed);
+        let reason = usage.stop_reason.clone().unwrap_or(StopReason::Incomplete);
         let inference_id = usage.inference_id();
         if let Some(billing) = billing {
             if let Err(error) = record_native_usage(billing, usage, reason).await {
@@ -1771,6 +1771,59 @@ mod tests {
         assert_eq!(recorded.stop_reason, Some(StopReason::Completed));
         assert_eq!(recorded.input_tokens, 4);
         assert_eq!(recorded.output_tokens, 9);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn stream_ending_without_a_declared_stop_reason_is_billed_as_incomplete() {
+        let usage_service = Arc::new(RecordingUsageService::default());
+        let mut stream = usage_stream_over(
+            vec![
+                Ok(Bytes::from_static(
+                    b"data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_stream\",\"usage\":{\"input_tokens\":4}}}\n\n",
+                )),
+                Ok(Bytes::from_static(
+                    b"data: {\"type\":\"message_delta\",\"delta\":{},\"usage\":{\"output_tokens\":9}}\n\n",
+                )),
+            ],
+            Some(billing_context(usage_service.clone())),
+        );
+        stream.peek_message_id().await;
+
+        use futures_util::StreamExt as _;
+        let mut stream = Box::pin(stream);
+        while let Some(item) = stream.next().await {
+            item.unwrap();
+        }
+        drop(stream);
+
+        let recorded = wait_for_recorded_usage(&usage_service).await;
+        assert_eq!(recorded.stop_reason, Some(StopReason::Incomplete));
+        assert_eq!(recorded.output_tokens, 9);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn upstream_ending_before_a_parseable_id_is_billed_as_incomplete() {
+        let usage_service = Arc::new(RecordingUsageService::default());
+        let leading = Bytes::from_static(
+            b"data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_stream\",\"usage\":{\"input_tokens\":4}}}",
+        );
+        let mut stream = usage_stream_over(
+            vec![Ok(leading)],
+            Some(billing_context(usage_service.clone())),
+        );
+        stream.peek_message_id().await;
+        assert!(stream.inner_done);
+
+        use futures_util::StreamExt as _;
+        let mut stream = Box::pin(stream);
+        while let Some(item) = stream.next().await {
+            item.unwrap();
+        }
+        drop(stream);
+
+        let recorded = wait_for_recorded_usage(&usage_service).await;
+        assert_eq!(recorded.stop_reason, Some(StopReason::Incomplete));
+        assert_eq!(recorded.input_tokens, 4);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

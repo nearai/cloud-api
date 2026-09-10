@@ -1,6 +1,7 @@
 use crate::conversions::{
     api_invitation_email_status_to_services, api_invitation_status_to_services,
-    services_invitation_email_delivery_to_api, services_invitation_resend_result_to_api,
+    api_role_to_services_role, services_invitation_email_delivery_to_api,
+    services_invitation_resend_result_to_api, services_member_to_api_member,
 };
 use crate::middleware::AdminUser;
 use crate::models::{
@@ -16,12 +17,14 @@ use crate::models::{
     ListOrganizationsAdminResponse, ListPricingChangesResponse, ListUsersResponse, MemberRole,
     ModelArchitecture, ModelDeprecationConfirmResponse, ModelDeprecationPreviewResponse,
     ModelDeprecationRequest, ModelHistoryEntry, ModelHistoryResponse, ModelMetadata,
-    ModelWithPricing, OrgLimitsHistoryEntry, OrgLimitsHistoryResponse, OrganizationUsage,
+    ModelWithPricing, OrgLimitsHistoryEntry, OrgLimitsHistoryResponse,
+    OrganizationFallbackResponse, OrganizationMemberResponse, OrganizationUsage,
     PricingChangeBatchRequest, PricingChangeConfirmResponse, PricingChangeModelPreviewDto,
     PricingChangePreviewResponse, PricingFieldUpdates, PricingFields, ScheduledPricingChangeDto,
     SpendLimit, UpdateAmlReportStatusRequest, UpdateOrganizationConcurrentLimitRequest,
-    UpdateOrganizationConcurrentLimitResponse, UpdateOrganizationLimitsRequest,
-    UpdateOrganizationLimitsResponse, UpdateServiceRequest, UpsertAmlAllowlistEntryRequest,
+    UpdateOrganizationConcurrentLimitResponse, UpdateOrganizationFallbackRequest,
+    UpdateOrganizationLimitsRequest, UpdateOrganizationLimitsResponse,
+    UpdateOrganizationMemberRequest, UpdateServiceRequest, UpsertAmlAllowlistEntryRequest,
 };
 use crate::routes::common::format_amount;
 use crate::routes::usage::{compute_organization_balance_response, OrganizationBalanceResponse};
@@ -36,12 +39,29 @@ use chrono::{DateTime, Duration, Timelike, Utc};
 use config::ApiConfig;
 use services::admin::{AdminService, AnalyticsService, UpdateModelAdminRequest};
 use services::aml::{AmlAllowlistEntry, AmlError, AmlReport};
-use services::auth::AuthServiceTrait;
+use services::auth::{AuthServiceTrait, UserId};
 use services::github_dispatch::GitHubDispatcher;
 use services::usage::UsageServiceTrait;
 use std::sync::Arc;
 use tracing::{debug, error, warn, Instrument};
 use uuid::Uuid;
+
+fn parse_stored_credit_type(
+    value: &str,
+) -> Result<CreditType, (StatusCode, ResponseJson<ErrorResponse>)> {
+    value.parse().map_err(|_| {
+        // Do not silently relabel unknown database values as purchased credits.
+        // The value itself is intentionally omitted from logs.
+        error!("Unsupported credit type returned by admin service");
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            ResponseJson(ErrorResponse::new(
+                "Failed to read organization limits".to_string(),
+                "internal_server_error".to_string(),
+            )),
+        )
+    })
+}
 
 /// OpenRouter's fixed `supported_sampling_parameters` vocabulary. Values written
 /// via the admin API are validated against this list, and any pinned/seeded
@@ -840,6 +860,20 @@ pub async fn batch_upsert_models(
             }
         })?;
 
+    // A pinned provider's primary/fallback role is catalog configuration, not
+    // startup state. Refresh it from each merged row before changing the live
+    // discovered providers so fallback-disabled requests cannot enter a stale
+    // role window after an admin routing update.
+    for (model_name, model) in &updated_models {
+        app_state
+            .inference_provider_pool
+            .refresh_pinned_provider_roles_from_catalog(
+                model_name,
+                &model.provider_type,
+                model.inference_url.is_some(),
+            );
+    }
+
     // Update providers at runtime so changes take effect without server restart.
     // Unregister first, then re-register — this handles type transitions
     // (e.g., inference_url → external) and deactivations cleanly.
@@ -1422,12 +1456,7 @@ pub async fn update_organization_limits(
         })?;
 
     // Convert service response to API response
-    let credit_type_enum = match updated_limits.credit_type.to_lowercase().as_str() {
-        "grant" => CreditType::Grant,
-        "payment" => CreditType::Payment,
-        "staking_farm" => CreditType::StakingFarm,
-        _ => CreditType::Payment, // Default fallback (should not happen)
-    };
+    let credit_type_enum = parse_stored_credit_type(&updated_limits.credit_type)?;
 
     let response = UpdateOrganizationLimitsResponse {
         organization_id: updated_limits.organization_id.to_string(),
@@ -1535,13 +1564,8 @@ pub async fn get_organization_limits_history(
     let entries: Vec<OrgLimitsHistoryEntry> = history
         .into_iter()
         .map(|h| {
-            let credit_type_enum = match h.credit_type.to_lowercase().as_str() {
-                "grant" => CreditType::Grant,
-                "payment" => CreditType::Payment,
-                "staking_farm" => CreditType::StakingFarm,
-                _ => CreditType::Payment,
-            };
-            OrgLimitsHistoryEntry {
+            let credit_type_enum = parse_stored_credit_type(&h.credit_type)?;
+            Ok(OrgLimitsHistoryEntry {
                 id: h.id.to_string(),
                 organization_id: h.organization_id.to_string(),
                 credit_type: credit_type_enum,
@@ -1558,9 +1582,9 @@ pub async fn get_organization_limits_history(
                 changed_by_user_id: h.changed_by_user_id.map(|id| id.to_string()),
                 changed_by_user_email: h.changed_by_user_email,
                 created_at: h.created_at.to_rfc3339(),
-            }
+            })
         })
-        .collect();
+        .collect::<Result<Vec<_>, (StatusCode, ResponseJson<ErrorResponse>)>>()?;
 
     let response = OrgLimitsHistoryResponse {
         history: entries,
@@ -2612,6 +2636,79 @@ pub async fn list_organizations(
     Ok(ResponseJson(response))
 }
 
+/// Get an organization's effective fallback policy (Admin only).
+#[utoipa::path(
+    get,
+    path = "/v1/admin/organizations/{org_id}/fallback",
+    tag = "Admin",
+    params(("org_id" = Uuid, Path, description = "Organization ID")),
+    responses(
+        (status = 200, description = "Fallback policy retrieved", body = OrganizationFallbackResponse),
+        (status = 401, description = "Unauthorized", body = ErrorResponse),
+        (status = 404, description = "Organization not found", body = ErrorResponse)
+    ),
+    security(("session_token" = []))
+)]
+pub async fn get_organization_fallback(
+    State(app_state): State<AdminAppState>,
+    Extension(_admin_user): Extension<AdminUser>,
+    Path(org_id): Path<Uuid>,
+) -> Result<ResponseJson<OrganizationFallbackResponse>, (StatusCode, ResponseJson<ErrorResponse>)> {
+    let enabled = app_state
+        .organization_service
+        .get_fallback_enabled_for_admin(services::organization::OrganizationId(org_id))
+        .await
+        .map_err(crate::routes::common::map_organization_error)?;
+
+    Ok(ResponseJson(OrganizationFallbackResponse {
+        organization_id: org_id,
+        enabled,
+    }))
+}
+
+/// Update an organization's fallback policy (Admin only).
+#[utoipa::path(
+    patch,
+    path = "/v1/admin/organizations/{org_id}/fallback",
+    tag = "Admin",
+    params(("org_id" = Uuid, Path, description = "Organization ID")),
+    request_body = UpdateOrganizationFallbackRequest,
+    responses(
+        (status = 200, description = "Fallback policy updated", body = OrganizationFallbackResponse),
+        (status = 401, description = "Unauthorized", body = ErrorResponse),
+        (status = 404, description = "Organization not found", body = ErrorResponse)
+    ),
+    security(("session_token" = []))
+)]
+pub async fn update_organization_fallback(
+    State(app_state): State<AdminAppState>,
+    Extension(admin_user): Extension<AdminUser>,
+    Path(org_id): Path<Uuid>,
+    Json(request): Json<UpdateOrganizationFallbackRequest>,
+) -> Result<ResponseJson<OrganizationFallbackResponse>, (StatusCode, ResponseJson<ErrorResponse>)> {
+    let enabled = app_state
+        .organization_service
+        .update_fallback_enabled_for_admin(
+            services::organization::OrganizationId(org_id),
+            request.enabled,
+        )
+        .await
+        .map_err(crate::routes::common::map_organization_error)?;
+
+    tracing::info!(
+        organization_id = %org_id,
+        actor_id = %admin_user.0.id,
+        actor_type = "platform_admin",
+        fallback_enabled = enabled,
+        "Organization fallback setting changed"
+    );
+
+    Ok(ResponseJson(OrganizationFallbackResponse {
+        organization_id: org_id,
+        enabled,
+    }))
+}
+
 /// Get a single organization by id (Admin only)
 ///
 /// Returns one organization with its spend limit and usage. Only authenticated
@@ -2837,6 +2934,86 @@ pub async fn list_organization_members(
         limit: params.limit,
         offset: params.offset,
     }))
+}
+
+/// Update an organization member role as a system administrator.
+///
+/// Assigning the owner role transfers ownership from the current owner to an
+/// existing organization member. The previous owner is demoted to admin.
+#[utoipa::path(
+    put,
+    path = "/v1/admin/organizations/{org_id}/members/{user_id}",
+    tag = "Admin",
+    params(
+        ("org_id" = Uuid, Path, description = "Organization ID"),
+        ("user_id" = Uuid, Path, description = "User ID")
+    ),
+    request_body = UpdateOrganizationMemberRequest,
+    responses(
+        (status = 200, description = "Member role updated", body = OrganizationMemberResponse),
+        (status = 400, description = "Invalid request", body = ErrorResponse),
+        (status = 401, description = "Unauthorized", body = ErrorResponse),
+        (status = 403, description = "System administrator privileges required", body = ErrorResponse),
+        (status = 404, description = "Organization or member not found", body = ErrorResponse),
+        (status = 422, description = "Malformed request body", body = ErrorResponse),
+        (status = 500, description = "Internal server error", body = ErrorResponse)
+    ),
+    security(
+        ("session_token" = [])
+    )
+)]
+pub async fn update_organization_member_role(
+    State(app_state): State<AdminAppState>,
+    Extension(admin_user): Extension<AdminUser>,
+    Path((org_id, user_id)): Path<(Uuid, Uuid)>,
+    Json(request): Json<UpdateOrganizationMemberRequest>,
+) -> Result<ResponseJson<OrganizationMemberResponse>, (StatusCode, ResponseJson<ErrorResponse>)> {
+    let new_role = api_role_to_services_role(request.role);
+    let update = app_state
+        .organization_service
+        .update_member_role_for_admin(
+            services::organization::OrganizationId(org_id),
+            UserId(user_id),
+            new_role,
+            UserId(admin_user.0.id),
+        )
+        .await
+        .map_err(|error| match error {
+            services::organization::OrganizationError::NotFound => (
+                StatusCode::NOT_FOUND,
+                ResponseJson(ErrorResponse::new(
+                    "Organization or member not found".to_string(),
+                    "not_found".to_string(),
+                )),
+            ),
+            services::organization::OrganizationError::InvalidParams(message) => (
+                StatusCode::BAD_REQUEST,
+                ResponseJson(ErrorResponse::new(message, "invalid_request".to_string())),
+            ),
+            services::organization::OrganizationError::Unauthorized(message) => (
+                StatusCode::FORBIDDEN,
+                ResponseJson(ErrorResponse::new(message, "forbidden".to_string())),
+            ),
+            error => {
+                error!("Failed to update organization member role: {:?}", error);
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    ResponseJson(ErrorResponse::new(
+                        "Failed to update organization member role".to_string(),
+                        "internal_server_error".to_string(),
+                    )),
+                )
+            }
+        })?;
+
+    tracing::info!(
+        organization_id = %org_id,
+        member_user_id = %user_id,
+        admin_user_id = %admin_user.0.id,
+        "System administrator updated organization member role"
+    );
+
+    Ok(ResponseJson(services_member_to_api_member(update.member)))
 }
 
 /// List organization invitation email deliveries (Admin only)
@@ -4037,9 +4214,9 @@ pub async fn get_model_consumption_timeseries(
 /// `ttft_sample_count` field in each bucket exposes the denominator so callers can
 /// compute coverage fraction (`ttft_sample_count / requests`).
 ///
-/// **Error rate** = `stop_reason IN ('provider_error','timeout')` / requests with a
-/// recorded `stop_reason`. Pre-V0037 rows (stop_reason IS NULL) are excluded from both
-/// numerator and denominator.
+/// **Error rate** = `stop_reason IN ('provider_error','timeout','incomplete')` / requests
+/// with a recorded `stop_reason`. Pre-V0037 rows (stop_reason IS NULL) are excluded from
+/// both numerator and denominator.
 #[utoipa::path(
     get,
     path = "/v1/admin/platform/performance-timeseries",

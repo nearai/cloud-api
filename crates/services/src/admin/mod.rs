@@ -14,7 +14,7 @@ pub use analytics::{
 };
 pub mod infra;
 pub mod pricing_scheduler;
-pub use infra::{InfraService, InfraSummary};
+pub use infra::{InfraService, InfraSummary, ModelGpuAllocation};
 pub use ports::{PlatformServiceInfo, *};
 pub use pricing_scheduler::ModelPricingScheduler;
 use std::sync::Arc;
@@ -1350,10 +1350,22 @@ impl AdminServiceImpl {
     fn validate_organization_limits(limits: &OrganizationLimitsUpdate) -> Result<(), AdminError> {
         // All amounts use fixed scale 9 (nano-dollars) and USD - no scale/currency validation needed
 
+        // With four API-supported credit types, this keeps every API-created
+        // aggregate below i64::MAX and prevents oversized values from breaking
+        // BIGINT sums used by admin listings. $1B remains effectively unlimited
+        // for the contract-customer workflow while retaining a safety boundary.
+        const MAX_SPEND_LIMIT_NANO_USD: i64 = 1_000_000_000_000_000_000;
+
         // Validate amount is non-negative
         if limits.spend_limit < 0 {
             return Err(AdminError::InvalidLimits(
                 "Spend limit cannot be negative".to_string(),
+            ));
+        }
+
+        if limits.spend_limit > MAX_SPEND_LIMIT_NANO_USD {
+            return Err(AdminError::InvalidLimits(
+                "Spend limit cannot exceed $1,000,000,000".to_string(),
             ));
         }
 

@@ -197,11 +197,24 @@ impl AttestationService {
             // inference backend; the gateway quote is a local dstack Unix-socket call.
             let model_fut = {
                 let pool = &self.inference_provider_pool;
+                // Cloned because `algo` is still borrowed above
+                // (`get_signing_address_hex`) and moved into `gateway_fut` below.
+                let algo_for_model = algo.clone();
                 async move {
                     if let Some(canonical) = resolved_canonical {
                         pool.get_attestation_report(
                             canonical,
-                            signing_algo,
+                            // Forward the NORMALIZED algo, never the caller's raw
+                            // Option. A missing `signing_algo` defaults to `ed25519`
+                            // here — in `normalize_signing_algo`, in `report_cache_key`
+                            // and in the gateway quote below — while inference-proxy
+                            // defaults a missing algo to `ecdsa`. Passing `None`
+                            // straight through therefore fetched an ECDSA model key
+                            // and stored it under an `a=ed25519` cache entry, so every
+                            // explicit `signing_algo=ed25519` request inside the cache
+                            // TTL was served a 64-byte ECDSA key where a 32-byte
+                            // Ed25519 key was expected (breaking E2EE downstream).
+                            Some(algo_for_model),
                             // Key fix: only forward the nonce when the caller supplied one.
                             // When None, inference-proxy serves its 5-min cached report
                             // instead of forcing a fresh GPU-evidence collection (~700 ms).

@@ -13,6 +13,8 @@ pub mod models;
 pub mod ports;
 mod report;
 pub mod report_data;
+#[cfg(test)]
+mod report_signing_algo_tests;
 mod service_trait;
 pub mod verification;
 

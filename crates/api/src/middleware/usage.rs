@@ -181,7 +181,7 @@ async fn check_organization_usage_after_staking_preflight(
                 StatusCode::PAYMENT_REQUIRED,
                 axum::Json(ErrorResponse::new(
                     format!(
-                        "Credit limit exceeded. Spent: {}, Limit: {}. Contact your organization administrator or support to increase the spending limit.",
+                        "Credit limit exceeded. Spent: {}, Limit: {}. Please purchase more credits.",
                         format_amount(spent),
                         format_amount(limit)
                     ),

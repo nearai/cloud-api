@@ -1468,6 +1468,7 @@ impl CompletionServiceImpl {
                     name: None,
                     tool_call_id: msg.tool_call_id.clone(),
                     tool_calls,
+                    reasoning_content: msg.reasoning_content.clone(),
                 }
             })
             .collect()
@@ -3798,6 +3799,7 @@ mod tests {
         inference_providers::ChatCompletionParams {
             model: model.to_string(),
             messages: vec![inference_providers::ChatMessage {
+                reasoning_content: None,
                 role: inference_providers::MessageRole::User,
                 content: Some(serde_json::json!("hi")),
                 name: None,

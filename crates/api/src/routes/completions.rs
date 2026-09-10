@@ -678,6 +678,7 @@ fn convert_chat_request_to_service(
                 role: msg.role.clone(),
                 content: message_content_to_value(&msg.content),
                 tool_call_id: msg.tool_call_id.clone(),
+                reasoning_content: msg.reasoning_content.clone(),
                 tool_calls: msg.tool_calls.as_ref().map(|calls| {
                     calls
                         .iter()
@@ -1325,6 +1326,7 @@ fn convert_text_request_to_service(
         request_id,
         model: request.model.clone(),
         messages: vec![CompletionMessage {
+            reasoning_content: None,
             role: "user".to_string(),
             content: serde_json::Value::String(prompt),
             tool_call_id: None,
@@ -1499,21 +1501,61 @@ async fn chat_completions_inner(
         .resolve_alias_cached(&request.model)
         .await;
     let resolved_model_name = alias_canonical.as_deref().unwrap_or(&request.model);
-    let model_attestation_supported = match app_state.models_service.get_models_with_pricing().await
-    {
-        Ok(models) => models
-            .iter()
-            .find(|model| model.model_name == resolved_model_name)
-            .map(|model| model.attestation_supported),
-        Err(error) => {
-            tracing::warn!(
-                model = %request.model,
-                error = %error,
-                "Failed to read cached model metadata for attestation signing decisions"
-            );
-            None
-        }
-    };
+    let (model_attestation_supported, model_input_modalities) =
+        match app_state.models_service.get_models_with_pricing().await {
+            Ok(models) => models
+                .iter()
+                .find(|model| model.model_name == resolved_model_name)
+                .map(|model| {
+                    (
+                        Some(model.attestation_supported),
+                        model.input_modalities.clone(),
+                    )
+                })
+                .unwrap_or((None, None)),
+            Err(error) => {
+                tracing::warn!(
+                    model = %request.model,
+                    error = %error,
+                    "Failed to read cached model metadata for attestation signing decisions"
+                );
+                (None, None)
+            }
+        };
+
+    // Refuse video/audio/file parts the catalog does not declare for this
+    // model before any dispatch. Engines answer an unsupported modality
+    // inconsistently (a valid video makes SGLang's GLM processor raise a 500,
+    // which surfaced here as a retried 502); the catalog's `inputModalities`
+    // is the contract, so the client gets a deterministic, non-retryable 400.
+    // Text and image are not gated (see `GATED_INPUT_MODALITIES`).
+    let requested_modalities = crate::models::requested_input_modalities(&request.messages);
+    if let Some(unsupported) = crate::models::unsupported_input_modality(
+        &requested_modalities,
+        model_input_modalities.as_deref(),
+    ) {
+        tracing::info!(
+            model = %request.model,
+            modality = unsupported,
+            "Rejecting request: model does not declare the requested input modality"
+        );
+        return (
+            StatusCode::BAD_REQUEST,
+            ResponseJson(ErrorResponse::with_param(
+                format!(
+                    "Model '{}' does not support {unsupported} input. Supported input modalities: {}.",
+                    request.model,
+                    model_input_modalities
+                        .as_deref()
+                        .map(|m| m.join(", "))
+                        .unwrap_or_default()
+                ),
+                "invalid_request_error".to_string(),
+                "messages".to_string(),
+            )),
+        )
+            .into_response();
+    }
     let usage_mode = chat_stream_usage_mode(&request, model_attestation_supported, e2ee_active);
     let rewrite_public_stream_usage = usage_mode.rewrite_public_stream_usage;
     let strip_intermediate_usage = usage_mode.strip_intermediate_usage;

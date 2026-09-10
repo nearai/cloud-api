@@ -886,6 +886,7 @@ mod tests {
     fn test_convert_messages_with_system() {
         let messages = vec![
             ChatMessage {
+                reasoning_content: None,
                 role: MessageRole::System,
                 content: Some(serde_json::Value::String("Be helpful".to_string())),
                 name: None,
@@ -893,6 +894,7 @@ mod tests {
                 tool_calls: None,
             },
             ChatMessage {
+                reasoning_content: None,
                 role: MessageRole::User,
                 content: Some(serde_json::Value::String("Hello".to_string())),
                 name: None,
@@ -918,6 +920,7 @@ mod tests {
         let data_uri = format!("data:image/png;base64,{payload}");
 
         let messages = vec![ChatMessage {
+            reasoning_content: None,
             role: MessageRole::User,
             content: Some(serde_json::json!([
                 {"type": "text", "text": "Describe this image."},
@@ -961,6 +964,7 @@ mod tests {
         // `mimeType` is empty/omitted with 400 "empty mimeType parameter in
         // fileData", so the serialized request must always carry it (#719).
         let messages = vec![ChatMessage {
+            reasoning_content: None,
             role: MessageRole::User,
             content: Some(serde_json::json!([
                 {"type": "image_url", "image_url": {"url": "https://example.com/cat.jpg"}}
@@ -1011,6 +1015,7 @@ mod tests {
         ];
         for (url, expected) in cases {
             let messages = vec![ChatMessage {
+                reasoning_content: None,
                 role: MessageRole::User,
                 content: Some(serde_json::json!([
                     {"type": "image_url", "image_url": {"url": url}}
@@ -1038,6 +1043,7 @@ mod tests {
         // image part rather than emit a `fileData` lacking `mimeType` (which
         // Gemini rejects, breaking the *entire* request). Text is preserved.
         let messages = vec![ChatMessage {
+            reasoning_content: None,
             role: MessageRole::User,
             content: Some(serde_json::json!([
                 {"type": "text", "text": "look at this"},

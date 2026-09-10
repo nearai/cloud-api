@@ -83,6 +83,7 @@ async fn test_chat_completion_streaming() {
         model: model_id.clone(),
         messages: vec![
             ChatMessage {
+                reasoning_content: None,
                 role: MessageRole::System,
                 content: Some(serde_json::Value::String(
                     "You are a helpful assistant. Please respond briefly.".to_string(),
@@ -92,6 +93,7 @@ async fn test_chat_completion_streaming() {
                 tool_calls: None,
             },
             ChatMessage {
+                reasoning_content: None,
                 role: MessageRole::User,
                 content: Some(serde_json::Value::String(
                     "Hello! Can you count to 3?".to_string(),
@@ -332,6 +334,7 @@ async fn test_error_handling() {
     let params = ChatCompletionParams {
         model: "nonexistent-model-12345".to_string(),
         messages: vec![ChatMessage {
+            reasoning_content: None,
             role: MessageRole::User,
             content: Some(serde_json::Value::String("Hello".to_string())),
             name: None,
@@ -422,6 +425,7 @@ async fn test_chat_completion_streaming_with_tool_calls() {
     let params = ChatCompletionParams {
         model: model_id.clone(),
         messages: vec![ChatMessage {
+            reasoning_content: None,
             role: MessageRole::User,
             content: Some(serde_json::Value::String(
                 "What's the weather in New York today?".to_string(),
@@ -619,6 +623,7 @@ async fn test_reasoning_content() {
     let params = ChatCompletionParams {
         model: "Qwen/Qwen3-30B-A3B-Instruct-2507".to_string(),
         messages: vec![ChatMessage {
+            reasoning_content: None,
             role: MessageRole::User,
             content: Some(serde_json::Value::String(
                 "Why is the sky blue?".to_string(),

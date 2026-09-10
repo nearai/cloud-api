@@ -6844,6 +6844,7 @@ mod tests {
         let params = inference_providers::ChatCompletionParams {
             model: model_id,
             messages: vec![inference_providers::ChatMessage {
+                reasoning_content: None,
                 role: inference_providers::MessageRole::User,
                 content: Some(serde_json::Value::String("Hello".to_string())),
                 name: None,
@@ -6918,6 +6919,7 @@ mod tests {
         let params = inference_providers::ChatCompletionParams {
             model: model_id,
             messages: vec![inference_providers::ChatMessage {
+                reasoning_content: None,
                 role: inference_providers::MessageRole::User,
                 content: Some(serde_json::Value::String("Hello".to_string())),
                 name: None,
@@ -8892,6 +8894,7 @@ mod tests {
         inference_providers::ChatCompletionParams {
             model: model.to_string(),
             messages: vec![inference_providers::ChatMessage {
+                reasoning_content: None,
                 role: inference_providers::MessageRole::User,
                 content: Some(serde_json::Value::String("hello".to_string())),
                 name: None,

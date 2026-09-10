@@ -917,6 +917,7 @@ mod tests {
     fn test_convert_messages_extracts_system() {
         let messages = vec![
             ChatMessage {
+                reasoning_content: None,
                 role: MessageRole::System,
                 content: Some(serde_json::Value::String("You are helpful.".to_string())),
                 name: None,
@@ -924,6 +925,7 @@ mod tests {
                 tool_calls: None,
             },
             ChatMessage {
+                reasoning_content: None,
                 role: MessageRole::User,
                 content: Some(serde_json::Value::String("Hello".to_string())),
                 name: None,
@@ -955,6 +957,7 @@ mod tests {
         let data_uri = format!("data:image/png;base64,{payload}");
 
         let messages = vec![ChatMessage {
+            reasoning_content: None,
             role: MessageRole::User,
             content: Some(serde_json::json!([
                 {"type": "text", "text": "Describe this image."},
@@ -1005,6 +1008,7 @@ mod tests {
     #[test]
     fn test_convert_messages_image_url_uses_url_source() {
         let messages = vec![ChatMessage {
+            reasoning_content: None,
             role: MessageRole::User,
             content: Some(serde_json::json!([
                 {"type": "image_url", "image_url": {"url": "https://example.com/cat.jpg"}}
@@ -1158,6 +1162,7 @@ mod tests {
     fn test_serialization_stable_when_anchor_moves() {
         let turn_n = vec![
             ChatMessage {
+                reasoning_content: None,
                 role: MessageRole::System,
                 content: Some(serde_json::json!([
                     {"type": "text", "text": "System A"},
@@ -1172,6 +1177,7 @@ mod tests {
                 tool_calls: None,
             },
             ChatMessage {
+                reasoning_content: None,
                 role: MessageRole::User,
                 content: Some(serde_json::json!([
                     {"type": "text", "text": "User A1"},
@@ -1186,6 +1192,7 @@ mod tests {
                 tool_calls: None,
             },
             ChatMessage {
+                reasoning_content: None,
                 role: MessageRole::Assistant,
                 content: Some(serde_json::Value::String("Assistant B".to_string())),
                 name: None,
@@ -1193,6 +1200,7 @@ mod tests {
                 tool_calls: None,
             },
             ChatMessage {
+                reasoning_content: None,
                 role: MessageRole::User,
                 content: Some(serde_json::Value::String("User C".to_string())),
                 name: None,
@@ -1202,6 +1210,7 @@ mod tests {
         ];
         let turn_n_plus_one = vec![
             ChatMessage {
+                reasoning_content: None,
                 role: MessageRole::System,
                 content: Some(serde_json::json!([
                     {"type": "text", "text": "System A"},
@@ -1216,6 +1225,7 @@ mod tests {
                 tool_calls: None,
             },
             ChatMessage {
+                reasoning_content: None,
                 role: MessageRole::User,
                 content: Some(serde_json::json!([
                     {"type": "text", "text": "User A1"},
@@ -1226,6 +1236,7 @@ mod tests {
                 tool_calls: None,
             },
             ChatMessage {
+                reasoning_content: None,
                 role: MessageRole::Assistant,
                 content: Some(serde_json::Value::String("Assistant B".to_string())),
                 name: None,
@@ -1233,6 +1244,7 @@ mod tests {
                 tool_calls: None,
             },
             ChatMessage {
+                reasoning_content: None,
                 role: MessageRole::User,
                 content: Some(serde_json::json!([{
                     "type": "text",
@@ -1244,6 +1256,7 @@ mod tests {
                 tool_calls: None,
             },
             ChatMessage {
+                reasoning_content: None,
                 role: MessageRole::Assistant,
                 content: Some(serde_json::Value::String("Assistant D".to_string())),
                 name: None,
@@ -1301,6 +1314,7 @@ mod tests {
     fn test_empty_system_stays_bare_string_when_caching_is_enabled() {
         let messages = vec![
             ChatMessage {
+                reasoning_content: None,
                 role: MessageRole::System,
                 content: Some(serde_json::Value::String(String::new())),
                 name: None,
@@ -1308,6 +1322,7 @@ mod tests {
                 tool_calls: None,
             },
             ChatMessage {
+                reasoning_content: None,
                 role: MessageRole::User,
                 content: Some(serde_json::json!([{
                     "type": "text",
@@ -1329,6 +1344,7 @@ mod tests {
         for content in [None, Some(serde_json::Value::String(String::new()))] {
             let messages = vec![
                 ChatMessage {
+                    reasoning_content: None,
                     role: MessageRole::User,
                     content: Some(serde_json::json!([{
                         "type": "text",
@@ -1340,6 +1356,7 @@ mod tests {
                     tool_calls: None,
                 },
                 ChatMessage {
+                    reasoning_content: None,
                     role: MessageRole::Assistant,
                     content,
                     name: None,
@@ -1360,6 +1377,7 @@ mod tests {
     fn test_multipart_text_not_newline_joined_when_caching() {
         let messages = vec![
             ChatMessage {
+                reasoning_content: None,
                 role: MessageRole::User,
                 content: Some(serde_json::json!([
                     {"type": "text", "text": "A"},
@@ -1370,6 +1388,7 @@ mod tests {
                 tool_calls: None,
             },
             ChatMessage {
+                reasoning_content: None,
                 role: MessageRole::User,
                 content: Some(serde_json::json!([{
                     "type": "text",
@@ -1396,6 +1415,7 @@ mod tests {
     fn test_non_caching_request_bytes_unchanged() {
         let messages = vec![
             ChatMessage {
+                reasoning_content: None,
                 role: MessageRole::System,
                 content: Some(serde_json::Value::String("System".to_string())),
                 name: None,
@@ -1403,6 +1423,7 @@ mod tests {
                 tool_calls: None,
             },
             ChatMessage {
+                reasoning_content: None,
                 role: MessageRole::User,
                 content: Some(serde_json::json!([
                     {"type": "text", "text": "User A"},
@@ -1413,6 +1434,7 @@ mod tests {
                 tool_calls: None,
             },
             ChatMessage {
+                reasoning_content: None,
                 role: MessageRole::Assistant,
                 content: Some(serde_json::json!([
                     {"type": "text", "text": "Assistant A"},
@@ -1442,6 +1464,7 @@ mod tests {
     fn test_system_bare_string_becomes_block_when_caching_enabled() {
         let messages = vec![
             ChatMessage {
+                reasoning_content: None,
                 role: MessageRole::System,
                 content: Some(serde_json::Value::String("System".to_string())),
                 name: None,
@@ -1449,6 +1472,7 @@ mod tests {
                 tool_calls: None,
             },
             ChatMessage {
+                reasoning_content: None,
                 role: MessageRole::User,
                 content: Some(serde_json::json!([{
                     "type": "text",
@@ -1477,6 +1501,7 @@ mod tests {
     #[test]
     fn test_empty_user_content_falls_back_to_string_form() {
         let messages = vec![ChatMessage {
+            reasoning_content: None,
             role: MessageRole::User,
             content: Some(serde_json::json!([{
                 "type": "text",
@@ -1502,6 +1527,7 @@ mod tests {
     #[test]
     fn test_assistant_flattening_unchanged() {
         let assistant = ChatMessage {
+            reasoning_content: None,
             role: MessageRole::Assistant,
             content: Some(serde_json::json!([
                 {"type": "text", "text": "A"},
@@ -1519,6 +1545,7 @@ mod tests {
 
         let cached_request = vec![
             ChatMessage {
+                reasoning_content: None,
                 role: MessageRole::User,
                 content: Some(serde_json::json!([{
                     "type": "text",
@@ -1551,6 +1578,7 @@ mod tests {
         // A system message whose text part carries cache_control must serialize
         // `system` as an array of text blocks with the breakpoint, not a string.
         let messages = vec![ChatMessage {
+            reasoning_content: None,
             role: MessageRole::System,
             content: Some(serde_json::json!([
                 {
@@ -1591,6 +1619,7 @@ mod tests {
         // no image). Unsupported one-hour TTLs are removed so Anthropic uses
         // its default five-minute tier, which Cloud can bill correctly.
         let messages = vec![ChatMessage {
+            reasoning_content: None,
             role: MessageRole::User,
             content: Some(serde_json::json!([
                 {
@@ -1652,6 +1681,7 @@ mod tests {
         // otherwise the breakpoint would be misattached to the wrong block. The
         // breakpoint here belongs to "Cached", and "Volatile" must keep none.
         let messages = vec![ChatMessage {
+            reasoning_content: None,
             role: MessageRole::User,
             content: Some(serde_json::json!([
                 {"type": "text"}, // malformed: dropped by parse_content
@@ -1708,6 +1738,7 @@ mod tests {
         // A plain-text assistant turn carrying cache_control must become the
         // block-array form with the breakpoint on the rebuilt text block.
         let messages = vec![ChatMessage {
+            reasoning_content: None,
             role: MessageRole::Assistant,
             content: Some(serde_json::json!([
                 {
@@ -1757,6 +1788,7 @@ mod tests {
         // caches up to and including the marked block, so the whole turn must
         // be covered rather than only its leading text.
         let messages = vec![ChatMessage {
+            reasoning_content: None,
             role: MessageRole::Assistant,
             content: Some(serde_json::json!([
                 {
@@ -1809,6 +1841,7 @@ mod tests {
     #[test]
     fn test_cache_control_on_empty_assistant_text_with_tool_calls_reaches_final_tool_use() {
         let messages = vec![ChatMessage {
+            reasoning_content: None,
             role: MessageRole::Assistant,
             content: Some(serde_json::json!([{
                 "type": "text",
@@ -1847,6 +1880,7 @@ mod tests {
         // Regression guard: an assistant turn with no breakpoint keeps the
         // bare-string form (byte-identical to pre-#666).
         let messages = vec![ChatMessage {
+            reasoning_content: None,
             role: MessageRole::Assistant,
             content: Some(serde_json::Value::String("Plain answer".to_string())),
             name: None,
@@ -1867,6 +1901,7 @@ mod tests {
         // `system` as a bare string (no #666 regression for the common case).
         let messages = vec![
             ChatMessage {
+                reasoning_content: None,
                 role: MessageRole::System,
                 content: Some(serde_json::Value::String("You are helpful.".to_string())),
                 name: None,
@@ -1874,6 +1909,7 @@ mod tests {
                 tool_calls: None,
             },
             ChatMessage {
+                reasoning_content: None,
                 role: MessageRole::User,
                 content: Some(serde_json::Value::String("Hello".to_string())),
                 name: None,
@@ -1904,6 +1940,7 @@ mod tests {
     #[test]
     fn test_cache_control_on_tool_message_reaches_tool_result() {
         let messages = vec![ChatMessage {
+            reasoning_content: None,
             role: MessageRole::Tool,
             content: Some(serde_json::json!([{
                 "type": "text",
@@ -1948,6 +1985,7 @@ mod tests {
     fn test_tool_message_without_cache_control_is_unchanged() {
         let messages = [
             ChatMessage {
+                reasoning_content: None,
                 role: MessageRole::Tool,
                 content: Some(serde_json::Value::String("bare result".to_string())),
                 name: None,
@@ -1955,6 +1993,7 @@ mod tests {
                 tool_calls: None,
             },
             ChatMessage {
+                reasoning_content: None,
                 role: MessageRole::Tool,
                 content: Some(serde_json::json!([{
                     "type": "text",
@@ -1983,6 +2022,7 @@ mod tests {
     #[test]
     fn test_tool_message_last_breakpoint_wins() {
         let messages = vec![ChatMessage {
+            reasoning_content: None,
             role: MessageRole::Tool,
             content: Some(serde_json::json!([
                 {
@@ -2022,6 +2062,7 @@ mod tests {
     #[test]
     fn test_breakpoint_cap_keeps_first_and_last_three() {
         let mut messages = vec![ChatMessage {
+            reasoning_content: None,
             role: MessageRole::System,
             content: Some(serde_json::json!([{
                 "type": "text",
@@ -2033,6 +2074,7 @@ mod tests {
             tool_calls: None,
         }];
         messages.extend((1..=5).map(|index| ChatMessage {
+            reasoning_content: None,
             role: MessageRole::User,
             content: Some(serde_json::json!([{
                 "type": "text",
@@ -2073,6 +2115,7 @@ mod tests {
     fn test_breakpoint_cap_no_op_at_or_below_limit() {
         let messages = (1..=4)
             .map(|index| ChatMessage {
+                reasoning_content: None,
                 role: MessageRole::User,
                 content: Some(serde_json::json!([{
                     "type": "text",
@@ -2106,6 +2149,7 @@ mod tests {
     fn test_breakpoint_cap_counts_tool_results() {
         let mut messages = (1..=4)
             .map(|index| ChatMessage {
+                reasoning_content: None,
                 role: MessageRole::User,
                 content: Some(serde_json::json!([{
                     "type": "text",
@@ -2118,6 +2162,7 @@ mod tests {
             })
             .collect::<Vec<_>>();
         messages.push(ChatMessage {
+            reasoning_content: None,
             role: MessageRole::Tool,
             content: Some(serde_json::json!([{
                 "type": "text",

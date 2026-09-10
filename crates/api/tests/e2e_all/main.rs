@@ -61,6 +61,7 @@ mod multiturn_tools;
 mod near_auth;
 mod oauth_frontend_callback;
 mod openai_tiered_pricing;
+mod openrouter_compat;
 mod openrouter_params;
 mod org_system_prompt;
 mod organization_deletion;

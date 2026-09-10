@@ -661,6 +661,50 @@ pub enum UsageCheckResult {
     NoLimitSet, // No spending limit configured - must set limit
 }
 
+impl UsageCheckResult {
+    /// Decide whether an organization may make a request from its current
+    /// balance and active spending limit. This is the single source of truth
+    /// for the credit gate: `check_can_use` and the inference middleware (which
+    /// fetches balance and limit separately so the reads can overlap other
+    /// preflight work) both go through it.
+    pub fn evaluate(
+        balance: Option<&OrganizationBalanceInfo>,
+        limit: Option<&OrganizationLimit>,
+    ) -> Self {
+        match (balance, limit) {
+            (Some(balance), Some(limit)) => {
+                // Compare amounts - deny if spent >= limit (all in same scale 9)
+                if balance.total_spent >= limit.spend_limit {
+                    UsageCheckResult::LimitExceeded {
+                        spent: balance.total_spent,
+                        limit: limit.spend_limit,
+                    }
+                } else {
+                    UsageCheckResult::Allowed {
+                        remaining: limit.spend_limit - balance.total_spent,
+                    }
+                }
+            }
+            // Has spent money but no limit set - DENY. Organizations must have
+            // limits set to use the API.
+            (Some(_balance), None) => UsageCheckResult::NoLimitSet,
+            // No usage yet, but a limit exists: allowed only if it is > 0.
+            (None, Some(limit)) => {
+                if limit.spend_limit > 0 {
+                    UsageCheckResult::Allowed {
+                        remaining: limit.spend_limit,
+                    }
+                } else {
+                    UsageCheckResult::NoCredits
+                }
+            }
+            // No balance and no limit - DENY. Organizations must purchase
+            // credits before using the API.
+            (None, None) => UsageCheckResult::NoCredits,
+        }
+    }
+}
+
 /// Organization balance information
 /// All amounts use fixed scale of 9 (nano-dollars) and USD currency
 #[derive(Debug, Clone)]

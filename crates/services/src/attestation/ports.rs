@@ -101,6 +101,20 @@ pub trait AttestationRepository: Send + Sync {
         chat_id: &str,
         signature: ChatSignature,
     ) -> Result<(), AttestationError>;
+
+    /// Store several signatures for one chat id. Backends that can write them
+    /// in a single statement should override this; the default stores them
+    /// one by one and stops at the first failure.
+    async fn add_chat_signatures(
+        &self,
+        chat_id: &str,
+        signatures: Vec<ChatSignature>,
+    ) -> Result<(), AttestationError> {
+        for signature in signatures {
+            self.add_chat_signature(chat_id, signature).await?;
+        }
+        Ok(())
+    }
     async fn get_chat_signature(
         &self,
         chat_id: &str,

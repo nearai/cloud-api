@@ -76,6 +76,7 @@ impl AttestationService {
         let environment = get_environment();
         let env_tag = format!("{TAG_ENVIRONMENT}:{environment}");
         let result: Result<(), AttestationError> = async {
+            let mut signatures = Vec::with_capacity(2);
             for algo in ["ecdsa", "ed25519"] {
                 let provider_signature = provider
                     .get_signature(chat_id, Some(algo.to_string()))
@@ -103,38 +104,39 @@ impl AttestationService {
                         );
                         AttestationError::ProviderError(e.to_string())
                     })?;
-                let signature = ChatSignature {
+                signatures.push(ChatSignature {
                     text: provider_signature.text,
                     signature: provider_signature.signature,
                     signing_address: provider_signature.signing_address,
                     signing_algo: provider_signature.signing_algo,
                     signature_kind: Some(SignatureKind::ProviderTee),
-                };
-
-                self.repository
-                    .add_chat_signature(chat_id, signature)
-                    .await
-                    .map_err(|e| {
-                        tracing::error!(
-                            %chat_id,
-                            error = %e,
-                            "Failed to store chat signature in repository for algorithm: {}",
-                            algo
-                        );
-                        let duration = start_time.elapsed();
-                        self.metrics_service.record_count(
-                            METRIC_VERIFICATION_FAILURE,
-                            1,
-                            &[&format!("{TAG_REASON}:{REASON_REPOSITORY_ERROR}"), &env_tag],
-                        );
-                        self.metrics_service.record_latency(
-                            METRIC_VERIFICATION_DURATION,
-                            duration,
-                            &[&env_tag],
-                        );
-                        AttestationError::RepositoryError(e.to_string())
-                    })?;
+                });
             }
+
+            // Both algorithms land in one statement: this runs before the
+            // client sees `[DONE]`, so every saved round trip is user-visible.
+            self.repository
+                .add_chat_signatures(chat_id, signatures)
+                .await
+                .map_err(|e| {
+                    tracing::error!(
+                        %chat_id,
+                        error = %e,
+                        "Failed to store chat signatures in repository"
+                    );
+                    let duration = start_time.elapsed();
+                    self.metrics_service.record_count(
+                        METRIC_VERIFICATION_FAILURE,
+                        1,
+                        &[&format!("{TAG_REASON}:{REASON_REPOSITORY_ERROR}"), &env_tag],
+                    );
+                    self.metrics_service.record_latency(
+                        METRIC_VERIFICATION_DURATION,
+                        duration,
+                        &[&env_tag],
+                    );
+                    AttestationError::RepositoryError(e.to_string())
+                })?;
             Ok(())
         }
         .await;

@@ -72,6 +72,67 @@ impl AttestationRepository for PgAttestationRepository {
         Ok(())
     }
 
+    /// One round trip for all signatures of a chat: the streaming path stores
+    /// an ecdsa and an ed25519 signature before the client sees `[DONE]`, and
+    /// on a replica far from the database each statement is a full network
+    /// round trip.
+    async fn add_chat_signatures(
+        &self,
+        chat_id: &str,
+        signatures: Vec<ChatSignature>,
+    ) -> Result<(), AttestationError> {
+        if signatures.is_empty() {
+            return Ok(());
+        }
+        let client = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| AttestationError::RepositoryError(e.to_string()))?;
+
+        let signature_kinds: Vec<Option<&str>> = signatures
+            .iter()
+            .map(|signature| signature.signature_kind.map(|kind| kind.as_str()))
+            .collect();
+        let mut sql = String::from(
+            "INSERT INTO chat_signatures (chat_id, text, signature, signing_address, signing_algo, signature_kind) VALUES ",
+        );
+        let mut params: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> = Vec::new();
+        for (index, (signature, signature_kind)) in
+            signatures.iter().zip(signature_kinds.iter()).enumerate()
+        {
+            if index > 0 {
+                sql.push_str(", ");
+            }
+            let base = index * 6;
+            sql.push_str(&format!(
+                "(${}, ${}, ${}, ${}, ${}, ${})",
+                base + 1,
+                base + 2,
+                base + 3,
+                base + 4,
+                base + 5,
+                base + 6
+            ));
+            params.push(&chat_id);
+            params.push(&signature.text);
+            params.push(&signature.signature);
+            params.push(&signature.signing_address);
+            params.push(&signature.signing_algo);
+            params.push(signature_kind);
+        }
+        sql.push_str(
+            " ON CONFLICT (chat_id, signing_algo) DO UPDATE SET text = EXCLUDED.text, signature = EXCLUDED.signature, signing_address = EXCLUDED.signing_address, signature_kind = EXCLUDED.signature_kind, updated_at = NOW()",
+        );
+
+        client
+            .execute(sql.as_str(), &params)
+            .await
+            .map_err(|e| AttestationError::RepositoryError(e.to_string()))?;
+
+        Ok(())
+    }
+
     async fn get_chat_signature(
         &self,
         chat_id: &str,

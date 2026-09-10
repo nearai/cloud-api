@@ -48,7 +48,7 @@ impl From<crate::models::Message> for ChatMessage {
             name: msg.name,
             tool_call_id: msg.tool_call_id,
             tool_calls,
-            reasoning_content: msg.reasoning_content,
+            reasoning_content: msg.reasoning_content.or(msg.reasoning),
         }
     }
 }
@@ -171,6 +171,7 @@ impl From<ChatMessage> for crate::models::Message {
             tool_call_id: msg.tool_call_id,
             tool_calls,
             reasoning_content: msg.reasoning_content,
+            reasoning: None,
         }
     }
 }
@@ -773,6 +774,7 @@ mod tests {
     #[test]
     fn test_message_conversion() {
         let http_msg = crate::models::Message {
+            reasoning: None,
             reasoning_content: None,
             role: "user".to_string(),
             content: Some(crate::models::MessageContent::Text("Hello".to_string())),
@@ -799,6 +801,7 @@ mod tests {
     #[test]
     fn test_developer_role_maps_to_system() {
         let http_msg = crate::models::Message {
+            reasoning: None,
             reasoning_content: None,
             role: "developer".to_string(),
             content: Some(crate::models::MessageContent::Text(
@@ -821,6 +824,7 @@ mod tests {
     fn test_tool_call_thought_signature_inbound_roundtrip() {
         let sig = "Ep8BCpwBAQw51sfQQgKQ2k...".to_string();
         let http_msg = crate::models::Message {
+            reasoning: None,
             reasoning_content: None,
             role: "assistant".to_string(),
             content: None,
@@ -848,6 +852,7 @@ mod tests {
     #[test]
     fn test_tool_call_without_thought_signature_still_works() {
         let http_msg = crate::models::Message {
+            reasoning: None,
             reasoning_content: None,
             role: "assistant".to_string(),
             content: None,
@@ -923,6 +928,7 @@ mod tests {
         let http_req = ChatCompletionRequest {
             model: "gpt-3.5-turbo".to_string(),
             messages: vec![crate::models::Message {
+                reasoning: None,
                 reasoning_content: None,
                 role: "user".to_string(),
                 content: Some(crate::models::MessageContent::Text(
@@ -988,6 +994,7 @@ mod tests {
         let http_req = ChatCompletionRequest {
             model: "gpt-3.5-turbo".to_string(),
             messages: vec![crate::models::Message {
+                reasoning: None,
                 reasoning_content: None,
                 role: "user".to_string(),
                 content: Some(crate::models::MessageContent::Text(

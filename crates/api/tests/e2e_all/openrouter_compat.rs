@@ -91,17 +91,20 @@ async fn test_prior_assistant_reasoning_content_reaches_provider() {
     }
 }
 
-/// OpenRouter's dialect spells the field `reasoning`; accept it as an alias.
+/// OpenRouter's dialect spells the field `reasoning`. Accept it alone, and
+/// accept a message carrying BOTH spellings — an assistant message we returned
+/// ourselves can have both, and clients echo it verbatim — with the canonical
+/// value winning.
 #[tokio::test]
-async fn test_reasoning_alias_is_accepted() {
+async fn test_reasoning_spellings_are_accepted() {
     let (server, mock, model, api_key) = setup().await;
     mock.when(RequestMatcher::Any)
         .respond_with(ResponseTemplate::new("ok"))
         .await;
+
+    // `reasoning` alone.
     let mut body = reasoning_repro(&model);
     let assistant = body["messages"][1].as_object_mut().unwrap();
-    // Move (not copy) the value: the canonical key must be absent, or serde
-    // sees the alias as a duplicate of it.
     let reasoning = assistant.remove("reasoning_content").unwrap();
     assistant.insert("reasoning".to_string(), reasoning);
     let response = server
@@ -111,13 +114,37 @@ async fn test_reasoning_alias_is_accepted() {
         .await;
     assert_eq!(response.status_code(), 200, "{}", response.text());
     let params = mock.last_chat_params().await.unwrap();
-    let assistant = params
+    let forwarded = params
         .messages
         .iter()
         .find(|m| m.role == inference_providers::MessageRole::Assistant)
         .unwrap();
     assert_eq!(
-        assistant.reasoning_content.as_deref(),
+        forwarded.reasoning_content.as_deref(),
+        Some("The secret word is \"xylophone\".")
+    );
+
+    // Both spellings on one message: still a 200, canonical forwarded.
+    let mut body = reasoning_repro(&model);
+    let assistant = body["messages"][1].as_object_mut().unwrap();
+    assistant.insert(
+        "reasoning".to_string(),
+        serde_json::Value::String("stale alias copy".to_string()),
+    );
+    let response = server
+        .post("/v1/chat/completions")
+        .add_header("Authorization", format!("Bearer {api_key}"))
+        .json(&body)
+        .await;
+    assert_eq!(response.status_code(), 200, "{}", response.text());
+    let params = mock.last_chat_params().await.unwrap();
+    let forwarded = params
+        .messages
+        .iter()
+        .find(|m| m.role == inference_providers::MessageRole::Assistant)
+        .unwrap();
+    assert_eq!(
+        forwarded.reasoning_content.as_deref(),
         Some("The secret word is \"xylophone\".")
     );
 }
@@ -197,7 +224,8 @@ async fn test_undeclared_input_modality_is_400_before_dispatch() {
         "undeclared modality must not reach the provider"
     );
 
-    // Audio in either spelling is refused the same way.
+    // Audio is a plumbed chat path whose catalog declarations are not audited
+    // yet: it is NOT gated (engine-decides), even on a text+image model.
     let audio = serde_json::json!({
         "model": model,
         "max_tokens": 8,
@@ -210,8 +238,7 @@ async fn test_undeclared_input_modality_is_400_before_dispatch() {
         .add_header("Authorization", format!("Bearer {api_key}"))
         .json(&audio)
         .await;
-    assert_eq!(response.status_code(), 400, "{}", response.text());
-    assert!(response.text().contains("does not support audio input"));
+    assert_eq!(response.status_code(), 200, "{}", response.text());
 
     // Text + image is declared: dispatched normally.
     let image = serde_json::json!({

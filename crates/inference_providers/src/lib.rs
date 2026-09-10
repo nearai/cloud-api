@@ -85,6 +85,7 @@ pub use anthropic_raw::{
 };
 pub use mock::MockProvider;
 pub use models::strip_cache_control;
+pub use models::strip_reasoning_content;
 pub use models::{
     is_client_audio_input_status, AudioOutput, AudioTranscriptionError, AudioTranscriptionParams,
     AudioTranscriptionResponse, ChatCompletionParams, ChatCompletionResponse,

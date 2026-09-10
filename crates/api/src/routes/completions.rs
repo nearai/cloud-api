@@ -678,7 +678,7 @@ fn convert_chat_request_to_service(
                 role: msg.role.clone(),
                 content: message_content_to_value(&msg.content),
                 tool_call_id: msg.tool_call_id.clone(),
-                reasoning_content: msg.reasoning_content.clone(),
+                reasoning_content: msg.prior_reasoning(),
                 tool_calls: msg.tool_calls.as_ref().map(|calls| {
                     calls
                         .iter()
@@ -1503,9 +1503,17 @@ async fn chat_completions_inner(
     let resolved_model_name = alias_canonical.as_deref().unwrap_or(&request.model);
     let (model_attestation_supported, model_input_modalities) =
         match app_state.models_service.get_models_with_pricing().await {
+            // Exact catalog name first, then the alias target: a name that is
+            // both a model and another model's alias must read its own
+            // capabilities.
             Ok(models) => models
                 .iter()
-                .find(|model| model.model_name == resolved_model_name)
+                .find(|model| model.model_name == request.model)
+                .or_else(|| {
+                    models
+                        .iter()
+                        .find(|model| model.model_name == resolved_model_name)
+                })
                 .map(|model| {
                     (
                         Some(model.attestation_supported),
@@ -1523,12 +1531,12 @@ async fn chat_completions_inner(
             }
         };
 
-    // Refuse video/audio/file parts the catalog does not declare for this
-    // model before any dispatch. Engines answer an unsupported modality
+    // Refuse gated parts (video) the catalog does not declare for this model
+    // before any dispatch. Engines answer an unsupported modality
     // inconsistently (a valid video makes SGLang's GLM processor raise a 500,
     // which surfaced here as a retried 502); the catalog's `inputModalities`
     // is the contract, so the client gets a deterministic, non-retryable 400.
-    // Text and image are not gated (see `GATED_INPUT_MODALITIES`).
+    // See `GATED_INPUT_MODALITIES` for what is and is not gated.
     let requested_modalities = crate::models::requested_input_modalities(&request.messages);
     if let Some(unsupported) = crate::models::unsupported_input_modality(
         &requested_modalities,
@@ -1547,8 +1555,9 @@ async fn chat_completions_inner(
                     request.model,
                     model_input_modalities
                         .as_deref()
+                        .filter(|m| !m.is_empty())
                         .map(|m| m.join(", "))
-                        .unwrap_or_default()
+                        .unwrap_or_else(|| "none declared".to_string())
                 ),
                 "invalid_request_error".to_string(),
                 "messages".to_string(),

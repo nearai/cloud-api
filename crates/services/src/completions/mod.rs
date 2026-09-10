@@ -816,14 +816,17 @@ fn compute_prefix_hash(messages: &[inference_providers::ChatMessage]) -> u64 {
 fn estimate_input_tokens(messages: &[inference_providers::ChatMessage]) -> u32 {
     let chars: usize = messages
         .iter()
-        .map(|m| match &m.content {
-            Some(serde_json::Value::String(s)) => s.len(),
-            Some(serde_json::Value::Array(parts)) => parts
-                .iter()
-                .filter_map(|p| p.get("text").and_then(|t| t.as_str()))
-                .map(|s| s.len())
-                .sum(),
-            _ => 0,
+        .map(|m| {
+            let content = match &m.content {
+                Some(serde_json::Value::String(s)) => s.len(),
+                Some(serde_json::Value::Array(parts)) => parts
+                    .iter()
+                    .filter_map(|p| p.get("text").and_then(|t| t.as_str()))
+                    .map(|s| s.len())
+                    .sum(),
+                _ => 0,
+            };
+            content + m.reasoning_content.as_ref().map_or(0, |r| r.len())
         })
         .sum();
     (chars / 4).max(1) as u32

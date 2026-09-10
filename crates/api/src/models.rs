@@ -149,23 +149,30 @@ pub fn requested_input_modalities(messages: &[Message]) -> Vec<&'static str> {
     out
 }
 
-/// Modalities refused up front when the catalog does not declare them. The
-/// chat stack serves none of these for any current model (audio is
-/// transcription-only on `/v1/audio/transcriptions`; the external converters
-/// carry no video/audio/file parts), so an undeclared one can only end in an
-/// engine error. `text` and `image` are deliberately not gated here: image
-/// declarations are not curated for every external model yet, and images are
-/// already validated on the engine path — that behavior is unchanged.
-pub const GATED_INPUT_MODALITIES: &[&str] = &["video", "audio", "file"];
+/// Modalities refused up front when the catalog does not declare them. Only
+/// `video` for now: no chat model on our stack serves it and every engine
+/// answers it with an error, so an undeclared video part can only fail.
+/// `audio` and `file` are real plumbed chat paths (`convert_part_to_vllm`
+/// turns `input_audio` into an `audio_url` for omni models) and their catalog
+/// declarations have not been audited; `text` and `image` likewise stay
+/// engine-decides (image declarations are not curated for every external
+/// model yet, and images are already validated on the engine path). Extend
+/// this list only after auditing the declarations of every model that serves
+/// the modality.
+pub const GATED_INPUT_MODALITIES: &[&str] = &["video"];
 
 /// The first requested, gated modality the model's catalog entry does not
-/// declare, if any. `None` when the catalog declares no modalities at all
-/// (unknown capability set: let the engine decide, as before).
+/// declare, if any. `None` when the catalog declares no modalities at all —
+/// absent *or* an empty list (an accidentally blank row must not become a
+/// hard failure): unknown capability set, let the engine decide, as before.
 pub fn unsupported_input_modality<'a>(
     requested: &[&'a str],
     declared: Option<&[String]>,
 ) -> Option<&'a str> {
     let declared = declared?;
+    if declared.is_empty() {
+        return None;
+    }
     requested
         .iter()
         .copied()
@@ -215,15 +222,32 @@ pub struct Message {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_calls: Option<Vec<ToolCall>>,
     /// Reasoning the model produced on a *previous* assistant turn, echoed
-    /// back by the client (`reasoning_content`, or `reasoning` in the
-    /// OpenRouter dialect). Thinking models continue their own chain of
+    /// back by the client. Thinking models continue their own chain of
     /// thought across tool calls only when this reaches the engine; without
     /// the field serde silently dropped it, so the model re-reasoned from
     /// scratch after every tool result. Forwarded verbatim to self-hosted and
     /// attested OpenAI-compatible engines; stripped for strict external
     /// upstreams (see `inference_providers::strip_reasoning_content`).
-    #[serde(default, alias = "reasoning", skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning_content: Option<String>,
+    /// OpenRouter-dialect spelling of the same field. Accepted on input and
+    /// folded into `reasoning_content` at conversion (see
+    /// [`Message::prior_reasoning`]); a sibling field rather than a serde
+    /// alias so a message carrying both spellings — which our own responses
+    /// may emit — stays valid instead of failing as a duplicate field. Never
+    /// emitted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning: Option<String>,
+}
+
+impl Message {
+    /// Prior-turn reasoning to forward upstream: the canonical
+    /// `reasoning_content` wins when both spellings are present.
+    pub fn prior_reasoning(&self) -> Option<String> {
+        self.reasoning_content
+            .clone()
+            .or_else(|| self.reasoning.clone())
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -4681,6 +4705,7 @@ mod tests {
         let request = ChatCompletionRequest {
             model: "gpt-4".to_string(),
             messages: vec![Message {
+                reasoning: None,
                 reasoning_content: None,
                 role: "user".to_string(),
                 content: Some(MessageContent::Parts(vec![
@@ -4865,6 +4890,7 @@ mod tests {
         let request = ChatCompletionRequest {
             model: "gpt-4".to_string(),
             messages: vec![Message {
+                reasoning: None,
                 reasoning_content: None,
                 role: "user".to_string(),
                 content: Some(MessageContent::Parts(vec![
@@ -4909,6 +4935,7 @@ mod tests {
         let request = ChatCompletionRequest {
             model: "gpt-4".to_string(),
             messages: vec![Message {
+                reasoning: None,
                 reasoning_content: None,
                 role: "user".to_string(),
                 content: Some(MessageContent::Parts(vec![
@@ -4948,6 +4975,7 @@ mod tests {
         let request = ChatCompletionRequest {
             model: "gpt-4".to_string(),
             messages: vec![Message {
+                reasoning: None,
                 reasoning_content: None,
                 role: "user".to_string(),
                 content: Some(MessageContent::Parts(vec![MessageContentPart::File {
@@ -4982,6 +5010,7 @@ mod tests {
         let request = ChatCompletionRequest {
             model: "gpt-4".to_string(),
             messages: vec![Message {
+                reasoning: None,
                 reasoning_content: None,
                 role: "user".to_string(),
                 content: Some(MessageContent::Text("Hello, world!".to_string())),
@@ -5012,6 +5041,7 @@ mod tests {
         ChatCompletionRequest {
             model: "gpt-4".to_string(),
             messages: vec![Message {
+                reasoning: None,
                 reasoning_content: None,
                 role: "user".to_string(),
                 content: Some(MessageContent::Text("hi".to_string())),
@@ -5554,6 +5584,7 @@ mod input_modality_tests {
 
     fn msg(content: Option<MessageContent>) -> Message {
         Message {
+            reasoning: None,
             role: "user".to_string(),
             content,
             name: None,
@@ -5608,33 +5639,26 @@ mod input_modality_tests {
             Some("video")
         );
         assert_eq!(
-            unsupported_input_modality(&["text", "audio"], Some(&declared)),
-            Some("audio")
-        );
-        assert_eq!(
-            unsupported_input_modality(&["file"], Some(&declared)),
-            Some("file")
-        );
-        assert_eq!(
             unsupported_input_modality(&["text", "image"], Some(&declared)),
             None
         );
+        // Audio and file are plumbed chat paths whose declarations are not
+        // audited yet: engine-decides, exactly like text and image.
+        assert_eq!(
+            unsupported_input_modality(&["text", "audio", "file"], Some(&declared)),
+            None
+        );
         // Declared (case-insensitively) → allowed.
-        let omni = vec!["text".to_string(), "AUDIO".to_string(), "video".to_string()];
+        let video_model = vec!["text".to_string(), "VIDEO".to_string()];
         assert_eq!(
-            unsupported_input_modality(&["text", "audio", "video"], Some(&omni)),
+            unsupported_input_modality(&["text", "video"], Some(&video_model)),
             None
         );
-        // No catalog declaration: nothing is rejected up front.
+        // No catalog declaration, absent or blank: nothing is rejected up front.
         assert_eq!(unsupported_input_modality(&["text", "video"], None), None);
-        // Text and image are never gated by the catalog, even when it omits them.
         assert_eq!(
-            unsupported_input_modality(&["text", "image"], Some(&[])),
+            unsupported_input_modality(&["text", "video"], Some(&[])),
             None
-        );
-        assert_eq!(
-            unsupported_input_modality(&["text", "image", "video"], Some(&[])),
-            Some("video")
         );
     }
 
@@ -5651,7 +5675,16 @@ mod input_modality_tests {
         let alias: Message =
             serde_json::from_str(r#"{"role":"assistant","content":"x","reasoning":"via alias"}"#)
                 .unwrap();
-        assert_eq!(alias.reasoning_content.as_deref(), Some("via alias"));
+        assert!(alias.reasoning_content.is_none());
+        assert_eq!(alias.prior_reasoning().as_deref(), Some("via alias"));
+
+        // Both spellings at once (our own responses can carry both): valid,
+        // canonical wins.
+        let both: Message = serde_json::from_str(
+            r#"{"role":"assistant","content":null,"reasoning_content":"canonical","reasoning":"alias"}"#,
+        )
+        .unwrap();
+        assert_eq!(both.prior_reasoning().as_deref(), Some("canonical"));
 
         let none: Message = serde_json::from_str(r#"{"role":"user","content":"hi"}"#).unwrap();
         assert!(none.reasoning_content.is_none());

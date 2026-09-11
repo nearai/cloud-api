@@ -3,7 +3,9 @@ use crate::models::{
     ServedProviderType, StopReason,
 };
 use crate::pool::DbPool;
-use crate::repositories::statement_cache::CachedStatements;
+use crate::repositories::statement_cache::{
+    invalidate_pool_statement_caches, is_stale_statement, CachedStatements,
+};
 use crate::repositories::utils::map_db_error;
 use crate::retry_db;
 use anyhow::{Context, Result};
@@ -78,6 +80,16 @@ impl OrganizationUsageRepository {
                 .context("Failed to get database connection")
                 .map_err(RepositoryError::PoolError)?;
 
+            // A stale statement inside the transaction aborts it; evict the
+            // statement from every pooled connection so the retry does not
+            // trip over another stale copy, then let `retry_db!` restart.
+            let pool = deadpool_postgres::Client::pool(&client);
+            let map_tx_error = |err: tokio_postgres::Error| {
+                if is_stale_statement(&err) {
+                    invalidate_pool_statement_caches(pool.as_ref());
+                }
+                map_db_error(err)
+            };
             let transaction = client.transaction().await.map_err(map_db_error)?;
 
             let id = Uuid::new_v4();
@@ -141,7 +153,7 @@ impl OrganizationUsageRepository {
                     ],
                 )
                 .await
-                .map_err(map_db_error)?;
+                .map_err(map_tx_error)?;
 
             let (row, was_inserted) = match maybe_row {
                 Some(row) => {
@@ -173,7 +185,7 @@ impl OrganizationUsageRepository {
                             ],
                         )
                         .await
-                        .map_err(map_db_error)?;
+                        .map_err(map_tx_error)?;
 
                     transaction.commit().await.map_err(map_db_error)?;
                     (row, true)

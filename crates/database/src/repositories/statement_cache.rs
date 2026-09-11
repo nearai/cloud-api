@@ -6,19 +6,29 @@
 //! one round trip. On a replica far from the database this is the difference
 //! between ~60 ms and ~120 ms per query.
 //!
-//! The one thing a cached statement cannot survive is a change to its result
-//! shape: after a migration adds a column to a table read with `SELECT *`,
-//! Postgres rejects the old plan with SQLSTATE 0A000 "cached plan must not
-//! change result type". That happens on replicas still running the previous
-//! release during a rolling deploy. The helpers below drop the stale statement
-//! from the connection's cache when they see that error, and
-//! [`map_db_error`](super::utils::map_db_error) classifies it as retryable so
-//! the surrounding `retry_db!` block re-prepares and re-runs the statement.
+//! A cached statement can outlive the server-side object it points at:
+//!
+//! - after a migration adds a column to a table read with `SELECT *`, Postgres
+//!   refuses the old plan with SQLSTATE 0A000 "cached plan must not change
+//!   result type" (a replica still on the previous release during a rolling
+//!   deploy hits this on every warm connection);
+//! - a statement can be missing on the server altogether, SQLSTATE 26000,
+//!   if the connection was reset underneath the cache.
+//!
+//! Both are handled the same way: the stale entry is evicted from every
+//! connection's cache in the pool (a schema change invalidates all of them
+//! at once), the statement is re-prepared and re-run on the same connection
+//! when no transaction is involved, and [`map_db_error`](super::utils::map_db_error)
+//! classifies the error as retryable so `retry_db!` re-runs transactional
+//! blocks with a fresh statement.
 
 use async_trait::async_trait;
-use deadpool_postgres::{Client, Transaction};
+use deadpool_postgres::{Client, Pool, Transaction};
 use tokio_postgres::{error::SqlState, types::ToSql, Error, Row};
 
+/// PostgreSQL routine that raises the stale-plan error; stable across server
+/// locales, unlike the message text.
+const STALE_PLAN_ROUTINE: &str = "RevalidateCachedQuery";
 const STALE_PLAN_MESSAGE: &str = "cached plan must not change result type";
 
 /// True when `err` is Postgres refusing a prepared statement whose result
@@ -26,8 +36,31 @@ const STALE_PLAN_MESSAGE: &str = "cached plan must not change result type";
 pub fn is_stale_cached_plan(err: &Error) -> bool {
     err.as_db_error().is_some_and(|db_err| {
         db_err.code() == &SqlState::FEATURE_NOT_SUPPORTED
-            && db_err.message().contains(STALE_PLAN_MESSAGE)
+            && (db_err.routine() == Some(STALE_PLAN_ROUTINE)
+                || db_err.message().contains(STALE_PLAN_MESSAGE))
     })
+}
+
+/// True when the server no longer has the prepared statement the cache
+/// handed out.
+pub fn is_missing_prepared_statement(err: &Error) -> bool {
+    err.as_db_error()
+        .is_some_and(|db_err| db_err.code() == &SqlState::INVALID_SQL_STATEMENT_NAME)
+}
+
+/// True for either way a cached statement handle can go bad.
+pub fn is_stale_statement(err: &Error) -> bool {
+    is_stale_cached_plan(err) || is_missing_prepared_statement(err)
+}
+
+/// Evict every cached statement on every connection of `pool`. A schema
+/// change invalidates the same statement on all warm connections, so a
+/// per-connection eviction would leave the next retry to trip over another
+/// stale copy.
+pub fn invalidate_pool_statement_caches(pool: Option<&Pool>) {
+    if let Some(pool) = pool {
+        pool.manager().statement_caches.clear();
+    }
 }
 
 /// Run queries through the connection's prepared-statement cache.
@@ -55,6 +88,25 @@ pub trait CachedStatements {
         -> Result<u64, Error>;
 }
 
+/// Runs a cached statement, and on a stale handle evicts it pool-wide and
+/// re-runs once on the same connection (outside a transaction only).
+macro_rules! run_cached {
+    ($self:ident, $method:ident, $sql:expr, $params:expr) => {{
+        let statement = $self.prepare_cached($sql).await?;
+        match $self.$method(&statement, $params).await {
+            Err(err) if is_stale_statement(&err) => {
+                $self.evict_stale($sql);
+                if !$self.can_retry_in_place() {
+                    return Err(err);
+                }
+                let statement = $self.prepare_cached($sql).await?;
+                $self.$method(&statement, $params).await
+            }
+            result => result,
+        }
+    }};
+}
+
 macro_rules! impl_cached_statements {
     ($ty:ty) => {
         #[async_trait]
@@ -64,10 +116,7 @@ macro_rules! impl_cached_statements {
                 sql: &str,
                 params: &[&(dyn ToSql + Sync)],
             ) -> Result<Vec<Row>, Error> {
-                let statement = self.prepare_cached(sql).await?;
-                let result = self.query(&statement, params).await;
-                self.forget_if_stale(sql, &result);
-                result
+                run_cached!(self, query, sql, params)
             }
 
             async fn cached_query_opt(
@@ -75,10 +124,7 @@ macro_rules! impl_cached_statements {
                 sql: &str,
                 params: &[&(dyn ToSql + Sync)],
             ) -> Result<Option<Row>, Error> {
-                let statement = self.prepare_cached(sql).await?;
-                let result = self.query_opt(&statement, params).await;
-                self.forget_if_stale(sql, &result);
-                result
+                run_cached!(self, query_opt, sql, params)
             }
 
             async fn cached_query_one(
@@ -86,10 +132,7 @@ macro_rules! impl_cached_statements {
                 sql: &str,
                 params: &[&(dyn ToSql + Sync)],
             ) -> Result<Row, Error> {
-                let statement = self.prepare_cached(sql).await?;
-                let result = self.query_one(&statement, params).await;
-                self.forget_if_stale(sql, &result);
-                result
+                run_cached!(self, query_one, sql, params)
             }
 
             async fn cached_execute(
@@ -97,30 +140,47 @@ macro_rules! impl_cached_statements {
                 sql: &str,
                 params: &[&(dyn ToSql + Sync)],
             ) -> Result<u64, Error> {
-                let statement = self.prepare_cached(sql).await?;
-                let result = self.execute(&statement, params).await;
-                self.forget_if_stale(sql, &result);
-                result
-            }
-        }
-
-        impl StaleStatementCleanup for $ty {
-            fn forget_if_stale<T>(&self, sql: &str, result: &Result<T, Error>) {
-                if let Err(err) = result {
-                    if is_stale_cached_plan(err) {
-                        tracing::warn!(
-                            "Dropping prepared statement whose result shape changed; retrying"
-                        );
-                        self.statement_cache.remove(sql, &[]);
-                    }
-                }
+                run_cached!(self, execute, sql, params)
             }
         }
     };
 }
 
 trait StaleStatementCleanup {
-    fn forget_if_stale<T>(&self, sql: &str, result: &Result<T, Error>);
+    /// Drop stale statements after the server rejected `sql`.
+    fn evict_stale(&self, sql: &str);
+    /// Whether the statement can be re-prepared and re-run on this
+    /// connection right away.
+    fn can_retry_in_place(&self) -> bool;
+}
+
+impl StaleStatementCleanup for Client {
+    fn evict_stale(&self, _sql: &str) {
+        tracing::warn!("Dropping cached prepared statements after a schema change; retrying");
+        match Client::pool(self) {
+            Some(pool) => invalidate_pool_statement_caches(Some(&pool)),
+            None => self.statement_cache.clear(),
+        }
+    }
+
+    fn can_retry_in_place(&self) -> bool {
+        true
+    }
+}
+
+impl StaleStatementCleanup for Transaction<'_> {
+    fn evict_stale(&self, _sql: &str) {
+        tracing::warn!("Dropping cached prepared statements after a schema change; retrying");
+        // The pool is not reachable from a transaction; callers that hold
+        // the client evict pool-wide through `invalidate_pool_statement_caches`.
+        self.statement_cache.clear();
+    }
+
+    fn can_retry_in_place(&self) -> bool {
+        // The transaction is aborted after the error; the surrounding
+        // `retry_db!` restarts it with a fresh statement.
+        false
+    }
 }
 
 impl_cached_statements!(Client);

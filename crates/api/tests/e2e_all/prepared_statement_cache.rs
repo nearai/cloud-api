@@ -6,6 +6,7 @@
 //! recover from that transparently, not surface a 500.
 
 use crate::common::*;
+use futures::future::join_all;
 
 #[tokio::test]
 async fn cached_statements_recover_from_a_column_added_under_them() {
@@ -23,10 +24,10 @@ async fn cached_statements_recover_from_a_column_added_under_them() {
     };
 
     // Warm the cache: API-key auth resolves the workspace and organization
-    // with a `SELECT w.*` on every request, through whichever pooled
-    // connection serves it. Several requests seed several connections.
-    for _ in 0..8 {
-        let response = probe().await;
+    // with a `SELECT w.*` on every request. Probes run concurrently so the
+    // statement is cached on every connection of the test pool, not just
+    // one; that is the shape of a warm production replica.
+    for response in join_all((0..8).map(|_| probe())).await {
         assert_eq!(response.status_code(), 200, "{}", response.text());
     }
 
@@ -34,7 +35,7 @@ async fn cached_statements_recover_from_a_column_added_under_them() {
     // this process still holds statements prepared against the old shape.
     let column = format!(
         "rolling_deploy_{}",
-        uuid::Uuid::new_v4().simple().to_string()[..8].to_string()
+        &uuid::Uuid::new_v4().simple().to_string()[..8]
     );
     {
         let client = database
@@ -56,11 +57,13 @@ async fn cached_statements_recover_from_a_column_added_under_them() {
     // Collect instead of asserting so the column is dropped even on failure;
     // a leftover column would fail the database-encryption classification
     // scans that share this database.
-    let mut outcomes = Vec::with_capacity(8);
-    for _ in 0..8 {
-        let response = probe().await;
-        outcomes.push((response.status_code(), response.text()));
-    }
+    // Concurrent again: every warm connection holds a stale plan, and each
+    // request must recover on whichever connection it lands on.
+    let outcomes: Vec<_> = join_all((0..8).map(|_| probe()))
+        .await
+        .into_iter()
+        .map(|response| (response.status_code(), response.text()))
+        .collect();
 
     let client = database
         .pool()

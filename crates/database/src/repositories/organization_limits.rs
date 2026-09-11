@@ -1,5 +1,6 @@
 use crate::models::{OrganizationLimitsHistory, UpdateOrganizationLimitsDbRequest};
 use crate::pool::DbPool;
+use crate::repositories::statement_cache::CachedStatements;
 use crate::repositories::utils::map_db_error;
 use crate::retry_db;
 use anyhow::{Context, Result};
@@ -122,7 +123,7 @@ impl OrganizationLimitsRepository {
                 .map_err(RepositoryError::PoolError)?;
 
             client
-                .query(
+                .cached_query(
                     r#"
                     SELECT id, organization_id, spend_limit, credit_type, source, currency,
                            effective_from, effective_until,

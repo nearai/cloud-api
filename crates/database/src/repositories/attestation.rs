@@ -1,3 +1,4 @@
+use crate::repositories::statement_cache::CachedStatements;
 use async_trait::async_trait;
 use services::attestation::{
     ports::AttestationRepository, AttestationError, ChatSignature, SignatureKind,
@@ -62,7 +63,7 @@ impl AttestationRepository for PgAttestationRepository {
             .map_err(|e| AttestationError::RepositoryError(e.to_string()))?;
         let signature_kind = signature.signature_kind.map(|kind| kind.as_str());
         client
-            .execute(
+            .cached_execute(
                 "INSERT INTO chat_signatures (chat_id, text, signature, signing_address, signing_algo, signature_kind) VALUES ($1, $2, $3, $4, $5, $6) ON CONFLICT (chat_id, signing_algo) DO UPDATE SET text = EXCLUDED.text, signature = EXCLUDED.signature, signing_address = EXCLUDED.signing_address, signature_kind = EXCLUDED.signature_kind, updated_at = NOW()",
                 &[&chat_id, &signature.text, &signature.signature, &signature.signing_address, &signature.signing_algo, &signature_kind],
             )

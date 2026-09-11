@@ -1,5 +1,6 @@
 use crate::models::ApiKey;
 use crate::pool::DbPool;
+use crate::repositories::statement_cache::CachedStatements;
 use crate::repositories::utils::map_db_error;
 use crate::retry_db;
 use anyhow::{Context, Result};
@@ -149,7 +150,7 @@ impl ApiKeyRepository {
                 .map_err(RepositoryError::PoolError)?;
 
             client
-                .query_opt(
+                .cached_query_opt(
                     r#"
             SELECT ak.*
             FROM api_keys ak
@@ -192,7 +193,7 @@ impl ApiKeyRepository {
                 .map_err(RepositoryError::PoolError)?;
 
             client
-                .execute(
+                .cached_execute(
                     "UPDATE api_keys SET last_used_at = NOW() WHERE id = $1",
                     &[&id],
                 )

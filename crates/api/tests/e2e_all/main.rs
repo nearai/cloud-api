@@ -66,6 +66,7 @@ mod org_system_prompt;
 mod organization_deletion;
 mod pagination_validation;
 mod patroni_failover;
+mod prepared_statement_cache;
 mod privacy_classify;
 mod privacy_redact;
 mod provider_errors;

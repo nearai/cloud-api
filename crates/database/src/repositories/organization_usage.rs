@@ -3,6 +3,7 @@ use crate::models::{
     ServedProviderType, StopReason,
 };
 use crate::pool::DbPool;
+use crate::repositories::statement_cache::CachedStatements;
 use crate::repositories::utils::map_db_error;
 use crate::retry_db;
 use anyhow::{Context, Result};
@@ -47,7 +48,7 @@ impl OrganizationUsageRepository {
                 .map_err(RepositoryError::PoolError)?;
 
             client
-                .query_one(
+                .cached_query_one(
                     r#"
                     SELECT COALESCE(SUM(total_cost), 0)::BIGINT as total_spend
                     FROM organization_usage_log
@@ -93,7 +94,7 @@ impl OrganizationUsageRepository {
                 .served_provider_type
                 .map(|provider| provider.as_str());
             let maybe_row = transaction
-                .query_opt(
+                .cached_query_opt(
                     r#"
                     INSERT INTO organization_usage_log (
                         id, organization_id, workspace_id, api_key_id,
@@ -146,7 +147,7 @@ impl OrganizationUsageRepository {
                 Some(row) => {
                     // New insert succeeded — update organization balance
                     transaction
-                        .execute(
+                        .cached_execute(
                             r#"
                             INSERT INTO organization_balance (
                                 organization_id,
@@ -188,7 +189,7 @@ impl OrganizationUsageRepository {
                     );
 
                     let existing = client
-                        .query_one(
+                        .cached_query_one(
                             r#"
                             SELECT *
                             FROM organization_usage_log
@@ -220,7 +221,7 @@ impl OrganizationUsageRepository {
                 .map_err(RepositoryError::PoolError)?;
 
             client
-                .query_opt(
+                .cached_query_opt(
                     r#"
                     SELECT organization_id, total_spent, last_usage_at,
                            total_requests, total_tokens, updated_at

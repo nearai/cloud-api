@@ -1,3 +1,4 @@
+use crate::repositories::statement_cache::CachedStatements;
 use crate::{
     models::{CreateWorkspaceRequest, UpdateWorkspaceRequest, Workspace},
     pool::DbPool,
@@ -380,7 +381,7 @@ impl WorkspaceRepository {
                 .map_err(RepositoryError::PoolError)?;
 
             client
-                .query_opt(
+                .cached_query_opt(
                     r#"
                 SELECT
                     w.*,

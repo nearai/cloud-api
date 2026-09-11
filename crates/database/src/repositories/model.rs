@@ -1,6 +1,7 @@
 use crate::constants::DEFAULT_MODEL_OWNED_BY;
 use crate::models::{Model, ModelHistory, UpdateModelPricingRequest};
 use crate::pool::DbPool;
+use crate::repositories::statement_cache::CachedStatements;
 use crate::repositories::utils::map_db_error;
 use crate::retry_db;
 use anyhow::{Context, Result};
@@ -269,7 +270,7 @@ impl ModelRepository {
                 .map_err(RepositoryError::PoolError)?;
 
             client
-                .query(
+                .cached_query(
                     r#"
                     SELECT
                         id, model_name, model_display_name, model_description, model_icon,
@@ -1301,7 +1302,7 @@ impl ModelRepository {
                 .map_err(RepositoryError::PoolError)?;
 
             client
-                .query_opt(
+                .cached_query_opt(
                     r#"
                     SELECT
                         m.id,

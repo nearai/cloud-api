@@ -40,7 +40,12 @@ impl AttestationService {
             .add_chat_signatures(signature_id, signatures)
             .await
             .map_err(|e| {
-                tracing::error!("Failed to store {} signatures in repository", id_label);
+                tracing::error!(
+                    signature_kind = id_label,
+                    signature_id = signature_id,
+                    error = %e,
+                    "Failed to store gateway signatures in repository"
+                );
                 AttestationError::RepositoryError(e.to_string())
             })?;
         tracing::info!(

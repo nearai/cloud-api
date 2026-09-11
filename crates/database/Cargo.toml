@@ -51,8 +51,8 @@ refinery = { version = "0.9", features = ["tokio-postgres"] }
 # For hashing API keys and session tokens
 sha2 = "0.11"
 hex = "0.4"
-aes-gcm = "0.10"
-base64 = "0.22"
+aes-gcm = "0.11"
+base64 = "0.23"
 rand = "0.10.1"
 
 # For User-Agent normalization

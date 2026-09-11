@@ -1,6 +1,7 @@
 pub mod ports;
 
 use crate::attestation::ports::AttestationServiceTrait;
+use crate::attestation::STREAM_SIGNATURE_STORE_TIMEOUT;
 use crate::inference_provider_pool::InferenceProviderPool;
 use crate::models::ModelsRepository;
 use crate::responses::models::ResponseId;
@@ -22,7 +23,6 @@ use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 use tracing::Instrument;
 
-const FINALIZE_TIMEOUT_SECS: u64 = 5;
 /// A raw provider terminal marker is only expected to contain `data: [DONE]`
 /// plus its SSE line ending. Bound it before accepting it as a signed terminal
 /// event so malformed padding cannot be retained or signed.
@@ -213,8 +213,8 @@ where
 
         Box::pin(async move {
             match tokio::time::timeout(
-                Duration::from_secs(FINALIZE_TIMEOUT_SECS),
-                attestation_service.store_chat_signature_from_provider(&chat_id),
+                STREAM_SIGNATURE_STORE_TIMEOUT,
+                attestation_service.store_stream_chat_signature_from_provider(&chat_id),
             )
             .await
             {
@@ -227,7 +227,7 @@ where
                         %organization_id,
                         %model_id,
                         "Timeout storing chat signature after {}s",
-                        FINALIZE_TIMEOUT_SECS
+                        STREAM_SIGNATURE_STORE_TIMEOUT.as_secs()
                     );
                     // The provider-store implementation normally unpins after
                     // it completes. A timeout cancels that future before its

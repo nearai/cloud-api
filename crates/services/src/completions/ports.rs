@@ -134,6 +134,10 @@ pub struct CompletionMessage {
     /// Tool calls made by the assistant - required for assistant messages that invoke tools
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_calls: Option<Vec<CompletionToolCall>>,
+    /// Prior-turn reasoning echoed by the client so thinking models can
+    /// continue across tool calls. Redacted like other client text.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_content: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

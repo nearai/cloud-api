@@ -5,39 +5,7 @@
 //! so we can assert on the redacted output without a live PII model.
 
 use crate::common::*;
-use api::models::{BatchUpdateModelApiRequest, ErrorResponse};
-
-async fn setup_privacy_filter_model(server: &axum_test::TestServer) -> String {
-    let mut batch = BatchUpdateModelApiRequest::new();
-    batch.insert(
-        "openai/privacy-filter".to_string(),
-        serde_json::from_value(serde_json::json!({
-            "inputCostPerToken": {
-                "amount": 1000000,
-                "currency": "USD"
-            },
-            "outputCostPerToken": {
-                "amount": 0,
-                "currency": "USD"
-            },
-            "costPerImage": {
-                "amount": 0,
-                "currency": "USD"
-            },
-            "modelDisplayName": "Privacy Filter",
-            "modelDescription": "PII span detection (token classification)",
-            "contextLength": 512,
-            "maxOutputLength": 1024,
-            "verifiable": false,
-            "isActive": true
-        }))
-        .unwrap(),
-    );
-    let updated = admin_batch_upsert_models(server, batch, get_session_id()).await;
-    assert_eq!(updated.len(), 1, "Should have updated 1 model");
-    tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
-    "openai/privacy-filter".to_string()
-}
+use api::models::ErrorResponse;
 
 #[tokio::test]
 async fn test_privacy_redact_basic_email() {

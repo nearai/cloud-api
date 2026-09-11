@@ -109,6 +109,77 @@ pub enum MessageContentPart {
     File { file_id: String },
 }
 
+impl MessageContentPart {
+    /// Catalog input modality this part requires (`inputModalities` vocabulary:
+    /// `text`, `image`, `audio`, `video`, `file`).
+    pub fn input_modality(&self) -> &'static str {
+        match self {
+            MessageContentPart::Text { .. } => "text",
+            MessageContentPart::ImageUrl { .. } => "image",
+            MessageContentPart::InputAudio { .. } | MessageContentPart::AudioUrl { .. } => "audio",
+            MessageContentPart::VideoUrl { .. } => "video",
+            MessageContentPart::File { .. } => "file",
+        }
+    }
+}
+
+/// Every input modality the conversation uses, in first-seen order. String
+/// content and text parts are `text`; typed parts map via
+/// [`MessageContentPart::input_modality`].
+pub fn requested_input_modalities(messages: &[Message]) -> Vec<&'static str> {
+    let mut out: Vec<&'static str> = Vec::new();
+    for msg in messages {
+        match &msg.content {
+            Some(MessageContent::Text(_)) => {
+                if !out.contains(&"text") {
+                    out.push("text");
+                }
+            }
+            Some(MessageContent::Parts(parts)) => {
+                for part in parts {
+                    let modality = part.input_modality();
+                    if !out.contains(&modality) {
+                        out.push(modality);
+                    }
+                }
+            }
+            None => {}
+        }
+    }
+    out
+}
+
+/// Modalities refused up front when the catalog does not declare them. Only
+/// `video` for now: no chat model on our stack serves it and every engine
+/// answers it with an error, so an undeclared video part can only fail.
+/// `audio` and `file` are real plumbed chat paths (`convert_part_to_vllm`
+/// turns `input_audio` into an `audio_url` for omni models) and their catalog
+/// declarations have not been audited; `text` and `image` likewise stay
+/// engine-decides (image declarations are not curated for every external
+/// model yet, and images are already validated on the engine path). Extend
+/// this list only after auditing the declarations of every model that serves
+/// the modality.
+pub const GATED_INPUT_MODALITIES: &[&str] = &["video"];
+
+/// The first requested, gated modality the model's catalog entry does not
+/// declare, if any. `None` when the catalog declares no modalities at all —
+/// absent *or* an empty list (an accidentally blank row must not become a
+/// hard failure): unknown capability set, let the engine decide, as before.
+pub fn unsupported_input_modality<'a>(
+    requested: &[&'a str],
+    declared: Option<&[String]>,
+) -> Option<&'a str> {
+    let declared = declared?;
+    if declared.is_empty() {
+        return None;
+    }
+    requested
+        .iter()
+        .copied()
+        .filter(|m| GATED_INPUT_MODALITIES.contains(m))
+        .find(|m| !declared.iter().any(|d| d.eq_ignore_ascii_case(m)))
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
 #[serde(untagged)]
 pub enum MessageImageUrl {
@@ -150,6 +221,33 @@ pub struct Message {
     pub tool_call_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_calls: Option<Vec<ToolCall>>,
+    /// Reasoning the model produced on a *previous* assistant turn, echoed
+    /// back by the client. Thinking models continue their own chain of
+    /// thought across tool calls only when this reaches the engine; without
+    /// the field serde silently dropped it, so the model re-reasoned from
+    /// scratch after every tool result. Forwarded verbatim to self-hosted and
+    /// attested OpenAI-compatible engines; stripped for strict external
+    /// upstreams (see `inference_providers::strip_reasoning_content`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_content: Option<String>,
+    /// OpenRouter-dialect spelling of the same field. Accepted on input and
+    /// folded into `reasoning_content` at conversion (see
+    /// [`Message::prior_reasoning`]); a sibling field rather than a serde
+    /// alias so a message carrying both spellings — which our own responses
+    /// may emit — stays valid instead of failing as a duplicate field. Never
+    /// emitted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning: Option<String>,
+}
+
+impl Message {
+    /// Prior-turn reasoning to forward upstream: the canonical
+    /// `reasoning_content` wins when both spellings are present.
+    pub fn prior_reasoning(&self) -> Option<String> {
+        self.reasoning_content
+            .clone()
+            .or_else(|| self.reasoning.clone())
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -4129,6 +4227,7 @@ pub struct ModelHistoryResponse {
 /// - grant: Free credits provided by the platform
 /// - payment: Credits purchased by the organization
 /// - staking_farm: House of Stake farm reward units converted into credits
+/// - postpay: Contract billing safety ceiling; usage is invoiced separately
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, ToSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum CreditType {
@@ -4138,6 +4237,8 @@ pub enum CreditType {
     Payment,
     #[serde(rename = "staking_farm", alias = "STAKING_FARM")]
     StakingFarm,
+    #[serde(alias = "POSTPAY")]
+    Postpay,
 }
 
 impl std::fmt::Display for CreditType {
@@ -4146,6 +4247,7 @@ impl std::fmt::Display for CreditType {
             CreditType::Grant => write!(f, "grant"),
             CreditType::Payment => write!(f, "payment"),
             CreditType::StakingFarm => write!(f, "staking_farm"),
+            CreditType::Postpay => write!(f, "postpay"),
         }
     }
 }
@@ -4157,6 +4259,25 @@ impl CreditType {
             CreditType::Grant => "grant",
             CreditType::Payment => "payment",
             CreditType::StakingFarm => "staking_farm",
+            CreditType::Postpay => "postpay",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error("unsupported credit type")]
+pub struct ParseCreditTypeError;
+
+impl std::str::FromStr for CreditType {
+    type Err = ParseCreditTypeError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value.to_ascii_lowercase().as_str() {
+            "grant" => Ok(Self::Grant),
+            "payment" => Ok(Self::Payment),
+            "staking_farm" => Ok(Self::StakingFarm),
+            "postpay" => Ok(Self::Postpay),
+            _ => Err(ParseCreditTypeError),
         }
     }
 }
@@ -4584,6 +4705,8 @@ mod tests {
         let request = ChatCompletionRequest {
             model: "gpt-4".to_string(),
             messages: vec![Message {
+                reasoning: None,
+                reasoning_content: None,
                 role: "user".to_string(),
                 content: Some(MessageContent::Parts(vec![
                     MessageContentPart::Text {
@@ -4767,6 +4890,8 @@ mod tests {
         let request = ChatCompletionRequest {
             model: "gpt-4".to_string(),
             messages: vec![Message {
+                reasoning: None,
+                reasoning_content: None,
                 role: "user".to_string(),
                 content: Some(MessageContent::Parts(vec![
                     MessageContentPart::Text {
@@ -4810,6 +4935,8 @@ mod tests {
         let request = ChatCompletionRequest {
             model: "gpt-4".to_string(),
             messages: vec![Message {
+                reasoning: None,
+                reasoning_content: None,
                 role: "user".to_string(),
                 content: Some(MessageContent::Parts(vec![
                     MessageContentPart::InputAudio {
@@ -4848,6 +4975,8 @@ mod tests {
         let request = ChatCompletionRequest {
             model: "gpt-4".to_string(),
             messages: vec![Message {
+                reasoning: None,
+                reasoning_content: None,
                 role: "user".to_string(),
                 content: Some(MessageContent::Parts(vec![MessageContentPart::File {
                     file_id: "file-abc123".to_string(),
@@ -4881,6 +5010,8 @@ mod tests {
         let request = ChatCompletionRequest {
             model: "gpt-4".to_string(),
             messages: vec![Message {
+                reasoning: None,
+                reasoning_content: None,
                 role: "user".to_string(),
                 content: Some(MessageContent::Text("Hello, world!".to_string())),
                 name: None,
@@ -4910,6 +5041,8 @@ mod tests {
         ChatCompletionRequest {
             model: "gpt-4".to_string(),
             messages: vec![Message {
+                reasoning: None,
+                reasoning_content: None,
                 role: "user".to_string(),
                 content: Some(MessageContent::Text("hi".to_string())),
                 name: None,
@@ -5421,4 +5554,140 @@ pub struct ScoreUsage {
     /// Prompt tokens details
     #[serde(skip_serializing_if = "Option::is_none")]
     pub prompt_tokens_details: Option<serde_json::Value>,
+}
+
+#[cfg(test)]
+mod credit_type_tests {
+    use super::CreditType;
+
+    #[test]
+    fn postpay_serializes_and_accepts_supported_casing() {
+        let lower: CreditType = serde_json::from_str("\"postpay\"").unwrap();
+        let upper: CreditType = serde_json::from_str("\"POSTPAY\"").unwrap();
+
+        assert_eq!(lower, CreditType::Postpay);
+        assert_eq!(upper, CreditType::Postpay);
+        assert_eq!(lower.as_str(), "postpay");
+        assert_eq!(serde_json::to_string(&lower).unwrap(), "\"postpay\"");
+    }
+
+    #[test]
+    fn credit_type_from_str_rejects_unknown_values() {
+        assert_eq!("POSTPAY".parse(), Ok(CreditType::Postpay));
+        assert!("unexpected".parse::<CreditType>().is_err());
+    }
+}
+
+#[cfg(test)]
+mod input_modality_tests {
+    use super::*;
+
+    fn msg(content: Option<MessageContent>) -> Message {
+        Message {
+            reasoning: None,
+            role: "user".to_string(),
+            content,
+            name: None,
+            tool_call_id: None,
+            tool_calls: None,
+            reasoning_content: None,
+        }
+    }
+
+    #[test]
+    fn collects_modalities_in_first_seen_order_without_duplicates() {
+        let messages = vec![
+            msg(Some(MessageContent::Text("hi".to_string()))),
+            msg(None),
+            msg(Some(MessageContent::Parts(vec![
+                MessageContentPart::Text {
+                    text: "look".to_string(),
+                    cache_control: None,
+                },
+                MessageContentPart::ImageUrl {
+                    image_url: MessageImageUrl::String("data:image/png;base64,AA==".to_string()),
+                    detail: None,
+                    cache_control: None,
+                },
+                MessageContentPart::VideoUrl {
+                    video_url: MessageVideoUrl::Object {
+                        url: "https://example.com/v.mp4".to_string(),
+                    },
+                },
+                MessageContentPart::InputAudio {
+                    input_audio: MessageInputAudio {
+                        data: "AA==".to_string(),
+                        format: Some("wav".to_string()),
+                    },
+                },
+                MessageContentPart::File {
+                    file_id: "file_1".to_string(),
+                },
+            ]))),
+        ];
+        assert_eq!(
+            requested_input_modalities(&messages),
+            vec!["text", "image", "video", "audio", "file"]
+        );
+    }
+
+    #[test]
+    fn undeclared_gated_modality_is_reported_and_unknown_catalog_is_permissive() {
+        let declared = vec!["text".to_string(), "Image".to_string()];
+        assert_eq!(
+            unsupported_input_modality(&["text", "image", "video"], Some(&declared)),
+            Some("video")
+        );
+        assert_eq!(
+            unsupported_input_modality(&["text", "image"], Some(&declared)),
+            None
+        );
+        // Audio and file are plumbed chat paths whose declarations are not
+        // audited yet: engine-decides, exactly like text and image.
+        assert_eq!(
+            unsupported_input_modality(&["text", "audio", "file"], Some(&declared)),
+            None
+        );
+        // Declared (case-insensitively) → allowed.
+        let video_model = vec!["text".to_string(), "VIDEO".to_string()];
+        assert_eq!(
+            unsupported_input_modality(&["text", "video"], Some(&video_model)),
+            None
+        );
+        // No catalog declaration, absent or blank: nothing is rejected up front.
+        assert_eq!(unsupported_input_modality(&["text", "video"], None), None);
+        assert_eq!(
+            unsupported_input_modality(&["text", "video"], Some(&[])),
+            None
+        );
+    }
+
+    #[test]
+    fn message_reasoning_content_roundtrips_and_accepts_reasoning_alias() {
+        let m: Message = serde_json::from_str(
+            r#"{"role":"assistant","content":null,"reasoning_content":"secret is xylophone","tool_calls":[]}"#,
+        )
+        .unwrap();
+        assert_eq!(m.reasoning_content.as_deref(), Some("secret is xylophone"));
+        let out = serde_json::to_value(&m).unwrap();
+        assert_eq!(out["reasoning_content"], "secret is xylophone");
+
+        let alias: Message =
+            serde_json::from_str(r#"{"role":"assistant","content":"x","reasoning":"via alias"}"#)
+                .unwrap();
+        assert!(alias.reasoning_content.is_none());
+        assert_eq!(alias.prior_reasoning().as_deref(), Some("via alias"));
+
+        // Both spellings at once (our own responses can carry both): valid,
+        // canonical wins.
+        let both: Message = serde_json::from_str(
+            r#"{"role":"assistant","content":null,"reasoning_content":"canonical","reasoning":"alias"}"#,
+        )
+        .unwrap();
+        assert_eq!(both.prior_reasoning().as_deref(), Some("canonical"));
+
+        let none: Message = serde_json::from_str(r#"{"role":"user","content":"hi"}"#).unwrap();
+        assert!(none.reasoning_content.is_none());
+        assert!(!serde_json::to_string(&none).unwrap().contains("reasoning"));
+    }
 }

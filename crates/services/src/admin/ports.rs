@@ -116,6 +116,18 @@ pub struct ModelPricing {
     pub openrouter_slug: Option<String>,
 }
 
+/// Stored fields needed to validate a partial model update before persisting it.
+#[derive(Debug, Clone)]
+pub struct ModelValidationState {
+    pub input_cost_per_token: i64,
+    pub output_cost_per_token: i64,
+    pub cost_per_image: i64,
+    pub cache_read_cost_per_token: Option<i64>,
+    pub allow_free: bool,
+    pub provider_type: String,
+    pub provider_config: Option<serde_json::Value>,
+}
+
 /// Model history entry - includes pricing, context length, and other model attributes
 /// All costs use fixed scale of 9 (nano-dollars) and USD currency
 #[derive(Debug, Clone)]
@@ -624,14 +636,12 @@ pub trait AdminRepository: Send + Sync {
         request: UpdateModelAdminRequest,
     ) -> Result<ModelPricing, anyhow::Error>;
 
-    /// Fetch the current pricing costs and allow_free flag for a model by name.
+    /// Fetch the stored fields needed to validate a partial model update.
     /// Returns `None` if the model does not exist (new model).
-    /// Returns `Some((input_cost, output_cost, cost_per_image, cache_read_cost_per_token, allow_free))`,
-    /// where `cache_read_cost_per_token` is `None` when cache pricing is disabled.
-    async fn get_model_costs(
+    async fn get_model_validation_state(
         &self,
         model_name: &str,
-    ) -> Result<Option<(i64, i64, i64, Option<i64>, bool)>, anyhow::Error>;
+    ) -> Result<Option<ModelValidationState>, anyhow::Error>;
 
     /// Get complete history for a model with pagination (includes pricing and other attributes)
     async fn get_model_history(

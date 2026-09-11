@@ -2,6 +2,9 @@
 // Each submodule was previously a separate test binary (e2e_*.rs).
 // Merging into one binary eliminates ~40 redundant link steps in CI.
 
+use std::fs::OpenOptions;
+use std::io::Write;
+
 #[path = "../common/mod.rs"]
 mod common;
 
@@ -15,6 +18,7 @@ mod admin_pricing_changes;
 mod admin_provider_attribution_model_revenue;
 mod admin_provider_attribution_platform;
 mod admin_provider_attribution_support;
+mod admin_routing_policy;
 mod admin_schema_compatibility;
 mod admin_services;
 mod api_keys;
@@ -59,6 +63,7 @@ mod multiturn_tools;
 mod near_auth;
 mod oauth_frontend_callback;
 mod openai_tiered_pricing;
+mod openrouter_compat;
 mod openrouter_params;
 mod org_system_prompt;
 mod organization_deletion;
@@ -84,3 +89,78 @@ mod usage_responses;
 mod vpc_login;
 mod web_context_search;
 mod web_search_citations;
+
+/// Run by nextest's setup script after this E2E binary has already been built.
+/// Keeping bootstrap in the same binary avoids a second cold compile/link in CI.
+#[tokio::test]
+#[ignore = "invoked by the nextest e2e setup script"]
+async fn bootstrap_e2e_database() {
+    common::db_setup::bootstrap_test_database().await;
+
+    let Some(nextest_env_path) = std::env::var_os("NEXTEST_ENV") else {
+        return;
+    };
+    let nextest_env_path = std::path::PathBuf::from(nextest_env_path);
+    assert!(
+        nextest_env_path.is_absolute(),
+        "NEXTEST_ENV must be an absolute path"
+    );
+
+    let mut nextest_env = OpenOptions::new()
+        .append(true)
+        .open(&nextest_env_path)
+        .expect("open nextest's environment file");
+    let marker = common::db_setup::nextest_bootstrap_marker()
+        .expect("the e2e bootstrap must be invoked by nextest");
+    assert!(
+        !marker.contains('\r') && !marker.contains('\n'),
+        "the e2e bootstrap marker cannot contain a line break"
+    );
+    writeln!(
+        nextest_env,
+        "{}={marker}",
+        common::db_setup::E2E_DATABASE_BOOTSTRAPPED_ENV,
+    )
+    .expect("record completed e2e database bootstrap for test processes");
+
+    // reqwest honors host-level proxy variables. Ensure local fake HTTP
+    // services remain local without discarding a developer's other exclusions.
+    let no_proxy = no_proxy_with_loopback();
+    assert!(
+        !no_proxy.contains('\r') && !no_proxy.contains('\n'),
+        "NO_PROXY cannot contain a line break"
+    );
+    writeln!(nextest_env, "NO_PROXY={no_proxy}")
+        .expect("record NO_PROXY for nextest test processes");
+    writeln!(nextest_env, "no_proxy={no_proxy}")
+        .expect("record no_proxy for nextest test processes");
+}
+
+fn no_proxy_with_loopback() -> String {
+    let mut entries = Vec::new();
+    for key in ["NO_PROXY", "no_proxy"] {
+        let Ok(existing) = std::env::var(key) else {
+            continue;
+        };
+        for entry in existing.split(',').map(str::trim) {
+            if !entry.is_empty()
+                && !entries
+                    .iter()
+                    .any(|known: &String| known.eq_ignore_ascii_case(entry))
+            {
+                entries.push(entry.to_string());
+            }
+        }
+    }
+
+    for loopback in ["localhost", "127.0.0.1", "::1"] {
+        if !entries
+            .iter()
+            .any(|entry| entry.eq_ignore_ascii_case(loopback))
+        {
+            entries.push(loopback.to_string());
+        }
+    }
+
+    entries.join(",")
+}

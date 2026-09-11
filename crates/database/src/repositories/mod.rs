@@ -6,6 +6,7 @@ pub mod api_key;
 pub mod attestation;
 pub mod concurrency_lease;
 pub mod conversation;
+pub mod credit_allocation;
 pub mod feature_request;
 pub mod file;
 pub mod mcp_connector;
@@ -46,6 +47,7 @@ pub use analytics::PgAnalyticsRepository;
 pub use api_key::ApiKeyRepository;
 pub use attestation::PgAttestationRepository;
 pub use conversation::PgConversationRepository;
+pub use credit_allocation::CreditAllocationPolicy;
 pub use feature_request::{
     FeatureRequestRepository, FeatureRequestSummary, FeatureRequestTarget,
     FeatureRequestVoteSummary, SubmitFeatureRequestParams, SubmitFeatureRequestResult,

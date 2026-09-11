@@ -1654,6 +1654,7 @@ mod tests {
         async fn get_usage_history_by_api_key(
             &self,
             _api_key_id: Uuid,
+            _credit_type: Option<&str>,
             _limit: Option<i64>,
             _offset: Option<i64>,
         ) -> Result<(Vec<services::usage::UsageLogEntry>, i64), services::usage::UsageError>
@@ -1666,6 +1667,7 @@ mod tests {
             _workspace_id: Uuid,
             _api_key_id: Uuid,
             _user_id: Uuid,
+            _credit_type: Option<&str>,
             _limit: Option<i64>,
             _offset: Option<i64>,
         ) -> Result<(Vec<services::usage::UsageLogEntry>, i64), services::usage::UsageError>

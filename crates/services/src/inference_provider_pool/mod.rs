@@ -625,6 +625,10 @@ pub struct InferenceProviderPool {
     chat_id_mapping: Arc<RwLock<HashMap<String, Arc<InferenceProviderTrait>>>>,
     /// Background task handle for periodic provider refresh from database
     refresh_task_handle: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
+    /// Serializes external-provider reloads and versions admin-triggered loads.
+    /// A periodic refresh snapshots this value before reading the database and
+    /// may apply its result only if no newer admin load has completed first.
+    external_provider_reload_generation: Arc<Mutex<u64>>,
     /// Per-provider consecutive failure count, keyed by Arc pointer address.
     /// Providers with high failure counts are deprioritized in load balancing.
     /// Counts reset to 0 on success and are cleaned up on refresh.
@@ -962,6 +966,7 @@ impl InferenceProviderPool {
             load_balancer_index: Arc::new(std::sync::RwLock::new(HashMap::new())),
             chat_id_mapping: Arc::new(RwLock::new(HashMap::new())),
             refresh_task_handle: Arc::new(Mutex::new(None)),
+            external_provider_reload_generation: Arc::new(Mutex::new(0)),
             provider_failure_counts: Arc::new(std::sync::RwLock::new(HashMap::new())),
             provider_load_state: Arc::new(std::sync::RwLock::new(HashMap::new())),
             inference_url_providers: Arc::new(RwLock::new(HashMap::new())),
@@ -982,6 +987,14 @@ impl InferenceProviderPool {
     /// a no-op.
     pub fn set_metrics_service(&self, metrics: Arc<dyn crate::metrics::MetricsServiceTrait>) {
         let _ = self.metrics_service.set(metrics);
+    }
+
+    /// Invalidate any periodic database snapshot that began before a completed
+    /// admin model write. Call this before reconciling the new row into the live
+    /// provider mappings, including deactivations that do not load a replacement.
+    pub async fn invalidate_periodic_provider_refreshes(&self) {
+        let mut generation = self.external_provider_reload_generation.lock().await;
+        *generation = generation.wrapping_add(1);
     }
 
     fn is_registered_fallback_provider(
@@ -1031,6 +1044,17 @@ impl InferenceProviderPool {
         &self,
         models: Vec<(String, serde_json::Value)>,
     ) -> Result<(), String> {
+        let mut generation = self.external_provider_reload_generation.lock().await;
+        *generation = generation.wrapping_add(1);
+        let result = self.load_external_providers_inner(models).await;
+        drop(generation);
+        result
+    }
+
+    async fn load_external_providers_inner(
+        &self,
+        models: Vec<(String, serde_json::Value)>,
+    ) -> Result<(), String> {
         let mut success_count = 0;
         let mut error_count = 0;
 
@@ -1056,6 +1080,10 @@ impl InferenceProviderPool {
                     success_count += 1;
                 }
                 Err(e) => {
+                    // A rejected external-config update must not leave an older
+                    // route serving. Unknown or misspelled fields may represent
+                    // a failed attempt to add a mandatory privacy restriction.
+                    mappings.model_to_providers.remove(&model_name);
                     warn!(model = %model_name, error = %e, "Failed to register external provider");
                     error_count += 1;
                 }
@@ -4321,13 +4349,18 @@ impl InferenceProviderPool {
         model_name: &str,
         provider_config: serde_json::Value,
     ) -> Result<(Arc<InferenceProviderTrait>, String), String> {
-        // Extract and remove per-model api_key from raw JSON before deserializing into ProviderConfig
         let mut provider_config = provider_config;
+        inference_providers::non_attested::external::validate_external_provider_config(
+            &provider_config,
+        )
+        .map_err(str::to_string)?;
+
+        // Extract and remove per-model api_key after validating the complete raw
+        // shape, then deserialize the remaining backend-specific configuration.
         let per_model_api_key = provider_config
             .as_object_mut()
             .and_then(|obj| obj.remove("api_key"))
             .and_then(|v| v.as_str().map(String::from));
-
         let config: ProviderConfig = serde_json::from_value(provider_config)
             .map_err(|e| format!("Failed to parse provider config: {e}"))?;
 
@@ -4453,11 +4486,38 @@ impl InferenceProviderPool {
             .collect()
     }
 
-    /// Sync external providers — just re-loads them into provider_mappings.
-    async fn sync_external_providers(&self, models: Vec<(String, serde_json::Value)>) {
-        if let Err(e) = self.load_external_providers(models).await {
-            warn!(error = %e, "Failed to sync external providers");
+    async fn external_provider_reload_generation(&self) -> u64 {
+        *self.external_provider_reload_generation.lock().await
+    }
+
+    /// Apply one periodic external-provider snapshot and stale cleanup only if
+    /// no admin-triggered external reload completed after the snapshot began.
+    /// The generation lock covers both replacement and cleanup, so an admin
+    /// reload cannot be removed by the tail end of an older refresh cycle.
+    async fn apply_periodic_provider_refresh(
+        &self,
+        external_models: Option<Vec<(String, serde_json::Value)>>,
+        valid_model_names: &std::collections::HashSet<String>,
+        expected_generation: u64,
+    ) -> Result<bool, String> {
+        let generation = self.external_provider_reload_generation.lock().await;
+        if *generation != expected_generation {
+            debug!(
+                expected_generation,
+                current_generation = *generation,
+                "Skipping stale periodic provider refresh after an admin reload"
+            );
+            return Ok(false);
         }
+
+        let load_result = if let Some(models) = external_models {
+            self.load_external_providers_inner(models).await
+        } else {
+            Ok(())
+        };
+        self.remove_stale_providers(valid_model_names).await;
+        drop(generation);
+        load_result.map(|()| true)
     }
 
     /// Drop the per-provider failure counters for providers replaced this refresh.
@@ -5467,13 +5527,16 @@ impl InferenceProviderPool {
                         }
                     }
 
-                    // Refresh external providers
-                    match source.fetch_external_models().await {
+                    // Snapshot before the database read. If an admin PATCH
+                    // reloads an external model while this read is in flight,
+                    // its newer provider must win over this periodic snapshot.
+                    let external_generation = pool.external_provider_reload_generation().await;
+                    let external_models = match source.fetch_external_models().await {
                         Ok(models) => {
                             for (name, _) in &models {
                                 valid_model_names.insert(name.clone());
                             }
-                            pool.sync_external_providers(models).await;
+                            Some(models)
                         }
                         Err(e) => {
                             warn!(error = %e, "Failed to refresh external providers");
@@ -5481,11 +5544,20 @@ impl InferenceProviderPool {
                             let mappings = pool.provider_mappings.read().await;
                             valid_model_names.extend(mappings.model_to_providers.keys().cloned());
                             drop(mappings);
+                            None
                         }
-                    }
+                    };
 
-                    // Remove providers for models no longer in the database
-                    pool.remove_stale_providers(&valid_model_names).await;
+                    if let Err(e) = pool
+                        .apply_periodic_provider_refresh(
+                            external_models,
+                            &valid_model_names,
+                            external_generation,
+                        )
+                        .await
+                    {
+                        warn!(error = %e, "Failed to sync external providers");
+                    }
                 }
             }
         });
@@ -6844,6 +6916,7 @@ mod tests {
         let params = inference_providers::ChatCompletionParams {
             model: model_id,
             messages: vec![inference_providers::ChatMessage {
+                reasoning_content: None,
                 role: inference_providers::MessageRole::User,
                 content: Some(serde_json::Value::String("Hello".to_string())),
                 name: None,
@@ -6918,6 +6991,7 @@ mod tests {
         let params = inference_providers::ChatCompletionParams {
             model: model_id,
             messages: vec![inference_providers::ChatMessage {
+                reasoning_content: None,
                 role: inference_providers::MessageRole::User,
                 content: Some(serde_json::Value::String("Hello".to_string())),
                 name: None,
@@ -7053,6 +7127,39 @@ mod tests {
         ]).await;
 
         assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_invalid_external_config_removes_existing_provider() {
+        for config in [
+            serde_json::json!({"backend": "anthropic", "base_url": "https://example.com",
+                "api_key": "synthetic-test-key", "enforced_request_body": {"provider": {"zdr": true}}}),
+            serde_json::json!({"backend": "gemini", "base_url": "https://example.com",
+                "api_key": "synthetic-test-key", "enforced_request_body": {"provider": {"zdr": true}}}),
+            serde_json::json!({"backend": "openai_compatible", "base_url": "https://example.com",
+                "api_key": "synthetic-test-key", "enforced_request_body": {"model": "override"}}),
+            serde_json::json!({"backend": "openai_compatible", "base_url": "https://example.com",
+                "api_key": "synthetic-test-key", "enforce_request_body": {"provider": {"zdr": true}}}),
+            serde_json::json!({"base_url": "https://example.com", "api_key": "synthetic-test-key",
+                "enforced_body": {"provider": {"zdr": true}}}),
+        ] {
+            let pool = InferenceProviderPool::new(None, ExternalProvidersConfig::default());
+            pool.load_external_providers(vec![(
+                "policy-test".into(),
+                serde_json::json!({
+                    "backend": "openai_compatible", "base_url": "https://example.com",
+                    "api_key": "synthetic-test-key"
+                }),
+            )])
+            .await
+            .unwrap();
+            assert!(pool.has_provider("policy-test").await);
+            assert!(pool
+                .load_external_providers(vec![("policy-test".into(), config)])
+                .await
+                .is_err());
+            assert!(!pool.has_provider("policy-test").await);
+        }
     }
 
     #[tokio::test]
@@ -7994,7 +8101,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_sync_external_providers() {
+    async fn test_reload_external_providers() {
         let pool = InferenceProviderPool::new(
             None,
             ExternalProvidersConfig {
@@ -8007,20 +8114,82 @@ mod tests {
             },
         );
 
-        pool.sync_external_providers(vec![
+        pool.load_external_providers(vec![
             ("gpt-4".to_string(), serde_json::json!({"backend": "openai_compatible", "base_url": "https://api.openai.com/v1"})),
-        ]).await;
+        ]).await.unwrap();
 
         assert!(pool.has_provider("gpt-4").await);
 
         // Sync with partial failures
-        pool.sync_external_providers(vec![
+        assert!(pool.load_external_providers(vec![
             ("gpt-4".to_string(), serde_json::json!({"backend": "openai_compatible", "base_url": "https://api.openai.com/v1"})),
             ("claude-3".to_string(), serde_json::json!({"backend": "anthropic", "base_url": "https://api.anthropic.com/v1"})),
-        ]).await;
+        ]).await.is_ok());
 
         assert!(pool.has_provider("gpt-4").await);
         assert!(!pool.has_provider("claude-3").await);
+    }
+
+    #[tokio::test]
+    async fn stale_periodic_snapshot_cannot_replace_or_remove_admin_reload() {
+        let pool = InferenceProviderPool::new(None, ExternalProvidersConfig::default());
+        let stale_config = serde_json::json!({
+            "backend": "openai_compatible",
+            "base_url": "https://old.example.com/v1",
+            "api_key": "synthetic-test-key"
+        });
+        pool.load_external_providers(vec![("policy-test".into(), stale_config.clone())])
+            .await
+            .unwrap();
+
+        // This is the generation a periodic task records before fetching its
+        // now-stale database snapshot.
+        let periodic_generation = pool.external_provider_reload_generation().await;
+
+        let enforced_config = serde_json::json!({
+            "backend": "openai_compatible",
+            "base_url": "https://new.example.com/v1",
+            "api_key": "synthetic-test-key",
+            "enforced_request_body": {"provider": {"zdr": true}}
+        });
+        pool.load_external_providers(vec![
+            ("policy-test".into(), enforced_config),
+            (
+                "admin-only".into(),
+                serde_json::json!({
+                    "backend": "openai_compatible",
+                    "base_url": "https://admin.example.com/v1",
+                    "api_key": "synthetic-test-key"
+                }),
+            ),
+        ])
+        .await
+        .unwrap();
+        let admin_provider = {
+            let mappings = pool.provider_mappings.read().await;
+            mappings.model_to_providers["policy-test"][0].clone()
+        };
+
+        let valid_names = HashSet::from(["policy-test".to_string()]);
+        let applied = pool
+            .apply_periodic_provider_refresh(
+                Some(vec![("policy-test".into(), stale_config)]),
+                &valid_names,
+                periodic_generation,
+            )
+            .await
+            .unwrap();
+
+        assert!(!applied, "the stale periodic snapshot must be discarded");
+        let mappings = pool.provider_mappings.read().await;
+        assert!(Arc::ptr_eq(
+            &mappings.model_to_providers["policy-test"][0],
+            &admin_provider
+        ));
+        assert!(
+            mappings.model_to_providers.contains_key("admin-only"),
+            "stale cleanup must not remove a model loaded by the newer admin update"
+        );
     }
 
     // ==================== 4xx Retry Behavior Tests ====================
@@ -8892,6 +9061,7 @@ mod tests {
         inference_providers::ChatCompletionParams {
             model: model.to_string(),
             messages: vec![inference_providers::ChatMessage {
+                reasoning_content: None,
                 role: inference_providers::MessageRole::User,
                 content: Some(serde_json::Value::String("hello".to_string())),
                 name: None,

@@ -614,12 +614,12 @@ fn build_final_usage_chunk_bytes(
 }
 
 // Helper function to extract inference ID from a parsed stream chunk
-fn extract_inference_id_from_chunk(chunk: &inference_providers::StreamChunk) -> Uuid {
+fn extract_inference_id_from_chunk(chunk: &inference_providers::StreamChunk) -> Option<Uuid> {
     let id = match chunk {
         inference_providers::StreamChunk::Chat(c) => &c.id,
         inference_providers::StreamChunk::Text(c) => &c.id,
     };
-    hash_inference_id_to_uuid(id)
+    (!id.is_empty()).then(|| hash_inference_id_to_uuid(id))
 }
 
 // Convert MessageContent to serde_json::Value, preserving multimodal parts (images, audio, etc.)
@@ -678,6 +678,7 @@ fn convert_chat_request_to_service(
                 role: msg.role.clone(),
                 content: message_content_to_value(&msg.content),
                 tool_call_id: msg.tool_call_id.clone(),
+                reasoning_content: msg.prior_reasoning(),
                 tool_calls: msg.tool_calls.as_ref().map(|calls| {
                     calls
                         .iter()
@@ -1325,6 +1326,7 @@ fn convert_text_request_to_service(
         request_id,
         model: request.model.clone(),
         messages: vec![CompletionMessage {
+            reasoning_content: None,
             role: "user".to_string(),
             content: serde_json::Value::String(prompt),
             tool_call_id: None,
@@ -1499,21 +1501,70 @@ async fn chat_completions_inner(
         .resolve_alias_cached(&request.model)
         .await;
     let resolved_model_name = alias_canonical.as_deref().unwrap_or(&request.model);
-    let model_attestation_supported = match app_state.models_service.get_models_with_pricing().await
-    {
-        Ok(models) => models
-            .iter()
-            .find(|model| model.model_name == resolved_model_name)
-            .map(|model| model.attestation_supported),
-        Err(error) => {
-            tracing::warn!(
-                model = %request.model,
-                error = %error,
-                "Failed to read cached model metadata for attestation signing decisions"
-            );
-            None
-        }
-    };
+    let (model_attestation_supported, model_input_modalities) =
+        match app_state.models_service.get_models_with_pricing().await {
+            // Exact catalog name first, then the alias target: a name that is
+            // both a model and another model's alias must read its own
+            // capabilities.
+            Ok(models) => models
+                .iter()
+                .find(|model| model.model_name == request.model)
+                .or_else(|| {
+                    models
+                        .iter()
+                        .find(|model| model.model_name == resolved_model_name)
+                })
+                .map(|model| {
+                    (
+                        Some(model.attestation_supported),
+                        model.input_modalities.clone(),
+                    )
+                })
+                .unwrap_or((None, None)),
+            Err(error) => {
+                tracing::warn!(
+                    model = %request.model,
+                    error = %error,
+                    "Failed to read cached model metadata for attestation signing decisions"
+                );
+                (None, None)
+            }
+        };
+
+    // Refuse gated parts (video) the catalog does not declare for this model
+    // before any dispatch. Engines answer an unsupported modality
+    // inconsistently (a valid video makes SGLang's GLM processor raise a 500,
+    // which surfaced here as a retried 502); the catalog's `inputModalities`
+    // is the contract, so the client gets a deterministic, non-retryable 400.
+    // See `GATED_INPUT_MODALITIES` for what is and is not gated.
+    let requested_modalities = crate::models::requested_input_modalities(&request.messages);
+    if let Some(unsupported) = crate::models::unsupported_input_modality(
+        &requested_modalities,
+        model_input_modalities.as_deref(),
+    ) {
+        tracing::info!(
+            model = %request.model,
+            modality = unsupported,
+            "Rejecting request: model does not declare the requested input modality"
+        );
+        return (
+            StatusCode::BAD_REQUEST,
+            ResponseJson(ErrorResponse::with_param(
+                format!(
+                    "Model '{}' does not support {unsupported} input. Supported input modalities: {}.",
+                    request.model,
+                    model_input_modalities
+                        .as_deref()
+                        .filter(|m| !m.is_empty())
+                        .map(|m| m.join(", "))
+                        .unwrap_or_else(|| "none declared".to_string())
+                ),
+                "invalid_request_error".to_string(),
+                "messages".to_string(),
+            )),
+        )
+            .into_response();
+    }
     let usage_mode = chat_stream_usage_mode(&request, model_attestation_supported, e2ee_active);
     let rewrite_public_stream_usage = usage_mode.rewrite_public_stream_usage;
     let strip_intermediate_usage = usage_mode.strip_intermediate_usage;
@@ -1635,8 +1686,9 @@ async fn chat_completions_inner(
                                 stream_chat_id = Some(match chunk {
                                     inference_providers::StreamChunk::Chat(c) => c.id.clone(),
                                     inference_providers::StreamChunk::Text(c) => c.id.clone(),
-                                });
-                                break Some(extract_inference_id_from_chunk(chunk));
+                                })
+                                .filter(|id| !id.is_empty());
+                                break extract_inference_id_from_chunk(chunk);
                             }
                             true
                         }
@@ -2730,8 +2782,9 @@ async fn completions_inner(
                                 stream_chat_id = Some(match chunk {
                                     inference_providers::StreamChunk::Chat(c) => c.id.clone(),
                                     inference_providers::StreamChunk::Text(c) => c.id.clone(),
-                                });
-                                break Some(extract_inference_id_from_chunk(chunk));
+                                })
+                                .filter(|id| !id.is_empty());
+                                break extract_inference_id_from_chunk(chunk);
                             }
                             true
                         }
@@ -4162,13 +4215,14 @@ mod tests {
 
     #[test]
     fn test_extract_inference_id_from_chunk_empty_id() {
+        // Given: Chutes omitted its provider inference id at the parsing boundary.
         let chunk = make_chat_chunk("");
+
+        // When: the route derives the optional public inference id.
         let result = extract_inference_id_from_chunk(&chunk);
-        // Empty string should still produce a valid UUID
-        assert!(
-            !result.is_nil(),
-            "empty provider ID should still produce a non-nil UUID"
-        );
+
+        // Then: absence stays absent instead of becoming a hash of the empty string.
+        assert_eq!(result, None);
     }
 
     fn empty_delta() -> inference_providers::models::ChatDelta {

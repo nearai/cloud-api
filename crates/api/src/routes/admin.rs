@@ -46,6 +46,23 @@ use std::sync::Arc;
 use tracing::{debug, error, warn, Instrument};
 use uuid::Uuid;
 
+fn parse_stored_credit_type(
+    value: &str,
+) -> Result<CreditType, (StatusCode, ResponseJson<ErrorResponse>)> {
+    value.parse().map_err(|_| {
+        // Do not silently relabel unknown database values as purchased credits.
+        // The value itself is intentionally omitted from logs.
+        error!("Unsupported credit type returned by admin service");
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            ResponseJson(ErrorResponse::new(
+                "Failed to read organization limits".to_string(),
+                "internal_server_error".to_string(),
+            )),
+        )
+    })
+}
+
 /// OpenRouter's fixed `supported_sampling_parameters` vocabulary. Values written
 /// via the admin API are validated against this list, and any pinned/seeded
 /// catalog row (e.g. the Chutes seed in `crate::ensure_chutes_catalog_row`) must
@@ -530,6 +547,29 @@ pub async fn batch_upsert_models(
 
     // Validate all pricing fields are non-negative to prevent incorrect billing
     for (model_name, request) in &batch_request {
+        if let Some(config) = &request.provider_config {
+            // Backend-less configs belong to non-external features such as
+            // long-context routing. The service layer repeats this validation
+            // against the merged stored provider type, which covers partial
+            // updates that omit `providerType`.
+            if request.provider_type.as_deref() == Some("external")
+                || config.get("backend").is_some()
+                || config.get("enforced_request_body").is_some()
+            {
+                inference_providers::non_attested::external::validate_external_provider_config(
+                    config,
+                )
+                .map_err(|error| {
+                    (
+                        StatusCode::BAD_REQUEST,
+                        ResponseJson(ErrorResponse::new(
+                            format!("model '{model_name}': {error}"),
+                            "invalid_request".to_string(),
+                        )),
+                    )
+                })?;
+            }
+        }
         let validate_price = |price: &Option<DecimalPriceRequest>, field: &str| {
             if let Some(p) = price {
                 p.validate().map_err(|e| {
@@ -857,6 +897,20 @@ pub async fn batch_upsert_models(
             );
     }
 
+    if batch_request.values().any(|request| {
+        request.provider_type.is_some()
+            || request.provider_config.is_some()
+            || request.inference_url.is_some()
+            || request.is_active.is_some()
+    }) {
+        // The database write is complete. Prevent an older periodic snapshot
+        // from replacing or removing the provider state reconciled below.
+        app_state
+            .inference_provider_pool
+            .invalidate_periodic_provider_refreshes()
+            .await;
+    }
+
     // Update providers at runtime so changes take effect without server restart.
     // Unregister first, then re-register — this handles type transitions
     // (e.g., inference_url → external) and deactivations cleanly.
@@ -951,11 +1005,12 @@ pub async fn batch_upsert_models(
     let external_models: Vec<(String, serde_json::Value)> = batch_request
         .iter()
         .filter_map(|(model_name, request)| {
-            let is_external = request.provider_type.as_deref() == Some("external");
-            let is_active = request.is_active != Some(false);
-
-            if is_external && is_active {
-                request
+            let merged = updated_models.get(model_name)?;
+            let touches_registration = request.provider_type.is_some()
+                || request.provider_config.is_some()
+                || request.is_active.is_some();
+            if merged.provider_type == "external" && merged.is_active && touches_registration {
+                merged
                     .provider_config
                     .clone()
                     .map(|config| (model_name.clone(), config))
@@ -1439,12 +1494,7 @@ pub async fn update_organization_limits(
         })?;
 
     // Convert service response to API response
-    let credit_type_enum = match updated_limits.credit_type.to_lowercase().as_str() {
-        "grant" => CreditType::Grant,
-        "payment" => CreditType::Payment,
-        "staking_farm" => CreditType::StakingFarm,
-        _ => CreditType::Payment, // Default fallback (should not happen)
-    };
+    let credit_type_enum = parse_stored_credit_type(&updated_limits.credit_type)?;
 
     let response = UpdateOrganizationLimitsResponse {
         organization_id: updated_limits.organization_id.to_string(),
@@ -1552,13 +1602,8 @@ pub async fn get_organization_limits_history(
     let entries: Vec<OrgLimitsHistoryEntry> = history
         .into_iter()
         .map(|h| {
-            let credit_type_enum = match h.credit_type.to_lowercase().as_str() {
-                "grant" => CreditType::Grant,
-                "payment" => CreditType::Payment,
-                "staking_farm" => CreditType::StakingFarm,
-                _ => CreditType::Payment,
-            };
-            OrgLimitsHistoryEntry {
+            let credit_type_enum = parse_stored_credit_type(&h.credit_type)?;
+            Ok(OrgLimitsHistoryEntry {
                 id: h.id.to_string(),
                 organization_id: h.organization_id.to_string(),
                 credit_type: credit_type_enum,
@@ -1575,9 +1620,9 @@ pub async fn get_organization_limits_history(
                 changed_by_user_id: h.changed_by_user_id.map(|id| id.to_string()),
                 changed_by_user_email: h.changed_by_user_email,
                 created_at: h.created_at.to_rfc3339(),
-            }
+            })
         })
-        .collect();
+        .collect::<Result<Vec<_>, (StatusCode, ResponseJson<ErrorResponse>)>>()?;
 
     let response = OrgLimitsHistoryResponse {
         history: entries,

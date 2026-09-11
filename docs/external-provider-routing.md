@@ -26,9 +26,10 @@ provider's ZDR endpoints, without fallback:
 ```
 
 The initial policy surface supports only the extra JSON `provider` object.
-The admin write path and provider loader reject policies on other backends,
-non-object policies, and other top-level keys (including typed fields such as
-`model` or `messages`, which could otherwise create duplicate JSON keys).
+The admin write path and provider loader reject unknown external-config fields,
+policies on other backends, empty or non-object provider policies, and other
+enforced top-level keys (including typed or backend-normalized fields such as
+`model`, `messages`, `reasoning_effort`, and `top_k`).
 Audio transcription and image editing fail before dispatch when a mandatory
 policy is configured, because multipart transport cannot carry these JSON fields.
 Credentials belong in the provider's secret configuration, never in either map.

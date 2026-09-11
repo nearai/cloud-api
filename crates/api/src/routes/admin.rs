@@ -548,7 +548,7 @@ pub async fn batch_upsert_models(
     // Validate all pricing fields are non-negative to prevent incorrect billing
     for (model_name, request) in &batch_request {
         if let Some(config) = &request.provider_config {
-            inference_providers::non_attested::external::validate_enforced_request_body(config)
+            inference_providers::non_attested::external::validate_external_provider_config(config)
                 .map_err(|error| {
                     (
                         StatusCode::BAD_REQUEST,

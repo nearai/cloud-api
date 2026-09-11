@@ -4336,7 +4336,7 @@ impl InferenceProviderPool {
             .and_then(|obj| obj.remove("api_key"))
             .and_then(|v| v.as_str().map(String::from));
 
-        inference_providers::non_attested::external::validate_enforced_request_body(
+        inference_providers::non_attested::external::validate_external_provider_config(
             &provider_config,
         )
         .map_err(str::to_string)?;

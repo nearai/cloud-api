@@ -107,7 +107,7 @@ fn absent_policy_preserves_existing_user_precedence() {
 #[test]
 fn unsupported_or_ambiguous_policy_configurations_are_rejected() {
     for backend in ["anthropic", "gemini", "unknown"] {
-        assert!(validate_enforced_request_body(&json!({
+        assert!(validate_external_provider_config(&json!({
             "backend": backend, "enforced_request_body": {"provider": policy()}
         }))
         .is_err());
@@ -120,19 +120,45 @@ fn unsupported_or_ambiguous_policy_configurations_are_rejected() {
         json!({"provider": null}),
         json!({"provider": "off"}),
         json!({"provider": []}),
+        json!({"provider": {}}),
     ] {
-        assert!(validate_enforced_request_body(&json!({
+        assert!(validate_external_provider_config(&json!({
             "backend": "openai_compatible", "enforced_request_body": enforced
+        }))
+        .is_err());
+    }
+    for key in [
+        "model",
+        "messages",
+        "stream",
+        "tools",
+        "reasoning_effort",
+        "top_k",
+        "repetition_penalty",
+        "min_p",
+        "top_a",
+    ] {
+        assert!(validate_external_provider_config(&json!({
+            "backend": "openai_compatible",
+            "enforced_request_body": {key: true}
+        }))
+        .is_err());
+    }
+    for typo in ["enforce_request_body", "enforced_body"] {
+        assert!(validate_external_provider_config(&json!({
+            "backend": "openai_compatible",
+            "base_url": "https://example.com",
+            typo: {"provider": policy()}
         }))
         .is_err());
     }
     for config in [
         json!({"backend": "anthropic"}),
-        json!({"backend": "gemini", "enforced_request_body": null}),
         json!({"backend": "openai_compatible", "enforced_request_body": {}}),
         json!({"backend": "openai_compatible", "enforced_request_body": {"provider": policy()}}),
+        json!({"long_context": {"inference_url": "https://example.com"}}),
     ] {
-        assert!(validate_enforced_request_body(&config).is_ok());
+        assert!(validate_external_provider_config(&config).is_ok());
     }
 }
 

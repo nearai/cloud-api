@@ -99,14 +99,48 @@ fn merge_json_enforced(target: &mut serde_json::Value, enforced: &serde_json::Va
     }
 }
 
-/// Validate mandatory routing configuration at both the admin write and load paths.
-/// Restrict this initial policy surface to `provider`, which is an extra field on
-/// every supported JSON endpoint, so typed fields cannot create duplicate keys.
-pub fn validate_enforced_request_body(config: &serde_json::Value) -> Result<(), &'static str> {
+/// Validate external provider configuration at both the admin write and load paths.
+/// Reject unknown fields so a misspelled mandatory policy cannot silently disappear.
+/// Restrict the initial policy surface to `provider`, which is an extra field on
+/// every supported JSON endpoint, so typed fields cannot create duplicate keys and
+/// backend normalization cannot remove or override the policy.
+pub fn validate_external_provider_config(config: &serde_json::Value) -> Result<(), &'static str> {
+    let Some(config) = config.as_object() else {
+        return Err("external provider config must be an object");
+    };
+    let Some(backend) = config.get("backend").and_then(|value| value.as_str()) else {
+        // Non-external model configurations, such as long-context routing, do not
+        // carry a backend and are outside this validator's scope.
+        if config.contains_key("enforced_request_body") {
+            return Err("enforced_request_body requires an openai_compatible backend");
+        }
+        return Ok(());
+    };
+    let allowed_fields: &[&str] = match backend {
+        "openai_compatible" => &[
+            "backend",
+            "base_url",
+            "organization_id",
+            "model_name",
+            "extra_request_body",
+            "enforced_request_body",
+            "api_key",
+        ],
+        "anthropic" => &["backend", "base_url", "version", "model_name", "api_key"],
+        "gemini" => &["backend", "base_url", "model_name", "api_key"],
+        _ => return Err("unsupported external provider backend"),
+    };
+    if config
+        .keys()
+        .any(|key| !allowed_fields.contains(&key.as_str()))
+    {
+        return Err("external provider config contains an unsupported field");
+    }
+
     let Some(enforced) = config.get("enforced_request_body").filter(|v| !v.is_null()) else {
         return Ok(());
     };
-    if config.get("backend").and_then(|v| v.as_str()) != Some("openai_compatible") {
+    if backend != "openai_compatible" {
         return Err("enforced_request_body requires an openai_compatible backend");
     }
     let fields = enforced
@@ -115,8 +149,13 @@ pub fn validate_enforced_request_body(config: &serde_json::Value) -> Result<(), 
     if fields.keys().any(|key| key != "provider") {
         return Err("enforced_request_body currently supports only the provider field");
     }
-    if fields.get("provider").is_some_and(|v| !v.is_object()) {
-        return Err("enforced_request_body.provider must be an object");
+    if let Some(provider) = fields.get("provider") {
+        let provider = provider
+            .as_object()
+            .ok_or("enforced_request_body.provider must be an object")?;
+        if provider.is_empty() {
+            return Err("enforced_request_body.provider must not be empty");
+        }
     }
     Ok(())
 }
@@ -224,25 +263,18 @@ impl ExternalProvider {
             timeout_seconds,
         } = external_config;
 
-        let enforced_request_body = match &provider_config {
-            ProviderConfig::OpenAiCompatible {
-                enforced_request_body,
-                ..
-            } => enforced_request_body.clone().unwrap_or_default(),
-            _ => std::collections::HashMap::new(),
-        };
-
-        let (backend, config, remote_model_name): (
+        let (backend, config, remote_model_name, enforced_request_body): (
             Arc<dyn ExternalBackend>,
             BackendConfig,
             Option<String>,
+            std::collections::HashMap<String, serde_json::Value>,
         ) = match provider_config {
             ProviderConfig::OpenAiCompatible {
                 base_url,
                 organization_id,
                 model_name: config_model_name,
                 extra_request_body,
-                ..
+                enforced_request_body,
             } => {
                 let mut extra = std::collections::HashMap::new();
                 if let Some(org_id) = organization_id {
@@ -259,6 +291,7 @@ impl ExternalProvider {
                         extra_request_body: extra_request_body.unwrap_or_default(),
                     },
                     config_model_name,
+                    enforced_request_body.unwrap_or_default(),
                 )
             }
             ProviderConfig::Anthropic {
@@ -279,6 +312,7 @@ impl ExternalProvider {
                         extra_request_body: std::collections::HashMap::new(),
                     },
                     config_model_name,
+                    std::collections::HashMap::new(),
                 )
             }
             ProviderConfig::Gemini {
@@ -294,6 +328,7 @@ impl ExternalProvider {
                     extra_request_body: std::collections::HashMap::new(),
                 },
                 config_model_name,
+                std::collections::HashMap::new(),
             ),
         };
 
@@ -319,8 +354,10 @@ impl ExternalProvider {
     }
 
     /// Inject provider-level default fields into the request body.
-    /// Per-request fields take precedence over defaults. Mandatory extra fields
-    /// are applied last so callers cannot override configured restrictions.
+    /// Per-request fields take precedence over defaults. Mandatory `provider`
+    /// fields then replace configured leaves so callers cannot weaken routing.
+    /// Other mandatory keys are rejected before construction, which also keeps
+    /// backend normalization from removing or overriding the policy.
     fn inject_extra_request_body(
         &self,
         extra: &mut std::collections::HashMap<String, serde_json::Value>,

@@ -1,6 +1,6 @@
 use crate::{
     middleware::AuthenticatedUser,
-    models::ErrorResponse,
+    models::{CreditType, ErrorResponse},
     routes::{api::AppState, common::format_amount},
 };
 use axum::{
@@ -97,6 +97,8 @@ pub struct OrganizationBalanceResponse {
     pub total_tokens: i64,
     pub updated_at: String,
     pub credit_limits: Vec<CreditLimitBreakdownResponse>,
+    /// Unresolved cost from completed requests that exceeded all capacity.
+    pub unfunded_amount: i64,
 }
 
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
@@ -106,6 +108,8 @@ pub struct CreditLimitBreakdownResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub source: Option<String>,
     pub amount: i64,
+    pub consumed: i64,
+    pub available: i64,
     pub currency: String,
 }
 
@@ -138,6 +142,8 @@ pub async fn compute_organization_balance_response(
             credit_type: limit.credit_type,
             source: limit.source,
             amount: limit.amount,
+            consumed: limit.consumed,
+            available: limit.available,
             currency: limit.currency,
         })
         .collect();
@@ -145,8 +151,8 @@ pub async fn compute_organization_balance_response(
     match balance {
         Some(balance) => {
             let (spend_limit, spend_limit_display, remaining, remaining_display) =
-                if let Some(limit_info) = limit {
-                    let remaining_amount = limit_info.spend_limit - balance.total_spent;
+                if let Some(limit_info) = limit.as_ref() {
+                    let remaining_amount = limit_info.available;
                     (
                         Some(limit_info.spend_limit),
                         Some(format_amount(limit_info.spend_limit)),
@@ -170,6 +176,7 @@ pub async fn compute_organization_balance_response(
                 total_tokens: balance.total_tokens,
                 updated_at: balance.updated_at.to_rfc3339(),
                 credit_limits,
+                unfunded_amount: limit.as_ref().map_or(0, |value| value.unfunded),
             })
         }
         None => {
@@ -180,13 +187,14 @@ pub async fn compute_organization_balance_response(
                     total_spent_display: format_amount(0),
                     spend_limit: Some(limit_info.spend_limit),
                     spend_limit_display: Some(format_amount(limit_info.spend_limit)),
-                    remaining: Some(limit_info.spend_limit),
-                    remaining_display: Some(format_amount(limit_info.spend_limit)),
+                    remaining: Some(limit_info.available),
+                    remaining_display: Some(format_amount(limit_info.available)),
                     last_usage_at: None,
                     total_requests: 0,
                     total_tokens: 0,
                     updated_at: Utc::now().to_rfc3339(),
                     credit_limits,
+                    unfunded_amount: limit_info.unfunded,
                 })
             } else {
                 Err((
@@ -244,6 +252,15 @@ pub struct UsageHistoryEntryResponse {
     /// Number of images generated (for image generation requests)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub image_count: Option<i32>,
+    /// None denotes legacy usage whose funding was not historically captured.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub credit_allocations: Option<Vec<services::usage::CreditAllocation>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub funded_amount: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub unfunded_amount: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub allocation_policy_version: Option<String>,
 }
 
 /// Usage history response
@@ -268,6 +285,7 @@ pub struct UsageHistoryQuery {
     pub end_time: Option<String>,
     pub workspace_id: Option<Uuid>,
     pub api_key_id: Option<Uuid>,
+    pub credit_type: Option<String>,
 }
 
 impl UsageHistoryQuery {
@@ -278,6 +296,7 @@ impl UsageHistoryQuery {
             || self.end_time.is_some()
             || self.workspace_id.is_some()
             || self.api_key_id.is_some()
+            || self.credit_type.is_some()
     }
 
     const fn has_time_filters(&self) -> bool {
@@ -303,6 +322,14 @@ pub struct ServiceUsageEntryResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub inference_id: Option<String>,
     pub created_at: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub credit_allocations: Option<Vec<services::usage::CreditAllocation>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub funded_amount: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub unfunded_amount: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub allocation_policy_version: Option<String>,
 }
 
 /// Service usage history response
@@ -324,6 +351,7 @@ pub struct ServiceUsageHistoryQuery {
     /// Filter by platform service name (e.g. \"web_search\").
     #[serde(rename = "serviceName")]
     pub service_name: Option<String>,
+    pub credit_type: Option<String>,
 }
 
 /// Get organization balance
@@ -381,7 +409,8 @@ pub async fn get_organization_balance(
         ("start_time" = Option<String>, Query, description = "Inclusive RFC3339 start timestamp. Takes precedence over start_date."),
         ("end_time" = Option<String>, Query, description = "Inclusive RFC3339 end timestamp. Takes precedence over end_date."),
         ("workspace_id" = Option<Uuid>, Query, description = "Filter by workspace ID."),
-        ("api_key_id" = Option<Uuid>, Query, description = "Filter by API key ID.")
+        ("api_key_id" = Option<Uuid>, Query, description = "Filter by API key ID."),
+        ("credit_type" = Option<CreditType>, Query, description = "Filter costs by their saved credit allocation.")
     ),
     responses(
         (status = 200, description = "Usage history", body = UsageHistoryResponse),
@@ -397,7 +426,7 @@ pub async fn get_organization_usage_history(
     State(app_state): State<AppState>,
     Extension(user): Extension<AuthenticatedUser>,
     Path(org_id): Path<String>,
-    Query(query): Query<UsageHistoryQuery>,
+    Query(mut query): Query<UsageHistoryQuery>,
 ) -> Result<ResponseJson<UsageHistoryResponse>, (StatusCode, ResponseJson<ErrorResponse>)> {
     tracing::debug!(
         "Get usage history for org {} by user {}, limit: {}, offset: {}",
@@ -409,6 +438,7 @@ pub async fn get_organization_usage_history(
 
     // Validate pagination parameters
     crate::routes::common::validate_limit_offset(query.limit, query.offset)?;
+    query.credit_type = normalize_credit_type_filter(query.credit_type.as_deref())?;
 
     let organization_id = check_org_membership(&app_state, user, &org_id).await?;
 
@@ -455,6 +485,10 @@ pub async fn get_organization_usage_history(
             provider_request_id: entry.provider_request_id,
             inference_id: entry.inference_id.map(|id| id.to_string()),
             image_count: entry.image_count,
+            credit_allocations: entry.credit_allocations,
+            funded_amount: entry.funded_amount,
+            unfunded_amount: entry.unfunded_amount,
+            allocation_policy_version: entry.allocation_policy_version,
         })
         .collect();
 
@@ -504,6 +538,7 @@ fn usage_history_report_query(
             end_time: None,
             workspace_id: query.workspace_id,
             api_key_id: query.api_key_id,
+            credit_type: query.credit_type.clone(),
             limit: query.limit,
             offset: query.offset,
         });
@@ -518,6 +553,7 @@ fn usage_history_report_query(
         model: None,
         inference_type: None,
         service_name: None,
+        credit_type: query.credit_type.clone(),
         limit: Some(
             u16::try_from(query.limit)
                 .map_err(|_| usage_history_query_bad_request("Limit cannot exceed 1000"))?,
@@ -533,9 +569,21 @@ fn usage_history_report_query(
         end_time: parsed.end_time,
         workspace_id: parsed.workspace_id,
         api_key_id: parsed.api_key_id,
+        credit_type: parsed.credit_type,
         limit: query.limit,
         offset: query.offset,
     })
+}
+
+fn normalize_credit_type_filter(value: Option<&str>) -> Result<Option<String>, UsageError> {
+    value
+        .map(|value| {
+            value
+                .parse::<CreditType>()
+                .map(|credit_type| credit_type.as_str().to_string())
+                .map_err(|_| usage_history_query_bad_request("Invalid credit type"))
+        })
+        .transpose()
 }
 
 fn usage_history_start_time(query: &UsageHistoryQuery) -> Result<Option<String>, UsageError> {
@@ -617,6 +665,10 @@ fn usage_report_row_response(
         provider_request_id: row.provider_request_id,
         inference_id: row.inference_id.map(|id| id.to_string()),
         image_count: row.image_count,
+        credit_allocations: row.credit_allocations,
+        funded_amount: row.funded_amount,
+        unfunded_amount: row.unfunded_amount,
+        allocation_policy_version: row.allocation_policy_version,
     })
 }
 
@@ -668,6 +720,7 @@ fn internal_usage_history_error(message: &str) -> UsageError {
     params(
         ("org_id" = String, Path, description = "Organization ID"),
         ("serviceName" = Option<String>, Query, description = "Filter by platform service name (e.g. web_search)"),
+        ("credit_type" = Option<CreditType>, Query, description = "Filter costs by their saved credit allocation."),
         ("limit" = Option<i64>, Query, description = "Number of records to return (default: 100)"),
         ("offset" = Option<i64>, Query, description = "Offset for pagination (default: 0)")
     ),
@@ -685,7 +738,7 @@ pub async fn get_service_usage_history(
     State(app_state): State<AppState>,
     Extension(user): Extension<AuthenticatedUser>,
     Path(org_id): Path<String>,
-    Query(query): Query<ServiceUsageHistoryQuery>,
+    Query(mut query): Query<ServiceUsageHistoryQuery>,
 ) -> Result<ResponseJson<ServiceUsageHistoryResponse>, (StatusCode, ResponseJson<ErrorResponse>)> {
     tracing::debug!(
         "Get service usage history for org {} by user {}, service: {:?}, limit: {}, offset: {}",
@@ -698,14 +751,22 @@ pub async fn get_service_usage_history(
 
     // Validate pagination parameters
     crate::routes::common::validate_limit_offset(query.limit, query.offset)?;
+    query.credit_type = normalize_credit_type_filter(query.credit_type.as_deref())?;
 
     let organization_id = check_org_membership(&app_state, user, &org_id).await?;
 
     let service_name = query.service_name.as_deref();
+    let credit_type = query.credit_type.as_deref();
 
     let (history, total) = app_state
         .service_usage_service
-        .get_usage_history(organization_id, service_name, query.limit, query.offset)
+        .get_usage_history(
+            organization_id,
+            service_name,
+            credit_type,
+            query.limit,
+            query.offset,
+        )
         .await
         .map_err(|_| {
             tracing::error!("Failed to get service usage history");
@@ -731,6 +792,10 @@ pub async fn get_service_usage_history(
             total_cost_display: format_amount(entry.total_cost),
             inference_id: entry.inference_id.map(|id| id.to_string()),
             created_at: entry.created_at.to_rfc3339(),
+            credit_allocations: entry.credit_allocations,
+            funded_amount: entry.funded_amount,
+            unfunded_amount: entry.unfunded_amount,
+            allocation_policy_version: entry.allocation_policy_version,
         })
         .collect();
 
@@ -753,7 +818,8 @@ pub async fn get_service_usage_history(
         ("workspace_id" = String, Path, description = "Workspace ID"),
         ("api_key_id" = String, Path, description = "API Key ID"),
         ("limit" = Option<i64>, Query, description = "Number of records to return (default: 100)"),
-        ("offset" = Option<i64>, Query, description = "Offset for pagination (default: 0)")
+        ("offset" = Option<i64>, Query, description = "Offset for pagination (default: 0)"),
+        ("credit_type" = Option<CreditType>, Query, description = "Filter costs by their saved credit allocation.")
     ),
     responses(
         (status = 200, description = "Usage history", body = UsageHistoryResponse),
@@ -770,7 +836,7 @@ pub async fn get_api_key_usage_history(
     State(app_state): State<AppState>,
     Extension(user): Extension<AuthenticatedUser>,
     Path((workspace_id, api_key_id)): Path<(String, String)>,
-    Query(query): Query<UsageHistoryQuery>,
+    Query(mut query): Query<UsageHistoryQuery>,
 ) -> Result<ResponseJson<UsageHistoryResponse>, (StatusCode, ResponseJson<ErrorResponse>)> {
     tracing::debug!(
         "Get usage history for API key {} in workspace {} by user {}, limit: {}, offset: {}",
@@ -783,6 +849,7 @@ pub async fn get_api_key_usage_history(
 
     // Validate pagination parameters
     crate::routes::common::validate_limit_offset(query.limit, query.offset)?;
+    query.credit_type = normalize_credit_type_filter(query.credit_type.as_deref())?;
 
     let workspace_uuid = Uuid::parse_str(&workspace_id).map_err(|_| {
         (
@@ -811,6 +878,7 @@ pub async fn get_api_key_usage_history(
             workspace_uuid,
             api_key_uuid,
             user.0.id,
+            query.credit_type.as_deref(),
             Some(query.limit),
             Some(query.offset),
         )
@@ -866,6 +934,10 @@ pub async fn get_api_key_usage_history(
             provider_request_id: entry.provider_request_id,
             inference_id: entry.inference_id.map(|id| id.to_string()),
             image_count: entry.image_count,
+            credit_allocations: entry.credit_allocations,
+            funded_amount: entry.funded_amount,
+            unfunded_amount: entry.unfunded_amount,
+            allocation_policy_version: entry.allocation_policy_version,
         })
         .collect();
 
@@ -913,6 +985,14 @@ pub enum RecordUsageResponse {
         total_cost_display: String,
         /// Timestamp of the recorded entry (RFC3339)
         created_at: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        credit_allocations: Option<Vec<services::usage::CreditAllocation>>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        funded_amount: Option<i64>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        unfunded_amount: Option<i64>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        allocation_policy_version: Option<String>,
     },
     /// Response for image generation usage
     ImageGeneration {
@@ -928,6 +1008,14 @@ pub enum RecordUsageResponse {
         total_cost_display: String,
         /// Timestamp of the recorded entry (RFC3339)
         created_at: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        credit_allocations: Option<Vec<services::usage::CreditAllocation>>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        funded_amount: Option<i64>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        unfunded_amount: Option<i64>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        allocation_policy_version: Option<String>,
     },
 }
 
@@ -953,6 +1041,10 @@ fn build_record_usage_response(entry: services::usage::UsageLogEntry) -> RecordU
             total_cost: entry.total_cost,
             total_cost_display: format_amount(entry.total_cost),
             created_at: entry.created_at.to_rfc3339(),
+            credit_allocations: entry.credit_allocations,
+            funded_amount: entry.funded_amount,
+            unfunded_amount: entry.unfunded_amount,
+            allocation_policy_version: entry.allocation_policy_version,
         },
         _ => RecordUsageResponse::ChatCompletion {
             id: entry.id.to_string(),
@@ -967,6 +1059,10 @@ fn build_record_usage_response(entry: services::usage::UsageLogEntry) -> RecordU
             total_cost: entry.total_cost,
             total_cost_display: format_amount(entry.total_cost),
             created_at: entry.created_at.to_rfc3339(),
+            credit_allocations: entry.credit_allocations,
+            funded_amount: entry.funded_amount,
+            unfunded_amount: entry.unfunded_amount,
+            allocation_policy_version: entry.allocation_policy_version,
         },
     }
 }

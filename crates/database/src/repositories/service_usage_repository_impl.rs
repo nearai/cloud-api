@@ -56,6 +56,7 @@ impl ServiceUsageRepositoryTrait for ServiceUsageRepositoryImpl {
         &self,
         organization_id: Uuid,
         service_name: Option<&str>,
+        credit_type: Option<&str>,
         limit: i64,
         offset: i64,
     ) -> anyhow::Result<(Vec<ServiceUsageLogEntry>, i64)> {
@@ -75,7 +76,7 @@ impl ServiceUsageRepositoryTrait for ServiceUsageRepositoryImpl {
 
         let (rows, total) = self
             .usage_repo
-            .list_for_org(organization_id, service_id, limit, offset)
+            .list_for_org(organization_id, service_id, credit_type, limit, offset)
             .await?;
 
         let entries = rows
@@ -90,6 +91,10 @@ impl ServiceUsageRepositoryTrait for ServiceUsageRepositoryImpl {
                 total_cost: row.total_cost,
                 inference_id: row.inference_id,
                 created_at: row.created_at,
+                credit_allocations: row.credit_allocations,
+                funded_amount: row.funded_amount,
+                unfunded_amount: row.unfunded_amount,
+                allocation_policy_version: row.allocation_policy_version,
             })
             .collect();
 

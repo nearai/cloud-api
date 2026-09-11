@@ -42,11 +42,18 @@ pub struct AdminCompositeRepository {
 
 impl AdminCompositeRepository {
     pub fn new(pool: DbPool) -> Self {
+        Self::with_accounting_config(pool, &config::CreditAllocationConfig::default())
+    }
+
+    pub fn with_accounting_config(pool: DbPool, config: &config::CreditAllocationConfig) -> Self {
         Self {
             pool: pool.clone(),
             model_repo: Arc::new(ModelRepository::new(pool.clone())),
             alias_repo: Arc::new(ModelAliasRepository::new(pool.clone())),
-            limits_repo: Arc::new(OrganizationLimitsRepository::new(pool.clone())),
+            limits_repo: Arc::new(OrganizationLimitsRepository::with_accounting_config(
+                pool.clone(),
+                config,
+            )),
             user_repo: Arc::new(UserRepository::new(pool.clone())),
             service_repo: Arc::new(ServiceRepository::new(pool)),
         }

@@ -18,6 +18,7 @@ pub struct InferenceUsageReportQuery {
     pub api_key_id: Option<Uuid>,
     pub model: Option<String>,
     pub inference_type: Option<String>,
+    pub credit_type: Option<String>,
     pub limit: u16,
     pub cursor: Option<InferenceUsageReportCursor>,
     pub deadline: Option<Instant>,
@@ -30,6 +31,7 @@ pub struct InferenceUsageHistoryQuery {
     pub end_time: Option<DateTime<Utc>>,
     pub workspace_id: Option<Uuid>,
     pub api_key_id: Option<Uuid>,
+    pub credit_type: Option<String>,
     pub limit: i64,
     pub offset: i64,
 }
@@ -44,6 +46,7 @@ impl InferenceUsageReportQuery {
             api_key_id: None,
             model: None,
             inference_type: None,
+            credit_type: None,
             limit: 100,
             cursor: None,
             deadline: None,
@@ -78,4 +81,8 @@ pub struct InferenceUsageReportRow {
     pub inference_id: Option<Uuid>,
     pub stop_reason: Option<String>,
     pub image_count: Option<i32>,
+    pub credit_allocations: Option<Vec<super::CreditAllocation>>,
+    pub funded_amount: Option<i64>,
+    pub unfunded_amount: Option<i64>,
+    pub allocation_policy_version: Option<String>,
 }

@@ -23,15 +23,25 @@ where
                 SELECT usage_log.workspace_id, usage_log.api_key_id,
                        services.service_name,
                        DATE_TRUNC('day', usage_log.created_at) AS day,
-                       usage_log.quantity, usage_log.total_cost
+                       usage_log.quantity,
+                       CASE WHEN $7::TEXT IS NULL THEN
+                           usage_log.total_cost
+                       ELSE allocation.amount END AS total_cost
                 FROM organization_service_usage_log AS usage_log
                 INNER JOIN services ON services.id = usage_log.service_id
+                LEFT JOIN LATERAL (
+                    SELECT COALESCE(SUM(original.amount), 0)::BIGINT AS amount
+                    FROM usage_credit_allocations original
+                    WHERE original.service_usage_id = usage_log.id
+                      AND original.credit_type = $7
+                ) allocation ON true
                 WHERE usage_log.organization_id = $1
                   AND ($2::TIMESTAMPTZ IS NULL OR usage_log.created_at >= $2)
                   AND ($3::TIMESTAMPTZ IS NULL OR usage_log.created_at <= $3)
                   AND ($4::UUID IS NULL OR usage_log.workspace_id = $4)
                   AND ($5::UUID IS NULL OR usage_log.api_key_id = $5)
                   AND ($6::TEXT IS NULL OR services.service_name = $6)
+                  AND ($7::TEXT IS NULL OR allocation.amount > 0)
             )
             SELECT
                 CASE
@@ -60,6 +70,7 @@ where
                 &filters.workspace_id,
                 &filters.api_key_id,
                 &filters.service_name,
+                &filters.credit_type,
             ],
         )
         .await

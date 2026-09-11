@@ -1,4 +1,5 @@
 use super::cursor::{ReportingUsageCursor, ReportingUsageCursorFilters};
+use crate::models::CreditType;
 use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
 use services::usage::InferenceType;
@@ -86,6 +87,7 @@ pub struct ReportingUsageQuery {
     pub model: Option<String>,
     pub inference_type: Option<InferenceType>,
     pub service_name: Option<String>,
+    pub credit_type: Option<String>,
     pub limit: ReportingUsageLimit,
     pub cursor: Option<ReportingUsageCursor>,
 }
@@ -100,6 +102,7 @@ pub struct ReportingUsageQueryParams {
     pub model: Option<String>,
     pub inference_type: Option<String>,
     pub service_name: Option<String>,
+    pub credit_type: Option<String>,
     pub limit: Option<u16>,
     pub cursor: Option<String>,
 }
@@ -116,6 +119,8 @@ pub enum ReportingUsageQueryError {
     InvalidSource(String),
     #[error("invalid inference_type: {0}")]
     InvalidInferenceType(String),
+    #[error("invalid credit_type: {0}")]
+    InvalidCreditType(String),
     #[error("limit must be positive")]
     LimitNotPositive,
     #[error("limit must not exceed {max}")]
@@ -141,6 +146,11 @@ impl TryFrom<ReportingUsageQueryParams> for ReportingUsageQuery {
             .map(InferenceType::from_str)
             .transpose()
             .map_err(ReportingUsageQueryError::InvalidInferenceType)?;
+        let requested_credit_type = params
+            .credit_type
+            .as_deref()
+            .map(parse_credit_type)
+            .transpose()?;
         let cursor = params
             .cursor
             .as_deref()
@@ -153,6 +163,7 @@ impl TryFrom<ReportingUsageQueryParams> for ReportingUsageQuery {
                 requested_end_time,
                 requested_source,
                 requested_inference_type,
+                requested_credit_type.as_deref(),
             )?,
             None => {
                 let (start_time, end_time) =
@@ -166,6 +177,7 @@ impl TryFrom<ReportingUsageQueryParams> for ReportingUsageQuery {
                     model: params.model,
                     inference_type: requested_inference_type,
                     service_name: params.service_name,
+                    credit_type: requested_credit_type,
                 }
             }
         };
@@ -179,6 +191,7 @@ impl TryFrom<ReportingUsageQueryParams> for ReportingUsageQuery {
             model: context.model,
             inference_type: context.inference_type,
             service_name: context.service_name,
+            credit_type: context.credit_type,
             limit: params
                 .limit
                 .map(ReportingUsageLimit::new)
@@ -187,6 +200,12 @@ impl TryFrom<ReportingUsageQueryParams> for ReportingUsageQuery {
             cursor,
         })
     }
+}
+
+fn parse_credit_type(value: &str) -> Result<String, ReportingUsageQueryError> {
+    CreditType::from_str(value)
+        .map(|credit_type| credit_type.as_str().to_string())
+        .map_err(|_| ReportingUsageQueryError::InvalidCreditType(value.to_string()))
 }
 
 fn parse_optional_time(

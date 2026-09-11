@@ -412,13 +412,17 @@ pub async fn init_domain_services_with_pool(
 
     // Prepare repositories for usage service (will be created after workspace service)
     let usage_repository = Arc::new(
-        database::repositories::OrganizationUsageRepository::with_reporting_statement_timeout(
+        database::repositories::OrganizationUsageRepository::with_accounting_config(
             database.pool().clone(),
             reporting_statement_timeout,
+            &config.credit_allocation,
         ),
     );
     let limits_repository_for_usage = Arc::new(
-        database::repositories::OrganizationLimitsRepository::new(database.pool().clone()),
+        database::repositories::OrganizationLimitsRepository::with_accounting_config(
+            database.pool().clone(),
+            &config.credit_allocation,
+        ),
     );
 
     // Create MCP client manager
@@ -525,9 +529,10 @@ pub async fn init_domain_services_with_pool(
         database.pool().clone(),
     ));
     let org_service_usage_repo = Arc::new(
-        database::repositories::OrganizationServiceUsageRepository::with_reporting_statement_timeout(
+        database::repositories::OrganizationServiceUsageRepository::with_accounting_config(
             database.pool().clone(),
             reporting_statement_timeout,
+            &config.credit_allocation,
         ),
     );
     let service_usage_repo = Arc::new(database::repositories::ServiceUsageRepositoryImpl::new(
@@ -552,8 +557,9 @@ pub async fn init_domain_services_with_pool(
         config.aml.clone(),
     ));
     let staking_farm_repository = Arc::new(
-        database::repositories::OrganizationStakingFarmSourcesRepository::new(
+        database::repositories::OrganizationStakingFarmSourcesRepository::with_accounting_config(
             database.pool().clone(),
+            &config.credit_allocation,
         ),
     ) as Arc<dyn services::staking_farm::StakingFarmRepository>;
     let staking_farm_contract_client = Arc::new(
@@ -2251,12 +2257,14 @@ fn build_admin_routes_with_options(
     use services::admin::AdminServiceImpl;
 
     // Create composite admin repository (handles models, organization limits, and users)
-    let admin_repository = Arc::new(AdminCompositeRepository::new(database.pool().clone()));
+    let admin_repository = Arc::new(AdminCompositeRepository::with_accounting_config(
+        database.pool().clone(),
+        &config.credit_allocation,
+    ));
 
     // Create admin access token repository
     let admin_access_token_repository =
         Arc::new(AdminAccessTokenRepository::new(database.pool().clone()));
-
     // Create admin service with composite repository.
     //
     // The admin service holds a reference to the `models_service` so it can
@@ -2923,6 +2931,7 @@ mod tests {
             staking_farm: config::StakingFarmConfig::default(),
             aml: config::AmlConfig::default(),
             usage_reporting: config::UsageReportingConfig::default(),
+            credit_allocation: config::CreditAllocationConfig::default(),
             ita: config::ItaAttestationConfig::default(),
         };
 
@@ -3039,6 +3048,7 @@ mod tests {
             staking_farm: config::StakingFarmConfig::default(),
             aml: config::AmlConfig::default(),
             usage_reporting: config::UsageReportingConfig::default(),
+            credit_allocation: config::CreditAllocationConfig::default(),
             ita: config::ItaAttestationConfig::default(),
         };
 

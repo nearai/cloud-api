@@ -116,6 +116,9 @@ pub fn validate_external_provider_config(config: &serde_json::Value) -> Result<(
         }
         return Ok(());
     };
+    if backend != "openai_compatible" && config.contains_key("enforced_request_body") {
+        return Err("enforced_request_body requires an openai_compatible backend");
+    }
     let allowed_fields: &[&str] = match backend {
         "openai_compatible" => &[
             "backend",
@@ -140,9 +143,6 @@ pub fn validate_external_provider_config(config: &serde_json::Value) -> Result<(
     let Some(enforced) = config.get("enforced_request_body").filter(|v| !v.is_null()) else {
         return Ok(());
     };
-    if backend != "openai_compatible" {
-        return Err("enforced_request_body requires an openai_compatible backend");
-    }
     let fields = enforced
         .as_object()
         .ok_or("enforced_request_body must be an object")?;

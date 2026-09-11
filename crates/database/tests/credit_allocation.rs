@@ -617,6 +617,59 @@ async fn single_credit_type_breakdown_includes_legacy_spend() -> anyhow::Result<
 }
 
 #[tokio::test]
+async fn multi_type_breakdown_exposes_legacy_spend_without_assigning_it() -> anyhow::Result<()> {
+    let pool = test_pool().await?;
+    let limits = OrganizationLimitsRepository::new(pool.clone());
+    let repository = OrganizationUsageRepository::new(pool.clone());
+    let org = insert_org_fixture(&pool).await?;
+    set_limit(&limits, org.org_id, "grant", 100).await?;
+    set_limit(&limits, org.org_id, "payment", 100).await?;
+
+    let client = pool.get().await?;
+    client
+        .execute(
+            r#"UPDATE organization_balance
+               SET total_spent = 90, legacy_unattributed_amount = 90,
+                   total_requests = 1, total_tokens = 1, updated_at = NOW()
+               WHERE organization_id = $1"#,
+            &[&org.org_id],
+        )
+        .await?;
+    drop(client);
+
+    let breakdown =
+        services::usage::ports::OrganizationLimitsRepository::get_current_limit_breakdown(
+            &limits, org.org_id,
+        )
+        .await?;
+    assert_eq!(breakdown.len(), 2);
+    assert!(breakdown
+        .iter()
+        .all(|credit| credit.consumed == 0 && credit.available == 100));
+
+    let aggregate = services::usage::ports::OrganizationLimitsRepository::get_current_limits(
+        &limits, org.org_id,
+    )
+    .await?
+    .expect("organization has active credit limits");
+    assert_eq!(aggregate.available, 110);
+
+    let balance = repository
+        .get_balance(org.org_id)
+        .await?
+        .expect("organization has a balance row");
+    assert_eq!(balance.legacy_unattributed_amount, 90);
+    assert_eq!(
+        breakdown.iter().map(|credit| credit.available).sum::<i64>()
+            - balance.legacy_unattributed_amount,
+        aggregate.available
+    );
+
+    cleanup_usage_fixtures(&pool, &[org.org_id], &[]).await?;
+    Ok(())
+}
+
+#[tokio::test]
 async fn limit_replacement_preserves_consumption_and_custom_order_is_honored() -> anyhow::Result<()>
 {
     let pool = test_pool().await?;

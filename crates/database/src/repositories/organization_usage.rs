@@ -325,7 +325,7 @@ impl OrganizationUsageRepository {
             client
                 .query_opt(
                     r#"
-                    SELECT organization_id, total_spent, last_usage_at,
+                    SELECT organization_id, total_spent, legacy_unattributed_amount, last_usage_at,
                            total_requests, total_tokens, updated_at
                     FROM organization_balance
                     WHERE organization_id = $1
@@ -678,6 +678,7 @@ impl OrganizationUsageRepository {
         OrganizationBalance {
             organization_id: row.get("organization_id"),
             total_spent: row.get("total_spent"),
+            legacy_unattributed_amount: row.get("legacy_unattributed_amount"),
             last_usage_at: row.get("last_usage_at"),
             total_requests: row.get("total_requests"),
             total_tokens: row.get("total_tokens"),

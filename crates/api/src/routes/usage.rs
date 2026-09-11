@@ -97,6 +97,10 @@ pub struct OrganizationBalanceResponse {
     pub total_tokens: i64,
     pub updated_at: String,
     pub credit_limits: Vec<CreditLimitBreakdownResponse>,
+    /// Spend recorded before per-type allocation was available. For multiple
+    /// active types, subtract this from their summed available amounts to
+    /// reconcile with the top-level remaining balance.
+    pub legacy_unattributed_amount: i64,
     /// Unresolved cost from completed requests that exceeded all capacity.
     pub unfunded_amount: i64,
 }
@@ -176,6 +180,7 @@ pub async fn compute_organization_balance_response(
                 total_tokens: balance.total_tokens,
                 updated_at: balance.updated_at.to_rfc3339(),
                 credit_limits,
+                legacy_unattributed_amount: balance.legacy_unattributed_amount,
                 unfunded_amount: limit.as_ref().map_or(0, |value| value.unfunded),
             })
         }
@@ -194,6 +199,7 @@ pub async fn compute_organization_balance_response(
                     total_tokens: 0,
                     updated_at: Utc::now().to_rfc3339(),
                     credit_limits,
+                    legacy_unattributed_amount: 0,
                     unfunded_amount: limit_info.unfunded,
                 })
             } else {

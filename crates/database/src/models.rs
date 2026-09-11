@@ -739,6 +739,7 @@ pub struct OrganizationUsageLog {
 pub struct OrganizationBalance {
     pub organization_id: Uuid,
     pub total_spent: i64,
+    pub legacy_unattributed_amount: i64,
     pub last_usage_at: Option<DateTime<Utc>>,
     pub total_requests: i64,
     pub total_tokens: i64,

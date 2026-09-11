@@ -812,6 +812,7 @@ impl UsageServiceTrait for UsageServiceImpl {
         Ok(balance.map(|b| OrganizationBalanceInfo {
             organization_id: b.organization_id,
             total_spent: b.total_spent,
+            legacy_unattributed_amount: b.legacy_unattributed_amount,
             last_usage_at: b.last_usage_at,
             total_requests: b.total_requests,
             total_tokens: b.total_tokens,

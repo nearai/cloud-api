@@ -65,18 +65,21 @@ async fn cached_statements_recover_from_a_column_added_under_them() {
         .map(|response| (response.status_code(), response.text()))
         .collect();
 
-    let client = database
-        .pool()
-        .get()
-        .await
-        .expect("failed to get database connection");
-    client
-        .execute(
-            &format!("ALTER TABLE workspaces DROP COLUMN IF EXISTS {column}"),
-            &[],
-        )
-        .await
-        .expect("failed to drop column");
+    // Best-effort cleanup that never panics: a leftover column breaks the
+    // database-encryption classification scans that share this database, so
+    // the drop must run even when the pool or the statement misbehaves, and
+    // the assertions below must still report the real outcome.
+    let cleanup = async {
+        let client = database.pool().get().await?;
+        client
+            .execute(
+                &format!("ALTER TABLE workspaces DROP COLUMN IF EXISTS {column}"),
+                &[],
+            )
+            .await?;
+        Ok::<(), Box<dyn std::error::Error>>(())
+    };
+    let cleanup = cleanup.await;
 
     for (status, body) in outcomes {
         assert_eq!(
@@ -84,4 +87,6 @@ async fn cached_statements_recover_from_a_column_added_under_them() {
             "request after a schema change must recover, got: {body}"
         );
     }
+
+    cleanup.expect("failed to drop the temporary column");
 }

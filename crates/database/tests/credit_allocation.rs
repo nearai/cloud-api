@@ -432,6 +432,30 @@ async fn service_retry_preserves_allocation_and_rejects_conflicts() -> anyhow::R
     assert_eq!(retried.id, original.id);
     assert_eq!(retried.credit_allocations, original.credit_allocations);
 
+    let client = pool.get().await?;
+    client
+        .execute(
+            "DELETE FROM usage_credit_allocations WHERE service_usage_id = $1",
+            &[&original.id],
+        )
+        .await?;
+    client
+        .execute(
+            r#"UPDATE organization_service_usage_log
+               SET funded_amount = NULL, unfunded_amount = NULL,
+                   allocation_policy_version = NULL
+               WHERE id = $1"#,
+            &[&original.id],
+        )
+        .await?;
+    drop(client);
+
+    let legacy_retry = repository.record_usage(&request).await?;
+    assert_eq!(legacy_retry.id, original.id);
+    assert_eq!(legacy_retry.credit_allocations, None);
+    assert_eq!(legacy_retry.funded_amount, None);
+    assert_eq!(legacy_retry.unfunded_amount, None);
+
     let mut conflicts = Vec::new();
     let mut changed = request.clone();
     changed.workspace_id = org.workspace_b_id;

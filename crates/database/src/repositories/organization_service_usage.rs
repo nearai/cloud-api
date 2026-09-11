@@ -394,7 +394,7 @@ impl OrganizationServiceUsageRepository {
                     let existing = client
                         .query_one(
                             r#"
-                            SELECT usage_log.*
+                            SELECT usage_log.*, NULL::JSONB AS credit_allocations
                             FROM organization_service_usage_log usage_log
                             WHERE usage_log.organization_id = $1
                               AND usage_log.inference_id = $2

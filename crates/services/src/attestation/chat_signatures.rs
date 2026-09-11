@@ -75,8 +75,8 @@ impl AttestationService {
 
         let environment = get_environment();
         let env_tag = format!("{TAG_ENVIRONMENT}:{environment}");
-        let result: Result<(), AttestationError> = async {
-            let mut signatures = Vec::with_capacity(2);
+        let mut signatures = Vec::with_capacity(2);
+        let fetched: Result<(), AttestationError> = async {
             for algo in ["ecdsa", "ed25519"] {
                 let provider_signature = provider
                     .get_signature(chat_id, Some(algo.to_string()))
@@ -113,8 +113,19 @@ impl AttestationService {
                 });
             }
 
-            // Both algorithms land in one statement: this runs before the
-            // client sees `[DONE]`, so every saved round trip is user-visible.
+            Ok(())
+        }
+        .await;
+
+        // Store whatever was fetched even if a later algorithm failed: the
+        // one-at-a-time implementation persisted each signature as it came,
+        // so a backend that serves ecdsa but fails ed25519 still leaves the
+        // chat verifiable by ecdsa. Both algorithms land in one statement:
+        // this runs before the client sees `[DONE]`, so every saved round
+        // trip is user-visible.
+        let stored: Result<(), AttestationError> = if signatures.is_empty() {
+            Ok(())
+        } else {
             self.repository
                 .add_chat_signatures(chat_id, signatures)
                 .await
@@ -136,10 +147,9 @@ impl AttestationService {
                         &[&env_tag],
                     );
                     AttestationError::RepositoryError(e.to_string())
-                })?;
-            Ok(())
-        }
-        .await;
+                })
+        };
+        let result = fetched.and(stored);
 
         provider.unpin_chat_connection(chat_id);
         result?;

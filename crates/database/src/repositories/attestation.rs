@@ -48,6 +48,27 @@ impl PgAttestationRepository {
     }
 }
 
+/// Collapse signatures that share a `signing_algo`, keeping the last one.
+///
+/// A multi-row `INSERT ... ON CONFLICT DO UPDATE` raises SQLSTATE 21000
+/// ("cannot affect row a second time") when two rows of the same statement
+/// hit the same arbiter key, whereas writing them one at a time simply let
+/// the later row overwrite the earlier. `signing_algo` is supplied by the
+/// inference backend, so the batch must tolerate duplicates the same way.
+fn last_signature_per_algo(signatures: Vec<ChatSignature>) -> Vec<ChatSignature> {
+    let mut deduped: Vec<ChatSignature> = Vec::with_capacity(signatures.len());
+    for signature in signatures {
+        match deduped
+            .iter_mut()
+            .find(|existing| existing.signing_algo == signature.signing_algo)
+        {
+            Some(existing) => *existing = signature,
+            None => deduped.push(signature),
+        }
+    }
+    deduped
+}
+
 #[async_trait]
 impl AttestationRepository for PgAttestationRepository {
     async fn add_chat_signature(
@@ -81,6 +102,7 @@ impl AttestationRepository for PgAttestationRepository {
         chat_id: &str,
         signatures: Vec<ChatSignature>,
     ) -> Result<(), AttestationError> {
+        let signatures = last_signature_per_algo(signatures);
         if signatures.is_empty() {
             return Ok(());
         }
@@ -162,5 +184,46 @@ impl AttestationRepository for PgAttestationRepository {
                 AttestationError::RepositoryError(e.to_string())
             })?;
         self.row_to_chat_signature(row)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn signature(algo: &str, text: &str) -> ChatSignature {
+        ChatSignature {
+            text: text.to_string(),
+            signature: format!("sig-{text}"),
+            signing_address: "addr".to_string(),
+            signing_algo: algo.to_string(),
+            signature_kind: None,
+        }
+    }
+
+    #[test]
+    fn distinct_algorithms_are_kept_in_order() {
+        let out = last_signature_per_algo(vec![signature("ecdsa", "a"), signature("ed25519", "b")]);
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0].signing_algo, "ecdsa");
+        assert_eq!(out[1].signing_algo, "ed25519");
+    }
+
+    #[test]
+    fn duplicate_algorithm_keeps_the_last_signature() {
+        let out = last_signature_per_algo(vec![
+            signature("ecdsa", "first"),
+            signature("ed25519", "b"),
+            signature("ecdsa", "second"),
+        ]);
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0].signing_algo, "ecdsa");
+        assert_eq!(out[0].text, "second");
+        assert_eq!(out[1].signing_algo, "ed25519");
+    }
+
+    #[test]
+    fn empty_input_stays_empty() {
+        assert!(last_signature_per_algo(Vec::new()).is_empty());
     }
 }

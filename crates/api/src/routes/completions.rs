@@ -3246,7 +3246,7 @@ fn nano_dollars_to_per_token_string(nano_dollars: i64) -> String {
     s
 }
 
-fn model_with_pricing_to_info(model: services::models::ModelWithPricing) -> ModelInfo {
+pub(crate) fn model_with_pricing_to_info(model: services::models::ModelWithPricing) -> ModelInfo {
     // Legacy HuggingFace-style fields: USD per million tokens.
     // nano_dollars_per_token * 0.001 = USD per million.
     let input_per_million = (model.input_cost_per_token as f64) * 0.001;

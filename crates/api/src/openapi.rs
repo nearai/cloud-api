@@ -58,6 +58,7 @@ use utoipa::{Modify, OpenApi};
         // Model endpoints (public model catalog)
         crate::routes::models::list_models,
         crate::routes::models::get_model_by_name,
+        crate::routes::openrouter::models,
         // Conversation endpoints
         crate::routes::conversations::create_conversation,
         crate::routes::conversations::get_conversation,

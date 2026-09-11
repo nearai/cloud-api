@@ -96,7 +96,7 @@ async fn cached_statements_recover_from_a_column_added_under_them() {
 
 enum UsageStatementInvalidation {
     AddedColumn,
-    Deallocated,
+    DeallocatedBalance,
 }
 
 async fn usage_fixture() -> (database::pool::DbPool, RecordUsageRequest) {
@@ -211,10 +211,24 @@ async fn assert_usage_recovers_without_double_charging(invalidation: UsageStatem
                 .await
                 .expect("invalidate the cached INSERT RETURNING result type");
         }
-        UsageStatementInvalidation::Deallocated => {
+        UsageStatementInvalidation::DeallocatedBalance => {
             for client in &connections {
-                // Invalidate server handles while retaining deadpool's cache.
-                client.batch_execute("DEALLOCATE ALL").await.unwrap();
+                // Leave the usage INSERT valid, so it succeeds before the
+                // balance UPSERT fails. Recovery must roll back that usage
+                // row and restart the entire transaction to charge once.
+                let balance_statement: String = client
+                    .query_one(
+                        "SELECT name FROM pg_prepared_statements WHERE statement LIKE $1",
+                        &[&"%INSERT INTO organization_balance%"],
+                    )
+                    .await
+                    .expect("every warmed session must have the balance UPSERT")
+                    .get(0);
+                let quoted_name = balance_statement.replace('"', "\"\"");
+                client
+                    .batch_execute(&format!("DEALLOCATE \"{quoted_name}\""))
+                    .await
+                    .expect("invalidate only the server's balance statement");
             }
         }
     }
@@ -238,8 +252,8 @@ async fn assert_usage_recovers_without_double_charging(invalidation: UsageStatem
         ensure!(duplicate.id == recovered.id && !duplicate.was_inserted);
         ensure!(duplicate.total_cost == request.total_cost);
 
-        // Only one connection is free: the new write must reuse the session
-        // (and cached INSERT) whose duplicate transaction just rolled back.
+        // Only one connection is free: a new write must succeed on the
+        // session whose duplicate transaction just rolled back.
         let mut after_rollback = request.clone();
         after_rollback.inference_id = Some(Uuid::new_v4());
         ensure!(repository.record_usage(after_rollback).await?.was_inserted);
@@ -307,6 +321,7 @@ async fn usage_transaction_recovers_from_changed_result_type_without_double_char
 }
 
 #[tokio::test]
-async fn usage_transaction_recovers_from_missing_statements_without_double_charging() {
-    assert_usage_recovers_without_double_charging(UsageStatementInvalidation::Deallocated).await;
+async fn usage_transaction_recovers_from_missing_balance_statement_without_double_charging() {
+    assert_usage_recovers_without_double_charging(UsageStatementInvalidation::DeallocatedBalance)
+        .await;
 }

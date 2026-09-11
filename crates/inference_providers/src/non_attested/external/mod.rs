@@ -29,6 +29,9 @@ pub mod content;
 pub mod gemini;
 pub mod openai_compatible;
 
+#[cfg(test)]
+mod routing_policy_tests;
+
 use crate::{
     AnthropicRawError, AnthropicRawRequest, AnthropicRawResponse, AttestationError,
     AudioTranscriptionError, AudioTranscriptionParams, AudioTranscriptionResponse,
@@ -81,6 +84,21 @@ fn merge_json_defaults(target: &mut serde_json::Value, defaults: &serde_json::Va
     }
 }
 
+/// Merge mandatory fields, replacing conflicting leaves (including nulls and arrays).
+fn merge_json_enforced(target: &mut serde_json::Value, enforced: &serde_json::Value) {
+    match (target, enforced) {
+        (serde_json::Value::Object(target), serde_json::Value::Object(enforced)) => {
+            for (key, value) in enforced {
+                merge_json_enforced(
+                    target.entry(key.clone()).or_insert(serde_json::Value::Null),
+                    value,
+                );
+            }
+        }
+        (target, enforced) => *target = enforced.clone(),
+    }
+}
+
 /// Provider configuration stored in database
 ///
 /// This enum represents the JSON configuration stored in the `provider_config`
@@ -103,6 +121,12 @@ pub enum ProviderConfig {
         /// Useful for provider-specific parameters like OpenRouter's `provider` preferences.
         #[serde(default)]
         extra_request_body: Option<std::collections::HashMap<String, serde_json::Value>>,
+        /// Mandatory extra fields applied after defaults and user parameters.
+        /// Objects merge recursively; configured leaves replace user values.
+        /// Use for routing/privacy restrictions that callers must not override.
+        /// Only extra body fields are supported, not typed fields such as `model`.
+        #[serde(default)]
+        enforced_request_body: Option<std::collections::HashMap<String, serde_json::Value>>,
     },
 
     /// Anthropic provider
@@ -165,6 +189,7 @@ pub struct ExternalProvider {
     backend: Arc<dyn ExternalBackend>,
     config: BackendConfig,
     model_name: String,
+    enforced_request_body: std::collections::HashMap<String, serde_json::Value>,
 }
 
 impl ExternalProvider {
@@ -177,6 +202,14 @@ impl ExternalProvider {
             timeout_seconds,
         } = external_config;
 
+        let enforced_request_body = match &provider_config {
+            ProviderConfig::OpenAiCompatible {
+                enforced_request_body,
+                ..
+            } => enforced_request_body.clone().unwrap_or_default(),
+            _ => std::collections::HashMap::new(),
+        };
+
         let (backend, config, remote_model_name): (
             Arc<dyn ExternalBackend>,
             BackendConfig,
@@ -187,6 +220,7 @@ impl ExternalProvider {
                 organization_id,
                 model_name: config_model_name,
                 extra_request_body,
+                ..
             } => {
                 let mut extra = std::collections::HashMap::new();
                 if let Some(org_id) = organization_id {
@@ -248,6 +282,7 @@ impl ExternalProvider {
             backend,
             config,
             model_name: effective_model_name,
+            enforced_request_body,
         }
     }
 
@@ -262,7 +297,8 @@ impl ExternalProvider {
     }
 
     /// Inject provider-level default fields into the request body.
-    /// Per-request fields from the user take precedence over provider defaults.
+    /// Per-request fields take precedence over defaults. Mandatory extra fields
+    /// are applied last so callers cannot override configured restrictions.
     fn inject_extra_request_body(
         &self,
         extra: &mut std::collections::HashMap<String, serde_json::Value>,
@@ -273,6 +309,12 @@ impl ExternalProvider {
             } else {
                 extra.insert(key.clone(), value.clone());
             }
+        }
+        for (key, value) in &self.enforced_request_body {
+            merge_json_enforced(
+                extra.entry(key.clone()).or_insert(serde_json::Value::Null),
+                value,
+            );
         }
     }
 }
@@ -661,6 +703,7 @@ mod tests {
             provider_config: ProviderConfig::OpenAiCompatible {
                 base_url: "https://api.openai.com/v1".to_string(),
                 organization_id: Some("org-123".to_string()),
+                enforced_request_body: None,
                 model_name: None,
                 extra_request_body: None,
             },
@@ -682,6 +725,7 @@ mod tests {
             provider_config: ProviderConfig::OpenAiCompatible {
                 base_url: "https://api.openai.com/v1".to_string(),
                 organization_id: None,
+                enforced_request_body: None,
                 model_name: Some("gpt-5.2".to_string()), // What OpenAI expects
                 extra_request_body: None,
             },
@@ -783,6 +827,7 @@ mod tests {
             provider_config: ProviderConfig::OpenAiCompatible {
                 base_url: "https://api.openai.com/v1".to_string(),
                 organization_id: None,
+                enforced_request_body: None,
                 model_name: None,
                 extra_request_body: None,
             },
@@ -806,6 +851,7 @@ mod tests {
             provider_config: ProviderConfig::OpenAiCompatible {
                 base_url: "https://api.openai.com/v1".to_string(),
                 organization_id: None,
+                enforced_request_body: None,
                 model_name: None,
                 extra_request_body: None,
             },
@@ -853,6 +899,7 @@ mod tests {
             provider_config: ProviderConfig::OpenAiCompatible {
                 base_url: "https://api.openai.com/v1".to_string(),
                 organization_id: None,
+                enforced_request_body: None,
                 model_name: None,
                 extra_request_body: None,
             },
@@ -880,6 +927,7 @@ mod tests {
             provider_config: ProviderConfig::OpenAiCompatible {
                 base_url: "https://api.openai.com/v1".to_string(),
                 organization_id: None,
+                enforced_request_body: None,
                 model_name: None,
                 extra_request_body: None,
             },
@@ -911,6 +959,7 @@ mod tests {
             provider_config: ProviderConfig::OpenAiCompatible {
                 base_url: "https://example.com".to_string(),
                 organization_id: None,
+                enforced_request_body: None,
                 model_name: None,
                 extra_request_body: None,
             },
@@ -1013,6 +1062,7 @@ mod tests {
             provider_config: ProviderConfig::OpenAiCompatible {
                 base_url: "https://openrouter.ai/api/v1".to_string(),
                 organization_id: None,
+                enforced_request_body: None,
                 model_name: None,
                 extra_request_body: Some(HashMap::from([(
                     "provider".to_string(),
@@ -1043,6 +1093,7 @@ mod tests {
             provider_config: ProviderConfig::OpenAiCompatible {
                 base_url: "https://openrouter.ai/api/v1".to_string(),
                 organization_id: None,
+                enforced_request_body: None,
                 model_name: None,
                 extra_request_body: Some(HashMap::from([(
                     "provider".to_string(),
@@ -1082,6 +1133,7 @@ mod tests {
             provider_config: ProviderConfig::OpenAiCompatible {
                 base_url: "https://openrouter.ai/api/v1".to_string(),
                 organization_id: None,
+                enforced_request_body: None,
                 model_name: None,
                 extra_request_body: Some(HashMap::from([(
                     "provider".to_string(),
@@ -1138,6 +1190,7 @@ mod tests {
             provider_config: ProviderConfig::OpenAiCompatible {
                 base_url: "https://api.openai.com/v1".to_string(),
                 organization_id: None,
+                enforced_request_body: None,
                 model_name: None,
                 extra_request_body: None,
             },

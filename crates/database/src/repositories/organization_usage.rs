@@ -3,6 +3,9 @@ use crate::models::{
     ServedProviderType, StopReason,
 };
 use crate::pool::DbPool;
+use crate::repositories::statement_cache::{
+    invalidate_pool_statement_caches, is_stale_statement, CachedStatements,
+};
 use crate::repositories::utils::map_db_error;
 use crate::retry_db;
 use anyhow::{Context, Result};
@@ -47,7 +50,7 @@ impl OrganizationUsageRepository {
                 .map_err(RepositoryError::PoolError)?;
 
             client
-                .query_one(
+                .cached_query_one(
                     r#"
                     SELECT COALESCE(SUM(total_cost), 0)::BIGINT as total_spend
                     FROM organization_usage_log
@@ -77,6 +80,16 @@ impl OrganizationUsageRepository {
                 .context("Failed to get database connection")
                 .map_err(RepositoryError::PoolError)?;
 
+            // A stale statement inside the transaction aborts it; evict the
+            // statement from every pooled connection so the retry does not
+            // trip over another stale copy, then let `retry_db!` restart.
+            let pool = deadpool_postgres::Client::pool(&client);
+            let map_tx_error = |err: tokio_postgres::Error| {
+                if is_stale_statement(&err) {
+                    invalidate_pool_statement_caches(pool.as_ref());
+                }
+                map_db_error(err)
+            };
             let transaction = client.transaction().await.map_err(map_db_error)?;
 
             let id = Uuid::new_v4();
@@ -93,7 +106,7 @@ impl OrganizationUsageRepository {
                 .served_provider_type
                 .map(|provider| provider.as_str());
             let maybe_row = transaction
-                .query_opt(
+                .cached_query_opt(
                     r#"
                     INSERT INTO organization_usage_log (
                         id, organization_id, workspace_id, api_key_id,
@@ -140,13 +153,13 @@ impl OrganizationUsageRepository {
                     ],
                 )
                 .await
-                .map_err(map_db_error)?;
+                .map_err(map_tx_error)?;
 
             let (row, was_inserted) = match maybe_row {
                 Some(row) => {
                     // New insert succeeded — update organization balance
                     transaction
-                        .execute(
+                        .cached_execute(
                             r#"
                             INSERT INTO organization_balance (
                                 organization_id,
@@ -172,7 +185,7 @@ impl OrganizationUsageRepository {
                             ],
                         )
                         .await
-                        .map_err(map_db_error)?;
+                        .map_err(map_tx_error)?;
 
                     transaction.commit().await.map_err(map_db_error)?;
                     (row, true)
@@ -188,7 +201,7 @@ impl OrganizationUsageRepository {
                     );
 
                     let existing = client
-                        .query_one(
+                        .cached_query_one(
                             r#"
                             SELECT *
                             FROM organization_usage_log
@@ -220,7 +233,7 @@ impl OrganizationUsageRepository {
                 .map_err(RepositoryError::PoolError)?;
 
             client
-                .query_opt(
+                .cached_query_opt(
                     r#"
                     SELECT organization_id, total_spent, last_usage_at,
                            total_requests, total_tokens, updated_at

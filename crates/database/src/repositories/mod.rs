@@ -33,6 +33,7 @@ pub mod retry;
 pub mod service;
 pub mod service_usage_repository_impl;
 pub mod session;
+pub mod statement_cache;
 pub mod usage_repository_impl;
 pub mod user;
 pub mod utils;

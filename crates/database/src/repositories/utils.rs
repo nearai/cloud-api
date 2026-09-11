@@ -41,6 +41,17 @@ pub fn map_db_error(err: tokio_postgres::Error) -> RepositoryError {
 
             &SqlState::QUERY_CANCELED => RepositoryError::QueryTimeout,
 
+            // A cached prepared statement outlived the server-side object it
+            // points at (schema change during a rolling deploy, or a reset
+            // connection). The caches have already been evicted (see
+            // `statement_cache`); classify as retryable so `retry_db!`
+            // re-prepares and re-runs it.
+            _ if super::statement_cache::is_stale_statement(&err) => {
+                RepositoryError::ConnectionFailed(
+                    "cached prepared statement is no longer valid".to_string(),
+                )
+            }
+
             // Default case - wrap in generic database error
             _ => RepositoryError::DatabaseError(anyhow::anyhow!(
                 "Database error ({}): {}",

@@ -1,4 +1,5 @@
 use crate::pool::DbPool;
+use crate::repositories::statement_cache::CachedStatements;
 use crate::repositories::utils::map_db_error;
 use crate::retry_db;
 use anyhow::{Context, Result};
@@ -165,7 +166,7 @@ impl StakingFarmRepository for OrganizationStakingFarmSourcesRepository {
                 .map_err(RepositoryError::PoolError)?;
 
             client
-                .query_opt(
+                .cached_query_opt(
                     r#"
                     SELECT id, organization_id, near_account_id, network_id, contract_id,
                            farm_product_id, farm_price_id, credit_nano_usd_per_reward_unit,

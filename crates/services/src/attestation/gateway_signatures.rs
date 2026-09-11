@@ -18,6 +18,7 @@ impl AttestationService {
         let env_tag = format!("{TAG_ENVIRONMENT}:{environment}");
         let signature_text = format!("{request_hash}:{response_hash}");
 
+        let mut signatures = Vec::with_capacity(2);
         for algo in ["ecdsa", "ed25519"] {
             let (signature_hex, signing_address) = match algo {
                 "ed25519" => self.sign_ed25519_gateway_signature(&signature_text),
@@ -26,34 +27,32 @@ impl AttestationService {
                     "Unknown signing algorithm: {algo}"
                 ))),
             }?;
-
-            self.repository
-                .add_chat_signature(
-                    signature_id,
-                    ChatSignature {
-                        text: signature_text.clone(),
-                        signature: signature_hex,
-                        signing_address,
-                        signing_algo: algo.to_string(),
-                        signature_kind: Some(SignatureKind::Gateway),
-                    },
-                )
-                .await
-                .map_err(|e| {
-                    tracing::error!(
-                        "Failed to store {} signature in repository for algorithm: {}",
-                        id_label,
-                        algo
-                    );
-                    AttestationError::RepositoryError(e.to_string())
-                })?;
-            tracing::info!(
-                signature_kind = id_label,
-                signature_id = signature_id,
-                signing_algo = algo,
-                "Stored gateway signature"
-            );
+            signatures.push(ChatSignature {
+                text: signature_text.clone(),
+                signature: signature_hex,
+                signing_address,
+                signing_algo: algo.to_string(),
+                signature_kind: Some(SignatureKind::Gateway),
+            });
         }
+
+        self.repository
+            .add_chat_signatures(signature_id, signatures)
+            .await
+            .map_err(|e| {
+                tracing::error!(
+                    signature_kind = id_label,
+                    signature_id = signature_id,
+                    error = %e,
+                    "Failed to store gateway signatures in repository"
+                );
+                AttestationError::RepositoryError(e.to_string())
+            })?;
+        tracing::info!(
+            signature_kind = id_label,
+            signature_id = signature_id,
+            "Stored gateway signatures"
+        );
 
         let duration = start_time.elapsed();
         self.metrics_service

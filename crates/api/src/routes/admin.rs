@@ -897,6 +897,20 @@ pub async fn batch_upsert_models(
             );
     }
 
+    if batch_request.values().any(|request| {
+        request.provider_type.is_some()
+            || request.provider_config.is_some()
+            || request.inference_url.is_some()
+            || request.is_active.is_some()
+    }) {
+        // The database write is complete. Prevent an older periodic snapshot
+        // from replacing or removing the provider state reconciled below.
+        app_state
+            .inference_provider_pool
+            .invalidate_periodic_provider_refreshes()
+            .await;
+    }
+
     // Update providers at runtime so changes take effect without server restart.
     // Unregister first, then re-register — this handles type transitions
     // (e.g., inference_url → external) and deactivations cleanly.

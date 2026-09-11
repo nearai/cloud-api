@@ -49,6 +49,39 @@ async fn admin_validates_mandatory_routing_before_persisting() {
             .iter()
             .any(|model| model["modelId"] == model_name));
     }
+
+    let missing_base_url_model = format!("invalid-schema-{}", uuid::Uuid::new_v4());
+    let response = server
+        .patch("/v1/admin/models")
+        .add_header("Authorization", format!("Bearer {}", get_session_id()))
+        .add_header("User-Agent", MOCK_USER_AGENT)
+        .json(&serde_json::json!({&missing_base_url_model: {
+            "isActive": false,
+            "modelDisplayName": "Synthetic schema validation test",
+            "modelDescription": "Synthetic schema validation test",
+            "contextLength": 4096,
+            "inputCostPerToken": {"amount": 220, "currency": "USD"},
+            "outputCostPerToken": {"amount": 660, "currency": "USD"},
+            "providerType": "external",
+            "providerConfig": {"backend": "openai_compatible",
+                "enforced_request_body": {"provider": {"zdr": true}}}
+        }}))
+        .await;
+    assert_eq!(response.status_code(), 400, "{}", response.text());
+    assert!(response.text().contains("backend schema"));
+    let models = server
+        .get("/v1/admin/models")
+        .add_header("Authorization", format!("Bearer {}", get_session_id()))
+        .add_header("User-Agent", MOCK_USER_AGENT)
+        .await;
+    models.assert_status_ok();
+    let body: serde_json::Value = models.json();
+    assert!(!body["models"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|model| model["modelId"] == missing_base_url_model));
+
     let model_name = format!("valid-policy-{}", uuid::Uuid::new_v4());
     let response = server
         .patch("/v1/admin/models")

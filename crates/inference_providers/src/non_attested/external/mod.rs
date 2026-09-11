@@ -134,23 +134,49 @@ pub fn validate_external_provider_config(config: &serde_json::Value) -> Result<(
     {
         return Err("external provider config contains an unsupported field");
     }
-
-    let Some(enforced) = config.get("enforced_request_body").filter(|v| !v.is_null()) else {
-        return Ok(());
-    };
-    let fields = enforced
-        .as_object()
-        .ok_or("enforced_request_body must be an object")?;
-    if fields.keys().any(|key| key != "provider") {
-        return Err("enforced_request_body currently supports only the provider field");
+    if config
+        .get("api_key")
+        .is_some_and(|value| !value.is_null() && !value.is_string())
+    {
+        return Err("external provider config api_key must be a string or null");
     }
-    if let Some(provider) = fields.get("provider") {
-        let provider = provider
+
+    if let Some(enforced) = config.get("enforced_request_body").filter(|v| !v.is_null()) {
+        let fields = enforced
             .as_object()
-            .ok_or("enforced_request_body.provider must be an object")?;
-        if provider.is_empty() {
-            return Err("enforced_request_body.provider must not be empty");
+            .ok_or("enforced_request_body must be an object")?;
+        if fields.keys().any(|key| key != "provider") {
+            return Err("enforced_request_body currently supports only the provider field");
         }
+        if let Some(provider) = fields.get("provider") {
+            let provider = provider
+                .as_object()
+                .ok_or("enforced_request_body.provider must be an object")?;
+            if provider.is_empty() {
+                return Err("enforced_request_body.provider must not be empty");
+            }
+        }
+    }
+
+    // Validate the complete backend schema before an admin write can succeed.
+    // `api_key` is pool-level metadata rather than part of `ProviderConfig`, so
+    // remove it exactly as the runtime loader does before deserializing.
+    let mut backend_config = serde_json::Value::Object(config.clone());
+    backend_config
+        .as_object_mut()
+        .expect("backend config was constructed from an object")
+        .remove("api_key");
+    serde_json::from_value::<ProviderConfig>(backend_config)
+        .map_err(|_| "external provider config does not match the backend schema")?;
+
+    let base_url = config
+        .get("base_url")
+        .and_then(serde_json::Value::as_str)
+        .ok_or("external provider config requires a string base_url")?;
+    let parsed_url = url::Url::parse(base_url)
+        .map_err(|_| "external provider config requires a valid base_url")?;
+    if !matches!(parsed_url.scheme(), "http" | "https") || parsed_url.host_str().is_none() {
+        return Err("external provider config base_url must be an HTTP(S) URL");
     }
     Ok(())
 }

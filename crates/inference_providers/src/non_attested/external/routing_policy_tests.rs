@@ -123,7 +123,8 @@ fn unsupported_or_ambiguous_policy_configurations_are_rejected() {
         json!({"provider": {}}),
     ] {
         assert!(validate_external_provider_config(&json!({
-            "backend": "openai_compatible", "enforced_request_body": enforced
+            "backend": "openai_compatible", "base_url": "https://example.com",
+            "enforced_request_body": enforced
         }))
         .is_err());
     }
@@ -140,6 +141,7 @@ fn unsupported_or_ambiguous_policy_configurations_are_rejected() {
     ] {
         assert!(validate_external_provider_config(&json!({
             "backend": "openai_compatible",
+            "base_url": "https://example.com",
             "enforced_request_body": {key: true}
         }))
         .is_err());
@@ -157,14 +159,25 @@ fn unsupported_or_ambiguous_policy_configurations_are_rejected() {
         json!({"base_url": "https://example.com"}),
         json!({"backend": null, "base_url": "https://example.com"}),
         json!({"backend": 7, "base_url": "https://example.com"}),
+        json!({"backend": "openai_compatible"}),
+        json!({"backend": "openai_compatible", "base_url": null}),
+        json!({"backend": "openai_compatible", "base_url": 7}),
+        json!({"backend": "openai_compatible", "base_url": "not-a-url"}),
+        json!({"backend": "openai_compatible", "base_url": "ftp://example.com"}),
+        json!({"backend": "openai_compatible", "base_url": "https://example.com", "api_key": 7}),
+        json!({"backend": "openai_compatible", "base_url": "https://example.com", "organization_id": 7}),
+        json!({"backend": "openai_compatible", "base_url": "https://example.com", "extra_request_body": []}),
+        json!({"backend": "anthropic"}),
+        json!({"backend": "gemini"}),
     ] {
         assert!(validate_external_provider_config(&config).is_err());
     }
     for config in [
-        json!({"backend": "anthropic"}),
-        json!({"backend": "openai_compatible", "enforced_request_body": null}),
-        json!({"backend": "openai_compatible", "enforced_request_body": {}}),
-        json!({"backend": "openai_compatible", "enforced_request_body": {"provider": policy()}}),
+        json!({"backend": "anthropic", "base_url": "https://example.com"}),
+        json!({"backend": "gemini", "base_url": "https://example.com"}),
+        json!({"backend": "openai_compatible", "base_url": "https://example.com", "enforced_request_body": null}),
+        json!({"backend": "openai_compatible", "base_url": "https://example.com", "enforced_request_body": {}}),
+        json!({"backend": "openai_compatible", "base_url": "https://example.com", "enforced_request_body": {"provider": policy()}}),
     ] {
         assert!(validate_external_provider_config(&config).is_ok());
     }

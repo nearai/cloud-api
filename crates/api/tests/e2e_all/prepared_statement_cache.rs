@@ -325,3 +325,73 @@ async fn usage_transaction_recovers_from_missing_balance_statement_without_doubl
     assert_usage_recovers_without_double_charging(UsageStatementInvalidation::DeallocatedBalance)
         .await;
 }
+
+#[tokio::test]
+async fn batched_signatures_reuse_a_prepared_statement() {
+    use services::attestation::{ports::AttestationRepository, ChatSignature, SignatureKind};
+
+    let (_server, database) = setup_test_server_with_database().await;
+    let pool = database.pool();
+    // Keep one connection available so both repository calls and the session
+    // inspection below use the same PostgreSQL prepared-statement cache.
+    let mut held_connections = Vec::new();
+    for _ in 1..pool.status().expect("database pool").max_size {
+        held_connections.push(pool.get().await.expect("hold another connection"));
+    }
+
+    let chat_id = format!("batch-cache-{}", uuid::Uuid::new_v4());
+    let signatures = |text: &str| {
+        ["ecdsa", "ed25519"]
+            .into_iter()
+            .map(|algo| ChatSignature {
+                text: text.to_string(),
+                signature: format!("synthetic-{algo}"),
+                signing_address: "synthetic-address".to_string(),
+                signing_algo: algo.to_string(),
+                signature_kind: Some(SignatureKind::ProviderTee),
+            })
+            .collect()
+    };
+    let cached_names = || async {
+        pool.get()
+            .await
+            .expect("inspect the warmed connection")
+            .query(
+                "SELECT name FROM pg_prepared_statements WHERE statement LIKE $1 ORDER BY name",
+                &[&"INSERT INTO chat_signatures%"],
+            )
+            .await
+            .expect("inspect prepared statements")
+            .into_iter()
+            .map(|row| row.get::<_, String>("name"))
+            .collect::<Vec<_>>()
+    };
+
+    database
+        .attestation
+        .add_chat_signatures(&chat_id, signatures("first"))
+        .await
+        .expect("store both signatures");
+    let first_names = cached_names().await;
+    assert_eq!(first_names.len(), 1, "the batch must be cached");
+
+    database
+        .attestation
+        .add_chat_signatures(&chat_id, signatures("updated"))
+        .await
+        .expect("update both signatures");
+    assert_eq!(
+        cached_names().await,
+        first_names,
+        "reuse the same statement"
+    );
+    for algo in ["ecdsa", "ed25519"] {
+        let stored = database
+            .attestation
+            .get_chat_signature(&chat_id, algo)
+            .await
+            .expect("read the updated signature");
+        assert_eq!(stored.text, "updated");
+        assert_eq!(stored.signature_kind, Some(SignatureKind::ProviderTee));
+    }
+}

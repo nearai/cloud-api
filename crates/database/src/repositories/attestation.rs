@@ -149,7 +149,7 @@ impl AttestationRepository for PgAttestationRepository {
         );
 
         client
-            .execute(sql.as_str(), &params)
+            .cached_execute(sql.as_str(), &params)
             .await
             .map_err(|e| AttestationError::RepositoryError(e.to_string()))?;
 

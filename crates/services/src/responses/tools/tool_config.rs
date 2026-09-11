@@ -546,7 +546,6 @@ pub fn convert_tool_calls(
                     tracing::info!(
                         model = model,
                         index = idx,
-                        inferred_tool = %inferred_name,
                         "Tool call missing name, inferring from single available tool"
                     );
                     inferred_name
@@ -554,7 +553,6 @@ pub fn convert_tool_calls(
                     tracing::warn!(
                         model = model,
                         index = idx,
-                        available_tools = ?available_tool_names,
                         "Tool call has no name and multiple tools available, cannot infer"
                     );
                     tracing::debug!(
@@ -590,7 +588,6 @@ pub fn convert_tool_calls(
             ParseArgsResult::Repaired(args) => {
                 tracing::info!(
                     model = model,
-                    tool_name = name,
                     index = idx,
                     "Repaired malformed web_search tool call JSON"
                 );
@@ -599,13 +596,11 @@ pub fn convert_tool_calls(
             ParseArgsResult::Failed => {
                 tracing::warn!(
                     model = model,
-                    tool_name = name,
                     index = idx,
                     "Failed to parse tool call arguments"
                 );
                 tracing::debug!(
                     model = model,
-                    tool_name = name,
                     index = idx,
                     arguments_len = args_str.len(),
                     "Failed to parse tool call"
@@ -631,7 +626,11 @@ pub fn convert_tool_calls(
             || name == COMPUTER_TOOL_NAME
             || is_function_tool
         {
-            tracing::debug!("Tool call detected (no query required): {}", name);
+            tracing::debug!(
+                model = model,
+                index = idx,
+                "Tool call detected without a query"
+            );
             let id = resolve_tool_call_id(id_opt, &name);
             tool_calls_detected.push(ToolCallInfo {
                 id: Some(id),
@@ -641,7 +640,7 @@ pub fn convert_tool_calls(
                 thought_signature,
             });
         } else if let Some(query) = args.get("query").and_then(|v| v.as_str()) {
-            tracing::debug!("Tool call detected: {}", name);
+            tracing::debug!(model = model, index = idx, "Tool call detected");
             let id = resolve_tool_call_id(id_opt, &name);
             tool_calls_detected.push(ToolCallInfo {
                 id: Some(id),
@@ -653,7 +652,6 @@ pub fn convert_tool_calls(
         } else {
             tracing::warn!(
                 model = model,
-                tool_name = name,
                 index = idx,
                 "Tool call has no 'query' field in arguments"
             );

@@ -240,6 +240,7 @@ impl ports::ResponseServiceTrait for ResponseServiceImpl {
                 Self::process_response_stream(tx.clone(), context, usage_tracker.clone()).await
             {
                 let status_code = e.http_status_code();
+                let error_category = e.log_category();
                 if e.is_client_caused() {
                     // Client-caused (invalid params, model chat-template rejection,
                     // bad tool call, ...). The client gets a structured 4xx /
@@ -247,11 +248,15 @@ impl ports::ResponseServiceTrait for ResponseServiceImpl {
                     // ERROR stream clean for real incidents.
                     tracing::warn!(
                         status_code,
-                        "Client error processing response stream: {:?}",
-                        e
+                        error_category,
+                        "Client error processing response stream"
                     );
                 } else {
-                    tracing::error!(status_code, "Error processing response stream: {:?}", e);
+                    tracing::error!(
+                        status_code,
+                        error_category,
+                        "Response stream processing failed"
+                    );
                 }
 
                 // Attach accumulated usage so downstream (e.g. non-streaming
@@ -283,9 +288,8 @@ impl ports::ResponseServiceTrait for ResponseServiceImpl {
                     conversation_title: None,
                     usage,
                 };
-                let result = tx.send(error_event).await;
-                if let Err(e) = result {
-                    tracing::error!("Error sending error event: {e:?}");
+                if tx.send(error_event).await.is_err() {
+                    tracing::error!("Failed to send response failure event");
                 }
             }
         });
@@ -295,6 +299,12 @@ impl ports::ResponseServiceTrait for ResponseServiceImpl {
 }
 
 impl ResponseServiceImpl {
+    const INPUT_FILE_FETCH_ERROR_MESSAGE: &str = "Failed to fetch input file content";
+
+    fn input_file_fetch_error() -> errors::ResponseError {
+        errors::ResponseError::InternalError(Self::INPUT_FILE_FETCH_ERROR_MESSAGE.to_string())
+    }
+
     /// Parse file ID from string (handles prefix)
     fn parse_file_id(file_id: &str) -> Result<Uuid, errors::ResponseError> {
         let id_str = file_id
@@ -325,8 +335,8 @@ impl ResponseServiceImpl {
                             file.filename, text_content
                         ))
                     }
-                    Err(e) => {
-                        tracing::warn!("Failed to convert file {} to UTF-8 text: {}", file_id, e);
+                    Err(_) => {
+                        tracing::warn!("Failed to convert file content to UTF-8 text");
                         Ok(format!(
                             "[File: {} - Content cannot be displayed as text]",
                             file.filename
@@ -334,11 +344,13 @@ impl ResponseServiceImpl {
                     }
                 }
             }
-            Err(e) => {
-                tracing::error!("Failed to fetch file content for {}: {}", file_id, e);
-                Err(errors::ResponseError::InternalError(format!(
-                    "Failed to fetch file content: {e}"
-                )))
+            Err(_) => {
+                tracing::error!(
+                    file_id = %file_uuid,
+                    error_category = "file_content_fetch_failed",
+                    "Failed to fetch input file content"
+                );
+                Err(Self::input_file_fetch_error())
             }
         }
     }
@@ -544,23 +556,34 @@ impl ResponseServiceImpl {
                         if let Some(reasoning) = delta_reasoning_opt {
                             if !reasoning.is_empty() {
                                 if !reasoning_item_emitted {
-                                    if let Err(e) = emitter
+                                    if emitter
                                         .emit_reasoning_started(ctx, &reasoning_item_id)
                                         .await
+                                        .is_err()
                                     {
-                                        tracing::debug!("emit_reasoning_started failed: {}", e);
+                                        tracing::debug!(
+                                            response_id = %ctx.response_id_str,
+                                            item_id = %reasoning_item_id,
+                                            "Failed to emit reasoning-start event"
+                                        );
                                     }
                                     reasoning_item_emitted = true;
                                 }
-                                if let Err(e) = emitter
+                                if emitter
                                     .emit_reasoning_delta(
                                         ctx,
                                         reasoning_item_id.clone(),
                                         reasoning.clone(),
                                     )
                                     .await
+                                    .is_err()
                                 {
-                                    tracing::debug!("emit_reasoning_delta failed: {}", e);
+                                    tracing::debug!(
+                                        response_id = %ctx.response_id_str,
+                                        item_id = %reasoning_item_id,
+                                        delta_len = reasoning.len(),
+                                        "Failed to emit reasoning delta"
+                                    );
                                 }
                                 reasoning_buffer.push_str(&reasoning);
                             }
@@ -581,7 +604,7 @@ impl ResponseServiceImpl {
                             && !inside_reasoning
                         {
                             // Close explicit reasoning item
-                            if let Err(e) = emitter
+                            if emitter
                                 .emit_reasoning_completed(
                                     ctx,
                                     &reasoning_item_id,
@@ -589,8 +612,13 @@ impl ResponseServiceImpl {
                                     response_items_repository,
                                 )
                                 .await
+                                .is_err()
                             {
-                                tracing::debug!("emit_reasoning_completed failed: {}", e);
+                                tracing::debug!(
+                                    response_id = %ctx.response_id_str,
+                                    item_id = %reasoning_item_id,
+                                    "Failed to emit completed reasoning"
+                                );
                             }
 
                             let reasoning_token_count =
@@ -613,11 +641,16 @@ impl ResponseServiceImpl {
                             TagTransition::OpeningTag(_) => {
                                 if !reasoning_item_emitted {
                                     // Emit reasoning item.added
-                                    if let Err(e) = emitter
+                                    if emitter
                                         .emit_reasoning_started(ctx, &reasoning_item_id)
                                         .await
+                                        .is_err()
                                     {
-                                        tracing::debug!("emit_reasoning_started failed: {}", e);
+                                        tracing::debug!(
+                                            response_id = %ctx.response_id_str,
+                                            item_id = %reasoning_item_id,
+                                            "Failed to emit reasoning-start event"
+                                        );
                                     }
                                     reasoning_item_emitted = true;
                                 }
@@ -625,7 +658,7 @@ impl ResponseServiceImpl {
                             TagTransition::ClosingTag(_) => {
                                 if reasoning_item_emitted {
                                     // Emit reasoning item.done and store
-                                    if let Err(e) = emitter
+                                    if emitter
                                         .emit_reasoning_completed(
                                             ctx,
                                             &reasoning_item_id,
@@ -633,8 +666,13 @@ impl ResponseServiceImpl {
                                             response_items_repository,
                                         )
                                         .await
+                                        .is_err()
                                     {
-                                        tracing::debug!("emit_reasoning_completed failed: {}", e);
+                                        tracing::debug!(
+                                            response_id = %ctx.response_id_str,
+                                            item_id = %reasoning_item_id,
+                                            "Failed to emit completed reasoning"
+                                        );
                                     }
 
                                     // Count reasoning tokens
@@ -655,17 +693,21 @@ impl ResponseServiceImpl {
 
                         // Emit reasoning deltas if inside reasoning block
                         if let Some(reasoning_content) = reasoning_delta {
-                            if reasoning_item_emitted {
-                                if let Err(e) = emitter
+                            if reasoning_item_emitted
+                                && emitter
                                     .emit_reasoning_delta(
                                         ctx,
                                         reasoning_item_id.clone(),
                                         reasoning_content,
                                     )
                                     .await
-                                {
-                                    tracing::debug!("emit_reasoning_delta failed: {}", e);
-                                }
+                                    .is_err()
+                            {
+                                tracing::debug!(
+                                    response_id = %ctx.response_id_str,
+                                    item_id = %reasoning_item_id,
+                                    "Failed to emit reasoning delta"
+                                );
                             }
                         }
 
@@ -673,10 +715,15 @@ impl ResponseServiceImpl {
                         if !clean_text.is_empty() {
                             // First time we receive message text, emit the item.added and content_part.added events
                             if !message_item_emitted && !stream_error {
-                                if let Err(e) =
-                                    Self::emit_message_started(emitter, ctx, &message_item_id).await
+                                if Self::emit_message_started(emitter, ctx, &message_item_id)
+                                    .await
+                                    .is_err()
                                 {
-                                    tracing::debug!("emit_message_started failed: {}", e);
+                                    tracing::debug!(
+                                        response_id = %ctx.response_id_str,
+                                        item_id = %message_item_id,
+                                        "Failed to emit message-start event"
+                                    );
                                     stream_error = true;
                                 } else {
                                     message_item_emitted = true;
@@ -686,19 +733,24 @@ impl ResponseServiceImpl {
                             current_text.push_str(&clean_text);
 
                             // Emit delta event for message content
-                            if !stream_error {
-                                if let Err(e) = emitter
+                            if !stream_error
+                                && emitter
                                     .emit_text_delta(
                                         ctx,
                                         message_item_id.clone(),
                                         clean_text.clone(),
                                     )
                                     .await
-                                {
-                                    tracing::debug!("emit_text_delta failed: {}", e);
-                                    // Client disconnected - save partial response and stop consuming stream
-                                    stream_error = true;
-                                }
+                                    .is_err()
+                            {
+                                tracing::debug!(
+                                    response_id = %ctx.response_id_str,
+                                    item_id = %message_item_id,
+                                    delta_len = clean_text.len(),
+                                    "Failed to emit response text delta"
+                                );
+                                // Client disconnected - save partial response and stop consuming stream
+                                stream_error = true;
                             }
                         }
 
@@ -719,15 +771,20 @@ impl ResponseServiceImpl {
                                         title: source.title.clone(),
                                         url: source.url.clone(),
                                     };
-                                    if let Err(e) = emitter
+                                    if emitter
                                         .emit_citation_annotation(
                                             ctx,
                                             message_item_id.clone(),
                                             annotation,
                                         )
                                         .await
+                                        .is_err()
                                     {
-                                        tracing::debug!("emit_citation_annotation failed: {}", e);
+                                        tracing::debug!(
+                                            response_id = %ctx.response_id_str,
+                                            item_id = %message_item_id,
+                                            "Failed to emit citation annotation"
+                                        );
                                     }
                                 }
                             }
@@ -741,19 +798,21 @@ impl ResponseServiceImpl {
                     Self::accumulate_tool_calls(&sse_event, &mut tool_call_accumulator);
                 }
                 Err(e) => {
-                    tracing::warn!(
-                        "Error in completion stream (client disconnect or stream error): {}",
-                        e
-                    );
-                    stream_error = true;
-                    stream_error_cause = Some(errors::ResponseError::from(
+                    let error_cause = errors::ResponseError::from(
                         crate::completions::CompletionServiceImpl::map_provider_error(
                             &process_context.request.model,
                             &e,
                             "responses stream",
                             process_context.organization_id,
                         ),
-                    ));
+                    );
+                    tracing::warn!(
+                        status_code = error_cause.http_status_code(),
+                        error_category = error_cause.log_category(),
+                        "Completion stream failed"
+                    );
+                    stream_error = true;
+                    stream_error_cause = Some(error_cause);
                     // Don't return early - save partial response below
                     break;
                 }
@@ -877,9 +936,9 @@ impl ResponseServiceImpl {
             metadata: None,
         };
 
-        // CRITICAL: Store to database FIRST before emitting events
-        // This ensures the message is persisted even if client disconnected and emit calls fail
-        if let Err(e) = response_items_repository
+        // Store to the database before emitting terminal events so the message
+        // remains available if the client disconnects while events are sent.
+        if response_items_repository
             .create(
                 ctx.response_id.clone(),
                 ctx.api_key_id,
@@ -887,17 +946,27 @@ impl ResponseServiceImpl {
                 item.clone(),
             )
             .await
+            .is_err()
         {
-            tracing::warn!("Failed to store message item: {}", e);
+            tracing::warn!(
+                response_id = %ctx.response_id_str,
+                item_id = %message_item_id,
+                "Failed to store message item"
+            );
         }
 
         // Try to emit events (may fail if client disconnected, but data is already saved)
         // Event: response.output_text.done
-        if let Err(e) = emitter
+        if emitter
             .emit_text_done(ctx, message_item_id.to_string(), clean_text.clone())
             .await
+            .is_err()
         {
-            tracing::debug!("Failed to emit text_done event: {}", e);
+            tracing::debug!(
+                response_id = %ctx.response_id_str,
+                item_id = %message_item_id,
+                "Failed to emit response text completion"
+            );
         }
 
         // Event: response.content_part.done
@@ -906,19 +975,29 @@ impl ResponseServiceImpl {
             annotations: annotations.clone(),
             logprobs: vec![],
         };
-        if let Err(e) = emitter
+        if emitter
             .emit_content_part_done(ctx, message_item_id.to_string(), part)
             .await
+            .is_err()
         {
-            tracing::debug!("Failed to emit content_part_done event: {}", e);
+            tracing::debug!(
+                response_id = %ctx.response_id_str,
+                item_id = %message_item_id,
+                "Failed to emit response content completion"
+            );
         }
 
         // Event: response.output_item.done
-        if let Err(e) = emitter
+        if emitter
             .emit_item_done(ctx, item, message_item_id.to_string())
             .await
+            .is_err()
         {
-            tracing::debug!("Failed to emit item_done event: {}", e);
+            tracing::debug!(
+                response_id = %ctx.response_id_str,
+                item_id = %message_item_id,
+                "Failed to emit response item completion"
+            );
         }
 
         Ok(())
@@ -1114,10 +1193,7 @@ impl ResponseServiceImpl {
             .await
         {
             if Self::has_image_generation_capability(&model.output_modalities) {
-                tracing::info!(
-                    "Image generation model detected, handling image operation: {}",
-                    model.model_name
-                );
+                tracing::info!(model = %model.model_name, "Processing image response request");
 
                 // Handle image generation/editing and return early
                 let image_result = Self::process_image_operation(
@@ -1148,7 +1224,7 @@ impl ResponseServiceImpl {
                         model: ctx.model.clone(),
                         metadata: None,
                     };
-                    if let Err(create_err) = context
+                    if context
                         .response_items_repository
                         .create(
                             ctx.response_id.clone(),
@@ -1157,13 +1233,14 @@ impl ResponseServiceImpl {
                             failed_item,
                         )
                         .await
+                        .is_err()
                     {
                         tracing::warn!(
-                            "Failed to store failed image response item: {}",
-                            create_err
+                            response_id = %ctx.response_id_str,
+                            "Failed to store failed image response item"
                         );
                     }
-                    if let Err(update_err) = context
+                    if context
                         .response_repository
                         .update(
                             ctx.response_id.clone(),
@@ -1173,10 +1250,12 @@ impl ResponseServiceImpl {
                             None,
                         )
                         .await
+                        .is_err()
                     {
                         tracing::warn!(
-                            "Failed to update response status to failed: {}",
-                            update_err
+                            response_id = %ctx.response_id_str,
+                            response_status = "failed",
+                            "Failed to update response status"
                         );
                     }
                     return Err(e);
@@ -1222,7 +1301,12 @@ impl ResponseServiceImpl {
             Err(errors::ResponseError::Completion(_)) => (models::ResponseStatus::Failed, None),
             Err(ref e) => {
                 // Log error but continue - we want to save partial response even on disconnect
-                tracing::warn!("Agent loop error (may be client disconnect): {:?}", e);
+                tracing::warn!(
+                    response_id = %ctx.response_id_str,
+                    status_code = e.http_status_code(),
+                    error_category = e.log_category(),
+                    "Agent loop stopped with a recoverable error"
+                );
                 (models::ResponseStatus::Completed, None)
             }
         };
@@ -1269,11 +1353,11 @@ impl ResponseServiceImpl {
             ctx.total_cached_tokens,
         );
         tracing::debug!(
-            "Final response usage: input={}, output={}, reasoning={}, total={}",
-            ctx.total_input_tokens,
-            ctx.total_output_tokens,
-            ctx.reasoning_tokens,
-            ctx.total_input_tokens + ctx.total_output_tokens
+            input_tokens = ctx.total_input_tokens,
+            output_tokens = ctx.total_output_tokens,
+            reasoning_tokens = ctx.reasoning_tokens,
+            total_tokens = ctx.total_input_tokens + ctx.total_output_tokens,
+            "Final response usage"
         );
 
         // Serialize usage to JSON for database storage
@@ -1305,7 +1389,7 @@ impl ResponseServiceImpl {
                     model: ctx.model.clone(),
                     metadata: None,
                 };
-                if let Err(create_err) = context
+                if context
                     .response_items_repository
                     .create(
                         ctx.response_id.clone(),
@@ -1314,10 +1398,14 @@ impl ResponseServiceImpl {
                         failed_item,
                     )
                     .await
+                    .is_err()
                 {
-                    tracing::warn!("Failed to store failed response item: {}", create_err);
+                    tracing::warn!(
+                        response_id = %ctx.response_id_str,
+                        "Failed to store failed response item"
+                    );
                 }
-                if let Err(update_err) = context
+                if context
                     .response_repository
                     .update(
                         ctx.response_id.clone(),
@@ -1327,13 +1415,18 @@ impl ResponseServiceImpl {
                         None,
                     )
                     .await
+                    .is_err()
                 {
-                    tracing::warn!("Failed to update response status to failed: {}", update_err);
+                    tracing::warn!(
+                        response_id = %ctx.response_id_str,
+                        response_status = "failed",
+                        "Failed to update response status"
+                    );
                 }
                 return Err(e);
             }
             Err(e @ errors::ResponseError::Completion(_)) => {
-                if let Err(update_err) = context
+                if context
                     .response_repository
                     .update(
                         ctx.response_id.clone(),
@@ -1343,16 +1436,18 @@ impl ResponseServiceImpl {
                         Some(usage_json),
                     )
                     .await
+                    .is_err()
                 {
                     tracing::warn!(
-                        "Failed to update partial response status to failed: {}",
-                        update_err
+                        response_id = %ctx.response_id_str,
+                        response_status = "failed",
+                        "Failed to update partial response status"
                     );
                 }
                 return Err(e);
             }
             _ => {
-                if let Err(e) = context
+                if context
                     .response_repository
                     .update(
                         ctx.response_id.clone(),
@@ -1362,8 +1457,12 @@ impl ResponseServiceImpl {
                         Some(usage_json),
                     )
                     .await
+                    .is_err()
                 {
-                    tracing::warn!("Failed to update response with usage: {}", e);
+                    tracing::warn!(
+                        response_id = %ctx.response_id_str,
+                        "Failed to update response usage"
+                    );
                 }
             }
         }
@@ -1375,11 +1474,19 @@ impl ResponseServiceImpl {
                 Ok(Ok(Ok(()))) => {
                     tracing::debug!("Title generation completed before response");
                 }
-                Ok(Ok(Err(e))) => {
-                    tracing::warn!("Title generation failed: {:?}", e);
+                Ok(Ok(Err(error))) => {
+                    tracing::warn!(
+                        response_id = %ctx.response_id_str,
+                        error_category = error.log_category(),
+                        "Title generation failed"
+                    );
                 }
-                Ok(Err(e)) => {
-                    tracing::warn!("Title generation task panicked: {:?}", e);
+                Ok(Err(_)) => {
+                    tracing::warn!(
+                        response_id = %ctx.response_id_str,
+                        error_category = "title_generation_task_panicked",
+                        "Title generation task panicked"
+                    );
                 }
                 Err(_) => {
                     tracing::debug!("Title generation timed out, continuing with response");
@@ -1419,7 +1526,7 @@ impl ResponseServiceImpl {
                 break;
             }
 
-            tracing::debug!("Agent loop iteration {}", iteration);
+            tracing::debug!(iteration = *iteration, "Agent loop iteration");
 
             // Prepare extra params with tools and encryption headers
             let mut extra = std::collections::HashMap::new();
@@ -1583,8 +1690,8 @@ impl ResponseServiceImpl {
                 consecutive_error_count += 1;
                 if consecutive_error_count >= MAX_CONSECUTIVE_TOOL_FAILURES {
                     tracing::error!(
-                        "Agent loop: {} consecutive iterations with tool call errors, stopping to prevent infinite retry",
-                        consecutive_error_count
+                        consecutive_error_count,
+                        "Agent loop stopped after consecutive tool call errors"
                     );
                     return Err(errors::ResponseError::InternalError(
                         format!("Tool calls failed {} consecutive iterations due to malformed arguments from model", MAX_CONSECUTIVE_TOOL_FAILURES),
@@ -1594,7 +1701,10 @@ impl ResponseServiceImpl {
                 consecutive_error_count = 0;
             }
 
-            tracing::debug!("Executing {} tool calls", stream_result.tool_calls.len());
+            tracing::debug!(
+                tool_call_count = stream_result.tool_calls.len(),
+                "Executing tool calls"
+            );
 
             // Execute each tool call, collecting any deferred instructions
             // Also track pending function calls for batching
@@ -2051,8 +2161,8 @@ impl ResponseServiceImpl {
         }
 
         tracing::debug!(
-            "Processed {} function call outputs into tool result messages",
-            messages.len()
+            tool_result_message_count = messages.len(),
+            "Processed function call outputs into tool result messages"
         );
 
         Ok(messages)
@@ -2222,8 +2332,8 @@ impl ResponseServiceImpl {
         }
 
         tracing::debug!(
-            "Stored user input messages as response_items for response {}",
-            response_id.0
+            response_id = response_id.0.to_string(),
+            "Stored user input messages as response items"
         );
         Ok(())
     }
@@ -2258,8 +2368,8 @@ impl ResponseServiceImpl {
             .await
         {
             Ok(prompt) => prompt,
-            Err(e) => {
-                tracing::warn!("Failed to fetch organization system prompt: {}", e);
+            Err(_) => {
+                tracing::warn!("Failed to fetch organization system prompt");
                 None
             }
         };
@@ -2451,8 +2561,11 @@ impl ResponseServiceImpl {
                         for result in futures::future::join_all(results).await {
                             match result {
                                 Ok(text) => text_parts.push(text),
-                                Err(e) => {
-                                    tracing::error!("Failed to process content part: {}", e);
+                                Err(error) => {
+                                    tracing::error!(
+                                        error_category = error.log_category(),
+                                        "Failed to process response content part"
+                                    );
                                 }
                             }
                         }
@@ -2621,9 +2734,9 @@ impl ResponseServiceImpl {
 
             let loaded_count = messages.len() - messages_before;
             tracing::info!(
-                "Loaded {} messages from conversation {}",
-                loaded_count,
-                conversation_id
+                loaded_message_count = loaded_count,
+                conversation_id = %conversation_id,
+                "Loaded messages from conversation"
             );
         }
 
@@ -2856,30 +2969,39 @@ impl ResponseServiceImpl {
                         // Self-closing reasoning tag: treat as no-op (empty reasoning block)
                         // Don't change inside_reasoning state, just ignore the tag
                         tag_transition = TagTransition::None;
-                        tracing::debug!("Detected self-closing reasoning tag: <{}/>", tag_name);
+                        tracing::debug!(
+                            tag_name = tag_name.as_str(),
+                            "Detected self-closing reasoning tag"
+                        );
                         // Don't include the tag itself in any output
                         continue;
                     } else if is_closing && *inside_reasoning {
                         // Closing reasoning tag
                         *inside_reasoning = false;
                         tag_transition = TagTransition::ClosingTag(tag_name.clone());
-                        tracing::debug!("Detected closing reasoning tag: </{}>", tag_name);
+                        tracing::debug!(
+                            tag_name = tag_name.as_str(),
+                            "Detected closing reasoning tag"
+                        );
                     } else if !is_closing && !*inside_reasoning {
                         // Opening reasoning tag (even with attributes)
                         *inside_reasoning = true;
                         tag_transition = TagTransition::OpeningTag(tag_name.clone());
-                        tracing::debug!("Detected opening reasoning tag: <{}>", tag_name);
+                        tracing::debug!(
+                            tag_name = tag_name.as_str(),
+                            "Detected opening reasoning tag"
+                        );
                     } else if is_closing && !*inside_reasoning {
                         // Closing tag encountered but not inside reasoning (malformed or extra closing tag)
                         tracing::debug!(
-                            "Ignoring closing reasoning tag </{}> - not currently inside reasoning block",
-                            tag_name
+                            tag_name = tag_name.as_str(),
+                            "Ignoring closing reasoning tag outside a reasoning block"
                         );
                     } else if !is_closing && *inside_reasoning {
                         // Opening tag encountered while already inside reasoning (nested or malformed)
                         tracing::debug!(
-                            "Ignoring opening reasoning tag <{}> - already inside reasoning block",
-                            tag_name
+                            tag_name = tag_name.as_str(),
+                            "Ignoring nested reasoning tag"
                         );
                     }
                     // Don't include the tag itself in any output
@@ -2923,9 +3045,9 @@ impl ResponseServiceImpl {
         if let Some(StreamChunk::Chat(chat_chunk)) = &event.chunk {
             if let Some(usage) = &chat_chunk.usage {
                 tracing::debug!(
-                    "Extracted usage from completion stream: input={}, output={}",
-                    usage.prompt_tokens,
-                    usage.completion_tokens
+                    input_tokens = usage.prompt_tokens,
+                    output_tokens = usage.completion_tokens,
+                    "Extracted usage from completion stream"
                 );
                 ctx.update_usage(
                     usage.prompt_tokens,
@@ -3304,8 +3426,11 @@ impl ResponseServiceImpl {
                 .get_inference_provider_pool()
                 .image_edit(params, process_context.body_hash.clone())
                 .await
-                .map_err(|e| {
-                    tracing::error!(error = %e, "Image edit request failed");
+                .map_err(|_| {
+                    tracing::error!(
+                        error_category = "image_edit_provider_failure",
+                        "Image edit request failed"
+                    );
                     errors::ResponseError::InternalError(
                         "Image edit processing failed. Please try again later.".to_string(),
                     )
@@ -3327,8 +3452,11 @@ impl ResponseServiceImpl {
                 .get_inference_provider_pool()
                 .image_generation(params, process_context.body_hash.clone())
                 .await
-                .map_err(|e| {
-                    tracing::error!(error = %e, "Image generation request failed");
+                .map_err(|_| {
+                    tracing::error!(
+                        error_category = "image_generation_provider_failure",
+                        "Image generation request failed"
+                    );
                     errors::ResponseError::InternalError(
                         "Image generation processing failed. Please try again later.".to_string(),
                     )
@@ -3633,6 +3761,17 @@ impl ResponseServiceImpl {
 mod tests {
     use super::*;
     use crate::responses::tools::WEB_SEARCH_TOOL_NAME;
+
+    #[test]
+    fn input_file_fetch_error_is_safe_for_clients() {
+        let error = ResponseServiceImpl::input_file_fetch_error().response_error();
+
+        assert_eq!(error.type_, "internal_server_error");
+        assert_eq!(
+            error.message,
+            "Internal server error: Failed to fetch input file content"
+        );
+    }
 
     #[test]
     fn test_process_reasoning_tags_simple_think() {

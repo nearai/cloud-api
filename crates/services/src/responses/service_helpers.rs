@@ -529,8 +529,8 @@ impl EventEmitter {
         self.emit_item_done(ctx, item.clone(), reasoning_id.to_string())
             .await?;
 
-        // Store the reasoning item in the database
-        if let Err(e) = response_items_repository
+        // Store the reasoning item in the database.
+        if response_items_repository
             .create(
                 ctx.response_id.clone(),
                 ctx.api_key_id,
@@ -538,8 +538,13 @@ impl EventEmitter {
                 item.clone(),
             )
             .await
+            .is_err()
         {
-            tracing::error!("Failed to store reasoning item in database: {}", e);
+            tracing::error!(
+                response_id = %ctx.response_id_str,
+                item_id = %reasoning_id,
+                "Failed to store reasoning item"
+            );
         }
 
         Ok(())

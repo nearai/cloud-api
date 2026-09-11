@@ -19,6 +19,7 @@ Production runs at **info level and above**. We ABSOLUTELY CANNOT and SHOULD NOT
 - **AI responses** - Model outputs, completions, or generated text
 - **Metadata that reveals customer information** - Custom fields, tags, labels that could expose user activity
 - **File contents** - Uploaded file data or processed file content
+- **Content-derived metadata** - Request/response digests, signature payloads, or other stable derivations of customer content
 - **Any PII** - Names, emails (except for auth flow), addresses, phone numbers in user content
 
 #### ✓ OK TO LOG (Permitted for Debugging)

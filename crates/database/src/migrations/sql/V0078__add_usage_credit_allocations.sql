@@ -85,53 +85,8 @@ CREATE INDEX usage_credit_allocations_service
     ON usage_credit_allocations(service_usage_id)
     WHERE service_usage_id IS NOT NULL;
 
--- Corrections and write-offs are additive audit records. They never update a
--- usage row or its original posting-time allocations.
-CREATE TABLE usage_credit_adjustments (
-    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
-    organization_id UUID NOT NULL REFERENCES organizations(id) ON DELETE CASCADE,
-    inference_usage_id UUID REFERENCES organization_usage_log(id) ON DELETE CASCADE,
-    service_usage_id UUID REFERENCES organization_service_usage_log(id) ON DELETE CASCADE,
-    adjustment_type VARCHAR(20) NOT NULL
-        CHECK (adjustment_type IN ('correction', 'writeoff')),
-    amount BIGINT NOT NULL CHECK (amount > 0),
-    unfunded_amount_reversed BIGINT NOT NULL
-        CHECK (unfunded_amount_reversed >= 0 AND unfunded_amount_reversed <= amount),
-    reason TEXT NOT NULL CHECK (LENGTH(BTRIM(reason)) > 0),
-    idempotency_key VARCHAR(100) NOT NULL CHECK (LENGTH(BTRIM(idempotency_key)) > 0),
-    changed_by_user_id UUID REFERENCES users(id) ON DELETE SET NULL,
-    changed_by_user_email VARCHAR(255),
-    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    CONSTRAINT usage_credit_adjustments_one_parent
-        CHECK ((inference_usage_id IS NOT NULL)::integer + (service_usage_id IS NOT NULL)::integer = 1),
-    CONSTRAINT usage_credit_adjustments_idempotency_unique
-        UNIQUE (organization_id, idempotency_key)
-);
-
-CREATE TABLE usage_credit_allocation_reversals (
-    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
-    adjustment_id UUID NOT NULL REFERENCES usage_credit_adjustments(id) ON DELETE CASCADE,
-    allocation_id UUID NOT NULL REFERENCES usage_credit_allocations(id) ON DELETE CASCADE,
-    amount BIGINT NOT NULL CHECK (amount > 0),
-    CONSTRAINT usage_credit_allocation_reversal_unique
-        UNIQUE (adjustment_id, allocation_id)
-);
-
-CREATE INDEX usage_credit_adjustments_inference
-    ON usage_credit_adjustments(inference_usage_id)
-    WHERE inference_usage_id IS NOT NULL;
-CREATE INDEX usage_credit_adjustments_service
-    ON usage_credit_adjustments(service_usage_id)
-    WHERE service_usage_id IS NOT NULL;
-CREATE INDEX usage_credit_adjustments_org
-    ON usage_credit_adjustments(organization_id);
-CREATE INDEX usage_credit_allocation_reversals_allocation
-    ON usage_credit_allocation_reversals(allocation_id);
-
 COMMENT ON TABLE usage_credit_allocations IS
     'Immutable funding ledger for posting-time splits and later overage settlements; amounts are nano-USD.';
-COMMENT ON TABLE usage_credit_adjustments IS
-    'Audited corrections and unfunded write-offs linked to immutable usage rows.';
 COMMENT ON COLUMN organization_usage_log.funded_amount IS
     'Attributed nano-USD; NULL means legacy usage with unknown funding.';
 COMMENT ON COLUMN organization_usage_log.unfunded_amount IS

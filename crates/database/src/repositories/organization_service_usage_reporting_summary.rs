@@ -25,19 +25,12 @@ where
                        DATE_TRUNC('day', usage_log.created_at) AS day,
                        usage_log.quantity,
                        CASE WHEN $7::TEXT IS NULL THEN
-                           usage_log.total_cost - COALESCE((
-                               SELECT SUM(amount)::BIGINT FROM usage_credit_adjustments adjustment
-                               WHERE adjustment.service_usage_id = usage_log.id
-                           ), 0)
+                           usage_log.total_cost
                        ELSE allocation.amount END AS total_cost
                 FROM organization_service_usage_log AS usage_log
                 INNER JOIN services ON services.id = usage_log.service_id
                 LEFT JOIN LATERAL (
-                    SELECT COALESCE(SUM(original.amount - COALESCE((
-                        SELECT SUM(reversal.amount)::BIGINT
-                        FROM usage_credit_allocation_reversals reversal
-                        WHERE reversal.allocation_id = original.id
-                    ), 0)), 0)::BIGINT AS amount
+                    SELECT COALESCE(SUM(original.amount), 0)::BIGINT AS amount
                     FROM usage_credit_allocations original
                     WHERE original.service_usage_id = usage_log.id
                       AND original.credit_type = $7

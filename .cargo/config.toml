@@ -1,11 +1,12 @@
 [build]
 # Enable reproducible builds
-incremental = false
 [target.'cfg(target_os = "linux")']
 rustflags = [
     # Remap source file paths to remove machine-specific paths
     "--remap-path-prefix", "${PWD}=.",
     "--remap-path-prefix", "/usr/local/cargo=/cargo",
+    # Disable incremental compilation for reproducibility
+    "-C", "incremental=false",
     # Disable debug info for reproducibility
     "-C", "debuginfo=0",
     # removes build-id hash

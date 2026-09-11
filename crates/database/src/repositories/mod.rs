@@ -5,7 +5,6 @@ pub mod analytics;
 pub mod api_key;
 pub mod attestation;
 pub mod conversation;
-pub mod credit_adjustment;
 pub mod credit_allocation;
 pub mod feature_request;
 pub mod file;

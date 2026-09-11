@@ -327,10 +327,7 @@ pub async fn settle_unfunded_usage(
                            - COALESCE((SELECT SUM(allocation.amount)::BIGINT
                                FROM usage_credit_allocations allocation
                                WHERE allocation.inference_usage_id = usage.id
-                                 AND allocation.allocation_phase = 'overage_settlement'), 0)
-                           - COALESCE((SELECT SUM(adjustment.unfunded_amount_reversed)::BIGINT
-                               FROM usage_credit_adjustments adjustment
-                               WHERE adjustment.inference_usage_id = usage.id), 0), 0)::BIGINT
+                                 AND allocation.allocation_phase = 'overage_settlement'), 0), 0)::BIGINT
                            AS outstanding
                 FROM organization_usage_log usage
                 WHERE usage.organization_id = $1 AND usage.unfunded_amount > 0
@@ -341,10 +338,7 @@ pub async fn settle_unfunded_usage(
                            - COALESCE((SELECT SUM(allocation.amount)::BIGINT
                                FROM usage_credit_allocations allocation
                                WHERE allocation.service_usage_id = usage.id
-                                 AND allocation.allocation_phase = 'overage_settlement'), 0)
-                           - COALESCE((SELECT SUM(adjustment.unfunded_amount_reversed)::BIGINT
-                               FROM usage_credit_adjustments adjustment
-                               WHERE adjustment.service_usage_id = usage.id), 0), 0)::BIGINT
+                                 AND allocation.allocation_phase = 'overage_settlement'), 0), 0)::BIGINT
                            AS outstanding
                 FROM organization_service_usage_log usage
                 WHERE usage.organization_id = $1 AND usage.unfunded_amount > 0
@@ -458,21 +452,12 @@ pub async fn load_allocations<C: GenericClient + Sync>(
         .query(
             r#"
             SELECT allocation.credit_type,
-                   allocation.amount - COALESCE((
-                       SELECT SUM(reversal.amount)::BIGINT
-                       FROM usage_credit_allocation_reversals reversal
-                       WHERE reversal.allocation_id = allocation.id
-                   ), 0) AS amount,
+                   allocation.amount AS amount,
                    allocation.source, allocation.organization_limit_id,
                    allocation.policy_version
             FROM usage_credit_allocations allocation
             WHERE (($1::UUID IS NOT NULL AND allocation.inference_usage_id = $1)
                 OR ($2::UUID IS NOT NULL AND allocation.service_usage_id = $2))
-              AND allocation.amount > COALESCE((
-                  SELECT SUM(reversal.amount)::BIGINT
-                  FROM usage_credit_allocation_reversals reversal
-                  WHERE reversal.allocation_id = allocation.id
-              ), 0)
             ORDER BY allocation.created_at, allocation.priority_position, allocation.id
             "#,
             &[&inference_id, &service_id],

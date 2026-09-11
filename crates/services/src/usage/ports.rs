@@ -628,7 +628,7 @@ pub struct OrganizationLimit {
     /// Remaining attributed capacity across active credit types.
     pub available: i64,
     /// Unresolved overage from already-executed usage. New usage is blocked
-    /// while this is positive, even if a later limit update adds capacity.
+    /// while this is positive. Added capacity automatically settles the debt.
     pub unfunded: i64,
 }
 

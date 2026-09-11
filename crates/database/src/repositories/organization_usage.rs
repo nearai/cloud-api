@@ -68,15 +68,9 @@ impl OrganizationUsageRepository {
             client
                 .query_one(
                     r#"
-                    SELECT COALESCE(SUM(
-                        usage_log.total_cost - COALESCE((
-                            SELECT SUM(amount)::BIGINT
-                            FROM usage_credit_adjustments adjustment
-                            WHERE adjustment.inference_usage_id = usage_log.id
-                        ), 0)
-                    ), 0)::BIGINT AS total_spend
-                    FROM organization_usage_log usage_log
-                    WHERE usage_log.api_key_id = $1
+                    SELECT COALESCE(SUM(total_cost), 0)::BIGINT as total_spend
+                    FROM organization_usage_log
+                    WHERE api_key_id = $1
                     "#,
                     &[&api_key_id],
                 )
@@ -245,12 +239,7 @@ impl OrganizationUsageRepository {
                     let existing = client
                         .query_one(
                             r#"
-                            SELECT usage_log.*,
-                                   usage_log.total_cost - COALESCE((
-                                       SELECT SUM(amount)::BIGINT
-                                       FROM usage_credit_adjustments adjustment
-                                       WHERE adjustment.inference_usage_id = usage_log.id
-                                   ), 0) AS filtered_total_cost
+                            SELECT usage_log.*
                             FROM organization_usage_log usage_log
                             WHERE usage_log.organization_id = $1
                               AND usage_log.inference_id = $2
@@ -398,23 +387,14 @@ impl OrganizationUsageRepository {
                 .query(
                     r#"
                     SELECT ul.*,
-                        ul.total_cost - COALESCE((SELECT SUM(amount)::BIGINT
-                            FROM usage_credit_adjustments adjustment
-                            WHERE adjustment.inference_usage_id = ul.id), 0)
-                            AS filtered_total_cost,
                         CASE WHEN ul.funded_amount IS NULL THEN NULL ELSE
                             COALESCE((SELECT jsonb_agg(jsonb_build_object(
-                                'type', a.credit_type, 'amount', a.amount - COALESCE((SELECT SUM(amount)::BIGINT
-                                    FROM usage_credit_allocation_reversals reversal
-                                    WHERE reversal.allocation_id = a.id), 0), 'source', a.source,
+                                'type', a.credit_type, 'amount', a.amount, 'source', a.source,
                                 'organization_limit_id', a.organization_limit_id,
                                 'policy_version', a.policy_version
                             ) ORDER BY a.created_at, a.priority_position, a.id)
                             FROM usage_credit_allocations a
-                            WHERE a.inference_usage_id = ul.id
-                              AND a.amount > COALESCE((SELECT SUM(amount)::BIGINT
-                                  FROM usage_credit_allocation_reversals reversal
-                                  WHERE reversal.allocation_id = a.id), 0)), '[]'::jsonb)
+                            WHERE a.inference_usage_id = ul.id), '[]'::jsonb)
                         END AS credit_allocations
                     FROM organization_usage_log ul
                     WHERE ul.organization_id = $1
@@ -455,10 +435,7 @@ impl OrganizationUsageRepository {
                       AND ($2::TEXT IS NULL OR EXISTS (
                           SELECT 1 FROM usage_credit_allocations a
                           WHERE a.inference_usage_id = organization_usage_log.id
-                            AND a.credit_type = $2
-                            AND a.amount > COALESCE((SELECT SUM(amount)::BIGINT
-                                FROM usage_credit_allocation_reversals reversal
-                                WHERE reversal.allocation_id = a.id), 0)))
+                            AND a.credit_type = $2))
                     "#,
                     &[&api_key_id, &credit_type],
                 )
@@ -492,40 +469,27 @@ impl OrganizationUsageRepository {
                 .query(
                     r#"
                     SELECT ul.*,
-                        CASE WHEN $2::TEXT IS NULL THEN ul.total_cost - COALESCE((
-                            SELECT SUM(amount)::BIGINT FROM usage_credit_adjustments adjustment
-                            WHERE adjustment.inference_usage_id = ul.id
-                        ), 0) ELSE
-                            (SELECT COALESCE(SUM(a.amount - COALESCE((SELECT SUM(amount)::BIGINT
-                                 FROM usage_credit_allocation_reversals reversal
-                                 WHERE reversal.allocation_id = a.id), 0)), 0)::BIGINT
+                        CASE WHEN $2::TEXT IS NULL THEN ul.total_cost ELSE
+                            (SELECT COALESCE(SUM(a.amount), 0)::BIGINT
                              FROM usage_credit_allocations a
                              WHERE a.inference_usage_id = ul.id AND a.credit_type = $2)
                         END AS filtered_total_cost,
                         CASE WHEN ul.funded_amount IS NULL THEN NULL ELSE
                             COALESCE((SELECT jsonb_agg(jsonb_build_object(
-                                'type', a.credit_type, 'amount', a.amount - COALESCE((SELECT SUM(amount)::BIGINT
-                                    FROM usage_credit_allocation_reversals reversal
-                                    WHERE reversal.allocation_id = a.id), 0), 'source', a.source,
+                                'type', a.credit_type, 'amount', a.amount, 'source', a.source,
                                 'organization_limit_id', a.organization_limit_id,
                                 'policy_version', a.policy_version
                             ) ORDER BY a.created_at, a.priority_position, a.id)
                             FROM usage_credit_allocations a
                             WHERE a.inference_usage_id = ul.id
-                              AND ($2::TEXT IS NULL OR a.credit_type = $2)
-                              AND a.amount > COALESCE((SELECT SUM(amount)::BIGINT
-                                  FROM usage_credit_allocation_reversals reversal
-                                  WHERE reversal.allocation_id = a.id), 0)), '[]'::jsonb)
+                              AND ($2::TEXT IS NULL OR a.credit_type = $2)), '[]'::jsonb)
                         END AS credit_allocations
                     FROM organization_usage_log ul
                     WHERE ul.api_key_id = $1
                       AND ($2::TEXT IS NULL OR EXISTS (
                           SELECT 1 FROM usage_credit_allocations filter_allocation
                           WHERE filter_allocation.inference_usage_id = ul.id
-                            AND filter_allocation.credit_type = $2
-                            AND filter_allocation.amount > COALESCE((SELECT SUM(amount)::BIGINT
-                                FROM usage_credit_allocation_reversals reversal
-                                WHERE reversal.allocation_id = filter_allocation.id), 0)))
+                            AND filter_allocation.credit_type = $2))
                     ORDER BY ul.created_at DESC
                     LIMIT $3 OFFSET $4
                     "#,

@@ -93,6 +93,9 @@ impl OAuthManager {
         let (auth_url, csrf_state) = client
             .authorize_url(CsrfToken::new_random)
             .add_scope(Scope::new("user:email".to_string()))
+            // Always show the account chooser so users can switch accounts
+            // after signing out, instead of being silently re-signed-in.
+            .add_extra_param("prompt", "select_account")
             .url();
 
         Ok((auth_url.to_string(), csrf_state.secret().to_string()))
@@ -113,6 +116,10 @@ impl OAuthManager {
             .add_scope(Scope::new("openid".to_string()))
             .add_scope(Scope::new("profile".to_string()))
             .set_pkce_challenge(pkce_challenge)
+            // Without `prompt`, Google skips the account chooser whenever the
+            // user has an active Google session and has already consented.
+            // `select_account` shows the chooser without re-prompting consent.
+            .add_extra_param("prompt", "select_account")
             .url();
 
         Ok((
@@ -330,4 +337,52 @@ struct GoogleUser {
     name: Option<String>,
     #[serde(default)]
     picture: Option<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn provider_config() -> OAuthProviderConfig {
+        OAuthProviderConfig {
+            client_id: "client-id".to_string(),
+            client_secret: "client-secret".to_string(),
+            redirect_uri: "https://example.com/callback".to_string(),
+        }
+    }
+
+    /// All values for `key`, so duplicated parameters are caught rather than
+    /// hidden by a first-match lookup.
+    fn query_params(url: &str, key: &str) -> Vec<String> {
+        url::Url::parse(url)
+            .expect("auth url must parse")
+            .query_pairs()
+            .filter(|(k, _)| k == key)
+            .map(|(_, v)| v.into_owned())
+            .collect()
+    }
+
+    #[test]
+    fn google_auth_url_forces_account_chooser() {
+        let manager = OAuthManager::new(None, Some(provider_config())).unwrap();
+        let (auth_url, state, verifier) = manager.google_auth_url().unwrap();
+
+        assert!(auth_url.starts_with("https://accounts.google.com/o/oauth2/v2/auth?"));
+        assert_eq!(query_params(&auth_url, "prompt"), ["select_account"]);
+        assert_eq!(query_params(&auth_url, "code_challenge_method"), ["S256"]);
+        // The returned tuple is positional; make sure state and verifier are
+        // not swapped or empty, since the route persists them by key.
+        assert_eq!(query_params(&auth_url, "state"), [state]);
+        assert!(!verifier.is_empty());
+    }
+
+    #[test]
+    fn github_auth_url_forces_account_chooser() {
+        let manager = OAuthManager::new(Some(provider_config()), None).unwrap();
+        let (auth_url, state) = manager.github_auth_url().unwrap();
+
+        assert!(auth_url.starts_with("https://github.com/login/oauth/authorize?"));
+        assert_eq!(query_params(&auth_url, "prompt"), ["select_account"]);
+        assert_eq!(query_params(&auth_url, "state"), [state]);
+    }
 }

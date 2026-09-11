@@ -18,6 +18,7 @@ mod admin_pricing_changes;
 mod admin_provider_attribution_model_revenue;
 mod admin_provider_attribution_platform;
 mod admin_provider_attribution_support;
+mod admin_routing_policy;
 mod admin_schema_compatibility;
 mod admin_services;
 mod api_keys;

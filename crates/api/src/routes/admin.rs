@@ -600,6 +600,29 @@ pub async fn batch_upsert_models(
 
     // Validate all pricing fields are non-negative to prevent incorrect billing
     for (model_name, request) in &batch_request {
+        if let Some(config) = &request.provider_config {
+            // Backend-less configs belong to non-external features such as
+            // long-context routing. The service layer repeats this validation
+            // against the merged stored provider type, which covers partial
+            // updates that omit `providerType`.
+            if request.provider_type.as_deref() == Some("external")
+                || config.get("backend").is_some()
+                || config.get("enforced_request_body").is_some()
+            {
+                inference_providers::non_attested::external::validate_external_provider_config(
+                    config,
+                )
+                .map_err(|error| {
+                    (
+                        StatusCode::BAD_REQUEST,
+                        ResponseJson(ErrorResponse::new(
+                            format!("model '{model_name}': {error}"),
+                            "invalid_request".to_string(),
+                        )),
+                    )
+                })?;
+            }
+        }
         let validate_price = |price: &Option<DecimalPriceRequest>, field: &str| {
             if let Some(p) = price {
                 p.validate().map_err(|e| {
@@ -927,6 +950,20 @@ pub async fn batch_upsert_models(
             );
     }
 
+    if batch_request.values().any(|request| {
+        request.provider_type.is_some()
+            || request.provider_config.is_some()
+            || request.inference_url.is_some()
+            || request.is_active.is_some()
+    }) {
+        // The database write is complete. Prevent an older periodic snapshot
+        // from replacing or removing the provider state reconciled below.
+        app_state
+            .inference_provider_pool
+            .invalidate_periodic_provider_refreshes()
+            .await;
+    }
+
     // Update providers at runtime so changes take effect without server restart.
     // Unregister first, then re-register — this handles type transitions
     // (e.g., inference_url → external) and deactivations cleanly.
@@ -1021,11 +1058,12 @@ pub async fn batch_upsert_models(
     let external_models: Vec<(String, serde_json::Value)> = batch_request
         .iter()
         .filter_map(|(model_name, request)| {
-            let is_external = request.provider_type.as_deref() == Some("external");
-            let is_active = request.is_active != Some(false);
-
-            if is_external && is_active {
-                request
+            let merged = updated_models.get(model_name)?;
+            let touches_registration = request.provider_type.is_some()
+                || request.provider_config.is_some()
+                || request.is_active.is_some();
+            if merged.provider_type == "external" && merged.is_active && touches_registration {
+                merged
                     .provider_config
                     .clone()
                     .map(|config| (model_name.clone(), config))

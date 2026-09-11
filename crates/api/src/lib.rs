@@ -1099,7 +1099,7 @@ pub async fn init_inference_providers(
 /// This function uses the existing MockProvider from inference_providers::mock
 /// and registers it for common test models without changing any implementations
 pub async fn init_inference_providers_with_mocks(
-    _config: &ApiConfig,
+    config: &ApiConfig,
 ) -> (
     Arc<services::inference_provider_pool::InferenceProviderPool>,
     Arc<inference_providers::mock::MockProvider>,
@@ -1110,7 +1110,7 @@ pub async fn init_inference_providers_with_mocks(
     let pool = Arc::new(
         services::inference_provider_pool::InferenceProviderPool::new(
             None,
-            config::ExternalProvidersConfig::default(),
+            config.external_providers.clone(),
         ),
     );
 

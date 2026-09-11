@@ -13,11 +13,13 @@ policy meaning changes. The configured version and the active limit/source are
 saved on each allocation; configuration changes never rewrite prior usage or
 idempotent retries.
 
-One usage row can therefore contain several `credit_allocations`. Their
-positive `amount` values plus `unfunded_amount` always equal `total_cost`.
-Zero-cost usage has an empty allocation list and zero unfunded cost. Historical
-rows created before attribution omit these fields rather than inventing a
-funding history.
+One usage row can therefore contain several `credit_allocations`. At posting,
+their positive `amount` values plus `unfunded_amount` equal `total_cost`.
+Later settlement allocations reduce the effective unfunded remainder by the
+same amount, so usage responses remain reconciled without rewriting the
+original usage row. Zero-cost usage has an empty allocation list and zero
+unfunded cost. Historical rows created before attribution omit these fields
+rather than inventing a funding history.
 
 The organization balance endpoint reports `amount`, lifetime `consumed`, and
 current `available` nano-USD for every active credit type. Postpay remains a
@@ -31,17 +33,12 @@ matching allocation amount, while request and token counts are not multiplied.
 
 If a completed request costs more than all available capacity, the full charge
 is retained with an `unfunded_amount`. Admission checks block subsequent usage
-until that debt is resolved. A later top-up does not silently relabel or settle
-the overage.
-
-Admins can post an idempotent adjustment to
-`POST /v1/admin/organizations/{org_id}/usage/adjustments`. A `writeoff` can
-resolve only unfunded debt. A `correction` first reverses unfunded cost, then
-reverses the original allocations from the last funding source backward (for
-example, postpay before payment). Original usage and allocation rows remain
-unchanged; the linked adjustment and allocation-reversal rows record the actor,
-reason, idempotency key, and time. Effective balances and reports include these
-adjustments without incrementing usage counts.
+until that debt is resolved. When capacity is later added or re-enabled from
+any source, it automatically funds the oldest overage first in the configured
+priority order. Settlement appends immutable allocation rows with the current
+limit, source, and policy version; it never edits the original posting-time
+allocations. If the added capacity exceeds the debt, the remainder is
+immediately available for new usage. No admin API call is required.
 
 ## Rollout notes
 

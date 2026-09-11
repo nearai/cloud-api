@@ -160,7 +160,6 @@ use utoipa::{Modify, OpenApi};
         crate::routes::admin::get_model_history,
         crate::routes::admin::get_admin_organization_balance,
         crate::routes::admin::update_organization_limits,
-        crate::routes::admin::create_usage_adjustment,
         crate::routes::admin::get_organization_limits_history,
         crate::routes::staking_farm::get_admin_organization_staking_farm,
         crate::routes::staking_farm::sync_admin_organization_staking_farm,
@@ -284,11 +283,6 @@ use utoipa::{Modify, OpenApi};
             // Organization limits models (Admin)
             UpdateOrganizationLimitsRequest, UpdateOrganizationLimitsResponse, SpendLimit, SpendLimitRequest,
             OrgLimitsHistoryEntry, OrgLimitsHistoryResponse,
-            crate::routes::admin::CreateUsageAdjustmentRequest,
-            crate::routes::admin::UsageAdjustmentResponse,
-            crate::routes::admin::CreditAllocationReversalResponse,
-            crate::routes::admin::UsageAdjustmentKind,
-            crate::routes::admin::UsageAdjustmentType,
             // Organization concurrent limit models (Admin)
             UpdateOrganizationConcurrentLimitRequest, UpdateOrganizationConcurrentLimitResponse,
             GetOrganizationConcurrentLimitResponse,

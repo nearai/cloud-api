@@ -17,11 +17,25 @@ use uuid::Uuid;
 #[derive(Debug, Clone)]
 pub struct OrganizationStakingFarmSourcesRepository {
     pool: DbPool,
+    allocation_policy: crate::repositories::credit_allocation::CreditAllocationPolicy,
 }
 
 impl OrganizationStakingFarmSourcesRepository {
     pub fn new(pool: DbPool) -> Self {
-        Self { pool }
+        Self {
+            pool,
+            allocation_policy:
+                crate::repositories::credit_allocation::CreditAllocationPolicy::default(),
+        }
+    }
+
+    pub fn with_accounting_config(pool: DbPool, config: &config::CreditAllocationConfig) -> Self {
+        Self {
+            pool,
+            allocation_policy: crate::repositories::credit_allocation::CreditAllocationPolicy::from(
+                config,
+            ),
+        }
     }
 
     fn row_to_source(row: &Row) -> OrganizationStakingFarmSource {
@@ -307,6 +321,13 @@ impl StakingFarmRepository for OrganizationStakingFarmSourcesRepository {
                 )
                 .await
                 .map_err(map_db_error)?;
+
+            crate::repositories::credit_allocation::settle_unfunded_usage(
+                &transaction,
+                organization_id,
+                &self.allocation_policy,
+            )
+            .await?;
 
             transaction.commit().await.map_err(map_db_error)?;
             Ok::<(), RepositoryError>(())

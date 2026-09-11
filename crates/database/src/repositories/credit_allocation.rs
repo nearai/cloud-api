@@ -154,8 +154,8 @@ pub async fn allocate_usage(
                 INSERT INTO usage_credit_allocations (
                     organization_id, inference_usage_id, service_usage_id,
                     credit_type, amount, organization_limit_id, source,
-                    policy_version, priority_position
-                ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+                    policy_version, allocation_phase, priority_position
+                ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'posting', $9)
                 "#,
                 &[
                     &organization_id,
@@ -220,6 +220,232 @@ pub async fn allocate_usage(
     })
 }
 
+/// Apply newly available credit capacity to previously unfunded usage.
+///
+/// Existing posting-time allocations are never updated. Each settlement is a
+/// new immutable allocation row linked to the original usage, and the
+/// organization accounting lock makes retries and concurrent credit writers
+/// safe. Oldest overages are settled first for deterministic reconciliation.
+pub async fn settle_unfunded_usage(
+    transaction: &Transaction<'_>,
+    organization_id: Uuid,
+    policy: &CreditAllocationPolicy,
+) -> Result<i64, RepositoryError> {
+    lock_organization_accounting(transaction, organization_id).await?;
+
+    let unresolved: i64 = transaction
+        .query_one(
+            r#"
+            SELECT COALESCE((SELECT unresolved_unfunded_amount
+                FROM organization_balance WHERE organization_id = $1), 0)::BIGINT AS amount
+            "#,
+            &[&organization_id],
+        )
+        .await
+        .map_err(map_db_error)?
+        .get("amount");
+    if unresolved == 0 {
+        return Ok(0);
+    }
+
+    let credit_rows = transaction
+        .query(
+            r#"
+            SELECT active.id, active.credit_type, active.source, active.spend_limit,
+                   COALESCE(consumed.amount, 0)::BIGINT AS consumed
+            FROM unnest($2::TEXT[]) WITH ORDINALITY AS wanted(credit_type, position)
+            JOIN organization_limits_history active
+              ON active.organization_id = $1
+             AND active.credit_type = wanted.credit_type
+             AND active.effective_until IS NULL
+            LEFT JOIN organization_credit_consumption consumed
+              ON consumed.organization_id = active.organization_id
+             AND consumed.credit_type = active.credit_type
+            ORDER BY wanted.position
+            "#,
+            &[&organization_id, &policy.priority],
+        )
+        .await
+        .map_err(map_db_error)?;
+
+    let legacy_unattributed: i64 = transaction
+        .query_one(
+            r#"
+            SELECT COALESCE((SELECT legacy_unattributed_amount
+                FROM organization_balance WHERE organization_id = $1), 0)::BIGINT AS amount
+            "#,
+            &[&organization_id],
+        )
+        .await
+        .map_err(map_db_error)?
+        .get("amount");
+
+    struct AvailableCredit {
+        limit_id: Uuid,
+        credit_type: String,
+        source: Option<String>,
+        amount: i64,
+        priority_position: i16,
+    }
+
+    let mut credits = credit_rows
+        .iter()
+        .enumerate()
+        .map(|(position, row)| {
+            Ok(AvailableCredit {
+                limit_id: row.get("id"),
+                credit_type: row.get("credit_type"),
+                source: row.get("source"),
+                amount: row
+                    .get::<_, i64>("spend_limit")
+                    .saturating_sub(row.get::<_, i64>("consumed"))
+                    .max(0),
+                priority_position: i16::try_from(position).map_err(|_| {
+                    RepositoryError::ValidationFailed("credit priority is too long".to_string())
+                })?,
+            })
+        })
+        .collect::<Result<Vec<_>, RepositoryError>>()?;
+    let mut aggregate_available = credits
+        .iter()
+        .map(|credit| credit.amount)
+        .fold(0_i64, i64::saturating_add)
+        .saturating_sub(legacy_unattributed)
+        .max(0);
+    if aggregate_available == 0 {
+        return Ok(0);
+    }
+
+    let debts = transaction
+        .query(
+            r#"
+            SELECT usage_kind, usage_id, outstanding
+            FROM (
+                SELECT 'inference'::TEXT AS usage_kind, usage.id AS usage_id,
+                       usage.created_at,
+                       GREATEST(usage.unfunded_amount
+                           - COALESCE((SELECT SUM(allocation.amount)::BIGINT
+                               FROM usage_credit_allocations allocation
+                               WHERE allocation.inference_usage_id = usage.id
+                                 AND allocation.allocation_phase = 'overage_settlement'), 0)
+                           - COALESCE((SELECT SUM(adjustment.unfunded_amount_reversed)::BIGINT
+                               FROM usage_credit_adjustments adjustment
+                               WHERE adjustment.inference_usage_id = usage.id), 0), 0)::BIGINT
+                           AS outstanding
+                FROM organization_usage_log usage
+                WHERE usage.organization_id = $1 AND usage.unfunded_amount > 0
+                UNION ALL
+                SELECT 'service'::TEXT AS usage_kind, usage.id AS usage_id,
+                       usage.created_at,
+                       GREATEST(usage.unfunded_amount
+                           - COALESCE((SELECT SUM(allocation.amount)::BIGINT
+                               FROM usage_credit_allocations allocation
+                               WHERE allocation.service_usage_id = usage.id
+                                 AND allocation.allocation_phase = 'overage_settlement'), 0)
+                           - COALESCE((SELECT SUM(adjustment.unfunded_amount_reversed)::BIGINT
+                               FROM usage_credit_adjustments adjustment
+                               WHERE adjustment.service_usage_id = usage.id), 0), 0)::BIGINT
+                           AS outstanding
+                FROM organization_service_usage_log usage
+                WHERE usage.organization_id = $1 AND usage.unfunded_amount > 0
+            ) debt
+            WHERE outstanding > 0
+            ORDER BY created_at, usage_id
+            "#,
+            &[&organization_id],
+        )
+        .await
+        .map_err(map_db_error)?;
+
+    let mut remaining_debt = unresolved;
+    let mut settled = 0_i64;
+    for debt in debts {
+        if remaining_debt == 0 || aggregate_available == 0 {
+            break;
+        }
+        let usage_kind: String = debt.get("usage_kind");
+        let usage_id: Uuid = debt.get("usage_id");
+        let mut outstanding = debt.get::<_, i64>("outstanding").min(remaining_debt);
+        for credit in &mut credits {
+            if outstanding == 0 || aggregate_available == 0 {
+                break;
+            }
+            let amount = outstanding.min(credit.amount).min(aggregate_available);
+            if amount == 0 {
+                continue;
+            }
+            let inference_usage_id = (usage_kind == "inference").then_some(usage_id);
+            let service_usage_id = (usage_kind == "service").then_some(usage_id);
+            transaction
+                .execute(
+                    r#"
+                    INSERT INTO usage_credit_allocations (
+                        organization_id, inference_usage_id, service_usage_id,
+                        credit_type, amount, organization_limit_id, source,
+                        policy_version, allocation_phase, priority_position
+                    ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8,
+                              'overage_settlement', $9)
+                    "#,
+                    &[
+                        &organization_id,
+                        &inference_usage_id,
+                        &service_usage_id,
+                        &credit.credit_type,
+                        &amount,
+                        &credit.limit_id,
+                        &credit.source,
+                        &policy.version,
+                        &credit.priority_position,
+                    ],
+                )
+                .await
+                .map_err(map_db_error)?;
+            transaction
+                .execute(
+                    r#"
+                    INSERT INTO organization_credit_consumption (
+                        organization_id, credit_type, amount, updated_at
+                    ) VALUES ($1, $2, $3, NOW())
+                    ON CONFLICT (organization_id, credit_type) DO UPDATE SET
+                        amount = organization_credit_consumption.amount + EXCLUDED.amount,
+                        updated_at = NOW()
+                    "#,
+                    &[&organization_id, &credit.credit_type, &amount],
+                )
+                .await
+                .map_err(map_db_error)?;
+
+            credit.amount -= amount;
+            outstanding -= amount;
+            aggregate_available -= amount;
+            remaining_debt -= amount;
+            settled += amount;
+        }
+    }
+
+    if settled > 0 {
+        let updated = transaction
+            .execute(
+                r#"
+                UPDATE organization_balance
+                SET unresolved_unfunded_amount = unresolved_unfunded_amount - $2,
+                    updated_at = NOW()
+                WHERE organization_id = $1 AND unresolved_unfunded_amount >= $2
+                "#,
+                &[&organization_id, &settled],
+            )
+            .await
+            .map_err(map_db_error)?;
+        if updated != 1 {
+            return Err(RepositoryError::ValidationFailed(
+                "overage settlement does not reconcile with organization balance".to_string(),
+            ));
+        }
+    }
+
+    Ok(settled)
+}
+
 pub async fn load_allocations<C: GenericClient + Sync>(
     client: &C,
     parent: UsageAllocationParent,
@@ -247,7 +473,7 @@ pub async fn load_allocations<C: GenericClient + Sync>(
                   FROM usage_credit_allocation_reversals reversal
                   WHERE reversal.allocation_id = allocation.id
               ), 0)
-            ORDER BY allocation.priority_position
+            ORDER BY allocation.created_at, allocation.priority_position, allocation.id
             "#,
             &[&inference_id, &service_id],
         )

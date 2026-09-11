@@ -1,5 +1,6 @@
 use crate::models::{OrganizationLimitsHistory, UpdateOrganizationLimitsDbRequest};
 use crate::pool::DbPool;
+use crate::repositories::credit_allocation::{settle_unfunded_usage, CreditAllocationPolicy};
 use crate::repositories::utils::map_db_error;
 use crate::retry_db;
 use anyhow::{Context, Result};
@@ -11,6 +12,7 @@ use uuid::Uuid;
 #[derive(Debug, Clone)]
 pub struct OrganizationLimitsRepository {
     pool: DbPool,
+    allocation_policy: CreditAllocationPolicy,
 }
 
 #[derive(Debug, Clone)]
@@ -22,7 +24,17 @@ pub struct CurrentCreditStatus {
 
 impl OrganizationLimitsRepository {
     pub fn new(pool: DbPool) -> Self {
-        Self { pool }
+        Self {
+            pool,
+            allocation_policy: CreditAllocationPolicy::default(),
+        }
+    }
+
+    pub fn with_accounting_config(pool: DbPool, config: &config::CreditAllocationConfig) -> Self {
+        Self {
+            pool,
+            allocation_policy: CreditAllocationPolicy::from(config),
+        }
     }
 
     /// Update organization limits - closes previous active limit of the same type and creates new one
@@ -106,6 +118,8 @@ impl OrganizationLimitsRepository {
                 )
                 .await
                 .map_err(map_db_error)?;
+
+            settle_unfunded_usage(&transaction, organization_id, &self.allocation_policy).await?;
 
             transaction.commit().await.map_err(map_db_error)?;
 

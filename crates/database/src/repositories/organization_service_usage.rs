@@ -105,9 +105,9 @@ impl OrganizationServiceUsageRepository {
                                 SELECT SUM(amount)::BIGINT FROM usage_credit_adjustments adjustment
                                 WHERE adjustment.service_usage_id = usage_log.id
                             ), 0) ELSE
-                                (SELECT a.amount - COALESCE((SELECT SUM(amount)::BIGINT
+                                (SELECT COALESCE(SUM(a.amount - COALESCE((SELECT SUM(amount)::BIGINT
                                      FROM usage_credit_allocation_reversals reversal
-                                     WHERE reversal.allocation_id = a.id), 0)
+                                     WHERE reversal.allocation_id = a.id), 0)), 0)::BIGINT
                                  FROM usage_credit_allocations a
                                  WHERE a.service_usage_id = usage_log.id AND a.credit_type = $3)
                             END AS total_cost,
@@ -121,7 +121,7 @@ impl OrganizationServiceUsageRepository {
                                         WHERE reversal.allocation_id = a.id), 0), 'source', a.source,
                                     'organization_limit_id', a.organization_limit_id,
                                     'policy_version', a.policy_version
-                                ) ORDER BY a.priority_position)
+                                ) ORDER BY a.created_at, a.priority_position, a.id)
                                 FROM usage_credit_allocations a
                                 WHERE a.service_usage_id = usage_log.id
                                   AND ($3::TEXT IS NULL OR a.credit_type = $3)
@@ -170,9 +170,9 @@ impl OrganizationServiceUsageRepository {
                                 SELECT SUM(amount)::BIGINT FROM usage_credit_adjustments adjustment
                                 WHERE adjustment.service_usage_id = usage_log.id
                             ), 0) ELSE
-                                (SELECT a.amount - COALESCE((SELECT SUM(amount)::BIGINT
+                                (SELECT COALESCE(SUM(a.amount - COALESCE((SELECT SUM(amount)::BIGINT
                                      FROM usage_credit_allocation_reversals reversal
-                                     WHERE reversal.allocation_id = a.id), 0)
+                                     WHERE reversal.allocation_id = a.id), 0)), 0)::BIGINT
                                  FROM usage_credit_allocations a
                                  WHERE a.service_usage_id = usage_log.id AND a.credit_type = $2)
                             END AS total_cost,
@@ -186,7 +186,7 @@ impl OrganizationServiceUsageRepository {
                                         WHERE reversal.allocation_id = a.id), 0), 'source', a.source,
                                     'organization_limit_id', a.organization_limit_id,
                                     'policy_version', a.policy_version
-                                ) ORDER BY a.priority_position)
+                                ) ORDER BY a.created_at, a.priority_position, a.id)
                                 FROM usage_credit_allocations a
                                 WHERE a.service_usage_id = usage_log.id
                                   AND ($2::TEXT IS NULL OR a.credit_type = $2)
@@ -264,10 +264,10 @@ impl OrganizationServiceUsageRepository {
                             SELECT SUM(amount)::BIGINT FROM usage_credit_adjustments adjustment
                             WHERE adjustment.service_usage_id = usage_log.id
                         ), 0) ELSE
-                            (SELECT a.amount - COALESCE((
+                            (SELECT COALESCE(SUM(a.amount - COALESCE((
                                 SELECT SUM(amount)::BIGINT FROM usage_credit_allocation_reversals reversal
                                 WHERE reversal.allocation_id = a.id
-                             ), 0) FROM usage_credit_allocations a
+                             ), 0)), 0)::BIGINT FROM usage_credit_allocations a
                              WHERE a.service_usage_id = usage_log.id AND a.credit_type = $7)
                         END AS total_cost,
                         usage_log.inference_id, usage_log.created_at,
@@ -280,7 +280,7 @@ impl OrganizationServiceUsageRepository {
                                     WHERE reversal.allocation_id = a.id), 0), 'source', a.source,
                                 'organization_limit_id', a.organization_limit_id,
                                 'policy_version', a.policy_version
-                            ) ORDER BY a.priority_position)
+                            ) ORDER BY a.created_at, a.priority_position, a.id)
                             FROM usage_credit_allocations a
                             WHERE a.service_usage_id = usage_log.id
                               AND ($7::TEXT IS NULL OR a.credit_type = $7)

@@ -170,7 +170,15 @@ impl CreditAdjustmentRepository {
             .query_one(
                 r#"
                 SELECT COALESCE(SUM(amount), 0)::BIGINT AS amount,
-                       COALESCE(SUM(unfunded_amount_reversed), 0)::BIGINT AS unfunded
+                       COALESCE(SUM(unfunded_amount_reversed), 0)::BIGINT AS unfunded,
+                       COALESCE((SELECT SUM(allocation.amount)::BIGINT
+                           FROM usage_credit_allocations allocation
+                           WHERE allocation.allocation_phase = 'overage_settlement'
+                             AND (($1::UUID IS NOT NULL
+                                   AND allocation.inference_usage_id = $1)
+                               OR ($2::UUID IS NOT NULL
+                                   AND allocation.service_usage_id = $2))), 0)::BIGINT
+                           AS settled
                 FROM usage_credit_adjustments
                 WHERE ($1::UUID IS NOT NULL AND inference_usage_id = $1)
                    OR ($2::UUID IS NOT NULL AND service_usage_id = $2)
@@ -184,6 +192,7 @@ impl CreditAdjustmentRepository {
             .saturating_sub(prior.get::<_, i64>("amount"));
         let unresolved_unfunded = original_unfunded
             .saturating_sub(prior.get::<_, i64>("unfunded"))
+            .saturating_sub(prior.get::<_, i64>("settled"))
             .max(0);
         if request.amount > effective_cost {
             return Err(RepositoryError::ValidationFailed(
@@ -248,7 +257,8 @@ impl CreditAdjustmentRepository {
                     ) reversed ON reversed.allocation_id = allocation.id
                     WHERE ($1::UUID IS NOT NULL AND allocation.inference_usage_id = $1)
                        OR ($2::UUID IS NOT NULL AND allocation.service_usage_id = $2)
-                    ORDER BY allocation.priority_position DESC
+                    ORDER BY allocation.created_at DESC, allocation.priority_position DESC,
+                             allocation.id DESC
                     "#,
                     &[&inference_usage_id, &service_usage_id],
                 )
@@ -355,7 +365,8 @@ async fn load_adjustment<C: tokio_postgres::GenericClient + Sync>(
             FROM usage_credit_allocation_reversals reversal
             JOIN usage_credit_allocations allocation ON allocation.id = reversal.allocation_id
             WHERE reversal.adjustment_id = $1
-            ORDER BY allocation.priority_position DESC
+            ORDER BY allocation.created_at DESC, allocation.priority_position DESC,
+                     allocation.id DESC
             "#,
             &[&row.get::<_, Uuid>("id")],
         )

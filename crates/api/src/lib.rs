@@ -419,7 +419,10 @@ pub async fn init_domain_services_with_pool(
         ),
     );
     let limits_repository_for_usage = Arc::new(
-        database::repositories::OrganizationLimitsRepository::new(database.pool().clone()),
+        database::repositories::OrganizationLimitsRepository::with_accounting_config(
+            database.pool().clone(),
+            &config.credit_allocation,
+        ),
     );
 
     // Create MCP client manager
@@ -554,8 +557,9 @@ pub async fn init_domain_services_with_pool(
         config.aml.clone(),
     ));
     let staking_farm_repository = Arc::new(
-        database::repositories::OrganizationStakingFarmSourcesRepository::new(
+        database::repositories::OrganizationStakingFarmSourcesRepository::with_accounting_config(
             database.pool().clone(),
+            &config.credit_allocation,
         ),
     ) as Arc<dyn services::staking_farm::StakingFarmRepository>;
     let staking_farm_contract_client = Arc::new(
@@ -2232,15 +2236,14 @@ fn build_admin_routes_with_options(
     use crate::routes::admin::{
         batch_upsert_models, cancel_model_pricing_change, confirm_model_deprecation,
         confirm_model_pricing_changes, create_admin_access_token, create_service,
-        create_usage_adjustment, delete_admin_access_token, delete_aml_allowlist_entry,
-        delete_model, deprecate_model, get_admin_organization_balance, get_billing_summary,
-        get_infra_summary, get_model_consumption_timeseries, get_model_history, get_model_revenue,
-        get_org_revenue, get_organization as get_admin_organization,
-        get_organization_concurrent_limit, get_organization_fallback,
-        get_organization_limits_history, get_organization_metrics, get_organization_timeseries,
-        get_performance_timeseries, get_platform_metrics, get_platform_timeseries,
-        get_revenue_density, list_admin_access_tokens, list_aml_allowlist, list_aml_reports,
-        list_invitation_email_deliveries, list_model_pricing_changes,
+        delete_admin_access_token, delete_aml_allowlist_entry, delete_model, deprecate_model,
+        get_admin_organization_balance, get_billing_summary, get_infra_summary,
+        get_model_consumption_timeseries, get_model_history, get_model_revenue, get_org_revenue,
+        get_organization as get_admin_organization, get_organization_concurrent_limit,
+        get_organization_fallback, get_organization_limits_history, get_organization_metrics,
+        get_organization_timeseries, get_performance_timeseries, get_platform_metrics,
+        get_platform_timeseries, get_revenue_density, list_admin_access_tokens, list_aml_allowlist,
+        list_aml_reports, list_invitation_email_deliveries, list_model_pricing_changes,
         list_models as admin_list_models, list_organization_members, list_organizations,
         list_users, preview_model_deprecation, preview_model_pricing_changes,
         resend_invitation_email, update_aml_report_status, update_organization_concurrent_limit,
@@ -2254,17 +2257,14 @@ fn build_admin_routes_with_options(
     use services::admin::AdminServiceImpl;
 
     // Create composite admin repository (handles models, organization limits, and users)
-    let admin_repository = Arc::new(AdminCompositeRepository::new(database.pool().clone()));
+    let admin_repository = Arc::new(AdminCompositeRepository::with_accounting_config(
+        database.pool().clone(),
+        &config.credit_allocation,
+    ));
 
     // Create admin access token repository
     let admin_access_token_repository =
         Arc::new(AdminAccessTokenRepository::new(database.pool().clone()));
-    let credit_adjustment_repository = Arc::new(
-        database::repositories::credit_adjustment::CreditAdjustmentRepository::new(
-            database.pool().clone(),
-        ),
-    );
-
     // Create admin service with composite repository.
     //
     // The admin service holds a reference to the `models_service` so it can
@@ -2304,7 +2304,6 @@ fn build_admin_routes_with_options(
         aml_service: services.aml_service,
         config: config.clone(),
         admin_access_token_repository,
-        credit_adjustment_repository,
         inference_provider_pool: services.inference_provider_pool,
         github_dispatcher,
         infra_service,
@@ -2373,10 +2372,6 @@ fn build_admin_routes_with_options(
         .route(
             "/admin/organizations/{org_id}/limits/history",
             axum::routing::get(get_organization_limits_history),
-        )
-        .route(
-            "/admin/organizations/{org_id}/usage/adjustments",
-            axum::routing::post(create_usage_adjustment),
         )
         .route(
             "/admin/organizations/{org_id}/usage/balance",

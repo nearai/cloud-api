@@ -33,11 +33,11 @@ where
                 FROM organization_service_usage_log AS usage_log
                 INNER JOIN services ON services.id = usage_log.service_id
                 LEFT JOIN LATERAL (
-                    SELECT original.amount - COALESCE((
+                    SELECT COALESCE(SUM(original.amount - COALESCE((
                         SELECT SUM(reversal.amount)::BIGINT
                         FROM usage_credit_allocation_reversals reversal
                         WHERE reversal.allocation_id = original.id
-                    ), 0) AS amount
+                    ), 0)), 0)::BIGINT AS amount
                     FROM usage_credit_allocations original
                     WHERE original.service_usage_id = usage_log.id
                       AND original.credit_type = $7

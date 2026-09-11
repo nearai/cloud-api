@@ -6,13 +6,15 @@ use database::repositories::{
     credit_adjustment::{
         AdjustedUsageKind, CreateCreditAdjustment, CreditAdjustmentKind, CreditAdjustmentRepository,
     },
-    OrganizationLimitsRepository, OrganizationServiceUsageRepository, OrganizationUsageRepository,
+    OrganizationLimitsRepository, OrganizationServiceUsageRepository,
+    OrganizationStakingFarmSourcesRepository, OrganizationUsageRepository,
     PostgresReportingUsageSummaryRepository, RecordServiceUsageRequest,
 };
 use services::reporting_usage::{
     ReportingUsageSummaryFilters, ReportingUsageSummaryRepository, ReportingUsageSummarySource,
 };
 use services::service_usage::ports::ServiceUsageReportFilters;
+use services::staking_farm::{StakingFarmRepository, CREDIT_SOURCE_HOUSE_OF_STAKE};
 use services::usage::{InferenceType, InferenceUsageReportQuery};
 use std::time::Duration;
 use support::{
@@ -706,7 +708,6 @@ async fn writeoff_clears_only_unfunded_debt_and_later_capacity_remains_separate(
     let usage = usage_repository
         .record_usage(usage(&org, &model, Uuid::new_v4(), 20))
         .await?;
-    set_limit(&limits, org.org_id, "payment", 5).await?;
     assert_eq!(limits.get_current_credit_status(org.org_id).await?.1, 1);
 
     let writeoff = adjustment_repository
@@ -724,6 +725,7 @@ async fn writeoff_clears_only_unfunded_debt_and_later_capacity_remains_separate(
         .await?;
     assert_eq!(writeoff.unfunded_amount_reversed, 1);
     assert!(writeoff.allocation_reversals.is_empty());
+    set_limit(&limits, org.org_id, "payment", 5).await?;
     let (status, unfunded, _) = limits.get_current_credit_status(org.org_id).await?;
     assert_eq!(unfunded, 0);
     assert_eq!(
@@ -734,6 +736,307 @@ async fn writeoff_clears_only_unfunded_debt_and_later_capacity_remains_separate(
             .available,
         1
     );
+
+    cleanup_usage_fixtures(&pool, &[org.org_id], &[model.id]).await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn every_credit_source_automatically_settles_overage() -> anyhow::Result<()> {
+    let pool = test_pool().await?;
+    let limits = OrganizationLimitsRepository::new(pool.clone());
+    let usage_repository = OrganizationUsageRepository::new(pool.clone());
+    let model = insert_model(&pool, "allocation-auto-settlement-sources").await?;
+
+    for credit_type in ["grant", "staking_farm", "payment", "postpay"] {
+        let org = insert_org_fixture(&pool).await?;
+        let request = usage(&org, &model, Uuid::new_v4(), 5);
+        let original = usage_repository.record_usage(request.clone()).await?;
+        assert_eq!(original.funded_amount, Some(0));
+        assert_eq!(original.unfunded_amount, Some(5));
+
+        let expected_source = if credit_type == "staking_farm" {
+            OrganizationStakingFarmSourcesRepository::new(pool.clone())
+                .update_staking_farm_limit(org.org_id, 7, None)
+                .await?;
+            CREDIT_SOURCE_HOUSE_OF_STAKE.to_string()
+        } else {
+            set_limit(&limits, org.org_id, credit_type, 7).await?;
+            format!("test-{credit_type}")
+        };
+
+        let (status, unfunded, _) = limits.get_current_credit_status(org.org_id).await?;
+        let status = status
+            .iter()
+            .find(|status| status.limit.credit_type == credit_type)
+            .expect("new credit type must be active");
+        assert_eq!(status.consumed, 5);
+        assert_eq!(status.available, 2);
+        assert_eq!(unfunded, 0);
+
+        let retried = usage_repository.record_usage(request).await?;
+        assert!(!retried.was_inserted);
+        assert_eq!(retried.funded_amount, Some(5));
+        assert_eq!(retried.unfunded_amount, Some(0));
+        let allocations = retried.credit_allocations.unwrap();
+        assert_eq!(allocations.len(), 1);
+        assert_eq!(allocations[0].credit_type, credit_type);
+        assert_eq!(allocations[0].amount, 5);
+        assert_eq!(
+            allocations[0].source.as_deref(),
+            Some(expected_source.as_str())
+        );
+        assert_eq!(allocations[0].policy_version, "v1");
+
+        let phase: String = pool
+            .get()
+            .await?
+            .query_one(
+                "SELECT allocation_phase FROM usage_credit_allocations WHERE inference_usage_id = $1",
+                &[&original.id],
+            )
+            .await?
+            .get(0);
+        assert_eq!(phase, "overage_settlement");
+        cleanup_usage_fixtures(&pool, &[org.org_id], &[]).await?;
+    }
+
+    cleanup_usage_fixtures(&pool, &[], &[model.id]).await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn service_usage_overage_is_automatically_settled() -> anyhow::Result<()> {
+    let pool = test_pool().await?;
+    let limits = OrganizationLimitsRepository::new(pool.clone());
+    let service_repository = OrganizationServiceUsageRepository::new(pool.clone());
+    let org = insert_org_fixture(&pool).await?;
+    let service_id = Uuid::new_v4();
+    pool.get()
+        .await?
+        .execute(
+            "INSERT INTO services (id, service_name, display_name, unit, cost_per_unit) VALUES ($1, $2, 'Settlement service', 'request', 5)",
+            &[&service_id, &format!("settlement-service-{service_id}")],
+        )
+        .await?;
+    let request = RecordServiceUsageRequest {
+        organization_id: org.org_id,
+        workspace_id: org.workspace_a_id,
+        api_key_id: org.api_key_a_id,
+        service_id,
+        quantity: 1,
+        total_cost: 5,
+        inference_id: Some(Uuid::new_v4()),
+    };
+    let original = service_repository.record_usage(&request).await?;
+    assert_eq!(original.unfunded_amount, Some(5));
+
+    set_limit(&limits, org.org_id, "payment", 7).await?;
+
+    let retried = service_repository.record_usage(&request).await?;
+    assert_eq!(retried.funded_amount, Some(5));
+    assert_eq!(retried.unfunded_amount, Some(0));
+    assert_eq!(
+        retried.credit_allocations.unwrap()[0].credit_type,
+        "payment"
+    );
+    let phase: String = pool
+        .get()
+        .await?
+        .query_one(
+            "SELECT allocation_phase FROM usage_credit_allocations WHERE service_usage_id = $1",
+            &[&original.id],
+        )
+        .await?
+        .get(0);
+    assert_eq!(phase, "overage_settlement");
+
+    cleanup_usage_fixtures(&pool, &[org.org_id], &[]).await?;
+    pool.get()
+        .await?
+        .execute("DELETE FROM services WHERE id = $1", &[&service_id])
+        .await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn partial_exact_and_excess_topups_settle_only_available_capacity() -> anyhow::Result<()> {
+    let pool = test_pool().await?;
+    let limits = OrganizationLimitsRepository::new(pool.clone());
+    let usage_repository = OrganizationUsageRepository::new(pool.clone());
+    let model = insert_model(&pool, "allocation-auto-settlement-boundaries").await?;
+
+    for (topup, expected_unfunded, expected_available) in [(3, 2, 0), (5, 0, 0), (7, 0, 2)] {
+        let org = insert_org_fixture(&pool).await?;
+        usage_repository
+            .record_usage(usage(&org, &model, Uuid::new_v4(), 5))
+            .await?;
+
+        set_limit(&limits, org.org_id, "payment", topup).await?;
+
+        let (status, unfunded, _) = limits.get_current_credit_status(org.org_id).await?;
+        assert_eq!(unfunded, expected_unfunded);
+        assert_eq!(status[0].consumed, topup.min(5));
+        assert_eq!(status[0].available, expected_available);
+        cleanup_usage_fixtures(&pool, &[org.org_id], &[]).await?;
+    }
+
+    cleanup_usage_fixtures(&pool, &[], &[model.id]).await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn same_credit_type_settlement_is_append_only_and_reports_effective_funding(
+) -> anyhow::Result<()> {
+    let pool = test_pool().await?;
+    let posting_limits = OrganizationLimitsRepository::new(pool.clone());
+    let usage_repository = OrganizationUsageRepository::new(pool.clone());
+    let org = insert_org_fixture(&pool).await?;
+    let model = insert_model(&pool, "allocation-auto-settlement-same-type").await?;
+    set_limit(&posting_limits, org.org_id, "grant", 2).await?;
+    let request = usage(&org, &model, Uuid::new_v4(), 5);
+    let original = usage_repository.record_usage(request.clone()).await?;
+    assert_eq!(original.unfunded_amount, Some(3));
+
+    let settlement_config = config::CreditAllocationConfig {
+        policy_version: "settlement-v2".to_string(),
+        ..config::CreditAllocationConfig::default()
+    };
+    let settlement_limits =
+        OrganizationLimitsRepository::with_accounting_config(pool.clone(), &settlement_config);
+    set_limit(&settlement_limits, org.org_id, "grant", 6).await?;
+
+    let retried = usage_repository.record_usage(request).await?;
+    assert_eq!(retried.funded_amount, Some(5));
+    assert_eq!(retried.unfunded_amount, Some(0));
+    assert_eq!(
+        retried
+            .credit_allocations
+            .unwrap()
+            .into_iter()
+            .map(|allocation| (allocation.credit_type, allocation.amount))
+            .collect::<Vec<_>>(),
+        vec![("grant".to_string(), 2), ("grant".to_string(), 3)]
+    );
+
+    let phases_and_versions = pool
+        .get()
+        .await?
+        .query(
+            "SELECT allocation_phase, policy_version FROM usage_credit_allocations WHERE inference_usage_id = $1 ORDER BY created_at, id",
+            &[&original.id],
+        )
+        .await?
+        .into_iter()
+        .map(|row| (row.get::<_, String>(0), row.get::<_, String>(1)))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        phases_and_versions,
+        vec![
+            ("posting".to_string(), "v1".to_string()),
+            (
+                "overage_settlement".to_string(),
+                "settlement-v2".to_string()
+            ),
+        ]
+    );
+
+    let filtered = usage_repository
+        .list_inference_usage_report(InferenceUsageReportQuery {
+            credit_type: Some("grant".to_string()),
+            ..InferenceUsageReportQuery::for_organization(org.org_id)
+        })
+        .await?;
+    assert_eq!(filtered.len(), 1);
+    assert_eq!(filtered[0].total_cost_nano_usd, 5);
+
+    cleanup_usage_fixtures(&pool, &[org.org_id], &[model.id]).await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn settlement_funds_oldest_overages_first() -> anyhow::Result<()> {
+    let pool = test_pool().await?;
+    let limits = OrganizationLimitsRepository::new(pool.clone());
+    let usage_repository = OrganizationUsageRepository::new(pool.clone());
+    let org = insert_org_fixture(&pool).await?;
+    let model = insert_model(&pool, "allocation-auto-settlement-fifo").await?;
+    let first = usage_repository
+        .record_usage(usage(&org, &model, Uuid::new_v4(), 2))
+        .await?;
+    let second_request = usage(&org, &model, Uuid::new_v4(), 3);
+    let second = usage_repository
+        .record_usage(second_request.clone())
+        .await?;
+
+    set_limit(&limits, org.org_id, "grant", 4).await?;
+    let history = usage_repository
+        .get_usage_history(org.org_id, Some(10), Some(0))
+        .await?;
+    let first_history = history.iter().find(|row| row.id == first.id).unwrap();
+    let second_history = history.iter().find(|row| row.id == second.id).unwrap();
+    assert_eq!(first_history.unfunded_amount, Some(0));
+    assert_eq!(second_history.funded_amount, Some(2));
+    assert_eq!(second_history.unfunded_amount, Some(1));
+    assert_eq!(limits.get_current_credit_status(org.org_id).await?.1, 1);
+
+    set_limit(&limits, org.org_id, "staking_farm", 2).await?;
+    let retried_second = usage_repository.record_usage(second_request).await?;
+    assert_eq!(retried_second.unfunded_amount, Some(0));
+    assert_eq!(limits.get_current_credit_status(org.org_id).await?.1, 0);
+    let staking = limits
+        .get_current_credit_status(org.org_id)
+        .await?
+        .0
+        .into_iter()
+        .find(|status| status.limit.credit_type == "staking_farm")
+        .unwrap();
+    assert_eq!(staking.consumed, 1);
+    assert_eq!(staking.available, 1);
+
+    cleanup_usage_fixtures(&pool, &[org.org_id], &[model.id]).await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn concurrent_credit_additions_cannot_double_settle_overage() -> anyhow::Result<()> {
+    let pool = test_pool().await?;
+    let usage_repository = OrganizationUsageRepository::new(pool.clone());
+    let org = insert_org_fixture(&pool).await?;
+    let model = insert_model(&pool, "allocation-auto-settlement-concurrent").await?;
+    usage_repository
+        .record_usage(usage(&org, &model, Uuid::new_v4(), 10))
+        .await?;
+
+    let grant_limits = OrganizationLimitsRepository::new(pool.clone());
+    let payment_limits = OrganizationLimitsRepository::new(pool.clone());
+    let (grant_result, payment_result) = tokio::join!(
+        set_limit(&grant_limits, org.org_id, "grant", 6),
+        set_limit(&payment_limits, org.org_id, "payment", 6),
+    );
+    grant_result?;
+    payment_result?;
+
+    let (statuses, unfunded, _) = grant_limits.get_current_credit_status(org.org_id).await?;
+    assert_eq!(unfunded, 0);
+    assert_eq!(
+        statuses.iter().map(|status| status.consumed).sum::<i64>(),
+        10
+    );
+    assert_eq!(
+        statuses.iter().map(|status| status.available).sum::<i64>(),
+        2
+    );
+    let settlement_total: i64 = pool
+        .get()
+        .await?
+        .query_one(
+            "SELECT COALESCE(SUM(amount), 0)::BIGINT FROM usage_credit_allocations WHERE organization_id = $1 AND allocation_phase = 'overage_settlement'",
+            &[&org.org_id],
+        )
+        .await?
+        .get(0);
+    assert_eq!(settlement_total, 10);
 
     cleanup_usage_fixtures(&pool, &[org.org_id], &[model.id]).await?;
     Ok(())

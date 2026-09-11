@@ -51,6 +51,8 @@ CREATE TABLE usage_credit_allocations (
     organization_limit_id UUID NOT NULL REFERENCES organization_limits_history(id),
     source VARCHAR(100),
     policy_version VARCHAR(50) NOT NULL,
+    allocation_phase VARCHAR(30) NOT NULL DEFAULT 'posting'
+        CHECK (allocation_phase IN ('posting', 'overage_settlement')),
     priority_position SMALLINT NOT NULL CHECK (priority_position >= 0),
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     CONSTRAINT usage_credit_allocations_one_parent
@@ -70,10 +72,10 @@ CREATE TABLE organization_credit_consumption (
 
 CREATE UNIQUE INDEX usage_credit_allocations_inference_type_unique
     ON usage_credit_allocations(inference_usage_id, credit_type)
-    WHERE inference_usage_id IS NOT NULL;
+    WHERE inference_usage_id IS NOT NULL AND allocation_phase = 'posting';
 CREATE UNIQUE INDEX usage_credit_allocations_service_type_unique
     ON usage_credit_allocations(service_usage_id, credit_type)
-    WHERE service_usage_id IS NOT NULL;
+    WHERE service_usage_id IS NOT NULL AND allocation_phase = 'posting';
 CREATE INDEX usage_credit_allocations_org_type
     ON usage_credit_allocations(organization_id, credit_type);
 CREATE INDEX usage_credit_allocations_inference
@@ -127,7 +129,7 @@ CREATE INDEX usage_credit_allocation_reversals_allocation
     ON usage_credit_allocation_reversals(allocation_id);
 
 COMMENT ON TABLE usage_credit_allocations IS
-    'Immutable posting-time funding split for inference and service usage; amounts are nano-USD.';
+    'Immutable funding ledger for posting-time splits and later overage settlements; amounts are nano-USD.';
 COMMENT ON TABLE usage_credit_adjustments IS
     'Audited corrections and unfunded write-offs linked to immutable usage rows.';
 COMMENT ON COLUMN organization_usage_log.funded_amount IS

@@ -163,7 +163,7 @@ const APPROVED: &[ApprovedGroup] = &[
     ApprovedGroup { table: "scheduled_model_pricing_changes", columns: &["model_name", "model_display_name", "status", "last_error", "cancelled_by_user_email", "created_by_user_email", "change_reason", "old_text_pricing", "new_text_pricing"], reason: "Restricted administrator pricing workflow and audit data" },
     ApprovedGroup { table: "services", columns: &["service_name", "display_name", "description", "unit"], reason: "Public service catalog" },
     ApprovedGroup { table: "usage_credit_adjustments", columns: &["adjustment_type", "reason", "idempotency_key", "changed_by_user_email"], reason: "Restricted audited billing correction and write-off history" },
-    ApprovedGroup { table: "usage_credit_allocations", columns: &["credit_type", "source", "policy_version"], reason: "Immutable restricted billing attribution records" },
+    ApprovedGroup { table: "usage_credit_allocations", columns: &["credit_type", "source", "policy_version", "allocation_phase"], reason: "Immutable restricted billing attribution records" },
     ApprovedGroup { table: "users", columns: &["email", "username", "display_name", "avatar_url", "auth_provider", "provider_user_id"], reason: "Account identity fields required for login, uniqueness, and user-facing profiles" },
     ApprovedGroup { table: "workspaces", columns: &["name", "description", "settings"], reason: "Workspace profile and administrator-managed settings" },
 ];
@@ -1185,6 +1185,7 @@ mod tests {
             ("usage_credit_allocations", "credit_type"),
             ("usage_credit_allocations", "source"),
             ("usage_credit_allocations", "policy_version"),
+            ("usage_credit_allocations", "allocation_phase"),
             ("usage_credit_adjustments", "adjustment_type"),
             ("usage_credit_adjustments", "reason"),
             ("usage_credit_adjustments", "idempotency_key"),

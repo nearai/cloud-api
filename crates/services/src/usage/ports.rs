@@ -661,6 +661,50 @@ pub enum UsageCheckResult {
     NoLimitSet, // No spending limit configured - must set limit
 }
 
+impl UsageCheckResult {
+    /// Decide whether an organization may make a request from its current
+    /// balance and active spending limit. This is the single source of truth
+    /// for the credit gate: `check_can_use` and the inference middleware (which
+    /// fetches balance and limit separately so the reads can overlap other
+    /// preflight work) both go through it.
+    pub fn evaluate(
+        balance: Option<&OrganizationBalanceInfo>,
+        limit: Option<&OrganizationLimit>,
+    ) -> Self {
+        match (balance, limit) {
+            (Some(balance), Some(limit)) => {
+                // Compare amounts - deny if spent >= limit (all in same scale 9)
+                if balance.total_spent >= limit.spend_limit {
+                    UsageCheckResult::LimitExceeded {
+                        spent: balance.total_spent,
+                        limit: limit.spend_limit,
+                    }
+                } else {
+                    UsageCheckResult::Allowed {
+                        remaining: limit.spend_limit - balance.total_spent,
+                    }
+                }
+            }
+            // Has spent money but no limit set - DENY. Organizations must have
+            // limits set to use the API.
+            (Some(_balance), None) => UsageCheckResult::NoLimitSet,
+            // No usage yet, but a limit exists: allowed only if it is > 0.
+            (None, Some(limit)) => {
+                if limit.spend_limit > 0 {
+                    UsageCheckResult::Allowed {
+                        remaining: limit.spend_limit,
+                    }
+                } else {
+                    UsageCheckResult::NoCredits
+                }
+            }
+            // No balance and no limit - DENY. Organizations must purchase
+            // credits before using the API.
+            (None, None) => UsageCheckResult::NoCredits,
+        }
+    }
+}
+
 /// Organization balance information
 /// All amounts use fixed scale of 9 (nano-dollars) and USD currency
 #[derive(Debug, Clone)]
@@ -815,5 +859,70 @@ mod tests {
     fn incomplete_round_trips_through_its_database_string() {
         assert_eq!(StopReason::Incomplete.as_str(), "incomplete");
         assert_eq!(StopReason::parse("incomplete"), StopReason::Incomplete);
+    }
+}
+
+#[cfg(test)]
+mod usage_check_result_tests {
+    use super::*;
+
+    fn balance(total_spent: i64) -> OrganizationBalanceInfo {
+        OrganizationBalanceInfo {
+            organization_id: Uuid::new_v4(),
+            total_spent,
+            last_usage_at: None,
+            total_requests: 1,
+            total_tokens: 1,
+            updated_at: Utc::now(),
+        }
+    }
+
+    #[test]
+    fn under_limit_is_allowed_with_the_remainder() {
+        let result = UsageCheckResult::evaluate(
+            Some(&balance(400)),
+            Some(&OrganizationLimit { spend_limit: 1000 }),
+        );
+        assert!(matches!(
+            result,
+            UsageCheckResult::Allowed { remaining: 600 }
+        ));
+    }
+
+    #[test]
+    fn at_or_over_limit_is_rejected() {
+        let result = UsageCheckResult::evaluate(
+            Some(&balance(1000)),
+            Some(&OrganizationLimit { spend_limit: 1000 }),
+        );
+        assert!(matches!(
+            result,
+            UsageCheckResult::LimitExceeded {
+                spent: 1000,
+                limit: 1000
+            }
+        ));
+    }
+
+    #[test]
+    fn usage_without_a_limit_is_no_limit_set() {
+        let result = UsageCheckResult::evaluate(Some(&balance(5)), None);
+        assert!(matches!(result, UsageCheckResult::NoLimitSet));
+    }
+
+    #[test]
+    fn fresh_organization_depends_on_a_positive_limit() {
+        assert!(matches!(
+            UsageCheckResult::evaluate(None, Some(&OrganizationLimit { spend_limit: 7 })),
+            UsageCheckResult::Allowed { remaining: 7 }
+        ));
+        assert!(matches!(
+            UsageCheckResult::evaluate(None, Some(&OrganizationLimit { spend_limit: 0 })),
+            UsageCheckResult::NoCredits
+        ));
+        assert!(matches!(
+            UsageCheckResult::evaluate(None, None),
+            UsageCheckResult::NoCredits
+        ));
     }
 }

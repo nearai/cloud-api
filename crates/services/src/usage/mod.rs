@@ -758,43 +758,7 @@ impl UsageServiceTrait for UsageServiceImpl {
             .await
             .map_err(|e| UsageError::InternalError(format!("Failed to get limits: {e}")))?;
 
-        match (balance, limit) {
-            (Some(balance), Some(limit)) => {
-                // Compare amounts - deny if spent >= limit (all in same scale 9)
-                if balance.total_spent >= limit.spend_limit {
-                    Ok(UsageCheckResult::LimitExceeded {
-                        spent: balance.total_spent,
-                        limit: limit.spend_limit,
-                    })
-                } else {
-                    Ok(UsageCheckResult::Allowed {
-                        remaining: limit.spend_limit - balance.total_spent,
-                    })
-                }
-            }
-            (Some(_balance), None) => {
-                // Has spent money but no limit set - DENY
-                // Organizations must have limits set to use the API
-                Ok(UsageCheckResult::NoLimitSet)
-            }
-            (None, Some(limit)) => {
-                // No usage yet, but limit exists
-                // Check if limit is > 0 (has credits)
-                if limit.spend_limit > 0 {
-                    Ok(UsageCheckResult::Allowed {
-                        remaining: limit.spend_limit,
-                    })
-                } else {
-                    // Limit is set to 0 - no credits
-                    Ok(UsageCheckResult::NoCredits)
-                }
-            }
-            (None, None) => {
-                // No balance and no limit - DENY (no credits)
-                // Organizations must purchase credits before using the API
-                Ok(UsageCheckResult::NoCredits)
-            }
-        }
+        Ok(UsageCheckResult::evaluate(balance.as_ref(), limit.as_ref()))
     }
 
     /// Get current balance for an organization

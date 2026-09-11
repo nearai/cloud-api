@@ -91,8 +91,8 @@ pub async fn check_usage_for_api_key(
                     .usage_repository
                     .get_api_key_spend(id)
                     .await
-                    .map_err(|_| {
-                        tracing::error!("Failed to get API key spend");
+                    .map_err(|error| {
+                        tracing::error!(error = %error, "Failed to get API key spend");
                     })
             }))
         }

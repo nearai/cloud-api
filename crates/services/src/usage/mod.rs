@@ -758,15 +758,6 @@ impl UsageServiceTrait for UsageServiceImpl {
             .await
             .map_err(|e| UsageError::InternalError(format!("Failed to get limits: {e}")))?;
 
-        let balance = balance.map(|b| OrganizationBalanceInfo {
-            organization_id: b.organization_id,
-            total_spent: b.total_spent,
-            last_usage_at: b.last_usage_at,
-            total_requests: b.total_requests,
-            total_tokens: b.total_tokens,
-            updated_at: b.updated_at,
-        });
-
         Ok(UsageCheckResult::evaluate(balance.as_ref(), limit.as_ref()))
     }
 

@@ -112,6 +112,7 @@ mod tests {
 
     fn message(role: MessageRole, content: Option<serde_json::Value>) -> ChatMessage {
         ChatMessage {
+            reasoning_content: None,
             role,
             content,
             name: None,

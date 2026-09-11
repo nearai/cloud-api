@@ -198,6 +198,7 @@ impl ExternalBackend for OpenAiCompatibleBackend {
         // model's content parts but openai_compatible upstreams (OpenAI, Azure,
         // Together, …) may 400 on an unknown `cache_control` content-part field.
         crate::strip_cache_control(&mut streaming_params.messages);
+        crate::strip_reasoning_content(&mut streaming_params.messages);
         streaming_params.model = model.to_string();
         streaming_params.stream = Some(true);
         streaming_params.stream_options = Some(StreamOptions {
@@ -270,6 +271,7 @@ impl ExternalBackend for OpenAiCompatibleBackend {
         // #666: drop Anthropic prompt-caching breakpoints before forwarding (see
         // the streaming path for the rationale).
         crate::strip_cache_control(&mut non_streaming_params.messages);
+        crate::strip_reasoning_content(&mut non_streaming_params.messages);
         non_streaming_params.model = model.to_string();
         non_streaming_params.stream = Some(false);
 
@@ -1095,6 +1097,7 @@ mod tests {
     fn test_cache_control_stripped_before_serializing_to_openai() {
         let mut params = make_chat_params(None, None);
         params.messages = vec![crate::ChatMessage {
+            reasoning_content: None,
             role: crate::MessageRole::User,
             content: Some(serde_json::json!([
                 {

@@ -128,6 +128,10 @@ pub(crate) fn estimate_input(params: &ChatCompletionParams) -> InputEstimate {
         if let Some(tool_calls) = &m.tool_calls {
             bytes += serde_json::to_string(tool_calls).map_or(0, |s| s.len());
         }
+        // Prior-turn reasoning is part of the prompt the engine renders.
+        if let Some(reasoning) = &m.reasoning_content {
+            bytes += reasoning.len();
+        }
     }
     if let Some(tools) = &params.tools {
         bytes += serde_json::to_string(tools).map_or(0, |s| s.len());
@@ -227,6 +231,9 @@ pub(crate) fn concat_prompt_text(params: &ChatCompletionParams) -> String {
             if let Ok(s) = serde_json::to_string(tool_calls) {
                 text.push_str(&s);
             }
+        }
+        if let Some(reasoning) = &msg.reasoning_content {
+            text.push_str(reasoning);
         }
         text.push('\n');
     }
@@ -376,5 +383,26 @@ mod tests {
             text.contains("\"f\""),
             "tool definitions count toward context"
         );
+    }
+    #[test]
+    fn prior_reasoning_counts_toward_input_estimates() {
+        let base: ChatCompletionParams = serde_json::from_value(serde_json::json!({
+            "model": "m",
+            "messages": [
+                {"role": "user", "content": "q"},
+                {"role": "assistant", "content": null, "tool_calls": []},
+                {"role": "tool", "tool_call_id": "c", "content": "r"}
+            ]
+        }))
+        .unwrap();
+        let mut with_reasoning = base.clone();
+        with_reasoning.messages[1].reasoning_content = Some("x".repeat(4_000));
+
+        let before = estimate_input(&base);
+        let after = estimate_input(&with_reasoning);
+        assert_eq!(after.countable_tokens, before.countable_tokens + 1_000);
+        assert_eq!(after.uncounted_tokens, before.uncounted_tokens);
+        assert!(concat_prompt_text(&with_reasoning).contains(&"x".repeat(4_000)));
+        assert!(!concat_prompt_text(&base).contains("xxxx"));
     }
 }

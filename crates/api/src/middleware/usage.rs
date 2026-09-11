@@ -55,10 +55,9 @@ pub struct UsageState {
     pub api_key_repository: Arc<database::repositories::ApiKeyRepository>,
 }
 
-/// Outcome of the optional per-key spend-limit read.
-///
-/// `None` means the key has no spend limit, so nothing was read.
-type ApiKeySpendRead = Option<Result<i64, ()>>;
+/// Result of reading a key's accumulated spend, for keys that carry a spend
+/// limit. `Err` means the read failed.
+type ApiKeySpendRead = Result<i64, ()>;
 
 pub async fn check_usage_for_api_key(
     state: &UsageState,
@@ -72,38 +71,38 @@ pub async fn check_usage_for_api_key(
         organization_id, api_key_id.0
     );
 
-    // Only keys with a spend limit need the (expensive) spend aggregate.
-    let api_key_uuid = match api_key.api_key.spend_limit {
-        Some(_) => Some(uuid::Uuid::parse_str(&api_key_id.0).map_err(|_| {
-            tracing::error!("Failed to parse API key ID");
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                axum::Json(ErrorResponse::new(
-                    "Internal error".to_string(),
-                    "internal_server_error".to_string(),
-                )),
-            )
-        })?),
+    // Only keys with a spend limit need the (expensive) spend aggregate. The
+    // limit travels with the read so the per-key gate cannot be skipped by a
+    // mismatch between the two.
+    let api_key_spend = match api_key.api_key.spend_limit {
+        Some(limit) => {
+            let id = uuid::Uuid::parse_str(&api_key_id.0).map_err(|_| {
+                tracing::error!("Failed to parse API key ID");
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    axum::Json(ErrorResponse::new(
+                        "Internal error".to_string(),
+                        "internal_server_error".to_string(),
+                    )),
+                )
+            })?;
+            Some((limit, async move {
+                state
+                    .usage_repository
+                    .get_api_key_spend(id)
+                    .await
+                    .map_err(|_| {
+                        tracing::error!("Failed to get API key spend");
+                    })
+            }))
+        }
         None => None,
     };
-
-    let api_key_spend =
-        async {
-            match api_key_uuid {
-                Some(id) => Some(state.usage_repository.get_api_key_spend(id).await.map_err(
-                    |_| {
-                        tracing::error!("Failed to get API key spend");
-                    },
-                )),
-                None => None,
-            }
-        };
 
     run_usage_checks(
         state.staking_farm_service.as_ref(),
         state.usage_service.as_ref(),
         organization_id,
-        api_key.api_key.spend_limit,
         api_key_spend,
     )
     .await
@@ -112,46 +111,33 @@ pub async fn check_usage_for_api_key(
 /// Run the pre-inference credit checks with as little sequential database
 /// waiting as possible.
 ///
-/// The per-key spend aggregate, the staking-farm preflight and the
-/// organization balance are independent, so they are awaited together. The
-/// spending limit is read only after the staking preflight has finished,
-/// because a stale staking source is synced in that preflight and the sync
-/// rewrites the organization's limits. On a cross-region replica each of
-/// these reads costs a full network round trip, so overlapping them removes
-/// two round-trip waits from every request.
+/// Order of operations:
+/// 1. The per-key spend gate (keys with a spend limit only). It rejects
+///    before any organization work, as it always did.
+/// 2. The staking-farm preflight and the organization balance read run
+///    concurrently: the preflight only ever writes the organization's
+///    limits, never its balance.
+/// 3. The spending limit is read after the preflight has finished, because
+///    a stale staking source is synced there and the sync rewrites limits.
+///    For organizations that have a staking source the balance is re-read
+///    at this point too, so a preflight that waited on the NEAR RPC cannot
+///    leave the gate evaluating a balance from before usage recorded in the
+///    meantime. Organizations without a source (nearly all traffic) keep the
+///    overlapped read.
+///
+/// On a cross-region replica each of these reads costs a full network round
+/// trip, so overlapping them removes a round-trip wait from every request.
 async fn run_usage_checks<F>(
     staking_farm_service: &(dyn StakingFarmPreflightSync + Send + Sync),
     usage_service: &(dyn UsageServiceTrait + Send + Sync),
     organization_id: uuid::Uuid,
-    api_key_spend_limit: Option<i64>,
-    api_key_spend: F,
+    api_key_spend: Option<(i64, F)>,
 ) -> Result<(), (StatusCode, axum::Json<ErrorResponse>)>
 where
     F: Future<Output = ApiKeySpendRead>,
 {
-    let staking_preflight = async {
-        if let Err(error) = staking_farm_service
-            .sync_organization_if_stale(organization_id)
-            .await
-        {
-            warn!(
-                organization_id = %organization_id,
-                error = %error,
-                "Staking farm preflight sync failed; continuing with last synced credits"
-            );
-        }
-    };
-
-    let (api_key_spend, (), balance) = tokio::join!(
-        api_key_spend,
-        staking_preflight,
-        usage_service.get_balance(organization_id)
-    );
-
-    // The per-key limit is checked first so its error reporting is unchanged
-    // from the previous sequential implementation.
-    if let (Some(api_key_limit), Some(spend)) = (api_key_spend_limit, api_key_spend) {
-        let api_key_spend = spend.map_err(|()| {
+    if let Some((api_key_limit, spend)) = api_key_spend {
+        let api_key_spend = spend.await.map_err(|()| {
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 axum::Json(ErrorResponse::new(
@@ -188,6 +174,29 @@ where
         );
     }
 
+    let staking_preflight = async {
+        match staking_farm_service
+            .sync_organization_if_stale(organization_id)
+            .await
+        {
+            Ok(source) => source.is_some(),
+            Err(error) => {
+                warn!(
+                    organization_id = %organization_id,
+                    error = %error,
+                    "Staking farm preflight sync failed; continuing with last synced credits"
+                );
+                // Unknown whether a source exists; take the conservative path.
+                true
+            }
+        }
+    };
+
+    let (has_staking_source, balance) = tokio::join!(
+        staking_preflight,
+        usage_service.get_balance(organization_id)
+    );
+
     let usage_check_failed = |_| {
         tracing::error!("Failed to check usage limits");
         (
@@ -197,6 +206,12 @@ where
                 "internal_server_error".to_string(),
             )),
         )
+    };
+    let balance = if has_staking_source {
+        // Same read order as before the overlap: balance after the preflight.
+        usage_service.get_balance(organization_id).await
+    } else {
+        balance
     };
     let balance = balance.map_err(usage_check_failed)?;
 
@@ -332,7 +347,37 @@ mod tests {
     struct MockStakingFarmPreflight {
         calls: Mutex<Vec<Uuid>>,
         should_fail: bool,
+        /// Source the preflight reports for the organization, if any.
+        source: Option<services::staking_farm::OrganizationStakingFarmSource>,
         events: Arc<Mutex<Vec<&'static str>>>,
+    }
+
+    fn staking_source_fixture(
+        organization_id: Uuid,
+    ) -> services::staking_farm::OrganizationStakingFarmSource {
+        let now = chrono::Utc::now();
+        services::staking_farm::OrganizationStakingFarmSource {
+            id: Uuid::new_v4(),
+            organization_id,
+            near_account_id: "alice.near".to_string(),
+            network_id: "mainnet".to_string(),
+            contract_id: "stake.dao".to_string(),
+            farm_product_id: "prod_test".to_string(),
+            farm_price_id: None,
+            credit_nano_usd_per_reward_unit: 1,
+            status: "active".to_string(),
+            sync_status: "synced".to_string(),
+            last_sync_error: None,
+            created_by_user_id: None,
+            created_at: now,
+            updated_at: now,
+            last_synced_at: Some(now),
+            last_synced_accumulated_reward_units_24: None,
+            last_synced_pending_reward_units_24: None,
+            last_synced_reward_units_24: None,
+            last_synced_credit_nano_usd: None,
+            active_positions: serde_json::json!([]),
+        }
     }
 
     impl StakingFarmPreflightSync for MockStakingFarmPreflight {
@@ -350,13 +395,20 @@ mod tests {
             >,
         > {
             self.calls.lock().unwrap().push(organization_id);
-            self.events.lock().unwrap().push("staking");
+            let events = self.events.clone();
             let should_fail = self.should_fail;
+            let source = self.source.clone();
             Box::pin(async move {
+                events.lock().unwrap().push("staking-start");
+                // Let any concurrently running read make progress, so a limit
+                // read that wrongly overlaps the preflight lands between
+                // start and done.
+                tokio::task::yield_now().await;
+                events.lock().unwrap().push("staking-done");
                 if should_fail {
                     anyhow::bail!("staking sync failed");
                 }
-                Ok(None)
+                Ok(source)
             })
         }
     }
@@ -514,9 +566,9 @@ mod tests {
     /// start until the preflight has finished. Balance is independent and is
     /// allowed to overlap the preflight.
     fn assert_limits_read_after_staking(events: &[&str]) {
-        let staking = events
+        let staking_done = events
             .iter()
-            .position(|e| *e == "staking")
+            .position(|e| *e == "staking-done")
             .expect("staking ran");
         let limits = events
             .iter()
@@ -524,10 +576,13 @@ mod tests {
             .expect("limits read");
         assert!(events.contains(&"balance"), "balance read: {events:?}");
         assert!(
-            staking < limits,
-            "limits read before staking preflight: {events:?}"
+            staking_done < limits,
+            "limits read before staking preflight finished: {events:?}"
         );
     }
+
+    /// Type for tests that pass no per-key spend read.
+    type NoSpendRead = std::future::Ready<ApiKeySpendRead>;
 
     #[tokio::test]
     async fn staking_farm_preflight_runs_before_limit_read() {
@@ -536,11 +591,12 @@ mod tests {
         let staking = MockStakingFarmPreflight {
             calls: Mutex::new(Vec::new()),
             should_fail: false,
+            source: None,
             events: events.clone(),
         };
         let usage = MockUsageService::allowed(events.clone());
 
-        run_usage_checks(&staking, &usage, organization_id, None, async { None })
+        run_usage_checks::<NoSpendRead>(&staking, &usage, organization_id, None)
             .await
             .unwrap();
 
@@ -556,11 +612,12 @@ mod tests {
         let staking = MockStakingFarmPreflight {
             calls: Mutex::new(Vec::new()),
             should_fail: true,
+            source: None,
             events: events.clone(),
         };
         let usage = MockUsageService::allowed(events.clone());
 
-        run_usage_checks(&staking, &usage, organization_id, None, async { None })
+        run_usage_checks::<NoSpendRead>(&staking, &usage, organization_id, None)
             .await
             .unwrap();
 
@@ -576,6 +633,7 @@ mod tests {
         let staking = MockStakingFarmPreflight {
             calls: Mutex::new(Vec::new()),
             should_fail: false,
+            source: None,
             events: events.clone(),
         };
         let usage = MockUsageService {
@@ -586,7 +644,7 @@ mod tests {
         };
 
         let (status, axum::Json(error)) =
-            run_usage_checks(&staking, &usage, organization_id, None, async { None })
+            run_usage_checks::<NoSpendRead>(&staking, &usage, organization_id, None)
                 .await
                 .unwrap_err();
 
@@ -601,21 +659,80 @@ mod tests {
         let staking = MockStakingFarmPreflight {
             calls: Mutex::new(Vec::new()),
             should_fail: false,
+            source: None,
             events: events.clone(),
         };
         let usage = MockUsageService::allowed(events.clone());
 
-        let (status, axum::Json(error)) =
-            run_usage_checks(&staking, &usage, organization_id, Some(10), async {
-                Some(Ok(10))
-            })
-            .await
-            .unwrap_err();
+        let (status, axum::Json(error)) = run_usage_checks(
+            &staking,
+            &usage,
+            organization_id,
+            Some((10, async { Ok(10) })),
+        )
+        .await
+        .unwrap_err();
 
         assert_eq!(status, StatusCode::PAYMENT_REQUIRED);
         assert_eq!(error.error.r#type, "api_key_limit_exceeded");
-        // The org limit read is skipped once the key itself is over budget.
-        assert!(usage.calls.lock().unwrap().is_empty());
+        // Nothing at the organization level runs once the key is over budget:
+        // no staking preflight, no balance or limit read.
+        assert!(staking.calls.lock().unwrap().is_empty());
+        assert!(events.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn balance_read_overlaps_the_staking_preflight_without_a_source() {
+        let organization_id = Uuid::new_v4();
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let staking = MockStakingFarmPreflight {
+            calls: Mutex::new(Vec::new()),
+            should_fail: false,
+            source: None,
+            events: events.clone(),
+        };
+        let usage = MockUsageService::allowed(events.clone());
+
+        run_usage_checks::<NoSpendRead>(&staking, &usage, organization_id, None)
+            .await
+            .unwrap();
+
+        let events = events.lock().unwrap().clone();
+        assert_eq!(
+            events,
+            vec!["staking-start", "balance", "staking-done", "limits"],
+            "balance must overlap the preflight and be read once"
+        );
+    }
+
+    #[tokio::test]
+    async fn balance_is_re_read_after_the_preflight_when_a_staking_source_exists() {
+        let organization_id = Uuid::new_v4();
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let staking = MockStakingFarmPreflight {
+            calls: Mutex::new(Vec::new()),
+            should_fail: false,
+            source: Some(staking_source_fixture(organization_id)),
+            events: events.clone(),
+        };
+        let usage = MockUsageService::allowed(events.clone());
+
+        run_usage_checks::<NoSpendRead>(&staking, &usage, organization_id, None)
+            .await
+            .unwrap();
+
+        let events = events.lock().unwrap().clone();
+        assert_eq!(
+            events,
+            vec![
+                "staking-start",
+                "balance",
+                "staking-done",
+                "balance",
+                "limits"
+            ],
+            "a staking organization must evaluate a balance read after the preflight"
+        );
     }
 
     #[tokio::test]
@@ -625,13 +742,17 @@ mod tests {
         let staking = MockStakingFarmPreflight {
             calls: Mutex::new(Vec::new()),
             should_fail: false,
+            source: None,
             events: events.clone(),
         };
         let usage = MockUsageService::allowed(events.clone());
 
-        let (status, _) = run_usage_checks(&staking, &usage, organization_id, Some(10), async {
-            Some(Err(()))
-        })
+        let (status, _) = run_usage_checks(
+            &staking,
+            &usage,
+            organization_id,
+            Some((10, async { Err(()) })),
+        )
         .await
         .unwrap_err();
 

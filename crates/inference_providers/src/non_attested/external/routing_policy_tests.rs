@@ -104,6 +104,70 @@ fn absent_policy_preserves_existing_user_precedence() {
     }
 }
 
+#[test]
+fn unsupported_or_ambiguous_policy_configurations_are_rejected() {
+    for backend in ["anthropic", "gemini", "unknown"] {
+        assert!(validate_enforced_request_body(&json!({
+            "backend": backend, "enforced_request_body": {"provider": policy()}
+        }))
+        .is_err());
+    }
+    for enforced in [
+        json!(false),
+        json!([]),
+        json!({"model": "override"}),
+        json!({"messages": []}),
+        json!({"provider": null}),
+        json!({"provider": "off"}),
+        json!({"provider": []}),
+    ] {
+        assert!(validate_enforced_request_body(&json!({
+            "backend": "openai_compatible", "enforced_request_body": enforced
+        }))
+        .is_err());
+    }
+    for config in [
+        json!({"backend": "anthropic"}),
+        json!({"backend": "gemini", "enforced_request_body": null}),
+        json!({"backend": "openai_compatible", "enforced_request_body": {}}),
+        json!({"backend": "openai_compatible", "enforced_request_body": {"provider": policy()}}),
+    ] {
+        assert!(validate_enforced_request_body(&config).is_ok());
+    }
+}
+
+#[tokio::test]
+async fn multipart_operations_fail_before_sending_a_policy_free_request() {
+    let server = MockServer::start().await;
+    let provider = provider(&server.uri());
+    let params = AudioTranscriptionParams {
+        model: "test-model".into(),
+        file_bytes: vec![1, 2, 3],
+        filename: "synthetic.wav".into(),
+        language: None,
+        response_format: None,
+        temperature: None,
+        timestamp_granularities: None,
+        extra: HashMap::new(),
+    };
+    assert!(matches!(
+        provider.audio_transcription(params, String::new()).await,
+        Err(AudioTranscriptionError::TranscriptionError(message)) if message.contains("mandatory routing")
+    ));
+    let params = ImageEditParams {
+        model: "test-model".into(),
+        prompt: "synthetic".into(),
+        image: Arc::new(vec![1, 2, 3]),
+        size: None,
+        response_format: None,
+    };
+    assert!(matches!(
+        provider.image_edit(Arc::new(params), String::new()).await,
+        Err(ImageEditError::EditError(message)) if message.contains("mandatory routing")
+    ));
+    assert!(server.received_requests().await.unwrap().is_empty());
+}
+
 async fn assert_policy_on_wire(stream: bool) {
     let server = MockServer::start().await;
     let response = if stream {

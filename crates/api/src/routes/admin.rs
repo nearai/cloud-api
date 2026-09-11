@@ -547,6 +547,18 @@ pub async fn batch_upsert_models(
 
     // Validate all pricing fields are non-negative to prevent incorrect billing
     for (model_name, request) in &batch_request {
+        if let Some(config) = &request.provider_config {
+            inference_providers::non_attested::external::validate_enforced_request_body(config)
+                .map_err(|error| {
+                    (
+                        StatusCode::BAD_REQUEST,
+                        ResponseJson(ErrorResponse::new(
+                            format!("model '{model_name}': {error}"),
+                            "invalid_request".to_string(),
+                        )),
+                    )
+                })?;
+        }
         let validate_price = |price: &Option<DecimalPriceRequest>, field: &str| {
             if let Some(p) = price {
                 p.validate().map_err(|e| {

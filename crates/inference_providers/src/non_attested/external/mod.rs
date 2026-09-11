@@ -99,6 +99,28 @@ fn merge_json_enforced(target: &mut serde_json::Value, enforced: &serde_json::Va
     }
 }
 
+/// Validate mandatory routing configuration at both the admin write and load paths.
+/// Restrict this initial policy surface to `provider`, which is an extra field on
+/// every supported JSON endpoint, so typed fields cannot create duplicate keys.
+pub fn validate_enforced_request_body(config: &serde_json::Value) -> Result<(), &'static str> {
+    let Some(enforced) = config.get("enforced_request_body").filter(|v| !v.is_null()) else {
+        return Ok(());
+    };
+    if config.get("backend").and_then(|v| v.as_str()) != Some("openai_compatible") {
+        return Err("enforced_request_body requires an openai_compatible backend");
+    }
+    let fields = enforced
+        .as_object()
+        .ok_or("enforced_request_body must be an object")?;
+    if fields.keys().any(|key| key != "provider") {
+        return Err("enforced_request_body currently supports only the provider field");
+    }
+    if fields.get("provider").is_some_and(|v| !v.is_object()) {
+        return Err("enforced_request_body.provider must be an object");
+    }
+    Ok(())
+}
+
 /// Provider configuration stored in database
 ///
 /// This enum represents the JSON configuration stored in the `provider_config`
@@ -124,7 +146,7 @@ pub enum ProviderConfig {
         /// Mandatory extra fields applied after defaults and user parameters.
         /// Objects merge recursively; configured leaves replace user values.
         /// Use for routing/privacy restrictions that callers must not override.
-        /// Only extra body fields are supported, not typed fields such as `model`.
+        /// Currently restricted to the extra `provider` object; typed fields are rejected.
         #[serde(default)]
         enforced_request_body: Option<std::collections::HashMap<String, serde_json::Value>>,
     },
@@ -432,6 +454,11 @@ impl InferenceProvider for ExternalProvider {
         params: AudioTranscriptionParams,
         _request_hash: String,
     ) -> Result<AudioTranscriptionResponse, AudioTranscriptionError> {
+        if !self.enforced_request_body.is_empty() {
+            return Err(AudioTranscriptionError::TranscriptionError(
+                "Audio transcription does not support mandatory routing fields".into(),
+            ));
+        }
         self.backend
             .audio_transcription(&self.config, &self.model_name, params)
             .await
@@ -443,6 +470,11 @@ impl InferenceProvider for ExternalProvider {
         params: Arc<ImageEditParams>,
         _request_hash: String,
     ) -> Result<ImageEditResponseWithBytes, ImageEditError> {
+        if !self.enforced_request_body.is_empty() {
+            return Err(ImageEditError::EditError(
+                "Image editing does not support mandatory routing fields".into(),
+            ));
+        }
         self.backend
             .image_edit(&self.config, &self.model_name, params)
             .await

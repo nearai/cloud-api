@@ -25,14 +25,22 @@ provider's ZDR endpoints, without fallback:
 }
 ```
 
-These settings apply to extra JSON body fields, such as `provider`, rather than
-typed request fields such as `model` or `messages`. Fields outside the mandatory
-configuration retain their existing semantics. Credentials belong in the
-provider's secret configuration, never in either extra-body map.
+The initial policy surface supports only the extra JSON `provider` object.
+The admin write path and provider loader reject policies on other backends,
+non-object policies, and other top-level keys (including typed fields such as
+`model` or `messages`, which could otherwise create duplicate JSON keys).
+Audio transcription and image editing fail before dispatch when a mandatory
+policy is configured, because multipart transport cannot carry these JSON fields.
+Credentials belong in the provider's secret configuration, never in either map.
+
+Caller fields outside the mandatory configuration retain their existing
+semantics. For example, `provider.ignore` can exclude all allowed providers and
+cause a request to fail; it cannot widen the permitted set or disable ZDR.
 
 Deploy support to every serving replica before enabling a model that requires
 this policy: older binaries ignore unknown configuration fields. Verify both
-streaming and non-streaming requests with conflicting caller preferences.
+streaming and non-streaming requests with conflicting caller preferences. Apply
+the policy to every provider configuration serving the model.
 
 OpenRouter's [`zdr` filter](https://openrouter.ai/docs/guides/features/zdr)
 restricts inference routing to eligible endpoints and fails if none are available.

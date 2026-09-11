@@ -1047,6 +1047,9 @@ impl InferenceProviderPool {
                 warn!(model = %model_name, "Skipping external provider for a pinned (attested) model");
                 continue;
             }
+            let has_mandatory_policy = provider_config
+                .get("enforced_request_body")
+                .is_some_and(|value| !value.is_null());
             match self.create_external_provider(&model_name, provider_config) {
                 Ok((provider, backend_type)) => {
                     mappings
@@ -1056,6 +1059,11 @@ impl InferenceProviderPool {
                     success_count += 1;
                 }
                 Err(e) => {
+                    if has_mandatory_policy {
+                        // A rejected policy update must not leave an older,
+                        // potentially unrestricted external route serving.
+                        mappings.model_to_providers.remove(&model_name);
+                    }
                     warn!(model = %model_name, error = %e, "Failed to register external provider");
                     error_count += 1;
                 }
@@ -4328,6 +4336,10 @@ impl InferenceProviderPool {
             .and_then(|obj| obj.remove("api_key"))
             .and_then(|v| v.as_str().map(String::from));
 
+        inference_providers::non_attested::external::validate_enforced_request_body(
+            &provider_config,
+        )
+        .map_err(str::to_string)?;
         let config: ProviderConfig = serde_json::from_value(provider_config)
             .map_err(|e| format!("Failed to parse provider config: {e}"))?;
 
@@ -7055,6 +7067,35 @@ mod tests {
         ]).await;
 
         assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_invalid_mandatory_routing_policy_never_enters_pool() {
+        for config in [
+            serde_json::json!({"backend": "anthropic", "base_url": "https://example.com",
+                "api_key": "synthetic-test-key", "enforced_request_body": {"provider": {"zdr": true}}}),
+            serde_json::json!({"backend": "gemini", "base_url": "https://example.com",
+                "api_key": "synthetic-test-key", "enforced_request_body": {"provider": {"zdr": true}}}),
+            serde_json::json!({"backend": "openai_compatible", "base_url": "https://example.com",
+                "api_key": "synthetic-test-key", "enforced_request_body": {"model": "override"}}),
+        ] {
+            let pool = InferenceProviderPool::new(None, ExternalProvidersConfig::default());
+            pool.load_external_providers(vec![(
+                "policy-test".into(),
+                serde_json::json!({
+                    "backend": "openai_compatible", "base_url": "https://example.com",
+                    "api_key": "synthetic-test-key"
+                }),
+            )])
+            .await
+            .unwrap();
+            assert!(pool.has_provider("policy-test").await);
+            assert!(pool
+                .load_external_providers(vec![("policy-test".into(), config)])
+                .await
+                .is_err());
+            assert!(!pool.has_provider("policy-test").await);
+        }
     }
 
     #[tokio::test]

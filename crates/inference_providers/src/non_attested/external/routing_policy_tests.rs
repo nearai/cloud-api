@@ -153,10 +153,18 @@ fn unsupported_or_ambiguous_policy_configurations_are_rejected() {
         .is_err());
     }
     for config in [
+        json!({}),
+        json!({"base_url": "https://example.com"}),
+        json!({"backend": null, "base_url": "https://example.com"}),
+        json!({"backend": 7, "base_url": "https://example.com"}),
+    ] {
+        assert!(validate_external_provider_config(&config).is_err());
+    }
+    for config in [
         json!({"backend": "anthropic"}),
+        json!({"backend": "openai_compatible", "enforced_request_body": null}),
         json!({"backend": "openai_compatible", "enforced_request_body": {}}),
         json!({"backend": "openai_compatible", "enforced_request_body": {"provider": policy()}}),
-        json!({"long_context": {"inference_url": "https://example.com"}}),
     ] {
         assert!(validate_external_provider_config(&config).is_ok());
     }

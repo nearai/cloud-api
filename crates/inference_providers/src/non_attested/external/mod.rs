@@ -109,12 +109,7 @@ pub fn validate_external_provider_config(config: &serde_json::Value) -> Result<(
         return Err("external provider config must be an object");
     };
     let Some(backend) = config.get("backend").and_then(|value| value.as_str()) else {
-        // Non-external model configurations, such as long-context routing, do not
-        // carry a backend and are outside this validator's scope.
-        if config.contains_key("enforced_request_body") {
-            return Err("enforced_request_body requires an openai_compatible backend");
-        }
-        return Ok(());
+        return Err("external provider config requires a string backend");
     };
     if backend != "openai_compatible" && config.contains_key("enforced_request_body") {
         return Err("enforced_request_body requires an openai_compatible backend");

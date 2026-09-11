@@ -1,5 +1,6 @@
 use crate::ita::ItaAttestationConfig;
 use std::{collections::HashMap, env};
+use uuid::Uuid;
 
 #[derive(Debug, Clone)]
 pub struct ApiConfig {
@@ -39,6 +40,81 @@ pub struct ApiConfig {
     /// every attributed usage charge, so changing it never rewrites history.
     pub credit_allocation: CreditAllocationConfig,
     pub ita: ItaAttestationConfig,
+    pub fleet_concurrency: FleetConcurrencyConfig,
+}
+
+/// How concurrent-request limits are enforced across replicas.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum FleetConcurrencyMode {
+    /// Each replica counts only its own in-flight requests.
+    #[default]
+    Off,
+    /// Leases are counted fleet-wide but rejection stays per-replica.
+    Shadow,
+    /// Admission is decided by the fleet-wide lease count.
+    Enforce,
+}
+
+#[derive(Debug, Clone)]
+pub struct FleetConcurrencyConfig {
+    pub mode: FleetConcurrencyMode,
+    pub lease_ttl_seconds: u64,
+    pub instance_id: String,
+}
+
+impl Default for FleetConcurrencyConfig {
+    fn default() -> Self {
+        Self {
+            mode: FleetConcurrencyMode::Off,
+            lease_ttl_seconds: 60,
+            instance_id: String::new(),
+        }
+    }
+}
+
+impl FleetConcurrencyConfig {
+    pub fn from_env() -> Self {
+        let requested = env::var("FLEET_CONCURRENCY_MODE").unwrap_or_default();
+        let mode = match requested.to_ascii_lowercase().as_str() {
+            "enforce" => FleetConcurrencyMode::Enforce,
+            "shadow" => FleetConcurrencyMode::Shadow,
+            "" | "off" => FleetConcurrencyMode::Off,
+            _ => {
+                // eprintln for the reason given on the CHUTES_MODELS warning
+                // below. Silence here reads as enforcement being on when it is
+                // not.
+                eprintln!(
+                    "WARN: unrecognised FLEET_CONCURRENCY_MODE '{requested}', \
+                     falling back to off"
+                );
+                FleetConcurrencyMode::Off
+            }
+        };
+
+        Self {
+            mode,
+            lease_ttl_seconds: match env::var("FLEET_CONCURRENCY_LEASE_TTL_SECONDS") {
+                Ok(value) => match value.parse::<u64>() {
+                    Ok(seconds) if seconds > 0 => seconds,
+                    _ => {
+                        eprintln!(
+                            "WARN: invalid FLEET_CONCURRENCY_LEASE_TTL_SECONDS '{value}', \
+                             falling back to 60"
+                        );
+                        60
+                    }
+                },
+                Err(_) => 60,
+            },
+            instance_id: env::var("FLEET_CONCURRENCY_INSTANCE_ID")
+                .ok()
+                .filter(|value| !value.is_empty())
+                .unwrap_or_else(|| {
+                    let host = env::var("HOSTNAME").unwrap_or_else(|_| "unknown".to_string());
+                    format!("{host}-{}", Uuid::new_v4().simple())
+                }),
+        }
+    }
 }
 
 impl ApiConfig {
@@ -81,6 +157,7 @@ impl ApiConfig {
             infra: InfraConfig::from_env()?,
             aml: AmlConfig::from_env()?,
             ita: ItaAttestationConfig::from_env()?,
+            fleet_concurrency: FleetConcurrencyConfig::from_env(),
             usage_reporting: UsageReportingConfig::from_env()?,
             credit_allocation: CreditAllocationConfig::from_env()?,
         })

@@ -283,6 +283,26 @@ fn validate_history_query(query: &InferenceUsageHistoryQuery) -> Result<()> {
 }
 
 fn row_to_report(row: &Row) -> InferenceUsageReportRow {
+    let total_cost_nano_usd = row.get("total_cost");
+    let credit_allocations: Option<Vec<services::usage::CreditAllocation>> = row
+        .try_get::<_, Option<serde_json::Value>>("credit_allocations")
+        .ok()
+        .flatten()
+        .and_then(|value| serde_json::from_value(value).ok());
+    let (funded_amount, unfunded_amount) = if row
+        .try_get::<_, Option<i64>>("funded_amount")
+        .ok()
+        .flatten()
+        .is_some()
+    {
+        let funded = credit_allocations
+            .as_ref()
+            .map(|allocations| allocations.iter().map(|allocation| allocation.amount).sum())
+            .unwrap_or(0);
+        (Some(funded), Some(total_cost_nano_usd - funded))
+    } else {
+        (None, None)
+    };
     InferenceUsageReportRow {
         id: row.get("id"),
         organization_id: row.get("organization_id"),
@@ -302,19 +322,15 @@ fn row_to_report(row: &Row) -> InferenceUsageReportRow {
         input_cost_nano_usd: row.get("input_cost"),
         output_cost_nano_usd: row.get("output_cost"),
         cache_read_cost_nano_usd: None,
-        total_cost_nano_usd: row.get("total_cost"),
+        total_cost_nano_usd,
         response_id: row.get("response_id"),
         provider_request_id: row.get("provider_request_id"),
         inference_id: row.get("inference_id"),
         stop_reason: row.get("stop_reason"),
         image_count: row.get("image_count"),
-        credit_allocations: row
-            .try_get::<_, Option<serde_json::Value>>("credit_allocations")
-            .ok()
-            .flatten()
-            .and_then(|value| serde_json::from_value(value).ok()),
-        funded_amount: row.try_get("funded_amount").ok().flatten(),
-        unfunded_amount: row.try_get("unfunded_amount").ok().flatten(),
+        credit_allocations,
+        funded_amount,
+        unfunded_amount,
         allocation_policy_version: row.try_get("allocation_policy_version").ok().flatten(),
     }
 }

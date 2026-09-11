@@ -1,6 +1,6 @@
 use crate::{
     middleware::AuthenticatedUser,
-    models::ErrorResponse,
+    models::{CreditType, ErrorResponse},
     routes::{api::AppState, common::format_amount},
 };
 use axum::{
@@ -409,7 +409,8 @@ pub async fn get_organization_balance(
         ("start_time" = Option<String>, Query, description = "Inclusive RFC3339 start timestamp. Takes precedence over start_date."),
         ("end_time" = Option<String>, Query, description = "Inclusive RFC3339 end timestamp. Takes precedence over end_date."),
         ("workspace_id" = Option<Uuid>, Query, description = "Filter by workspace ID."),
-        ("api_key_id" = Option<Uuid>, Query, description = "Filter by API key ID.")
+        ("api_key_id" = Option<Uuid>, Query, description = "Filter by API key ID."),
+        ("credit_type" = Option<CreditType>, Query, description = "Filter costs by their saved credit allocation.")
     ),
     responses(
         (status = 200, description = "Usage history", body = UsageHistoryResponse),
@@ -576,7 +577,7 @@ fn usage_history_report_query(
 }
 
 fn validate_credit_type_filter(value: Option<&str>) -> Result<(), UsageError> {
-    if value.is_none_or(|value| matches!(value, "grant" | "postpay" | "staking_farm" | "payment")) {
+    if value.is_none_or(|value| value.parse::<CreditType>().is_ok()) {
         Ok(())
     } else {
         Err(usage_history_query_bad_request("Invalid credit type"))
@@ -717,6 +718,7 @@ fn internal_usage_history_error(message: &str) -> UsageError {
     params(
         ("org_id" = String, Path, description = "Organization ID"),
         ("serviceName" = Option<String>, Query, description = "Filter by platform service name (e.g. web_search)"),
+        ("credit_type" = Option<CreditType>, Query, description = "Filter costs by their saved credit allocation."),
         ("limit" = Option<i64>, Query, description = "Number of records to return (default: 100)"),
         ("offset" = Option<i64>, Query, description = "Offset for pagination (default: 0)")
     ),
@@ -814,7 +816,8 @@ pub async fn get_service_usage_history(
         ("workspace_id" = String, Path, description = "Workspace ID"),
         ("api_key_id" = String, Path, description = "API Key ID"),
         ("limit" = Option<i64>, Query, description = "Number of records to return (default: 100)"),
-        ("offset" = Option<i64>, Query, description = "Offset for pagination (default: 0)")
+        ("offset" = Option<i64>, Query, description = "Offset for pagination (default: 0)"),
+        ("credit_type" = Option<CreditType>, Query, description = "Filter costs by their saved credit allocation.")
     ),
     responses(
         (status = 200, description = "Usage history", body = UsageHistoryResponse),

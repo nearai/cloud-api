@@ -4,9 +4,6 @@ use services::usage::CreditAllocation;
 use tokio_postgres::{GenericClient, Transaction};
 use uuid::Uuid;
 
-pub const DEFAULT_CREDIT_USAGE_ORDER: [&str; 4] = ["grant", "postpay", "staking_farm", "payment"];
-pub const DEFAULT_ALLOCATION_POLICY_VERSION: &str = "v1";
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CreditAllocationPolicy {
     pub priority: Vec<String>,
@@ -15,13 +12,8 @@ pub struct CreditAllocationPolicy {
 
 impl Default for CreditAllocationPolicy {
     fn default() -> Self {
-        Self {
-            priority: DEFAULT_CREDIT_USAGE_ORDER
-                .into_iter()
-                .map(str::to_string)
-                .collect(),
-            version: DEFAULT_ALLOCATION_POLICY_VERSION.to_string(),
-        }
+        let config = config::CreditAllocationConfig::default();
+        Self::from(&config)
     }
 }
 
@@ -95,18 +87,9 @@ pub async fn allocate_usage(
               ON active.organization_id = $1
              AND active.credit_type = wanted.credit_type
              AND active.effective_until IS NULL
-            LEFT JOIN (
-                SELECT allocation.credit_type,
-                       (SUM(allocation.amount) - COALESCE(SUM(reversed.amount), 0))::BIGINT AS amount
-                FROM usage_credit_allocations allocation
-                LEFT JOIN (
-                    SELECT allocation_id, SUM(amount)::BIGINT AS amount
-                    FROM usage_credit_allocation_reversals
-                    GROUP BY allocation_id
-                ) reversed ON reversed.allocation_id = allocation.id
-                WHERE allocation.organization_id = $1
-                GROUP BY allocation.credit_type
-            ) consumed ON consumed.credit_type = active.credit_type
+            LEFT JOIN organization_credit_consumption consumed
+              ON consumed.organization_id = active.organization_id
+             AND consumed.credit_type = active.credit_type
             ORDER BY wanted.position
             "#,
             &[&organization_id, &policy.priority],
@@ -114,25 +97,17 @@ pub async fn allocate_usage(
         .await
         .map_err(map_db_error)?;
 
-    // Pre-allocation usage has no defensible per-type split. Keep it unknown,
-    // but reserve the same amount from aggregate capacity so rollout cannot
-    // accidentally make already-spent credits available again.
+    // Pre-allocation usage has no defensible per-type split. The migration
+    // snapshots it once so the posting hot path does not rescan lifetime usage
+    // while holding the organization's accounting lock.
     let legacy_unattributed: i64 = transaction
         .query_one(
             r#"
-            SELECT GREATEST(
-                COALESCE((SELECT total_spent FROM organization_balance
-                          WHERE organization_id = $1), 0)
-                - (
-                    COALESCE((SELECT SUM(total_cost) FROM organization_usage_log
-                              WHERE organization_id = $1 AND funded_amount IS NOT NULL), 0)
-                  + COALESCE((SELECT SUM(total_cost) FROM organization_service_usage_log
-                              WHERE organization_id = $1 AND funded_amount IS NOT NULL), 0)
-                  - COALESCE((SELECT SUM(amount)::BIGINT FROM usage_credit_adjustments
-                              WHERE organization_id = $1), 0)
-                ),
-                0
-            )::BIGINT AS amount
+            SELECT COALESCE((
+                SELECT legacy_unattributed_amount
+                FROM organization_balance
+                WHERE organization_id = $1
+            ), 0)::BIGINT AS amount
             "#,
             &[&organization_id],
         )
@@ -196,6 +171,20 @@ pub async fn allocate_usage(
             )
             .await
             .map_err(map_db_error)?;
+        transaction
+            .execute(
+                r#"
+                INSERT INTO organization_credit_consumption (
+                    organization_id, credit_type, amount, updated_at
+                ) VALUES ($1, $2, $3, NOW())
+                ON CONFLICT (organization_id, credit_type) DO UPDATE SET
+                    amount = organization_credit_consumption.amount + EXCLUDED.amount,
+                    updated_at = NOW()
+                "#,
+                &[&organization_id, &credit_type, &amount],
+            )
+            .await
+            .map_err(map_db_error)?;
 
         allocations.push(CreditAllocation {
             credit_type,
@@ -206,6 +195,22 @@ pub async fn allocate_usage(
         });
         remaining -= amount;
         aggregate_available -= amount;
+    }
+
+    let updated = transaction
+        .execute(
+            r#"UPDATE organization_balance
+               SET unresolved_unfunded_amount = unresolved_unfunded_amount + $2,
+                   updated_at = NOW()
+               WHERE organization_id = $1"#,
+            &[&organization_id, &remaining],
+        )
+        .await
+        .map_err(map_db_error)?;
+    if updated != 1 {
+        return Err(RepositoryError::ValidationFailed(
+            "organization accounting balance is missing".to_string(),
+        ));
     }
 
     Ok(AllocationResult {
@@ -226,11 +231,23 @@ pub async fn load_allocations<C: GenericClient + Sync>(
     let rows = client
         .query(
             r#"
-            SELECT credit_type, amount, source, organization_limit_id, policy_version
-            FROM usage_credit_allocations
-            WHERE ($1::UUID IS NOT NULL AND inference_usage_id = $1)
-               OR ($2::UUID IS NOT NULL AND service_usage_id = $2)
-            ORDER BY priority_position
+            SELECT allocation.credit_type,
+                   allocation.amount - COALESCE((
+                       SELECT SUM(reversal.amount)::BIGINT
+                       FROM usage_credit_allocation_reversals reversal
+                       WHERE reversal.allocation_id = allocation.id
+                   ), 0) AS amount,
+                   allocation.source, allocation.organization_limit_id,
+                   allocation.policy_version
+            FROM usage_credit_allocations allocation
+            WHERE (($1::UUID IS NOT NULL AND allocation.inference_usage_id = $1)
+                OR ($2::UUID IS NOT NULL AND allocation.service_usage_id = $2))
+              AND allocation.amount > COALESCE((
+                  SELECT SUM(reversal.amount)::BIGINT
+                  FROM usage_credit_allocation_reversals reversal
+                  WHERE reversal.allocation_id = allocation.id
+              ), 0)
+            ORDER BY allocation.priority_position
             "#,
             &[&inference_id, &service_id],
         )

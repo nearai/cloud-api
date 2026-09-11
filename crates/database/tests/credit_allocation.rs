@@ -103,14 +103,23 @@ async fn priority_splits_exactly_and_records_overage() -> anyhow::Result<()> {
     let model = insert_model(&pool, "allocation-priority").await?;
 
     for (cost, expected, unfunded) in [
-        (12, vec![("grant", 2), ("postpay", 10)], 0),
+        (
+            12,
+            vec![
+                ("grant", 2),
+                ("staking_farm", 3),
+                ("payment", 4),
+                ("postpay", 3),
+            ],
+            0,
+        ),
         (
             17,
             vec![
                 ("grant", 2),
-                ("postpay", 10),
                 ("staking_farm", 3),
-                ("payment", 2),
+                ("payment", 4),
+                ("postpay", 8),
             ],
             0,
         ),
@@ -118,9 +127,9 @@ async fn priority_splits_exactly_and_records_overage() -> anyhow::Result<()> {
             20,
             vec![
                 ("grant", 2),
-                ("postpay", 10),
                 ("staking_farm", 3),
                 ("payment", 4),
+                ("postpay", 10),
             ],
             1,
         ),
@@ -209,24 +218,74 @@ async fn retry_keeps_original_split_and_conflicting_retry_is_rejected() -> anyho
     let repository = OrganizationUsageRepository::new(pool.clone());
     let org = insert_org_fixture(&pool).await?;
     let model = insert_model(&pool, "allocation-retry").await?;
+    let other_model = insert_model(&pool, "allocation-retry-other").await?;
     set_example_limits(&limits, org.org_id).await?;
     let inference_id = Uuid::new_v4();
 
-    let original = repository
-        .record_usage(usage(&org, &model, inference_id, 12))
-        .await?;
+    let request = usage(&org, &model, inference_id, 12);
+    let original = repository.record_usage(request.clone()).await?;
     set_limit(&limits, org.org_id, "grant", 100).await?;
-    let retried = repository
-        .record_usage(usage(&org, &model, inference_id, 12))
-        .await?;
+    let retried = repository.record_usage(request.clone()).await?;
 
     assert!(!retried.was_inserted);
     assert_eq!(retried.id, original.id);
     assert_eq!(retried.credit_allocations, original.credit_allocations);
-    assert!(repository
-        .record_usage(usage(&org, &model, inference_id, 13))
-        .await
-        .is_err());
+    let mut conflicts = Vec::new();
+    let mut changed = request.clone();
+    changed.workspace_id = org.workspace_b_id;
+    conflicts.push(("workspace_id", changed));
+    let mut changed = request.clone();
+    changed.api_key_id = org.api_key_b_id;
+    conflicts.push(("api_key_id", changed));
+    let mut changed = request.clone();
+    changed.model_id = other_model.id;
+    conflicts.push(("model_id", changed));
+    let mut changed = request.clone();
+    changed.model_name.push_str("-different");
+    conflicts.push(("model_name", changed));
+    let mut changed = request.clone();
+    changed.input_tokens = 2;
+    conflicts.push(("input_tokens", changed));
+    let mut changed = request.clone();
+    changed.output_tokens = 1;
+    conflicts.push(("output_tokens", changed));
+    let mut changed = request.clone();
+    changed.cache_read_tokens = 1;
+    conflicts.push(("cache_read_tokens", changed));
+    let mut changed = request.clone();
+    changed.cache_write_tokens = 1;
+    conflicts.push(("cache_write_tokens", changed));
+    let mut changed = request.clone();
+    changed.input_cost = 11;
+    conflicts.push(("input_cost", changed));
+    let mut changed = request.clone();
+    changed.output_cost = 1;
+    conflicts.push(("output_cost", changed));
+    let mut changed = request.clone();
+    changed.total_cost = 13;
+    conflicts.push(("total_cost", changed));
+    let mut changed = request.clone();
+    changed.inference_type = InferenceType::Embedding.as_str().to_string();
+    conflicts.push(("inference_type", changed));
+    let mut changed = request.clone();
+    changed.image_count = Some(1);
+    conflicts.push(("image_count", changed));
+    let mut changed = request.clone();
+    changed.billing_details = Some(serde_json::json!({"pricing": "different"}));
+    conflicts.push(("billing_details", changed));
+    let mut changed = request.clone();
+    changed.service_tier = Some("flex".to_string());
+    conflicts.push(("service_tier", changed));
+    let mut changed = request.clone();
+    changed.context_band = Some("long".to_string());
+    conflicts.push(("context_band", changed));
+
+    for (field, conflicting_request) in conflicts {
+        assert!(
+            repository.record_usage(conflicting_request).await.is_err(),
+            "a retry with conflicting {field} must be rejected"
+        );
+    }
 
     let client = pool.get().await?;
     let allocation_total: i64 = client
@@ -237,6 +296,185 @@ async fn retry_keeps_original_split_and_conflicting_retry_is_rejected() -> anyho
         .await?
         .get(0);
     assert_eq!(allocation_total, 12);
+    cleanup_usage_fixtures(&pool, &[org.org_id], &[model.id, other_model.id]).await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn funding_columns_must_be_null_or_populated_as_a_pair() -> anyhow::Result<()> {
+    let pool = test_pool().await?;
+    let limits = OrganizationLimitsRepository::new(pool.clone());
+    let inference_repository = OrganizationUsageRepository::new(pool.clone());
+    let service_repository = OrganizationServiceUsageRepository::new(pool.clone());
+    let org = insert_org_fixture(&pool).await?;
+    let model = insert_model(&pool, "allocation-funding-pair").await?;
+    set_limit(&limits, org.org_id, "grant", 10).await?;
+
+    let inference = inference_repository
+        .record_usage(usage(&org, &model, Uuid::new_v4(), 2))
+        .await?;
+    let service_id = Uuid::new_v4();
+    let client = pool.get().await?;
+    client
+        .execute(
+            "INSERT INTO services (id, service_name, display_name, unit, cost_per_unit) VALUES ($1, $2, 'Funding pair service', 'request', 2)",
+            &[&service_id, &format!("funding-pair-service-{service_id}")],
+        )
+        .await?;
+    let service = service_repository
+        .record_usage(&RecordServiceUsageRequest {
+            organization_id: org.org_id,
+            workspace_id: org.workspace_a_id,
+            api_key_id: org.api_key_a_id,
+            service_id,
+            quantity: 1,
+            total_cost: 2,
+            inference_id: Some(Uuid::new_v4()),
+        })
+        .await?;
+
+    for query in [
+        "UPDATE organization_usage_log SET funded_amount = NULL WHERE id = $1",
+        "UPDATE organization_usage_log SET unfunded_amount = NULL WHERE id = $1",
+        "UPDATE organization_usage_log SET funded_amount = -1, unfunded_amount = 3 WHERE id = $1",
+        "UPDATE organization_usage_log SET funded_amount = 1, unfunded_amount = 2 WHERE id = $1",
+    ] {
+        assert!(
+            client.execute(query, &[&inference.id]).await.is_err(),
+            "inference funding columns must reject a half-populated pair"
+        );
+    }
+    for query in [
+        "UPDATE organization_service_usage_log SET funded_amount = NULL WHERE id = $1",
+        "UPDATE organization_service_usage_log SET unfunded_amount = NULL WHERE id = $1",
+        "UPDATE organization_service_usage_log SET funded_amount = -1, unfunded_amount = 3 WHERE id = $1",
+        "UPDATE organization_service_usage_log SET funded_amount = 1, unfunded_amount = 2 WHERE id = $1",
+    ] {
+        assert!(
+            client.execute(query, &[&service.id]).await.is_err(),
+            "service funding columns must reject a half-populated pair"
+        );
+    }
+
+    drop(client);
+    cleanup_usage_fixtures(&pool, &[org.org_id], &[model.id]).await?;
+    pool.get()
+        .await?
+        .execute("DELETE FROM services WHERE id = $1", &[&service_id])
+        .await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn service_retry_preserves_allocation_and_rejects_conflicts() -> anyhow::Result<()> {
+    let pool = test_pool().await?;
+    let limits = OrganizationLimitsRepository::new(pool.clone());
+    let repository = OrganizationServiceUsageRepository::new(pool.clone());
+    let org = insert_org_fixture(&pool).await?;
+    set_limit(&limits, org.org_id, "grant", 10).await?;
+    let service_id = Uuid::new_v4();
+    let other_service_id = Uuid::new_v4();
+    let client = pool.get().await?;
+    for (id, name) in [
+        (service_id, format!("retry-service-{service_id}")),
+        (
+            other_service_id,
+            format!("retry-service-{other_service_id}"),
+        ),
+    ] {
+        client
+            .execute(
+                "INSERT INTO services (id, service_name, display_name, unit, cost_per_unit) VALUES ($1, $2, 'Retry service', 'request', 2)",
+                &[&id, &name],
+            )
+            .await?;
+    }
+    drop(client);
+
+    let request = RecordServiceUsageRequest {
+        organization_id: org.org_id,
+        workspace_id: org.workspace_a_id,
+        api_key_id: org.api_key_a_id,
+        service_id,
+        quantity: 1,
+        total_cost: 2,
+        inference_id: Some(Uuid::new_v4()),
+    };
+    let original = repository.record_usage(&request).await?;
+    let retried = repository.record_usage(&request).await?;
+    assert_eq!(retried.id, original.id);
+    assert_eq!(retried.credit_allocations, original.credit_allocations);
+
+    let mut conflicts = Vec::new();
+    let mut changed = request.clone();
+    changed.workspace_id = org.workspace_b_id;
+    conflicts.push(("workspace_id", changed));
+    let mut changed = request.clone();
+    changed.api_key_id = org.api_key_b_id;
+    conflicts.push(("api_key_id", changed));
+    let mut changed = request.clone();
+    changed.service_id = other_service_id;
+    conflicts.push(("service_id", changed));
+    let mut changed = request.clone();
+    changed.quantity = 2;
+    conflicts.push(("quantity", changed));
+    let mut changed = request.clone();
+    changed.total_cost = 3;
+    conflicts.push(("total_cost", changed));
+
+    for (field, conflicting_request) in conflicts {
+        assert!(
+            repository.record_usage(&conflicting_request).await.is_err(),
+            "a service retry with conflicting {field} must be rejected"
+        );
+    }
+
+    cleanup_usage_fixtures(&pool, &[org.org_id], &[]).await?;
+    pool.get()
+        .await?
+        .execute(
+            "DELETE FROM services WHERE id IN ($1, $2)",
+            &[&service_id, &other_service_id],
+        )
+        .await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn retry_preserves_unknown_attribution_for_legacy_usage() -> anyhow::Result<()> {
+    let pool = test_pool().await?;
+    let limits = OrganizationLimitsRepository::new(pool.clone());
+    let repository = OrganizationUsageRepository::new(pool.clone());
+    let org = insert_org_fixture(&pool).await?;
+    let model = insert_model(&pool, "allocation-legacy-retry").await?;
+    set_limit(&limits, org.org_id, "grant", 10).await?;
+    let request = usage(&org, &model, Uuid::new_v4(), 2);
+    let original = repository.record_usage(request.clone()).await?;
+
+    let client = pool.get().await?;
+    client
+        .execute(
+            "DELETE FROM usage_credit_allocations WHERE inference_usage_id = $1",
+            &[&original.id],
+        )
+        .await?;
+    client
+        .execute(
+            r#"UPDATE organization_usage_log
+               SET funded_amount = NULL, unfunded_amount = NULL,
+                   allocation_policy_version = NULL
+               WHERE id = $1"#,
+            &[&original.id],
+        )
+        .await?;
+    drop(client);
+
+    let retried = repository.record_usage(request).await?;
+    assert!(!retried.was_inserted);
+    assert_eq!(retried.credit_allocations, None);
+    assert_eq!(retried.funded_amount, None);
+    assert_eq!(retried.unfunded_amount, None);
+
     cleanup_usage_fixtures(&pool, &[org.org_id], &[model.id]).await?;
     Ok(())
 }
@@ -254,7 +492,8 @@ async fn ambiguous_legacy_spend_stays_unknown_and_cannot_restore_capacity() -> a
     client
         .execute(
             r#"UPDATE organization_balance
-               SET total_spent = 40, total_requests = 1, total_tokens = 1, updated_at = NOW()
+               SET total_spent = 40, legacy_unattributed_amount = 40,
+                   total_requests = 1, total_tokens = 1, updated_at = NOW()
                WHERE organization_id = $1"#,
             &[&org.org_id],
         )
@@ -348,9 +587,8 @@ async fn corrections_reverse_last_funding_first_and_retries_are_idempotent() -> 
     let org = insert_org_fixture(&pool).await?;
     let model = insert_model(&pool, "allocation-correction").await?;
     set_example_limits(&limits, org.org_id).await?;
-    let usage = usage_repository
-        .record_usage(usage(&org, &model, Uuid::new_v4(), 17))
-        .await?;
+    let usage_request = usage(&org, &model, Uuid::new_v4(), 17);
+    let usage = usage_repository.record_usage(usage_request.clone()).await?;
     let request = CreateCreditAdjustment {
         organization_id: org.org_id,
         usage_id: usage.id,
@@ -371,7 +609,7 @@ async fn corrections_reverse_last_funding_first_and_retries_are_idempotent() -> 
             .iter()
             .map(|reversal| (reversal.credit_type.as_str(), reversal.amount))
             .collect::<Vec<_>>(),
-        vec![("payment", 2), ("staking_farm", 2)]
+        vec![("postpay", 4)]
     );
     let retried = adjustment_repository.create(&request).await?;
     assert_eq!(retried.id, correction.id);
@@ -385,9 +623,9 @@ async fn corrections_reverse_last_funding_first_and_retries_are_idempotent() -> 
         .map(|status| (status.limit.credit_type.as_str(), status.consumed))
         .collect::<std::collections::HashMap<_, _>>();
     assert_eq!(consumed["grant"], 2);
-    assert_eq!(consumed["postpay"], 10);
-    assert_eq!(consumed["staking_farm"], 1);
-    assert_eq!(consumed["payment"], 0);
+    assert_eq!(consumed["postpay"], 4);
+    assert_eq!(consumed["staking_farm"], 3);
+    assert_eq!(consumed["payment"], 4);
     assert_eq!(unfunded, 0);
     assert_eq!(
         usage_repository
@@ -397,6 +635,40 @@ async fn corrections_reverse_last_funding_first_and_retries_are_idempotent() -> 
             .total_spent,
         13
     );
+    assert_eq!(
+        usage_repository.get_api_key_spend(org.api_key_a_id).await?,
+        13
+    );
+
+    let retried_usage = usage_repository.record_usage(usage_request).await?;
+    assert_eq!(retried_usage.total_cost, 13);
+    assert_eq!(retried_usage.funded_amount, Some(13));
+    assert_eq!(retried_usage.unfunded_amount, Some(0));
+    assert_eq!(
+        retried_usage
+            .credit_allocations
+            .unwrap()
+            .into_iter()
+            .map(|allocation| (allocation.credit_type, allocation.amount))
+            .collect::<Vec<_>>(),
+        vec![
+            ("grant".to_string(), 2),
+            ("staking_farm".to_string(), 3),
+            ("payment".to_string(), 4),
+            ("postpay".to_string(), 4),
+        ]
+    );
+
+    let history = usage_repository
+        .get_usage_history(org.org_id, Some(10), Some(0))
+        .await?;
+    let adjusted_history = history
+        .iter()
+        .find(|row| row.id == usage.id)
+        .expect("corrected usage should remain in history");
+    assert_eq!(adjusted_history.total_cost, 13);
+    assert_eq!(adjusted_history.funded_amount, Some(13));
+    assert_eq!(adjusted_history.unfunded_amount, Some(0));
 
     let all_rows = usage_repository
         .list_inference_usage_report(InferenceUsageReportQuery::for_organization(org.org_id))
@@ -408,14 +680,14 @@ async fn corrections_reverse_last_funding_first_and_retries_are_idempotent() -> 
             ..InferenceUsageReportQuery::for_organization(org.org_id)
         })
         .await?;
-    assert!(payment_rows.is_empty());
+    assert_eq!(payment_rows[0].total_cost_nano_usd, 4);
     let staking_rows = usage_repository
         .list_inference_usage_report(InferenceUsageReportQuery {
             credit_type: Some("staking_farm".to_string()),
             ..InferenceUsageReportQuery::for_organization(org.org_id)
         })
         .await?;
-    assert_eq!(staking_rows[0].total_cost_nano_usd, 1);
+    assert_eq!(staking_rows[0].total_cost_nano_usd, 3);
 
     cleanup_usage_fixtures(&pool, &[org.org_id], &[model.id]).await?;
     Ok(())

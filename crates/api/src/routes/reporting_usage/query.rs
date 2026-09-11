@@ -1,4 +1,5 @@
 use super::cursor::{ReportingUsageCursor, ReportingUsageCursorFilters};
+use crate::models::CreditType;
 use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
 use services::usage::InferenceType;
@@ -201,12 +202,9 @@ impl TryFrom<ReportingUsageQueryParams> for ReportingUsageQuery {
 }
 
 fn parse_credit_type(value: &str) -> Result<String, ReportingUsageQueryError> {
-    match value {
-        "grant" | "postpay" | "staking_farm" | "payment" => Ok(value.to_string()),
-        other => Err(ReportingUsageQueryError::InvalidCreditType(
-            other.to_string(),
-        )),
-    }
+    CreditType::from_str(value)
+        .map(|credit_type| credit_type.as_str().to_string())
+        .map_err(|_| ReportingUsageQueryError::InvalidCreditType(value.to_string()))
 }
 
 fn parse_optional_time(

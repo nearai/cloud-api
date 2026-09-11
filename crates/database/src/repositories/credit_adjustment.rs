@@ -238,7 +238,7 @@ impl CreditAdjustmentRepository {
             let allocations = transaction
                 .query(
                     r#"
-                    SELECT allocation.id, allocation.amount
+                    SELECT allocation.id, allocation.credit_type, allocation.amount
                          - COALESCE(reversed.amount, 0)::BIGINT AS available
                     FROM usage_credit_allocations allocation
                     LEFT JOIN (
@@ -270,6 +270,22 @@ impl CreditAdjustmentRepository {
                     )
                     .await
                     .map_err(map_db_error)?;
+                let credit_type: String = allocation.get("credit_type");
+                let consumption_updated = transaction
+                    .execute(
+                        r#"UPDATE organization_credit_consumption
+                           SET amount = amount - $3, updated_at = NOW()
+                           WHERE organization_id = $1 AND credit_type = $2
+                             AND amount >= $3"#,
+                        &[&request.organization_id, &credit_type, &amount],
+                    )
+                    .await
+                    .map_err(map_db_error)?;
+                if consumption_updated != 1 {
+                    return Err(RepositoryError::ValidationFailed(
+                        "adjustment does not reconcile with credit consumption".to_string(),
+                    ));
+                }
                 funded_to_reverse -= amount;
             }
             if funded_to_reverse != 0 {
@@ -282,9 +298,16 @@ impl CreditAdjustmentRepository {
         let updated = transaction
             .execute(
                 r#"UPDATE organization_balance
-                   SET total_spent = total_spent - $2, updated_at = NOW()
-                   WHERE organization_id = $1 AND total_spent >= $2"#,
-                &[&request.organization_id, &request.amount],
+                   SET total_spent = total_spent - $2,
+                       unresolved_unfunded_amount = unresolved_unfunded_amount - $3,
+                       updated_at = NOW()
+                   WHERE organization_id = $1 AND total_spent >= $2
+                     AND unresolved_unfunded_amount >= $3"#,
+                &[
+                    &request.organization_id,
+                    &request.amount,
+                    &unfunded_reversed,
+                ],
             )
             .await
             .map_err(map_db_error)?;

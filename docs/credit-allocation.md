@@ -4,7 +4,7 @@ Every newly posted inference or platform-service charge is split, in exact
 integer nano-USD, across the organization's active credit ceilings. The default
 order is:
 
-`grant -> postpay -> staking_farm -> payment`
+`grant -> staking_farm -> payment -> postpay`
 
 Set `CREDIT_USAGE_ORDER` to a comma-separated permutation of those four
 API/database names to change the order. Set
@@ -38,7 +38,7 @@ Admins can post an idempotent adjustment to
 `POST /v1/admin/organizations/{org_id}/usage/adjustments`. A `writeoff` can
 resolve only unfunded debt. A `correction` first reverses unfunded cost, then
 reverses the original allocations from the last funding source backward (for
-example, payment before staking). Original usage and allocation rows remain
+example, postpay before payment). Original usage and allocation rows remain
 unchanged; the linked adjustment and allocation-reversal rows record the actor,
 reason, idempotency key, and time. Effective balances and reports include these
 adjustments without incrementing usage counts.
@@ -48,8 +48,10 @@ adjustments without incrementing usage counts.
 - Deploy every inference, service, limit, and staking writer together. They
   coordinate through the same per-organization database lock.
 - Existing unattributed usage remains unknown and continues reducing aggregate
-  admission capacity. Establish reviewed starting ceilings rather than
-  backfilling speculative per-type allocations.
+  admission capacity. Its amount is snapshotted during the allocation-ledger
+  migration so usage posting does not rescan lifetime history. Establish
+  reviewed starting ceilings rather than backfilling speculative per-type
+  allocations.
 - Monitor allocation reconciliation and unfunded balances before expanding the
   rollout. Allocation rows and their parent usage/balance update commit in one
   transaction.

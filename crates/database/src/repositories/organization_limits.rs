@@ -5,7 +5,7 @@ use crate::retry_db;
 use anyhow::{Context, Result};
 use chrono::Utc;
 use services::common::RepositoryError;
-use tokio_postgres::Row;
+use tokio_postgres::{IsolationLevel, Row};
 use uuid::Uuid;
 
 #[derive(Debug, Clone)]
@@ -158,39 +158,56 @@ impl OrganizationLimitsRepository {
         &self,
         organization_id: Uuid,
     ) -> Result<(Vec<CurrentCreditStatus>, i64, i64)> {
-        let client = self
-            .pool
-            .get()
-            .await
-            .context("Failed to get database connection")?;
-        let rows = client
-            .query(
-                r#"
+        let (rows, funding) = retry_db!("get_current_credit_status", {
+            let mut client = self
+                .pool
+                .get()
+                .await
+                .context("Failed to get database connection")
+                .map_err(RepositoryError::PoolError)?;
+            let transaction = client
+                .build_transaction()
+                .isolation_level(IsolationLevel::RepeatableRead)
+                .read_only(true)
+                .start()
+                .await
+                .map_err(map_db_error)?;
+            let rows = transaction
+                .query(
+                    r#"
                 SELECT olh.id, olh.organization_id, olh.spend_limit, olh.credit_type,
                        olh.source, olh.currency, olh.effective_from, olh.effective_until,
                        olh.changed_by, olh.change_reason, olh.changed_by_user_id,
                        olh.changed_by_user_email, olh.created_at,
                        COALESCE(consumed.amount, 0)::BIGINT AS consumed
                 FROM organization_limits_history olh
-                LEFT JOIN (
-                    SELECT allocation.credit_type,
-                           (SUM(allocation.amount) - COALESCE(SUM(reversed.amount), 0))::BIGINT AS amount
-                    FROM usage_credit_allocations allocation
-                    LEFT JOIN (
-                        SELECT allocation_id, SUM(amount)::BIGINT AS amount
-                        FROM usage_credit_allocation_reversals
-                        GROUP BY allocation_id
-                    ) reversed ON reversed.allocation_id = allocation.id
-                    WHERE allocation.organization_id = $1
-                    GROUP BY allocation.credit_type
-                ) consumed ON consumed.credit_type = olh.credit_type
+                LEFT JOIN organization_credit_consumption consumed
+                  ON consumed.organization_id = olh.organization_id
+                 AND consumed.credit_type = olh.credit_type
                 WHERE olh.organization_id = $1 AND olh.effective_until IS NULL
                 ORDER BY olh.credit_type, olh.effective_from DESC
                 "#,
-                &[&organization_id],
-            )
-            .await
-            .map_err(map_db_error)?;
+                    &[&organization_id],
+                )
+                .await
+                .map_err(map_db_error)?;
+            let funding = transaction
+                .query_one(
+                    r#"
+                    SELECT COALESCE((SELECT unresolved_unfunded_amount
+                              FROM organization_balance
+                              WHERE organization_id = $1), 0)::BIGINT AS unfunded,
+                           COALESCE((SELECT legacy_unattributed_amount
+                              FROM organization_balance
+                              WHERE organization_id = $1), 0)::BIGINT AS unattributed
+                    "#,
+                    &[&organization_id],
+                )
+                .await
+                .map_err(map_db_error)?;
+            transaction.commit().await.map_err(map_db_error)?;
+            Ok::<_, RepositoryError>((rows, funding))
+        })?;
         let statuses = rows
             .iter()
             .map(|row| {
@@ -203,36 +220,6 @@ impl OrganizationLimitsRepository {
                 }
             })
             .collect();
-        let funding = client
-            .query_one(
-                r#"
-                SELECT (
-                    COALESCE((SELECT SUM(unfunded_amount) FROM organization_usage_log
-                              WHERE organization_id = $1), 0)
-                  + COALESCE((SELECT SUM(unfunded_amount) FROM organization_service_usage_log
-                              WHERE organization_id = $1), 0)
-                  - COALESCE((SELECT SUM(unfunded_amount_reversed)::BIGINT
-                              FROM usage_credit_adjustments
-                              WHERE organization_id = $1), 0)
-                )::BIGINT AS unfunded,
-                GREATEST(
-                    COALESCE((SELECT total_spent FROM organization_balance
-                              WHERE organization_id = $1), 0)
-                    - (
-                        COALESCE((SELECT SUM(total_cost) FROM organization_usage_log
-                                  WHERE organization_id = $1 AND funded_amount IS NOT NULL), 0)
-                      + COALESCE((SELECT SUM(total_cost) FROM organization_service_usage_log
-                                  WHERE organization_id = $1 AND funded_amount IS NOT NULL), 0)
-                      - COALESCE((SELECT SUM(amount)::BIGINT FROM usage_credit_adjustments
-                                  WHERE organization_id = $1), 0)
-                    ),
-                    0
-                )::BIGINT AS unattributed
-                "#,
-                &[&organization_id],
-            )
-            .await
-            .map_err(map_db_error)?;
         Ok((
             statuses,
             funding.get("unfunded"),

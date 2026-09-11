@@ -1,7 +1,8 @@
 use crate::models::OrganizationServiceUsageLog;
 use crate::pool::DbPool;
 use crate::repositories::credit_allocation::{
-    allocate_usage, load_allocations, CreditAllocationPolicy, UsageAllocationParent,
+    allocate_usage, load_allocations, lock_organization_accounting, CreditAllocationPolicy,
+    UsageAllocationParent,
 };
 use crate::repositories::utils::map_db_error;
 use crate::retry_db;
@@ -212,7 +213,10 @@ impl OrganizationServiceUsageRepository {
             }
         })?;
 
-        let logs = rows.iter().map(|row| self.row_to_log(row, None)).collect();
+        let logs = rows
+            .iter()
+            .map(|row| self.row_to_log(row, None))
+            .collect::<Result<Vec<_>>>()?;
         Ok((logs, total))
     }
 
@@ -325,7 +329,7 @@ impl OrganizationServiceUsageRepository {
             Ok::<_, RepositoryError>(rows)
         })?;
 
-        Ok(rows.iter().map(Self::row_to_report_entry).collect())
+        rows.iter().map(Self::row_to_report_entry).collect()
     }
 
     /// Record service usage and update organization_balance. Idempotent when inference_id is set:
@@ -343,6 +347,9 @@ impl OrganizationServiceUsageRepository {
                 .map_err(RepositoryError::PoolError)?;
 
             let transaction = client.transaction().await.map_err(map_db_error)?;
+            // Lock before the child INSERT to avoid two concurrent FK
+            // KEY SHARE locks deadlocking when allocation requests FOR UPDATE.
+            lock_organization_accounting(&transaction, request.organization_id).await?;
 
             let id = Uuid::new_v4();
             let now = Utc::now();
@@ -421,7 +428,7 @@ impl OrganizationServiceUsageRepository {
                         .map_err(map_db_error)?;
 
                     transaction.commit().await.map_err(map_db_error)?;
-                    (r, allocation.allocations)
+                    (r, Some(allocation.allocations))
                 }
                 None => {
                     transaction.rollback().await.map_err(map_db_error)?;
@@ -434,8 +441,15 @@ impl OrganizationServiceUsageRepository {
                     let existing = client
                         .query_one(
                             r#"
-                            SELECT * FROM organization_service_usage_log
-                            WHERE organization_id = $1 AND inference_id = $2
+                            SELECT usage_log.*,
+                                   usage_log.total_cost - COALESCE((
+                                       SELECT SUM(amount)::BIGINT
+                                       FROM usage_credit_adjustments adjustment
+                                       WHERE adjustment.service_usage_id = usage_log.id
+                                   ), 0) AS effective_total_cost
+                            FROM organization_service_usage_log usage_log
+                            WHERE usage_log.organization_id = $1
+                              AND usage_log.inference_id = $2
                             "#,
                             &[&request.organization_id, &request.inference_id],
                         )
@@ -452,11 +466,22 @@ impl OrganizationServiceUsageRepository {
                                 .to_string(),
                         ));
                     }
-                    let allocations = load_allocations(
-                        &**client,
-                        UsageAllocationParent::Service(existing.get("id")),
-                    )
-                    .await?;
+                    let allocations = if existing
+                        .try_get::<_, Option<i64>>("funded_amount")
+                        .ok()
+                        .flatten()
+                        .is_some()
+                    {
+                        Some(
+                            load_allocations(
+                                &**client,
+                                UsageAllocationParent::Service(existing.get("id")),
+                            )
+                            .await?,
+                        )
+                    } else {
+                        None
+                    };
                     (existing, allocations)
                 }
             };
@@ -464,39 +489,52 @@ impl OrganizationServiceUsageRepository {
             Ok::<_, RepositoryError>((row, allocations))
         })?;
 
-        Ok(self.row_to_log(&result.0, Some(result.1)))
+        self.row_to_log(&result.0, result.1)
     }
 
     fn row_to_log(
         &self,
         row: &Row,
         allocations_override: Option<Vec<services::usage::CreditAllocation>>,
-    ) -> OrganizationServiceUsageLog {
-        let credit_allocations = allocations_override.or_else(|| {
-            row.try_get::<_, Option<serde_json::Value>>("credit_allocations")
-                .ok()
-                .flatten()
-                .and_then(|value| serde_json::from_value(value).ok())
-        });
-        OrganizationServiceUsageLog {
+    ) -> Result<OrganizationServiceUsageLog> {
+        let credit_allocations = match allocations_override {
+            Some(allocations) => Some(allocations),
+            None => row
+                .try_get::<_, Option<serde_json::Value>>("credit_allocations")?
+                .map(serde_json::from_value)
+                .transpose()?,
+        };
+        let total_cost = row
+            .try_get("effective_total_cost")
+            .unwrap_or_else(|_| row.get("total_cost"));
+        let (funded_amount, unfunded_amount) =
+            effective_funding(row, &credit_allocations, total_cost);
+        Ok(OrganizationServiceUsageLog {
             id: row.get("id"),
             organization_id: row.get("organization_id"),
             workspace_id: row.get("workspace_id"),
             api_key_id: row.get("api_key_id"),
             service_id: row.get("service_id"),
             quantity: row.get("quantity"),
-            total_cost: row.get("total_cost"),
+            total_cost,
             inference_id: row.get("inference_id"),
             created_at: row.get("created_at"),
             credit_allocations,
-            funded_amount: row.try_get("funded_amount").ok().flatten(),
-            unfunded_amount: row.try_get("unfunded_amount").ok().flatten(),
+            funded_amount,
+            unfunded_amount,
             allocation_policy_version: row.try_get("allocation_policy_version").ok().flatten(),
-        }
+        })
     }
 
-    fn row_to_report_entry(row: &Row) -> ServiceUsageReportEntry {
-        ServiceUsageReportEntry {
+    fn row_to_report_entry(row: &Row) -> Result<ServiceUsageReportEntry> {
+        let credit_allocations = row
+            .try_get::<_, Option<serde_json::Value>>("credit_allocations")?
+            .map(serde_json::from_value)
+            .transpose()?;
+        let total_cost = row.get("total_cost");
+        let (funded_amount, unfunded_amount) =
+            effective_funding(row, &credit_allocations, total_cost);
+        Ok(ServiceUsageReportEntry {
             id: row.get("id"),
             organization_id: row.get("organization_id"),
             workspace_id: row.get("workspace_id"),
@@ -507,14 +545,30 @@ impl OrganizationServiceUsageRepository {
             total_cost: row.get("total_cost"),
             inference_id: row.get("inference_id"),
             created_at: row.get("created_at"),
-            credit_allocations: row
-                .try_get::<_, Option<serde_json::Value>>("credit_allocations")
-                .ok()
-                .flatten()
-                .and_then(|value| serde_json::from_value(value).ok()),
-            funded_amount: row.try_get("funded_amount").ok().flatten(),
-            unfunded_amount: row.try_get("unfunded_amount").ok().flatten(),
+            credit_allocations,
+            funded_amount,
+            unfunded_amount,
             allocation_policy_version: row.try_get("allocation_policy_version").ok().flatten(),
-        }
+        })
     }
+}
+
+fn effective_funding(
+    row: &Row,
+    credit_allocations: &Option<Vec<services::usage::CreditAllocation>>,
+    total_cost: i64,
+) -> (Option<i64>, Option<i64>) {
+    if row
+        .try_get::<_, Option<i64>>("funded_amount")
+        .ok()
+        .flatten()
+        .is_none()
+    {
+        return (None, None);
+    }
+    let funded = credit_allocations
+        .as_ref()
+        .map(|allocations| allocations.iter().map(|allocation| allocation.amount).sum())
+        .unwrap_or(0);
+    (Some(funded), Some(total_cost - funded))
 }

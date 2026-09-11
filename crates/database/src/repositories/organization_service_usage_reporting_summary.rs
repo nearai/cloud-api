@@ -32,17 +32,16 @@ where
                        ELSE allocation.amount END AS total_cost
                 FROM organization_service_usage_log AS usage_log
                 INNER JOIN services ON services.id = usage_log.service_id
-                LEFT JOIN (
-                    SELECT original.id, original.service_usage_id, original.credit_type,
-                           original.amount - COALESCE(reversed.amount, 0) AS amount
+                LEFT JOIN LATERAL (
+                    SELECT original.amount - COALESCE((
+                        SELECT SUM(reversal.amount)::BIGINT
+                        FROM usage_credit_allocation_reversals reversal
+                        WHERE reversal.allocation_id = original.id
+                    ), 0) AS amount
                     FROM usage_credit_allocations original
-                    LEFT JOIN (
-                        SELECT allocation_id, SUM(amount)::BIGINT AS amount
-                        FROM usage_credit_allocation_reversals
-                        GROUP BY allocation_id
-                    ) reversed ON reversed.allocation_id = original.id
-                ) allocation ON allocation.service_usage_id = usage_log.id
-                            AND allocation.credit_type = $7
+                    WHERE original.service_usage_id = usage_log.id
+                      AND original.credit_type = $7
+                ) allocation ON true
                 WHERE usage_log.organization_id = $1
                   AND ($2::TIMESTAMPTZ IS NULL OR usage_log.created_at >= $2)
                   AND ($3::TIMESTAMPTZ IS NULL OR usage_log.created_at <= $3)

@@ -100,7 +100,7 @@ pub struct CreditAllocationConfig {
 impl Default for CreditAllocationConfig {
     fn default() -> Self {
         Self {
-            priority: ["grant", "postpay", "staking_farm", "payment"]
+            priority: ["grant", "staking_farm", "payment", "postpay"]
                 .into_iter()
                 .map(str::to_string)
                 .collect(),
@@ -111,7 +111,7 @@ impl Default for CreditAllocationConfig {
 
 impl CreditAllocationConfig {
     pub fn from_env() -> Result<Self, String> {
-        const SUPPORTED: [&str; 4] = ["grant", "postpay", "staking_farm", "payment"];
+        const SUPPORTED: [&str; 4] = ["grant", "staking_farm", "payment", "postpay"];
         let defaults = Self::default();
         let priority = env::var("CREDIT_USAGE_ORDER")
             .unwrap_or_else(|_| defaults.priority.join(","))
@@ -1399,6 +1399,34 @@ mod tests {
         }
     }
 
+    struct CreditAllocationEnvGuard {
+        values: [(&'static str, Option<OsString>); 2],
+    }
+
+    impl CreditAllocationEnvGuard {
+        fn new() -> Self {
+            const KEYS: [&str; 2] = ["CREDIT_USAGE_ORDER", "CREDIT_ALLOCATION_POLICY_VERSION"];
+            let guard = Self {
+                values: KEYS.map(|key| (key, std::env::var_os(key))),
+            };
+            for key in KEYS {
+                std::env::remove_var(key);
+            }
+            guard
+        }
+    }
+
+    impl Drop for CreditAllocationEnvGuard {
+        fn drop(&mut self) {
+            for (key, value) in &mut self.values {
+                match value.take() {
+                    Some(value) => std::env::set_var(*key, value),
+                    None => std::env::remove_var(*key),
+                }
+            }
+        }
+    }
+
     #[test]
     #[serial]
     fn otlp_config_without_instance_file_preserves_existing_defaults() {
@@ -1499,7 +1527,33 @@ mod tests {
 
     #[test]
     #[serial]
+    fn credit_allocation_defaults_and_policy_version_boundaries() {
+        let _env = CreditAllocationEnvGuard::new();
+        let defaults = CreditAllocationConfig::from_env().unwrap();
+        assert_eq!(
+            defaults.priority,
+            ["grant", "staking_farm", "payment", "postpay"]
+        );
+        assert_eq!(defaults.policy_version, "v1");
+
+        std::env::set_var("CREDIT_ALLOCATION_POLICY_VERSION", "");
+        assert!(CreditAllocationConfig::from_env().is_err());
+        std::env::set_var("CREDIT_ALLOCATION_POLICY_VERSION", "v".repeat(50));
+        assert_eq!(
+            CreditAllocationConfig::from_env()
+                .unwrap()
+                .policy_version
+                .len(),
+            50
+        );
+        std::env::set_var("CREDIT_ALLOCATION_POLICY_VERSION", "v".repeat(51));
+        assert!(CreditAllocationConfig::from_env().is_err());
+    }
+
+    #[test]
+    #[serial]
     fn credit_allocation_uses_requested_priority_and_version() {
+        let _env = CreditAllocationEnvGuard::new();
         std::env::set_var(
             "CREDIT_USAGE_ORDER",
             "payment, staking_farm, postpay, grant",
@@ -1513,13 +1567,12 @@ mod tests {
             ["payment", "staking_farm", "postpay", "grant"]
         );
         assert_eq!(config.policy_version, "emergency-v2");
-        std::env::remove_var("CREDIT_USAGE_ORDER");
-        std::env::remove_var("CREDIT_ALLOCATION_POLICY_VERSION");
     }
 
     #[test]
     #[serial]
     fn credit_allocation_rejects_missing_duplicate_and_unknown_types() {
+        let _env = CreditAllocationEnvGuard::new();
         for invalid in [
             "grant,postpay,staking_farm",
             "grant,postpay,staking_farm,grant",
@@ -1528,7 +1581,6 @@ mod tests {
             std::env::set_var("CREDIT_USAGE_ORDER", invalid);
             assert!(CreditAllocationConfig::from_env().is_err(), "{invalid}");
         }
-        std::env::remove_var("CREDIT_USAGE_ORDER");
     }
 
     #[test]

@@ -1538,6 +1538,8 @@ pub async fn update_organization_limits(
         (status = 400, description = "Invalid or non-reconciling adjustment", body = ErrorResponse),
         (status = 401, description = "Unauthorized", body = ErrorResponse),
         (status = 404, description = "Organization or usage not found", body = ErrorResponse),
+        (status = 409, description = "Idempotency conflict", body = ErrorResponse),
+        (status = 503, description = "Transaction conflict; retry request", body = ErrorResponse),
         (status = 500, description = "Internal server error", body = ErrorResponse)
     ),
     security(("session_token" = []))
@@ -1583,9 +1585,20 @@ pub async fn create_credit_adjustment(
             ),
             services::common::RepositoryError::ValidationFailed(message) => (
                 StatusCode::BAD_REQUEST,
+                ResponseJson(ErrorResponse::new(message, "validation_error".to_string())),
+            ),
+            services::common::RepositoryError::AlreadyExists => (
+                StatusCode::CONFLICT,
                 ResponseJson(ErrorResponse::new(
-                    message,
-                    "invalid_adjustment".to_string(),
+                    "Credit adjustment already exists".to_string(),
+                    "conflict".to_string(),
+                )),
+            ),
+            services::common::RepositoryError::TransactionConflict => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                ResponseJson(ErrorResponse::new(
+                    "Transaction conflict; retry request".to_string(),
+                    "transaction_conflict".to_string(),
                 )),
             ),
             other => {

@@ -8,9 +8,12 @@ ALTER TABLE organization_usage_log
     ADD COLUMN allocation_policy_version VARCHAR(50),
     ADD CONSTRAINT organization_usage_funding_nonnegative
         CHECK ((funded_amount IS NULL AND unfunded_amount IS NULL)
-            OR (funded_amount >= 0 AND unfunded_amount >= 0)),
+            OR (funded_amount IS NOT NULL AND unfunded_amount IS NOT NULL
+                AND funded_amount >= 0 AND unfunded_amount >= 0)) NOT VALID,
     ADD CONSTRAINT organization_usage_funding_reconciles
-        CHECK (funded_amount IS NULL OR funded_amount + unfunded_amount = total_cost);
+        CHECK ((funded_amount IS NULL AND unfunded_amount IS NULL)
+            OR (funded_amount IS NOT NULL AND unfunded_amount IS NOT NULL
+                AND funded_amount + unfunded_amount = total_cost)) NOT VALID;
 
 ALTER TABLE organization_service_usage_log
     ADD COLUMN funded_amount BIGINT,
@@ -18,9 +21,24 @@ ALTER TABLE organization_service_usage_log
     ADD COLUMN allocation_policy_version VARCHAR(50),
     ADD CONSTRAINT organization_service_usage_funding_nonnegative
         CHECK ((funded_amount IS NULL AND unfunded_amount IS NULL)
-            OR (funded_amount >= 0 AND unfunded_amount >= 0)),
+            OR (funded_amount IS NOT NULL AND unfunded_amount IS NOT NULL
+                AND funded_amount >= 0 AND unfunded_amount >= 0)) NOT VALID,
     ADD CONSTRAINT organization_service_usage_funding_reconciles
-        CHECK (funded_amount IS NULL OR funded_amount + unfunded_amount = total_cost);
+        CHECK ((funded_amount IS NULL AND unfunded_amount IS NULL)
+            OR (funded_amount IS NOT NULL AND unfunded_amount IS NOT NULL
+                AND funded_amount + unfunded_amount = total_cost)) NOT VALID;
+
+-- Snapshot the rollout-era unattributed spend once. Recomputing it from the
+-- lifetime usage tables on every charge would make the accounting lock slower
+-- as an organization's history grows. New organizations keep the zero default.
+ALTER TABLE organization_balance
+    ADD COLUMN legacy_unattributed_amount BIGINT NOT NULL DEFAULT 0
+        CHECK (legacy_unattributed_amount >= 0),
+    ADD COLUMN unresolved_unfunded_amount BIGINT NOT NULL DEFAULT 0
+        CHECK (unresolved_unfunded_amount >= 0);
+
+UPDATE organization_balance
+SET legacy_unattributed_amount = GREATEST(total_spent, 0);
 
 CREATE TABLE usage_credit_allocations (
     id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
@@ -37,6 +55,17 @@ CREATE TABLE usage_credit_allocations (
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     CONSTRAINT usage_credit_allocations_one_parent
         CHECK ((inference_usage_id IS NOT NULL)::integer + (service_usage_id IS NOT NULL)::integer = 1)
+);
+
+-- Bounded accounting counters used by usage posting and admission checks.
+-- The immutable allocation ledger remains the source for history/reporting.
+CREATE TABLE organization_credit_consumption (
+    organization_id UUID NOT NULL REFERENCES organizations(id) ON DELETE CASCADE,
+    credit_type VARCHAR(50) NOT NULL
+        CHECK (credit_type IN ('grant', 'postpay', 'staking_farm', 'payment')),
+    amount BIGINT NOT NULL DEFAULT 0 CHECK (amount >= 0),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (organization_id, credit_type)
 );
 
 CREATE UNIQUE INDEX usage_credit_allocations_inference_type_unique
@@ -92,6 +121,8 @@ CREATE INDEX usage_credit_adjustments_inference
 CREATE INDEX usage_credit_adjustments_service
     ON usage_credit_adjustments(service_usage_id)
     WHERE service_usage_id IS NOT NULL;
+CREATE INDEX usage_credit_adjustments_org
+    ON usage_credit_adjustments(organization_id);
 CREATE INDEX usage_credit_allocation_reversals_allocation
     ON usage_credit_allocation_reversals(allocation_id);
 

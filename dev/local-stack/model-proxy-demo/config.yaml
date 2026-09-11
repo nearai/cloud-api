@@ -1,0 +1,32 @@
+# Minimal localhost model-proxy config for the control-plane demo.
+# Fast intervals so the demo asserts within seconds; no TLS listener
+# (cert/key/base_domain unset), no peer sync (urls empty), no admin token.
+proxy:
+  bind_address: "127.0.0.1:18443"
+  client_hello_timeout_ms: 2000
+  backend_connect_timeout_ms: 5000
+  max_connections_per_ip: 100
+  max_backend_retries: 2
+
+discovery:
+  refresh_interval_s: 2
+  probe_timeout_ms: 5000
+  routing_port: 18444
+  forget_after_s: 600
+
+health_check:
+  interval_s: 2
+  timeout_ms: 3000
+  health_check_path: "/v1/models"
+  slow_threshold_ms: 0
+
+circuit_breaker:
+  failure_threshold: 2
+  recovery_threshold: 2
+  cooldown_s: 5
+
+admin:
+  bind_address: "127.0.0.1:19090"
+  metrics_enabled: true
+
+peers: {}

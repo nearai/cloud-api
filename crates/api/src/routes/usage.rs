@@ -983,9 +983,13 @@ pub enum RecordUsageResponse {
         total_cost_display: String,
         /// Timestamp of the recorded entry (RFC3339)
         created_at: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
         credit_allocations: Option<Vec<services::usage::CreditAllocation>>,
+        #[serde(skip_serializing_if = "Option::is_none")]
         funded_amount: Option<i64>,
+        #[serde(skip_serializing_if = "Option::is_none")]
         unfunded_amount: Option<i64>,
+        #[serde(skip_serializing_if = "Option::is_none")]
         allocation_policy_version: Option<String>,
     },
     /// Response for image generation usage
@@ -1002,9 +1006,13 @@ pub enum RecordUsageResponse {
         total_cost_display: String,
         /// Timestamp of the recorded entry (RFC3339)
         created_at: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
         credit_allocations: Option<Vec<services::usage::CreditAllocation>>,
+        #[serde(skip_serializing_if = "Option::is_none")]
         funded_amount: Option<i64>,
+        #[serde(skip_serializing_if = "Option::is_none")]
         unfunded_amount: Option<i64>,
+        #[serde(skip_serializing_if = "Option::is_none")]
         allocation_policy_version: Option<String>,
     },
 }

@@ -97,10 +97,12 @@ pub struct CreditAllocationConfig {
     pub policy_version: String,
 }
 
+pub const SUPPORTED_CREDIT_TYPES: [&str; 4] = ["grant", "staking_farm", "payment", "postpay"];
+
 impl Default for CreditAllocationConfig {
     fn default() -> Self {
         Self {
-            priority: ["grant", "staking_farm", "payment", "postpay"]
+            priority: SUPPORTED_CREDIT_TYPES
                 .into_iter()
                 .map(str::to_string)
                 .collect(),
@@ -111,7 +113,6 @@ impl Default for CreditAllocationConfig {
 
 impl CreditAllocationConfig {
     pub fn from_env() -> Result<Self, String> {
-        const SUPPORTED: [&str; 4] = ["grant", "staking_farm", "payment", "postpay"];
         let defaults = Self::default();
         let priority = env::var("CREDIT_USAGE_ORDER")
             .unwrap_or_else(|_| defaults.priority.join(","))
@@ -120,17 +121,17 @@ impl CreditAllocationConfig {
             .filter(|value| !value.is_empty())
             .collect::<Vec<_>>();
 
-        if priority.len() != SUPPORTED.len()
+        if priority.len() != SUPPORTED_CREDIT_TYPES.len()
             || priority
                 .iter()
-                .any(|value| !SUPPORTED.contains(&value.as_str()))
-            || SUPPORTED
+                .any(|value| !SUPPORTED_CREDIT_TYPES.contains(&value.as_str()))
+            || SUPPORTED_CREDIT_TYPES
                 .iter()
                 .any(|supported| priority.iter().filter(|value| value == supported).count() != 1)
         {
             return Err(format!(
                 "CREDIT_USAGE_ORDER must contain each supported credit type exactly once: {}",
-                SUPPORTED.join(",")
+                SUPPORTED_CREDIT_TYPES.join(",")
             ));
         }
 

@@ -102,8 +102,14 @@ fn reporting_usage_cursor_restores_omitted_context_and_rejects_conflicts() {
     assert_eq!(continuation.model, first_page.model);
     assert_eq!(continuation.inference_type, first_page.inference_type);
     assert_eq!(continuation.service_name, first_page.service_name);
+    assert_eq!(continuation.credit_type, first_page.credit_type);
 
     // When/Then: explicitly changing any bound context invalidates the cursor.
+    let conflicting_credit_type = ReportingUsageQueryParams {
+        credit_type: Some("payment".to_string()),
+        cursor: Some(cursor.clone()),
+        ..ReportingUsageQueryParams::default()
+    };
     let conflicting_source = ReportingUsageQueryParams {
         source: Some("service".to_string()),
         cursor: Some(cursor.clone()),
@@ -119,7 +125,12 @@ fn reporting_usage_cursor_restores_omitted_context_and_rejects_conflicts() {
         cursor: Some(cursor),
         ..ReportingUsageQueryParams::default()
     };
-    for params in [conflicting_source, conflicting_start, conflicting_workspace] {
+    for params in [
+        conflicting_credit_type,
+        conflicting_source,
+        conflicting_start,
+        conflicting_workspace,
+    ] {
         assert!(matches!(
             ReportingUsageQuery::try_from(params),
             Err(ReportingUsageQueryError::InvalidCursor)
@@ -190,6 +201,10 @@ fn reporting_usage_query_rejects_invalid_range_source_and_cursor() {
         source: Some("database".to_string()),
         ..ReportingUsageQueryParams::default()
     };
+    let bad_credit_type = ReportingUsageQueryParams {
+        credit_type: Some("bogus".to_string()),
+        ..ReportingUsageQueryParams::default()
+    };
     let excessive_limit = ReportingUsageQueryParams {
         limit: Some(1001),
         ..ReportingUsageQueryParams::default()
@@ -220,6 +235,10 @@ fn reporting_usage_query_rejects_invalid_range_source_and_cursor() {
     assert!(matches!(
         ReportingUsageQuery::try_from(bad_source),
         Err(ReportingUsageQueryError::InvalidSource(_))
+    ));
+    assert!(matches!(
+        ReportingUsageQuery::try_from(bad_credit_type),
+        Err(ReportingUsageQueryError::InvalidCreditType(_))
     ));
     assert!(matches!(
         ReportingUsageQuery::try_from(excessive_limit),

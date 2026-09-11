@@ -162,6 +162,34 @@ async fn priority_splits_exactly_and_records_overage() -> anyhow::Result<()> {
 }
 
 #[tokio::test]
+async fn in_flight_usage_is_billed_after_organization_deactivation() -> anyhow::Result<()> {
+    let pool = test_pool().await?;
+    let limits = OrganizationLimitsRepository::new(pool.clone());
+    let repository = OrganizationUsageRepository::new(pool.clone());
+    let org = insert_org_fixture(&pool).await?;
+    let model = insert_model(&pool, "allocation-inactive-org").await?;
+    set_limit(&limits, org.org_id, "grant", 10).await?;
+
+    pool.get()
+        .await?
+        .execute(
+            "UPDATE organizations SET is_active = false WHERE id = $1",
+            &[&org.org_id],
+        )
+        .await?;
+
+    let recorded = repository
+        .record_usage(usage(&org, &model, Uuid::new_v4(), 4))
+        .await?;
+    assert_eq!(recorded.funded_amount, Some(4));
+    assert_eq!(recorded.unfunded_amount, Some(0));
+    assert_eq!(recorded.credit_allocations.unwrap()[0].amount, 4);
+
+    cleanup_usage_fixtures(&pool, &[org.org_id], &[model.id]).await?;
+    Ok(())
+}
+
+#[tokio::test]
 async fn missing_disabled_exhausted_and_zero_cost_types_are_skipped() -> anyhow::Result<()> {
     let pool = test_pool().await?;
     let limits = OrganizationLimitsRepository::new(pool.clone());

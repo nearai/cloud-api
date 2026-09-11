@@ -47,14 +47,18 @@ pub async fn lock_organization_accounting(
 ) -> Result<(), RepositoryError> {
     let row = transaction
         .query_opt(
-            "SELECT id FROM organizations WHERE id = $1 AND is_active = true FOR UPDATE",
+            // Accounting must still finish for an in-flight request when an
+            // organization is deactivated after admission. The authorization
+            // path owns the active-state check; this lock only establishes
+            // that the durable accounting parent exists.
+            "SELECT id FROM organizations WHERE id = $1 FOR UPDATE",
             &[&organization_id],
         )
         .await
         .map_err(map_db_error)?;
     if row.is_none() {
         return Err(RepositoryError::NotFound(format!(
-            "Active organization not found: {organization_id}"
+            "Organization not found: {organization_id}"
         )));
     }
     Ok(())

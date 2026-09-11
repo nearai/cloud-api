@@ -198,23 +198,23 @@ pub struct AdminAppState {
 
 #[derive(Debug, serde::Deserialize, utoipa::ToSchema)]
 #[serde(rename_all = "snake_case")]
-pub enum CreditAdjustmentUsageKind {
+pub enum UsageAdjustmentKind {
     Inference,
     Service,
 }
 
 #[derive(Debug, serde::Deserialize, utoipa::ToSchema)]
 #[serde(rename_all = "snake_case")]
-pub enum CreditAdjustmentType {
+pub enum UsageAdjustmentType {
     Correction,
     Writeoff,
 }
 
 #[derive(Debug, serde::Deserialize, utoipa::ToSchema)]
-pub struct CreateCreditAdjustmentRequest {
+pub struct CreateUsageAdjustmentRequest {
     pub usage_id: Uuid,
-    pub usage_kind: CreditAdjustmentUsageKind,
-    pub adjustment_type: CreditAdjustmentType,
+    pub usage_kind: UsageAdjustmentKind,
+    pub adjustment_type: UsageAdjustmentType,
     /// Positive nano-USD amount to correct or write off.
     pub amount: i64,
     pub reason: String,
@@ -231,7 +231,7 @@ pub struct CreditAllocationReversalResponse {
 }
 
 #[derive(Debug, serde::Serialize, utoipa::ToSchema)]
-pub struct CreditAdjustmentResponse {
+pub struct UsageAdjustmentResponse {
     pub id: Uuid,
     pub organization_id: Uuid,
     pub usage_id: Uuid,
@@ -1532,9 +1532,9 @@ pub async fn update_organization_limits(
     path = "/v1/admin/organizations/{org_id}/usage/adjustments",
     tag = "Admin",
     params(("org_id" = String, Path, description = "Organization ID")),
-    request_body = CreateCreditAdjustmentRequest,
+    request_body = CreateUsageAdjustmentRequest,
     responses(
-        (status = 200, description = "Idempotent adjustment result", body = CreditAdjustmentResponse),
+        (status = 200, description = "Idempotent adjustment result", body = UsageAdjustmentResponse),
         (status = 400, description = "Invalid or non-reconciling adjustment", body = ErrorResponse),
         (status = 401, description = "Unauthorized", body = ErrorResponse),
         (status = 404, description = "Organization or usage not found", body = ErrorResponse),
@@ -1544,12 +1544,12 @@ pub async fn update_organization_limits(
     ),
     security(("session_token" = []))
 )]
-pub async fn create_credit_adjustment(
+pub async fn create_usage_adjustment(
     State(app_state): State<AdminAppState>,
     Path(org_id): Path<String>,
     Extension(admin_user): Extension<AdminUser>,
-    ResponseJson(request): ResponseJson<CreateCreditAdjustmentRequest>,
-) -> Result<ResponseJson<CreditAdjustmentResponse>, (StatusCode, ResponseJson<ErrorResponse>)> {
+    ResponseJson(request): ResponseJson<CreateUsageAdjustmentRequest>,
+) -> Result<ResponseJson<UsageAdjustmentResponse>, (StatusCode, ResponseJson<ErrorResponse>)> {
     use database::repositories::credit_adjustment::{
         AdjustedUsageKind, CreateCreditAdjustment, CreditAdjustmentKind,
     };
@@ -1557,12 +1557,12 @@ pub async fn create_credit_adjustment(
     let organization_id = Uuid::parse_str(&org_id)
         .map_err(|_| bad_request("Invalid organization ID format", "invalid_id"))?;
     let usage_kind = match request.usage_kind {
-        CreditAdjustmentUsageKind::Inference => AdjustedUsageKind::Inference,
-        CreditAdjustmentUsageKind::Service => AdjustedUsageKind::Service,
+        UsageAdjustmentKind::Inference => AdjustedUsageKind::Inference,
+        UsageAdjustmentKind::Service => AdjustedUsageKind::Service,
     };
     let adjustment_kind = match request.adjustment_type {
-        CreditAdjustmentType::Correction => CreditAdjustmentKind::Correction,
-        CreditAdjustmentType::Writeoff => CreditAdjustmentKind::Writeoff,
+        UsageAdjustmentType::Correction => CreditAdjustmentKind::Correction,
+        UsageAdjustmentType::Writeoff => CreditAdjustmentKind::Writeoff,
     };
     let adjustment = app_state
         .credit_adjustment_repository
@@ -1613,7 +1613,7 @@ pub async fn create_credit_adjustment(
             }
         })?;
 
-    Ok(ResponseJson(CreditAdjustmentResponse {
+    Ok(ResponseJson(UsageAdjustmentResponse {
         id: adjustment.id,
         organization_id: adjustment.organization_id,
         usage_id: adjustment.usage_id,

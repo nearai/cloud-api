@@ -70,7 +70,7 @@ fn reporting_usage_cursor_restores_omitted_context_and_rejects_conflicts() {
         model: Some("test-model".to_string()),
         inference_type: Some("chat_completion".to_string()),
         service_name: Some("web_search".to_string()),
-        credit_type: Some("grant".to_string()),
+        credit_type: Some("GRANT".to_string()),
         limit: Some(1),
         cursor: None,
     })
@@ -103,6 +103,14 @@ fn reporting_usage_cursor_restores_omitted_context_and_rejects_conflicts() {
     assert_eq!(continuation.inference_type, first_page.inference_type);
     assert_eq!(continuation.service_name, first_page.service_name);
     assert_eq!(continuation.credit_type, first_page.credit_type);
+
+    let repeated_mixed_case = ReportingUsageQuery::try_from(ReportingUsageQueryParams {
+        credit_type: Some("GRANT".to_string()),
+        cursor: Some(cursor.clone()),
+        ..ReportingUsageQueryParams::default()
+    })
+    .unwrap();
+    assert_eq!(repeated_mixed_case.credit_type.as_deref(), Some("grant"));
 
     // When/Then: explicitly changing any bound context invalidates the cursor.
     let conflicting_credit_type = ReportingUsageQueryParams {

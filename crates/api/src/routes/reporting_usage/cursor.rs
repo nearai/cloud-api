@@ -107,6 +107,7 @@ impl ReportingUsageCursor {
         end_time: Option<DateTime<Utc>>,
         source: Option<ReportingUsageSource>,
         inference_type: Option<InferenceType>,
+        credit_type: Option<&str>,
     ) -> Result<ReportingUsageCursorFilters, ReportingUsageQueryError> {
         let context = &self.context;
         let conflicts = start_time.is_some_and(|value| value != context.start_time)
@@ -127,10 +128,7 @@ impl ReportingUsageCursor {
                 .service_name
                 .as_deref()
                 .is_some_and(|value| context.service_name.as_deref() != Some(value))
-            || params
-                .credit_type
-                .as_deref()
-                .is_some_and(|value| context.credit_type.as_deref() != Some(value));
+            || credit_type.is_some_and(|value| context.credit_type.as_deref() != Some(value));
         if conflicts {
             return Err(ReportingUsageQueryError::InvalidCursor);
         }

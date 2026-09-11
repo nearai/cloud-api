@@ -163,6 +163,7 @@ impl TryFrom<ReportingUsageQueryParams> for ReportingUsageQuery {
                 requested_end_time,
                 requested_source,
                 requested_inference_type,
+                requested_credit_type.as_deref(),
             )?,
             None => {
                 let (start_time, end_time) =

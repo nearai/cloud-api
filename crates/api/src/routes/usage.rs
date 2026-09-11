@@ -426,7 +426,7 @@ pub async fn get_organization_usage_history(
     State(app_state): State<AppState>,
     Extension(user): Extension<AuthenticatedUser>,
     Path(org_id): Path<String>,
-    Query(query): Query<UsageHistoryQuery>,
+    Query(mut query): Query<UsageHistoryQuery>,
 ) -> Result<ResponseJson<UsageHistoryResponse>, (StatusCode, ResponseJson<ErrorResponse>)> {
     tracing::debug!(
         "Get usage history for org {} by user {}, limit: {}, offset: {}",
@@ -438,7 +438,7 @@ pub async fn get_organization_usage_history(
 
     // Validate pagination parameters
     crate::routes::common::validate_limit_offset(query.limit, query.offset)?;
-    validate_credit_type_filter(query.credit_type.as_deref())?;
+    query.credit_type = normalize_credit_type_filter(query.credit_type.as_deref())?;
 
     let organization_id = check_org_membership(&app_state, user, &org_id).await?;
 
@@ -531,7 +531,6 @@ fn usage_history_report_query(
     organization_id: Uuid,
     query: &UsageHistoryQuery,
 ) -> Result<InferenceUsageHistoryQuery, UsageError> {
-    validate_credit_type_filter(query.credit_type.as_deref())?;
     if !query.has_time_filters() {
         return Ok(InferenceUsageHistoryQuery {
             organization_id,
@@ -576,12 +575,15 @@ fn usage_history_report_query(
     })
 }
 
-fn validate_credit_type_filter(value: Option<&str>) -> Result<(), UsageError> {
-    if value.is_none_or(|value| value.parse::<CreditType>().is_ok()) {
-        Ok(())
-    } else {
-        Err(usage_history_query_bad_request("Invalid credit type"))
-    }
+fn normalize_credit_type_filter(value: Option<&str>) -> Result<Option<String>, UsageError> {
+    value
+        .map(|value| {
+            value
+                .parse::<CreditType>()
+                .map(|credit_type| credit_type.as_str().to_string())
+                .map_err(|_| usage_history_query_bad_request("Invalid credit type"))
+        })
+        .transpose()
 }
 
 fn usage_history_start_time(query: &UsageHistoryQuery) -> Result<Option<String>, UsageError> {
@@ -736,7 +738,7 @@ pub async fn get_service_usage_history(
     State(app_state): State<AppState>,
     Extension(user): Extension<AuthenticatedUser>,
     Path(org_id): Path<String>,
-    Query(query): Query<ServiceUsageHistoryQuery>,
+    Query(mut query): Query<ServiceUsageHistoryQuery>,
 ) -> Result<ResponseJson<ServiceUsageHistoryResponse>, (StatusCode, ResponseJson<ErrorResponse>)> {
     tracing::debug!(
         "Get service usage history for org {} by user {}, service: {:?}, limit: {}, offset: {}",
@@ -749,7 +751,7 @@ pub async fn get_service_usage_history(
 
     // Validate pagination parameters
     crate::routes::common::validate_limit_offset(query.limit, query.offset)?;
-    validate_credit_type_filter(query.credit_type.as_deref())?;
+    query.credit_type = normalize_credit_type_filter(query.credit_type.as_deref())?;
 
     let organization_id = check_org_membership(&app_state, user, &org_id).await?;
 
@@ -834,7 +836,7 @@ pub async fn get_api_key_usage_history(
     State(app_state): State<AppState>,
     Extension(user): Extension<AuthenticatedUser>,
     Path((workspace_id, api_key_id)): Path<(String, String)>,
-    Query(query): Query<UsageHistoryQuery>,
+    Query(mut query): Query<UsageHistoryQuery>,
 ) -> Result<ResponseJson<UsageHistoryResponse>, (StatusCode, ResponseJson<ErrorResponse>)> {
     tracing::debug!(
         "Get usage history for API key {} in workspace {} by user {}, limit: {}, offset: {}",
@@ -847,7 +849,7 @@ pub async fn get_api_key_usage_history(
 
     // Validate pagination parameters
     crate::routes::common::validate_limit_offset(query.limit, query.offset)?;
-    validate_credit_type_filter(query.credit_type.as_deref())?;
+    query.credit_type = normalize_credit_type_filter(query.credit_type.as_deref())?;
 
     let workspace_uuid = Uuid::parse_str(&workspace_id).map_err(|_| {
         (

@@ -23,6 +23,16 @@ pub trait AttestationServiceTrait: Send + Sync {
         chat_id: &str,
     ) -> Result<(), AttestationError>;
 
+    /// Fetch and store provider signatures before a stream sends `[DONE]`.
+    /// Implementations may reserve part of the caller's finalization deadline
+    /// to persist partial fetches; background callers use the method above.
+    async fn store_stream_chat_signature_from_provider(
+        &self,
+        chat_id: &str,
+    ) -> Result<(), AttestationError> {
+        self.store_chat_signature_from_provider(chat_id).await
+    }
+
     /// Store a chat signature directly over gateway-emitted bytes.
     /// Creates a signature with text format "request_hash:response_hash"
     /// and stores both ECDSA and ED25519 signatures.

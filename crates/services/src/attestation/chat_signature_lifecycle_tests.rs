@@ -36,18 +36,35 @@ use crate::{
 
 /// Repository that records stored signatures and succeeds.
 #[derive(Clone, Default)]
-struct RecordingRepository {
+pub(super) struct RecordingRepository {
     stored: Arc<Mutex<Vec<(String, ChatSignature)>>>,
+    batch_sizes: Arc<Mutex<Vec<usize>>>,
 }
 
 impl RecordingRepository {
-    fn stored(&self) -> Vec<(String, ChatSignature)> {
+    pub(super) fn stored(&self) -> Vec<(String, ChatSignature)> {
         self.stored.lock().map(|s| s.clone()).unwrap_or_default()
+    }
+
+    pub(super) fn batch_sizes(&self) -> Vec<usize> {
+        self.batch_sizes.lock().unwrap().clone()
     }
 }
 
 #[async_trait]
 impl AttestationRepository for RecordingRepository {
+    async fn add_chat_signatures(
+        &self,
+        chat_id: &str,
+        signatures: Vec<ChatSignature>,
+    ) -> Result<(), AttestationError> {
+        self.batch_sizes.lock().unwrap().push(signatures.len());
+        for signature in signatures {
+            self.add_chat_signature(chat_id, signature).await?;
+        }
+        Ok(())
+    }
+
     async fn add_chat_signature(
         &self,
         chat_id: &str,
@@ -72,7 +89,7 @@ impl AttestationRepository for RecordingRepository {
 }
 
 /// Repository whose store always fails.
-struct FailingRepository;
+pub(super) struct FailingRepository;
 
 #[async_trait]
 impl AttestationRepository for FailingRepository {
@@ -251,7 +268,7 @@ async fn pool_with_pinned_chat(chat_id: &str) -> (Arc<InferenceProviderPool>, Ar
     (pool, provider)
 }
 
-fn lifecycle_service(
+pub(super) fn lifecycle_service(
     repository: Arc<dyn AttestationRepository + Send + Sync>,
     pool: Arc<InferenceProviderPool>,
 ) -> AttestationService {

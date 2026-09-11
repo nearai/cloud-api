@@ -23,15 +23,33 @@ where
                 SELECT usage_log.workspace_id, usage_log.api_key_id,
                        services.service_name,
                        DATE_TRUNC('day', usage_log.created_at) AS day,
-                       usage_log.quantity, usage_log.total_cost
+                       usage_log.quantity,
+                       CASE WHEN $7::TEXT IS NULL THEN
+                           usage_log.total_cost - COALESCE((
+                               SELECT SUM(amount)::BIGINT FROM usage_credit_adjustments adjustment
+                               WHERE adjustment.service_usage_id = usage_log.id
+                           ), 0)
+                       ELSE allocation.amount END AS total_cost
                 FROM organization_service_usage_log AS usage_log
                 INNER JOIN services ON services.id = usage_log.service_id
+                LEFT JOIN (
+                    SELECT original.id, original.service_usage_id, original.credit_type,
+                           original.amount - COALESCE(reversed.amount, 0) AS amount
+                    FROM usage_credit_allocations original
+                    LEFT JOIN (
+                        SELECT allocation_id, SUM(amount)::BIGINT AS amount
+                        FROM usage_credit_allocation_reversals
+                        GROUP BY allocation_id
+                    ) reversed ON reversed.allocation_id = original.id
+                ) allocation ON allocation.service_usage_id = usage_log.id
+                            AND allocation.credit_type = $7
                 WHERE usage_log.organization_id = $1
                   AND ($2::TIMESTAMPTZ IS NULL OR usage_log.created_at >= $2)
                   AND ($3::TIMESTAMPTZ IS NULL OR usage_log.created_at <= $3)
                   AND ($4::UUID IS NULL OR usage_log.workspace_id = $4)
                   AND ($5::UUID IS NULL OR usage_log.api_key_id = $5)
                   AND ($6::TEXT IS NULL OR services.service_name = $6)
+                  AND ($7::TEXT IS NULL OR allocation.amount > 0)
             )
             SELECT
                 CASE
@@ -60,6 +78,7 @@ where
                 &filters.workspace_id,
                 &filters.api_key_id,
                 &filters.service_name,
+                &filters.credit_type,
             ],
         )
         .await

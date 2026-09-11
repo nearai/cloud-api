@@ -259,15 +259,11 @@ impl StakingFarmRepository for OrganizationStakingFarmSourcesRepository {
 
             let transaction = client.transaction().await.map_err(map_db_error)?;
             let now = Utc::now();
-            let advisory_key = format!("{organization_id}:{CREDIT_TYPE_STAKING_FARM}");
-
-            transaction
-                .query_one(
-                    "SELECT pg_advisory_xact_lock(hashtext($1))",
-                    &[&advisory_key],
-                )
-                .await
-                .map_err(map_db_error)?;
+            crate::repositories::credit_allocation::lock_organization_accounting(
+                &transaction,
+                organization_id,
+            )
+            .await?;
 
             transaction
                 .execute(

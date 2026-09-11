@@ -35,6 +35,9 @@ pub struct ApiConfig {
     pub staking_farm: StakingFarmConfig,
     pub aml: AmlConfig,
     pub usage_reporting: UsageReportingConfig,
+    /// Posting-time credit allocation policy. The order is persisted with
+    /// every attributed usage charge, so changing it never rewrites history.
+    pub credit_allocation: CreditAllocationConfig,
     pub ita: ItaAttestationConfig,
 }
 
@@ -79,6 +82,71 @@ impl ApiConfig {
             aml: AmlConfig::from_env()?,
             ita: ItaAttestationConfig::from_env()?,
             usage_reporting: UsageReportingConfig::from_env()?,
+            credit_allocation: CreditAllocationConfig::from_env()?,
+        })
+    }
+}
+
+/// Credit funding priority used when a usage charge is posted.
+///
+/// API/database credit type names are used deliberately so the configured
+/// values can be passed to the accounting repository without translation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CreditAllocationConfig {
+    pub priority: Vec<String>,
+    pub policy_version: String,
+}
+
+impl Default for CreditAllocationConfig {
+    fn default() -> Self {
+        Self {
+            priority: ["grant", "postpay", "staking_farm", "payment"]
+                .into_iter()
+                .map(str::to_string)
+                .collect(),
+            policy_version: "v1".to_string(),
+        }
+    }
+}
+
+impl CreditAllocationConfig {
+    pub fn from_env() -> Result<Self, String> {
+        const SUPPORTED: [&str; 4] = ["grant", "postpay", "staking_farm", "payment"];
+        let defaults = Self::default();
+        let priority = env::var("CREDIT_USAGE_ORDER")
+            .unwrap_or_else(|_| defaults.priority.join(","))
+            .split(',')
+            .map(|value| value.trim().to_ascii_lowercase())
+            .filter(|value| !value.is_empty())
+            .collect::<Vec<_>>();
+
+        if priority.len() != SUPPORTED.len()
+            || priority
+                .iter()
+                .any(|value| !SUPPORTED.contains(&value.as_str()))
+            || SUPPORTED
+                .iter()
+                .any(|supported| priority.iter().filter(|value| value == supported).count() != 1)
+        {
+            return Err(format!(
+                "CREDIT_USAGE_ORDER must contain each supported credit type exactly once: {}",
+                SUPPORTED.join(",")
+            ));
+        }
+
+        let policy_version = env::var("CREDIT_ALLOCATION_POLICY_VERSION")
+            .unwrap_or(defaults.policy_version)
+            .trim()
+            .to_string();
+        if policy_version.is_empty() || policy_version.len() > 50 {
+            return Err(
+                "CREDIT_ALLOCATION_POLICY_VERSION must be between 1 and 50 characters".into(),
+            );
+        }
+
+        Ok(Self {
+            priority,
+            policy_version,
         })
     }
 }
@@ -1427,6 +1495,40 @@ mod tests {
             config.database_statement_timeout()
                 < std::time::Duration::from_secs(config.request_timeout_seconds)
         );
+    }
+
+    #[test]
+    #[serial]
+    fn credit_allocation_uses_requested_priority_and_version() {
+        std::env::set_var(
+            "CREDIT_USAGE_ORDER",
+            "payment, staking_farm, postpay, grant",
+        );
+        std::env::set_var("CREDIT_ALLOCATION_POLICY_VERSION", "emergency-v2");
+
+        let config = CreditAllocationConfig::from_env().unwrap();
+
+        assert_eq!(
+            config.priority,
+            ["payment", "staking_farm", "postpay", "grant"]
+        );
+        assert_eq!(config.policy_version, "emergency-v2");
+        std::env::remove_var("CREDIT_USAGE_ORDER");
+        std::env::remove_var("CREDIT_ALLOCATION_POLICY_VERSION");
+    }
+
+    #[test]
+    #[serial]
+    fn credit_allocation_rejects_missing_duplicate_and_unknown_types() {
+        for invalid in [
+            "grant,postpay,staking_farm",
+            "grant,postpay,staking_farm,grant",
+            "grant,postpay,staking_farm,cash",
+        ] {
+            std::env::set_var("CREDIT_USAGE_ORDER", invalid);
+            assert!(CreditAllocationConfig::from_env().is_err(), "{invalid}");
+        }
+        std::env::remove_var("CREDIT_USAGE_ORDER");
     }
 
     #[test]

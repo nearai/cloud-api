@@ -49,8 +49,35 @@ impl OrganizationUsageRepository {
                         id, organization_id, workspace_id, api_key_id, created_at,
                         model_name, inference_type, input_tokens, output_tokens,
                         cache_read_tokens, cache_write_tokens, total_tokens, input_cost, output_cost,
-                        total_cost, response_id, provider_request_id, inference_id,
-                        stop_reason, image_count, service_tier, context_band, billing_details
+                        CASE WHEN $8::TEXT IS NULL THEN total_cost - COALESCE((
+                            SELECT SUM(amount)::BIGINT FROM usage_credit_adjustments adjustment
+                            WHERE adjustment.inference_usage_id = organization_usage_log.id
+                        ), 0) ELSE
+                            (SELECT a.amount - COALESCE((
+                                SELECT SUM(amount)::BIGINT FROM usage_credit_allocation_reversals reversal
+                                WHERE reversal.allocation_id = a.id
+                             ), 0) FROM usage_credit_allocations a
+                             WHERE a.inference_usage_id = organization_usage_log.id
+                               AND a.credit_type = $8)
+                        END AS total_cost,
+                        response_id, provider_request_id, inference_id,
+                        stop_reason, image_count, service_tier, context_band, billing_details,
+                        funded_amount, unfunded_amount, allocation_policy_version,
+                        CASE WHEN funded_amount IS NULL THEN NULL ELSE
+                            COALESCE((SELECT jsonb_agg(jsonb_build_object(
+                                'type', a.credit_type, 'amount', a.amount - COALESCE((SELECT SUM(amount)::BIGINT
+                                    FROM usage_credit_allocation_reversals reversal
+                                    WHERE reversal.allocation_id = a.id), 0), 'source', a.source,
+                                'organization_limit_id', a.organization_limit_id,
+                                'policy_version', a.policy_version
+                            ) ORDER BY a.priority_position)
+                            FROM usage_credit_allocations a
+                            WHERE a.inference_usage_id = organization_usage_log.id
+                              AND ($8::TEXT IS NULL OR a.credit_type = $8)
+                              AND a.amount > COALESCE((SELECT SUM(amount)::BIGINT
+                                  FROM usage_credit_allocation_reversals reversal
+                                  WHERE reversal.allocation_id = a.id), 0)), '[]'::jsonb)
+                        END AS credit_allocations
                     FROM organization_usage_log
                     WHERE organization_id = $1
                       AND ($2::TIMESTAMPTZ IS NULL OR created_at >= $2)
@@ -59,13 +86,22 @@ impl OrganizationUsageRepository {
                       AND ($5::UUID IS NULL OR api_key_id = $5)
                       AND ($6::TEXT IS NULL OR model_name = $6)
                       AND ($7::TEXT IS NULL OR inference_type = $7)
+                      AND ($8::TEXT IS NULL OR EXISTS (
+                          SELECT 1 FROM usage_credit_allocations allocation_filter
+                          WHERE allocation_filter.inference_usage_id = organization_usage_log.id
+                            AND allocation_filter.credit_type = $8
+                            AND allocation_filter.amount > COALESCE((
+                                SELECT SUM(amount)::BIGINT FROM usage_credit_allocation_reversals reversal
+                                WHERE reversal.allocation_id = allocation_filter.id
+                            ), 0)
+                      ))
                       AND (
-                          $8::TIMESTAMPTZ IS NULL
-                          OR created_at < $8
-                          OR (created_at = $8 AND id < $9::UUID)
+                          $9::TIMESTAMPTZ IS NULL
+                          OR created_at < $9
+                          OR (created_at = $9 AND id < $10::UUID)
                       )
                     ORDER BY created_at DESC, id DESC
-                    LIMIT $10
+                    LIMIT $11
                     "#,
                     &[
                         &query.organization_id,
@@ -75,6 +111,7 @@ impl OrganizationUsageRepository {
                         &query.api_key_id,
                         &query.model,
                         &query.inference_type,
+                        &query.credit_type,
                         &cursor_created_at,
                         &cursor_id,
                         &limit,
@@ -110,16 +147,52 @@ impl OrganizationUsageRepository {
                         id, organization_id, workspace_id, api_key_id, created_at,
                         model_name, inference_type, input_tokens, output_tokens,
                         cache_read_tokens, cache_write_tokens, total_tokens, input_cost, output_cost,
-                        total_cost, response_id, provider_request_id, inference_id,
-                        stop_reason, image_count, service_tier, context_band, billing_details
+                        CASE WHEN $6::TEXT IS NULL THEN total_cost - COALESCE((
+                            SELECT SUM(amount)::BIGINT FROM usage_credit_adjustments adjustment
+                            WHERE adjustment.inference_usage_id = organization_usage_log.id
+                        ), 0) ELSE
+                            (SELECT a.amount - COALESCE((
+                                SELECT SUM(amount)::BIGINT FROM usage_credit_allocation_reversals reversal
+                                WHERE reversal.allocation_id = a.id
+                             ), 0) FROM usage_credit_allocations a
+                             WHERE a.inference_usage_id = organization_usage_log.id
+                               AND a.credit_type = $6)
+                        END AS total_cost,
+                        response_id, provider_request_id, inference_id,
+                        stop_reason, image_count, service_tier, context_band, billing_details,
+                        funded_amount, unfunded_amount, allocation_policy_version,
+                        CASE WHEN funded_amount IS NULL THEN NULL ELSE
+                            COALESCE((SELECT jsonb_agg(jsonb_build_object(
+                                'type', a.credit_type, 'amount', a.amount - COALESCE((SELECT SUM(amount)::BIGINT
+                                    FROM usage_credit_allocation_reversals reversal
+                                    WHERE reversal.allocation_id = a.id), 0), 'source', a.source,
+                                'organization_limit_id', a.organization_limit_id,
+                                'policy_version', a.policy_version
+                            ) ORDER BY a.priority_position)
+                            FROM usage_credit_allocations a
+                            WHERE a.inference_usage_id = organization_usage_log.id
+                              AND ($6::TEXT IS NULL OR a.credit_type = $6)
+                              AND a.amount > COALESCE((SELECT SUM(amount)::BIGINT
+                                  FROM usage_credit_allocation_reversals reversal
+                                  WHERE reversal.allocation_id = a.id), 0)), '[]'::jsonb)
+                        END AS credit_allocations
                     FROM organization_usage_log
                     WHERE organization_id = $1
                       AND ($2::TIMESTAMPTZ IS NULL OR created_at >= $2)
                       AND ($3::TIMESTAMPTZ IS NULL OR created_at <= $3)
                       AND ($4::UUID IS NULL OR workspace_id = $4)
                       AND ($5::UUID IS NULL OR api_key_id = $5)
+                      AND ($6::TEXT IS NULL OR EXISTS (
+                          SELECT 1 FROM usage_credit_allocations allocation_filter
+                          WHERE allocation_filter.inference_usage_id = organization_usage_log.id
+                            AND allocation_filter.credit_type = $6
+                            AND allocation_filter.amount > COALESCE((
+                                SELECT SUM(amount)::BIGINT FROM usage_credit_allocation_reversals reversal
+                                WHERE reversal.allocation_id = allocation_filter.id
+                            ), 0)
+                      ))
                     ORDER BY created_at DESC, id DESC
-                    LIMIT $6 OFFSET $7
+                    LIMIT $7 OFFSET $8
                     "#,
                     &[
                         &query.organization_id,
@@ -127,6 +200,7 @@ impl OrganizationUsageRepository {
                         &query.end_time,
                         &query.workspace_id,
                         &query.api_key_id,
+                        &query.credit_type,
                         &query.limit,
                         &query.offset,
                     ],
@@ -144,6 +218,15 @@ impl OrganizationUsageRepository {
                       AND ($3::TIMESTAMPTZ IS NULL OR created_at <= $3)
                       AND ($4::UUID IS NULL OR workspace_id = $4)
                       AND ($5::UUID IS NULL OR api_key_id = $5)
+                      AND ($6::TEXT IS NULL OR EXISTS (
+                          SELECT 1 FROM usage_credit_allocations allocation_filter
+                          WHERE allocation_filter.inference_usage_id = organization_usage_log.id
+                            AND allocation_filter.credit_type = $6
+                            AND allocation_filter.amount > COALESCE((
+                                SELECT SUM(amount)::BIGINT FROM usage_credit_allocation_reversals reversal
+                                WHERE reversal.allocation_id = allocation_filter.id
+                            ), 0)
+                      ))
                     "#,
                     &[
                         &query.organization_id,
@@ -151,6 +234,7 @@ impl OrganizationUsageRepository {
                         &query.end_time,
                         &query.workspace_id,
                         &query.api_key_id,
+                        &query.credit_type,
                     ],
                 )
                 .await
@@ -224,5 +308,13 @@ fn row_to_report(row: &Row) -> InferenceUsageReportRow {
         inference_id: row.get("inference_id"),
         stop_reason: row.get("stop_reason"),
         image_count: row.get("image_count"),
+        credit_allocations: row
+            .try_get::<_, Option<serde_json::Value>>("credit_allocations")
+            .ok()
+            .flatten()
+            .and_then(|value| serde_json::from_value(value).ok()),
+        funded_amount: row.try_get("funded_amount").ok().flatten(),
+        unfunded_amount: row.try_get("unfunded_amount").ok().flatten(),
+        allocation_policy_version: row.try_get("allocation_policy_version").ok().flatten(),
     }
 }

@@ -412,9 +412,10 @@ pub async fn init_domain_services_with_pool(
 
     // Prepare repositories for usage service (will be created after workspace service)
     let usage_repository = Arc::new(
-        database::repositories::OrganizationUsageRepository::with_reporting_statement_timeout(
+        database::repositories::OrganizationUsageRepository::with_accounting_config(
             database.pool().clone(),
             reporting_statement_timeout,
+            &config.credit_allocation,
         ),
     );
     let limits_repository_for_usage = Arc::new(
@@ -525,9 +526,10 @@ pub async fn init_domain_services_with_pool(
         database.pool().clone(),
     ));
     let org_service_usage_repo = Arc::new(
-        database::repositories::OrganizationServiceUsageRepository::with_reporting_statement_timeout(
+        database::repositories::OrganizationServiceUsageRepository::with_accounting_config(
             database.pool().clone(),
             reporting_statement_timeout,
+            &config.credit_allocation,
         ),
     );
     let service_usage_repo = Arc::new(database::repositories::ServiceUsageRepositoryImpl::new(
@@ -2229,9 +2231,9 @@ fn build_admin_routes_with_options(
     use crate::middleware::admin_middleware;
     use crate::routes::admin::{
         batch_upsert_models, cancel_model_pricing_change, confirm_model_deprecation,
-        confirm_model_pricing_changes, create_admin_access_token, create_service,
-        delete_admin_access_token, delete_aml_allowlist_entry, delete_model, deprecate_model,
-        get_admin_organization_balance, get_billing_summary, get_infra_summary,
+        confirm_model_pricing_changes, create_admin_access_token, create_credit_adjustment,
+        create_service, delete_admin_access_token, delete_aml_allowlist_entry, delete_model,
+        deprecate_model, get_admin_organization_balance, get_billing_summary, get_infra_summary,
         get_model_consumption_timeseries, get_model_history, get_model_revenue, get_org_revenue,
         get_organization as get_admin_organization, get_organization_concurrent_limit,
         get_organization_fallback, get_organization_limits_history, get_organization_metrics,
@@ -2256,6 +2258,11 @@ fn build_admin_routes_with_options(
     // Create admin access token repository
     let admin_access_token_repository =
         Arc::new(AdminAccessTokenRepository::new(database.pool().clone()));
+    let credit_adjustment_repository = Arc::new(
+        database::repositories::credit_adjustment::CreditAdjustmentRepository::new(
+            database.pool().clone(),
+        ),
+    );
 
     // Create admin service with composite repository.
     //
@@ -2296,6 +2303,7 @@ fn build_admin_routes_with_options(
         aml_service: services.aml_service,
         config: config.clone(),
         admin_access_token_repository,
+        credit_adjustment_repository,
         inference_provider_pool: services.inference_provider_pool,
         github_dispatcher,
         infra_service,
@@ -2364,6 +2372,10 @@ fn build_admin_routes_with_options(
         .route(
             "/admin/organizations/{org_id}/limits/history",
             axum::routing::get(get_organization_limits_history),
+        )
+        .route(
+            "/admin/organizations/{org_id}/usage/adjustments",
+            axum::routing::post(create_credit_adjustment),
         )
         .route(
             "/admin/organizations/{org_id}/usage/balance",
@@ -2923,6 +2935,7 @@ mod tests {
             staking_farm: config::StakingFarmConfig::default(),
             aml: config::AmlConfig::default(),
             usage_reporting: config::UsageReportingConfig::default(),
+            credit_allocation: config::CreditAllocationConfig::default(),
             ita: config::ItaAttestationConfig::default(),
         };
 
@@ -3039,6 +3052,7 @@ mod tests {
             staking_farm: config::StakingFarmConfig::default(),
             aml: config::AmlConfig::default(),
             usage_reporting: config::UsageReportingConfig::default(),
+            credit_allocation: config::CreditAllocationConfig::default(),
             ita: config::ItaAttestationConfig::default(),
         };
 

@@ -287,6 +287,7 @@ pub trait UsageServiceTrait: Send + Sync {
     async fn get_usage_history_by_api_key(
         &self,
         api_key_id: Uuid,
+        credit_type: Option<&str>,
         limit: Option<i64>,
         offset: Option<i64>,
     ) -> Result<(Vec<UsageLogEntry>, i64), UsageError>;
@@ -299,6 +300,7 @@ pub trait UsageServiceTrait: Send + Sync {
         workspace_id: Uuid,
         api_key_id: Uuid,
         user_id: Uuid,
+        credit_type: Option<&str>,
         limit: Option<i64>,
         offset: Option<i64>,
     ) -> Result<(Vec<UsageLogEntry>, i64), UsageError>;
@@ -359,6 +361,7 @@ pub trait UsageRepository: Send + Sync {
     async fn get_usage_history_by_api_key(
         &self,
         api_key_id: Uuid,
+        credit_type: Option<&str>,
         limit: Option<i64>,
         offset: Option<i64>,
     ) -> anyhow::Result<(Vec<UsageLogEntry>, i64)>;
@@ -622,6 +625,11 @@ pub struct ModelPricing {
 #[derive(Debug, Clone)]
 pub struct OrganizationLimit {
     pub spend_limit: i64,
+    /// Remaining attributed capacity across active credit types.
+    pub available: i64,
+    /// Unresolved overage from already-executed usage. New usage is blocked
+    /// while this is positive, even if a later limit update adds capacity.
+    pub unfunded: i64,
 }
 
 /// One active credit source contributing to an organization's spending limit.
@@ -631,7 +639,22 @@ pub struct OrganizationCreditLimit {
     pub credit_type: String,
     pub source: Option<String>,
     pub amount: i64,
+    pub consumed: i64,
+    pub available: i64,
     pub currency: String,
+}
+
+/// Immutable portion of a usage charge paid by one credit type.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
+pub struct CreditAllocation {
+    #[serde(rename = "type")]
+    pub credit_type: String,
+    pub amount: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub organization_limit_id: Option<Uuid>,
+    pub policy_version: String,
 }
 
 /// Cost breakdown for a request
@@ -728,6 +751,12 @@ pub struct UsageLogEntry {
     /// The database balance is correctly updated only for new inserts,
     /// and this flag ensures metrics tracking follows the same pattern.
     pub was_inserted: bool,
+    /// None marks pre-attribution historical usage. New zero-cost usage uses
+    /// Some(empty), preserving the distinction without fake allocations.
+    pub credit_allocations: Option<Vec<CreditAllocation>>,
+    pub funded_amount: Option<i64>,
+    pub unfunded_amount: Option<i64>,
+    pub allocation_policy_version: Option<String>,
     pub provider_attribution: ProviderAttribution,
 }
 

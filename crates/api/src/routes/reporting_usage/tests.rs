@@ -70,6 +70,7 @@ fn reporting_usage_cursor_restores_omitted_context_and_rejects_conflicts() {
         model: Some("test-model".to_string()),
         inference_type: Some("chat_completion".to_string()),
         service_name: Some("web_search".to_string()),
+        credit_type: Some("grant".to_string()),
         limit: Some(1),
         cursor: None,
     })
@@ -266,6 +267,10 @@ fn reporting_usage_query_manual_codec_serializes_response_and_cursor() {
             api_key_id,
             total_cost_nano_usd: 42,
             total_cost_usd: Some("$0.000000042".to_string()),
+            credit_allocations: None,
+            funded_amount: None,
+            unfunded_amount: None,
+            allocation_policy_version: None,
             usage: ReportingUsageDetails::Inference {
                 inference: ReportingInferenceUsage {
                     model: "test-model".to_string(),

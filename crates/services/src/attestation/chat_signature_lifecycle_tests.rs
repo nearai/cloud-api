@@ -200,6 +200,7 @@ impl UsageRepository for NoopUsageRepository {
     async fn get_usage_history_by_api_key(
         &self,
         _api_key_id: Uuid,
+        _credit_type: Option<&str>,
         _limit: Option<i64>,
         _offset: Option<i64>,
     ) -> anyhow::Result<(Vec<UsageLogEntry>, i64)> {

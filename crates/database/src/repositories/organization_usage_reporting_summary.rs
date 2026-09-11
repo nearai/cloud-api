@@ -20,18 +20,36 @@ where
         .query(
             r#"
             WITH filtered AS MATERIALIZED (
-                SELECT workspace_id, api_key_id, model_name,
-                       DATE_TRUNC('day', created_at) AS day,
-                       input_tokens, output_tokens, cache_read_tokens,
-                       total_tokens, total_cost
-                FROM organization_usage_log
-                WHERE organization_id = $1
-                  AND ($2::TIMESTAMPTZ IS NULL OR created_at >= $2)
-                  AND ($3::TIMESTAMPTZ IS NULL OR created_at <= $3)
-                  AND ($4::UUID IS NULL OR workspace_id = $4)
-                  AND ($5::UUID IS NULL OR api_key_id = $5)
-                  AND ($6::TEXT IS NULL OR model_name = $6)
-                  AND ($7::TEXT IS NULL OR inference_type = $7)
+                SELECT usage_log.workspace_id, usage_log.api_key_id, usage_log.model_name,
+                       DATE_TRUNC('day', usage_log.created_at) AS day,
+                       usage_log.input_tokens, usage_log.output_tokens,
+                       usage_log.cache_read_tokens, usage_log.total_tokens,
+                       CASE WHEN $8::TEXT IS NULL THEN
+                           usage_log.total_cost - COALESCE((
+                               SELECT SUM(amount)::BIGINT FROM usage_credit_adjustments adjustment
+                               WHERE adjustment.inference_usage_id = usage_log.id
+                           ), 0)
+                       ELSE allocation.amount END AS total_cost
+                FROM organization_usage_log usage_log
+                LEFT JOIN (
+                    SELECT original.id, original.inference_usage_id, original.credit_type,
+                           original.amount - COALESCE(reversed.amount, 0) AS amount
+                    FROM usage_credit_allocations original
+                    LEFT JOIN (
+                        SELECT allocation_id, SUM(amount)::BIGINT AS amount
+                        FROM usage_credit_allocation_reversals
+                        GROUP BY allocation_id
+                    ) reversed ON reversed.allocation_id = original.id
+                ) allocation ON allocation.inference_usage_id = usage_log.id
+                            AND allocation.credit_type = $8
+                WHERE usage_log.organization_id = $1
+                  AND ($2::TIMESTAMPTZ IS NULL OR usage_log.created_at >= $2)
+                  AND ($3::TIMESTAMPTZ IS NULL OR usage_log.created_at <= $3)
+                  AND ($4::UUID IS NULL OR usage_log.workspace_id = $4)
+                  AND ($5::UUID IS NULL OR usage_log.api_key_id = $5)
+                  AND ($6::TEXT IS NULL OR usage_log.model_name = $6)
+                  AND ($7::TEXT IS NULL OR usage_log.inference_type = $7)
+                  AND ($8::TEXT IS NULL OR allocation.amount > 0)
             )
             SELECT
                 CASE
@@ -64,6 +82,7 @@ where
                 &filters.api_key_id,
                 &filters.model,
                 &filters.inference_type,
+                &filters.credit_type,
             ],
         )
         .await

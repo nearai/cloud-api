@@ -86,6 +86,7 @@ pub struct ReportingUsageQuery {
     pub model: Option<String>,
     pub inference_type: Option<InferenceType>,
     pub service_name: Option<String>,
+    pub credit_type: Option<String>,
     pub limit: ReportingUsageLimit,
     pub cursor: Option<ReportingUsageCursor>,
 }
@@ -100,6 +101,7 @@ pub struct ReportingUsageQueryParams {
     pub model: Option<String>,
     pub inference_type: Option<String>,
     pub service_name: Option<String>,
+    pub credit_type: Option<String>,
     pub limit: Option<u16>,
     pub cursor: Option<String>,
 }
@@ -116,6 +118,8 @@ pub enum ReportingUsageQueryError {
     InvalidSource(String),
     #[error("invalid inference_type: {0}")]
     InvalidInferenceType(String),
+    #[error("invalid credit_type: {0}")]
+    InvalidCreditType(String),
     #[error("limit must be positive")]
     LimitNotPositive,
     #[error("limit must not exceed {max}")]
@@ -141,6 +145,11 @@ impl TryFrom<ReportingUsageQueryParams> for ReportingUsageQuery {
             .map(InferenceType::from_str)
             .transpose()
             .map_err(ReportingUsageQueryError::InvalidInferenceType)?;
+        let requested_credit_type = params
+            .credit_type
+            .as_deref()
+            .map(parse_credit_type)
+            .transpose()?;
         let cursor = params
             .cursor
             .as_deref()
@@ -166,6 +175,7 @@ impl TryFrom<ReportingUsageQueryParams> for ReportingUsageQuery {
                     model: params.model,
                     inference_type: requested_inference_type,
                     service_name: params.service_name,
+                    credit_type: requested_credit_type,
                 }
             }
         };
@@ -179,6 +189,7 @@ impl TryFrom<ReportingUsageQueryParams> for ReportingUsageQuery {
             model: context.model,
             inference_type: context.inference_type,
             service_name: context.service_name,
+            credit_type: context.credit_type,
             limit: params
                 .limit
                 .map(ReportingUsageLimit::new)
@@ -186,6 +197,15 @@ impl TryFrom<ReportingUsageQueryParams> for ReportingUsageQuery {
                 .unwrap_or_default(),
             cursor,
         })
+    }
+}
+
+fn parse_credit_type(value: &str) -> Result<String, ReportingUsageQueryError> {
+    match value {
+        "grant" | "postpay" | "staking_farm" | "payment" => Ok(value.to_string()),
+        other => Err(ReportingUsageQueryError::InvalidCreditType(
+            other.to_string(),
+        )),
     }
 }
 

@@ -10,7 +10,7 @@ use services::admin::{
     AdminModelInfo, AdminOrganizationInfo, AdminOrganizationMemberInfo, AdminRepository,
     DeprecateModelOutcome, ModelDeprecationDeliveryRecord, ModelDeprecationEmailStatus,
     ModelDeprecationModel, ModelDeprecationRecipient, ModelHistoryEntry, ModelPricing,
-    ModelPricingSnapshot, OrganizationLimits, OrganizationLimitsHistoryEntry,
+    ModelPricingSnapshot, ModelValidationState, OrganizationLimits, OrganizationLimitsHistoryEntry,
     OrganizationLimitsUpdate, PlatformServiceInfo, PricingChangeDeliveryRecord,
     PricingChangeOpenConflictError, PricingChangeRecipientRow, ScheduledPricingChange,
     ScheduledPricingChangeInsert, ScheduledPricingChangeStatus, UpdateModelAdminRequest, UserInfo,
@@ -42,11 +42,18 @@ pub struct AdminCompositeRepository {
 
 impl AdminCompositeRepository {
     pub fn new(pool: DbPool) -> Self {
+        Self::with_accounting_config(pool, &config::CreditAllocationConfig::default())
+    }
+
+    pub fn with_accounting_config(pool: DbPool, config: &config::CreditAllocationConfig) -> Self {
         Self {
             pool: pool.clone(),
             model_repo: Arc::new(ModelRepository::new(pool.clone())),
             alias_repo: Arc::new(ModelAliasRepository::new(pool.clone())),
-            limits_repo: Arc::new(OrganizationLimitsRepository::new(pool.clone())),
+            limits_repo: Arc::new(OrganizationLimitsRepository::with_accounting_config(
+                pool.clone(),
+                config,
+            )),
             user_repo: Arc::new(UserRepository::new(pool.clone())),
             service_repo: Arc::new(ServiceRepository::new(pool)),
         }
@@ -211,19 +218,19 @@ impl AdminRepository for AdminCompositeRepository {
         })
     }
 
-    async fn get_model_costs(
+    async fn get_model_validation_state(
         &self,
         model_name: &str,
-    ) -> Result<Option<(i64, i64, i64, Option<i64>, bool)>> {
+    ) -> Result<Option<ModelValidationState>> {
         let model = self.model_repo.get_by_internal_name(model_name).await?;
-        Ok(model.map(|m| {
-            (
-                m.input_cost_per_token,
-                m.output_cost_per_token,
-                m.cost_per_image,
-                m.cache_read_cost_per_token,
-                m.allow_free,
-            )
+        Ok(model.map(|m| ModelValidationState {
+            input_cost_per_token: m.input_cost_per_token,
+            output_cost_per_token: m.output_cost_per_token,
+            cost_per_image: m.cost_per_image,
+            cache_read_cost_per_token: m.cache_read_cost_per_token,
+            allow_free: m.allow_free,
+            provider_type: m.provider_type,
+            provider_config: m.provider_config,
         }))
     }
 

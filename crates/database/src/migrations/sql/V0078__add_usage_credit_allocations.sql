@@ -1,0 +1,93 @@
+-- Immutable posting-time attribution for inference and platform-service usage.
+-- Existing rows remain NULL/unknown; the migration deliberately does not
+-- invent a historical funding split from aggregate spend.
+
+ALTER TABLE organization_usage_log
+    ADD COLUMN funded_amount BIGINT,
+    ADD COLUMN unfunded_amount BIGINT,
+    ADD COLUMN allocation_policy_version VARCHAR(50),
+    ADD CONSTRAINT organization_usage_funding_nonnegative
+        CHECK ((funded_amount IS NULL AND unfunded_amount IS NULL)
+            OR (funded_amount IS NOT NULL AND unfunded_amount IS NOT NULL
+                AND funded_amount >= 0 AND unfunded_amount >= 0)) NOT VALID,
+    ADD CONSTRAINT organization_usage_funding_reconciles
+        CHECK ((funded_amount IS NULL AND unfunded_amount IS NULL)
+            OR (funded_amount IS NOT NULL AND unfunded_amount IS NOT NULL
+                AND funded_amount + unfunded_amount = total_cost)) NOT VALID;
+
+ALTER TABLE organization_service_usage_log
+    ADD COLUMN funded_amount BIGINT,
+    ADD COLUMN unfunded_amount BIGINT,
+    ADD COLUMN allocation_policy_version VARCHAR(50),
+    ADD CONSTRAINT organization_service_usage_funding_nonnegative
+        CHECK ((funded_amount IS NULL AND unfunded_amount IS NULL)
+            OR (funded_amount IS NOT NULL AND unfunded_amount IS NOT NULL
+                AND funded_amount >= 0 AND unfunded_amount >= 0)) NOT VALID,
+    ADD CONSTRAINT organization_service_usage_funding_reconciles
+        CHECK ((funded_amount IS NULL AND unfunded_amount IS NULL)
+            OR (funded_amount IS NOT NULL AND unfunded_amount IS NOT NULL
+                AND funded_amount + unfunded_amount = total_cost)) NOT VALID;
+
+-- Snapshot the rollout-era unattributed spend once. Recomputing it from the
+-- lifetime usage tables on every charge would make the accounting lock slower
+-- as an organization's history grows. New organizations keep the zero default.
+ALTER TABLE organization_balance
+    ADD COLUMN legacy_unattributed_amount BIGINT NOT NULL DEFAULT 0
+        CHECK (legacy_unattributed_amount >= 0),
+    ADD COLUMN unresolved_unfunded_amount BIGINT NOT NULL DEFAULT 0
+        CHECK (unresolved_unfunded_amount >= 0);
+
+UPDATE organization_balance
+SET legacy_unattributed_amount = GREATEST(total_spent, 0);
+
+CREATE TABLE usage_credit_allocations (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    organization_id UUID NOT NULL REFERENCES organizations(id) ON DELETE CASCADE,
+    inference_usage_id UUID REFERENCES organization_usage_log(id) ON DELETE CASCADE,
+    service_usage_id UUID REFERENCES organization_service_usage_log(id) ON DELETE CASCADE,
+    credit_type VARCHAR(50) NOT NULL
+        CHECK (credit_type IN ('grant', 'postpay', 'staking_farm', 'payment')),
+    amount BIGINT NOT NULL CHECK (amount > 0),
+    organization_limit_id UUID NOT NULL REFERENCES organization_limits_history(id),
+    source VARCHAR(100),
+    policy_version VARCHAR(50) NOT NULL,
+    allocation_phase VARCHAR(30) NOT NULL DEFAULT 'posting'
+        CHECK (allocation_phase IN ('posting', 'overage_settlement')),
+    priority_position SMALLINT NOT NULL CHECK (priority_position >= 0),
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    CONSTRAINT usage_credit_allocations_one_parent
+        CHECK ((inference_usage_id IS NOT NULL)::integer + (service_usage_id IS NOT NULL)::integer = 1)
+);
+
+-- Bounded accounting counters used by usage posting and admission checks.
+-- The immutable allocation ledger remains the source for history/reporting.
+CREATE TABLE organization_credit_consumption (
+    organization_id UUID NOT NULL REFERENCES organizations(id) ON DELETE CASCADE,
+    credit_type VARCHAR(50) NOT NULL
+        CHECK (credit_type IN ('grant', 'postpay', 'staking_farm', 'payment')),
+    amount BIGINT NOT NULL DEFAULT 0 CHECK (amount >= 0),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (organization_id, credit_type)
+);
+
+CREATE UNIQUE INDEX usage_credit_allocations_inference_type_unique
+    ON usage_credit_allocations(inference_usage_id, credit_type)
+    WHERE inference_usage_id IS NOT NULL AND allocation_phase = 'posting';
+CREATE UNIQUE INDEX usage_credit_allocations_service_type_unique
+    ON usage_credit_allocations(service_usage_id, credit_type)
+    WHERE service_usage_id IS NOT NULL AND allocation_phase = 'posting';
+CREATE INDEX usage_credit_allocations_org_type
+    ON usage_credit_allocations(organization_id, credit_type);
+CREATE INDEX usage_credit_allocations_inference
+    ON usage_credit_allocations(inference_usage_id)
+    WHERE inference_usage_id IS NOT NULL;
+CREATE INDEX usage_credit_allocations_service
+    ON usage_credit_allocations(service_usage_id)
+    WHERE service_usage_id IS NOT NULL;
+
+COMMENT ON TABLE usage_credit_allocations IS
+    'Immutable funding ledger for posting-time splits and later overage settlements; amounts are nano-USD.';
+COMMENT ON COLUMN organization_usage_log.funded_amount IS
+    'Attributed nano-USD; NULL means legacy usage with unknown funding.';
+COMMENT ON COLUMN organization_usage_log.unfunded_amount IS
+    'Nano-USD overage recorded after execution; NULL means legacy/unknown funding.';

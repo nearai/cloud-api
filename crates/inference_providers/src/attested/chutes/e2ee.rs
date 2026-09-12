@@ -166,6 +166,7 @@ pub struct PreparedRequest {
 /// so this must outlive the whole response.
 pub struct ResponseSession {
     response_dk: ml_kem::DecapsulationKey768,
+    synthetic_stream_id: String,
 }
 
 /// Build an E2EE request blob for `request_json` (the OpenAI request body)
@@ -215,11 +216,18 @@ pub fn build_request(
 
     Ok(PreparedRequest {
         blob,
-        session: ResponseSession { response_dk },
+        session: ResponseSession {
+            response_dk,
+            synthetic_stream_id: format!("chutes-gateway-{}", uuid::Uuid::new_v4()),
+        },
     })
 }
 
 impl ResponseSession {
+    pub(super) fn synthetic_stream_id(&self) -> &str {
+        &self.synthetic_stream_id
+    }
+
     /// Decrypt a non-streaming response blob (`mlkem_ct ‖ nonce ‖ ct ‖ tag`,
     /// keyed with `info="e2e-resp-v1"`, gzip-compressed) into the OpenAI
     /// response JSON bytes.

@@ -117,6 +117,7 @@ async fn organization_usage_reporting_filters_and_cursor() -> anyhow::Result<()>
             api_key_id: Some(org.api_key_a_id),
             model: Some(model.name.clone()),
             inference_type: Some("chat_completion".to_string()),
+            credit_type: None,
             limit: 1,
             cursor: None,
             deadline: None,
@@ -149,6 +150,7 @@ async fn organization_usage_reporting_filters_and_cursor() -> anyhow::Result<()>
             api_key_id: Some(org.api_key_a_id),
             model: Some(model.name.clone()),
             inference_type: Some("chat_completion".to_string()),
+            credit_type: None,
             limit: 1,
             cursor: Some(InferenceUsageReportCursor {
                 created_at: first_page[0].created_at,

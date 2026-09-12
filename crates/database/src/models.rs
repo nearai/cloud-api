@@ -727,6 +727,10 @@ pub struct OrganizationUsageLog {
     pub served_provider_type: Option<ServedProviderType>,
     pub served_via_fallback: bool,
     pub was_inserted: bool,
+    pub credit_allocations: Option<Vec<services::usage::CreditAllocation>>,
+    pub funded_amount: Option<i64>,
+    pub unfunded_amount: Option<i64>,
+    pub allocation_policy_version: Option<String>,
 }
 
 /// Organization balance summary - cached aggregate spending
@@ -813,6 +817,10 @@ pub struct OrganizationServiceUsageLog {
     pub total_cost: i64,
     pub inference_id: Option<Uuid>,
     pub created_at: DateTime<Utc>,
+    pub credit_allocations: Option<Vec<services::usage::CreditAllocation>>,
+    pub funded_amount: Option<i64>,
+    pub unfunded_amount: Option<i64>,
+    pub allocation_policy_version: Option<String>,
 }
 
 // ============================================

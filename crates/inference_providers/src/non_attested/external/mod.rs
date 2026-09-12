@@ -29,6 +29,9 @@ pub mod content;
 pub mod gemini;
 pub mod openai_compatible;
 
+#[cfg(test)]
+mod routing_policy_tests;
+
 use crate::{
     AnthropicRawError, AnthropicRawRequest, AnthropicRawResponse, AttestationError,
     AudioTranscriptionError, AudioTranscriptionParams, AudioTranscriptionResponse,
@@ -81,6 +84,103 @@ fn merge_json_defaults(target: &mut serde_json::Value, defaults: &serde_json::Va
     }
 }
 
+/// Merge mandatory fields, replacing conflicting leaves (including nulls and arrays).
+fn merge_json_enforced(target: &mut serde_json::Value, enforced: &serde_json::Value) {
+    match (target, enforced) {
+        (serde_json::Value::Object(target), serde_json::Value::Object(enforced)) => {
+            for (key, value) in enforced {
+                merge_json_enforced(
+                    target.entry(key.clone()).or_insert(serde_json::Value::Null),
+                    value,
+                );
+            }
+        }
+        (target, enforced) => *target = enforced.clone(),
+    }
+}
+
+/// Validate external provider configuration at both the admin write and load paths.
+/// Reject unknown fields so a misspelled mandatory policy cannot silently disappear.
+/// Restrict the initial policy surface to `provider`, which is an extra field on
+/// every supported JSON endpoint, so typed fields cannot create duplicate keys and
+/// backend normalization cannot remove or override the policy.
+pub fn validate_external_provider_config(config: &serde_json::Value) -> Result<(), &'static str> {
+    let Some(config) = config.as_object() else {
+        return Err("external provider config must be an object");
+    };
+    let Some(backend) = config.get("backend").and_then(|value| value.as_str()) else {
+        return Err("external provider config requires a string backend");
+    };
+    if backend != "openai_compatible" && config.contains_key("enforced_request_body") {
+        return Err("enforced_request_body requires an openai_compatible backend");
+    }
+    let allowed_fields: &[&str] = match backend {
+        "openai_compatible" => &[
+            "backend",
+            "base_url",
+            "organization_id",
+            "model_name",
+            "extra_request_body",
+            "enforced_request_body",
+            "api_key",
+        ],
+        "anthropic" => &["backend", "base_url", "version", "model_name", "api_key"],
+        "gemini" => &["backend", "base_url", "model_name", "api_key"],
+        _ => return Err("unsupported external provider backend"),
+    };
+    if config
+        .keys()
+        .any(|key| !allowed_fields.contains(&key.as_str()))
+    {
+        return Err("external provider config contains an unsupported field");
+    }
+    if config
+        .get("api_key")
+        .is_some_and(|value| !value.is_null() && !value.is_string())
+    {
+        return Err("external provider config api_key must be a string or null");
+    }
+
+    if let Some(enforced) = config.get("enforced_request_body").filter(|v| !v.is_null()) {
+        let fields = enforced
+            .as_object()
+            .ok_or("enforced_request_body must be an object")?;
+        if fields.keys().any(|key| key != "provider") {
+            return Err("enforced_request_body currently supports only the provider field");
+        }
+        if let Some(provider) = fields.get("provider") {
+            let provider = provider
+                .as_object()
+                .ok_or("enforced_request_body.provider must be an object")?;
+            if provider.is_empty() {
+                return Err("enforced_request_body.provider must not be empty");
+            }
+        }
+    }
+
+    // Validate the complete backend schema before an admin write can succeed.
+    // `api_key` is pool-level metadata rather than part of `ProviderConfig`, so
+    // remove it exactly as the runtime loader does before deserializing.
+    let mut backend_config = serde_json::Value::Object(config.clone());
+    backend_config
+        .as_object_mut()
+        .expect("backend config was constructed from an object")
+        .remove("api_key");
+    serde_json::from_value::<ProviderConfig>(backend_config)
+        .map_err(|_| "external provider config does not match the backend schema")?;
+
+    let base_url = config
+        .get("base_url")
+        .and_then(serde_json::Value::as_str)
+        .ok_or("external provider config requires a string base_url")?;
+    let parsed_url = url::Url::parse(base_url)
+        .map_err(|_| "external provider config requires a valid base_url")?;
+    if !matches!(parsed_url.scheme(), "http" | "https") || parsed_url.host_str().is_none() {
+        return Err("external provider config base_url must be an HTTP(S) URL");
+    }
+    Ok(())
+}
+
 /// Provider configuration stored in database
 ///
 /// This enum represents the JSON configuration stored in the `provider_config`
@@ -103,6 +203,12 @@ pub enum ProviderConfig {
         /// Useful for provider-specific parameters like OpenRouter's `provider` preferences.
         #[serde(default)]
         extra_request_body: Option<std::collections::HashMap<String, serde_json::Value>>,
+        /// Mandatory extra fields applied after defaults and user parameters.
+        /// Objects merge recursively; configured leaves replace user values.
+        /// Use for routing/privacy restrictions that callers must not override.
+        /// Currently restricted to the extra `provider` object; typed fields are rejected.
+        #[serde(default)]
+        enforced_request_body: Option<std::collections::HashMap<String, serde_json::Value>>,
     },
 
     /// Anthropic provider
@@ -165,6 +271,7 @@ pub struct ExternalProvider {
     backend: Arc<dyn ExternalBackend>,
     config: BackendConfig,
     model_name: String,
+    enforced_request_body: std::collections::HashMap<String, serde_json::Value>,
 }
 
 impl ExternalProvider {
@@ -177,16 +284,18 @@ impl ExternalProvider {
             timeout_seconds,
         } = external_config;
 
-        let (backend, config, remote_model_name): (
+        let (backend, config, remote_model_name, enforced_request_body): (
             Arc<dyn ExternalBackend>,
             BackendConfig,
             Option<String>,
+            std::collections::HashMap<String, serde_json::Value>,
         ) = match provider_config {
             ProviderConfig::OpenAiCompatible {
                 base_url,
                 organization_id,
                 model_name: config_model_name,
                 extra_request_body,
+                enforced_request_body,
             } => {
                 let mut extra = std::collections::HashMap::new();
                 if let Some(org_id) = organization_id {
@@ -203,6 +312,7 @@ impl ExternalProvider {
                         extra_request_body: extra_request_body.unwrap_or_default(),
                     },
                     config_model_name,
+                    enforced_request_body.unwrap_or_default(),
                 )
             }
             ProviderConfig::Anthropic {
@@ -223,6 +333,7 @@ impl ExternalProvider {
                         extra_request_body: std::collections::HashMap::new(),
                     },
                     config_model_name,
+                    std::collections::HashMap::new(),
                 )
             }
             ProviderConfig::Gemini {
@@ -238,6 +349,7 @@ impl ExternalProvider {
                     extra_request_body: std::collections::HashMap::new(),
                 },
                 config_model_name,
+                std::collections::HashMap::new(),
             ),
         };
 
@@ -248,6 +360,7 @@ impl ExternalProvider {
             backend,
             config,
             model_name: effective_model_name,
+            enforced_request_body,
         }
     }
 
@@ -262,7 +375,10 @@ impl ExternalProvider {
     }
 
     /// Inject provider-level default fields into the request body.
-    /// Per-request fields from the user take precedence over provider defaults.
+    /// Per-request fields take precedence over defaults. Mandatory `provider`
+    /// fields then replace configured leaves so callers cannot weaken routing.
+    /// Other mandatory keys are rejected before construction, which also keeps
+    /// backend normalization from removing or overriding the policy.
     fn inject_extra_request_body(
         &self,
         extra: &mut std::collections::HashMap<String, serde_json::Value>,
@@ -273,6 +389,12 @@ impl ExternalProvider {
             } else {
                 extra.insert(key.clone(), value.clone());
             }
+        }
+        for (key, value) in &self.enforced_request_body {
+            merge_json_enforced(
+                extra.entry(key.clone()).or_insert(serde_json::Value::Null),
+                value,
+            );
         }
     }
 }
@@ -390,6 +512,11 @@ impl InferenceProvider for ExternalProvider {
         params: AudioTranscriptionParams,
         _request_hash: String,
     ) -> Result<AudioTranscriptionResponse, AudioTranscriptionError> {
+        if !self.enforced_request_body.is_empty() {
+            return Err(AudioTranscriptionError::TranscriptionError(
+                "Audio transcription does not support mandatory routing fields".into(),
+            ));
+        }
         self.backend
             .audio_transcription(&self.config, &self.model_name, params)
             .await
@@ -401,6 +528,11 @@ impl InferenceProvider for ExternalProvider {
         params: Arc<ImageEditParams>,
         _request_hash: String,
     ) -> Result<ImageEditResponseWithBytes, ImageEditError> {
+        if !self.enforced_request_body.is_empty() {
+            return Err(ImageEditError::EditError(
+                "Image editing does not support mandatory routing fields".into(),
+            ));
+        }
         self.backend
             .image_edit(&self.config, &self.model_name, params)
             .await
@@ -661,6 +793,7 @@ mod tests {
             provider_config: ProviderConfig::OpenAiCompatible {
                 base_url: "https://api.openai.com/v1".to_string(),
                 organization_id: Some("org-123".to_string()),
+                enforced_request_body: None,
                 model_name: None,
                 extra_request_body: None,
             },
@@ -682,6 +815,7 @@ mod tests {
             provider_config: ProviderConfig::OpenAiCompatible {
                 base_url: "https://api.openai.com/v1".to_string(),
                 organization_id: None,
+                enforced_request_body: None,
                 model_name: Some("gpt-5.2".to_string()), // What OpenAI expects
                 extra_request_body: None,
             },
@@ -783,6 +917,7 @@ mod tests {
             provider_config: ProviderConfig::OpenAiCompatible {
                 base_url: "https://api.openai.com/v1".to_string(),
                 organization_id: None,
+                enforced_request_body: None,
                 model_name: None,
                 extra_request_body: None,
             },
@@ -806,6 +941,7 @@ mod tests {
             provider_config: ProviderConfig::OpenAiCompatible {
                 base_url: "https://api.openai.com/v1".to_string(),
                 organization_id: None,
+                enforced_request_body: None,
                 model_name: None,
                 extra_request_body: None,
             },
@@ -853,6 +989,7 @@ mod tests {
             provider_config: ProviderConfig::OpenAiCompatible {
                 base_url: "https://api.openai.com/v1".to_string(),
                 organization_id: None,
+                enforced_request_body: None,
                 model_name: None,
                 extra_request_body: None,
             },
@@ -880,6 +1017,7 @@ mod tests {
             provider_config: ProviderConfig::OpenAiCompatible {
                 base_url: "https://api.openai.com/v1".to_string(),
                 organization_id: None,
+                enforced_request_body: None,
                 model_name: None,
                 extra_request_body: None,
             },
@@ -911,6 +1049,7 @@ mod tests {
             provider_config: ProviderConfig::OpenAiCompatible {
                 base_url: "https://example.com".to_string(),
                 organization_id: None,
+                enforced_request_body: None,
                 model_name: None,
                 extra_request_body: None,
             },
@@ -1013,6 +1152,7 @@ mod tests {
             provider_config: ProviderConfig::OpenAiCompatible {
                 base_url: "https://openrouter.ai/api/v1".to_string(),
                 organization_id: None,
+                enforced_request_body: None,
                 model_name: None,
                 extra_request_body: Some(HashMap::from([(
                     "provider".to_string(),
@@ -1043,6 +1183,7 @@ mod tests {
             provider_config: ProviderConfig::OpenAiCompatible {
                 base_url: "https://openrouter.ai/api/v1".to_string(),
                 organization_id: None,
+                enforced_request_body: None,
                 model_name: None,
                 extra_request_body: Some(HashMap::from([(
                     "provider".to_string(),
@@ -1082,6 +1223,7 @@ mod tests {
             provider_config: ProviderConfig::OpenAiCompatible {
                 base_url: "https://openrouter.ai/api/v1".to_string(),
                 organization_id: None,
+                enforced_request_body: None,
                 model_name: None,
                 extra_request_body: Some(HashMap::from([(
                     "provider".to_string(),
@@ -1138,6 +1280,7 @@ mod tests {
             provider_config: ProviderConfig::OpenAiCompatible {
                 base_url: "https://api.openai.com/v1".to_string(),
                 organization_id: None,
+                enforced_request_body: None,
                 model_name: None,
                 extra_request_body: None,
             },

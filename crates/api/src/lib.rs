@@ -114,6 +114,22 @@ pub struct DomainServices {
         Arc<dyn services::service_usage::ServiceUsageServiceTrait + Send + Sync>,
 }
 
+/// Controls process-level background work started while the application router
+/// is built. Production uses [`Default`]; tests can disable workers whose
+/// behavior is unrelated to the request under test.
+#[derive(Clone, Copy, Debug)]
+pub struct AppBuildOptions {
+    pub start_database_encryption_recovery: bool,
+}
+
+impl Default for AppBuildOptions {
+    fn default() -> Self {
+        Self {
+            start_database_encryption_recovery: true,
+        }
+    }
+}
+
 /// Initialize database connection and run migrations
 pub async fn init_database(db_config: &config::DatabaseConfig) -> Arc<Database> {
     let database = Arc::new(
@@ -396,13 +412,17 @@ pub async fn init_domain_services_with_pool(
 
     // Prepare repositories for usage service (will be created after workspace service)
     let usage_repository = Arc::new(
-        database::repositories::OrganizationUsageRepository::with_reporting_statement_timeout(
+        database::repositories::OrganizationUsageRepository::with_accounting_config(
             database.pool().clone(),
             reporting_statement_timeout,
+            &config.credit_allocation,
         ),
     );
     let limits_repository_for_usage = Arc::new(
-        database::repositories::OrganizationLimitsRepository::new(database.pool().clone()),
+        database::repositories::OrganizationLimitsRepository::with_accounting_config(
+            database.pool().clone(),
+            &config.credit_allocation,
+        ),
     );
 
     // Create MCP client manager
@@ -522,9 +542,10 @@ pub async fn init_domain_services_with_pool(
         database.pool().clone(),
     ));
     let org_service_usage_repo = Arc::new(
-        database::repositories::OrganizationServiceUsageRepository::with_reporting_statement_timeout(
+        database::repositories::OrganizationServiceUsageRepository::with_accounting_config(
             database.pool().clone(),
             reporting_statement_timeout,
+            &config.credit_allocation,
         ),
     );
     let service_usage_repo = Arc::new(database::repositories::ServiceUsageRepositoryImpl::new(
@@ -549,8 +570,9 @@ pub async fn init_domain_services_with_pool(
         config.aml.clone(),
     ));
     let staking_farm_repository = Arc::new(
-        database::repositories::OrganizationStakingFarmSourcesRepository::new(
+        database::repositories::OrganizationStakingFarmSourcesRepository::with_accounting_config(
             database.pool().clone(),
+            &config.credit_allocation,
         ),
     ) as Arc<dyn services::staking_farm::StakingFarmRepository>;
     let staking_farm_contract_client = Arc::new(
@@ -1096,7 +1118,7 @@ pub async fn init_inference_providers(
 /// This function uses the existing MockProvider from inference_providers::mock
 /// and registers it for common test models without changing any implementations
 pub async fn init_inference_providers_with_mocks(
-    _config: &ApiConfig,
+    config: &ApiConfig,
 ) -> (
     Arc<services::inference_provider_pool::InferenceProviderPool>,
     Arc<inference_providers::mock::MockProvider>,
@@ -1107,7 +1129,7 @@ pub async fn init_inference_providers_with_mocks(
     let pool = Arc::new(
         services::inference_provider_pool::InferenceProviderPool::new(
             None,
-            config::ExternalProvidersConfig::default(),
+            config.external_providers.clone(),
         ),
     );
 
@@ -1119,8 +1141,14 @@ pub async fn init_inference_providers_with_mocks(
     // Register providers for models commonly used in tests
     let test_models = vec![
         "Qwen/Qwen3-30B-A3B-Instruct-2507".to_string(),
+        "Qwen/Qwen3-30B-A3B-Instruct-2507-e2e-cache-pricing".to_string(),
+        "Qwen/Qwen3-30B-A3B-Instruct-2507-e2e-high-context-completion".to_string(),
+        "Qwen/Qwen3-30B-A3B-Instruct-2507-e2e-high-context-streaming".to_string(),
+        "Qwen/Qwen3-30B-A3B-Instruct-2507-e2e-aliases".to_string(),
+        "Qwen/Qwen3-30B-A3B-Instruct-2507-e2e-alias-consistency".to_string(),
         "zai-org/GLM-4.6".to_string(),
         "nearai/gpt-oss-120b".to_string(),
+        "nearai/gpt-oss-120b-e2e-aliases".to_string(),
         "dphn/Dolphin-Mistral-24B-Venice-Edition".to_string(),
         "deepseek-ai/DeepSeek-V3.1".to_string(),
         "Qwen/Qwen3-Omni-30B-A3B-Instruct".to_string(),
@@ -1180,6 +1208,23 @@ pub fn build_app_with_config(
     auth_components: AuthComponents,
     domain_services: DomainServices,
     config: Arc<ApiConfig>,
+) -> Router {
+    build_app_with_config_and_options(
+        database,
+        auth_components,
+        domain_services,
+        config,
+        AppBuildOptions::default(),
+    )
+}
+
+/// Build the complete application router with explicit process-level behavior.
+pub fn build_app_with_config_and_options(
+    database: Arc<Database>,
+    auth_components: AuthComponents,
+    domain_services: DomainServices,
+    config: Arc<ApiConfig>,
+    build_options: AppBuildOptions,
 ) -> Router {
     // Create analytics service (shared between user and admin routes)
     let analytics_repository = Arc::new(database::repositories::PgAnalyticsRepository::new(
@@ -1332,10 +1377,11 @@ pub fn build_app_with_config(
 
     let services_routes = build_services_routes(database.pool().clone());
 
-    let admin_routes = build_admin_routes(
+    let admin_routes = build_admin_routes_with_options(
         database.clone(),
         &auth_components.auth_state_middleware,
         config.clone(),
+        build_options,
         AdminRouteServices {
             inference_provider_pool: app_state.inference_provider_pool.clone(),
             analytics_service,
@@ -2183,6 +2229,22 @@ pub fn build_admin_routes(
     config: Arc<ApiConfig>,
     services: AdminRouteServices,
 ) -> Router {
+    build_admin_routes_with_options(
+        database,
+        auth_state_middleware,
+        config,
+        AppBuildOptions::default(),
+        services,
+    )
+}
+
+fn build_admin_routes_with_options(
+    database: Arc<Database>,
+    auth_state_middleware: &AuthState,
+    config: Arc<ApiConfig>,
+    build_options: AppBuildOptions,
+    services: AdminRouteServices,
+) -> Router {
     use crate::middleware::admin_middleware;
     use crate::routes::admin::{
         batch_upsert_models, cancel_model_pricing_change, confirm_model_deprecation,
@@ -2208,12 +2270,14 @@ pub fn build_admin_routes(
     use services::admin::AdminServiceImpl;
 
     // Create composite admin repository (handles models, organization limits, and users)
-    let admin_repository = Arc::new(AdminCompositeRepository::new(database.pool().clone()));
+    let admin_repository = Arc::new(AdminCompositeRepository::with_accounting_config(
+        database.pool().clone(),
+        &config.credit_allocation,
+    ));
 
     // Create admin access token repository
     let admin_access_token_repository =
         Arc::new(AdminAccessTokenRepository::new(database.pool().clone()));
-
     // Create admin service with composite repository.
     //
     // The admin service holds a reference to the `models_service` so it can
@@ -2440,7 +2504,9 @@ pub fn build_admin_routes(
         .with_state(admin_app_state);
 
     let admin_routes = if let Some(database_encryption_state) = database_encryption_state {
-        database_encryption_state.recover_jobs();
+        if build_options.start_database_encryption_recovery {
+            database_encryption_state.recover_jobs();
+        }
         admin_routes.merge(
             Router::new()
                 .route(
@@ -2879,6 +2945,7 @@ mod tests {
             aml: config::AmlConfig::default(),
             usage_reporting: config::UsageReportingConfig::default(),
             stream_watchdog: config::StreamWatchdogConfig::default(),
+            credit_allocation: config::CreditAllocationConfig::default(),
             ita: config::ItaAttestationConfig::default(),
         };
 
@@ -2996,6 +3063,7 @@ mod tests {
             aml: config::AmlConfig::default(),
             usage_reporting: config::UsageReportingConfig::default(),
             stream_watchdog: config::StreamWatchdogConfig::default(),
+            credit_allocation: config::CreditAllocationConfig::default(),
             ita: config::ItaAttestationConfig::default(),
         };
 

@@ -1,6 +1,7 @@
 pub mod ports;
 
 use crate::attestation::ports::AttestationServiceTrait;
+use crate::attestation::STREAM_SIGNATURE_STORE_TIMEOUT;
 use crate::inference_provider_pool::InferenceProviderPool;
 use crate::models::ModelsRepository;
 use crate::responses::models::ResponseId;
@@ -22,7 +23,6 @@ use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 use tracing::Instrument;
 
-const FINALIZE_TIMEOUT_SECS: u64 = 5;
 /// A raw provider terminal marker is only expected to contain `data: [DONE]`
 /// plus its SSE line ending. Bound it before accepting it as a signed terminal
 /// event so malformed padding cannot be retained or signed.
@@ -216,8 +216,8 @@ where
 
         Box::pin(async move {
             match tokio::time::timeout(
-                Duration::from_secs(FINALIZE_TIMEOUT_SECS),
-                attestation_service.store_chat_signature_from_provider(&chat_id),
+                STREAM_SIGNATURE_STORE_TIMEOUT,
+                attestation_service.store_stream_chat_signature_from_provider(&chat_id),
             )
             .await
             {
@@ -230,7 +230,7 @@ where
                         %organization_id,
                         %model_id,
                         "Timeout storing chat signature after {}s",
-                        FINALIZE_TIMEOUT_SECS
+                        STREAM_SIGNATURE_STORE_TIMEOUT.as_secs()
                     );
                     // The provider-store implementation normally unpins after
                     // it completes. A timeout cancels that future before its
@@ -937,14 +937,17 @@ fn compute_prefix_hash(messages: &[inference_providers::ChatMessage]) -> u64 {
 fn estimate_input_tokens(messages: &[inference_providers::ChatMessage]) -> u32 {
     let chars: usize = messages
         .iter()
-        .map(|m| match &m.content {
-            Some(serde_json::Value::String(s)) => s.len(),
-            Some(serde_json::Value::Array(parts)) => parts
-                .iter()
-                .filter_map(|p| p.get("text").and_then(|t| t.as_str()))
-                .map(|s| s.len())
-                .sum(),
-            _ => 0,
+        .map(|m| {
+            let content = match &m.content {
+                Some(serde_json::Value::String(s)) => s.len(),
+                Some(serde_json::Value::Array(parts)) => parts
+                    .iter()
+                    .filter_map(|p| p.get("text").and_then(|t| t.as_str()))
+                    .map(|s| s.len())
+                    .sum(),
+                _ => 0,
+            };
+            content + m.reasoning_content.as_ref().map_or(0, |r| r.len())
         })
         .sum();
     (chars / 4).max(1) as u32
@@ -1595,6 +1598,7 @@ impl CompletionServiceImpl {
                     name: None,
                     tool_call_id: msg.tool_call_id.clone(),
                     tool_calls,
+                    reasoning_content: msg.reasoning_content.clone(),
                 }
             })
             .collect()
@@ -4612,6 +4616,7 @@ mod tests {
         inference_providers::ChatCompletionParams {
             model: model.to_string(),
             messages: vec![inference_providers::ChatMessage {
+                reasoning_content: None,
                 role: inference_providers::MessageRole::User,
                 content: Some(serde_json::json!("hi")),
                 name: None,

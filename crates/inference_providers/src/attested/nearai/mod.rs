@@ -3663,6 +3663,7 @@ mod tests {
         let params = ChatCompletionParams {
             model: "test-model".to_string(),
             messages: vec![ChatMessage {
+                reasoning_content: None,
                 role: MessageRole::User,
                 content: Some(serde_json::Value::String("hi".to_string())),
                 name: None,
@@ -4161,6 +4162,7 @@ mod tests {
 
     fn role_msg(role: crate::MessageRole, content: &str) -> crate::ChatMessage {
         crate::ChatMessage {
+            reasoning_content: None,
             role,
             content: Some(serde_json::Value::String(content.to_string())),
             name: None,

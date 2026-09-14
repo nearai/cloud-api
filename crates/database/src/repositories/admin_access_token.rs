@@ -1,6 +1,9 @@
 use crate::pool::DbPool;
 use crate::retry_db;
-use crate::{models::AdminAccessToken, repositories::utils::map_db_error};
+use crate::{
+    models::{AdminAccessToken, AdminAccessTokenPermission},
+    repositories::utils::map_db_error,
+};
 use anyhow::{Context, Result};
 use chrono::Utc;
 use services::common::RepositoryError;
@@ -15,6 +18,28 @@ pub struct AdminAccessTokenRepository {
 impl AdminAccessTokenRepository {
     pub fn new(pool: DbPool) -> Self {
         Self { pool }
+    }
+
+    fn from_row(row: &tokio_postgres::Row) -> Result<AdminAccessToken> {
+        Ok(AdminAccessToken {
+            id: row.get("id"),
+            token_hash: row.get("token_hash"),
+            created_by_user_id: row.get("created_by_user_id"),
+            name: row.get("name"),
+            creation_reason: row.get("creation_reason"),
+            created_at: row.get("created_at"),
+            expires_at: row.get("expires_at"),
+            last_used_at: row.get("last_used_at"),
+            is_active: row.get("is_active"),
+            revoked_at: row.get("revoked_at"),
+            revoked_by_user_id: row.get("revoked_by_user_id"),
+            revocation_reason: row.get("revocation_reason"),
+            user_agent: row.get("user_agent"),
+            permission: row
+                .try_get::<_, &str>("permission")?
+                .parse()
+                .map_err(anyhow::Error::msg)?,
+        })
     }
 
     /// Generate a new admin access token
@@ -37,6 +62,7 @@ impl AdminAccessTokenRepository {
         creation_reason: String,
         expires_at: chrono::DateTime<Utc>,
         user_agent: Option<String>,
+        permission: AdminAccessTokenPermission,
     ) -> Result<(AdminAccessToken, String)> {
         let id = Uuid::new_v4();
         let admin_access_token = Self::generate_admin_access_token();
@@ -56,8 +82,8 @@ impl AdminAccessTokenRepository {
                     r#"
                 INSERT INTO admin_access_token (
                     id, token_hash, created_by_user_id, name, creation_reason,
-                    created_at, expires_at, is_active, user_agent
-                ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+                    created_at, expires_at, is_active, user_agent, permission
+                ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
                 RETURNING *
                 "#,
                     &[
@@ -70,27 +96,14 @@ impl AdminAccessTokenRepository {
                         &expires_at,
                         &true,
                         &user_agent,
+                        &permission.as_str(),
                     ],
                 )
                 .await
                 .map_err(map_db_error)
         })?;
 
-        let admin_token = AdminAccessToken {
-            id: row.get("id"),
-            token_hash: row.get("token_hash"),
-            created_by_user_id: row.get("created_by_user_id"),
-            name: row.get("name"),
-            creation_reason: row.get("creation_reason"),
-            created_at: row.get("created_at"),
-            expires_at: row.get("expires_at"),
-            last_used_at: row.get("last_used_at"),
-            is_active: row.get("is_active"),
-            revoked_at: row.get("revoked_at"),
-            revoked_by_user_id: row.get("revoked_by_user_id"),
-            revocation_reason: row.get("revocation_reason"),
-            user_agent: row.get("user_agent"),
-        };
+        let admin_token = Self::from_row(&row)?;
 
         debug!(
             "Created admin access token {} for user {}",
@@ -134,6 +147,7 @@ impl AdminAccessTokenRepository {
 
         match row {
             Some(row) => {
+                let mut admin_token = Self::from_row(&row)?;
                 let now = Utc::now();
                 let client = self
                     .pool
@@ -156,21 +170,7 @@ impl AdminAccessTokenRepository {
                     tracing::warn!("Failed to update last_used_at for admin access token");
                 }
 
-                let admin_token = AdminAccessToken {
-                    id: row.get("id"),
-                    token_hash: row.get("token_hash"),
-                    created_by_user_id: row.get("created_by_user_id"),
-                    name: row.get("name"),
-                    creation_reason: row.get("creation_reason"),
-                    created_at: row.get("created_at"),
-                    expires_at: row.get("expires_at"),
-                    last_used_at: Some(now),
-                    is_active: row.get("is_active"),
-                    revoked_at: row.get("revoked_at"),
-                    revoked_by_user_id: row.get("revoked_by_user_id"),
-                    revocation_reason: row.get("revocation_reason"),
-                    user_agent: row.get("user_agent"),
-                };
+                admin_token.last_used_at = Some(now);
 
                 Ok(Some(admin_token))
             }
@@ -196,21 +196,7 @@ impl AdminAccessTokenRepository {
 
         match row {
             Some(row) => {
-                let admin_token = AdminAccessToken {
-                    id: row.get("id"),
-                    token_hash: row.get("token_hash"),
-                    created_by_user_id: row.get("created_by_user_id"),
-                    name: row.get("name"),
-                    creation_reason: row.get("creation_reason"),
-                    created_at: row.get("created_at"),
-                    expires_at: row.get("expires_at"),
-                    last_used_at: row.get("last_used_at"),
-                    is_active: row.get("is_active"),
-                    revoked_at: row.get("revoked_at"),
-                    revoked_by_user_id: row.get("revoked_by_user_id"),
-                    revocation_reason: row.get("revocation_reason"),
-                    user_agent: row.get("user_agent"),
-                };
+                let admin_token = Self::from_row(&row)?;
                 Ok(Some(admin_token))
             }
             None => Ok(None),
@@ -238,21 +224,7 @@ impl AdminAccessTokenRepository {
 
         let mut admin_tokens = Vec::new();
         for row in rows {
-            let admin_token = AdminAccessToken {
-                id: row.get("id"),
-                token_hash: row.get("token_hash"),
-                created_by_user_id: row.get("created_by_user_id"),
-                name: row.get("name"),
-                creation_reason: row.get("creation_reason"),
-                created_at: row.get("created_at"),
-                expires_at: row.get("expires_at"),
-                last_used_at: row.get("last_used_at"),
-                is_active: row.get("is_active"),
-                revoked_at: row.get("revoked_at"),
-                revoked_by_user_id: row.get("revoked_by_user_id"),
-                revocation_reason: row.get("revocation_reason"),
-                user_agent: row.get("user_agent"),
-            };
+            let admin_token = Self::from_row(&row)?;
             admin_tokens.push(admin_token);
         }
 

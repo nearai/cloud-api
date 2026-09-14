@@ -953,6 +953,9 @@ pub struct AuthConfig {
     /// Email domains that are granted platform admin access
     /// Users with emails from these domains will have admin privileges
     pub admin_domains: Vec<String>,
+    /// Enable only after all API instances enforce admin token permissions.
+    /// Disabling issuance does not disable enforcement for existing tokens.
+    pub admin_read_only_tokens_enabled: bool,
     /// Reject session access tokens that carry no `sid` (session id) claim.
     ///
     /// Access tokens minted since session binding was introduced are tied to
@@ -1022,6 +1025,10 @@ impl AuthConfig {
             google,
             near,
             admin_domains,
+            admin_read_only_tokens_enabled: parse_bool_env(
+                "AUTH_ADMIN_READ_ONLY_TOKENS_ENABLED",
+                false,
+            )?,
             require_session_bound_access_tokens: parse_bool_env(
                 "AUTH_REQUIRE_SESSION_BOUND_ACCESS_TOKENS",
                 false,
@@ -1593,6 +1600,7 @@ mod tests {
             google: None,
             near: NearConfig::default(),
             admin_domains: vec!["near.ai".to_string(), "near.org".to_string()],
+            admin_read_only_tokens_enabled: false,
             require_session_bound_access_tokens: false,
         };
 
@@ -1617,6 +1625,7 @@ mod tests {
             google: None,
             near: NearConfig::default(),
             admin_domains: vec![],
+            admin_read_only_tokens_enabled: false,
             require_session_bound_access_tokens: false,
         };
 

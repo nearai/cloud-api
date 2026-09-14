@@ -268,17 +268,38 @@ async fn test_signature_returns_stream_disconnected_on_client_disconnect() {
     }
     let response_id = response_id.expect("Should have response_id from stream");
 
-    // Wait for async DB writes
-    tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
-
-    // Manually update the usage record to simulate a client disconnect
-    // (The mock ends the stream normally, so we need to update the stop_reason manually)
     let pool = database.pool();
-    let client = pool.get().await.expect("Failed to get database connection");
     let response_uuid_str = response_id.strip_prefix("resp_").unwrap_or(&response_id);
     let response_uuid = uuid::Uuid::parse_str(response_uuid_str).expect("Invalid response ID");
 
+    // The mock truncates the provider stream, but Responses API still emits
+    // response.completed and asynchronously stores a gateway signature. Wait
+    // for both it and this response's usage row before simulating a client
+    // disconnect, so UPDATE cannot miss the row or DELETE race the signature write.
+    tokio::time::timeout(tokio::time::Duration::from_secs(5), async {
+        loop {
+            let client = pool.get().await.expect("Failed to get database connection");
+            let row = client
+                .query_one(
+                    "SELECT EXISTS (SELECT 1 FROM organization_usage_log WHERE response_id = $1)
+                     AND EXISTS (SELECT 1 FROM chat_signatures WHERE chat_id = $2 AND signing_algo = 'ecdsa')",
+                    &[&response_uuid, &response_id],
+                )
+                .await
+                .expect("Failed to check response usage and signature readiness");
+            let ready: bool = row.get(0);
+            drop(client);
+            if ready {
+                break;
+            }
+            tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("Response usage and gateway signature should be recorded within 5 seconds");
+
     // Delete any signature that might have been stored (to simulate no signature available)
+    let client = pool.get().await.expect("Failed to get database connection");
     client
         .execute(
             "DELETE FROM chat_signatures WHERE chat_id = $1",
@@ -293,13 +314,18 @@ async fn test_signature_returns_stream_disconnected_on_client_disconnect() {
     // used by the request can be closed asynchronously while this test is
     // preparing the assertion.
     let client = pool.get().await.expect("Failed to get database connection");
-    client
+    let updated = client
         .execute(
             "UPDATE organization_usage_log SET stop_reason = 'client_disconnect' WHERE response_id = $1",
             &[&response_uuid],
         )
         .await
         .expect("Failed to update stop_reason");
+    assert_eq!(
+        updated, 1,
+        "Should update exactly this response's usage row"
+    );
+    drop(client);
 
     // Now call the signature endpoint - should return 200 with STREAM_DISCONNECTED
     let signature_resp = server

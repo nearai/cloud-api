@@ -2828,7 +2828,7 @@ mod tests {
     }
 
     #[test]
-    fn test_openapi_admin_aml_paths_require_session_security() {
+    fn test_openapi_admin_aml_paths_require_admin_security() {
         let spec = serde_json::to_value(ApiDoc::openapi()).unwrap();
         let paths = spec["paths"].as_object().unwrap();
 
@@ -2846,8 +2846,8 @@ mod tests {
             );
             assert_eq!(
                 operation["security"],
-                serde_json::json!([{ "session_token": [] }]),
-                "{method} {path} must require session_token security"
+                serde_json::json!([{ "session_token": [] }, { "admin_token": [] }]),
+                "{method} {path} must require session_token or admin_token security"
             );
         }
     }

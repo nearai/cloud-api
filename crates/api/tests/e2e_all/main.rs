@@ -21,6 +21,7 @@ mod admin_provider_attribution_support;
 mod admin_routing_policy;
 mod admin_schema_compatibility;
 mod admin_services;
+mod admin_token_permissions;
 mod api_keys;
 mod attestation_auth;
 mod audio_image;

@@ -5,13 +5,14 @@ use crate::conversions::{
 };
 use crate::middleware::AdminUser;
 use crate::models::{
-    AdminAccessTokenResponse, AdminAmlAllowlistEntryResponse, AdminAmlReportResponse,
-    AdminInvitationEmailResendResultResponse, AdminModelListResponse, AdminModelWithPricing,
-    AdminOrganizationMemberResponse, AdminOrganizationResponse, AdminServiceResponse,
-    AdminUserOrganizationDetails, AdminUserResponse, BatchUpdateModelApiRequest,
-    CreateAdminAccessTokenRequest, CreateServiceRequest, CreditType, DecimalPrice,
-    DecimalPriceRequest, DeleteAdminAccessTokenRequest, DeleteModelRequest, DeprecateModelRequest,
-    DeprecateModelResponse, ErrorResponse, GetOrganizationConcurrentLimitResponse,
+    AdminAccessTokenPermission, AdminAccessTokenResponse, AdminAmlAllowlistEntryResponse,
+    AdminAmlReportResponse, AdminInvitationEmailResendResultResponse, AdminModelListResponse,
+    AdminModelWithPricing, AdminOrganizationMemberResponse, AdminOrganizationResponse,
+    AdminServiceResponse, AdminUserOrganizationDetails, AdminUserResponse,
+    BatchUpdateModelApiRequest, CreateAdminAccessTokenRequest, CreateServiceRequest, CreditType,
+    DecimalPrice, DecimalPriceRequest, DeleteAdminAccessTokenRequest, DeleteModelRequest,
+    DeprecateModelRequest, DeprecateModelResponse, ErrorResponse,
+    GetOrganizationConcurrentLimitResponse, ListAdminAccessTokensResponse,
     ListAdminAmlAllowlistResponse, ListAdminAmlReportsResponse,
     ListAdminInvitationEmailDeliveriesResponse, ListAdminOrganizationMembersResponse,
     ListOrganizationsAdminResponse, ListPricingChangesResponse, ListUsersResponse, MemberRole,
@@ -3324,6 +3325,8 @@ pub async fn update_service(
         (status = 200, description = "Admin access token created successfully", body = AdminAccessTokenResponse),
         (status = 400, description = "Invalid request", body = ErrorResponse),
         (status = 401, description = "Unauthorized", body = ErrorResponse),
+        (status = 503, description = "Read-only token issuance is disabled during rollout", body = ErrorResponse),
+        (status = 422, description = "Request deserialization failed (including invalid permission values)"),
         (status = 500, description = "Internal server error", body = ErrorResponse)
     ),
     security(
@@ -3361,6 +3364,18 @@ pub async fn create_admin_access_token(
         ));
     }
 
+    if request_body.permission == AdminAccessTokenPermission::ReadOnly
+        && !app_state.config.auth.admin_read_only_tokens_enabled
+    {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            ResponseJson(ErrorResponse::new(
+                "Read-only admin token issuance is not enabled".to_string(),
+                "read_only_token_issuance_disabled".to_string(),
+            )),
+        ));
+    }
+
     // Create admin access token directly in database
     let expires_at = Utc::now() + chrono::Duration::hours(request_body.expires_in_hours);
 
@@ -3372,6 +3387,7 @@ pub async fn create_admin_access_token(
             request_body.reason,
             expires_at,
             user_agent,
+            request_body.permission.into(),
         )
         .await
     {
@@ -3390,6 +3406,7 @@ pub async fn create_admin_access_token(
                 expires_at: admin_token.expires_at,
                 name: admin_token.name,
                 reason: admin_token.creation_reason,
+                permission: admin_token.permission.into(),
             };
 
             Ok(ResponseJson(response))
@@ -3420,7 +3437,7 @@ pub async fn create_admin_access_token(
         ("offset" = Option<i64>, Query, description = "Number of records to skip (default: 0)")
     ),
     responses(
-        (status = 200, description = "Admin access tokens retrieved successfully"),
+        (status = 200, description = "Admin access tokens retrieved successfully", body = ListAdminAccessTokensResponse),
         (status = 401, description = "Unauthorized", body = ErrorResponse),
         (status = 500, description = "Internal server error", body = ErrorResponse)
     ),
@@ -3432,7 +3449,8 @@ pub async fn list_admin_access_tokens(
     State(app_state): State<AdminAppState>,
     Extension(admin_user): Extension<AdminUser>, // Require admin auth
     axum::extract::Query(params): axum::extract::Query<ListUsersQueryParams>,
-) -> Result<ResponseJson<serde_json::Value>, (StatusCode, ResponseJson<ErrorResponse>)> {
+) -> Result<ResponseJson<ListAdminAccessTokensResponse>, (StatusCode, ResponseJson<ErrorResponse>)>
+{
     crate::routes::common::validate_limit_offset(params.limit, params.offset)?;
 
     debug!(
@@ -3454,12 +3472,12 @@ pub async fn list_admin_access_tokens(
                 .await
                 .unwrap_or(0);
 
-            let response = serde_json::json!({
-                "data": tokens,
-                "limit": params.limit,
-                "offset": params.offset,
-                "total": total
-            });
+            let response = ListAdminAccessTokensResponse {
+                data: tokens.into_iter().map(Into::into).collect(),
+                limit: params.limit,
+                offset: params.offset,
+                total,
+            };
 
             Ok(ResponseJson(response))
         }

@@ -1999,6 +1999,7 @@ pub fn build_feature_request_routes(
             auth_middleware,
         ));
 
+    // Classify read operations in middleware::admin_policy when adding admin routes.
     let admin_routes = Router::new()
         .route("/admin/feature-requests", get(list_admin_feature_requests))
         .with_state(state)
@@ -2322,6 +2323,7 @@ fn build_admin_routes_with_options(
     })
     .ok();
 
+    // Classify read operations in middleware::admin_policy when adding admin routes.
     let admin_routes = Router::new()
         .route(
             "/admin/models",
@@ -2890,6 +2892,7 @@ mod tests {
                 google: None,
                 near: config::NearConfig::default(),
                 admin_domains: vec![],
+                admin_read_only_tokens_enabled: false,
                 require_session_bound_access_tokens: false,
             },
             database: config::DatabaseConfig {
@@ -3007,6 +3010,7 @@ mod tests {
                 google: None,
                 near: config::NearConfig::default(),
                 admin_domains: vec![],
+                admin_read_only_tokens_enabled: false,
                 require_session_bound_access_tokens: false,
             },
             database: config::DatabaseConfig {

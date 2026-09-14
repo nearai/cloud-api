@@ -175,6 +175,37 @@ pub struct Session {
     pub user_agent: String,
 }
 
+/// Immutable permission of an admin access token. Unknown persisted values must
+/// fail validation instead of falling back to the backwards-compatible default.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AdminAccessTokenPermission {
+    ReadOnly,
+    #[default]
+    ReadWrite,
+}
+
+impl AdminAccessTokenPermission {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::ReadOnly => "read_only",
+            Self::ReadWrite => "read_write",
+        }
+    }
+}
+
+impl std::str::FromStr for AdminAccessTokenPermission {
+    type Err = &'static str;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "read_only" => Ok(Self::ReadOnly),
+            "read_write" => Ok(Self::ReadWrite),
+            _ => Err("Invalid admin access token permission"),
+        }
+    }
+}
+
 /// Admin access token for tracking and managing admin access tokens
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AdminAccessToken {
@@ -191,6 +222,7 @@ pub struct AdminAccessToken {
     pub revoked_by_user_id: Option<Uuid>,
     pub revocation_reason: Option<String>,
     pub user_agent: Option<String>,
+    pub permission: AdminAccessTokenPermission,
 }
 
 /// Request/Response DTOs

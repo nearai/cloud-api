@@ -95,6 +95,9 @@ impl OAuthManager {
             .add_scope(Scope::new("user:email".to_string()))
             // Always show the account chooser so users can switch accounts
             // after signing out, instead of being silently re-signed-in.
+            // GitHub documents `prompt=select_account` for its authorize
+            // endpoint (OAuth Apps and GitHub Apps alike):
+            // https://docs.github.com/en/apps/oauth-apps/building-oauth-apps/authorizing-oauth-apps#parameters
             .add_extra_param("prompt", "select_account")
             .url();
 
@@ -342,6 +345,9 @@ struct GoogleUser {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    use base64::Engine;
+    use sha2::{Digest, Sha256};
 
     fn provider_config() -> OAuthProviderConfig {
         OAuthProviderConfig {
@@ -370,6 +376,13 @@ mod tests {
         assert!(auth_url.starts_with("https://accounts.google.com/o/oauth2/v2/auth?"));
         assert_eq!(query_params(&auth_url, "prompt"), ["select_account"]);
         assert_eq!(query_params(&auth_url, "code_challenge_method"), ["S256"]);
+        // The challenge must actually derive from the returned verifier
+        // (SHA-256, base64url without padding) or the token exchange fails.
+        let expected_challenge = URL_SAFE_NO_PAD.encode(Sha256::digest(verifier.as_bytes()));
+        assert_eq!(
+            query_params(&auth_url, "code_challenge"),
+            [expected_challenge]
+        );
         // The returned tuple is positional; make sure state and verifier are
         // not swapped or empty, since the route persists them by key.
         assert_eq!(query_params(&auth_url, "state"), [state]);

@@ -395,7 +395,7 @@ where
 
         let input_bucket = get_input_bucket(input_tokens);
         let mut metric_tags = self.metric_tags.clone();
-        metric_tags.push(format!("{TAG_INPUT_BUCKET}:{input_bucket}"));
+        CompletionServiceImpl::set_input_bucket_tag(&mut metric_tags, input_bucket);
 
         // Spawn critical billing operations on blocking thread pool with timeout.
         // The tokio runtime waits for blocking tasks during graceful shutdown,
@@ -406,8 +406,8 @@ where
             // the real input-token bucket is known. They intentionally exclude
             // streams that produced a first token but ended without billable
             // usage or a response ID (for example, interrupted/error streams),
-            // so they are a billable-completion subset of the unbucketed TTFT
-            // series rather than a directly comparable population. Emit them
+            // so they are a billable-completion subset of the request-estimated
+            // TTFT series rather than a directly comparable population. Emit them
             // before the billing timeout so a stalled usage write cannot also
             // discard already-observed latency telemetry.
             let ttft_tags: Vec<&str> = metric_tags.iter().map(|s| s.as_str()).collect();
@@ -1147,6 +1147,36 @@ impl CompletionServiceImpl {
         ]
     }
 
+    fn set_input_bucket_tag(metric_tags: &mut Vec<String>, input_bucket: &str) {
+        let prefix = format!("{TAG_INPUT_BUCKET}:");
+        metric_tags.retain(|tag| !tag.starts_with(&prefix));
+        metric_tags.push(format!("{prefix}{input_bucket}"));
+    }
+
+    fn create_estimated_input_metric_tags(
+        model_name: &str,
+        estimated_input_tokens: u32,
+    ) -> Vec<String> {
+        let input_bucket = i32::try_from(estimated_input_tokens).map_or("128k+", get_input_bucket);
+        let mut metric_tags = Self::create_metric_tags(model_name);
+        Self::set_input_bucket_tag(&mut metric_tags, input_bucket);
+        metric_tags
+    }
+
+    fn record_stream_admission_metrics(
+        metrics_service: &dyn MetricsServiceTrait,
+        model_name: &str,
+        estimated_input_tokens: u32,
+        queue_time: Duration,
+    ) -> Vec<String> {
+        let metric_tags =
+            Self::create_estimated_input_metric_tags(model_name, estimated_input_tokens);
+        let tags: Vec<&str> = metric_tags.iter().map(String::as_str).collect();
+        metrics_service.record_count(METRIC_REQUEST_COUNT, 1, &tags);
+        metrics_service.record_latency(METRIC_LATENCY_QUEUE_TIME, queue_time, &tags);
+        metric_tags
+    }
+
     pub(crate) fn map_provider_error(
         model: &str,
         error: &inference_providers::CompletionError,
@@ -1569,6 +1599,7 @@ impl CompletionServiceImpl {
         model_id: Uuid,
         model_name: String,
         inference_type: crate::usage::ports::InferenceType,
+        estimated_input_tokens: u32,
         service_start_time: Instant,
         provider_start_time: Instant,
         concurrent_counter: Option<Arc<AtomicU32>>,
@@ -1580,16 +1611,13 @@ impl CompletionServiceImpl {
         requested_service_tier: Option<TextServiceTier>,
         latency_reporter: Option<super::inference_provider_pool::ProviderLatencyReporter>,
     ) -> StreamingResult {
-        // Create low-cardinality metric tags (no org/workspace/key - those go to database)
-        let metric_tags = Self::create_metric_tags(&model_name);
-
-        let tags_str: Vec<&str> = metric_tags.iter().map(|s| s.as_str()).collect();
-        self.metrics_service
-            .record_count(METRIC_REQUEST_COUNT, 1, &tags_str);
-
         let queue_time = provider_start_time.duration_since(service_start_time);
-        self.metrics_service
-            .record_latency(METRIC_LATENCY_QUEUE_TIME, queue_time, &tags_str);
+        let metric_tags = Self::record_stream_admission_metrics(
+            self.metrics_service.as_ref(),
+            &model_name,
+            estimated_input_tokens,
+            queue_time,
+        );
 
         let intercepted_stream = InterceptStream {
             inner: llm_stream,
@@ -1772,9 +1800,10 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
         let provider_start_time = Instant::now();
 
         // Compute routing hints from the request messages for adaptive load balancing.
+        let estimated_input_tokens = estimate_input_tokens(&chat_params.messages);
         let routing_hints = super::inference_provider_pool::ChatRoutingHints {
             prefix_hash: Some(compute_prefix_hash(&chat_params.messages)),
-            estimated_tokens: Some(estimate_input_tokens(&chat_params.messages)),
+            estimated_tokens: Some(estimated_input_tokens),
             fallback_disabled: !request.fallback_enabled,
         };
 
@@ -1826,6 +1855,7 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
                 model.id,
                 model.model_name.clone(),
                 inference_type,
+                estimated_input_tokens,
                 service_start_time,
                 provider_start_time,
                 counter,
@@ -2040,7 +2070,7 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
         tokio::spawn(async move {
             let mut tags = CompletionServiceImpl::create_metric_tags(&model_name);
             let input_bucket = get_input_bucket(input_tokens);
-            tags.push(format!("{TAG_INPUT_BUCKET}:{input_bucket}"));
+            CompletionServiceImpl::set_input_bucket_tag(&mut tags, input_bucket);
             let tags_str: Vec<&str> = tags.iter().map(|s| s.as_str()).collect();
 
             metrics_service.record_count(METRIC_REQUEST_COUNT, 1, &tags_str);
@@ -2653,7 +2683,8 @@ mod tests {
 
         let stream = stream::iter(vec![Ok(content_chunk), Ok(usage_chunk)]);
 
-        let metric_tags = CompletionServiceImpl::create_metric_tags("test-model");
+        let mut metric_tags = CompletionServiceImpl::create_metric_tags("test-model");
+        metric_tags.push(format!("{}:{}", TAG_INPUT_BUCKET, "1-4k"));
 
         let now = Instant::now();
         let mut intercept_stream = InterceptStream {
@@ -2746,6 +2777,15 @@ mod tests {
         assert!(bucketed_ttft
             .tags
             .contains(&format!("{}:{}", TAG_INPUT_BUCKET, "0-1k")));
+        assert_eq!(
+            bucketed_ttft
+                .tags
+                .iter()
+                .filter(|tag| tag.starts_with(&format!("{TAG_INPUT_BUCKET}:")))
+                .count(),
+            1,
+            "final usage must replace the estimated input bucket"
+        );
 
         let bucketed_e2e_ttft = metrics
             .iter()
@@ -3062,6 +3102,50 @@ mod tests {
         assert!(tags.iter().any(|t| t.starts_with("model:")));
         assert!(tags.iter().any(|t| t.starts_with("environment:")));
         assert!(tags.iter().any(|t| t == "model:gpt-4"));
+    }
+
+    #[test]
+    fn set_input_bucket_tag_adds_and_replaces_the_bucket() {
+        let mut tags = CompletionServiceImpl::create_metric_tags("test-model");
+
+        CompletionServiceImpl::set_input_bucket_tag(&mut tags, "1-4k");
+        CompletionServiceImpl::set_input_bucket_tag(&mut tags, "0-1k");
+
+        let input_buckets: Vec<_> = tags
+            .iter()
+            .filter(|tag| tag.starts_with(&format!("{TAG_INPUT_BUCKET}:")))
+            .map(String::as_str)
+            .collect();
+        assert_eq!(input_buckets, vec!["input_bucket:0-1k"]);
+    }
+
+    #[test]
+    fn streaming_request_metric_tags_include_estimated_input_bucket() {
+        let metrics_service = CapturingMetricsService::new();
+        CompletionServiceImpl::record_stream_admission_metrics(
+            &metrics_service,
+            "test-model",
+            4001,
+            Duration::ZERO,
+        );
+
+        let metrics = metrics_service.get_metrics();
+        let request_count = metrics
+            .iter()
+            .find(|metric| metric.name == METRIC_REQUEST_COUNT)
+            .expect("streaming request count metric missing");
+        assert!(matches!(request_count.value, MetricValue::Count(1)));
+        assert!(request_count
+            .tags
+            .contains(&"input_bucket:4-16k".to_string()));
+        assert_eq!(
+            request_count
+                .tags
+                .iter()
+                .filter(|tag| tag.starts_with(&format!("{TAG_INPUT_BUCKET}:")))
+                .count(),
+            1
+        );
     }
 
     #[tokio::test]

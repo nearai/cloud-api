@@ -5,8 +5,9 @@ rustflags = [
     # Remap source file paths to remove machine-specific paths
     "--remap-path-prefix", "${PWD}=.",
     "--remap-path-prefix", "/usr/local/cargo=/cargo",
-    # Disable incremental compilation for reproducibility
-    "-C", "incremental=false",
+    # Incremental compilation is disabled via `incremental = false` in the
+    # Cargo.toml dev profile (release is non-incremental by default). Do not
+    # pass `-C incremental=...` here: rustc reads the value as a cache directory.
     # Disable debug info for reproducibility
     "-C", "debuginfo=0",
     # removes build-id hash

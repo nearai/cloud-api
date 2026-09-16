@@ -78,6 +78,13 @@ pub const METRIC_BILLING_PRICING_FALLBACK: &str = "cloud_api.billing.pricing_fal
 pub const METRIC_PROVIDER_TOKEN_ANOMALIES: &str = "cloud_api.provider.token_anomalies";
 pub const METRIC_PROVIDER_ZERO_TOKENS: &str = "cloud_api.provider.zero_tokens";
 
+// Per-instance concurrency slots. Totals only: no organization tag, so no unbounded cardinality.
+// Orgs at their limit are identified by the "Organization concurrent request limit exceeded" warn log.
+pub const METRIC_CONCURRENT_SLOTS_IN_USE: &str = "cloud_api.concurrent_slots.in_use";
+pub const METRIC_CONCURRENT_SLOTS_MAX_PER_KEY: &str = "cloud_api.concurrent_slots.max_per_key";
+pub const METRIC_CONCURRENT_SLOTS_OVER_THRESHOLD: &str =
+    "cloud_api.concurrent_slots.over_threshold";
+
 // HTTP metrics
 pub const METRIC_HTTP_REQUESTS: &str = "cloud_api.http.requests";
 pub const METRIC_HTTP_DURATION: &str = "cloud_api.http.duration";

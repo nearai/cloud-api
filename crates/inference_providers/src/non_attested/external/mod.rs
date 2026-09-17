@@ -421,6 +421,7 @@ impl InferenceProvider for ExternalProvider {
         mut params: ChatCompletionParams,
         _request_hash: String,
     ) -> Result<StreamingResult, CompletionError> {
+        params.strip_client_priority();
         strip_internal_keys(&mut params.extra);
         self.inject_extra_request_body(&mut params.extra);
         self.backend
@@ -434,6 +435,7 @@ impl InferenceProvider for ExternalProvider {
         mut params: ChatCompletionParams,
         _request_hash: String,
     ) -> Result<ChatCompletionResponseWithBytes, CompletionError> {
+        params.strip_client_priority();
         strip_internal_keys(&mut params.extra);
         self.inject_extra_request_body(&mut params.extra);
         self.backend

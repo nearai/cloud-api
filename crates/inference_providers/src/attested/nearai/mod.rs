@@ -796,6 +796,17 @@ impl Fleet {
         pinned_pub_key
     }
 
+    fn prepare_priority_header(
+        headers: &mut reqwest::header::HeaderMap,
+        params: &mut ChatCompletionParams,
+    ) {
+        headers.insert(
+            "x-nearai-priority",
+            HeaderValue::from(params.request_priority),
+        );
+        params.strip_client_priority();
+    }
+
     /// Prepare tracing headers by extracting correlation IDs from `extra` and forwarding
     /// as HTTP headers. Removes the keys from `extra` so they don't leak into the JSON body.
     ///
@@ -1716,14 +1727,8 @@ impl InferenceProvider for Fleet {
             .map_err(|e| CompletionError::CompletionError(format!("Invalid request hash: {e}")))?;
         headers.insert("X-Request-Hash", request_hash_value);
 
+        Self::prepare_priority_header(&mut headers, &mut streaming_params);
         // Prepare tracing headers (request_id, org_id, workspace_id)
-        headers.insert(
-            "x-nearai-priority",
-            HeaderValue::from(streaming_params.request_priority),
-        );
-        // Scheduler policy comes only from authenticated server context.
-        streaming_params.extra.remove("priority");
-        streaming_params.extra.remove("request_priority");
         self.prepare_tracing_headers(&mut headers, &mut streaming_params.extra);
         // Prepare encryption headers
         let pinned_pub_key =
@@ -1879,14 +1884,8 @@ impl InferenceProvider for Fleet {
             .map_err(|e| CompletionError::CompletionError(format!("Invalid request hash: {e}")))?;
         headers.insert("X-Request-Hash", request_hash_value);
 
+        Self::prepare_priority_header(&mut headers, &mut non_streaming_params);
         // Prepare tracing headers (request_id, org_id, workspace_id)
-        headers.insert(
-            "x-nearai-priority",
-            HeaderValue::from(non_streaming_params.request_priority),
-        );
-        // Scheduler policy comes only from authenticated server context.
-        non_streaming_params.extra.remove("priority");
-        non_streaming_params.extra.remove("request_priority");
         self.prepare_tracing_headers(&mut headers, &mut non_streaming_params.extra);
         // Prepare encryption headers
         let pinned_pub_key =

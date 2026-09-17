@@ -32,8 +32,8 @@ async fn priority_is_a_per_request_header_for_json_and_sse() {
                     "model": "synthetic-model", "choices": [{"index": 0,
                     "delta": {"content": "priority-ok"}, "finish_reason": "stop"}],
                     "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}});
-                ResponseTemplate::new(200).insert_header("content-type", "text/event-stream")
-                    .set_body_string(format!("data: {chunk}\n\ndata: [DONE]\n\n"))
+                ResponseTemplate::new(200).set_body_raw(
+                    format!("data: {chunk}\n\ndata: [DONE]\n\n"), "text/event-stream")
             } else {
                 ResponseTemplate::new(200).set_body_json(json!({
                     "id": "synthetic", "object": "chat.completion", "created": 0,
@@ -110,41 +110,86 @@ fn internal_priority_is_never_serialized() {
     assert_eq!(params.clone().request_priority, -2);
 }
 
+#[test]
+fn client_priority_is_removed_from_extra_and_original_request() {
+    let mut request = params(-2);
+    request.original_request = Some(json!({
+        "priority": 999, "request_priority": 999, "service_tier": "priority",
+        "metadata": {"priority": "application value"}
+    }));
+    request.strip_client_priority();
+    assert_eq!(request.request_priority, -2);
+    assert!(!request.extra.contains_key("priority"));
+    assert!(!request.extra.contains_key("request_priority"));
+    let original = request.original_request.unwrap();
+    assert!(original.get("priority").is_none());
+    assert!(original.get("request_priority").is_none());
+    assert_eq!(original["service_tier"], "priority");
+    assert_eq!(original["metadata"]["priority"], "application value");
+}
+
 #[tokio::test]
-async fn external_provider_does_not_receive_internal_priority() {
-    use crate::non_attested::external::backend::{BackendConfig, ExternalBackend};
-    use crate::non_attested::external::openai_compatible::OpenAiCompatibleBackend;
+async fn external_provider_does_not_receive_internal_or_client_priority() {
+    use crate::non_attested::external::{ExternalProvider, ExternalProviderConfig, ProviderConfig};
     let upstream = MockServer::start().await;
     Mock::given(method("POST"))
         .and(path("/chat/completions"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "id": "synthetic", "object": "chat.completion", "created": 0,
-            "model": "synthetic-model", "choices": [{"index": 0,
-                "message": {"role": "assistant", "content": "ok"}, "finish_reason": "stop"}],
-            "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
-        })))
-        .expect(1)
+        .respond_with(|request: &wiremock::Request| {
+            let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+            if body["stream"] == true {
+                let chunk = json!({"id": "synthetic", "object": "chat.completion.chunk", "created": 0,
+                    "model": "synthetic-model", "choices": [{"index": 0,
+                    "delta": {"content": "ok"}, "finish_reason": "stop"}],
+                    "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}});
+                ResponseTemplate::new(200).set_body_raw(
+                    format!("data: {chunk}\n\ndata: [DONE]\n\n"), "text/event-stream")
+            } else {
+                ResponseTemplate::new(200).set_body_json(json!({
+                    "id": "synthetic", "object": "chat.completion", "created": 0,
+                    "model": "synthetic-model", "choices": [{"index": 0,
+                        "message": {"role": "assistant", "content": "ok"}, "finish_reason": "stop"}],
+                    "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
+                }))
+            }
+        })
+        .expect(2)
         .mount(&upstream)
         .await;
-    let config = BackendConfig {
-        base_url: upstream.uri(),
+    let provider = ExternalProvider::new(ExternalProviderConfig {
+        model_name: "synthetic-model".into(),
+        provider_config: ProviderConfig::OpenAiCompatible {
+            base_url: upstream.uri(),
+            organization_id: None,
+            model_name: None,
+            extra_request_body: None,
+            enforced_request_body: None,
+        },
         api_key: "synthetic".into(),
-        ..Default::default()
-    };
-    let mut request: ChatCompletionParams = serde_json::from_value(json!({
-        "model": "synthetic-model", "messages": [{"role": "user", "content": "synthetic"}],
-        "service_tier": "priority"
-    }))
-    .unwrap();
-    request.request_priority = -2;
-    OpenAiCompatibleBackend::new()
-        .chat_completion(&config, "synthetic-model", request)
+        timeout_seconds: 5,
+    });
+    let mut request = params(-2);
+    request.service_tier = Some(crate::ChatServiceTier::Priority);
+    let response = provider
+        .chat_completion(request.clone(), "synthetic-hash".into())
         .await
         .unwrap();
-    let requests = upstream.received_requests().await.unwrap();
-    assert!(!requests[0].headers.contains_key("x-nearai-priority"));
-    let body: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
-    assert!(body.get("request_priority").is_none());
-    assert!(body.get("priority").is_none());
-    assert_eq!(body["service_tier"], "priority");
+    assert_eq!(
+        response.response.choices[0].message.content.as_deref(),
+        Some("ok")
+    );
+    let stream = provider
+        .chat_completion_stream(request, "synthetic-hash".into())
+        .await
+        .unwrap();
+    let events: Vec<_> = stream.try_collect().await.unwrap();
+    assert!(events
+        .iter()
+        .any(|event| String::from_utf8_lossy(&event.raw_bytes).contains("ok")));
+    for request in upstream.received_requests().await.unwrap() {
+        assert!(!request.headers.contains_key("x-nearai-priority"));
+        let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+        assert!(body.get("request_priority").is_none());
+        assert!(body.get("priority").is_none());
+        assert_eq!(body["service_tier"], "priority");
+    }
 }

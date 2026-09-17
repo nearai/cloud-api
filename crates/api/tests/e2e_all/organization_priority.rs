@@ -143,7 +143,14 @@ async fn priority_requires_platform_admin_and_respects_token_permissions() {
     drop(client);
     let org = create_org_with_session(&server, &owner_session).await;
     let client = db.pool().get().await.unwrap();
-    client.execute("INSERT INTO organization_members (organization_id, user_id, role, joined_at) VALUES ($1, $2, 'admin', NOW())", &[&Uuid::parse_str(&org.id).unwrap(), &org_admin_id]).await.unwrap();
+    client
+        .execute(
+            "INSERT INTO organization_members (organization_id, user_id, role, joined_at) \
+             VALUES ($1, $2, 'admin', NOW())",
+            &[&Uuid::parse_str(&org.id).unwrap(), &org_admin_id],
+        )
+        .await
+        .unwrap();
     drop(client);
     let api_key = get_api_key_for_org_with_session(&server, org.id.clone(), &owner_session).await;
     // MockAuthService treats every session as a platform admin. Exercise the
@@ -289,10 +296,14 @@ async fn priority_flows_through_chat_text_responses_and_updates_without_cache() 
                     "{endpoint}: {}",
                     response.text()
                 );
-                assert_eq!(
-                    mock.last_chat_params().await.unwrap().request_priority,
-                    priority
-                );
+                let params = mock.last_chat_params().await.unwrap();
+                assert_eq!(params.request_priority, priority);
+                assert!(!params.extra.contains_key("priority"));
+                assert!(!params.extra.contains_key("request_priority"));
+                if let Some(original) = &params.original_request {
+                    assert!(original.get("priority").is_none());
+                    assert!(original.get("request_priority").is_none());
+                }
                 if stream {
                     assert!(response.text().contains(if endpoint == "responses" {
                         "response.completed"
@@ -322,6 +333,38 @@ async fn priority_flows_through_chat_text_responses_and_updates_without_cache() 
     let mut seen = mock.chat_request_priorities().await[before..].to_vec();
     seen.sort();
     assert_eq!(seen, vec![-2, 0]);
+}
+
+#[tokio::test]
+async fn priority_updates_bypass_warm_real_auth_caches_on_both_instances() {
+    let setup = setup_test_server().await;
+    let org = setup_org_with_credits(&setup, 100_000_000_000).await;
+    let key = get_api_key_for_org(&setup, org.id.clone()).await;
+    // Independent AuthService instances retain their own API-key caches.
+    let (first, _, first_provider, _) = setup_test_server_with_pool_and_config(|config| {
+        config.auth.mock = false;
+    })
+    .await;
+    let (second, _, second_provider, _) = setup_test_server_with_pool_and_config(|config| {
+        config.auth.mock = false;
+    })
+    .await;
+    for priority in [0, -2, 1000, 0] {
+        set_priority(&setup, &org.id, priority).await;
+        for (server, provider) in [(&first, &first_provider), (&second, &second_provider)] {
+            let response = server
+                .post("/v1/chat/completions")
+                .add_header("Authorization", format!("Bearer {key}"))
+                .json(&json!({"model": E2E_QWEN_MODEL_NAME,
+                    "messages": [{"role": "user", "content": "synthetic cache test"}]}))
+                .await;
+            response.assert_status_ok();
+            assert_eq!(
+                provider.last_chat_params().await.unwrap().request_priority,
+                priority
+            );
+        }
+    }
 }
 
 /// Pause a synthetic tool so an admin update can occur between generations.
@@ -394,7 +437,7 @@ async fn priority_is_preserved_for_tool_iterations_and_background_title() {
     let update_during_tool = async {
         tokio::time::timeout(std::time::Duration::from_secs(10), tool.entered.notified())
             .await
-            .unwrap();
+            .expect("web_context_search tool was not invoked within 10s");
         set_priority(&server, &org.id, 0).await;
         tool.resume.notify_one();
     };

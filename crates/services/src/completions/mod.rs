@@ -1711,6 +1711,7 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
             original_request: request.original_request.clone(),
             extra,
         };
+        chat_params.strip_client_priority();
 
         // Resolve model name (could be an alias) and get model details in a single DB call
         // This also validates that the model exists and is active
@@ -1896,6 +1897,7 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
             original_request: request.original_request.clone(),
             extra,
         };
+        chat_params.strip_client_priority();
 
         // Resolve model name (could be an alias) and get model details in a single DB call
         // This also validates that the model exists and is active

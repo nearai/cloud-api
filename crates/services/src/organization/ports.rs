@@ -25,7 +25,7 @@ impl std::fmt::Display for OrganizationId {
 pub struct Organization {
     /// Operator-controlled scheduler priority. Never accepted from or exposed in JSON.
     #[serde(skip)]
-    pub request_priority: i32,
+    pub request_priority: inference_providers::models::RequestPriority,
     pub id: OrganizationId,
     pub name: String,
     pub description: Option<String>,

@@ -76,7 +76,7 @@ pub enum CompletionError {
 pub struct CompletionRequest {
     /// Operator-controlled scheduler priority. Never accepted from or exposed in JSON.
     #[serde(skip)]
-    pub request_priority: i32,
+    pub request_priority: inference_providers::models::RequestPriority,
     /// UUIDv4 correlation ID generated (or echoed) by the API layer.
     /// Propagated downstream as `X-Request-Id` so every hop can join on it.
     pub request_id: uuid::Uuid,

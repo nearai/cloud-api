@@ -117,7 +117,7 @@ pub struct ToolCall {
     pub index: Option<i64>,
     /// Thought signature for Gemini 3 models (required for tool calls to work correctly)
     /// Only included if the model returned one - older models don't use this
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(flatten, with = "crate::thought_signature")]
     pub thought_signature: Option<String>,
 }
 
@@ -133,8 +133,8 @@ pub struct ToolCallDelta {
     pub index: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub function: Option<FunctionCallDelta>,
-    /// Thought signature for Gemini 3 models (internal use only, not exposed to clients)
-    #[serde(skip_serializing_if = "Option::is_none")]
+    /// Thought signature for Gemini tool-call replay, emitted in both wire formats
+    #[serde(flatten, with = "crate::thought_signature")]
     pub thought_signature: Option<String>,
 }
 

@@ -897,6 +897,53 @@ mod tests {
     use super::*;
 
     #[test]
+    fn test_thought_signature_roundtrip_through_compatible_tool_calls() {
+        let parts: Vec<GeminiPart> = serde_json::from_value(serde_json::json!([
+            {"functionCall": {"name": "read", "args": {"path": "."}},
+             "thoughtSignature": "opaque+/signature=="},
+            {"functionCall": {"name": "read", "args": {"path": "src"}}}
+        ]))
+        .unwrap();
+        let (_, calls) = extract_response_content(&parts);
+        let calls = calls.unwrap();
+        let complete = serde_json::to_value(&calls).unwrap();
+        let chunk = ChunkContext::new("test".into(), "gemini".into(), 0).tool_calls_chunk(
+            calls,
+            Some(crate::FinishReason::ToolCalls),
+            None,
+        );
+        let stream = serde_json::to_value(chunk).unwrap();
+        for mut wire_calls in [
+            complete,
+            stream["choices"][0]["delta"]["tool_calls"].clone(),
+        ] {
+            assert_eq!(
+                wire_calls[0]["extra_content"]["google"]["thought_signature"],
+                "opaque+/signature=="
+            );
+            assert_eq!(wire_calls[0]["thought_signature"], "opaque+/signature==");
+            assert!(wire_calls[1].get("extra_content").is_none());
+            assert!(wire_calls[1].get("thought_signature").is_none());
+            // The SDK only replays the nested format, not our legacy field.
+            for call in wire_calls.as_array_mut().unwrap() {
+                call.as_object_mut().unwrap().remove("thought_signature");
+            }
+            let message: ChatMessage = serde_json::from_value(serde_json::json!({
+                "role": "assistant", "tool_calls": wire_calls
+            }))
+            .unwrap();
+            let (_, contents) = convert_messages(&[message]);
+            let replay = serde_json::to_value(&contents).unwrap();
+            assert_eq!(
+                replay[0]["parts"][0]["thoughtSignature"],
+                "opaque+/signature=="
+            );
+            assert!(replay[0]["parts"][1].get("thoughtSignature").is_none());
+            assert_eq!(replay[0]["parts"][0]["functionCall"]["name"], "read");
+        }
+    }
+
+    #[test]
     fn test_tool_results_with_refs_preserve_original_text() {
         let cases = [
             "{\n  \"$ref\": \"#/$defs/Config\", \"$defs\": {\"Config\": {\"type\": \"object\"}}\n}",

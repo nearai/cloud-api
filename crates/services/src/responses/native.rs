@@ -101,6 +101,12 @@ impl NativeResponsesService {
                 }
                 _ => NativeResponsesError::Internal("Failed to enforce concurrency limit"),
             })?;
+        // Scheduling priority is internal NEAR metadata, not an OpenAI parameter.
+        // Match the external Chat transport's client-priority stripping policy.
+        if let Some(fields) = body.as_object_mut() {
+            fields.remove("priority");
+            fields.remove("request_priority");
+        }
         body["model"] = json!(model.model_name);
         body["service_tier"] = json!("default");
         if let Some(limit) = model.max_output_length {

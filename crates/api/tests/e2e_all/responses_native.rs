@@ -84,6 +84,7 @@ async fn native_flow(prefix: &str, enabled: bool) {
         {"type":"function_call","call_id":"call_prior","name":"weather","arguments":"{}"},
         {"type":"function_call_output","call_id":"call_prior","output":"sunny"}],
         "include":["reasoning.encrypted_content"],"parallel_tool_calls":false,
+        "priority":999,"request_priority":999,
         "tools":[{"type":"function","name":"weather","parameters":{"type":"object","properties":{},"additionalProperties":false},"strict":true}]});
     let response = server
         .post("/v1/responses")
@@ -96,6 +97,8 @@ async fn native_flow(prefix: &str, enabled: bool) {
     assert_eq!(native["output"][1]["call_id"], "call_native");
     let forwarded = captured.lock().unwrap()[0].clone();
     assert_eq!(forwarded["model"], model);
+    assert!(forwarded.get("priority").is_none());
+    assert!(forwarded.get("request_priority").is_none());
     for field in ["input", "include", "parallel_tool_calls", "tools", "store"] {
         assert_eq!(forwarded[field], request[field], "{field}");
     }

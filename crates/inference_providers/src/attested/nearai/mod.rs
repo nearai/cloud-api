@@ -1717,6 +1717,13 @@ impl InferenceProvider for Fleet {
         headers.insert("X-Request-Hash", request_hash_value);
 
         // Prepare tracing headers (request_id, org_id, workspace_id)
+        headers.insert(
+            "x-nearai-priority",
+            HeaderValue::from(streaming_params.request_priority),
+        );
+        // Scheduler policy comes only from authenticated server context.
+        streaming_params.extra.remove("priority");
+        streaming_params.extra.remove("request_priority");
         self.prepare_tracing_headers(&mut headers, &mut streaming_params.extra);
         // Prepare encryption headers
         let pinned_pub_key =
@@ -1873,6 +1880,13 @@ impl InferenceProvider for Fleet {
         headers.insert("X-Request-Hash", request_hash_value);
 
         // Prepare tracing headers (request_id, org_id, workspace_id)
+        headers.insert(
+            "x-nearai-priority",
+            HeaderValue::from(non_streaming_params.request_priority),
+        );
+        // Scheduler policy comes only from authenticated server context.
+        non_streaming_params.extra.remove("priority");
+        non_streaming_params.extra.remove("request_priority");
         self.prepare_tracing_headers(&mut headers, &mut non_streaming_params.extra);
         // Prepare encryption headers
         let pinned_pub_key =
@@ -3661,6 +3675,7 @@ mod tests {
         );
 
         let params = ChatCompletionParams {
+            request_priority: 0,
             model: "test-model".to_string(),
             messages: vec![ChatMessage {
                 reasoning_content: None,
@@ -5341,3 +5356,6 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+mod priority_tests;

@@ -19,13 +19,14 @@ use crate::models::{
     ModelArchitecture, ModelDeprecationConfirmResponse, ModelDeprecationPreviewResponse,
     ModelDeprecationRequest, ModelHistoryEntry, ModelHistoryResponse, ModelMetadata,
     ModelWithPricing, OrgLimitsHistoryEntry, OrgLimitsHistoryResponse,
-    OrganizationFallbackResponse, OrganizationMemberResponse, OrganizationUsage,
-    PricingChangeBatchRequest, PricingChangeConfirmResponse, PricingChangeModelPreviewDto,
-    PricingChangePreviewResponse, PricingFieldUpdates, PricingFields, ScheduledPricingChangeDto,
-    SpendLimit, UpdateAmlReportStatusRequest, UpdateOrganizationConcurrentLimitRequest,
-    UpdateOrganizationConcurrentLimitResponse, UpdateOrganizationFallbackRequest,
-    UpdateOrganizationLimitsRequest, UpdateOrganizationLimitsResponse,
-    UpdateOrganizationMemberRequest, UpdateServiceRequest, UpsertAmlAllowlistEntryRequest,
+    OrganizationFallbackResponse, OrganizationMemberResponse, OrganizationPriorityResponse,
+    OrganizationUsage, PricingChangeBatchRequest, PricingChangeConfirmResponse,
+    PricingChangeModelPreviewDto, PricingChangePreviewResponse, PricingFieldUpdates, PricingFields,
+    ScheduledPricingChangeDto, SpendLimit, UpdateAmlReportStatusRequest,
+    UpdateOrganizationConcurrentLimitRequest, UpdateOrganizationConcurrentLimitResponse,
+    UpdateOrganizationFallbackRequest, UpdateOrganizationLimitsRequest,
+    UpdateOrganizationLimitsResponse, UpdateOrganizationMemberRequest,
+    UpdateOrganizationPriorityRequest, UpdateServiceRequest, UpsertAmlAllowlistEntryRequest,
 };
 use crate::routes::common::format_amount;
 use crate::routes::usage::{compute_organization_balance_response, OrganizationBalanceResponse};
@@ -2673,6 +2674,74 @@ pub async fn list_organizations(
     };
 
     Ok(ResponseJson(response))
+}
+
+/// Get an organization's scheduler priority (platform admins only).
+#[utoipa::path(
+    get,
+    path = "/v1/admin/organizations/{org_id}/priority",
+    tag = "Admin",
+    params(("org_id" = Uuid, Path, description = "Organization ID")),
+    responses(
+        (status = 200, description = "Scheduler priority retrieved", body = OrganizationPriorityResponse),
+        (status = 401, description = "Unauthorized", body = ErrorResponse),
+        (status = 403, description = "Forbidden", body = ErrorResponse),
+        (status = 404, description = "Organization not found", body = ErrorResponse)
+    ),
+    security(("session_token" = []))
+)]
+pub async fn get_organization_priority(
+    State(app_state): State<AdminAppState>,
+    Extension(_admin_user): Extension<AdminUser>,
+    Path(org_id): Path<Uuid>,
+) -> Result<ResponseJson<OrganizationPriorityResponse>, (StatusCode, ResponseJson<ErrorResponse>)> {
+    let priority = app_state
+        .organization_service
+        .get_request_priority_for_admin(services::organization::OrganizationId(org_id))
+        .await
+        .map_err(crate::routes::common::map_organization_error)?;
+    Ok(ResponseJson(OrganizationPriorityResponse {
+        organization_id: org_id,
+        priority,
+    }))
+}
+
+/// Set an organization's scheduler priority (platform admins with write access only).
+#[utoipa::path(
+    patch,
+    path = "/v1/admin/organizations/{org_id}/priority",
+    tag = "Admin",
+    params(("org_id" = Uuid, Path, description = "Organization ID")),
+    request_body = UpdateOrganizationPriorityRequest,
+    responses(
+        (status = 200, description = "Scheduler priority updated", body = OrganizationPriorityResponse),
+        (status = 400, description = "Priority outside -1000..1000", body = ErrorResponse),
+        (status = 401, description = "Unauthorized", body = ErrorResponse),
+        (status = 403, description = "Forbidden", body = ErrorResponse),
+        (status = 404, description = "Organization not found", body = ErrorResponse)
+    ),
+    security(("session_token" = []))
+)]
+pub async fn update_organization_priority(
+    State(app_state): State<AdminAppState>,
+    Extension(admin_user): Extension<AdminUser>,
+    Path(org_id): Path<Uuid>,
+    Json(request): Json<UpdateOrganizationPriorityRequest>,
+) -> Result<ResponseJson<OrganizationPriorityResponse>, (StatusCode, ResponseJson<ErrorResponse>)> {
+    let priority = app_state
+        .organization_service
+        .update_request_priority_for_admin(
+            services::organization::OrganizationId(org_id),
+            request.priority,
+        )
+        .await
+        .map_err(crate::routes::common::map_organization_error)?;
+    tracing::info!(organization_id = %org_id, actor_id = %admin_user.0.id,
+        actor_type = "platform_admin", priority, "Organization request priority changed");
+    Ok(ResponseJson(OrganizationPriorityResponse {
+        organization_id: org_id,
+        priority,
+    }))
 }
 
 /// Get an organization's effective fallback policy (Admin only).

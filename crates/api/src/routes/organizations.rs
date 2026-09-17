@@ -976,6 +976,20 @@ mod tests {
             unimplemented!()
         }
 
+        async fn get_request_priority_for_admin(
+            &self,
+            _: OrganizationId,
+        ) -> Result<i32, OrganizationError> {
+            unimplemented!()
+        }
+        async fn update_request_priority_for_admin(
+            &self,
+            _: OrganizationId,
+            _: i32,
+        ) -> Result<i32, OrganizationError> {
+            unimplemented!()
+        }
+
         async fn get_fallback_enabled_for_admin(
             &self,
             _: OrganizationId,

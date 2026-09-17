@@ -1678,6 +1678,7 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
         Self::inject_tracing_headers(&mut extra, request_id, organization_id, workspace_id);
 
         let mut chat_params = inference_providers::ChatCompletionParams {
+            request_priority: request.request_priority,
             model: request.model.clone(),
             messages: chat_messages,
             max_tokens: request.max_tokens,
@@ -1862,6 +1863,7 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
         Self::inject_tracing_headers(&mut extra, request_id, organization_id, workspace_id);
 
         let mut chat_params = inference_providers::ChatCompletionParams {
+            request_priority: request.request_priority,
             model: request.model.clone(),
             messages: chat_messages,
             max_tokens: request.max_tokens,
@@ -3800,6 +3802,7 @@ mod tests {
 
     fn chat_params_for_compat_tests(model: &str) -> inference_providers::ChatCompletionParams {
         inference_providers::ChatCompletionParams {
+            request_priority: 0,
             model: model.to_string(),
             messages: vec![inference_providers::ChatMessage {
                 reasoning_content: None,

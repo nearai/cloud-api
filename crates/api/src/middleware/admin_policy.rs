@@ -40,6 +40,7 @@ pub(crate) fn admin_operation(method: &Method, matched_path: &str) -> AdminOpera
                 | "/admin/aml/allowlist"
                 | "/admin/organizations/{org_id}/concurrent-limit"
                 | "/admin/organizations/{org_id}/fallback"
+                | "/admin/organizations/{org_id}/priority"
                 | "/admin/organizations/{org_id}/metrics"
                 | "/admin/organizations/{org_id}/metrics/timeseries"
                 | "/admin/platform/metrics"

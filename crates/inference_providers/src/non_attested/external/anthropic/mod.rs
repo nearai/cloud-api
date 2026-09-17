@@ -684,6 +684,7 @@ mod tests {
 
     fn make_params(temperature: Option<f32>, top_p: Option<f32>) -> ChatCompletionParams {
         ChatCompletionParams {
+            request_priority: 0,
             model: "claude-sonnet-4-5-20250514".to_string(),
             messages: vec![crate::ChatMessage {
                 reasoning_content: None,

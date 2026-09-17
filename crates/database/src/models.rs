@@ -6,6 +6,9 @@ use uuid::Uuid;
 /// Organization model - top level entity
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Organization {
+    /// Operator-controlled scheduler priority. Never accepted from or exposed in JSON.
+    #[serde(skip)]
+    pub request_priority: i32,
     pub id: Uuid,
     pub name: String,
     pub description: Option<String>,

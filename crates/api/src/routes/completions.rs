@@ -642,6 +642,7 @@ fn convert_chat_request_to_service(
     organization_id: Uuid,
     workspace_id: Uuid,
     fallback_enabled: bool,
+    request_priority: i32,
     body_hash: RequestBodyHash,
     request_id: Uuid,
 ) -> ServiceCompletionRequest {
@@ -669,6 +670,7 @@ fn convert_chat_request_to_service(
     }
 
     ServiceCompletionRequest {
+        request_priority,
         request_id,
         model: request.model.clone(),
         messages: request
@@ -1300,6 +1302,7 @@ fn convert_text_request_to_service(
     organization_id: Uuid,
     workspace_id: Uuid,
     fallback_enabled: bool,
+    request_priority: i32,
     body_hash: RequestBodyHash,
     request_id: Uuid,
 ) -> ServiceCompletionRequest {
@@ -1323,6 +1326,7 @@ fn convert_text_request_to_service(
     }
 
     ServiceCompletionRequest {
+        request_priority,
         request_id,
         model: request.model.clone(),
         messages: vec![CompletionMessage {
@@ -1466,6 +1470,7 @@ async fn chat_completions_inner(
         api_key.organization.id.0,
         api_key.workspace.id.0,
         api_key.organization.fallback_enabled(),
+        api_key.organization.request_priority,
         body_hash,
         request_id,
     );
@@ -2750,6 +2755,7 @@ async fn completions_inner(
         api_key.organization.id.0,
         api_key.workspace.id.0,
         api_key.organization.fallback_enabled(),
+        api_key.organization.request_priority,
         body_hash,
         request_id,
     );
@@ -4778,6 +4784,7 @@ mod tests {
             Uuid::nil(),
             Uuid::nil(),
             true,
+            0,
             body_hash,
             Uuid::nil(),
         );

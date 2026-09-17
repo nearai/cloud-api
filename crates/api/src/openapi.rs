@@ -171,6 +171,8 @@ use utoipa::{Modify, OpenApi};
         crate::routes::admin::update_organization_concurrent_limit,
         crate::routes::admin::get_organization_concurrent_limit,
         crate::routes::admin::get_organization_fallback,
+        crate::routes::admin::get_organization_priority,
+        crate::routes::admin::update_organization_priority,
         crate::routes::admin::update_organization_fallback,
         crate::routes::admin::get_organization_metrics,
         crate::routes::admin::get_platform_metrics,
@@ -287,6 +289,7 @@ use utoipa::{Modify, OpenApi};
             UpdateOrganizationConcurrentLimitRequest, UpdateOrganizationConcurrentLimitResponse,
             GetOrganizationConcurrentLimitResponse,
             UpdateOrganizationFallbackRequest, OrganizationFallbackResponse,
+            UpdateOrganizationPriorityRequest, OrganizationPriorityResponse,
             // Invitation email delivery models (Admin)
             AdminInvitationEmailDeliveryResponse, ListAdminInvitationEmailDeliveriesResponse,
             AdminInvitationEmailResendResultResponse,

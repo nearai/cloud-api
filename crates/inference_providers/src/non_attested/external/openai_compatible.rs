@@ -772,6 +772,7 @@ mod tests {
             );
         }
         ChatCompletionParams {
+            request_priority: 0,
             model: "gpt-5.5".to_string(),
             messages: vec![],
             max_completion_tokens: None,

@@ -222,6 +222,9 @@ pub enum ChatServiceTier {
 /// Parameters for chat completion requests (matches OpenAI API)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChatCompletionParams {
+    /// Operator-controlled scheduler priority. Never accepted from or exposed in JSON.
+    #[serde(skip)]
+    pub request_priority: i32,
     /// Model ID to use for the completion
     pub model: String,
 

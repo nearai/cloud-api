@@ -64,6 +64,7 @@ impl PgOrganizationRepository {
         owner_id: Uuid,
     ) -> Result<Organization> {
         Ok(Organization {
+            request_priority: db_org.request_priority,
             id: OrganizationId::from(db_org.id),
             name: db_org.name,
             description: db_org.description,
@@ -596,6 +597,7 @@ impl PgOrganizationRepository {
     // Helper function to convert database row to Organization
     fn row_to_db_organization(&self, row: tokio_postgres::Row) -> anyhow::Result<DbOrganization> {
         Ok(DbOrganization {
+            request_priority: row.try_get("request_priority")?,
             id: row.try_get("id")?,
             name: row.try_get("name")?,
             description: row.try_get("description")?,
@@ -682,6 +684,26 @@ impl OrganizationRepository for PgOrganizationRepository {
             )),
             None => Ok(None),
         }
+    }
+
+    async fn set_request_priority(
+        &self,
+        id: Uuid,
+        priority: i32,
+    ) -> Result<Option<i32>, RepositoryError> {
+        let row = retry_db!("set_organization_request_priority", {
+            let client = self
+                .pool
+                .get()
+                .await
+                .context("Failed to get database connection")
+                .map_err(RepositoryError::PoolError)?;
+            client.query_opt(
+                "UPDATE organizations SET request_priority = $2, updated_at = NOW() WHERE id = $1 AND is_active = true RETURNING request_priority",
+                &[&id, &priority],
+            ).await.map_err(map_db_error)
+        })?;
+        Ok(row.map(|row| row.get("request_priority")))
     }
 
     async fn get_by_name(&self, name: &str) -> Result<Option<Organization>, RepositoryError> {

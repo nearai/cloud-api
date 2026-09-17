@@ -100,6 +100,7 @@ impl From<ChatCompletionRequest> for ChatCompletionParams {
         }
 
         Self {
+            request_priority: 0,
             model: req.model,
             messages: req.messages.into_iter().map(|m| m.into()).collect(),
             max_tokens: req.max_tokens,

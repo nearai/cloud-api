@@ -7,8 +7,26 @@ use std::sync::{Arc, Mutex};
 
 #[tokio::test]
 async fn native_stateless_astra_preserves_protocol_and_isolates_legacy_routes() {
-    let (server, pool, _, database) = setup_test_server_with_pool().await;
-    let model = format!("openai/gpt-6-astra-{}", uuid::Uuid::new_v4());
+    native_flow("openai/gpt-6-astra", true).await;
+}
+
+#[tokio::test]
+async fn native_routing_supports_explicitly_configured_non_astra_models() {
+    native_flow("configured/custom-model", true).await;
+}
+
+#[tokio::test]
+async fn native_routing_is_disabled_when_allowlist_is_empty() {
+    native_flow("openai/gpt-6-astra", false).await;
+}
+
+async fn native_flow(prefix: &str, enabled: bool) {
+    let model = format!("{prefix}-{}", uuid::Uuid::new_v4());
+    let alias = format!("native-alias-{}", uuid::Uuid::new_v4());
+    let (server, pool, _, database) = setup_test_server_with_pool_and_config(|config| {
+        config.native_responses_models = if enabled { vec![model.clone()] } else { vec![] };
+    })
+    .await;
     let other = format!("other-{}", uuid::Uuid::new_v4());
     let captured = Arc::new(Mutex::new(Vec::<Value>::new()));
     let calls = captured.clone();
@@ -36,6 +54,7 @@ async fn native_stateless_astra_preserves_protocol_and_isolates_legacy_routes() 
                 "inputCostPerToken":{"amount":1000,"currency":"USD"},"outputCostPerToken":{"amount":2000,"currency":"USD"},
                 "modelDisplayName":"Routing fixture","modelDescription":"Native Responses test",
                 "contextLength":10000,"maxOutputLength":1000,"isActive":true,"ownedBy":"openai",
+                "aliases":if name == &model {vec![alias.clone()]} else {vec![]},
                 "verifiable":false,"inputModalities":["text"],"outputModalities":["text"]
             }))
             .unwrap(),
@@ -49,7 +68,18 @@ async fn native_stateless_astra_preserves_protocol_and_isolates_legacy_routes() 
     let org = setup_org_with_credits(&server, 10_000_000_000).await;
     let key = get_api_key_for_org(&server, org.id.clone()).await;
     let auth = format!("Bearer {key}");
-    let mut request = json!({"model":model,"store":false,"input":[
+    if !enabled {
+        let response = server
+            .post("/v1/responses")
+            .add_header("Authorization", &auth)
+            .json(&json!({"model":model,"store":false,"input":"hello"}))
+            .await;
+        assert_eq!(response.status_code(), 200, "{}", response.text());
+        assert!(captured.lock().unwrap().is_empty());
+        assert!(provider.last_chat_params().await.is_some());
+        return;
+    }
+    let mut request = json!({"model":alias,"store":false,"input":[
         {"type":"reasoning","id":"rs_prior","summary":[],"encrypted_content":"prior-opaque"},
         {"type":"function_call","call_id":"call_prior","name":"weather","arguments":"{}"},
         {"type":"function_call_output","call_id":"call_prior","output":"sunny"}],
@@ -65,6 +95,7 @@ async fn native_stateless_astra_preserves_protocol_and_isolates_legacy_routes() 
     assert_eq!(native["output"][0]["encrypted_content"], "opaque");
     assert_eq!(native["output"][1]["call_id"], "call_native");
     let forwarded = captured.lock().unwrap()[0].clone();
+    assert_eq!(forwarded["model"], model);
     for field in ["input", "include", "parallel_tool_calls", "tools", "store"] {
         assert_eq!(forwarded[field], request[field], "{field}");
     }

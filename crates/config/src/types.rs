@@ -3,6 +3,8 @@ use std::{collections::HashMap, env};
 
 #[derive(Debug, Clone)]
 pub struct ApiConfig {
+    /// Canonical model IDs eligible for native stateless Responses. Empty disables routing.
+    pub native_responses_models: Vec<String>,
     pub server: ServerConfig,
     /// API key for authenticating with inference backends (vLLM/SGLang via inference_url)
     pub inference_api_key: Option<String>,
@@ -46,6 +48,9 @@ impl ApiConfig {
     pub fn from_env() -> Result<Self, String> {
         let auth = AuthConfig::from_env()?;
         Ok(Self {
+            native_responses_models: parse_native_responses_models(
+                &env::var("NATIVE_RESPONSES_MODELS").unwrap_or_default(),
+            ),
             server: ServerConfig::from_env()?,
             inference_api_key: env::var("INFERENCE_API_KEY")
                 .or_else(|_| env::var("MODEL_DISCOVERY_API_KEY"))
@@ -2651,5 +2656,31 @@ impl Default for CorsConfig {
             exact_matches,
             wildcard_suffixes,
         }
+    }
+}
+
+fn parse_native_responses_models(value: &str) -> Vec<String> {
+    let mut models: Vec<String> = value
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_owned)
+        .collect();
+    models.sort();
+    models.dedup();
+    models
+}
+
+#[cfg(test)]
+mod native_responses_config_tests {
+    use super::*;
+    #[test]
+    fn comma_separated_models_are_exact_trimmed_and_deduplicated() {
+        assert!(parse_native_responses_models("").is_empty());
+        assert!(parse_native_responses_models(" , ").is_empty());
+        assert_eq!(
+            parse_native_responses_models(" openai/gpt-6-astra,custom/model,openai/gpt-6-astra,,"),
+            vec!["custom/model", "openai/gpt-6-astra"]
+        );
     }
 }

@@ -12,10 +12,6 @@ pub struct ResponsesRawResponse {
     pub body: ResponsesRawBody,
 }
 
-pub fn is_astra(model: &str) -> bool {
-    model == "gpt-6-astra" || model.starts_with("gpt-6-astra-")
-}
-
 /// Explicitly opt into a request with no gateway or upstream retained state.
 /// Null optional fields have the same meaning as omitted fields.
 pub fn is_stateless(body: &serde_json::Value) -> bool {

@@ -1750,7 +1750,14 @@ pub fn build_response_routes(
     rate_limit_state: middleware::RateLimitState,
 ) -> Router {
     let route_state = responses::ResponseRouteState {
-        native_app_state,
+        native_service: services::responses::native::NativeResponsesService {
+            models: native_app_state.config.native_responses_models.clone(),
+            models_service: native_app_state.models_service,
+            completion_service: native_app_state.completion_service,
+            inference_provider_pool: native_app_state.inference_provider_pool,
+            usage_service: native_app_state.usage_service,
+            attestation_service: native_app_state.attestation_service,
+        },
         response_service: response_service.clone(),
         attestation_service: attestation_service.clone(),
     };
@@ -2880,6 +2887,7 @@ mod tests {
             },
             inference_api_key: Some("test-key".to_string()),
             internal_usage_token: None,
+            native_responses_models: Vec::new(),
             logging: config::LoggingConfig {
                 level: "info".to_string(),
                 format: "compact".to_string(),
@@ -2998,6 +3006,7 @@ mod tests {
             },
             inference_api_key: Some("test-key".to_string()),
             internal_usage_token: None,
+            native_responses_models: Vec::new(),
             logging: config::LoggingConfig {
                 level: "info".to_string(),
                 format: "compact".to_string(),

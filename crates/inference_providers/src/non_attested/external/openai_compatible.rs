@@ -191,12 +191,9 @@ impl ExternalBackend for OpenAiCompatibleBackend {
         mut body: serde_json::Value,
     ) -> Result<crate::responses_raw::ResponsesRawResponse, CompletionError> {
         use futures_util::TryStreamExt;
-        if !is_openai_source(&config.base_url)
-            || !crate::responses_raw::is_astra(model)
-            || !crate::responses_raw::is_stateless(&body)
-        {
+        if !is_openai_source(&config.base_url) || !crate::responses_raw::is_stateless(&body) {
             return Err(CompletionError::CompletionError(
-                "Native Responses requires stateless Astra on an OpenAI upstream".into(),
+                "Native Responses requires stateless requests on an OpenAI upstream".into(),
             ));
         }
         body["model"] = serde_json::json!(model);

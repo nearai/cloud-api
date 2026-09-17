@@ -84,6 +84,7 @@ pub fn test_config() -> ApiConfig {
             .ok()
             .or(Some("test_api_key".to_string())),
         internal_usage_token: None,
+        native_responses_models: Vec::new(),
         logging: config::LoggingConfig {
             level: "debug".to_string(),
             format: "compact".to_string(),

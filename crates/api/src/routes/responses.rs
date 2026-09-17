@@ -225,7 +225,7 @@ impl From<ServiceResponseError> for ErrorResponse {
 // State for response routes
 #[derive(Clone)]
 pub struct ResponseRouteState {
-    pub native_app_state: super::api::AppState,
+    pub native_service: services::responses::native::NativeResponsesService,
     pub response_service: Arc<ResponseServiceImpl>,
     pub attestation_service: Arc<dyn AttestationServiceTrait>,
 }
@@ -258,16 +258,20 @@ pub async fn create_response(
     OpenAiJson(raw): OpenAiJson<Box<serde_json::value::RawValue>>,
 ) -> axum::response::Response {
     // Keep the original JSON for legacy typed extraction (including its errors).
-    let native = serde_json::from_str::<serde_json::Value>(raw.get())
-        .ok()
-        .filter(super::responses_native::selected);
-    if let Some(body) = native {
+    let body = serde_json::from_str::<serde_json::Value>(raw.get()).ok();
+    let native = if let Some(body) = body.as_ref() {
+        state.native_service.selected_model(body).await
+    } else {
+        None
+    };
+    if let Some(model) = native {
         return super::responses_native::handle(
-            state.native_app_state,
+            state.native_service,
+            model,
             api_key,
             headers,
             body_hash.hash,
-            body,
+            body.expect("selected request has valid JSON"),
         )
         .await;
     }

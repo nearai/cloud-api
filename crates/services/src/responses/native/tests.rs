@@ -1,33 +1,24 @@
 use super::*;
 
 #[test]
-fn selection_changes_only_explicit_stateless_astra() {
-    let native = json!({"model": "openai/gpt-6-astra", "store": false});
-    assert!(selected(&native));
-    let mut value = native.clone();
-    value["model"] = json!("openai/gpt-6-astra-2026-09-01");
-    assert!(selected(&value));
-    for value in [
-        json!({"model": "openai/gpt-6-astra"}),
-        json!({"model": "openai/gpt-6-astra", "store": true}),
-        json!({"model": "openai/gpt-6-astra", "store": null}),
-        json!({"model": "openai/gpt-6-astra", "store": "false"}),
-        json!({"model": "openai/gpt-5.6-sol", "store": false}),
-        json!({"model": "other/gpt-6-astra", "store": false}),
-        json!({"model": "openai/gpt-6-astrafoo", "store": false}),
+fn selection_changes_only_explicit_stateless_allowlisted_models() {
+    let models = vec!["openai/gpt-6-astra".into(), "custom/model".into()];
+    let native = json!({"store":false});
+    assert!(selected(&models, "openai/gpt-6-astra", &native));
+    assert!(selected(&models, "custom/model", &native));
+    assert!(!selected(&[], "openai/gpt-6-astra", &native));
+    assert!(!selected(&models, "openai/gpt-6-astra-2026-09-03", &native));
+    assert!(!selected(&models, "another/model", &native));
+    for body in [
+        json!({}),
+        json!({"store":true}),
+        json!({"store":null}),
+        json!({"store":"false"}),
+        json!({"store":false,"conversation":"conv_1"}),
+        json!({"store":false,"previous_response_id":"resp_1"}),
+        json!({"store":false,"background":true}),
     ] {
-        assert!(!selected(&value), "{value}");
-    }
-    for (field, value) in [
-        ("conversation", json!("conv_local")),
-        ("previous_response_id", json!("resp_local")),
-        ("background", json!(true)),
-    ] {
-        let mut body = native.clone();
-        body[field] = value;
-        assert!(!selected(&body));
-        body[field] = Value::Null;
-        assert!(selected(&body));
+        assert!(!selected(&models, "openai/gpt-6-astra", &body));
     }
 }
 

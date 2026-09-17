@@ -593,9 +593,10 @@ impl InferenceProvider for ExternalProvider {
     }
 
     fn supports_responses_raw(&self) -> bool {
+        // Capability depends on the protocol/host, not the deployment name.
+        // The service authorizes canonical model IDs through its allowlist.
         self.backend.backend_type() == "openai_compatible"
             && openai_compatible::is_openai_source(&self.config.base_url)
-            && crate::responses_raw::is_astra(&self.model_name)
     }
 
     async fn anthropic_raw(
@@ -616,6 +617,18 @@ impl InferenceProvider for ExternalProvider {
 mod tests {
     use super::*;
     use std::collections::HashMap;
+
+    #[test]
+    fn native_responses_capability_accepts_deployment_overrides() {
+        let config = ExternalProviderConfig {
+            model_name: "openai/gpt-6-astra".into(),
+            provider_config: serde_json::from_value(serde_json::json!({
+                "backend":"openai_compatible", "base_url":"https://example.openai.azure.com/openai/v1", "model_name":"astra-prod"
+            })).unwrap(),
+            api_key: "test".into(), timeout_seconds: 30,
+        };
+        assert!(ExternalProvider::new(config).supports_responses_raw());
+    }
 
     #[test]
     fn strip_internal_keys_removes_routing_pin_and_tracing_keys() {

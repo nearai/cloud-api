@@ -12,6 +12,7 @@ async fn backend() -> (MockServer, OpenAiCompatibleBackend, BackendConfig) {
         client: Client::builder()
             .no_proxy()
             .resolve("api.openai.com", *server.address())
+            .resolve("example.openai.azure.com", *server.address())
             .build()
             .unwrap(),
     };
@@ -25,7 +26,10 @@ async fn backend() -> (MockServer, OpenAiCompatibleBackend, BackendConfig) {
 
 #[tokio::test]
 async fn native_responses_preserves_request_fields_and_response_bytes() {
-    let (server, backend, config) = backend().await;
+    let (server, backend, mut config) = backend().await;
+    config.base_url = config
+        .base_url
+        .replace("api.openai.com", "example.openai.azure.com");
     let body = json!({"model":"openai/gpt-6-astra", "store":false,
         "input":[{"type":"reasoning","id":"rs_1","encrypted_content":"opaque","summary":[]},
             {"type":"function_call","call_id":"call_1","name":"weather","arguments":"{}"},
@@ -34,7 +38,7 @@ async fn native_responses_preserves_request_fields_and_response_bytes() {
         "reasoning":{"effort":"high"}, "parallel_tool_calls":false, "include":["reasoning.encrypted_content"],
         "text":{"format":{"type":"json_object"}}, "future_field":{"preserved":true}});
     let mut expected = body.clone();
-    expected["model"] = json!("gpt-6-astra");
+    expected["model"] = json!("astra-prod");
     let bytes = "{ \"id\": \"resp_1\", \"output\": [{\"type\":\"reasoning\",\"encrypted_content\":\"opaque\"}] }";
     Mock::given(method("POST"))
         .and(path("/v1/responses"))
@@ -45,7 +49,7 @@ async fn native_responses_preserves_request_fields_and_response_bytes() {
         .mount(&server)
         .await;
     let response = backend
-        .responses_raw(&config, "gpt-6-astra", body)
+        .responses_raw(&config, "astra-prod", body)
         .await
         .unwrap();
     let chunks: Vec<_> = response.body.try_collect().await.unwrap();
@@ -53,7 +57,7 @@ async fn native_responses_preserves_request_fields_and_response_bytes() {
 }
 
 #[tokio::test]
-async fn native_transport_rejects_stateful_requests_and_other_models() {
+async fn native_transport_rejects_stateful_requests_and_other_hosts() {
     let (server, backend, config) = backend().await;
     for body in [
         json!({}),
@@ -67,10 +71,6 @@ async fn native_transport_rejects_stateful_requests_and_other_models() {
             .await
             .is_err());
     }
-    assert!(backend
-        .responses_raw(&config, "gpt-5.6-sol", json!({"store":false}))
-        .await
-        .is_err());
     let other = BackendConfig {
         base_url: server.uri(),
         ..config

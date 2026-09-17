@@ -16,6 +16,7 @@ pub mod health;
 pub mod mcp_server;
 pub mod models;
 pub mod ohttp;
+pub mod openrouter;
 pub mod organization_members;
 pub mod organizations;
 pub mod reporting_tokens;

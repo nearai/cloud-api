@@ -2860,6 +2860,21 @@ pub struct OrganizationSettingsResponse {
     pub settings: OrganizationSettings,
 }
 
+/// Operator-controlled priority for the inference scheduler. Higher values run first.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct UpdateOrganizationPriorityRequest {
+    /// Inclusive range -1000..1000. Set 0 to restore the default.
+    #[schema(minimum = -1000, maximum = 1000)]
+    pub priority: i32,
+}
+
+/// Scheduler priority, available only through platform-admin endpoints.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct OrganizationPriorityResponse {
+    pub organization_id: uuid::Uuid,
+    pub priority: i32,
+}
+
 /// Admin request to update an organization's fallback policy.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "camelCase")]

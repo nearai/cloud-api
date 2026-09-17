@@ -100,6 +100,9 @@ impl From<ChatCompletionRequest> for ChatCompletionParams {
         }
 
         Self {
+            // This conversion has no authenticated org context. Production
+            // completion routes supply organization priority through the service.
+            request_priority: 0,
             model: req.model,
             messages: req.messages.into_iter().map(|m| m.into()).collect(),
             max_tokens: req.max_tokens,

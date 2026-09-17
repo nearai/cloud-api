@@ -23,6 +23,9 @@ impl std::fmt::Display for OrganizationId {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Organization {
+    /// Operator-controlled scheduler priority. Never accepted from or exposed in JSON.
+    #[serde(skip)]
+    pub request_priority: inference_providers::models::RequestPriority,
     pub id: OrganizationId,
     pub name: String,
     pub description: Option<String>,
@@ -336,6 +339,13 @@ pub trait OrganizationRepository: Send + Sync {
     ) -> Result<Organization, RepositoryError>;
 
     async fn get_by_id(&self, id: Uuid) -> Result<Option<Organization>, RepositoryError>;
+
+    /// Set operator policy without touching customer-editable settings.
+    async fn set_request_priority(
+        &self,
+        id: Uuid,
+        priority: i32,
+    ) -> Result<Option<i32>, RepositoryError>;
 
     async fn get_by_name(&self, name: &str) -> Result<Option<Organization>, RepositoryError>;
 
@@ -768,6 +778,19 @@ pub trait OrganizationServiceTrait: Send + Sync {
         user_id: UserId,
         patch: PatchOrganizationSettings,
     ) -> Result<OrganizationSettings, OrganizationError>;
+
+    /// Read scheduler priority from an admin-authenticated call path.
+    async fn get_request_priority_for_admin(
+        &self,
+        organization_id: OrganizationId,
+    ) -> Result<i32, OrganizationError>;
+
+    /// Set scheduler priority from an admin-authenticated call path.
+    async fn update_request_priority_for_admin(
+        &self,
+        organization_id: OrganizationId,
+        priority: i32,
+    ) -> Result<i32, OrganizationError>;
 
     /// Get the effective fallback policy from an admin-authenticated call path.
     async fn get_fallback_enabled_for_admin(

@@ -2242,14 +2242,15 @@ fn build_admin_routes_with_options(
         get_model_consumption_timeseries, get_model_history, get_model_revenue, get_org_revenue,
         get_organization as get_admin_organization, get_organization_concurrent_limit,
         get_organization_fallback, get_organization_limits_history, get_organization_metrics,
-        get_organization_timeseries, get_performance_timeseries, get_platform_metrics,
-        get_platform_timeseries, get_revenue_density, list_admin_access_tokens, list_aml_allowlist,
-        list_aml_reports, list_invitation_email_deliveries, list_model_pricing_changes,
+        get_organization_priority, get_organization_timeseries, get_performance_timeseries,
+        get_platform_metrics, get_platform_timeseries, get_revenue_density,
+        list_admin_access_tokens, list_aml_allowlist, list_aml_reports,
+        list_invitation_email_deliveries, list_model_pricing_changes,
         list_models as admin_list_models, list_organization_members, list_organizations,
         list_users, preview_model_deprecation, preview_model_pricing_changes,
         resend_invitation_email, update_aml_report_status, update_organization_concurrent_limit,
         update_organization_fallback, update_organization_limits, update_organization_member_role,
-        update_service, upsert_aml_allowlist_entry, AdminAppState,
+        update_organization_priority, update_service, upsert_aml_allowlist_entry, AdminAppState,
     };
     use crate::routes::staking_farm::{
         get_admin_organization_staking_farm, sync_admin_organization_staking_farm,
@@ -2404,6 +2405,10 @@ fn build_admin_routes_with_options(
             "/admin/organizations/{org_id}/concurrent-limit",
             axum::routing::patch(update_organization_concurrent_limit)
                 .get(get_organization_concurrent_limit),
+        )
+        .route(
+            "/admin/organizations/{org_id}/priority",
+            axum::routing::get(get_organization_priority).patch(update_organization_priority),
         )
         .route(
             "/admin/organizations/{org_id}/fallback",

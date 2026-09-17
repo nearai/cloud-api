@@ -495,6 +495,7 @@ mod tests {
 
     fn base_params() -> ChatCompletionParams {
         ChatCompletionParams {
+            request_priority: 0,
             model: "gemini-2.5-flash".to_string(),
             messages: vec![crate::ChatMessage {
                 reasoning_content: None,

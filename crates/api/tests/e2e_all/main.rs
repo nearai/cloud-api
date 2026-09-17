@@ -67,6 +67,7 @@ mod openrouter_compat;
 mod openrouter_params;
 mod org_system_prompt;
 mod organization_deletion;
+mod organization_priority;
 mod pagination_validation;
 mod patroni_failover;
 mod privacy_classify;

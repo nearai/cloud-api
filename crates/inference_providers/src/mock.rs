@@ -690,6 +690,8 @@ pub struct MockProvider {
     config: Arc<Mutex<MockConfig>>,
     /// Last chat completion params received (for test assertions)
     last_chat_params: Arc<Mutex<Option<ChatCompletionParams>>>,
+    /// Numeric policy metadata only, for multi-request propagation assertions.
+    chat_request_priorities: Arc<Mutex<Vec<i32>>>,
     /// When true, get_attestation_report returns an error (simulates blocked/broken backend)
     fail_attestation: Arc<std::sync::atomic::AtomicBool>,
     /// Trust tier reported by [`InferenceProvider::tier`]; defaults to
@@ -752,6 +754,7 @@ impl MockProvider {
                 audio_transcription_error_override: None,
             })),
             last_chat_params: Arc::new(Mutex::new(None)),
+            chat_request_priorities: Arc::new(Mutex::new(Vec::new())),
             fail_attestation: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             tier: crate::ProviderTier::NonAttested,
             provider_source: crate::ProviderSource::External,
@@ -779,6 +782,7 @@ impl MockProvider {
                 audio_transcription_error_override: None,
             })),
             last_chat_params: Arc::new(Mutex::new(None)),
+            chat_request_priorities: Arc::new(Mutex::new(Vec::new())),
             fail_attestation: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             tier: crate::ProviderTier::NonAttested,
             provider_source: crate::ProviderSource::External,
@@ -804,6 +808,7 @@ impl MockProvider {
                 audio_transcription_error_override: None,
             })),
             last_chat_params: Arc::new(Mutex::new(None)),
+            chat_request_priorities: Arc::new(Mutex::new(Vec::new())),
             fail_attestation: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             tier: crate::ProviderTier::NonAttested,
             provider_source: crate::ProviderSource::External,
@@ -856,7 +861,12 @@ impl MockProvider {
             .store(fail, std::sync::atomic::Ordering::Relaxed);
     }
 
-    /// Get the last chat completion params received by the mock provider
+    /// Get the scheduler priorities recorded across mock completion calls.
+    pub async fn chat_request_priorities(&self) -> Vec<i32> {
+        self.chat_request_priorities.lock().await.clone()
+    }
+
+    /// Get the last chat completion params received by the mock provider.
     pub async fn last_chat_params(&self) -> Option<ChatCompletionParams> {
         self.last_chat_params.lock().await.clone()
     }
@@ -1097,6 +1107,10 @@ impl crate::InferenceProvider for MockProvider {
         params: ChatCompletionParams,
         request_hash: String,
     ) -> Result<StreamingResult, CompletionError> {
+        self.chat_request_priorities
+            .lock()
+            .await
+            .push(params.request_priority);
         *self.last_chat_params.lock().await = Some(params.clone());
 
         // Check for invalid model
@@ -1224,6 +1238,10 @@ impl crate::InferenceProvider for MockProvider {
         params: ChatCompletionParams,
         request_hash: String,
     ) -> Result<ChatCompletionResponseWithBytes, CompletionError> {
+        self.chat_request_priorities
+            .lock()
+            .await
+            .push(params.request_priority);
         *self.last_chat_params.lock().await = Some(params.clone());
 
         // Check for invalid model

@@ -6954,6 +6954,7 @@ mod tests {
             .await;
 
         let params = inference_providers::ChatCompletionParams {
+            request_priority: 0,
             model: model_id,
             messages: vec![inference_providers::ChatMessage {
                 reasoning_content: None,
@@ -7029,6 +7030,7 @@ mod tests {
         pool.register_provider(model_id.clone(), mock_provider.clone())
             .await;
         let params = inference_providers::ChatCompletionParams {
+            request_priority: 0,
             model: model_id,
             messages: vec![inference_providers::ChatMessage {
                 reasoning_content: None,
@@ -9099,6 +9101,7 @@ mod tests {
 
     fn fallback_params(model: &str) -> inference_providers::ChatCompletionParams {
         inference_providers::ChatCompletionParams {
+            request_priority: 0,
             model: model.to_string(),
             messages: vec![inference_providers::ChatMessage {
                 reasoning_content: None,
@@ -9175,9 +9178,11 @@ mod tests {
             );
         }
 
+        let mut params = fallback_params(&model_id);
+        params.request_priority = -2;
         let started = std::time::Instant::now();
         let resp = pool
-            .chat_completion(fallback_params(&model_id), "test-hash".to_string())
+            .chat_completion(params, "test-hash".to_string())
             .await
             .expect("NEAR 5xx must fall back to Chutes, not fail the client request");
         let elapsed = started.elapsed();
@@ -9191,6 +9196,11 @@ mod tests {
         assert!(
             chutes.last_chat_params().await.is_some(),
             "Chutes must serve the fallback after the NEAR 5xx"
+        );
+        assert_eq!(near.last_chat_params().await.unwrap().request_priority, -2);
+        assert_eq!(
+            chutes.last_chat_params().await.unwrap().request_priority,
+            -2
         );
         let body = String::from_utf8_lossy(&resp.raw_bytes);
         assert!(

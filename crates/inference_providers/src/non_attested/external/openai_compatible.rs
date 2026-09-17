@@ -9,6 +9,8 @@
 //! - Anyscale
 //! - Any other OpenAI-compatible provider
 
+mod responses;
+
 use super::backend::{BackendConfig, ExternalBackend};
 use crate::{
     models::StreamOptions, sse_parser::new_external_sse_parser, AudioTranscriptionError,
@@ -64,6 +66,13 @@ impl Default for OpenAiCompatibleBackend {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// Astra requires Responses for function calling. Route all its turns through
+/// the same transport, including tool-result follow-ups without a tools array.
+/// Leave other models and third-party OpenAI-compatible endpoints unchanged.
+fn uses_responses(base_url: &str, model: &str) -> bool {
+    is_openai_source(base_url) && (model == "gpt-6-astra" || model.starts_with("gpt-6-astra-"))
 }
 
 /// OpenAI's `/v1/chat/completions` rejects the combination of function tools
@@ -190,6 +199,13 @@ impl ExternalBackend for OpenAiCompatibleBackend {
         model: &str,
         params: ChatCompletionParams,
     ) -> Result<StreamingResult, CompletionError> {
+        if uses_responses(&config.base_url, model) {
+            let response = responses::send(self, config, model, &params, true).await?;
+            return Ok(responses::parse_stream(
+                response.bytes_stream(),
+                model.to_string(),
+            ));
+        }
         let url = format!("{}/chat/completions", config.base_url);
 
         // Ensure streaming and usage are enabled
@@ -264,6 +280,9 @@ impl ExternalBackend for OpenAiCompatibleBackend {
         model: &str,
         params: ChatCompletionParams,
     ) -> Result<ChatCompletionResponseWithBytes, CompletionError> {
+        if uses_responses(&config.base_url, model) {
+            return responses::completion(self, config, model, &params).await;
+        }
         let url = format!("{}/chat/completions", config.base_url);
 
         // Ensure non-streaming

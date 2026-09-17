@@ -2301,21 +2301,43 @@ mod tests {
 
     #[test]
     #[serial]
-    fn native_anthropic_beta_allowlist_is_trimmed_and_deduplicated() {
-        let previous = std::env::var_os("ANTHROPIC_ALLOWED_BETAS");
+    fn native_anthropic_beta_denylist_is_trimmed_and_deduplicated() {
+        let previous = std::env::var_os("ANTHROPIC_DENIED_BETAS");
         std::env::set_var(
-            "ANTHROPIC_ALLOWED_BETAS",
-            "future-beta-1, future-beta-2, future-beta-1, ",
+            "ANTHROPIC_DENIED_BETAS",
+            "premium-beta-1, premium-beta-2, premium-beta-1, ",
         );
 
         assert_eq!(
-            ExternalProvidersConfig::from_env().anthropic_allowed_betas,
-            vec!["future-beta-1".to_string(), "future-beta-2".to_string()]
+            ExternalProvidersConfig::from_env().anthropic_denied_betas,
+            vec!["premium-beta-1".to_string(), "premium-beta-2".to_string()]
         );
 
         match previous {
+            Some(value) => std::env::set_var("ANTHROPIC_DENIED_BETAS", value),
+            None => std::env::remove_var("ANTHROPIC_DENIED_BETAS"),
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn retired_anthropic_beta_allowlist_no_longer_gates_tokens() {
+        let previous_allowed = std::env::var_os("ANTHROPIC_ALLOWED_BETAS");
+        let previous_denied = std::env::var_os("ANTHROPIC_DENIED_BETAS");
+        std::env::set_var("ANTHROPIC_ALLOWED_BETAS", "legacy-beta-2026-01-01");
+        std::env::remove_var("ANTHROPIC_DENIED_BETAS");
+
+        assert!(ExternalProvidersConfig::from_env()
+            .anthropic_denied_betas
+            .is_empty());
+
+        match previous_allowed {
             Some(value) => std::env::set_var("ANTHROPIC_ALLOWED_BETAS", value),
             None => std::env::remove_var("ANTHROPIC_ALLOWED_BETAS"),
+        }
+        match previous_denied {
+            Some(value) => std::env::set_var("ANTHROPIC_DENIED_BETAS", value),
+            None => std::env::remove_var("ANTHROPIC_DENIED_BETAS"),
         }
     }
 }
@@ -2355,9 +2377,10 @@ pub struct ExternalProvidersConfig {
     /// Expose the native Anthropic Messages routes. Hard-off by default so the
     /// first rollout can be enabled on staging without changing production.
     pub enable_anthropic_messages: bool,
-    /// Additional native Anthropic beta tokens admitted by operations without
-    /// waiting for a Cloud API release.
-    pub anthropic_allowed_betas: Vec<String>,
+    /// Native Anthropic beta tokens refused at the router. Unknown tokens are
+    /// otherwise relayed to Anthropic, so this is the operator kill-switch for a
+    /// future header-only premium beta — settable without a Cloud API release.
+    pub anthropic_denied_betas: Vec<String>,
     /// Google Gemini API key
     pub gemini_api_key: Option<String>,
     /// Default timeout for external provider requests (seconds)
@@ -2409,7 +2432,13 @@ impl ExternalProvidersConfig {
             .ok()
             .map(|value| value == "1" || value.eq_ignore_ascii_case("true"))
             .unwrap_or(false);
-        let mut anthropic_allowed_betas = env::var("ANTHROPIC_ALLOWED_BETAS")
+        if env::var_os("ANTHROPIC_ALLOWED_BETAS").is_some() {
+            eprintln!(
+                "WARN: ANTHROPIC_ALLOWED_BETAS is ignored; native Anthropic beta tokens are \
+                 relayed upstream (use ANTHROPIC_DENIED_BETAS to refuse one)"
+            );
+        }
+        let mut anthropic_denied_betas = env::var("ANTHROPIC_DENIED_BETAS")
             .ok()
             .map(|value| {
                 value
@@ -2420,8 +2449,8 @@ impl ExternalProvidersConfig {
                     .collect::<Vec<_>>()
             })
             .unwrap_or_default();
-        anthropic_allowed_betas.sort_unstable();
-        anthropic_allowed_betas.dedup();
+        anthropic_denied_betas.sort_unstable();
+        anthropic_denied_betas.dedup();
 
         // Gemini API key
         let gemini_api_key = if let Ok(path) = env::var("GEMINI_API_KEY_FILE") {
@@ -2533,7 +2562,7 @@ impl ExternalProvidersConfig {
             openai_api_key,
             anthropic_api_key,
             enable_anthropic_messages,
-            anthropic_allowed_betas,
+            anthropic_denied_betas,
             gemini_api_key,
             timeout_seconds,
             refresh_interval_secs,

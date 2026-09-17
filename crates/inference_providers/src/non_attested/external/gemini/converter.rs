@@ -431,12 +431,14 @@ pub fn convert_messages(
                     .map(&extract_content)
                     .unwrap_or_default();
 
-                // Try to parse as JSON object, otherwise wrap as {"result": content}
+                // Try to parse as JSON object, otherwise wrap as {"result": content}.
                 // Gemini requires functionResponse.response to be a JSON object (Struct),
-                // not a string or other primitive value
+                // not a string or other primitive value. It interprets structured $ref
+                // fields as media-part references, so preserve results containing them
+                // as the original text instead (including JSON Schema references).
                 let response: serde_json::Value = serde_json::from_str(&content)
                     .ok()
-                    .filter(|v: &serde_json::Value| v.is_object())
+                    .filter(|v: &serde_json::Value| v.is_object() && !contains_ref_key(v))
                     .unwrap_or_else(|| serde_json::json!({"result": content}));
 
                 // Get function name from the message's name field
@@ -451,6 +453,16 @@ pub fn convert_messages(
     }
 
     (system_instruction, contents)
+}
+
+fn contains_ref_key(value: &serde_json::Value) -> bool {
+    match value {
+        serde_json::Value::Object(object) => {
+            object.contains_key("$ref") || object.values().any(contains_ref_key)
+        }
+        serde_json::Value::Array(array) => array.iter().any(contains_ref_key),
+        _ => false,
+    }
 }
 
 /// JSON Schema keywords that Gemini's OpenAPI subset does not accept.
@@ -883,6 +895,54 @@ impl SSEEventParser for GeminiEventParser {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_tool_results_with_refs_preserve_original_text() {
+        let cases = [
+            "{\n  \"$ref\": \"#/$defs/Config\", \"$defs\": {\"Config\": {\"type\": \"object\"}}\n}",
+            r##"{"schema":{"$ref":"#/$defs/Config"},"other":42}"##,
+            r##"{"schemas":[{"nested":[{"$ref":"#/$defs/Config"}]}]}"##,
+            r##"[{"$ref":"#/$defs/Config"}]"##,
+        ];
+        for content in cases {
+            let response = serialized_tool_response(content);
+            assert_eq!(response["name"], "get_config");
+            assert_eq!(response["response"], serde_json::json!({"result": content}));
+        }
+    }
+
+    #[test]
+    fn test_tool_results_without_refs_keep_existing_format() {
+        for content in [
+            r#"{"temperature":20,"details":{"units":"C"}}"#,
+            r#"{"text":"literal $ref and #/$defs/Config","$defs":{"Config":{}}}"#,
+        ] {
+            assert_eq!(
+                serialized_tool_response(content)["response"],
+                serde_json::from_str::<serde_json::Value>(content).unwrap()
+            );
+        }
+        for content in ["plain text", "42", "null", "[1,2]", "{invalid json"] {
+            assert_eq!(
+                serialized_tool_response(content)["response"],
+                serde_json::json!({"result": content})
+            );
+        }
+    }
+
+    fn serialized_tool_response(content: &str) -> serde_json::Value {
+        let messages = vec![ChatMessage {
+            reasoning_content: None,
+            role: MessageRole::Tool,
+            content: Some(serde_json::json!(content)),
+            name: Some("get_config".to_string()),
+            tool_call_id: Some("call_config".to_string()),
+            tool_calls: None,
+        }];
+        let (_, contents) = convert_messages(&messages);
+        let wire = serde_json::to_value(&contents).unwrap();
+        wire[0]["parts"][0]["functionResponse"].clone()
+    }
 
     #[test]
     fn test_convert_messages_with_system() {

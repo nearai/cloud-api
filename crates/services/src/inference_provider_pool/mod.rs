@@ -4197,6 +4197,35 @@ impl InferenceProviderPool {
         })
     }
 
+    /// Dispatch native Responses once, without falling back to Chat Completions.
+    pub async fn responses_raw(
+        &self,
+        model: &str,
+        body: serde_json::Value,
+    ) -> Result<
+        (
+            inference_providers::responses_raw::ResponsesRawResponse,
+            crate::usage::ProviderAttribution,
+        ),
+        CompletionError,
+    > {
+        let providers = self
+            .get_providers_with_fallback(model, None, &ChatRoutingHints::default())
+            .await
+            .ok_or_else(|| {
+                CompletionError::CompletionError("No native Responses provider".into())
+            })?;
+        let provider = providers
+            .into_iter()
+            .find(|p| p.supports_responses_raw())
+            .ok_or_else(|| {
+                CompletionError::CompletionError("No native Responses provider".into())
+            })?;
+        let attribution = served_provider_attribution(provider.as_ref(), false);
+        let response = provider.responses_raw(body).await?;
+        Ok((response, attribution))
+    }
+
     /// Dispatch one native Anthropic request without retrying or crossing
     /// protocol/provider boundaries.
     pub async fn anthropic_raw(

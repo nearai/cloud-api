@@ -576,6 +576,28 @@ impl InferenceProvider for ExternalProvider {
             .await
     }
 
+    async fn responses_raw(
+        &self,
+        body: serde_json::Value,
+    ) -> Result<crate::responses_raw::ResponsesRawResponse, CompletionError> {
+        // Apply operator defaults and enforced policy before transport validation.
+        let mut fields = serde_json::from_value(body).map_err(|e| {
+            CompletionError::CompletionError(format!("Invalid Responses body: {e}"))
+        })?;
+        self.inject_extra_request_body(&mut fields);
+        let body = serde_json::to_value(fields)
+            .map_err(|e| CompletionError::CompletionError(e.to_string()))?;
+        self.backend
+            .responses_raw(&self.config, &self.model_name, body)
+            .await
+    }
+
+    fn supports_responses_raw(&self) -> bool {
+        self.backend.backend_type() == "openai_compatible"
+            && openai_compatible::is_openai_source(&self.config.base_url)
+            && crate::responses_raw::is_astra(&self.model_name)
+    }
+
     async fn anthropic_raw(
         &self,
         request: AnthropicRawRequest,

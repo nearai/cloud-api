@@ -225,6 +225,7 @@ impl From<ServiceResponseError> for ErrorResponse {
 // State for response routes
 #[derive(Clone)]
 pub struct ResponseRouteState {
+    pub native_app_state: super::api::AppState,
     pub response_service: Arc<ResponseServiceImpl>,
     pub attestation_service: Arc<dyn AttestationServiceTrait>,
 }
@@ -249,6 +250,45 @@ pub struct ResponseRouteState {
     )
 )]
 pub async fn create_response(
+    State(state): State<ResponseRouteState>,
+    Extension(api_key): Extension<AuthenticatedApiKey>,
+    Extension(body_hash): Extension<RequestBodyHash>,
+    Extension(correlation): Extension<RequestCorrelation>,
+    headers: HeaderMap,
+    OpenAiJson(raw): OpenAiJson<Box<serde_json::value::RawValue>>,
+) -> axum::response::Response {
+    // Keep the original JSON for legacy typed extraction (including its errors).
+    let native = serde_json::from_str::<serde_json::Value>(raw.get())
+        .ok()
+        .filter(super::responses_native::selected);
+    if let Some(body) = native {
+        return super::responses_native::handle(
+            state.native_app_state,
+            api_key,
+            headers,
+            body_hash.hash,
+            body,
+        )
+        .await;
+    }
+    // All other requests keep the existing typed validation, defaults and
+    // stateful service. Native-only fields never pass through that conversion.
+    let request = match axum::Json::<CreateResponseRequest>::from_bytes(raw.get().as_bytes()) {
+        Ok(axum::Json(request)) => request,
+        Err(e) => return super::extractors::OpenAiJsonRejection(e).into_response(),
+    };
+    create_legacy_response(
+        State(state),
+        Extension(api_key),
+        Extension(body_hash),
+        Extension(correlation),
+        headers,
+        OpenAiJson(request),
+    )
+    .await
+}
+
+async fn create_legacy_response(
     State(state): State<ResponseRouteState>,
     Extension(api_key): Extension<AuthenticatedApiKey>,
     Extension(body_hash): Extension<RequestBodyHash>,

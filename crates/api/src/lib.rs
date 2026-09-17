@@ -1325,6 +1325,7 @@ pub fn build_app_with_config_and_options(
     let internal_routes = build_internal_routes(app_state.clone());
 
     let response_routes = build_response_routes(
+        app_state.clone(),
         domain_services.response_service,
         domain_services.attestation_service.clone(),
         &auth_components.auth_state_middleware,
@@ -1741,6 +1742,7 @@ pub fn build_completion_routes(
 
 /// Build response routes with auth
 pub fn build_response_routes(
+    native_app_state: AppState,
     response_service: Arc<services::ResponseService>,
     attestation_service: Arc<dyn services::attestation::ports::AttestationServiceTrait>,
     auth_state_middleware: &AuthState,
@@ -1748,6 +1750,7 @@ pub fn build_response_routes(
     rate_limit_state: middleware::RateLimitState,
 ) -> Router {
     let route_state = responses::ResponseRouteState {
+        native_app_state,
         response_service: response_service.clone(),
         attestation_service: attestation_service.clone(),
     };

@@ -9,8 +9,6 @@
 //! - Anyscale
 //! - Any other OpenAI-compatible provider
 
-mod responses;
-
 use super::backend::{BackendConfig, ExternalBackend};
 use crate::{
     models::StreamOptions, sse_parser::new_external_sse_parser, AudioTranscriptionError,
@@ -68,13 +66,6 @@ impl Default for OpenAiCompatibleBackend {
     }
 }
 
-/// Astra requires Responses for function calling. Route all its turns through
-/// the same transport, including tool-result follow-ups without a tools array.
-/// Leave other models and third-party OpenAI-compatible endpoints unchanged.
-fn uses_responses(base_url: &str, model: &str) -> bool {
-    is_openai_source(base_url) && (model == "gpt-6-astra" || model.starts_with("gpt-6-astra-"))
-}
-
 /// OpenAI's `/v1/chat/completions` rejects the combination of function tools
 /// and `reasoning_effort` for reasoning models (gpt-5.5, o1, o3, …) with:
 ///
@@ -128,7 +119,7 @@ fn normalize_reasoning_effort_for_openai_tools(
 /// (Together, Groq, Fireworks, OpenRouter, …) are intentionally excluded
 /// because they tend to accept (or apply) the extra sampling knobs below, and
 /// stripping them there would silently change behaviour.
-fn is_openai_source(base_url: &str) -> bool {
+pub(super) fn is_openai_source(base_url: &str) -> bool {
     // Match on the parsed URL *host* (lower-cased), not a substring of the whole
     // URL. A substring check would both miss mixed-case hosts (`API.OPENAI.COM`)
     // and misclassify look-alikes such as `api.openai.com.evil.example` as
@@ -193,19 +184,56 @@ impl ExternalBackend for OpenAiCompatibleBackend {
         "openai_compatible"
     }
 
+    async fn responses_raw(
+        &self,
+        config: &BackendConfig,
+        model: &str,
+        mut body: serde_json::Value,
+    ) -> Result<crate::responses_raw::ResponsesRawResponse, CompletionError> {
+        use futures_util::TryStreamExt;
+        if !is_openai_source(&config.base_url)
+            || !crate::responses_raw::is_astra(model)
+            || !crate::responses_raw::is_stateless(&body)
+        {
+            return Err(CompletionError::CompletionError(
+                "Native Responses requires stateless Astra on an OpenAI upstream".into(),
+            ));
+        }
+        body["model"] = serde_json::json!(model);
+        let response = self
+            .client
+            .post(format!(
+                "{}/responses",
+                config.base_url.trim_end_matches('/')
+            ))
+            .headers(
+                self.build_headers(config)
+                    .map_err(CompletionError::CompletionError)?,
+            )
+            .timeout(std::time::Duration::from_secs(
+                config.timeout_seconds as u64,
+            ))
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| CompletionError::CompletionError(e.to_string()))?;
+        Ok(crate::responses_raw::ResponsesRawResponse {
+            status: response.status(),
+            headers: response.headers().clone(),
+            body: Box::pin(
+                response
+                    .bytes_stream()
+                    .map_err(|e| CompletionError::CompletionError(e.to_string())),
+            ),
+        })
+    }
+
     async fn chat_completion_stream(
         &self,
         config: &BackendConfig,
         model: &str,
         params: ChatCompletionParams,
     ) -> Result<StreamingResult, CompletionError> {
-        if uses_responses(&config.base_url, model) {
-            let response = responses::send(self, config, model, &params, true).await?;
-            return Ok(responses::parse_stream(
-                response.bytes_stream(),
-                model.to_string(),
-            ));
-        }
         let url = format!("{}/chat/completions", config.base_url);
 
         // Ensure streaming and usage are enabled
@@ -280,9 +308,6 @@ impl ExternalBackend for OpenAiCompatibleBackend {
         model: &str,
         params: ChatCompletionParams,
     ) -> Result<ChatCompletionResponseWithBytes, CompletionError> {
-        if uses_responses(&config.base_url, model) {
-            return responses::completion(self, config, model, &params).await;
-        }
         let url = format!("{}/chat/completions", config.base_url);
 
         // Ensure non-streaming
@@ -1161,3 +1186,6 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+mod responses_raw_tests;

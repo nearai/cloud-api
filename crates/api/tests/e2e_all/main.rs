@@ -79,6 +79,7 @@ mod repositories;
 mod request_id_contract;
 mod rerank;
 mod response_signature_verification;
+mod responses_native;
 mod score;
 mod serving_provider;
 mod session_logout;

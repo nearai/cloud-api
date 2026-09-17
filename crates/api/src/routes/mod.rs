@@ -27,3 +27,5 @@ pub mod unsupported;
 pub mod usage;
 pub mod users;
 pub mod workspaces;
+
+mod responses_native;

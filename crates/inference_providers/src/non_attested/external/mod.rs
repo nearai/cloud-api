@@ -578,6 +578,29 @@ impl InferenceProvider for ExternalProvider {
             .await
     }
 
+    async fn responses_raw(
+        &self,
+        body: serde_json::Value,
+    ) -> Result<crate::responses_raw::ResponsesRawResponse, CompletionError> {
+        // Apply operator defaults and enforced policy before transport validation.
+        let mut fields = serde_json::from_value(body).map_err(|e| {
+            CompletionError::CompletionError(format!("Invalid Responses body: {e}"))
+        })?;
+        self.inject_extra_request_body(&mut fields);
+        let body = serde_json::to_value(fields)
+            .map_err(|e| CompletionError::CompletionError(e.to_string()))?;
+        self.backend
+            .responses_raw(&self.config, &self.model_name, body)
+            .await
+    }
+
+    fn supports_responses_raw(&self) -> bool {
+        // Capability depends on the protocol/host, not the deployment name.
+        // The service authorizes canonical model IDs through its allowlist.
+        self.backend.backend_type() == "openai_compatible"
+            && openai_compatible::is_openai_source(&self.config.base_url)
+    }
+
     async fn anthropic_raw(
         &self,
         request: AnthropicRawRequest,
@@ -596,6 +619,18 @@ impl InferenceProvider for ExternalProvider {
 mod tests {
     use super::*;
     use std::collections::HashMap;
+
+    #[test]
+    fn native_responses_capability_accepts_deployment_overrides() {
+        let config = ExternalProviderConfig {
+            model_name: "openai/gpt-6-astra".into(),
+            provider_config: serde_json::from_value(serde_json::json!({
+                "backend":"openai_compatible", "base_url":"https://example.openai.azure.com/openai/v1", "model_name":"astra-prod"
+            })).unwrap(),
+            api_key: "test".into(), timeout_seconds: 30,
+        };
+        assert!(ExternalProvider::new(config).supports_responses_raw());
+    }
 
     #[test]
     fn strip_internal_keys_removes_routing_pin_and_tracing_keys() {

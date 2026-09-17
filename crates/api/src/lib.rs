@@ -1325,6 +1325,7 @@ pub fn build_app_with_config_and_options(
     let internal_routes = build_internal_routes(app_state.clone());
 
     let response_routes = build_response_routes(
+        app_state.clone(),
         domain_services.response_service,
         domain_services.attestation_service.clone(),
         &auth_components.auth_state_middleware,
@@ -1741,6 +1742,7 @@ pub fn build_completion_routes(
 
 /// Build response routes with auth
 pub fn build_response_routes(
+    native_app_state: AppState,
     response_service: Arc<services::ResponseService>,
     attestation_service: Arc<dyn services::attestation::ports::AttestationServiceTrait>,
     auth_state_middleware: &AuthState,
@@ -1748,6 +1750,14 @@ pub fn build_response_routes(
     rate_limit_state: middleware::RateLimitState,
 ) -> Router {
     let route_state = responses::ResponseRouteState {
+        native_service: services::responses::native::NativeResponsesService {
+            models: native_app_state.config.native_responses_models.clone(),
+            models_service: native_app_state.models_service,
+            completion_service: native_app_state.completion_service,
+            inference_provider_pool: native_app_state.inference_provider_pool,
+            usage_service: native_app_state.usage_service,
+            attestation_service: native_app_state.attestation_service,
+        },
         response_service: response_service.clone(),
         attestation_service: attestation_service.clone(),
     };
@@ -2882,6 +2892,7 @@ mod tests {
             },
             inference_api_key: Some("test-key".to_string()),
             internal_usage_token: None,
+            native_responses_models: Vec::new(),
             logging: config::LoggingConfig {
                 level: "info".to_string(),
                 format: "compact".to_string(),
@@ -3000,6 +3011,7 @@ mod tests {
             },
             inference_api_key: Some("test-key".to_string()),
             internal_usage_token: None,
+            native_responses_models: Vec::new(),
             logging: config::LoggingConfig {
                 level: "info".to_string(),
                 format: "compact".to_string(),

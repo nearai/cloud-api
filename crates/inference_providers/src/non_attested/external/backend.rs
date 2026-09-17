@@ -205,6 +205,18 @@ pub trait ExternalBackend: Send + Sync {
         )))
     }
 
+    /// Performs a native stateless Responses request as a raw HTTP passthrough.
+    async fn responses_raw(
+        &self,
+        _config: &BackendConfig,
+        _model: &str,
+        _body: serde_json::Value,
+    ) -> Result<crate::responses_raw::ResponsesRawResponse, CompletionError> {
+        Err(CompletionError::CompletionError(
+            "Native Responses is unavailable for this backend".into(),
+        ))
+    }
+
     /// Performs a native Anthropic Messages request as a raw HTTP passthrough.
     async fn anthropic_raw(
         &self,

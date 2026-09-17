@@ -4197,6 +4197,46 @@ impl InferenceProviderPool {
         })
     }
 
+    /// Dispatch native Responses once, without falling back to Chat Completions.
+    pub async fn responses_raw(
+        &self,
+        model: &str,
+        body: serde_json::Value,
+        fallback_enabled: bool,
+    ) -> Result<
+        (
+            inference_providers::responses_raw::ResponsesRawResponse,
+            crate::usage::ProviderAttribution,
+        ),
+        CompletionError,
+    > {
+        let providers = self
+            .get_providers_with_fallback(
+                model,
+                None,
+                &ChatRoutingHints {
+                    fallback_disabled: !fallback_enabled,
+                    ..Default::default()
+                },
+            )
+            .await
+            .ok_or_else(|| {
+                CompletionError::CompletionError("No native Responses provider".into())
+            })?;
+        let provider = providers
+            .into_iter()
+            .find(|p| p.supports_responses_raw())
+            .ok_or_else(|| {
+                CompletionError::CompletionError("No native Responses provider".into())
+            })?;
+        let attribution = served_provider_attribution(
+            provider.as_ref(),
+            self.is_registered_fallback_provider(model, &provider),
+        );
+        let response = provider.responses_raw(body).await?;
+        Ok((response, attribution))
+    }
+
     /// Dispatch one native Anthropic request without retrying or crossing
     /// protocol/provider boundaries.
     pub async fn anthropic_raw(
@@ -10607,6 +10647,52 @@ mod tests {
             .expect("registered model");
         assert_eq!(standalone_again.len(), 1);
         assert!(Arc::ptr_eq(&standalone_again[0], &pinned_provider));
+    }
+
+    #[tokio::test]
+    async fn native_responses_honors_fallback_policy_and_attribution() {
+        use inference_providers::{
+            mock::MockProvider, responses_raw::ResponsesRawResponse, ProviderTier,
+        };
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let pool = InferenceProviderPool::new(None, ExternalProvidersConfig::default());
+        let calls = Arc::new(AtomicUsize::new(0));
+        let captured = calls.clone();
+        let primary = Arc::new(MockProvider::new_accept_all().with_tier(ProviderTier::NonAttested));
+        let fallback = Arc::new(
+            MockProvider::new_accept_all()
+                .with_tier(ProviderTier::NonAttested)
+                .with_responses_handler(move |_| {
+                    captured.fetch_add(1, Ordering::SeqCst);
+                    ResponsesRawResponse {
+                        status: reqwest::StatusCode::OK,
+                        headers: Default::default(),
+                        body: Box::pin(futures::stream::empty()),
+                    }
+                }),
+        );
+        let model = "native/policy";
+        pool.register_provider(model.into(), primary).await;
+        pool.register_pinned_secondary_provider(model.into(), fallback.clone(), None)
+            .await;
+        assert!(pool
+            .responses_raw(model, serde_json::json!({"store":false}), false)
+            .await
+            .is_err());
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        let (_, attribution) = pool
+            .responses_raw(model, serde_json::json!({"store":false}), true)
+            .await
+            .unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert!(attribution.served_via_fallback);
+        pool.register_provider("native/primary".into(), fallback)
+            .await;
+        let (_, attribution) = pool
+            .responses_raw("native/primary", serde_json::json!({"store":false}), false)
+            .await
+            .unwrap();
+        assert!(!attribution.served_via_fallback);
     }
 
     #[tokio::test]

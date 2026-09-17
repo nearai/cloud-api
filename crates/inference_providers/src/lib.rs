@@ -62,6 +62,7 @@ pub mod chunk_builder;
 pub mod mock;
 pub mod models;
 pub mod non_attested;
+pub mod responses_raw;
 pub mod rotation;
 pub mod spki_verifier;
 pub mod sse_parser;
@@ -343,6 +344,20 @@ pub trait InferenceProvider {
         body: bytes::Bytes,
         extra: std::collections::HashMap<String, serde_json::Value>,
     ) -> Result<bytes::Bytes, PrivacyClassifyError>;
+
+    /// Native stateless Responses transport, deliberately separate from chat.
+    async fn responses_raw(
+        &self,
+        _body: serde_json::Value,
+    ) -> Result<responses_raw::ResponsesRawResponse, CompletionError> {
+        Err(CompletionError::CompletionError(
+            "Native Responses is unavailable for this provider".into(),
+        ))
+    }
+
+    fn supports_responses_raw(&self) -> bool {
+        false
+    }
 
     /// Performs a native Anthropic Messages request without schema conversion.
     ///

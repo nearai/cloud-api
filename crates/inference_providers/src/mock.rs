@@ -676,8 +676,12 @@ impl MockExpectationBuilder {
     }
 }
 
+type ResponsesHandler =
+    Arc<dyn Fn(serde_json::Value) -> crate::responses_raw::ResponsesRawResponse + Send + Sync>;
+
 /// Mock provider that implements InferenceProvider for testing
 pub struct MockProvider {
+    responses_handler: Option<ResponsesHandler>,
     /// List of available mock models
     models: Vec<ModelInfo>,
     /// Map of chat_id to (request_hash, response_hash) for signature generation
@@ -714,6 +718,18 @@ pub struct MockProvider {
 }
 
 impl MockProvider {
+    /// Install a native Responses fixture without affecting chat fixtures.
+    pub fn with_responses_handler(
+        mut self,
+        handler: impl Fn(serde_json::Value) -> crate::responses_raw::ResponsesRawResponse
+            + Send
+            + Sync
+            + 'static,
+    ) -> Self {
+        self.responses_handler = Some(Arc::new(handler));
+        self
+    }
+
     /// Create a new mock provider with default models
     pub fn new() -> Self {
         let models = vec![ModelInfo {
@@ -746,6 +762,7 @@ impl MockProvider {
             supports_client_e2ee: true,
             supports_chat_signatures: true,
             unpinned_chat_ids: Arc::new(std::sync::Mutex::new(Vec::new())),
+            responses_handler: None,
         }
     }
 
@@ -773,6 +790,7 @@ impl MockProvider {
             supports_client_e2ee: true,
             supports_chat_signatures: true,
             unpinned_chat_ids: Arc::new(std::sync::Mutex::new(Vec::new())),
+            responses_handler: None,
         }
     }
 
@@ -798,6 +816,7 @@ impl MockProvider {
             supports_client_e2ee: true,
             supports_chat_signatures: true,
             unpinned_chat_ids: Arc::new(std::sync::Mutex::new(Vec::new())),
+            responses_handler: None,
         }
     }
 
@@ -1036,6 +1055,20 @@ impl Default for MockProvider {
 
 #[async_trait]
 impl crate::InferenceProvider for MockProvider {
+    fn supports_responses_raw(&self) -> bool {
+        self.responses_handler.is_some()
+    }
+
+    async fn responses_raw(
+        &self,
+        body: serde_json::Value,
+    ) -> Result<crate::responses_raw::ResponsesRawResponse, CompletionError> {
+        self.responses_handler
+            .as_ref()
+            .map(|handler| handler(body))
+            .ok_or_else(|| CompletionError::CompletionError("No native Responses fixture".into()))
+    }
+
     fn tier(&self) -> crate::ProviderTier {
         self.tier
     }

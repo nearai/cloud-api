@@ -492,6 +492,8 @@ const GEMINI_UNSUPPORTED_SCHEMA_KEYS: &[&str] = &[
     "dependentSchemas",
     "else",
     "examples",
+    "exclusiveMaximum",
+    "exclusiveMinimum",
     "if",
     "patternProperties",
     "propertyNames",
@@ -1353,6 +1355,57 @@ mod tests {
             !serialized.contains("additionalProperties"),
             "serialized parameters must not contain `additionalProperties`; got: {}",
             serialized
+        );
+    }
+
+    #[test]
+    fn test_convert_tools_strips_exclusive_bounds_and_preserves_supported_constraints() {
+        // #1075: OpenCode emits exclusive bounds, which Gemini's parameters
+        // Schema rejects. Stripping them is best-effort: callers still need to
+        // validate arguments against their original schema.
+        let tools = vec![ToolDefinition {
+            type_: "function".to_string(),
+            function: crate::FunctionDefinition {
+                name: "measure".to_string(),
+                description: None,
+                parameters: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "t": {"type": "number", "exclusiveMinimum": 0},
+                        "exclusiveMinimum": {"type": "number", "exclusiveMaximum": 10},
+                        "exclusiveMaximum": {"type": "string"},
+                        "samples": {
+                            "type": "array", "minItems": 1, "maxItems": 10,
+                            "items": {"anyOf": [
+                                {"type": "number", "minimum": 0, "maximum": 10,
+                                 "exclusiveMinimum": 0, "exclusiveMaximum": 10},
+                                {"type": "integer", "minimum": 0, "exclusiveMinimum": true}
+                            ]}
+                        }
+                    },
+                    "required": ["t", "exclusiveMinimum", "exclusiveMaximum"]
+                }),
+            },
+        }];
+        let converted = convert_tools(&tools);
+        assert_eq!(
+            converted[0].function_declarations[0].parameters,
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "t": {"type": "number"},
+                    "exclusiveMinimum": {"type": "number"},
+                    "exclusiveMaximum": {"type": "string"},
+                    "samples": {
+                        "type": "array", "minItems": 1, "maxItems": 10,
+                        "items": {"anyOf": [
+                            {"type": "number", "minimum": 0, "maximum": 10},
+                            {"type": "integer", "minimum": 0}
+                        ]}
+                    }
+                },
+                "required": ["t", "exclusiveMinimum", "exclusiveMaximum"]
+            })
         );
     }
 

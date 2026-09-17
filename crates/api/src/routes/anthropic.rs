@@ -6,9 +6,12 @@
 //!
 //! `anthropic-beta` is transport, not policy: tokens are syntax-checked and
 //! relayed verbatim, leaving Anthropic (which rejects names it does not know)
-//! as the authority on validity. Billing and product policy are enforced on the
-//! body instead — see [`reject_unsupported_features`] — so a beta token can
-//! never by itself unlock a premium or server-side feature.
+//! as the authority on validity. Body-gated billing and product restrictions
+//! remain enforced by [`reject_unsupported_features`]. An accepted beta can still
+//! introduce header-only pricing or change the response shape: incompatible
+//! non-streaming usage yields a 502 after upstream may already have billed the
+//! work. `ANTHROPIC_DENIED_BETAS` is the global operator kill-switch for these
+//! cases; model-specific pricing restrictions need separate policy.
 
 use crate::middleware::auth::AuthenticatedApiKey;
 use crate::models::AnthropicErrorResponse;
@@ -1304,6 +1307,19 @@ redact-thinking-2026-02-12";
     }
 
     #[test]
+    fn beta_token_deduplication_preserves_case() {
+        let mut headers = request_headers();
+        headers.insert("anthropic-beta", HeaderValue::from_static("beta,BETA,beta"));
+        // Preserve provider-visible spelling; only identical tokens deduplicate.
+        // Operator denial intentionally covers all case variants instead.
+        assert_eq!(
+            normalized_beta_header(&headers, &[]).unwrap().as_deref(),
+            Some("beta,BETA")
+        );
+        assert!(normalized_beta_header(&headers, &["BeTa".to_string()]).is_err());
+    }
+
+    #[test]
     fn current_claude_code_beta_set_and_query_are_accepted() {
         let mut headers = request_headers();
         headers.insert(
@@ -1374,14 +1390,37 @@ redact-thinking-2026-02-12";
         let mut headers = request_headers();
         headers.insert("anthropic-beta", HeaderValue::from_bytes(b"\xff").unwrap());
         assert!(normalized_beta_header(&headers, &[]).is_err());
+    }
 
-        // One below each bound still passes.
+    #[test]
+    fn beta_token_limits_are_inclusive() {
+        // Exactly the maximum token length and distinct-token count are valid.
         let mut headers = request_headers();
         headers.insert(
             "anthropic-beta",
             HeaderValue::from_str(&"a".repeat(MAX_BETA_TOKEN_LEN)).unwrap(),
         );
         assert!(normalized_beta_header(&headers, &[]).is_ok());
+
+        let at_limit = (0..MAX_BETA_TOKENS)
+            .map(|index| format!("beta-{index}"))
+            .collect::<Vec<_>>()
+            .join(",");
+        headers.insert("anthropic-beta", HeaderValue::from_str(&at_limit).unwrap());
+        assert_eq!(
+            normalized_beta_header(&headers, &[]).unwrap().as_deref(),
+            Some(at_limit.as_str())
+        );
+        // A duplicate does not consume another distinct-token slot.
+        headers.append("anthropic-beta", HeaderValue::from_static("beta-0"));
+        assert_eq!(
+            normalized_beta_header(&headers, &[]).unwrap().as_deref(),
+            Some(at_limit.as_str())
+        );
+        headers.append("anthropic-beta", HeaderValue::from_static("beta-extra"));
+        let error = normalized_beta_header(&headers, &[]).unwrap_err();
+        assert_eq!(error.status, StatusCode::BAD_REQUEST);
+        assert!(error.message.contains("more than 64 distinct tokens"));
     }
 
     #[test]

@@ -3,6 +3,9 @@ use axum::http::{Method, StatusCode};
 use serde_json::{json, Value};
 use uuid::Uuid;
 
+#[path = "organization_priority_local_proxy.rs"]
+mod local_proxy;
+
 async fn admin_call(
     server: &axum_test::TestServer,
     method: Method,

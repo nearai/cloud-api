@@ -66,6 +66,7 @@ pub mod responses_raw;
 pub mod rotation;
 pub mod spki_verifier;
 pub mod sse_parser;
+pub mod thought_signature;
 
 // Attested NEAR-AI fleet provider. Use the module path (`nearai::Provider`,
 // `nearai::Config`) rather than a bare re-export to keep the names unambiguous.

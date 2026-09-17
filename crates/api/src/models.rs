@@ -259,8 +259,26 @@ pub struct ToolCall {
     /// Gemini-3 thought_signature. The client must echo this verbatim on
     /// the next turn or Gemini rejects the request with
     /// "Function call is missing a thought_signature".
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(flatten, with = "inference_providers::thought_signature")]
+    #[schema(schema_with = tool_call_signature_schema)]
     pub thought_signature: Option<String>,
+}
+
+// This flattened field serializes a legacy signature and the Google-compatible
+// nested form from one internal value. Describe both keys in the API schema.
+fn tool_call_signature_schema() -> utoipa::openapi::schema::Object {
+    use utoipa::openapi::schema::{ObjectBuilder, Type};
+    let signature = ObjectBuilder::new().schema_type(Type::String).build();
+    ObjectBuilder::new()
+        .property("thought_signature", signature.clone())
+        .property(
+            "extra_content",
+            ObjectBuilder::new().property(
+                "google",
+                ObjectBuilder::new().property("thought_signature", signature),
+            ),
+        )
+        .build()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]

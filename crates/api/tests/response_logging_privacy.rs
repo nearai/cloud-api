@@ -17,6 +17,7 @@ fn response_log_sources() -> Result<Vec<(PathBuf, String)>, String> {
     let api_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let mut paths = vec![
         api_root.join("src/routes/responses.rs"),
+        api_root.join("src/routes/responses_native.rs"),
         api_root.join("src/middleware/body_hash.rs"),
     ];
     collect_rust_sources(&api_root.join("../services/src/responses"), &mut paths)?;
@@ -725,7 +726,9 @@ fn is_allowed_plain_field(field: Option<&str>, expression: &str) -> bool {
         ("error_category", r#""image_edit_provider_failure""#),
         ("error_category", r#""image_generation_provider_failure""#),
         ("error_category", r#""invalid_json""#),
+        ("error_category", r#""signature_recording_failed""#),
         ("error_category", r#""title_generation_task_panicked""#),
+        ("error_category", r#""usage_recording_failed""#),
         ("error_category", "e.log_category()"),
         ("error_category", "error.log_category()"),
         ("error_category", "error_category"),

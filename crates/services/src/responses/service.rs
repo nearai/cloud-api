@@ -17,6 +17,8 @@ struct ProcessStreamContext {
     request_id: uuid::Uuid,
     organization_id: uuid::Uuid,
     workspace_id: uuid::Uuid,
+    fallback_enabled: bool,
+    request_priority: inference_providers::models::RequestPriority,
     body_hash: String,
     signing_algo: Option<String>,
     client_pub_key: Option<String>,
@@ -63,6 +65,8 @@ impl ports::ResponseServiceTrait for ResponseServiceImpl {
         request_id: uuid::Uuid,
         organization_id: uuid::Uuid,
         workspace_id: uuid::Uuid,
+        fallback_enabled: bool,
+        request_priority: inference_providers::models::RequestPriority,
         body_hash: String,
         signing_algo: Option<String>,
         client_pub_key: Option<String>,
@@ -126,6 +130,8 @@ impl ports::ResponseServiceTrait for ResponseServiceImpl {
                 request_id,
                 organization_id,
                 workspace_id,
+                fallback_enabled,
+                request_priority,
                 body_hash,
                 signing_algo: signing_algo_clone,
                 client_pub_key: client_pub_key_clone,
@@ -889,6 +895,7 @@ impl ResponseServiceImpl {
         }
 
         let completion_request = CompletionRequest {
+            request_priority: process_context.request_priority,
             request_id: process_context.request_id,
             model: process_context.request.model.clone(),
             messages: messages.to_vec(),
@@ -901,11 +908,15 @@ impl ResponseServiceImpl {
             api_key_id: process_context.api_key_id.to_string(),
             organization_id: process_context.organization_id,
             workspace_id: process_context.workspace_id,
+            fallback_enabled: process_context.fallback_enabled,
             metadata: process_context.request.metadata.clone(),
             store: process_context.request.store,
             body_hash: process_context.body_hash.clone(),
             response_id: None,
-            skip_provider_chat_signature: false,
+            // Responses rewrites the upstream stream and publishes its own
+            // gateway signature over the client-visible bytes. Do not also
+            // fetch a provider signature for this internal Chat Completion.
+            skip_provider_chat_signature: true,
             original_request: None,
             n: None,
             service_tier: Some(inference_providers::ChatServiceTier::Default),
@@ -1267,6 +1278,7 @@ impl ResponseServiceImpl {
                 content: serde_json::Value::String(String::new()),
                 tool_call_id: None,
                 tool_calls: None,
+                reasoning_content: None,
             }
         });
         message.tool_calls = Some(std::mem::take(pending_function_calls));
@@ -1310,6 +1322,7 @@ impl ResponseServiceImpl {
                     content: serde_json::Value::String(output.clone()),
                     tool_call_id: Some(call_id.clone()),
                     tool_calls: None,
+                    reasoning_content: None,
                 });
                 true
             }
@@ -1353,6 +1366,7 @@ impl ResponseServiceImpl {
                 content: serde_json::Value::String(prompt),
                 tool_call_id: None,
                 tool_calls: None,
+                reasoning_content: None,
             });
         }
 
@@ -1374,6 +1388,7 @@ impl ResponseServiceImpl {
             content: serde_json::Value::String(system_content),
             tool_call_id: None,
             tool_calls: None,
+            reasoning_content: None,
         });
 
         match &request.input {
@@ -1382,6 +1397,7 @@ impl ResponseServiceImpl {
                 content: serde_json::Value::String(text.clone()),
                 tool_call_id: None,
                 tool_calls: None,
+                reasoning_content: None,
             }),
             Some(models::ResponseInput::Items(items)) => {
                 let mut pending_function_calls = Vec::new();
@@ -1411,6 +1427,7 @@ impl ResponseServiceImpl {
                                 content,
                                 tool_call_id: None,
                                 tool_calls: None,
+                                reasoning_content: None,
                             };
                             // An assistant message immediately before
                             // replayed function calls belongs to the same

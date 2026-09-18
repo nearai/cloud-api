@@ -21,8 +21,9 @@ use reqwest::Client;
 use sha2::{Digest, Sha256};
 use std::cmp::Reverse;
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, RwLock};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock, RwLock};
+use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::Semaphore;
 
 /// EMA smoothing for per-backend TTFT: fast warmup then stable.
@@ -40,6 +41,8 @@ const TTFT_SLOW_FLOOR_MS: f64 = 500.0;
 /// prefix from monopolizing a replica. The counter is process-local and tracks
 /// only live requests; it never stores message content.
 const PREFIX_AFFINITY_BURST: u32 = 4;
+/// Minimum interval between warnings for a stale or unknown pinned key.
+const UNKNOWN_KEY_WARN_INTERVAL_MS: u64 = 60_000;
 
 #[derive(Default, Clone, Copy)]
 pub(super) struct BackendStat {
@@ -74,6 +77,26 @@ fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
 }
 
 type PrefixLoads = HashMap<u64, Vec<u32>>;
+
+/// Outcome of resolving a pinned pubkey against the discovery key map.
+pub(super) enum KeyGroup {
+    /// No map yet, or a homogeneous fleet: route unrestricted, silently.
+    Unrestricted,
+    /// The map is populated but does not know this key: route unrestricted
+    /// and warn because the client may be holding a stale attestation.
+    UnknownKey,
+    /// Route only to these indices.
+    Indices(Vec<usize>),
+}
+
+impl KeyGroup {
+    fn indices(&self) -> Option<&[usize]> {
+        match self {
+            Self::Unrestricted | Self::UnknownKey => None,
+            Self::Indices(indices) => Some(indices),
+        }
+    }
+}
 
 /// Reservation for one live affinity-routed request. Releasing is RAII-based
 /// so cancellation, errors, and dropped streams cannot leak routing load.
@@ -141,6 +164,13 @@ pub(super) struct Fleet {
     /// Live request counts by routing key and backend index. Entries exist only
     /// while a request is in flight and contain no prompt or response content.
     prefix_loads: Arc<Mutex<PrefixLoads>>,
+    /// Pubkey (lowercase hex) to rotation indices that can serve it, from the
+    /// last discovery cycle. Empty means no restriction. A backend-count
+    /// change clears this because the index-to-backend binding is then stale.
+    backend_keys: Arc<RwLock<HashMap<String, Vec<usize>>>>,
+    /// Epoch-ms of the last `UnknownKey` warning, so a client stuck on a stale
+    /// attestation cannot flood the log from the request hot path.
+    last_unknown_key_warn_ms: AtomicU64,
     /// Provider config (base_url, api_key, timeouts).
     pub(super) config: Config,
     /// General-purpose client for non-completion requests (attestation, models).
@@ -183,6 +213,8 @@ impl Fleet {
                 rotation::MAX_FANOUT
             ])),
             prefix_loads: Arc::new(Mutex::new(HashMap::new())),
+            backend_keys: Arc::new(RwLock::new(HashMap::new())),
+            last_unknown_key_warn_ms: AtomicU64::new(0),
             config,
             client,
             fallback_client,
@@ -217,13 +249,20 @@ impl Fleet {
     /// reachable as the stateless primary. Process-local state affects only
     /// temporary first-turn spillover while requests overlap.
     #[cfg(test)]
-    pub(super) fn select_index(&self, messages: &[crate::ChatMessage]) -> Option<usize> {
+    pub(super) fn select_index(
+        &self,
+        messages: &[crate::ChatMessage],
+        pinned_pub_key: Option<&str>,
+    ) -> Option<usize> {
         let count = self.rotation_count();
         if count == 0 {
             return None;
         }
+        let key_group = self.resolve_key_group(pinned_pub_key, count);
         let route_key = self.route_key(messages);
-        self.candidate_indices(route_key, count).into_iter().next()
+        self.candidate_indices(route_key, count, key_group.indices())
+            .into_iter()
+            .next()
     }
 
     /// Reserve a backend for this request.
@@ -233,17 +272,48 @@ impl Fleet {
     /// the stable first two messages select a conversation home instead. That
     /// allows at most one deterministic handoff after the first turn and keeps
     /// all later growing-history requests on the same backend.
-    pub(super) fn acquire_index(&self, messages: &[crate::ChatMessage]) -> Option<RouteLease> {
+    pub(super) fn acquire_index(
+        &self,
+        messages: &[crate::ChatMessage],
+        pinned_pub_key: Option<&str>,
+    ) -> Option<RouteLease> {
         let count = self.rotation_count();
         if count == 0 {
             return None;
         }
+        let key_group = self.resolve_key_group(pinned_pub_key, count);
+        if matches!(key_group, KeyGroup::UnknownKey) {
+            let now_ms = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map_or(0, |elapsed| {
+                    elapsed
+                        .as_secs()
+                        .saturating_mul(1_000)
+                        .saturating_add(u64::from(elapsed.subsec_millis()))
+                });
+            if self.should_warn_unknown_key(now_ms) {
+                let pub_key_prefix: String = pinned_pub_key
+                    .unwrap_or_default()
+                    .chars()
+                    .take(16)
+                    .collect();
+                tracing::warn!(
+                    pub_key_prefix = %pub_key_prefix,
+                    "No backend key group found for pinned model public key; routing unrestricted"
+                );
+            }
+        }
+        let allowed = key_group.indices();
         let has_history = has_conversation_history(messages);
         let route_key = self.route_key(messages);
         if messages.is_empty() {
-            return Some(self.reserve_index(route_key, 0));
+            let index = allowed
+                .and_then(|group| group.first())
+                .copied()
+                .unwrap_or(0);
+            return Some(self.reserve_index(route_key, index));
         }
-        let candidates = self.candidate_indices(route_key, count);
+        let candidates = self.candidate_indices(route_key, count, allowed);
         if has_history {
             return Some(self.reserve_index(route_key, candidates[0]));
         }
@@ -302,8 +372,22 @@ impl Fleet {
         }
     }
 
-    pub(super) fn candidate_indices(&self, route_key: u64, count: usize) -> Vec<usize> {
-        let preferred = (route_key % count as u64) as usize;
+    pub(super) fn candidate_indices(
+        &self,
+        route_key: u64,
+        count: usize,
+        allowed: Option<&[usize]>,
+    ) -> Vec<usize> {
+        let (preferred, indices) = match allowed {
+            Some(group) if !group.is_empty() => (
+                group[(route_key % group.len() as u64) as usize],
+                group.to_vec(),
+            ),
+            Some(_) | None => (
+                (route_key % count as u64) as usize,
+                (0..count).collect::<Vec<_>>(),
+            ),
+        };
         let stats = lock(&self.backend_stats);
         // Warmed EMA for index `i`, or None if out of range / not yet warmed.
         // `.get()` keeps this panic-free regardless of how `count` relates to
@@ -314,7 +398,11 @@ impl Fleet {
                 .filter(|s| s.samples >= TTFT_WARMUP_SAMPLES && s.ttft_ewma_ms > 0.0)
                 .map(|s| s.ttft_ewma_ms)
         };
-        let min_warm = (0..count).filter_map(ema).fold(f64::MAX, f64::min);
+        let min_warm = indices
+            .iter()
+            .copied()
+            .filter_map(ema)
+            .fold(f64::MAX, f64::min);
         let is_slow = |index: usize| {
             ema(index).is_some_and(|value| {
                 value > TTFT_SLOW_FLOOR_MS
@@ -322,7 +410,10 @@ impl Fleet {
                     && value > TTFT_SLOW_RATIO * min_warm
             })
         };
-        let mut candidates: Vec<usize> = (0..count).filter(|index| !is_slow(*index)).collect();
+        let mut candidates: Vec<usize> = indices
+            .into_iter()
+            .filter(|index| !is_slow(*index))
+            .collect();
         // Preserve the modulo primary, but give each colliding routing key a
         // different deterministic spill order. A simple ring makes all keys
         // with the same primary pile onto the same secondary under pressure.
@@ -371,10 +462,29 @@ impl Fleet {
 
     /// Ordering of indices to try as fallback after `tried` returned 5xx,
     /// fastest-EMA first (unwarmed backends sorted last, stable by index).
-    pub(super) fn fallback_indices(&self, tried: usize) -> Vec<usize> {
+    ///
+    /// When the request carries a pinned model pubkey and discovery resolved a
+    /// key group for it, candidates are restricted to that group: a backend
+    /// outside the group holds a different KMS-root-derived keypair and would
+    /// fail to decrypt, turning a retryable 5xx into a misleading
+    /// `400 "Decryption failed"`. An exhausted group yields an empty list, and
+    /// the caller then surfaces the original 5xx.
+    pub(super) fn fallback_indices_for(
+        &self,
+        tried: usize,
+        pinned_pub_key: Option<&str>,
+    ) -> Vec<usize> {
         let count = self.rotation_count();
+        let key_group = self.resolve_key_group(pinned_pub_key, count);
         let stats = lock(&self.backend_stats);
-        let mut idxs: Vec<usize> = (0..count).filter(|&i| i != tried).collect();
+        let mut idxs: Vec<usize> = match key_group.indices() {
+            Some(indices) => indices
+                .iter()
+                .copied()
+                .filter(|&index| index != tried)
+                .collect(),
+            None => (0..count).filter(|&index| index != tried).collect(),
+        };
         idxs.sort_by(|&a, &b| {
             let key = |i: usize| {
                 let s = stats[i];
@@ -455,6 +565,83 @@ impl Fleet {
             for s in stats.iter_mut() {
                 *s = BackendStat::default();
             }
+            self.backend_keys
+                .write()
+                .unwrap_or_else(|e| e.into_inner())
+                .clear();
+        }
+    }
+
+    pub(super) fn set_backend_keys(&self, map: HashMap<String, Vec<usize>>) {
+        let mut backend_keys = self.backend_keys.write().unwrap_or_else(|e| e.into_inner());
+        if *backend_keys == map {
+            return;
+        }
+
+        // Only clear clients in verifier mode: there, a `None` slot is
+        // lazily re-verified on next use. In legacy/test mode (no verifier)
+        // the slots are eagerly pre-created and there is nothing to re-create
+        // them — clearing would wedge the provider with "no backend verifier
+        // configured". Those legacy clients aren't backend-pinned by
+        // attestation anyway, so leaving them is correct.
+        if self.backend_verifier.is_some() {
+            for slot in &self.index_clients {
+                *lock(slot) = None;
+            }
+        }
+        let mut stats = lock(&self.backend_stats);
+        for stat in stats.iter_mut() {
+            *stat = BackendStat::default();
+        }
+        *backend_keys = map;
+    }
+
+    pub(super) fn should_warn_unknown_key(&self, now_ms: u64) -> bool {
+        let mut last_warn_ms = self.last_unknown_key_warn_ms.load(Ordering::Relaxed);
+        loop {
+            if last_warn_ms != 0
+                && now_ms.saturating_sub(last_warn_ms) < UNKNOWN_KEY_WARN_INTERVAL_MS
+            {
+                return false;
+            }
+            match self.last_unknown_key_warn_ms.compare_exchange(
+                last_warn_ms,
+                now_ms,
+                Ordering::AcqRel,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return true,
+                Err(observed) => last_warn_ms = observed,
+            }
+        }
+    }
+
+    fn resolve_key_group(&self, pinned_pub_key: Option<&str>, count: usize) -> KeyGroup {
+        match pinned_pub_key.filter(|_| key_affinity_enabled()) {
+            Some(pub_key) => self.key_group(pub_key, count),
+            None => KeyGroup::Unrestricted,
+        }
+    }
+
+    /// Return the routing policy for `pub_key`, bounded by the live count.
+    pub(super) fn key_group(&self, pub_key: &str, count: usize) -> KeyGroup {
+        let backend_keys = self.backend_keys.read().unwrap_or_else(|e| e.into_inner());
+        if backend_keys.is_empty() {
+            return KeyGroup::Unrestricted;
+        }
+        let normalized = pub_key.to_lowercase();
+        let Some(group) = backend_keys.get(&normalized) else {
+            return KeyGroup::UnknownKey;
+        };
+        let filtered: Vec<usize> = group
+            .iter()
+            .copied()
+            .filter(|index| *index < count)
+            .collect();
+        if filtered.is_empty() {
+            KeyGroup::UnknownKey
+        } else {
+            KeyGroup::Indices(filtered)
         }
     }
 
@@ -483,4 +670,18 @@ fn route_index_score(route_key: u64, index: usize) -> u64 {
             .try_into()
             .expect("SHA-256 digest always contains eight bytes"),
     )
+}
+
+pub(super) fn key_affinity_value_enabled(value: Option<&str>) -> bool {
+    !matches!(value, Some("0" | "false" | "FALSE"))
+}
+
+/// Set `E2EE_BACKEND_KEY_AFFINITY=0` (or `false`) to disable pubkey-to-backend
+/// affinity and restore pre-change routing. Default: enabled.
+fn key_affinity_enabled() -> bool {
+    static VALUE: OnceLock<bool> = OnceLock::new();
+    *VALUE.get_or_init(|| {
+        let value = std::env::var("E2EE_BACKEND_KEY_AFFINITY").ok();
+        key_affinity_value_enabled(value.as_deref())
+    })
 }

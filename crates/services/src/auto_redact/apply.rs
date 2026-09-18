@@ -29,6 +29,9 @@ pub enum TextRef {
     /// realistic values (e.g. `redacted1@example.com`) that fit inside
     /// the JSON string without needing JSON-escaping.
     ToolCallArg { msg_idx: usize, tc_idx: usize },
+    /// `messages[msg_idx].reasoning_content` — prior-turn reasoning echoed
+    /// back by the client, which can restate PII from the original prompt.
+    Reasoning { msg_idx: usize },
 }
 
 /// Pull every text fragment from `messages` along with a reference for
@@ -76,6 +79,14 @@ pub fn collect_text_fragments(messages: &[CompletionMessage]) -> (Vec<TextRef>, 
                 }
             }
         }
+
+        // Prior-turn reasoning is client-supplied text like any other.
+        if let Some(reasoning) = &msg.reasoning_content {
+            if !reasoning.is_empty() {
+                refs.push(TextRef::Reasoning { msg_idx });
+                texts.push(reasoning.clone());
+            }
+        }
     }
 
     (refs, texts)
@@ -111,6 +122,9 @@ pub fn write_back(messages: &mut [CompletionMessage], refs: &[TextRef], redacted
                         tc.arguments = new_text;
                     }
                 }
+            }
+            TextRef::Reasoning { msg_idx } => {
+                messages[*msg_idx].reasoning_content = Some(new_text);
             }
         }
     }
@@ -233,6 +247,7 @@ mod tests {
 
     fn msg(role: &str, content: serde_json::Value) -> CompletionMessage {
         CompletionMessage {
+            reasoning_content: None,
             role: role.to_string(),
             content,
             tool_call_id: None,
@@ -520,12 +535,14 @@ mod tests {
         // every follow-up.
         let messages = vec![
             CompletionMessage {
+                reasoning_content: None,
                 role: "user".to_string(),
                 content: json!("Send a note to alice@example.com"),
                 tool_call_id: None,
                 tool_calls: None,
             },
             CompletionMessage {
+                reasoning_content: None,
                 role: "assistant".to_string(),
                 content: json!(null),
                 tool_call_id: None,
@@ -554,6 +571,7 @@ mod tests {
     #[test]
     fn write_back_updates_tool_call_arguments() {
         let mut messages = vec![CompletionMessage {
+            reasoning_content: None,
             role: "assistant".to_string(),
             content: json!(null),
             tool_call_id: None,
@@ -574,5 +592,48 @@ mod tests {
         );
         let tcs = messages[0].tool_calls.as_ref().unwrap();
         assert_eq!(tcs[0].arguments, r#"{"to":"<email1>"}"#);
+    }
+    #[test]
+    fn reasoning_content_is_collected_and_written_back() {
+        let mut messages = vec![
+            CompletionMessage {
+                role: "user".to_string(),
+                content: serde_json::Value::String("email alice@example.com".to_string()),
+                tool_call_id: None,
+                tool_calls: None,
+                reasoning_content: None,
+            },
+            CompletionMessage {
+                role: "assistant".to_string(),
+                content: serde_json::Value::Null,
+                tool_call_id: None,
+                tool_calls: None,
+                reasoning_content: Some("The user is alice@example.com".to_string()),
+            },
+            CompletionMessage {
+                role: "assistant".to_string(),
+                content: serde_json::Value::Null,
+                tool_call_id: None,
+                tool_calls: None,
+                reasoning_content: Some(String::new()),
+            },
+        ];
+        let (refs, texts) = collect_text_fragments(&messages);
+        assert_eq!(texts.len(), 2, "empty reasoning is skipped: {texts:?}");
+        assert!(matches!(refs[1], TextRef::Reasoning { msg_idx: 1 }));
+
+        write_back(
+            &mut messages,
+            &refs,
+            vec![
+                "email redacted1@example.com".to_string(),
+                "The user is redacted1@example.com".to_string(),
+            ],
+        );
+        assert_eq!(
+            messages[1].reasoning_content.as_deref(),
+            Some("The user is redacted1@example.com")
+        );
+        assert_eq!(messages[2].reasoning_content.as_deref(), Some(""));
     }
 }

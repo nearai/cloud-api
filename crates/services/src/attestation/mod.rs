@@ -11,6 +11,8 @@ mod lifecycle;
 pub mod measurement;
 pub mod models;
 pub mod ports;
+#[cfg(test)]
+mod provider_signature_tests;
 mod report;
 pub mod report_data;
 mod service_trait;
@@ -22,6 +24,7 @@ use config::ItaAttestationConfig;
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use k256::ecdsa::{SigningKey as EcdsaSigningKey, VerifyingKey as EcdsaVerifyingKey};
 
+pub(crate) use chat_signatures::STREAM_SIGNATURE_STORE_TIMEOUT;
 pub use environment::{
     compute_spki_hash, load_tls_cert_fingerprint, load_vpc_info, load_vpc_shared_secret,
 };

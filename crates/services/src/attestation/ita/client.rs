@@ -58,12 +58,23 @@ impl ItaClient {
         config: &ItaAttestationConfig,
         timeout: Duration,
     ) -> Result<Self, ItaClientError> {
-        Self::from_config_with_timeout(config, timeout)
+        // Local fake ITA servers must not inherit a developer machine's or CI
+        // host's system proxy; routing loopback traffic through it changes
+        // timeouts and error classification in otherwise deterministic tests.
+        Self::from_config_with_builder(config, timeout, reqwest::Client::builder().no_proxy())
     }
 
     fn from_config_with_timeout(
         config: &ItaAttestationConfig,
         timeout: Duration,
+    ) -> Result<Self, ItaClientError> {
+        Self::from_config_with_builder(config, timeout, reqwest::Client::builder())
+    }
+
+    fn from_config_with_builder(
+        config: &ItaAttestationConfig,
+        timeout: Duration,
+        http_client_builder: reqwest::ClientBuilder,
     ) -> Result<Self, ItaClientError> {
         let api_key = config
             .api_key
@@ -95,7 +106,7 @@ impl ItaClient {
                 .map_err(|_| ItaClientError::InvalidConfig {
                     reason: "attest endpoint URL",
                 })?;
-        let http_client = reqwest::Client::builder()
+        let http_client = http_client_builder
             .timeout(timeout)
             .connect_timeout(timeout)
             .read_timeout(timeout)

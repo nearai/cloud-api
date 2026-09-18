@@ -431,12 +431,14 @@ pub fn convert_messages(
                     .map(&extract_content)
                     .unwrap_or_default();
 
-                // Try to parse as JSON object, otherwise wrap as {"result": content}
+                // Try to parse as JSON object, otherwise wrap as {"result": content}.
                 // Gemini requires functionResponse.response to be a JSON object (Struct),
-                // not a string or other primitive value
+                // not a string or other primitive value. It interprets structured $ref
+                // fields as media-part references, so preserve results containing them
+                // as the original text instead (including JSON Schema references).
                 let response: serde_json::Value = serde_json::from_str(&content)
                     .ok()
-                    .filter(|v: &serde_json::Value| v.is_object())
+                    .filter(|v: &serde_json::Value| v.is_object() && !contains_ref_key(v))
                     .unwrap_or_else(|| serde_json::json!({"result": content}));
 
                 // Get function name from the message's name field
@@ -451,6 +453,16 @@ pub fn convert_messages(
     }
 
     (system_instruction, contents)
+}
+
+fn contains_ref_key(value: &serde_json::Value) -> bool {
+    match value {
+        serde_json::Value::Object(object) => {
+            object.contains_key("$ref") || object.values().any(contains_ref_key)
+        }
+        serde_json::Value::Array(array) => array.iter().any(contains_ref_key),
+        _ => false,
+    }
 }
 
 /// JSON Schema keywords that Gemini's OpenAPI subset does not accept.
@@ -492,6 +504,8 @@ const GEMINI_UNSUPPORTED_SCHEMA_KEYS: &[&str] = &[
     "dependentSchemas",
     "else",
     "examples",
+    "exclusiveMaximum",
+    "exclusiveMinimum",
     "if",
     "patternProperties",
     "propertyNames",
@@ -883,9 +897,105 @@ mod tests {
     use super::*;
 
     #[test]
+    fn test_thought_signature_roundtrip_through_compatible_tool_calls() {
+        let parts: Vec<GeminiPart> = serde_json::from_value(serde_json::json!([
+            {"functionCall": {"name": "read", "args": {"path": "."}},
+             "thoughtSignature": "opaque+/signature=="},
+            {"functionCall": {"name": "read", "args": {"path": "src"}}}
+        ]))
+        .unwrap();
+        let (_, calls) = extract_response_content(&parts);
+        let calls = calls.unwrap();
+        let complete = serde_json::to_value(&calls).unwrap();
+        let chunk = ChunkContext::new("test".into(), "gemini".into(), 0).tool_calls_chunk(
+            calls,
+            Some(crate::FinishReason::ToolCalls),
+            None,
+        );
+        let stream = serde_json::to_value(chunk).unwrap();
+        for mut wire_calls in [
+            complete,
+            stream["choices"][0]["delta"]["tool_calls"].clone(),
+        ] {
+            assert_eq!(
+                wire_calls[0]["extra_content"]["google"]["thought_signature"],
+                "opaque+/signature=="
+            );
+            assert_eq!(wire_calls[0]["thought_signature"], "opaque+/signature==");
+            assert!(wire_calls[1].get("extra_content").is_none());
+            assert!(wire_calls[1].get("thought_signature").is_none());
+            // The SDK only replays the nested format, not our legacy field.
+            for call in wire_calls.as_array_mut().unwrap() {
+                call.as_object_mut().unwrap().remove("thought_signature");
+            }
+            let message: ChatMessage = serde_json::from_value(serde_json::json!({
+                "role": "assistant", "tool_calls": wire_calls
+            }))
+            .unwrap();
+            let (_, contents) = convert_messages(&[message]);
+            let replay = serde_json::to_value(&contents).unwrap();
+            assert_eq!(
+                replay[0]["parts"][0]["thoughtSignature"],
+                "opaque+/signature=="
+            );
+            assert!(replay[0]["parts"][1].get("thoughtSignature").is_none());
+            assert_eq!(replay[0]["parts"][0]["functionCall"]["name"], "read");
+        }
+    }
+
+    #[test]
+    fn test_tool_results_with_refs_preserve_original_text() {
+        let cases = [
+            "{\n  \"$ref\": \"#/$defs/Config\", \"$defs\": {\"Config\": {\"type\": \"object\"}}\n}",
+            r##"{"schema":{"$ref":"#/$defs/Config"},"other":42}"##,
+            r##"{"schemas":[{"nested":[{"$ref":"#/$defs/Config"}]}]}"##,
+            r##"[{"$ref":"#/$defs/Config"}]"##,
+        ];
+        for content in cases {
+            let response = serialized_tool_response(content);
+            assert_eq!(response["name"], "get_config");
+            assert_eq!(response["response"], serde_json::json!({"result": content}));
+        }
+    }
+
+    #[test]
+    fn test_tool_results_without_refs_keep_existing_format() {
+        for content in [
+            r#"{"temperature":20,"details":{"units":"C"}}"#,
+            r#"{"text":"literal $ref and #/$defs/Config","$defs":{"Config":{}}}"#,
+        ] {
+            assert_eq!(
+                serialized_tool_response(content)["response"],
+                serde_json::from_str::<serde_json::Value>(content).unwrap()
+            );
+        }
+        for content in ["plain text", "42", "null", "[1,2]", "{invalid json"] {
+            assert_eq!(
+                serialized_tool_response(content)["response"],
+                serde_json::json!({"result": content})
+            );
+        }
+    }
+
+    fn serialized_tool_response(content: &str) -> serde_json::Value {
+        let messages = vec![ChatMessage {
+            reasoning_content: None,
+            role: MessageRole::Tool,
+            content: Some(serde_json::json!(content)),
+            name: Some("get_config".to_string()),
+            tool_call_id: Some("call_config".to_string()),
+            tool_calls: None,
+        }];
+        let (_, contents) = convert_messages(&messages);
+        let wire = serde_json::to_value(&contents).unwrap();
+        wire[0]["parts"][0]["functionResponse"].clone()
+    }
+
+    #[test]
     fn test_convert_messages_with_system() {
         let messages = vec![
             ChatMessage {
+                reasoning_content: None,
                 role: MessageRole::System,
                 content: Some(serde_json::Value::String("Be helpful".to_string())),
                 name: None,
@@ -893,6 +1003,7 @@ mod tests {
                 tool_calls: None,
             },
             ChatMessage {
+                reasoning_content: None,
                 role: MessageRole::User,
                 content: Some(serde_json::Value::String("Hello".to_string())),
                 name: None,
@@ -918,6 +1029,7 @@ mod tests {
         let data_uri = format!("data:image/png;base64,{payload}");
 
         let messages = vec![ChatMessage {
+            reasoning_content: None,
             role: MessageRole::User,
             content: Some(serde_json::json!([
                 {"type": "text", "text": "Describe this image."},
@@ -961,6 +1073,7 @@ mod tests {
         // `mimeType` is empty/omitted with 400 "empty mimeType parameter in
         // fileData", so the serialized request must always carry it (#719).
         let messages = vec![ChatMessage {
+            reasoning_content: None,
             role: MessageRole::User,
             content: Some(serde_json::json!([
                 {"type": "image_url", "image_url": {"url": "https://example.com/cat.jpg"}}
@@ -1011,6 +1124,7 @@ mod tests {
         ];
         for (url, expected) in cases {
             let messages = vec![ChatMessage {
+                reasoning_content: None,
                 role: MessageRole::User,
                 content: Some(serde_json::json!([
                     {"type": "image_url", "image_url": {"url": url}}
@@ -1038,6 +1152,7 @@ mod tests {
         // image part rather than emit a `fileData` lacking `mimeType` (which
         // Gemini rejects, breaking the *entire* request). Text is preserved.
         let messages = vec![ChatMessage {
+            reasoning_content: None,
             role: MessageRole::User,
             content: Some(serde_json::json!([
                 {"type": "text", "text": "look at this"},
@@ -1347,6 +1462,57 @@ mod tests {
             !serialized.contains("additionalProperties"),
             "serialized parameters must not contain `additionalProperties`; got: {}",
             serialized
+        );
+    }
+
+    #[test]
+    fn test_convert_tools_strips_exclusive_bounds_and_preserves_supported_constraints() {
+        // #1075: OpenCode emits exclusive bounds, which Gemini's parameters
+        // Schema rejects. Stripping them is best-effort: callers still need to
+        // validate arguments against their original schema.
+        let tools = vec![ToolDefinition {
+            type_: "function".to_string(),
+            function: crate::FunctionDefinition {
+                name: "measure".to_string(),
+                description: None,
+                parameters: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "t": {"type": "number", "exclusiveMinimum": 0},
+                        "exclusiveMinimum": {"type": "number", "exclusiveMaximum": 10},
+                        "exclusiveMaximum": {"type": "string"},
+                        "samples": {
+                            "type": "array", "minItems": 1, "maxItems": 10,
+                            "items": {"anyOf": [
+                                {"type": "number", "minimum": 0, "maximum": 10,
+                                 "exclusiveMinimum": 0, "exclusiveMaximum": 10},
+                                {"type": "integer", "minimum": 0, "exclusiveMinimum": true}
+                            ]}
+                        }
+                    },
+                    "required": ["t", "exclusiveMinimum", "exclusiveMaximum"]
+                }),
+            },
+        }];
+        let converted = convert_tools(&tools);
+        assert_eq!(
+            converted[0].function_declarations[0].parameters,
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "t": {"type": "number"},
+                    "exclusiveMinimum": {"type": "number"},
+                    "exclusiveMaximum": {"type": "string"},
+                    "samples": {
+                        "type": "array", "minItems": 1, "maxItems": 10,
+                        "items": {"anyOf": [
+                            {"type": "number", "minimum": 0, "maximum": 10},
+                            {"type": "integer", "minimum": 0}
+                        ]}
+                    }
+                },
+                "required": ["t", "exclusiveMinimum", "exclusiveMaximum"]
+            })
         );
     }
 

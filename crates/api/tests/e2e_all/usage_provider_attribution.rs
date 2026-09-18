@@ -230,11 +230,8 @@ async fn duplicate_usage_preserves_original_provider_attribution() {
         .await
         .expect("first usage should insert");
 
-    // When: a duplicate write carries different costs and attribution.
+    // When: a duplicate write carries different non-billable provider attribution.
     let mut duplicate_request = attributed_usage_request(&fixture, inference_id);
-    duplicate_request.input_tokens = 99;
-    duplicate_request.output_tokens = 99;
-    duplicate_request.total_cost = 99;
     duplicate_request.served_provider_tier = Some(ServedProviderTier::Near);
     duplicate_request.served_provider_type = Some(ServedProviderType::Vllm);
     duplicate_request.served_via_fallback = false;

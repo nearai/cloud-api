@@ -62,9 +62,11 @@ pub mod chunk_builder;
 pub mod mock;
 pub mod models;
 pub mod non_attested;
+pub mod responses_raw;
 pub mod rotation;
 pub mod spki_verifier;
 pub mod sse_parser;
+pub mod thought_signature;
 
 // Attested NEAR-AI fleet provider. Use the module path (`nearai::Provider`,
 // `nearai::Config`) rather than a bare re-export to keep the names unambiguous.
@@ -85,6 +87,7 @@ pub use anthropic_raw::{
 };
 pub use mock::MockProvider;
 pub use models::strip_cache_control;
+pub use models::strip_reasoning_content;
 pub use models::{
     is_client_audio_input_status, AudioOutput, AudioTranscriptionError, AudioTranscriptionParams,
     AudioTranscriptionResponse, ChatCompletionParams, ChatCompletionResponse,
@@ -343,6 +346,20 @@ pub trait InferenceProvider {
         extra: std::collections::HashMap<String, serde_json::Value>,
     ) -> Result<bytes::Bytes, PrivacyClassifyError>;
 
+    /// Native stateless Responses transport, deliberately separate from chat.
+    async fn responses_raw(
+        &self,
+        _body: serde_json::Value,
+    ) -> Result<responses_raw::ResponsesRawResponse, CompletionError> {
+        Err(CompletionError::CompletionError(
+            "Native Responses is unavailable for this provider".into(),
+        ))
+    }
+
+    fn supports_responses_raw(&self) -> bool {
+        false
+    }
+
     /// Performs a native Anthropic Messages request without schema conversion.
     ///
     /// Implementations must preserve the upstream status, response headers, and
@@ -428,6 +445,13 @@ pub trait InferenceProvider {
     /// the sticky backend returns a 5xx. Default is a no-op — only providers
     /// that participate in model-proxy rotation (vLLM) override it.
     fn set_backend_count(&self, _count: usize) {}
+
+    /// Update the provider's pubkey-to-backend-index map from discovery so a
+    /// model-pubkey-pinned request reaches a backend holding the private key.
+    /// An empty map means no restriction. Call this after `set_backend_count`,
+    /// because a count change clears stale index bindings. Rotation providers
+    /// override this default no-op.
+    fn set_backend_keys(&self, _map: std::collections::HashMap<String, Vec<usize>>) {}
 
     /// Exact input-token count via the backend's tokenizer (`POST /v1/tokenize`,
     /// proxied to the engine's native tokenize endpoint). The pool calls this

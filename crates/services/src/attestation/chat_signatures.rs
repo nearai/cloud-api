@@ -7,11 +7,17 @@ use super::{
 };
 use crate::{metrics::consts::*, usage::StopReason};
 
-/// Upper bound on the gateway signature store at end-of-stream. The client is
+/// Upper bound on signature finalization at end-of-stream. The client is
 /// still waiting for the held-back `[DONE]` while this runs, so it must be
 /// bounded; on timeout the routing pin is still released and the stream ends
 /// without a stored signature (logged by the caller).
-pub(in crate::attestation) const STREAM_SIGNATURE_STORE_TIMEOUT: Duration = Duration::from_secs(5);
+pub(crate) const STREAM_SIGNATURE_STORE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Reserve the final second of the streaming deadline for persisting fetched
+/// signatures. An outer timeout would otherwise drop an already-fetched ECDSA
+/// signature if the ED25519 fetch stalls before the batch can be written.
+pub(in crate::attestation) const PROVIDER_SIGNATURE_FETCH_TIMEOUT: Duration =
+    STREAM_SIGNATURE_STORE_TIMEOUT.saturating_sub(Duration::from_secs(1));
 
 impl AttestationService {
     pub(in crate::attestation) async fn get_chat_signature_impl(
@@ -54,6 +60,7 @@ impl AttestationService {
     pub(in crate::attestation) async fn store_chat_signature_from_provider_impl(
         &self,
         chat_id: &str,
+        fetch_deadline: Option<tokio::time::Instant>,
     ) -> Result<(), AttestationError> {
         let start_time = std::time::Instant::now();
         let provider = self
@@ -65,74 +72,103 @@ impl AttestationService {
             })?;
 
         if !provider.supports_chat_signatures() {
+            // The pool pins the serving connection before it knows whether the
+            // selected provider exposes per-response signatures. Providers
+            // such as Chutes deliberately do not, but their normal completion
+            // path must still drain that pin.
+            provider.unpin_chat_connection(chat_id);
             return Ok(());
         }
 
         let environment = get_environment();
         let env_tag = format!("{TAG_ENVIRONMENT}:{environment}");
-        let result: Result<(), AttestationError> = async {
+        let mut signatures = Vec::with_capacity(2);
+        let fetched: Result<(), AttestationError> = async {
             for algo in ["ecdsa", "ed25519"] {
-                let provider_signature = provider
-                    .get_signature(chat_id, Some(algo.to_string()))
-                    .await
-                    .map_err(|e| {
-                        // The error string embeds the backend URL on connection
-                        // failures — without it (and chat_id) these events are
-                        // impossible to attribute to a model/backend.
-                        tracing::error!(
-                            %chat_id,
-                            error = %e,
-                            "Failed to get chat signature from provider for algorithm: {}",
-                            algo
-                        );
-                        let duration = start_time.elapsed();
-                        self.metrics_service.record_count(
-                            METRIC_VERIFICATION_FAILURE,
-                            1,
-                            &[&format!("{TAG_REASON}:{REASON_INFERENCE_ERROR}"), &env_tag],
-                        );
-                        self.metrics_service.record_latency(
-                            METRIC_VERIFICATION_DURATION,
-                            duration,
-                            &[&env_tag],
-                        );
-                        AttestationError::ProviderError(e.to_string())
-                    })?;
-                let signature = ChatSignature {
+                let fetch = async {
+                    provider
+                        .get_signature(chat_id, Some(algo.to_string()))
+                        .await
+                        .map_err(|e| AttestationError::ProviderError(e.to_string()))
+                };
+                let provider_signature = match fetch_deadline {
+                    Some(deadline) => match tokio::time::timeout_at(deadline, fetch).await {
+                        Ok(result) => result,
+                        Err(_) => Err(AttestationError::ProviderError(format!(
+                            "Timed out fetching chat signature for algorithm: {algo}"
+                        ))),
+                    },
+                    None => fetch.await,
+                }
+                .inspect_err(|e| {
+                    // The error string embeds the backend URL on connection
+                    // failures — without it (and chat_id) these events are
+                    // impossible to attribute to a model/backend.
+                    tracing::error!(
+                        %chat_id,
+                        error = %e,
+                        "Failed to get chat signature from provider for algorithm: {}",
+                        algo
+                    );
+                    let duration = start_time.elapsed();
+                    self.metrics_service.record_count(
+                        METRIC_VERIFICATION_FAILURE,
+                        1,
+                        &[&format!("{TAG_REASON}:{REASON_INFERENCE_ERROR}"), &env_tag],
+                    );
+                    self.metrics_service.record_latency(
+                        METRIC_VERIFICATION_DURATION,
+                        duration,
+                        &[&env_tag],
+                    );
+                })?;
+                signatures.push(ChatSignature {
                     text: provider_signature.text,
                     signature: provider_signature.signature,
                     signing_address: provider_signature.signing_address,
                     signing_algo: provider_signature.signing_algo,
                     signature_kind: Some(SignatureKind::ProviderTee),
-                };
-
-                self.repository
-                    .add_chat_signature(chat_id, signature)
-                    .await
-                    .map_err(|e| {
-                        tracing::error!(
-                            %chat_id,
-                            error = %e,
-                            "Failed to store chat signature in repository for algorithm: {}",
-                            algo
-                        );
-                        let duration = start_time.elapsed();
-                        self.metrics_service.record_count(
-                            METRIC_VERIFICATION_FAILURE,
-                            1,
-                            &[&format!("{TAG_REASON}:{REASON_REPOSITORY_ERROR}"), &env_tag],
-                        );
-                        self.metrics_service.record_latency(
-                            METRIC_VERIFICATION_DURATION,
-                            duration,
-                            &[&env_tag],
-                        );
-                        AttestationError::RepositoryError(e.to_string())
-                    })?;
+                });
             }
+
             Ok(())
         }
         .await;
+
+        // Store whatever was fetched even if a later algorithm failed or hit
+        // the fetch deadline, leaving time before the outer stream timeout. The
+        // one-at-a-time implementation persisted each signature as it came,
+        // so a backend that serves ecdsa but fails ed25519 still leaves the
+        // chat verifiable by ecdsa. Both algorithms land in one statement:
+        // this runs before the client sees `[DONE]`, so every saved round
+        // trip is user-visible.
+        let stored: Result<(), AttestationError> = if signatures.is_empty() {
+            Ok(())
+        } else {
+            self.repository
+                .add_chat_signatures(chat_id, signatures)
+                .await
+                .map_err(|e| {
+                    tracing::error!(
+                        %chat_id,
+                        error = %e,
+                        "Failed to store chat signatures in repository"
+                    );
+                    let duration = start_time.elapsed();
+                    self.metrics_service.record_count(
+                        METRIC_VERIFICATION_FAILURE,
+                        1,
+                        &[&format!("{TAG_REASON}:{REASON_REPOSITORY_ERROR}"), &env_tag],
+                    );
+                    self.metrics_service.record_latency(
+                        METRIC_VERIFICATION_DURATION,
+                        duration,
+                        &[&env_tag],
+                    );
+                    AttestationError::RepositoryError(e.to_string())
+                })
+        };
+        let result = fetched.and(stored);
 
         provider.unpin_chat_connection(chat_id);
         result?;
@@ -155,10 +191,11 @@ impl AttestationService {
             .await
     }
 
-    /// Store the gateway signature for a stream and then release the
-    /// provider-pool signature-fetch routing pin, mirroring the lifecycle
-    /// ownership of `store_chat_signature_from_provider_impl` (which unpins
-    /// after the provider fetch). The store is bounded by
+    /// Store a gateway signature and then release the provider-pool
+    /// signature-fetch routing pin, mirroring the lifecycle ownership of
+    /// `store_chat_signature_from_provider_impl` (which unpins after the
+    /// provider fetch). This is used by non-streaming response-rewrite paths;
+    /// streaming cleanup is owned by `InterceptStream`. The store is bounded by
     /// [`STREAM_SIGNATURE_STORE_TIMEOUT`] *inside* this method so the unpin
     /// runs even when the store hangs — an outer timeout would drop the
     /// future and leak the pin.
@@ -184,9 +221,8 @@ impl AttestationService {
     }
 
     /// Release the provider-pool signature-fetch routing pin for `chat_id`.
-    /// Called on gateway-signed streams (where the provider signature fetch —
-    /// and its post-fetch unpin — is skipped) and on errored streams that
-    /// store nothing.
+    /// Called by non-streaming response-rewrite paths and by completion-stream
+    /// finalization when no provider signature is stored.
     pub(in crate::attestation) async fn release_chat_signature_pin_impl(&self, chat_id: &str) {
         if let Some(provider) = self
             .inference_provider_pool

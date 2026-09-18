@@ -80,9 +80,11 @@ async fn test_chat_completion_streaming() {
     println!("Testing with model: {model_id}");
 
     let params = ChatCompletionParams {
+        request_priority: 0,
         model: model_id.clone(),
         messages: vec![
             ChatMessage {
+                reasoning_content: None,
                 role: MessageRole::System,
                 content: Some(serde_json::Value::String(
                     "You are a helpful assistant. Please respond briefly.".to_string(),
@@ -92,6 +94,7 @@ async fn test_chat_completion_streaming() {
                 tool_calls: None,
             },
             ChatMessage {
+                reasoning_content: None,
                 role: MessageRole::User,
                 content: Some(serde_json::Value::String(
                     "Hello! Can you count to 3?".to_string(),
@@ -330,8 +333,10 @@ async fn test_error_handling() {
     let provider = create_test_provider();
 
     let params = ChatCompletionParams {
+        request_priority: 0,
         model: "nonexistent-model-12345".to_string(),
         messages: vec![ChatMessage {
+            reasoning_content: None,
             role: MessageRole::User,
             content: Some(serde_json::Value::String("Hello".to_string())),
             name: None,
@@ -420,8 +425,10 @@ async fn test_chat_completion_streaming_with_tool_calls() {
     }];
 
     let params = ChatCompletionParams {
+        request_priority: 0,
         model: model_id.clone(),
         messages: vec![ChatMessage {
+            reasoning_content: None,
             role: MessageRole::User,
             content: Some(serde_json::Value::String(
                 "What's the weather in New York today?".to_string(),
@@ -617,8 +624,10 @@ async fn test_reasoning_content() {
         .await;
 
     let params = ChatCompletionParams {
+        request_priority: 0,
         model: "Qwen/Qwen3-30B-A3B-Instruct-2507".to_string(),
         messages: vec![ChatMessage {
+            reasoning_content: None,
             role: MessageRole::User,
             content: Some(serde_json::Value::String(
                 "Why is the sky blue?".to_string(),

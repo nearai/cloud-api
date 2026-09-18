@@ -6,7 +6,6 @@
 //! collision avoidance, and large payloads.
 
 use crate::common::*;
-use api::models::BatchUpdateModelApiRequest;
 
 /// Pull `choices[0].message.content` out of a chat completion response as
 /// a `String`. Returns empty string if not present.
@@ -16,31 +15,6 @@ fn extract_choice_text(value: &serde_json::Value) -> String {
         .and_then(|v| v.as_str())
         .unwrap_or("")
         .to_string()
-}
-
-/// Register openai/privacy-filter in the cloud-api models DB. Required for
-/// auto-redact to route the detector call through the provider pool.
-async fn setup_privacy_filter_model(server: &axum_test::TestServer) {
-    let mut batch = BatchUpdateModelApiRequest::new();
-    batch.insert(
-        "openai/privacy-filter".to_string(),
-        serde_json::from_value(serde_json::json!({
-            "inputCostPerToken": {"amount": 0, "scale": 9, "currency": "USD"},
-            "outputCostPerToken": {"amount": 0, "scale": 9, "currency": "USD"},
-            "costPerImage": {"amount": 0, "scale": 9, "currency": "USD"},
-            "modelDisplayName": "Privacy Filter",
-            "modelDescription": "PII span detection",
-            "contextLength": 512,
-            "maxOutputLength": 1024,
-            "verifiable": false,
-            "isActive": true,
-            "allowFree": true
-        }))
-        .unwrap(),
-    );
-    let updated = admin_batch_upsert_models(server, batch, get_session_id()).await;
-    assert_eq!(updated.len(), 1);
-    tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
 }
 
 /// Empty messages array with auto-redact enabled. The route's own

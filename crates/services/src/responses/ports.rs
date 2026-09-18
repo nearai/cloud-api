@@ -141,6 +141,8 @@ pub trait ResponseServiceTrait: Send + Sync {
         request_id: uuid::Uuid,
         organization_id: uuid::Uuid,
         workspace_id: uuid::Uuid,
+        fallback_enabled: bool,
+        request_priority: inference_providers::models::RequestPriority,
         body_hash: String,
         signing_algo: Option<String>,
         client_pub_key: Option<String>,

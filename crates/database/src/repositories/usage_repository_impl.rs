@@ -76,6 +76,10 @@ impl services::usage::ports::UsageRepository for OrganizationUsageRepository {
             response_id: log.response_id,
             image_count: log.image_count,
             was_inserted: log.was_inserted,
+            credit_allocations: log.credit_allocations,
+            funded_amount: log.funded_amount,
+            unfunded_amount: log.unfunded_amount,
+            allocation_policy_version: log.allocation_policy_version,
             provider_attribution: services::usage::ProviderAttribution {
                 served_provider_tier: log.served_provider_tier,
                 served_provider_type: log.served_provider_type,
@@ -145,6 +149,10 @@ impl services::usage::ports::UsageRepository for OrganizationUsageRepository {
                 response_id: log.response_id,
                 image_count: log.image_count,
                 was_inserted: true,
+                credit_allocations: log.credit_allocations,
+                funded_amount: log.funded_amount,
+                unfunded_amount: log.unfunded_amount,
+                allocation_policy_version: log.allocation_policy_version,
                 provider_attribution: services::usage::ProviderAttribution {
                     served_provider_tier: log.served_provider_tier,
                     served_provider_type: log.served_provider_type,
@@ -159,14 +167,17 @@ impl services::usage::ports::UsageRepository for OrganizationUsageRepository {
     async fn get_usage_history_by_api_key(
         &self,
         api_key_id: Uuid,
+        credit_type: Option<&str>,
         limit: Option<i64>,
         offset: Option<i64>,
     ) -> anyhow::Result<(Vec<UsageLogEntry>, i64)> {
         let logs = self
-            .get_usage_history_by_api_key(api_key_id, limit, offset)
+            .get_usage_history_by_api_key(api_key_id, credit_type, limit, offset)
             .await?;
 
-        let total = self.count_usage_history_by_api_key(api_key_id).await?;
+        let total = self
+            .count_usage_history_by_api_key(api_key_id, credit_type)
+            .await?;
 
         let entries = logs
             .into_iter()
@@ -201,6 +212,10 @@ impl services::usage::ports::UsageRepository for OrganizationUsageRepository {
                 response_id: log.response_id,
                 image_count: log.image_count,
                 was_inserted: true,
+                credit_allocations: log.credit_allocations,
+                funded_amount: log.funded_amount,
+                unfunded_amount: log.unfunded_amount,
+                allocation_policy_version: log.allocation_policy_version,
                 provider_attribution: services::usage::ProviderAttribution {
                     served_provider_tier: log.served_provider_tier,
                     served_provider_type: log.served_provider_type,

@@ -252,7 +252,7 @@ impl AnalyticsRepository for PgAnalyticsRepository {
             .map_err(|e| RepositoryError::PoolError(e.into()))?;
 
         // Counts: total active users/orgs (snapshot) + new signups (within the period) +
-        // paying-org count (orgs with an active payment-type credit).
+        // paying-org count (orgs with an active prepaid or contract credit).
         let counts_row = client
             .query_one(
                 r#"
@@ -266,7 +266,9 @@ impl AnalyticsRepository for PgAnalyticsRepository {
                     (SELECT COUNT(DISTINCT olh.organization_id)
                         FROM organization_limits_history olh
                         JOIN organizations o ON o.id = olh.organization_id AND o.is_active = true
-                        WHERE olh.credit_type = 'payment' AND olh.effective_until IS NULL)::bigint as paying_organizations
+                        WHERE (olh.credit_type = 'payment'
+                            OR (olh.credit_type = 'postpay' AND olh.spend_limit > 0))
+                            AND olh.effective_until IS NULL)::bigint as paying_organizations
                 "#,
                 &[&start, &end],
             )
@@ -296,7 +298,8 @@ impl AnalyticsRepository for PgAnalyticsRepository {
                     COALESCE(SUM(ul.total_cost) FILTER (WHERE NOT COALESCE(m.verifiable, false)), 0)::bigint as external_nano,
                     COUNT(*) FILTER (WHERE NOT COALESCE(m.verifiable, false))::bigint as external_requests,
                     COUNT(*) FILTER (WHERE ul.stop_reason IN ('provider_error', 'timeout'))::bigint as error_count,
-                    PERCENTILE_CONT(0.95) WITHIN GROUP (ORDER BY ul.ttft_ms)::double precision as p95_ttft_ms
+                    PERCENTILE_CONT(0.95) WITHIN GROUP (ORDER BY ul.ttft_ms)::double precision as p95_ttft_ms,
+                    COUNT(*) FILTER (WHERE ul.stop_reason = 'incomplete')::bigint as incomplete_count
                 FROM organization_usage_log ul
                 LEFT JOIN models m ON m.id = ul.model_id
                 WHERE ul.created_at >= $1 AND ul.created_at < $2
@@ -317,8 +320,14 @@ impl AnalyticsRepository for PgAnalyticsRepository {
         let non_verifiable_requests: i64 = summary_row.get(8);
         let error_count: i64 = summary_row.get(9);
         let p95_ttft_ms: Option<f64> = summary_row.get(10);
+        let incomplete_count: i64 = summary_row.get(11);
         let provider_error_or_timeout_rate = if total_requests > 0 {
             error_count as f64 / total_requests as f64
+        } else {
+            0.0
+        };
+        let incomplete_stream_rate = if total_requests > 0 {
+            incomplete_count as f64 / total_requests as f64
         } else {
             0.0
         };
@@ -404,6 +413,7 @@ impl AnalyticsRepository for PgAnalyticsRepository {
             non_verifiable_consumed_usd,
             non_verifiable_requests,
             provider_error_or_timeout_rate,
+            incomplete_stream_rate,
             p95_ttft_ms,
             provider_usage,
             top_models,
@@ -614,16 +624,20 @@ impl AnalyticsRepository for PgAnalyticsRepository {
             .await
             .map_err(|e| RepositoryError::PoolError(e.into()))?;
 
-        // Active credit LIMITS (caps) by type + paying/granted org counts. These are
-        // ceilings from organization_limits_history, NOT payments/cash received. Joined to
-        // organizations with is_active = true so soft-deleted orgs aren't counted.
+        // Active credit LIMITS (caps) by type + paying/granted org counts. Postpay
+        // identifies a paying organization, but its safety ceiling is deliberately
+        // excluded from active_paid_credit_limit_usd because it is not prepaid cash.
+        // Joined to active organizations so soft-deleted orgs aren't counted.
         let limits_row = client
             .query_one(
                 r#"
                 SELECT
                     COALESCE(SUM(olh.spend_limit) FILTER (WHERE olh.credit_type = 'payment'), 0)::bigint as paid_limit,
                     COALESCE(SUM(olh.spend_limit) FILTER (WHERE olh.credit_type = 'grant'), 0)::bigint as grant_limit,
-                    COUNT(DISTINCT olh.organization_id) FILTER (WHERE olh.credit_type = 'payment')::bigint as paying_orgs,
+                    COUNT(DISTINCT olh.organization_id) FILTER (
+                        WHERE olh.credit_type = 'payment'
+                            OR (olh.credit_type = 'postpay' AND olh.spend_limit > 0)
+                    )::bigint as paying_orgs,
                     COUNT(DISTINCT olh.organization_id) FILTER (WHERE olh.credit_type = 'grant')::bigint as granted_orgs
                 FROM organization_limits_history olh
                 JOIN organizations o ON o.id = olh.organization_id AND o.is_active = true
@@ -658,17 +672,18 @@ impl AnalyticsRepository for PgAnalyticsRepository {
         let inference_consumed_usd = nano_to_usd(consumed_row.get::<_, i64>(1));
         let service_consumed_usd = nano_to_usd(consumed_row.get::<_, i64>(2));
 
-        // Active paid credit limit broken down by funding source (active orgs only).
+        // Active prepaid credit limit broken down by funding source (active orgs only).
+        // Contract postpay ceilings are intentionally not part of this cash-like metric.
         let source_rows = client
             .query(
                 r#"
                 SELECT
                     COALESCE(olh.source, 'unknown') as source,
-                    COALESCE(SUM(olh.spend_limit) FILTER (WHERE olh.credit_type = 'payment'), 0)::bigint as paid_limit,
+                    COALESCE(SUM(olh.spend_limit), 0)::bigint as paid_limit,
                     COUNT(DISTINCT olh.organization_id)::bigint as org_count
                 FROM organization_limits_history olh
                 JOIN organizations o ON o.id = olh.organization_id AND o.is_active = true
-                WHERE olh.effective_until IS NULL
+                WHERE olh.effective_until IS NULL AND olh.credit_type = 'payment'
                 GROUP BY olh.source
                 ORDER BY paid_limit DESC
                 "#,
@@ -835,7 +850,7 @@ impl AnalyticsRepository for PgAnalyticsRepository {
             RevenueSort::Requests => "requests",
             RevenueSort::Tokens => "tokens",
         };
-        // `is_paying` is a current-state flag (org has an active payment credit), used
+        // `is_paying` is a current-state flag (org has an active prepaid or contract credit), used
         // both as an output column and as the optional `paying` filter (via HAVING).
         // `search` is a case-insensitive substring on org name (the `%…%` is the bind).
         let org_like = query.search.as_ref().map(|s| format!("%{s}%"));
@@ -843,7 +858,9 @@ impl AnalyticsRepository for PgAnalyticsRepository {
             WITH paying AS (
                 SELECT DISTINCT organization_id
                 FROM organization_limits_history
-                WHERE credit_type = 'payment' AND effective_until IS NULL
+                WHERE (credit_type = 'payment'
+                    OR (credit_type = 'postpay' AND spend_limit > 0))
+                    AND effective_until IS NULL
             )
             SELECT
                 o.id as organization_id,
@@ -1046,7 +1063,7 @@ impl AnalyticsRepository for PgAnalyticsRepository {
                 PERCENTILE_CONT(0.99) WITHIN GROUP (ORDER BY ul.ttft_ms)::double precision AS p99_ttft_ms,
                 CASE
                     WHEN COUNT(*) FILTER (WHERE ul.stop_reason IS NOT NULL) = 0 THEN NULL
-                    ELSE COUNT(*) FILTER (WHERE ul.stop_reason IN ('provider_error', 'timeout'))::float8
+                    ELSE COUNT(*) FILTER (WHERE ul.stop_reason IN ('provider_error', 'timeout', 'incomplete'))::float8
                          / COUNT(*) FILTER (WHERE ul.stop_reason IS NOT NULL)::float8
                 END AS error_rate
             FROM organization_usage_log ul

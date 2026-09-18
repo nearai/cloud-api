@@ -3,6 +3,7 @@
 // This module contains custom middleware for the API layer,
 // including authentication, authorization, and request processing.
 
+pub(crate) mod admin_policy;
 pub mod auth;
 pub mod body_hash;
 pub mod metrics;

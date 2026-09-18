@@ -129,6 +129,7 @@ fn admin_provider_attribution_preserves_existing_response_fields() {
         non_verifiable_consumed_usd: 4.5,
         non_verifiable_requests: 5,
         provider_error_or_timeout_rate: 0.25,
+        incomplete_stream_rate: 0.1,
         p95_ttft_ms: Some(123.0),
         provider_usage: PlatformProviderUsage {
             fallback: ProviderUsageTotals {
@@ -204,6 +205,10 @@ fn admin_provider_attribution_preserves_existing_response_fields() {
         provider_request_id: Some("provider-request-1".to_string()),
         inference_id: Some("inference-1".to_string()),
         image_count: None,
+        credit_allocations: None,
+        funded_amount: None,
+        unfunded_amount: None,
+        allocation_policy_version: None,
     };
 
     // When: the DTOs are serialized as route JSON responses.

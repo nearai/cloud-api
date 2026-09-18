@@ -21,6 +21,15 @@ pub struct ReportingUsageExportRow {
     pub total_cost_nano_usd: i64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub total_cost_usd: Option<String>,
+    /// None marks historical usage recorded before funding attribution.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub credit_allocations: Option<Vec<services::usage::CreditAllocation>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub funded_amount: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub unfunded_amount: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub allocation_policy_version: Option<String>,
     #[serde(flatten)]
     pub usage: ReportingUsageDetails,
 }

@@ -163,9 +163,10 @@ jobs:
   # End-to-end tests. All e2e tests are compiled into a single binary
   # (tests/e2e_all/) for faster linking. Isolation comes from UUID-scoped
   # orgs/workspaces/keys on a shared database, not separate databases.
-  # nextest concurrency is capped by .config/nextest.toml (e2e-db group
-  # max-threads = 16; 16 * 4 pool conns = 64 < PG default max_connections
-  # = 100), so no ALTER SYSTEM / restart step is needed.
+  # A nextest setup script creates/migrates that database exactly once, then
+  # e2e concurrency is capped by .config/nextest.toml at 4 active tests. Most
+  # pools are capped at 4 connections; even tests with a second pool leave
+  # PostgreSQL headroom for runner-side services.
   e2e-test:
     name: E2E tests
     needs: changes
@@ -217,6 +218,14 @@ jobs:
         RUST_LOG: debug
         DEV: "true"
 
+  script-test:
+    name: Script tests
+    runs-on: [self-hosted, infra]
+    steps:
+      - uses: actions/checkout@v7
+      - name: Test synthetic rollout verification
+        run: python3 -B -m unittest discover -s scripts/tests -v
+
   # Aggregates all test jobs into a single required status check. The branch
   # ruleset requires "Test Suite", so this job MUST always run and always report
   # a result (note `if: always()` plus no `paths:` filter on the workflow) —
@@ -226,7 +235,7 @@ jobs:
   test-suite:
     name: Test Suite
     runs-on: [self-hosted, infra]
-    needs: [changes, lint, unit-test, integration-test, e2e-test]
+    needs: [changes, lint, unit-test, integration-test, e2e-test, script-test]
     if: always()
     steps:
       - name: Check all tests passed
@@ -235,6 +244,11 @@ jobs:
           # conclude tests were unnecessary.
           if [[ "${{ needs.changes.result }}" != "success" ]]; then
             echo "Change-detection job did not succeed (${{ needs.changes.result }}); failing closed."
+            exit 1
+          fi
+
+          if [[ "${{ needs.script-test.result }}" != "success" ]]; then
+            echo "Script tests did not succeed; failing closed."
             exit 1
           fi
 

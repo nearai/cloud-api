@@ -114,6 +114,22 @@ pub struct DomainServices {
         Arc<dyn services::service_usage::ServiceUsageServiceTrait + Send + Sync>,
 }
 
+/// Controls process-level background work started while the application router
+/// is built. Production uses [`Default`]; tests can disable workers whose
+/// behavior is unrelated to the request under test.
+#[derive(Clone, Copy, Debug)]
+pub struct AppBuildOptions {
+    pub start_database_encryption_recovery: bool,
+}
+
+impl Default for AppBuildOptions {
+    fn default() -> Self {
+        Self {
+            start_database_encryption_recovery: true,
+        }
+    }
+}
+
 /// Initialize database connection and run migrations
 pub async fn init_database(db_config: &config::DatabaseConfig) -> Arc<Database> {
     let database = Arc::new(
@@ -396,13 +412,17 @@ pub async fn init_domain_services_with_pool(
 
     // Prepare repositories for usage service (will be created after workspace service)
     let usage_repository = Arc::new(
-        database::repositories::OrganizationUsageRepository::with_reporting_statement_timeout(
+        database::repositories::OrganizationUsageRepository::with_accounting_config(
             database.pool().clone(),
             reporting_statement_timeout,
+            &config.credit_allocation,
         ),
     );
     let limits_repository_for_usage = Arc::new(
-        database::repositories::OrganizationLimitsRepository::new(database.pool().clone()),
+        database::repositories::OrganizationLimitsRepository::with_accounting_config(
+            database.pool().clone(),
+            &config.credit_allocation,
+        ),
     );
 
     // Create MCP client manager
@@ -503,9 +523,10 @@ pub async fn init_domain_services_with_pool(
         database.pool().clone(),
     ));
     let org_service_usage_repo = Arc::new(
-        database::repositories::OrganizationServiceUsageRepository::with_reporting_statement_timeout(
+        database::repositories::OrganizationServiceUsageRepository::with_accounting_config(
             database.pool().clone(),
             reporting_statement_timeout,
+            &config.credit_allocation,
         ),
     );
     let service_usage_repo = Arc::new(database::repositories::ServiceUsageRepositoryImpl::new(
@@ -530,8 +551,9 @@ pub async fn init_domain_services_with_pool(
         config.aml.clone(),
     ));
     let staking_farm_repository = Arc::new(
-        database::repositories::OrganizationStakingFarmSourcesRepository::new(
+        database::repositories::OrganizationStakingFarmSourcesRepository::with_accounting_config(
             database.pool().clone(),
+            &config.credit_allocation,
         ),
     ) as Arc<dyn services::staking_farm::StakingFarmRepository>;
     let staking_farm_contract_client = Arc::new(
@@ -615,9 +637,8 @@ pub async fn init_domain_services_with_mcp_factory(
     domain_services
 }
 
-/// Like `init_domain_services_with_pool` but use the given web search provider (for tests with mock).
-/// Rebuilds response_service so both the standalone web search route and Response API (web search
-/// tool) use the mock; otherwise response_service would still hold the original Brave provider.
+/// Like `init_domain_services_with_pool` but use the given web-search provider
+/// for the standalone `/mcp` route in tests.
 pub async fn init_domain_services_with_pool_and_web_search_provider(
     database: Arc<Database>,
     config: &ApiConfig,
@@ -1066,7 +1087,7 @@ pub async fn init_inference_providers(
 /// This function uses the existing MockProvider from inference_providers::mock
 /// and registers it for common test models without changing any implementations
 pub async fn init_inference_providers_with_mocks(
-    _config: &ApiConfig,
+    config: &ApiConfig,
 ) -> (
     Arc<services::inference_provider_pool::InferenceProviderPool>,
     Arc<inference_providers::mock::MockProvider>,
@@ -1077,7 +1098,7 @@ pub async fn init_inference_providers_with_mocks(
     let pool = Arc::new(
         services::inference_provider_pool::InferenceProviderPool::new(
             None,
-            config::ExternalProvidersConfig::default(),
+            config.external_providers.clone(),
         ),
     );
 
@@ -1089,8 +1110,14 @@ pub async fn init_inference_providers_with_mocks(
     // Register providers for models commonly used in tests
     let test_models = vec![
         "Qwen/Qwen3-30B-A3B-Instruct-2507".to_string(),
+        "Qwen/Qwen3-30B-A3B-Instruct-2507-e2e-cache-pricing".to_string(),
+        "Qwen/Qwen3-30B-A3B-Instruct-2507-e2e-high-context-completion".to_string(),
+        "Qwen/Qwen3-30B-A3B-Instruct-2507-e2e-high-context-streaming".to_string(),
+        "Qwen/Qwen3-30B-A3B-Instruct-2507-e2e-aliases".to_string(),
+        "Qwen/Qwen3-30B-A3B-Instruct-2507-e2e-alias-consistency".to_string(),
         "zai-org/GLM-4.6".to_string(),
         "nearai/gpt-oss-120b".to_string(),
+        "nearai/gpt-oss-120b-e2e-aliases".to_string(),
         "dphn/Dolphin-Mistral-24B-Venice-Edition".to_string(),
         "deepseek-ai/DeepSeek-V3.1".to_string(),
         "Qwen/Qwen3-Omni-30B-A3B-Instruct".to_string(),
@@ -1150,6 +1177,23 @@ pub fn build_app_with_config(
     auth_components: AuthComponents,
     domain_services: DomainServices,
     config: Arc<ApiConfig>,
+) -> Router {
+    build_app_with_config_and_options(
+        database,
+        auth_components,
+        domain_services,
+        config,
+        AppBuildOptions::default(),
+    )
+}
+
+/// Build the complete application router with explicit process-level behavior.
+pub fn build_app_with_config_and_options(
+    database: Arc<Database>,
+    auth_components: AuthComponents,
+    domain_services: DomainServices,
+    config: Arc<ApiConfig>,
+    build_options: AppBuildOptions,
 ) -> Router {
     // Create analytics service (shared between user and admin routes)
     let analytics_repository = Arc::new(database::repositories::PgAnalyticsRepository::new(
@@ -1263,6 +1307,7 @@ pub fn build_app_with_config(
     let internal_routes = build_internal_routes(app_state.clone());
 
     let response_routes = build_response_routes(
+        app_state.clone(),
         domain_services.response_service,
         domain_services.attestation_service.clone(),
         &auth_components.auth_state_middleware,
@@ -1302,10 +1347,11 @@ pub fn build_app_with_config(
 
     let services_routes = build_services_routes(database.pool().clone());
 
-    let admin_routes = build_admin_routes(
+    let admin_routes = build_admin_routes_with_options(
         database.clone(),
         &auth_components.auth_state_middleware,
         config.clone(),
+        build_options,
         AdminRouteServices {
             inference_provider_pool: app_state.inference_provider_pool.clone(),
             analytics_service,
@@ -1678,6 +1724,7 @@ pub fn build_completion_routes(
 
 /// Build response routes with auth
 pub fn build_response_routes(
+    native_app_state: AppState,
     response_service: Arc<services::ResponseService>,
     attestation_service: Arc<dyn services::attestation::ports::AttestationServiceTrait>,
     auth_state_middleware: &AuthState,
@@ -1685,6 +1732,14 @@ pub fn build_response_routes(
     rate_limit_state: middleware::RateLimitState,
 ) -> Router {
     let route_state = responses::ResponseRouteState {
+        native_service: services::responses::native::NativeResponsesService {
+            models: native_app_state.config.native_responses_models.clone(),
+            models_service: native_app_state.models_service,
+            completion_service: native_app_state.completion_service,
+            inference_provider_pool: native_app_state.inference_provider_pool,
+            usage_service: native_app_state.usage_service,
+            attestation_service: native_app_state.attestation_service,
+        },
         response_service: response_service.clone(),
         attestation_service,
     };
@@ -1996,6 +2051,7 @@ pub fn build_feature_request_routes(
             auth_middleware,
         ));
 
+    // Classify read operations in middleware::admin_policy when adding admin routes.
     let admin_routes = Router::new()
         .route("/admin/feature-requests", get(list_admin_feature_requests))
         .with_state(state)
@@ -2223,6 +2279,22 @@ pub fn build_admin_routes(
     config: Arc<ApiConfig>,
     services: AdminRouteServices,
 ) -> Router {
+    build_admin_routes_with_options(
+        database,
+        auth_state_middleware,
+        config,
+        AppBuildOptions::default(),
+        services,
+    )
+}
+
+fn build_admin_routes_with_options(
+    database: Arc<Database>,
+    auth_state_middleware: &AuthState,
+    config: Arc<ApiConfig>,
+    build_options: AppBuildOptions,
+    services: AdminRouteServices,
+) -> Router {
     use crate::middleware::admin_middleware;
     use crate::routes::admin::{
         batch_upsert_models, cancel_model_pricing_change, confirm_model_deprecation,
@@ -2232,14 +2304,15 @@ pub fn build_admin_routes(
         get_model_consumption_timeseries, get_model_history, get_model_revenue, get_org_revenue,
         get_organization as get_admin_organization, get_organization_concurrent_limit,
         get_organization_fallback, get_organization_limits_history, get_organization_metrics,
-        get_organization_timeseries, get_performance_timeseries, get_platform_metrics,
-        get_platform_timeseries, get_revenue_density, list_admin_access_tokens, list_aml_allowlist,
-        list_aml_reports, list_invitation_email_deliveries, list_model_pricing_changes,
+        get_organization_priority, get_organization_timeseries, get_performance_timeseries,
+        get_platform_metrics, get_platform_timeseries, get_revenue_density,
+        list_admin_access_tokens, list_aml_allowlist, list_aml_reports,
+        list_invitation_email_deliveries, list_model_pricing_changes,
         list_models as admin_list_models, list_organization_members, list_organizations,
         list_users, preview_model_deprecation, preview_model_pricing_changes,
         resend_invitation_email, update_aml_report_status, update_organization_concurrent_limit,
-        update_organization_fallback, update_organization_limits, update_service,
-        upsert_aml_allowlist_entry, AdminAppState,
+        update_organization_fallback, update_organization_limits, update_organization_member_role,
+        update_organization_priority, update_service, upsert_aml_allowlist_entry, AdminAppState,
     };
     use crate::routes::staking_farm::{
         get_admin_organization_staking_farm, sync_admin_organization_staking_farm,
@@ -2248,12 +2321,14 @@ pub fn build_admin_routes(
     use services::admin::AdminServiceImpl;
 
     // Create composite admin repository (handles models, organization limits, and users)
-    let admin_repository = Arc::new(AdminCompositeRepository::new(database.pool().clone()));
+    let admin_repository = Arc::new(AdminCompositeRepository::with_accounting_config(
+        database.pool().clone(),
+        &config.credit_allocation,
+    ));
 
     // Create admin access token repository
     let admin_access_token_repository =
         Arc::new(AdminAccessTokenRepository::new(database.pool().clone()));
-
     // Create admin service with composite repository.
     //
     // The admin service holds a reference to the `models_service` so it can
@@ -2311,6 +2386,7 @@ pub fn build_admin_routes(
     })
     .ok();
 
+    // Classify read operations in middleware::admin_policy when adding admin routes.
     let admin_routes = Router::new()
         .route(
             "/admin/models",
@@ -2393,6 +2469,10 @@ pub fn build_admin_routes(
                 .get(get_organization_concurrent_limit),
         )
         .route(
+            "/admin/organizations/{org_id}/priority",
+            axum::routing::get(get_organization_priority).patch(update_organization_priority),
+        )
+        .route(
             "/admin/organizations/{org_id}/fallback",
             axum::routing::get(get_organization_fallback).patch(update_organization_fallback),
         )
@@ -2462,6 +2542,10 @@ pub fn build_admin_routes(
             axum::routing::get(list_organization_members),
         )
         .route(
+            "/admin/organizations/{org_id}/members/{user_id}",
+            axum::routing::put(update_organization_member_role),
+        )
+        .route(
             "/admin/access-tokens",
             axum::routing::post(create_admin_access_token),
         )
@@ -2476,7 +2560,9 @@ pub fn build_admin_routes(
         .with_state(admin_app_state);
 
     let admin_routes = if let Some(database_encryption_state) = database_encryption_state {
-        database_encryption_state.recover_jobs();
+        if build_options.start_database_encryption_recovery {
+            database_encryption_state.recover_jobs();
+        }
         admin_routes.merge(
             Router::new()
                 .route(
@@ -2901,8 +2987,7 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_openapi_admin_aml_paths_require_session_security() {
+    fn test_openapi_admin_aml_paths_require_admin_security() {
         let spec = serde_json::to_value(ApiDoc::openapi()).unwrap();
         let paths = spec["paths"].as_object().unwrap();
 
@@ -2920,8 +3005,8 @@ mod tests {
             );
             assert_eq!(
                 operation["security"],
-                serde_json::json!([{ "session_token": [] }]),
-                "{method} {path} must require session_token security"
+                serde_json::json!([{ "session_token": [] }, { "admin_token": [] }]),
+                "{method} {path} must require session_token or admin_token security"
             );
         }
     }
@@ -3112,6 +3197,7 @@ mod tests {
             },
             inference_api_key: Some("test-key".to_string()),
             internal_usage_token: None,
+            native_responses_models: Vec::new(),
             logging: config::LoggingConfig {
                 level: "info".to_string(),
                 format: "compact".to_string(),
@@ -3127,9 +3213,11 @@ mod tests {
                 google: None,
                 near: config::NearConfig::default(),
                 admin_domains: vec![],
+                admin_read_only_tokens_enabled: false,
                 require_session_bound_access_tokens: false,
             },
             database: config::DatabaseConfig {
+                connection_mode: config::DatabaseConnectionMode::Patroni,
                 primary_app_id: "postgres-patroni-1".to_string(),
                 gateway_subdomain: "cvm1.near.ai".to_string(),
                 host: None,
@@ -3167,6 +3255,7 @@ mod tests {
             staking_farm: config::StakingFarmConfig::default(),
             aml: config::AmlConfig::default(),
             usage_reporting: config::UsageReportingConfig::default(),
+            credit_allocation: config::CreditAllocationConfig::default(),
             ita: config::ItaAttestationConfig::default(),
         };
 
@@ -3199,6 +3288,7 @@ mod tests {
     async fn test_with_custom_database() {
         // Create custom database config for testing
         let db_config = config::DatabaseConfig {
+            connection_mode: config::DatabaseConnectionMode::Patroni,
             primary_app_id: "postgres-patroni-1".to_string(),
             gateway_subdomain: "cvm1.near.ai".to_string(),
             port: 5432,
@@ -3226,6 +3316,7 @@ mod tests {
             },
             inference_api_key: Some("test-key".to_string()),
             internal_usage_token: None,
+            native_responses_models: Vec::new(),
             logging: config::LoggingConfig {
                 level: "info".to_string(),
                 format: "compact".to_string(),
@@ -3241,9 +3332,11 @@ mod tests {
                 google: None,
                 near: config::NearConfig::default(),
                 admin_domains: vec![],
+                admin_read_only_tokens_enabled: false,
                 require_session_bound_access_tokens: false,
             },
             database: config::DatabaseConfig {
+                connection_mode: config::DatabaseConnectionMode::Patroni,
                 primary_app_id: "postgres-patroni-1".to_string(),
                 gateway_subdomain: "cvm1.near.ai".to_string(),
                 host: None,
@@ -3281,6 +3374,7 @@ mod tests {
             staking_farm: config::StakingFarmConfig::default(),
             aml: config::AmlConfig::default(),
             usage_reporting: config::UsageReportingConfig::default(),
+            credit_allocation: config::CreditAllocationConfig::default(),
             ita: config::ItaAttestationConfig::default(),
         };
 

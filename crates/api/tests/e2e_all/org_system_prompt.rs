@@ -273,6 +273,19 @@ async fn test_legacy_full_settings_update_rejects_stale_fallback_snapshot() {
     let org = create_org(&server).await;
     let owner_token = get_access_token_from_refresh_token(&server, get_session_id()).await;
     let org_id = uuid::Uuid::parse_str(&org.id).unwrap();
+    let (admin_session, _) = setup_unique_test_session(&database).await;
+    let admin_id = uuid::Uuid::parse_str(admin_session.trim_start_matches("rt_")).unwrap();
+    database
+        .pool()
+        .get()
+        .await
+        .expect("database connection")
+        .execute(
+            "INSERT INTO organization_members (organization_id, user_id, role) VALUES ($1, $2, 'admin')",
+            &[&org_id, &admin_id],
+        )
+        .await
+        .expect("insert organization admin");
 
     let disabled = server
         .patch(&format!("/v1/organizations/{}/settings", org.id))
@@ -298,6 +311,7 @@ async fn test_legacy_full_settings_update_rejects_stale_fallback_snapshot() {
                 })),
             },
             Some(Some(json!(true))),
+            admin_id,
         )
         .await;
     assert!(matches!(stale, Err(RepositoryError::TransactionConflict)));

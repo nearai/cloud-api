@@ -129,7 +129,7 @@ struct ApprovedGroup {
 }
 
 const APPROVED: &[ApprovedGroup] = &[
-    ApprovedGroup { table: "admin_access_token", columns: &["token_hash", "name", "creation_reason", "revocation_reason", "user_agent"], reason: "Operational admin-token metadata; the credential itself is stored as a one-way hash" },
+    ApprovedGroup { table: "admin_access_token", columns: &["token_hash", "name", "creation_reason", "revocation_reason", "user_agent", "permission"], reason: "Operational admin-token metadata; the credential itself is stored as a one-way hash" },
     ApprovedGroup { table: "aml_allowlisted_accounts", columns: &["account_id", "address_type", "reason"], reason: "Queryable compliance allowlist and audit rationale" },
     ApprovedGroup { table: "aml_reports", columns: &["flow", "provider", "account_id", "address_type", "risk_level", "report_id", "reason", "result_json"], reason: "Queryable compliance evidence with access restricted to AML/admin workflows" },
     ApprovedGroup { table: "api_keys", columns: &["key_hash", "name", "key_prefix"], reason: "API credentials are one-way hashed; name and prefix are query/display metadata" },
@@ -149,16 +149,20 @@ const APPROVED: &[ApprovedGroup] = &[
     ApprovedGroup { table: "oauth_states", columns: &["state", "provider", "pkce_verifier", "frontend_callback"], reason: "Short-lived OAuth handshake state required for indexed callback lookup and PKCE completion" },
     ApprovedGroup { table: "organization_invitations", columns: &["email", "role", "status", "token", "email_status", "email_last_error", "email_message_id"], reason: "Invitation workflow data required for indexed acceptance and delivery operations; tokens are short-lived" },
     ApprovedGroup { table: "organization_limits_history", columns: &["changed_by", "change_reason", "changed_by_user_email", "credit_type", "source", "currency"], reason: "Restricted billing and limits audit history" },
+    ApprovedGroup { table: "organization_member_role_audit_log", columns: &["previous_role", "new_role"], reason: "Restricted administrator member-role audit history" },
     ApprovedGroup { table: "organization_members", columns: &["role"], reason: "Queryable authorization role" },
+    ApprovedGroup { table: "organization_credit_consumption", columns: &["credit_type"], reason: "Restricted current billing consumption counter" },
     ApprovedGroup { table: "organization_reporting_tokens", columns: &["name", "token_hash", "token_prefix"], reason: "Reporting credentials are one-way hashed; name and prefix are display metadata" },
     ApprovedGroup { table: "organization_staking_farm_sources", columns: &["near_account_id", "network_id", "contract_id", "farm_product_id", "farm_price_id", "status", "sync_status", "last_sync_error", "active_positions"], reason: "Public-chain identifiers and restricted staking synchronization state" },
-    ApprovedGroup { table: "organization_usage_log", columns: &["request_type", "model_name", "inference_type", "provider_request_id", "stop_reason", "served_provider_tier", "served_provider_type", "billing_details", "service_tier", "context_band"], reason: "Restricted metering and billing dimensions" },
+    ApprovedGroup { table: "organization_service_usage_log", columns: &["allocation_policy_version"], reason: "Restricted platform-service metering and billing dimensions" },
+    ApprovedGroup { table: "organization_usage_log", columns: &["request_type", "model_name", "inference_type", "provider_request_id", "stop_reason", "served_provider_tier", "served_provider_type", "billing_details", "service_tier", "context_band", "allocation_policy_version"], reason: "Restricted metering and billing dimensions" },
     ApprovedGroup { table: "organizations", columns: &["name", "description", "settings"], reason: "Organization profile and administrator-managed settings" },
     ApprovedGroup { table: "refresh_tokens", columns: &["token_hash", "ip_address", "user_agent"], reason: "Refresh credentials are one-way hashed; security telemetry supports session management" },
     ApprovedGroup { table: "refinery_schema_history", columns: &["name", "applied_on", "checksum"], reason: "Database migration framework bookkeeping" },
     ApprovedGroup { table: "responses", columns: &["model", "status", "usage", "next_response_ids"], reason: "Queryable response lifecycle, routing, usage, and structural relationship data" },
     ApprovedGroup { table: "scheduled_model_pricing_changes", columns: &["model_name", "model_display_name", "status", "last_error", "cancelled_by_user_email", "created_by_user_email", "change_reason", "old_text_pricing", "new_text_pricing"], reason: "Restricted administrator pricing workflow and audit data" },
     ApprovedGroup { table: "services", columns: &["service_name", "display_name", "description", "unit"], reason: "Public service catalog" },
+    ApprovedGroup { table: "usage_credit_allocations", columns: &["credit_type", "source", "policy_version", "allocation_phase"], reason: "Immutable restricted billing attribution records" },
     ApprovedGroup { table: "users", columns: &["email", "username", "display_name", "avatar_url", "auth_provider", "provider_user_id"], reason: "Account identity fields required for login, uniqueness, and user-facing profiles" },
     ApprovedGroup { table: "workspaces", columns: &["name", "description", "settings"], reason: "Workspace profile and administrator-managed settings" },
 ];
@@ -1167,6 +1171,26 @@ mod tests {
             !FIELDS.iter().any(|field| field.table == excluded.table)
                 && APPROVED.iter().all(|group| group.table != excluded.table)
         }));
+    }
+
+    #[test]
+    fn credit_allocation_plaintext_fields_have_explicit_approval_reasons() {
+        for (table, column) in [
+            ("organization_usage_log", "allocation_policy_version"),
+            (
+                "organization_service_usage_log",
+                "allocation_policy_version",
+            ),
+            ("usage_credit_allocations", "credit_type"),
+            ("usage_credit_allocations", "source"),
+            ("usage_credit_allocations", "policy_version"),
+            ("usage_credit_allocations", "allocation_phase"),
+        ] {
+            assert!(
+                approved_reason(table, column).is_some(),
+                "{table}.{column} must have an explicit plaintext approval reason"
+            );
+        }
     }
 
     #[test]

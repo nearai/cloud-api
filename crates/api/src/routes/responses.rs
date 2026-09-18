@@ -269,6 +269,7 @@ impl From<ServiceResponseError> for ErrorResponse {
 // State for response routes
 #[derive(Clone)]
 pub struct ResponseRouteState {
+    pub native_service: services::responses::native::NativeResponsesService,
     pub response_service: Arc<ResponseServiceImpl>,
     /// Existing completed-response gateway attestation remains best-effort.
     /// Its stored material is a response ID plus signatures over
@@ -452,6 +453,49 @@ pub async fn create_response(
     Extension(body_hash): Extension<RequestBodyHash>,
     Extension(correlation): Extension<RequestCorrelation>,
     headers: HeaderMap,
+    OpenAiJson(raw): OpenAiJson<Box<serde_json::value::RawValue>>,
+) -> axum::response::Response {
+    // Keep the original JSON for typed compatibility extraction (including its errors).
+    let body = serde_json::from_str::<serde_json::Value>(raw.get()).ok();
+    let native = if let Some(body) = body.as_ref() {
+        state.native_service.selected_model(body).await
+    } else {
+        None
+    };
+    if let Some(model) = native {
+        return super::responses_native::handle(
+            state.native_service,
+            model,
+            api_key,
+            headers,
+            body_hash.hash,
+            body.expect("selected request has valid JSON"),
+        )
+        .await;
+    }
+    // All other requests use the typed stateless compatibility adapter.
+    // Native-only fields never pass through that conversion.
+    let request = match axum::Json::<CreateResponseRequest>::from_bytes(raw.get().as_bytes()) {
+        Ok(axum::Json(request)) => request,
+        Err(e) => return super::extractors::OpenAiJsonRejection(e).into_response(),
+    };
+    create_typed_stateless_response(
+        State(state),
+        Extension(api_key),
+        Extension(body_hash),
+        Extension(correlation),
+        headers,
+        OpenAiJson(request),
+    )
+    .await
+}
+
+async fn create_typed_stateless_response(
+    State(state): State<ResponseRouteState>,
+    Extension(api_key): Extension<AuthenticatedApiKey>,
+    Extension(body_hash): Extension<RequestBodyHash>,
+    Extension(correlation): Extension<RequestCorrelation>,
+    headers: HeaderMap,
     OpenAiJson(mut request): OpenAiJson<CreateResponseRequest>,
 ) -> axum::response::Response {
     let service = state.response_service.clone();
@@ -536,6 +580,7 @@ pub async fn create_response(
                 api_key.organization.id.0,
                 api_key.workspace.id.0,
                 api_key.organization.fallback_enabled(),
+                api_key.organization.request_priority,
                 body_hash.hash.clone(),
                 signing_algo.clone(),
                 client_pub_key.clone(),
@@ -593,6 +638,7 @@ pub async fn create_response(
                 api_key.organization.id.0,
                 api_key.workspace.id.0,
                 api_key.organization.fallback_enabled(),
+                api_key.organization.request_priority,
                 body_hash.hash.clone(),
                 signing_algo.clone(),
                 client_pub_key.clone(),

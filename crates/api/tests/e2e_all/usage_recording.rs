@@ -496,7 +496,7 @@ async fn test_record_chat_completion_usage_with_cached_tokens() {
 
     // Setup model with cache-read pricing:
     // input: 1_000_000, output: 2_000_000, cache_read: 500_000 nano-dollars per token
-    setup_qwen_model_with_cache_pricing(&server).await;
+    let model = setup_qwen_model_with_cache_pricing(&server).await;
 
     // Setup org with $10 credits and an API key identity
     let id = provision_identity(&server).await;
@@ -507,7 +507,7 @@ async fn test_record_chat_completion_usage_with_cached_tokens() {
         &id,
         serde_json::json!({
             "type": "chat_completion",
-            "model": "Qwen/Qwen3-30B-A3B-Instruct-2507",
+            "model": model,
             "input_tokens": 100,
             "output_tokens": 50,
             "cache_read_tokens": 40,
@@ -686,7 +686,7 @@ async fn test_record_chat_completion_usage_cache_read_capped_to_input() {
     let server = enable_internal_usage_server().await;
 
     // Setup model with cache-read pricing enabled
-    setup_qwen_model_with_cache_pricing(&server).await;
+    let model = setup_qwen_model_with_cache_pricing(&server).await;
 
     let id = provision_identity(&server).await;
 
@@ -696,7 +696,7 @@ async fn test_record_chat_completion_usage_cache_read_capped_to_input() {
         &id,
         serde_json::json!({
             "type": "chat_completion",
-            "model": "Qwen/Qwen3-30B-A3B-Instruct-2507",
+            "model": model,
             "input_tokens": 30,
             "output_tokens": 0,
             "cache_read_tokens": 100,

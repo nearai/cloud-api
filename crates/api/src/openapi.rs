@@ -7,7 +7,7 @@ use utoipa::{Modify, OpenApi};
 #[openapi(
     info(
         title = "NEAR AI Cloud API",
-        description = "A comprehensive cloud API for AI model inference, temporary confidential-data migration views, and organization administration.\n\n## Authentication\n\nThis API supports four authentication methods:\n\n1. **Access Token (JWT)**: Use `Authorization: Bearer <jwt_token>` with a short-lived JWT access token for most API endpoints. Obtain this by calling POST /users/me/access_tokens with a refresh token.\n2. **Refresh Token**: Use `Authorization: Bearer <refresh_token>` (prefix: `rt_`) only with POST /users/me/access_tokens to create new JWT access tokens. Obtained from OAuth login.\n3. **API Key (Programmatic Access)**: Use `Authorization: Bearer sk-<api_key>` with an API key (prefix: `sk-`).\n4. **Reporting Token (Read-only Usage Reporting)**: Use `Authorization: Bearer rpt-<reporting_token>` only with usage reporting endpoints.\n\nClick the **Authorize** button above to configure authentication.",
+        description = "A comprehensive cloud API for AI model inference, temporary confidential-data migration views, and organization administration.\n\n## Authentication\n\nThis API supports five authentication methods:\n\n1. **Access Token (JWT)**: Use `Authorization: Bearer <jwt_token>` with a short-lived JWT access token for most API endpoints. Obtain this by calling POST /users/me/access_tokens with a refresh token.\n2. **Refresh Token**: Use `Authorization: Bearer <refresh_token>` (prefix: `rt_`) only with POST /users/me/access_tokens to create new JWT access tokens. Obtained from OAuth login.\n3. **API Key (Programmatic Access)**: Use `Authorization: Bearer sk-<api_key>` with an API key (prefix: `sk-`).\n4. **Reporting Token (Read-only Usage Reporting)**: Use `Authorization: Bearer rpt-<reporting_token>` only with usage reporting endpoints.\n5. **Admin Access Token**: Use `Authorization: Bearer adm_<token>` with approved admin operations. `read_only` permits explicitly approved reads across organizations; `read_write` preserves admin-token write access. Token management always requires an admin session.\n\nClick the **Authorize** button above to configure authentication.",
         version = "1.0.0",
         contact(
             name = "NEAR AI Team",
@@ -159,6 +159,8 @@ use utoipa::{Modify, OpenApi};
         crate::routes::admin::update_organization_concurrent_limit,
         crate::routes::admin::get_organization_concurrent_limit,
         crate::routes::admin::get_organization_fallback,
+        crate::routes::admin::get_organization_priority,
+        crate::routes::admin::update_organization_priority,
         crate::routes::admin::update_organization_fallback,
         crate::routes::admin::get_organization_metrics,
         crate::routes::admin::get_platform_metrics,
@@ -173,6 +175,7 @@ use utoipa::{Modify, OpenApi};
         crate::routes::admin::list_users,
         crate::routes::admin::get_organization,
         crate::routes::admin::list_organization_members,
+        crate::routes::admin::update_organization_member_role,
         crate::routes::admin::create_admin_access_token,
         crate::routes::admin::list_admin_access_tokens,
         crate::routes::admin::delete_admin_access_token,
@@ -276,6 +279,7 @@ use utoipa::{Modify, OpenApi};
             UpdateOrganizationConcurrentLimitRequest, UpdateOrganizationConcurrentLimitResponse,
             GetOrganizationConcurrentLimitResponse,
             UpdateOrganizationFallbackRequest, OrganizationFallbackResponse,
+            UpdateOrganizationPriorityRequest, OrganizationPriorityResponse,
             // Invitation email delivery models (Admin)
             AdminInvitationEmailDeliveryResponse, ListAdminInvitationEmailDeliveriesResponse,
             AdminInvitationEmailResendResultResponse,
@@ -287,6 +291,7 @@ use utoipa::{Modify, OpenApi};
             UpsertAmlAllowlistEntryRequest,
             // Admin access token models
             CreateAdminAccessTokenRequest, AdminAccessTokenResponse,
+            AdminAccessTokenPermission, AdminAccessTokenListEntry, ListAdminAccessTokensResponse,
             // Usage tracking models
             crate::routes::usage::OrganizationBalanceResponse,
             crate::routes::usage::UsageHistoryResponse,
@@ -360,10 +365,102 @@ use utoipa::{Modify, OpenApi};
             services::admin::ModelGpuAllocation,
         ),
     ),
-    modifiers(&SecurityAddon)
+    modifiers(&SecurityAddon, &AdminPermissionsAddon)
     // No servers - let client determine the URL dynamically
 )]
 pub struct ApiDoc;
+
+/// Keep endpoint permission documentation tied to the authorization registry.
+struct AdminPermissionsAddon;
+
+impl Modify for AdminPermissionsAddon {
+    fn modify(&self, openapi: &mut utoipa::openapi::OpenApi) {
+        use crate::middleware::admin_policy::{admin_operation, AdminOperation};
+        use axum::http::Method;
+        use utoipa::openapi::security::SecurityRequirement;
+        use utoipa::openapi::{ContentBuilder, Ref, RefOr, ResponseBuilder};
+
+        if let Some(components) = openapi.components.as_mut() {
+            components.add_security_scheme(
+                "admin_token",
+                SecurityScheme::Http(
+                    HttpBuilder::new()
+                        .scheme(HttpAuthScheme::Bearer)
+                        .bearer_format("adm_")
+                        .description(Some("Opaque admin access token. Permission is immutable and applies across organizations: read_only allows approved reads; read_write allows admin mutations. Both require the creator to remain an admin. Token management requires an admin session. Usage bookkeeping and audit logging remain enabled."))
+                        .build(),
+                ),
+            );
+        }
+        for (path, item) in &mut openapi.paths.paths {
+            if !path.starts_with("/v1/admin/") {
+                continue;
+            }
+            for (method, operation) in [
+                (Method::GET, &mut item.get),
+                (Method::HEAD, &mut item.head),
+                (Method::POST, &mut item.post),
+                (Method::PUT, &mut item.put),
+                (Method::PATCH, &mut item.patch),
+                (Method::DELETE, &mut item.delete),
+                (Method::OPTIONS, &mut item.options),
+                (Method::TRACE, &mut item.trace),
+            ] {
+                let Some(operation) = operation else { continue };
+                let policy = admin_operation(&method, path);
+                let description = match policy {
+                    AdminOperation::Read => "Admin permissions: admin session, read_write token, or read_only token. Approved read across organizations; does not mutate business state.",
+                    AdminOperation::Write => "Admin permissions: admin session or read_write token. A read_only token receives HTTP 403 with error.type insufficient_permissions before the handler runs.",
+                    AdminOperation::SessionOnly => "Admin permissions: admin session only. Both read_only and read_write admin tokens receive HTTP 403 with error.type forbidden.",
+                };
+                let existing = operation.description.get_or_insert_default();
+                if !existing.is_empty() {
+                    existing.push_str("\n\n");
+                }
+                existing.push_str(description);
+                let mut security = vec![SecurityRequirement::new(
+                    "session_token",
+                    Vec::<String>::new(),
+                )];
+                if policy != AdminOperation::SessionOnly {
+                    security.push(SecurityRequirement::new(
+                        "admin_token",
+                        Vec::<String>::new(),
+                    ));
+                }
+                operation.security = Some(security);
+
+                let forbidden = if policy == AdminOperation::SessionOnly {
+                    "Admin session required; admin tokens receive error.type forbidden."
+                } else {
+                    "Missing admin privileges (forbidden) or insufficient token permission (insufficient_permissions)."
+                };
+                let response = operation
+                    .responses
+                    .responses
+                    .entry("403".to_string())
+                    .or_insert_with(|| {
+                        ResponseBuilder::new()
+                            .description("")
+                            .content(
+                                "application/json",
+                                ContentBuilder::new()
+                                    .schema(Some(Ref::from_schema_name("ErrorResponse")))
+                                    .build(),
+                            )
+                            .build()
+                            .into()
+                    });
+                if let RefOr::T(response) = response {
+                    if !response.description.is_empty() {
+                        response.description.push(' ');
+                    }
+                    response.description.push_str(forbidden);
+                }
+            }
+        }
+    }
+}
 
 /// Security configuration for OpenAPI
 pub struct SecurityAddon;
@@ -432,3 +529,100 @@ impl Modify for SecurityAddon {
 }
 
 // Server URL will be determined dynamically on the client side
+
+#[cfg(test)]
+mod admin_token_permission_tests {
+    use super::*;
+    use serde_json::{json, Value};
+
+    #[test]
+    fn permission_request_defaults_only_when_omitted() {
+        let body = json!({"name": "test", "reason": "test", "expires_in_hours": 24});
+        let request: CreateAdminAccessTokenRequest = serde_json::from_value(body.clone()).unwrap();
+        assert_eq!(request.permission, AdminAccessTokenPermission::ReadWrite);
+        for (value, expected) in [
+            ("read_only", AdminAccessTokenPermission::ReadOnly),
+            ("read_write", AdminAccessTokenPermission::ReadWrite),
+        ] {
+            let mut body = body.clone();
+            body["permission"] = json!(value);
+            let request: CreateAdminAccessTokenRequest = serde_json::from_value(body).unwrap();
+            assert_eq!(request.permission, expected);
+        }
+        for value in [Value::Null, json!("unknown"), json!(false)] {
+            let mut body = body.clone();
+            body["permission"] = value;
+            assert!(serde_json::from_value::<CreateAdminAccessTokenRequest>(body).is_err());
+        }
+        assert!("unknown"
+            .parse::<database::models::AdminAccessTokenPermission>()
+            .is_err());
+    }
+
+    #[test]
+    fn permission_schema_and_admin_authorization_are_documented() {
+        let doc = serde_json::to_value(ApiDoc::openapi()).unwrap();
+        let schemas = &doc["components"]["schemas"];
+        assert_eq!(
+            schemas["AdminAccessTokenPermission"]["enum"],
+            json!(["read_only", "read_write"])
+        );
+        let create = &schemas["CreateAdminAccessTokenRequest"];
+        assert_eq!(create["properties"]["permission"]["default"], "read_write");
+        assert!(!create["required"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("permission")));
+        for model in ["AdminAccessTokenResponse", "AdminAccessTokenListEntry"] {
+            assert!(schemas[model]["properties"].get("permission").is_some());
+        }
+        for (path, method, phrase, tokens_allowed) in [
+            ("/v1/admin/models", "get", "read_only token", true),
+            (
+                "/v1/admin/models",
+                "patch",
+                "insufficient_permissions",
+                true,
+            ),
+            (
+                "/v1/admin/models/pricing-changes/preview",
+                "post",
+                "read_only token",
+                true,
+            ),
+            ("/v1/admin/feature-requests", "get", "read_only token", true),
+            ("/v1/admin/access-tokens", "get", "session only", false),
+            ("/v1/admin/access-tokens", "post", "session only", false),
+            (
+                "/v1/admin/access-tokens/{token_id}",
+                "delete",
+                "session only",
+                false,
+            ),
+        ] {
+            let operation = &doc["paths"][path][method];
+            assert!(
+                operation["description"].as_str().unwrap().contains(phrase),
+                "{method} {path}"
+            );
+            assert!(operation["responses"].get("403").is_some());
+            assert_eq!(
+                operation["security"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|s| s.get("admin_token").is_some()),
+                tokens_allowed
+            );
+        }
+        assert!(doc["paths"]["/v1/admin/access-tokens"]["post"]["responses"]
+            .get("503")
+            .is_some());
+        assert!(
+            doc["paths"]["/v1/admin/access-tokens"]["get"]["responses"]["200"]["content"]
+                ["application/json"]["schema"]
+                .to_string()
+                .contains("ListAdminAccessTokensResponse")
+        );
+    }
+}

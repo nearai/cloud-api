@@ -796,6 +796,17 @@ impl Fleet {
         pinned_pub_key
     }
 
+    fn prepare_priority_header(
+        headers: &mut reqwest::header::HeaderMap,
+        params: &mut ChatCompletionParams,
+    ) {
+        headers.insert(
+            "x-nearai-priority",
+            HeaderValue::from(params.request_priority),
+        );
+        params.strip_client_priority();
+    }
+
     /// Prepare tracing headers by extracting correlation IDs from `extra` and forwarding
     /// as HTTP headers. Removes the keys from `extra` so they don't leak into the JSON body.
     ///
@@ -1716,6 +1727,7 @@ impl InferenceProvider for Fleet {
             .map_err(|e| CompletionError::CompletionError(format!("Invalid request hash: {e}")))?;
         headers.insert("X-Request-Hash", request_hash_value);
 
+        Self::prepare_priority_header(&mut headers, &mut streaming_params);
         // Prepare tracing headers (request_id, org_id, workspace_id)
         self.prepare_tracing_headers(&mut headers, &mut streaming_params.extra);
         // Prepare encryption headers
@@ -1872,6 +1884,7 @@ impl InferenceProvider for Fleet {
             .map_err(|e| CompletionError::CompletionError(format!("Invalid request hash: {e}")))?;
         headers.insert("X-Request-Hash", request_hash_value);
 
+        Self::prepare_priority_header(&mut headers, &mut non_streaming_params);
         // Prepare tracing headers (request_id, org_id, workspace_id)
         self.prepare_tracing_headers(&mut headers, &mut non_streaming_params.extra);
         // Prepare encryption headers
@@ -3661,8 +3674,10 @@ mod tests {
         );
 
         let params = ChatCompletionParams {
+            request_priority: 0,
             model: "test-model".to_string(),
             messages: vec![ChatMessage {
+                reasoning_content: None,
                 role: MessageRole::User,
                 content: Some(serde_json::Value::String("hi".to_string())),
                 name: None,
@@ -4161,6 +4176,7 @@ mod tests {
 
     fn role_msg(role: crate::MessageRole, content: &str) -> crate::ChatMessage {
         crate::ChatMessage {
+            reasoning_content: None,
             role,
             content: Some(serde_json::Value::String(content.to_string())),
             name: None,
@@ -5339,3 +5355,6 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+mod priority_tests;

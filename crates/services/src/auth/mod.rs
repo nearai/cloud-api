@@ -935,6 +935,13 @@ mod tests {
         async fn get_by_id(&self, _: Uuid) -> Result<Option<Organization>, RepositoryError> {
             unimplemented!()
         }
+        async fn set_request_priority(
+            &self,
+            _: Uuid,
+            _: i32,
+        ) -> Result<Option<i32>, RepositoryError> {
+            unimplemented!()
+        }
         async fn get_by_name(&self, _: &str) -> Result<Option<Organization>, RepositoryError> {
             unimplemented!()
         }
@@ -950,6 +957,7 @@ mod tests {
             _: Uuid,
             _: UpdateOrganizationRequest,
             _: Option<Option<serde_json::Value>>,
+            _: Uuid,
         ) -> Result<Organization, RepositoryError> {
             unimplemented!()
         }
@@ -957,11 +965,13 @@ mod tests {
             &self,
             _: Uuid,
             _: crate::organization::PatchOrganizationSettings,
+            _: Option<Uuid>,
         ) -> Result<Organization, RepositoryError> {
             unimplemented!()
         }
         async fn delete_if_no_staking_farm_source(
             &self,
+            _: Uuid,
             _: Uuid,
         ) -> Result<DeleteOrganizationResult, RepositoryError> {
             unimplemented!()
@@ -979,10 +989,25 @@ mod tests {
             _: Uuid,
             _: Uuid,
             _: UpdateOrganizationMemberRequest,
+            _: Uuid,
         ) -> Result<OrganizationMember, RepositoryError> {
             unimplemented!()
         }
-        async fn remove_member(&self, _: Uuid, _: Uuid) -> Result<bool, RepositoryError> {
+        async fn update_member_role_with_audit(
+            &self,
+            _: Uuid,
+            _: Uuid,
+            _: UpdateOrganizationMemberRequest,
+            _: Uuid,
+        ) -> Result<crate::organization::OrganizationMemberRoleUpdate, RepositoryError> {
+            unimplemented!()
+        }
+        async fn remove_member(
+            &self,
+            _: Uuid,
+            _: Uuid,
+            _: Uuid,
+        ) -> Result<crate::organization::RemoveOrganizationMemberResult, RepositoryError> {
             unimplemented!()
         }
         async fn list_members_paginated(
@@ -1228,6 +1253,15 @@ mod tests {
         ) -> Result<OrganizationMember, OrganizationError> {
             unimplemented!()
         }
+        async fn update_member_role_for_admin(
+            &self,
+            _: OrganizationId,
+            _: UserId,
+            _: MemberRole,
+            _: UserId,
+        ) -> Result<crate::organization::OrganizationMemberRoleUpdate, OrganizationError> {
+            unimplemented!()
+        }
         async fn remove_member_validated(
             &self,
             _: OrganizationId,
@@ -1321,6 +1355,20 @@ mod tests {
         ) -> Result<crate::organization::OrganizationSettings, OrganizationError> {
             unimplemented!()
         }
+        async fn get_request_priority_for_admin(
+            &self,
+            _: OrganizationId,
+        ) -> Result<i32, OrganizationError> {
+            unimplemented!()
+        }
+        async fn update_request_priority_for_admin(
+            &self,
+            _: OrganizationId,
+            _: i32,
+        ) -> Result<i32, OrganizationError> {
+            unimplemented!()
+        }
+
         async fn get_fallback_enabled_for_admin(
             &self,
             _: OrganizationId,

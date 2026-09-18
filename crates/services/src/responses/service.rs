@@ -22,6 +22,7 @@ struct ProcessStreamContext {
     organization_id: uuid::Uuid,
     workspace_id: uuid::Uuid,
     fallback_enabled: bool,
+    request_priority: inference_providers::models::RequestPriority,
     body_hash: String,
     signing_algo: Option<String>,
     client_pub_key: Option<String>,
@@ -87,6 +88,7 @@ impl ports::ResponseServiceTrait for ResponseServiceImpl {
         organization_id: uuid::Uuid,
         workspace_id: uuid::Uuid,
         fallback_enabled: bool,
+        request_priority: inference_providers::models::RequestPriority,
         body_hash: String,
         signing_algo: Option<String>,
         client_pub_key: Option<String>,
@@ -154,6 +156,7 @@ impl ports::ResponseServiceTrait for ResponseServiceImpl {
                 organization_id,
                 workspace_id,
                 fallback_enabled,
+                request_priority,
                 body_hash,
                 signing_algo: signing_algo_clone,
                 client_pub_key: client_pub_key_clone,
@@ -1166,6 +1169,7 @@ impl ResponseServiceImpl {
         }
 
         let completion_request = CompletionRequest {
+            request_priority: process_context.request_priority,
             request_id: process_context.request_id,
             model: process_context.request.model.clone(),
             messages: messages.to_vec(),
@@ -1558,6 +1562,7 @@ impl ResponseServiceImpl {
                 content: serde_json::Value::String(String::new()),
                 tool_call_id: None,
                 tool_calls: None,
+                reasoning_content: None,
             }
         });
         message.tool_calls = Some(std::mem::take(pending_function_calls));
@@ -1601,6 +1606,7 @@ impl ResponseServiceImpl {
                     content: serde_json::Value::String(output.clone()),
                     tool_call_id: Some(call_id.clone()),
                     tool_calls: None,
+                    reasoning_content: None,
                 });
                 true
             }
@@ -1647,6 +1653,7 @@ impl ResponseServiceImpl {
                     content: serde_json::Value::String(prompt),
                     tool_call_id: None,
                     tool_calls: None,
+                    reasoning_content: None,
                 });
                 tracing::debug!("Prepended organization system prompt to messages");
             }
@@ -1672,6 +1679,7 @@ impl ResponseServiceImpl {
                 content: serde_json::Value::String(combined_instructions),
                 tool_call_id: None,
                 tool_calls: None,
+                reasoning_content: None,
             });
         } else {
             // Add language instruction and time context as a system message if no instructions provided
@@ -1681,6 +1689,7 @@ impl ResponseServiceImpl {
                 content: serde_json::Value::String(system_content),
                 tool_call_id: None,
                 tool_calls: None,
+                reasoning_content: None,
             });
         }
 
@@ -1765,6 +1774,7 @@ impl ResponseServiceImpl {
                             content: serde_json::Value::String(String::new()),
                             tool_call_id: None,
                             tool_calls: Some(std::mem::take(pending)),
+                            reasoning_content: None,
                         });
                         *pending_resp_id = None;
                     }
@@ -1835,6 +1845,7 @@ impl ResponseServiceImpl {
                                 content: serde_json::Value::String(text),
                                 tool_call_id: None,
                                 tool_calls: None,
+                                reasoning_content: None,
                             });
                         }
                     }
@@ -1878,6 +1889,7 @@ impl ResponseServiceImpl {
                             content: serde_json::Value::String(output),
                             tool_call_id: Some(call_id),
                             tool_calls: None,
+                            reasoning_content: None,
                         });
                     }
                     models::ResponseOutputItem::McpCall {
@@ -1926,6 +1938,7 @@ impl ResponseServiceImpl {
                                 content: serde_json::Value::String(tool_output),
                                 tool_call_id: Some(tool_call_id),
                                 tool_calls: None,
+                                reasoning_content: None,
                             });
                         }
                     }
@@ -1970,6 +1983,7 @@ impl ResponseServiceImpl {
                             ),
                             tool_call_id: Some(tc_id),
                             tool_calls: None,
+                            reasoning_content: None,
                         });
                     }
                     // Skip items that don't contribute to conversation context
@@ -2004,6 +2018,7 @@ impl ResponseServiceImpl {
                         content: serde_json::Value::String(text.clone()),
                         tool_call_id: None,
                         tool_calls: None,
+                        reasoning_content: None,
                     });
                 }
                 models::ResponseInput::Items(items) => {
@@ -2039,6 +2054,7 @@ impl ResponseServiceImpl {
                                     content,
                                     tool_call_id: None,
                                     tool_calls: None,
+                                    reasoning_content: None,
                                 };
                                 // An assistant message immediately before
                                 // replayed function calls belongs to the same

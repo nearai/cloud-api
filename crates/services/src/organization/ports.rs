@@ -23,6 +23,9 @@ impl std::fmt::Display for OrganizationId {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Organization {
+    /// Operator-controlled scheduler priority. Never accepted from or exposed in JSON.
+    #[serde(skip)]
+    pub request_priority: inference_providers::models::RequestPriority,
     pub id: OrganizationId,
     pub name: String,
     pub description: Option<String>,
@@ -70,6 +73,12 @@ pub struct OrganizationMember {
     pub user_id: UserId,
     pub role: MemberRole,
     pub joined_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone)]
+pub struct OrganizationMemberRoleUpdate {
+    pub member: OrganizationMember,
+    pub previous_role: MemberRole,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -177,7 +186,16 @@ pub struct UpdateOrganizationMemberRequest {
 pub enum DeleteOrganizationResult {
     Deleted,
     NotFound,
+    Unauthorized,
     StakingWalletBound,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RemoveOrganizationMemberResult {
+    Removed,
+    NotFound,
+    Unauthorized,
+    LastOwner,
 }
 
 /// Organization member with full user information
@@ -322,6 +340,13 @@ pub trait OrganizationRepository: Send + Sync {
 
     async fn get_by_id(&self, id: Uuid) -> Result<Option<Organization>, RepositoryError>;
 
+    /// Set operator policy without touching customer-editable settings.
+    async fn set_request_priority(
+        &self,
+        id: Uuid,
+        priority: i32,
+    ) -> Result<Option<i32>, RepositoryError>;
+
     async fn get_by_name(&self, name: &str) -> Result<Option<Organization>, RepositoryError>;
 
     async fn get_member(
@@ -337,14 +362,17 @@ pub trait OrganizationRepository: Send + Sync {
         id: Uuid,
         request: UpdateOrganizationRequest,
         expected_fallback_override: Option<Option<serde_json::Value>>,
+        actor_user_id: Uuid,
     ) -> Result<Organization, RepositoryError>;
 
     /// Atomically applies the organization-settings fields present in `patch`.
     /// Omitted fields are preserved and explicit nulls remove their JSON keys.
+    /// `actor_user_id = None` is reserved for system-administrator operations.
     async fn patch_settings(
         &self,
         id: Uuid,
         patch: PatchOrganizationSettings,
+        actor_user_id: Option<Uuid>,
     ) -> Result<Organization, RepositoryError>;
 
     /// Soft-deletes an active organization only if it has no staking farm source.
@@ -356,6 +384,7 @@ pub trait OrganizationRepository: Send + Sync {
     async fn delete_if_no_staking_farm_source(
         &self,
         id: Uuid,
+        owner_user_id: Uuid,
     ) -> Result<DeleteOrganizationResult, RepositoryError>;
 
     async fn add_member(
@@ -370,9 +399,26 @@ pub trait OrganizationRepository: Send + Sync {
         org_id: Uuid,
         user_id: Uuid,
         request: UpdateOrganizationMemberRequest,
+        requester_user_id: Uuid,
     ) -> Result<OrganizationMember, RepositoryError>;
 
-    async fn remove_member(&self, org_id: Uuid, user_id: Uuid) -> Result<bool, RepositoryError>;
+    /// Atomically update a member role and record the system administrator
+    /// responsible for the change. Promoting an existing member to owner transfers
+    /// ownership and demotes the previous owner to admin.
+    async fn update_member_role_with_audit(
+        &self,
+        org_id: Uuid,
+        user_id: Uuid,
+        request: UpdateOrganizationMemberRequest,
+        changed_by_user_id: Uuid,
+    ) -> Result<OrganizationMemberRoleUpdate, RepositoryError>;
+
+    async fn remove_member(
+        &self,
+        org_id: Uuid,
+        user_id: Uuid,
+        requester_user_id: Uuid,
+    ) -> Result<RemoveOrganizationMemberResult, RepositoryError>;
 
     async fn list_members_paginated(
         &self,
@@ -624,6 +670,18 @@ pub trait OrganizationServiceTrait: Send + Sync {
         new_role: MemberRole,
     ) -> Result<OrganizationMember, OrganizationError>;
 
+    /// Update a member role after system-admin authorization has been verified.
+    /// The caller MUST enforce system-admin authorization (the API uses
+    /// `admin_middleware` and the `AdminUser` extension). This method does not
+    /// check the caller's organization membership or system-admin privileges.
+    async fn update_member_role_for_admin(
+        &self,
+        organization_id: OrganizationId,
+        member_id: UserId,
+        new_role: MemberRole,
+        changed_by_user_id: UserId,
+    ) -> Result<OrganizationMemberRoleUpdate, OrganizationError>;
+
     /// Remove member with last owner protection
     async fn remove_member_validated(
         &self,
@@ -720,6 +778,19 @@ pub trait OrganizationServiceTrait: Send + Sync {
         user_id: UserId,
         patch: PatchOrganizationSettings,
     ) -> Result<OrganizationSettings, OrganizationError>;
+
+    /// Read scheduler priority from an admin-authenticated call path.
+    async fn get_request_priority_for_admin(
+        &self,
+        organization_id: OrganizationId,
+    ) -> Result<i32, OrganizationError>;
+
+    /// Set scheduler priority from an admin-authenticated call path.
+    async fn update_request_priority_for_admin(
+        &self,
+        organization_id: OrganizationId,
+        priority: i32,
+    ) -> Result<i32, OrganizationError>;
 
     /// Get the effective fallback policy from an admin-authenticated call path.
     async fn get_fallback_enabled_for_admin(

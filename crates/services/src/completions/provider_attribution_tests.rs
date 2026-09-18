@@ -82,9 +82,11 @@ fn test_model(model_name: &str) -> ModelWithPricing {
 
 fn completion_request(model: &str) -> ports::CompletionRequest {
     ports::CompletionRequest {
+        request_priority: 0,
         request_id: Uuid::new_v4(),
         model: model.to_string(),
         messages: vec![ports::CompletionMessage {
+            reasoning_content: None,
             role: "user".to_string(),
             content: serde_json::Value::String("hello".to_string()),
             tool_call_id: None,

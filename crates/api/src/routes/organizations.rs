@@ -859,6 +859,17 @@ mod tests {
             unimplemented!()
         }
 
+        async fn update_member_role_for_admin(
+            &self,
+            _: OrganizationId,
+            _: UserId,
+            _: MemberRole,
+            _: UserId,
+        ) -> Result<services::organization::OrganizationMemberRoleUpdate, OrganizationError>
+        {
+            unimplemented!()
+        }
+
         async fn remove_member_validated(
             &self,
             _: OrganizationId,
@@ -962,6 +973,20 @@ mod tests {
             _: UserId,
             _: services::organization::PatchOrganizationSettings,
         ) -> Result<services::organization::OrganizationSettings, OrganizationError> {
+            unimplemented!()
+        }
+
+        async fn get_request_priority_for_admin(
+            &self,
+            _: OrganizationId,
+        ) -> Result<i32, OrganizationError> {
+            unimplemented!()
+        }
+        async fn update_request_priority_for_admin(
+            &self,
+            _: OrganizationId,
+            _: i32,
+        ) -> Result<i32, OrganizationError> {
             unimplemented!()
         }
 

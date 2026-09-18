@@ -3,6 +3,15 @@
 //! The request body stays schema-free on purpose. Cloud API validates only the
 //! fields needed for routing, billing, and explicit feature gates, then the raw
 //! transport rewrites `model` and forwards the rest to Anthropic.
+//!
+//! `anthropic-beta` is transport, not policy: tokens are syntax-checked and
+//! relayed verbatim, leaving Anthropic (which rejects names it does not know)
+//! as the authority on validity. Body-gated billing and product restrictions
+//! remain enforced by [`reject_unsupported_features`]. An accepted beta can still
+//! introduce header-only pricing or change the response shape: incompatible
+//! non-streaming usage yields a 502 after upstream may already have billed the
+//! work. `ANTHROPIC_DENIED_BETAS` is the global operator kill-switch for these
+//! cases; model-specific pricing restrictions need separate policy.
 
 use crate::middleware::auth::AuthenticatedApiKey;
 use crate::models::AnthropicErrorResponse;
@@ -46,26 +55,13 @@ const MAX_STREAM_ID_PEEK_BYTES: usize = 64 * 1024;
 /// otherwise delay response start indefinitely. Generous because the peek
 /// ends at the first stream event, well before first content.
 const STREAM_ID_PEEK_TIMEOUT: Duration = Duration::from_secs(30);
-const ALLOWED_ANTHROPIC_BETAS: &[&str] = &[
-    // Current Claude Code transport marker and token-only request controls.
-    "claude-code-20250219",
-    "interleaved-thinking-2025-05-14",
-    "thinking-token-count-2026-05-13",
-    "context-management-2025-06-27",
-    "prompt-caching-scope-2026-01-05",
-    "effort-2025-11-24",
-    "structured-outputs-2025-12-15",
-    "fine-grained-tool-streaming-2025-05-14",
-    "token-efficient-tools-2025-02-19",
-    "prompt-caching-2024-07-31",
-    // Sent by Claude Code for [1m]-suffixed models. Upstream treats it as a
-    // no-op: every current 1M-window model serves the full window by default
-    // at standard per-token pricing, so relaying it has no billing effect.
-    "context-1m-2025-08-07",
-    // Claude Code currently sends this marker on ordinary requests. The
-    // separate typed-tool body gate still rejects invocation of the advisor.
-    "advisor-tool-2026-03-01",
-];
+/// Upper bound on a single `anthropic-beta` token. Roughly triple the longest
+/// name Anthropic has published, so the endpoint is never the reason a
+/// plausible future token is refused.
+const MAX_BETA_TOKEN_LEN: usize = 128;
+/// Upper bound on distinct `anthropic-beta` tokens in one request. Current
+/// Claude Code sends thirteen.
+const MAX_BETA_TOKENS: usize = 64;
 
 struct PreparedRequest {
     body: serde_json::Value,
@@ -343,7 +339,7 @@ impl Stream for NativeUsageStream {
             return Poll::Ready(Some(item));
         }
         if this.inner_done {
-            this.finish_billing(StopReason::Completed);
+            this.finish_billing(StopReason::Incomplete);
             return Poll::Ready(None);
         }
         match this.inner.as_mut().poll_next(cx) {
@@ -356,7 +352,7 @@ impl Stream for NativeUsageStream {
                 Poll::Ready(Some(Err(error)))
             }
             Poll::Ready(None) => {
-                this.finish_billing(StopReason::Completed);
+                this.finish_billing(StopReason::Incomplete);
                 Poll::Ready(None)
             }
             Poll::Pending => Poll::Pending,
@@ -456,7 +452,7 @@ async fn handle_request(
         query.as_deref(),
         &body,
         endpoint,
-        &app_state.config.external_providers.anthropic_allowed_betas,
+        &app_state.config.external_providers.anthropic_denied_betas,
     ) {
         Ok(prepared) => prepared,
         Err(error) => return error.into_response(),
@@ -602,7 +598,7 @@ fn prepare_request(
     query: Option<&str>,
     body: &[u8],
     endpoint: AnthropicRawEndpoint,
-    additional_allowed_betas: &[String],
+    denied_betas: &[String],
 ) -> RouteResult<PreparedRequest> {
     reject_unsupported_anthropic_headers(headers)?;
     reject_e2ee(headers)?;
@@ -660,7 +656,7 @@ fn prepare_request(
         beta_query: normalize_query(query)?,
         headers: AnthropicRawHeaders {
             version: single_header(headers, "anthropic-version")?,
-            beta: normalized_beta_header(headers, additional_allowed_betas)?,
+            beta: normalized_beta_header(headers, denied_betas)?,
         },
     })
 }
@@ -824,13 +820,45 @@ fn single_header(headers: &HeaderMap, name: &'static str) -> RouteResult<Option<
         })
 }
 
+/// Whether a token is safe to relay verbatim in the upstream header.
+///
+/// Anthropic's published names are lowercase alphanumerics and dashes; upper
+/// case, `_` and `.` are admitted so a plausible future spelling is not refused
+/// here. Everything else (whitespace, quotes, separators, control characters)
+/// is rejected to keep the relayed header value unambiguous.
+fn beta_token_is_well_formed(token: &str) -> bool {
+    !token.is_empty()
+        && token.len() <= MAX_BETA_TOKEN_LEN
+        && token
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+}
+
+fn malformed_beta_token(token: &str) -> AnthropicRouteError {
+    // Echoing is safe: the value already passed `to_str`, and the error body is
+    // JSON-escaped. Never log it — beta tokens travel with customer requests.
+    let shown: String = token.chars().take(64).collect();
+    AnthropicRouteError::new(
+        StatusCode::BAD_REQUEST,
+        "invalid_request_error",
+        format!(
+            "anthropic-beta token '{shown}' is malformed: use ASCII letters, digits, \
+             '-', '_' or '.' (at most {MAX_BETA_TOKEN_LEN} characters)"
+        ),
+    )
+}
+
+/// Collect the client's `anthropic-beta` tokens for relay.
+///
+/// Unknown tokens are forwarded on purpose. Anthropic answers a name it does
+/// not recognise with its own 400, so an allowlist here adds no protection and
+/// only goes stale on every client release (nearai/cloud-api#970, #988, #1068).
+/// `ANTHROPIC_DENIED_BETAS` remains as an operator kill-switch, and the body
+/// gates in [`reject_unsupported_features`] still enforce billing policy.
 fn normalized_beta_header(
     headers: &HeaderMap,
-    additional_allowed_betas: &[String],
+    denied_betas: &[String],
 ) -> RouteResult<Option<String>> {
-    // Keep the default surface narrow, while allowing operators to admit a
-    // newly released token through ANTHROPIC_ALLOWED_BETAS without a code
-    // deployment. Body policy still blocks unsupported server-side products.
     let mut betas = Vec::<String>::new();
     for value in headers.get_all("anthropic-beta") {
         let value = value.to_str().map_err(|_| {
@@ -845,18 +873,33 @@ fn normalized_beta_header(
             .map(str::trim)
             .filter(|token| !token.is_empty())
         {
-            if !ALLOWED_ANTHROPIC_BETAS.contains(&token)
-                && !additional_allowed_betas
-                    .iter()
-                    .any(|allowed| allowed == token)
+            if !beta_token_is_well_formed(token) {
+                return Err(malformed_beta_token(token));
+            }
+            if denied_betas
+                .iter()
+                .any(|denied| denied.eq_ignore_ascii_case(token))
             {
-                return Err(unsupported_feature(&format!(
-                    "anthropic-beta token '{token}'"
-                )));
+                return Err(AnthropicRouteError::new(
+                    StatusCode::BAD_REQUEST,
+                    "invalid_request_error",
+                    format!(
+                        "anthropic-beta token '{token}' is disabled on this endpoint by \
+                         operator policy"
+                    ),
+                ));
             }
-            if !betas.iter().any(|existing| existing == token) {
-                betas.push(token.to_string());
+            if betas.iter().any(|existing| existing == token) {
+                continue;
             }
+            if betas.len() == MAX_BETA_TOKENS {
+                return Err(AnthropicRouteError::new(
+                    StatusCode::BAD_REQUEST,
+                    "invalid_request_error",
+                    format!("anthropic-beta lists more than {MAX_BETA_TOKENS} distinct tokens"),
+                ));
+            }
+            betas.push(token.to_string());
         }
     }
     Ok((!betas.is_empty()).then(|| betas.join(",")))
@@ -963,7 +1006,7 @@ async fn build_upstream_response(
                 );
             }
         };
-        let reason = usage.stop_reason.clone().unwrap_or(StopReason::Completed);
+        let reason = usage.stop_reason.clone().unwrap_or(StopReason::Incomplete);
         let inference_id = usage.inference_id();
         if let Some(billing) = billing {
             if let Err(error) = record_native_usage(billing, usage, reason).await {
@@ -1222,8 +1265,17 @@ mod tests {
         assert!(!prepared.stream);
     }
 
+    /// The default `anthropic-beta` header sent by Claude Code 2.1.272, plus
+    /// `redact-thinking-2026-02-12`, which it adds conditionally.
+    const CLAUDE_CODE_BETAS: &str = "claude-code-20250219,interleaved-thinking-2025-05-14,\
+thinking-token-count-2026-05-13,context-management-2025-06-27,\
+prompt-caching-scope-2026-01-05,mid-conversation-system-2026-04-07,\
+advisor-tool-2026-03-01,effort-2025-11-24,fallback-credit-2026-06-01,afk-mode-2026-01-31,\
+per-turn-control-2026-07-01,mid-conversation-tool-changes-2026-07-01,\
+redact-thinking-2026-02-12";
+
     #[test]
-    fn beta_tokens_are_preserved_and_deduplicated() {
+    fn beta_tokens_are_relayed_verbatim_and_deduplicated() {
         let mut headers = request_headers();
         headers.append(
             "anthropic-beta",
@@ -1231,26 +1283,40 @@ mod tests {
         );
         headers.append(
             "anthropic-beta",
-            HeaderValue::from_static("claude-code-20250219"),
+            HeaderValue::from_static("claude-code-20250219, future-beta-2099-12-31"),
         );
         assert_eq!(
             normalized_beta_header(&headers, &[]).unwrap().as_deref(),
-            Some("claude-code-20250219,interleaved-thinking-2025-05-14")
+            Some("claude-code-20250219,interleaved-thinking-2025-05-14,future-beta-2099-12-31")
         );
 
+        // A token this endpoint has never heard of is Anthropic's call, not ours.
         headers.insert(
             "anthropic-beta",
             HeaderValue::from_static("fast-mode-2026-02-01"),
         );
-        assert!(normalized_beta_header(&headers, &[]).is_err());
-
-        let additional = vec!["fast-mode-2026-02-01".to_string()];
         assert_eq!(
-            normalized_beta_header(&headers, &additional)
-                .unwrap()
-                .as_deref(),
+            normalized_beta_header(&headers, &[]).unwrap().as_deref(),
             Some("fast-mode-2026-02-01")
         );
+
+        assert_eq!(
+            normalized_beta_header(&request_headers(), &[]).unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn beta_token_deduplication_preserves_case() {
+        let mut headers = request_headers();
+        headers.insert("anthropic-beta", HeaderValue::from_static("beta,BETA,beta"));
+        // Preserve provider-visible spelling; only identical tokens deduplicate.
+        // Operator denial intentionally covers all case variants instead.
+        assert_eq!(
+            normalized_beta_header(&headers, &[]).unwrap().as_deref(),
+            Some("beta,BETA")
+        );
+        assert!(normalized_beta_header(&headers, &["BeTa".to_string()]).is_err());
     }
 
     #[test]
@@ -1258,9 +1324,7 @@ mod tests {
         let mut headers = request_headers();
         headers.insert(
             "anthropic-beta",
-            HeaderValue::from_static(
-                "claude-code-20250219,interleaved-thinking-2025-05-14,thinking-token-count-2026-05-13,context-management-2025-06-27,prompt-caching-scope-2026-01-05,advisor-tool-2026-03-01,effort-2025-11-24,structured-outputs-2025-12-15,context-1m-2025-08-07",
-            ),
+            HeaderValue::from_str(CLAUDE_CODE_BETAS).unwrap(),
         );
         let prepared = prepare_request(
             &headers,
@@ -1272,13 +1336,127 @@ mod tests {
         .unwrap();
 
         assert!(prepared.beta_query);
+        assert_eq!(prepared.headers.beta.as_deref(), Some(CLAUDE_CODE_BETAS));
+        assert!(normalize_query(Some("future=true")).is_err());
+    }
+
+    #[test]
+    fn denied_beta_tokens_are_rejected_case_insensitively() {
+        let denied = vec!["fast-mode-2026-02-01".to_string()];
+        let mut headers = request_headers();
+        headers.insert(
+            "anthropic-beta",
+            HeaderValue::from_static("Fast-Mode-2026-02-01,claude-code-20250219"),
+        );
+        let error = normalized_beta_header(&headers, &denied).unwrap_err();
+        assert_eq!(error.status, StatusCode::BAD_REQUEST);
+        assert!(error.message.contains("disabled"));
+
+        headers.insert(
+            "anthropic-beta",
+            HeaderValue::from_static("claude-code-20250219"),
+        );
+        assert_eq!(
+            normalized_beta_header(&headers, &denied)
+                .unwrap()
+                .as_deref(),
+            Some("claude-code-20250219")
+        );
+    }
+
+    #[test]
+    fn malformed_beta_tokens_are_rejected() {
+        let over_long = "a".repeat(MAX_BETA_TOKEN_LEN + 1);
+        let too_many = (0..=MAX_BETA_TOKENS)
+            .map(|index| format!("beta-{index}"))
+            .collect::<Vec<_>>()
+            .join(",");
+        for value in [
+            "claude code",
+            "foo;bar",
+            "\"quoted\"",
+            &over_long,
+            &too_many,
+        ] {
+            let mut headers = request_headers();
+            headers.insert("anthropic-beta", HeaderValue::from_str(value).unwrap());
+            let error = normalized_beta_header(&headers, &[]).unwrap_err();
+            assert_eq!(error.status, StatusCode::BAD_REQUEST);
+            // Must not read like the retired allowlist: an operator or syntax
+            // refusal has to be distinguishable from a stale gate in triage.
+            assert!(!error.message.contains("is not supported"), "{value}");
+        }
+
+        let mut headers = request_headers();
+        headers.insert("anthropic-beta", HeaderValue::from_bytes(b"\xff").unwrap());
+        assert!(normalized_beta_header(&headers, &[]).is_err());
+    }
+
+    #[test]
+    fn beta_token_limits_are_inclusive() {
+        // Exactly the maximum token length and distinct-token count are valid.
+        let mut headers = request_headers();
+        headers.insert(
+            "anthropic-beta",
+            HeaderValue::from_str(&"a".repeat(MAX_BETA_TOKEN_LEN)).unwrap(),
+        );
+        assert!(normalized_beta_header(&headers, &[]).is_ok());
+
+        let at_limit = (0..MAX_BETA_TOKENS)
+            .map(|index| format!("beta-{index}"))
+            .collect::<Vec<_>>()
+            .join(",");
+        headers.insert("anthropic-beta", HeaderValue::from_str(&at_limit).unwrap());
+        assert_eq!(
+            normalized_beta_header(&headers, &[]).unwrap().as_deref(),
+            Some(at_limit.as_str())
+        );
+        // A duplicate does not consume another distinct-token slot.
+        headers.append("anthropic-beta", HeaderValue::from_static("beta-0"));
+        assert_eq!(
+            normalized_beta_header(&headers, &[]).unwrap().as_deref(),
+            Some(at_limit.as_str())
+        );
+        headers.append("anthropic-beta", HeaderValue::from_static("beta-extra"));
+        let error = normalized_beta_header(&headers, &[]).unwrap_err();
+        assert_eq!(error.status, StatusCode::BAD_REQUEST);
+        assert!(error.message.contains("more than 64 distinct tokens"));
+    }
+
+    #[test]
+    fn beta_header_alone_never_unlocks_a_body_gated_feature() {
+        let mut headers = request_headers();
+        headers.insert(
+            "anthropic-beta",
+            HeaderValue::from_static("fast-mode-2026-02-01"),
+        );
+        let prepared = prepare_request(
+            &headers,
+            None,
+            &base_body(),
+            AnthropicRawEndpoint::Messages,
+            &[],
+        )
+        .unwrap();
         assert_eq!(
             prepared.headers.beta.as_deref(),
-            headers
-                .get("anthropic-beta")
-                .and_then(|value| value.to_str().ok())
+            Some("fast-mode-2026-02-01")
         );
-        assert!(normalize_query(Some("future=true")).is_err());
+
+        // `PreparedRequest` is deliberately not `Debug` (it holds the customer
+        // body), so inspect the error arm directly rather than `unwrap_err`.
+        let mut body: serde_json::Value = serde_json::from_slice(&base_body()).unwrap();
+        body["speed"] = serde_json::json!("fast");
+        let Err(error) = prepare_request(
+            &headers,
+            None,
+            &serde_json::to_vec(&body).unwrap(),
+            AnthropicRawEndpoint::Messages,
+            &[],
+        ) else {
+            panic!("speed=fast must stay rejected regardless of the beta header");
+        };
+        assert!(error.message.contains("speed=fast"));
     }
 
     #[test]
@@ -1654,6 +1832,7 @@ mod tests {
         async fn get_usage_history_by_api_key(
             &self,
             _api_key_id: Uuid,
+            _credit_type: Option<&str>,
             _limit: Option<i64>,
             _offset: Option<i64>,
         ) -> Result<(Vec<services::usage::UsageLogEntry>, i64), services::usage::UsageError>
@@ -1666,6 +1845,7 @@ mod tests {
             _workspace_id: Uuid,
             _api_key_id: Uuid,
             _user_id: Uuid,
+            _credit_type: Option<&str>,
             _limit: Option<i64>,
             _offset: Option<i64>,
         ) -> Result<(Vec<services::usage::UsageLogEntry>, i64), services::usage::UsageError>
@@ -1771,6 +1951,59 @@ mod tests {
         assert_eq!(recorded.stop_reason, Some(StopReason::Completed));
         assert_eq!(recorded.input_tokens, 4);
         assert_eq!(recorded.output_tokens, 9);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn stream_ending_without_a_declared_stop_reason_is_billed_as_incomplete() {
+        let usage_service = Arc::new(RecordingUsageService::default());
+        let mut stream = usage_stream_over(
+            vec![
+                Ok(Bytes::from_static(
+                    b"data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_stream\",\"usage\":{\"input_tokens\":4}}}\n\n",
+                )),
+                Ok(Bytes::from_static(
+                    b"data: {\"type\":\"message_delta\",\"delta\":{},\"usage\":{\"output_tokens\":9}}\n\n",
+                )),
+            ],
+            Some(billing_context(usage_service.clone())),
+        );
+        stream.peek_message_id().await;
+
+        use futures_util::StreamExt as _;
+        let mut stream = Box::pin(stream);
+        while let Some(item) = stream.next().await {
+            item.unwrap();
+        }
+        drop(stream);
+
+        let recorded = wait_for_recorded_usage(&usage_service).await;
+        assert_eq!(recorded.stop_reason, Some(StopReason::Incomplete));
+        assert_eq!(recorded.output_tokens, 9);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn upstream_ending_before_a_parseable_id_is_billed_as_incomplete() {
+        let usage_service = Arc::new(RecordingUsageService::default());
+        let leading = Bytes::from_static(
+            b"data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_stream\",\"usage\":{\"input_tokens\":4}}}",
+        );
+        let mut stream = usage_stream_over(
+            vec![Ok(leading)],
+            Some(billing_context(usage_service.clone())),
+        );
+        stream.peek_message_id().await;
+        assert!(stream.inner_done);
+
+        use futures_util::StreamExt as _;
+        let mut stream = Box::pin(stream);
+        while let Some(item) = stream.next().await {
+            item.unwrap();
+        }
+        drop(stream);
+
+        let recorded = wait_for_recorded_usage(&usage_service).await;
+        assert_eq!(recorded.stop_reason, Some(StopReason::Incomplete));
+        assert_eq!(recorded.input_tokens, 4);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

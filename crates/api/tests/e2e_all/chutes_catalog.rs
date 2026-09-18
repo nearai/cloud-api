@@ -11,8 +11,10 @@ use std::sync::Arc;
 
 fn chat_params(model: &str) -> inference_providers::ChatCompletionParams {
     inference_providers::ChatCompletionParams {
+        request_priority: 0,
         model: model.to_string(),
         messages: vec![inference_providers::ChatMessage {
+            reasoning_content: None,
             role: inference_providers::MessageRole::User,
             content: Some(serde_json::Value::String("hello".to_string())),
             name: None,

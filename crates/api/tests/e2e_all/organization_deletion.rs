@@ -230,6 +230,7 @@ async fn test_cached_api_key_is_rejected_after_organization_deletion() {
     let deleted = services::organization::OrganizationRepository::delete_if_no_staking_farm_source(
         &organization_repository,
         organization_id,
+        uuid::Uuid::parse_str(&org.owner_id).expect("owner id"),
     )
     .await
     .expect("organization deletion should succeed");

@@ -48,6 +48,7 @@ impl From<crate::models::Message> for ChatMessage {
             name: msg.name,
             tool_call_id: msg.tool_call_id,
             tool_calls,
+            reasoning_content: msg.reasoning_content.or(msg.reasoning),
         }
     }
 }
@@ -99,6 +100,9 @@ impl From<ChatCompletionRequest> for ChatCompletionParams {
         }
 
         Self {
+            // This conversion has no authenticated org context. Production
+            // completion routes supply organization priority through the service.
+            request_priority: 0,
             model: req.model,
             messages: req.messages.into_iter().map(|m| m.into()).collect(),
             max_tokens: req.max_tokens,
@@ -169,6 +173,8 @@ impl From<ChatMessage> for crate::models::Message {
             name: msg.name.clone(),
             tool_call_id: msg.tool_call_id,
             tool_calls,
+            reasoning_content: msg.reasoning_content,
+            reasoning: None,
         }
     }
 }
@@ -771,6 +777,8 @@ mod tests {
     #[test]
     fn test_message_conversion() {
         let http_msg = crate::models::Message {
+            reasoning: None,
+            reasoning_content: None,
             role: "user".to_string(),
             content: Some(crate::models::MessageContent::Text("Hello".to_string())),
             name: None,
@@ -796,6 +804,8 @@ mod tests {
     #[test]
     fn test_developer_role_maps_to_system() {
         let http_msg = crate::models::Message {
+            reasoning: None,
+            reasoning_content: None,
             role: "developer".to_string(),
             content: Some(crate::models::MessageContent::Text(
                 "You are helpful.".to_string(),
@@ -814,9 +824,69 @@ mod tests {
     /// the next turn with 400 "Function call is missing a thought_signature".
     /// Confirms the signature survives `Message -> ChatMessage`.
     #[test]
+    fn test_tool_call_thought_signature_wire_formats() {
+        use serde_json::json;
+        for (fields, expected) in [
+            (
+                json!({"extra_content":{"google":{"thought_signature":"nested"}}}),
+                Some("nested"),
+            ),
+            (json!({"thought_signature":"legacy"}), Some("legacy")),
+            (
+                json!({"thought_signature":"legacy", "extra_content":{"google":{"thought_signature":"nested"}}}),
+                Some("nested"),
+            ),
+            (
+                json!({"thought_signature":"legacy", "extra_content":{"google":{"thought_signature":null}}}),
+                Some("legacy"),
+            ),
+            (json!({}), None),
+            (json!({"extra_content":null}), None),
+            (
+                json!({"extra_content":{"google":null,"unrelated":true}}),
+                None,
+            ),
+        ] {
+            let mut call = json!({"id":"call_read", "type":"function", "function":{"name":"read", "arguments":"{}"}});
+            call.as_object_mut()
+                .unwrap()
+                .extend(fields.as_object().unwrap().clone());
+            let msg: crate::models::Message = serde_json::from_value(json!({
+                "role":"assistant", "tool_calls":[call]
+            }))
+            .unwrap();
+            let domain: ChatMessage = msg.into();
+            assert_eq!(
+                domain.tool_calls.as_ref().unwrap()[0]
+                    .thought_signature
+                    .as_deref(),
+                expected
+            );
+            let outbound: crate::models::Message = domain.into();
+            let wire = serde_json::to_value(outbound).unwrap();
+            let call = &wire["tool_calls"][0];
+            match expected {
+                Some(signature) => {
+                    assert_eq!(call["thought_signature"], signature);
+                    assert_eq!(
+                        call["extra_content"]["google"]["thought_signature"],
+                        signature
+                    );
+                }
+                None => {
+                    assert!(call.get("thought_signature").is_none());
+                    assert!(call.get("extra_content").is_none());
+                }
+            }
+        }
+    }
+
+    #[test]
     fn test_tool_call_thought_signature_inbound_roundtrip() {
         let sig = "Ep8BCpwBAQw51sfQQgKQ2k...".to_string();
         let http_msg = crate::models::Message {
+            reasoning: None,
+            reasoning_content: None,
             role: "assistant".to_string(),
             content: None,
             name: None,
@@ -843,6 +913,8 @@ mod tests {
     #[test]
     fn test_tool_call_without_thought_signature_still_works() {
         let http_msg = crate::models::Message {
+            reasoning: None,
+            reasoning_content: None,
             role: "assistant".to_string(),
             content: None,
             name: None,
@@ -870,6 +942,7 @@ mod tests {
     fn test_tool_call_thought_signature_outbound_roundtrip() {
         let sig = "test-signature-bytes".to_string();
         let domain_msg = ChatMessage {
+            reasoning_content: None,
             role: MessageRole::Assistant,
             content: None,
             name: None,
@@ -916,6 +989,8 @@ mod tests {
         let http_req = ChatCompletionRequest {
             model: "gpt-3.5-turbo".to_string(),
             messages: vec![crate::models::Message {
+                reasoning: None,
+                reasoning_content: None,
                 role: "user".to_string(),
                 content: Some(crate::models::MessageContent::Text(
                     "Test message".to_string(),
@@ -980,6 +1055,8 @@ mod tests {
         let http_req = ChatCompletionRequest {
             model: "gpt-3.5-turbo".to_string(),
             messages: vec![crate::models::Message {
+                reasoning: None,
+                reasoning_content: None,
                 role: "user".to_string(),
                 content: Some(crate::models::MessageContent::Text(
                     "Test message".to_string(),

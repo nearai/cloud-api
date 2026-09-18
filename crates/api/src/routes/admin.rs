@@ -1,29 +1,32 @@
 use crate::conversions::{
     api_invitation_email_status_to_services, api_invitation_status_to_services,
-    services_invitation_email_delivery_to_api, services_invitation_resend_result_to_api,
+    api_role_to_services_role, services_invitation_email_delivery_to_api,
+    services_invitation_resend_result_to_api, services_member_to_api_member,
 };
 use crate::middleware::AdminUser;
 use crate::models::{
-    AdminAccessTokenResponse, AdminAmlAllowlistEntryResponse, AdminAmlReportResponse,
-    AdminInvitationEmailResendResultResponse, AdminModelListResponse, AdminModelWithPricing,
-    AdminOrganizationMemberResponse, AdminOrganizationResponse, AdminServiceResponse,
-    AdminUserOrganizationDetails, AdminUserResponse, BatchUpdateModelApiRequest,
-    CreateAdminAccessTokenRequest, CreateServiceRequest, CreditType, DecimalPrice,
-    DecimalPriceRequest, DeleteAdminAccessTokenRequest, DeleteModelRequest, DeprecateModelRequest,
-    DeprecateModelResponse, ErrorResponse, GetOrganizationConcurrentLimitResponse,
+    AdminAccessTokenPermission, AdminAccessTokenResponse, AdminAmlAllowlistEntryResponse,
+    AdminAmlReportResponse, AdminInvitationEmailResendResultResponse, AdminModelListResponse,
+    AdminModelWithPricing, AdminOrganizationMemberResponse, AdminOrganizationResponse,
+    AdminServiceResponse, AdminUserOrganizationDetails, AdminUserResponse,
+    BatchUpdateModelApiRequest, CreateAdminAccessTokenRequest, CreateServiceRequest, CreditType,
+    DecimalPrice, DecimalPriceRequest, DeleteAdminAccessTokenRequest, DeleteModelRequest,
+    DeprecateModelRequest, DeprecateModelResponse, ErrorResponse,
+    GetOrganizationConcurrentLimitResponse, ListAdminAccessTokensResponse,
     ListAdminAmlAllowlistResponse, ListAdminAmlReportsResponse,
     ListAdminInvitationEmailDeliveriesResponse, ListAdminOrganizationMembersResponse,
     ListOrganizationsAdminResponse, ListPricingChangesResponse, ListUsersResponse, MemberRole,
     ModelArchitecture, ModelDeprecationConfirmResponse, ModelDeprecationPreviewResponse,
     ModelDeprecationRequest, ModelHistoryEntry, ModelHistoryResponse, ModelMetadata,
     ModelWithPricing, OrgLimitsHistoryEntry, OrgLimitsHistoryResponse,
-    OrganizationFallbackResponse, OrganizationUsage, PricingChangeBatchRequest,
-    PricingChangeConfirmResponse, PricingChangeModelPreviewDto, PricingChangePreviewResponse,
-    PricingFieldUpdates, PricingFields, ScheduledPricingChangeDto, SpendLimit,
-    UpdateAmlReportStatusRequest, UpdateOrganizationConcurrentLimitRequest,
-    UpdateOrganizationConcurrentLimitResponse, UpdateOrganizationFallbackRequest,
-    UpdateOrganizationLimitsRequest, UpdateOrganizationLimitsResponse, UpdateServiceRequest,
-    UpsertAmlAllowlistEntryRequest,
+    OrganizationFallbackResponse, OrganizationMemberResponse, OrganizationPriorityResponse,
+    OrganizationUsage, PricingChangeBatchRequest, PricingChangeConfirmResponse,
+    PricingChangeModelPreviewDto, PricingChangePreviewResponse, PricingFieldUpdates, PricingFields,
+    ScheduledPricingChangeDto, SpendLimit, UpdateAmlReportStatusRequest,
+    UpdateOrganizationConcurrentLimitRequest, UpdateOrganizationConcurrentLimitResponse,
+    UpdateOrganizationFallbackRequest, UpdateOrganizationLimitsRequest,
+    UpdateOrganizationLimitsResponse, UpdateOrganizationMemberRequest,
+    UpdateOrganizationPriorityRequest, UpdateServiceRequest, UpsertAmlAllowlistEntryRequest,
 };
 use crate::routes::common::format_amount;
 use crate::routes::usage::{compute_organization_balance_response, OrganizationBalanceResponse};
@@ -38,12 +41,29 @@ use chrono::{DateTime, Duration, Timelike, Utc};
 use config::ApiConfig;
 use services::admin::{AdminService, AnalyticsService, UpdateModelAdminRequest};
 use services::aml::{AmlAllowlistEntry, AmlError, AmlReport};
-use services::auth::AuthServiceTrait;
+use services::auth::{AuthServiceTrait, UserId};
 use services::github_dispatch::GitHubDispatcher;
 use services::usage::UsageServiceTrait;
 use std::sync::Arc;
 use tracing::{debug, error, warn, Instrument};
 use uuid::Uuid;
+
+fn parse_stored_credit_type(
+    value: &str,
+) -> Result<CreditType, (StatusCode, ResponseJson<ErrorResponse>)> {
+    value.parse().map_err(|_| {
+        // Do not silently relabel unknown database values as purchased credits.
+        // The value itself is intentionally omitted from logs.
+        error!("Unsupported credit type returned by admin service");
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            ResponseJson(ErrorResponse::new(
+                "Failed to read organization limits".to_string(),
+                "internal_server_error".to_string(),
+            )),
+        )
+    })
+}
 
 /// OpenRouter's fixed `supported_sampling_parameters` vocabulary. Values written
 /// via the admin API are validated against this list, and any pinned/seeded
@@ -529,6 +549,29 @@ pub async fn batch_upsert_models(
 
     // Validate all pricing fields are non-negative to prevent incorrect billing
     for (model_name, request) in &batch_request {
+        if let Some(config) = &request.provider_config {
+            // Backend-less configs belong to non-external features such as
+            // long-context routing. The service layer repeats this validation
+            // against the merged stored provider type, which covers partial
+            // updates that omit `providerType`.
+            if request.provider_type.as_deref() == Some("external")
+                || config.get("backend").is_some()
+                || config.get("enforced_request_body").is_some()
+            {
+                inference_providers::non_attested::external::validate_external_provider_config(
+                    config,
+                )
+                .map_err(|error| {
+                    (
+                        StatusCode::BAD_REQUEST,
+                        ResponseJson(ErrorResponse::new(
+                            format!("model '{model_name}': {error}"),
+                            "invalid_request".to_string(),
+                        )),
+                    )
+                })?;
+            }
+        }
         let validate_price = |price: &Option<DecimalPriceRequest>, field: &str| {
             if let Some(p) = price {
                 p.validate().map_err(|e| {
@@ -856,6 +899,20 @@ pub async fn batch_upsert_models(
             );
     }
 
+    if batch_request.values().any(|request| {
+        request.provider_type.is_some()
+            || request.provider_config.is_some()
+            || request.inference_url.is_some()
+            || request.is_active.is_some()
+    }) {
+        // The database write is complete. Prevent an older periodic snapshot
+        // from replacing or removing the provider state reconciled below.
+        app_state
+            .inference_provider_pool
+            .invalidate_periodic_provider_refreshes()
+            .await;
+    }
+
     // Update providers at runtime so changes take effect without server restart.
     // Unregister first, then re-register — this handles type transitions
     // (e.g., inference_url → external) and deactivations cleanly.
@@ -950,11 +1007,12 @@ pub async fn batch_upsert_models(
     let external_models: Vec<(String, serde_json::Value)> = batch_request
         .iter()
         .filter_map(|(model_name, request)| {
-            let is_external = request.provider_type.as_deref() == Some("external");
-            let is_active = request.is_active != Some(false);
-
-            if is_external && is_active {
-                request
+            let merged = updated_models.get(model_name)?;
+            let touches_registration = request.provider_type.is_some()
+                || request.provider_config.is_some()
+                || request.is_active.is_some();
+            if merged.provider_type == "external" && merged.is_active && touches_registration {
+                merged
                     .provider_config
                     .clone()
                     .map(|config| (model_name.clone(), config))
@@ -1438,12 +1496,7 @@ pub async fn update_organization_limits(
         })?;
 
     // Convert service response to API response
-    let credit_type_enum = match updated_limits.credit_type.to_lowercase().as_str() {
-        "grant" => CreditType::Grant,
-        "payment" => CreditType::Payment,
-        "staking_farm" => CreditType::StakingFarm,
-        _ => CreditType::Payment, // Default fallback (should not happen)
-    };
+    let credit_type_enum = parse_stored_credit_type(&updated_limits.credit_type)?;
 
     let response = UpdateOrganizationLimitsResponse {
         organization_id: updated_limits.organization_id.to_string(),
@@ -1551,13 +1604,8 @@ pub async fn get_organization_limits_history(
     let entries: Vec<OrgLimitsHistoryEntry> = history
         .into_iter()
         .map(|h| {
-            let credit_type_enum = match h.credit_type.to_lowercase().as_str() {
-                "grant" => CreditType::Grant,
-                "payment" => CreditType::Payment,
-                "staking_farm" => CreditType::StakingFarm,
-                _ => CreditType::Payment,
-            };
-            OrgLimitsHistoryEntry {
+            let credit_type_enum = parse_stored_credit_type(&h.credit_type)?;
+            Ok(OrgLimitsHistoryEntry {
                 id: h.id.to_string(),
                 organization_id: h.organization_id.to_string(),
                 credit_type: credit_type_enum,
@@ -1574,9 +1622,9 @@ pub async fn get_organization_limits_history(
                 changed_by_user_id: h.changed_by_user_id.map(|id| id.to_string()),
                 changed_by_user_email: h.changed_by_user_email,
                 created_at: h.created_at.to_rfc3339(),
-            }
+            })
         })
-        .collect();
+        .collect::<Result<Vec<_>, (StatusCode, ResponseJson<ErrorResponse>)>>()?;
 
     let response = OrgLimitsHistoryResponse {
         history: entries,
@@ -2628,6 +2676,74 @@ pub async fn list_organizations(
     Ok(ResponseJson(response))
 }
 
+/// Get an organization's scheduler priority (platform admins only).
+#[utoipa::path(
+    get,
+    path = "/v1/admin/organizations/{org_id}/priority",
+    tag = "Admin",
+    params(("org_id" = Uuid, Path, description = "Organization ID")),
+    responses(
+        (status = 200, description = "Scheduler priority retrieved", body = OrganizationPriorityResponse),
+        (status = 401, description = "Unauthorized", body = ErrorResponse),
+        (status = 403, description = "Forbidden", body = ErrorResponse),
+        (status = 404, description = "Organization not found", body = ErrorResponse)
+    ),
+    security(("session_token" = []))
+)]
+pub async fn get_organization_priority(
+    State(app_state): State<AdminAppState>,
+    Extension(_admin_user): Extension<AdminUser>,
+    Path(org_id): Path<Uuid>,
+) -> Result<ResponseJson<OrganizationPriorityResponse>, (StatusCode, ResponseJson<ErrorResponse>)> {
+    let priority = app_state
+        .organization_service
+        .get_request_priority_for_admin(services::organization::OrganizationId(org_id))
+        .await
+        .map_err(crate::routes::common::map_organization_error)?;
+    Ok(ResponseJson(OrganizationPriorityResponse {
+        organization_id: org_id,
+        priority,
+    }))
+}
+
+/// Set an organization's scheduler priority (platform admins with write access only).
+#[utoipa::path(
+    patch,
+    path = "/v1/admin/organizations/{org_id}/priority",
+    tag = "Admin",
+    params(("org_id" = Uuid, Path, description = "Organization ID")),
+    request_body = UpdateOrganizationPriorityRequest,
+    responses(
+        (status = 200, description = "Scheduler priority updated", body = OrganizationPriorityResponse),
+        (status = 400, description = "Priority outside -1000..1000", body = ErrorResponse),
+        (status = 401, description = "Unauthorized", body = ErrorResponse),
+        (status = 403, description = "Forbidden", body = ErrorResponse),
+        (status = 404, description = "Organization not found", body = ErrorResponse)
+    ),
+    security(("session_token" = []))
+)]
+pub async fn update_organization_priority(
+    State(app_state): State<AdminAppState>,
+    Extension(admin_user): Extension<AdminUser>,
+    Path(org_id): Path<Uuid>,
+    Json(request): Json<UpdateOrganizationPriorityRequest>,
+) -> Result<ResponseJson<OrganizationPriorityResponse>, (StatusCode, ResponseJson<ErrorResponse>)> {
+    let priority = app_state
+        .organization_service
+        .update_request_priority_for_admin(
+            services::organization::OrganizationId(org_id),
+            request.priority,
+        )
+        .await
+        .map_err(crate::routes::common::map_organization_error)?;
+    tracing::info!(organization_id = %org_id, actor_id = %admin_user.0.id,
+        actor_type = "platform_admin", priority, "Organization request priority changed");
+    Ok(ResponseJson(OrganizationPriorityResponse {
+        organization_id: org_id,
+        priority,
+    }))
+}
+
 /// Get an organization's effective fallback policy (Admin only).
 #[utoipa::path(
     get,
@@ -2928,6 +3044,86 @@ pub async fn list_organization_members(
     }))
 }
 
+/// Update an organization member role as a system administrator.
+///
+/// Assigning the owner role transfers ownership from the current owner to an
+/// existing organization member. The previous owner is demoted to admin.
+#[utoipa::path(
+    put,
+    path = "/v1/admin/organizations/{org_id}/members/{user_id}",
+    tag = "Admin",
+    params(
+        ("org_id" = Uuid, Path, description = "Organization ID"),
+        ("user_id" = Uuid, Path, description = "User ID")
+    ),
+    request_body = UpdateOrganizationMemberRequest,
+    responses(
+        (status = 200, description = "Member role updated", body = OrganizationMemberResponse),
+        (status = 400, description = "Invalid request", body = ErrorResponse),
+        (status = 401, description = "Unauthorized", body = ErrorResponse),
+        (status = 403, description = "System administrator privileges required", body = ErrorResponse),
+        (status = 404, description = "Organization or member not found", body = ErrorResponse),
+        (status = 422, description = "Malformed request body", body = ErrorResponse),
+        (status = 500, description = "Internal server error", body = ErrorResponse)
+    ),
+    security(
+        ("session_token" = [])
+    )
+)]
+pub async fn update_organization_member_role(
+    State(app_state): State<AdminAppState>,
+    Extension(admin_user): Extension<AdminUser>,
+    Path((org_id, user_id)): Path<(Uuid, Uuid)>,
+    Json(request): Json<UpdateOrganizationMemberRequest>,
+) -> Result<ResponseJson<OrganizationMemberResponse>, (StatusCode, ResponseJson<ErrorResponse>)> {
+    let new_role = api_role_to_services_role(request.role);
+    let update = app_state
+        .organization_service
+        .update_member_role_for_admin(
+            services::organization::OrganizationId(org_id),
+            UserId(user_id),
+            new_role,
+            UserId(admin_user.0.id),
+        )
+        .await
+        .map_err(|error| match error {
+            services::organization::OrganizationError::NotFound => (
+                StatusCode::NOT_FOUND,
+                ResponseJson(ErrorResponse::new(
+                    "Organization or member not found".to_string(),
+                    "not_found".to_string(),
+                )),
+            ),
+            services::organization::OrganizationError::InvalidParams(message) => (
+                StatusCode::BAD_REQUEST,
+                ResponseJson(ErrorResponse::new(message, "invalid_request".to_string())),
+            ),
+            services::organization::OrganizationError::Unauthorized(message) => (
+                StatusCode::FORBIDDEN,
+                ResponseJson(ErrorResponse::new(message, "forbidden".to_string())),
+            ),
+            error => {
+                error!("Failed to update organization member role: {:?}", error);
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    ResponseJson(ErrorResponse::new(
+                        "Failed to update organization member role".to_string(),
+                        "internal_server_error".to_string(),
+                    )),
+                )
+            }
+        })?;
+
+    tracing::info!(
+        organization_id = %org_id,
+        member_user_id = %user_id,
+        admin_user_id = %admin_user.0.id,
+        "System administrator updated organization member role"
+    );
+
+    Ok(ResponseJson(services_member_to_api_member(update.member)))
+}
+
 /// List organization invitation email deliveries (Admin only)
 ///
 /// Returns delivery metadata for organization invitation emails without exposing invitation tokens.
@@ -3198,6 +3394,8 @@ pub async fn update_service(
         (status = 200, description = "Admin access token created successfully", body = AdminAccessTokenResponse),
         (status = 400, description = "Invalid request", body = ErrorResponse),
         (status = 401, description = "Unauthorized", body = ErrorResponse),
+        (status = 503, description = "Read-only token issuance is disabled during rollout", body = ErrorResponse),
+        (status = 422, description = "Request deserialization failed (including invalid permission values)"),
         (status = 500, description = "Internal server error", body = ErrorResponse)
     ),
     security(
@@ -3235,6 +3433,18 @@ pub async fn create_admin_access_token(
         ));
     }
 
+    if request_body.permission == AdminAccessTokenPermission::ReadOnly
+        && !app_state.config.auth.admin_read_only_tokens_enabled
+    {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            ResponseJson(ErrorResponse::new(
+                "Read-only admin token issuance is not enabled".to_string(),
+                "read_only_token_issuance_disabled".to_string(),
+            )),
+        ));
+    }
+
     // Create admin access token directly in database
     let expires_at = Utc::now() + chrono::Duration::hours(request_body.expires_in_hours);
 
@@ -3246,6 +3456,7 @@ pub async fn create_admin_access_token(
             request_body.reason,
             expires_at,
             user_agent,
+            request_body.permission.into(),
         )
         .await
     {
@@ -3264,6 +3475,7 @@ pub async fn create_admin_access_token(
                 expires_at: admin_token.expires_at,
                 name: admin_token.name,
                 reason: admin_token.creation_reason,
+                permission: admin_token.permission.into(),
             };
 
             Ok(ResponseJson(response))
@@ -3294,7 +3506,7 @@ pub async fn create_admin_access_token(
         ("offset" = Option<i64>, Query, description = "Number of records to skip (default: 0)")
     ),
     responses(
-        (status = 200, description = "Admin access tokens retrieved successfully"),
+        (status = 200, description = "Admin access tokens retrieved successfully", body = ListAdminAccessTokensResponse),
         (status = 401, description = "Unauthorized", body = ErrorResponse),
         (status = 500, description = "Internal server error", body = ErrorResponse)
     ),
@@ -3306,7 +3518,8 @@ pub async fn list_admin_access_tokens(
     State(app_state): State<AdminAppState>,
     Extension(admin_user): Extension<AdminUser>, // Require admin auth
     axum::extract::Query(params): axum::extract::Query<ListUsersQueryParams>,
-) -> Result<ResponseJson<serde_json::Value>, (StatusCode, ResponseJson<ErrorResponse>)> {
+) -> Result<ResponseJson<ListAdminAccessTokensResponse>, (StatusCode, ResponseJson<ErrorResponse>)>
+{
     crate::routes::common::validate_limit_offset(params.limit, params.offset)?;
 
     debug!(
@@ -3328,12 +3541,12 @@ pub async fn list_admin_access_tokens(
                 .await
                 .unwrap_or(0);
 
-            let response = serde_json::json!({
-                "data": tokens,
-                "limit": params.limit,
-                "offset": params.offset,
-                "total": total
-            });
+            let response = ListAdminAccessTokensResponse {
+                data: tokens.into_iter().map(Into::into).collect(),
+                limit: params.limit,
+                offset: params.offset,
+                total,
+            };
 
             Ok(ResponseJson(response))
         }
@@ -4126,9 +4339,9 @@ pub async fn get_model_consumption_timeseries(
 /// `ttft_sample_count` field in each bucket exposes the denominator so callers can
 /// compute coverage fraction (`ttft_sample_count / requests`).
 ///
-/// **Error rate** = `stop_reason IN ('provider_error','timeout')` / requests with a
-/// recorded `stop_reason`. Pre-V0037 rows (stop_reason IS NULL) are excluded from both
-/// numerator and denominator.
+/// **Error rate** = `stop_reason IN ('provider_error','timeout','incomplete')` / requests
+/// with a recorded `stop_reason`. Pre-V0037 rows (stop_reason IS NULL) are excluded from
+/// both numerator and denominator.
 #[utoipa::path(
     get,
     path = "/v1/admin/platform/performance-timeseries",

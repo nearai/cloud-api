@@ -15,7 +15,7 @@ async fn test_responses_non_stream_records_cache_usage_in_history() {
     let (server, _pool, mock_provider, _db) = setup_test_server_with_pool().await;
 
     // Use cache-aware pricing so cache_read_tokens is meaningful in billing too
-    setup_qwen_model_with_cache_pricing(&server).await;
+    let model = setup_qwen_model_with_cache_pricing(&server).await;
     let org = setup_org_with_credits(&server, 10_000_000_000i64).await;
     let api_key = get_api_key_for_org(&server, org.id.clone()).await;
 
@@ -41,7 +41,7 @@ async fn test_responses_non_stream_records_cache_usage_in_history() {
             "max_output_tokens": 64,
             "stream": false,
             "store": false,
-            "model": E2E_QWEN_MODEL_NAME
+            "model": model
         }))
         .await;
 
@@ -126,7 +126,7 @@ async fn test_responses_non_stream_records_cache_usage_in_history() {
 async fn test_responses_stream_records_cache_usage_in_history() {
     let (server, _pool, mock_provider, _db) = setup_test_server_with_pool().await;
 
-    setup_qwen_model_with_cache_pricing(&server).await;
+    let model = setup_qwen_model_with_cache_pricing(&server).await;
     let org = setup_org_with_credits(&server, 10_000_000_000i64).await;
     let api_key = get_api_key_for_org(&server, org.id.clone()).await;
 
@@ -150,7 +150,7 @@ async fn test_responses_stream_records_cache_usage_in_history() {
             "max_output_tokens": 64,
             "stream": true,
             "store": false,
-            "model": E2E_QWEN_MODEL_NAME
+            "model": model
         }))
         .await;
 

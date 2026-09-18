@@ -138,6 +138,10 @@ impl UsageServiceTrait for MockUsageService {
             response_id: _request.response_id,
             image_count: _request.image_count,
             was_inserted: true,
+            credit_allocations: Some(Vec::new()),
+            funded_amount: Some(0),
+            unfunded_amount: Some(0),
+            allocation_policy_version: Some("test".to_string()),
             provider_attribution: _request.provider_attribution,
         })
     }
@@ -252,6 +256,10 @@ impl UsageServiceTrait for MockUsageService {
             response_id: None,
             image_count,
             was_inserted: true,
+            credit_allocations: Some(Vec::new()),
+            funded_amount: Some(0),
+            unfunded_amount: Some(0),
+            allocation_policy_version: Some("test".to_string()),
             provider_attribution: ProviderAttribution::default(),
         })
     }
@@ -293,6 +301,7 @@ impl UsageServiceTrait for MockUsageService {
     async fn get_usage_history_by_api_key(
         &self,
         _api_key_id: Uuid,
+        _credit_type: Option<&str>,
         _limit: Option<i64>,
         _offset: Option<i64>,
     ) -> Result<(Vec<UsageLogEntry>, i64), UsageError> {
@@ -304,6 +313,7 @@ impl UsageServiceTrait for MockUsageService {
         _workspace_id: Uuid,
         _api_key_id: Uuid,
         _user_id: Uuid,
+        _credit_type: Option<&str>,
         _limit: Option<i64>,
         _offset: Option<i64>,
     ) -> Result<(Vec<UsageLogEntry>, i64), UsageError> {
@@ -406,6 +416,10 @@ impl UsageServiceTrait for CapturingUsageService {
             response_id: request.response_id.clone(),
             image_count: request.image_count,
             was_inserted: true,
+            credit_allocations: Some(Vec::new()),
+            funded_amount: Some(0),
+            unfunded_amount: Some(0),
+            allocation_policy_version: Some("test".to_string()),
             provider_attribution: request.provider_attribution,
         };
         self.requests.lock().unwrap().push(request);
@@ -522,6 +536,10 @@ impl UsageServiceTrait for CapturingUsageService {
             response_id: None,
             image_count,
             was_inserted: true,
+            credit_allocations: Some(Vec::new()),
+            funded_amount: Some(0),
+            unfunded_amount: Some(0),
+            allocation_policy_version: Some("test".to_string()),
             provider_attribution: ProviderAttribution::default(),
         })
     }
@@ -563,6 +581,7 @@ impl UsageServiceTrait for CapturingUsageService {
     async fn get_usage_history_by_api_key(
         &self,
         _api_key_id: Uuid,
+        _credit_type: Option<&str>,
         _limit: Option<i64>,
         _offset: Option<i64>,
     ) -> Result<(Vec<UsageLogEntry>, i64), UsageError> {
@@ -574,6 +593,7 @@ impl UsageServiceTrait for CapturingUsageService {
         _workspace_id: Uuid,
         _api_key_id: Uuid,
         _user_id: Uuid,
+        _credit_type: Option<&str>,
         _limit: Option<i64>,
         _offset: Option<i64>,
     ) -> Result<(Vec<UsageLogEntry>, i64), UsageError> {

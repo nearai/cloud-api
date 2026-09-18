@@ -192,7 +192,11 @@ async fn backend_output_limits_six_model_regression() {
         assert_openrouter_output(row, case.expected);
     }
 
-    let list_json = get_json(&server, "/v1/model/list?limit=500").await;
+    // This endpoint slices an already bounded in-memory catalog and has no
+    // maximum limit. Request all entries so a concurrent cache refresh cannot
+    // push an alphabetically late test model onto a second page.
+    let list_path = format!("/v1/model/list?limit={}", i64::MAX);
+    let list_json = get_json(&server, &list_path).await;
     let list_rows = list_json["models"]
         .as_array()
         .expect("/v1/model/list models should be an array");

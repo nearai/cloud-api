@@ -20,8 +20,8 @@ pub struct AttestationQuery {
     pub signing_algo: Option<String>,
     pub nonce: Option<String>,
     pub signing_address: Option<String>,
-    /// Include TLS certificate fingerprint in the report data.
-    /// Defaults to false; when true, report_data[..32] = SHA256(signing_address || cert_fingerprint).
+    /// Include the TLS certificate SPKI fingerprint in the report-data binding.
+    /// Defaults to false; when true, report_data[..32] = SHA256(signing_address || tls_cert_fingerprint).
     pub include_tls_fingerprint: Option<bool>,
     /// Restrict the report to a specific serving tier.
     /// Accepted values: `near` (NEAR AI's own TEE fleet) or `chutes` (attested Chutes fallback).
@@ -62,7 +62,9 @@ pub struct DstackCpuQuote {
     pub intel_quote: String,
     /// The event log associated with the quote
     pub event_log: String,
-    /// The report data that contains signing address and nonce
+    /// Value bound into the quote. Its final 32 bytes contain the request nonce.
+    /// With `include_tls_fingerprint=true`, its first 32 bytes are
+    /// SHA-256(signing_address || tls_cert_fingerprint).
     pub report_data: String,
     /// The nonce used in the attestation request
     pub request_nonce: String,
@@ -100,7 +102,9 @@ pub struct AttestationResponse {
     pub gateway_attestation: DstackCpuQuote,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub model_attestations: Vec<serde_json::Map<String, serde_json::Value>>,
-    /// TLS certificate file (PEM) from TLS_CERT_PATH; report_data binds via SHA256 of these exact bytes
+    /// PEM-encoded TLS certificate read from `TLS_CERT_PATH` when `include_tls_fingerprint=true`.
+    /// `report_data` binds `tls_cert_fingerprint` (the SHA-256 hash of the TLS SPKI) together with
+    /// `signing_address`, not the PEM bytes.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tls_certificate: Option<String>,
     /// Hex-encoded OHTTP key configuration (RFC 9458). Present only when OHTTP_ENABLED=true.

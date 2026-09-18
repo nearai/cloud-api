@@ -39,14 +39,28 @@ impl WorkspaceRepository {
                 .context("Failed to get database connection")
                 .map_err(RepositoryError::PoolError)?;
 
+            // The membership check happens in the service layer, in a separate
+            // statement. Lock the active organization here as well: an unlocked
+            // EXISTS can read the pre-delete version under READ COMMITTED while
+            // deletion holds an uncommitted FOR UPDATE lock. Waiting on FOR SHARE
+            // makes this statement recheck the active flag after that deletion
+            // commits, so it cannot leave an active workspace under a deleted org.
+            // The foreign key alone does not catch it because the soft-deleted
+            // parent row still exists.
             client
-                .query_one(
+                .query_opt(
                     r#"
                 INSERT INTO workspaces (
                     id, name, description, organization_id,
                     created_by_user_id, created_at, updated_at, is_active
                 )
-                VALUES ($1, $2, $3, $4, $5, $6, $7, true)
+                SELECT $1, $2, $3, $4, $5, $6, $7, true
+                WHERE EXISTS (
+                    SELECT 1
+                    FROM organizations
+                    WHERE id = $4 AND is_active = true
+                    FOR SHARE
+                )
                 RETURNING *
                 "#,
                     &[
@@ -61,6 +75,10 @@ impl WorkspaceRepository {
                 )
                 .await
                 .map_err(map_db_error)
+        })?;
+
+        let row = row.ok_or_else(|| {
+            RepositoryError::NotFound("active organization for new workspace".to_string())
         })?;
 
         debug!(
@@ -369,7 +387,8 @@ impl WorkspaceRepository {
                     o.id as org_id, o.name as org_name,
                     o.description as org_description, o.created_at as org_created_at,
                     o.updated_at as org_updated_at, o.is_active as org_is_active,
-                    o.rate_limit as org_rate_limit, o.settings as org_settings
+                    o.rate_limit as org_rate_limit, o.settings as org_settings,
+                    o.request_priority as org_request_priority
                 FROM workspaces w
                 JOIN organizations o ON w.organization_id = o.id
                 WHERE w.id = $1 AND w.is_active = true AND o.is_active = true
@@ -395,6 +414,7 @@ impl WorkspaceRepository {
                 };
 
                 let organization = crate::models::Organization {
+                    request_priority: row.get("org_request_priority"),
                     id: row.get("org_id"),
                     name: row.get("org_name"),
                     description: row.get("org_description"),
@@ -417,6 +437,7 @@ fn db_organization_to_service_organization(
     db_organization: crate::models::Organization,
 ) -> services::organization::Organization {
     services::organization::Organization {
+        request_priority: db_organization.request_priority,
         id: services::organization::ports::OrganizationId(db_organization.id),
         name: db_organization.name,
         description: db_organization.description,
@@ -575,10 +596,13 @@ impl services::workspace::ports::WorkspaceRepository for WorkspaceRepository {
                     r#"
                     SELECT w.*
                     FROM workspaces w
+                    INNER JOIN organizations o
+                        ON w.organization_id = o.id
                     INNER JOIN organization_members om
                         ON w.organization_id = om.organization_id
                     WHERE om.user_id = $1
                       AND w.is_active = true
+                      AND o.is_active = true
                     ORDER BY w.created_at ASC
                     LIMIT $2
                     "#,

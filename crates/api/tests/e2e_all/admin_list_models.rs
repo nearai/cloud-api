@@ -75,25 +75,11 @@ async fn test_admin_list_models_with_models() {
     let updated = admin_batch_upsert_models(&server, batch, get_session_id()).await;
     assert_eq!(updated.len(), 1, "Should have created 1 model");
 
-    // List models
-    let response = server
-        .get("/v1/admin/models?limit=500")
-        .add_header("Authorization", format!("Bearer {}", get_session_id()))
-        .add_header("User-Agent", MOCK_USER_AGENT)
-        .await;
-
-    assert_eq!(response.status_code(), 200);
-
-    let list_response: AdminModelListResponse =
-        serde_json::from_str(&response.text()).expect("Failed to parse response");
-
-    println!("Models found: {}", list_response.total);
+    let models = list_all_admin_models(&server, false).await;
+    println!("Models found: {}", models.len());
 
     // Find our test model
-    let our_model = list_response
-        .models
-        .iter()
-        .find(|m| m.model_id == model_name);
+    let our_model = models.iter().find(|m| m.model_id == model_name);
 
     assert!(our_model.is_some(), "Should find the test model in list");
     let model = our_model.unwrap();
@@ -467,22 +453,11 @@ async fn test_admin_list_models_include_inactive() {
     admin_batch_upsert_models(&server, batch, get_session_id()).await;
 
     // List models without include_inactive (default - should only show active)
-    let response = server
-        .get("/v1/admin/models?limit=500")
-        .add_header("Authorization", format!("Bearer {}", get_session_id()))
-        .add_header("User-Agent", MOCK_USER_AGENT)
-        .await;
-
-    assert_eq!(response.status_code(), 200);
-    let list_response: AdminModelListResponse =
-        serde_json::from_str(&response.text()).expect("Failed to parse response");
-
-    let active_found = list_response
-        .models
+    let active_models = list_all_admin_models(&server, false).await;
+    let active_found = active_models
         .iter()
         .any(|m| m.model_id == active_model_name);
-    let inactive_found = list_response
-        .models
+    let inactive_found = active_models
         .iter()
         .any(|m| m.model_id == inactive_model_name);
 
@@ -493,24 +468,9 @@ async fn test_admin_list_models_include_inactive() {
     );
 
     // List models with include_inactive=true
-    let response = server
-        .get("/v1/admin/models?include_inactive=true&limit=500")
-        .add_header("Authorization", format!("Bearer {}", get_session_id()))
-        .add_header("User-Agent", MOCK_USER_AGENT)
-        .await;
-
-    assert_eq!(response.status_code(), 200);
-    let list_response: AdminModelListResponse =
-        serde_json::from_str(&response.text()).expect("Failed to parse response");
-
-    let active_found = list_response
-        .models
-        .iter()
-        .any(|m| m.model_id == active_model_name);
-    let inactive_found = list_response
-        .models
-        .iter()
-        .any(|m| m.model_id == inactive_model_name);
+    let all_models = list_all_admin_models(&server, true).await;
+    let active_found = all_models.iter().any(|m| m.model_id == active_model_name);
+    let inactive_found = all_models.iter().any(|m| m.model_id == inactive_model_name);
 
     assert!(
         active_found,
@@ -522,8 +482,7 @@ async fn test_admin_list_models_include_inactive() {
     );
 
     // Verify the inactive model has is_active=false
-    let inactive_model = list_response
-        .models
+    let inactive_model = all_models
         .iter()
         .find(|m| m.model_id == inactive_model_name)
         .unwrap();
@@ -617,20 +576,8 @@ async fn test_admin_list_models_has_timestamps() {
     );
     admin_batch_upsert_models(&server, batch, get_session_id()).await;
 
-    // List models (use high limit to find our model in shared DB)
-    let response = server
-        .get("/v1/admin/models?limit=500")
-        .add_header("Authorization", format!("Bearer {}", get_session_id()))
-        .add_header("User-Agent", MOCK_USER_AGENT)
-        .await;
-
-    assert_eq!(response.status_code(), 200);
-    let list_response: AdminModelListResponse =
-        serde_json::from_str(&response.text()).expect("Failed to parse response");
-
-    // Find our model
-    let model = list_response
-        .models
+    let models = list_all_admin_models(&server, false).await;
+    let model = models
         .iter()
         .find(|m| m.model_id == model_name)
         .expect("Should find our model");
@@ -734,21 +681,9 @@ async fn test_admin_list_models_after_soft_delete() {
     admin_batch_upsert_models(&server, batch, get_session_id()).await;
 
     // Verify model exists in active list
-    let response = server
-        .get("/v1/admin/models?limit=500")
-        .add_header("Authorization", format!("Bearer {}", get_session_id()))
-        .add_header("User-Agent", MOCK_USER_AGENT)
-        .await;
-
-    assert_eq!(response.status_code(), 200);
-    let list_response: AdminModelListResponse =
-        serde_json::from_str(&response.text()).expect("Failed to parse response");
-
+    let active_models = list_all_admin_models(&server, false).await;
     assert!(
-        list_response
-            .models
-            .iter()
-            .any(|m| m.model_id == model_name),
+        active_models.iter().any(|m| m.model_id == model_name),
         "Model should be in active list"
     );
 
@@ -764,39 +699,15 @@ async fn test_admin_list_models_after_soft_delete() {
     assert_eq!(delete_response.status_code(), 204, "Delete should succeed");
 
     // Model should NOT be in default active-only list
-    let response = server
-        .get("/v1/admin/models?limit=500")
-        .add_header("Authorization", format!("Bearer {}", get_session_id()))
-        .add_header("User-Agent", MOCK_USER_AGENT)
-        .await;
-
-    assert_eq!(response.status_code(), 200);
-    let list_response: AdminModelListResponse =
-        serde_json::from_str(&response.text()).expect("Failed to parse response");
-
+    let active_models = list_all_admin_models(&server, false).await;
     assert!(
-        !list_response
-            .models
-            .iter()
-            .any(|m| m.model_id == model_name),
+        !active_models.iter().any(|m| m.model_id == model_name),
         "Deleted model should NOT be in active list"
     );
 
     // Model SHOULD be in include_inactive list
-    let response = server
-        .get("/v1/admin/models?include_inactive=true&limit=500")
-        .add_header("Authorization", format!("Bearer {}", get_session_id()))
-        .add_header("User-Agent", MOCK_USER_AGENT)
-        .await;
-
-    assert_eq!(response.status_code(), 200);
-    let list_response: AdminModelListResponse =
-        serde_json::from_str(&response.text()).expect("Failed to parse response");
-
-    let deleted_model = list_response
-        .models
-        .iter()
-        .find(|m| m.model_id == model_name);
+    let all_models = list_all_admin_models(&server, true).await;
+    let deleted_model = all_models.iter().find(|m| m.model_id == model_name);
     assert!(
         deleted_model.is_some(),
         "Deleted model should be in include_inactive list"
@@ -838,18 +749,8 @@ async fn test_admin_list_models_datacenters_round_trip() {
     );
     admin_batch_upsert_models(&server, batch, get_session_id()).await;
 
-    let response = server
-        .get("/v1/admin/models?limit=500")
-        .add_header("Authorization", format!("Bearer {}", get_session_id()))
-        .add_header("User-Agent", MOCK_USER_AGENT)
-        .await;
-    assert_eq!(response.status_code(), 200);
-
-    let list_response: AdminModelListResponse =
-        serde_json::from_str(&response.text()).expect("Failed to parse response");
-
-    let model = list_response
-        .models
+    let models = list_all_admin_models(&server, false).await;
+    let model = models
         .iter()
         .find(|m| m.model_id == model_name)
         .expect("Should find the datacenters test model");

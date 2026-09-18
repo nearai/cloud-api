@@ -10,7 +10,7 @@ const COST_EPSILON: f64 = 1e-9;
 #[tokio::test]
 async fn admin_platform_metrics_reports_fallback_and_chutes_usage() {
     let fixture = setup_platform_provider_usage_fixture().await;
-    let (start, end) = isolated_provider_usage_window();
+    let (start, end) = isolated_provider_usage_window(&fixture).await;
 
     for row in [
         ProviderUsageSeedRow {
@@ -107,7 +107,7 @@ async fn admin_platform_metrics_reports_fallback_and_chutes_usage() {
 #[tokio::test]
 async fn admin_platform_metrics_prefers_served_attribution_over_model_metadata() {
     let fixture = setup_platform_provider_usage_fixture().await;
-    let (start, end) = isolated_provider_usage_window();
+    let (start, end) = isolated_provider_usage_window(&fixture).await;
     insert_platform_provider_usage_row(
         &fixture,
         ProviderUsageSeedRow {

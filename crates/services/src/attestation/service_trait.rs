@@ -1,6 +1,7 @@
 use async_trait::async_trait;
 
 use super::{
+    chat_signatures::PROVIDER_SIGNATURE_FETCH_TIMEOUT,
     ita::{ItaTokenQuery, ItaTokenResponse},
     models::AttestationReport,
     ports, AttestationError, AttestationService, SignatureLookupResult,
@@ -21,7 +22,20 @@ impl ports::AttestationServiceTrait for AttestationService {
         &self,
         chat_id: &str,
     ) -> Result<(), AttestationError> {
-        self.store_chat_signature_from_provider_impl(chat_id).await
+        self.store_chat_signature_from_provider_impl(chat_id, None)
+            .await
+    }
+
+    async fn store_stream_chat_signature_from_provider(
+        &self,
+        chat_id: &str,
+    ) -> Result<(), AttestationError> {
+        // Start the budget before provider lookup and share it across both
+        // algorithms. Non-streaming/background callers retain their existing
+        // provider timeouts, without this streaming-specific deadline.
+        let deadline = tokio::time::Instant::now() + PROVIDER_SIGNATURE_FETCH_TIMEOUT;
+        self.store_chat_signature_from_provider_impl(chat_id, Some(deadline))
+            .await
     }
 
     async fn store_chat_signature(

@@ -1,9 +1,10 @@
 use axum::{
-    extract::{Request, State},
+    extract::{MatchedPath, Request, State},
     http::StatusCode,
     middleware::Next,
     response::Response,
 };
+use database::models::AdminAccessTokenPermission;
 use database::User as DbUser;
 use services::auth::{AuthError, AuthServiceTrait, OAuthManager, SessionToken};
 use services::common::REPORTING_TOKEN_PREFIX;
@@ -57,6 +58,53 @@ pub struct AuthenticatedUser(pub DbUser);
 /// Authenticated admin user (extends AuthenticatedUser)
 #[derive(Clone)]
 pub struct AdminUser(pub DbUser);
+
+/// Authentication source and immutable token permission retained alongside
+/// AdminUser. Session access and opaque admin tokens have different privileges.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AdminAuthContext {
+    Session,
+    AccessToken {
+        token_id: uuid::Uuid,
+        permission: AdminAccessTokenPermission,
+    },
+}
+
+fn authorize_admin_operation(
+    context: AdminAuthContext,
+    request: &Request,
+) -> Result<(), (StatusCode, axum::Json<crate::models::ErrorResponse>)> {
+    use super::admin_policy::{admin_operation, AdminOperation};
+
+    let AdminAuthContext::AccessToken { permission, .. } = context else {
+        return Ok(());
+    };
+    let matched_path = request
+        .extensions()
+        .get::<MatchedPath>()
+        .map(|p| p.as_str());
+    // Missing route metadata is unclassified and must never grant read access.
+    let operation = admin_operation(request.method(), matched_path.unwrap_or(""));
+    if operation == AdminOperation::SessionOnly {
+        return Err((
+            StatusCode::FORBIDDEN,
+            axum::Json(crate::models::ErrorResponse::new(
+                "Access token management endpoint detected".to_string(),
+                "forbidden".to_string(),
+            )),
+        ));
+    }
+    if permission == AdminAccessTokenPermission::ReadOnly && operation != AdminOperation::Read {
+        return Err((
+            StatusCode::FORBIDDEN,
+            axum::Json(crate::models::ErrorResponse::new(
+                "Admin access token does not have permission for this operation".to_string(),
+                "insufficient_permissions".to_string(),
+            )),
+        ));
+    }
+    Ok(())
+}
 
 /// Get admin user by ID from database
 async fn get_admin_user_by_id(
@@ -362,21 +410,6 @@ pub async fn admin_middleware(
                             "Authenticated via admin access token"
                         );
 
-                        // Check if this is an admin access token management endpoint
-                        let path = request.uri().path();
-                        let is_access_token_management = path.starts_with("/admin/access-tokens");
-                        // For access token management endpoints, only allow session-based authentication
-                        if is_access_token_management {
-                            debug!("Access token management endpoint detected. Forbidden.");
-                            return Err((
-                                StatusCode::FORBIDDEN,
-                                axum::Json(crate::models::ErrorResponse::new(
-                                    "Access token management endpoint detected".to_string(),
-                                    "forbidden".to_string(),
-                                )),
-                            ));
-                        }
-
                         // Query the actual admin user from database
                         match get_admin_user_by_id(&state, admin_token.created_by_user_id).await {
                             Ok(admin_user) => {
@@ -386,7 +419,13 @@ pub async fn admin_middleware(
                                     authenticated = true,
                                     "Retrieved admin user for access token"
                                 );
-                                Ok(admin_user)
+                                Ok((
+                                    admin_user,
+                                    AdminAuthContext::AccessToken {
+                                        token_id: admin_token.id,
+                                        permission: admin_token.permission,
+                                    },
+                                ))
                             }
                             Err(_) => {
                                 error!("Failed to get admin user for access token");
@@ -410,7 +449,9 @@ pub async fn admin_middleware(
             } else {
                 // Not an admin access token, try as session token
                 debug!("Token does not appear to be an admin access token, trying session token");
-                authenticate_session_access(&state, token.to_string()).await
+                authenticate_session_access(&state, token.to_string())
+                    .await
+                    .map(|user| (user, AdminAuthContext::Session))
             }
         } else {
             debug!("Authorization header uses unsupported scheme");
@@ -433,7 +474,7 @@ pub async fn admin_middleware(
     };
 
     match auth_result {
-        Ok(user) => {
+        Ok((user, context)) => {
             // Check if user has admin access based on email domain
             let is_admin = check_admin_access(&state, &user);
 
@@ -448,6 +489,8 @@ pub async fn admin_middleware(
                 ));
             }
 
+            authorize_admin_operation(context, &request)?;
+
             debug!(admin_user_id = %user.id, authenticated = true, "Admin access granted");
 
             // Add both AuthenticatedUser and AdminUser extensions
@@ -456,6 +499,7 @@ pub async fn admin_middleware(
                 .extensions_mut()
                 .insert(AuthenticatedUser(user.clone()));
             request.extensions_mut().insert(AdminUser(user));
+            request.extensions_mut().insert(context);
             Ok(next.run(request).await)
         }
         Err(status) => Err(status),
@@ -681,8 +725,10 @@ async fn authenticate_session_refresh(
     Err(StatusCode::UNAUTHORIZED)
 }
 
-/// Authenticate using API key
-async fn authenticate_api_key(
+/// Validate API-key material itself. Callers must still resolve its parent
+/// workspace and organization before accepting it for a request, because the
+/// in-process API-key cache can outlive a workspace or organization deletion.
+async fn validate_api_key_credentials(
     state: &AuthState,
     api_key: &str,
 ) -> Result<services::workspace::ApiKey, (StatusCode, axum::Json<crate::models::ErrorResponse>)> {
@@ -725,6 +771,18 @@ async fn authenticate_api_key(
             ))
         }
     }
+}
+
+/// Authenticate an API key for a route that needs only the key. The parent
+/// lookup is intentionally still required: a cached key must not remain usable
+/// after its workspace or organization is deactivated.
+async fn authenticate_api_key(
+    state: &AuthState,
+    api_key: &str,
+) -> Result<services::workspace::ApiKey, (StatusCode, axum::Json<crate::models::ErrorResponse>)> {
+    Ok(authenticate_api_key_with_context(state, api_key)
+        .await?
+        .api_key)
 }
 
 async fn authenticate_reporting_token(
@@ -774,8 +832,9 @@ async fn authenticate_api_key_with_context(
     state: &AuthState,
     api_key: &str,
 ) -> Result<AuthenticatedApiKey, (StatusCode, axum::Json<crate::models::ErrorResponse>)> {
-    // First validate the API key
-    let validated_api_key = authenticate_api_key(state, api_key).await?;
+    // First validate the API key material. The parent lookup below is required
+    // even after a cache hit so deactivated/deleted parents fail closed immediately.
+    let validated_api_key = validate_api_key_credentials(state, api_key).await?;
 
     debug!(
         "Resolving workspace and organization for API key: {:?}",
@@ -884,6 +943,21 @@ fn convert_user_to_db_user(user: services::auth::User) -> DbUser {
 mod tests {
     use super::*;
     use axum::http::{HeaderMap, HeaderValue};
+
+    #[test]
+    fn missing_route_metadata_never_grants_read_permission() {
+        let request = Request::builder()
+            .uri("/v1/admin/models")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let context = AdminAuthContext::AccessToken {
+            token_id: uuid::Uuid::nil(),
+            permission: AdminAccessTokenPermission::ReadOnly,
+        };
+        let (status, axum::Json(error)) = authorize_admin_operation(context, &request).unwrap_err();
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(error.error.r#type, "insufficient_permissions");
+    }
 
     #[test]
     fn anthropic_auth_accepts_sdk_and_bearer_credentials() {

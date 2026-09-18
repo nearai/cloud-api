@@ -206,6 +206,17 @@ mod response_item_workspace_scoping {
             .expect("owner listing should succeed");
         assert_eq!(own_items.len(), 3, "owner should see all 3 items");
 
+        let client = database.pool().get().await.expect("database connection");
+        let stored: serde_json::Value = client
+            .query_one(
+                "SELECT item FROM response_items WHERE conversation_id=$1 LIMIT 1",
+                &[&ws_a.conversation_id.0],
+            )
+            .await
+            .expect("stored response item")
+            .get(0);
+        assert_eq!(stored[database::field_encryption::MARKER], true);
+
         // The same conversation queried with a foreign workspace returns
         // nothing, even though the conversation ID is known.
         let foreign_items = repo
@@ -310,5 +321,229 @@ mod response_item_workspace_scoping {
             .await
             .expect("foreign get_by_id should not error");
         assert!(foreign.is_none(), "foreign workspace must not see the item");
+    }
+}
+
+// ============================================
+// Confidential repository fields at rest
+// ============================================
+
+mod database_encryption_at_rest {
+    use crate::common::*;
+    use database::models::{CreateMcpConnectorRequest, McpAuthType};
+    use database::repositories::{FileRepository, McpConnectorRepository};
+    use services::files::ports::CreateFileParams;
+    use uuid::Uuid;
+
+    #[tokio::test]
+    async fn file_repository_encrypts_storage_and_returns_plaintext() {
+        let (server, database) = setup_test_server_with_database().await;
+        let organization = create_org(&server).await;
+        let _api_key = get_api_key_for_org(&server, organization.id.clone()).await;
+        let organization_id = Uuid::parse_str(&organization.id).expect("organization UUID");
+        let client = database.pool().get().await.expect("database connection");
+        let workspace_id: Uuid = client
+            .query_one(
+                "SELECT id FROM workspaces WHERE organization_id=$1 LIMIT 1",
+                &[&organization_id],
+            )
+            .await
+            .expect("workspace")
+            .get(0);
+        let api_key_id: Uuid = client
+            .query_one(
+                "SELECT id FROM api_keys WHERE workspace_id=$1 LIMIT 1",
+                &[&workspace_id],
+            )
+            .await
+            .expect("API key")
+            .get(0);
+        drop(client);
+
+        let repository = FileRepository::new(database.pool().clone());
+        let created = repository
+            .create(CreateFileParams {
+                filename: "private.txt".into(),
+                bytes: 7,
+                content_type: "text/plain".into(),
+                purpose: "assistants".into(),
+                storage_key: "private/object/key".into(),
+                workspace_id,
+                uploaded_by_api_key_id: api_key_id,
+                expires_at: None,
+            })
+            .await
+            .expect("create encrypted file row");
+        assert_eq!(created.filename, "private.txt");
+        assert_eq!(created.storage_key, "private/object/key");
+
+        let client = database.pool().get().await.expect("database connection");
+        let row = client
+            .query_one(
+                "SELECT filename,content_type,storage_key FROM files WHERE id=$1",
+                &[&created.id],
+            )
+            .await
+            .expect("stored file row");
+        for column in ["filename", "content_type", "storage_key"] {
+            let stored: String = row.get(column);
+            assert!(stored.contains(database::field_encryption::MARKER));
+            assert!(!stored.contains("private/object/key"));
+        }
+
+        let fetched = repository
+            .get_by_id(created.id)
+            .await
+            .expect("read file")
+            .expect("file exists");
+        assert_eq!(fetched.filename, "private.txt");
+        assert_eq!(fetched.content_type, "text/plain");
+        assert_eq!(fetched.storage_key, "private/object/key");
+
+        let configured_key_id = database.pool().encryption_key_id();
+        database
+            .pool()
+            .set_encryption_key_id("wrong-db-key-id".to_string());
+        assert!(repository.get_by_id(created.id).await.is_err());
+        database.pool().set_encryption_key_id(configured_key_id);
+
+        let client = database.pool().get().await.expect("database connection");
+        client
+            .execute(
+                "UPDATE files SET filename='legacy.txt',content_type='text/legacy',storage_key='legacy/key' WHERE id=$1",
+                &[&created.id],
+            )
+            .await
+            .expect("write legacy plaintext row");
+        drop(client);
+        let legacy = repository
+            .get_by_id(created.id)
+            .await
+            .expect("read legacy file")
+            .expect("legacy file exists");
+        assert_eq!(legacy.filename, "legacy.txt");
+        assert_eq!(legacy.content_type, "text/legacy");
+        assert_eq!(legacy.storage_key, "legacy/key");
+    }
+
+    #[tokio::test]
+    async fn mcp_repository_encrypts_configuration_and_usage_payloads() {
+        let (server, database) = setup_test_server_with_database().await;
+        let organization = create_org(&server).await;
+        let organization_id = Uuid::parse_str(&organization.id).expect("organization UUID");
+        let user_id = Uuid::parse_str(MOCK_USER_ID).expect("user UUID");
+        let repository = McpConnectorRepository::new(database.pool().clone());
+
+        let connector = repository
+            .create(
+                organization_id,
+                user_id,
+                CreateMcpConnectorRequest {
+                    name: format!("private-{}", Uuid::new_v4()),
+                    description: Some("internal tools".into()),
+                    mcp_server_url: "https://internal.example/mcp".into(),
+                    auth_type: McpAuthType::Bearer,
+                    bearer_token: Some("bearer-secret".into()),
+                },
+            )
+            .await
+            .expect("create MCP connector");
+        assert_eq!(connector.mcp_server_url, "https://internal.example/mcp");
+        assert_eq!(
+            connector.auth_config.as_ref().unwrap()["token"],
+            "bearer-secret"
+        );
+
+        repository
+            .log_usage(
+                connector.id,
+                user_id,
+                "tools/call".into(),
+                Some(serde_json::json!({"argument":"private request"})),
+                Some(serde_json::json!({"result":"private response"})),
+                Some(200),
+                Some("private error".into()),
+                Some(5),
+            )
+            .await
+            .expect("log MCP usage");
+
+        let client = database.pool().get().await.expect("database connection");
+        let connector_row = client
+            .query_one(
+                "SELECT description,mcp_server_url,auth_config FROM mcp_connectors WHERE id=$1",
+                &[&connector.id],
+            )
+            .await
+            .expect("stored connector");
+        assert!(connector_row
+            .get::<_, String>("mcp_server_url")
+            .contains(database::field_encryption::MARKER));
+        assert_eq!(
+            connector_row.get::<_, serde_json::Value>("auth_config")
+                [database::field_encryption::MARKER],
+            true
+        );
+
+        let usage_row = client
+            .query_one(
+                "SELECT request_payload,response_payload,error_message FROM mcp_connector_usage WHERE connector_id=$1 ORDER BY created_at DESC LIMIT 1",
+                &[&connector.id],
+            )
+            .await
+            .expect("stored usage");
+        assert_eq!(
+            usage_row.get::<_, serde_json::Value>("request_payload")
+                [database::field_encryption::MARKER],
+            true
+        );
+        assert_eq!(
+            usage_row.get::<_, serde_json::Value>("response_payload")
+                [database::field_encryption::MARKER],
+            true
+        );
+        assert!(usage_row
+            .get::<_, String>("error_message")
+            .contains(database::field_encryption::MARKER));
+        drop(client);
+
+        let fetched = repository
+            .get_by_id(connector.id)
+            .await
+            .expect("read connector")
+            .expect("connector exists");
+        assert_eq!(fetched.mcp_server_url, "https://internal.example/mcp");
+        assert_eq!(fetched.auth_config.unwrap()["token"], "bearer-secret");
+        let usage = repository
+            .get_usage_logs(connector.id, 1)
+            .await
+            .expect("read usage");
+        assert_eq!(
+            usage[0].request_payload.as_ref().unwrap()["argument"],
+            "private request"
+        );
+        assert_eq!(
+            usage[0].response_payload.as_ref().unwrap()["result"],
+            "private response"
+        );
+        assert_eq!(usage[0].error_message.as_deref(), Some("private error"));
+
+        let client = database.pool().get().await.expect("database connection");
+        client
+            .execute(
+                "UPDATE mcp_connectors SET description='legacy description',mcp_server_url='https://legacy.example/mcp',auth_config=$2 WHERE id=$1",
+                &[&connector.id, &serde_json::json!({"token":"legacy token"})],
+            )
+            .await
+            .expect("write legacy connector values");
+        drop(client);
+        let legacy = repository
+            .get_by_id(connector.id)
+            .await
+            .expect("read legacy connector")
+            .expect("legacy connector exists");
+        assert_eq!(legacy.description.as_deref(), Some("legacy description"));
+        assert_eq!(legacy.mcp_server_url, "https://legacy.example/mcp");
+        assert_eq!(legacy.auth_config.unwrap()["token"], "legacy token");
     }
 }

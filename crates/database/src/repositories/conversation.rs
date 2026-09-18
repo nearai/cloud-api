@@ -20,6 +20,38 @@ impl PgConversationRepository {
         Self { pool }
     }
 
+    fn encrypt_metadata(
+        &self,
+        id: Uuid,
+        metadata: &serde_json::Value,
+    ) -> Result<serde_json::Value> {
+        match self.pool.encryption_write_context() {
+            Some((key, key_id)) => crate::field_encryption::encrypt_json_with_key_id(
+                &key,
+                &key_id,
+                "conversations",
+                "metadata",
+                id,
+                metadata,
+            ),
+            None => Ok(metadata.clone()),
+        }
+    }
+
+    fn decrypt_metadata(&self, id: Uuid, metadata: serde_json::Value) -> Result<serde_json::Value> {
+        match self.pool.encryption_context() {
+            Some((key, key_id)) => crate::field_encryption::decrypt_json_if_encrypted_with_key_id(
+                &key,
+                &key_id,
+                "conversations",
+                "metadata",
+                id,
+                metadata,
+            ),
+            None => Ok(metadata),
+        }
+    }
+
     // Helper method to convert database row to Conversation model
     fn row_to_conversation(&self, row: tokio_postgres::Row) -> Result<Conversation> {
         let id: Uuid = row.try_get("id")?;
@@ -36,7 +68,7 @@ impl PgConversationRepository {
             deleted_at: row.try_get("deleted_at")?,
             cloned_from_id: cloned_from_id.map(|id| id.into()),
             root_response_id: None,
-            metadata: row.try_get("metadata")?,
+            metadata: self.decrypt_metadata(id, row.try_get("metadata")?)?,
             created_at: row.try_get("created_at")?,
             updated_at: row.try_get("updated_at")?,
         })
@@ -53,6 +85,7 @@ impl ConversationRepository for PgConversationRepository {
         metadata: serde_json::Value,
     ) -> Result<Conversation> {
         let id = Uuid::new_v4();
+        let stored_metadata = self.encrypt_metadata(id, &metadata)?;
 
         let row = retry_db!("create_new_conversation", {
             let now = Utc::now();
@@ -70,7 +103,7 @@ impl ConversationRepository for PgConversationRepository {
             VALUES ($1, $2, $3, $4, $5, $6)
             RETURNING *
             "#,
-                &[&id, &workspace_id.0, &api_key_id, &metadata, &now, &now],
+                &[&id, &workspace_id.0, &api_key_id, &stored_metadata, &now, &now],
             )
             .await
             .map_err(map_db_error)
@@ -119,6 +152,7 @@ impl ConversationRepository for PgConversationRepository {
         workspace_id: WorkspaceId,
         metadata: serde_json::Value,
     ) -> Result<Option<Conversation>> {
+        let stored_metadata = self.encrypt_metadata(id.0, &metadata)?;
         let row = retry_db!("update_conversation_metadata", {
             let now = Utc::now();
             let client = self
@@ -136,7 +170,7 @@ impl ConversationRepository for PgConversationRepository {
             WHERE id = $1 AND workspace_id = $2 AND deleted_at IS NULL
             RETURNING *
             "#,
-                    &[&id.0, &workspace_id.0, &metadata, &now],
+                    &[&id.0, &workspace_id.0, &stored_metadata, &now],
                 )
                 .await
                 .map_err(map_db_error)
@@ -266,47 +300,54 @@ impl ConversationRepository for PgConversationRepository {
             .await
             .context("Failed to start transaction")?;
 
-        // Step 1: Clone the conversation with a new ID and append " (Copy)" to title in metadata
-        // Reset pinned_at, archived_at, deleted_at to NULL for the clone
-        let conv_row = transaction
+        // Decrypt and re-encrypt metadata because the envelope AAD includes the row ID.
+        let original = transaction
             .query_opt(
+                "SELECT metadata FROM conversations WHERE id = $1 AND workspace_id = $2 AND deleted_at IS NULL",
+                &[&id.0, &workspace_id.0],
+            )
+            .await
+            .context("Failed to load conversation metadata for clone")?;
+        let Some(original) = original else {
+            // Conversation not found or is deleted, rollback and return None
+            transaction.rollback().await.ok();
+            return Ok(None);
+        };
+        let mut metadata = self.decrypt_metadata(id.0, original.try_get("metadata")?)?;
+        if let Some(title) = metadata.get_mut("title") {
+            if let Some(title) = title.as_str() {
+                *metadata.get_mut("title").expect("title exists") =
+                    serde_json::Value::String(format!("{title} (Copy)"));
+            }
+        }
+        let stored_metadata = self.encrypt_metadata(new_conv_id, &metadata)?;
+        transaction
+            .execute(
                 r#"
-            INSERT INTO conversations (id, workspace_id, api_key_id, pinned_at, archived_at, deleted_at, cloned_from_id, metadata, created_at, updated_at)
-            SELECT 
-                $1, 
-                workspace_id, 
-                $2, 
-                NULL,
-                NULL,
-                NULL,
-                id,
-                CASE 
-                    WHEN metadata->>'title' IS NOT NULL THEN 
-                        jsonb_set(metadata, '{title}', to_jsonb((metadata->>'title') || ' (Copy)'))
-                    ELSE 
-                        metadata
-                END,
-                $3, 
-                $4
-            FROM conversations
-            WHERE id = $5 AND workspace_id = $6 AND deleted_at IS NULL
-            RETURNING *
-            "#,
-                &[&new_conv_id, &api_key_id, &now, &now, &id.0, &workspace_id.0],
+                INSERT INTO conversations (
+                    id, workspace_id, api_key_id, pinned_at, archived_at, deleted_at,
+                    cloned_from_id, metadata, created_at, updated_at
+                )
+                SELECT $1, workspace_id, $2, NULL, NULL, NULL, id, $3, $4, $4
+                FROM conversations
+                WHERE id = $5 AND workspace_id = $6 AND deleted_at IS NULL
+                "#,
+                &[
+                    &new_conv_id,
+                    &api_key_id,
+                    &stored_metadata,
+                    &now,
+                    &id.0,
+                    &workspace_id.0,
+                ],
             )
             .await
             .context("Failed to clone conversation")?;
 
-        if conv_row.is_none() {
-            // Conversation not found or is deleted, rollback and return None
-            transaction.rollback().await.ok();
-            return Ok(None);
-        }
-
         // Step 2: Get all responses from the original conversation
         let original_responses = transaction
             .query(
-                "SELECT id FROM responses WHERE conversation_id = $1 AND workspace_id = $2 ORDER BY created_at ASC",
+                "SELECT id, instructions, metadata, is_root_response FROM responses WHERE conversation_id = $1 AND workspace_id = $2 ORDER BY created_at ASC",
                 &[&id.0, &workspace_id.0],
             )
             .await
@@ -319,30 +360,113 @@ impl ConversationRepository for PgConversationRepository {
             let old_response_id: Uuid = orig_row.try_get("id")?;
             let new_response_id = Uuid::new_v4();
             id_map.insert(old_response_id, new_response_id);
+            let instructions: Option<String> = orig_row.try_get("instructions")?;
+            let metadata: Option<serde_json::Value> = orig_row.try_get("metadata")?;
+            let stored_root_flag: bool = orig_row.try_get("is_root_response")?;
+            let (plain_instructions, plain_metadata) =
+                if let Some((key, key_id)) = self.pool.encryption_context() {
+                    (
+                        instructions
+                            .map(|value| {
+                                crate::field_encryption::decrypt_if_encrypted_with_key_id(
+                                    &key,
+                                    &key_id,
+                                    "responses",
+                                    "instructions",
+                                    old_response_id,
+                                    value,
+                                )
+                            })
+                            .transpose()?,
+                        metadata
+                            .map(|value| {
+                                crate::field_encryption::decrypt_json_if_encrypted_with_key_id(
+                                    &key,
+                                    &key_id,
+                                    "responses",
+                                    "metadata",
+                                    old_response_id,
+                                    value,
+                                )
+                            })
+                            .transpose()?,
+                    )
+                } else {
+                    (instructions, metadata)
+                };
+            let is_root_response = stored_root_flag
+                || plain_metadata.as_ref().is_some_and(|metadata| {
+                    metadata
+                        .get("root_response")
+                        .and_then(|value| value.as_bool())
+                        == Some(true)
+                });
+            let (stored_instructions, stored_response_metadata) =
+                if let Some((key, key_id)) = self.pool.encryption_write_context() {
+                    (
+                        plain_instructions
+                            .map(|plain| {
+                                crate::field_encryption::encrypt_with_key_id(
+                                    &key,
+                                    &key_id,
+                                    "responses",
+                                    "instructions",
+                                    new_response_id,
+                                    &plain,
+                                )
+                            })
+                            .transpose()?,
+                        plain_metadata
+                            .as_ref()
+                            .map(|plain| {
+                                crate::field_encryption::encrypt_json_with_key_id(
+                                    &key,
+                                    &key_id,
+                                    "responses",
+                                    "metadata",
+                                    new_response_id,
+                                    plain,
+                                )
+                            })
+                            .transpose()?,
+                    )
+                } else {
+                    (plain_instructions, plain_metadata)
+                };
 
             // Clone the response with new ID and new conversation_id
             transaction
                 .execute(
                     r#"
-                INSERT INTO responses (id, workspace_id, api_key_id, model, status, instructions, conversation_id, previous_response_id, next_response_ids, usage, metadata, created_at, updated_at)
+                INSERT INTO responses (id, workspace_id, api_key_id, model, status, instructions, conversation_id, previous_response_id, next_response_ids, usage, metadata, is_root_response, created_at, updated_at)
                 SELECT 
                     $1,
                     workspace_id,
                     $2,
                     model,
                     status,
-                    instructions,
+                    $4,
                     $3,
                     previous_response_id,
                     next_response_ids,
                     usage,
-                    metadata,
-                    $4,
-                    $5
+                    $5,
+                    $6,
+                    $7,
+                    $7
                 FROM responses
-                WHERE id = $6
+                WHERE id = $8
                 "#,
-                    &[&new_response_id, &api_key_id, &new_conv_id, &now, &now, &old_response_id],
+                    &[
+                        &new_response_id,
+                        &api_key_id,
+                        &new_conv_id,
+                        &stored_instructions,
+                        &stored_response_metadata,
+                        &is_root_response,
+                        &now,
+                        &old_response_id,
+                    ],
                 )
                 .await
                 .context("Failed to clone response")?;
@@ -410,6 +534,7 @@ impl ConversationRepository for PgConversationRepository {
             .context("Failed to get original response items")?;
 
         for item_row in &original_items {
+            let old_item_id: Uuid = item_row.try_get("id")?;
             let old_response_id: Uuid = item_row.try_get("response_id")?;
             let mut item_json: serde_json::Value = item_row.try_get("item")?;
             let original_created_at: chrono::DateTime<Utc> = item_row.try_get("created_at")?;
@@ -421,12 +546,34 @@ impl ConversationRepository for PgConversationRepository {
                 .unwrap_or(old_response_id);
             let new_item_id = Uuid::new_v4();
 
+            if let Some((key, key_id)) = self.pool.encryption_context() {
+                item_json = crate::field_encryption::decrypt_json_if_encrypted_with_key_id(
+                    &key,
+                    &key_id,
+                    "response_items",
+                    "item",
+                    old_item_id,
+                    item_json,
+                )?;
+            }
+
             // Update the "id" field inside the item JSON to use the new item ID
             // The item JSON has a structure like: { "id": "msg_...", "type": "message", ... }
             if let Some(obj) = item_json.as_object_mut() {
                 // Generate a new message ID in the format "msg_<uuid without hyphens>"
                 let new_msg_id = format!("msg_{}", new_item_id.as_simple());
                 obj.insert("id".to_string(), serde_json::Value::String(new_msg_id));
+            }
+
+            if let Some((key, key_id)) = self.pool.encryption_write_context() {
+                item_json = crate::field_encryption::encrypt_json_with_key_id(
+                    &key,
+                    &key_id,
+                    "response_items",
+                    "item",
+                    new_item_id,
+                    &item_json,
+                )?;
             }
 
             transaction

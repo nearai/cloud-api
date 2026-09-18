@@ -1,6 +1,7 @@
 use api::models::BatchUpdateModelApiRequest;
 use axum::http::header::RETRY_AFTER;
 use serde_json::{json, Value};
+use std::sync::OnceLock;
 
 use crate::common::{fake_ita::FakeIta, fake_ita::FakeItaMode, fake_ita::ObservedAttest, *};
 
@@ -104,8 +105,7 @@ async fn ita_token_rate_limit_preserves_retry_after_header() {
 async fn ita_token_rejects_alias_when_no_aliasing_is_requested() {
     // Given: a model alias exists and ITA is configured.
     let fake_ita = FakeIta::start(FakeItaMode::Success).await;
-    let server = setup_ita_server(&fake_ita, ItaServerMode::Enabled { max_retries: 0 }).await;
-    let alias = setup_deprecated_alias(&server).await;
+    let (server, alias, canonical) = setup_deprecated_alias(&fake_ita).await;
     let encoded_alias = url::form_urlencoded::byte_serialize(alias.as_bytes()).collect::<String>();
 
     // When: the caller opts into strict no-aliasing behavior.
@@ -119,7 +119,7 @@ async fn ita_token_rejects_alias_when_no_aliasing_is_requested() {
     // Then: the route rejects before calling fake ITA, preserving fail-closed alias semantics.
     assert_eq!(response.status_code(), 400, "{}", response.text());
     assert!(
-        response.text().contains(E2E_QWEN_MODEL_NAME),
+        response.text().contains(&canonical),
         "rejection should name canonical model: {}",
         response.text()
     );
@@ -130,8 +130,7 @@ async fn ita_token_rejects_alias_when_no_aliasing_is_requested() {
 async fn ita_token_announces_alias_when_alias_is_served() {
     // Given: a model alias exists and ITA is configured.
     let fake_ita = FakeIta::start(FakeItaMode::Success).await;
-    let server = setup_ita_server(&fake_ita, ItaServerMode::Enabled { max_retries: 0 }).await;
-    let alias = setup_deprecated_alias(&server).await;
+    let (server, alias, canonical) = setup_deprecated_alias(&fake_ita).await;
     let encoded_alias = url::form_urlencoded::byte_serialize(alias.as_bytes()).collect::<String>();
 
     // When: the caller requests through the alias without strict rejection.
@@ -147,11 +146,11 @@ async fn ita_token_announces_alias_when_alias_is_served() {
         .headers()
         .get(HEADER_MODEL_ALIAS_RESOLVED)
         .and_then(|value| value.to_str().ok());
-    let expected_header = format!("{alias} -> {E2E_QWEN_MODEL_NAME}");
+    let expected_header = format!("{alias} -> {canonical}");
     assert_eq!(header, Some(expected_header.as_str()));
     let body: Value = response.json();
     assert_eq!(body["models"].as_array().map(Vec::len), Some(1));
-    assert_eq!(body["models"][0]["model"], E2E_QWEN_MODEL_NAME);
+    assert_eq!(body["models"][0]["model"], canonical);
     assert_eq!(body["models"][0]["token"], "gateway.jwt");
 }
 
@@ -213,18 +212,67 @@ fn print_curl_style_response(path: &str, response: &axum_test::TestResponse) {
     println!("{}", response.text());
 }
 
-async fn setup_deprecated_alias(server: &axum_test::TestServer) -> String {
-    setup_qwen_model(server).await;
+async fn setup_alias_ita_server(fake_ita: &FakeIta, canonical: &str) -> axum_test::TestServer {
+    static DEV_ENV: OnceLock<()> = OnceLock::new();
+    DEV_ENV.get_or_init(|| {
+        std::env::set_var("DEV", "1");
+        std::env::set_var("BRAVE_SEARCH_PRO_API_KEY", "ita-attestation-e2e");
+    });
 
-    let alias = format!("test-ita-alias/{}", uuid::Uuid::new_v4());
+    crate::common::ita_evidence::setup_test_server_with_config_and_ita_model_evidence_for_model(
+        canonical.to_string(),
+        |config| {
+            config.ita = config::ItaAttestationConfig {
+                enabled: true,
+                api_base_url: config::ItaBaseUrl::parse(&fake_ita.base_url, "ITA_API_BASE_URL")
+                    .expect("fake ITA base URL should be valid"),
+                portal_base_url: config::ItaBaseUrl::parse(
+                    "https://portal.example.test",
+                    "ITA_PORTAL_BASE_URL",
+                )
+                .expect("test portal base URL should be valid"),
+                api_key: Some("test-api-key".to_string()),
+                timeout_seconds: 1,
+                max_retries: 0,
+                retry_backoff_ms: 1,
+                policy_ids: config::ItaPolicyIds::parse_csv("", "ITA_POLICY_IDS")
+                    .expect("empty test policy list should be valid"),
+                policy_must_match: false,
+                token_signing_alg: config::ItaTokenSigningAlg::Ps384,
+            };
+        },
+    )
+    .await
+}
+
+async fn setup_deprecated_alias(fake_ita: &FakeIta) -> (axum_test::TestServer, String, String) {
+    let suffix = uuid::Uuid::new_v4();
+    let canonical = format!("test-ita-successor/Model-{suffix}");
+    let alias = format!("test-ita-alias/{suffix}");
+    let server = setup_alias_ita_server(fake_ita, &canonical).await;
+
     let mut batch = BatchUpdateModelApiRequest::new();
+    batch.insert(
+        canonical.clone(),
+        serde_json::from_value(json!({
+            "inputCostPerToken": { "amount": 1_000_000, "currency": "USD" },
+            "outputCostPerToken": { "amount": 2_000_000, "currency": "USD" },
+            "modelDisplayName": "ITA Alias Successor Model",
+            "modelDescription": "Per-test canonical model for ITA alias e2e",
+            "contextLength": 128000,
+            "maxOutputLength": 1024,
+            "verifiable": true,
+            "isActive": true
+        }))
+        .expect("canonical test model request should deserialize"),
+    );
     batch.insert(
         alias.clone(),
         serde_json::from_value(json!({
             "inputCostPerToken": { "amount": 1_000_000, "currency": "USD" },
             "outputCostPerToken": { "amount": 2_000_000, "currency": "USD" },
             "modelDisplayName": "ITA Alias Test Model",
-            "modelDescription": "Synthetic model deprecated onto Qwen for ITA e2e",
+            "modelDescription": "Synthetic model deprecated onto a per-test ITA successor",
             "contextLength": 4096,
             "maxOutputLength": 1024,
             "verifiable": false,
@@ -232,7 +280,7 @@ async fn setup_deprecated_alias(server: &axum_test::TestServer) -> String {
         }))
         .expect("test model request should deserialize"),
     );
-    admin_batch_upsert_models(server, batch, get_session_id()).await;
+    admin_batch_upsert_models(&server, batch, get_session_id()).await;
 
     let response = server
         .post("/v1/admin/models/deprecate")
@@ -240,10 +288,10 @@ async fn setup_deprecated_alias(server: &axum_test::TestServer) -> String {
         .add_header("User-Agent", MOCK_USER_AGENT)
         .json(&json!({
             "modelId": alias,
-            "successorModelId": E2E_QWEN_MODEL_NAME,
+            "successorModelId": canonical,
             "changeReason": "ITA alias e2e"
         }))
         .await;
     assert_eq!(response.status_code(), 200, "{}", response.text());
-    alias
+    (server, alias, canonical)
 }

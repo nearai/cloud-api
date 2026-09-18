@@ -23,6 +23,16 @@ pub trait AttestationServiceTrait: Send + Sync {
         chat_id: &str,
     ) -> Result<(), AttestationError>;
 
+    /// Fetch and store provider signatures before a stream sends `[DONE]`.
+    /// Implementations may reserve part of the caller's finalization deadline
+    /// to persist partial fetches; background callers use the method above.
+    async fn store_stream_chat_signature_from_provider(
+        &self,
+        chat_id: &str,
+    ) -> Result<(), AttestationError> {
+        self.store_chat_signature_from_provider(chat_id).await
+    }
+
     /// Store a chat signature directly over gateway-emitted bytes.
     /// Creates a signature with text format "request_hash:response_hash"
     /// and stores both ECDSA and ED25519 signatures.
@@ -35,11 +45,9 @@ pub trait AttestationServiceTrait: Send + Sync {
 
     /// Store a gateway chat signature and then release the provider-pool
     /// signature-fetch routing pin for `chat_id`, mirroring the lifecycle
-    /// ownership of [`Self::store_chat_signature_from_provider`]: the pin is
-    /// released whether the store succeeds, fails, or times out, so the
-    /// provider's chat_id → backend map cannot grow unboundedly on
-    /// gateway-signed streams (where the provider signature fetch — and its
-    /// post-fetch unpin — is skipped).
+    /// ownership of [`Self::store_chat_signature_from_provider`]. This is for
+    /// callers that own both operations, such as non-streaming response
+    /// rewrites; stream lifecycle cleanup is owned by `InterceptStream`.
     async fn store_chat_signature_and_unpin(
         &self,
         chat_id: &str,
@@ -103,6 +111,20 @@ pub trait AttestationRepository: Send + Sync {
         chat_id: &str,
         signature: ChatSignature,
     ) -> Result<(), AttestationError>;
+
+    /// Store several signatures for one chat id. Backends that can write them
+    /// in a single statement should override this; the default stores them
+    /// one by one and stops at the first failure.
+    async fn add_chat_signatures(
+        &self,
+        chat_id: &str,
+        signatures: Vec<ChatSignature>,
+    ) -> Result<(), AttestationError> {
+        for signature in signatures {
+            self.add_chat_signature(chat_id, signature).await?;
+        }
+        Ok(())
+    }
     async fn get_chat_signature(
         &self,
         chat_id: &str,

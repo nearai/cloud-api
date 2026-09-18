@@ -1,12 +1,28 @@
 use std::sync::Arc;
 
-use api::{build_app_with_config, init_auth_services};
+use api::{build_app_with_config_and_options, init_auth_services};
 use async_trait::async_trait;
 use base64::Engine;
 
-use super::{assert_mock_user_in_db, setup_test_infrastructure, E2E_QWEN_MODEL_NAME};
+use super::{
+    assert_mock_user_in_db, setup_test_infrastructure, E2E_APP_BUILD_OPTIONS, E2E_QWEN_MODEL_NAME,
+};
 
 pub async fn setup_test_server_with_config_and_ita_model_evidence<F>(
+    mutate: F,
+) -> axum_test::TestServer
+where
+    F: FnOnce(&mut config::ApiConfig),
+{
+    setup_test_server_with_config_and_ita_model_evidence_for_model(
+        E2E_QWEN_MODEL_NAME.to_string(),
+        mutate,
+    )
+    .await
+}
+
+pub async fn setup_test_server_with_config_and_ita_model_evidence_for_model<F>(
+    model_name: String,
     mutate: F,
 ) -> axum_test::TestServer
 where
@@ -22,7 +38,7 @@ where
     let ita_provider: Arc<dyn inference_providers::InferenceProvider + Send + Sync> =
         Arc::new(ItaCompatibleModelEvidenceProvider::new(mock_provider));
     inference_provider_pool
-        .register_provider(E2E_QWEN_MODEL_NAME.to_string(), ita_provider)
+        .register_provider(model_name, ita_provider)
         .await;
 
     let metrics_service = Arc::new(services::metrics::MockMetricsService);
@@ -34,11 +50,12 @@ where
         metrics_service,
     )
     .await;
-    let app = build_app_with_config(
+    let app = build_app_with_config_and_options(
         infra.database.clone(),
         auth_components,
         domain_services,
         Arc::new(infra.config),
+        E2E_APP_BUILD_OPTIONS,
     );
     axum_test::TestServer::new(app)
 }

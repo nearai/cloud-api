@@ -38,14 +38,28 @@ impl ApiKeyRepository {
                 .context("Failed to get database connection")
                 .map_err(RepositoryError::PoolError)?;
 
+            // Permissions are checked in the service layer, in a separate statement.
+            // Lock the active organization here too: an unlocked EXISTS can read
+            // the pre-delete version under READ COMMITTED while organization
+            // deletion holds an uncommitted FOR UPDATE lock. FOR SHARE waits and
+            // rechecks after the delete commits, so this cannot mint a key under a
+            // deleted org. Locking only the organization preserves the deletion
+            // path's organization-first lock order.
             client
-                .query_one(
+                .query_opt(
                     r#"
                 INSERT INTO api_keys (
                     id, key_hash, key_prefix, name, workspace_id, created_by_user_id,
                     created_at, expires_at, last_used_at, is_active, deleted_at, spend_limit
                 )
-                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NULL, true, NULL, $9)
+                SELECT $1, $2, $3, $4, $5, $6, $7, $8, NULL, true, NULL, $9
+                WHERE EXISTS (
+                    SELECT 1
+                    FROM workspaces w
+                    JOIN organizations o ON w.organization_id = o.id
+                    WHERE w.id = $5 AND w.is_active = true AND o.is_active = true
+                    FOR SHARE OF o
+                )
                 RETURNING *
                 "#,
                     &[
@@ -62,6 +76,10 @@ impl ApiKeyRepository {
                 )
                 .await
                 .map_err(map_db_error)
+        })?;
+
+        let _row = _row.ok_or_else(|| {
+            RepositoryError::NotFound("active workspace for new API key".to_string())
         })?;
 
         debug!(
@@ -133,11 +151,16 @@ impl ApiKeyRepository {
             client
                 .query_opt(
                     r#"
-            SELECT * FROM api_keys 
-            WHERE key_hash = $1 
-              AND is_active = true 
-              AND deleted_at IS NULL
-              AND (expires_at IS NULL OR expires_at > NOW())
+            SELECT ak.*
+            FROM api_keys ak
+            JOIN workspaces w ON w.id = ak.workspace_id
+            JOIN organizations o ON o.id = w.organization_id
+            WHERE ak.key_hash = $1
+              AND ak.is_active = true
+              AND ak.deleted_at IS NULL
+              AND (ak.expires_at IS NULL OR ak.expires_at > NOW())
+              AND w.is_active = true
+              AND o.is_active = true
             "#,
                     &[&key_hash],
                 )

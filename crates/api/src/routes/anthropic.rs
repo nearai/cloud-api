@@ -3,6 +3,15 @@
 //! The request body stays schema-free on purpose. Cloud API validates only the
 //! fields needed for routing, billing, and explicit feature gates, then the raw
 //! transport rewrites `model` and forwards the rest to Anthropic.
+//!
+//! `anthropic-beta` is transport, not policy: tokens are syntax-checked and
+//! relayed verbatim, leaving Anthropic (which rejects names it does not know)
+//! as the authority on validity. Body-gated billing and product restrictions
+//! remain enforced by [`reject_unsupported_features`]. An accepted beta can still
+//! introduce header-only pricing or change the response shape: incompatible
+//! non-streaming usage yields a 502 after upstream may already have billed the
+//! work. `ANTHROPIC_DENIED_BETAS` is the global operator kill-switch for these
+//! cases; model-specific pricing restrictions need separate policy.
 
 use crate::middleware::auth::AuthenticatedApiKey;
 use crate::models::AnthropicErrorResponse;
@@ -10,6 +19,7 @@ use crate::routes::api::AppState;
 use crate::routes::common::{
     no_aliasing_requested, HEADER_MODEL_ALIAS_RESOLVED, HEADER_NO_ALIASING,
 };
+use crate::routes::completions::HEADER_INFERENCE_ID;
 use axum::body::{Body, Bytes};
 use axum::extract::{Extension, RawQuery, State};
 use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
@@ -19,12 +29,14 @@ use inference_providers::{
     anthropic_raw::AnthropicRawBody, AnthropicRawEndpoint, AnthropicRawError, AnthropicRawHeaders,
     AnthropicRawRequest, AnthropicRawResponse,
 };
+use services::completions::hash_inference_id_to_uuid;
 use services::completions::ports::{CompletionError, ConcurrentRequestGuard};
 use services::models::{ModelWithPricing, ModelsError, ModelsServiceTrait};
 use services::usage::{
     five_minute_cache_write_rate, CacheWriteBilling, InferenceType, ProviderAttribution,
     RecordUsageServiceRequest, StopReason, UsageServiceTrait,
 };
+use std::collections::VecDeque;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
@@ -32,22 +44,24 @@ use std::time::Duration;
 use uuid::Uuid;
 
 const MAX_SSE_USAGE_LINE_BYTES: usize = 256 * 1024;
-const ALLOWED_ANTHROPIC_BETAS: &[&str] = &[
-    // Current Claude Code transport marker and token-only request controls.
-    "claude-code-20250219",
-    "interleaved-thinking-2025-05-14",
-    "thinking-token-count-2026-05-13",
-    "context-management-2025-06-27",
-    "prompt-caching-scope-2026-01-05",
-    "effort-2025-11-24",
-    "structured-outputs-2025-12-15",
-    "fine-grained-tool-streaming-2025-05-14",
-    "token-efficient-tools-2025-02-19",
-    "prompt-caching-2024-07-31",
-    // Claude Code currently sends this marker on ordinary requests. The
-    // separate typed-tool body gate still rejects invocation of the advisor.
-    "advisor-tool-2026-03-01",
-];
+/// Cap on bytes buffered while waiting for `message_start` to reveal the
+/// provider message id at stream start. The id normally arrives in the first
+/// few hundred bytes; past the cap the response streams without an
+/// `inference-id` header rather than stalling or buffering unbounded.
+const MAX_STREAM_ID_PEEK_BYTES: usize = 64 * 1024;
+/// Elapsed-time bound on the same peek. The provider timeout covers only
+/// connection setup, not body reads, so an upstream that stalls (or drips
+/// keepalives that never reach the byte cap) before `message_start` would
+/// otherwise delay response start indefinitely. Generous because the peek
+/// ends at the first stream event, well before first content.
+const STREAM_ID_PEEK_TIMEOUT: Duration = Duration::from_secs(30);
+/// Upper bound on a single `anthropic-beta` token. Roughly triple the longest
+/// name Anthropic has published, so the endpoint is never the reason a
+/// plausible future token is refused.
+const MAX_BETA_TOKEN_LEN: usize = 128;
+/// Upper bound on distinct `anthropic-beta` tokens in one request. Current
+/// Claude Code sends thirteen.
+const MAX_BETA_TOKENS: usize = 64;
 
 struct PreparedRequest {
     body: serde_json::Value,
@@ -132,6 +146,17 @@ impl NativeUsage {
         let input_tokens = self.input_tokens_for_billing();
         saturating_token_count(self.cache_creation_input_tokens)
             .min(input_tokens.saturating_sub(self.cache_read_tokens_for_billing()))
+    }
+
+    /// Billing lookup key for /v1/billing/costs: the same deterministic hash
+    /// of the provider message id that the OpenAI-compatible plane stores and
+    /// exposes via the `inference-id` header. `None` when the upstream
+    /// response carried no id (the usage record then falls back to a random
+    /// UUID so the row still exists, but it is not client-correlatable).
+    fn inference_id(&self) -> Option<Uuid> {
+        self.provider_request_id
+            .as_deref()
+            .map(hash_inference_id_to_uuid)
     }
 }
 
@@ -244,6 +269,13 @@ impl SseUsageParser {
 struct NativeUsageStream {
     inner: AnthropicRawBody,
     parser: SseUsageParser,
+    /// Bytes (and at most one trailing error) already read while peeking for
+    /// the `message_start` id. They were fed to `parser` at peek time, so
+    /// they are replayed to the client verbatim without re-parsing.
+    prelude: VecDeque<Result<Bytes, AnthropicRawError>>,
+    /// True when the peek already observed the upstream end (EOF or error):
+    /// `inner` must not be polled again after the prelude drains.
+    inner_done: bool,
     billing: Option<NativeBillingContext>,
     concurrent_slot: Option<ConcurrentRequestGuard>,
     runtime_handle: tokio::runtime::Handle,
@@ -300,6 +332,16 @@ impl Stream for NativeUsageStream {
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let this = self.get_mut();
+        if let Some(item) = this.prelude.pop_front() {
+            if item.is_err() {
+                this.finish_billing(StopReason::ProviderError);
+            }
+            return Poll::Ready(Some(item));
+        }
+        if this.inner_done {
+            this.finish_billing(StopReason::Incomplete);
+            return Poll::Ready(None);
+        }
         match this.inner.as_mut().poll_next(cx) {
             Poll::Ready(Some(Ok(bytes))) => {
                 this.parser.push(&bytes);
@@ -310,7 +352,7 @@ impl Stream for NativeUsageStream {
                 Poll::Ready(Some(Err(error)))
             }
             Poll::Ready(None) => {
-                this.finish_billing(StopReason::Completed);
+                this.finish_billing(StopReason::Incomplete);
                 Poll::Ready(None)
             }
             Poll::Pending => Poll::Pending,
@@ -321,6 +363,43 @@ impl Stream for NativeUsageStream {
 impl Drop for NativeUsageStream {
     fn drop(&mut self) {
         self.finish_billing(StopReason::ClientDisconnect);
+    }
+}
+
+impl NativeUsageStream {
+    /// Read leading upstream bytes until the SSE parser sees the
+    /// `message_start` id, so the response can expose the same `inference-id`
+    /// header as the OpenAI-compatible plane before the body starts. Peeked
+    /// bytes (and a terminal error, if one arrives) land in `self.prelude`
+    /// for verbatim replay to the client.
+    ///
+    /// All state lives in `self` so the peek is cancellation-safe: wrapping
+    /// it in a timeout, or the client disconnecting mid-peek, cannot lose
+    /// already-peeked bytes or skip billing — dropping the stream still runs
+    /// `finish_billing` with everything the parser has seen.
+    async fn peek_message_id(&mut self) {
+        use futures_util::StreamExt as _;
+        let mut peeked_bytes = 0usize;
+        while self.parser.usage.provider_request_id.is_none()
+            && peeked_bytes < MAX_STREAM_ID_PEEK_BYTES
+        {
+            match self.inner.next().await {
+                Some(Ok(bytes)) => {
+                    self.parser.push(&bytes);
+                    peeked_bytes += bytes.len();
+                    self.prelude.push_back(Ok(bytes));
+                }
+                Some(Err(error)) => {
+                    self.prelude.push_back(Err(error));
+                    self.inner_done = true;
+                    return;
+                }
+                None => {
+                    self.inner_done = true;
+                    return;
+                }
+            }
+        }
     }
 }
 
@@ -373,7 +452,7 @@ async fn handle_request(
         query.as_deref(),
         &body,
         endpoint,
-        &app_state.config.external_providers.anthropic_allowed_betas,
+        &app_state.config.external_providers.anthropic_denied_betas,
     ) {
         Ok(prepared) => prepared,
         Err(error) => return error.into_response(),
@@ -519,7 +598,7 @@ fn prepare_request(
     query: Option<&str>,
     body: &[u8],
     endpoint: AnthropicRawEndpoint,
-    additional_allowed_betas: &[String],
+    denied_betas: &[String],
 ) -> RouteResult<PreparedRequest> {
     reject_unsupported_anthropic_headers(headers)?;
     reject_e2ee(headers)?;
@@ -577,7 +656,7 @@ fn prepare_request(
         beta_query: normalize_query(query)?,
         headers: AnthropicRawHeaders {
             version: single_header(headers, "anthropic-version")?,
-            beta: normalized_beta_header(headers, additional_allowed_betas)?,
+            beta: normalized_beta_header(headers, denied_betas)?,
         },
     })
 }
@@ -741,13 +820,45 @@ fn single_header(headers: &HeaderMap, name: &'static str) -> RouteResult<Option<
         })
 }
 
+/// Whether a token is safe to relay verbatim in the upstream header.
+///
+/// Anthropic's published names are lowercase alphanumerics and dashes; upper
+/// case, `_` and `.` are admitted so a plausible future spelling is not refused
+/// here. Everything else (whitespace, quotes, separators, control characters)
+/// is rejected to keep the relayed header value unambiguous.
+fn beta_token_is_well_formed(token: &str) -> bool {
+    !token.is_empty()
+        && token.len() <= MAX_BETA_TOKEN_LEN
+        && token
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+}
+
+fn malformed_beta_token(token: &str) -> AnthropicRouteError {
+    // Echoing is safe: the value already passed `to_str`, and the error body is
+    // JSON-escaped. Never log it — beta tokens travel with customer requests.
+    let shown: String = token.chars().take(64).collect();
+    AnthropicRouteError::new(
+        StatusCode::BAD_REQUEST,
+        "invalid_request_error",
+        format!(
+            "anthropic-beta token '{shown}' is malformed: use ASCII letters, digits, \
+             '-', '_' or '.' (at most {MAX_BETA_TOKEN_LEN} characters)"
+        ),
+    )
+}
+
+/// Collect the client's `anthropic-beta` tokens for relay.
+///
+/// Unknown tokens are forwarded on purpose. Anthropic answers a name it does
+/// not recognise with its own 400, so an allowlist here adds no protection and
+/// only goes stale on every client release (nearai/cloud-api#970, #988, #1068).
+/// `ANTHROPIC_DENIED_BETAS` remains as an operator kill-switch, and the body
+/// gates in [`reject_unsupported_features`] still enforce billing policy.
 fn normalized_beta_header(
     headers: &HeaderMap,
-    additional_allowed_betas: &[String],
+    denied_betas: &[String],
 ) -> RouteResult<Option<String>> {
-    // Keep the default surface narrow, while allowing operators to admit a
-    // newly released token through ANTHROPIC_ALLOWED_BETAS without a code
-    // deployment. Body policy still blocks unsupported server-side products.
     let mut betas = Vec::<String>::new();
     for value in headers.get_all("anthropic-beta") {
         let value = value.to_str().map_err(|_| {
@@ -762,18 +873,33 @@ fn normalized_beta_header(
             .map(str::trim)
             .filter(|token| !token.is_empty())
         {
-            if !ALLOWED_ANTHROPIC_BETAS.contains(&token)
-                && !additional_allowed_betas
-                    .iter()
-                    .any(|allowed| allowed == token)
+            if !beta_token_is_well_formed(token) {
+                return Err(malformed_beta_token(token));
+            }
+            if denied_betas
+                .iter()
+                .any(|denied| denied.eq_ignore_ascii_case(token))
             {
-                return Err(unsupported_feature(&format!(
-                    "anthropic-beta token '{token}'"
-                )));
+                return Err(AnthropicRouteError::new(
+                    StatusCode::BAD_REQUEST,
+                    "invalid_request_error",
+                    format!(
+                        "anthropic-beta token '{token}' is disabled on this endpoint by \
+                         operator policy"
+                    ),
+                ));
             }
-            if !betas.iter().any(|existing| existing == token) {
-                betas.push(token.to_string());
+            if betas.iter().any(|existing| existing == token) {
+                continue;
             }
+            if betas.len() == MAX_BETA_TOKENS {
+                return Err(AnthropicRouteError::new(
+                    StatusCode::BAD_REQUEST,
+                    "invalid_request_error",
+                    format!("anthropic-beta lists more than {MAX_BETA_TOKENS} distinct tokens"),
+                ));
+            }
+            betas.push(token.to_string());
         }
     }
     Ok((!betas.is_empty()).then(|| betas.join(",")))
@@ -880,7 +1006,8 @@ async fn build_upstream_response(
                 );
             }
         };
-        let reason = usage.stop_reason.clone().unwrap_or(StopReason::Completed);
+        let reason = usage.stop_reason.clone().unwrap_or(StopReason::Incomplete);
+        let inference_id = usage.inference_id();
         if let Some(billing) = billing {
             if let Err(error) = record_native_usage(billing, usage, reason).await {
                 tracing::error!(error = %error, "Failed to record native Anthropic usage");
@@ -891,21 +1018,35 @@ async fn build_upstream_response(
                 );
             }
         }
-        return response_from_bytes(status, upstream.headers, bytes, alias_from);
+        return response_from_bytes(status, upstream.headers, bytes, alias_from, inference_id);
     }
 
+    let mut inference_id = None;
     let body = if status.is_success() && endpoint == AnthropicRawEndpoint::Messages && stream {
-        Body::from_stream(NativeUsageStream {
+        // Construct the billing-owning stream before the first await so a
+        // client disconnect (or the peek timeout) during the peek still runs
+        // its Drop and records whatever usage the parser has seen.
+        let mut usage_stream = NativeUsageStream {
             inner: upstream.body,
             parser: SseUsageParser::default(),
+            prelude: VecDeque::new(),
+            inner_done: false,
             billing,
             concurrent_slot,
             runtime_handle: tokio::runtime::Handle::current(),
-        })
+        };
+        let _ = tokio::time::timeout(STREAM_ID_PEEK_TIMEOUT, usage_stream.peek_message_id()).await;
+        inference_id = usage_stream.parser.usage.inference_id();
+        if inference_id.is_none() {
+            tracing::warn!(
+                "Native Anthropic stream did not reveal a message id before response start"
+            );
+        }
+        Body::from_stream(usage_stream)
     } else {
         Body::from_stream(upstream.body)
     };
-    response_from_body(status, upstream.headers, body, alias_from)
+    response_from_body(status, upstream.headers, body, alias_from, inference_id)
 }
 
 async fn collect_body(upstream: &mut AnthropicRawResponse) -> Result<Vec<u8>, AnthropicRawError> {
@@ -966,6 +1107,12 @@ async fn record_native_usage(
         return Ok(());
     }
 
+    // Key the usage row by the deterministic hash of the provider message id
+    // (also exposed as the `inference-id` response header) so data-plane
+    // clients can look the request up via /v1/billing/costs, exactly like the
+    // OpenAI-compatible plane. Random fallback keeps the row when the
+    // upstream response carried no id.
+    let inference_id = usage.inference_id().unwrap_or_else(Uuid::new_v4);
     let request = RecordUsageServiceRequest {
         organization_id: context.organization_id,
         workspace_id: context.workspace_id,
@@ -984,7 +1131,7 @@ async fn record_native_usage(
         inference_type: context.inference_type,
         ttft_ms: None,
         avg_itl_ms: None,
-        inference_id: Some(Uuid::new_v4()),
+        inference_id: Some(inference_id),
         provider_request_id: usage.provider_request_id,
         stop_reason: Some(stop_reason),
         response_id: None,
@@ -1004,8 +1151,9 @@ fn response_from_bytes(
     headers: HeaderMap,
     body: Vec<u8>,
     alias_from: Option<String>,
+    inference_id: Option<Uuid>,
 ) -> Response {
-    response_from_body(status, headers, Body::from(body), alias_from)
+    response_from_body(status, headers, Body::from(body), alias_from, inference_id)
 }
 
 fn response_from_body(
@@ -1013,6 +1161,7 @@ fn response_from_body(
     headers: HeaderMap,
     body: Body,
     alias_from: Option<String>,
+    inference_id: Option<Uuid>,
 ) -> Response {
     let mut response = Response::new(body);
     *response.status_mut() = status;
@@ -1026,6 +1175,11 @@ fn response_from_body(
         "x-serving-provider",
         HeaderValue::from_static("non-attested"),
     );
+    if let Some(inference_id) = inference_id {
+        if let Ok(value) = HeaderValue::from_str(&inference_id.to_string()) {
+            response.headers_mut().insert(HEADER_INFERENCE_ID, value);
+        }
+    }
     if let Some(alias) = alias_from.and_then(|alias| HeaderValue::from_str(&alias).ok()) {
         response
             .headers_mut()
@@ -1111,8 +1265,17 @@ mod tests {
         assert!(!prepared.stream);
     }
 
+    /// The default `anthropic-beta` header sent by Claude Code 2.1.272, plus
+    /// `redact-thinking-2026-02-12`, which it adds conditionally.
+    const CLAUDE_CODE_BETAS: &str = "claude-code-20250219,interleaved-thinking-2025-05-14,\
+thinking-token-count-2026-05-13,context-management-2025-06-27,\
+prompt-caching-scope-2026-01-05,mid-conversation-system-2026-04-07,\
+advisor-tool-2026-03-01,effort-2025-11-24,fallback-credit-2026-06-01,afk-mode-2026-01-31,\
+per-turn-control-2026-07-01,mid-conversation-tool-changes-2026-07-01,\
+redact-thinking-2026-02-12";
+
     #[test]
-    fn beta_tokens_are_preserved_and_deduplicated() {
+    fn beta_tokens_are_relayed_verbatim_and_deduplicated() {
         let mut headers = request_headers();
         headers.append(
             "anthropic-beta",
@@ -1120,26 +1283,40 @@ mod tests {
         );
         headers.append(
             "anthropic-beta",
-            HeaderValue::from_static("claude-code-20250219"),
+            HeaderValue::from_static("claude-code-20250219, future-beta-2099-12-31"),
         );
         assert_eq!(
             normalized_beta_header(&headers, &[]).unwrap().as_deref(),
-            Some("claude-code-20250219,interleaved-thinking-2025-05-14")
+            Some("claude-code-20250219,interleaved-thinking-2025-05-14,future-beta-2099-12-31")
         );
 
+        // A token this endpoint has never heard of is Anthropic's call, not ours.
         headers.insert(
             "anthropic-beta",
             HeaderValue::from_static("fast-mode-2026-02-01"),
         );
-        assert!(normalized_beta_header(&headers, &[]).is_err());
-
-        let additional = vec!["fast-mode-2026-02-01".to_string()];
         assert_eq!(
-            normalized_beta_header(&headers, &additional)
-                .unwrap()
-                .as_deref(),
+            normalized_beta_header(&headers, &[]).unwrap().as_deref(),
             Some("fast-mode-2026-02-01")
         );
+
+        assert_eq!(
+            normalized_beta_header(&request_headers(), &[]).unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn beta_token_deduplication_preserves_case() {
+        let mut headers = request_headers();
+        headers.insert("anthropic-beta", HeaderValue::from_static("beta,BETA,beta"));
+        // Preserve provider-visible spelling; only identical tokens deduplicate.
+        // Operator denial intentionally covers all case variants instead.
+        assert_eq!(
+            normalized_beta_header(&headers, &[]).unwrap().as_deref(),
+            Some("beta,BETA")
+        );
+        assert!(normalized_beta_header(&headers, &["BeTa".to_string()]).is_err());
     }
 
     #[test]
@@ -1147,9 +1324,7 @@ mod tests {
         let mut headers = request_headers();
         headers.insert(
             "anthropic-beta",
-            HeaderValue::from_static(
-                "claude-code-20250219,interleaved-thinking-2025-05-14,thinking-token-count-2026-05-13,context-management-2025-06-27,prompt-caching-scope-2026-01-05,advisor-tool-2026-03-01,effort-2025-11-24,structured-outputs-2025-12-15",
-            ),
+            HeaderValue::from_str(CLAUDE_CODE_BETAS).unwrap(),
         );
         let prepared = prepare_request(
             &headers,
@@ -1161,13 +1336,127 @@ mod tests {
         .unwrap();
 
         assert!(prepared.beta_query);
+        assert_eq!(prepared.headers.beta.as_deref(), Some(CLAUDE_CODE_BETAS));
+        assert!(normalize_query(Some("future=true")).is_err());
+    }
+
+    #[test]
+    fn denied_beta_tokens_are_rejected_case_insensitively() {
+        let denied = vec!["fast-mode-2026-02-01".to_string()];
+        let mut headers = request_headers();
+        headers.insert(
+            "anthropic-beta",
+            HeaderValue::from_static("Fast-Mode-2026-02-01,claude-code-20250219"),
+        );
+        let error = normalized_beta_header(&headers, &denied).unwrap_err();
+        assert_eq!(error.status, StatusCode::BAD_REQUEST);
+        assert!(error.message.contains("disabled"));
+
+        headers.insert(
+            "anthropic-beta",
+            HeaderValue::from_static("claude-code-20250219"),
+        );
+        assert_eq!(
+            normalized_beta_header(&headers, &denied)
+                .unwrap()
+                .as_deref(),
+            Some("claude-code-20250219")
+        );
+    }
+
+    #[test]
+    fn malformed_beta_tokens_are_rejected() {
+        let over_long = "a".repeat(MAX_BETA_TOKEN_LEN + 1);
+        let too_many = (0..=MAX_BETA_TOKENS)
+            .map(|index| format!("beta-{index}"))
+            .collect::<Vec<_>>()
+            .join(",");
+        for value in [
+            "claude code",
+            "foo;bar",
+            "\"quoted\"",
+            &over_long,
+            &too_many,
+        ] {
+            let mut headers = request_headers();
+            headers.insert("anthropic-beta", HeaderValue::from_str(value).unwrap());
+            let error = normalized_beta_header(&headers, &[]).unwrap_err();
+            assert_eq!(error.status, StatusCode::BAD_REQUEST);
+            // Must not read like the retired allowlist: an operator or syntax
+            // refusal has to be distinguishable from a stale gate in triage.
+            assert!(!error.message.contains("is not supported"), "{value}");
+        }
+
+        let mut headers = request_headers();
+        headers.insert("anthropic-beta", HeaderValue::from_bytes(b"\xff").unwrap());
+        assert!(normalized_beta_header(&headers, &[]).is_err());
+    }
+
+    #[test]
+    fn beta_token_limits_are_inclusive() {
+        // Exactly the maximum token length and distinct-token count are valid.
+        let mut headers = request_headers();
+        headers.insert(
+            "anthropic-beta",
+            HeaderValue::from_str(&"a".repeat(MAX_BETA_TOKEN_LEN)).unwrap(),
+        );
+        assert!(normalized_beta_header(&headers, &[]).is_ok());
+
+        let at_limit = (0..MAX_BETA_TOKENS)
+            .map(|index| format!("beta-{index}"))
+            .collect::<Vec<_>>()
+            .join(",");
+        headers.insert("anthropic-beta", HeaderValue::from_str(&at_limit).unwrap());
+        assert_eq!(
+            normalized_beta_header(&headers, &[]).unwrap().as_deref(),
+            Some(at_limit.as_str())
+        );
+        // A duplicate does not consume another distinct-token slot.
+        headers.append("anthropic-beta", HeaderValue::from_static("beta-0"));
+        assert_eq!(
+            normalized_beta_header(&headers, &[]).unwrap().as_deref(),
+            Some(at_limit.as_str())
+        );
+        headers.append("anthropic-beta", HeaderValue::from_static("beta-extra"));
+        let error = normalized_beta_header(&headers, &[]).unwrap_err();
+        assert_eq!(error.status, StatusCode::BAD_REQUEST);
+        assert!(error.message.contains("more than 64 distinct tokens"));
+    }
+
+    #[test]
+    fn beta_header_alone_never_unlocks_a_body_gated_feature() {
+        let mut headers = request_headers();
+        headers.insert(
+            "anthropic-beta",
+            HeaderValue::from_static("fast-mode-2026-02-01"),
+        );
+        let prepared = prepare_request(
+            &headers,
+            None,
+            &base_body(),
+            AnthropicRawEndpoint::Messages,
+            &[],
+        )
+        .unwrap();
         assert_eq!(
             prepared.headers.beta.as_deref(),
-            headers
-                .get("anthropic-beta")
-                .and_then(|value| value.to_str().ok())
+            Some("fast-mode-2026-02-01")
         );
-        assert!(normalize_query(Some("future=true")).is_err());
+
+        // `PreparedRequest` is deliberately not `Debug` (it holds the customer
+        // body), so inspect the error arm directly rather than `unwrap_err`.
+        let mut body: serde_json::Value = serde_json::from_slice(&base_body()).unwrap();
+        body["speed"] = serde_json::json!("fast");
+        let Err(error) = prepare_request(
+            &headers,
+            None,
+            &serde_json::to_vec(&body).unwrap(),
+            AnthropicRawEndpoint::Messages,
+            &[],
+        ) else {
+            panic!("speed=fast must stay rejected regardless of the beta header");
+        };
+        assert!(error.message.contains("speed=fast"));
     }
 
     #[test]
@@ -1322,6 +1611,7 @@ mod tests {
             headers,
             br#"{"type":"error"}"#.to_vec(),
             None,
+            None,
         );
         assert!(response.headers().get(header::CONTENT_LENGTH).is_none());
         assert_eq!(
@@ -1341,5 +1631,416 @@ mod tests {
             .headers()
             .get("anthropic-ratelimit-requests-remaining")
             .is_none());
+    }
+
+    #[test]
+    fn usage_inference_id_matches_the_chat_plane_hash_of_the_message_id() {
+        let usage = parse_non_stream_usage(
+            br#"{"id":"msg_1","usage":{"input_tokens":1,"output_tokens":1}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            usage.inference_id(),
+            Some(hash_inference_id_to_uuid("msg_1"))
+        );
+
+        let no_id =
+            parse_non_stream_usage(br#"{"usage":{"input_tokens":1,"output_tokens":1}}"#).unwrap();
+        assert_eq!(no_id.inference_id(), None);
+    }
+
+    #[test]
+    fn responses_expose_the_inference_id_header_when_known() {
+        let inference_id = hash_inference_id_to_uuid("msg_header");
+        let response = response_from_bytes(
+            StatusCode::OK,
+            HeaderMap::new(),
+            br#"{"type":"message"}"#.to_vec(),
+            None,
+            Some(inference_id),
+        );
+        assert_eq!(
+            response.headers().get(HEADER_INFERENCE_ID).unwrap(),
+            &inference_id.to_string()
+        );
+    }
+
+    fn raw_body_from(items: Vec<Result<Bytes, AnthropicRawError>>) -> AnthropicRawBody {
+        Box::pin(futures_util::stream::iter(items))
+    }
+
+    fn usage_stream_over(
+        items: Vec<Result<Bytes, AnthropicRawError>>,
+        billing: Option<NativeBillingContext>,
+    ) -> NativeUsageStream {
+        NativeUsageStream {
+            inner: raw_body_from(items),
+            parser: SseUsageParser::default(),
+            prelude: VecDeque::new(),
+            inner_done: false,
+            billing,
+            concurrent_slot: None,
+            runtime_handle: tokio::runtime::Handle::current(),
+        }
+    }
+
+    #[tokio::test]
+    async fn stream_peek_reveals_the_message_id_and_replays_bytes_verbatim() {
+        let first = Bytes::from_static(b"event: message_start\nda");
+        let second = Bytes::from_static(
+            b"ta: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_stream\",\"usage\":{\"input_tokens\":4}}}\n\n",
+        );
+        let tail = Bytes::from_static(
+            b"data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":9}}\n\n",
+        );
+        let mut stream = usage_stream_over(
+            vec![Ok(first.clone()), Ok(second.clone()), Ok(tail.clone())],
+            None,
+        );
+        stream.peek_message_id().await;
+
+        assert_eq!(
+            stream.parser.usage.inference_id(),
+            Some(hash_inference_id_to_uuid("msg_stream"))
+        );
+        assert!(!stream.inner_done);
+
+        // The client must receive every byte exactly once and in order, and
+        // the tee parser must keep accounting for post-peek usage events.
+        use futures_util::StreamExt as _;
+        let mut stream = Box::pin(stream);
+        let mut replayed = Vec::new();
+        while let Some(item) = stream.next().await {
+            replayed.extend_from_slice(&item.unwrap());
+        }
+        let mut expected = Vec::new();
+        expected.extend_from_slice(&first);
+        expected.extend_from_slice(&second);
+        expected.extend_from_slice(&tail);
+        assert_eq!(replayed, expected);
+        assert_eq!(stream.parser.finish().output_tokens_for_billing(), 9);
+    }
+
+    #[tokio::test]
+    async fn stream_peek_gives_up_at_the_byte_cap_without_dropping_bytes() {
+        let preamble = Bytes::from(vec![b'x'; MAX_STREAM_ID_PEEK_BYTES + 1]);
+        let mut stream = usage_stream_over(
+            vec![Ok(preamble.clone()), Ok(Bytes::from_static(b"tail"))],
+            None,
+        );
+        stream.peek_message_id().await;
+
+        assert_eq!(stream.parser.usage.inference_id(), None);
+        assert!(!stream.inner_done);
+        assert_eq!(stream.prelude.len(), 1);
+        assert_eq!(stream.prelude[0].as_ref().unwrap(), &preamble);
+    }
+
+    #[tokio::test]
+    async fn stream_peek_captures_an_immediate_upstream_end() {
+        let mut stream = usage_stream_over(vec![], None);
+        stream.peek_message_id().await;
+        assert!(stream.prelude.is_empty());
+        assert!(stream.inner_done);
+    }
+
+    /// Captures `record_usage` requests for assertion. Recording is the only
+    /// method the streaming billing path calls; the rest stay unimplemented.
+    /// Returning Err spares constructing a full UsageLogEntry — the request
+    /// is captured before the result is inspected.
+    #[derive(Default)]
+    struct RecordingUsageService {
+        records: std::sync::Mutex<Vec<RecordUsageServiceRequest>>,
+    }
+
+    #[async_trait::async_trait]
+    impl UsageServiceTrait for RecordingUsageService {
+        async fn calculate_cost(
+            &self,
+            _model_id: &str,
+            _input_tokens: i32,
+            _output_tokens: i32,
+            _cache_read_tokens: i32,
+        ) -> Result<services::usage::CostBreakdown, services::usage::UsageError> {
+            unimplemented!()
+        }
+
+        async fn record_usage(
+            &self,
+            request: RecordUsageServiceRequest,
+        ) -> Result<services::usage::UsageLogEntry, services::usage::UsageError> {
+            self.records
+                .lock()
+                .expect("records mutex should not poison")
+                .push(request);
+            Err(services::usage::UsageError::InternalError(
+                "recorded".to_string(),
+            ))
+        }
+
+        async fn record_usage_from_api(
+            &self,
+            _organization_id: Uuid,
+            _workspace_id: Uuid,
+            _api_key_id: Uuid,
+            _request: services::usage::RecordUsageApiRequest,
+        ) -> Result<services::usage::UsageLogEntry, services::usage::UsageError> {
+            unimplemented!()
+        }
+
+        async fn check_can_use(
+            &self,
+            _organization_id: Uuid,
+        ) -> Result<services::usage::UsageCheckResult, services::usage::UsageError> {
+            unimplemented!()
+        }
+
+        async fn get_balance(
+            &self,
+            _organization_id: Uuid,
+        ) -> Result<Option<services::usage::OrganizationBalanceInfo>, services::usage::UsageError>
+        {
+            unimplemented!()
+        }
+
+        async fn get_usage_history(
+            &self,
+            _organization_id: Uuid,
+            _limit: Option<i64>,
+            _offset: Option<i64>,
+        ) -> Result<(Vec<services::usage::UsageLogEntry>, i64), services::usage::UsageError>
+        {
+            unimplemented!()
+        }
+
+        async fn get_limit(
+            &self,
+            _organization_id: Uuid,
+        ) -> Result<Option<services::usage::OrganizationLimit>, services::usage::UsageError>
+        {
+            unimplemented!()
+        }
+
+        async fn get_credit_limits(
+            &self,
+            _organization_id: Uuid,
+        ) -> Result<Vec<services::usage::OrganizationCreditLimit>, services::usage::UsageError>
+        {
+            unimplemented!()
+        }
+
+        async fn get_usage_history_by_api_key(
+            &self,
+            _api_key_id: Uuid,
+            _credit_type: Option<&str>,
+            _limit: Option<i64>,
+            _offset: Option<i64>,
+        ) -> Result<(Vec<services::usage::UsageLogEntry>, i64), services::usage::UsageError>
+        {
+            unimplemented!()
+        }
+
+        async fn get_api_key_usage_history_with_permissions(
+            &self,
+            _workspace_id: Uuid,
+            _api_key_id: Uuid,
+            _user_id: Uuid,
+            _credit_type: Option<&str>,
+            _limit: Option<i64>,
+            _offset: Option<i64>,
+        ) -> Result<(Vec<services::usage::UsageLogEntry>, i64), services::usage::UsageError>
+        {
+            unimplemented!()
+        }
+
+        async fn get_costs_by_inference_ids(
+            &self,
+            _organization_id: Uuid,
+            _inference_ids: Vec<Uuid>,
+        ) -> Result<Vec<services::usage::InferenceCost>, services::usage::UsageError> {
+            unimplemented!()
+        }
+
+        async fn get_usage_by_model(
+            &self,
+            _organization_id: Uuid,
+            _start_date: chrono::DateTime<chrono::Utc>,
+        ) -> Result<Vec<services::usage::UsageByModelEntry>, services::usage::UsageError> {
+            unimplemented!()
+        }
+
+        async fn list_inference_usage_report(
+            &self,
+            _query: services::usage::InferenceUsageReportQuery,
+        ) -> Result<Vec<services::usage::InferenceUsageReportRow>, services::usage::UsageError>
+        {
+            unimplemented!()
+        }
+
+        async fn list_inference_usage_history(
+            &self,
+            _query: services::usage::InferenceUsageHistoryQuery,
+        ) -> Result<(Vec<services::usage::InferenceUsageReportRow>, i64), services::usage::UsageError>
+        {
+            unimplemented!()
+        }
+    }
+
+    fn billing_context(usage_service: Arc<RecordingUsageService>) -> NativeBillingContext {
+        NativeBillingContext {
+            usage_service,
+            organization_id: Uuid::new_v4(),
+            workspace_id: Uuid::new_v4(),
+            api_key_id: Uuid::new_v4(),
+            model_id: Uuid::new_v4(),
+            inference_type: InferenceType::ChatCompletionStream,
+            provider_attribution: ProviderAttribution::default(),
+            cache_write_cost_per_token: 0,
+        }
+    }
+
+    /// Billing runs on a spawned blocking task after the stream finishes;
+    /// poll briefly instead of racing it.
+    async fn wait_for_recorded_usage(
+        usage_service: &RecordingUsageService,
+    ) -> RecordUsageServiceRequest {
+        for _ in 0..200 {
+            {
+                let mut records = usage_service
+                    .records
+                    .lock()
+                    .expect("records mutex should not poison");
+                if let Some(request) = records.pop() {
+                    return request;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("usage was not recorded within 2s");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn completed_stream_records_usage_under_the_derived_inference_id() {
+        let usage_service = Arc::new(RecordingUsageService::default());
+        let mut stream = usage_stream_over(
+            vec![
+                Ok(Bytes::from_static(
+                    b"data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_stream\",\"usage\":{\"input_tokens\":4}}}\n\n",
+                )),
+                Ok(Bytes::from_static(
+                    b"data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":9}}\n\n",
+                )),
+            ],
+            Some(billing_context(usage_service.clone())),
+        );
+        stream.peek_message_id().await;
+
+        use futures_util::StreamExt as _;
+        let mut stream = Box::pin(stream);
+        while let Some(item) = stream.next().await {
+            item.unwrap();
+        }
+        drop(stream);
+
+        let recorded = wait_for_recorded_usage(&usage_service).await;
+        assert_eq!(
+            recorded.inference_id,
+            Some(hash_inference_id_to_uuid("msg_stream"))
+        );
+        assert_eq!(recorded.provider_request_id.as_deref(), Some("msg_stream"));
+        assert_eq!(recorded.stop_reason, Some(StopReason::Completed));
+        assert_eq!(recorded.input_tokens, 4);
+        assert_eq!(recorded.output_tokens, 9);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn stream_ending_without_a_declared_stop_reason_is_billed_as_incomplete() {
+        let usage_service = Arc::new(RecordingUsageService::default());
+        let mut stream = usage_stream_over(
+            vec![
+                Ok(Bytes::from_static(
+                    b"data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_stream\",\"usage\":{\"input_tokens\":4}}}\n\n",
+                )),
+                Ok(Bytes::from_static(
+                    b"data: {\"type\":\"message_delta\",\"delta\":{},\"usage\":{\"output_tokens\":9}}\n\n",
+                )),
+            ],
+            Some(billing_context(usage_service.clone())),
+        );
+        stream.peek_message_id().await;
+
+        use futures_util::StreamExt as _;
+        let mut stream = Box::pin(stream);
+        while let Some(item) = stream.next().await {
+            item.unwrap();
+        }
+        drop(stream);
+
+        let recorded = wait_for_recorded_usage(&usage_service).await;
+        assert_eq!(recorded.stop_reason, Some(StopReason::Incomplete));
+        assert_eq!(recorded.output_tokens, 9);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn upstream_ending_before_a_parseable_id_is_billed_as_incomplete() {
+        let usage_service = Arc::new(RecordingUsageService::default());
+        let leading = Bytes::from_static(
+            b"data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_stream\",\"usage\":{\"input_tokens\":4}}}",
+        );
+        let mut stream = usage_stream_over(
+            vec![Ok(leading)],
+            Some(billing_context(usage_service.clone())),
+        );
+        stream.peek_message_id().await;
+        assert!(stream.inner_done);
+
+        use futures_util::StreamExt as _;
+        let mut stream = Box::pin(stream);
+        while let Some(item) = stream.next().await {
+            item.unwrap();
+        }
+        drop(stream);
+
+        let recorded = wait_for_recorded_usage(&usage_service).await;
+        assert_eq!(recorded.stop_reason, Some(StopReason::Incomplete));
+        assert_eq!(recorded.input_tokens, 4);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn upstream_error_during_peek_is_replayed_and_billed_as_provider_error() {
+        let usage_service = Arc::new(RecordingUsageService::default());
+        // No trailing newline: the peek cannot parse the id from the
+        // buffered line, so it keeps reading and captures the error;
+        // `finish()` still recovers the id and tokens for billing.
+        let leading = Bytes::from_static(
+            b"data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_stream\",\"usage\":{\"input_tokens\":4}}}",
+        );
+        let mut stream = usage_stream_over(
+            vec![
+                Ok(leading.clone()),
+                Err(AnthropicRawError::Transport("upstream died".to_string())),
+            ],
+            Some(billing_context(usage_service.clone())),
+        );
+        stream.peek_message_id().await;
+        assert!(stream.inner_done);
+        assert_eq!(stream.prelude.len(), 2);
+
+        use futures_util::StreamExt as _;
+        let mut stream = Box::pin(stream);
+        let first = stream.next().await.expect("peeked bytes replay first");
+        assert_eq!(first.unwrap(), leading);
+        let second = stream.next().await.expect("the captured error replays");
+        assert!(second.is_err());
+        assert!(stream.next().await.is_none());
+        drop(stream);
+
+        let recorded = wait_for_recorded_usage(&usage_service).await;
+        assert_eq!(
+            recorded.inference_id,
+            Some(hash_inference_id_to_uuid("msg_stream"))
+        );
+        assert_eq!(recorded.stop_reason, Some(StopReason::ProviderError));
+        assert_eq!(recorded.input_tokens, 4);
     }
 }

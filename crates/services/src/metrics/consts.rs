@@ -51,6 +51,7 @@ pub const METRIC_CACHE_HIT_RATE: &str = "cloud_api.cache.hit_rate";
 pub const METRIC_PROVIDER_REQUESTS: &str = "cloud_api.provider.requests";
 
 pub const METRIC_PROVIDER_ATTEMPTS: &str = "cloud_api.provider.attempts";
+pub const METRIC_BACKEND_KEY_DIVERGENCE: &str = "cloud_api.backend.key_divergence";
 
 // Error metrics
 pub const METRIC_REQUEST_ERRORS: &str = "cloud_api.request.errors";

@@ -760,15 +760,16 @@ impl UsageServiceTrait for UsageServiceImpl {
 
         match (balance, limit) {
             (Some(balance), Some(limit)) => {
-                // Compare amounts - deny if spent >= limit (all in same scale 9)
-                if balance.total_spent >= limit.spend_limit {
+                // An already-recorded overage is an accounting debt, not
+                // ordinary spend that a later top-up may silently absorb.
+                if limit.unfunded > 0 || limit.available == 0 {
                     Ok(UsageCheckResult::LimitExceeded {
                         spent: balance.total_spent,
                         limit: limit.spend_limit,
                     })
                 } else {
                     Ok(UsageCheckResult::Allowed {
-                        remaining: limit.spend_limit - balance.total_spent,
+                        remaining: limit.available,
                     })
                 }
             }
@@ -780,9 +781,9 @@ impl UsageServiceTrait for UsageServiceImpl {
             (None, Some(limit)) => {
                 // No usage yet, but limit exists
                 // Check if limit is > 0 (has credits)
-                if limit.spend_limit > 0 {
+                if limit.unfunded == 0 && limit.available > 0 {
                     Ok(UsageCheckResult::Allowed {
-                        remaining: limit.spend_limit,
+                        remaining: limit.available,
                     })
                 } else {
                     // Limit is set to 0 - no credits
@@ -862,12 +863,13 @@ impl UsageServiceTrait for UsageServiceImpl {
     async fn get_usage_history_by_api_key(
         &self,
         api_key_id: Uuid,
+        credit_type: Option<&str>,
         limit: Option<i64>,
         offset: Option<i64>,
     ) -> Result<(Vec<UsageLogEntry>, i64), UsageError> {
         let (logs, total) = self
             .usage_repository
-            .get_usage_history_by_api_key(api_key_id, limit, offset)
+            .get_usage_history_by_api_key(api_key_id, credit_type, limit, offset)
             .await
             .map_err(|e| {
                 UsageError::InternalError(format!("Failed to get API key usage history: {e}"))
@@ -882,6 +884,7 @@ impl UsageServiceTrait for UsageServiceImpl {
         workspace_id: Uuid,
         api_key_id: Uuid,
         user_id: Uuid,
+        credit_type: Option<&str>,
         limit: Option<i64>,
         offset: Option<i64>,
     ) -> Result<(Vec<UsageLogEntry>, i64), UsageError> {
@@ -920,19 +923,21 @@ impl UsageServiceTrait for UsageServiceImpl {
         // Get the usage history
         let (logs, total) = self
             .usage_repository
-            .get_usage_history_by_api_key(api_key_id, limit, offset)
+            .get_usage_history_by_api_key(api_key_id, credit_type, limit, offset)
             .await
             .map_err(|e| UsageError::InternalError(format!("Failed to get usage history: {e}")))?;
 
         Ok((logs, total))
     }
 
-    /// Get costs by inference IDs (for HuggingFace billing integration)
+    /// Get costs by inference IDs (for HuggingFace billing integration).
+    /// Returns entries for the found inference IDs only.
     async fn get_costs_by_inference_ids(
         &self,
         organization_id: Uuid,
         inference_ids: Vec<Uuid>,
     ) -> Result<Vec<InferenceCost>, UsageError> {
+        let requested = inference_ids.clone();
         let results = self
             .usage_repository
             .get_costs_by_inference_ids(organization_id, inference_ids)
@@ -941,10 +946,16 @@ impl UsageServiceTrait for UsageServiceImpl {
                 UsageError::InternalError(format!("Failed to get costs by inference IDs: {e}"))
             })?;
 
-        // Log count of inference IDs that were not found (cost = 0)
-        let not_found_count = results.iter().filter(|ic| ic.cost_nano_usd == 0).count();
+        // Callers routinely probe with IDs that may not exist (wrong header,
+        // recent request not yet recorded), so a miss is expected traffic,
+        // not a server error. Count by membership: the repository returns one
+        // entry per distinct found ID, so a length comparison would report
+        // phantom misses for duplicated request IDs.
+        let found: std::collections::HashSet<Uuid> =
+            results.iter().map(|cost| cost.inference_id).collect();
+        let not_found_count = requested.iter().filter(|id| !found.contains(id)).count();
         if not_found_count > 0 {
-            tracing::error!(
+            tracing::debug!(
                 "Inference IDs not found in usage log: count={}",
                 not_found_count
             );

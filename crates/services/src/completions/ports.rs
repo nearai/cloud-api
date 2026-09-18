@@ -74,6 +74,9 @@ pub enum CompletionError {
 // Request/Response models
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CompletionRequest {
+    /// Operator-controlled scheduler priority. Never accepted from or exposed in JSON.
+    #[serde(skip)]
+    pub request_priority: inference_providers::models::RequestPriority,
     /// UUIDv4 correlation ID generated (or echoed) by the API layer.
     /// Propagated downstream as `X-Request-Id` so every hop can join on it.
     pub request_id: uuid::Uuid,
@@ -90,6 +93,8 @@ pub struct CompletionRequest {
     pub api_key_id: String, // For usage tracking (ID only, no name)
     pub organization_id: Uuid,
     pub workspace_id: Uuid,
+    /// Whether providers explicitly registered as fallbacks may be used.
+    pub fallback_enabled: bool,
     pub metadata: Option<serde_json::Value>,
     /// Whether to store the output (required for metadata to be sent to OpenAI)
     pub store: Option<bool>,
@@ -132,6 +137,10 @@ pub struct CompletionMessage {
     /// Tool calls made by the assistant - required for assistant messages that invoke tools
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_calls: Option<Vec<CompletionToolCall>>,
+    /// Prior-turn reasoning echoed by the client so thinking models can
+    /// continue across tool calls. Redacted like other client text.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_content: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

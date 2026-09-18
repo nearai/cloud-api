@@ -23,6 +23,57 @@ async fn create_conversation(
     response.json::<api::models::ConversationObject>()
 }
 
+/// Wait for the usage row produced by a specific Responses API call.
+///
+/// Creating the first response in a conversation can also trigger asynchronous
+/// title generation, which records a separate usage row for the same
+/// organization. Match the stable response ID so assertions always inspect the
+/// row produced by the request under test.
+async fn wait_for_response_usage(
+    server: &axum_test::TestServer,
+    organization_id: &str,
+    response_id: &str,
+) -> api::routes::usage::UsageHistoryEntryResponse {
+    let response_uuid =
+        uuid::Uuid::parse_str(response_id.strip_prefix("resp_").unwrap_or(response_id))
+            .expect("response ID should contain a valid UUID");
+    let expected_response_id = format!("resp_{response_uuid}");
+
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            let history_resp = server
+                .get(&format!(
+                    "/v1/organizations/{organization_id}/usage/history?limit=100&offset=0"
+                ))
+                .add_header("Authorization", format!("Bearer {}", get_session_id()))
+                .add_header("User-Agent", MOCK_USER_AGENT)
+                .await;
+
+            assert_eq!(
+                history_resp.status_code(),
+                200,
+                "usage history should succeed: {}",
+                history_resp.text()
+            );
+
+            let history: api::routes::usage::UsageHistoryResponse = history_resp.json();
+            if let Some(entry) = history
+                .data
+                .into_iter()
+                .find(|entry| entry.response_id.as_deref() == Some(expected_response_id.as_str()))
+            {
+                break entry;
+            }
+
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| {
+        panic!("usage for response {response_id} should be recorded within 5 seconds")
+    })
+}
+
 /// Non-streaming Responses API: set mock cache_tokens based on provider token estimate,
 /// then verify:
 /// - ResponseObject.usage.input_tokens_details.cached_tokens equals that cache_tokens
@@ -32,7 +83,7 @@ async fn test_responses_non_stream_records_cache_usage_in_history() {
     let (server, _pool, mock_provider, _db) = setup_test_server_with_pool().await;
 
     // Use cache-aware pricing so cache_read_tokens is meaningful in billing too
-    setup_qwen_model_with_cache_pricing(&server).await;
+    let model = setup_qwen_model_with_cache_pricing(&server).await;
     let org = setup_org_with_credits(&server, 10_000_000_000i64).await;
     let api_key = get_api_key_for_org(&server, org.id.clone()).await;
 
@@ -61,7 +112,7 @@ async fn test_responses_non_stream_records_cache_usage_in_history() {
             "temperature": 0.7,
             "max_output_tokens": 64,
             "stream": false,
-            "model": E2E_QWEN_MODEL_NAME
+            "model": model
         }))
         .await;
 
@@ -92,32 +143,11 @@ async fn test_responses_non_stream_records_cache_usage_in_history() {
         "ResponseObject.usage cached_tokens should equal configured cache_tokens"
     );
 
-    // Allow async usage recording (ResponseService records usage after stream/agent loop)
-    tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
-
-    // Verify org usage history reflects the same cache_read_tokens
-    let history_resp = server
-        .get(&format!(
-            "/v1/organizations/{}/usage/history?limit=1&offset=0",
-            org.id
-        ))
-        .add_header("Authorization", format!("Bearer {}", get_session_id()))
-        .add_header("User-Agent", MOCK_USER_AGENT)
-        .await;
-
+    let entry = wait_for_response_usage(&server, &org.id, &response_obj.id).await;
     assert_eq!(
-        history_resp.status_code(),
-        200,
-        "usage history should succeed: {}",
-        history_resp.text()
+        entry.model, E2E_QWEN_CACHE_MODEL_NAME,
+        "usage history should identify the model used by the response"
     );
-
-    let history: api::routes::usage::UsageHistoryResponse = history_resp.json();
-    assert!(
-        !history.data.is_empty(),
-        "Should have usage history entries"
-    );
-    let entry = &history.data[0];
     assert_eq!(
         entry.cache_read_tokens, cache_tokens,
         "usage history should record cache_read_tokens consistent with ResponseObject"
@@ -146,7 +176,7 @@ async fn test_responses_non_stream_records_cache_usage_in_history() {
 async fn test_responses_stream_records_cache_usage_in_history() {
     let (server, _pool, mock_provider, _db) = setup_test_server_with_pool().await;
 
-    setup_qwen_model_with_cache_pricing(&server).await;
+    let model = setup_qwen_model_with_cache_pricing(&server).await;
     let org = setup_org_with_credits(&server, 10_000_000_000i64).await;
     let api_key = get_api_key_for_org(&server, org.id.clone()).await;
 
@@ -172,7 +202,7 @@ async fn test_responses_stream_records_cache_usage_in_history() {
             "temperature": 0.7,
             "max_output_tokens": 64,
             "stream": true,
-            "model": E2E_QWEN_MODEL_NAME
+            "model": model
         }))
         .await;
 
@@ -216,6 +246,7 @@ async fn test_responses_stream_records_cache_usage_in_history() {
     }
 
     let completed = completed_response.expect("Should capture final response from stream");
+    let response_id = completed.id.clone();
     let usage = completed.usage;
     assert!(
         usage.input_tokens > 0 && usage.output_tokens > 0,
@@ -231,30 +262,11 @@ async fn test_responses_stream_records_cache_usage_in_history() {
         "streaming ResponseObject usage cached_tokens should equal configured cache_tokens"
     );
 
-    // Give ResponseService time to finalize and record usage
-    tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
-
-    let history_resp = server
-        .get(&format!(
-            "/v1/organizations/{}/usage/history?limit=1&offset=0",
-            org.id
-        ))
-        .add_header("Authorization", format!("Bearer {}", get_session_id()))
-        .add_header("User-Agent", MOCK_USER_AGENT)
-        .await;
-
+    let entry = wait_for_response_usage(&server, &org.id, &response_id).await;
     assert_eq!(
-        history_resp.status_code(),
-        200,
-        "usage history should succeed after streaming response"
+        entry.model, E2E_QWEN_CACHE_MODEL_NAME,
+        "usage history should identify the model used by the streaming response"
     );
-
-    let history: api::routes::usage::UsageHistoryResponse = history_resp.json();
-    assert!(
-        !history.data.is_empty(),
-        "Should have usage history entries after streaming response"
-    );
-    let entry = &history.data[0];
     assert_eq!(
         entry.cache_read_tokens, cache_tokens,
         "cache_read_tokens should equal configured cache_tokens"

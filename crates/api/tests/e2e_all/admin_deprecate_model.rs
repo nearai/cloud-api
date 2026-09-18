@@ -1,9 +1,7 @@
 // E2E tests for model deprecation admin workflows.
 
 use crate::common::*;
-use api::models::{
-    AdminModelListResponse, BatchUpdateModelApiRequest, DeprecateModelResponse, ErrorResponse,
-};
+use api::models::{BatchUpdateModelApiRequest, DeprecateModelResponse, ErrorResponse};
 
 /// Build a minimal model upsert payload — enough to satisfy the "new model"
 /// required-field validation (modelDisplayName, modelDescription, contextLength).
@@ -193,32 +191,19 @@ async fn test_deprecate_hides_old_from_admin_list_by_default() {
     assert_eq!(resp.status_code(), 200);
 
     // Default listing (active only) should NOT contain the deprecated model.
-    let active_list_resp = server
-        .get("/v1/admin/models?limit=500")
-        .add_header("Authorization", format!("Bearer {}", get_session_id()))
-        .add_header("User-Agent", MOCK_USER_AGENT)
-        .await;
-    let active: AdminModelListResponse =
-        serde_json::from_str(&active_list_resp.text()).expect("parse list");
+    let active = list_all_admin_models(&server, false).await;
     assert!(
-        !active.models.iter().any(|m| m.model_id == old),
+        !active.iter().any(|m| m.model_id == old),
         "deprecated model should be hidden from active listing"
     );
     assert!(
-        active.models.iter().any(|m| m.model_id == new),
+        active.iter().any(|m| m.model_id == new),
         "successor should remain visible"
     );
 
     // include_inactive=true should still surface the deprecated model.
-    let all_list_resp = server
-        .get("/v1/admin/models?limit=500&include_inactive=true")
-        .add_header("Authorization", format!("Bearer {}", get_session_id()))
-        .add_header("User-Agent", MOCK_USER_AGENT)
-        .await;
-    let all: AdminModelListResponse =
-        serde_json::from_str(&all_list_resp.text()).expect("parse list");
+    let all = list_all_admin_models(&server, true).await;
     let deprecated_entry = all
-        .models
         .iter()
         .find(|m| m.model_id == old)
         .expect("deprecated model should appear when include_inactive=true");

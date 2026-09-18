@@ -23,6 +23,44 @@ impl FileRepository {
         params: services::files::ports::CreateFileParams,
     ) -> Result<File, RepositoryError> {
         let id = Uuid::new_v4();
+        let (filename, content_type, storage_key) =
+            if let Some((key, key_id)) = self.pool.encryption_write_context() {
+                (
+                    crate::field_encryption::encrypt_with_key_id(
+                        &key,
+                        &key_id,
+                        "files",
+                        "filename",
+                        id,
+                        &params.filename,
+                    )
+                    .map_err(RepositoryError::DataConversionError)?,
+                    crate::field_encryption::encrypt_with_key_id(
+                        &key,
+                        &key_id,
+                        "files",
+                        "content_type",
+                        id,
+                        &params.content_type,
+                    )
+                    .map_err(RepositoryError::DataConversionError)?,
+                    crate::field_encryption::encrypt_with_key_id(
+                        &key,
+                        &key_id,
+                        "files",
+                        "storage_key",
+                        id,
+                        &params.storage_key,
+                    )
+                    .map_err(RepositoryError::DataConversionError)?,
+                )
+            } else {
+                (
+                    params.filename.clone(),
+                    params.content_type.clone(),
+                    params.storage_key.clone(),
+                )
+            };
 
         let row = match retry_db!("create_new_file_record", {
             let now = Utc::now();
@@ -45,11 +83,11 @@ impl FileRepository {
                 "#,
                     &[
                         &id,
-                        &params.filename,
+                        &filename,
                         &params.bytes,
-                        &params.content_type,
+                        &content_type,
                         &params.purpose,
-                        &params.storage_key,
+                        &storage_key,
                         &params.workspace_id,
                         &params.uploaded_by_api_key_id,
                         &now,
@@ -359,13 +397,38 @@ impl FileRepository {
 
     /// Helper function to convert database row to File
     fn row_to_file(&self, row: tokio_postgres::Row) -> Result<File> {
+        let id: Uuid = row.get("id");
+        let mut filename: String = row.get("filename");
+        let mut content_type: String = row.get("content_type");
+        let mut storage_key: String = row.get("storage_key");
+        if let Some((key, key_id)) = self.pool.encryption_context() {
+            filename = crate::field_encryption::decrypt_if_encrypted_with_key_id(
+                &key, &key_id, "files", "filename", id, filename,
+            )?;
+            content_type = crate::field_encryption::decrypt_if_encrypted_with_key_id(
+                &key,
+                &key_id,
+                "files",
+                "content_type",
+                id,
+                content_type,
+            )?;
+            storage_key = crate::field_encryption::decrypt_if_encrypted_with_key_id(
+                &key,
+                &key_id,
+                "files",
+                "storage_key",
+                id,
+                storage_key,
+            )?;
+        }
         Ok(File {
-            id: row.get("id"),
-            filename: row.get("filename"),
+            id,
+            filename,
             bytes: row.get("bytes"),
-            content_type: row.get("content_type"),
+            content_type,
             purpose: row.get("purpose"),
-            storage_key: row.get("storage_key"),
+            storage_key,
             workspace_id: row.get("workspace_id"),
             uploaded_by_api_key_id: row.get("uploaded_by_api_key_id"),
             created_at: row.get("created_at"),

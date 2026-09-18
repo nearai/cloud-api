@@ -82,9 +82,11 @@ fn test_model(model_name: &str) -> ModelWithPricing {
 
 fn completion_request(model: &str) -> ports::CompletionRequest {
     ports::CompletionRequest {
+        request_priority: 0,
         request_id: Uuid::new_v4(),
         model: model.to_string(),
         messages: vec![ports::CompletionMessage {
+            reasoning_content: None,
             role: "user".to_string(),
             content: serde_json::Value::String("hello".to_string()),
             tool_call_id: None,
@@ -101,6 +103,7 @@ fn completion_request(model: &str) -> ports::CompletionRequest {
         api_key_id: Uuid::new_v4().to_string(),
         organization_id: Uuid::new_v4(),
         workspace_id: Uuid::new_v4(),
+        fallback_enabled: true,
         metadata: None,
         store: None,
         body_hash: "test-body-hash".to_string(),

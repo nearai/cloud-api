@@ -81,6 +81,8 @@ impl std::str::FromStr for InferenceType {
 pub enum StopReason {
     /// Stream completed normally (model emitted stop token)
     Completed,
+    /// Stream ended without the provider ever declaring a finish reason
+    Incomplete,
     /// Hit max tokens limit
     Length,
     /// Content was filtered by safety systems
@@ -106,6 +108,7 @@ impl StopReason {
     pub fn as_str(&self) -> &str {
         match self {
             StopReason::Completed => "completed",
+            StopReason::Incomplete => "incomplete",
             StopReason::Length => "length",
             StopReason::ContentFilter => "content_filter",
             StopReason::ClientDisconnect => "client_disconnect",
@@ -122,6 +125,7 @@ impl StopReason {
     pub fn parse(s: &str) -> Self {
         match s {
             "completed" => StopReason::Completed,
+            "incomplete" => StopReason::Incomplete,
             "length" => StopReason::Length,
             "content_filter" => StopReason::ContentFilter,
             "client_disconnect" => StopReason::ClientDisconnect,
@@ -152,6 +156,20 @@ impl StopReason {
             inference_providers::FinishReason::Length => StopReason::Length,
             inference_providers::FinishReason::ContentFilter => StopReason::ContentFilter,
             inference_providers::FinishReason::ToolCalls => StopReason::ToolCalls,
+        }
+    }
+
+    /// Resolve why a finished stream ended, from the signals the interceptor observed
+    pub fn for_stream_outcome(
+        error: Option<&inference_providers::CompletionError>,
+        stream_completed: bool,
+        finish_reason: Option<&inference_providers::FinishReason>,
+    ) -> Self {
+        match (error, stream_completed, finish_reason) {
+            (Some(err), _, _) => Self::from_completion_error(err),
+            (None, false, _) => StopReason::ClientDisconnect,
+            (None, true, Some(reason)) => Self::from_provider_finish_reason(reason),
+            (None, true, None) => StopReason::Incomplete,
         }
     }
 
@@ -269,6 +287,7 @@ pub trait UsageServiceTrait: Send + Sync {
     async fn get_usage_history_by_api_key(
         &self,
         api_key_id: Uuid,
+        credit_type: Option<&str>,
         limit: Option<i64>,
         offset: Option<i64>,
     ) -> Result<(Vec<UsageLogEntry>, i64), UsageError>;
@@ -281,6 +300,7 @@ pub trait UsageServiceTrait: Send + Sync {
         workspace_id: Uuid,
         api_key_id: Uuid,
         user_id: Uuid,
+        credit_type: Option<&str>,
         limit: Option<i64>,
         offset: Option<i64>,
     ) -> Result<(Vec<UsageLogEntry>, i64), UsageError>;
@@ -341,6 +361,7 @@ pub trait UsageRepository: Send + Sync {
     async fn get_usage_history_by_api_key(
         &self,
         api_key_id: Uuid,
+        credit_type: Option<&str>,
         limit: Option<i64>,
         offset: Option<i64>,
     ) -> anyhow::Result<(Vec<UsageLogEntry>, i64)>;
@@ -604,6 +625,11 @@ pub struct ModelPricing {
 #[derive(Debug, Clone)]
 pub struct OrganizationLimit {
     pub spend_limit: i64,
+    /// Remaining attributed capacity across active credit types.
+    pub available: i64,
+    /// Unresolved overage from already-executed usage. New usage is blocked
+    /// while this is positive. Added capacity automatically settles the debt.
+    pub unfunded: i64,
 }
 
 /// One active credit source contributing to an organization's spending limit.
@@ -613,7 +639,22 @@ pub struct OrganizationCreditLimit {
     pub credit_type: String,
     pub source: Option<String>,
     pub amount: i64,
+    pub consumed: i64,
+    pub available: i64,
     pub currency: String,
+}
+
+/// Immutable portion of a usage charge paid by one credit type.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
+pub struct CreditAllocation {
+    #[serde(rename = "type")]
+    pub credit_type: String,
+    pub amount: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub organization_limit_id: Option<Uuid>,
+    pub policy_version: String,
 }
 
 /// Cost breakdown for a request
@@ -710,6 +751,12 @@ pub struct UsageLogEntry {
     /// The database balance is correctly updated only for new inserts,
     /// and this flag ensures metrics tracking follows the same pattern.
     pub was_inserted: bool,
+    /// None marks pre-attribution historical usage. New zero-cost usage uses
+    /// Some(empty), preserving the distinction without fake allocations.
+    pub credit_allocations: Option<Vec<CreditAllocation>>,
+    pub funded_amount: Option<i64>,
+    pub unfunded_amount: Option<i64>,
+    pub allocation_policy_version: Option<String>,
     pub provider_attribution: ProviderAttribution,
 }
 
@@ -747,3 +794,55 @@ impl std::fmt::Display for UsageError {
 }
 
 impl std::error::Error for UsageError {}
+
+#[cfg(test)]
+mod tests {
+    use super::StopReason;
+    use inference_providers::{CompletionError, FinishReason};
+
+    #[test]
+    fn stream_without_a_finish_reason_is_incomplete() {
+        assert_eq!(
+            StopReason::for_stream_outcome(None, true, None),
+            StopReason::Incomplete
+        );
+    }
+
+    #[test]
+    fn declared_finish_reason_maps_to_the_provider_value() {
+        assert_eq!(
+            StopReason::for_stream_outcome(None, true, Some(&FinishReason::Stop)),
+            StopReason::Stop
+        );
+        assert_eq!(
+            StopReason::for_stream_outcome(None, true, Some(&FinishReason::Length)),
+            StopReason::Length
+        );
+    }
+
+    #[test]
+    fn unfinished_stream_is_a_disconnect() {
+        assert_eq!(
+            StopReason::for_stream_outcome(None, false, None),
+            StopReason::ClientDisconnect
+        );
+    }
+
+    #[test]
+    fn error_outranks_disconnect_and_incomplete() {
+        let error = CompletionError::Timeout {
+            operation: "stream".to_string(),
+            timeout_seconds: 30,
+        };
+        assert_eq!(
+            StopReason::for_stream_outcome(Some(&error), false, None),
+            StopReason::Timeout
+        );
+    }
+
+    #[test]
+    fn incomplete_round_trips_through_its_database_string() {
+        assert_eq!(StopReason::Incomplete.as_str(), "incomplete");
+        assert_eq!(StopReason::parse("incomplete"), StopReason::Incomplete);
+    }
+}

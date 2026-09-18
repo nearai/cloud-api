@@ -31,14 +31,21 @@ ANTHROPIC_BETA = os.environ.get(
     "ANTHROPIC_BETA",
     ",".join(
         [
+            # The default header sent by Claude Code 2.1.272, plus
+            # redact-thinking-2026-02-12, which it adds conditionally.
             "claude-code-20250219",
             "interleaved-thinking-2025-05-14",
             "thinking-token-count-2026-05-13",
             "context-management-2025-06-27",
             "prompt-caching-scope-2026-01-05",
+            "mid-conversation-system-2026-04-07",
             "advisor-tool-2026-03-01",
             "effort-2025-11-24",
-            "structured-outputs-2025-12-15",
+            "fallback-credit-2026-06-01",
+            "afk-mode-2026-01-31",
+            "per-turn-control-2026-07-01",
+            "mid-conversation-tool-changes-2026-07-01",
+            "redact-thinking-2026-02-12",
         ]
     ),
 )

@@ -64,6 +64,7 @@ impl PgOrganizationRepository {
         owner_id: Uuid,
     ) -> Result<Organization> {
         Ok(Organization {
+            request_priority: db_org.request_priority,
             id: OrganizationId::from(db_org.id),
             name: db_org.name,
             description: db_org.description,
@@ -275,17 +276,64 @@ impl PgOrganizationRepository {
         &self,
         id: Uuid,
         request: DbUpdateOrganizationRequest,
+        expected_fallback_override: Option<Option<serde_json::Value>>,
+        actor_user_id: Uuid,
     ) -> Result<DbOrganization, RepositoryError> {
         let row = retry_db!("update_organization", {
-            let client = self
+            let mut client = self
                 .pool
                 .get()
                 .await
                 .context("Failed to get database connection")
                 .map_err(RepositoryError::PoolError)?;
 
-            client
-                .query_one(
+            let transaction = client.transaction().await.map_err(map_db_error)?;
+            let locked_organization = transaction
+                .query_opt(
+                    "SELECT settings FROM organizations
+                     WHERE id = $1 AND is_active = true
+                     FOR UPDATE",
+                    &[&id],
+                )
+                .await
+                .map_err(map_db_error)?
+                .ok_or_else(|| RepositoryError::NotFound(id.to_string()))?;
+            let current_settings = locked_organization
+                .get::<_, Option<serde_json::Value>>("settings")
+                .unwrap_or_else(|| serde_json::json!({}));
+
+            let actor_role = transaction
+                .query_opt(
+                    "SELECT role FROM organization_members
+                     WHERE organization_id = $1 AND user_id = $2",
+                    &[&id, &actor_user_id],
+                )
+                .await
+                .map_err(map_db_error)?
+                .map(|row| row.get::<_, String>("role"));
+            if !matches!(actor_role.as_deref(), Some("owner") | Some("admin")) {
+                return Err(RepositoryError::ValidationFailed(
+                    "Only owners and admins can update organization".to_string(),
+                ));
+            }
+
+            if let Some(expected) = expected_fallback_override.as_ref() {
+                if current_settings.get("fallback_enabled") != expected.as_ref() {
+                    return Err(RepositoryError::TransactionConflict);
+                }
+            }
+
+            let fallback_changed = request.settings.as_ref().is_some_and(|settings| {
+                current_settings.get("fallback_enabled") != settings.get("fallback_enabled")
+            });
+            if fallback_changed && actor_role.as_deref() != Some("owner") {
+                return Err(RepositoryError::ValidationFailed(
+                    "Only organization owners can manage fallback".to_string(),
+                ));
+            }
+
+            let row = transaction
+                .query_opt(
                     r#"
             UPDATE organizations
             SET name = COALESCE($2, name),
@@ -293,7 +341,8 @@ impl PgOrganizationRepository {
                 rate_limit = COALESCE($4, rate_limit),
                 settings = COALESCE($5, settings),
                 updated_at = NOW()
-            WHERE id = $1 AND is_active = true
+            WHERE id = $1
+              AND is_active = true
             RETURNING *
             "#,
                     &[
@@ -305,34 +354,15 @@ impl PgOrganizationRepository {
                     ],
                 )
                 .await
-                .map_err(map_db_error)
+                .map_err(map_db_error)?
+                .ok_or(RepositoryError::TransactionConflict)?;
+            transaction.commit().await.map_err(map_db_error)?;
+            Ok(row)
         })?;
 
         debug!("Updated organization: {}", id);
         self.row_to_db_organization(row)
             .map_err(RepositoryError::DataConversionError)
-    }
-
-    /// Delete an organization (soft delete)
-    pub async fn delete(&self, id: Uuid) -> Result<bool> {
-        let rows_affected = retry_db!("delete_organization", {
-            let client = self
-                .pool
-                .get()
-                .await
-                .context("Failed to get database connection")
-                .map_err(RepositoryError::PoolError)?;
-
-            client
-                .execute(
-                    "UPDATE organizations SET is_active = false WHERE id = $1 AND is_active = true",
-                    &[&id],
-                )
-                .await
-                .map_err(map_db_error)
-        })?;
-
-        Ok(rows_affected > 0)
     }
 
     /// Add a member to an organization - internal method
@@ -406,16 +436,65 @@ impl PgOrganizationRepository {
         org_id: Uuid,
         user_id: Uuid,
         request: DbUpdateOrganizationMemberRequest,
+        requester_user_id: Uuid,
     ) -> Result<DbOrganizationMember, RepositoryError> {
         let row = retry_db!("update_member_role", {
-            let client = self
+            let mut client = self
                 .pool
                 .get()
                 .await
                 .context("Failed to get database connection")
                 .map_err(RepositoryError::PoolError)?;
 
-            client
+            let transaction = client.transaction().await.map_err(map_db_error)?;
+            transaction
+                .query_opt(
+                    "SELECT id FROM organizations
+                     WHERE id = $1 AND is_active = true
+                     FOR UPDATE",
+                    &[&org_id],
+                )
+                .await
+                .map_err(map_db_error)?
+                .ok_or_else(|| RepositoryError::NotFound("organization".to_string()))?;
+
+            let requester_role = transaction
+                .query_opt(
+                    "SELECT role FROM organization_members
+                     WHERE organization_id = $1 AND user_id = $2",
+                    &[&org_id, &requester_user_id],
+                )
+                .await
+                .map_err(map_db_error)?
+                .map(|row| row.get::<_, String>("role"));
+            if requester_role.as_deref() != Some("owner") {
+                return Err(RepositoryError::ValidationFailed(
+                    "Only the owner can change member roles".to_string(),
+                ));
+            }
+
+            let current = transaction
+                .query_opt(
+                    "SELECT role FROM organization_members
+                     WHERE organization_id = $1 AND user_id = $2
+                     FOR UPDATE",
+                    &[&org_id, &user_id],
+                )
+                .await
+                .map_err(map_db_error)?
+                .ok_or_else(|| RepositoryError::NotFound("organization member".to_string()))?;
+            if current.get::<_, String>("role") == "owner" {
+                return Err(RepositoryError::ValidationFailed(
+                    "Cannot change the owner's role. Use transfer ownership instead.".to_string(),
+                ));
+            }
+            if request.role == DbOrganizationRole::Owner {
+                return Err(RepositoryError::ValidationFailed(
+                    "Cannot set a member as owner. Use transfer ownership instead.".to_string(),
+                ));
+            }
+
+            let row = transaction
                 .query_one(
                     r#"
             UPDATE organization_members
@@ -426,7 +505,9 @@ impl PgOrganizationRepository {
                     &[&org_id, &user_id, &request.role.to_string().to_lowercase()],
                 )
                 .await
-                .map_err(map_db_error)
+                .map_err(map_db_error)?;
+            transaction.commit().await.map_err(map_db_error)?;
+            Ok(row)
         })?;
 
         debug!(
@@ -516,6 +597,7 @@ impl PgOrganizationRepository {
     // Helper function to convert database row to Organization
     fn row_to_db_organization(&self, row: tokio_postgres::Row) -> anyhow::Result<DbOrganization> {
         Ok(DbOrganization {
+            request_priority: row.try_get("request_priority")?,
             id: row.try_get("id")?,
             name: row.try_get("name")?,
             description: row.try_get("description")?,
@@ -604,6 +686,26 @@ impl OrganizationRepository for PgOrganizationRepository {
         }
     }
 
+    async fn set_request_priority(
+        &self,
+        id: Uuid,
+        priority: i32,
+    ) -> Result<Option<i32>, RepositoryError> {
+        let row = retry_db!("set_organization_request_priority", {
+            let client = self
+                .pool
+                .get()
+                .await
+                .context("Failed to get database connection")
+                .map_err(RepositoryError::PoolError)?;
+            client.query_opt(
+                "UPDATE organizations SET request_priority = $2, updated_at = NOW() WHERE id = $1 AND is_active = true RETURNING request_priority",
+                &[&id, &priority],
+            ).await.map_err(map_db_error)
+        })?;
+        Ok(row.map(|row| row.get("request_priority")))
+    }
+
     async fn get_by_name(&self, name: &str) -> Result<Option<Organization>, RepositoryError> {
         match self.get_by_name_internal(name).await? {
             Some(db_org) => Ok(Some(
@@ -633,6 +735,8 @@ impl OrganizationRepository for PgOrganizationRepository {
         &self,
         id: Uuid,
         request: UpdateOrganizationRequest,
+        expected_fallback_override: Option<Option<serde_json::Value>>,
+        actor_user_id: Uuid,
     ) -> Result<Organization, RepositoryError> {
         let db_request = DbUpdateOrganizationRequest {
             name: request.name,
@@ -641,7 +745,127 @@ impl OrganizationRepository for PgOrganizationRepository {
             settings: request.settings,
         };
 
-        let db_org = self.update_internal(id, db_request).await?;
+        let db_org = self
+            .update_internal(id, db_request, expected_fallback_override, actor_user_id)
+            .await?;
+        self.db_to_domain_organization(db_org)
+            .await
+            .map_err(RepositoryError::DataConversionError)
+    }
+
+    async fn patch_settings(
+        &self,
+        id: Uuid,
+        patch: PatchOrganizationSettings,
+        actor_user_id: Option<Uuid>,
+    ) -> Result<Organization, RepositoryError> {
+        let has_system_prompt = patch.system_prompt.is_some();
+        let system_prompt = patch.system_prompt.flatten();
+        let has_fallback_enabled = patch.fallback_enabled.is_some();
+        let fallback_enabled = patch.fallback_enabled.flatten();
+
+        // Apply both supported keys in one statement. PostgreSQL takes the row
+        // lock for the UPDATE, so concurrent patches to different keys always
+        // start from the latest committed settings instead of overwriting one
+        // another with stale read-modify-write snapshots.
+        let row = retry_db!("patch_organization_settings", {
+            let mut client = self
+                .pool
+                .get()
+                .await
+                .context("Failed to get database connection")
+                .map_err(RepositoryError::PoolError)?;
+
+            let transaction = client.transaction().await.map_err(map_db_error)?;
+            transaction
+                .query_opt(
+                    "SELECT id FROM organizations
+                     WHERE id = $1 AND is_active = true
+                     FOR UPDATE",
+                    &[&id],
+                )
+                .await
+                .map_err(map_db_error)?
+                .ok_or_else(|| RepositoryError::NotFound(id.to_string()))?;
+
+            if let Some(actor_user_id) = actor_user_id {
+                let actor_role = transaction
+                    .query_opt(
+                        "SELECT role FROM organization_members
+                         WHERE organization_id = $1 AND user_id = $2",
+                        &[&id, &actor_user_id],
+                    )
+                    .await
+                    .map_err(map_db_error)?
+                    .map(|row| row.get::<_, String>("role"));
+                let can_manage = matches!(actor_role.as_deref(), Some("owner" | "admin"));
+                if has_system_prompt && !can_manage {
+                    return Err(RepositoryError::ValidationFailed(
+                        "Insufficient permissions to manage organization settings".to_string(),
+                    ));
+                }
+                if has_fallback_enabled && actor_role.as_deref() != Some("owner") {
+                    return Err(RepositoryError::ValidationFailed(
+                        "Only organization owners can manage fallback".to_string(),
+                    ));
+                }
+            }
+
+            let row = transaction
+                .query_opt(
+                    r#"
+                    WITH current_settings AS (
+                        SELECT CASE
+                            WHEN jsonb_typeof(settings) = 'object' THEN settings
+                            ELSE '{}'::jsonb
+                        END AS value
+                        FROM organizations
+                        WHERE id = $1 AND is_active = true
+                        FOR UPDATE
+                    ), prompt_patched AS (
+                        SELECT CASE
+                            WHEN $2::boolean AND $3::text IS NULL
+                                THEN value - 'system_prompt'
+                            WHEN $2::boolean
+                                THEN jsonb_set(value, '{system_prompt}', to_jsonb($3::text), true)
+                            ELSE value
+                        END AS value
+                        FROM current_settings
+                    ), fully_patched AS (
+                        SELECT CASE
+                            WHEN $4::boolean AND $5::boolean IS NULL
+                                THEN value - 'fallback_enabled'
+                            WHEN $4::boolean
+                                THEN jsonb_set(value, '{fallback_enabled}', to_jsonb($5::boolean), true)
+                            ELSE value
+                        END AS value
+                        FROM prompt_patched
+                    )
+                    UPDATE organizations AS organization
+                    SET settings = fully_patched.value,
+                        updated_at = NOW()
+                    FROM fully_patched
+                    WHERE organization.id = $1 AND organization.is_active = true
+                    RETURNING organization.*
+                    "#,
+                    &[
+                        &id,
+                        &has_system_prompt,
+                        &system_prompt,
+                        &has_fallback_enabled,
+                        &fallback_enabled,
+                    ],
+                )
+                .await
+                .map_err(map_db_error)?;
+            transaction.commit().await.map_err(map_db_error)?;
+            Ok(row)
+        })?
+        .ok_or_else(|| RepositoryError::NotFound(id.to_string()))?;
+
+        let db_org = self
+            .row_to_db_organization(row)
+            .map_err(RepositoryError::DataConversionError)?;
         self.db_to_domain_organization(db_org)
             .await
             .map_err(RepositoryError::DataConversionError)
@@ -650,6 +874,7 @@ impl OrganizationRepository for PgOrganizationRepository {
     async fn delete_if_no_staking_farm_source(
         &self,
         id: Uuid,
+        owner_user_id: Uuid,
     ) -> Result<DeleteOrganizationResult, RepositoryError> {
         retry_db!("delete_organization_if_no_staking_farm_source", {
             let mut client = self
@@ -675,6 +900,24 @@ impl OrganizationRepository for PgOrganizationRepository {
                 transaction.rollback().await.map_err(map_db_error)?;
                 DeleteOrganizationResult::NotFound
             } else {
+                let owner_row = transaction
+                    .query_one(
+                        "SELECT EXISTS (
+                             SELECT 1 FROM organization_members
+                             WHERE organization_id = $1
+                               AND user_id = $2
+                               AND role = 'owner'
+                         ) AS is_owner",
+                        &[&id, &owner_user_id],
+                    )
+                    .await
+                    .map_err(map_db_error)?;
+
+                if !owner_row.get::<_, bool>("is_owner") {
+                    transaction.rollback().await.map_err(map_db_error)?;
+                    return Ok(DeleteOrganizationResult::Unauthorized);
+                }
+
                 let row = transaction
                     .query_one(
                         // Keep this status-agnostic: any staking source row means
@@ -696,6 +939,59 @@ impl OrganizationRepository for PgOrganizationRepository {
                         )
                         .await
                         .map_err(map_db_error)?;
+
+                    if rows_affected > 0 {
+                        // Deactivating only the organization row leaves its workspaces and
+                        // API keys marked active while every lookup for them joins
+                        // `organizations` with `is_active = true` and fails. Those rows are
+                        // dead but still advertised: `/v1/users/me` kept listing the
+                        // workspaces, so clients that pick the current org from that list
+                        // pinned themselves to a deleted org. Cascade in the same
+                        // transaction so the deletion is all-or-nothing and `is_active`
+                        // stays truthful at every level.
+                        // `deleted_at` as well as `is_active`: a normal revoke sets
+                        // `deleted_at` (see `ApiKeyRepository::revoke`) and the listing
+                        // queries key off it, so setting only `is_active` would leave
+                        // these rows reading as "not deleted, merely inactive".
+                        transaction
+                            .execute(
+                                r#"
+                                UPDATE api_keys
+                                SET is_active = false,
+                                    deleted_at = COALESCE(deleted_at, NOW())
+                                WHERE (is_active = true OR deleted_at IS NULL)
+                                  AND workspace_id IN (
+                                      SELECT id FROM workspaces WHERE organization_id = $1
+                                  )
+                                "#,
+                                &[&id],
+                            )
+                            .await
+                            .map_err(map_db_error)?;
+
+                        // Reporting-token validation also requires an active organization,
+                        // but revoke the persisted rows so credential state remains truthful
+                        // and a deleted org cannot regain access through a future validation
+                        // path. No `revoked_by_user_id`: this is a system revocation, not a
+                        // user's.
+                        transaction
+                            .execute(
+                                "UPDATE organization_reporting_tokens SET revoked_at = NOW() \
+                                 WHERE organization_id = $1 AND revoked_at IS NULL",
+                                &[&id],
+                            )
+                            .await
+                            .map_err(map_db_error)?;
+
+                        transaction
+                            .execute(
+                                "UPDATE workspaces SET is_active = false, updated_at = NOW() \
+                                 WHERE organization_id = $1 AND is_active = true",
+                                &[&id],
+                            )
+                            .await
+                            .map_err(map_db_error)?;
+                    }
 
                     transaction.commit().await.map_err(map_db_error)?;
 
@@ -734,37 +1030,282 @@ impl OrganizationRepository for PgOrganizationRepository {
         org_id: Uuid,
         user_id: Uuid,
         request: UpdateOrganizationMemberRequest,
+        requester_user_id: Uuid,
     ) -> Result<OrganizationMember, RepositoryError> {
         let db_request = DbUpdateOrganizationMemberRequest {
             role: self.domain_to_db_role(request.role),
         };
 
         let db_member = self
-            .update_member_internal(org_id, user_id, db_request)
+            .update_member_internal(org_id, user_id, db_request, requester_user_id)
             .await?;
         self.db_to_domain_member(db_member)
             .map_err(RepositoryError::DataConversionError)
     }
 
-    async fn remove_member(&self, org_id: Uuid, user_id: Uuid) -> Result<bool, RepositoryError> {
-        let rows_affected = retry_db!("remove_member", {
-            let client = self
+    async fn update_member_role_with_audit(
+        &self,
+        org_id: Uuid,
+        user_id: Uuid,
+        request: UpdateOrganizationMemberRequest,
+        changed_by_user_id: Uuid,
+    ) -> Result<OrganizationMemberRoleUpdate, RepositoryError> {
+        let new_role = self
+            .domain_to_db_role(request.role)
+            .to_string()
+            .to_lowercase();
+
+        let (row, previous_role) = retry_db!("update_member_role_with_audit", {
+            let mut client = self
+                .pool
+                .get()
+                .await
+                .context("Failed to get database connection")
+                .map_err(RepositoryError::PoolError)?;
+            let transaction = client.transaction().await.map_err(map_db_error)?;
+
+            transaction
+                .query_opt(
+                    "SELECT id FROM organizations
+                     WHERE id = $1 AND is_active = true
+                     FOR UPDATE",
+                    &[&org_id],
+                )
+                .await
+                .map_err(map_db_error)?
+                .ok_or_else(|| RepositoryError::NotFound("organization".to_string()))?;
+
+            let current = transaction
+                .query_opt(
+                    "SELECT * FROM organization_members
+                     WHERE organization_id = $1 AND user_id = $2
+                     FOR UPDATE",
+                    &[&org_id, &user_id],
+                )
+                .await
+                .map_err(map_db_error)?
+                .ok_or_else(|| RepositoryError::NotFound("organization member".to_string()))?;
+            let previous_role: String = current.get("role");
+            if previous_role == "owner" && previous_role != new_role {
+                return Err(RepositoryError::ValidationFailed(
+                    "The organization owner's role cannot be changed".to_string(),
+                ));
+            }
+
+            let row = if previous_role == new_role {
+                current
+            } else if new_role == "owner" {
+                let current_owner_rows = transaction
+                    .query(
+                        "SELECT user_id FROM organization_members
+                         WHERE organization_id = $1
+                           AND role = 'owner'
+                           AND user_id <> $2
+                         ORDER BY user_id
+                         FOR UPDATE",
+                        &[&org_id, &user_id],
+                    )
+                    .await
+                    .map_err(map_db_error)?;
+                if current_owner_rows.is_empty() {
+                    return Err(RepositoryError::DataConversionError(anyhow::anyhow!(
+                        "Organization has no owner: {org_id}"
+                    )));
+                }
+                let current_owner_ids = current_owner_rows
+                    .iter()
+                    .map(|owner| owner.get::<_, Uuid>("user_id"))
+                    .collect::<Vec<_>>();
+
+                transaction
+                    .execute(
+                        "UPDATE organization_members
+                         SET role = 'admin'
+                         WHERE organization_id = $1
+                           AND role = 'owner'
+                           AND user_id = ANY($2)",
+                        &[&org_id, &current_owner_ids],
+                    )
+                    .await
+                    .map_err(map_db_error)?;
+
+                let row = transaction
+                    .query_one(
+                        "UPDATE organization_members
+                         SET role = 'owner'
+                         WHERE organization_id = $1 AND user_id = $2
+                         RETURNING *",
+                        &[&org_id, &user_id],
+                    )
+                    .await
+                    .map_err(map_db_error)?;
+
+                transaction
+                    .execute(
+                        "INSERT INTO organization_member_role_audit_log (
+                             organization_id,
+                             member_user_id,
+                             changed_by_user_id,
+                             previous_role,
+                             new_role
+                         )
+                         SELECT $1::uuid, prior_owner.user_id, $2::uuid, 'owner', 'admin'
+                         FROM UNNEST($3::uuid[]) AS prior_owner(user_id)
+                         UNION ALL
+                         SELECT $1::uuid, $4::uuid, $2::uuid, $5, 'owner'",
+                        &[
+                            &org_id,
+                            &changed_by_user_id,
+                            &current_owner_ids,
+                            &user_id,
+                            &previous_role,
+                        ],
+                    )
+                    .await
+                    .map_err(map_db_error)?;
+                row
+            } else {
+                let row = transaction
+                    .query_one(
+                        "UPDATE organization_members
+                         SET role = $3
+                         WHERE organization_id = $1 AND user_id = $2
+                         RETURNING *",
+                        &[&org_id, &user_id, &new_role],
+                    )
+                    .await
+                    .map_err(map_db_error)?;
+
+                transaction
+                    .execute(
+                        "INSERT INTO organization_member_role_audit_log (
+                             organization_id,
+                             member_user_id,
+                             changed_by_user_id,
+                             previous_role,
+                             new_role
+                         ) VALUES ($1, $2, $3, $4, $5)",
+                        &[
+                            &org_id,
+                            &user_id,
+                            &changed_by_user_id,
+                            &previous_role,
+                            &new_role,
+                        ],
+                    )
+                    .await
+                    .map_err(map_db_error)?;
+                row
+            };
+
+            transaction.commit().await.map_err(map_db_error)?;
+            Ok((row, previous_role))
+        })?;
+
+        let previous_role = self
+            .role_str_to_domain_role(&previous_role)
+            .map_err(RepositoryError::DataConversionError)?;
+        let member = self
+            .row_to_db_org_member(row)
+            .and_then(|member| self.db_to_domain_member(member))
+            .map_err(RepositoryError::DataConversionError)?;
+
+        Ok(OrganizationMemberRoleUpdate {
+            member,
+            previous_role,
+        })
+    }
+
+    async fn remove_member(
+        &self,
+        org_id: Uuid,
+        user_id: Uuid,
+        requester_user_id: Uuid,
+    ) -> Result<RemoveOrganizationMemberResult, RepositoryError> {
+        retry_db!("remove_member", {
+            let mut client = self
                 .pool
                 .get()
                 .await
                 .context("Failed to get database connection")
                 .map_err(RepositoryError::PoolError)?;
 
-            client
+            let transaction = client.transaction().await.map_err(map_db_error)?;
+
+            let organization = transaction
+                .query_opt(
+                    "SELECT id FROM organizations
+                     WHERE id = $1 AND is_active = true
+                     FOR UPDATE",
+                    &[&org_id],
+                )
+                .await
+                .map_err(map_db_error)?;
+            if organization.is_none() {
+                transaction.rollback().await.map_err(map_db_error)?;
+                return Ok(RemoveOrganizationMemberResult::NotFound);
+            }
+
+            if requester_user_id != user_id {
+                let requester_role = transaction
+                    .query_opt(
+                        "SELECT role FROM organization_members
+                         WHERE organization_id = $1 AND user_id = $2",
+                        &[&org_id, &requester_user_id],
+                    )
+                    .await
+                    .map_err(map_db_error)?
+                    .map(|row| row.get::<_, String>("role"));
+                if !matches!(requester_role.as_deref(), Some("owner" | "admin")) {
+                    transaction.rollback().await.map_err(map_db_error)?;
+                    return Ok(RemoveOrganizationMemberResult::Unauthorized);
+                }
+            }
+
+            let member = transaction
+                .query_opt(
+                    "SELECT role FROM organization_members
+                     WHERE organization_id = $1 AND user_id = $2
+                     FOR UPDATE",
+                    &[&org_id, &user_id],
+                )
+                .await
+                .map_err(map_db_error)?;
+            let Some(member) = member else {
+                transaction.rollback().await.map_err(map_db_error)?;
+                return Ok(RemoveOrganizationMemberResult::NotFound);
+            };
+
+            if member.get::<_, String>("role") == "owner" {
+                let owner_count = transaction
+                    .query_one(
+                        "SELECT COUNT(*) FROM organization_members
+                         WHERE organization_id = $1 AND role = 'owner'",
+                        &[&org_id],
+                    )
+                    .await
+                    .map_err(map_db_error)?
+                    .get::<_, i64>(0);
+                if owner_count <= 1 {
+                    transaction.rollback().await.map_err(map_db_error)?;
+                    return Ok(RemoveOrganizationMemberResult::LastOwner);
+                }
+            }
+
+            let rows_affected = transaction
                 .execute(
                     "DELETE FROM organization_members WHERE organization_id = $1 AND user_id = $2",
                     &[&org_id, &user_id],
                 )
                 .await
-                .map_err(map_db_error)
-        })?;
-
-        Ok(rows_affected > 0)
+                .map_err(map_db_error)?;
+            transaction.commit().await.map_err(map_db_error)?;
+            Ok(if rows_affected > 0 {
+                RemoveOrganizationMemberResult::Removed
+            } else {
+                RemoveOrganizationMemberResult::NotFound
+            })
+        })
     }
 
     async fn list_members_paginated(

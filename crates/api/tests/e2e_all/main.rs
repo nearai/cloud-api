@@ -38,7 +38,6 @@ mod client_disconnect;
 mod concurrent_limit;
 mod conversations;
 mod credit_types;
-mod cross_workspace;
 mod database_encryption;
 mod deser_error_envelope;
 mod duplicate_names;
@@ -54,7 +53,6 @@ mod glm52_tier_routing;
 mod health;
 mod invitations;
 mod ita_attestation;
-mod mcp;
 mod mcp_server;
 mod message_metadata;
 mod model_alias_transparency;
@@ -78,8 +76,8 @@ mod reporting_usage;
 mod repositories;
 mod request_id_contract;
 mod rerank;
-mod response_signature_verification;
 mod responses_native;
+mod responses_stateless;
 mod score;
 mod serving_provider;
 mod session_logout;
@@ -89,8 +87,6 @@ mod usage_provider_attribution;
 mod usage_recording;
 mod usage_responses;
 mod vpc_login;
-mod web_context_search;
-mod web_search_citations;
 
 /// Run by nextest's setup script after this E2E binary has already been built.
 /// Keeping bootstrap in the same binary avoids a second cold compile/link in CI.

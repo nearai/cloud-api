@@ -307,20 +307,33 @@ impl Billing {
                 image_count: None,
                 provider_attribution: self.attribution,
             };
-            if let Err(e) = self.service.usage_service.record_usage(request).await {
-                tracing::error!(error = %e, "Failed to record native Responses usage");
+            if self
+                .service
+                .usage_service
+                .record_usage(request)
+                .await
+                .is_err()
+            {
+                tracing::error!(
+                    error_category = "usage_recording_failed",
+                    "Failed to record native Responses usage"
+                );
                 return Err(());
             }
         }
         if let (Some(id), Some(digest)) = (id, digest) {
             // Only digest material is retained, never response/input content.
-            if let Err(e) = self
+            if self
                 .service
                 .attestation_service
                 .store_response_signature(&id, self.request_hash, digest)
                 .await
+                .is_err()
             {
-                tracing::error!(error = %e, "Failed to record native Responses signature");
+                tracing::error!(
+                    error_category = "signature_recording_failed",
+                    "Failed to record native Responses signature"
+                );
             }
         }
         Ok(())

@@ -302,10 +302,7 @@ async fn create_legacy_response(
 ) -> axum::response::Response {
     let service = state.response_service.clone();
     let attestation_service = state.attestation_service.clone();
-    debug!(
-        "Create response request from api key: {:?}",
-        api_key.api_key.id
-    );
+    debug!("Create response request");
 
     // Validate the request
     if let Err(error) = request.validate() {
@@ -410,7 +407,10 @@ async fn create_legacy_response(
                                 let mut rid = response_id_inner.lock().await;
                                 if rid.is_none() {
                                     *rid = Some(response.id.clone());
-                                    tracing::debug!("Extracted response_id: {}", response.id);
+                                    tracing::debug!(
+                                        response_id = response.id.as_str(),
+                                        "Extracted response ID"
+                                    );
                                 }
                             }
                         }
@@ -435,23 +435,23 @@ async fn create_legacy_response(
                                 let rid = rid.clone();
                                 let req_hash = request_hash_inner.clone();
                                 let attest = attestation_inner.clone();
-                                tracing::debug!(
-                                    "Storing signature for response_id: {}, request_hash: {}, response_hash: {}",
-                                    rid, req_hash, response_hash
-                                );
+                                tracing::debug!(response_id = %rid, "Storing response signature");
 
                                 // Spawn task to store signature asynchronously (doesn't block stream)
                                 // but we've already computed the hash with complete data
                                 tokio::spawn(async move {
                                     // Store both ECDSA and ED25519 signatures
-                                    if let Err(e) = attest.store_response_signature(
+                                    if attest.store_response_signature(
                                         &rid,
                                         req_hash.clone(),
                                         response_hash.clone(),
-                                    ).await {
-                                        tracing::error!("Failed to store response signature: {}", e);
+                                    ).await.is_err() {
+                                        tracing::error!(
+                                            response_id = %rid,
+                                            "Failed to store response signature"
+                                        );
                                     } else {
-                                        tracing::debug!("Successfully stored signature for response_id: {}", rid);
+                                        tracing::debug!(response_id = %rid, "Stored response signature");
                                     }
                                 });
                             }
@@ -471,13 +471,14 @@ async fn create_legacy_response(
                     .unwrap()
             }
             Err(error) => {
+                let status_code = map_response_error_to_status(&error);
                 tracing::error!(
                     user_id = %api_key.api_key.created_by_user_id.0,
                     model = %model,
-                    error = %error,
+                    status_code = status_code.as_u16(),
+                    error_category = error.log_category(),
                     "Failed to create streaming response"
                 );
-                let status_code = map_response_error_to_status(&error);
                 (status_code, ResponseJson::<ErrorResponse>(error.into())).into_response()
             }
         }
@@ -543,8 +544,8 @@ async fn create_legacy_response(
                             if let Some(response) = &event.response {
                                 response_id = Some(response.id.clone());
                                 tracing::debug!(
-                                    "Non-streaming: extracted response_id={}",
-                                    response.id
+                                    response_id = response.id.as_str(),
+                                    "Non-streaming response ID extracted"
                                 );
                             }
                         }
@@ -553,9 +554,9 @@ async fn create_legacy_response(
                             if let Some(delta) = &event.delta {
                                 delta_count += 1;
                                 tracing::debug!(
-                                    "Non-streaming: delta #{} len={}",
                                     delta_count,
-                                    delta.len()
+                                    delta_len = delta.len(),
+                                    "Non-streaming response delta"
                                 );
                                 content.push_str(delta);
                             }
@@ -566,8 +567,8 @@ async fn create_legacy_response(
                                 tracked_usage = event.usage.clone();
                             }
                             tracing::debug!(
-                                "Non-streaming: response.completed event, accumulated_content_len={}",
-                                content.len()
+                                accumulated_content_len = content.len(),
+                                "Non-streaming response completed"
                             );
                             // The response object is already in the right format
                             if let Some(response_obj) = event.response {
@@ -595,8 +596,10 @@ async fn create_legacy_response(
                                                 } = content_part
                                                 {
                                                     tracing::debug!(
-                                                        "Non-streaming: final_response output[{}].content[{}] text_len={}",
-                                                        idx, cidx, text.len()
+                                                        output_index = idx,
+                                                        content_index = cidx,
+                                                        text_len = text.len(),
+                                                        "Non-streaming final response text"
                                                     );
                                                 }
                                             }
@@ -620,10 +623,10 @@ async fn create_legacy_response(
                     }
                 }
                 tracing::info!(
-                    "Non-streaming: collected {} events, {} deltas, accumulated_content_len={}",
                     event_count,
                     delta_count,
-                    content.len()
+                    accumulated_content_len = content.len(),
+                    "Collected non-streaming response events"
                 );
 
                 if final_response.is_none() {
@@ -706,8 +709,9 @@ async fn create_legacy_response(
                 };
 
                 debug!(
-                    "Created response {} for key {}",
-                    response.id, api_key.api_key.created_by_user_id.0
+                    response_id = response.id.as_str(),
+                    user_id = %api_key.api_key.created_by_user_id.0,
+                    "Created response"
                 );
 
                 // Store signature for non-streaming response
@@ -716,26 +720,28 @@ async fn create_legacy_response(
                     serde_json::to_string(&response).expect("response serialization failed");
                 let response_hash = compute_sha256(response_json.as_bytes());
 
-                if let Err(e) = attestation_service
+                if attestation_service
                     .store_response_signature(&response_id, body_hash.hash.clone(), response_hash)
                     .await
+                    .is_err()
                 {
                     tracing::error!(
-                        "Failed to store response signature for non-streaming: {}",
-                        e
+                        response_id = %response_id,
+                        "Failed to store response signature for non-streaming response"
                     );
                 }
 
                 (StatusCode::OK, ResponseJson(response)).into_response()
             }
             Err(error) => {
+                let status_code = map_response_error_to_status(&error);
                 tracing::error!(
                     user_id = %api_key.api_key.created_by_user_id.0,
                     model = %model,
-                    error = %error,
+                    status_code = status_code.as_u16(),
+                    error_category = error.log_category(),
                     "Failed to create non-streaming response"
                 );
-                let status_code = map_response_error_to_status(&error);
                 (status_code, ResponseJson::<ErrorResponse>(error.into())).into_response()
             }
         }
@@ -859,8 +865,9 @@ pub async fn list_input_items(
 ) -> Result<ResponseJson<ResponseInputItemList>, (StatusCode, ResponseJson<ErrorResponse>)> {
     let service = state.response_service.clone();
     debug!(
-        "List input items for response {} from workspace {}",
-        response_id, auth.workspace.id.0
+        response_id = response_id.as_str(),
+        workspace_id = auth.workspace.id.0.to_string(),
+        "Listing input items"
     );
 
     // Parse response ID (format: "resp_{uuid}")

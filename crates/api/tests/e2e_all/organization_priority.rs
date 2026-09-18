@@ -43,6 +43,8 @@ async fn set_priority(server: &axum_test::TestServer, org_id: &str, priority: i3
 #[tokio::test]
 async fn priority_crud_validation_and_database_constraint() {
     let (server, db) = setup_test_server_with_database().await;
+    // Reserve the first membership so the organization under test is deletable.
+    let _default = create_org(&server).await;
     let org = create_org(&server).await;
     let id = Uuid::parse_str(&org.id).unwrap();
     let session = get_session_id();

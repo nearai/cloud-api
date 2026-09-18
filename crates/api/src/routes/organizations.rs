@@ -623,7 +623,7 @@ pub async fn update_organization(
         (status = 401, description = "Unauthorized", body = ErrorResponse),
         (status = 403, description = "Forbidden", body = ErrorResponse),
         (status = 404, description = "Organization not found", body = ErrorResponse),
-        (status = 409, description = "Organization is bound to a NEAR staking wallet", body = ErrorResponse),
+        (status = 409, description = "Organization is a user default or is bound to a NEAR staking wallet", body = ErrorResponse),
         (status = 500, description = "Internal server error", body = ErrorResponse)
     ),
     security(
@@ -660,6 +660,9 @@ pub async fn delete_organization(
         }
         Err(OrganizationError::Unauthorized(msg)) => Err(map_delete_organization_error(
             OrganizationError::Unauthorized(msg),
+        )),
+        Err(OrganizationError::DefaultOrganization) => Err(map_delete_organization_error(
+            OrganizationError::DefaultOrganization,
         )),
         Err(OrganizationError::StakingWalletBound) => Err(map_delete_organization_error(
             OrganizationError::StakingWalletBound,
@@ -1037,6 +1040,8 @@ mod tests {
             is_active: true,
             auth_provider: "test".to_string(),
             provider_user_id: id.to_string(),
+            default_organization_id: None,
+            default_organization_source: "pending".to_string(),
             tokens_revoked_at: None,
         })
     }

@@ -935,6 +935,8 @@ fn convert_user_to_db_user(user: services::auth::User) -> DbUser {
         is_active: user.is_active,
         auth_provider: user.auth_provider,
         provider_user_id: user.provider_user_id,
+        default_organization_id: user.default_organization_id,
+        default_organization_source: user.default_organization_source,
         tokens_revoked_at: user.tokens_revoked_at,
     }
 }

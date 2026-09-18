@@ -918,6 +918,19 @@ impl OrganizationRepository for PgOrganizationRepository {
                     return Ok(DeleteOrganizationResult::Unauthorized);
                 }
 
+                if transaction
+                    .query_one(
+                        "SELECT EXISTS (SELECT 1 FROM users WHERE default_organization_id = $1)",
+                        &[&id],
+                    )
+                    .await
+                    .map_err(map_db_error)?
+                    .get::<_, bool>(0)
+                {
+                    transaction.rollback().await.map_err(map_db_error)?;
+                    return Ok(DeleteOrganizationResult::DefaultOrganization);
+                }
+
                 let row = transaction
                     .query_one(
                         // Keep this status-agnostic: any staking source row means

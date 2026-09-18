@@ -108,6 +108,8 @@ async fn test_duplicate_organization_name_case_sensitive() {
 #[tokio::test]
 async fn test_organization_name_reuse_after_deletion() {
     let server = setup_test_server().await;
+    // Reserve the first membership so the organization under test is deletable.
+    let _default = create_org(&server).await;
 
     let org_name = format!("reusable-org-{}", uuid::Uuid::new_v4());
 

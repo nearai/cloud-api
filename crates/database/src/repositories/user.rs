@@ -526,6 +526,8 @@ impl UserRepository {
             is_active: row.get("is_active"),
             auth_provider: row.get("auth_provider"),
             provider_user_id: row.get("provider_user_id"),
+            default_organization_id: row.get("default_organization_id"),
+            default_organization_source: row.get("default_organization_source"),
             tokens_revoked_at: row.get("tokens_revoked_at"),
         })
     }
@@ -546,6 +548,8 @@ fn db_user_to_service_user(db_user: User) -> services::auth::User {
         last_login: db_user.last_login_at,
         created_at: db_user.created_at,
         updated_at: db_user.updated_at,
+        default_organization_id: db_user.default_organization_id,
+        default_organization_source: db_user.default_organization_source,
         tokens_revoked_at: db_user.tokens_revoked_at,
     }
 }

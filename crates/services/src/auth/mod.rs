@@ -400,7 +400,13 @@ impl AuthServiceTrait for AuthService {
             }
         }
 
-        Ok(new_user)
+        self.user_repository
+            .get_by_id(new_user.id.clone())
+            .await
+            .map_err(|e| {
+                AuthError::InternalError(format!("Failed to reload registered user: {e}"))
+            })?
+            .ok_or_else(|| AuthError::InternalError("Registered user not found".to_string()))
     }
 
     async fn cleanup_expired_sessions(&self) -> Result<usize, AuthError> {
@@ -643,6 +649,8 @@ mod tests {
             last_login: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),
+            default_organization_id: None,
+            default_organization_source: "pending".to_string(),
             tokens_revoked_at: None,
         }
     }

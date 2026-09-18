@@ -560,6 +560,13 @@ pub fn map_organization_error(
                 "conflict".to_string(),
             )),
         ),
+        OrganizationError::DefaultOrganization => (
+            StatusCode::CONFLICT,
+            ResponseJson(ErrorResponse::new(
+                "Default organizations cannot be deleted".to_string(),
+                "default_organization".to_string(),
+            )),
+        ),
         OrganizationError::StakingWalletBound => (
             StatusCode::CONFLICT,
             ResponseJson(ErrorResponse::new(
@@ -591,6 +598,13 @@ pub fn map_organization_error(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn map_default_organization_deletion_returns_conflict() {
+        let (status, body) = map_organization_error(OrganizationError::DefaultOrganization);
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(body.error.r#type, "default_organization");
+    }
 
     #[test]
     fn map_organization_error_staking_wallet_bound_returns_conflict() {

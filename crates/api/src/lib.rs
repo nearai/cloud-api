@@ -2946,6 +2946,7 @@ mod tests {
         );
     }
 
+    #[test]
     fn test_openapi_admin_aml_paths_require_admin_security() {
         let spec = serde_json::to_value(ApiDoc::openapi()).unwrap();
         let paths = spec["paths"].as_object().unwrap();

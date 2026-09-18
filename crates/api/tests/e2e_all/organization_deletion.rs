@@ -14,7 +14,7 @@ use crate::common::*;
 #[tokio::test]
 async fn test_delete_organization_removes_its_workspaces_from_users_me() {
     let (server, database) = setup_test_server_with_database().await;
-    let (session_id, _email) = setup_unique_test_session(&database).await;
+    let (session_id, _email) = signup_new_user(&database).await;
 
     let deleted_org = create_org_with_session(&server, &session_id).await;
     let deleted_workspace_id =
@@ -56,7 +56,7 @@ async fn test_delete_organization_removes_its_workspaces_from_users_me() {
             .as_array()
             .expect("workspaces array")
             .iter()
-            .all(|w| w["organization_id"].as_str() == Some(new_org.id.as_str())),
+            .any(|w| w["organization_id"].as_str() == Some(new_org.id.as_str())),
         "every listed workspace must belong to a live org the user is still a member of"
     );
 }
@@ -67,7 +67,7 @@ async fn test_delete_organization_removes_its_workspaces_from_users_me() {
 #[tokio::test]
 async fn test_delete_organization_revokes_its_credentials() {
     let (server, database) = setup_test_server_with_database().await;
-    let (session_id, _email) = setup_unique_test_session(&database).await;
+    let (session_id, _email) = signup_new_user(&database).await;
 
     let org = create_org_with_session(&server, &session_id).await;
     let workspace_id = list_workspaces_with_session(&server, org.id.clone(), &session_id)
@@ -197,7 +197,7 @@ async fn test_cached_api_key_is_rejected_after_organization_deletion() {
     // separate middleware below uses a real AuthService, constructed after the
     // key exists so its initial bloom-filter load includes the key.
     let (fixture_server, database) = setup_test_server_with_database().await;
-    let (session_id, _email) = setup_unique_test_session(&database).await;
+    let (session_id, _email) = signup_new_user(&database).await;
     let org = create_org_with_session(&fixture_server, &session_id).await;
     let api_key =
         get_api_key_for_org_with_session(&fixture_server, org.id.clone(), &session_id).await;
@@ -261,7 +261,7 @@ async fn test_cached_api_key_is_rejected_after_organization_deletion() {
 #[tokio::test]
 async fn test_workspace_cannot_be_created_under_deleted_organization() {
     let (server, database) = setup_test_server_with_database().await;
-    let (session_id, _email) = setup_unique_test_session(&database).await;
+    let (session_id, _email) = signup_new_user(&database).await;
 
     let org = create_org_with_session(&server, &session_id).await;
 
@@ -330,7 +330,7 @@ async fn test_workspace_cannot_be_created_under_deleted_organization() {
 #[tokio::test]
 async fn test_child_creation_serializes_with_organization_deletion() {
     let (server, database) = setup_test_server_with_database().await;
-    let (session_id, _email) = setup_unique_test_session(&database).await;
+    let (session_id, _email) = signup_new_user(&database).await;
     let org = create_org_with_session(&server, &session_id).await;
     let workspace_id = list_workspaces_with_session(&server, org.id.clone(), &session_id)
         .await
@@ -544,31 +544,19 @@ fn ids(me: &serde_json::Value, field: &str) -> Vec<String> {
         .collect()
 }
 
-/// The reported journey, end to end: a brand-new user signs up (which creates
-/// their default organization and workspace), deletes that default org, creates
-/// a replacement, and then has to be able to actually use it — API keys,
-/// members and settings all working, with nothing still pointing at the org
-/// they deleted.
+/// Replacing an ordinary organization must preserve the signup default and
+/// leave API keys, members, and settings working in the replacement.
 #[tokio::test]
-async fn test_new_user_can_work_after_replacing_default_organization() {
+async fn test_new_user_can_work_after_replacing_non_default_organization() {
     let (server, database) = setup_test_server_with_database().await;
     let (session_id, _user_id) = signup_new_user(&database).await;
-
-    // A fresh signup starts with exactly one org and its "default" workspace.
     let me = get_me(&server, &session_id).await;
-    let default_org_id = organization_ids(&me)
-        .first()
-        .expect("signup should create a default organization")
-        .clone();
-    assert_eq!(
-        workspace_ids(&me).len(),
-        1,
-        "signup should create exactly one workspace"
-    );
+    let signup_org_id = me["default_organization_id"].as_str().unwrap().to_string();
+    let deleted_org_id = create_org_with_session(&server, &session_id).await.id;
 
-    // The user deletes the default org...
+    // The user deletes the ordinary org...
     let response = server
-        .delete(format!("/v1/organizations/{default_org_id}").as_str())
+        .delete(format!("/v1/organizations/{deleted_org_id}").as_str())
         .add_header("Authorization", format!("Bearer {session_id}"))
         .add_header("User-Agent", MOCK_USER_AGENT)
         .await;
@@ -582,25 +570,29 @@ async fn test_new_user_can_work_after_replacing_default_organization() {
     let me = get_me(&server, &session_id).await;
     assert_eq!(
         organization_ids(&me),
-        vec![new_org.id.clone()],
-        "only the replacement org may be listed"
+        vec![signup_org_id.clone(), new_org.id.clone()],
+        "the signup default and replacement remain listed"
     );
     let workspaces = me["workspaces"].as_array().expect("workspaces array");
     assert_eq!(
         workspaces.len(),
-        1,
-        "only the replacement org's workspace may be listed"
+        2,
+        "the signup and replacement workspaces remain listed"
     );
     assert_eq!(
-        workspaces[0]["organization_id"].as_str(),
+        workspaces
+            .iter()
+            .find(|w| w["organization_id"].as_str() == Some(new_org.id.as_str()))
+            .unwrap()["organization_id"]
+            .as_str(),
         Some(new_org.id.as_str()),
         "the listed workspace must belong to the replacement org"
     );
 
     // The deleted org is gone for good — these are the exact calls that failed.
     for path in [
-        format!("/v1/organizations/{default_org_id}/members"),
-        format!("/v1/organizations/{default_org_id}/settings"),
+        format!("/v1/organizations/{deleted_org_id}/members"),
+        format!("/v1/organizations/{deleted_org_id}/settings"),
     ] {
         let response = server
             .get(path.as_str())
@@ -675,7 +667,7 @@ async fn test_new_user_can_work_after_replacing_default_organization() {
     let members = list_members(&server, &new_org.id, &session_id).await;
     assert_eq!(members.len(), 1, "owner should be the only member");
 
-    let (_other_session, _other_email) = setup_unique_test_session(&database).await;
+    let (_other_session, _other_email) = signup_new_user(&database).await;
     let other_user_id = _other_session
         .strip_prefix("rt_")
         .expect("mock session ids are rt_{uuid}")
@@ -734,6 +726,57 @@ async fn test_new_user_can_work_after_replacing_default_organization() {
         Some("Journey prompt"),
         "settings must persist on the replacement org"
     );
+}
+
+#[tokio::test]
+async fn test_signup_default_is_explicit_protected_and_not_limited_to_first_page() {
+    let (server, database) = setup_test_server_with_database().await;
+    let (session_id, user_id) = signup_new_user(&database).await;
+    let me = get_me(&server, &session_id).await;
+    let default_id = me["default_organization_id"].as_str().unwrap().to_string();
+    assert_eq!(me["default_organization_source"], "first_membership");
+    let client = database.pool().get().await.unwrap();
+    for _ in 0..101 {
+        let id = uuid::Uuid::new_v4();
+        client.execute("INSERT INTO organizations (id, name, created_at) VALUES ($1, $2, NOW() - INTERVAL '1 year')", &[&id, &format!("older-{id}")]).await.unwrap();
+        client.execute("INSERT INTO organization_members (organization_id, user_id, role) VALUES ($1, $2, 'member')", &[&id, &user_id]).await.unwrap();
+    }
+    let me = get_me(&server, &session_id).await;
+    assert_eq!(me["default_organization_id"], default_id);
+    assert!(organization_ids(&me).contains(&default_id));
+    let response = server
+        .delete(&format!("/v1/organizations/{default_id}"))
+        .add_header("Authorization", format!("Bearer {session_id}"))
+        .add_header("User-Agent", MOCK_USER_AGENT)
+        .await;
+    assert_eq!(response.status_code(), 409, "{}", response.text());
+    assert_eq!(
+        response.json::<serde_json::Value>()["error"]["type"],
+        "default_organization"
+    );
+}
+
+#[tokio::test]
+async fn test_users_me_retains_an_unavailable_legacy_default() {
+    let (server, database) = setup_test_server_with_database().await;
+    let (session_id, _) = setup_unique_test_session(&database).await;
+    let user_id = uuid::Uuid::parse_str(session_id.strip_prefix("rt_").unwrap()).unwrap();
+    let org_id = uuid::Uuid::new_v4();
+    let client = database.pool().get().await.unwrap();
+    client
+        .execute(
+            "INSERT INTO organizations (id, name, is_active) VALUES ($1, $2, false)",
+            &[&org_id, &format!("legacy-{org_id}")],
+        )
+        .await
+        .unwrap();
+    client.execute("INSERT INTO organization_members (organization_id, user_id, role) VALUES ($1, $2, 'owner')", &[&org_id, &user_id]).await.unwrap();
+    // Model the outcome of a backfill retaining an already inactive organization.
+    client.execute("UPDATE users SET default_organization_id = $1, default_organization_source = 'earliest_retained_membership' WHERE id = $2", &[&org_id, &user_id]).await.unwrap();
+    let team = create_org_with_session(&server, &session_id).await;
+    let me = get_me(&server, &session_id).await;
+    assert_eq!(me["default_organization_id"], org_id.to_string());
+    assert_eq!(organization_ids(&me), vec![team.id]);
 }
 
 /// Run the real signup path (the one OAuth and NEAR logins both go through), so

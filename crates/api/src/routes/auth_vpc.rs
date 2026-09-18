@@ -123,30 +123,31 @@ pub async fn vpc_login(
 
     // Create unbound API key for this session
     // 1. Get default organization for user
-    let orgs = state
-        .organization_service
-        .list_organizations_for_user(user.id.clone(), 1, 0, None, None)
-        .await
-        .map_err(|e| {
-            tracing::error!("Failed to list organizations for user: {e:?}");
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "Organization lookup error".to_string(),
-            )
-        })?;
-
-    let org = orgs.first().ok_or_else(|| {
-        tracing::error!("User has no organizations");
+    let default_org_id = user.default_organization_id.ok_or_else(|| {
         (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "No organization found".to_string(),
+            StatusCode::CONFLICT,
+            "Default organization is unavailable".to_string(),
         )
     })?;
+
+    let org = state
+        .organization_service
+        .get_organization(services::organization::OrganizationId(default_org_id))
+        .await
+        .map_err(|_| {
+            (
+                StatusCode::CONFLICT,
+                "Default organization is unavailable".to_string(),
+            )
+        })?;
 
     // 2. Get default workspace for organization
     let workspaces = state
         .workspace_service
-        .list_workspaces_for_organization(org.id.clone(), user.id.clone())
+        .list_workspaces_for_organization(
+            services::organization::OrganizationId(default_org_id),
+            user.id.clone(),
+        )
         .await
         .map_err(|e| {
             tracing::error!("Failed to list workspaces: {e:?}");

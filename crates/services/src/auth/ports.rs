@@ -71,6 +71,8 @@ impl std::fmt::Display for SessionToken {
 // Domain models
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct User {
+    pub default_organization_id: Option<Uuid>,
+    pub default_organization_source: String,
     pub id: UserId,
     pub email: String,
     pub username: String,
@@ -402,6 +404,8 @@ impl MockAuthService {
             last_login: Some(chrono::Utc::now()),
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
+            default_organization_id: None,
+            default_organization_source: "pending".to_string(),
             tokens_revoked_at: None,
         }
     }

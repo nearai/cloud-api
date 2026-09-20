@@ -1,3 +1,5 @@
+// This test uses the shared pool but not the usage-reporting fixtures.
+#[allow(dead_code)]
 mod support;
 
 use database::repositories::{PgOrganizationRepository, UserRepository};

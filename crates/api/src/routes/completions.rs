@@ -1920,7 +1920,7 @@ async fn chat_completions_inner(
                                                 };
                                                 let mut chat_id =
                                                     public_signature_chat_id.lock().await;
-                                                if chat_id.is_none() {
+                                                if chat_id.is_none() && !candidate.is_empty() {
                                                     *chat_id = Some(candidate);
                                                 }
                                             }
@@ -1993,7 +1993,7 @@ async fn chat_completions_inner(
                                             }
                                         };
                                         let mut chat_id = public_signature_chat_id.lock().await;
-                                        if chat_id.is_none() {
+                                        if chat_id.is_none() && !candidate.is_empty() {
                                             *chat_id = Some(candidate);
                                         }
                                     }

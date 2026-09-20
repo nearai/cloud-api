@@ -447,6 +447,187 @@ async fn test_non_attested_chat_gateway_signature_hashes_exact_json() {
 }
 
 #[tokio::test]
+async fn test_non_attested_gateway_signatures_ignore_empty_upstream_ids() {
+    use inference_providers::{ExternalProvider, ExternalProviderConfig, ProviderConfig};
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let (server, pool, _mock, database) = setup_test_server_with_pool().await;
+    let (model_name, _) = setup_non_attested_signature_model(&server, &pool).await;
+    let org = setup_org_with_credits(&server, 10_000_000_000i64).await;
+    let api_key = get_api_key_for_org(&server, org.id).await;
+    let upstream = MockServer::start().await;
+    pool.register_provider(
+        model_name.clone(),
+        Arc::new(ExternalProvider::new(ExternalProviderConfig {
+            model_name: model_name.clone(),
+            provider_config: ProviderConfig::OpenAiCompatible {
+                base_url: upstream.uri(),
+                organization_id: None,
+                model_name: None,
+                extra_request_body: None,
+                enforced_request_body: None,
+            },
+            api_key: "synthetic-test-key".to_string(),
+            timeout_seconds: 5,
+        })),
+    )
+    .await;
+
+    for (case, stream, options) in [
+        ("nonstream", false, None),
+        ("default", true, None),
+        (
+            "include_usage",
+            true,
+            Some(serde_json::json!({ "include_usage": true })),
+        ),
+        (
+            "continuous_usage",
+            true,
+            Some(serde_json::json!({ "continuous_usage_stats": true })),
+        ),
+    ] {
+        // An empty first ID must neither create a signature under "" nor
+        // prevent a later valid ID from becoming the signature lookup key.
+        for later_valid_id in [false, true] {
+            if !stream && later_valid_id {
+                continue;
+            }
+            let chat_id = if later_valid_id {
+                format!("chatcmpl-{}", uuid::Uuid::new_v4())
+            } else {
+                String::new()
+            };
+            let upstream_response = if stream {
+                let first = serde_json::json!({
+                    "id": "", "object": "chat.completion.chunk", "created": 0,
+                    "model": model_name,
+                    "choices": [{ "index": 0, "delta": { "content": "hello" },
+                        "finish_reason": null }]
+                });
+                let last = serde_json::json!({
+                    "id": chat_id, "object": "chat.completion.chunk", "created": 0,
+                    "model": model_name,
+                    "choices": [{ "index": 0, "delta": {}, "finish_reason": "stop" }],
+                    "usage": { "prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2 }
+                });
+                // Extra whitespace survives only the raw passthrough path.
+                ResponseTemplate::new(200).set_body_raw(
+                    format!("data:  {first}\n\ndata: {last}\n\ndata: [DONE]\n\n"),
+                    "text/event-stream",
+                )
+            } else {
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "id": "", "object": "chat.completion", "created": 0,
+                    "model": model_name,
+                    "choices": [{ "index": 0,
+                        "message": { "role": "assistant", "content": "hello" },
+                        "finish_reason": "stop" }],
+                    "usage": { "prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2 }
+                }))
+            };
+            upstream.reset().await;
+            Mock::given(method("POST"))
+                .and(path("/chat/completions"))
+                .respond_with(upstream_response)
+                .expect(1)
+                .mount(&upstream)
+                .await;
+
+            let mut request_body = serde_json::json!({
+                "model": model_name,
+                "messages": [{ "role": "user", "content": "Say hello." }],
+                "stream": stream,
+                "nonce": if later_valid_id { 910 } else { 909 }
+            });
+            if let Some(options) = &options {
+                request_body["stream_options"] = options.clone();
+            }
+            let request_json = request_body.to_string();
+            let response = server
+                .post("/v1/chat/completions")
+                .add_header("Authorization", format!("Bearer {api_key}"))
+                .content_type("application/json")
+                .bytes(Bytes::from(request_json.clone()))
+                .await;
+            assert_eq!(response.status_code(), 200, "{case}: {}", response.text());
+            let response_text = response.text();
+            if stream {
+                assert!(response_text.ends_with("data: [DONE]\n\n"), "{case}");
+                assert_eq!(first_stream_chat_id(&response_text), "", "{case}");
+                assert_eq!(
+                    response_text.contains("data:  {"),
+                    case == "continuous_usage",
+                    "{case}: exercise raw passthrough or typed reserialization"
+                );
+            } else {
+                assert_eq!(response.json::<serde_json::Value>()["id"], "");
+            }
+
+            let signature_text = format!(
+                "{}:{}",
+                compute_sha256(&request_json),
+                compute_sha256(&response_text)
+            );
+            let client = database
+                .pool()
+                .get()
+                .await
+                .expect("database should connect");
+            let stored = client
+                .query(
+                    "SELECT chat_id FROM chat_signatures WHERE text = $1",
+                    &[&signature_text],
+                )
+                .await
+                .expect("signature lookup should succeed");
+            if later_valid_id {
+                assert_eq!(stored.len(), 2, "{case}: store both algorithms");
+                for row in stored {
+                    assert_eq!(row.get::<_, String>(0), chat_id, "{case}");
+                }
+                assert_gateway_signatures(
+                    &server,
+                    &api_key,
+                    &chat_id,
+                    &request_json,
+                    &response_text,
+                )
+                .await;
+            } else {
+                assert!(stored.is_empty(), "{case}: empty IDs must not be stored");
+            }
+            upstream.verify().await;
+        }
+    }
+}
+
+#[tokio::test]
+async fn test_non_attested_e2ee_chat_is_rejected_before_inference() {
+    let (server, pool, _mock, _database) = setup_test_server_with_pool().await;
+    let (model_name, mock) = setup_non_attested_signature_model(&server, &pool).await;
+    let org = setup_org_with_credits(&server, 10_000_000_000i64).await;
+    let api_key = get_api_key_for_org(&server, org.id).await;
+
+    for stream in [false, true] {
+        let response = server
+            .post("/v1/chat/completions")
+            .add_header("Authorization", format!("Bearer {api_key}"))
+            .add_header("X-Model-Pub-Key", "ab".repeat(32))
+            .json(&serde_json::json!({
+                "model": model_name,
+                "messages": [{ "role": "user", "content": "encrypted-placeholder" }],
+                "stream": stream
+            }))
+            .await;
+        assert_eq!(response.status_code(), 400, "{}", response.text());
+        assert!(response.text().contains("does not support encryption"));
+        assert!(mock.last_chat_params().await.is_none());
+    }
+}
+
+#[tokio::test]
 async fn test_non_attested_stream_gateway_signatures_are_ready_at_done() {
     use http_body_util::BodyExt;
     use tower::ServiceExt;

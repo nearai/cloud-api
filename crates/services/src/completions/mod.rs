@@ -158,7 +158,7 @@ where
 {
     /// Finalize attestation handling before the route sends `[DONE]` to the client.
     /// This stores a provider signature when supported, otherwise releases the
-    /// provider-routing pin without publishing a signature.
+    /// provider-routing pin. The API route handles Gateway signatures separately.
     fn create_signature_future(&self) -> FinalizeFuture {
         let organization_id = self.organization_id;
         let model_id = self.model_id;
@@ -175,8 +175,8 @@ where
 
         // The provider pool pins every streamed chat that has a chat id, even
         // when the authoritative model record says it is non-attested. There is
-        // no signature to store in that case, but the normal EOF path still
-        // owns releasing the pin.
+        // no provider signature to collect in that case, but the normal EOF
+        // path still owns releasing the pin before the route signs public bytes.
         if !self.attestation_supported {
             return Box::pin(async move {
                 attestation_service

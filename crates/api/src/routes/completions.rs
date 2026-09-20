@@ -1620,12 +1620,17 @@ async fn chat_completions_inner(
         service_request.original_request = None;
     }
 
+    // Non-attested (Incognito) models have no model TEE signature to collect.
+    // Sign their public request/response bytes at the Gateway even when neither
+    // body was rewritten. Missing catalog metadata is not a non-attested model.
+    let non_attested_requires_gateway_signature = model_attestation_supported == Some(false);
     // Auto-redact and alias handling can change the bytes returned to the
     // client. A provider signature covers the upstream request and response,
     // so it cannot verify those public bytes.
     let alias_requires_gateway_signature =
         alias_canonical.is_some() && model_attestation_supported.unwrap_or(false);
-    let gateway_signature_enabled = usage_mode.gateway_signature_enabled
+    let gateway_signature_enabled = non_attested_requires_gateway_signature
+        || usage_mode.gateway_signature_enabled
         || auto_redact_requires_gateway_signature(auto_redact_enabled, model_attestation_supported)
         || alias_requires_gateway_signature;
     let public_response_rewritten = auto_redact_enabled || alias_canonical.is_some();
@@ -1642,7 +1647,7 @@ async fn chat_completions_inner(
     // Gateway signature either, but omitting a signature is still better than
     // returning one that cannot verify.
     service_request.skip_provider_chat_signature =
-        usage_mode.gateway_signature_enabled || public_response_rewritten;
+        gateway_signature_enabled || public_response_rewritten;
     // Defer an upstream terminator whenever this route would otherwise relay it
     // unchanged. The completion service owns the authoritative model lookup, so
     // it decides whether finalization stores a provider signature or is a no-op.
@@ -2473,30 +2478,28 @@ async fn chat_completions_inner(
                     _ => body_bytes,
                 };
 
-                if public_response_rewritten {
-                    if gateway_signature_enabled {
-                        let response_hash = hex::encode(Sha256::digest(&body_bytes));
-                        if let Err(error) = app_state
-                            .attestation_service
-                            .store_chat_signature_and_unpin(
-                                &response_with_bytes.response.id,
-                                request_hash.clone(),
-                                response_hash,
-                            )
-                            .await
-                        {
-                            tracing::error!(
-                                chat_id = %response_with_bytes.response.id,
-                                error = %error,
-                                "Failed to store public chat completion signature"
-                            );
-                        }
-                    } else {
-                        app_state
-                            .attestation_service
-                            .release_chat_signature_pin(&response_with_bytes.response.id)
-                            .await;
+                if gateway_signature_enabled {
+                    let response_hash = hex::encode(Sha256::digest(&body_bytes));
+                    if let Err(error) = app_state
+                        .attestation_service
+                        .store_chat_signature_and_unpin(
+                            &response_with_bytes.response.id,
+                            request_hash.clone(),
+                            response_hash,
+                        )
+                        .await
+                    {
+                        tracing::error!(
+                            chat_id = %response_with_bytes.response.id,
+                            error = %error,
+                            "Failed to store public chat completion signature"
+                        );
                     }
+                } else if public_response_rewritten {
+                    app_state
+                        .attestation_service
+                        .release_chat_signature_pin(&response_with_bytes.response.id)
+                        .await;
                 }
 
                 let mut response_builder = Response::builder()
@@ -3780,11 +3783,12 @@ mod tests {
     }
 
     #[test]
-    fn include_usage_rewrites_non_attested_without_gateway_signature() {
+    fn include_usage_rewrites_non_attested_streams() {
         let request = chat_request_with_include_usage(Some(true));
         let mode = chat_stream_usage_mode(&request, Some(false), false);
 
         assert!(mode.rewrite_public_stream_usage);
+        // Incognito signing is selected independently of usage shaping by the route.
         assert!(!mode.gateway_signature_enabled);
         assert!(!mode.strip_intermediate_usage);
     }

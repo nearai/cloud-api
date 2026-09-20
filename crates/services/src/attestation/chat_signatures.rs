@@ -194,7 +194,7 @@ impl AttestationService {
     /// Store a gateway signature and then release the provider-pool
     /// signature-fetch routing pin, mirroring the lifecycle ownership of
     /// `store_chat_signature_from_provider_impl` (which unpins after the
-    /// provider fetch). This is used by non-streaming response-rewrite paths;
+    /// provider fetch). This is used by non-streaming Gateway-signing paths;
     /// streaming cleanup is owned by `InterceptStream`. The store is bounded by
     /// [`STREAM_SIGNATURE_STORE_TIMEOUT`] *inside* this method so the unpin
     /// runs even when the store hangs — an outer timeout would drop the

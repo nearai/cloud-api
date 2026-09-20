@@ -321,6 +321,7 @@ pub struct CreateInvitationRequest {
 #[serde(rename_all = "snake_case")]
 pub enum OrganizationOrderBy {
     CreatedAt,
+    JoinedAt,
 }
 
 #[derive(Debug, Deserialize)]

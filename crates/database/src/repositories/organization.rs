@@ -1385,7 +1385,8 @@ impl OrganizationRepository for PgOrganizationRepository {
         let order_direction = order_direction.unwrap_or(OrganizationOrderDirection::Asc);
 
         let order_by_column = match order_by {
-            OrganizationOrderBy::CreatedAt => "created_at",
+            OrganizationOrderBy::CreatedAt => "o.created_at",
+            OrganizationOrderBy::JoinedAt => "om.joined_at",
         };
 
         let order_dir = match order_direction {
@@ -1405,10 +1406,10 @@ impl OrganizationRepository for PgOrganizationRepository {
                 .query(
                     &format!(
                         "
-                    SELECT DISTINCT o.* FROM organizations o
+                    SELECT o.* FROM organizations o
                     INNER JOIN organization_members om ON o.id = om.organization_id
                     WHERE om.user_id = $1 AND o.is_active = true
-                    ORDER BY o.{order_by_column} {order_dir}
+                    ORDER BY {order_by_column} {order_dir}, o.id ASC
                     LIMIT $2 OFFSET $3
                 "
                     ),
@@ -1445,7 +1446,8 @@ impl OrganizationRepository for PgOrganizationRepository {
         let order_direction = order_direction.unwrap_or(OrganizationOrderDirection::Asc);
 
         let order_by_column = match order_by {
-            OrganizationOrderBy::CreatedAt => "created_at",
+            OrganizationOrderBy::CreatedAt => "o.created_at",
+            OrganizationOrderBy::JoinedAt => "om.joined_at",
         };
 
         let order_dir = match order_direction {
@@ -1476,7 +1478,7 @@ impl OrganizationRepository for PgOrganizationRepository {
                         LIMIT 1
                     ) owner_om ON true
                     WHERE om.user_id = $1 AND o.is_active = true
-                    ORDER BY o.{order_by_column} {order_dir}
+                    ORDER BY {order_by_column} {order_dir}, o.id ASC
                     LIMIT $2 OFFSET $3
                 "
                     ),

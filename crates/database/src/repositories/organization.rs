@@ -932,6 +932,29 @@ impl OrganizationRepository for PgOrganizationRepository {
                     transaction.rollback().await.map_err(map_db_error)?;
                     DeleteOrganizationResult::StakingWalletBound
                 } else {
+                    // Protect the earliest active membership of every current member,
+                    // not only the owner. Use the same total order as /users/me,
+                    // without a listing limit. The organization lock above keeps
+                    // this check and the soft-delete in the same transaction.
+                    let is_default: bool = transaction.query_one(
+                        "SELECT EXISTS (
+                            SELECT 1 FROM organization_members candidate
+                            WHERE candidate.organization_id = $1
+                              AND NOT EXISTS (
+                                SELECT 1 FROM organization_members earlier
+                                JOIN organizations o ON o.id = earlier.organization_id AND o.is_active
+                                WHERE earlier.user_id = candidate.user_id
+                                  AND (earlier.joined_at, earlier.organization_id)
+                                      < (candidate.joined_at, candidate.organization_id)
+                              )
+                        )",
+                        &[&id],
+                    ).await.map_err(map_db_error)?.get(0);
+                    if is_default {
+                        transaction.rollback().await.map_err(map_db_error)?;
+                        return Ok(DeleteOrganizationResult::DefaultOrganization);
+                    }
+
                     let rows_affected = transaction
                         .execute(
                             "UPDATE organizations SET is_active = false WHERE id = $1 AND is_active = true",

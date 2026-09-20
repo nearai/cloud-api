@@ -40,6 +40,7 @@ mod conversations;
 mod credit_types;
 mod cross_workspace;
 mod database_encryption;
+mod default_organization_deletion;
 mod deser_error_envelope;
 mod duplicate_names;
 mod embeddings;

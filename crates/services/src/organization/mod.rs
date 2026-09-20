@@ -266,6 +266,9 @@ impl OrganizationServiceImpl {
             DeleteOrganizationResult::Unauthorized => Err(OrganizationError::Unauthorized(
                 "Only the owner can delete an organization".to_string(),
             )),
+            DeleteOrganizationResult::DefaultOrganization => {
+                Err(OrganizationError::DefaultOrganization)
+            }
             DeleteOrganizationResult::StakingWalletBound => {
                 Err(OrganizationError::StakingWalletBound)
             }

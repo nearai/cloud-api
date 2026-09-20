@@ -14,9 +14,22 @@ default used by managed Playground or staking.
 This is a dynamic default: removing the first membership or deactivating its
 organization advances the default to the next available membership. Rejoining
 an organization uses the new membership's timestamp. There is no persisted
-default ID, historical backfill, migration, or new deletion restriction.
-Existing deletion rules continue to apply. This addresses the ordering part of
-#1088, not its original permanent-designation/deletion-protection requirements.
+default ID, historical backfill, or migration.
+
+The organization deletion API rejects an organization that is the earliest
+active membership of any current member, even when it is not the requesting
+owner's default. It returns HTTP 409 with error type `default_organization`.
+The repository checks the full membership set inside the existing deletion
+transaction, after ownership and staking restrictions, while holding the target
+organization row lock. Non-default organizations remain deletable under the
+existing rules. The UI hides deletion for the signed-in user's default and
+handles server rejections for other members' defaults.
+
+Protection follows the dynamic definition: if a member leaves, their former
+organization is no longer protected on their behalf. Ownership transfer alone
+does not remove a retained membership's protection. This does not restore the
+original permanent-designation requirement in #1088 or prevent administrative
+SQL repairs/deactivation outside the user-facing deletion API.
 
 `GET /v1/organizations` accepts `order_by=joined_at` with either `asc` or `desc`
 as `order_direction`. Its existing default remains organization creation order.

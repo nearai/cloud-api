@@ -138,12 +138,14 @@ pub struct ListOrganizationsParams {
 #[serde(rename_all = "snake_case")]
 pub enum OrganizationOrderBy {
     CreatedAt,
+    JoinedAt,
 }
 
 impl From<OrganizationOrderBy> for services::organization::OrganizationOrderBy {
     fn from(value: OrganizationOrderBy) -> Self {
         match value {
             OrganizationOrderBy::CreatedAt => Self::CreatedAt,
+            OrganizationOrderBy::JoinedAt => Self::JoinedAt,
         }
     }
 }

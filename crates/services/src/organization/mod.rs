@@ -2609,7 +2609,7 @@ mod tests {
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
             default_organization_id: None,
-            default_organization_source: "pending".to_string(),
+            default_organization_source: crate::auth::DefaultOrganizationSource::Pending,
             tokens_revoked_at: None,
         };
         let invitation_repo = Arc::new(StubInvitationRepo {
@@ -2693,7 +2693,7 @@ mod tests {
                 created_at: now,
                 updated_at: now,
                 default_organization_id: None,
-                default_organization_source: "pending".to_string(),
+                default_organization_source: crate::auth::DefaultOrganizationSource::Pending,
                 tokens_revoked_at: None,
             },
             get_by_id_calls: Mutex::new(0),
@@ -2907,7 +2907,7 @@ mod tests {
                 created_at: chrono::Utc::now(),
                 updated_at: chrono::Utc::now(),
                 default_organization_id: None,
-                default_organization_source: "pending".to_string(),
+                default_organization_source: crate::auth::DefaultOrganizationSource::Pending,
                 tokens_revoked_at: None,
             },
             get_by_id_calls: Mutex::new(0),

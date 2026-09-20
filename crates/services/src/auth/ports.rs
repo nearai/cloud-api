@@ -68,11 +68,35 @@ impl std::fmt::Display for SessionToken {
     }
 }
 
+/// Provenance of the persisted default organization. Wire values match the SQL constraint.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum DefaultOrganizationSource {
+    Pending,
+    FirstMembership,
+    EarliestRetainedMembership,
+    Unresolved,
+}
+
+impl std::str::FromStr for DefaultOrganizationSource {
+    type Err = anyhow::Error;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "pending" => Ok(Self::Pending),
+            "first_membership" => Ok(Self::FirstMembership),
+            "earliest_retained_membership" => Ok(Self::EarliestRetainedMembership),
+            "unresolved" => Ok(Self::Unresolved),
+            _ => anyhow::bail!("Unknown default organization source: {value}"),
+        }
+    }
+}
+
 // Domain models
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct User {
     pub default_organization_id: Option<Uuid>,
-    pub default_organization_source: String,
+    pub default_organization_source: DefaultOrganizationSource,
     pub id: UserId,
     pub email: String,
     pub username: String,
@@ -156,6 +180,11 @@ pub enum AuthError {
 // Repository traits
 #[async_trait]
 pub trait UserRepository: Send + Sync {
+    /// Atomically create a user and their initial organization, membership and workspace.
+    async fn register_from_oauth(&self, _info: OAuthUserInfo) -> anyhow::Result<User> {
+        anyhow::bail!("Atomic registration is not implemented by this repository")
+    }
+
     async fn create(
         &self,
         email: String,
@@ -405,7 +434,7 @@ impl MockAuthService {
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
             default_organization_id: None,
-            default_organization_source: "pending".to_string(),
+            default_organization_source: crate::auth::DefaultOrganizationSource::Pending,
             tokens_revoked_at: None,
         }
     }

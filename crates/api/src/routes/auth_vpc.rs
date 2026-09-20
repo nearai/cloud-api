@@ -101,6 +101,81 @@ pub async fn vpc_login(
             )
         })?;
 
+    // Mock authentication returns a synthetic identity. Resolve its persisted
+    // designation just as /users/me does, rather than guessing from list order.
+    let user = if state.config.auth.mock {
+        state
+            .user_service
+            .get_user(user.id.clone())
+            .await
+            .map_err(|e| {
+                tracing::error!("Failed to load VPC user: {e:?}");
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "User lookup error".to_string(),
+                )
+            })?
+    } else {
+        user
+    };
+
+    // Create unbound API key for this session
+    // 1. Get default organization for user
+    let default_org_id = user.default_organization_id.ok_or_else(|| {
+        (
+            StatusCode::CONFLICT,
+            "Default organization is unavailable".to_string(),
+        )
+    })?;
+
+    let org = state
+        .organization_service
+        .get_organization(services::organization::OrganizationId(default_org_id))
+        .await
+        .map_err(|error| match error {
+            services::organization::OrganizationError::NotFound => (
+                StatusCode::CONFLICT,
+                "Default organization is unavailable".to_string(),
+            ),
+            error => {
+                tracing::error!("Failed to load default organization: {error:?}");
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "Organization lookup error".to_string(),
+                )
+            }
+        })?;
+
+    // 2. Get default workspace for organization
+    let workspaces = state
+        .workspace_service
+        .list_workspaces_for_organization(
+            services::organization::OrganizationId(default_org_id),
+            user.id.clone(),
+        )
+        .await
+        .map_err(|e| {
+            if matches!(e, services::workspace::WorkspaceError::Unauthorized(_)) {
+                return (
+                    StatusCode::FORBIDDEN,
+                    "Default organization access denied".to_string(),
+                );
+            }
+            tracing::error!("Failed to list workspaces: {e:?}");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Workspace lookup error".to_string(),
+            )
+        })?;
+
+    let workspace = workspaces.first().ok_or_else(|| {
+        tracing::error!("Organization has no workspaces");
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "No workspace found".to_string(),
+        )
+    })?;
+
     // Create session
     let (access_token, session, refresh_token) = state
         .auth_service
@@ -120,50 +195,6 @@ pub async fn vpc_login(
                 "Session creation error".to_string(),
             )
         })?;
-
-    // Create unbound API key for this session
-    // 1. Get default organization for user
-    let default_org_id = user.default_organization_id.ok_or_else(|| {
-        (
-            StatusCode::CONFLICT,
-            "Default organization is unavailable".to_string(),
-        )
-    })?;
-
-    let org = state
-        .organization_service
-        .get_organization(services::organization::OrganizationId(default_org_id))
-        .await
-        .map_err(|_| {
-            (
-                StatusCode::CONFLICT,
-                "Default organization is unavailable".to_string(),
-            )
-        })?;
-
-    // 2. Get default workspace for organization
-    let workspaces = state
-        .workspace_service
-        .list_workspaces_for_organization(
-            services::organization::OrganizationId(default_org_id),
-            user.id.clone(),
-        )
-        .await
-        .map_err(|e| {
-            tracing::error!("Failed to list workspaces: {e:?}");
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "Workspace lookup error".to_string(),
-            )
-        })?;
-
-    let workspace = workspaces.first().ok_or_else(|| {
-        tracing::error!("Organization has no workspaces");
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "No workspace found".to_string(),
-        )
-    })?;
 
     // 3. Create API key
     let api_key_name = format!("VPC Key - {}", payload.client_id);

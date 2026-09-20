@@ -43,6 +43,7 @@ async fn test_delete_organization_removes_its_workspaces_from_users_me() {
     let new_org = create_org_with_session(&server, &session_id).await;
 
     let me = get_me(&server, &session_id).await;
+    assert!(organization_ids(&me).contains(&new_org.id));
     assert!(
         !organization_ids(&me).contains(&deleted_org.id),
         "deleted org must not be listed"
@@ -56,7 +57,9 @@ async fn test_delete_organization_removes_its_workspaces_from_users_me() {
             .as_array()
             .expect("workspaces array")
             .iter()
-            .any(|w| w["organization_id"].as_str() == Some(new_org.id.as_str())),
+            .all(|w| organization_ids(&me)
+                .iter()
+                .any(|id| w["organization_id"].as_str() == Some(id.as_str()))),
         "every listed workspace must belong to a live org the user is still a member of"
     );
 }
@@ -770,9 +773,9 @@ async fn test_users_me_retains_an_unavailable_legacy_default() {
         )
         .await
         .unwrap();
-    client.execute("INSERT INTO organization_members (organization_id, user_id, role) VALUES ($1, $2, 'owner')", &[&org_id, &user_id]).await.unwrap();
     // Model the outcome of a backfill retaining an already inactive organization.
     client.execute("UPDATE users SET default_organization_id = $1, default_organization_source = 'earliest_retained_membership' WHERE id = $2", &[&org_id, &user_id]).await.unwrap();
+    client.execute("INSERT INTO organization_members (organization_id, user_id, role) VALUES ($1, $2, 'owner')", &[&org_id, &user_id]).await.unwrap();
     let team = create_org_with_session(&server, &session_id).await;
     let me = get_me(&server, &session_id).await;
     assert_eq!(me["default_organization_id"], org_id.to_string());

@@ -282,11 +282,6 @@ async fn require_near_default_org(
     }
 
     let org_id = services::organization::OrganizationId(organization_id);
-    app_state
-        .organization_service
-        .get_organization(org_id.clone())
-        .await
-        .map_err(crate::routes::common::map_organization_error)?;
     if app_state
         .organization_service
         .get_user_role(org_id, UserId(user.0.id))

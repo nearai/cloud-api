@@ -281,7 +281,7 @@ pub fn current_unix_timestamp() -> i64 {
 pub fn services_user_to_api_user(user: &services::auth::User) -> crate::models::UserResponse {
     crate::models::UserResponse {
         default_organization_id: user.default_organization_id.map(|id| id.to_string()),
-        default_organization_source: user.default_organization_source.clone(),
+        default_organization_source: user.default_organization_source,
         id: user.id.0.to_string(),
         email: user.email.clone(),
         username: user.username.clone(),
@@ -305,7 +305,7 @@ pub fn services_user_to_api_user_with_relations(
 ) -> crate::models::UserResponse {
     crate::models::UserResponse {
         default_organization_id: user.default_organization_id.map(|id| id.to_string()),
-        default_organization_source: user.default_organization_source.clone(),
+        default_organization_source: user.default_organization_source,
         id: user.id.0.to_string(),
         email: user.email.clone(),
         username: user.username.clone(),

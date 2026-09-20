@@ -150,7 +150,8 @@ pub async fn get_current_user(
     // The default can be outside the listing's first page. Include it only when
     // the user still has access; an unavailable designation must never fall back.
     if let Some(id) = user_data.default_organization_id {
-        if !organizations.iter().any(|org| org.id == id.to_string()) {
+        let default_id = id.to_string();
+        if !organizations.iter().any(|org| org.id == default_id) {
             let org_id = services::organization::OrganizationId(id);
             let role = match app_state
                 .organization_service

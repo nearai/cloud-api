@@ -404,3 +404,60 @@ async fn test_vpc_login_missing_fields() {
 
     println!("✅ Correctly rejected requests with missing fields");
 }
+
+#[tokio::test]
+async fn test_vpc_login_mock_uses_persisted_default() {
+    let _guard = setup_vpc_shared_secret("test_vpc_secret_123");
+    let server = setup_test_server().await;
+    create_org(&server).await;
+    let me = server
+        .get("/v1/users/me")
+        .add_header("Authorization", format!("Bearer {}", get_session_id()))
+        .await
+        .json::<serde_json::Value>();
+    let timestamp = chrono::Utc::now().timestamp();
+    let response = server
+        .post("/v1/auth/vpc/login")
+        .json(&serde_json::json!({
+            "timestamp": timestamp,
+            "signature": generate_vpc_signature(timestamp, "test_vpc_secret_123"),
+            "client_id": "mock-vpc-client"
+        }))
+        .await;
+    assert_eq!(response.status_code(), 200, "{}", response.text());
+    let body = response.json::<VpcLoginResponse>();
+    assert_eq!(
+        body.organization.id.to_string(),
+        me["default_organization_id"].as_str().unwrap()
+    );
+}
+
+#[tokio::test]
+async fn test_vpc_login_revoked_default_membership_is_forbidden() {
+    let _guard = setup_vpc_shared_secret("test_vpc_secret_123");
+    let (server, database) =
+        setup_test_server_with_config_and_database(|config| config.auth.mock = false).await;
+    let timestamp = chrono::Utc::now().timestamp();
+    let request = serde_json::json!({
+        "timestamp": timestamp,
+        "signature": generate_vpc_signature(timestamp, "test_vpc_secret_123"),
+        "client_id": format!("revoked-{}", uuid::Uuid::new_v4())
+    });
+    let response = server.post("/v1/auth/vpc/login").json(&request).await;
+    assert_eq!(response.status_code(), 200, "{}", response.text());
+    let body = response.json::<VpcLoginResponse>();
+    // Transfer ownership before revoking membership, leaving a valid organization.
+    let (new_owner_session, _) = setup_unique_test_session(&database).await;
+    let new_owner = uuid::Uuid::parse_str(new_owner_session.strip_prefix("rt_").unwrap()).unwrap();
+    let client = database.pool().get().await.unwrap();
+    client.execute("INSERT INTO organization_members (organization_id, user_id, role) VALUES ($1, $2, 'owner')", &[&body.organization.id.0, &new_owner]).await.unwrap();
+    client
+        .execute(
+            "DELETE FROM organization_members WHERE user_id = $1 AND organization_id = $2",
+            &[&body.session.user_id.0, &body.organization.id.0],
+        )
+        .await
+        .unwrap();
+    let response = server.post("/v1/auth/vpc/login").json(&request).await;
+    assert_eq!(response.status_code(), 403, "{}", response.text());
+}

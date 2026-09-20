@@ -107,9 +107,9 @@ async fn test_duplicate_organization_name_case_sensitive() {
 
 #[tokio::test]
 async fn test_organization_name_reuse_after_deletion() {
-    let server = setup_test_server().await;
-    // Reserve the first membership so the organization under test is deletable.
-    let _default = create_org(&server).await;
+    let (server, database) = setup_test_server_with_database().await;
+    let (owner_session, _) = setup_unique_test_session(&database).await;
+    let _default = create_org_with_session(&server, &owner_session).await;
 
     let org_name = format!("reusable-org-{}", uuid::Uuid::new_v4());
 
@@ -121,7 +121,7 @@ async fn test_organization_name_reuse_after_deletion() {
 
     let create_response = server
         .post("/v1/organizations")
-        .add_header("Authorization", format!("Bearer {}", get_session_id()))
+        .add_header("Authorization", format!("Bearer {}", owner_session))
         .json(&create_request)
         .await;
 
@@ -137,7 +137,7 @@ async fn test_organization_name_reuse_after_deletion() {
     // Step 2: Delete the organization
     let delete_response = server
         .delete(format!("/v1/organizations/{}", org.id).as_str())
-        .add_header("Authorization", format!("Bearer {}", get_session_id()))
+        .add_header("Authorization", format!("Bearer {}", owner_session))
         .await;
 
     assert_eq!(
@@ -154,7 +154,7 @@ async fn test_organization_name_reuse_after_deletion() {
 
     let recreate_response = server
         .post("/v1/organizations")
-        .add_header("Authorization", format!("Bearer {}", get_session_id()))
+        .add_header("Authorization", format!("Bearer {}", owner_session))
         .json(&recreate_request)
         .await;
 

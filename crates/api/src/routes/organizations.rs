@@ -1041,7 +1041,7 @@ mod tests {
             auth_provider: "test".to_string(),
             provider_user_id: id.to_string(),
             default_organization_id: None,
-            default_organization_source: "pending".to_string(),
+            default_organization_source: services::auth::DefaultOrganizationSource::Pending,
             tokens_revoked_at: None,
         })
     }

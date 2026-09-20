@@ -527,7 +527,9 @@ impl UserRepository {
             auth_provider: row.get("auth_provider"),
             provider_user_id: row.get("provider_user_id"),
             default_organization_id: row.get("default_organization_id"),
-            default_organization_source: row.get("default_organization_source"),
+            default_organization_source: row
+                .get::<_, String>("default_organization_source")
+                .parse()?,
             tokens_revoked_at: row.get("tokens_revoked_at"),
         })
     }
@@ -557,6 +559,57 @@ fn db_user_to_service_user(db_user: User) -> services::auth::User {
 // Implement the service trait
 #[async_trait]
 impl services::auth::UserRepository for UserRepository {
+    async fn register_from_oauth(
+        &self,
+        info: services::auth::OAuthUserInfo,
+    ) -> Result<services::auth::User> {
+        let id = Uuid::new_v4();
+        let org_id = Uuid::new_v4();
+        let workspace_id = Uuid::new_v4();
+        let name = format!(
+            "{}-org-{}",
+            info.email
+                .split('@')
+                .next()
+                .unwrap_or("user")
+                .chars()
+                .take(100)
+                .collect::<String>(),
+            org_id
+        );
+        let row = retry_db!("register_oauth_user", {
+            let mut client = self
+                .pool
+                .get()
+                .await
+                .context("Failed to get registration connection")
+                .map_err(RepositoryError::PoolError)?;
+            let tx = client.transaction().await.map_err(map_db_error)?;
+            tx.execute(
+                "INSERT INTO users (id, email, username, display_name, avatar_url, auth_provider, provider_user_id) VALUES ($1,$2,$3,$4,$5,$6,$7)",
+                &[&id, &info.email, &info.username, &info.display_name, &info.avatar_url, &info.provider, &info.provider_user_id],
+            ).await.map_err(map_db_error)?;
+            tx.execute(
+                "INSERT INTO organizations (id, name) VALUES ($1,$2)",
+                &[&org_id, &name],
+            )
+            .await
+            .map_err(map_db_error)?;
+            tx.execute("INSERT INTO organization_members (organization_id, user_id, role) VALUES ($1,$2,'owner')", &[&org_id, &id]).await.map_err(map_db_error)?;
+            tx.execute("INSERT INTO workspaces (id, name, description, organization_id, created_by_user_id) VALUES ($1,'default',$2,$3,$4)",
+                &[&workspace_id, &format!("Default workspace for {name}"), &org_id, &id]).await.map_err(map_db_error)?;
+            // Read the trigger-assigned designation before committing. A failure in
+            // any registration step rolls back the complete signup, including user.
+            let row = tx
+                .query_one("SELECT * FROM users WHERE id = $1", &[&id])
+                .await
+                .map_err(map_db_error)?;
+            tx.commit().await.map_err(map_db_error)?;
+            Ok(row)
+        })?;
+        Ok(db_user_to_service_user(self.row_to_user(row)?))
+    }
+
     async fn create(
         &self,
         email: String,

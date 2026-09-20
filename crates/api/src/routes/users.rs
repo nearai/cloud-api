@@ -125,7 +125,7 @@ pub async fn get_current_user(
 
     // Get user's organizations with roles — single JOIN query (replaces prior N+1 pattern of
     // list_organizations_for_user + N × get_user_role).
-    let organizations = match app_state
+    let mut organizations: Vec<crate::models::UserOrganizationResponse> = match app_state
         .organization_service
         .list_organizations_with_roles_for_user(user_id.clone(), 100, 0, None, None)
         .await
@@ -146,6 +146,42 @@ pub async fn get_current_user(
             Vec::new()
         }
     };
+
+    // The default can be outside the listing's first page. Include it only when
+    // the user still has access; an unavailable designation must never fall back.
+    if let Some(id) = user_data.default_organization_id {
+        let default_id = id.to_string();
+        if !organizations.iter().any(|org| org.id == default_id) {
+            let org_id = services::organization::OrganizationId(id);
+            let role = match app_state
+                .organization_service
+                .get_user_role(org_id.clone(), user_id.clone())
+                .await
+            {
+                Ok(role) => role,
+                Err(OrganizationError::NotFound) => None,
+                Err(error) => return Err(crate::routes::common::map_organization_error(error)),
+            };
+            if let Some(role) = role {
+                match app_state
+                    .organization_service
+                    .get_organization(org_id)
+                    .await
+                {
+                    Ok(org) => organizations.push(crate::models::UserOrganizationResponse {
+                        id: org.id.0.to_string(),
+                        name: org.name,
+                        description: org.description,
+                        role: crate::conversions::services_role_to_api_role(role),
+                        is_active: org.is_active,
+                        created_at: org.created_at,
+                    }),
+                    Err(OrganizationError::NotFound) => {}
+                    Err(error) => return Err(crate::routes::common::map_organization_error(error)),
+                }
+            }
+        }
+    }
 
     // Get user's workspaces across all their organizations — single JOIN query (replaces prior
     // N+1 pattern of iterating over orgs and calling list_workspaces_for_organization per org,

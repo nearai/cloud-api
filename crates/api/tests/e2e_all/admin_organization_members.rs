@@ -172,8 +172,10 @@ async fn test_admin_list_organization_members_deactivated_org() {
     // A soft-deleted org always 404s — even though its member rows survive the
     // soft delete — matching /v1/admin/organizations, which hides inactive orgs.
     let (server, database) = setup_test_server_with_database().await;
+    let (owner_session, _) = setup_unique_test_session(&database).await;
+    let _default = create_org_with_session(&server, &owner_session).await;
 
-    let org = create_org(&server).await;
+    let org = create_org_with_session(&server, &owner_session).await;
     let org_uuid = uuid::Uuid::parse_str(&org.id).expect("org id should be a uuid");
 
     {
@@ -307,9 +309,11 @@ async fn test_admin_list_organization_members_org_not_found() {
 #[tokio::test]
 async fn test_admin_get_organization_ok_and_not_found() {
     let (server, database) = setup_test_server_with_database().await;
+    let (owner_session, _) = setup_unique_test_session(&database).await;
+    let _default = create_org_with_session(&server, &owner_session).await;
 
     // Existing active org -> 200 with matching id/name.
-    let org = create_org(&server).await;
+    let org = create_org_with_session(&server, &owner_session).await;
     let response = server
         .get(format!("/v1/admin/organizations/{}", org.id).as_str())
         .add_header("Authorization", format!("Bearer {}", get_session_id()))
@@ -732,8 +736,8 @@ async fn test_admin_transfers_organization_ownership_to_member() {
         .await;
     assert_eq!(
         new_owner_delete.status_code(),
-        200,
-        "New owner should be able to delete the organization: {}",
+        409,
+        "Ownership transfer must not allow deletion of a user's default organization: {}",
         new_owner_delete.text()
     );
 }

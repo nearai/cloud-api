@@ -261,6 +261,9 @@ impl OrganizationServiceImpl {
             .await
             .map_err(Self::map_repository_error)?
         {
+            DeleteOrganizationResult::DefaultOrganization => {
+                Err(OrganizationError::DefaultOrganization)
+            }
             DeleteOrganizationResult::Deleted => Ok(true),
             DeleteOrganizationResult::NotFound => Ok(false),
             DeleteOrganizationResult::Unauthorized => Err(OrganizationError::Unauthorized(
@@ -2605,6 +2608,8 @@ mod tests {
             last_login: None,
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
+            default_organization_id: None,
+            default_organization_source: crate::auth::DefaultOrganizationSource::Pending,
             tokens_revoked_at: None,
         };
         let invitation_repo = Arc::new(StubInvitationRepo {
@@ -2687,6 +2692,8 @@ mod tests {
                 last_login: None,
                 created_at: now,
                 updated_at: now,
+                default_organization_id: None,
+                default_organization_source: crate::auth::DefaultOrganizationSource::Pending,
                 tokens_revoked_at: None,
             },
             get_by_id_calls: Mutex::new(0),
@@ -2899,6 +2906,8 @@ mod tests {
                 last_login: None,
                 created_at: chrono::Utc::now(),
                 updated_at: chrono::Utc::now(),
+                default_organization_id: None,
+                default_organization_source: crate::auth::DefaultOrganizationSource::Pending,
                 tokens_revoked_at: None,
             },
             get_by_id_calls: Mutex::new(0),

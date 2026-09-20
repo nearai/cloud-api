@@ -164,6 +164,7 @@ const APPROVED: &[ApprovedGroup] = &[
     ApprovedGroup { table: "services", columns: &["service_name", "display_name", "description", "unit"], reason: "Public service catalog" },
     ApprovedGroup { table: "usage_credit_allocations", columns: &["credit_type", "source", "policy_version", "allocation_phase"], reason: "Immutable restricted billing attribution records" },
     ApprovedGroup { table: "users", columns: &["email", "username", "display_name", "avatar_url", "auth_provider", "provider_user_id"], reason: "Account identity fields required for login, uniqueness, and user-facing profiles" },
+    ApprovedGroup { table: "users", columns: &["default_organization_source"], reason: "Non-sensitive designation provenance used to distinguish first memberships, legacy backfills, and unresolved defaults" },
     ApprovedGroup { table: "workspaces", columns: &["name", "description", "settings"], reason: "Workspace profile and administrator-managed settings" },
 ];
 

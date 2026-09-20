@@ -280,7 +280,6 @@ impl AuthServiceTrait for AuthService {
     }
 
     async fn get_or_create_oauth_user(&self, oauth_info: OAuthUserInfo) -> Result<User, AuthError> {
-        use crate::organization::OrganizationId;
         // Look up by provider identity — the stable, unique identifier from the OAuth provider
         let existing_user = self
             .user_repository
@@ -321,86 +320,10 @@ impl AuthServiceTrait for AuthService {
             return Ok(user);
         }
 
-        // Create new user
-        let new_user = self
-            .user_repository
-            .create_from_oauth(
-                oauth_info.email.clone(),
-                oauth_info.username.clone(),
-                oauth_info.display_name.clone(),
-                oauth_info.avatar_url.clone(),
-                oauth_info.provider.clone(),
-                oauth_info.provider_user_id.clone(),
-            )
+        self.user_repository
+            .register_from_oauth(oauth_info)
             .await
-            .map_err(|e| AuthError::InternalError(format!("Failed to create user: {e}")))?;
-
-        // Create default organization and workspace for new user
-        debug!(
-            user_id = %new_user.id.0,
-            "Creating default organization and workspace for new user"
-        );
-
-        // Generate organization name from user email with random suffix
-        let org_name = {
-            use rand::RngExt;
-            let username = oauth_info.email.split('@').next().unwrap_or("user");
-            const CHARSET: &[u8] = b"abcdefghijklmnopqrstuvwxyz0123456789";
-            let mut rng = rand::rng();
-            let suffix: String = (0..4)
-                .map(|_| {
-                    let idx = rng.random_range(0..CHARSET.len());
-                    CHARSET[idx] as char
-                })
-                .collect();
-            format!("{username}-org-{suffix}")
-        }; // rng is dropped here
-
-        // Create organization
-        match self
-            .organization_service
-            .create_organization(org_name.clone(), None, new_user.id.clone())
-            .await
-        {
-            Ok(organization) => {
-                debug!(
-                    organization_id = %organization.id.0,
-                    user_id = %new_user.id.0,
-                    "Created default organization for user"
-                );
-
-                // Create default workspace
-                let workspace_result = self
-                    .workspace_repository
-                    .create(
-                        "default".to_string(),
-                        Some(format!("Default workspace for {org_name}")),
-                        OrganizationId(organization.id.0),
-                        new_user.id.clone(),
-                    )
-                    .await;
-
-                match workspace_result {
-                    Ok(workspace) => {
-                        debug!(
-                            workspace_id = %workspace.id.0,
-                            user_id = %new_user.id.0,
-                            "Created default workspace for user"
-                        );
-                    }
-                    Err(_) => {
-                        // Log error but don't fail user creation
-                        tracing::error!("Failed to create default workspace for new user");
-                    }
-                }
-            }
-            Err(_) => {
-                // Log error but don't fail user creation
-                tracing::error!("Failed to create default organization for new user");
-            }
-        }
-
-        Ok(new_user)
+            .map_err(|e| AuthError::InternalError(format!("Failed to register user: {e}")))
     }
 
     async fn cleanup_expired_sessions(&self) -> Result<usize, AuthError> {
@@ -643,6 +566,8 @@ mod tests {
             last_login: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),
+            default_organization_id: None,
+            default_organization_source: crate::auth::DefaultOrganizationSource::Pending,
             tokens_revoked_at: None,
         }
     }

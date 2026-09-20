@@ -3021,6 +3021,10 @@ pub struct AdminUserResponse {
 /// User response model (full user profile)
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct UserResponse {
+    /// Persisted designation; may refer to an unavailable organization. Never infer a fallback.
+    pub default_organization_id: Option<String>,
+    /// first_membership, earliest_retained_membership, unresolved, or pending.
+    pub default_organization_source: services::auth::DefaultOrganizationSource,
     pub id: String,
     pub email: String,
     pub username: String,

@@ -24,6 +24,8 @@ pub struct Organization {
 /// User model - can belong to multiple organizations
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct User {
+    pub default_organization_id: Option<Uuid>,
+    pub default_organization_source: services::auth::DefaultOrganizationSource,
     pub id: Uuid,
     pub email: String,
     pub username: String,

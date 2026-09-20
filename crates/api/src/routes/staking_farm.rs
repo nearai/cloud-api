@@ -11,7 +11,6 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use services::aml::AmlError;
 use services::auth::UserId;
-use services::organization::OrganizationId;
 use services::staking_farm::{
     OrganizationStakingFarmSource, StakingFarmOrganizationInactive, StakingFarmSourceConflict,
 };
@@ -263,24 +262,38 @@ async fn require_near_default_org(
         ));
     }
 
-    // The organization service returns active memberships in creation order; until
-    // users have a designated default-org flag, treat the earliest org as default.
-    let orgs = app_state
-        .organization_service
-        .list_organizations_for_user(UserId(user.0.id), 1, 0, None, None)
+    let current_user = app_state
+        .user_service
+        .get_user(UserId(user.0.id))
         .await
         .map_err(internal_error)?;
-
-    let default_org = orgs
-        .first()
+    let default_org = current_user
+        .default_organization_id
         .ok_or_else(|| not_found("No default organization found for user"))?;
-    if default_org.id != OrganizationId(organization_id) {
+    if default_org != organization_id {
         return Err((
             StatusCode::FORBIDDEN,
             ResponseJson(ErrorResponse::new(
                 "Staking farm credits can only be linked to the user's default organization"
                     .to_string(),
                 "non_default_organization".to_string(),
+            )),
+        ));
+    }
+
+    let org_id = services::organization::OrganizationId(organization_id);
+    if app_state
+        .organization_service
+        .get_user_role(org_id, UserId(user.0.id))
+        .await
+        .map_err(crate::routes::common::map_organization_error)?
+        .is_none()
+    {
+        return Err((
+            StatusCode::FORBIDDEN,
+            ResponseJson(ErrorResponse::new(
+                "Default organization membership is no longer available".to_string(),
+                "forbidden".to_string(),
             )),
         ));
     }

@@ -149,6 +149,8 @@ pub enum OrganizationError {
 
     #[error("Organization is bound to a NEAR staking wallet")]
     StakingWalletBound,
+    #[error("Default organizations cannot be deleted")]
+    DefaultOrganization,
 
     #[error("Internal error: {0}")]
     InternalError(String),
@@ -188,6 +190,7 @@ pub enum DeleteOrganizationResult {
     NotFound,
     Unauthorized,
     StakingWalletBound,
+    DefaultOrganization,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

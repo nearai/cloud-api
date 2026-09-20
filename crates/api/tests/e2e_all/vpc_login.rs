@@ -57,10 +57,9 @@ async fn test_vpc_login_success() {
     // The guard must be kept alive for the test duration to ensure cleanup happens after the test
     let _guard = setup_vpc_shared_secret("test_vpc_secret_123");
 
-    let server = setup_test_server().await;
-
-    // VPC login requires user to have an organization, create one for the mock user
-    create_org(&server).await;
+    // Exercise real signup so the returned user has its persisted default
+    // organization and the issued credentials belong to that VPC identity.
+    let server = setup_test_server_with_config(|config| config.auth.mock = false).await;
 
     let timestamp = chrono::Utc::now().timestamp();
     let signature = generate_vpc_signature(timestamp, "test_vpc_secret_123");
@@ -213,10 +212,9 @@ async fn test_vpc_login_invalid_hex_signature() {
 async fn test_vpc_login_creates_user_and_resources() {
     let _guard = setup_vpc_shared_secret("test_vpc_secret_123");
 
-    let server = setup_test_server().await;
-
-    // VPC login requires user to have an organization, create one for the mock user
-    create_org(&server).await;
+    // Exercise real signup so the returned user has its persisted default
+    // organization and the issued credentials belong to that VPC identity.
+    let server = setup_test_server_with_config(|config| config.auth.mock = false).await;
 
     let client_id = format!("vpc-client-{}", uuid::Uuid::new_v4());
     let timestamp = chrono::Utc::now().timestamp();
@@ -264,10 +262,9 @@ async fn test_vpc_login_creates_user_and_resources() {
 async fn test_vpc_login_api_key_works() {
     let _guard = setup_vpc_shared_secret("test_vpc_secret_123");
 
-    let server = setup_test_server().await;
-
-    // VPC login requires user to have an organization, create one for the mock user
-    create_org(&server).await;
+    // Exercise real signup so the returned user has its persisted default
+    // organization and the issued credentials belong to that VPC identity.
+    let server = setup_test_server_with_config(|config| config.auth.mock = false).await;
 
     let timestamp = chrono::Utc::now().timestamp();
     let signature = generate_vpc_signature(timestamp, "test_vpc_secret_123");
@@ -284,12 +281,23 @@ async fn test_vpc_login_api_key_works() {
 
     let body = response.json::<VpcLoginResponse>();
 
-    // Try to use the API key on an authenticated endpoint
-    let auth_response = server
-        .get("/v1/files?limit=1")
-        .add_header("Authorization", format!("Bearer {}", body.api_key))
-        .add_header("User-Agent", MOCK_USER_AGENT)
-        .await;
+    // Real authentication refreshes its API-key bloom filter every 10 seconds.
+    // Wait for the new key to become visible, without masking other HTTP errors.
+    let auth_response = tokio::time::timeout(std::time::Duration::from_secs(20), async {
+        loop {
+            let response = server
+                .get("/v1/files?limit=1")
+                .add_header("Authorization", format!("Bearer {}", body.api_key))
+                .add_header("User-Agent", MOCK_USER_AGENT)
+                .await;
+            if response.status_code() != 401 {
+                break response;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .expect("VPC API key should become visible to real authentication");
 
     assert_eq!(
         auth_response.status_code(),
@@ -304,10 +312,9 @@ async fn test_vpc_login_api_key_works() {
 async fn test_vpc_login_access_token_works() {
     let _guard = setup_vpc_shared_secret("test_vpc_secret_123");
 
-    let server = setup_test_server().await;
-
-    // VPC login requires user to have an organization, create one for the mock user
-    create_org(&server).await;
+    // Exercise real signup so the returned user has its persisted default
+    // organization and the issued credentials belong to that VPC identity.
+    let server = setup_test_server_with_config(|config| config.auth.mock = false).await;
 
     let timestamp = chrono::Utc::now().timestamp();
     let signature = generate_vpc_signature(timestamp, "test_vpc_secret_123");
@@ -336,11 +343,13 @@ async fn test_vpc_login_access_token_works() {
         "Access token from VPC login should work for authenticated requests"
     );
 
-    // Note: In mock auth mode, the mock service returns the mock user, not the actual VPC user.
-    // The important thing is that the access token is accepted (200 response).
     let user = user_response.json::<api::models::UserResponse>();
-    assert!(!user.id.is_empty(), "User should have an id");
-    assert!(!user.email.is_empty(), "User should have an email");
+    assert_eq!(user.id, body.session.user_id.to_string());
+    assert_eq!(user.email, "access-token-test-client@vpc.internal.near.ai");
+    assert_eq!(
+        user.default_organization_id,
+        Some(body.organization.id.to_string())
+    );
 
     println!("✅ Access token from VPC login works correctly");
 }
@@ -394,4 +403,61 @@ async fn test_vpc_login_missing_fields() {
     );
 
     println!("✅ Correctly rejected requests with missing fields");
+}
+
+#[tokio::test]
+async fn test_vpc_login_mock_uses_persisted_default() {
+    let _guard = setup_vpc_shared_secret("test_vpc_secret_123");
+    let server = setup_test_server().await;
+    create_org(&server).await;
+    let me = server
+        .get("/v1/users/me")
+        .add_header("Authorization", format!("Bearer {}", get_session_id()))
+        .await
+        .json::<serde_json::Value>();
+    let timestamp = chrono::Utc::now().timestamp();
+    let response = server
+        .post("/v1/auth/vpc/login")
+        .json(&serde_json::json!({
+            "timestamp": timestamp,
+            "signature": generate_vpc_signature(timestamp, "test_vpc_secret_123"),
+            "client_id": "mock-vpc-client"
+        }))
+        .await;
+    assert_eq!(response.status_code(), 200, "{}", response.text());
+    let body = response.json::<VpcLoginResponse>();
+    assert_eq!(
+        body.organization.id.to_string(),
+        me["default_organization_id"].as_str().unwrap()
+    );
+}
+
+#[tokio::test]
+async fn test_vpc_login_revoked_default_membership_is_forbidden() {
+    let _guard = setup_vpc_shared_secret("test_vpc_secret_123");
+    let (server, database) =
+        setup_test_server_with_config_and_database(|config| config.auth.mock = false).await;
+    let timestamp = chrono::Utc::now().timestamp();
+    let request = serde_json::json!({
+        "timestamp": timestamp,
+        "signature": generate_vpc_signature(timestamp, "test_vpc_secret_123"),
+        "client_id": format!("revoked-{}", uuid::Uuid::new_v4())
+    });
+    let response = server.post("/v1/auth/vpc/login").json(&request).await;
+    assert_eq!(response.status_code(), 200, "{}", response.text());
+    let body = response.json::<VpcLoginResponse>();
+    // Transfer ownership before revoking membership, leaving a valid organization.
+    let (new_owner_session, _) = setup_unique_test_session(&database).await;
+    let new_owner = uuid::Uuid::parse_str(new_owner_session.strip_prefix("rt_").unwrap()).unwrap();
+    let client = database.pool().get().await.unwrap();
+    client.execute("INSERT INTO organization_members (organization_id, user_id, role) VALUES ($1, $2, 'owner')", &[&body.organization.id.0, &new_owner]).await.unwrap();
+    client
+        .execute(
+            "DELETE FROM organization_members WHERE user_id = $1 AND organization_id = $2",
+            &[&body.session.user_id.0, &body.organization.id.0],
+        )
+        .await
+        .unwrap();
+    let response = server.post("/v1/auth/vpc/login").json(&request).await;
+    assert_eq!(response.status_code(), 403, "{}", response.text());
 }

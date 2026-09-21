@@ -153,6 +153,7 @@ pub fn test_config() -> ApiConfig {
             enabled: true,
             ..config::UsageReportingConfig::default()
         },
+        stream_watchdog: config::StreamWatchdogConfig::default(),
         credit_allocation: config::CreditAllocationConfig::default(),
         ita: config::ItaAttestationConfig::default(),
     }

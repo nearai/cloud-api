@@ -95,7 +95,7 @@ fn format_error_chain<E: std::error::Error>(e: &E) -> String {
 /// strips; the corresponding HTTP header names are `X-Request-Id`, `X-Org-Id`,
 /// and `X-Workspace-Id`. Exposed as `pub(crate)` so `external/mod.rs` can use
 /// the same constants instead of hardcoding the strings.
-pub(crate) mod tracing_headers {
+pub mod tracing_headers {
     /// UUIDv4 generated per request by cloud-api. Join key across all hops.
     pub const REQUEST_ID: &str = "x_request_id";
     /// Organization UUID of the authenticated API key owner.

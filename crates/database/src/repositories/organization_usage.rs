@@ -3,6 +3,10 @@ use crate::models::{
     ServedProviderType, StopReason,
 };
 use crate::pool::DbPool;
+use crate::repositories::credit_allocation::{
+    allocate_usage, load_allocations, lock_organization_accounting, CreditAllocationPolicy,
+    UsageAllocationParent,
+};
 use crate::repositories::utils::map_db_error;
 use crate::retry_db;
 use anyhow::{Context, Result};
@@ -18,6 +22,7 @@ use uuid::Uuid;
 pub struct OrganizationUsageRepository {
     pub(crate) pool: DbPool,
     pub(crate) reporting_statement_timeout: Duration,
+    allocation_policy: CreditAllocationPolicy,
 }
 
 impl OrganizationUsageRepository {
@@ -26,6 +31,7 @@ impl OrganizationUsageRepository {
             pool,
             reporting_statement_timeout:
                 crate::repositories::reporting_query::DEFAULT_REPORTING_STATEMENT_TIMEOUT,
+            allocation_policy: CreditAllocationPolicy::default(),
         }
     }
 
@@ -33,6 +39,19 @@ impl OrganizationUsageRepository {
         Self {
             pool,
             reporting_statement_timeout: statement_timeout,
+            allocation_policy: CreditAllocationPolicy::default(),
+        }
+    }
+
+    pub fn with_accounting_config(
+        pool: DbPool,
+        statement_timeout: Duration,
+        config: &config::CreditAllocationConfig,
+    ) -> Self {
+        Self {
+            pool,
+            reporting_statement_timeout: statement_timeout,
+            allocation_policy: CreditAllocationPolicy::from(config),
         }
     }
 
@@ -78,6 +97,10 @@ impl OrganizationUsageRepository {
                 .map_err(RepositoryError::PoolError)?;
 
             let transaction = client.transaction().await.map_err(map_db_error)?;
+            // Take the exclusive accounting lock before inserting the child
+            // usage row. Otherwise concurrent inserts first acquire FK
+            // KEY SHARE locks and can deadlock when allocation upgrades them.
+            lock_organization_accounting(&transaction, request.organization_id).await?;
 
             let id = Uuid::new_v4();
             let now = Utc::now();
@@ -142,8 +165,34 @@ impl OrganizationUsageRepository {
                 .await
                 .map_err(map_db_error)?;
 
-            let (row, was_inserted) = match maybe_row {
-                Some(row) => {
+            let (row, was_inserted, allocations) = match maybe_row {
+                Some(_row) => {
+                    let allocation = allocate_usage(
+                        &transaction,
+                        request.organization_id,
+                        UsageAllocationParent::Inference(id),
+                        request.total_cost,
+                        &self.allocation_policy,
+                    )
+                    .await?;
+                    let row = transaction
+                        .query_one(
+                            r#"
+                            UPDATE organization_usage_log
+                            SET funded_amount = $2, unfunded_amount = $3,
+                                allocation_policy_version = $4
+                            WHERE id = $1
+                            RETURNING *
+                            "#,
+                            &[
+                                &id,
+                                &allocation.funded_amount,
+                                &allocation.unfunded_amount,
+                                &self.allocation_policy.version,
+                            ],
+                        )
+                        .await
+                        .map_err(map_db_error)?;
                     // New insert succeeded — update organization balance
                     transaction
                         .execute(
@@ -175,7 +224,7 @@ impl OrganizationUsageRepository {
                         .map_err(map_db_error)?;
 
                     transaction.commit().await.map_err(map_db_error)?;
-                    (row, true)
+                    (row, true, Some(allocation.allocations))
                 }
                 None => {
                     // Duplicate — inference_id already exists for this org.
@@ -190,23 +239,77 @@ impl OrganizationUsageRepository {
                     let existing = client
                         .query_one(
                             r#"
-                            SELECT *
-                            FROM organization_usage_log
-                            WHERE organization_id = $1 AND inference_id = $2
+                            SELECT usage_log.*
+                            FROM organization_usage_log usage_log
+                            WHERE usage_log.organization_id = $1
+                              AND usage_log.inference_id = $2
                             "#,
                             &[&request.organization_id, &request.inference_id],
                         )
                         .await
                         .map_err(map_db_error)?;
-                    (existing, false)
+                    let conflicts = existing.get::<_, Uuid>("workspace_id") != request.workspace_id
+                        || existing.get::<_, Uuid>("api_key_id") != request.api_key_id
+                        || existing.get::<_, Uuid>("model_id") != request.model_id
+                        || existing.get::<_, String>("model_name") != request.model_name
+                        || existing.get::<_, i32>("input_tokens") != request.input_tokens
+                        || existing.get::<_, i32>("output_tokens") != request.output_tokens
+                        || existing.get::<_, i32>("cache_read_tokens") != request.cache_read_tokens
+                        || existing.get::<_, i32>("cache_write_tokens")
+                            != request.cache_write_tokens
+                        || existing.get::<_, i64>("input_cost") != request.input_cost
+                        || existing.get::<_, i64>("output_cost") != request.output_cost
+                        || existing.get::<_, i64>("total_cost") != request.total_cost
+                        || existing
+                            .try_get::<_, Option<String>>("inference_type")
+                            .ok()
+                            .flatten()
+                            .as_deref()
+                            != Some(request.inference_type.as_str())
+                        || existing.get::<_, Option<i32>>("image_count") != request.image_count
+                        || existing.get::<_, Option<serde_json::Value>>("billing_details")
+                            != request.billing_details
+                        || existing.get::<_, Option<String>>("service_tier")
+                            != request.service_tier
+                        || existing.get::<_, Option<String>>("context_band")
+                            != request.context_band;
+                    if conflicts {
+                        return Err(RepositoryError::ValidationFailed(
+                            "usage id already exists with different billable data".to_string(),
+                        ));
+                    }
+                    let allocations = if existing
+                        .try_get::<_, Option<i64>>("funded_amount")
+                        .ok()
+                        .flatten()
+                        .is_some()
+                    {
+                        Some(
+                            load_allocations(
+                                &**client,
+                                UsageAllocationParent::Inference(existing.get("id")),
+                            )
+                            .await?,
+                        )
+                    } else {
+                        None
+                    };
+                    (existing, false, allocations)
                 }
             };
 
-            Ok::<(tokio_postgres::Row, bool), RepositoryError>((row, was_inserted))
+            Ok::<
+                (
+                    tokio_postgres::Row,
+                    bool,
+                    Option<Vec<services::usage::CreditAllocation>>,
+                ),
+                RepositoryError,
+            >((row, was_inserted, allocations))
         })?;
 
-        let (row, was_inserted) = result;
-        self.row_to_usage_log(&row, was_inserted)
+        let (row, was_inserted, allocations) = result;
+        self.row_to_usage_log(&row, was_inserted, allocations)
     }
 
     /// Get current balance for an organization
@@ -283,17 +386,19 @@ impl OrganizationUsageRepository {
             client
                 .query(
                     r#"
-                    SELECT
-                        id, organization_id, workspace_id, api_key_id,
-                        model_id, model_name, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, total_tokens,
-                        input_cost, output_cost, total_cost,
-                        inference_type, created_at, ttft_ms, avg_itl_ms, inference_id,
-                        provider_request_id, stop_reason, response_id, image_count,
-                        served_provider_tier, served_provider_type, served_via_fallback,
-                        billing_details, service_tier, context_band
-                    FROM organization_usage_log
-                    WHERE organization_id = $1
-                    ORDER BY created_at DESC
+                    SELECT ul.*,
+                        CASE WHEN ul.funded_amount IS NULL THEN NULL ELSE
+                            COALESCE((SELECT jsonb_agg(jsonb_build_object(
+                                'type', a.credit_type, 'amount', a.amount, 'source', a.source,
+                                'organization_limit_id', a.organization_limit_id,
+                                'policy_version', a.policy_version
+                            ) ORDER BY a.created_at, a.priority_position, a.id)
+                            FROM usage_credit_allocations a
+                            WHERE a.inference_usage_id = ul.id), '[]'::jsonb)
+                        END AS credit_allocations
+                    FROM organization_usage_log ul
+                    WHERE ul.organization_id = $1
+                    ORDER BY ul.created_at DESC
                     LIMIT $2 OFFSET $3
                     "#,
                     &[&organization_id, &limit, &offset],
@@ -303,12 +408,16 @@ impl OrganizationUsageRepository {
         })?;
 
         rows.iter()
-            .map(|row| self.row_to_usage_log(row, true))
+            .map(|row| self.row_to_usage_log(row, true, None))
             .collect()
     }
 
     /// Count total usage history records for an API key
-    pub async fn count_usage_history_by_api_key(&self, api_key_id: Uuid) -> Result<i64> {
+    pub async fn count_usage_history_by_api_key(
+        &self,
+        api_key_id: Uuid,
+        credit_type: Option<&str>,
+    ) -> Result<i64> {
         let row = retry_db!("count_usage_history_by_api_key", {
             let client = self
                 .pool
@@ -323,8 +432,12 @@ impl OrganizationUsageRepository {
                     SELECT COUNT(*) as count
                     FROM organization_usage_log
                     WHERE api_key_id = $1
+                      AND ($2::TEXT IS NULL OR EXISTS (
+                          SELECT 1 FROM usage_credit_allocations a
+                          WHERE a.inference_usage_id = organization_usage_log.id
+                            AND a.credit_type = $2))
                     "#,
-                    &[&api_key_id],
+                    &[&api_key_id, &credit_type],
                 )
                 .await
                 .map_err(map_db_error)
@@ -337,6 +450,7 @@ impl OrganizationUsageRepository {
     pub async fn get_usage_history_by_api_key(
         &self,
         api_key_id: Uuid,
+        credit_type: Option<&str>,
         limit: Option<i64>,
         offset: Option<i64>,
     ) -> Result<Vec<OrganizationUsageLog>> {
@@ -354,27 +468,39 @@ impl OrganizationUsageRepository {
             client
                 .query(
                     r#"
-                    SELECT
-                        id, organization_id, workspace_id, api_key_id,
-                        model_id, model_name, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, total_tokens,
-                        input_cost, output_cost, total_cost,
-                        inference_type, created_at, ttft_ms, avg_itl_ms, inference_id,
-                        provider_request_id, stop_reason, response_id, image_count,
-                        served_provider_tier, served_provider_type, served_via_fallback,
-                        billing_details, service_tier, context_band
-                    FROM organization_usage_log
-                    WHERE api_key_id = $1
-                    ORDER BY created_at DESC
-                    LIMIT $2 OFFSET $3
+                    SELECT ul.*,
+                        CASE WHEN $2::TEXT IS NULL THEN ul.total_cost ELSE
+                            (SELECT COALESCE(SUM(a.amount), 0)::BIGINT
+                             FROM usage_credit_allocations a
+                             WHERE a.inference_usage_id = ul.id AND a.credit_type = $2)
+                        END AS filtered_total_cost,
+                        CASE WHEN ul.funded_amount IS NULL THEN NULL ELSE
+                            COALESCE((SELECT jsonb_agg(jsonb_build_object(
+                                'type', a.credit_type, 'amount', a.amount, 'source', a.source,
+                                'organization_limit_id', a.organization_limit_id,
+                                'policy_version', a.policy_version
+                            ) ORDER BY a.created_at, a.priority_position, a.id)
+                            FROM usage_credit_allocations a
+                            WHERE a.inference_usage_id = ul.id
+                              AND ($2::TEXT IS NULL OR a.credit_type = $2)), '[]'::jsonb)
+                        END AS credit_allocations
+                    FROM organization_usage_log ul
+                    WHERE ul.api_key_id = $1
+                      AND ($2::TEXT IS NULL OR EXISTS (
+                          SELECT 1 FROM usage_credit_allocations filter_allocation
+                          WHERE filter_allocation.inference_usage_id = ul.id
+                            AND filter_allocation.credit_type = $2))
+                    ORDER BY ul.created_at DESC
+                    LIMIT $3 OFFSET $4
                     "#,
-                    &[&api_key_id, &limit, &offset],
+                    &[&api_key_id, &credit_type, &limit, &offset],
                 )
                 .await
                 .map_err(map_db_error)
         })?;
 
         rows.iter()
-            .map(|row| self.row_to_usage_log(row, true))
+            .map(|row| self.row_to_usage_log(row, true, None))
             .collect()
     }
 
@@ -467,7 +593,12 @@ impl OrganizationUsageRepository {
             .collect())
     }
 
-    fn row_to_usage_log(&self, row: &Row, was_inserted: bool) -> Result<OrganizationUsageLog> {
+    fn row_to_usage_log(
+        &self,
+        row: &Row,
+        was_inserted: bool,
+        allocations_override: Option<Vec<services::usage::CreditAllocation>>,
+    ) -> Result<OrganizationUsageLog> {
         // Parse stop_reason from string to enum
         let stop_reason_str: Option<String> = row.get("stop_reason");
         let stop_reason = stop_reason_str.as_deref().map(StopReason::parse);
@@ -477,6 +608,33 @@ impl OrganizationUsageRepository {
         let response_id = response_id_uuid.map(ResponseId::from);
         let served_provider_tier = parse_served_provider_tier(row.get("served_provider_tier"))?;
         let served_provider_type = parse_served_provider_type(row.get("served_provider_type"))?;
+
+        let credit_allocations = match allocations_override {
+            Some(value) => Some(value),
+            None => row
+                .try_get::<_, Option<serde_json::Value>>("credit_allocations")
+                .ok()
+                .flatten()
+                .map(serde_json::from_value)
+                .transpose()?,
+        };
+        let total_cost = row
+            .try_get("filtered_total_cost")
+            .unwrap_or_else(|_| row.get("total_cost"));
+        let (funded_amount, unfunded_amount) = if row
+            .try_get::<_, Option<i64>>("funded_amount")
+            .ok()
+            .flatten()
+            .is_some()
+        {
+            let funded = credit_allocations
+                .as_ref()
+                .map(|allocations| allocations.iter().map(|allocation| allocation.amount).sum())
+                .unwrap_or(0);
+            (Some(funded), Some(total_cost - funded))
+        } else {
+            (None, None)
+        };
 
         Ok(OrganizationUsageLog {
             id: row.get("id"),
@@ -495,7 +653,7 @@ impl OrganizationUsageRepository {
             total_tokens: row.get("total_tokens"),
             input_cost: row.get("input_cost"),
             output_cost: row.get("output_cost"),
-            total_cost: row.get("total_cost"),
+            total_cost,
             inference_type: row.get("inference_type"),
             created_at: row.get("created_at"),
             ttft_ms: row.get("ttft_ms"),
@@ -509,6 +667,10 @@ impl OrganizationUsageRepository {
             served_provider_type,
             served_via_fallback: row.get("served_via_fallback"),
             was_inserted,
+            credit_allocations,
+            funded_amount,
+            unfunded_amount,
+            allocation_policy_version: row.try_get("allocation_policy_version").ok().flatten(),
         })
     }
 

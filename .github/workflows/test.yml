@@ -9,8 +9,8 @@ name: Tests
 on:
   push:
     branches: [ main, develop ]
+  # Include stacked PRs targeting another feature branch.
   pull_request:
-    branches: [ main, develop ]
 
 env:
   CARGO_TERM_COLOR: always
@@ -218,6 +218,14 @@ jobs:
         RUST_LOG: debug
         DEV: "true"
 
+  script-test:
+    name: Script tests
+    runs-on: [self-hosted, infra]
+    steps:
+      - uses: actions/checkout@v7
+      - name: Test synthetic rollout verification
+        run: python3 -B -m unittest discover -s scripts/tests -v
+
   # Aggregates all test jobs into a single required status check. The branch
   # ruleset requires "Test Suite", so this job MUST always run and always report
   # a result (note `if: always()` plus no `paths:` filter on the workflow) —
@@ -227,7 +235,7 @@ jobs:
   test-suite:
     name: Test Suite
     runs-on: [self-hosted, infra]
-    needs: [changes, lint, unit-test, integration-test, e2e-test]
+    needs: [changes, lint, unit-test, integration-test, e2e-test, script-test]
     if: always()
     steps:
       - name: Check all tests passed
@@ -236,6 +244,11 @@ jobs:
           # conclude tests were unnecessary.
           if [[ "${{ needs.changes.result }}" != "success" ]]; then
             echo "Change-detection job did not succeed (${{ needs.changes.result }}); failing closed."
+            exit 1
+          fi
+
+          if [[ "${{ needs.script-test.result }}" != "success" ]]; then
+            echo "Script tests did not succeed; failing closed."
             exit 1
           fi
 

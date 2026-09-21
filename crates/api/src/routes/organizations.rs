@@ -138,12 +138,14 @@ pub struct ListOrganizationsParams {
 #[serde(rename_all = "snake_case")]
 pub enum OrganizationOrderBy {
     CreatedAt,
+    JoinedAt,
 }
 
 impl From<OrganizationOrderBy> for services::organization::OrganizationOrderBy {
     fn from(value: OrganizationOrderBy) -> Self {
         match value {
             OrganizationOrderBy::CreatedAt => Self::CreatedAt,
+            OrganizationOrderBy::JoinedAt => Self::JoinedAt,
         }
     }
 }
@@ -623,7 +625,7 @@ pub async fn update_organization(
         (status = 401, description = "Unauthorized", body = ErrorResponse),
         (status = 403, description = "Forbidden", body = ErrorResponse),
         (status = 404, description = "Organization not found", body = ErrorResponse),
-        (status = 409, description = "Organization is bound to a NEAR staking wallet", body = ErrorResponse),
+        (status = 409, description = "Organization is a default or is bound to a NEAR staking wallet", body = ErrorResponse),
         (status = 500, description = "Internal server error", body = ErrorResponse)
     ),
     security(
@@ -660,6 +662,9 @@ pub async fn delete_organization(
         }
         Err(OrganizationError::Unauthorized(msg)) => Err(map_delete_organization_error(
             OrganizationError::Unauthorized(msg),
+        )),
+        Err(OrganizationError::DefaultOrganization) => Err(map_delete_organization_error(
+            OrganizationError::DefaultOrganization,
         )),
         Err(OrganizationError::StakingWalletBound) => Err(map_delete_organization_error(
             OrganizationError::StakingWalletBound,
@@ -973,6 +978,20 @@ mod tests {
             _: UserId,
             _: services::organization::PatchOrganizationSettings,
         ) -> Result<services::organization::OrganizationSettings, OrganizationError> {
+            unimplemented!()
+        }
+
+        async fn get_request_priority_for_admin(
+            &self,
+            _: OrganizationId,
+        ) -> Result<i32, OrganizationError> {
+            unimplemented!()
+        }
+        async fn update_request_priority_for_admin(
+            &self,
+            _: OrganizationId,
+            _: i32,
+        ) -> Result<i32, OrganizationError> {
             unimplemented!()
         }
 

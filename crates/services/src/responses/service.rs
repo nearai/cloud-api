@@ -35,6 +35,7 @@ struct ProcessStreamContext {
     organization_id: uuid::Uuid,
     workspace_id: uuid::Uuid,
     fallback_enabled: bool,
+    request_priority: inference_providers::models::RequestPriority,
     body_hash: String,
     signing_algo: Option<String>,
     client_pub_key: Option<String>,
@@ -147,6 +148,7 @@ impl ports::ResponseServiceTrait for ResponseServiceImpl {
         organization_id: uuid::Uuid,
         workspace_id: uuid::Uuid,
         fallback_enabled: bool,
+        request_priority: inference_providers::models::RequestPriority,
         body_hash: String,
         signing_algo: Option<String>,
         client_pub_key: Option<String>,
@@ -218,6 +220,7 @@ impl ports::ResponseServiceTrait for ResponseServiceImpl {
                 organization_id,
                 workspace_id,
                 fallback_enabled,
+                request_priority,
                 body_hash,
                 signing_algo: signing_algo_clone,
                 client_pub_key: client_pub_key_clone,
@@ -1074,6 +1077,7 @@ impl ResponseServiceImpl {
             context.organization_id,
             context.workspace_id,
             context.fallback_enabled,
+            context.request_priority,
             context.conversation_service.clone(),
             context.completion_service.clone(),
             emitter.tx.clone(),
@@ -1458,6 +1462,7 @@ impl ResponseServiceImpl {
 
             // Create completion request (names not included - tracked via database analytics)
             let completion_request = CompletionRequest {
+                request_priority: process_context.request_priority,
                 request_id: process_context.request_id,
                 model: process_context.request.model.clone(),
                 messages: messages.clone(),
@@ -1520,6 +1525,7 @@ impl ResponseServiceImpl {
                 // No tool calls - add assistant message with just text (if any)
                 if !stream_result.text.is_empty() {
                     messages.push(CompletionMessage {
+                        reasoning_content: None,
                         role: "assistant".to_string(),
                         content: serde_json::Value::String(stream_result.text.clone()),
                         tool_call_id: None,
@@ -1564,6 +1570,7 @@ impl ResponseServiceImpl {
             };
 
             messages.push(CompletionMessage {
+                reasoning_content: None,
                 role: "assistant".to_string(),
                 content: serde_json::Value::String(stream_result.text.clone()),
                 tool_call_id: None,
@@ -1617,6 +1624,7 @@ impl ResponseServiceImpl {
                         // MCP tool requires approval - flush any deferred instructions before pausing
                         if !deferred_instructions.is_empty() {
                             messages.push(CompletionMessage {
+                                reasoning_content: None,
                                 role: "system".to_string(),
                                 content: serde_json::Value::String(
                                     std::mem::take(&mut deferred_instructions).join("\n\n"),
@@ -1639,6 +1647,7 @@ impl ResponseServiceImpl {
             if !pending_function_calls.is_empty() {
                 if !deferred_instructions.is_empty() {
                     messages.push(CompletionMessage {
+                        reasoning_content: None,
                         role: "system".to_string(),
                         content: serde_json::Value::String(
                             std::mem::take(&mut deferred_instructions).join("\n\n"),
@@ -1654,6 +1663,7 @@ impl ResponseServiceImpl {
             // This ensures tool results are consecutive (required by OpenAI/Anthropic/Gemini)
             if !deferred_instructions.is_empty() {
                 messages.push(CompletionMessage {
+                    reasoning_content: None,
                     role: "system".to_string(),
                     content: serde_json::Value::String(deferred_instructions.join("\n\n")),
                     tool_call_id: None,
@@ -1695,6 +1705,7 @@ impl ResponseServiceImpl {
             // This allows the LLM to see what went wrong and retry
             // Note: tool_call_id is required for the API to match results to calls
             messages.push(CompletionMessage {
+                reasoning_content: None,
                 role: "tool".to_string(),
                 content: serde_json::Value::String(format!(
                     "ERROR: {}\n\nPlease correct the tool call format and try again.",
@@ -1841,6 +1852,7 @@ impl ResponseServiceImpl {
         // Add tool result to message history with matching tool_call_id
         // This is REQUIRED by all providers for the agent loop to work correctly
         messages.push(CompletionMessage {
+            reasoning_content: None,
             role: "tool".to_string(),
             content: serde_json::Value::String(tool_content),
             tool_call_id: Some(tool_call_id),
@@ -2035,6 +2047,7 @@ impl ResponseServiceImpl {
 
             // Create tool result message with the function output
             messages.push(CompletionMessage {
+                reasoning_content: None,
                 role: "tool".to_string(),
                 content: serde_json::Value::String(output.to_string()),
                 tool_call_id: Some(call_id.to_string()),
@@ -2260,6 +2273,7 @@ impl ResponseServiceImpl {
         if let Some(prompt) = org_system_prompt {
             if !prompt.is_empty() {
                 messages.push(CompletionMessage {
+                    reasoning_content: None,
                     role: "system".to_string(),
                     content: serde_json::Value::String(prompt),
                     tool_call_id: None,
@@ -2285,6 +2299,7 @@ impl ResponseServiceImpl {
             let combined_instructions =
                 format!("{instructions}\n\n{language_instruction}\n\n{time_context}");
             messages.push(CompletionMessage {
+                reasoning_content: None,
                 role: "system".to_string(),
                 content: serde_json::Value::String(combined_instructions),
                 tool_call_id: None,
@@ -2294,6 +2309,7 @@ impl ResponseServiceImpl {
             // Add language instruction and time context as a system message if no instructions provided
             let system_content = format!("{language_instruction}\n\n{time_context}");
             messages.push(CompletionMessage {
+                reasoning_content: None,
                 role: "system".to_string(),
                 content: serde_json::Value::String(system_content),
                 tool_call_id: None,
@@ -2378,6 +2394,7 @@ impl ResponseServiceImpl {
                  msgs: &mut Vec<CompletionMessage>| {
                     if !pending.is_empty() {
                         msgs.push(CompletionMessage {
+                            reasoning_content: None,
                             role: "assistant".to_string(),
                             content: serde_json::Value::String(String::new()),
                             tool_call_id: None,
@@ -2448,6 +2465,7 @@ impl ResponseServiceImpl {
                         let text = text_parts.join("\n");
                         if !text.is_empty() {
                             messages.push(CompletionMessage {
+                                reasoning_content: None,
                                 role: role.clone(),
                                 content: serde_json::Value::String(text),
                                 tool_call_id: None,
@@ -2490,6 +2508,7 @@ impl ResponseServiceImpl {
                             &mut messages,
                         );
                         messages.push(CompletionMessage {
+                            reasoning_content: None,
                             role: "tool".to_string(),
                             content: serde_json::Value::String(output),
                             tool_call_id: Some(call_id),
@@ -2538,6 +2557,7 @@ impl ResponseServiceImpl {
                                 &mut messages,
                             );
                             messages.push(CompletionMessage {
+                                reasoning_content: None,
                                 role: "tool".to_string(),
                                 content: serde_json::Value::String(tool_output),
                                 tool_call_id: Some(tool_call_id),
@@ -2580,6 +2600,7 @@ impl ResponseServiceImpl {
                             &mut messages,
                         );
                         messages.push(CompletionMessage {
+                            reasoning_content: None,
                             role: "tool".to_string(),
                             content: serde_json::Value::String(
                                 "[tool result not stored]".to_string(),
@@ -2616,6 +2637,7 @@ impl ResponseServiceImpl {
             match input {
                 models::ResponseInput::Text(text) => {
                     messages.push(CompletionMessage {
+                        reasoning_content: None,
                         role: "user".to_string(),
                         content: serde_json::Value::String(text.clone()),
                         tool_call_id: None,
@@ -2641,6 +2663,7 @@ impl ResponseServiceImpl {
                                     }
                                 };
                                 messages.push(CompletionMessage {
+                                    reasoning_content: None,
                                     role: role.clone(),
                                     content,
                                     tool_call_id: None,
@@ -2968,6 +2991,7 @@ impl ResponseServiceImpl {
         organization_id: uuid::Uuid,
         workspace_id: uuid::Uuid,
         fallback_enabled: bool,
+        request_priority: inference_providers::models::RequestPriority,
         conversation_service: Arc<dyn ConversationServiceTrait>,
         completion_service: Arc<dyn CompletionServiceTrait>,
         tx: futures::channel::mpsc::UnboundedSender<models::ResponseStreamEvent>,
@@ -3040,6 +3064,7 @@ impl ResponseServiceImpl {
                 organization_id,
                 workspace_id,
                 fallback_enabled,
+                request_priority,
                 conversation_service,
                 completion_service,
                 tx,
@@ -3061,6 +3086,7 @@ impl ResponseServiceImpl {
         organization_id: uuid::Uuid,
         workspace_id: uuid::Uuid,
         fallback_enabled: bool,
+        request_priority: inference_providers::models::RequestPriority,
         conversation_service: Arc<dyn ConversationServiceTrait>,
         completion_service: Arc<dyn CompletionServiceTrait>,
         mut tx: futures::channel::mpsc::UnboundedSender<models::ResponseStreamEvent>,
@@ -3113,6 +3139,7 @@ impl ResponseServiceImpl {
             request_id,
             model: title_model,
             messages: vec![crate::completions::ports::CompletionMessage {
+                reasoning_content: None,
                 role: "user".to_string(),
                 content: serde_json::Value::String(title_prompt),
                 tool_call_id: None,
@@ -3128,6 +3155,7 @@ impl ResponseServiceImpl {
             organization_id,
             workspace_id,
             fallback_enabled,
+            request_priority,
             metadata: None,
             store: None,
             body_hash: String::new(),

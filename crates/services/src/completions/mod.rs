@@ -1,6 +1,7 @@
 pub mod ports;
 
 use crate::attestation::ports::AttestationServiceTrait;
+use crate::attestation::STREAM_SIGNATURE_STORE_TIMEOUT;
 use crate::inference_provider_pool::InferenceProviderPool;
 use crate::models::ModelsRepository;
 use crate::responses::models::ResponseId;
@@ -22,7 +23,6 @@ use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 use tracing::Instrument;
 
-const FINALIZE_TIMEOUT_SECS: u64 = 5;
 /// A raw provider terminal marker is only expected to contain `data: [DONE]`
 /// plus its SSE line ending. Bound it before accepting it as a signed terminal
 /// event so malformed padding cannot be retained or signed.
@@ -158,7 +158,7 @@ where
 {
     /// Finalize attestation handling before the route sends `[DONE]` to the client.
     /// This stores a provider signature when supported, otherwise releases the
-    /// provider-routing pin without publishing a signature.
+    /// provider-routing pin. The API route handles Gateway signatures separately.
     fn create_signature_future(&self) -> FinalizeFuture {
         let organization_id = self.organization_id;
         let model_id = self.model_id;
@@ -175,8 +175,8 @@ where
 
         // The provider pool pins every streamed chat that has a chat id, even
         // when the authoritative model record says it is non-attested. There is
-        // no signature to store in that case, but the normal EOF path still
-        // owns releasing the pin.
+        // no provider signature to collect in that case, but the normal EOF
+        // path still owns releasing the pin before the route signs public bytes.
         if !self.attestation_supported {
             return Box::pin(async move {
                 attestation_service
@@ -213,8 +213,8 @@ where
 
         Box::pin(async move {
             match tokio::time::timeout(
-                Duration::from_secs(FINALIZE_TIMEOUT_SECS),
-                attestation_service.store_chat_signature_from_provider(&chat_id),
+                STREAM_SIGNATURE_STORE_TIMEOUT,
+                attestation_service.store_stream_chat_signature_from_provider(&chat_id),
             )
             .await
             {
@@ -227,7 +227,7 @@ where
                         %organization_id,
                         %model_id,
                         "Timeout storing chat signature after {}s",
-                        FINALIZE_TIMEOUT_SECS
+                        STREAM_SIGNATURE_STORE_TIMEOUT.as_secs()
                     );
                     // The provider-store implementation normally unpins after
                     // it completes. A timeout cancels that future before its
@@ -816,14 +816,17 @@ fn compute_prefix_hash(messages: &[inference_providers::ChatMessage]) -> u64 {
 fn estimate_input_tokens(messages: &[inference_providers::ChatMessage]) -> u32 {
     let chars: usize = messages
         .iter()
-        .map(|m| match &m.content {
-            Some(serde_json::Value::String(s)) => s.len(),
-            Some(serde_json::Value::Array(parts)) => parts
-                .iter()
-                .filter_map(|p| p.get("text").and_then(|t| t.as_str()))
-                .map(|s| s.len())
-                .sum(),
-            _ => 0,
+        .map(|m| {
+            let content = match &m.content {
+                Some(serde_json::Value::String(s)) => s.len(),
+                Some(serde_json::Value::Array(parts)) => parts
+                    .iter()
+                    .filter_map(|p| p.get("text").and_then(|t| t.as_str()))
+                    .map(|s| s.len())
+                    .sum(),
+                _ => 0,
+            };
+            content + m.reasoning_content.as_ref().map_or(0, |r| r.len())
         })
         .sum();
     (chars / 4).max(1) as u32
@@ -1468,6 +1471,7 @@ impl CompletionServiceImpl {
                     name: None,
                     tool_call_id: msg.tool_call_id.clone(),
                     tool_calls,
+                    reasoning_content: msg.reasoning_content.clone(),
                 }
             })
             .collect()
@@ -1674,6 +1678,7 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
         Self::inject_tracing_headers(&mut extra, request_id, organization_id, workspace_id);
 
         let mut chat_params = inference_providers::ChatCompletionParams {
+            request_priority: request.request_priority,
             model: request.model.clone(),
             messages: chat_messages,
             max_tokens: request.max_tokens,
@@ -1706,6 +1711,7 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
             original_request: request.original_request.clone(),
             extra,
         };
+        chat_params.strip_client_priority();
 
         // Resolve model name (could be an alias) and get model details in a single DB call
         // This also validates that the model exists and is active
@@ -1858,6 +1864,7 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
         Self::inject_tracing_headers(&mut extra, request_id, organization_id, workspace_id);
 
         let mut chat_params = inference_providers::ChatCompletionParams {
+            request_priority: request.request_priority,
             model: request.model.clone(),
             messages: chat_messages,
             max_tokens: request.max_tokens,
@@ -1890,6 +1897,7 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
             original_request: request.original_request.clone(),
             extra,
         };
+        chat_params.strip_client_priority();
 
         // Resolve model name (could be an alias) and get model details in a single DB call
         // This also validates that the model exists and is active
@@ -3796,8 +3804,10 @@ mod tests {
 
     fn chat_params_for_compat_tests(model: &str) -> inference_providers::ChatCompletionParams {
         inference_providers::ChatCompletionParams {
+            request_priority: 0,
             model: model.to_string(),
             messages: vec![inference_providers::ChatMessage {
+                reasoning_content: None,
                 role: inference_providers::MessageRole::User,
                 content: Some(serde_json::json!("hi")),
                 name: None,

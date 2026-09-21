@@ -70,6 +70,7 @@ fn reporting_usage_cursor_restores_omitted_context_and_rejects_conflicts() {
         model: Some("test-model".to_string()),
         inference_type: Some("chat_completion".to_string()),
         service_name: Some("web_search".to_string()),
+        credit_type: Some("GRANT".to_string()),
         limit: Some(1),
         cursor: None,
     })
@@ -101,8 +102,22 @@ fn reporting_usage_cursor_restores_omitted_context_and_rejects_conflicts() {
     assert_eq!(continuation.model, first_page.model);
     assert_eq!(continuation.inference_type, first_page.inference_type);
     assert_eq!(continuation.service_name, first_page.service_name);
+    assert_eq!(continuation.credit_type, first_page.credit_type);
+
+    let repeated_mixed_case = ReportingUsageQuery::try_from(ReportingUsageQueryParams {
+        credit_type: Some("GRANT".to_string()),
+        cursor: Some(cursor.clone()),
+        ..ReportingUsageQueryParams::default()
+    })
+    .unwrap();
+    assert_eq!(repeated_mixed_case.credit_type.as_deref(), Some("grant"));
 
     // When/Then: explicitly changing any bound context invalidates the cursor.
+    let conflicting_credit_type = ReportingUsageQueryParams {
+        credit_type: Some("payment".to_string()),
+        cursor: Some(cursor.clone()),
+        ..ReportingUsageQueryParams::default()
+    };
     let conflicting_source = ReportingUsageQueryParams {
         source: Some("service".to_string()),
         cursor: Some(cursor.clone()),
@@ -118,7 +133,12 @@ fn reporting_usage_cursor_restores_omitted_context_and_rejects_conflicts() {
         cursor: Some(cursor),
         ..ReportingUsageQueryParams::default()
     };
-    for params in [conflicting_source, conflicting_start, conflicting_workspace] {
+    for params in [
+        conflicting_credit_type,
+        conflicting_source,
+        conflicting_start,
+        conflicting_workspace,
+    ] {
         assert!(matches!(
             ReportingUsageQuery::try_from(params),
             Err(ReportingUsageQueryError::InvalidCursor)
@@ -189,6 +209,10 @@ fn reporting_usage_query_rejects_invalid_range_source_and_cursor() {
         source: Some("database".to_string()),
         ..ReportingUsageQueryParams::default()
     };
+    let bad_credit_type = ReportingUsageQueryParams {
+        credit_type: Some("bogus".to_string()),
+        ..ReportingUsageQueryParams::default()
+    };
     let excessive_limit = ReportingUsageQueryParams {
         limit: Some(1001),
         ..ReportingUsageQueryParams::default()
@@ -219,6 +243,10 @@ fn reporting_usage_query_rejects_invalid_range_source_and_cursor() {
     assert!(matches!(
         ReportingUsageQuery::try_from(bad_source),
         Err(ReportingUsageQueryError::InvalidSource(_))
+    ));
+    assert!(matches!(
+        ReportingUsageQuery::try_from(bad_credit_type),
+        Err(ReportingUsageQueryError::InvalidCreditType(_))
     ));
     assert!(matches!(
         ReportingUsageQuery::try_from(excessive_limit),
@@ -266,6 +294,10 @@ fn reporting_usage_query_manual_codec_serializes_response_and_cursor() {
             api_key_id,
             total_cost_nano_usd: 42,
             total_cost_usd: Some("$0.000000042".to_string()),
+            credit_allocations: None,
+            funded_amount: None,
+            unfunded_amount: None,
+            allocation_policy_version: None,
             usage: ReportingUsageDetails::Inference {
                 inference: ReportingInferenceUsage {
                     model: "test-model".to_string(),

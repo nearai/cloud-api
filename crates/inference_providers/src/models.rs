@@ -14,6 +14,23 @@ pub struct ChatMessage {
     pub tool_call_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_calls: Option<Vec<ToolCall>>,
+    /// Prior-turn reasoning echoed by the client (`reasoning_content`) so a
+    /// thinking model can continue its chain of thought across tool calls.
+    /// Serialized verbatim for OpenAI-compatible open-model engines
+    /// (vLLM/SGLang, Chutes); see `strip_reasoning_content` for upstreams
+    /// with strict message schemas.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_content: Option<String>,
+}
+
+/// Drop `reasoning_content` from every message before sending to an upstream
+/// whose message schema rejects unknown properties (OpenAI/Azure-style
+/// `openai_compatible` externals). Self-hosted and attested engines keep it:
+/// interleaved thinking across tool calls depends on it.
+pub fn strip_reasoning_content(messages: &mut [ChatMessage]) {
+    for msg in messages.iter_mut() {
+        msg.reasoning_content = None;
+    }
 }
 
 /// Remove every `cache_control` breakpoint from a chat message's content parts.
@@ -100,7 +117,7 @@ pub struct ToolCall {
     pub index: Option<i64>,
     /// Thought signature for Gemini 3 models (required for tool calls to work correctly)
     /// Only included if the model returned one - older models don't use this
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(flatten, with = "crate::thought_signature")]
     pub thought_signature: Option<String>,
 }
 
@@ -116,8 +133,8 @@ pub struct ToolCallDelta {
     pub index: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub function: Option<FunctionCallDelta>,
-    /// Thought signature for Gemini 3 models (internal use only, not exposed to clients)
-    #[serde(skip_serializing_if = "Option::is_none")]
+    /// Thought signature for Gemini tool-call replay, emitted in both wire formats
+    #[serde(flatten, with = "crate::thought_signature")]
     pub thought_signature: Option<String>,
 }
 
@@ -202,9 +219,17 @@ pub enum ChatServiceTier {
     Priority,
 }
 
+/// Operator scheduler priority, in the inclusive range -1000..=1000; default 0.
+/// Higher values run first. The organization admin service and database CHECK
+/// validate writes; request paths carry the value loaded from that column.
+pub type RequestPriority = i32;
+
 /// Parameters for chat completion requests (matches OpenAI API)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChatCompletionParams {
+    /// Operator-controlled scheduler priority. Never accepted from or exposed in JSON.
+    #[serde(skip)]
+    pub request_priority: RequestPriority,
     /// Model ID to use for the completion
     pub model: String,
 
@@ -305,6 +330,23 @@ pub struct ChatCompletionParams {
 
     #[serde(flatten)]
     pub extra: std::collections::HashMap<String, serde_json::Value>,
+}
+
+impl ChatCompletionParams {
+    /// Customer JSON cannot select scheduler policy, including in adapters
+    /// that use the original request sidecar. Preserve unrelated provider fields.
+    pub fn strip_client_priority(&mut self) {
+        self.extra.remove("priority");
+        self.extra.remove("request_priority");
+        if let Some(original) = self
+            .original_request
+            .as_mut()
+            .and_then(|value| value.as_object_mut())
+        {
+            original.remove("priority");
+            original.remove("request_priority");
+        }
+    }
 }
 
 /// Parameters for text completion requests (legacy OpenAI API)
@@ -1457,6 +1499,7 @@ mod tests {
     #[test]
     fn test_strip_cache_control_removes_breakpoints_from_parts() {
         let mut messages = vec![ChatMessage {
+            reasoning_content: None,
             role: MessageRole::User,
             content: Some(serde_json::json!([
                 {
@@ -1489,11 +1532,44 @@ mod tests {
         assert!(json.contains("https://example.com/a.png"));
     }
 
+    /// Prior-turn reasoning must reach OpenAI-compatible open-model engines
+    /// verbatim (thinking models continue across tool calls only then), and
+    /// must be absent for upstreams with strict message schemas.
+    #[test]
+    fn test_reasoning_content_serializes_and_strips() {
+        let mut messages = vec![ChatMessage {
+            role: MessageRole::Assistant,
+            content: None,
+            name: None,
+            tool_call_id: None,
+            tool_calls: None,
+            reasoning_content: Some("The secret word is xylophone".to_string()),
+        }];
+        let json = serde_json::to_string(&messages).unwrap();
+        assert!(
+            json.contains("\"reasoning_content\":\"The secret word is xylophone\""),
+            "{json}"
+        );
+
+        strip_reasoning_content(&mut messages);
+        let json = serde_json::to_string(&messages).unwrap();
+        assert!(!json.contains("reasoning_content"), "{json}");
+
+        // Absent → omitted on the wire (byte-identical to before the field existed).
+        let plain: ChatMessage = serde_json::from_str(r#"{"role":"user","content":"hi"}"#).unwrap();
+        assert!(plain.reasoning_content.is_none());
+        assert_eq!(
+            serde_json::to_string(&plain).unwrap(),
+            r#"{"role":"user","content":"hi"}"#
+        );
+    }
+
     /// String content never carries a breakpoint and must be left untouched, so
     /// the common (uncached / string-content) request stays byte-identical.
     #[test]
     fn test_strip_cache_control_leaves_string_content_untouched() {
         let original = ChatMessage {
+            reasoning_content: None,
             role: MessageRole::User,
             content: Some(serde_json::Value::String("Hello".to_string())),
             name: None,

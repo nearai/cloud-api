@@ -62,9 +62,11 @@ pub mod chunk_builder;
 pub mod mock;
 pub mod models;
 pub mod non_attested;
+pub mod responses_raw;
 pub mod rotation;
 pub mod spki_verifier;
 pub mod sse_parser;
+pub mod thought_signature;
 
 // Attested NEAR-AI fleet provider. Use the module path (`nearai::Provider`,
 // `nearai::Config`) rather than a bare re-export to keep the names unambiguous.
@@ -85,6 +87,7 @@ pub use anthropic_raw::{
 };
 pub use mock::MockProvider;
 pub use models::strip_cache_control;
+pub use models::strip_reasoning_content;
 pub use models::{
     is_client_audio_input_status, AudioOutput, AudioTranscriptionError, AudioTranscriptionParams,
     AudioTranscriptionResponse, ChatCompletionParams, ChatCompletionResponse,
@@ -343,6 +346,20 @@ pub trait InferenceProvider {
         extra: std::collections::HashMap<String, serde_json::Value>,
     ) -> Result<bytes::Bytes, PrivacyClassifyError>;
 
+    /// Native stateless Responses transport, deliberately separate from chat.
+    async fn responses_raw(
+        &self,
+        _body: serde_json::Value,
+    ) -> Result<responses_raw::ResponsesRawResponse, CompletionError> {
+        Err(CompletionError::CompletionError(
+            "Native Responses is unavailable for this provider".into(),
+        ))
+    }
+
+    fn supports_responses_raw(&self) -> bool {
+        false
+    }
+
     /// Performs a native Anthropic Messages request without schema conversion.
     ///
     /// Implementations must preserve the upstream status, response headers, and
@@ -417,6 +434,14 @@ pub trait InferenceProvider {
     /// that masks the primary's failure and suppresses its retry.
     fn supports_client_e2ee(&self) -> bool {
         true
+    }
+
+    /// Whether this provider can enforce this public-key routing constraint
+    /// during per-request backend discovery, without a pool signing-key entry.
+    /// Returning true only accepts the key's format: the provider MUST select
+    /// and verify a backend with that exact key, or fail closed, on every attempt.
+    fn supports_per_request_pubkey_routing(&self, _public_key: &str) -> bool {
+        false
     }
 
     /// Clean up the dedicated client for a chat_id after signature fetching.

@@ -7,7 +7,7 @@ use uuid::Uuid;
 
 pub(super) enum ExportRow {
     Inference(Box<InferenceUsageReportRow>),
-    Service(ServiceUsageReportEntry),
+    Service(Box<ServiceUsageReportEntry>),
 }
 
 impl ExportRow {
@@ -41,7 +41,7 @@ impl From<ExportRow> for ReportingUsageExportRow {
     fn from(row: ExportRow) -> Self {
         match row {
             ExportRow::Inference(row) => inference_export_row(*row),
-            ExportRow::Service(row) => service_export_row(row),
+            ExportRow::Service(row) => service_export_row(*row),
         }
     }
 }
@@ -54,6 +54,10 @@ fn inference_export_row(row: InferenceUsageReportRow) -> ReportingUsageExportRow
         api_key_id: row.api_key_id,
         total_cost_nano_usd: row.total_cost_nano_usd,
         total_cost_usd: None,
+        credit_allocations: row.credit_allocations,
+        funded_amount: row.funded_amount,
+        unfunded_amount: row.unfunded_amount,
+        allocation_policy_version: row.allocation_policy_version,
         usage: ReportingUsageDetails::Inference {
             inference: ReportingInferenceUsage {
                 model: row.model,
@@ -82,6 +86,10 @@ fn service_export_row(row: ServiceUsageReportEntry) -> ReportingUsageExportRow {
         api_key_id: row.api_key_id,
         total_cost_nano_usd: row.total_cost,
         total_cost_usd: None,
+        credit_allocations: row.credit_allocations,
+        funded_amount: row.funded_amount,
+        unfunded_amount: row.unfunded_amount,
+        allocation_policy_version: row.allocation_policy_version,
         usage: ReportingUsageDetails::Service {
             service: ReportingServiceUsage {
                 service_name: row.service_name,

@@ -5,26 +5,28 @@ use crate::conversions::{
 };
 use crate::middleware::AdminUser;
 use crate::models::{
-    AdminAccessTokenResponse, AdminAmlAllowlistEntryResponse, AdminAmlReportResponse,
-    AdminInvitationEmailResendResultResponse, AdminModelListResponse, AdminModelWithPricing,
-    AdminOrganizationMemberResponse, AdminOrganizationResponse, AdminServiceResponse,
-    AdminUserOrganizationDetails, AdminUserResponse, BatchUpdateModelApiRequest,
-    CreateAdminAccessTokenRequest, CreateServiceRequest, CreditType, DecimalPrice,
-    DecimalPriceRequest, DeleteAdminAccessTokenRequest, DeleteModelRequest, DeprecateModelRequest,
-    DeprecateModelResponse, ErrorResponse, GetOrganizationConcurrentLimitResponse,
+    AdminAccessTokenPermission, AdminAccessTokenResponse, AdminAmlAllowlistEntryResponse,
+    AdminAmlReportResponse, AdminInvitationEmailResendResultResponse, AdminModelListResponse,
+    AdminModelWithPricing, AdminOrganizationMemberResponse, AdminOrganizationResponse,
+    AdminServiceResponse, AdminUserOrganizationDetails, AdminUserResponse,
+    BatchUpdateModelApiRequest, CreateAdminAccessTokenRequest, CreateServiceRequest, CreditType,
+    DecimalPrice, DecimalPriceRequest, DeleteAdminAccessTokenRequest, DeleteModelRequest,
+    DeprecateModelRequest, DeprecateModelResponse, ErrorResponse,
+    GetOrganizationConcurrentLimitResponse, ListAdminAccessTokensResponse,
     ListAdminAmlAllowlistResponse, ListAdminAmlReportsResponse,
     ListAdminInvitationEmailDeliveriesResponse, ListAdminOrganizationMembersResponse,
     ListOrganizationsAdminResponse, ListPricingChangesResponse, ListUsersResponse, MemberRole,
     ModelArchitecture, ModelDeprecationConfirmResponse, ModelDeprecationPreviewResponse,
     ModelDeprecationRequest, ModelHistoryEntry, ModelHistoryResponse, ModelMetadata,
     ModelWithPricing, OrgLimitsHistoryEntry, OrgLimitsHistoryResponse,
-    OrganizationFallbackResponse, OrganizationMemberResponse, OrganizationUsage,
-    PricingChangeBatchRequest, PricingChangeConfirmResponse, PricingChangeModelPreviewDto,
-    PricingChangePreviewResponse, PricingFieldUpdates, PricingFields, ScheduledPricingChangeDto,
-    SpendLimit, UpdateAmlReportStatusRequest, UpdateOrganizationConcurrentLimitRequest,
-    UpdateOrganizationConcurrentLimitResponse, UpdateOrganizationFallbackRequest,
-    UpdateOrganizationLimitsRequest, UpdateOrganizationLimitsResponse,
-    UpdateOrganizationMemberRequest, UpdateServiceRequest, UpsertAmlAllowlistEntryRequest,
+    OrganizationFallbackResponse, OrganizationMemberResponse, OrganizationPriorityResponse,
+    OrganizationUsage, PricingChangeBatchRequest, PricingChangeConfirmResponse,
+    PricingChangeModelPreviewDto, PricingChangePreviewResponse, PricingFieldUpdates, PricingFields,
+    ScheduledPricingChangeDto, SpendLimit, UpdateAmlReportStatusRequest,
+    UpdateOrganizationConcurrentLimitRequest, UpdateOrganizationConcurrentLimitResponse,
+    UpdateOrganizationFallbackRequest, UpdateOrganizationLimitsRequest,
+    UpdateOrganizationLimitsResponse, UpdateOrganizationMemberRequest,
+    UpdateOrganizationPriorityRequest, UpdateServiceRequest, UpsertAmlAllowlistEntryRequest,
 };
 use crate::routes::common::format_amount;
 use crate::routes::usage::{compute_organization_balance_response, OrganizationBalanceResponse};
@@ -547,6 +549,29 @@ pub async fn batch_upsert_models(
 
     // Validate all pricing fields are non-negative to prevent incorrect billing
     for (model_name, request) in &batch_request {
+        if let Some(config) = &request.provider_config {
+            // Backend-less configs belong to non-external features such as
+            // long-context routing. The service layer repeats this validation
+            // against the merged stored provider type, which covers partial
+            // updates that omit `providerType`.
+            if request.provider_type.as_deref() == Some("external")
+                || config.get("backend").is_some()
+                || config.get("enforced_request_body").is_some()
+            {
+                inference_providers::non_attested::external::validate_external_provider_config(
+                    config,
+                )
+                .map_err(|error| {
+                    (
+                        StatusCode::BAD_REQUEST,
+                        ResponseJson(ErrorResponse::new(
+                            format!("model '{model_name}': {error}"),
+                            "invalid_request".to_string(),
+                        )),
+                    )
+                })?;
+            }
+        }
         let validate_price = |price: &Option<DecimalPriceRequest>, field: &str| {
             if let Some(p) = price {
                 p.validate().map_err(|e| {
@@ -874,6 +899,20 @@ pub async fn batch_upsert_models(
             );
     }
 
+    if batch_request.values().any(|request| {
+        request.provider_type.is_some()
+            || request.provider_config.is_some()
+            || request.inference_url.is_some()
+            || request.is_active.is_some()
+    }) {
+        // The database write is complete. Prevent an older periodic snapshot
+        // from replacing or removing the provider state reconciled below.
+        app_state
+            .inference_provider_pool
+            .invalidate_periodic_provider_refreshes()
+            .await;
+    }
+
     // Update providers at runtime so changes take effect without server restart.
     // Unregister first, then re-register — this handles type transitions
     // (e.g., inference_url → external) and deactivations cleanly.
@@ -968,11 +1007,12 @@ pub async fn batch_upsert_models(
     let external_models: Vec<(String, serde_json::Value)> = batch_request
         .iter()
         .filter_map(|(model_name, request)| {
-            let is_external = request.provider_type.as_deref() == Some("external");
-            let is_active = request.is_active != Some(false);
-
-            if is_external && is_active {
-                request
+            let merged = updated_models.get(model_name)?;
+            let touches_registration = request.provider_type.is_some()
+                || request.provider_config.is_some()
+                || request.is_active.is_some();
+            if merged.provider_type == "external" && merged.is_active && touches_registration {
+                merged
                     .provider_config
                     .clone()
                     .map(|config| (model_name.clone(), config))
@@ -2636,6 +2676,74 @@ pub async fn list_organizations(
     Ok(ResponseJson(response))
 }
 
+/// Get an organization's scheduler priority (platform admins only).
+#[utoipa::path(
+    get,
+    path = "/v1/admin/organizations/{org_id}/priority",
+    tag = "Admin",
+    params(("org_id" = Uuid, Path, description = "Organization ID")),
+    responses(
+        (status = 200, description = "Scheduler priority retrieved", body = OrganizationPriorityResponse),
+        (status = 401, description = "Unauthorized", body = ErrorResponse),
+        (status = 403, description = "Forbidden", body = ErrorResponse),
+        (status = 404, description = "Organization not found", body = ErrorResponse)
+    ),
+    security(("session_token" = []))
+)]
+pub async fn get_organization_priority(
+    State(app_state): State<AdminAppState>,
+    Extension(_admin_user): Extension<AdminUser>,
+    Path(org_id): Path<Uuid>,
+) -> Result<ResponseJson<OrganizationPriorityResponse>, (StatusCode, ResponseJson<ErrorResponse>)> {
+    let priority = app_state
+        .organization_service
+        .get_request_priority_for_admin(services::organization::OrganizationId(org_id))
+        .await
+        .map_err(crate::routes::common::map_organization_error)?;
+    Ok(ResponseJson(OrganizationPriorityResponse {
+        organization_id: org_id,
+        priority,
+    }))
+}
+
+/// Set an organization's scheduler priority (platform admins with write access only).
+#[utoipa::path(
+    patch,
+    path = "/v1/admin/organizations/{org_id}/priority",
+    tag = "Admin",
+    params(("org_id" = Uuid, Path, description = "Organization ID")),
+    request_body = UpdateOrganizationPriorityRequest,
+    responses(
+        (status = 200, description = "Scheduler priority updated", body = OrganizationPriorityResponse),
+        (status = 400, description = "Priority outside -1000..1000", body = ErrorResponse),
+        (status = 401, description = "Unauthorized", body = ErrorResponse),
+        (status = 403, description = "Forbidden", body = ErrorResponse),
+        (status = 404, description = "Organization not found", body = ErrorResponse)
+    ),
+    security(("session_token" = []))
+)]
+pub async fn update_organization_priority(
+    State(app_state): State<AdminAppState>,
+    Extension(admin_user): Extension<AdminUser>,
+    Path(org_id): Path<Uuid>,
+    Json(request): Json<UpdateOrganizationPriorityRequest>,
+) -> Result<ResponseJson<OrganizationPriorityResponse>, (StatusCode, ResponseJson<ErrorResponse>)> {
+    let priority = app_state
+        .organization_service
+        .update_request_priority_for_admin(
+            services::organization::OrganizationId(org_id),
+            request.priority,
+        )
+        .await
+        .map_err(crate::routes::common::map_organization_error)?;
+    tracing::info!(organization_id = %org_id, actor_id = %admin_user.0.id,
+        actor_type = "platform_admin", priority, "Organization request priority changed");
+    Ok(ResponseJson(OrganizationPriorityResponse {
+        organization_id: org_id,
+        priority,
+    }))
+}
+
 /// Get an organization's effective fallback policy (Admin only).
 #[utoipa::path(
     get,
@@ -3286,6 +3394,8 @@ pub async fn update_service(
         (status = 200, description = "Admin access token created successfully", body = AdminAccessTokenResponse),
         (status = 400, description = "Invalid request", body = ErrorResponse),
         (status = 401, description = "Unauthorized", body = ErrorResponse),
+        (status = 503, description = "Read-only token issuance is disabled during rollout", body = ErrorResponse),
+        (status = 422, description = "Request deserialization failed (including invalid permission values)"),
         (status = 500, description = "Internal server error", body = ErrorResponse)
     ),
     security(
@@ -3323,6 +3433,18 @@ pub async fn create_admin_access_token(
         ));
     }
 
+    if request_body.permission == AdminAccessTokenPermission::ReadOnly
+        && !app_state.config.auth.admin_read_only_tokens_enabled
+    {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            ResponseJson(ErrorResponse::new(
+                "Read-only admin token issuance is not enabled".to_string(),
+                "read_only_token_issuance_disabled".to_string(),
+            )),
+        ));
+    }
+
     // Create admin access token directly in database
     let expires_at = Utc::now() + chrono::Duration::hours(request_body.expires_in_hours);
 
@@ -3334,6 +3456,7 @@ pub async fn create_admin_access_token(
             request_body.reason,
             expires_at,
             user_agent,
+            request_body.permission.into(),
         )
         .await
     {
@@ -3352,6 +3475,7 @@ pub async fn create_admin_access_token(
                 expires_at: admin_token.expires_at,
                 name: admin_token.name,
                 reason: admin_token.creation_reason,
+                permission: admin_token.permission.into(),
             };
 
             Ok(ResponseJson(response))
@@ -3382,7 +3506,7 @@ pub async fn create_admin_access_token(
         ("offset" = Option<i64>, Query, description = "Number of records to skip (default: 0)")
     ),
     responses(
-        (status = 200, description = "Admin access tokens retrieved successfully"),
+        (status = 200, description = "Admin access tokens retrieved successfully", body = ListAdminAccessTokensResponse),
         (status = 401, description = "Unauthorized", body = ErrorResponse),
         (status = 500, description = "Internal server error", body = ErrorResponse)
     ),
@@ -3394,7 +3518,8 @@ pub async fn list_admin_access_tokens(
     State(app_state): State<AdminAppState>,
     Extension(admin_user): Extension<AdminUser>, // Require admin auth
     axum::extract::Query(params): axum::extract::Query<ListUsersQueryParams>,
-) -> Result<ResponseJson<serde_json::Value>, (StatusCode, ResponseJson<ErrorResponse>)> {
+) -> Result<ResponseJson<ListAdminAccessTokensResponse>, (StatusCode, ResponseJson<ErrorResponse>)>
+{
     crate::routes::common::validate_limit_offset(params.limit, params.offset)?;
 
     debug!(
@@ -3416,12 +3541,12 @@ pub async fn list_admin_access_tokens(
                 .await
                 .unwrap_or(0);
 
-            let response = serde_json::json!({
-                "data": tokens,
-                "limit": params.limit,
-                "offset": params.offset,
-                "total": total
-            });
+            let response = ListAdminAccessTokensResponse {
+                data: tokens.into_iter().map(Into::into).collect(),
+                limit: params.limit,
+                offset: params.offset,
+                total,
+            };
 
             Ok(ResponseJson(response))
         }
@@ -3600,6 +3725,37 @@ pub struct MetricsQueryParams {
     pub end: Option<String>,
 }
 
+const CREDIT_TYPE_QUERY_DESCRIPTION: &str = "Filter consumed inference usage by grant, staking_farm, payment, or postpay. Costs include only saved matching allocations, including settlements. Each matching request and its full tokens count once; counts are not additive across credit types. Unattributed historical usage is excluded. Period totals may increase until outstanding unfunded usage is settled. Omit for all usage.";
+
+#[derive(Debug, serde::Deserialize)]
+pub struct OrganizationMetricsQueryParams {
+    #[serde(flatten)]
+    pub metrics: MetricsQueryParams,
+    /// Optional saved credit allocation type: grant, staking_farm, payment, or postpay.
+    pub credit_type: Option<String>,
+}
+
+fn parse_metrics_credit_type(
+    value: Option<&str>,
+) -> Result<Option<String>, (StatusCode, ResponseJson<ErrorResponse>)> {
+    value
+        .map(|value| {
+            value
+                .parse::<CreditType>()
+                .map(|kind| kind.as_str().to_string())
+                .map_err(|_| {
+                    (
+                        StatusCode::BAD_REQUEST,
+                        ResponseJson(ErrorResponse::new(
+                            format!("invalid credit_type: {value}"),
+                            "invalid_request".to_string(),
+                        )),
+                    )
+                })
+        })
+        .transpose()
+}
+
 /// Get organization metrics (Admin only)
 ///
 /// Returns usage metrics for an organization including summary totals,
@@ -3611,7 +3767,8 @@ pub struct MetricsQueryParams {
     params(
         ("org_id" = String, Path, description = "Organization ID to get metrics for"),
         ("start" = Option<String>, Query, description = "Start of time range (ISO 8601). Defaults to 30 days ago."),
-        ("end" = Option<String>, Query, description = "End of time range (ISO 8601). Defaults to now.")
+        ("end" = Option<String>, Query, description = "End of time range (ISO 8601). Defaults to now."),
+        ("credit_type" = Option<CreditType>, Query, description = CREDIT_TYPE_QUERY_DESCRIPTION)
     ),
     responses(
         (status = 200, description = "Organization metrics retrieved successfully"),
@@ -3627,15 +3784,18 @@ pub struct MetricsQueryParams {
 pub async fn get_organization_metrics(
     State(app_state): State<AdminAppState>,
     Path(org_id): Path<String>,
-    Query(params): Query<MetricsQueryParams>,
+    Query(params): Query<OrganizationMetricsQueryParams>,
     Extension(_admin_user): Extension<AdminUser>,
 ) -> Result<
     ResponseJson<services::admin::OrganizationMetrics>,
     (StatusCode, ResponseJson<ErrorResponse>),
 > {
+    let credit_type = parse_metrics_credit_type(params.credit_type.as_deref())?;
+
     debug!(
+        credit_type = ?credit_type,
         "Get organization metrics request for org_id: {}, start: {:?}, end: {:?}",
-        org_id, params.start, params.end
+        org_id, params.metrics.start, params.metrics.end
     );
 
     // Parse organization ID
@@ -3651,12 +3811,14 @@ pub async fn get_organization_metrics(
 
     // Parse time range with defaults
     let end = params
+        .metrics
         .end
         .and_then(|s| chrono::DateTime::parse_from_rfc3339(&s).ok())
         .map(|dt| dt.with_timezone(&Utc))
         .unwrap_or_else(Utc::now);
 
     let start = params
+        .metrics
         .start
         .and_then(|s| chrono::DateTime::parse_from_rfc3339(&s).ok())
         .map(|dt| dt.with_timezone(&Utc))
@@ -3665,7 +3827,7 @@ pub async fn get_organization_metrics(
     // Get metrics from analytics service
     let metrics = app_state
         .analytics_service
-        .get_organization_metrics(organization_id, start, end)
+        .get_organization_metrics(organization_id, start, end, credit_type.as_deref())
         .await
         .map_err(|e| {
             error!("Failed to get organization metrics, error: {:?}", e);
@@ -4106,6 +4268,14 @@ pub struct TimeSeriesQueryParams {
     pub granularity: String,
 }
 
+#[derive(Debug, serde::Deserialize)]
+pub struct OrganizationTimeSeriesQueryParams {
+    #[serde(flatten)]
+    pub metrics: TimeSeriesQueryParams,
+    /// Optional saved credit allocation type: grant, staking_farm, payment, or postpay.
+    pub credit_type: Option<String>,
+}
+
 fn default_granularity() -> String {
     "day".to_string()
 }
@@ -4339,7 +4509,8 @@ pub async fn get_revenue_density(
         ("org_id" = String, Path, description = "Organization ID to get metrics for"),
         ("start" = Option<String>, Query, description = "Start of time range (ISO 8601). Defaults to 30 days ago."),
         ("end" = Option<String>, Query, description = "End of time range (ISO 8601). Defaults to now."),
-        ("granularity" = Option<String>, Query, description = "Time granularity: hour, day (default), or week")
+        ("granularity" = Option<String>, Query, description = "Time granularity: hour, day (default), or week"),
+        ("credit_type" = Option<CreditType>, Query, description = CREDIT_TYPE_QUERY_DESCRIPTION)
     ),
     responses(
         (status = 200, description = "Time series metrics retrieved successfully"),
@@ -4355,15 +4526,18 @@ pub async fn get_revenue_density(
 pub async fn get_organization_timeseries(
     State(app_state): State<AdminAppState>,
     Path(org_id): Path<String>,
-    Query(params): Query<TimeSeriesQueryParams>,
+    Query(params): Query<OrganizationTimeSeriesQueryParams>,
     Extension(_admin_user): Extension<AdminUser>,
 ) -> Result<
     ResponseJson<services::admin::TimeSeriesMetrics>,
     (StatusCode, ResponseJson<ErrorResponse>),
 > {
+    let credit_type = parse_metrics_credit_type(params.credit_type.as_deref())?;
+
     debug!(
+        credit_type = ?credit_type,
         "Get organization timeseries request for org_id: {}, start: {:?}, end: {:?}, granularity: {}",
-        org_id, params.start, params.end, params.granularity
+        org_id, params.metrics.start, params.metrics.end, params.metrics.granularity
     );
 
     // Parse organization ID
@@ -4378,8 +4552,8 @@ pub async fn get_organization_timeseries(
     })?;
 
     // Validate granularity
-    let granularity = match params.granularity.as_str() {
-        "hour" | "day" | "week" => params.granularity.as_str(),
+    let granularity = match params.metrics.granularity.as_str() {
+        "hour" | "day" | "week" => params.metrics.granularity.as_str(),
         _ => {
             return Err((
                 StatusCode::BAD_REQUEST,
@@ -4393,8 +4567,8 @@ pub async fn get_organization_timeseries(
 
     // Parse time range — hard error on bad input, 366-day cap for non-hour granularities
     let (start, end) = crate::routes::common::parse_metrics_range(
-        params.start.as_deref(),
-        params.end.as_deref(),
+        params.metrics.start.as_deref(),
+        params.metrics.end.as_deref(),
         Some(granularity),
         31,
     )?;
@@ -4402,7 +4576,13 @@ pub async fn get_organization_timeseries(
     // Get timeseries from analytics service
     let metrics = app_state
         .analytics_service
-        .get_organization_timeseries(organization_id, start, end, granularity)
+        .get_organization_timeseries(
+            organization_id,
+            start,
+            end,
+            granularity,
+            credit_type.as_deref(),
+        )
         .await
         .map_err(|e| {
             error!("Failed to get organization timeseries, error: {:?}", e);

@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 use services::usage::InferenceType;
 use uuid::Uuid;
 
-const REPORTING_USAGE_CURSOR_VERSION: u8 = 3;
+const REPORTING_USAGE_CURSOR_VERSION: u8 = 4;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReportingUsageCursor {
@@ -43,6 +43,7 @@ impl ReportingUsageCursor {
                 model: query.model.clone(),
                 inference_type: query.inference_type,
                 service_name: query.service_name.clone(),
+                credit_type: query.credit_type.clone(),
             },
         })
     }
@@ -106,6 +107,7 @@ impl ReportingUsageCursor {
         end_time: Option<DateTime<Utc>>,
         source: Option<ReportingUsageSource>,
         inference_type: Option<InferenceType>,
+        credit_type: Option<&str>,
     ) -> Result<ReportingUsageCursorFilters, ReportingUsageQueryError> {
         let context = &self.context;
         let conflicts = start_time.is_some_and(|value| value != context.start_time)
@@ -125,7 +127,8 @@ impl ReportingUsageCursor {
             || params
                 .service_name
                 .as_deref()
-                .is_some_and(|value| context.service_name.as_deref() != Some(value));
+                .is_some_and(|value| context.service_name.as_deref() != Some(value))
+            || credit_type.is_some_and(|value| context.credit_type.as_deref() != Some(value));
         if conflicts {
             return Err(ReportingUsageQueryError::InvalidCursor);
         }
@@ -163,6 +166,7 @@ struct ReportingUsageCursorContext {
     model: Option<String>,
     inference_type: Option<InferenceType>,
     service_name: Option<String>,
+    credit_type: Option<String>,
 }
 
 impl ReportingUsageCursorContext {
@@ -176,6 +180,7 @@ impl ReportingUsageCursorContext {
             model: self.model.clone(),
             inference_type: self.inference_type,
             service_name: self.service_name.clone(),
+            credit_type: self.credit_type.clone(),
         }
     }
 }
@@ -189,4 +194,5 @@ pub(super) struct ReportingUsageCursorFilters {
     pub model: Option<String>,
     pub inference_type: Option<InferenceType>,
     pub service_name: Option<String>,
+    pub credit_type: Option<String>,
 }

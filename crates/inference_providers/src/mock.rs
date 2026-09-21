@@ -676,8 +676,12 @@ impl MockExpectationBuilder {
     }
 }
 
+type ResponsesHandler =
+    Arc<dyn Fn(serde_json::Value) -> crate::responses_raw::ResponsesRawResponse + Send + Sync>;
+
 /// Mock provider that implements InferenceProvider for testing
 pub struct MockProvider {
+    responses_handler: Option<ResponsesHandler>,
     /// List of available mock models
     models: Vec<ModelInfo>,
     /// Map of chat_id to (request_hash, response_hash) for signature generation
@@ -686,6 +690,8 @@ pub struct MockProvider {
     config: Arc<Mutex<MockConfig>>,
     /// Last chat completion params received (for test assertions)
     last_chat_params: Arc<Mutex<Option<ChatCompletionParams>>>,
+    /// Numeric policy metadata only, for multi-request propagation assertions.
+    chat_request_priorities: Arc<Mutex<Vec<i32>>>,
     /// When true, get_attestation_report returns an error (simulates blocked/broken backend)
     fail_attestation: Arc<std::sync::atomic::AtomicBool>,
     /// Trust tier reported by [`InferenceProvider::tier`]; defaults to
@@ -712,6 +718,18 @@ pub struct MockProvider {
 }
 
 impl MockProvider {
+    /// Install a native Responses fixture without affecting chat fixtures.
+    pub fn with_responses_handler(
+        mut self,
+        handler: impl Fn(serde_json::Value) -> crate::responses_raw::ResponsesRawResponse
+            + Send
+            + Sync
+            + 'static,
+    ) -> Self {
+        self.responses_handler = Some(Arc::new(handler));
+        self
+    }
+
     /// Create a new mock provider with default models
     pub fn new() -> Self {
         let models = vec![ModelInfo {
@@ -736,6 +754,7 @@ impl MockProvider {
                 audio_transcription_error_override: None,
             })),
             last_chat_params: Arc::new(Mutex::new(None)),
+            chat_request_priorities: Arc::new(Mutex::new(Vec::new())),
             fail_attestation: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             tier: crate::ProviderTier::NonAttested,
             provider_source: crate::ProviderSource::External,
@@ -743,6 +762,7 @@ impl MockProvider {
             supports_client_e2ee: true,
             supports_chat_signatures: true,
             unpinned_chat_ids: Arc::new(std::sync::Mutex::new(Vec::new())),
+            responses_handler: None,
         }
     }
 
@@ -762,6 +782,7 @@ impl MockProvider {
                 audio_transcription_error_override: None,
             })),
             last_chat_params: Arc::new(Mutex::new(None)),
+            chat_request_priorities: Arc::new(Mutex::new(Vec::new())),
             fail_attestation: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             tier: crate::ProviderTier::NonAttested,
             provider_source: crate::ProviderSource::External,
@@ -769,6 +790,7 @@ impl MockProvider {
             supports_client_e2ee: true,
             supports_chat_signatures: true,
             unpinned_chat_ids: Arc::new(std::sync::Mutex::new(Vec::new())),
+            responses_handler: None,
         }
     }
 
@@ -786,6 +808,7 @@ impl MockProvider {
                 audio_transcription_error_override: None,
             })),
             last_chat_params: Arc::new(Mutex::new(None)),
+            chat_request_priorities: Arc::new(Mutex::new(Vec::new())),
             fail_attestation: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             tier: crate::ProviderTier::NonAttested,
             provider_source: crate::ProviderSource::External,
@@ -793,6 +816,7 @@ impl MockProvider {
             supports_client_e2ee: true,
             supports_chat_signatures: true,
             unpinned_chat_ids: Arc::new(std::sync::Mutex::new(Vec::new())),
+            responses_handler: None,
         }
     }
 
@@ -837,7 +861,12 @@ impl MockProvider {
             .store(fail, std::sync::atomic::Ordering::Relaxed);
     }
 
-    /// Get the last chat completion params received by the mock provider
+    /// Get the scheduler priorities recorded across mock completion calls.
+    pub async fn chat_request_priorities(&self) -> Vec<i32> {
+        self.chat_request_priorities.lock().await.clone()
+    }
+
+    /// Get the last chat completion params received by the mock provider.
     pub async fn last_chat_params(&self) -> Option<ChatCompletionParams> {
         self.last_chat_params.lock().await.clone()
     }
@@ -1026,6 +1055,20 @@ impl Default for MockProvider {
 
 #[async_trait]
 impl crate::InferenceProvider for MockProvider {
+    fn supports_responses_raw(&self) -> bool {
+        self.responses_handler.is_some()
+    }
+
+    async fn responses_raw(
+        &self,
+        body: serde_json::Value,
+    ) -> Result<crate::responses_raw::ResponsesRawResponse, CompletionError> {
+        self.responses_handler
+            .as_ref()
+            .map(|handler| handler(body))
+            .ok_or_else(|| CompletionError::CompletionError("No native Responses fixture".into()))
+    }
+
     fn tier(&self) -> crate::ProviderTier {
         self.tier
     }
@@ -1064,6 +1107,10 @@ impl crate::InferenceProvider for MockProvider {
         params: ChatCompletionParams,
         request_hash: String,
     ) -> Result<StreamingResult, CompletionError> {
+        self.chat_request_priorities
+            .lock()
+            .await
+            .push(params.request_priority);
         *self.last_chat_params.lock().await = Some(params.clone());
 
         // Check for invalid model
@@ -1191,6 +1238,10 @@ impl crate::InferenceProvider for MockProvider {
         params: ChatCompletionParams,
         request_hash: String,
     ) -> Result<ChatCompletionResponseWithBytes, CompletionError> {
+        self.chat_request_priorities
+            .lock()
+            .await
+            .push(params.request_priority);
         *self.last_chat_params.lock().await = Some(params.clone());
 
         // Check for invalid model

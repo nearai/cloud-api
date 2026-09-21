@@ -927,6 +927,7 @@ pub async fn process_approval_responses(
             .await?
         {
             messages.push(crate::completions::ports::CompletionMessage {
+                reasoning_content: None,
                 role: "tool".to_string(),
                 content: serde_json::Value::String(result_message),
                 tool_call_id: None, // MCP approval responses don't have a tool_call_id

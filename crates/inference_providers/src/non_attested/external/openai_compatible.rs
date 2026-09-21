@@ -119,7 +119,7 @@ fn normalize_reasoning_effort_for_openai_tools(
 /// (Together, Groq, Fireworks, OpenRouter, …) are intentionally excluded
 /// because they tend to accept (or apply) the extra sampling knobs below, and
 /// stripping them there would silently change behaviour.
-fn is_openai_source(base_url: &str) -> bool {
+pub(super) fn is_openai_source(base_url: &str) -> bool {
     // Match on the parsed URL *host* (lower-cased), not a substring of the whole
     // URL. A substring check would both miss mixed-case hosts (`API.OPENAI.COM`)
     // and misclassify look-alikes such as `api.openai.com.evil.example` as
@@ -184,6 +184,47 @@ impl ExternalBackend for OpenAiCompatibleBackend {
         "openai_compatible"
     }
 
+    async fn responses_raw(
+        &self,
+        config: &BackendConfig,
+        model: &str,
+        mut body: serde_json::Value,
+    ) -> Result<crate::responses_raw::ResponsesRawResponse, CompletionError> {
+        use futures_util::TryStreamExt;
+        if !is_openai_source(&config.base_url) || !crate::responses_raw::is_stateless(&body) {
+            return Err(CompletionError::CompletionError(
+                "Native Responses requires stateless requests on an OpenAI upstream".into(),
+            ));
+        }
+        body["model"] = serde_json::json!(model);
+        let response = self
+            .client
+            .post(format!(
+                "{}/responses",
+                config.base_url.trim_end_matches('/')
+            ))
+            .headers(
+                self.build_headers(config)
+                    .map_err(CompletionError::CompletionError)?,
+            )
+            .timeout(std::time::Duration::from_secs(
+                config.timeout_seconds as u64,
+            ))
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| CompletionError::CompletionError(e.to_string()))?;
+        Ok(crate::responses_raw::ResponsesRawResponse {
+            status: response.status(),
+            headers: response.headers().clone(),
+            body: Box::pin(
+                response
+                    .bytes_stream()
+                    .map_err(|e| CompletionError::CompletionError(e.to_string())),
+            ),
+        })
+    }
+
     async fn chat_completion_stream(
         &self,
         config: &BackendConfig,
@@ -198,6 +239,7 @@ impl ExternalBackend for OpenAiCompatibleBackend {
         // model's content parts but openai_compatible upstreams (OpenAI, Azure,
         // Together, …) may 400 on an unknown `cache_control` content-part field.
         crate::strip_cache_control(&mut streaming_params.messages);
+        crate::strip_reasoning_content(&mut streaming_params.messages);
         streaming_params.model = model.to_string();
         streaming_params.stream = Some(true);
         streaming_params.stream_options = Some(StreamOptions {
@@ -270,6 +312,7 @@ impl ExternalBackend for OpenAiCompatibleBackend {
         // #666: drop Anthropic prompt-caching breakpoints before forwarding (see
         // the streaming path for the rationale).
         crate::strip_cache_control(&mut non_streaming_params.messages);
+        crate::strip_reasoning_content(&mut non_streaming_params.messages);
         non_streaming_params.model = model.to_string();
         non_streaming_params.stream = Some(false);
 
@@ -770,6 +813,7 @@ mod tests {
             );
         }
         ChatCompletionParams {
+            request_priority: 0,
             model: "gpt-5.5".to_string(),
             messages: vec![],
             max_completion_tokens: None,
@@ -1095,6 +1139,7 @@ mod tests {
     fn test_cache_control_stripped_before_serializing_to_openai() {
         let mut params = make_chat_params(None, None);
         params.messages = vec![crate::ChatMessage {
+            reasoning_content: None,
             role: crate::MessageRole::User,
             content: Some(serde_json::json!([
                 {
@@ -1139,3 +1184,6 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+mod responses_raw_tests;

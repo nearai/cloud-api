@@ -337,7 +337,8 @@ pub struct EncryptionHeaders {
 /// - `x-client-pub-key`: Must be a valid hex string with correct length based on algorithm
 ///   - Ed25519: 64 hex characters (32 bytes)
 ///   - ECDSA: 128 hex characters (64 bytes) or 130 hex characters (65 bytes with 0x04 prefix)
-/// - `x-model-pub-key`: Must be a valid hex string (reasonable length: 64-130 hex characters)
+/// - `x-model-pub-key`: NEAR hex key (64-130 characters) or Chutes standard
+///   base64 ML-KEM-768 key (1184 decoded bytes); routing alone needs no client key
 /// - `x-encryption-version`: Must be "1" or "2" (selects encryption protocol version)
 ///
 /// Returns:
@@ -357,8 +358,18 @@ pub fn validate_encryption_headers(
         .map(|s| s.to_string());
     let model_pub_key = headers
         .get("x-model-pub-key")
-        .and_then(|h| h.to_str().ok())
-        .map(|s| s.to_string());
+        .map(|h| {
+            h.to_str().map(str::to_string).map_err(|_| {
+                (
+                    StatusCode::BAD_REQUEST,
+                    ResponseJson(ErrorResponse::new(
+                        "X-Model-Pub-Key must be a valid ASCII string".to_string(),
+                        "invalid_parameter".to_string(),
+                    )),
+                )
+            })
+        })
+        .transpose()?;
     let encryption_version = headers
         .get("x-encryption-version")
         .and_then(|h| h.to_str().ok())
@@ -473,26 +484,16 @@ pub fn validate_encryption_headers(
 
     // Validate model public key if provided
     if let Some(ref pub_key) = model_pub_key {
-        // Check if it's a valid hex string
-        if hex::decode(pub_key).is_err() {
+        let near_key = (64..=130).contains(&pub_key.len()) && hex::decode(pub_key).is_ok();
+        let chutes_key =
+            inference_providers::attested::chutes::e2ee::is_encoded_public_key(pub_key);
+        if !near_key && !chutes_key {
             return Err((
                 StatusCode::BAD_REQUEST,
                 ResponseJson(ErrorResponse::new(
-                    "X-Model-Pub-Key must be a valid hex string".to_string(),
-                    "invalid_parameter".to_string(),
-                )),
-            ));
-        }
-
-        // Check reasonable length (64-130 hex characters, which covers both Ed25519 and ECDSA)
-        if pub_key.len() < 64 || pub_key.len() > 130 {
-            return Err((
-                StatusCode::BAD_REQUEST,
-                ResponseJson(ErrorResponse::new(
-                    format!(
-                        "X-Model-Pub-Key must be between 64 and 130 hex characters, got {} characters",
-                        pub_key.len()
-                    ),
+                    "X-Model-Pub-Key must be 64-130 hex characters (NEAR) or a standard base64 \
+                     ML-KEM-768 public key encoding 1184 bytes (Chutes)"
+                        .to_string(),
                     "invalid_parameter".to_string(),
                 )),
             ));
@@ -558,6 +559,14 @@ pub fn map_organization_error(
             ResponseJson(ErrorResponse::new(
                 "Organization already exists".to_string(),
                 "conflict".to_string(),
+            )),
+        ),
+        OrganizationError::DefaultOrganization => (
+            StatusCode::CONFLICT,
+            ResponseJson(ErrorResponse::new(
+                "Organization cannot be deleted because it is a member's default organization"
+                    .to_string(),
+                "default_organization".to_string(),
             )),
         ),
         OrganizationError::StakingWalletBound => (
@@ -749,6 +758,65 @@ mod tests {
     fn test_map_domain_error_service_overloaded() {
         let error = CompletionError::ServiceOverloaded("overloaded".to_string());
         assert_eq!(map_domain_error_to_status(&error).as_u16(), 429);
+    }
+
+    #[test]
+    fn model_pub_key_accepts_chutes_routing_without_client_encryption() {
+        use base64::Engine;
+        let key = base64::engine::general_purpose::STANDARD.encode([42; 1184]);
+        let mut headers = HeaderMap::new();
+        headers.insert("x-model-pub-key", key.parse().unwrap());
+        let validated = validate_encryption_headers(&headers).unwrap();
+        assert_eq!(validated.model_pub_key.as_deref(), Some(key.as_str()));
+        assert!(validated.client_pub_key.is_none());
+        assert!(validated.signing_algo.is_none());
+        assert!(validated.encryption_version.is_none());
+    }
+
+    #[test]
+    fn model_pub_key_preserves_near_hex_keys() {
+        for key in [
+            "ab".repeat(32),
+            "AB".repeat(64),
+            format!("04{}", "ab".repeat(64)),
+        ] {
+            let mut headers = HeaderMap::new();
+            headers.insert("x-model-pub-key", key.parse().unwrap());
+            let validated = validate_encryption_headers(&headers).unwrap();
+            assert_eq!(validated.model_pub_key, Some(key));
+        }
+    }
+
+    #[test]
+    fn model_pub_key_rejects_malformed_keys_instead_of_dropping_the_pin() {
+        use base64::Engine;
+        let b64 = base64::engine::general_purpose::STANDARD;
+        for key in [
+            String::new(),
+            "ab".repeat(31),
+            "ab".repeat(66),
+            "z".repeat(64),
+            b64.encode([42; 1183]),
+            b64.encode([42; 1185]),
+            b64.encode([42; 1184]).trim_end_matches('=').to_string(),
+            "!".repeat(1580),
+        ] {
+            let mut headers = HeaderMap::new();
+            headers.insert("x-model-pub-key", key.parse().unwrap());
+            assert_eq!(
+                validate_encryption_headers(&headers).unwrap_err().0,
+                StatusCode::BAD_REQUEST
+            );
+        }
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-model-pub-key",
+            axum::http::HeaderValue::from_bytes(b"\xff").unwrap(),
+        );
+        assert_eq!(
+            validate_encryption_headers(&headers).unwrap_err().0,
+            StatusCode::BAD_REQUEST
+        );
     }
 
     #[test]

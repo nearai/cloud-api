@@ -64,6 +64,7 @@ impl PgOrganizationRepository {
         owner_id: Uuid,
     ) -> Result<Organization> {
         Ok(Organization {
+            request_priority: db_org.request_priority,
             id: OrganizationId::from(db_org.id),
             name: db_org.name,
             description: db_org.description,
@@ -371,54 +372,50 @@ impl PgOrganizationRepository {
         request: DbAddOrganizationMemberRequest,
         invited_by: Uuid,
     ) -> Result<DbOrganizationMember, RepositoryError> {
-        // Check if user is already a member
-        let existing = retry_db!("check_if_user_is_member", {
-            let client = self
-                .pool
-                .get()
-                .await
-                .context("Failed to get database connection")
-                .map_err(RepositoryError::PoolError)?;
-
-            client
-            .query_opt(
-                "SELECT * FROM organization_members WHERE organization_id = $1 AND user_id = $2",
-                &[&org_id, &request.user_id],
-            )
-            .await
-            .map_err(map_db_error)
-        })?;
-
-        if existing.is_some() {
-            return Err(RepositoryError::AlreadyExists);
-        }
-
         let id = Uuid::new_v4();
-
         let row = retry_db!("add_member_to_organization", {
-            let now = Utc::now();
-            let client = self
+            let mut client = self
                 .pool
                 .get()
                 .await
                 .context("Failed to get database connection")
                 .map_err(RepositoryError::PoolError)?;
+            let transaction = client.transaction().await.map_err(map_db_error)?;
 
-            client.query_one(
-            r#"
-            INSERT INTO organization_members (id, organization_id, user_id, role, joined_at, invited_by)
-            VALUES ($1, $2, $3, $4, $5, $6)
-            RETURNING *
-            "#,
-            &[
-                &id,
-                &org_id,
-                &request.user_id,
-                &request.role.to_string().to_lowercase(),
-                &now,
-                &invited_by,
-            ],
-        ).await.map_err(map_db_error)
+            // Hold the active parent through insertion. Deletion takes FOR UPDATE,
+            // so it either sees this member or finishes before we check is_active.
+            let organization = transaction
+                .query_opt(
+                    "SELECT id FROM organizations WHERE id = $1 AND is_active = true FOR SHARE",
+                    &[&org_id],
+                )
+                .await
+                .map_err(map_db_error)?;
+            if organization.is_none() {
+                return Err(RepositoryError::NotFound(org_id.to_string()));
+            }
+
+            let existing = transaction
+                .query_opt(
+                    "SELECT id FROM organization_members WHERE organization_id = $1 AND user_id = $2",
+                    &[&org_id, &request.user_id],
+                )
+                .await
+                .map_err(map_db_error)?;
+            if existing.is_some() {
+                return Err(RepositoryError::AlreadyExists);
+            }
+
+            let now = Utc::now();
+            let row = transaction.query_one(
+                "INSERT INTO organization_members (id, organization_id, user_id, role, joined_at, invited_by)
+                 VALUES ($1, $2, $3, $4, $5, $6)
+                 RETURNING *",
+                &[&id, &org_id, &request.user_id,
+                  &request.role.to_string().to_lowercase(), &now, &invited_by],
+            ).await.map_err(map_db_error)?;
+            transaction.commit().await.map_err(map_db_error)?;
+            Ok(row)
         })?;
 
         debug!(
@@ -596,6 +593,7 @@ impl PgOrganizationRepository {
     // Helper function to convert database row to Organization
     fn row_to_db_organization(&self, row: tokio_postgres::Row) -> anyhow::Result<DbOrganization> {
         Ok(DbOrganization {
+            request_priority: row.try_get("request_priority")?,
             id: row.try_get("id")?,
             name: row.try_get("name")?,
             description: row.try_get("description")?,
@@ -682,6 +680,26 @@ impl OrganizationRepository for PgOrganizationRepository {
             )),
             None => Ok(None),
         }
+    }
+
+    async fn set_request_priority(
+        &self,
+        id: Uuid,
+        priority: i32,
+    ) -> Result<Option<i32>, RepositoryError> {
+        let row = retry_db!("set_organization_request_priority", {
+            let client = self
+                .pool
+                .get()
+                .await
+                .context("Failed to get database connection")
+                .map_err(RepositoryError::PoolError)?;
+            client.query_opt(
+                "UPDATE organizations SET request_priority = $2, updated_at = NOW() WHERE id = $1 AND is_active = true RETURNING request_priority",
+                &[&id, &priority],
+            ).await.map_err(map_db_error)
+        })?;
+        Ok(row.map(|row| row.get("request_priority")))
     }
 
     async fn get_by_name(&self, name: &str) -> Result<Option<Organization>, RepositoryError> {
@@ -910,6 +928,29 @@ impl OrganizationRepository for PgOrganizationRepository {
                     transaction.rollback().await.map_err(map_db_error)?;
                     DeleteOrganizationResult::StakingWalletBound
                 } else {
+                    // Protect the earliest active membership of every current member,
+                    // not only the owner. Use the same total order as /users/me,
+                    // without a listing limit. The organization lock above keeps
+                    // this check and the soft-delete in the same transaction.
+                    let is_default: bool = transaction.query_one(
+                        "SELECT EXISTS (
+                            SELECT 1 FROM organization_members candidate
+                            WHERE candidate.organization_id = $1
+                              AND NOT EXISTS (
+                                SELECT 1 FROM organization_members earlier
+                                JOIN organizations o ON o.id = earlier.organization_id AND o.is_active
+                                WHERE earlier.user_id = candidate.user_id
+                                  AND (earlier.joined_at, earlier.organization_id)
+                                      < (candidate.joined_at, candidate.organization_id)
+                              )
+                        )",
+                        &[&id],
+                    ).await.map_err(map_db_error)?.get(0);
+                    if is_default {
+                        transaction.rollback().await.map_err(map_db_error)?;
+                        return Ok(DeleteOrganizationResult::DefaultOrganization);
+                    }
+
                     let rows_affected = transaction
                         .execute(
                             "UPDATE organizations SET is_active = false WHERE id = $1 AND is_active = true",
@@ -1363,7 +1404,8 @@ impl OrganizationRepository for PgOrganizationRepository {
         let order_direction = order_direction.unwrap_or(OrganizationOrderDirection::Asc);
 
         let order_by_column = match order_by {
-            OrganizationOrderBy::CreatedAt => "created_at",
+            OrganizationOrderBy::CreatedAt => "o.created_at",
+            OrganizationOrderBy::JoinedAt => "om.joined_at",
         };
 
         let order_dir = match order_direction {
@@ -1383,10 +1425,10 @@ impl OrganizationRepository for PgOrganizationRepository {
                 .query(
                     &format!(
                         "
-                    SELECT DISTINCT o.* FROM organizations o
+                    SELECT o.* FROM organizations o
                     INNER JOIN organization_members om ON o.id = om.organization_id
                     WHERE om.user_id = $1 AND o.is_active = true
-                    ORDER BY o.{order_by_column} {order_dir}
+                    ORDER BY {order_by_column} {order_dir}, o.id ASC
                     LIMIT $2 OFFSET $3
                 "
                     ),
@@ -1423,7 +1465,8 @@ impl OrganizationRepository for PgOrganizationRepository {
         let order_direction = order_direction.unwrap_or(OrganizationOrderDirection::Asc);
 
         let order_by_column = match order_by {
-            OrganizationOrderBy::CreatedAt => "created_at",
+            OrganizationOrderBy::CreatedAt => "o.created_at",
+            OrganizationOrderBy::JoinedAt => "om.joined_at",
         };
 
         let order_dir = match order_direction {
@@ -1454,7 +1497,7 @@ impl OrganizationRepository for PgOrganizationRepository {
                         LIMIT 1
                     ) owner_om ON true
                     WHERE om.user_id = $1 AND o.is_active = true
-                    ORDER BY o.{order_by_column} {order_dir}
+                    ORDER BY {order_by_column} {order_dir}, o.id ASC
                     LIMIT $2 OFFSET $3
                 "
                     ),

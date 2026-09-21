@@ -84,6 +84,7 @@ pub fn test_config() -> ApiConfig {
             .ok()
             .or(Some("test_api_key".to_string())),
         internal_usage_token: None,
+        native_responses_models: Vec::new(),
         logging: config::LoggingConfig {
             level: "debug".to_string(),
             format: "compact".to_string(),
@@ -100,6 +101,7 @@ pub fn test_config() -> ApiConfig {
             google: None,
             near: config::NearConfig::default(),
             admin_domains: vec!["test.com".to_string()],
+            admin_read_only_tokens_enabled: false,
             require_session_bound_access_tokens: false,
         },
         database: config::DatabaseConfig {
@@ -151,6 +153,7 @@ pub fn test_config() -> ApiConfig {
             enabled: true,
             ..config::UsageReportingConfig::default()
         },
+        credit_allocation: config::CreditAllocationConfig::default(),
         ita: config::ItaAttestationConfig::default(),
     }
 }
@@ -474,6 +477,29 @@ pub async fn setup_test_server_with_pool() -> (
     let (server, inference_provider_pool, mock_provider, _router) =
         build_test_server_components(infra.database.clone(), infra.config).await;
 
+    (
+        server,
+        inference_provider_pool,
+        mock_provider,
+        infra.database,
+    )
+}
+
+pub async fn setup_test_server_with_pool_and_config<F>(
+    mutate: F,
+) -> (
+    axum_test::TestServer,
+    std::sync::Arc<services::inference_provider_pool::InferenceProviderPool>,
+    std::sync::Arc<inference_providers::mock::MockProvider>,
+    Arc<Database>,
+)
+where
+    F: FnOnce(&mut config::ApiConfig),
+{
+    let mut infra = setup_test_infrastructure().await;
+    mutate(&mut infra.config);
+    let (server, inference_provider_pool, mock_provider, _router) =
+        build_test_server_components(infra.database.clone(), infra.config).await;
     (
         server,
         inference_provider_pool,

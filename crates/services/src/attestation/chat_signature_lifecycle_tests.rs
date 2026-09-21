@@ -36,18 +36,35 @@ use crate::{
 
 /// Repository that records stored signatures and succeeds.
 #[derive(Clone, Default)]
-struct RecordingRepository {
+pub(super) struct RecordingRepository {
     stored: Arc<Mutex<Vec<(String, ChatSignature)>>>,
+    batch_sizes: Arc<Mutex<Vec<usize>>>,
 }
 
 impl RecordingRepository {
-    fn stored(&self) -> Vec<(String, ChatSignature)> {
+    pub(super) fn stored(&self) -> Vec<(String, ChatSignature)> {
         self.stored.lock().map(|s| s.clone()).unwrap_or_default()
+    }
+
+    pub(super) fn batch_sizes(&self) -> Vec<usize> {
+        self.batch_sizes.lock().unwrap().clone()
     }
 }
 
 #[async_trait]
 impl AttestationRepository for RecordingRepository {
+    async fn add_chat_signatures(
+        &self,
+        chat_id: &str,
+        signatures: Vec<ChatSignature>,
+    ) -> Result<(), AttestationError> {
+        self.batch_sizes.lock().unwrap().push(signatures.len());
+        for signature in signatures {
+            self.add_chat_signature(chat_id, signature).await?;
+        }
+        Ok(())
+    }
+
     async fn add_chat_signature(
         &self,
         chat_id: &str,
@@ -72,7 +89,7 @@ impl AttestationRepository for RecordingRepository {
 }
 
 /// Repository whose store always fails.
-struct FailingRepository;
+pub(super) struct FailingRepository;
 
 #[async_trait]
 impl AttestationRepository for FailingRepository {
@@ -183,6 +200,7 @@ impl UsageRepository for NoopUsageRepository {
     async fn get_usage_history_by_api_key(
         &self,
         _api_key_id: Uuid,
+        _credit_type: Option<&str>,
         _limit: Option<i64>,
         _offset: Option<i64>,
     ) -> anyhow::Result<(Vec<UsageLogEntry>, i64)> {
@@ -251,7 +269,7 @@ async fn pool_with_pinned_chat(chat_id: &str) -> (Arc<InferenceProviderPool>, Ar
     (pool, provider)
 }
 
-fn lifecycle_service(
+pub(super) fn lifecycle_service(
     repository: Arc<dyn AttestationRepository + Send + Sync>,
     pool: Arc<InferenceProviderPool>,
 ) -> AttestationService {
@@ -302,6 +320,22 @@ async fn store_and_unpin_stores_gateway_signature_and_releases_pin_on_success() 
         vec![chat_id.to_string()],
         "the signature-fetch routing pin must be released exactly once"
     );
+}
+
+#[tokio::test]
+async fn store_and_unpin_rejects_empty_id_without_storing_and_releases_pin() {
+    let (pool, provider) = pool_with_pinned_chat("").await;
+    let repository = RecordingRepository::default();
+    let service = lifecycle_service(Arc::new(repository.clone()), pool);
+
+    let result = service
+        .store_chat_signature_and_unpin("", "req-hash".to_string(), "resp-hash".to_string())
+        .await;
+
+    assert!(matches!(result, Err(AttestationError::InvalidParameter(_))));
+    assert!(repository.stored().is_empty());
+    assert!(repository.batch_sizes().is_empty());
+    assert_eq!(provider.unpinned_chat_ids(), vec![String::new()]);
 }
 
 #[tokio::test]

@@ -266,6 +266,9 @@ impl OrganizationServiceImpl {
             DeleteOrganizationResult::Unauthorized => Err(OrganizationError::Unauthorized(
                 "Only the owner can delete an organization".to_string(),
             )),
+            DeleteOrganizationResult::DefaultOrganization => {
+                Err(OrganizationError::DefaultOrganization)
+            }
             DeleteOrganizationResult::StakingWalletBound => {
                 Err(OrganizationError::StakingWalletBound)
             }
@@ -353,6 +356,7 @@ impl OrganizationServiceImpl {
             .await
             .map_err(|e| match e {
                 RepositoryError::AlreadyExists => OrganizationError::AlreadyMember,
+                RepositoryError::NotFound(_) => OrganizationError::NotFound,
                 _ => Self::map_repository_error(e),
             })
     }
@@ -1258,7 +1262,10 @@ impl OrganizationServiceImpl {
                 invitation.invited_by_user_id.0,
             )
             .await
-            .map_err(|e| OrganizationError::InternalError(format!("Failed to add member: {e}")))?;
+            .map_err(|e| match e {
+                RepositoryError::NotFound(_) => OrganizationError::NotFound,
+                _ => OrganizationError::InternalError(format!("Failed to add member: {e}")),
+            })?;
 
         // Mark invitation as accepted
         self.invitation_repository

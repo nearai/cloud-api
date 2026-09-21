@@ -149,6 +149,8 @@ pub enum OrganizationError {
 
     #[error("Organization is bound to a NEAR staking wallet")]
     StakingWalletBound,
+    #[error("An organization that is a member's default cannot be deleted")]
+    DefaultOrganization,
 
     #[error("Internal error: {0}")]
     InternalError(String),
@@ -188,6 +190,7 @@ pub enum DeleteOrganizationResult {
     NotFound,
     Unauthorized,
     StakingWalletBound,
+    DefaultOrganization,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -376,7 +379,8 @@ pub trait OrganizationRepository: Send + Sync {
         actor_user_id: Option<Uuid>,
     ) -> Result<Organization, RepositoryError>;
 
-    /// Soft-deletes an active organization only if it has no staking farm source.
+    /// Soft-deletes an active organization only if it has no staking farm source
+    /// and is not any current member's earliest active membership (joined_at, ID).
     ///
     /// The staking-source check is deliberately status-agnostic: the org-to-wallet
     /// binding is permanent, and unbinding is not an API operation. Scoping this to

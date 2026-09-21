@@ -117,7 +117,7 @@ pub struct ToolCall {
     pub index: Option<i64>,
     /// Thought signature for Gemini 3 models (required for tool calls to work correctly)
     /// Only included if the model returned one - older models don't use this
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(flatten, with = "crate::thought_signature")]
     pub thought_signature: Option<String>,
 }
 
@@ -133,8 +133,8 @@ pub struct ToolCallDelta {
     pub index: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub function: Option<FunctionCallDelta>,
-    /// Thought signature for Gemini 3 models (internal use only, not exposed to clients)
-    #[serde(skip_serializing_if = "Option::is_none")]
+    /// Thought signature for Gemini tool-call replay, emitted in both wire formats
+    #[serde(flatten, with = "crate::thought_signature")]
     pub thought_signature: Option<String>,
 }
 
@@ -219,9 +219,17 @@ pub enum ChatServiceTier {
     Priority,
 }
 
+/// Operator scheduler priority, in the inclusive range -1000..=1000; default 0.
+/// Higher values run first. The organization admin service and database CHECK
+/// validate writes; request paths carry the value loaded from that column.
+pub type RequestPriority = i32;
+
 /// Parameters for chat completion requests (matches OpenAI API)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChatCompletionParams {
+    /// Operator-controlled scheduler priority. Never accepted from or exposed in JSON.
+    #[serde(skip)]
+    pub request_priority: RequestPriority,
     /// Model ID to use for the completion
     pub model: String,
 
@@ -322,6 +330,23 @@ pub struct ChatCompletionParams {
 
     #[serde(flatten)]
     pub extra: std::collections::HashMap<String, serde_json::Value>,
+}
+
+impl ChatCompletionParams {
+    /// Customer JSON cannot select scheduler policy, including in adapters
+    /// that use the original request sidecar. Preserve unrelated provider fields.
+    pub fn strip_client_priority(&mut self) {
+        self.extra.remove("priority");
+        self.extra.remove("request_priority");
+        if let Some(original) = self
+            .original_request
+            .as_mut()
+            .and_then(|value| value.as_object_mut())
+        {
+            original.remove("priority");
+            original.remove("request_priority");
+        }
+    }
 }
 
 /// Parameters for text completion requests (legacy OpenAI API)

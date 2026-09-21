@@ -84,6 +84,7 @@ pub fn test_config() -> ApiConfig {
             .ok()
             .or(Some("test_api_key".to_string())),
         internal_usage_token: None,
+        native_responses_models: Vec::new(),
         logging: config::LoggingConfig {
             level: "debug".to_string(),
             format: "compact".to_string(),
@@ -100,6 +101,7 @@ pub fn test_config() -> ApiConfig {
             google: None,
             near: config::NearConfig::default(),
             admin_domains: vec!["test.com".to_string()],
+            admin_read_only_tokens_enabled: false,
             require_session_bound_access_tokens: false,
         },
         database: config::DatabaseConfig {

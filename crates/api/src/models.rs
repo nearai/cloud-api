@@ -259,8 +259,26 @@ pub struct ToolCall {
     /// Gemini-3 thought_signature. The client must echo this verbatim on
     /// the next turn or Gemini rejects the request with
     /// "Function call is missing a thought_signature".
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(flatten, with = "inference_providers::thought_signature")]
+    #[schema(schema_with = tool_call_signature_schema)]
     pub thought_signature: Option<String>,
+}
+
+// This flattened field serializes a legacy signature and the Google-compatible
+// nested form from one internal value. Describe both keys in the API schema.
+fn tool_call_signature_schema() -> utoipa::openapi::schema::Object {
+    use utoipa::openapi::schema::{ObjectBuilder, Type};
+    let signature = ObjectBuilder::new().schema_type(Type::String).build();
+    ObjectBuilder::new()
+        .property("thought_signature", signature.clone())
+        .property(
+            "extra_content",
+            ObjectBuilder::new().property(
+                "google",
+                ObjectBuilder::new().property("thought_signature", signature),
+            ),
+        )
+        .build()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -2860,6 +2878,21 @@ pub struct OrganizationSettingsResponse {
     pub settings: OrganizationSettings,
 }
 
+/// Operator-controlled priority for the inference scheduler. Higher values run first.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct UpdateOrganizationPriorityRequest {
+    /// Inclusive range -1000..1000. Set 0 to restore the default.
+    #[schema(minimum = -1000, maximum = 1000)]
+    pub priority: i32,
+}
+
+/// Scheduler priority, available only through platform-admin endpoints.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct OrganizationPriorityResponse {
+    pub organization_id: uuid::Uuid,
+    pub priority: i32,
+}
+
 /// Admin request to update an organization's fallback policy.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "camelCase")]
@@ -3156,6 +3189,37 @@ pub struct ListAdminOrganizationMembersResponse {
     pub offset: i64,
 }
 
+/// Immutable admin-token permission across organizations. Read-only tokens can
+/// invoke explicitly approved reads (including pricing/deprecation previews and
+/// database-encryption scans), but cannot mutate business state. Usage
+/// bookkeeping and audit logging remain enabled. Both permissions are forbidden
+/// from creating, listing, or revoking admin tokens; those require an admin session.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum AdminAccessTokenPermission {
+    ReadOnly,
+    #[default]
+    ReadWrite,
+}
+
+impl From<AdminAccessTokenPermission> for database::models::AdminAccessTokenPermission {
+    fn from(permission: AdminAccessTokenPermission) -> Self {
+        match permission {
+            AdminAccessTokenPermission::ReadOnly => Self::ReadOnly,
+            AdminAccessTokenPermission::ReadWrite => Self::ReadWrite,
+        }
+    }
+}
+
+impl From<database::models::AdminAccessTokenPermission> for AdminAccessTokenPermission {
+    fn from(permission: database::models::AdminAccessTokenPermission) -> Self {
+        match permission {
+            database::models::AdminAccessTokenPermission::ReadOnly => Self::ReadOnly,
+            database::models::AdminAccessTokenPermission::ReadWrite => Self::ReadWrite,
+        }
+    }
+}
+
 /// Admin access token request model
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct CreateAdminAccessTokenRequest {
@@ -3165,6 +3229,11 @@ pub struct CreateAdminAccessTokenRequest {
     pub name: String,
     /// Reason for creating the token (required)
     pub reason: String,
+    /// Defaults to read_write when omitted for backwards compatibility. Null
+    /// and unknown values are rejected. Revoke and recreate to change permission.
+    #[serde(default)]
+    #[schema(default = "read_write")]
+    pub permission: AdminAccessTokenPermission,
 }
 
 /// Admin access token response model
@@ -3177,6 +3246,55 @@ pub struct AdminAccessTokenResponse {
     pub expires_at: DateTime<Utc>,
     pub name: String,
     pub reason: String,
+    pub permission: AdminAccessTokenPermission,
+}
+
+/// Persisted admin token metadata. Preserves the existing listing response.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct AdminAccessTokenListEntry {
+    pub id: uuid::Uuid,
+    pub token_hash: String,
+    pub created_by_user_id: uuid::Uuid,
+    pub name: String,
+    pub creation_reason: String,
+    pub created_at: DateTime<Utc>,
+    pub expires_at: DateTime<Utc>,
+    pub last_used_at: Option<DateTime<Utc>>,
+    pub is_active: bool,
+    pub revoked_at: Option<DateTime<Utc>>,
+    pub revoked_by_user_id: Option<uuid::Uuid>,
+    pub revocation_reason: Option<String>,
+    pub user_agent: Option<String>,
+    pub permission: AdminAccessTokenPermission,
+}
+
+impl From<database::models::AdminAccessToken> for AdminAccessTokenListEntry {
+    fn from(token: database::models::AdminAccessToken) -> Self {
+        Self {
+            id: token.id,
+            token_hash: token.token_hash,
+            created_by_user_id: token.created_by_user_id,
+            name: token.name,
+            creation_reason: token.creation_reason,
+            created_at: token.created_at,
+            expires_at: token.expires_at,
+            last_used_at: token.last_used_at,
+            is_active: token.is_active,
+            revoked_at: token.revoked_at,
+            revoked_by_user_id: token.revoked_by_user_id,
+            revocation_reason: token.revocation_reason,
+            user_agent: token.user_agent,
+            permission: token.permission.into(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct ListAdminAccessTokensResponse {
+    pub data: Vec<AdminAccessTokenListEntry>,
+    pub limit: i64,
+    pub offset: i64,
+    pub total: i64,
 }
 
 /// Delete admin access token request model

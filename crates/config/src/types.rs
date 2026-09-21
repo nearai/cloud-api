@@ -3,6 +3,8 @@ use std::{collections::HashMap, env};
 
 #[derive(Debug, Clone)]
 pub struct ApiConfig {
+    /// Canonical model IDs eligible for native stateless Responses. Empty disables routing.
+    pub native_responses_models: Vec<String>,
     pub server: ServerConfig,
     /// API key for authenticating with inference backends (vLLM/SGLang via inference_url)
     pub inference_api_key: Option<String>,
@@ -46,6 +48,9 @@ impl ApiConfig {
     pub fn from_env() -> Result<Self, String> {
         let auth = AuthConfig::from_env()?;
         Ok(Self {
+            native_responses_models: parse_native_responses_models(
+                &env::var("NATIVE_RESPONSES_MODELS").unwrap_or_default(),
+            ),
             server: ServerConfig::from_env()?,
             inference_api_key: env::var("INFERENCE_API_KEY")
                 .or_else(|_| env::var("MODEL_DISCOVERY_API_KEY"))
@@ -953,6 +958,9 @@ pub struct AuthConfig {
     /// Email domains that are granted platform admin access
     /// Users with emails from these domains will have admin privileges
     pub admin_domains: Vec<String>,
+    /// Enable only after all API instances enforce admin token permissions.
+    /// Disabling issuance does not disable enforcement for existing tokens.
+    pub admin_read_only_tokens_enabled: bool,
     /// Reject session access tokens that carry no `sid` (session id) claim.
     ///
     /// Access tokens minted since session binding was introduced are tied to
@@ -1022,6 +1030,10 @@ impl AuthConfig {
             google,
             near,
             admin_domains,
+            admin_read_only_tokens_enabled: parse_bool_env(
+                "AUTH_ADMIN_READ_ONLY_TOKENS_ENABLED",
+                false,
+            )?,
             require_session_bound_access_tokens: parse_bool_env(
                 "AUTH_REQUIRE_SESSION_BOUND_ACCESS_TOKENS",
                 false,
@@ -1593,6 +1605,7 @@ mod tests {
             google: None,
             near: NearConfig::default(),
             admin_domains: vec!["near.ai".to_string(), "near.org".to_string()],
+            admin_read_only_tokens_enabled: false,
             require_session_bound_access_tokens: false,
         };
 
@@ -1617,6 +1630,7 @@ mod tests {
             google: None,
             near: NearConfig::default(),
             admin_domains: vec![],
+            admin_read_only_tokens_enabled: false,
             require_session_bound_access_tokens: false,
         };
 
@@ -2292,21 +2306,43 @@ mod tests {
 
     #[test]
     #[serial]
-    fn native_anthropic_beta_allowlist_is_trimmed_and_deduplicated() {
-        let previous = std::env::var_os("ANTHROPIC_ALLOWED_BETAS");
+    fn native_anthropic_beta_denylist_is_trimmed_and_deduplicated() {
+        let previous = std::env::var_os("ANTHROPIC_DENIED_BETAS");
         std::env::set_var(
-            "ANTHROPIC_ALLOWED_BETAS",
-            "future-beta-1, future-beta-2, future-beta-1, ",
+            "ANTHROPIC_DENIED_BETAS",
+            "premium-beta-1, premium-beta-2, premium-beta-1, ",
         );
 
         assert_eq!(
-            ExternalProvidersConfig::from_env().anthropic_allowed_betas,
-            vec!["future-beta-1".to_string(), "future-beta-2".to_string()]
+            ExternalProvidersConfig::from_env().anthropic_denied_betas,
+            vec!["premium-beta-1".to_string(), "premium-beta-2".to_string()]
         );
 
         match previous {
+            Some(value) => std::env::set_var("ANTHROPIC_DENIED_BETAS", value),
+            None => std::env::remove_var("ANTHROPIC_DENIED_BETAS"),
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn retired_anthropic_beta_allowlist_no_longer_gates_tokens() {
+        let previous_allowed = std::env::var_os("ANTHROPIC_ALLOWED_BETAS");
+        let previous_denied = std::env::var_os("ANTHROPIC_DENIED_BETAS");
+        std::env::set_var("ANTHROPIC_ALLOWED_BETAS", "legacy-beta-2026-01-01");
+        std::env::remove_var("ANTHROPIC_DENIED_BETAS");
+
+        assert!(ExternalProvidersConfig::from_env()
+            .anthropic_denied_betas
+            .is_empty());
+
+        match previous_allowed {
             Some(value) => std::env::set_var("ANTHROPIC_ALLOWED_BETAS", value),
             None => std::env::remove_var("ANTHROPIC_ALLOWED_BETAS"),
+        }
+        match previous_denied {
+            Some(value) => std::env::set_var("ANTHROPIC_DENIED_BETAS", value),
+            None => std::env::remove_var("ANTHROPIC_DENIED_BETAS"),
         }
     }
 }
@@ -2346,9 +2382,10 @@ pub struct ExternalProvidersConfig {
     /// Expose the native Anthropic Messages routes. Hard-off by default so the
     /// first rollout can be enabled on staging without changing production.
     pub enable_anthropic_messages: bool,
-    /// Additional native Anthropic beta tokens admitted by operations without
-    /// waiting for a Cloud API release.
-    pub anthropic_allowed_betas: Vec<String>,
+    /// Native Anthropic beta tokens refused at the router. Unknown tokens are
+    /// otherwise relayed to Anthropic, so this is the operator kill-switch for a
+    /// future header-only premium beta — settable without a Cloud API release.
+    pub anthropic_denied_betas: Vec<String>,
     /// Google Gemini API key
     pub gemini_api_key: Option<String>,
     /// Default timeout for external provider requests (seconds)
@@ -2400,7 +2437,13 @@ impl ExternalProvidersConfig {
             .ok()
             .map(|value| value == "1" || value.eq_ignore_ascii_case("true"))
             .unwrap_or(false);
-        let mut anthropic_allowed_betas = env::var("ANTHROPIC_ALLOWED_BETAS")
+        if env::var_os("ANTHROPIC_ALLOWED_BETAS").is_some() {
+            eprintln!(
+                "WARN: ANTHROPIC_ALLOWED_BETAS is ignored; native Anthropic beta tokens are \
+                 relayed upstream (use ANTHROPIC_DENIED_BETAS to refuse one)"
+            );
+        }
+        let mut anthropic_denied_betas = env::var("ANTHROPIC_DENIED_BETAS")
             .ok()
             .map(|value| {
                 value
@@ -2411,8 +2454,8 @@ impl ExternalProvidersConfig {
                     .collect::<Vec<_>>()
             })
             .unwrap_or_default();
-        anthropic_allowed_betas.sort_unstable();
-        anthropic_allowed_betas.dedup();
+        anthropic_denied_betas.sort_unstable();
+        anthropic_denied_betas.dedup();
 
         // Gemini API key
         let gemini_api_key = if let Ok(path) = env::var("GEMINI_API_KEY_FILE") {
@@ -2524,7 +2567,7 @@ impl ExternalProvidersConfig {
             openai_api_key,
             anthropic_api_key,
             enable_anthropic_messages,
-            anthropic_allowed_betas,
+            anthropic_denied_betas,
             gemini_api_key,
             timeout_seconds,
             refresh_interval_secs,
@@ -2613,5 +2656,31 @@ impl Default for CorsConfig {
             exact_matches,
             wildcard_suffixes,
         }
+    }
+}
+
+fn parse_native_responses_models(value: &str) -> Vec<String> {
+    let mut models: Vec<String> = value
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_owned)
+        .collect();
+    models.sort();
+    models.dedup();
+    models
+}
+
+#[cfg(test)]
+mod native_responses_config_tests {
+    use super::*;
+    #[test]
+    fn comma_separated_models_are_exact_trimmed_and_deduplicated() {
+        assert!(parse_native_responses_models("").is_empty());
+        assert!(parse_native_responses_models(" , ").is_empty());
+        assert_eq!(
+            parse_native_responses_models(" openai/gpt-6-astra,custom/model,openai/gpt-6-astra,,"),
+            vec!["custom/model", "openai/gpt-6-astra"]
+        );
     }
 }

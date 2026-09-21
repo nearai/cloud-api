@@ -25,6 +25,9 @@ use tracing::{debug, info, warn};
 mod context_routing;
 pub use context_routing::expand_inference_endpoints;
 
+#[cfg(test)]
+mod chutes_routing_tests;
+
 mod provider_attribution;
 use provider_attribution::{served_provider_attribution, ServedProviderResult};
 pub use provider_attribution::{
@@ -145,10 +148,9 @@ fn record_provider_attempt(
 }
 
 /// Carry the routing pin to the provider for backend-key affinity. The NEAR
-/// provider strips it in `prepare_encryption_headers` before serialising, and
-/// the external provider strips it in `strip_internal_keys`, so it never
-/// reaches an upstream request body. A pubkey-routed request only ever selects
-/// a provider registered in `pubkey_to_providers`.
+/// provider strips it in `prepare_encryption_headers` before serialising,
+/// Chutes strips it in `request_body`, and the external provider strips it in
+/// `strip_internal_keys`, so it never reaches an upstream request body.
 fn reinsert_pubkey_pin(params: &mut ChatCompletionParams, pub_key: Option<&str>) {
     if let Some(pub_key) = pub_key {
         params.extra.insert(
@@ -1239,11 +1241,10 @@ impl InferenceProviderPool {
     /// primary provider is absent.
     ///
     /// Unlike [`Self::register_provider`], this does NOT run signing-key attestation
-    /// discovery (a wasted round trip for Chutes, which has no signing-address pubkey
-    /// and verifies its backend per request) and so does NOT populate
-    /// `pubkey_to_providers`. A pubkey-routed (E2EE) request — selected via
-    /// `model_pub_key` — therefore gets NO Chutes fallback by design: Chutes has no
-    /// per-response signing key, its integrity is the ML-KEM AEAD channel itself.
+    /// discovery (Chutes has no signing-address pubkey and verifies its backend
+    /// per request) and so does NOT populate `pubkey_to_providers`. Providers
+    /// that enforce keys during request-time discovery can opt into routing via
+    /// `supports_per_request_pubkey_routing`, independently of that signing-key map.
     pub async fn register_pinned_provider(
         &self,
         model_id: String,
@@ -2087,15 +2088,19 @@ impl InferenceProviderPool {
         // Filter by model_pub_key if provided
         let providers = if let Some(pub_key) = model_pub_key {
             // Use the existing 'mappings' lock instead of acquiring it again
-            let pub_key_providers = mappings.pubkey_to_providers.get(pub_key)?.clone();
+            let pub_key_providers = mappings.pubkey_to_providers.get(pub_key);
 
-            // Find intersection: providers that are in both lists
+            // Signing-key providers must be in both maps. A provider with
+            // request-time key discovery (Chutes) enforces the exact pin itself;
+            // do not cache its rotating instance keys in the signing-key map.
             let filtered: Vec<Arc<InferenceProviderTrait>> = model_providers
                 .iter()
                 .filter(|model_provider| {
-                    pub_key_providers
-                        .iter()
-                        .any(|pub_provider| Arc::ptr_eq(model_provider, pub_provider))
+                    pub_key_providers.is_some_and(|providers| {
+                        providers
+                            .iter()
+                            .any(|pub_provider| Arc::ptr_eq(model_provider, pub_provider))
+                    }) || model_provider.supports_per_request_pubkey_routing(pub_key)
                 })
                 .cloned()
                 .collect();
@@ -4195,6 +4200,46 @@ impl InferenceProviderPool {
                 "No providers available for embeddings".to_string(),
             ),
         })
+    }
+
+    /// Dispatch native Responses once, without falling back to Chat Completions.
+    pub async fn responses_raw(
+        &self,
+        model: &str,
+        body: serde_json::Value,
+        fallback_enabled: bool,
+    ) -> Result<
+        (
+            inference_providers::responses_raw::ResponsesRawResponse,
+            crate::usage::ProviderAttribution,
+        ),
+        CompletionError,
+    > {
+        let providers = self
+            .get_providers_with_fallback(
+                model,
+                None,
+                &ChatRoutingHints {
+                    fallback_disabled: !fallback_enabled,
+                    ..Default::default()
+                },
+            )
+            .await
+            .ok_or_else(|| {
+                CompletionError::CompletionError("No native Responses provider".into())
+            })?;
+        let provider = providers
+            .into_iter()
+            .find(|p| p.supports_responses_raw())
+            .ok_or_else(|| {
+                CompletionError::CompletionError("No native Responses provider".into())
+            })?;
+        let attribution = served_provider_attribution(
+            provider.as_ref(),
+            self.is_registered_fallback_provider(model, &provider),
+        );
+        let response = provider.responses_raw(body).await?;
+        Ok((response, attribution))
     }
 
     /// Dispatch one native Anthropic request without retrying or crossing
@@ -6914,6 +6959,7 @@ mod tests {
             .await;
 
         let params = inference_providers::ChatCompletionParams {
+            request_priority: 0,
             model: model_id,
             messages: vec![inference_providers::ChatMessage {
                 reasoning_content: None,
@@ -6989,6 +7035,7 @@ mod tests {
         pool.register_provider(model_id.clone(), mock_provider.clone())
             .await;
         let params = inference_providers::ChatCompletionParams {
+            request_priority: 0,
             model: model_id,
             messages: vec![inference_providers::ChatMessage {
                 reasoning_content: None,
@@ -9059,6 +9106,7 @@ mod tests {
 
     fn fallback_params(model: &str) -> inference_providers::ChatCompletionParams {
         inference_providers::ChatCompletionParams {
+            request_priority: 0,
             model: model.to_string(),
             messages: vec![inference_providers::ChatMessage {
                 reasoning_content: None,
@@ -9135,9 +9183,11 @@ mod tests {
             );
         }
 
+        let mut params = fallback_params(&model_id);
+        params.request_priority = -2;
         let started = std::time::Instant::now();
         let resp = pool
-            .chat_completion(fallback_params(&model_id), "test-hash".to_string())
+            .chat_completion(params, "test-hash".to_string())
             .await
             .expect("NEAR 5xx must fall back to Chutes, not fail the client request");
         let elapsed = started.elapsed();
@@ -9151,6 +9201,11 @@ mod tests {
         assert!(
             chutes.last_chat_params().await.is_some(),
             "Chutes must serve the fallback after the NEAR 5xx"
+        );
+        assert_eq!(near.last_chat_params().await.unwrap().request_priority, -2);
+        assert_eq!(
+            chutes.last_chat_params().await.unwrap().request_priority,
+            -2
         );
         let body = String::from_utf8_lossy(&resp.raw_bytes);
         assert!(
@@ -10597,6 +10652,52 @@ mod tests {
             .expect("registered model");
         assert_eq!(standalone_again.len(), 1);
         assert!(Arc::ptr_eq(&standalone_again[0], &pinned_provider));
+    }
+
+    #[tokio::test]
+    async fn native_responses_honors_fallback_policy_and_attribution() {
+        use inference_providers::{
+            mock::MockProvider, responses_raw::ResponsesRawResponse, ProviderTier,
+        };
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let pool = InferenceProviderPool::new(None, ExternalProvidersConfig::default());
+        let calls = Arc::new(AtomicUsize::new(0));
+        let captured = calls.clone();
+        let primary = Arc::new(MockProvider::new_accept_all().with_tier(ProviderTier::NonAttested));
+        let fallback = Arc::new(
+            MockProvider::new_accept_all()
+                .with_tier(ProviderTier::NonAttested)
+                .with_responses_handler(move |_| {
+                    captured.fetch_add(1, Ordering::SeqCst);
+                    ResponsesRawResponse {
+                        status: reqwest::StatusCode::OK,
+                        headers: Default::default(),
+                        body: Box::pin(futures::stream::empty()),
+                    }
+                }),
+        );
+        let model = "native/policy";
+        pool.register_provider(model.into(), primary).await;
+        pool.register_pinned_secondary_provider(model.into(), fallback.clone(), None)
+            .await;
+        assert!(pool
+            .responses_raw(model, serde_json::json!({"store":false}), false)
+            .await
+            .is_err());
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        let (_, attribution) = pool
+            .responses_raw(model, serde_json::json!({"store":false}), true)
+            .await
+            .unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert!(attribution.served_via_fallback);
+        pool.register_provider("native/primary".into(), fallback)
+            .await;
+        let (_, attribution) = pool
+            .responses_raw("native/primary", serde_json::json!({"store":false}), false)
+            .await
+            .unwrap();
+        assert!(!attribution.served_via_fallback);
     }
 
     #[tokio::test]

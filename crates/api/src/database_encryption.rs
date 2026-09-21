@@ -129,7 +129,7 @@ struct ApprovedGroup {
 }
 
 const APPROVED: &[ApprovedGroup] = &[
-    ApprovedGroup { table: "admin_access_token", columns: &["token_hash", "name", "creation_reason", "revocation_reason", "user_agent"], reason: "Operational admin-token metadata; the credential itself is stored as a one-way hash" },
+    ApprovedGroup { table: "admin_access_token", columns: &["token_hash", "name", "creation_reason", "revocation_reason", "user_agent", "permission"], reason: "Operational admin-token metadata; the credential itself is stored as a one-way hash" },
     ApprovedGroup { table: "aml_allowlisted_accounts", columns: &["account_id", "address_type", "reason"], reason: "Queryable compliance allowlist and audit rationale" },
     ApprovedGroup { table: "aml_reports", columns: &["flow", "provider", "account_id", "address_type", "risk_level", "report_id", "reason", "result_json"], reason: "Queryable compliance evidence with access restricted to AML/admin workflows" },
     ApprovedGroup { table: "api_keys", columns: &["key_hash", "name", "key_prefix"], reason: "API credentials are one-way hashed; name and prefix are query/display metadata" },

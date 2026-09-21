@@ -1325,6 +1325,7 @@ pub fn build_app_with_config_and_options(
     let internal_routes = build_internal_routes(app_state.clone());
 
     let response_routes = build_response_routes(
+        app_state.clone(),
         domain_services.response_service,
         domain_services.attestation_service.clone(),
         &auth_components.auth_state_middleware,
@@ -1741,6 +1742,7 @@ pub fn build_completion_routes(
 
 /// Build response routes with auth
 pub fn build_response_routes(
+    native_app_state: AppState,
     response_service: Arc<services::ResponseService>,
     attestation_service: Arc<dyn services::attestation::ports::AttestationServiceTrait>,
     auth_state_middleware: &AuthState,
@@ -1748,6 +1750,14 @@ pub fn build_response_routes(
     rate_limit_state: middleware::RateLimitState,
 ) -> Router {
     let route_state = responses::ResponseRouteState {
+        native_service: services::responses::native::NativeResponsesService {
+            models: native_app_state.config.native_responses_models.clone(),
+            models_service: native_app_state.models_service,
+            completion_service: native_app_state.completion_service,
+            inference_provider_pool: native_app_state.inference_provider_pool,
+            usage_service: native_app_state.usage_service,
+            attestation_service: native_app_state.attestation_service,
+        },
         response_service: response_service.clone(),
         attestation_service: attestation_service.clone(),
     };
@@ -1999,6 +2009,7 @@ pub fn build_feature_request_routes(
             auth_middleware,
         ));
 
+    // Classify read operations in middleware::admin_policy when adding admin routes.
     let admin_routes = Router::new()
         .route("/admin/feature-requests", get(list_admin_feature_requests))
         .with_state(state)
@@ -2241,14 +2252,15 @@ fn build_admin_routes_with_options(
         get_model_consumption_timeseries, get_model_history, get_model_revenue, get_org_revenue,
         get_organization as get_admin_organization, get_organization_concurrent_limit,
         get_organization_fallback, get_organization_limits_history, get_organization_metrics,
-        get_organization_timeseries, get_performance_timeseries, get_platform_metrics,
-        get_platform_timeseries, get_revenue_density, list_admin_access_tokens, list_aml_allowlist,
-        list_aml_reports, list_invitation_email_deliveries, list_model_pricing_changes,
+        get_organization_priority, get_organization_timeseries, get_performance_timeseries,
+        get_platform_metrics, get_platform_timeseries, get_revenue_density,
+        list_admin_access_tokens, list_aml_allowlist, list_aml_reports,
+        list_invitation_email_deliveries, list_model_pricing_changes,
         list_models as admin_list_models, list_organization_members, list_organizations,
         list_users, preview_model_deprecation, preview_model_pricing_changes,
         resend_invitation_email, update_aml_report_status, update_organization_concurrent_limit,
         update_organization_fallback, update_organization_limits, update_organization_member_role,
-        update_service, upsert_aml_allowlist_entry, AdminAppState,
+        update_organization_priority, update_service, upsert_aml_allowlist_entry, AdminAppState,
     };
     use crate::routes::staking_farm::{
         get_admin_organization_staking_farm, sync_admin_organization_staking_farm,
@@ -2322,6 +2334,7 @@ fn build_admin_routes_with_options(
     })
     .ok();
 
+    // Classify read operations in middleware::admin_policy when adding admin routes.
     let admin_routes = Router::new()
         .route(
             "/admin/models",
@@ -2402,6 +2415,10 @@ fn build_admin_routes_with_options(
             "/admin/organizations/{org_id}/concurrent-limit",
             axum::routing::patch(update_organization_concurrent_limit)
                 .get(get_organization_concurrent_limit),
+        )
+        .route(
+            "/admin/organizations/{org_id}/priority",
+            axum::routing::get(get_organization_priority).patch(update_organization_priority),
         )
         .route(
             "/admin/organizations/{org_id}/fallback",
@@ -2826,7 +2843,7 @@ mod tests {
     }
 
     #[test]
-    fn test_openapi_admin_aml_paths_require_session_security() {
+    fn test_openapi_admin_aml_paths_require_admin_security() {
         let spec = serde_json::to_value(ApiDoc::openapi()).unwrap();
         let paths = spec["paths"].as_object().unwrap();
 
@@ -2844,8 +2861,8 @@ mod tests {
             );
             assert_eq!(
                 operation["security"],
-                serde_json::json!([{ "session_token": [] }]),
-                "{method} {path} must require session_token security"
+                serde_json::json!([{ "session_token": [] }, { "admin_token": [] }]),
+                "{method} {path} must require session_token or admin_token security"
             );
         }
     }
@@ -2875,6 +2892,7 @@ mod tests {
             },
             inference_api_key: Some("test-key".to_string()),
             internal_usage_token: None,
+            native_responses_models: Vec::new(),
             logging: config::LoggingConfig {
                 level: "info".to_string(),
                 format: "compact".to_string(),
@@ -2890,6 +2908,7 @@ mod tests {
                 google: None,
                 near: config::NearConfig::default(),
                 admin_domains: vec![],
+                admin_read_only_tokens_enabled: false,
                 require_session_bound_access_tokens: false,
             },
             database: config::DatabaseConfig {
@@ -2992,6 +3011,7 @@ mod tests {
             },
             inference_api_key: Some("test-key".to_string()),
             internal_usage_token: None,
+            native_responses_models: Vec::new(),
             logging: config::LoggingConfig {
                 level: "info".to_string(),
                 format: "compact".to_string(),
@@ -3007,6 +3027,7 @@ mod tests {
                 google: None,
                 near: config::NearConfig::default(),
                 admin_domains: vec![],
+                admin_read_only_tokens_enabled: false,
                 require_session_bound_access_tokens: false,
             },
             database: config::DatabaseConfig {

@@ -100,6 +100,9 @@ impl From<ChatCompletionRequest> for ChatCompletionParams {
         }
 
         Self {
+            // This conversion has no authenticated org context. Production
+            // completion routes supply organization priority through the service.
+            request_priority: 0,
             model: req.model,
             messages: req.messages.into_iter().map(|m| m.into()).collect(),
             max_tokens: req.max_tokens,
@@ -820,6 +823,64 @@ mod tests {
     /// on each assistant `tool_calls[*]`. If the API drops it, Gemini rejects
     /// the next turn with 400 "Function call is missing a thought_signature".
     /// Confirms the signature survives `Message -> ChatMessage`.
+    #[test]
+    fn test_tool_call_thought_signature_wire_formats() {
+        use serde_json::json;
+        for (fields, expected) in [
+            (
+                json!({"extra_content":{"google":{"thought_signature":"nested"}}}),
+                Some("nested"),
+            ),
+            (json!({"thought_signature":"legacy"}), Some("legacy")),
+            (
+                json!({"thought_signature":"legacy", "extra_content":{"google":{"thought_signature":"nested"}}}),
+                Some("nested"),
+            ),
+            (
+                json!({"thought_signature":"legacy", "extra_content":{"google":{"thought_signature":null}}}),
+                Some("legacy"),
+            ),
+            (json!({}), None),
+            (json!({"extra_content":null}), None),
+            (
+                json!({"extra_content":{"google":null,"unrelated":true}}),
+                None,
+            ),
+        ] {
+            let mut call = json!({"id":"call_read", "type":"function", "function":{"name":"read", "arguments":"{}"}});
+            call.as_object_mut()
+                .unwrap()
+                .extend(fields.as_object().unwrap().clone());
+            let msg: crate::models::Message = serde_json::from_value(json!({
+                "role":"assistant", "tool_calls":[call]
+            }))
+            .unwrap();
+            let domain: ChatMessage = msg.into();
+            assert_eq!(
+                domain.tool_calls.as_ref().unwrap()[0]
+                    .thought_signature
+                    .as_deref(),
+                expected
+            );
+            let outbound: crate::models::Message = domain.into();
+            let wire = serde_json::to_value(outbound).unwrap();
+            let call = &wire["tool_calls"][0];
+            match expected {
+                Some(signature) => {
+                    assert_eq!(call["thought_signature"], signature);
+                    assert_eq!(
+                        call["extra_content"]["google"]["thought_signature"],
+                        signature
+                    );
+                }
+                None => {
+                    assert!(call.get("thought_signature").is_none());
+                    assert!(call.get("extra_content").is_none());
+                }
+            }
+        }
+    }
+
     #[test]
     fn test_tool_call_thought_signature_inbound_roundtrip() {
         let sig = "Ep8BCpwBAQw51sfQQgKQ2k...".to_string();

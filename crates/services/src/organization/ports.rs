@@ -23,6 +23,9 @@ impl std::fmt::Display for OrganizationId {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Organization {
+    /// Operator-controlled scheduler priority. Never accepted from or exposed in JSON.
+    #[serde(skip)]
+    pub request_priority: inference_providers::models::RequestPriority,
     pub id: OrganizationId,
     pub name: String,
     pub description: Option<String>,
@@ -146,6 +149,8 @@ pub enum OrganizationError {
 
     #[error("Organization is bound to a NEAR staking wallet")]
     StakingWalletBound,
+    #[error("An organization that is a member's default cannot be deleted")]
+    DefaultOrganization,
 
     #[error("Internal error: {0}")]
     InternalError(String),
@@ -185,6 +190,7 @@ pub enum DeleteOrganizationResult {
     NotFound,
     Unauthorized,
     StakingWalletBound,
+    DefaultOrganization,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -318,6 +324,7 @@ pub struct CreateInvitationRequest {
 #[serde(rename_all = "snake_case")]
 pub enum OrganizationOrderBy {
     CreatedAt,
+    JoinedAt,
 }
 
 #[derive(Debug, Deserialize)]
@@ -336,6 +343,13 @@ pub trait OrganizationRepository: Send + Sync {
     ) -> Result<Organization, RepositoryError>;
 
     async fn get_by_id(&self, id: Uuid) -> Result<Option<Organization>, RepositoryError>;
+
+    /// Set operator policy without touching customer-editable settings.
+    async fn set_request_priority(
+        &self,
+        id: Uuid,
+        priority: i32,
+    ) -> Result<Option<i32>, RepositoryError>;
 
     async fn get_by_name(&self, name: &str) -> Result<Option<Organization>, RepositoryError>;
 
@@ -365,7 +379,8 @@ pub trait OrganizationRepository: Send + Sync {
         actor_user_id: Option<Uuid>,
     ) -> Result<Organization, RepositoryError>;
 
-    /// Soft-deletes an active organization only if it has no staking farm source.
+    /// Soft-deletes an active organization only if it has no staking farm source
+    /// and is not any current member's earliest active membership (joined_at, ID).
     ///
     /// The staking-source check is deliberately status-agnostic: the org-to-wallet
     /// binding is permanent, and unbinding is not an API operation. Scoping this to
@@ -768,6 +783,19 @@ pub trait OrganizationServiceTrait: Send + Sync {
         user_id: UserId,
         patch: PatchOrganizationSettings,
     ) -> Result<OrganizationSettings, OrganizationError>;
+
+    /// Read scheduler priority from an admin-authenticated call path.
+    async fn get_request_priority_for_admin(
+        &self,
+        organization_id: OrganizationId,
+    ) -> Result<i32, OrganizationError>;
+
+    /// Set scheduler priority from an admin-authenticated call path.
+    async fn update_request_priority_for_admin(
+        &self,
+        organization_id: OrganizationId,
+        priority: i32,
+    ) -> Result<i32, OrganizationError>;
 
     /// Get the effective fallback policy from an admin-authenticated call path.
     async fn get_fallback_enabled_for_admin(

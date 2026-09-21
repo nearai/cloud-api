@@ -27,7 +27,7 @@
 //! the job of the Chutes-specific verifier (a later PR); this module only models
 //! the wire shape and extracts the fields.
 
-use serde::{Deserialize, Deserializer};
+use serde::{Deserialize, Deserializer, Serialize};
 
 /// Deserialize a value that may be absent **or explicitly `null`** into its
 /// `Default`. `#[serde(default)]` alone only covers an absent key; Python-backed
@@ -72,7 +72,7 @@ pub struct InstanceEvidence {
 }
 
 /// NVIDIA confidential-compute evidence for one physical GPU.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct GpuEvidence {
     /// Base64 NVIDIA device certificate chain.
     pub certificate: String,

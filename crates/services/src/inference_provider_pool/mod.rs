@@ -25,6 +25,9 @@ use tracing::{debug, info, warn};
 mod context_routing;
 pub use context_routing::expand_inference_endpoints;
 
+#[cfg(test)]
+mod chutes_routing_tests;
+
 mod provider_attribution;
 use provider_attribution::{served_provider_attribution, ServedProviderResult};
 pub use provider_attribution::{
@@ -145,10 +148,9 @@ fn record_provider_attempt(
 }
 
 /// Carry the routing pin to the provider for backend-key affinity. The NEAR
-/// provider strips it in `prepare_encryption_headers` before serialising, and
-/// the external provider strips it in `strip_internal_keys`, so it never
-/// reaches an upstream request body. A pubkey-routed request only ever selects
-/// a provider registered in `pubkey_to_providers`.
+/// provider strips it in `prepare_encryption_headers` before serialising,
+/// Chutes strips it in `request_body`, and the external provider strips it in
+/// `strip_internal_keys`, so it never reaches an upstream request body.
 fn reinsert_pubkey_pin(params: &mut ChatCompletionParams, pub_key: Option<&str>) {
     if let Some(pub_key) = pub_key {
         params.extra.insert(
@@ -1239,11 +1241,10 @@ impl InferenceProviderPool {
     /// primary provider is absent.
     ///
     /// Unlike [`Self::register_provider`], this does NOT run signing-key attestation
-    /// discovery (a wasted round trip for Chutes, which has no signing-address pubkey
-    /// and verifies its backend per request) and so does NOT populate
-    /// `pubkey_to_providers`. A pubkey-routed (E2EE) request — selected via
-    /// `model_pub_key` — therefore gets NO Chutes fallback by design: Chutes has no
-    /// per-response signing key, its integrity is the ML-KEM AEAD channel itself.
+    /// discovery (Chutes has no signing-address pubkey and verifies its backend
+    /// per request) and so does NOT populate `pubkey_to_providers`. Providers
+    /// that enforce keys during request-time discovery can opt into routing via
+    /// `supports_per_request_pubkey_routing`, independently of that signing-key map.
     pub async fn register_pinned_provider(
         &self,
         model_id: String,
@@ -2087,15 +2088,19 @@ impl InferenceProviderPool {
         // Filter by model_pub_key if provided
         let providers = if let Some(pub_key) = model_pub_key {
             // Use the existing 'mappings' lock instead of acquiring it again
-            let pub_key_providers = mappings.pubkey_to_providers.get(pub_key)?.clone();
+            let pub_key_providers = mappings.pubkey_to_providers.get(pub_key);
 
-            // Find intersection: providers that are in both lists
+            // Signing-key providers must be in both maps. A provider with
+            // request-time key discovery (Chutes) enforces the exact pin itself;
+            // do not cache its rotating instance keys in the signing-key map.
             let filtered: Vec<Arc<InferenceProviderTrait>> = model_providers
                 .iter()
                 .filter(|model_provider| {
-                    pub_key_providers
-                        .iter()
-                        .any(|pub_provider| Arc::ptr_eq(model_provider, pub_provider))
+                    pub_key_providers.is_some_and(|providers| {
+                        providers
+                            .iter()
+                            .any(|pub_provider| Arc::ptr_eq(model_provider, pub_provider))
+                    }) || model_provider.supports_per_request_pubkey_routing(pub_key)
                 })
                 .cloned()
                 .collect();

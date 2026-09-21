@@ -42,6 +42,18 @@ use std::io::{Read, Write};
 pub const MLKEM_CT_LEN: usize = 1088;
 /// ML-KEM-768 public-key length (bytes).
 pub const MLKEM_PK_LEN: usize = 1184;
+
+/// Whether a routing key has the standard base64 encoding and size used by
+/// Chutes attestation reports. This checks the wire format, not attestation;
+/// the chosen instance must still verify before the key is used for inference.
+pub fn is_encoded_public_key(public_key: &str) -> bool {
+    use base64::Engine;
+    public_key.len() == MLKEM_PK_LEN.div_ceil(3) * 4
+        && base64::engine::general_purpose::STANDARD
+            .decode(public_key)
+            .is_ok_and(|bytes| bytes.len() == MLKEM_PK_LEN)
+}
+
 /// ChaCha20-Poly1305 nonce length (bytes).
 pub const NONCE_LEN: usize = 12;
 /// Poly1305 tag length (bytes).
@@ -311,7 +323,7 @@ fn split_blob(blob: &[u8]) -> Result<BlobParts<'_>, E2eeError> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod test_support {
     use super::*;
     use ml_kem::DecapsulationKey768;
 
@@ -321,7 +333,7 @@ mod tests {
 
     /// Pretend to be an instance: decrypt a request blob, returning the OpenAI
     /// payload JSON and the client's ephemeral response public key (raw bytes).
-    fn instance_open_request(
+    pub(crate) fn instance_open_request(
         instance_dk: &DecapsulationKey768,
         blob: &[u8],
     ) -> (serde_json::Value, Vec<u8>) {
@@ -340,7 +352,7 @@ mod tests {
 
     /// Pretend to be an instance: encapsulate a non-stream response to the
     /// client's ephemeral pubkey and seal the (gzipped) response JSON.
-    fn instance_seal_response(
+    pub(crate) fn instance_seal_response(
         client_response_pk: &[u8],
         response_json: &serde_json::Value,
     ) -> Vec<u8> {
@@ -359,7 +371,7 @@ mod tests {
 
     /// Instance side of streaming: emit the `e2e_init` ciphertext + a sealed
     /// content frame (no gzip), returning (init_ct, stream_frame).
-    fn instance_stream(client_response_pk: &[u8], chunk: &[u8]) -> (Vec<u8>, Vec<u8>) {
+    pub(crate) fn instance_stream(client_response_pk: &[u8], chunk: &[u8]) -> (Vec<u8>, Vec<u8>) {
         let ek = EncapsulationKey768::new_from_slice(client_response_pk).unwrap();
         let (mlkem_ct, ss) = ek.encapsulate();
         let key = derive_key(ss.as_slice(), mlkem_ct.as_slice(), INFO_STREAM);
@@ -371,10 +383,16 @@ mod tests {
         (mlkem_ct.as_slice().to_vec(), frame)
     }
 
-    fn instance_keypair() -> (DecapsulationKey768, Vec<u8>) {
+    pub(crate) fn instance_keypair() -> (DecapsulationKey768, Vec<u8>) {
         let (dk, ek) = MlKem768::generate_keypair();
         (dk, ek.to_bytes().as_slice().to_vec())
     }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::test_support::*;
+    use super::*;
 
     #[test]
     fn request_blob_has_expected_shape() {

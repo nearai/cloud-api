@@ -436,6 +436,14 @@ pub trait InferenceProvider {
         true
     }
 
+    /// Whether this provider can enforce this public-key routing constraint
+    /// during per-request backend discovery, without a pool signing-key entry.
+    /// Returning true only accepts the key's format: the provider MUST select
+    /// and verify a backend with that exact key, or fail closed, on every attempt.
+    fn supports_per_request_pubkey_routing(&self, _public_key: &str) -> bool {
+        false
+    }
+
     /// Clean up the dedicated client for a chat_id after signature fetching.
     fn unpin_chat_connection(&self, _chat_id: &str) {}
 

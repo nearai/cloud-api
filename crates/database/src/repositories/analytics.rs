@@ -39,6 +39,24 @@ const ORGANIZATION_USAGE_METRICS_CTE: &str = r#"
     )
 "#;
 
+// The default path must not depend on custom-plan constant folding: generic
+// prepared plans must also avoid per-request allocation lookups.
+const UNFILTERED_ORGANIZATION_USAGE_METRICS_CTE: &str = r#"
+    WITH metric_usage AS (
+        SELECT ul.*, ul.total_cost AS filtered_cost
+        FROM organization_usage_log ul
+        WHERE ul.organization_id = $1 AND ul.created_at >= $2 AND ul.created_at < $3
+          AND $4::TEXT IS NULL
+    )
+"#;
+
+fn organization_usage_metrics_cte(credit_type: Option<&str>) -> &'static str {
+    match credit_type {
+        Some(_) => ORGANIZATION_USAGE_METRICS_CTE,
+        None => UNFILTERED_ORGANIZATION_USAGE_METRICS_CTE,
+    }
+}
+
 /// PostgreSQL implementation of the analytics repository
 pub struct PgAnalyticsRepository {
     pool: DbPool,
@@ -88,6 +106,7 @@ impl AnalyticsRepository for PgAnalyticsRepository {
         end: DateTime<Utc>,
         credit_type: Option<&str>,
     ) -> Result<OrganizationMetrics, RepositoryError> {
+        let usage_cte = organization_usage_metrics_cte(credit_type);
         let client = self
             .pool
             .get()
@@ -105,7 +124,7 @@ impl AnalyticsRepository for PgAnalyticsRepository {
         let summary_row = client
             .query_one(
                 &format!(
-                    r#"{ORGANIZATION_USAGE_METRICS_CTE}
+                    r#"{usage_cte}
                 SELECT
                     COUNT(*)::bigint as requests,
                     COALESCE(SUM(input_tokens), 0)::bigint as input_tokens,
@@ -137,7 +156,7 @@ impl AnalyticsRepository for PgAnalyticsRepository {
         let workspace_rows = client
             .query(
                 &format!(
-                    r#"{ORGANIZATION_USAGE_METRICS_CTE}
+                    r#"{usage_cte}
                 SELECT
                     w.id as workspace_id,
                     w.name as workspace_name,
@@ -177,7 +196,7 @@ impl AnalyticsRepository for PgAnalyticsRepository {
         let api_key_rows = client
             .query(
                 &format!(
-                    r#"{ORGANIZATION_USAGE_METRICS_CTE}
+                    r#"{usage_cte}
                 SELECT 
                     ak.id as api_key_id,
                     ak.name as api_key_name,
@@ -212,7 +231,7 @@ impl AnalyticsRepository for PgAnalyticsRepository {
         // Get metrics by model (including latency metrics: TTFT and ITL)
         let model_rows = client
             .query(
-                &format!(r#"{ORGANIZATION_USAGE_METRICS_CTE}
+                &format!(r#"{usage_cte}
                 SELECT
                     ul.model_name,
                     COUNT(*)::bigint as requests,
@@ -453,6 +472,7 @@ impl AnalyticsRepository for PgAnalyticsRepository {
         granularity: &str,
         credit_type: Option<&str>,
     ) -> Result<TimeSeriesMetrics, RepositoryError> {
+        let usage_cte = organization_usage_metrics_cte(credit_type);
         let client = self
             .pool
             .get()
@@ -475,7 +495,7 @@ impl AnalyticsRepository for PgAnalyticsRepository {
 
         // Get time series data
         let query = format!(
-            r#"{ORGANIZATION_USAGE_METRICS_CTE}
+            r#"{usage_cte}
             SELECT
                 DATE_TRUNC('{date_trunc}', created_at)::text as date,
                 COUNT(*)::bigint as requests,

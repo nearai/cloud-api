@@ -267,6 +267,7 @@ async fn admin_metrics_credit_type_allows_read_only_tokens() {
 fn admin_metrics_credit_type_is_documented() {
     use utoipa::OpenApi;
     let spec = serde_json::to_value(api::openapi::ApiDoc::openapi()).unwrap();
+    let mut descriptions = Vec::new();
     for path in [
         "/v1/admin/organizations/{org_id}/metrics",
         "/v1/admin/organizations/{org_id}/metrics/timeseries",
@@ -279,9 +280,11 @@ fn admin_metrics_credit_type_is_documented() {
             .expect("credit_type parameter");
         assert_eq!(parameter["in"], "query");
         assert_eq!(parameter["required"], false);
+        descriptions.push(parameter["description"].clone());
         assert!(parameter["description"]
             .as_str()
             .unwrap()
             .contains("settlements"));
     }
+    assert_eq!(descriptions[0], descriptions[1]);
 }

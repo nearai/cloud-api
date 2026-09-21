@@ -3725,10 +3725,13 @@ pub struct MetricsQueryParams {
     pub end: Option<String>,
 }
 
+const CREDIT_TYPE_QUERY_DESCRIPTION: &str = "Filter consumed inference usage by grant, staking_farm, payment, or postpay. Costs include only saved matching allocations, including settlements. Each matching request and its full tokens count once; counts are not additive across credit types. Unattributed historical usage is excluded. Omit for all usage.";
+
 #[derive(Debug, serde::Deserialize)]
 pub struct OrganizationMetricsQueryParams {
     pub start: Option<String>,
     pub end: Option<String>,
+    /// Optional saved credit allocation type: grant, staking_farm, payment, or postpay.
     pub credit_type: Option<String>,
 }
 
@@ -3765,7 +3768,7 @@ fn parse_metrics_credit_type(
         ("org_id" = String, Path, description = "Organization ID to get metrics for"),
         ("start" = Option<String>, Query, description = "Start of time range (ISO 8601). Defaults to 30 days ago."),
         ("end" = Option<String>, Query, description = "End of time range (ISO 8601). Defaults to now."),
-        ("credit_type" = Option<CreditType>, Query, description = "Filter consumed inference usage by grant, staking_farm, payment, or postpay. Costs include only saved matching allocations, including settlements. Each matching request and its full tokens count once; counts are not additive across credit types. Unattributed historical usage is excluded. Omit for all usage.")
+        ("credit_type" = Option<CreditType>, Query, description = CREDIT_TYPE_QUERY_DESCRIPTION)
     ),
     responses(
         (status = 200, description = "Organization metrics retrieved successfully"),
@@ -4271,6 +4274,7 @@ pub struct OrganizationTimeSeriesQueryParams {
     /// Granularity: "hour", "day" (default), or "week"
     #[serde(default = "default_granularity")]
     pub granularity: String,
+    /// Optional saved credit allocation type: grant, staking_farm, payment, or postpay.
     pub credit_type: Option<String>,
 }
 
@@ -4508,7 +4512,7 @@ pub async fn get_revenue_density(
         ("start" = Option<String>, Query, description = "Start of time range (ISO 8601). Defaults to 30 days ago."),
         ("end" = Option<String>, Query, description = "End of time range (ISO 8601). Defaults to now."),
         ("granularity" = Option<String>, Query, description = "Time granularity: hour, day (default), or week"),
-        ("credit_type" = Option<CreditType>, Query, description = "Filter consumed inference usage by grant, staking_farm, payment, or postpay. Costs include only saved matching allocations, including settlements. Each matching request and its full tokens count once; counts are not additive across credit types. Unattributed historical usage is excluded. Omit for all usage.")
+        ("credit_type" = Option<CreditType>, Query, description = CREDIT_TYPE_QUERY_DESCRIPTION)
     ),
     responses(
         (status = 200, description = "Time series metrics retrieved successfully"),

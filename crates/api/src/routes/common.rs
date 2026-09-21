@@ -561,6 +561,14 @@ pub fn map_organization_error(
                 "conflict".to_string(),
             )),
         ),
+        OrganizationError::DefaultOrganization => (
+            StatusCode::CONFLICT,
+            ResponseJson(ErrorResponse::new(
+                "Organization cannot be deleted because it is a member's default organization"
+                    .to_string(),
+                "default_organization".to_string(),
+            )),
+        ),
         OrganizationError::StakingWalletBound => (
             StatusCode::CONFLICT,
             ResponseJson(ErrorResponse::new(

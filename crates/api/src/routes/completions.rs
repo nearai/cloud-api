@@ -2478,7 +2478,17 @@ async fn chat_completions_inner(
                     _ => body_bytes,
                 };
 
-                if gateway_signature_enabled {
+                // Attestation support does not imply per-response signatures:
+                // Chutes needs a Gateway receipt even for unchanged JSON. The
+                // pool records the actual serving provider before returning,
+                // so this also covers NEAR-to-Chutes fallback.
+                if gateway_signature_enabled
+                    || app_state
+                        .inference_provider_pool
+                        .get_provider_by_chat_id(&response_with_bytes.response.id)
+                        .await
+                        .is_some_and(|provider| !provider.supports_chat_signatures())
+                {
                     let response_hash = hex::encode(Sha256::digest(&body_bytes));
                     if let Err(error) = app_state
                         .attestation_service

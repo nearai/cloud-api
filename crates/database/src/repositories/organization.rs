@@ -372,54 +372,50 @@ impl PgOrganizationRepository {
         request: DbAddOrganizationMemberRequest,
         invited_by: Uuid,
     ) -> Result<DbOrganizationMember, RepositoryError> {
-        // Check if user is already a member
-        let existing = retry_db!("check_if_user_is_member", {
-            let client = self
-                .pool
-                .get()
-                .await
-                .context("Failed to get database connection")
-                .map_err(RepositoryError::PoolError)?;
-
-            client
-            .query_opt(
-                "SELECT * FROM organization_members WHERE organization_id = $1 AND user_id = $2",
-                &[&org_id, &request.user_id],
-            )
-            .await
-            .map_err(map_db_error)
-        })?;
-
-        if existing.is_some() {
-            return Err(RepositoryError::AlreadyExists);
-        }
-
         let id = Uuid::new_v4();
-
         let row = retry_db!("add_member_to_organization", {
-            let now = Utc::now();
-            let client = self
+            let mut client = self
                 .pool
                 .get()
                 .await
                 .context("Failed to get database connection")
                 .map_err(RepositoryError::PoolError)?;
+            let transaction = client.transaction().await.map_err(map_db_error)?;
 
-            client.query_one(
-            r#"
-            INSERT INTO organization_members (id, organization_id, user_id, role, joined_at, invited_by)
-            VALUES ($1, $2, $3, $4, $5, $6)
-            RETURNING *
-            "#,
-            &[
-                &id,
-                &org_id,
-                &request.user_id,
-                &request.role.to_string().to_lowercase(),
-                &now,
-                &invited_by,
-            ],
-        ).await.map_err(map_db_error)
+            // Hold the active parent through insertion. Deletion takes FOR UPDATE,
+            // so it either sees this member or finishes before we check is_active.
+            let organization = transaction
+                .query_opt(
+                    "SELECT id FROM organizations WHERE id = $1 AND is_active = true FOR SHARE",
+                    &[&org_id],
+                )
+                .await
+                .map_err(map_db_error)?;
+            if organization.is_none() {
+                return Err(RepositoryError::NotFound(org_id.to_string()));
+            }
+
+            let existing = transaction
+                .query_opt(
+                    "SELECT id FROM organization_members WHERE organization_id = $1 AND user_id = $2",
+                    &[&org_id, &request.user_id],
+                )
+                .await
+                .map_err(map_db_error)?;
+            if existing.is_some() {
+                return Err(RepositoryError::AlreadyExists);
+            }
+
+            let now = Utc::now();
+            let row = transaction.query_one(
+                "INSERT INTO organization_members (id, organization_id, user_id, role, joined_at, invited_by)
+                 VALUES ($1, $2, $3, $4, $5, $6)
+                 RETURNING *",
+                &[&id, &org_id, &request.user_id,
+                  &request.role.to_string().to_lowercase(), &now, &invited_by],
+            ).await.map_err(map_db_error)?;
+            transaction.commit().await.map_err(map_db_error)?;
+            Ok(row)
         })?;
 
         debug!(
@@ -932,6 +928,29 @@ impl OrganizationRepository for PgOrganizationRepository {
                     transaction.rollback().await.map_err(map_db_error)?;
                     DeleteOrganizationResult::StakingWalletBound
                 } else {
+                    // Protect the earliest active membership of every current member,
+                    // not only the owner. Use the same total order as /users/me,
+                    // without a listing limit. The organization lock above keeps
+                    // this check and the soft-delete in the same transaction.
+                    let is_default: bool = transaction.query_one(
+                        "SELECT EXISTS (
+                            SELECT 1 FROM organization_members candidate
+                            WHERE candidate.organization_id = $1
+                              AND NOT EXISTS (
+                                SELECT 1 FROM organization_members earlier
+                                JOIN organizations o ON o.id = earlier.organization_id AND o.is_active
+                                WHERE earlier.user_id = candidate.user_id
+                                  AND (earlier.joined_at, earlier.organization_id)
+                                      < (candidate.joined_at, candidate.organization_id)
+                              )
+                        )",
+                        &[&id],
+                    ).await.map_err(map_db_error)?.get(0);
+                    if is_default {
+                        transaction.rollback().await.map_err(map_db_error)?;
+                        return Ok(DeleteOrganizationResult::DefaultOrganization);
+                    }
+
                     let rows_affected = transaction
                         .execute(
                             "UPDATE organizations SET is_active = false WHERE id = $1 AND is_active = true",

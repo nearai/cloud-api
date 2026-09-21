@@ -288,3 +288,132 @@ fn admin_metrics_credit_type_is_documented() {
     }
     assert_eq!(descriptions[0], descriptions[1]);
 }
+
+#[tokio::test]
+async fn admin_metrics_credit_type_timeout_is_shared_and_transaction_local() {
+    use crate::admin_provider_attribution_support::{
+        insert_platform_provider_usage_row, ProviderUsageSeedRow,
+    };
+    use services::{admin::AnalyticsRepository, common::RepositoryError};
+    use std::time::Duration;
+
+    let fixture = setup_platform_provider_usage_fixture().await;
+    insert_platform_provider_usage_row(
+        &fixture,
+        ProviderUsageSeedRow {
+            created_at: Utc::now(),
+            input_tokens: 100,
+            output_tokens: 20,
+            cache_read_tokens: 0,
+            total_cost: 1_000_000_000,
+            served_provider_type: None,
+            served_provider_tier: None,
+            served_via_fallback: false,
+        },
+    )
+    .await;
+    // Temporary views isolate delays to this test's single pooled connection;
+    // no shared-table locks or changes to other tests' data are needed.
+    let pool = crate::common::db_setup::create_test_pool().await;
+    pool.current().unwrap().resize(1);
+    let client = pool.get().await.unwrap();
+    let usage_id: Uuid = client
+        .query_one(
+            "SELECT id FROM organization_usage_log WHERE organization_id = $1",
+            &[&fixture.organization_id],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    let original_timeout: String = client
+        .query_one("SHOW statement_timeout", &[])
+        .await
+        .unwrap()
+        .get(0);
+    client
+        .batch_execute(&format!(
+            "CREATE TEMP VIEW organizations AS
+         SELECT '{}'::uuid AS id, 'Slow metrics fixture'::text AS name FROM pg_sleep(0.25);
+         CREATE TEMP VIEW usage_credit_allocations AS
+         SELECT '{}'::uuid AS inference_usage_id, 'postpay'::text AS credit_type,
+                1000000000::bigint AS amount FROM pg_sleep(0.25);",
+            fixture.organization_id, usage_id,
+        ))
+        .await
+        .unwrap();
+    drop(client);
+    let repo = database::repositories::PgAnalyticsRepository::with_filtered_metrics_timeout(
+        pool.clone(),
+        Duration::from_millis(400),
+    );
+    let start = Utc::now() - chrono::Duration::days(1);
+    let end = Utc::now() + chrono::Duration::days(1);
+    // Each delayed statement is individually shorter than the budget, but the
+    // organization lookup and allocation query together exceed it.
+    let summary = tokio::time::timeout(
+        Duration::from_secs(5),
+        repo.get_organization_metrics(fixture.organization_id, start, end, Some("postpay")),
+    )
+    .await
+    .expect("database should cancel before the test deadline");
+    assert!(
+        matches!(summary, Err(RepositoryError::QueryTimeout)),
+        "{summary:?}"
+    );
+    let timeseries = tokio::time::timeout(
+        Duration::from_secs(5),
+        repo.get_organization_timeseries(
+            fixture.organization_id,
+            start,
+            end,
+            "day",
+            Some("postpay"),
+        ),
+    )
+    .await
+    .expect("database should cancel before the test deadline");
+    assert!(
+        matches!(timeseries, Err(RepositoryError::QueryTimeout)),
+        "{timeseries:?}"
+    );
+
+    let client = pool.get().await.unwrap();
+    let timeout: String = client
+        .query_one("SHOW statement_timeout", &[])
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(
+        timeout, original_timeout,
+        "SET LOCAL must not leak after errors"
+    );
+    drop(client);
+    let unfiltered = repo
+        .get_organization_metrics(fixture.organization_id, start, end, None)
+        .await
+        .unwrap();
+    assert_eq!(unfiltered.summary.total_requests, 1);
+    assert_eq!(unfiltered.summary.total_cost_usd, 1.0);
+
+    // A successful filtered request must also restore the pooled connection.
+    let repo = database::repositories::PgAnalyticsRepository::with_filtered_metrics_timeout(
+        pool.clone(),
+        Duration::from_secs(5),
+    );
+    let filtered = repo
+        .get_organization_timeseries(fixture.organization_id, start, end, "day", Some("postpay"))
+        .await
+        .unwrap();
+    assert_eq!(filtered.data.len(), 1);
+    assert_eq!(filtered.data[0].cost_usd, 1.0);
+    let client = pool.get().await.unwrap();
+    let timeout: String = client
+        .query_one("SHOW statement_timeout", &[])
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(
+        timeout, original_timeout,
+        "SET LOCAL must not leak after success"
+    );
+}

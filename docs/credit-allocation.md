@@ -39,6 +39,11 @@ filter is omitted.
 Admin metrics retain their existing inference-usage scope (not platform-service
 usage), response shape, and half-open `[start, end)` usage timestamp range.
 Settlement amounts belong to the original usage date, not the settlement date.
+A period's per-credit totals may therefore increase on later queries until its
+outstanding unfunded usage is settled; these are not frozen invoice totals.
+Filtered admin metrics share a 10-second database-query budget across their
+statements, using transaction-local timeouts. Unfiltered requests keep their
+existing timeout behavior.
 The optional filter accepts `grant`, `staking_farm`, `payment`, and `postpay`
 (case-insensitively, like reporting); unsupported values return HTTP 400.
 For example, September postpay consumption can be queried with

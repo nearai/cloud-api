@@ -3725,12 +3725,12 @@ pub struct MetricsQueryParams {
     pub end: Option<String>,
 }
 
-const CREDIT_TYPE_QUERY_DESCRIPTION: &str = "Filter consumed inference usage by grant, staking_farm, payment, or postpay. Costs include only saved matching allocations, including settlements. Each matching request and its full tokens count once; counts are not additive across credit types. Unattributed historical usage is excluded. Omit for all usage.";
+const CREDIT_TYPE_QUERY_DESCRIPTION: &str = "Filter consumed inference usage by grant, staking_farm, payment, or postpay. Costs include only saved matching allocations, including settlements. Each matching request and its full tokens count once; counts are not additive across credit types. Unattributed historical usage is excluded. Period totals may increase until outstanding unfunded usage is settled. Omit for all usage.";
 
 #[derive(Debug, serde::Deserialize)]
 pub struct OrganizationMetricsQueryParams {
-    pub start: Option<String>,
-    pub end: Option<String>,
+    #[serde(flatten)]
+    pub metrics: MetricsQueryParams,
     /// Optional saved credit allocation type: grant, staking_farm, payment, or postpay.
     pub credit_type: Option<String>,
 }
@@ -3790,12 +3790,13 @@ pub async fn get_organization_metrics(
     ResponseJson<services::admin::OrganizationMetrics>,
     (StatusCode, ResponseJson<ErrorResponse>),
 > {
-    debug!(
-        "Get organization metrics request for org_id: {}, start: {:?}, end: {:?}",
-        org_id, params.start, params.end
-    );
-
     let credit_type = parse_metrics_credit_type(params.credit_type.as_deref())?;
+
+    debug!(
+        credit_type = ?credit_type,
+        "Get organization metrics request for org_id: {}, start: {:?}, end: {:?}",
+        org_id, params.metrics.start, params.metrics.end
+    );
 
     // Parse organization ID
     let organization_id = uuid::Uuid::parse_str(&org_id).map_err(|_| {
@@ -3810,12 +3811,14 @@ pub async fn get_organization_metrics(
 
     // Parse time range with defaults
     let end = params
+        .metrics
         .end
         .and_then(|s| chrono::DateTime::parse_from_rfc3339(&s).ok())
         .map(|dt| dt.with_timezone(&Utc))
         .unwrap_or_else(Utc::now);
 
     let start = params
+        .metrics
         .start
         .and_then(|s| chrono::DateTime::parse_from_rfc3339(&s).ok())
         .map(|dt| dt.with_timezone(&Utc))
@@ -4267,13 +4270,8 @@ pub struct TimeSeriesQueryParams {
 
 #[derive(Debug, serde::Deserialize)]
 pub struct OrganizationTimeSeriesQueryParams {
-    /// Start of time range (ISO 8601 format). Defaults to 30 days ago.
-    pub start: Option<String>,
-    /// End of time range (ISO 8601 format). Defaults to now.
-    pub end: Option<String>,
-    /// Granularity: "hour", "day" (default), or "week"
-    #[serde(default = "default_granularity")]
-    pub granularity: String,
+    #[serde(flatten)]
+    pub metrics: TimeSeriesQueryParams,
     /// Optional saved credit allocation type: grant, staking_farm, payment, or postpay.
     pub credit_type: Option<String>,
 }
@@ -4534,12 +4532,13 @@ pub async fn get_organization_timeseries(
     ResponseJson<services::admin::TimeSeriesMetrics>,
     (StatusCode, ResponseJson<ErrorResponse>),
 > {
-    debug!(
-        "Get organization timeseries request for org_id: {}, start: {:?}, end: {:?}, granularity: {}",
-        org_id, params.start, params.end, params.granularity
-    );
-
     let credit_type = parse_metrics_credit_type(params.credit_type.as_deref())?;
+
+    debug!(
+        credit_type = ?credit_type,
+        "Get organization timeseries request for org_id: {}, start: {:?}, end: {:?}, granularity: {}",
+        org_id, params.metrics.start, params.metrics.end, params.metrics.granularity
+    );
 
     // Parse organization ID
     let organization_id = uuid::Uuid::parse_str(&org_id).map_err(|_| {
@@ -4553,8 +4552,8 @@ pub async fn get_organization_timeseries(
     })?;
 
     // Validate granularity
-    let granularity = match params.granularity.as_str() {
-        "hour" | "day" | "week" => params.granularity.as_str(),
+    let granularity = match params.metrics.granularity.as_str() {
+        "hour" | "day" | "week" => params.metrics.granularity.as_str(),
         _ => {
             return Err((
                 StatusCode::BAD_REQUEST,
@@ -4568,8 +4567,8 @@ pub async fn get_organization_timeseries(
 
     // Parse time range — hard error on bad input, 366-day cap for non-hour granularities
     let (start, end) = crate::routes::common::parse_metrics_range(
-        params.start.as_deref(),
-        params.end.as_deref(),
+        params.metrics.start.as_deref(),
+        params.metrics.end.as_deref(),
         Some(granularity),
         31,
     )?;

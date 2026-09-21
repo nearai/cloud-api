@@ -323,6 +323,22 @@ async fn store_and_unpin_stores_gateway_signature_and_releases_pin_on_success() 
 }
 
 #[tokio::test]
+async fn store_and_unpin_rejects_empty_id_without_storing_and_releases_pin() {
+    let (pool, provider) = pool_with_pinned_chat("").await;
+    let repository = RecordingRepository::default();
+    let service = lifecycle_service(Arc::new(repository.clone()), pool);
+
+    let result = service
+        .store_chat_signature_and_unpin("", "req-hash".to_string(), "resp-hash".to_string())
+        .await;
+
+    assert!(matches!(result, Err(AttestationError::InvalidParameter(_))));
+    assert!(repository.stored().is_empty());
+    assert!(repository.batch_sizes().is_empty());
+    assert_eq!(provider.unpinned_chat_ids(), vec![String::new()]);
+}
+
+#[tokio::test]
 async fn store_and_unpin_releases_pin_when_store_fails() {
     let chat_id = "chatcmpl-lifecycle-store-error";
     let (pool, provider) = pool_with_pinned_chat(chat_id).await;

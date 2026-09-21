@@ -25,6 +25,13 @@ organization row lock. Non-default organizations remain deletable under the
 existing rules. The UI hides deletion for the signed-in user's default and
 handles server rejections for other members' defaults.
 
+Adding a member, including accepting an invitation, checks that the organization
+is active and holds a `FOR SHARE` row lock through the membership insert in the
+same transaction. This serializes with deletion's `FOR UPDATE` lock: deletion
+sees a committed new member, or the insert rejects the deleted organization.
+Accepting an outstanding invitation to a deleted organization returns HTTP 404
+without creating a membership or marking the invitation accepted.
+
 Protection follows the dynamic definition: if a member leaves, their former
 organization is no longer protected on their behalf. Ownership transfer alone
 does not remove a retained membership's protection. This does not restore the

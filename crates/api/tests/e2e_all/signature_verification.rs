@@ -415,6 +415,148 @@ async fn test_raw_provider_signature_is_available_when_done_is_emitted() {
 }
 
 #[tokio::test]
+async fn test_chutes_non_streaming_chat_gateway_signature_hashes_exact_json() {
+    assert_chutes_chat_signature_routing(None).await;
+}
+
+#[tokio::test]
+async fn test_near_to_chutes_non_streaming_chat_gateway_signature_hashes_exact_json() {
+    assert_chutes_chat_signature_routing(Some(false)).await;
+}
+
+#[tokio::test]
+async fn test_near_non_streaming_chat_retains_provider_signature_with_chutes_fallback() {
+    assert_chutes_chat_signature_routing(Some(true)).await;
+}
+
+// None: Chutes-only model; Some(false): NEAR fails and falls back to Chutes;
+// Some(true): NEAR succeeds even though a non-signing fallback is registered.
+async fn assert_chutes_chat_signature_routing(near_succeeds: Option<bool>) {
+    use inference_providers::{CompletionError, ProviderSource, ProviderTier};
+
+    let (server, pool, _mock, _database) = setup_test_server_with_pool().await;
+    let model_name = format!("nearai/test-chutes-signature-{}", uuid::Uuid::new_v4());
+    let near = Arc::new(
+        MockProvider::new_accept_all()
+            .with_tier(ProviderTier::Near)
+            .with_provider_source(ProviderSource::Vllm),
+    );
+    if let Some(succeeds) = near_succeeds {
+        if !succeeds {
+            near.set_error_override(Some(CompletionError::HttpError {
+                status_code: 503,
+                message: "NEAR unavailable".to_string(),
+                is_external: true,
+            }))
+            .await;
+        }
+        pool.register_provider(model_name.clone(), near.clone())
+            .await;
+    }
+    let chutes = Arc::new(
+        MockProvider::new_accept_all()
+            .with_tier(ProviderTier::Attested3p)
+            .with_provider_source(ProviderSource::Chutes)
+            .with_client_e2ee_support(false)
+            .with_chat_signature_support(false),
+    );
+    pool.register_pinned_secondary_provider(model_name.clone(), chutes.clone(), None)
+        .await;
+    let mut batch = BatchUpdateModelApiRequest::new();
+    batch.insert(
+        model_name.clone(),
+        serde_json::from_value(serde_json::json!({
+            "inputCostPerToken": { "amount": 1_000_000, "currency": "USD" },
+            "outputCostPerToken": { "amount": 2_000_000, "currency": "USD" },
+            "modelDisplayName": "Chutes signature fixture",
+            "modelDescription": "Isolated serving-provider signature test model",
+            "contextLength": 128000,
+            "maxOutputLength": 1024,
+            "verifiable": true,
+            "isActive": true,
+            "attestationSupported": true,
+            "providerType": if near_succeeds.is_some() { "vllm" } else { "chutes" }
+        }))
+        .expect("test model fixture should deserialize"),
+    );
+    let updated = admin_batch_upsert_models(&server, batch, get_session_id()).await;
+    assert!(updated[0].metadata.attestation_supported);
+    let org = setup_org_with_credits(&server, 10_000_000_000i64).await;
+    let api_key = get_api_key_for_org(&server, org.id).await;
+
+    // Canonical name, no auto-redaction, and non-canonical JSON whitespace:
+    // no rewrite condition should be needed to produce a Gateway receipt.
+    let request_json = serde_json::to_string_pretty(&serde_json::json!({
+        "model": model_name,
+        "messages": [{ "role": "user", "content": "Respond with two words." }],
+        "stream": false,
+        "nonce": 1101
+    }))
+    .expect("request should serialize");
+    let response = server
+        .post("/v1/chat/completions")
+        .add_header("Authorization", format!("Bearer {api_key}"))
+        .content_type("application/json")
+        .bytes(Bytes::from(request_json.clone()))
+        .await;
+    assert_eq!(response.status_code(), 200, "{}", response.text());
+    let served_by_near = near_succeeds == Some(true);
+    assert_eq!(
+        response.header("x-serving-provider"),
+        if served_by_near { "near" } else { "chutes" }
+    );
+    assert_eq!(
+        near.last_chat_params().await.is_some(),
+        near_succeeds.is_some()
+    );
+    assert_eq!(chutes.last_chat_params().await.is_some(), !served_by_near);
+    let response_text = response.text();
+    let completion: serde_json::Value =
+        serde_json::from_str(&response_text).expect("completion should be JSON");
+    let chat_id = completion["id"]
+        .as_str()
+        .expect("completion should have an id");
+
+    if served_by_near {
+        // Non-streaming provider signatures are collected asynchronously.
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while near.unpinned_chat_ids().is_empty() {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("NEAR provider signatures should be stored");
+        for algorithm in ["ecdsa", "ed25519"] {
+            let signature_response = server
+                .get(format!("/v1/signature/{chat_id}?signing_algo={algorithm}").as_str())
+                .add_header("Authorization", format!("Bearer {api_key}"))
+                .await;
+            assert_eq!(
+                signature_response.status_code(),
+                200,
+                "{}",
+                signature_response.text()
+            );
+            let signature = signature_response.json::<serde_json::Value>();
+            assert_eq!(signature["signature_kind"], "provider_tee");
+            assert_eq!(
+                signature["text"],
+                format!(
+                    "{}:{}",
+                    compute_sha256(&request_json),
+                    compute_sha256(&response_text)
+                )
+            );
+        }
+    } else {
+        // Both algorithms must be available immediately and verify against the
+        // exact public bytes, even when the configured primary supports signing.
+        assert_gateway_signatures(&server, &api_key, chat_id, &request_json, &response_text).await;
+        assert!(chutes.unpinned_chat_ids().contains(&chat_id.to_string()));
+    }
+}
+
+#[tokio::test]
 async fn test_non_attested_chat_gateway_signature_hashes_exact_json() {
     let (server, _router, pool, _mock, _database) = setup_test_server_with_pool_and_router().await;
     let (model_name, mock) = setup_non_attested_signature_model(&server, &pool).await;

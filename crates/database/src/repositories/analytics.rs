@@ -22,6 +22,23 @@ use std::collections::BTreeMap;
 use tokio_postgres::Error as PostgresError;
 use uuid::Uuid;
 
+// Keep one row per inference request, even when posting and settlement both
+// allocate the requested credit type. Unfiltered costs retain historical usage.
+const ORGANIZATION_USAGE_METRICS_CTE: &str = r#"
+    WITH metric_usage AS (
+        SELECT ul.*, CASE WHEN $4::TEXT IS NULL THEN ul.total_cost
+                          ELSE allocation.amount END AS filtered_cost
+        FROM organization_usage_log ul
+        LEFT JOIN LATERAL (
+            SELECT SUM(a.amount)::BIGINT AS amount
+            FROM usage_credit_allocations a
+            WHERE a.inference_usage_id = ul.id AND a.credit_type = $4
+        ) allocation ON true
+        WHERE ul.organization_id = $1 AND ul.created_at >= $2 AND ul.created_at < $3
+          AND ($4::TEXT IS NULL OR allocation.amount > 0)
+    )
+"#;
+
 /// PostgreSQL implementation of the analytics repository
 pub struct PgAnalyticsRepository {
     pool: DbPool,
@@ -69,6 +86,7 @@ impl AnalyticsRepository for PgAnalyticsRepository {
         org_id: Uuid,
         start: DateTime<Utc>,
         end: DateTime<Utc>,
+        credit_type: Option<&str>,
     ) -> Result<OrganizationMetrics, RepositoryError> {
         let client = self
             .pool
@@ -86,20 +104,22 @@ impl AnalyticsRepository for PgAnalyticsRepository {
         // Get summary metrics including unique API keys
         let summary_row = client
             .query_one(
-                r#"
+                &format!(
+                    r#"{ORGANIZATION_USAGE_METRICS_CTE}
                 SELECT
                     COUNT(*)::bigint as requests,
                     COALESCE(SUM(input_tokens), 0)::bigint as input_tokens,
                     COALESCE(SUM(output_tokens), 0)::bigint as output_tokens,
                     COALESCE(SUM(cache_read_tokens), 0)::bigint as cache_read_tokens,
-                    COALESCE(SUM(total_cost), 0)::bigint as cost_nano,
+                    COALESCE(SUM(filtered_cost), 0)::bigint as cost_nano,
                     COUNT(DISTINCT api_key_id)::bigint as unique_api_keys
-                FROM organization_usage_log
+                FROM metric_usage
                 WHERE organization_id = $1
                   AND created_at >= $2
                   AND created_at < $3
-                "#,
-                &[&org_id, &start, &end],
+                "#
+                ),
+                &[&org_id, &start, &end, &credit_type],
             )
             .await
             .map_err(|e| RepositoryError::DatabaseError(e.into()))?;
@@ -116,7 +136,8 @@ impl AnalyticsRepository for PgAnalyticsRepository {
         // Get metrics by workspace
         let workspace_rows = client
             .query(
-                r#"
+                &format!(
+                    r#"{ORGANIZATION_USAGE_METRICS_CTE}
                 SELECT
                     w.id as workspace_id,
                     w.name as workspace_name,
@@ -124,16 +145,17 @@ impl AnalyticsRepository for PgAnalyticsRepository {
                     COALESCE(SUM(ul.input_tokens), 0)::bigint as input_tokens,
                     COALESCE(SUM(ul.output_tokens), 0)::bigint as output_tokens,
                     COALESCE(SUM(ul.cache_read_tokens), 0)::bigint as cache_read_tokens,
-                    COALESCE(SUM(ul.total_cost), 0)::bigint as cost_nano
+                    COALESCE(SUM(ul.filtered_cost), 0)::bigint as cost_nano
                 FROM workspaces w
-                LEFT JOIN organization_usage_log ul ON ul.workspace_id = w.id 
+                LEFT JOIN metric_usage ul ON ul.workspace_id = w.id
                     AND ul.created_at >= $2 
                     AND ul.created_at < $3
                 WHERE w.organization_id = $1
                 GROUP BY w.id, w.name
                 ORDER BY requests DESC
-                "#,
-                &[&org_id, &start, &end],
+                "#
+                ),
+                &[&org_id, &start, &end, &credit_type],
             )
             .await
             .map_err(|e| RepositoryError::DatabaseError(e.into()))?;
@@ -154,14 +176,15 @@ impl AnalyticsRepository for PgAnalyticsRepository {
         // Get metrics by API key
         let api_key_rows = client
             .query(
-                r#"
+                &format!(
+                    r#"{ORGANIZATION_USAGE_METRICS_CTE}
                 SELECT 
                     ak.id as api_key_id,
                     ak.name as api_key_name,
                     COUNT(ul.id)::bigint as requests,
-                    COALESCE(SUM(ul.total_cost), 0)::bigint as cost_nano
+                    COALESCE(SUM(ul.filtered_cost), 0)::bigint as cost_nano
                 FROM api_keys ak
-                LEFT JOIN organization_usage_log ul ON ul.api_key_id = ak.id 
+                LEFT JOIN metric_usage ul ON ul.api_key_id = ak.id
                     AND ul.created_at >= $2 
                     AND ul.created_at < $3
                 WHERE ak.workspace_id IN (
@@ -169,8 +192,9 @@ impl AnalyticsRepository for PgAnalyticsRepository {
                 )
                 GROUP BY ak.id, ak.name
                 ORDER BY requests DESC
-                "#,
-                &[&org_id, &start, &end],
+                "#
+                ),
+                &[&org_id, &start, &end, &credit_type],
             )
             .await
             .map_err(|e| RepositoryError::DatabaseError(e.into()))?;
@@ -188,26 +212,26 @@ impl AnalyticsRepository for PgAnalyticsRepository {
         // Get metrics by model (including latency metrics: TTFT and ITL)
         let model_rows = client
             .query(
-                r#"
+                &format!(r#"{ORGANIZATION_USAGE_METRICS_CTE}
                 SELECT
                     ul.model_name,
                     COUNT(*)::bigint as requests,
                     COALESCE(SUM(ul.input_tokens), 0)::bigint as input_tokens,
                     COALESCE(SUM(ul.output_tokens), 0)::bigint as output_tokens,
                     COALESCE(SUM(ul.cache_read_tokens), 0)::bigint as cache_read_tokens,
-                    COALESCE(SUM(ul.total_cost), 0)::bigint as cost_nano,
+                    COALESCE(SUM(ul.filtered_cost), 0)::bigint as cost_nano,
                     AVG(ul.ttft_ms)::double precision as avg_ttft_ms,
                     PERCENTILE_CONT(0.95) WITHIN GROUP (ORDER BY ul.ttft_ms)::double precision as p95_ttft_ms,
                     AVG(ul.avg_itl_ms)::double precision as avg_itl_ms,
                     PERCENTILE_CONT(0.95) WITHIN GROUP (ORDER BY ul.avg_itl_ms)::double precision as p95_itl_ms
-                FROM organization_usage_log ul
+                FROM metric_usage ul
                 WHERE ul.organization_id = $1
                   AND ul.created_at >= $2
                   AND ul.created_at < $3
                 GROUP BY ul.model_name
                 ORDER BY requests DESC
-                "#,
-                &[&org_id, &start, &end],
+                "#),
+                &[&org_id, &start, &end, &credit_type],
             )
             .await
             .map_err(|e| RepositoryError::DatabaseError(e.into()))?;
@@ -427,6 +451,7 @@ impl AnalyticsRepository for PgAnalyticsRepository {
         start: DateTime<Utc>,
         end: DateTime<Utc>,
         granularity: &str,
+        credit_type: Option<&str>,
     ) -> Result<TimeSeriesMetrics, RepositoryError> {
         let client = self
             .pool
@@ -450,15 +475,15 @@ impl AnalyticsRepository for PgAnalyticsRepository {
 
         // Get time series data
         let query = format!(
-            r#"
+            r#"{ORGANIZATION_USAGE_METRICS_CTE}
             SELECT
                 DATE_TRUNC('{date_trunc}', created_at)::text as date,
                 COUNT(*)::bigint as requests,
                 COALESCE(SUM(input_tokens), 0)::bigint as input_tokens,
                 COALESCE(SUM(output_tokens), 0)::bigint as output_tokens,
                 COALESCE(SUM(cache_read_tokens), 0)::bigint as cache_read_tokens,
-                COALESCE(SUM(total_cost), 0)::bigint as cost_nano
-            FROM organization_usage_log
+                COALESCE(SUM(filtered_cost), 0)::bigint as cost_nano
+            FROM metric_usage
             WHERE organization_id = $1
               AND created_at >= $2
               AND created_at < $3
@@ -468,7 +493,7 @@ impl AnalyticsRepository for PgAnalyticsRepository {
         );
 
         let rows = client
-            .query(&query, &[&org_id, &start, &end])
+            .query(&query, &[&org_id, &start, &end, &credit_type])
             .await
             .map_err(|e| RepositoryError::DatabaseError(e.into()))?;
 

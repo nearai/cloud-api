@@ -13,6 +13,7 @@ mod admin_analytics;
 mod admin_deprecate_model;
 mod admin_invitation_email_deliveries;
 mod admin_list_models;
+mod admin_metrics_credit_type;
 mod admin_organization_members;
 mod admin_pricing_changes;
 mod admin_provider_attribution_model_revenue;

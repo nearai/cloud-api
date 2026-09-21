@@ -27,9 +27,23 @@ cumulative contract ceiling and is kept separate from purchased payment
 credits. Replacing a ceiling does not reset consumption: changing 100 to 150
 adds 50 of capacity, while writing 150 again adds none.
 
-Both usage-history endpoints and the reporting export/summary accept a
+Both usage-history endpoints, the reporting export/summary, and admin organization
+metrics (`/v1/admin/organizations/{org_id}/metrics` and `/metrics/timeseries`) accept a
 `credit_type` filter. Mixed charges are returned once; filtered cost is only the
-matching allocation amount, while request and token counts are not multiplied.
+matching allocation amount, including later settlement allocations, while request
+and token counts are not multiplied. Each matching request contributes its full
+token counts once; request/token counts are not additive across credit types.
+Unattributed historical usage is excluded when filtering and retained when the
+filter is omitted.
+
+Admin metrics retain their existing inference-usage scope (not platform-service
+usage), response shape, and half-open `[start, end)` usage timestamp range.
+Settlement amounts belong to the original usage date, not the settlement date.
+The optional filter accepts `grant`, `staking_farm`, `payment`, and `postpay`
+(case-insensitively, like reporting); unsupported values return HTTP 400.
+For example, September postpay consumption can be queried with
+`/v1/admin/organizations/{org_id}/metrics?start=2026-09-01T00:00:00Z&end=2026-10-01T00:00:00Z&credit_type=postpay`.
+This reports consumed usage, not invoices, payment status, or cash received.
 
 If a completed request costs more than all available capacity, the full charge
 is retained with an `unfunded_amount`. Admission checks block subsequent usage

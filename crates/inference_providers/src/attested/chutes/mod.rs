@@ -32,6 +32,8 @@ pub mod e2ee_stream;
 pub mod evidence;
 pub mod measurements;
 pub mod report_data;
+#[cfg(test)]
+mod report_tests;
 pub mod verifier_port;
 
 use std::collections::HashMap;
@@ -1674,7 +1676,8 @@ impl InferenceProvider for Provider {
             };
 
             // A self-describing, independently re-verifiable report: the verdict
-            // plus the raw quote + cert so a client can recompute the bindings.
+            // plus the raw quote, cert, and all GPU evidence from this same
+            // verified instance and evidence request.
             let mut m = serde_json::Map::new();
             m.insert("provider".to_string(), json!("chutes"));
             m.insert("verified".to_string(), json!(true));
@@ -1687,6 +1690,7 @@ impl InferenceProvider for Provider {
             );
             m.insert("tcb_status".to_string(), json!(info.tcb_status));
             m.insert("gpu_verdict".to_string(), json!(info.gpu_verdict));
+            m.insert("gpu_evidence".to_string(), json!(evidence.gpu_evidence));
             m.insert("e2e_pubkey".to_string(), json!(info.e2e_pubkey));
             m.insert("nonce".to_string(), json!(boot_nonce));
             m.insert("quote_b64".to_string(), json!(evidence.quote));

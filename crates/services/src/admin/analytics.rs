@@ -549,6 +549,7 @@ pub trait AnalyticsRepository: Send + Sync {
         org_id: Uuid,
         start: DateTime<Utc>,
         end: DateTime<Utc>,
+        credit_type: Option<&str>,
     ) -> Result<OrganizationMetrics, RepositoryError>;
 
     /// Get platform-wide metrics for admin dashboard
@@ -565,6 +566,7 @@ pub trait AnalyticsRepository: Send + Sync {
         start: DateTime<Utc>,
         end: DateTime<Utc>,
         granularity: &str,
+        credit_type: Option<&str>,
     ) -> Result<TimeSeriesMetrics, RepositoryError>;
 
     /// Get platform-wide time series for admin dashboards
@@ -632,9 +634,10 @@ impl AnalyticsService {
         org_id: Uuid,
         start: DateTime<Utc>,
         end: DateTime<Utc>,
+        credit_type: Option<&str>,
     ) -> Result<OrganizationMetrics, super::AdminError> {
         self.repository
-            .get_organization_metrics(org_id, start, end)
+            .get_organization_metrics(org_id, start, end, credit_type)
             .await
             .map_err(|e| super::AdminError::InternalError(e.to_string()))
     }
@@ -666,9 +669,10 @@ impl AnalyticsService {
         start: DateTime<Utc>,
         end: DateTime<Utc>,
         granularity: &str,
+        credit_type: Option<&str>,
     ) -> Result<TimeSeriesMetrics, super::AdminError> {
         self.repository
-            .get_organization_timeseries(org_id, start, end, granularity)
+            .get_organization_timeseries(org_id, start, end, granularity, credit_type)
             .await
             .map_err(|e| super::AdminError::InternalError(e.to_string()))
     }

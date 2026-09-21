@@ -1392,7 +1392,7 @@ pub async fn get_user_organization_metrics(
 
     let metrics = app_state
         .analytics_service
-        .get_organization_metrics(organization_id, start, end)
+        .get_organization_metrics(organization_id, start, end, None)
         .await
         .map_err(|e| {
             tracing::error!("Failed to get organization metrics: {}", e);
@@ -1491,7 +1491,7 @@ pub async fn get_user_organization_timeseries(
 
     let timeseries = app_state
         .analytics_service
-        .get_organization_timeseries(organization_id, start, end, granularity)
+        .get_organization_timeseries(organization_id, start, end, granularity, None)
         .await
         .map_err(|e| {
             tracing::error!("Failed to get organization timeseries: {}", e);

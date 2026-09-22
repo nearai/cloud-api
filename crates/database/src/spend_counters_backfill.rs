@@ -7,6 +7,7 @@ use tokio_postgres::{IsolationLevel, Transaction};
 use uuid::Uuid;
 
 const LOCK_TIMEOUT: Duration = Duration::from_secs(5);
+// ponytail: each apply statement is capped at 5s; larger units require a resumable protocol.
 const APPLY_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

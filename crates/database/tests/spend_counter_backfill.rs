@@ -7,9 +7,13 @@ use database::{ensure_spend_counters_ready, migrations, DbPool, PreparedSpendBac
 use deadpool::Runtime;
 use deadpool_postgres::{Config, PoolConfig, Timeouts};
 use services::usage::InferenceType;
+use std::future::Future;
 use std::time::Duration;
 use tokio_postgres::NoTls;
 use uuid::Uuid;
+
+#[path = "spend_counter_backfill/coverage.rs"]
+mod coverage;
 
 struct TestDatabase {
     pool: DbPool,
@@ -30,7 +34,7 @@ struct Fixture {
 
 #[tokio::test]
 async fn backfill_reconciles_snapshot_delta_and_is_idempotent() -> anyhow::Result<()> {
-    let database = test_database().await?;
+    run_backfill_test(|database| async move {
     let fixture = fixture(&database.pool).await?;
 
     // Historical rows exceed the C1 counters already present for the mixed key.
@@ -148,13 +152,14 @@ async fn backfill_reconciles_snapshot_delta_and_is_idempotent() -> anyhow::Resul
     drop(client);
     drop(inference_repository);
     drop(service_repository);
-    database.cleanup().await?;
     Ok(())
+    })
+    .await
 }
 
 #[tokio::test]
 async fn backfill_rejects_negative_drift_and_rolls_back_overflow() -> anyhow::Result<()> {
-    let database = test_database().await?;
+    run_backfill_test(|database| async move {
     let fixture = fixture(&database.pool).await?;
     let client = database.pool.get().await?;
     client
@@ -312,103 +317,134 @@ async fn backfill_rejects_negative_drift_and_rolls_back_overflow() -> anyhow::Re
     assert_eq!(balance.get::<_, i64>(0), i64::MAX);
     assert!(balance.get::<_, Option<chrono::DateTime<Utc>>>(1).is_none());
     drop(client);
-    database.cleanup().await?;
     Ok(())
+    })
+    .await
 }
 
 #[tokio::test]
 async fn spend_readiness_checks_missing_and_inactive_organizations() -> anyhow::Result<()> {
-    let database = test_database().await?;
-    let fixture = fixture(&database.pool).await?;
-    let client = database.pool.get().await?;
-    client
-        .execute(
-            "UPDATE organization_balance SET spend_counters_ready_at = NULL
+    run_backfill_test(|database| async move {
+        let fixture = fixture(&database.pool).await?;
+        let client = database.pool.get().await?;
+        client
+            .execute(
+                "UPDATE organization_balance SET spend_counters_ready_at = NULL
              WHERE organization_id = $1",
-            &[&fixture.organization_id],
+                &[&fixture.organization_id],
+            )
+            .await?;
+        drop(client);
+        let prepared = PreparedSpendBackfill::prepare(
+            &database.pool,
+            fixture.organization_id,
+            Duration::from_secs(30),
         )
-        .await?;
-    drop(client);
-    let prepared = PreparedSpendBackfill::prepare(
-        &database.pool,
-        fixture.organization_id,
-        Duration::from_secs(30),
-    )
-    .await?
-    .expect("empty historical organization is incomplete");
-    assert_eq!(
-        prepared.apply().await?,
-        database::SpendBackfillOutcome::Applied { key_count: 0 }
-    );
-    ensure_spend_counters_ready(&database.pool).await?;
+        .await?
+        .expect("empty historical organization is incomplete");
+        assert_eq!(
+            prepared.apply().await?,
+            database::SpendBackfillOutcome::Applied { key_count: 0 }
+        );
+        ensure_spend_counters_ready(&database.pool).await?;
 
-    let mut client = database.pool.get().await?;
-    let migration_tx = client.build_transaction().start().await?;
-    migration_tx
-        .batch_execute(
-            "CREATE TEMP TABLE organization_balance (
+        let mut client = database.pool.get().await?;
+        let migration_tx = client.build_transaction().start().await?;
+        migration_tx
+            .batch_execute(
+                "CREATE TEMP TABLE organization_balance (
                  organization_id UUID PRIMARY KEY,
                  inference_spent BIGINT NOT NULL DEFAULT 0,
                  service_spent BIGINT NOT NULL DEFAULT 0
              );
              INSERT INTO organization_balance (organization_id) VALUES (uuid_generate_v4());",
-        )
-        .await?;
-    migration_tx
-        .batch_execute(include_str!(
-            "../src/migrations/sql/V0082__add_spend_counters_readiness.sql"
-        ))
-        .await?;
-    let legacy = migration_tx
-        .query_one(
-            "SELECT spend_counters_ready_at FROM organization_balance LIMIT 1",
-            &[],
-        )
-        .await?;
-    assert!(legacy.get::<_, Option<chrono::DateTime<Utc>>>(0).is_none());
-    let future = migration_tx
-        .query_one(
-            "INSERT INTO organization_balance (organization_id)
+            )
+            .await?;
+        migration_tx
+            .batch_execute(include_str!(
+                "../src/migrations/sql/V0082__add_spend_counters_readiness.sql"
+            ))
+            .await?;
+        let legacy = migration_tx
+            .query_one(
+                "SELECT spend_counters_ready_at FROM organization_balance LIMIT 1",
+                &[],
+            )
+            .await?;
+        assert!(legacy.get::<_, Option<chrono::DateTime<Utc>>>(0).is_none());
+        let future = migration_tx
+            .query_one(
+                "INSERT INTO organization_balance (organization_id)
              VALUES (uuid_generate_v4())
              RETURNING spend_counters_ready_at",
-            &[],
-        )
-        .await?;
-    assert!(future.get::<_, Option<chrono::DateTime<Utc>>>(0).is_some());
-    migration_tx.rollback().await?;
+                &[],
+            )
+            .await?;
+        assert!(future.get::<_, Option<chrono::DateTime<Utc>>>(0).is_some());
+        migration_tx.rollback().await?;
 
-    client
-        .execute(
-            "UPDATE organizations SET is_active = false WHERE id = $1",
-            &[&fixture.organization_id],
-        )
-        .await?;
-    ensure_spend_counters_ready(&database.pool).await?;
-    client
-        .execute(
-            "UPDATE organization_balance SET spend_counters_ready_at = NULL
+        client
+            .execute(
+                "UPDATE organizations SET is_active = false WHERE id = $1",
+                &[&fixture.organization_id],
+            )
+            .await?;
+        ensure_spend_counters_ready(&database.pool).await?;
+        client
+            .execute(
+                "UPDATE organization_balance SET spend_counters_ready_at = NULL
              WHERE organization_id = $1",
-            &[&fixture.organization_id],
-        )
-        .await?;
-    assert!(ensure_spend_counters_ready(&database.pool)
-        .await
-        .expect_err("inactive incomplete organizations must block readers")
-        .to_string()
-        .contains("remain unreconciled"));
-    client
-        .execute(
-            "DELETE FROM organization_balance WHERE organization_id = $1",
-            &[&fixture.organization_id],
-        )
-        .await?;
-    assert!(ensure_spend_counters_ready(&database.pool)
-        .await
-        .expect_err("missing balances must be distinguished")
-        .to_string()
-        .contains("lack balances"));
-    drop(client);
-    database.cleanup().await?;
+                &[&fixture.organization_id],
+            )
+            .await?;
+        assert!(ensure_spend_counters_ready(&database.pool)
+            .await
+            .expect_err("inactive incomplete organizations must block readers")
+            .to_string()
+            .contains("remain unreconciled"));
+        client
+            .execute(
+                "DELETE FROM organization_balance WHERE organization_id = $1",
+                &[&fixture.organization_id],
+            )
+            .await?;
+        assert!(ensure_spend_counters_ready(&database.pool)
+            .await
+            .expect_err("missing balances must be distinguished")
+            .to_string()
+            .contains("lack balances"));
+        drop(client);
+        Ok(())
+    })
+    .await
+}
+
+async fn run_backfill_test<F, Fut>(test: F) -> anyhow::Result<()>
+where
+    F: FnOnce(TestDatabase) -> Fut + Send + 'static,
+    Fut: Future<Output = anyhow::Result<()>> + Send + 'static,
+{
+    let database = test_database().await?;
+    let admin = database.admin.clone();
+    let database_name = database.database_name.clone();
+    let result = tokio::spawn(test(database)).await;
+    let cleanup: anyhow::Result<()> = async {
+        let client = admin.get().await?;
+        client
+            .batch_execute(&format!(
+                "DROP DATABASE IF EXISTS {} WITH (FORCE)",
+                database_name
+            ))
+            .await?;
+        Ok(())
+    }
+    .await;
+    let test_result = match result {
+        Ok(result) => result,
+        Err(error) => Err(anyhow::Error::new(error).context("backfill test task failed")),
+    };
+    test_result?;
+    cleanup?;
     Ok(())
 }
 
@@ -645,16 +681,4 @@ async fn insert_service(
         )
         .await?;
     Ok(())
-}
-
-impl TestDatabase {
-    async fn cleanup(self) -> anyhow::Result<()> {
-        drop(self.pool);
-        self.admin
-            .get()
-            .await?
-            .batch_execute(&format!("DROP DATABASE {}", self.database_name))
-            .await?;
-        Ok(())
-    }
 }

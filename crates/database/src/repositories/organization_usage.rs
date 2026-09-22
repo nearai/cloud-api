@@ -55,7 +55,7 @@ impl OrganizationUsageRepository {
         }
     }
 
-    /// Get total spend for a specific API key
+    /// Get inference-only spend for a specific API key for admission-limit checks.
     pub async fn get_api_key_spend(&self, api_key_id: Uuid) -> Result<i64> {
         let row = retry_db!("get_api_key_spend", {
             let client = self
@@ -68,9 +68,10 @@ impl OrganizationUsageRepository {
             client
                 .query_one(
                     r#"
-                    SELECT COALESCE(SUM(total_cost), 0)::BIGINT as total_spend
-                    FROM organization_usage_log
-                    WHERE api_key_id = $1
+                    SELECT COALESCE(
+                        (SELECT inference_spent FROM api_key_spend WHERE api_key_id = $1),
+                        0
+                    )::BIGINT as inference_spend
                     "#,
                     &[&api_key_id],
                 )
@@ -78,8 +79,8 @@ impl OrganizationUsageRepository {
                 .map_err(map_db_error)
         })?;
 
-        let total_spend: i64 = row.get("total_spend");
-        Ok(total_spend)
+        let inference_spend: i64 = row.get("inference_spend");
+        Ok(inference_spend)
     }
 
     /// Record usage and update balance atomically.

@@ -253,8 +253,8 @@ impl ApiKeyRepository {
         Ok(row.get::<_, i64>("count"))
     }
 
-    /// List API keys for a workspace with usage data
-    /// This is the primary method to list API keys, using an efficient JOIN query
+    /// List API keys for a workspace with usage data.
+    /// This is the primary method to list API keys, using the spend counter JOIN.
     pub async fn list_by_workspace_paginated(
         &self,
         workspace_id: Uuid,
@@ -305,22 +305,11 @@ impl ApiKeyRepository {
                     ak.deleted_at,
                     ak.spend_limit,
                     (
-                        COALESCE(inference_usage.total_cost, 0)
-                        + COALESCE(service_usage.total_cost, 0)
+                        COALESCE(spend.inference_spent, 0)
+                        + COALESCE(spend.service_spent, 0)
                     )::BIGINT as usage
                 FROM api_keys ak
-                LEFT JOIN (
-                    SELECT api_key_id, COALESCE(SUM(total_cost), 0)::BIGINT AS total_cost
-                    FROM organization_usage_log
-                    WHERE workspace_id = $1
-                    GROUP BY api_key_id
-                ) inference_usage ON ak.id = inference_usage.api_key_id
-                LEFT JOIN (
-                    SELECT api_key_id, COALESCE(SUM(total_cost), 0)::BIGINT AS total_cost
-                    FROM organization_service_usage_log
-                    WHERE workspace_id = $1
-                    GROUP BY api_key_id
-                ) service_usage ON ak.id = service_usage.api_key_id
+                LEFT JOIN api_key_spend spend ON ak.id = spend.api_key_id
                 WHERE ak.workspace_id = $1 AND ak.deleted_at IS NULL
                 ORDER BY {order_by_column} {order_dir}{tie_breaker}
                 LIMIT $2 OFFSET $3

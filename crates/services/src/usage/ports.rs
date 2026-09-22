@@ -366,7 +366,7 @@ pub trait UsageRepository: Send + Sync {
         offset: Option<i64>,
     ) -> anyhow::Result<(Vec<UsageLogEntry>, i64)>;
 
-    /// Get total spend for a specific API key
+    /// Get inference-only spend for a specific API key
     async fn get_api_key_spend(&self, api_key_id: Uuid) -> anyhow::Result<i64>;
 
     /// Get costs by inference IDs (for HuggingFace billing integration)

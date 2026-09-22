@@ -7,6 +7,7 @@ use crate::repositories::credit_allocation::{
     allocate_usage, load_allocations, lock_organization_accounting, CreditAllocationPolicy,
     UsageAllocationParent,
 };
+use crate::repositories::spend_counters::increment_api_key_spend;
 use crate::repositories::utils::map_db_error;
 use crate::retry_db;
 use anyhow::{Context, Result};
@@ -200,13 +201,16 @@ impl OrganizationUsageRepository {
                             INSERT INTO organization_balance (
                                 organization_id,
                                 total_spent,
+                                inference_spent,
+                                service_spent,
                                 last_usage_at,
                                 total_requests,
                                 total_tokens,
                                 updated_at
-                            ) VALUES ($1, $2, $3, 1, $4, $5)
+                            ) VALUES ($1, $2, $2, 0, $3, 1, $4, $5)
                             ON CONFLICT (organization_id) DO UPDATE SET
                                 total_spent = organization_balance.total_spent + $2,
+                                inference_spent = organization_balance.inference_spent + $2,
                                 total_requests = organization_balance.total_requests + 1,
                                 total_tokens = organization_balance.total_tokens + $4,
                                 last_usage_at = $3,
@@ -222,6 +226,14 @@ impl OrganizationUsageRepository {
                         )
                         .await
                         .map_err(map_db_error)?;
+                    increment_api_key_spend(
+                        &transaction,
+                        request.api_key_id,
+                        request.total_cost,
+                        0,
+                        now,
+                    )
+                    .await?;
 
                     transaction.commit().await.map_err(map_db_error)?;
                     (row, true, Some(allocation.allocations))

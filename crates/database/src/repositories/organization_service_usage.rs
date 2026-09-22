@@ -4,6 +4,7 @@ use crate::repositories::credit_allocation::{
     allocate_usage, load_allocations, lock_organization_accounting, CreditAllocationPolicy,
     UsageAllocationParent,
 };
+use crate::repositories::spend_counters::increment_api_key_spend;
 use crate::repositories::utils::map_db_error;
 use crate::retry_db;
 use anyhow::{Context, Result};
@@ -363,22 +364,27 @@ impl OrganizationServiceUsageRepository {
                         .execute(
                             r#"
                             INSERT INTO organization_balance (
-                                organization_id, total_spent, last_usage_at, total_requests, total_tokens, updated_at
-                            ) VALUES ($1, $2, $3, 0, 0, $4)
+                                organization_id, total_spent, inference_spent, service_spent,
+                                last_usage_at, total_requests, total_tokens, updated_at
+                            ) VALUES ($1, $2, 0, $2, $3, 0, 0, $4)
                             ON CONFLICT (organization_id) DO UPDATE SET
                                 total_spent = organization_balance.total_spent + $2,
+                                service_spent = organization_balance.service_spent + $2,
                                 last_usage_at = $3,
                                 updated_at = $4
                             "#,
-                            &[
-                                &request.organization_id,
-                                &request.total_cost,
-                                &now,
-                                &now,
-                            ],
+                            &[&request.organization_id, &request.total_cost, &now, &now],
                         )
                         .await
                         .map_err(map_db_error)?;
+                    increment_api_key_spend(
+                        &transaction,
+                        request.api_key_id,
+                        0,
+                        request.total_cost,
+                        now,
+                    )
+                    .await?;
 
                     transaction.commit().await.map_err(map_db_error)?;
                     (r, Some(allocation.allocations))

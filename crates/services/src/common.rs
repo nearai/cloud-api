@@ -1,3 +1,5 @@
+pub mod request_context;
+
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
@@ -99,6 +101,28 @@ pub enum RepositoryError {
     DatabaseError(#[source] anyhow::Error),
     #[error("Data conversion error: {0}")]
     DataConversionError(#[source] anyhow::Error),
+}
+
+impl RepositoryError {
+    /// Stable category for diagnostics without logging free-form database or
+    /// conversion messages, which may contain customer-supplied values.
+    pub fn log_category(&self) -> &'static str {
+        match self {
+            Self::NotFound(_) => "not_found",
+            Self::AlreadyExists => "already_exists",
+            Self::RequiredFieldMissing(_) => "required_field_missing",
+            Self::ForeignKeyViolation(_) => "foreign_key_violation",
+            Self::ValidationFailed(_) => "validation_failed",
+            Self::DependencyExists(_) => "dependency_exists",
+            Self::TransactionConflict => "transaction_conflict",
+            Self::ConnectionFailed(_) => "connection_failed",
+            Self::AuthenticationFailed => "authentication_failed",
+            Self::QueryTimeout => "query_timeout",
+            Self::PoolError(_) => "pool_error",
+            Self::DatabaseError(_) => "database_error",
+            Self::DataConversionError(_) => "data_conversion_error",
+        }
+    }
 }
 
 pub fn is_query_timeout(error: &anyhow::Error) -> bool {

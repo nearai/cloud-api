@@ -5,6 +5,7 @@ use crate::retry_db;
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
+use services::common::request_context::current_request_id;
 use services::common::{extract_api_key_prefix, generate_api_key, hash_api_key, RepositoryError};
 use services::workspace::ports::{ApiKeyOrderBy, ApiKeyOrderDirection, CreateApiKeyRequest};
 use tracing::debug;
@@ -235,10 +236,11 @@ impl ApiKeyRepository {
     pub async fn count_by_workspace(&self, workspace_id: Uuid) -> Result<i64, RepositoryError> {
         let row = retry_db!("count_api_keys_by_workspace", {
             let pool_started = std::time::Instant::now();
-            tracing::info!(event = "workspace_api_key_db_phase_started", operation = "count_by_workspace", phase = "pool", %workspace_id);
             let client = self.pool.get().await;
-            tracing::info!(
+            tracing::debug!(
+                target: "workspace_api_key_timing",
                 event = "workspace_api_key_db_phase_finished",
+                request_id = current_request_id().as_deref(),
                 operation = "count_by_workspace",
                 phase = "pool",
                 %workspace_id,
@@ -249,7 +251,6 @@ impl ApiKeyRepository {
                 .context("Failed to get database connection")
                 .map_err(RepositoryError::PoolError)?;
             let query_started = std::time::Instant::now();
-            tracing::info!(event = "workspace_api_key_db_phase_started", operation = "count_by_workspace", phase = "query", %workspace_id);
 
             let result = client
             .query_one(
@@ -258,8 +259,10 @@ impl ApiKeyRepository {
             )
             .await
             .map_err(map_db_error);
-            tracing::info!(
+            tracing::debug!(
+                target: "workspace_api_key_timing",
                 event = "workspace_api_key_db_phase_finished",
+                request_id = current_request_id().as_deref(),
                 operation = "count_by_workspace",
                 phase = "query",
                 %workspace_id,
@@ -300,10 +303,11 @@ impl ApiKeyRepository {
 
         let rows = retry_db!("list_api_keys_by_workspace_paginated", {
             let pool_started = std::time::Instant::now();
-            tracing::info!(event = "workspace_api_key_db_phase_started", operation = "list_by_workspace_paginated", phase = "pool", %workspace_id);
             let client = self.pool.get().await;
-            tracing::info!(
+            tracing::debug!(
+                target: "workspace_api_key_timing",
                 event = "workspace_api_key_db_phase_finished",
+                request_id = current_request_id().as_deref(),
                 operation = "list_by_workspace_paginated",
                 phase = "pool",
                 %workspace_id,
@@ -314,7 +318,6 @@ impl ApiKeyRepository {
                 .context("Failed to get database connection")
                 .map_err(RepositoryError::PoolError)?;
             let query_started = std::time::Instant::now();
-            tracing::info!(event = "workspace_api_key_db_phase_started", operation = "list_by_workspace_paginated", phase = "query", %workspace_id);
 
             let result = client
                 .query(
@@ -359,8 +362,10 @@ impl ApiKeyRepository {
                 )
                 .await
                 .map_err(map_db_error);
-            tracing::info!(
+            tracing::debug!(
+                target: "workspace_api_key_timing",
                 event = "workspace_api_key_db_phase_finished",
+                request_id = current_request_id().as_deref(),
                 operation = "list_by_workspace_paginated",
                 phase = "query",
                 %workspace_id,

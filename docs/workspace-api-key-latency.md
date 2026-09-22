@@ -23,24 +23,40 @@ root cause and production latency remain unverified.
 
 ## Runtime evidence
 
-The existing request-correlation middleware attaches `request_id`, method, and
-path to the HTTP tracing span. The list handler adds workspace ID, limit, and
-offset without logging keys, authorization headers, or response bodies.
-At INFO level it now emits:
+The existing request-correlation middleware validates/generates a request UUID
+and scopes it to downstream work using a task-local context. Every timing event
+records `request_id` and `workspace_id` directly; handler events also record
+`limit` and `offset`. Correlation therefore survives the production JSON
+formatter's disabled current/ancestor-span fields. The formatter's privacy
+settings remain unchanged. Spawned background tasks do not inherit the context.
 
-| Event | Meaning |
-| --- | --- |
-| `workspace_api_key_list_started` | Request passed extraction and pagination validation and entered the handler work |
-| `workspace_api_key_permission_started` / `finished` | Permission-check duration for count and list separately, including their own database waits |
-| `workspace_api_key_db_phase_started` / `finished` | Pool acquisition and SQL execution separately for count and usage-bearing list |
-| `workspace_api_key_list_phase_finished` | Count/list service wall time, including permission checks, database retries, and mapping; list completion also includes combined service wall time |
+Only the two `workspace_api_key_list_phase_finished` service summaries are INFO
+by default (one if counting fails). More detailed completion timings and the
+handler-entry event are DEBUG, under the dedicated `workspace_api_key_timing`
+target. Enable just these safe timing events for an investigation with:
 
-Finished events include `elapsed_ms` and `success`. Repository phase events
-repeat on database retry; correlate them with existing retry attempt logs.
-Service/permission/repository times are nested and must not be added together.
-The combined service time excludes authentication middleware, response
-serialization, gateway time, and network transit. A started phase without a
-finished phase is incomplete evidence, not proof that PostgreSQL cancelled it.
+```sh
+LOG_LEVEL=info,workspace_api_key_timing=debug
+```
+
+Set that target to `warn` to suppress timing events entirely. Detailed phase
+start events were removed to avoid duplicating completion events.
+
+| Event | Level | Meaning |
+| --- | --- | --- |
+| `workspace_api_key_list_started` | DEBUG | Handler entry after extraction and pagination validation |
+| `workspace_api_key_permission_finished` | DEBUG | Permission-check duration for count and list separately, including their own database waits |
+| `workspace_api_key_db_phase_finished` | DEBUG | Pool acquisition and SQL execution separately for count and usage-bearing list |
+| `workspace_api_key_list_phase_finished` | INFO | Count/list service wall time, including permissions, retries, and mapping; list completion includes combined service wall time |
+
+Finished events include `elapsed_ms` and `success`. Repository completion events
+repeat on database retry. Service/permission/repository times are nested and
+must not be added together. Combined service time excludes authentication
+middleware, response serialization, gateway time, and network transit. Missing
+completion events are incomplete evidence, not proof that PostgreSQL cancelled
+work. Metadata failures log stable workspace/repository error categories and
+request IDs rather than free-form error strings, which may contain customer
+values.
 
 For the reported 2026-09-21 18:49:00–18:50:24 UTC window:
 
@@ -69,19 +85,21 @@ connection variables (`DATABASE_HOST`, `DATABASE_PORT`, `DATABASE_USERNAME`,
 `DATABASE_PASSWORD`). Examples below assume these are already configured.
 
 ```sh
-TEST_DATABASE_NAME=cloud_api_key_lookup_test cargo test -p api --test e2e_all \
-  api_key_metadata::metadata_lookup -- --test-threads=1 --nocapture
+TEST_DATABASE_NAME=cloud_api_key_lookup_test cargo nextest run -p api --test e2e_all \
+  -E 'test(/^api_key_metadata::/)'
 
 TEST_DATABASE_NAME=cloud_api_key_lookup_bench KEY_LOOKUP_USAGE_ROWS=100000 \
-  RUST_LOG=info cargo test -p api --test e2e_all \
-  api_key_metadata::measure_workspace_key_lookup_latency \
-  -- --ignored --test-threads=1 --nocapture
+  cargo nextest run -p api --test e2e_all --run-ignored only \
+  -E 'test(/^api_key_metadata::measure_workspace_key_lookup_latency$/)' \
+  --success-output immediate
 ```
 
 The lock regression holds ACCESS EXCLUSIVE locks on both usage tables and
-requires the metadata request to complete within two seconds. This detects an
+requires the metadata request to complete within five seconds. This detects an
 accidental dependency on usage aggregation without asserting production speed.
-Run these tests serially so locks do not interfere with unrelated usage tests.
+The nextest exclusive override prevents this lock test from overlapping any
+other test. The opt-in benchmark uses the same exclusive override for isolated
+measurements and global ANALYZE operations. Use nextest so these rules apply.
 
 The opt-in benchmark creates 64 keys and the configured number of inference
 rows AND service rows, distributed across the keys. It analyzes those tables,
@@ -96,6 +114,9 @@ retained in the dedicated test DB for plan inspection. Repeated runs add data;
 use a fresh database when comparing dataset sizes.
 
 ## Local measurements (2026-09-22)
+
+Collected at commit `30fde5b2`, before the review changes moved detailed timing
+events from INFO to DEBUG and added explicit event-level request IDs.
 
 Environment: Apple Silicon macOS, PostgreSQL 17.9 (Homebrew), Rust debug test
 build, INFO tracing, in-process Axum test transport, mock authentication, four
@@ -115,7 +136,7 @@ not a reproduction of the production incident or evidence for closing #1105.
 | 100,000 | 4 | metadata | 80 | 2.07 | 2.44 | 2.76 | 0 |
 | 100,000 | 4 | list | 80 | 28.78 | 31.07 | 31.55 | 0 |
 
-The new INFO events also separated the 105 list requests in the large-history
+The INFO events at that revision separated the 105 list requests in the large-history
 run (including warm-up batches, both concurrency levels). Durations below are
 integer milliseconds, so 0 means below one millisecond, not zero work.
 

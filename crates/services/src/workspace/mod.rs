@@ -1,3 +1,4 @@
+use crate::common::request_context::current_request_id;
 pub mod ports;
 
 pub use ports::*;
@@ -273,12 +274,13 @@ impl WorkspaceServiceTrait for WorkspaceServiceImpl {
     ) -> Result<Vec<ApiKey>, WorkspaceError> {
         // Check permissions
         let started = std::time::Instant::now();
-        tracing::info!(event = "workspace_api_key_permission_started", operation = "list_api_keys_paginated", workspace_id = %workspace_id.0);
         let permission = self
             .check_workspace_permission(workspace_id.clone(), requester_id)
             .await;
-        tracing::info!(
+        tracing::debug!(
+            target: "workspace_api_key_timing",
             event = "workspace_api_key_permission_finished",
+            request_id = current_request_id().as_deref(),
             operation = "list_api_keys_paginated",
             workspace_id = %workspace_id.0,
             elapsed_ms = started.elapsed().as_millis() as u64,
@@ -310,9 +312,19 @@ impl WorkspaceServiceTrait for WorkspaceServiceImpl {
         // Get the API key
         let api_key = self
             .api_key_repository
-            .get_by_id(api_key_id)
+            .get_by_id(api_key_id.clone())
             .await
-            .map_err(|e| WorkspaceError::InternalError(format!("Failed to get API key: {e}")))?;
+            .map_err(|e| {
+                tracing::error!(
+                    event = "workspace_api_key_metadata_repository_failed",
+                    request_id = current_request_id().as_deref(),
+                    workspace_id = %workspace_id.0,
+                    api_key_id = %api_key_id.0,
+                    error_category = e.log_category(),
+                    "Failed to read API key metadata",
+                );
+                WorkspaceError::InternalError(format!("Failed to get API key: {e}"))
+            })?;
 
         // Verify it belongs to this workspace
         if let Some(ref key) = api_key {
@@ -552,12 +564,13 @@ impl WorkspaceServiceTrait for WorkspaceServiceImpl {
     ) -> Result<i64, WorkspaceError> {
         // Check permissions
         let started = std::time::Instant::now();
-        tracing::info!(event = "workspace_api_key_permission_started", operation = "count_api_keys_by_workspace", workspace_id = %workspace_id.0);
         let permission = self
             .check_workspace_permission(workspace_id.clone(), requester_id)
             .await;
-        tracing::info!(
+        tracing::debug!(
+            target: "workspace_api_key_timing",
             event = "workspace_api_key_permission_finished",
+            request_id = current_request_id().as_deref(),
             operation = "count_api_keys_by_workspace",
             workspace_id = %workspace_id.0,
             elapsed_ms = started.elapsed().as_millis() as u64,

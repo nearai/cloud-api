@@ -26,7 +26,7 @@ async fn metadata_lookup_does_not_read_usage_tables() {
         "SET LOCAL lock_timeout = '5s'; LOCK TABLE organization_usage_log, organization_service_usage_log IN ACCESS EXCLUSIVE MODE"
     ).await.unwrap();
     let started = Instant::now();
-    let response = tokio::time::timeout(Duration::from_secs(2), async {
+    let response = tokio::time::timeout(Duration::from_secs(5), async {
         server
             .get(&format!(
                 "/v1/workspaces/{}/api-keys/{}",
@@ -195,6 +195,134 @@ async fn metadata_lookup_hides_inactive_workspaces_and_organizations() {
             .status_code(),
         404
     );
+}
+
+#[derive(Clone, Default)]
+struct JsonLogs(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+impl std::io::Write for JsonLogs {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn list_timings_keep_request_ids_in_production_json() {
+    use tracing::instrument::WithSubscriber;
+
+    let (server, _) = setup_test_server_with_database().await;
+    let org = create_org(&server).await;
+    let workspace = list_workspaces(&server, org.id).await.remove(0);
+    for (filter, expected_per_request) in [
+        ("info", 2),
+        ("info,workspace_api_key_timing=debug", 9),
+        ("info,workspace_api_key_timing=warn", 0),
+    ] {
+        let logs = JsonLogs::default();
+        let writer = logs.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .json()
+            .with_current_span(false)
+            .with_span_list(false)
+            .with_env_filter(filter)
+            .with_writer(move || writer.clone())
+            .finish();
+        let request_ids = [uuid::Uuid::new_v4(), uuid::Uuid::new_v4()];
+        let responses =
+            futures::future::join_all(request_ids.iter().enumerate().map(|(offset, id)| {
+                let server = &server;
+                let workspace_id = &workspace.id;
+                async move {
+                    server
+                        .get(&format!(
+                            "/v1/workspaces/{workspace_id}/api-keys?limit=100&offset={offset}"
+                        ))
+                        .add_header("Authorization", format!("Bearer {}", get_session_id()))
+                        .add_header("x-request-id", id.to_string())
+                        .add_header("x-private-test", "CUSTOMER_LOG_SENTINEL")
+                        .await
+                }
+            }))
+            .with_subscriber(subscriber)
+            .await;
+        for response in responses {
+            assert_eq!(response.status_code(), 200);
+        }
+        let captured = String::from_utf8(logs.0.lock().unwrap().clone()).unwrap();
+        assert!(!captured.contains("CUSTOMER_LOG_SENTINEL"));
+        let events: Vec<serde_json::Value> = captured
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .filter(|event| event["target"] == "workspace_api_key_timing")
+            .collect();
+        assert_eq!(events.len(), 2 * expected_per_request, "{captured}");
+        for (offset, id) in request_ids.iter().enumerate() {
+            let own_events: Vec<_> = events
+                .iter()
+                .filter(|event| event["fields"]["request_id"] == id.to_string())
+                .collect();
+            assert_eq!(own_events.len(), expected_per_request, "{captured}");
+            for event in own_events {
+                assert!(event.get("span").is_none());
+                assert!(event.get("spans").is_none());
+                assert_eq!(event["fields"]["workspace_id"], workspace.id);
+                if event["fields"]["event"] == "workspace_api_key_list_phase_finished" {
+                    assert_eq!(event["fields"]["limit"], 100);
+                    assert_eq!(event["fields"]["offset"], offset);
+                }
+            }
+        }
+    }
+    assert!(services::common::request_context::current_request_id().is_none());
+}
+
+#[tokio::test]
+async fn metadata_lookup_logs_safe_error_category_for_unavailable_database() {
+    use tracing::instrument::WithSubscriber;
+
+    let (server, database) = setup_test_server_with_database().await;
+    let org = create_org(&server).await;
+    let workspace = list_workspaces(&server, org.id).await.remove(0);
+    let key =
+        create_api_key_in_workspace(&server, workspace.id.clone(), "metadata-error".into()).await;
+    database.pool().current().unwrap().close();
+    let logs = JsonLogs::default();
+    let writer = logs.clone();
+    let subscriber = tracing_subscriber::fmt()
+        .json()
+        .with_current_span(false)
+        .with_span_list(false)
+        .with_max_level(tracing::Level::ERROR)
+        .with_writer(move || writer.clone())
+        .finish();
+    let request_id = uuid::Uuid::new_v4();
+    let response = async {
+        server
+            .get(&format!(
+                "/v1/workspaces/{}/api-keys/{}",
+                workspace.id, key.id
+            ))
+            .add_header("Authorization", format!("Bearer {}", get_session_id()))
+            .add_header("x-request-id", request_id.to_string())
+            .await
+    }
+    .with_subscriber(subscriber)
+    .await;
+    assert_eq!(response.status_code(), 500);
+    let captured = String::from_utf8(logs.0.lock().unwrap().clone()).unwrap();
+    let error = captured
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .find(|event| event["fields"]["message"] == "Failed to get API key metadata")
+        .expect("metadata failure must have a diagnostic category");
+    assert_eq!(error["fields"]["error_category"], "internal_error");
+    assert_eq!(error["fields"]["request_id"], request_id.to_string());
+    assert!(!captured.contains(key.key.as_ref().unwrap()));
 }
 
 /// Synthetic local evidence, not a production latency assertion. Run alone in

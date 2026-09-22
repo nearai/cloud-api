@@ -12,6 +12,7 @@ use axum::{
     http::StatusCode,
 };
 use serde::{Deserialize, Serialize};
+use services::common::request_context::current_request_id;
 use services::organization::OrganizationId;
 use tracing::{debug, error};
 use utoipa::ToSchema;
@@ -858,7 +859,14 @@ pub async fn list_workspace_api_keys(
     let workspace_id_typed = services::workspace::WorkspaceId(workspace_id);
 
     let started = std::time::Instant::now();
-    tracing::info!(event = "workspace_api_key_list_started");
+    tracing::debug!(
+        target: "workspace_api_key_timing",
+        event = "workspace_api_key_list_started",
+        request_id = current_request_id().as_deref(),
+        %workspace_id,
+        limit = params.limit,
+        offset = params.offset,
+    );
 
     // Get total count from service
     let count_result = app_state
@@ -866,7 +874,12 @@ pub async fn list_workspace_api_keys(
         .count_api_keys_by_workspace(workspace_id_typed.clone(), user_id.clone())
         .await;
     tracing::info!(
+        target: "workspace_api_key_timing",
         event = "workspace_api_key_list_phase_finished",
+        request_id = current_request_id().as_deref(),
+        %workspace_id,
+        limit = params.limit,
+        offset = params.offset,
         phase = "count_service",
         elapsed_ms = started.elapsed().as_millis() as u64,
         success = count_result.is_ok(),
@@ -916,7 +929,12 @@ pub async fn list_workspace_api_keys(
         )
         .await;
     tracing::info!(
+        target: "workspace_api_key_timing",
         event = "workspace_api_key_list_phase_finished",
+        request_id = current_request_id().as_deref(),
+        %workspace_id,
+        limit = params.limit,
+        offset = params.offset,
         phase = "list_service",
         elapsed_ms = list_started.elapsed().as_millis() as u64,
         total_elapsed_ms = started.elapsed().as_millis() as u64,
@@ -1017,8 +1035,24 @@ pub async fn get_workspace_api_key(
             StatusCode::FORBIDDEN,
             Json(ErrorResponse::new(msg, "forbidden".to_string())),
         )),
-        Err(_) => {
-            error!(%workspace_id, %key_id, "Failed to get API key metadata");
+        Err(err) => {
+            // Do not log free-form error strings: repository messages may
+            // include customer values. Preserve the category for diagnosis.
+            let error_category = match err {
+                services::workspace::WorkspaceError::InternalError(_) => "internal_error",
+                services::workspace::WorkspaceError::InvalidParams(_) => "invalid_params",
+                services::workspace::WorkspaceError::AlreadyExists => "already_exists",
+                services::workspace::WorkspaceError::ApiKeyNotFound => "api_key_not_found",
+                services::workspace::WorkspaceError::NotFound => "not_found",
+                services::workspace::WorkspaceError::Unauthorized(_) => "unauthorized",
+            };
+            error!(
+                %workspace_id,
+                %key_id,
+                request_id = current_request_id().as_deref(),
+                error_category,
+                "Failed to get API key metadata",
+            );
             Err((
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(ErrorResponse::new(

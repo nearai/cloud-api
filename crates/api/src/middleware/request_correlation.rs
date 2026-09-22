@@ -38,7 +38,11 @@ pub async fn request_correlation_middleware(mut request: Request<Body>, next: Ne
         path = %path,
     );
 
-    let mut response = async move { next.run(request).await }
+    let mut response =
+        services::common::request_context::scope(
+            request_id,
+            async move { next.run(request).await },
+        )
         .instrument(span)
         .await;
     if let Ok(value) = HeaderValue::from_str(&request_id.to_string()) {

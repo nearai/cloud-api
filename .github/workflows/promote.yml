@@ -177,3 +177,18 @@ jobs:
             gh release create "$TAG" --title "Production Release ${TAG}" --notes "$NOTES" --latest
           fi
           echo "- release: [\`${TAG}\`](${{ github.server_url }}/${{ github.repository }}/releases/tag/${TAG})" >> "$GITHUB_STEP_SUMMARY"
+
+  deploy-prod:
+    name: Deploy production and verify rollout
+    needs: tag-prod
+    runs-on: ubuntu-latest
+    timeout-minutes: 125
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+      - name: Deploy latest prod image and wait for health checks
+        env:
+          GH_TOKEN: ${{ secrets.REPOSITORY_DISPATCH_TOKEN }}
+        run: python3 scripts/deploy_prod.py

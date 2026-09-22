@@ -234,20 +234,39 @@ impl ApiKeyRepository {
     /// Count API keys for a workspace
     pub async fn count_by_workspace(&self, workspace_id: Uuid) -> Result<i64, RepositoryError> {
         let row = retry_db!("count_api_keys_by_workspace", {
-            let client = self
-                .pool
-                .get()
-                .await
+            let pool_started = std::time::Instant::now();
+            tracing::info!(event = "workspace_api_key_db_phase_started", operation = "count_by_workspace", phase = "pool", %workspace_id);
+            let client = self.pool.get().await;
+            tracing::info!(
+                event = "workspace_api_key_db_phase_finished",
+                operation = "count_by_workspace",
+                phase = "pool",
+                %workspace_id,
+                elapsed_ms = pool_started.elapsed().as_millis() as u64,
+                success = client.is_ok(),
+            );
+            let client = client
                 .context("Failed to get database connection")
                 .map_err(RepositoryError::PoolError)?;
+            let query_started = std::time::Instant::now();
+            tracing::info!(event = "workspace_api_key_db_phase_started", operation = "count_by_workspace", phase = "query", %workspace_id);
 
-            client
+            let result = client
             .query_one(
                 "SELECT COUNT(*) as count FROM api_keys WHERE workspace_id = $1 AND deleted_at IS NULL",
                 &[&workspace_id],
             )
             .await
-            .map_err(map_db_error)
+            .map_err(map_db_error);
+            tracing::info!(
+                event = "workspace_api_key_db_phase_finished",
+                operation = "count_by_workspace",
+                phase = "query",
+                %workspace_id,
+                elapsed_ms = query_started.elapsed().as_millis() as u64,
+                success = result.is_ok(),
+            );
+            result
         })?;
 
         Ok(row.get::<_, i64>("count"))
@@ -280,14 +299,24 @@ impl ApiKeyRepository {
         };
 
         let rows = retry_db!("list_api_keys_by_workspace_paginated", {
-            let client = self
-                .pool
-                .get()
-                .await
+            let pool_started = std::time::Instant::now();
+            tracing::info!(event = "workspace_api_key_db_phase_started", operation = "list_by_workspace_paginated", phase = "pool", %workspace_id);
+            let client = self.pool.get().await;
+            tracing::info!(
+                event = "workspace_api_key_db_phase_finished",
+                operation = "list_by_workspace_paginated",
+                phase = "pool",
+                %workspace_id,
+                elapsed_ms = pool_started.elapsed().as_millis() as u64,
+                success = client.is_ok(),
+            );
+            let client = client
                 .context("Failed to get database connection")
                 .map_err(RepositoryError::PoolError)?;
+            let query_started = std::time::Instant::now();
+            tracing::info!(event = "workspace_api_key_db_phase_started", operation = "list_by_workspace_paginated", phase = "query", %workspace_id);
 
-            client
+            let result = client
                 .query(
                     &format!(
                         r#"
@@ -329,7 +358,16 @@ impl ApiKeyRepository {
                     &[&workspace_id, &limit, &offset],
                 )
                 .await
-                .map_err(map_db_error)
+                .map_err(map_db_error);
+            tracing::info!(
+                event = "workspace_api_key_db_phase_finished",
+                operation = "list_by_workspace_paginated",
+                phase = "query",
+                %workspace_id,
+                elapsed_ms = query_started.elapsed().as_millis() as u64,
+                success = result.is_ok(),
+            );
+            result
         })?;
 
         rows.into_iter()

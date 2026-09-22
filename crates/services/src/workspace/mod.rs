@@ -272,8 +272,19 @@ impl WorkspaceServiceTrait for WorkspaceServiceImpl {
         order_direction: Option<ApiKeyOrderDirection>,
     ) -> Result<Vec<ApiKey>, WorkspaceError> {
         // Check permissions
-        self.check_workspace_permission(workspace_id.clone(), requester_id)
-            .await?;
+        let started = std::time::Instant::now();
+        tracing::info!(event = "workspace_api_key_permission_started", operation = "list_api_keys_paginated", workspace_id = %workspace_id.0);
+        let permission = self
+            .check_workspace_permission(workspace_id.clone(), requester_id)
+            .await;
+        tracing::info!(
+            event = "workspace_api_key_permission_finished",
+            operation = "list_api_keys_paginated",
+            workspace_id = %workspace_id.0,
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            success = permission.is_ok(),
+        );
+        permission?;
 
         // List API keys with pagination (repository now includes usage data via JOIN)
         self.api_key_repository
@@ -540,8 +551,19 @@ impl WorkspaceServiceTrait for WorkspaceServiceImpl {
         requester_id: UserId,
     ) -> Result<i64, WorkspaceError> {
         // Check permissions
-        self.check_workspace_permission(workspace_id.clone(), requester_id)
-            .await?;
+        let started = std::time::Instant::now();
+        tracing::info!(event = "workspace_api_key_permission_started", operation = "count_api_keys_by_workspace", workspace_id = %workspace_id.0);
+        let permission = self
+            .check_workspace_permission(workspace_id.clone(), requester_id)
+            .await;
+        tracing::info!(
+            event = "workspace_api_key_permission_finished",
+            operation = "count_api_keys_by_workspace",
+            workspace_id = %workspace_id.0,
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            success = permission.is_ok(),
+        );
+        permission?;
 
         // Count API keys
         self.api_key_repository

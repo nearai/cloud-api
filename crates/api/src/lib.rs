@@ -1957,7 +1957,9 @@ pub fn build_workspace_routes(app_state: AppState, auth_state_middleware: &AuthS
         )
         .route(
             "/workspaces/{workspace_id}/api-keys/{key_id}",
-            axum::routing::delete(revoke_workspace_api_key).patch(update_workspace_api_key),
+            get(get_workspace_api_key)
+                .delete(revoke_workspace_api_key)
+                .patch(update_workspace_api_key),
         )
         .route(
             "/workspaces/{workspace_id}/api-keys/{key_id}/spend-limit",

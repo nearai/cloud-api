@@ -839,6 +839,7 @@ pub async fn create_workspace_api_key(
         ("session_token" = [])
     )
 )]
+#[tracing::instrument(skip_all, fields(%workspace_id, limit = params.limit, offset = params.offset))]
 pub async fn list_workspace_api_keys(
     State(app_state): State<AppState>,
     Extension(user): Extension<AuthenticatedUser>,
@@ -856,12 +857,21 @@ pub async fn list_workspace_api_keys(
     let user_id = authenticated_user_to_user_id(user);
     let workspace_id_typed = services::workspace::WorkspaceId(workspace_id);
 
+    let started = std::time::Instant::now();
+    tracing::info!(event = "workspace_api_key_list_started");
+
     // Get total count from service
-    let total = match app_state
+    let count_result = app_state
         .workspace_service
         .count_api_keys_by_workspace(workspace_id_typed.clone(), user_id.clone())
-        .await
-    {
+        .await;
+    tracing::info!(
+        event = "workspace_api_key_list_phase_finished",
+        phase = "count_service",
+        elapsed_ms = started.elapsed().as_millis() as u64,
+        success = count_result.is_ok(),
+    );
+    let total = match count_result {
         Ok(count) => count,
         Err(services::workspace::WorkspaceError::NotFound) => {
             return Err((
@@ -893,7 +903,8 @@ pub async fn list_workspace_api_keys(
     // Use workspace service to list workspace API keys with pagination and usage data
     let order_by = params.order_by.map(Into::into);
     let order_direction = params.order_direction.map(Into::into);
-    match app_state
+    let list_started = std::time::Instant::now();
+    let list_result = app_state
         .workspace_service
         .list_api_keys_paginated(
             workspace_id_typed,
@@ -903,8 +914,15 @@ pub async fn list_workspace_api_keys(
             order_by,
             order_direction,
         )
-        .await
-    {
+        .await;
+    tracing::info!(
+        event = "workspace_api_key_list_phase_finished",
+        phase = "list_service",
+        elapsed_ms = list_started.elapsed().as_millis() as u64,
+        total_elapsed_ms = started.elapsed().as_millis() as u64,
+        success = list_result.is_ok(),
+    );
+    match list_result {
         Ok(api_keys) => {
             debug!(
                 "Found {} API keys for workspace {}",
@@ -940,6 +958,71 @@ pub async fn list_workspace_api_keys(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(ErrorResponse::new(
                     "Failed to list API keys".to_string(),
+                    "internal_server_error".to_string(),
+                )),
+            ))
+        }
+    }
+}
+
+/// Read key metadata without aggregating usage or returning key material.
+#[utoipa::path(
+    get,
+    path = "/v1/workspaces/{workspace_id}/api-keys/{key_id}",
+    tag = "Workspaces",
+    params(
+        ("workspace_id" = Uuid, Path, description = "Workspace ID"),
+        ("key_id" = Uuid, Path, description = "API Key ID")
+    ),
+    responses(
+        (status = 200, description = "API key metadata; usage is omitted and key is null", body = ApiKeyResponse),
+        (status = 401, description = "Unauthorized", body = ErrorResponse),
+        (status = 403, description = "Forbidden", body = ErrorResponse),
+        (status = 404, description = "Workspace or API key not found", body = ErrorResponse),
+        (status = 500, description = "Internal server error", body = ErrorResponse)
+    ),
+    security(("session_token" = []))
+)]
+pub async fn get_workspace_api_key(
+    State(app_state): State<AppState>,
+    Extension(user): Extension<AuthenticatedUser>,
+    Path((workspace_id, key_id)): Path<(Uuid, Uuid)>,
+) -> Result<Json<ApiKeyResponse>, (StatusCode, Json<ErrorResponse>)> {
+    match app_state
+        .workspace_service
+        .get_api_key(
+            services::workspace::WorkspaceId(workspace_id),
+            services::workspace::ApiKeyId(key_id.to_string()),
+            authenticated_user_to_user_id(user),
+        )
+        .await
+    {
+        Ok(Some(mut key)) => {
+            // The repository's metadata lookup defaults usage to zero. That is
+            // not measured usage and must not be presented as a spending balance.
+            key.usage = None;
+            key.key = None;
+            Ok(Json(crate::conversions::workspace_api_key_to_api_response(
+                key,
+            )))
+        }
+        Ok(None) | Err(services::workspace::WorkspaceError::NotFound) => Err((
+            StatusCode::NOT_FOUND,
+            Json(ErrorResponse::new(
+                "Workspace or API key not found".to_string(),
+                "not_found".to_string(),
+            )),
+        )),
+        Err(services::workspace::WorkspaceError::Unauthorized(msg)) => Err((
+            StatusCode::FORBIDDEN,
+            Json(ErrorResponse::new(msg, "forbidden".to_string())),
+        )),
+        Err(_) => {
+            error!(%workspace_id, %key_id, "Failed to get API key metadata");
+            Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse::new(
+                    "Failed to get API key".to_string(),
                     "internal_server_error".to_string(),
                 )),
             ))

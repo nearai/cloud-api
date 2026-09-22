@@ -99,6 +99,7 @@ use utoipa::{Modify, OpenApi};
         crate::routes::workspaces::delete_workspace,
         crate::routes::workspaces::create_workspace_api_key,
         crate::routes::workspaces::list_workspace_api_keys,
+        crate::routes::workspaces::get_workspace_api_key,
         crate::routes::workspaces::revoke_workspace_api_key,
         crate::routes::workspaces::update_api_key_spend_limit,
         crate::routes::workspaces::update_workspace_api_key,

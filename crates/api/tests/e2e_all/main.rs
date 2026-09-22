@@ -10,6 +10,7 @@ mod common;
 
 mod admin_activation_pricing_gate;
 mod admin_analytics;
+mod admin_analytics_range_hygiene;
 mod admin_deprecate_model;
 mod admin_invitation_email_deliveries;
 mod admin_list_models;
@@ -87,6 +88,7 @@ mod score;
 mod serving_provider;
 mod session_logout;
 mod signature_verification;
+mod spend_counters;
 mod usage_chat_completions;
 mod usage_provider_attribution;
 mod usage_recording;

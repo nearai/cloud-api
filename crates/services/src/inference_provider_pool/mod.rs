@@ -244,12 +244,14 @@ pub struct ChatRoutingHints {
     pub fallback_disabled: bool,
     /// The requesting organization's scheduler priority
     /// (`organizations.request_priority`; negative = deprioritized). Defaults
-    /// to `0`, today's behavior. Below `0`, `get_providers_with_fallback`
-    /// pins the candidate list to the single NEAR context tier the
-    /// request's estimated size selects — see
+    /// to `0`, today's behavior. Below `0`, the provider-attempt retry loop
+    /// (`retry_with_fallback_caps`) pins the request to the single NEAR
+    /// context tier its estimated size selects — see
     /// `context_routing::pin_near_tier_for_low_priority` — so a saturated
-    /// tier's retryable error surfaces to the client instead of spilling
-    /// onto the other NEAR tier.
+    /// tier's RETRYABLE error (5xx/timeout/queue-full) surfaces to the
+    /// client instead of spilling onto the other NEAR tier. The existing
+    /// context-length-400 fall-through to a larger declared NEAR sibling is
+    /// unaffected by the pin (see `context_routing` module docs).
     pub request_priority: RequestPriority,
 }
 
@@ -2157,57 +2159,6 @@ impl InferenceProviderPool {
             return Some(providers);
         }
 
-        // Negative-priority organizations never fall back between NEAR
-        // context tiers (see `context_routing::pin_near_tier_for_low_priority`):
-        // pin the candidates to the tier the estimated request size selects
-        // before the capacity sort below decides an order the retry loop
-        // would otherwise walk across both tiers.
-        let providers = if hints.request_priority < 0 {
-            match hints.estimated_tokens {
-                Some(estimated_tokens) => {
-                    let candidates: Vec<(bool, Option<u32>)> = {
-                        let states = self
-                            .provider_load_state
-                            .read()
-                            .unwrap_or_else(|e| e.into_inner());
-                        providers
-                            .iter()
-                            .map(|p| {
-                                let is_near = p.tier() == inference_providers::ProviderTier::Near;
-                                let cap = states
-                                    .get(&(Arc::as_ptr(p) as *const () as usize))
-                                    .and_then(|s| s.max_context_tokens);
-                                (is_near, cap)
-                            })
-                            .collect()
-                    };
-                    let decision = context_routing::pin_near_tier_for_low_priority(
-                        &candidates,
-                        estimated_tokens,
-                    );
-                    let dropped = decision.keep.iter().filter(|keep| !**keep).count();
-                    if dropped > 0 {
-                        tracing::debug!(
-                            model_id = %model_id,
-                            request_priority = hints.request_priority,
-                            estimated_tokens,
-                            pinned_capacity = ?decision.pinned_capacity,
-                            dropped,
-                            "Pinned low-priority request to its selected NEAR context tier"
-                        );
-                    }
-                    providers
-                        .into_iter()
-                        .zip(decision.keep)
-                        .filter_map(|(p, keep)| keep.then_some(p))
-                        .collect()
-                }
-                None => providers,
-            }
-        } else {
-            providers
-        };
-
         if providers.len() == 1 {
             return Some(providers);
         }
@@ -2954,6 +2905,57 @@ impl InferenceProviderPool {
                 .any(|cap| cap.is_some_and(|cap| req > cap))
         });
 
+        // Negative-priority organizations never fall back to the OTHER NEAR
+        // context tier on a RETRYABLE error (module docs on
+        // `context_routing::pin_near_tier_for_low_priority`). Computed here
+        // from the UNPRUNED `providers`/`ctx_caps` above (so the
+        // `context_tier` tag and the context-length-400 self-heal below,
+        // which both read `ctx_caps`, are unaffected by the pin) and
+        // enforced per-attempt in the provider loop below, not by narrowing
+        // the candidate list — that would also suppress the self-heal.
+        let pinned_near_capacity = hints
+            .estimated_tokens
+            .filter(|_| hints.request_priority < 0)
+            .and_then(|estimated_tokens| {
+                let candidates: Vec<(bool, Option<u32>)> = providers
+                    .iter()
+                    .map(|p| {
+                        let is_near = p.tier() == inference_providers::ProviderTier::Near;
+                        let cap = ctx_caps
+                            .get(&(Arc::as_ptr(p) as *const () as usize))
+                            .copied()
+                            .flatten();
+                        (is_near, cap)
+                    })
+                    .collect();
+                context_routing::pin_near_tier_for_low_priority(&candidates, estimated_tokens)
+            });
+        if let Some(pinned) = pinned_near_capacity {
+            let dropped = providers
+                .iter()
+                .filter(|p| {
+                    p.tier() == inference_providers::ProviderTier::Near
+                        && ctx_caps
+                            .get(&(Arc::as_ptr(p) as *const () as usize))
+                            .copied()
+                            .flatten()
+                            .is_some_and(|cap| cap != pinned)
+                })
+                .count();
+            if dropped > 0 {
+                // Numbers only — never content (see CLAUDE.md logging rules).
+                tracing::info!(
+                    model_id = %model_id,
+                    request_priority = hints.request_priority,
+                    estimated_tokens = hints.estimated_tokens,
+                    pinned_capacity = pinned,
+                    dropped,
+                    "Pinning low-priority request to its selected NEAR context tier; \
+                     retryable errors will not fall back to the other tier"
+                );
+            }
+        }
+
         tracing::info!(
             model_id = %model_id,
             providers_count = providers.len(),
@@ -2985,6 +2987,14 @@ impl InferenceProviderPool {
         let mut total_attempts: usize = 0;
         let mut retry_count: usize = 0;
         let started_at = std::time::Instant::now();
+        // Set (only relevant when `pinned_near_capacity` is `Some`) after the
+        // pinned tier's own attempt: true exactly when that attempt's
+        // context-length 400 fell through to a strictly larger declared NEAR
+        // sibling. Read by the very next iteration to let that one sibling
+        // attempt proceed despite the pin — the same self-heal priority >= 0
+        // requests get. Always overwritten by the pinned tier's own next
+        // attempt, so a stale value from an earlier retry round can't leak.
+        let mut prev_pinned_tier_ctx_400 = false;
         // Snapshot the full model→providers count once. Reading it again at the
         // failure path can race with a concurrent provider refresh, which would
         // give an inconsistent number relative to `providers_tried`.
@@ -3000,6 +3010,30 @@ impl InferenceProviderPool {
         loop {
             // Try each provider in order until one succeeds
             for (attempt, provider) in providers.iter().enumerate() {
+                // Negative-priority pin: skip a NEAR sibling whose declared
+                // capacity differs from the pinned one, unless the pinned
+                // tier's most recent attempt this round context-400'd and
+                // THIS provider is the strictly-larger sibling it fell
+                // through to (`prev_pinned_tier_ctx_400`, set below —
+                // mirrors the `ctx_400_falls_through` self-heal). A NEAR
+                // candidate with no declared capacity is never skipped here
+                // (finding 3: only declared capacities create tiers).
+                if let Some(pinned) = pinned_near_capacity {
+                    if provider.tier() == inference_providers::ProviderTier::Near {
+                        if let Some(cap) = ctx_caps
+                            .get(&(Arc::as_ptr(provider) as *const () as usize))
+                            .copied()
+                            .flatten()
+                        {
+                            let is_pinned_tier = cap == pinned;
+                            let allowed_fall_through = prev_pinned_tier_ctx_400 && cap > pinned;
+                            if !is_pinned_tier && !allowed_fall_through {
+                                continue;
+                            }
+                        }
+                    }
+                }
+
                 total_attempts += 1;
                 tracing::debug!(
                     model_id = %model_id,
@@ -3176,6 +3210,23 @@ impl InferenceProviderPool {
                                     },
                                 );
                                 return Err(Self::sanitize_completion_error(e, model_id));
+                            }
+                        }
+
+                        // Update the low-priority pin's fall-through gate for the
+                        // NEXT iteration: only the pinned tier's own attempt sets
+                        // it (to this attempt's context_400_fell_through — true or
+                        // false), so a sibling allowed through by a previous round
+                        // can't keep the gate open once the pinned tier is
+                        // re-attempted and fails differently.
+                        if let Some(pinned) = pinned_near_capacity {
+                            let is_pinned_tier_provider = ctx_caps
+                                .get(&(Arc::as_ptr(provider) as *const () as usize))
+                                .copied()
+                                .flatten()
+                                == Some(pinned);
+                            if is_pinned_tier_provider {
+                                prev_pinned_tier_ctx_400 = context_400_fell_through;
                             }
                         }
 
@@ -9787,13 +9838,19 @@ mod tests {
         );
     }
 
-    /// Organizations at negative scheduler priority never fall back between
-    /// NEAR context tiers: the candidate list is pinned to the tier the
-    /// estimated request size selects (module docs on
-    /// `context_routing::pin_near_tier_for_low_priority`). Priority >= 0
-    /// keeps today's cross-tier fallback behaviour.
+    /// `get_providers_with_fallback` must NOT prune or reorder candidates
+    /// based on `request_priority` — the negative-priority pin (module docs
+    /// on `context_routing::pin_near_tier_for_low_priority`) is enforced
+    /// per-attempt by the PROVIDER-ATTEMPT RETRY LOOP instead (see
+    /// `low_priority_retry_does_not_fall_back_across_near_tiers` and
+    /// `low_priority_context_400_still_falls_through_to_larger_near_tier`
+    /// below). Pruning here, before the retry loop's `ctx_caps` snapshot is
+    /// taken, was review finding 1 on #1117: it silently deleted the
+    /// context-length-400 self-heal for every negative-priority request,
+    /// because the dropped sibling's declared capacity was no longer visible
+    /// to `larger_ctx_sibling_exists`.
     #[tokio::test]
-    async fn low_priority_pins_near_tier_to_selected_capacity() {
+    async fn get_providers_with_fallback_ignores_request_priority() {
         use inference_providers::mock::MockProvider;
         use inference_providers::ProviderTier;
 
@@ -9835,128 +9892,37 @@ mod tests {
 
         let ptr = |p: &Arc<InferenceProviderTrait>| Arc::as_ptr(p) as *const () as usize;
 
-        // (a) Short request at priority -2: only the size-selected (base)
-        // NEAR tier and Chutes remain — the long tier is dropped entirely,
-        // not just sorted after.
-        let short = pool
-            .get_providers_with_fallback(
-                &model,
-                None,
-                &ChatRoutingHints {
-                    request_priority: -2,
-                    estimated_tokens: Some(10_000),
-                    ..Default::default()
-                },
-            )
-            .await
-            .expect("providers");
-        assert_eq!(
-            short.iter().map(&ptr).collect::<Vec<_>>(),
-            vec![ptr(&base), ptr(&chutes)],
-            "low priority + small request: base tier and Chutes only, long tier dropped"
-        );
-
-        // (b) Oversized-for-base request at priority -2: only the long tier
-        // and Chutes remain — base is dropped entirely.
-        let oversized = pool
-            .get_providers_with_fallback(
-                &model,
-                None,
-                &ChatRoutingHints {
-                    request_priority: -2,
-                    estimated_tokens: Some(300_000),
-                    ..Default::default()
-                },
-            )
-            .await
-            .expect("providers");
-        assert_eq!(
-            oversized.iter().map(&ptr).collect::<Vec<_>>(),
-            vec![ptr(&long), ptr(&chutes)],
-            "low priority + oversized-for-base request: long tier and Chutes only, base dropped"
-        );
-
-        // (c) Same short request at priority 0: unchanged — both NEAR tiers
-        // stay in the list, ordered best-fit exactly as before this change.
-        let unchanged = pool
-            .get_providers_with_fallback(
-                &model,
-                None,
-                &ChatRoutingHints {
-                    request_priority: 0,
-                    estimated_tokens: Some(10_000),
-                    ..Default::default()
-                },
-            )
-            .await
-            .expect("providers");
-        assert_eq!(
-            unchanged.iter().map(&ptr).collect::<Vec<_>>(),
-            vec![ptr(&base), ptr(&long), ptr(&chutes)],
-            "priority >= 0 must keep today's cross-tier fallback behaviour"
-        );
-    }
-
-    /// A single-capacity model has only one NEAR tier: negative priority
-    /// must not drop anything, since there is no second NEAR tier to pin
-    /// away from.
-    #[tokio::test]
-    async fn low_priority_pin_is_noop_for_single_capacity_model() {
-        use inference_providers::mock::MockProvider;
-        use inference_providers::ProviderTier;
-
-        let pool = InferenceProviderPool::new(None, ExternalProvidersConfig::default());
-        let model = "z-ai/glm-5.1".to_string();
-
-        let near_a: Arc<InferenceProviderTrait> =
-            Arc::new(MockProvider::new().with_tier(ProviderTier::Near));
-        let near_b: Arc<InferenceProviderTrait> =
-            Arc::new(MockProvider::new().with_tier(ProviderTier::Near));
-        let chutes: Arc<InferenceProviderTrait> =
-            Arc::new(MockProvider::new().with_tier(ProviderTier::Attested3p));
-
-        {
-            let mut m = pool.provider_mappings.write().await;
-            m.model_to_providers.insert(
-                model.clone(),
-                vec![near_a.clone(), near_b.clone(), chutes.clone()],
+        // Short request (fits base) and oversized-for-base request (fits
+        // only long): both must return the SAME candidate list, in the SAME
+        // best-fit order, whether priority is -2 or 0.
+        for estimated_tokens in [10_000, 300_000] {
+            let mut orders = Vec::new();
+            for request_priority in [-2, 0] {
+                let providers = pool
+                    .get_providers_with_fallback(
+                        &model,
+                        None,
+                        &ChatRoutingHints {
+                            request_priority,
+                            estimated_tokens: Some(estimated_tokens),
+                            ..Default::default()
+                        },
+                    )
+                    .await
+                    .expect("providers");
+                orders.push(providers.iter().map(&ptr).collect::<Vec<_>>());
+            }
+            assert_eq!(
+                orders[0], orders[1],
+                "estimated_tokens={estimated_tokens}: request_priority must not \
+                 change get_providers_with_fallback's candidate list or order"
+            );
+            assert_eq!(
+                orders[0].len(),
+                3,
+                "estimated_tokens={estimated_tokens}: no candidate may be dropped here"
             );
         }
-        {
-            let mut states = pool
-                .provider_load_state
-                .write()
-                .unwrap_or_else(|e| e.into_inner());
-            for p in [&near_a, &near_b] {
-                states
-                    .entry(Arc::as_ptr(p) as *const () as usize)
-                    .or_default()
-                    .max_context_tokens = Some(131_072);
-            }
-        }
-
-        let result = pool
-            .get_providers_with_fallback(
-                &model,
-                None,
-                &ChatRoutingHints {
-                    request_priority: -1,
-                    estimated_tokens: Some(10_000),
-                    ..Default::default()
-                },
-            )
-            .await
-            .expect("providers");
-
-        let ptr = |p: &Arc<InferenceProviderTrait>| Arc::as_ptr(p) as *const () as usize;
-        let kept: std::collections::HashSet<usize> = result.iter().map(&ptr).collect();
-        assert_eq!(
-            kept,
-            [ptr(&near_a), ptr(&near_b), ptr(&chutes)]
-                .into_iter()
-                .collect(),
-            "single NEAR capacity: negative priority must not drop any candidate"
-        );
     }
 
     /// End-to-end: a negative-priority request whose selected (long) NEAR
@@ -10051,6 +10017,92 @@ mod tests {
             }
             other => panic!("expected the long tier's HttpError(503), got: {other}"),
         }
+    }
+
+    /// Regression test for review finding 1 on #1117: the negative-priority
+    /// pin must block only the RETRYABLE-error spill between NEAR tiers
+    /// (previous test), never the existing context-length-400 self-heal. A
+    /// request whose ESTIMATE fits the pinned (base) tier but whose ACTUAL
+    /// size does not — a byte-heuristic under-estimate, or an E2EE request
+    /// that skips the exact tokenize count — must still fall through to the
+    /// larger declared NEAR sibling, exactly as it would at priority >= 0
+    /// (`context_400_fall_through_does_not_clobber_retryable_error` above).
+    #[tokio::test]
+    async fn low_priority_context_400_still_falls_through_to_larger_near_tier() {
+        use inference_providers::mock::MockProvider;
+        use inference_providers::{CompletionError, ProviderTier};
+
+        let pool = InferenceProviderPool::new(None, ExternalProvidersConfig::default());
+        let model_id = "z-ai/glm-5.2".to_string();
+
+        let base = Arc::new(MockProvider::new_accept_all().with_tier(ProviderTier::Near));
+        base.set_error_override(Some(CompletionError::HttpError {
+            status_code: 400,
+            message: "This model's maximum context length is 262144 tokens.".to_string(),
+            is_external: true,
+        }))
+        .await;
+        // No error override: the long tier serves successfully.
+        let long = Arc::new(MockProvider::new_accept_all().with_tier(ProviderTier::Near));
+
+        {
+            let mut m = pool.provider_mappings.write().await;
+            m.model_to_providers.insert(
+                model_id.clone(),
+                vec![
+                    base.clone() as Arc<InferenceProviderTrait>,
+                    long.clone() as Arc<InferenceProviderTrait>,
+                ],
+            );
+        }
+        {
+            let mut states = pool
+                .provider_load_state
+                .write()
+                .unwrap_or_else(|e| e.into_inner());
+            states
+                .entry(Arc::as_ptr(&base) as *const () as usize)
+                .or_default()
+                .max_context_tokens = Some(262_144);
+            states
+                .entry(Arc::as_ptr(&long) as *const () as usize)
+                .or_default()
+                .max_context_tokens = Some(1_048_576);
+        }
+
+        // ~833KB of text -> internally-computed requirement is ~250k,
+        // comfortably inside base's 262144 window, so the pin selects base —
+        // but base still 400s on the actual (under-estimated) request.
+        let mut params = fallback_params(&model_id);
+        params.messages[0].content = Some(serde_json::Value::String("a".repeat(833_334)));
+
+        let result = pool
+            .chat_completion_with_attribution_and_hints(
+                params,
+                "test-hash".to_string(),
+                ChatRoutingHints {
+                    request_priority: -2,
+                    ..Default::default()
+                },
+            )
+            .await;
+
+        match result {
+            Ok(_) => {}
+            Err(e) => panic!(
+                "the long provider must be attempted and serve the \
+                 context-400 fall-through, got error: {e}"
+            ),
+        }
+        assert!(
+            base.last_chat_params().await.is_some(),
+            "the pinned (base) tier must still be tried first"
+        );
+        assert!(
+            long.last_chat_params().await.is_some(),
+            "the larger declared NEAR sibling must be tried after the pinned \
+             tier's context-length 400, even at negative priority"
+        );
     }
 
     /// The requirement refinement only activates for models whose providers

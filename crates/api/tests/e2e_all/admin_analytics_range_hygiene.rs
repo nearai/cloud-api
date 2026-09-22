@@ -1,12 +1,6 @@
 use crate::common::*;
 use services::admin::OrganizationMetrics;
 
-async fn setup_hygiene_server() -> axum_test::TestServer {
-    std::env::set_var("DEV", "1");
-    std::env::set_var("BRAVE_SEARCH_PRO_API_KEY", "analytics-range-hygiene-test");
-    setup_test_server().await
-}
-
 async fn admin_get(server: &axum_test::TestServer, path: &str) -> axum_test::TestResponse {
     server
         .get(path)
@@ -23,7 +17,7 @@ fn assert_invalid_parameter(response: axum_test::TestResponse) {
 
 #[tokio::test]
 async fn revenue_density_rejects_malformed_bounds() {
-    let server = setup_hygiene_server().await;
+    let server = setup_test_server().await;
 
     for query in ["start=not-a-timestamp", "end=not-a-timestamp"] {
         assert_invalid_parameter(
@@ -38,7 +32,7 @@ async fn revenue_density_rejects_malformed_bounds() {
 
 #[tokio::test]
 async fn revenue_density_rejects_reversed_bounds() {
-    let server = setup_hygiene_server().await;
+    let server = setup_test_server().await;
 
     assert_invalid_parameter(
         admin_get(
@@ -59,7 +53,7 @@ async fn revenue_density_rejects_reversed_bounds() {
 
 #[tokio::test]
 async fn revenue_density_enforces_90_day_cap() {
-    let server = setup_hygiene_server().await;
+    let server = setup_test_server().await;
 
     let at_cap = admin_get(
         &server,
@@ -78,8 +72,27 @@ async fn revenue_density_enforces_90_day_cap() {
 }
 
 #[tokio::test]
+async fn revenue_density_400_day_request_reports_90_day_limit() {
+    let server = setup_test_server().await;
+
+    let response = admin_get(
+        &server,
+        "/v1/admin/platform/revenue-density?start=2025-08-18T00:00:00Z&end=2026-09-22T00:00:00Z",
+    )
+    .await;
+
+    assert_eq!(response.status_code(), 400, "{}", response.text());
+    let error = response.json::<api::models::ErrorResponse>();
+    assert_eq!(error.error.r#type, "invalid_parameter");
+    assert_eq!(
+        error.error.message,
+        "'day' granularity is limited to 90 days"
+    );
+}
+
+#[tokio::test]
 async fn organization_metrics_rejects_malformed_and_reversed_bounds() {
-    let server = setup_hygiene_server().await;
+    let server = setup_test_server().await;
     let organization = create_org(&server).await;
 
     for query in [
@@ -103,7 +116,7 @@ async fn organization_metrics_rejects_malformed_and_reversed_bounds() {
 
 #[tokio::test]
 async fn organization_metrics_uses_30_day_default_and_366_day_maximum() {
-    let server = setup_hygiene_server().await;
+    let server = setup_test_server().await;
     let organization = create_org(&server).await;
 
     let default = admin_get(

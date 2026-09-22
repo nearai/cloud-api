@@ -28,6 +28,8 @@ pub struct OpenAiCompatibleBackend {
     client: Client,
 }
 
+pub(super) const CATALOG_MODEL_NAME_KEY: &str = "catalog_model_name";
+
 impl OpenAiCompatibleBackend {
     pub fn new() -> Self {
         let client = Client::builder()
@@ -87,6 +89,7 @@ fn normalize_reasoning_effort_for_openai_tools(
     params: &mut ChatCompletionParams,
     base_url: &str,
     model: &str,
+    catalog_model: Option<&str>,
 ) {
     if params.tools.as_ref().is_none_or(|t| t.is_empty()) {
         return;
@@ -94,10 +97,13 @@ fn normalize_reasoning_effort_for_openai_tools(
     if !is_openai_source(base_url) {
         return;
     }
-    if model.starts_with("gpt-5.6")
-        || model.starts_with("gpt-6-sol")
-        || model.starts_with("gpt-6-luna")
-    {
+    let supports_none = |name: &str| {
+        let name = name.rsplit('/').next().unwrap_or(name);
+        name.starts_with("gpt-5.6")
+            || name.starts_with("gpt-6-sol")
+            || name.starts_with("gpt-6-luna")
+    };
+    if supports_none(model) || catalog_model.is_some_and(supports_none) {
         let previous = params
             .extra
             .insert("reasoning_effort".to_string(), serde_json::json!("none"));
@@ -263,7 +269,12 @@ impl ExternalBackend for OpenAiCompatibleBackend {
         }
         streaming_params.max_tokens = None;
 
-        normalize_reasoning_effort_for_openai_tools(&mut streaming_params, &config.base_url, model);
+        normalize_reasoning_effort_for_openai_tools(
+            &mut streaming_params,
+            &config.base_url,
+            model,
+            config.extra.get(CATALOG_MODEL_NAME_KEY).map(String::as_str),
+        );
         strip_unsupported_sampling_params(&mut streaming_params, &config.base_url, model);
 
         let headers = self
@@ -336,6 +347,7 @@ impl ExternalBackend for OpenAiCompatibleBackend {
             &mut non_streaming_params,
             &config.base_url,
             model,
+            config.extra.get(CATALOG_MODEL_NAME_KEY).map(String::as_str),
         );
         strip_unsupported_sampling_params(&mut non_streaming_params, &config.base_url, model);
 
@@ -869,6 +881,7 @@ mod tests {
             &mut params,
             "https://api.openai.com/v1",
             "gpt-5.5",
+            None,
         );
         assert!(!params.extra.contains_key("reasoning_effort"));
     }
@@ -889,6 +902,7 @@ mod tests {
                 &mut params,
                 "https://api.openai.com/v1",
                 model,
+                None,
             );
             assert_eq!(
                 params.extra.get("reasoning_effort"),
@@ -906,6 +920,7 @@ mod tests {
                 &mut params,
                 "https://api.openai.com/v1",
                 model,
+                None,
             );
             assert_eq!(
                 params.extra.get("reasoning_effort"),
@@ -922,8 +937,24 @@ mod tests {
             &mut params,
             "https://api.openai.com/v1",
             "gpt-6-astra",
+            None,
         );
         assert!(!params.extra.contains_key("reasoning_effort"));
+    }
+
+    #[test]
+    fn test_azure_deployment_override_uses_catalog_model_capability() {
+        let mut params = make_chat_params(Some(bash_tool()), Some("high"));
+        normalize_reasoning_effort_for_openai_tools(
+            &mut params,
+            "https://my-resource.openai.azure.com",
+            "sol-prod",
+            Some("openai/gpt-6-sol"),
+        );
+        assert_eq!(
+            params.extra.get("reasoning_effort"),
+            Some(&serde_json::json!("none"))
+        );
     }
 
     /// `reasoning_effort` on OpenAI without tools is fine — model still
@@ -935,6 +966,7 @@ mod tests {
             &mut params,
             "https://api.openai.com/v1",
             "gpt-5.5",
+            None,
         );
         assert_eq!(
             params.extra.get("reasoning_effort"),
@@ -951,6 +983,7 @@ mod tests {
             &mut params,
             "https://api.openai.com/v1",
             "gpt-5.5",
+            None,
         );
         assert_eq!(
             params.extra.get("reasoning_effort"),
@@ -969,7 +1002,7 @@ mod tests {
             "https://api.anyscale.com/v1",
         ] {
             let mut params = make_chat_params(Some(bash_tool()), Some("low"));
-            normalize_reasoning_effort_for_openai_tools(&mut params, base_url, "gpt-5.5");
+            normalize_reasoning_effort_for_openai_tools(&mut params, base_url, "gpt-5.5", None);
             assert_eq!(
                 params.extra.get("reasoning_effort"),
                 Some(&serde_json::Value::String("low".to_string())),
@@ -987,6 +1020,7 @@ mod tests {
             &mut params,
             "https://my-resource.openai.azure.com",
             "gpt-5.5",
+            None,
         );
         assert!(!params.extra.contains_key("reasoning_effort"));
     }
@@ -999,6 +1033,7 @@ mod tests {
             &mut params,
             "https://api.openai.com/v1",
             "gpt-5.5",
+            None,
         );
         assert!(!params.extra.contains_key("reasoning_effort"));
     }
@@ -1016,6 +1051,7 @@ mod tests {
             &mut params,
             "https://api.openai.com/v1",
             "gpt-5.5",
+            None,
         );
         assert!(!params.extra.contains_key("reasoning_effort"));
         assert_eq!(

@@ -3809,22 +3809,13 @@ pub async fn get_organization_metrics(
         )
     })?;
 
-    // Parse time range with defaults
-    let end = params
-        .metrics
-        .end
-        .and_then(|s| chrono::DateTime::parse_from_rfc3339(&s).ok())
-        .map(|dt| dt.with_timezone(&Utc))
-        .unwrap_or_else(Utc::now);
+    let (start, end) = crate::routes::common::parse_metrics_range(
+        params.metrics.start.as_deref(),
+        params.metrics.end.as_deref(),
+        None,
+        31,
+    )?;
 
-    let start = params
-        .metrics
-        .start
-        .and_then(|s| chrono::DateTime::parse_from_rfc3339(&s).ok())
-        .map(|dt| dt.with_timezone(&Utc))
-        .unwrap_or_else(|| end - Duration::days(30));
-
-    // Get metrics from analytics service
     let metrics = app_state
         .analytics_service
         .get_organization_metrics(organization_id, start, end, credit_type.as_deref())
@@ -4472,8 +4463,17 @@ pub async fn get_revenue_density(
         params.start.as_deref(),
         params.end.as_deref(),
         None,
-        90,
+        31,
     )?;
+    if end - start > Duration::days(90) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            ResponseJson(ErrorResponse::new(
+                "Revenue density is limited to 90 days; use a shorter range".to_string(),
+                "invalid_parameter".to_string(),
+            )),
+        ));
+    }
 
     let result = app_state
         .analytics_service

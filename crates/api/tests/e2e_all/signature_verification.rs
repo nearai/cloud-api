@@ -580,7 +580,7 @@ async fn test_near_to_chutes_stream_gateway_signatures_hash_exact_sse() {
 }
 
 #[tokio::test]
-async fn test_chutes_stream_gateway_signature_includes_long_control_prefix() {
+async fn test_chutes_stream_with_unknown_provider_keeps_existing_signature_rules() {
     // Greater than the route's MAX_LEADING_CONTROL_EVENTS (32): the initial
     // bounded peek cannot discover either the chat ID or its serving provider.
     assert_chutes_stream_signature_routing(false, 40).await;
@@ -713,10 +713,21 @@ async fn assert_chutes_stream_signature_routing(near_fallback: bool, leading_con
             "{case}: all leading control bytes must survive in order"
         );
         let chat_id = first_stream_chat_id(&response_text);
-        // The default path filters usage; continuous usage preserves upstream
-        // wire bytes. Both must expose a Gateway receipt before public [DONE],
-        // even though model metadata says this is an attested model.
-        assert_gateway_signatures(&server, &api_key, &chat_id, &request_json, &response_text).await;
+        if leading_controls > 32 && expect_usage {
+            // No provider mapping and no rewrite: do not invent a Gateway receipt.
+            for algorithm in ["ecdsa", "ed25519"] {
+                let signature = server
+                    .get(format!("/v1/signature/{chat_id}?signing_algo={algorithm}").as_str())
+                    .add_header("Authorization", format!("Bearer {api_key}"))
+                    .await;
+                assert_eq!(signature.status_code(), 404, "{}", signature.text());
+            }
+        } else {
+            // Usage rewriting still requires a Gateway signature. Passthrough
+            // does too when the actual provider is known not to sign responses.
+            assert_gateway_signatures(&server, &api_key, &chat_id, &request_json, &response_text)
+                .await;
+        }
         // If the bounded peek found no ID, the pool already released the
         // unnamed pending connection. The route must not unpin it again.
         expected_unpinned_chat_ids.push(if leading_controls == 0 {

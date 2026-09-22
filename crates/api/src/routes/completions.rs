@@ -1728,10 +1728,8 @@ async fn chat_completions_inner(
                 };
                 let provider_requires_gateway_signature = match &serving_provider {
                     Some(provider) => !provider.supports_chat_signatures(),
-                    // A long control-event prefix can exhaust the bounded
-                    // peek before a provider mapping exists. Plaintext can
-                    // still receive a Gateway receipt once its chat ID arrives.
-                    None => !e2ee_active,
+                    // Missing provider information does not imply missing signature support.
+                    None => false,
                 };
                 let gateway_signature_enabled =
                     gateway_signature_enabled || provider_requires_gateway_signature;

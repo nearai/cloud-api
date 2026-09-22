@@ -47,6 +47,10 @@ threads-required = "num-test-threads"
 filter = "package(api) & binary(e2e_all)"
 test-group = "e2e-db"
 
+[[profile.default.overrides]]
+filter = "package(database) & binary(spend_counter_backfill)"
+test-group = "e2e-db"
+
 [[profile.default.scripts]]
 filter = "package(api) & binary(e2e_all)"
 setup = "e2e-db-bootstrap"

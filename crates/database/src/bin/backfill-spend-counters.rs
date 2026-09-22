@@ -105,8 +105,12 @@ fn parse_args(args: Vec<String>) -> Result<Option<Options>> {
                 timeout_seconds = value
                     .parse()
                     .with_context(|| format!("invalid timeout seconds: {value}"))?;
-                if timeout_seconds == 0 {
-                    bail!("--statement-timeout-seconds must be positive");
+                let timeout = Duration::from_secs(timeout_seconds);
+                if timeout.as_millis() == 0 || timeout.as_millis() > i32::MAX as u128 {
+                    bail!(
+                        "--statement-timeout-seconds must produce a timeout between 1ms and {}ms",
+                        i32::MAX
+                    );
                 }
             }
             unknown => bail!("unknown argument {unknown}; use --help"),
@@ -123,6 +127,95 @@ fn print_help() {
         "Usage: backfill-spend-counters [--organization UUID] [--statement-timeout-seconds N]\n\n\
 Reconciles incomplete organization spend counters. Deploy counter writers (#1116)\n\
 to every process and drain all older writers first. Do not rewrite or delete raw usage history\n\
-while this process runs. The command does not run migrations."
+while this process runs. The statement timeout applies to the repeatable-read snapshot;\n\
+apply and accounting-lock statements remain capped at 5 seconds. The command does not run migrations."
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_args_defaults() {
+        let options = parse_args(Vec::new()).unwrap().unwrap();
+        assert_eq!(options.organization_id, None);
+        assert_eq!(options.statement_timeout, Duration::from_secs(300));
+    }
+
+    #[test]
+    fn parse_args_accepts_organization_uuid() {
+        let organization_id = Uuid::new_v4();
+        let options = parse_args(vec![
+            "--organization".to_string(),
+            organization_id.to_string(),
+        ])
+        .unwrap()
+        .unwrap();
+        assert_eq!(options.organization_id, Some(organization_id));
+    }
+
+    #[test]
+    fn parse_args_rejects_missing_organization_uuid() {
+        let error = parse_args(vec!["--organization".to_string()]).unwrap_err();
+        assert!(error.to_string().contains("--organization needs a UUID"));
+    }
+
+    #[test]
+    fn parse_args_rejects_invalid_organization_uuid() {
+        let error =
+            parse_args(vec!["--organization".to_string(), "not-a-uuid".to_string()]).unwrap_err();
+        assert!(error.to_string().contains("invalid organization UUID"));
+    }
+
+    #[test]
+    fn parse_args_rejects_missing_statement_timeout() {
+        let error = parse_args(vec!["--statement-timeout-seconds".to_string()]).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("--statement-timeout-seconds needs an integer"));
+    }
+
+    #[test]
+    fn parse_args_rejects_invalid_statement_timeout() {
+        let error = parse_args(vec![
+            "--statement-timeout-seconds".to_string(),
+            "not-a-number".to_string(),
+        ])
+        .unwrap_err();
+        assert!(error.to_string().contains("invalid timeout seconds"));
+    }
+
+    #[test]
+    fn parse_args_rejects_zero_statement_timeout() {
+        let error = parse_args(vec![
+            "--statement-timeout-seconds".to_string(),
+            "0".to_string(),
+        ])
+        .unwrap_err();
+        assert!(error.to_string().contains("must produce a timeout"));
+    }
+
+    #[test]
+    fn parse_args_rejects_oversized_statement_timeout() {
+        let seconds = (i32::MAX as u64 / 1000) + 1;
+        let error = parse_args(vec![
+            "--statement-timeout-seconds".to_string(),
+            seconds.to_string(),
+        ])
+        .unwrap_err();
+        assert!(error.to_string().contains("must produce a timeout"));
+    }
+
+    #[test]
+    fn parse_args_help_returns_none() {
+        assert!(parse_args(vec!["--help".to_string()]).unwrap().is_none());
+        assert!(parse_args(vec!["-h".to_string()]).unwrap().is_none());
+    }
+
+    #[test]
+    fn parse_args_rejects_unknown_flag() {
+        let error = parse_args(vec!["--unknown".to_string()]).unwrap_err();
+        assert!(error.to_string().contains("unknown argument --unknown"));
+    }
 }

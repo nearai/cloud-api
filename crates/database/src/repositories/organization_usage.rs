@@ -193,23 +193,39 @@ impl OrganizationUsageRepository {
                         )
                         .await
                         .map_err(map_db_error)?;
-                    // New insert succeeded — update organization balance
+                    // New insert succeeded — update organization balance and the
+                    // per-key spend counter in one statement.
                     transaction
                         .execute(
                             r#"
-                            INSERT INTO organization_balance (
-                                organization_id,
-                                total_spent,
-                                last_usage_at,
-                                total_requests,
-                                total_tokens,
-                                updated_at
-                            ) VALUES ($1, $2, $3, 1, $4, $5)
-                            ON CONFLICT (organization_id) DO UPDATE SET
-                                total_spent = organization_balance.total_spent + $2,
-                                total_requests = organization_balance.total_requests + 1,
-                                total_tokens = organization_balance.total_tokens + $4,
-                                last_usage_at = $3,
+                            WITH balance_upsert AS (
+                                INSERT INTO organization_balance (
+                                    organization_id,
+                                    total_spent,
+                                    inference_spent,
+                                    service_spent,
+                                    last_usage_at,
+                                    total_requests,
+                                    total_tokens,
+                                    updated_at
+                                ) VALUES ($1, $2, $2, 0, $3, 1, $4, $5)
+                                ON CONFLICT (organization_id) DO UPDATE SET
+                                    total_spent = organization_balance.total_spent + $2,
+                                    inference_spent = organization_balance.inference_spent + $2,
+                                    total_requests = organization_balance.total_requests + 1,
+                                    total_tokens = organization_balance.total_tokens + $4,
+                                    last_usage_at = $3,
+                                    updated_at = $5
+                                RETURNING organization_id
+                            )
+                            INSERT INTO api_key_spend (
+                                api_key_id, inference_spent, service_spent, updated_at
+                            )
+                            SELECT $6, $2, 0, $5
+                            FROM balance_upsert
+                            WHERE TRUE
+                            ON CONFLICT (api_key_id) DO UPDATE SET
+                                inference_spent = api_key_spend.inference_spent + $2,
                                 updated_at = $5
                             "#,
                             &[
@@ -218,6 +234,7 @@ impl OrganizationUsageRepository {
                                 &now,
                                 &(total_tokens as i64),
                                 &now,
+                                &request.api_key_id,
                             ],
                         )
                         .await

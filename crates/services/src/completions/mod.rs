@@ -268,6 +268,35 @@ where
         )
         .entered();
 
+        // A stream that never produced a first token otherwise vanishes from every
+        // TTFT histogram entirely (TTFT is only recorded on the first chunk), which
+        // biases TTFT percentiles optimistic exactly when things are going wrong.
+        // Record it here, before any early return below, so it always runs once per
+        // stream (this function is only ever called from `Drop`, which runs once).
+        if !self.first_token_received {
+            let reason = if self.last_error.is_some() {
+                REASON_STREAM_ERROR
+            } else if !self.stream_completed {
+                REASON_STREAM_INTERRUPTED
+            } else {
+                REASON_STREAM_EMPTY
+            };
+            let mut no_first_token_tags = self.metric_tags.clone();
+            no_first_token_tags.push(format!("{TAG_REASON}:{reason}"));
+            let no_first_token_tags: Vec<&str> =
+                no_first_token_tags.iter().map(|s| s.as_str()).collect();
+            self.metrics_service.record_count(
+                METRIC_STREAMING_NO_FIRST_TOKEN,
+                1,
+                &no_first_token_tags,
+            );
+            self.metrics_service.record_latency(
+                METRIC_LATENCY_STREAMING_NO_FIRST_TOKEN_WAIT,
+                self.service_start_time.elapsed(),
+                &no_first_token_tags,
+            );
+        }
+
         let (
             input_tokens,
             output_tokens,
@@ -1139,11 +1168,19 @@ impl CompletionServiceImpl {
     /// These tags are used for OTLP/Datadog metrics and should only include
     /// low-cardinality values to minimize costs (~98% savings vs high-cardinality).
     /// High-cardinality data (org/workspace/key) is tracked via database analytics.
-    fn create_metric_tags(model_name: &str) -> Vec<String> {
+    /// `client` is a bounded exception: it is derived from `organization_id` via
+    /// `metrics::client_label` (an env-configured allow-list, capped at 16 distinct
+    /// labels, everything else collapses to `"other"`), so it never leaks a raw
+    /// org/workspace/key id into the tag set.
+    fn create_metric_tags(model_name: &str, organization_id: Uuid) -> Vec<String> {
         let environment = get_environment();
         vec![
             format!("{}:{}", TAG_MODEL, model_name),
             format!("{}:{}", TAG_ENVIRONMENT, environment),
+            format!(
+                "{TAG_CLIENT}:{}",
+                crate::metrics::client_label(organization_id)
+            ),
         ]
     }
 
@@ -1411,8 +1448,16 @@ impl CompletionServiceImpl {
         }
     }
 
-    /// Record an error metric with the appropriate error type tag
-    fn record_error(&self, error: &ports::CompletionError, model_name: Option<&str>) {
+    /// Record an error metric with the appropriate error type tag. `organization_id`
+    /// feeds the bounded `client` tag (see `create_metric_tags`) so pre-stream
+    /// failures (overloaded, provider error before streaming) can be broken down
+    /// per client for a success-rate SLA.
+    fn record_error(
+        &self,
+        error: &ports::CompletionError,
+        model_name: Option<&str>,
+        organization_id: Uuid,
+    ) {
         let error_type = match error {
             ports::CompletionError::InvalidModel(_) => ERROR_TYPE_INVALID_MODEL,
             ports::CompletionError::InvalidParams(_) => ERROR_TYPE_INVALID_PARAMS,
@@ -1426,6 +1471,10 @@ impl CompletionServiceImpl {
         let mut tags = vec![
             format!("{}:{}", TAG_ERROR_TYPE, error_type),
             format!("{}:{}", TAG_ENVIRONMENT, environment),
+            format!(
+                "{TAG_CLIENT}:{}",
+                crate::metrics::client_label(organization_id)
+            ),
         ];
 
         // Add model tag if available (for model-specific errors)
@@ -1545,6 +1594,7 @@ impl CompletionServiceImpl {
                 self.record_error(
                     &ports::CompletionError::RateLimitExceeded(msg.clone()),
                     Some(model_name),
+                    organization_id,
                 );
                 return Err(ports::CompletionError::RateLimitExceeded(msg));
             }
@@ -1580,8 +1630,9 @@ impl CompletionServiceImpl {
         requested_service_tier: Option<TextServiceTier>,
         latency_reporter: Option<super::inference_provider_pool::ProviderLatencyReporter>,
     ) -> StreamingResult {
-        // Create low-cardinality metric tags (no org/workspace/key - those go to database)
-        let metric_tags = Self::create_metric_tags(&model_name);
+        // Create low-cardinality metric tags (no org/workspace/key - those go to
+        // database; `client` is the bounded exception, see `create_metric_tags`)
+        let metric_tags = Self::create_metric_tags(&model_name, organization_id);
 
         let tags_str: Vec<&str> = metric_tags.iter().map(|s| s.as_str()).collect();
         self.metrics_service
@@ -1660,7 +1711,7 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
             Ok(id) => id,
             Err(e) => {
                 let err = ports::CompletionError::InvalidParams(format!("Invalid API key ID: {e}"));
-                self.record_error(&err, None);
+                self.record_error(&err, None, organization_id);
                 return Err(err);
             }
         };
@@ -1727,14 +1778,14 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
                     request.model
                 ));
                 // Do not record the invalid model name in metrics to avoid high cardinality
-                self.record_error(&err, None);
+                self.record_error(&err, None, organization_id);
                 return Err(err);
             }
             Err(e) => {
                 let err =
                     ports::CompletionError::InternalError(format!("Failed to resolve model: {e}"));
                 // Do not record the possibly invalid model name in metrics
-                self.record_error(&err, None);
+                self.record_error(&err, None, organization_id);
                 return Err(err);
             }
         };
@@ -1799,7 +1850,7 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
                     "chat completion stream",
                     organization_id,
                 );
-                self.record_error(&err, Some(canonical_name));
+                self.record_error(&err, Some(canonical_name), organization_id);
                 return Err(err);
             }
         };
@@ -1913,14 +1964,14 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
                     request.model
                 ));
                 // Do not record the invalid model name in metrics to avoid high cardinality
-                self.record_error(&err, None);
+                self.record_error(&err, None, organization_id);
                 return Err(err);
             }
             Err(e) => {
                 let err =
                     ports::CompletionError::InternalError(format!("Failed to resolve model: {e}"));
                 // Do not record the possibly invalid model name in metrics
-                self.record_error(&err, None);
+                self.record_error(&err, None, organization_id);
                 return Err(err);
             }
         };
@@ -1934,7 +1985,7 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
             Ok(id) => id,
             Err(e) => {
                 let err = ports::CompletionError::InvalidParams(format!("Invalid API key ID: {e}"));
-                self.record_error(&err, Some(canonical_name));
+                self.record_error(&err, Some(canonical_name), organization_id);
                 return Err(err);
             }
         };
@@ -1988,7 +2039,7 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
                     "chat completion",
                     organization_id,
                 );
-                self.record_error(&err, Some(canonical_name));
+                self.record_error(&err, Some(canonical_name), organization_id);
                 return Err(err);
             }
         };
@@ -2042,7 +2093,7 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
         let model_name = model.model_name.clone();
 
         tokio::spawn(async move {
-            let mut tags = CompletionServiceImpl::create_metric_tags(&model_name);
+            let mut tags = CompletionServiceImpl::create_metric_tags(&model_name, organization_id);
             let input_bucket = get_input_bucket(input_tokens);
             tags.push(format!("{TAG_INPUT_BUCKET}:{input_bucket}"));
             let tags_str: Vec<&str> = tags.iter().map(|s| s.as_str()).collect();
@@ -2120,7 +2171,7 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
             .map_err(|e| {
                 let err =
                     ports::CompletionError::InternalError(format!("Failed to record usage: {e}"));
-                self.record_error(&err, Some(&model.model_name));
+                self.record_error(&err, Some(&model.model_name), organization_id);
                 err
             })?;
 
@@ -2443,13 +2494,14 @@ mod tests {
         impl Stream<Item = Result<SSEEvent, inference_providers::CompletionError>> + Unpin,
     > {
         let now = Instant::now();
+        let organization_id = Uuid::new_v4();
         InterceptStream {
             inner: stream::iter(events),
             attestation_service: Arc::new(MockAttestationService),
             usage_service: Arc::new(MockUsageService),
             metrics_service: Arc::new(CapturingMetricsService::new()),
             request_id: Uuid::new_v4(),
-            organization_id: Uuid::new_v4(),
+            organization_id,
             workspace_id: Uuid::new_v4(),
             api_key_id: Uuid::new_v4(),
             model_id: Uuid::new_v4(),
@@ -2463,7 +2515,7 @@ mod tests {
             token_count: 0,
             last_token_time: None,
             total_itl_ms: 0.0,
-            metric_tags: CompletionServiceImpl::create_metric_tags("test-model"),
+            metric_tags: CompletionServiceImpl::create_metric_tags("test-model", organization_id),
             concurrent_counter: None,
             last_usage_stats: None,
             last_chat_id: None,
@@ -2657,7 +2709,7 @@ mod tests {
 
         let stream = stream::iter(vec![Ok(content_chunk), Ok(usage_chunk)]);
 
-        let metric_tags = CompletionServiceImpl::create_metric_tags("test-model");
+        let metric_tags = CompletionServiceImpl::create_metric_tags("test-model", organization_id);
 
         let now = Instant::now();
         let mut intercept_stream = InterceptStream {
@@ -2833,13 +2885,14 @@ mod tests {
             })),
         };
         let stream = stream::iter(vec![Ok(usage_chunk)]);
+        let organization_id = Uuid::new_v4();
         let intercept_stream = InterceptStream {
             inner: stream,
             attestation_service: Arc::new(MockAttestationService),
             usage_service: usage_service.clone(),
             metrics_service: metrics_service.clone(),
             request_id: Uuid::new_v4(),
-            organization_id: Uuid::new_v4(),
+            organization_id,
             workspace_id: Uuid::new_v4(),
             api_key_id: Uuid::new_v4(),
             model_id: Uuid::new_v4(),
@@ -2853,7 +2906,7 @@ mod tests {
             token_count: 0,
             last_token_time: None,
             total_itl_ms: 0.0,
-            metric_tags: CompletionServiceImpl::create_metric_tags("test-model"),
+            metric_tags: CompletionServiceImpl::create_metric_tags("test-model", organization_id),
             concurrent_counter: None,
             last_usage_stats: None,
             last_chat_id: None,
@@ -2981,7 +3034,7 @@ mod tests {
         // Simulate a stream with delays between chunks
         let stream = stream::iter(vec![Ok(chunk1), Ok(chunk2), Ok(usage_chunk)]);
 
-        let metric_tags = CompletionServiceImpl::create_metric_tags("test-model");
+        let metric_tags = CompletionServiceImpl::create_metric_tags("test-model", organization_id);
 
         // Use a start time from "before" to simulate real TTFT
         let service_start_time = Instant::now() - Duration::from_millis(50);
@@ -3060,12 +3113,17 @@ mod tests {
 
     #[tokio::test]
     async fn test_create_metric_tags_includes_model_and_environment() {
-        let tags = CompletionServiceImpl::create_metric_tags("gpt-4");
+        // A random org id has no configured `METRICS_CLIENT_ORG_LABELS` entry
+        // (the OnceLock-backed lookup is env-independent here, see
+        // `client_label::tests::client_label_falls_back_to_other_when_env_unset`),
+        // so it must collapse to the bounded "other" label.
+        let tags = CompletionServiceImpl::create_metric_tags("gpt-4", Uuid::new_v4());
 
-        assert_eq!(tags.len(), 2);
+        assert_eq!(tags.len(), 3);
         assert!(tags.iter().any(|t| t.starts_with("model:")));
         assert!(tags.iter().any(|t| t.starts_with("environment:")));
         assert!(tags.iter().any(|t| t == "model:gpt-4"));
+        assert!(tags.iter().any(|t| t == "client:other"));
     }
 
     #[tokio::test]
@@ -3112,7 +3170,7 @@ mod tests {
         };
 
         let stream = stream::iter(vec![Ok(usage_chunk)]);
-        let metric_tags = CompletionServiceImpl::create_metric_tags("test-model");
+        let metric_tags = CompletionServiceImpl::create_metric_tags("test-model", organization_id);
 
         let now = Instant::now();
         let intercept_stream = InterceptStream {
@@ -3168,6 +3226,184 @@ mod tests {
             req.avg_itl_ms.is_none(),
             "avg_itl_ms should be None for single chunk, got {:?}",
             req.avg_itl_ms
+        );
+    }
+
+    #[tokio::test]
+    async fn test_no_first_token_error_records_no_first_token_metric_not_ttft() {
+        let metrics_service = Arc::new(CapturingMetricsService::new());
+        let attestation_service = Arc::new(MockAttestationService);
+        let usage_service = Arc::new(MockUsageService);
+
+        let organization_id = Uuid::new_v4();
+        let now = Instant::now();
+
+        // A provider error arrives before any chunk was ever produced.
+        let stream = stream::iter(vec![Err(
+            inference_providers::CompletionError::CompletionError(
+                "provider error before any token".to_string(),
+            ),
+        )]);
+
+        let intercept_stream = InterceptStream {
+            inner: stream,
+            attestation_service,
+            usage_service,
+            metrics_service: metrics_service.clone(),
+            request_id: Uuid::new_v4(),
+            organization_id,
+            workspace_id: Uuid::new_v4(),
+            api_key_id: Uuid::new_v4(),
+            model_id: Uuid::new_v4(),
+            model_name: "test-model".to_string(),
+            inference_type: crate::usage::ports::InferenceType::ChatCompletionStream,
+            service_start_time: now,
+            provider_start_time: now,
+            first_token_received: false,
+            first_token_time: None,
+            ttft_ms: None,
+            token_count: 0,
+            last_token_time: None,
+            total_itl_ms: 0.0,
+            metric_tags: CompletionServiceImpl::create_metric_tags("test-model", organization_id),
+            concurrent_counter: None,
+            last_usage_stats: None,
+            last_chat_id: None,
+            stream_completed: false,
+            saw_upstream_done_marker: false,
+            response_id: None,
+            last_finish_reason: None,
+            last_error: None,
+            state: StreamState::Streaming,
+            attestation_supported: true,
+            store_provider_chat_signature: true,
+            provider_attribution: crate::usage::ProviderAttribution::default(),
+            cache_write_cost_per_token: None,
+            requested_service_tier: None,
+            provider_service_tier: None,
+            latency_reporter: None,
+        };
+
+        let _ = intercept_stream.collect::<Vec<_>>().await;
+        // record_usage_and_metrics runs synchronously in Drop (it only spawns
+        // billing/usage work, not this metric), but keep the same wait pattern
+        // as the other InterceptStream tests for consistency.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let metrics = metrics_service.get_metrics();
+
+        let no_first_token = metrics
+            .iter()
+            .find(|m| m.name == METRIC_STREAMING_NO_FIRST_TOKEN)
+            .expect("no_first_token metric missing");
+        assert!(matches!(no_first_token.value, MetricValue::Count(1)));
+        assert!(no_first_token
+            .tags
+            .contains(&format!("{TAG_REASON}:{REASON_STREAM_ERROR}")));
+
+        let wait_metric = metrics
+            .iter()
+            .find(|m| m.name == METRIC_LATENCY_STREAMING_NO_FIRST_TOKEN_WAIT)
+            .expect("no_first_token wait latency metric missing");
+        assert!(matches!(wait_metric.value, MetricValue::Latency(_)));
+
+        assert!(
+            !metrics.iter().any(|m| m.name == METRIC_LATENCY_TTFT),
+            "a stream that never produced a chunk must not record TTFT"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_no_first_token_metric_not_recorded_when_a_token_arrives() {
+        let metrics_service = Arc::new(CapturingMetricsService::new());
+        let attestation_service = Arc::new(MockAttestationService);
+        let usage_service = Arc::new(MockUsageService);
+
+        let organization_id = Uuid::new_v4();
+        let now = Instant::now();
+
+        let usage_chunk = SSEEvent {
+            raw_bytes: Bytes::from("data: usage"),
+            raw_passthrough: true,
+            chunk: Some(StreamChunk::Chat(ChatCompletionChunk {
+                id: "chat-1".to_string(),
+                object: "chat.completion.chunk".to_string(),
+                created: 1234567890,
+                model: "test-model".to_string(),
+                choices: vec![ChatChoice {
+                    index: 0,
+                    delta: None,
+                    logprobs: None,
+                    finish_reason: Some(FinishReason::Stop),
+                    token_ids: None,
+                }],
+                usage: Some(TokenUsage {
+                    prompt_tokens: 5,
+                    completion_tokens: 1,
+                    total_tokens: 6,
+                    prompt_tokens_details: None,
+                }),
+                service_tier: None,
+                prompt_token_ids: None,
+                modality: None,
+                system_fingerprint: None,
+                extra: Default::default(),
+            })),
+        };
+
+        let stream = stream::iter(vec![Ok(usage_chunk)]);
+        let intercept_stream = InterceptStream {
+            inner: stream,
+            attestation_service,
+            usage_service,
+            metrics_service: metrics_service.clone(),
+            request_id: Uuid::new_v4(),
+            organization_id,
+            workspace_id: Uuid::new_v4(),
+            api_key_id: Uuid::new_v4(),
+            model_id: Uuid::new_v4(),
+            model_name: "test-model".to_string(),
+            inference_type: crate::usage::ports::InferenceType::ChatCompletionStream,
+            service_start_time: now,
+            provider_start_time: now,
+            first_token_received: false,
+            first_token_time: None,
+            ttft_ms: None,
+            token_count: 0,
+            last_token_time: None,
+            total_itl_ms: 0.0,
+            metric_tags: CompletionServiceImpl::create_metric_tags("test-model", organization_id),
+            concurrent_counter: None,
+            last_usage_stats: None,
+            last_chat_id: None,
+            stream_completed: false,
+            saw_upstream_done_marker: false,
+            response_id: None,
+            last_finish_reason: None,
+            last_error: None,
+            state: StreamState::Streaming,
+            attestation_supported: true,
+            store_provider_chat_signature: true,
+            provider_attribution: crate::usage::ProviderAttribution::default(),
+            cache_write_cost_per_token: None,
+            requested_service_tier: None,
+            provider_service_tier: None,
+            latency_reporter: None,
+        };
+
+        let _ = intercept_stream.collect::<Vec<_>>().await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let metrics = metrics_service.get_metrics();
+        assert!(
+            !metrics
+                .iter()
+                .any(|m| m.name == METRIC_STREAMING_NO_FIRST_TOKEN),
+            "a stream that produced a token must not record no_first_token"
+        );
+        assert!(
+            metrics.iter().any(|m| m.name == METRIC_LATENCY_TTFT),
+            "TTFT should still be recorded when a token arrives"
         );
     }
 

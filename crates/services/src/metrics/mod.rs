@@ -1,5 +1,8 @@
 pub mod capturing;
+pub mod client_label;
 pub mod consts;
+
+pub use client_label::client_label;
 
 use async_trait::async_trait;
 use opentelemetry::{
@@ -15,6 +18,16 @@ pub trait MetricsServiceTrait: Send + Sync {
     fn record_count(&self, name: &str, value: i64, tags: &[&str]);
     fn record_histogram(&self, name: &str, value: f64, tags: &[&str]);
 }
+
+/// Explicit bucket boundaries (ms) for the TTFT-family histograms. The OTel
+/// SDK default boundaries (`0,5,10,25,...,10000`) are too coarse between 1s
+/// and 10s and have nothing above 10s, which is exactly the range an SLA-grade
+/// TTFT dashboard needs resolution in. SLA thresholds must land on one of
+/// these boundaries so the backend can compute an exact `histogram_quantile`.
+const TTFT_BUCKET_BOUNDARIES_MS: [f64; 19] = [
+    50.0, 100.0, 250.0, 500.0, 750.0, 1000.0, 1500.0, 2000.0, 2500.0, 3000.0, 4000.0, 5000.0,
+    7500.0, 10000.0, 15000.0, 20000.0, 30000.0, 60000.0, 120000.0,
+];
 
 pub struct OtlpMetricsService {
     meter: Meter,
@@ -82,14 +95,34 @@ impl MetricsServiceTrait for OtlpMetricsService {
                     "Time to create and store gateway signatures"
                 }
                 consts::METRIC_HTTP_DURATION => "HTTP request processing time",
+                consts::METRIC_LATENCY_STREAMING_NO_FIRST_TOKEN_WAIT => {
+                    "Wait time (service-start to stream end) for streams that never produced a first token"
+                }
                 _ => "Latency measurement",
             };
 
-            self.meter
+            let builder = self
+                .meter
                 .u64_histogram(name.to_string())
                 .with_description(description)
-                .with_unit("ms")
-                .build()
+                .with_unit("ms");
+
+            // Coarse default OTel buckets (nothing above 10s) are not enough
+            // resolution for an SLA-grade TTFT dashboard; give the TTFT-family
+            // histograms explicit boundaries. Every other histogram keeps the
+            // SDK defaults.
+            let builder = match name {
+                consts::METRIC_LATENCY_TTFT
+                | consts::METRIC_LATENCY_TTFT_TOTAL
+                | consts::METRIC_LATENCY_STREAMING_TTFT_BY_INPUT
+                | consts::METRIC_LATENCY_STREAMING_TTFT_TOTAL_BY_INPUT
+                | consts::METRIC_LATENCY_STREAMING_NO_FIRST_TOKEN_WAIT => {
+                    builder.with_boundaries(TTFT_BUCKET_BOUNDARIES_MS.to_vec())
+                }
+                _ => builder,
+            };
+
+            builder.build()
         });
 
         let kv_tags = Self::parse_tags(tags);
@@ -101,6 +134,9 @@ impl MetricsServiceTrait for OtlpMetricsService {
         let counter = counters.entry(name.to_string()).or_insert_with(|| {
             let description = match name {
                 consts::METRIC_REQUEST_COUNT => "Total number of API requests",
+                consts::METRIC_STREAMING_NO_FIRST_TOKEN => {
+                    "Streams that ended without ever producing a first token, by reason"
+                }
                 consts::METRIC_PROVIDER_REQUESTS => {
                     "Served requests by provider tier + fallback (Chutes-served traffic, NEAR->fallback rate)"
                 }

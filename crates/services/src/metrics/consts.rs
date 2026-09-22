@@ -12,6 +12,10 @@ pub const METRIC_LATENCY_TOTAL: &str = "cloud_api.latency.total";
 pub const METRIC_LATENCY_QUEUE_TIME: &str = "cloud_api.latency.queue_time";
 pub const METRIC_LATENCY_DECODING_TIME: &str = "cloud_api.latency.decoding_time";
 pub const METRIC_TOKENS_PER_SECOND: &str = "cloud_api.tokens_per_second";
+// Wait time (service-start to Drop) for a stream that never produced a first
+// token, paired with the `cloud_api.streaming.no_first_token` count below.
+pub const METRIC_LATENCY_STREAMING_NO_FIRST_TOKEN_WAIT: &str =
+    "cloud_api.latency.streaming_no_first_token_wait";
 
 // Verification metrics (optional - for signature verification)
 pub const METRIC_VERIFICATION_SUCCESS: &str = "cloud_api.verification.success";
@@ -31,6 +35,11 @@ pub const TAG_RESULT: &str = "result";
 
 // Usage/engagement metrics
 pub const METRIC_REQUEST_COUNT: &str = "cloud_api.request.count";
+// Streams that ended (Drop) without ever producing a first token. Without
+// this, those streams simply vanish from the TTFT histograms, which biases
+// TTFT percentiles optimistic during an outage (the worst streams never
+// report a TTFT sample at all). Tagged `reason` (error|interrupted|empty).
+pub const METRIC_STREAMING_NO_FIRST_TOKEN: &str = "cloud_api.streaming.no_first_token";
 pub const METRIC_TOKENS_INPUT: &str = "cloud_api.tokens.input";
 pub const METRIC_TOKENS_OUTPUT: &str = "cloud_api.tokens.output";
 // Prefix-cache-hit observability (chat-completions path, request-granular, same
@@ -92,6 +101,8 @@ pub const TAG_METHOD: &str = "method";
 pub const TAG_REASON: &str = "reason";
 pub const TAG_INPUT_BUCKET: &str = "input_bucket";
 pub const TAG_INFERENCE_TYPE: &str = "inference_type";
+// Bounded per-org label (see `metrics::client_label`) — never the raw org id.
+pub const TAG_CLIENT: &str = "client";
 
 // Error types for TAG_ERROR_TYPE
 pub const ERROR_TYPE_INVALID_MODEL: &str = "invalid_model";
@@ -108,6 +119,11 @@ pub const REASON_REPOSITORY_ERROR: &str = "repository_error";
 // Provider token anomaly reasons
 pub const REASON_TOKEN_OVERFLOW: &str = "overflow";
 pub const REASON_MISSING_USAGE: &str = "missing_usage";
+
+// Reasons for cloud_api.streaming.no_first_token
+pub const REASON_STREAM_ERROR: &str = "error";
+pub const REASON_STREAM_INTERRUPTED: &str = "interrupted";
+pub const REASON_STREAM_EMPTY: &str = "empty";
 
 /// Get the current environment from the ENVIRONMENT env var, defaulting to "local"
 pub fn get_environment() -> String {

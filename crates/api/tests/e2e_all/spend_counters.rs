@@ -28,6 +28,7 @@ async fn fixture() -> (
         "spend-counter-key".to_string(),
     )
     .await;
+    let api_key_id: Uuid = api_key.id.parse().expect("API key UUID");
     let client = database.pool().get().await.expect("database connection");
     let model = client
         .query_one(
@@ -43,7 +44,7 @@ async fn fixture() -> (
     let request = RecordUsageRequest {
         organization_id: org.id.parse().expect("organization UUID"),
         workspace_id: workspace.id.parse().expect("workspace UUID"),
-        api_key_id: api_key.id.parse().expect("API key UUID"),
+        api_key_id,
         model_id,
         model_name,
         input_tokens: 1,
@@ -68,12 +69,7 @@ async fn fixture() -> (
         served_provider_type: None,
         served_via_fallback: false,
     };
-    (
-        server,
-        database,
-        request,
-        api_key.id.parse().expect("API key UUID"),
-    )
+    (server, database, request, api_key_id)
 }
 
 #[tokio::test]
@@ -139,6 +135,7 @@ async fn spend_counters_track_inference_and_service_separately_on_one_key() -> a
 async fn spend_counters_ignore_duplicates_and_failed_posts() -> anyhow::Result<()> {
     let (_server, database, inference, api_key_id) = fixture().await;
     let repository = OrganizationUsageRepository::new(database.pool().clone());
+    let service_repository = OrganizationServiceUsageRepository::new(database.pool().clone());
     repository.record_usage(inference.clone()).await?;
     repository.record_usage(inference.clone()).await?;
 
@@ -168,9 +165,11 @@ async fn spend_counters_ignore_duplicates_and_failed_posts() -> anyhow::Result<(
     else {
         panic!("expected a database overflow error");
     };
-    assert_eq!(
-        cause.to_string(),
-        "Database error (22003): bigint out of range"
+    // map_db_error retains SQLSTATE in this prefix; PostgreSQL diagnostic wording
+    // is not the failure-kind contract checked by this rollback test.
+    assert!(
+        cause.to_string().starts_with("Database error (22003): "),
+        "expected SQLSTATE 22003, got: {cause}"
     );
 
     let client = database.pool().get().await?;
@@ -210,8 +209,154 @@ async fn spend_counters_ignore_duplicates_and_failed_posts() -> anyhow::Result<(
     assert_eq!(balance.get::<_, i64>("unresolved_unfunded_amount"), 3_000);
     client
         .execute(
+            // Restore the counter after forcing it to MAX; leaving MAX in the
+            // shared database can overflow aggregate spend reads.
             "UPDATE api_key_spend SET inference_spent = $2 WHERE api_key_id = $1",
             &[&api_key_id, &3_000i64],
+        )
+        .await?;
+
+    let service_id = Uuid::new_v4();
+    client
+        .execute(
+            "INSERT INTO services (id, service_name, display_name, unit, cost_per_unit) VALUES ($1, $2, $2, 'request', 1)",
+            &[&service_id, &format!("spend-counter-overflow-service-{service_id}")],
+        )
+        .await?;
+
+    let service_key_overflow_id = Uuid::new_v4();
+    client
+        .execute(
+            "UPDATE api_key_spend SET service_spent = $2 WHERE api_key_id = $1",
+            &[&api_key_id, &i64::MAX],
+        )
+        .await?;
+    drop(client);
+
+    let service_request = RecordServiceUsageRequest {
+        organization_id: inference.organization_id,
+        workspace_id: inference.workspace_id,
+        api_key_id,
+        service_id,
+        quantity: 1,
+        total_cost: 1,
+        inference_id: Some(service_key_overflow_id),
+    };
+    let error = service_repository
+        .record_usage(&service_request)
+        .await
+        .expect_err("a per-key service counter overflow must roll back the service transaction");
+    let services::common::RepositoryError::DatabaseError(cause) = error
+        .downcast::<services::common::RepositoryError>()
+        .expect("repository error")
+    else {
+        panic!("expected a database overflow error");
+    };
+    assert!(
+        cause.to_string().starts_with("Database error (22003): "),
+        "expected SQLSTATE 22003, got: {cause}"
+    );
+
+    let client = database.pool().get().await?;
+    let key = client
+        .query_one(
+            "SELECT inference_spent, service_spent FROM api_key_spend WHERE api_key_id = $1",
+            &[&api_key_id],
+        )
+        .await?;
+    assert_eq!(key.get::<_, i64>("inference_spent"), 3_000);
+    assert_eq!(key.get::<_, i64>("service_spent"), i64::MAX);
+    let service_count: i64 = client
+        .query_one(
+            "SELECT COUNT(*)::BIGINT FROM organization_service_usage_log WHERE inference_id = $1",
+            &[&service_key_overflow_id],
+        )
+        .await?
+        .get(0);
+    assert_eq!(service_count, 0);
+    let balance = client
+        .query_one(
+            "SELECT total_spent, inference_spent, service_spent, unresolved_unfunded_amount FROM organization_balance WHERE organization_id = $1",
+            &[&inference.organization_id],
+        )
+        .await?;
+    assert_eq!(balance.get::<_, i64>("total_spent"), 3_000);
+    assert_eq!(balance.get::<_, i64>("inference_spent"), 3_000);
+    assert_eq!(balance.get::<_, i64>("service_spent"), 0);
+    assert_eq!(balance.get::<_, i64>("unresolved_unfunded_amount"), 3_000);
+
+    let organization_overflow_id = Uuid::new_v4();
+    client
+        .execute(
+            "UPDATE api_key_spend SET service_spent = 0 WHERE api_key_id = $1",
+            &[&api_key_id],
+        )
+        .await?;
+    client
+        .execute(
+            "UPDATE organization_balance SET service_spent = $2 WHERE organization_id = $1",
+            &[&inference.organization_id, &i64::MAX],
+        )
+        .await?;
+    drop(client);
+
+    let mut organization_overflow_request = service_request.clone();
+    organization_overflow_request.inference_id = Some(organization_overflow_id);
+    let error = service_repository
+        .record_usage(&organization_overflow_request)
+        .await
+        .expect_err(
+            "an organization service counter overflow must roll back the service transaction",
+        );
+    let services::common::RepositoryError::DatabaseError(cause) = error
+        .downcast::<services::common::RepositoryError>()
+        .expect("repository error")
+    else {
+        panic!("expected a database overflow error");
+    };
+    assert!(
+        cause.to_string().starts_with("Database error (22003): "),
+        "expected SQLSTATE 22003, got: {cause}"
+    );
+
+    let client = database.pool().get().await?;
+    let key = client
+        .query_one(
+            "SELECT inference_spent, service_spent FROM api_key_spend WHERE api_key_id = $1",
+            &[&api_key_id],
+        )
+        .await?;
+    assert_eq!(key.get::<_, i64>("inference_spent"), 3_000);
+    assert_eq!(key.get::<_, i64>("service_spent"), 0);
+    let service_count: i64 = client
+        .query_one(
+            "SELECT COUNT(*)::BIGINT FROM organization_service_usage_log WHERE inference_id = $1",
+            &[&organization_overflow_id],
+        )
+        .await?
+        .get(0);
+    assert_eq!(service_count, 0);
+    let balance = client
+        .query_one(
+            "SELECT total_spent, inference_spent, service_spent, unresolved_unfunded_amount FROM organization_balance WHERE organization_id = $1",
+            &[&inference.organization_id],
+        )
+        .await?;
+    assert_eq!(balance.get::<_, i64>("total_spent"), 3_000);
+    assert_eq!(balance.get::<_, i64>("inference_spent"), 3_000);
+    assert_eq!(balance.get::<_, i64>("service_spent"), i64::MAX);
+    assert_eq!(balance.get::<_, i64>("unresolved_unfunded_amount"), 3_000);
+
+    client
+        .execute(
+            "UPDATE api_key_spend SET service_spent = 0 WHERE api_key_id = $1",
+            &[&api_key_id],
+        )
+        .await?;
+    client
+        .execute(
+            "UPDATE organization_balance SET service_spent = 0 WHERE organization_id = $1",
+            &[&inference.organization_id],
         )
         .await?;
     Ok(())

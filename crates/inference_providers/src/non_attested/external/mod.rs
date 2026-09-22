@@ -298,6 +298,12 @@ impl ExternalProvider {
                 enforced_request_body,
             } => {
                 let mut extra = std::collections::HashMap::new();
+                // Preserve the catalog identity separately from a provider-specific
+                // deployment override (notably Azure) for capability decisions.
+                extra.insert(
+                    openai_compatible::CATALOG_MODEL_NAME_KEY.to_string(),
+                    model_name.clone(),
+                );
                 if let Some(org_id) = organization_id {
                     extra.insert("organization_id".to_string(), org_id);
                 }
@@ -865,6 +871,14 @@ mod tests {
         // The provider should use the config model_name, not the database model name
         assert_eq!(provider.model_name(), "gpt-5.2");
         assert_eq!(provider.backend_type(), "openai_compatible");
+        assert_eq!(
+            provider
+                .config
+                .extra
+                .get(openai_compatible::CATALOG_MODEL_NAME_KEY)
+                .map(String::as_str),
+            Some("openai/gpt-5.2")
+        );
     }
 
     #[test]

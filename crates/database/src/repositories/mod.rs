@@ -34,7 +34,6 @@ pub mod retry;
 pub mod service;
 pub mod service_usage_repository_impl;
 pub mod session;
-pub(crate) mod spend_counters;
 pub mod usage_repository_impl;
 pub mod user;
 pub mod utils;

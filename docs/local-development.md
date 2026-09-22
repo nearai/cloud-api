@@ -370,11 +370,10 @@ or `docker compose down -v` to wipe the volume.
 ## 8. Reproduction scripts
 
 `test_signature.sh` at the repo root doubles as a worked example —
-completion → signature lookup roundtrip. It takes `base_url` as a
-positional argument and reads the key from the `API_KEY` environment
-variable (it refuses to run without one), so you can point it at the
-local server:
+completion → signature lookup roundtrip. It accepts positional
+`base_url` and `api_key` arguments so you can point it at the local
+server:
 
 ```bash
-API_KEY="$API_KEY" ./test_signature.sh http://localhost:3000
+./test_signature.sh http://localhost:3000 "$API_KEY"
 ```

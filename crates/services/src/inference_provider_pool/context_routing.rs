@@ -28,6 +28,15 @@
 //!
 //! Without a `long_context` block this is the identity expansion — every
 //! other model registers exactly as before.
+//!
+//! Organizations at negative scheduler priority (`ChatRoutingHints.request_priority
+//! < 0`) never fall back between the two NEAR tiers: [`pin_near_tier_for_low_priority`]
+//! narrows `get_providers_with_fallback`'s candidate list, before it sorts them, down to
+//! the single NEAR capacity the request's estimated size selects (the attested
+//! third-party fallback, e.g. Chutes, is unaffected). This keeps a burst of
+//! oversized low-priority requests from spilling a saturated long-context host's
+//! retryable errors onto the interactive base fleet — the request instead fails
+//! (or is retried by the caller) on the tier it was sized for.
 
 use std::sync::OnceLock;
 
@@ -245,6 +254,72 @@ pub(crate) fn concat_prompt_text(params: &ChatCompletionParams) -> String {
     text
 }
 
+/// Outcome of [`pin_near_tier_for_low_priority`]: which of the input
+/// candidates (same order) survive, and the NEAR capacity pinned to.
+pub(crate) struct TierPinDecision {
+    /// One entry per input candidate, in order: `true` to keep, `false` to
+    /// drop it from the routing candidate list.
+    pub keep: Vec<bool>,
+    /// The NEAR capacity every surviving NEAR candidate declares. `None`
+    /// when no pinning applied (fewer than two distinct NEAR capacities), in
+    /// which case every `keep` entry is `true`.
+    pub pinned_capacity: Option<u32>,
+}
+
+/// Decide which candidates survive `get_providers_with_fallback` for a
+/// request from a negative-priority organization (module docs above).
+/// `candidates` is `(is_near_tier, declared_max_context_tokens)` per
+/// provider, in the pool's existing candidate order; a candidate with no
+/// declared capacity is treated as unlimited, matching the routing sort's
+/// `max_context_tokens.unwrap_or(u32::MAX)` convention.
+///
+/// A model whose NEAR candidates share one capacity (or has fewer than two)
+/// is left untouched — there is only one NEAR tier, so nothing to pin
+/// between. Otherwise every NEAR candidate is dropped except those at the
+/// smallest declared capacity still `>= estimated_tokens` (the tier the
+/// request's size selects); if the estimate doesn't fit any NEAR tier, the
+/// largest capacity (closest to fitting) is kept instead — mirroring the
+/// "nothing fits: closest first" rule the capacity sort already applies.
+/// Non-NEAR candidates (the attested third-party fallback) are never
+/// dropped here.
+///
+/// Pure and pool-free so it can be unit-tested directly.
+pub(crate) fn pin_near_tier_for_low_priority(
+    candidates: &[(bool, Option<u32>)],
+    estimated_tokens: u32,
+) -> TierPinDecision {
+    let mut near_capacities: Vec<u32> = candidates
+        .iter()
+        .filter(|(is_near, _)| *is_near)
+        .map(|(_, cap)| cap.unwrap_or(u32::MAX))
+        .collect();
+    near_capacities.sort_unstable();
+    near_capacities.dedup();
+
+    if near_capacities.len() < 2 {
+        return TierPinDecision {
+            keep: vec![true; candidates.len()],
+            pinned_capacity: None,
+        };
+    }
+
+    let pinned = near_capacities
+        .iter()
+        .copied()
+        .find(|&cap| cap >= estimated_tokens)
+        .unwrap_or_else(|| *near_capacities.last().expect("checked len >= 2 above"));
+
+    let keep = candidates
+        .iter()
+        .map(|(is_near, cap)| !is_near || cap.unwrap_or(u32::MAX) == pinned)
+        .collect();
+
+    TierPinDecision {
+        keep,
+        pinned_capacity: Some(pinned),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -404,5 +479,56 @@ mod tests {
         assert_eq!(after.uncounted_tokens, before.uncounted_tokens);
         assert!(concat_prompt_text(&with_reasoning).contains(&"x".repeat(4_000)));
         assert!(!concat_prompt_text(&base).contains("xxxx"));
+    }
+
+    #[test]
+    fn pin_near_tier_keeps_smallest_fitting_near_capacity() {
+        let candidates = [
+            (true, Some(262_144)),
+            (true, Some(1_048_576)),
+            (false, Some(1_048_576)),
+        ];
+        let decision = pin_near_tier_for_low_priority(&candidates, 10_000);
+        assert_eq!(decision.keep, vec![true, false, true]);
+        assert_eq!(decision.pinned_capacity, Some(262_144));
+    }
+
+    #[test]
+    fn pin_near_tier_keeps_largest_capacity_when_nothing_fits() {
+        let candidates = [
+            (true, Some(262_144)),
+            (true, Some(1_048_576)),
+            (false, Some(1_048_576)),
+        ];
+        let decision = pin_near_tier_for_low_priority(&candidates, 2_000_000);
+        assert_eq!(decision.keep, vec![false, true, true]);
+        assert_eq!(decision.pinned_capacity, Some(1_048_576));
+    }
+
+    #[test]
+    fn pin_near_tier_is_noop_with_one_distinct_near_capacity() {
+        // Two NEAR candidates at the same capacity: nothing to pin between.
+        let candidates = [(true, Some(262_144)), (true, Some(262_144)), (false, None)];
+        let decision = pin_near_tier_for_low_priority(&candidates, 10_000);
+        assert_eq!(decision.keep, vec![true, true, true]);
+        assert_eq!(decision.pinned_capacity, None);
+    }
+
+    #[test]
+    fn pin_near_tier_is_noop_with_a_single_near_candidate() {
+        let candidates = [(true, Some(262_144)), (false, Some(1_048_576))];
+        let decision = pin_near_tier_for_low_priority(&candidates, 10_000);
+        assert_eq!(decision.keep, vec![true, true]);
+        assert_eq!(decision.pinned_capacity, None);
+    }
+
+    #[test]
+    fn pin_near_tier_treats_undeclared_capacity_as_unlimited() {
+        // A NEAR candidate with no declared capacity behaves like the
+        // routing sort's `unwrap_or(u32::MAX)` — effectively the largest tier.
+        let candidates = [(true, Some(262_144)), (true, None)];
+        let decision = pin_near_tier_for_low_priority(&candidates, 2_000_000);
+        assert_eq!(decision.keep, vec![false, true]);
+        assert_eq!(decision.pinned_capacity, Some(u32::MAX));
     }
 }

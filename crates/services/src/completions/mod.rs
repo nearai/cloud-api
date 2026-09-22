@@ -1778,6 +1778,7 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
             prefix_hash: Some(compute_prefix_hash(&chat_params.messages)),
             estimated_tokens: Some(estimate_input_tokens(&chat_params.messages)),
             fallback_disabled: !request.fallback_enabled,
+            request_priority: chat_params.request_priority,
         };
 
         // Get the LLM stream
@@ -1967,6 +1968,8 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
         Self::reject_n_gt_1_if_unsupported(model.attestation_supported, request.n, canonical_name)?;
 
         let provider_start_time = Instant::now();
+        // Read before `chat_params` moves into the call below.
+        let request_priority = chat_params.request_priority;
         let result = self
             .inference_provider_pool
             .chat_completion_with_attribution_and_hints(
@@ -1974,6 +1977,7 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
                 request.body_hash.clone(),
                 super::inference_provider_pool::ChatRoutingHints {
                     fallback_disabled: !request.fallback_enabled,
+                    request_priority,
                     ..Default::default()
                 },
             )

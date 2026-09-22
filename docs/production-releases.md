@@ -11,7 +11,9 @@ image digest is passed by the caller. An external tag change before resolution
 can change the deployed image. Promotion and rollback share the
 `prod-image-mutation` concurrency group, held while waiting for deployment.
 The infrastructure workflow serializes production CVM updates separately and
-retains its daily 02:00 UTC reconciliation schedule.
+reconciles at 00:00 UTC every day except Thursday (`0 0 * * 0-3,5-6`).
+Thursday deployment is triggered by successful promotion; a failed promotion
+does not dispatch deployment.
 
 ## Setup and verification
 
@@ -23,8 +25,8 @@ rules still apply; required approval can delay an otherwise automatic release.
 
 Verifier pin validation remains enabled. The image commit must be present in
 the verifier's accepted staging or production configuration before deployment.
-The playbook performs per-instance health checks; the workflow additionally
-checks `https://cloud-api.near.ai/v1/health` after rollout. Changed-release
+The playbook performs per-instance health checks and ingress verification
+during rollout. Changed-release
 notifications and the infrastructure summary record the deployed digest.
 
 The caller summary links the exact deployment run. Failed, cancelled, or timed

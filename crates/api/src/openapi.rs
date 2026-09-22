@@ -180,6 +180,7 @@ use utoipa::{Modify, OpenApi};
         crate::routes::admin::get_platform_timeseries,
         crate::routes::admin::get_billing_summary,
         crate::routes::admin::get_model_revenue,
+        crate::routes::admin::get_revenue_density,
         crate::routes::admin::get_org_revenue,
         crate::routes::admin::get_infra_summary,
         crate::routes::admin::list_invitation_email_deliveries,

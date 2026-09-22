@@ -172,16 +172,17 @@ pub fn allowlisted_date_trunc(
 /// - `start >= end` → 400
 /// - per-granularity absolute caps prevent unbounded full-table scans:
 ///   - `hour`  → max `max_hour_days` days (caller-specified)
-///   - `day`   → max 366 days
+///   - `day`   → max `max_day_days` days
 ///   - `week`  → max 3 years (1096 days)
 ///   - `month` → max 5 years (1826 days)
-///   - `None`  → max 366 days (non-timeseries endpoints)
+///   - `None`  → max `max_day_days` days (non-timeseries endpoints)
 #[allow(clippy::type_complexity)]
 pub fn parse_metrics_range(
     start: Option<&str>,
     end: Option<&str>,
     granularity: Option<&str>,
     max_hour_days: i64,
+    max_day_days: i64,
 ) -> Result<
     (chrono::DateTime<chrono::Utc>, chrono::DateTime<chrono::Utc>),
     (StatusCode, ResponseJson<ErrorResponse>),
@@ -242,12 +243,12 @@ pub fn parse_metrics_range(
                 ));
             }
         }
-        // "day" or None: absolute cap of 366 days
+        // "day" or None: caller-configured cap for non-hour ranges.
         _ => {
-            if window > chrono::Duration::days(366) {
-                return Err(range_err(
-                    "'day' granularity is limited to 366 days".to_string(),
-                ));
+            if window > chrono::Duration::days(max_day_days) {
+                return Err(range_err(format!(
+                    "'day' granularity is limited to {max_day_days} days"
+                )));
             }
         }
     }

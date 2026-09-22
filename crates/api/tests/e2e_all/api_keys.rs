@@ -135,12 +135,12 @@ async fn test_list_workspace_api_keys_orders_by_usage() {
 
     drop(client);
     let inference_repository = OrganizationUsageRepository::new(database.pool().clone());
-    let mut inference = RecordUsageRequest {
+    let inference = RecordUsageRequest {
         organization_id,
         workspace_id,
         api_key_id: service_spend_key_id,
         model_id,
-        model_name: model_name.clone(),
+        model_name,
         input_tokens: 10,
         output_tokens: 10,
         input_cost: 1,
@@ -167,10 +167,15 @@ async fn test_list_workspace_api_keys_orders_by_usage() {
         .record_usage(inference.clone())
         .await
         .unwrap();
-    inference.api_key_id = inference_spend_key_id;
-    inference.total_cost = 300_000_000;
-    inference.inference_id = Some(uuid::Uuid::new_v4());
-    inference_repository.record_usage(inference).await.unwrap();
+    inference_repository
+        .record_usage(RecordUsageRequest {
+            api_key_id: inference_spend_key_id,
+            total_cost: 300_000_000,
+            inference_id: Some(uuid::Uuid::new_v4()),
+            ..inference
+        })
+        .await
+        .unwrap();
     OrganizationServiceUsageRepository::new(database.pool().clone())
         .record_usage(&RecordServiceUsageRequest {
             organization_id,

@@ -1,3 +1,6 @@
+#[allow(dead_code)]
+mod support;
+
 use database::repositories::{
     ApiKeyRepository, OrganizationUsageRepository, PgAnalyticsRepository,
 };
@@ -6,35 +9,13 @@ use deadpool::Runtime;
 use deadpool_postgres::{Config, PoolConfig};
 use services::admin::AnalyticsRepository;
 use services::workspace::ports::{ApiKeyOrderBy, ApiKeyOrderDirection};
+use support::pool_config;
 use tokio_postgres::NoTls;
 use uuid::Uuid;
 
-fn env_value(primary: &str, fallback: &str, default: &str) -> String {
-    std::env::var(primary)
-        .or_else(|_| std::env::var(fallback))
-        .unwrap_or_else(|_| default.to_string())
-}
-
-fn pool_config() -> Config {
-    let mut config = Config::new();
-    config.host = Some(env_value("PGHOST", "DATABASE_HOST", "localhost"));
-    config.port = Some(
-        env_value("PGPORT", "DATABASE_PORT", "5432")
-            .parse()
-            .expect("database port must be numeric"),
-    );
-    config.dbname = Some(env_value(
-        "PGDATABASE",
-        "TEST_DATABASE_NAME",
-        "platform_api",
-    ));
-    config.user = Some(env_value("PGUSER", "DATABASE_USERNAME", "postgres"));
-    config.password = Some(env_value("PGPASSWORD", "DATABASE_PASSWORD", "postgres"));
-    config.pool = Some(PoolConfig::new(4));
-    config
-}
-
 async fn new_pool(config: &Config) -> anyhow::Result<DbPool> {
+    let mut config = config.clone();
+    config.pool = Some(PoolConfig::new(4));
     Ok(DbPool::new(
         config.create_pool(Some(Runtime::Tokio1), NoTls)?,
     ))
@@ -113,6 +94,19 @@ async fn drop_schema(
     Ok(())
 }
 
+// A spawned task lets cleanup run after either a returned error or an assertion panic.
+async fn with_scoped_pool<F, Fut>(test: F) -> anyhow::Result<()>
+where
+    F: FnOnce(DbPool) -> Fut,
+    Fut: std::future::Future<Output = anyhow::Result<()>> + Send + 'static,
+{
+    let (admin_pool, pool, schema) = scoped_pool().await?;
+    let result = tokio::spawn(test(pool.clone())).await;
+    let cleanup = drop_schema(admin_pool, pool, schema).await;
+    result??;
+    cleanup
+}
+
 async fn insert_key(
     pool: &DbPool,
     workspace_id: Uuid,
@@ -151,104 +145,106 @@ async fn insert_key(
 
 #[tokio::test]
 async fn key_list_reads_counter_cohort_with_stable_pagination() -> anyhow::Result<()> {
-    let (admin_pool, pool, schema) = scoped_pool().await?;
-    let workspace_id = Uuid::new_v4();
-    let zero = Uuid::new_v4();
-    let inference = Uuid::new_v4();
-    let service = Uuid::new_v4();
-    let mixed = Uuid::new_v4();
-    let deleted = Uuid::new_v4();
-    let other_workspace = Uuid::new_v4();
-    let other_workspace_key = Uuid::new_v4();
-    insert_key(&pool, workspace_id, zero, "zero", 0, 0, false).await?;
-    insert_key(&pool, workspace_id, inference, "inference", 30, 0, false).await?;
-    insert_key(&pool, workspace_id, service, "service", 0, 40, false).await?;
-    insert_key(&pool, workspace_id, mixed, "mixed", 50, 70, false).await?;
-    insert_key(&pool, workspace_id, deleted, "deleted", 900, 900, true).await?;
-    insert_key(
-        &pool,
-        other_workspace,
-        other_workspace_key,
-        "other-workspace",
-        9_000,
-        9_000,
-        false,
-    )
-    .await?;
-    pool.get()
-        .await?
-        .execute("DELETE FROM api_key_spend WHERE api_key_id = $1", &[&zero])
-        .await?;
-
-    // The isolated schema deliberately has no raw usage tables.
-    ensure_spend_counters_ready(&pool).await?;
-    let repository = ApiKeyRepository::new(pool.clone());
-    let first_page = repository
-        .list_by_workspace_paginated(
-            workspace_id,
-            3,
-            0,
-            Some(ApiKeyOrderBy::Usage),
-            Some(ApiKeyOrderDirection::Desc),
+    with_scoped_pool(|pool| async move {
+        let workspace_id = Uuid::new_v4();
+        let zero = Uuid::new_v4();
+        let inference = Uuid::new_v4();
+        let service = Uuid::new_v4();
+        let mixed = Uuid::new_v4();
+        let deleted = Uuid::new_v4();
+        let other_workspace = Uuid::new_v4();
+        let other_workspace_key = Uuid::new_v4();
+        insert_key(&pool, workspace_id, zero, "zero", 0, 0, false).await?;
+        insert_key(&pool, workspace_id, inference, "inference", 30, 0, false).await?;
+        insert_key(&pool, workspace_id, service, "service", 0, 40, false).await?;
+        insert_key(&pool, workspace_id, mixed, "mixed", 50, 70, false).await?;
+        insert_key(&pool, workspace_id, deleted, "deleted", 900, 900, true).await?;
+        insert_key(
+            &pool,
+            other_workspace,
+            other_workspace_key,
+            "other-workspace",
+            9_000,
+            9_000,
+            false,
         )
         .await?;
-    assert_eq!(
-        first_page.iter().map(|key| key.id).collect::<Vec<_>>(),
-        vec![mixed, service, inference]
-    );
-    assert_eq!(
-        first_page.iter().map(|key| key.usage).collect::<Vec<_>>(),
-        vec![120, 40, 30]
-    );
+        pool.get()
+            .await?
+            .execute("DELETE FROM api_key_spend WHERE api_key_id = $1", &[&zero])
+            .await?;
 
-    let second_page = repository
-        .list_by_workspace_paginated(
-            workspace_id,
-            3,
-            3,
-            Some(ApiKeyOrderBy::Usage),
-            Some(ApiKeyOrderDirection::Desc),
-        )
-        .await?;
-    assert_eq!(
-        second_page.iter().map(|key| key.id).collect::<Vec<_>>(),
-        vec![zero]
-    );
-    assert_eq!(second_page[0].usage, 0);
-    assert!(!second_page.iter().any(|key| key.id == deleted));
+        // The isolated schema deliberately has no raw usage tables.
+        ensure_spend_counters_ready(&pool).await?;
+        let repository = ApiKeyRepository::new(pool.clone());
+        let first_page = repository
+            .list_by_workspace_paginated(
+                workspace_id,
+                3,
+                0,
+                Some(ApiKeyOrderBy::Usage),
+                Some(ApiKeyOrderDirection::Desc),
+            )
+            .await?;
+        assert_eq!(
+            first_page.iter().map(|key| key.id).collect::<Vec<_>>(),
+            vec![mixed, service, inference]
+        );
+        assert_eq!(
+            first_page.iter().map(|key| key.usage).collect::<Vec<_>>(),
+            vec![120, 40, 30]
+        );
 
-    let ascending = repository
-        .list_by_workspace_paginated(
-            workspace_id,
-            2,
-            0,
-            Some(ApiKeyOrderBy::Usage),
-            Some(ApiKeyOrderDirection::Asc),
-        )
-        .await?;
-    assert_eq!(
-        ascending.iter().map(|key| key.id).collect::<Vec<_>>(),
-        vec![zero, inference]
-    );
-    let past_end = repository
-        .list_by_workspace_paginated(
-            workspace_id,
-            2,
-            99,
-            Some(ApiKeyOrderBy::Usage),
-            Some(ApiKeyOrderDirection::Desc),
-        )
-        .await?;
-    assert!(past_end.is_empty());
-    assert!(!first_page.iter().any(|key| key.id == other_workspace_key));
+        let second_page = repository
+            .list_by_workspace_paginated(
+                workspace_id,
+                3,
+                3,
+                Some(ApiKeyOrderBy::Usage),
+                Some(ApiKeyOrderDirection::Desc),
+            )
+            .await?;
+        assert_eq!(
+            second_page.iter().map(|key| key.id).collect::<Vec<_>>(),
+            vec![zero]
+        );
+        assert_eq!(second_page[0].usage, 0);
+        assert!(!second_page.iter().any(|key| key.id == deleted));
 
-    drop_schema(admin_pool, pool, schema).await
+        let ascending = repository
+            .list_by_workspace_paginated(
+                workspace_id,
+                2,
+                0,
+                Some(ApiKeyOrderBy::Usage),
+                Some(ApiKeyOrderDirection::Asc),
+            )
+            .await?;
+        assert_eq!(
+            ascending.iter().map(|key| key.id).collect::<Vec<_>>(),
+            vec![zero, inference]
+        );
+        let past_end = repository
+            .list_by_workspace_paginated(
+                workspace_id,
+                2,
+                99,
+                Some(ApiKeyOrderBy::Usage),
+                Some(ApiKeyOrderDirection::Desc),
+            )
+            .await?;
+        assert!(past_end.is_empty());
+        assert!(!first_page.iter().any(|key| key.id == other_workspace_key));
+
+        Ok(())
+    })
+    .await
 }
 
 #[tokio::test]
 async fn admission_spend_reads_inference_counter_and_excludes_service_counter() -> anyhow::Result<()>
 {
-    let (admin_pool, pool, schema) = scoped_pool().await?;
+    with_scoped_pool(|pool| async move {
     let inference_key = Uuid::new_v4();
     let service_key = Uuid::new_v4();
     let now = chrono::Utc::now();
@@ -272,12 +268,13 @@ async fn admission_spend_reads_inference_counter_and_excludes_service_counter() 
     assert_eq!(repository.get_api_key_spend(service_key).await?, 0);
     assert_eq!(repository.get_api_key_spend(Uuid::new_v4()).await?, 0);
 
-    drop_schema(admin_pool, pool, schema).await
+    Ok(())
+    }).await
 }
 
 #[tokio::test]
 async fn billing_summary_reads_balance_splits_and_preserves_legacy_total() -> anyhow::Result<()> {
-    let (admin_pool, pool, schema) = scoped_pool().await?;
+    with_scoped_pool(|pool| async move {
     let organization_id = Uuid::new_v4();
     let client = pool.get().await?;
     client
@@ -308,5 +305,6 @@ async fn billing_summary_reads_balance_splits_and_preserves_legacy_total() -> an
     assert_eq!(summary.inference_consumed_usd, 35e-9);
     assert_eq!(summary.service_consumed_usd, 20e-9);
 
-    drop_schema(admin_pool, pool, schema).await
+    Ok(())
+    }).await
 }

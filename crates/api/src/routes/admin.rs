@@ -37,7 +37,7 @@ use axum::{
     response::Json as ResponseJson,
     Extension,
 };
-use chrono::{DateTime, Duration, Timelike, Utc};
+use chrono::{DateTime, Timelike, Utc};
 use config::ApiConfig;
 use services::admin::{AdminService, AnalyticsService, UpdateModelAdminRequest};
 use services::aml::{AmlAllowlistEntry, AmlError, AmlReport};
@@ -3766,8 +3766,8 @@ fn parse_metrics_credit_type(
     tag = "Admin",
     params(
         ("org_id" = String, Path, description = "Organization ID to get metrics for"),
-        ("start" = Option<String>, Query, description = "Start of time range (ISO 8601). Defaults to 30 days ago."),
-        ("end" = Option<String>, Query, description = "End of time range (ISO 8601). Defaults to now."),
+        ("start" = Option<String>, Query, description = "Start of time range (ISO 8601). Defaults to 30 days ago. Window may not exceed 366 days."),
+        ("end" = Option<String>, Query, description = "End of time range (ISO 8601). Defaults to now. Window may not exceed 366 days."),
         ("credit_type" = Option<CreditType>, Query, description = CREDIT_TYPE_QUERY_DESCRIPTION)
     ),
     responses(
@@ -3809,22 +3809,14 @@ pub async fn get_organization_metrics(
         )
     })?;
 
-    // Parse time range with defaults
-    let end = params
-        .metrics
-        .end
-        .and_then(|s| chrono::DateTime::parse_from_rfc3339(&s).ok())
-        .map(|dt| dt.with_timezone(&Utc))
-        .unwrap_or_else(Utc::now);
+    let (start, end) = crate::routes::common::parse_metrics_range(
+        params.metrics.start.as_deref(),
+        params.metrics.end.as_deref(),
+        None,
+        0,
+        366,
+    )?;
 
-    let start = params
-        .metrics
-        .start
-        .and_then(|s| chrono::DateTime::parse_from_rfc3339(&s).ok())
-        .map(|dt| dt.with_timezone(&Utc))
-        .unwrap_or_else(|| end - Duration::days(30));
-
-    // Get metrics from analytics service
     let metrics = app_state
         .analytics_service
         .get_organization_metrics(organization_id, start, end, credit_type.as_deref())
@@ -3892,6 +3884,7 @@ pub async fn get_platform_metrics(
         params.end.as_deref(),
         None,
         0,
+        366,
     )?;
 
     // Get platform metrics from analytics service
@@ -3969,6 +3962,7 @@ pub async fn get_platform_timeseries(
         params.end.as_deref(),
         Some(granularity),
         31,
+        366,
     )?;
 
     let metrics = app_state
@@ -4097,6 +4091,7 @@ pub async fn get_model_revenue(
         params.end.as_deref(),
         None,
         0,
+        366,
     )?;
     let sort = services::admin::RevenueSort::from_query(params.sort.as_deref())
         .map_err(|m| bad_request(m, "invalid_parameter"))?;
@@ -4199,6 +4194,7 @@ pub async fn get_org_revenue(
         params.end.as_deref(),
         None,
         0,
+        366,
     )?;
     let sort = services::admin::RevenueSort::from_query(params.sort.as_deref())
         .map_err(|m| bad_request(m, "invalid_parameter"))?;
@@ -4350,6 +4346,7 @@ pub async fn get_model_consumption_timeseries(
         params.end.as_deref(),
         Some(granularity),
         31,
+        366,
     )?;
 
     let result = app_state
@@ -4419,6 +4416,7 @@ pub async fn get_performance_timeseries(
         params.end.as_deref(),
         Some(granularity),
         31,
+        366,
     )?;
 
     let result = app_state
@@ -4459,6 +4457,23 @@ pub struct RevenueDensityParams {
 /// then returns P50/P95/P99/peak over active buckets — platform-wide and per model.
 /// Use the annualized figures to estimate potential revenue if a given demand
 /// rate were sustained continuously.
+#[utoipa::path(
+    get,
+    path = "/v1/admin/platform/revenue-density",
+    tag = "Admin",
+    params(
+        ("start" = Option<String>, Query, description = "Start of time range (ISO 8601). Defaults to 30 days ago. Window may not exceed 90 days."),
+        ("end" = Option<String>, Query, description = "End of time range (ISO 8601). Defaults to now. Window may not exceed 90 days."),
+        ("provider_type" = Option<String>, Query, description = "Filter by provider type (vllm, external, or chutes)")
+    ),
+    responses(
+        (status = 200, description = "Revenue density retrieved successfully", body = services::admin::RevenueDensityReport),
+        (status = 400, description = "Invalid request", body = ErrorResponse),
+        (status = 401, description = "Unauthorized", body = ErrorResponse),
+        (status = 500, description = "Internal server error", body = ErrorResponse)
+    ),
+    security(("session_token" = []))
+)]
 pub async fn get_revenue_density(
     State(app_state): State<AdminAppState>,
     Query(params): Query<RevenueDensityParams>,
@@ -4472,6 +4487,7 @@ pub async fn get_revenue_density(
         params.start.as_deref(),
         params.end.as_deref(),
         None,
+        0,
         90,
     )?;
 
@@ -4571,6 +4587,7 @@ pub async fn get_organization_timeseries(
         params.metrics.end.as_deref(),
         Some(granularity),
         31,
+        366,
     )?;
 
     // Get timeseries from analytics service

@@ -1,3 +1,4 @@
+use crate::common::api_key_timing::{measure, Operation, Phase};
 use crate::common::request_context::current_request_id;
 pub mod ports;
 
@@ -273,20 +274,13 @@ impl WorkspaceServiceTrait for WorkspaceServiceImpl {
         order_direction: Option<ApiKeyOrderDirection>,
     ) -> Result<Vec<ApiKey>, WorkspaceError> {
         // Check permissions
-        let started = std::time::Instant::now();
-        let permission = self
-            .check_workspace_permission(workspace_id.clone(), requester_id)
-            .await;
-        tracing::debug!(
-            target: "workspace_api_key_timing",
-            event = "workspace_api_key_permission_finished",
-            request_id = current_request_id().as_deref(),
-            operation = "list_api_keys_paginated",
-            workspace_id = %workspace_id.0,
-            elapsed_ms = started.elapsed().as_millis() as u64,
-            success = permission.is_ok(),
-        );
-        permission?;
+        measure(
+            Operation::List,
+            Phase::Permission,
+            workspace_id.0,
+            self.check_workspace_permission(workspace_id.clone(), requester_id),
+        )
+        .await?;
 
         // List API keys with pagination (repository now includes usage data via JOIN)
         self.api_key_repository
@@ -563,20 +557,13 @@ impl WorkspaceServiceTrait for WorkspaceServiceImpl {
         requester_id: UserId,
     ) -> Result<i64, WorkspaceError> {
         // Check permissions
-        let started = std::time::Instant::now();
-        let permission = self
-            .check_workspace_permission(workspace_id.clone(), requester_id)
-            .await;
-        tracing::debug!(
-            target: "workspace_api_key_timing",
-            event = "workspace_api_key_permission_finished",
-            request_id = current_request_id().as_deref(),
-            operation = "count_api_keys_by_workspace",
-            workspace_id = %workspace_id.0,
-            elapsed_ms = started.elapsed().as_millis() as u64,
-            success = permission.is_ok(),
-        );
-        permission?;
+        measure(
+            Operation::Count,
+            Phase::Permission,
+            workspace_id.0,
+            self.check_workspace_permission(workspace_id.clone(), requester_id),
+        )
+        .await?;
 
         // Count API keys
         self.api_key_repository

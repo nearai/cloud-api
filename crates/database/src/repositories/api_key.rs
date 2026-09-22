@@ -5,7 +5,7 @@ use crate::retry_db;
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
-use services::common::request_context::current_request_id;
+use services::common::api_key_timing::{measure, Operation, Phase};
 use services::common::{extract_api_key_prefix, generate_api_key, hash_api_key, RepositoryError};
 use services::workspace::ports::{ApiKeyOrderBy, ApiKeyOrderDirection, CreateApiKeyRequest};
 use tracing::debug;
@@ -235,41 +235,21 @@ impl ApiKeyRepository {
     /// Count API keys for a workspace
     pub async fn count_by_workspace(&self, workspace_id: Uuid) -> Result<i64, RepositoryError> {
         let row = retry_db!("count_api_keys_by_workspace", {
-            let pool_started = std::time::Instant::now();
-            let client = self.pool.get().await;
-            tracing::debug!(
-                target: "workspace_api_key_timing",
-                event = "workspace_api_key_db_phase_finished",
-                request_id = current_request_id().as_deref(),
-                operation = "count_by_workspace",
-                phase = "pool",
-                %workspace_id,
-                elapsed_ms = pool_started.elapsed().as_millis() as u64,
-                success = client.is_ok(),
-            );
-            let client = client
+            let client = measure(Operation::Count, Phase::Pool, workspace_id, self.pool.get())
+                .await
                 .context("Failed to get database connection")
                 .map_err(RepositoryError::PoolError)?;
-            let query_started = std::time::Instant::now();
-
-            let result = client
-            .query_one(
-                "SELECT COUNT(*) as count FROM api_keys WHERE workspace_id = $1 AND deleted_at IS NULL",
-                &[&workspace_id],
+            measure(
+                Operation::Count,
+                Phase::Query,
+                workspace_id,
+                client.query_one(
+                    "SELECT COUNT(*) as count FROM api_keys WHERE workspace_id = $1 AND deleted_at IS NULL",
+                    &[&workspace_id],
+                ),
             )
             .await
-            .map_err(map_db_error);
-            tracing::debug!(
-                target: "workspace_api_key_timing",
-                event = "workspace_api_key_db_phase_finished",
-                request_id = current_request_id().as_deref(),
-                operation = "count_by_workspace",
-                phase = "query",
-                %workspace_id,
-                elapsed_ms = query_started.elapsed().as_millis() as u64,
-                success = result.is_ok(),
-            );
-            result
+            .map_err(map_db_error)
         })?;
 
         Ok(row.get::<_, i64>("count"))
@@ -302,25 +282,15 @@ impl ApiKeyRepository {
         };
 
         let rows = retry_db!("list_api_keys_by_workspace_paginated", {
-            let pool_started = std::time::Instant::now();
-            let client = self.pool.get().await;
-            tracing::debug!(
-                target: "workspace_api_key_timing",
-                event = "workspace_api_key_db_phase_finished",
-                request_id = current_request_id().as_deref(),
-                operation = "list_by_workspace_paginated",
-                phase = "pool",
-                %workspace_id,
-                elapsed_ms = pool_started.elapsed().as_millis() as u64,
-                success = client.is_ok(),
-            );
-            let client = client
+            let client = measure(Operation::List, Phase::Pool, workspace_id, self.pool.get())
+                .await
                 .context("Failed to get database connection")
                 .map_err(RepositoryError::PoolError)?;
-            let query_started = std::time::Instant::now();
-
-            let result = client
-                .query(
+            measure(
+                Operation::List,
+                Phase::Query,
+                workspace_id,
+                client.query(
                     &format!(
                         r#"
                 SELECT 
@@ -359,20 +329,10 @@ impl ApiKeyRepository {
                 "#
                     ),
                     &[&workspace_id, &limit, &offset],
-                )
-                .await
-                .map_err(map_db_error);
-            tracing::debug!(
-                target: "workspace_api_key_timing",
-                event = "workspace_api_key_db_phase_finished",
-                request_id = current_request_id().as_deref(),
-                operation = "list_by_workspace_paginated",
-                phase = "query",
-                %workspace_id,
-                elapsed_ms = query_started.elapsed().as_millis() as u64,
-                success = result.is_ok(),
-            );
-            result
+                ),
+            )
+            .await
+            .map_err(map_db_error)
         })?;
 
         rows.into_iter()

@@ -49,8 +49,10 @@ start events were removed to avoid duplicating completion events.
 | `workspace_api_key_db_phase_finished` | DEBUG | Pool acquisition and SQL execution separately for count and usage-bearing list |
 | `workspace_api_key_list_phase_finished` | INFO | Count/list service wall time, including permissions, retries, and mapping; list completion includes combined service wall time |
 
-Finished events include `elapsed_ms` and `success`. Repository completion events
-repeat on database retry. Service/permission/repository times are nested and
+Finished events include `elapsed_ms` and `success`. A shared timing helper keeps
+permission/pool/query fields consistent. The `operation` field uses
+`count_api_keys` or `list_api_keys` across handler, service, and repository layers.
+Repository completion events repeat on database retry. Service/permission/repository times are nested and
 must not be added together. Combined service time excludes authentication
 middleware, response serialization, gateway time, and network transit. Missing
 completion events are incomplete evidence, not proof that PostgreSQL cancelled

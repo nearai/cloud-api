@@ -12,6 +12,7 @@ use axum::{
     http::StatusCode,
 };
 use serde::{Deserialize, Serialize};
+use services::common::api_key_timing::Operation;
 use services::common::request_context::current_request_id;
 use services::organization::OrganizationId;
 use tracing::{debug, error};
@@ -880,6 +881,7 @@ pub async fn list_workspace_api_keys(
         %workspace_id,
         limit = params.limit,
         offset = params.offset,
+        operation = Operation::Count.as_str(),
         phase = "count_service",
         elapsed_ms = started.elapsed().as_millis() as u64,
         success = count_result.is_ok(),
@@ -935,6 +937,7 @@ pub async fn list_workspace_api_keys(
         %workspace_id,
         limit = params.limit,
         offset = params.offset,
+        operation = Operation::List.as_str(),
         phase = "list_service",
         elapsed_ms = list_started.elapsed().as_millis() as u64,
         total_elapsed_ms = started.elapsed().as_millis() as u64,

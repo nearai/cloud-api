@@ -267,6 +267,27 @@ async fn list_timings_keep_request_ids_in_production_json() {
                 .filter(|event| event["fields"]["request_id"] == id.to_string())
                 .collect();
             assert_eq!(own_events.len(), expected_per_request, "{captured}");
+            for operation in ["count_api_keys", "list_api_keys"] {
+                let phases: std::collections::BTreeSet<_> = own_events
+                    .iter()
+                    .filter(|event| event["fields"]["operation"] == operation)
+                    .map(|event| event["fields"]["phase"].as_str().unwrap())
+                    .collect();
+                let summary = if operation == "count_api_keys" {
+                    "count_service"
+                } else {
+                    "list_service"
+                };
+                let expected: std::collections::BTreeSet<_> = match expected_per_request {
+                    9 => [summary, "permission", "pool", "query"]
+                        .into_iter()
+                        .collect(),
+                    2 => [summary].into_iter().collect(),
+                    0 => Default::default(),
+                    _ => unreachable!(),
+                };
+                assert_eq!(phases, expected, "{captured}");
+            }
             for event in own_events {
                 assert!(event.get("span").is_none());
                 assert!(event.get("spans").is_none());

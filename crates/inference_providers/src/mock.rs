@@ -226,6 +226,8 @@ pub struct ResponseTemplate {
     disconnect_after_chunks: Option<usize>,
     /// Simulate an upstream stream error after N chunks.
     stream_error_after_chunks: Option<(usize, CompletionError)>,
+    /// Number of raw SSE comments emitted before the first chat-id-bearing chunk.
+    leading_control_events: usize,
     /// Tool calls to include in the response
     tool_calls: Option<Vec<ToolCall>>,
     /// If set, usage will include prompt_tokens_details.cached_tokens (for cache-hit tests)
@@ -249,6 +251,7 @@ impl ResponseTemplate {
             reasoning_content: None,
             disconnect_after_chunks: None,
             stream_error_after_chunks: None,
+            leading_control_events: 0,
             tool_calls: None,
             cache_tokens: None,
             cache_write_tokens: None,
@@ -314,6 +317,13 @@ impl ResponseTemplate {
     /// Simulate an upstream stream error after N chunks
     pub fn with_stream_error_after(mut self, chunks: usize, error: CompletionError) -> Self {
         self.stream_error_after_chunks = Some((chunks, error));
+        self
+    }
+
+    /// Prefix a stream with deterministic raw comments to exercise bounded
+    /// chat-id peeking without discarding any client-visible bytes.
+    pub fn with_leading_control_events(mut self, count: usize) -> Self {
+        self.leading_control_events = count;
         self
     }
 
@@ -711,6 +721,9 @@ pub struct MockProvider {
     /// to `true`. Set via [`MockProvider::with_chat_signature_support`] to model a
     /// provider whose response integrity does not use per-response signatures.
     supports_chat_signatures: bool,
+    /// Exact request-time routing key accepted by this fixture, independently
+    /// of the signing-key attestation map (as used by Chutes).
+    per_request_public_key: Option<String>,
     /// Chat ids passed to [`InferenceProvider::unpin_chat_connection`], in call
     /// order. Lets lifecycle tests assert the signature-fetch routing pin was
     /// released. `std::sync::Mutex` because the trait method is synchronous.
@@ -761,6 +774,7 @@ impl MockProvider {
             supports_streaming: true,
             supports_client_e2ee: true,
             supports_chat_signatures: true,
+            per_request_public_key: None,
             unpinned_chat_ids: Arc::new(std::sync::Mutex::new(Vec::new())),
             responses_handler: None,
         }
@@ -789,6 +803,7 @@ impl MockProvider {
             supports_streaming: true,
             supports_client_e2ee: true,
             supports_chat_signatures: true,
+            per_request_public_key: None,
             unpinned_chat_ids: Arc::new(std::sync::Mutex::new(Vec::new())),
             responses_handler: None,
         }
@@ -815,6 +830,7 @@ impl MockProvider {
             supports_streaming: true,
             supports_client_e2ee: true,
             supports_chat_signatures: true,
+            per_request_public_key: None,
             unpinned_chat_ids: Arc::new(std::sync::Mutex::new(Vec::new())),
             responses_handler: None,
         }
@@ -852,6 +868,13 @@ impl MockProvider {
     /// which use a different integrity mechanism.
     pub fn with_chat_signature_support(mut self, supported: bool) -> Self {
         self.supports_chat_signatures = supported;
+        self
+    }
+
+    /// Accept one exact request-time public-key pin without advertising it as
+    /// an Ed25519/ECDSA signing key in the mock attestation report.
+    pub fn with_per_request_pubkey_routing(mut self, public_key: String) -> Self {
+        self.per_request_public_key = Some(public_key);
         self
     }
 
@@ -1089,6 +1112,10 @@ impl crate::InferenceProvider for MockProvider {
         self.supports_chat_signatures
     }
 
+    fn supports_per_request_pubkey_routing(&self, public_key: &str) -> bool {
+        self.per_request_public_key.as_deref() == Some(public_key)
+    }
+
     fn unpin_chat_connection(&self, chat_id: &str) {
         if let Ok(mut ids) = self.unpinned_chat_ids.lock() {
             ids.push(chat_id.to_string());
@@ -1188,9 +1215,15 @@ impl crate::InferenceProvider for MockProvider {
         // verbatim — re-serializing the parsed chunk yields different bytes.
         // This makes the e2e signature tests a regression guard for byte-exact
         // streaming passthrough (issue #701).
+        let leading_controls: Vec<Bytes> = (0..response_template.leading_control_events)
+            .map(|index| Bytes::from(format!(": mock control {index}\r\n\r\n")))
+            .collect();
         let chat_id_opt = chunks.first().map(|c| c.id.clone());
         if let Some(chat_id) = chat_id_opt {
             let mut accumulated: Vec<u8> = Vec::new();
+            for control in &leading_controls {
+                accumulated.extend_from_slice(control);
+            }
             for chunk in &chunks {
                 accumulated.extend_from_slice(&Self::mock_chunk_wire_bytes(chunk)?);
             }
@@ -1210,16 +1243,23 @@ impl crate::InferenceProvider for MockProvider {
         // The trailing [DONE] terminator is emitted as a chunk-less control
         // event, matching the lossless passthrough parser behavior.
         let stream = stream::iter(
-            chunks
+            leading_controls
                 .into_iter()
-                .map(move |chunk| {
+                .map(|raw_bytes| {
+                    Ok(SSEEvent {
+                        raw_bytes,
+                        chunk: None,
+                        raw_passthrough: true,
+                    })
+                })
+                .chain(chunks.into_iter().map(move |chunk| {
                     let raw_bytes = Bytes::from(Self::mock_chunk_wire_bytes(&chunk)?);
                     Ok(SSEEvent {
                         raw_bytes,
                         chunk: Some(StreamChunk::Chat(chunk)),
                         raw_passthrough: true,
                     })
-                })
+                }))
                 .chain(send_done.then(|| {
                     Ok(SSEEvent {
                         raw_bytes: Bytes::from_static(b"data: [DONE]\n\n"),

@@ -119,13 +119,13 @@ fn provider_tier_to_str(tier: inference_providers::ProviderTier) -> &'static str
     }
 }
 
-/// True when any E2EE encryption header was supplied. E2EE bodies are opaque
-/// to the gateway, so alias warnings can't be injected into them — the
-/// `x-model-alias-resolved` response header is the only signal in that mode.
+/// True when a client encryption header was supplied. `X-Model-Pub-Key` alone
+/// only pins routing and does not make the request or response encrypted.
+/// E2EE bodies are opaque to the gateway, so alias warnings use the response
+/// header rather than being injected into the body.
 fn e2ee_requested(encryption_headers: &crate::routes::common::EncryptionHeaders) -> bool {
     encryption_headers.signing_algo.is_some()
         || encryption_headers.client_pub_key.is_some()
-        || encryption_headers.model_pub_key.is_some()
         || encryption_headers.encryption_version.is_some()
         || encryption_headers.encrypt_all_fields.is_some()
 }
@@ -1634,18 +1634,17 @@ async fn chat_completions_inner(
         || auto_redact_requires_gateway_signature(auto_redact_enabled, model_attestation_supported)
         || alias_requires_gateway_signature;
     let public_response_rewritten = auto_redact_enabled || alias_canonical.is_some();
-    // A raw stream can require a Gateway signature only after it reaches EOF:
-    // if its provider omitted `[DONE]`, the route appends one for the client.
+    // A raw stream may also require a Gateway signature at EOF: if its provider
+    // omitted `[DONE]`, the route appends one for the client.
     // Hash attested streams as they are emitted so that tail path can decide
     // whether the final client-visible bytes need a Gateway signature.
     let may_need_synthesized_done_gateway_signature =
         synthesized_done_requires_gateway_signature(model_attestation_supported, e2ee_active);
     let hash_client_visible_stream =
         gateway_signature_enabled || may_need_synthesized_done_gateway_signature;
-    // Never publish a provider signature over bytes that auto-redact or alias
-    // routing changes. If metadata is unavailable, we cannot safely create a
-    // Gateway signature either, but omitting a signature is still better than
-    // returning one that cannot verify.
+    // Never publish a provider signature over bytes that this route rewrites.
+    // The actual provider can additionally require Gateway signing once the
+    // stream starts, even if no public bytes need rewriting.
     service_request.skip_provider_chat_signature =
         gateway_signature_enabled || public_response_rewritten;
     // Defer an upstream terminator whenever this route would otherwise relay it
@@ -1713,6 +1712,31 @@ async fn chat_completions_inner(
                         }
                     }
                 };
+
+                // The model may have fallen back to Chutes, which attests its
+                // deployment but does not sign individual responses. Decide
+                // from the actual serving provider before emitting any bytes,
+                // including the leading control events buffered above.
+                let serving_provider = match stream_chat_id.as_deref() {
+                    Some(chat_id) => {
+                        app_state
+                            .inference_provider_pool
+                            .get_provider_by_chat_id(chat_id)
+                            .await
+                    }
+                    None => None,
+                };
+                let provider_requires_gateway_signature = match &serving_provider {
+                    Some(provider) => !provider.supports_chat_signatures(),
+                    // A long control-event prefix can exhaust the bounded
+                    // peek before a provider mapping exists. Plaintext can
+                    // still receive a Gateway receipt once its chat ID arrives.
+                    None => !e2ee_active,
+                };
+                let gateway_signature_enabled =
+                    gateway_signature_enabled || provider_requires_gateway_signature;
+                let hash_client_visible_stream =
+                    hash_client_visible_stream || provider_requires_gateway_signature;
 
                 // Warning to inject into the first streamed chunk. Skipped
                 // for E2EE (the chunks are opaque; the response header is
@@ -2343,18 +2367,7 @@ async fn chat_completions_inner(
                         .filter_map(std::future::ready),
                     );
 
-                // Look up which trust tier served this stream. The pool stores a
-                // chat_id → provider mapping when the first chunk arrives; we read
-                // it now (synchronously, before streaming starts) so the header is
-                // present on the initial HTTP/1.1 response line.
-                let serving_tier = if let Some(ref chat_id) = stream_chat_id {
-                    app_state
-                        .inference_provider_pool
-                        .get_provider_tier_for_chat_id(chat_id)
-                        .await
-                } else {
-                    None
-                };
+                let serving_tier = serving_provider.as_ref().map(|provider| provider.tier());
 
                 // Return raw streaming response with SSE headers
                 let mut response_builder = Response::builder()
@@ -3356,6 +3369,43 @@ fn model_with_pricing_to_info(model: services::models::ModelWithPricing) -> Mode
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn model_public_key_alone_does_not_enable_e2ee() {
+        let mut headers = crate::routes::common::EncryptionHeaders {
+            signing_algo: None,
+            client_pub_key: None,
+            model_pub_key: None,
+            encryption_version: None,
+            encrypt_all_fields: None,
+        };
+        assert!(!e2ee_requested(&headers));
+        headers.model_pub_key = Some("model routing key".to_string());
+        assert!(!e2ee_requested(&headers));
+
+        headers.client_pub_key = Some("client response key".to_string());
+        assert!(e2ee_requested(&headers));
+    }
+
+    #[test]
+    fn encryption_parameters_still_enable_e2ee() {
+        for field in ["signing_algo", "encryption_version", "encrypt_all_fields"] {
+            let mut headers = crate::routes::common::EncryptionHeaders {
+                signing_algo: None,
+                client_pub_key: None,
+                model_pub_key: Some("model routing key".to_string()),
+                encryption_version: None,
+                encrypt_all_fields: None,
+            };
+            match field {
+                "signing_algo" => headers.signing_algo = Some("ed25519".to_string()),
+                "encryption_version" => headers.encryption_version = Some("2".to_string()),
+                "encrypt_all_fields" => headers.encrypt_all_fields = Some("true".to_string()),
+                _ => unreachable!(),
+            }
+            assert!(e2ee_requested(&headers), "{field}");
+        }
+    }
 
     #[test]
     fn nano_dollars_zero_renders_as_bare_zero() {

@@ -429,12 +429,14 @@ async fn test_near_non_streaming_chat_retains_provider_signature_with_chutes_fal
     assert_chutes_chat_signature_routing(Some(true)).await;
 }
 
-// None: Chutes-only model; Some(false): NEAR fails and falls back to Chutes;
-// Some(true): NEAR succeeds even though a non-signing fallback is registered.
-async fn assert_chutes_chat_signature_routing(near_succeeds: Option<bool>) {
+async fn setup_chutes_signature_model(
+    server: &axum_test::TestServer,
+    pool: &services::inference_provider_pool::InferenceProviderPool,
+    near_succeeds: Option<bool>,
+    routing_public_key: Option<&str>,
+) -> (String, Arc<MockProvider>, Arc<MockProvider>) {
     use inference_providers::{CompletionError, ProviderSource, ProviderTier};
 
-    let (server, pool, _mock, _database) = setup_test_server_with_pool().await;
     let model_name = format!("nearai/test-chutes-signature-{}", uuid::Uuid::new_v4());
     let near = Arc::new(
         MockProvider::new_accept_all()
@@ -453,13 +455,15 @@ async fn assert_chutes_chat_signature_routing(near_succeeds: Option<bool>) {
         pool.register_provider(model_name.clone(), near.clone())
             .await;
     }
-    let chutes = Arc::new(
-        MockProvider::new_accept_all()
-            .with_tier(ProviderTier::Attested3p)
-            .with_provider_source(ProviderSource::Chutes)
-            .with_client_e2ee_support(false)
-            .with_chat_signature_support(false),
-    );
+    let mut chutes = MockProvider::new_accept_all()
+        .with_tier(ProviderTier::Attested3p)
+        .with_provider_source(ProviderSource::Chutes)
+        .with_client_e2ee_support(false)
+        .with_chat_signature_support(false);
+    if let Some(public_key) = routing_public_key {
+        chutes = chutes.with_per_request_pubkey_routing(public_key.to_string());
+    }
+    let chutes = Arc::new(chutes);
     pool.register_pinned_secondary_provider(model_name.clone(), chutes.clone(), None)
         .await;
     let mut batch = BatchUpdateModelApiRequest::new();
@@ -479,8 +483,17 @@ async fn assert_chutes_chat_signature_routing(near_succeeds: Option<bool>) {
         }))
         .expect("test model fixture should deserialize"),
     );
-    let updated = admin_batch_upsert_models(&server, batch, get_session_id()).await;
+    let updated = admin_batch_upsert_models(server, batch, get_session_id()).await;
     assert!(updated[0].metadata.attestation_supported);
+    (model_name, near, chutes)
+}
+
+// None: Chutes-only model; Some(false): NEAR fails and falls back to Chutes;
+// Some(true): NEAR succeeds even though a non-signing fallback is registered.
+async fn assert_chutes_chat_signature_routing(near_succeeds: Option<bool>) {
+    let (server, pool, _mock, _database) = setup_test_server_with_pool().await;
+    let (model_name, near, chutes) =
+        setup_chutes_signature_model(&server, &pool, near_succeeds, None).await;
     let org = setup_org_with_credits(&server, 10_000_000_000i64).await;
     let api_key = get_api_key_for_org(&server, org.id).await;
 
@@ -553,6 +566,183 @@ async fn assert_chutes_chat_signature_routing(near_succeeds: Option<bool>) {
         // exact public bytes, even when the configured primary supports signing.
         assert_gateway_signatures(&server, &api_key, chat_id, &request_json, &response_text).await;
         assert!(chutes.unpinned_chat_ids().contains(&chat_id.to_string()));
+    }
+}
+
+#[tokio::test]
+async fn test_chutes_routing_only_stream_gateway_signatures_hash_exact_sse() {
+    assert_chutes_stream_signature_routing(false, 0).await;
+}
+
+#[tokio::test]
+async fn test_near_to_chutes_stream_gateway_signatures_hash_exact_sse() {
+    assert_chutes_stream_signature_routing(true, 0).await;
+}
+
+#[tokio::test]
+async fn test_chutes_stream_gateway_signature_includes_long_control_prefix() {
+    // Greater than the route's MAX_LEADING_CONTROL_EVENTS (32): the initial
+    // bounded peek cannot discover either the chat ID or its serving provider.
+    assert_chutes_stream_signature_routing(false, 40).await;
+}
+
+async fn assert_chutes_stream_signature_routing(near_fallback: bool, leading_controls: usize) {
+    use base64::Engine;
+    use http_body_util::BodyExt;
+    use inference_providers::mock::ResponseTemplate;
+    use tower::ServiceExt;
+
+    let (server, router, pool, _mock, _database) = setup_test_server_with_pool_and_router().await;
+    // A pinned Chutes key intentionally cannot fall back from a NEAR key.
+    // Exercise key routing on Chutes-only models and actual-provider fallback
+    // separately, without removing a caller's requested pin.
+    let routing_key =
+        (!near_fallback).then(|| base64::engine::general_purpose::STANDARD.encode([42u8; 1184]));
+    let (model_name, near, chutes) = setup_chutes_signature_model(
+        &server,
+        &pool,
+        near_fallback.then_some(false),
+        routing_key.as_deref(),
+    )
+    .await;
+    chutes
+        .set_default_response(
+            ResponseTemplate::new("hello 世界").with_leading_control_events(leading_controls),
+        )
+        .await;
+    let org = setup_org_with_credits(&server, 10_000_000_000i64).await;
+    let api_key = get_api_key_for_org(&server, org.id).await;
+    let mut expected_unpinned_chat_ids = Vec::new();
+
+    for (case, options, expect_usage) in [
+        ("default", None, false),
+        (
+            "continuous_usage",
+            Some(serde_json::json!({ "continuous_usage_stats": true })),
+            true,
+        ),
+    ] {
+        let mut request_body = serde_json::json!({
+            "model": model_name,
+            "messages": [{ "role": "user", "content": "Respond with two words." }],
+            "stream": true,
+            "nonce": 1109
+        });
+        if let Some(options) = options {
+            request_body["stream_options"] = options;
+        }
+        // Non-canonical whitespace ensures the Gateway signs the caller's
+        // request bytes, not a parsed-and-reserialized JSON representation.
+        let request_json =
+            serde_json::to_string_pretty(&request_body).expect("request should serialize");
+        let mut request = axum::http::Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header("Authorization", format!("Bearer {api_key}"))
+            .header("Content-Type", "application/json");
+        if let Some(key) = &routing_key {
+            request = request.header("X-Model-Pub-Key", key);
+        }
+        let response = router
+            .clone()
+            .oneshot(
+                request
+                    .body(axum::body::Body::from(request_json.clone()))
+                    .expect("request should build"),
+            )
+            .await
+            .expect("stream should start");
+        assert_eq!(response.status(), axum::http::StatusCode::OK, "{case}");
+        if leading_controls == 0 {
+            assert_eq!(
+                response
+                    .headers()
+                    .get("x-serving-provider")
+                    .expect("serving provider"),
+                "chutes",
+                "{case}"
+            );
+        } else {
+            assert!(
+                response.headers().get("inference-id").is_none(),
+                "{case}: exercise the bounded-peek path without a known chat ID"
+            );
+        }
+
+        let params = chutes
+            .last_chat_params()
+            .await
+            .expect("Chutes should serve the request");
+        assert_eq!(
+            near.last_chat_params().await.is_some(),
+            near_fallback,
+            "{case}"
+        );
+        assert_eq!(
+            params
+                .extra
+                .get("x_model_pub_key")
+                .and_then(serde_json::Value::as_str),
+            routing_key.as_deref(),
+            "{case}: keep the routing pin"
+        );
+        assert!(!params.extra.contains_key("x_client_pub_key"), "{case}");
+        assert!(!params.extra.contains_key("x_signing_algo"), "{case}");
+
+        let mut body = response.into_body();
+        let mut received = Vec::new();
+        while let Some(frame) = body.frame().await {
+            if let Some(data) = frame.expect("stream frame should not error").data_ref() {
+                received.extend_from_slice(data);
+                if String::from_utf8_lossy(&received).contains("data: [DONE]") {
+                    break;
+                }
+            }
+        }
+        let response_text = String::from_utf8(received).expect("SSE should be UTF-8");
+        assert!(
+            response_text.ends_with("data: [DONE]\n\n"),
+            "{case}: {response_text}"
+        );
+        assert_eq!(response_text.matches("data: [DONE]").count(), 1, "{case}");
+        let expected_prefix: String = (0..leading_controls)
+            .map(|index| format!(": mock control {index}\r\n\r\n"))
+            .collect();
+        assert!(
+            response_text.starts_with(&expected_prefix),
+            "{case}: all leading control bytes must survive in order"
+        );
+        let chat_id = first_stream_chat_id(&response_text);
+        // The default path filters usage; continuous usage preserves upstream
+        // wire bytes. Both must expose a Gateway receipt before public [DONE],
+        // even though model metadata says this is an attested model.
+        assert_gateway_signatures(&server, &api_key, &chat_id, &request_json, &response_text).await;
+        // If the bounded peek found no ID, the pool already released the
+        // unnamed pending connection. The route must not unpin it again.
+        expected_unpinned_chat_ids.push(if leading_controls == 0 {
+            chat_id
+        } else {
+            String::new()
+        });
+        assert_eq!(
+            chutes.unpinned_chat_ids(),
+            expected_unpinned_chat_ids,
+            "{case}"
+        );
+
+        let saw_usage = response_text.lines().any(|line| {
+            line.strip_prefix("data: ")
+                .and_then(|data| serde_json::from_str::<StreamChunk>(data).ok())
+                .is_some_and(
+                    |chunk| matches!(chunk, StreamChunk::Chat(chunk) if chunk.usage.is_some()),
+                )
+        });
+        assert_eq!(saw_usage, expect_usage, "{case}: {response_text}");
+        while let Some(frame) = body.frame().await {
+            if let Some(data) = frame.expect("trailing frame should not error").data_ref() {
+                assert!(data.is_empty(), "{case}: no bytes may follow [DONE]");
+            }
+        }
     }
 }
 

@@ -1,4 +1,9 @@
 use crate::common::*;
+use database::models::RecordUsageRequest;
+use database::repositories::{
+    OrganizationServiceUsageRepository, OrganizationUsageRepository, RecordServiceUsageRequest,
+};
+use services::usage::InferenceType;
 
 // ============================================
 // API Key Creation and Management Tests
@@ -128,75 +133,72 @@ async fn test_list_workspace_api_keys_orders_by_usage() {
         .unwrap()
         .get(0);
 
-    for (api_key_id, total_cost) in [
-        (service_spend_key_id, 100_000_000_i64),
-        (inference_spend_key_id, 300_000_000_i64),
+    drop(client);
+    let inference_repository = OrganizationUsageRepository::new(database.pool().clone());
+    let mut inference = RecordUsageRequest {
+        organization_id,
+        workspace_id,
+        api_key_id: service_spend_key_id,
+        model_id,
+        model_name: model_name.clone(),
+        input_tokens: 10,
+        output_tokens: 10,
+        input_cost: 1,
+        output_cost: 1,
+        total_cost: 100_000_000,
+        inference_type: InferenceType::ChatCompletion.as_str().to_string(),
+        ttft_ms: None,
+        avg_itl_ms: None,
+        inference_id: Some(uuid::Uuid::new_v4()),
+        provider_request_id: None,
+        stop_reason: None,
+        response_id: None,
+        image_count: None,
+        cache_read_tokens: 0,
+        cache_write_tokens: 0,
+        billing_details: None,
+        service_tier: None,
+        context_band: None,
+        served_provider_tier: None,
+        served_provider_type: None,
+        served_via_fallback: false,
+    };
+    inference_repository
+        .record_usage(inference.clone())
+        .await
+        .unwrap();
+    inference.api_key_id = inference_spend_key_id;
+    inference.total_cost = 300_000_000;
+    inference.inference_id = Some(uuid::Uuid::new_v4());
+    inference_repository.record_usage(inference).await.unwrap();
+    OrganizationServiceUsageRepository::new(database.pool().clone())
+        .record_usage(&RecordServiceUsageRequest {
+            organization_id,
+            workspace_id,
+            api_key_id: service_spend_key_id,
+            service_id,
+            quantity: 1,
+            total_cost: 400_000_000,
+            inference_id: None,
+        })
+        .await
+        .unwrap();
+
+    let client = database.pool().get().await.unwrap();
+
+    for (api_key_id, hours) in [
+        (service_spend_key_id, 3_i64),
+        (inference_spend_key_id, 2_i64),
+        (unused_key_id, 1_i64),
     ] {
         client
             .execute(
-                r#"
-                INSERT INTO organization_usage_log (
-                    id, organization_id, workspace_id, api_key_id,
-                    model_id, model_name, input_tokens, output_tokens,
-                    total_tokens, input_cost, output_cost, total_cost,
-                    inference_type, created_at
-                ) VALUES ($1, $2, $3, $4, $5, $6, 10, 10, 20, 1, 1, $7,
-                          'chat_completion', NOW())
-                "#,
-                &[
-                    &uuid::Uuid::new_v4(),
-                    &organization_id,
-                    &workspace_id,
-                    &api_key_id,
-                    &model_id,
-                    &model_name,
-                    &total_cost,
-                ],
+                "UPDATE api_keys SET created_at = NOW() + ($2::BIGINT * INTERVAL '1 hour') WHERE id = $1",
+                &[&api_key_id, &hours],
             )
             .await
             .unwrap();
     }
-
-    client
-        .execute(
-            r#"
-            INSERT INTO organization_service_usage_log (
-                id, organization_id, workspace_id, api_key_id,
-                service_id, quantity, total_cost, inference_id, created_at
-            ) VALUES ($1, $2, $3, $4, $5, 1, 400000000, NULL, NOW())
-            "#,
-            &[
-                &uuid::Uuid::new_v4(),
-                &organization_id,
-                &workspace_id,
-                &service_spend_key_id,
-                &service_id,
-            ],
-        )
-        .await
-        .unwrap();
-
-    client
-        .execute(
-            "UPDATE api_keys SET created_at = NOW() + INTERVAL '3 hours' WHERE id = $1",
-            &[&service_spend_key_id],
-        )
-        .await
-        .unwrap();
-    client
-        .execute(
-            "UPDATE api_keys SET created_at = NOW() + INTERVAL '2 hours' WHERE id = $1",
-            &[&inference_spend_key_id],
-        )
-        .await
-        .unwrap();
-    client
-        .execute(
-            "UPDATE api_keys SET created_at = NOW() + INTERVAL '1 hour' WHERE id = $1",
-            &[&unused_key_id],
-        )
-        .await
-        .unwrap();
 
     let default_response = server
         .get(format!("/v1/workspaces/{}/api-keys?limit=3", workspace.id).as_str())

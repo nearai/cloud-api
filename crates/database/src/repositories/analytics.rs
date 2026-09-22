@@ -545,16 +545,16 @@ impl AnalyticsRepository for PgAnalyticsRepository {
         let paying_org_count: i64 = limits_row.get(2);
         let granted_org_count: i64 = limits_row.get(3);
 
-        // All-time consumed cost. `total` (from the cached balance) is ALL usage
-        // (inference + services); the inference/service splits come from their logs
-        // and reconcile to the total.
+        // All-time consumed cost. Keep the legacy total independently; historical
+        // adjustments can differ from the balance splits.
         let consumed_row = client
             .query_one(
                 r#"
                 SELECT
-                    (SELECT COALESCE(SUM(total_spent), 0) FROM organization_balance)::bigint as total_nano,
-                    (SELECT COALESCE(SUM(total_cost), 0) FROM organization_usage_log)::bigint as inference_nano,
-                    (SELECT COALESCE(SUM(total_cost), 0) FROM organization_service_usage_log)::bigint as service_nano
+                    COALESCE(SUM(total_spent), 0)::bigint as total_nano,
+                    COALESCE(SUM(inference_spent), 0)::bigint as inference_nano,
+                    COALESCE(SUM(service_spent), 0)::bigint as service_nano
+                FROM organization_balance
                 "#,
                 &[],
             )

@@ -48,7 +48,7 @@ filter = "package(api) & binary(e2e_all)"
 test-group = "e2e-db"
 
 [[profile.default.overrides]]
-filter = "package(database) & binary(spend_counter_backfill)"
+filter = "package(database) & (binary(spend_counter_backfill) | binary(counter_readers))"
 test-group = "e2e-db"
 
 [[profile.default.scripts]]

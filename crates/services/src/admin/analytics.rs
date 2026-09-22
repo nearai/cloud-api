@@ -220,12 +220,11 @@ pub struct BillingSummary {
     /// Sum of active grant-type spend limits (caps), USD
     pub active_grant_credit_limit_usd: f64,
     /// All-time consumed cost across all orgs, USD — **all usage** (from
-    /// organization_balance: inference + services). `inference_consumed_usd +
-    /// service_consumed_usd` reconcile to this.
+    /// organization_balance: inference + services).
     pub total_consumed_usd: f64,
-    /// All-time inference consumed cost, USD (organization_usage_log)
+    /// All-time inference consumed cost, USD (organization_balance.inference_spent)
     pub inference_consumed_usd: f64,
-    /// All-time service consumed cost, USD (organization_service_usage_log, e.g. web_search)
+    /// All-time service consumed cost, USD (organization_balance.service_spent, e.g. web_search)
     pub service_consumed_usd: f64,
     pub paying_org_count: i64,
     pub granted_org_count: i64,

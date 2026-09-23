@@ -3,6 +3,8 @@ use services::common::RepositoryError;
 /// Total matching groups for a paginated report. The page's `total_groups`
 /// column (`COUNT(*) OVER ()`, evaluated after GROUP BY/HAVING and before
 /// LIMIT) carries it; only an empty page past the end needs the count query.
+/// Callers must pass `limit >= 1` (the routes enforce it): with `limit == 0` an
+/// empty first page would be indistinguishable from an empty result set.
 pub(super) async fn page_total(
     client: &tokio_postgres::Client,
     rows: &[tokio_postgres::Row],

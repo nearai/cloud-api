@@ -102,6 +102,34 @@ async fn admin_platform_metrics_reports_fallback_and_chutes_usage() {
         1
     );
     assert_eq!(provider_tier_usage(&metrics, None).requests, 1);
+
+    // Each list is ordered NULLS FIRST, then ascending, as the separate GROUP BY
+    // queries returned it before they became one GROUPING SETS scan.
+    let types: Vec<Option<&str>> = metrics
+        .provider_usage
+        .by_provider_type
+        .iter()
+        .map(|usage| usage.provider_type.as_deref())
+        .collect();
+    assert_eq!(
+        types,
+        [None, Some("chutes"), Some("external"), Some("vllm")]
+    );
+    let tiers: Vec<Option<&str>> = metrics
+        .provider_usage
+        .by_provider_tier
+        .iter()
+        .map(|usage| usage.provider_tier.as_deref())
+        .collect();
+    assert_eq!(
+        tiers,
+        [
+            None,
+            Some("attested_3p"),
+            Some("near"),
+            Some("non_attested")
+        ]
+    );
 }
 
 #[tokio::test]

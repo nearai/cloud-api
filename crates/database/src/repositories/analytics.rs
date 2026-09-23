@@ -685,19 +685,18 @@ impl AnalyticsRepository for PgAnalyticsRepository {
             LIMIT $6 OFFSET $7
             "#
         );
+        // One bind list: the count shares the data query's filters ($1-$5).
+        let params: [&(dyn tokio_postgres::types::ToSql + Sync); 7] = [
+            &query.start,
+            &query.end,
+            &query.verifiable,
+            &query.provider_type,
+            &model_like,
+            &query.limit,
+            &query.offset,
+        ];
         let rows = client
-            .query(
-                &data_sql,
-                &[
-                    &query.start,
-                    &query.end,
-                    &query.verifiable,
-                    &query.provider_type,
-                    &model_like,
-                    &query.limit,
-                    &query.offset,
-                ],
-            )
+            .query(&data_sql, &params)
             .await
             .map_err(|e| RepositoryError::DatabaseError(e.into()))?;
         let count_sql = format!(
@@ -707,15 +706,9 @@ impl AnalyticsRepository for PgAnalyticsRepository {
         let total = pagination::page_total(
             &client,
             &rows,
-            query.offset,
+            (query.limit, query.offset),
             &count_sql,
-            &[
-                &query.start,
-                &query.end,
-                &query.verifiable,
-                &query.provider_type,
-                &model_like,
-            ],
+            &params[..5],
         )
         .await?;
 
@@ -806,27 +799,26 @@ impl AnalyticsRepository for PgAnalyticsRepository {
         "#;
 
         let data_sql = format!("{cte_and_from} ORDER BY {sort_col} DESC LIMIT $5 OFFSET $6");
+        // One bind list: the count shares the data query's filters ($1-$4).
+        let params: [&(dyn tokio_postgres::types::ToSql + Sync); 6] = [
+            &query.start,
+            &query.end,
+            &query.paying,
+            &org_like,
+            &query.limit,
+            &query.offset,
+        ];
         let rows = client
-            .query(
-                &data_sql,
-                &[
-                    &query.start,
-                    &query.end,
-                    &query.paying,
-                    &org_like,
-                    &query.limit,
-                    &query.offset,
-                ],
-            )
+            .query(&data_sql, &params)
             .await
             .map_err(|e| RepositoryError::DatabaseError(e.into()))?;
         let count_sql = format!("SELECT COUNT(*)::bigint FROM ({cte_and_from}) t");
         let total = pagination::page_total(
             &client,
             &rows,
-            query.offset,
+            (query.limit, query.offset),
             &count_sql,
-            &[&query.start, &query.end, &query.paying, &org_like],
+            &params[..4],
         )
         .await?;
 

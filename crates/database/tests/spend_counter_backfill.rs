@@ -424,7 +424,16 @@ where
     F: FnOnce(TestDatabase) -> Fut + Send + 'static,
     Fut: Future<Output = anyhow::Result<()>> + Send + 'static,
 {
-    let database = test_database().await?;
+    run_backfill_test_at(None, test).await
+}
+
+/// Like `run_backfill_test`, but stops migrating at `schema_version` when given.
+async fn run_backfill_test_at<F, Fut>(schema_version: Option<i32>, test: F) -> anyhow::Result<()>
+where
+    F: FnOnce(TestDatabase) -> Fut + Send + 'static,
+    Fut: Future<Output = anyhow::Result<()>> + Send + 'static,
+{
+    let database = test_database(schema_version).await?;
     let admin = database.admin.clone();
     let database_name = database.database_name.clone();
     let result = tokio::spawn(test(database)).await;
@@ -448,7 +457,7 @@ where
     Ok(())
 }
 
-async fn test_database() -> anyhow::Result<TestDatabase> {
+async fn test_database(schema_version: Option<i32>) -> anyhow::Result<TestDatabase> {
     let admin_config = pool_config(None);
     let admin: DbPool = admin_config
         .create_pool(Some(Runtime::Tokio1), NoTls)?
@@ -463,7 +472,18 @@ async fn test_database() -> anyhow::Result<TestDatabase> {
     let pool: DbPool = scoped_config
         .create_pool(Some(Runtime::Tokio1), NoTls)?
         .into();
-    migrations::run(&pool).await?;
+    match schema_version {
+        None => migrations::run(&pool).await?,
+        Some(version) => {
+            let sql = concat!(env!("CARGO_MANIFEST_DIR"), "/src/migrations/sql");
+            let migrations = refinery::load_sql_migrations(sql)?;
+            let mut client = pool.get().await?;
+            refinery::Runner::new(&migrations)
+                .set_target(refinery::Target::Version(version))
+                .run_async(&mut **client)
+                .await?;
+        }
+    }
     Ok(TestDatabase {
         pool,
         admin,

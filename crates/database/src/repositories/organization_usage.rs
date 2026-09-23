@@ -385,32 +385,6 @@ impl OrganizationUsageRepository {
         Ok(row_opt.map(|row| self.row_to_balance(&row)))
     }
 
-    /// Count total usage history records for an organization
-    pub async fn count_usage_history(&self, organization_id: Uuid) -> Result<i64> {
-        let row = retry_db!("count_organization_usage_history", {
-            let client = self
-                .pool
-                .get()
-                .await
-                .context("Failed to get database connection")
-                .map_err(RepositoryError::PoolError)?;
-
-            client
-                .query_one(
-                    r#"
-                    SELECT COUNT(*) as count
-                    FROM organization_usage_log
-                    WHERE organization_id = $1
-                    "#,
-                    &[&organization_id],
-                )
-                .await
-                .map_err(map_db_error)
-        })?;
-
-        Ok(row.get::<_, i64>("count"))
-    }
-
     /// Get usage history for an organization
     pub async fn get_usage_history(
         &self,

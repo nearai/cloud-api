@@ -114,7 +114,16 @@ impl services::usage::ports::UsageRepository for OrganizationUsageRepository {
             .get_usage_history(organization_id, limit, offset)
             .await?;
 
-        let total = self.count_usage_history(organization_id).await?;
+        // ponytail: `total` is organization_balance.total_requests, which the posting
+        // transaction increments once per inserted usage row, instead of a lifetime
+        // COUNT(*) over the organization's usage log (a multi-GB scan for large
+        // organizations that timed the Usage page out). It can exceed the row count
+        // where V0045's one-time dedupe deleted duplicates, which only adds empty
+        // trailing pages. Exact alternative: keyset pages with `has_more`, no total.
+        let total = self
+            .get_balance(organization_id)
+            .await?
+            .map_or(0, |balance| balance.total_requests);
 
         let entries = logs
             .into_iter()

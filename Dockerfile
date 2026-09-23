@@ -40,7 +40,7 @@ COPY crates/ ./crates/
 COPY .cargo/ ./.cargo/
 
 # Build the application in release mode
-RUN cargo build --release --locked --bin api --bin backfill-spend-counters
+RUN cargo build --release --locked --bin api
 
 
 # Runtime stage
@@ -86,7 +86,6 @@ WORKDIR /app
 
 # Copy the built binary
 COPY --from=builder /app/target/release/api /app/api
-COPY --from=builder /app/target/release/backfill-spend-counters /app/backfill-spend-counters
 
 # Copy the migration SQL files
 RUN mkdir -p /app/crates/database/src/migrations/sql

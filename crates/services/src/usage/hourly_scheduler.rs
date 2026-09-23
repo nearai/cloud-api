@@ -1,0 +1,216 @@
+//! Maintains `usage_hourly`: plans each tick from data-derived progress and drives the
+//! `UsageHourlyRepository` port. Planning is pure so it is unit-tested without a database.
+
+use chrono::{DateTime, DurationRound, NaiveDate, TimeDelta, Timelike, Utc};
+
+use super::ports::HourlyProgress;
+
+pub const REREAD_HOURS: i64 = 3;
+pub const CATCH_UP_DAYS: i64 = 3;
+pub const NIGHTLY_PARITY_HOUR: u32 = 3;
+pub const TICK_MINUTE: u32 = 5;
+
+pub fn trunc_hour(t: DateTime<Utc>) -> DateTime<Utc> {
+    t.duration_trunc(TimeDelta::hours(1))
+        .expect("UTC timestamps within chrono range truncate to the hour")
+}
+
+pub fn trunc_day(t: DateTime<Utc>) -> DateTime<Utc> {
+    t.duration_trunc(TimeDelta::days(1))
+        .expect("UTC timestamps within chrono range truncate to the day")
+}
+
+/// One data-derived cursor (spec §5.3). `from` resumes at the next raw hour after the last
+/// computed hour (jumping empty spans), never later than the 3-hour re-read boundary.
+/// Catch-up windows end on UTC midnight so every historical day ends inside exactly one window.
+pub fn plan_window(progress: HourlyProgress, now: DateTime<Utc>) -> (DateTime<Utc>, DateTime<Utc>) {
+    let target = trunc_hour(now);
+    let reread = target - TimeDelta::hours(REREAD_HOURS);
+    let from = progress.next_raw_hour.unwrap_or(target).min(reread);
+    let to = if from < reread {
+        (trunc_day(from) + TimeDelta::days(CATCH_UP_DAYS)).min(reread)
+    } else {
+        target
+    };
+    (from, to)
+}
+
+/// UTC days whose parity to check after recomputing [from, to), sorted and deduplicated.
+pub fn parity_days(from: DateTime<Utc>, to: DateTime<Utc>, now: DateTime<Utc>) -> Vec<NaiveDate> {
+    let horizon = trunc_hour(now);
+    let mut days = std::collections::BTreeSet::new();
+    let mut day_end = trunc_day(from) + TimeDelta::days(1);
+    while day_end <= to {
+        if day_end > from && day_end + TimeDelta::hours(REREAD_HOURS) <= horizon {
+            days.insert((day_end - TimeDelta::days(1)).date_naive());
+        }
+        day_end += TimeDelta::days(1);
+    }
+    if now.hour() == NIGHTLY_PARITY_HOUR {
+        days.insert((trunc_day(now) - TimeDelta::days(1)).date_naive());
+    }
+    days.into_iter().collect()
+}
+
+/// Delay from `now` to the next HH:05:00 UTC (strictly in the future).
+pub fn initial_delay(now: DateTime<Utc>) -> std::time::Duration {
+    let mut next = trunc_hour(now) + TimeDelta::minutes(TICK_MINUTE as i64);
+    if next <= now {
+        next += TimeDelta::hours(1);
+    }
+    (next - now).to_std().expect("next tick is in the future")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn t(s: &str) -> DateTime<Utc> {
+        DateTime::parse_from_rfc3339(s).unwrap().with_timezone(&Utc)
+    }
+    fn p(max_hour: Option<&str>, next_raw_hour: Option<&str>) -> HourlyProgress {
+        HourlyProgress {
+            max_hour: max_hour.map(t),
+            next_raw_hour: next_raw_hour.map(t),
+        }
+    }
+    fn d(s: &str) -> NaiveDate {
+        NaiveDate::parse_from_str(s, "%Y-%m-%d").unwrap()
+    }
+
+    #[test]
+    fn first_run_starts_at_oldest_raw_hour_and_ends_on_a_utc_midnight() {
+        let (from, to) = plan_window(
+            p(None, Some("2026-05-01T14:00:00Z")),
+            t("2026-09-24T10:07:00Z"),
+        );
+        assert_eq!(from, t("2026-05-01T14:00:00Z"));
+        assert_eq!(to, t("2026-05-04T00:00:00Z"));
+    }
+
+    #[test]
+    fn catch_up_resumes_after_max_hour_and_jumps_empty_spans() {
+        // max_hour D2 20:00; next raw row is 10 days later: the window starts there, not at 21:00.
+        let (from, to) = plan_window(
+            p(Some("2026-05-03T20:00:00Z"), Some("2026-05-13T07:00:00Z")),
+            t("2026-09-24T10:07:00Z"),
+        );
+        assert_eq!(from, t("2026-05-13T07:00:00Z"));
+        assert_eq!(to, t("2026-05-16T00:00:00Z"));
+    }
+
+    #[test]
+    fn catch_up_never_passes_the_reread_boundary() {
+        let (from, to) = plan_window(
+            p(Some("2026-09-23T10:00:00Z"), Some("2026-09-23T11:00:00Z")),
+            t("2026-09-24T10:07:00Z"),
+        );
+        assert_eq!(from, t("2026-09-23T11:00:00Z"));
+        assert_eq!(to, t("2026-09-24T07:00:00Z")); // target (10:00) - 3h
+    }
+
+    #[test]
+    fn steady_state_rereads_last_three_closed_hours() {
+        let (from, to) = plan_window(
+            p(Some("2026-09-24T09:00:00Z"), None),
+            t("2026-09-24T10:05:00Z"),
+        );
+        assert_eq!(
+            (from, to),
+            (t("2026-09-24T07:00:00Z"), t("2026-09-24T10:00:00Z"))
+        );
+    }
+
+    #[test]
+    fn no_traffic_for_many_hours_is_caught_up_not_stalled() {
+        // Review Focus 4: trailing empty span must not re-plan [max_hour+1h, ...) forever.
+        let (from, to) = plan_window(
+            p(Some("2026-09-20T09:00:00Z"), None),
+            t("2026-09-24T10:05:00Z"),
+        );
+        assert_eq!(
+            (from, to),
+            (t("2026-09-24T07:00:00Z"), t("2026-09-24T10:00:00Z"))
+        );
+    }
+
+    #[test]
+    fn no_raw_data_at_all_plans_the_reread_window() {
+        let (from, to) = plan_window(p(None, None), t("2026-09-24T10:05:00Z"));
+        assert_eq!(
+            (from, to),
+            (t("2026-09-24T07:00:00Z"), t("2026-09-24T10:00:00Z"))
+        );
+    }
+
+    #[test]
+    fn outage_resumes_from_last_computed_hour() {
+        let (from, to) = plan_window(
+            p(Some("2026-09-23T04:00:00Z"), Some("2026-09-23T05:00:00Z")),
+            t("2026-09-24T10:05:00Z"),
+        );
+        assert_eq!(
+            (from, to),
+            (t("2026-09-23T05:00:00Z"), t("2026-09-24T07:00:00Z"))
+        );
+    }
+
+    #[test]
+    fn window_is_never_empty_or_inverted() {
+        let now = t("2026-09-24T10:05:00Z");
+        for next in [
+            None,
+            Some("2020-01-01T00:00:00Z"),
+            Some("2026-09-24T06:00:00Z"),
+            Some("2026-09-24T07:00:00Z"),
+            Some("2026-09-24T09:00:00Z"),
+        ] {
+            let (from, to) = plan_window(p(Some("2019-01-01T00:00:00Z"), next), now);
+            assert!(from < to, "next={next:?}");
+            assert!(from <= t("2026-09-24T07:00:00Z"));
+            assert!(to <= t("2026-09-24T10:00:00Z"));
+        }
+    }
+
+    #[test]
+    fn parity_days_cover_each_catch_up_day_exactly_once() {
+        let now = t("2026-09-24T10:05:00Z");
+        // First run window [D0 14:00, D3 00:00): D0, D1, D2 end inside it.
+        assert_eq!(
+            parity_days(t("2026-05-01T14:00:00Z"), t("2026-05-04T00:00:00Z"), now),
+            vec![d("2026-05-01"), d("2026-05-02"), d("2026-05-03")]
+        );
+        // Next window [D3 00:00, D6 00:00): D3, D4, D5 only; D2 is not repeated.
+        assert_eq!(
+            parity_days(t("2026-05-04T00:00:00Z"), t("2026-05-07T00:00:00Z"), now),
+            vec![d("2026-05-04"), d("2026-05-05"), d("2026-05-06")]
+        );
+    }
+
+    #[test]
+    fn parity_waits_for_the_reread_horizon_and_runs_nightly_at_03() {
+        // 01:05: window [22:00, 01:00) contains midnight, but 23:00 is still re-read until 02:05.
+        assert!(parity_days(
+            t("2026-09-23T22:00:00Z"),
+            t("2026-09-24T01:00:00Z"),
+            t("2026-09-24T01:05:00Z")
+        )
+        .is_empty());
+        // 03:05 tick: yesterday is checked.
+        assert_eq!(
+            parity_days(
+                t("2026-09-24T00:00:00Z"),
+                t("2026-09-24T03:00:00Z"),
+                t("2026-09-24T03:05:00Z")
+            ),
+            vec![d("2026-09-23")]
+        );
+    }
+
+    #[test]
+    fn initial_delay_targets_next_hh05() {
+        assert_eq!(initial_delay(t("2026-09-24T10:03:00Z")).as_secs(), 120);
+        assert_eq!(initial_delay(t("2026-09-24T10:05:00Z")).as_secs(), 3600);
+        assert_eq!(initial_delay(t("2026-09-24T10:30:00Z")).as_secs(), 35 * 60);
+    }
+}

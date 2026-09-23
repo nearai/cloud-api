@@ -3,7 +3,10 @@
 
 use chrono::{DateTime, DurationRound, NaiveDate, TimeDelta, Timelike, Utc};
 
-use super::ports::HourlyProgress;
+use std::sync::Arc;
+use tracing::{error, info, warn};
+
+use super::ports::{DayParity, HourlyProgress, UsageHourlyRepository};
 
 pub const REREAD_HOURS: i64 = 3;
 pub const CATCH_UP_DAYS: i64 = 3;
@@ -59,6 +62,148 @@ pub fn initial_delay(now: DateTime<Utc>) -> std::time::Duration {
         next += TimeDelta::hours(1);
     }
     (next - now).to_std().expect("next tick is in the future")
+}
+
+/// Tick spacing while catching up after deploy (spec §5.2): one 3-day window per minute.
+pub const CATCH_UP_TICK_SECS: u64 = 60;
+
+/// Delay until the next regular tick: the next HH:05 UTC when the interval is the default
+/// hourly cadence, otherwise the plain interval.
+pub fn next_regular_delay(now: DateTime<Utc>, interval_secs: u64) -> std::time::Duration {
+    if interval_secs == 3600 {
+        initial_delay(now)
+    } else {
+        std::time::Duration::from_secs(interval_secs)
+    }
+}
+
+#[derive(Debug)]
+pub struct TickOutcome {
+    pub from: DateTime<Utc>,
+    pub to: DateTime<Utc>,
+    pub caught_up: bool,
+    pub skipped: bool,
+    pub rows_written: u64,
+    pub parity: Vec<DayParity>,
+}
+
+/// Keeps `usage_hourly` current (spec §5.2). Multi-instance safe: `recompute` takes a
+/// transaction-scoped try-lock, so at most one replica writes per tick; losers log `skipped`.
+pub struct UsageHourlyScheduler {
+    repository: Arc<dyn UsageHourlyRepository>,
+    task_handle: tokio::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
+}
+
+impl UsageHourlyScheduler {
+    pub fn new(repository: Arc<dyn UsageHourlyRepository>) -> Self {
+        Self {
+            repository,
+            task_handle: tokio::sync::Mutex::new(None),
+        }
+    }
+
+    /// First tick shortly after start. While catching up (after deploy), ticks every
+    /// CATCH_UP_TICK_SECS; once caught up, at HH:05 UTC (outside the :17-:24 and :01 IO burst
+    /// windows) every `interval_secs`. 0 disables (test servers drive `run_once` directly).
+    pub async fn start(self: Arc<Self>, interval_secs: u64) {
+        if interval_secs == 0 {
+            info!("usage_hourly scheduler disabled (interval is 0)");
+            return;
+        }
+        let handle = tokio::spawn({
+            let scheduler = self.clone();
+            async move {
+                // Fast catch-up: while behind, tick again after CATCH_UP_TICK_SECS; once caught up
+                // (or on error), wait for the next HH:05 on the regular cadence.
+                let mut delay = std::time::Duration::from_secs(CATCH_UP_TICK_SECS);
+                loop {
+                    tokio::time::sleep(delay).await;
+                    delay = match scheduler.run_once(Utc::now()).await {
+                        Ok(outcome) if !outcome.caught_up => {
+                            std::time::Duration::from_secs(CATCH_UP_TICK_SECS)
+                        }
+                        Ok(_) => next_regular_delay(Utc::now(), interval_secs),
+                        Err(e) => {
+                            error!(error = %e, "usage_hourly tick failed");
+                            next_regular_delay(Utc::now(), interval_secs)
+                        }
+                    };
+                }
+            }
+        });
+        *self.task_handle.lock().await = Some(handle);
+        info!(
+            "usage_hourly scheduler started with interval: {} seconds",
+            interval_secs
+        );
+    }
+
+    pub async fn shutdown(&self) {
+        if let Some(handle) = self.task_handle.lock().await.take() {
+            handle.abort();
+            info!("usage_hourly scheduler task cancelled");
+        }
+    }
+
+    /// One pass: plan from progress, recompute, check parity days, log. Public so tests
+    /// can drive it deterministically with an explicit clock.
+    pub async fn run_once(&self, now: DateTime<Utc>) -> anyhow::Result<TickOutcome> {
+        let started = std::time::Instant::now();
+        let progress = self.repository.progress().await?;
+        let (from, to) = plan_window(progress, now);
+        let caught_up = from == trunc_hour(now) - TimeDelta::hours(REREAD_HOURS);
+
+        let Some(report) = self.repository.recompute(from, to, false).await? else {
+            info!(%from, %to, skipped = true, "usage_hourly tick");
+            return Ok(TickOutcome {
+                from,
+                to,
+                caught_up,
+                skipped: true,
+                rows_written: 0,
+                parity: vec![],
+            });
+        };
+
+        let mut parity = Vec::new();
+        for day in parity_days(from, to, now) {
+            let result = self.repository.day_parity(day).await?;
+            if result.is_ok() {
+                info!(%day, requests = result.raw.request_count, "usage_hourly parity ok");
+            } else {
+                warn!(
+                    %day,
+                    raw_requests = result.raw.request_count,
+                    aggregate_requests = result.aggregate.request_count,
+                    raw_cost = result.raw.total_cost,
+                    aggregate_cost = result.aggregate.total_cost,
+                    raw_tokens = result.raw.total_tokens,
+                    aggregate_tokens = result.aggregate.total_tokens,
+                    "usage_hourly parity mismatch"
+                );
+            }
+            parity.push(result);
+        }
+
+        info!(
+            %from,
+            %to,
+            rows_written = report.rows_written,
+            duration_ms = started.elapsed().as_millis() as u64,
+            max_hour = ?progress.max_hour,
+            caught_up,
+            skipped = false,
+            "usage_hourly tick"
+        );
+        Ok(TickOutcome {
+            from,
+            to,
+            caught_up,
+            skipped: false,
+            rows_written: report.rows_written,
+            parity,
+        })
+    }
 }
 
 #[cfg(test)]
@@ -212,5 +357,104 @@ mod tests {
         assert_eq!(initial_delay(t("2026-09-24T10:03:00Z")).as_secs(), 120);
         assert_eq!(initial_delay(t("2026-09-24T10:05:00Z")).as_secs(), 3600);
         assert_eq!(initial_delay(t("2026-09-24T10:30:00Z")).as_secs(), 35 * 60);
+    }
+    use crate::usage::ports::{DayParity, DayTotals, RecomputeReport, UsageHourlyRepository};
+    use std::sync::{Arc, Mutex};
+
+    #[derive(Default)]
+    struct FakeRepo {
+        progress: Mutex<Option<HourlyProgress>>,
+        lock_busy: bool,
+        recomputes: Mutex<Vec<(DateTime<Utc>, DateTime<Utc>)>>,
+        parity_calls: Mutex<Vec<NaiveDate>>,
+    }
+
+    #[async_trait::async_trait]
+    impl UsageHourlyRepository for FakeRepo {
+        async fn progress(&self) -> anyhow::Result<HourlyProgress> {
+            Ok(self.progress.lock().unwrap().expect("progress set"))
+        }
+        async fn recompute(
+            &self,
+            from: DateTime<Utc>,
+            to: DateTime<Utc>,
+            _wait: bool,
+        ) -> anyhow::Result<Option<RecomputeReport>> {
+            if self.lock_busy {
+                return Ok(None);
+            }
+            self.recomputes.lock().unwrap().push((from, to));
+            Ok(Some(RecomputeReport { rows_written: 7 }))
+        }
+        async fn day_parity(&self, day: NaiveDate) -> anyhow::Result<DayParity> {
+            self.parity_calls.lock().unwrap().push(day);
+            Ok(DayParity {
+                day,
+                raw: DayTotals::default(),
+                aggregate: DayTotals::default(),
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn tick_recomputes_planned_window_then_checks_parity_days() {
+        let repo = Arc::new(FakeRepo::default());
+        *repo.progress.lock().unwrap() = Some(p(None, Some("2026-05-01T14:00:00Z")));
+        let scheduler = UsageHourlyScheduler::new(repo.clone());
+        let outcome = scheduler.run_once(t("2026-09-24T10:05:00Z")).await.unwrap();
+        assert!(!outcome.skipped);
+        assert_eq!(outcome.rows_written, 7);
+        assert_eq!(
+            *repo.recomputes.lock().unwrap(),
+            vec![(t("2026-05-01T14:00:00Z"), t("2026-05-04T00:00:00Z"))]
+        );
+        assert_eq!(
+            *repo.parity_calls.lock().unwrap(),
+            vec![d("2026-05-01"), d("2026-05-02"), d("2026-05-03")]
+        );
+    }
+
+    #[tokio::test]
+    async fn tick_skips_without_parity_when_another_replica_holds_the_lock() {
+        let repo = Arc::new(FakeRepo {
+            lock_busy: true,
+            ..Default::default()
+        });
+        *repo.progress.lock().unwrap() = Some(p(None, Some("2026-05-01T14:00:00Z")));
+        let outcome = UsageHourlyScheduler::new(repo.clone())
+            .run_once(t("2026-09-24T03:05:00Z"))
+            .await
+            .unwrap();
+        assert!(outcome.skipped);
+        assert!(repo.parity_calls.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn tick_reports_caught_up_only_on_the_reread_window() {
+        let repo = Arc::new(FakeRepo::default());
+        *repo.progress.lock().unwrap() = Some(p(None, Some("2026-05-01T14:00:00Z")));
+        let behind = UsageHourlyScheduler::new(repo.clone())
+            .run_once(t("2026-09-24T10:05:00Z"))
+            .await
+            .unwrap();
+        assert!(!behind.caught_up);
+        *repo.progress.lock().unwrap() = Some(p(Some("2026-09-24T09:00:00Z"), None));
+        let current = UsageHourlyScheduler::new(repo.clone())
+            .run_once(t("2026-09-24T10:05:00Z"))
+            .await
+            .unwrap();
+        assert!(current.caught_up);
+    }
+
+    #[test]
+    fn regular_delay_aligns_hourly_cadence_to_hh05() {
+        assert_eq!(
+            next_regular_delay(t("2026-09-24T10:30:00Z"), 3600).as_secs(),
+            35 * 60
+        );
+        assert_eq!(
+            next_regular_delay(t("2026-09-24T10:30:00Z"), 120).as_secs(),
+            120
+        );
     }
 }

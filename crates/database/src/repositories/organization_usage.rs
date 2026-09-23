@@ -72,8 +72,8 @@ impl OrganizationUsageRepository {
                         (
                             SELECT balance.spend_counters_ready_at IS NOT NULL
                             FROM api_keys AS key
-                            JOIN workspaces AS workspace ON workspace.id = key.workspace_id
-                            JOIN organization_balance AS balance
+                            LEFT JOIN workspaces AS workspace ON workspace.id = key.workspace_id
+                            LEFT JOIN organization_balance AS balance
                               ON balance.organization_id = workspace.organization_id
                             WHERE key.id = $1
                         ) AS counters_ready,
@@ -89,6 +89,7 @@ impl OrganizationUsageRepository {
             // ponytail: raw fallback for organizations whose spend counters are not yet reconciled
             // (spend_counters_ready_at IS NULL). Delete once backfill-spend-counters has completed
             // in every environment and spend_counter_readiness reports ready at startup.
+            // NULL means the key does not exist, so it has no usage: the counter's 0 is exact.
             if row.get::<_, Option<bool>>("counters_ready") == Some(false) {
                 client
                     .query_one(

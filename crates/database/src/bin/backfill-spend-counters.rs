@@ -43,9 +43,12 @@ async fn main() -> Result<()> {
         "starting spend counter backfill; all writers must maintain counters and raw history must not be rewritten"
     );
 
+    let mut pending = 0_u64;
     let mut drifted = 0_u64;
     if let Some(organization_id) = options.organization_id {
-        drifted += u64::from(reconcile_one(&database, organization_id, &options).await?);
+        let check = reconcile_one(&database, organization_id, &options).await?;
+        pending += u64::from(check.pending);
+        drifted += u64::from(check.drifted);
     } else {
         let mut after = None;
         loop {
@@ -59,27 +62,43 @@ async fn main() -> Result<()> {
             }
             after = ids.last().copied();
             for organization_id in ids {
-                drifted += u64::from(reconcile_one(&database, organization_id, &options).await?);
+                let check = reconcile_one(&database, organization_id, &options).await?;
+                pending += u64::from(check.pending);
+                drifted += u64::from(check.drifted);
             }
         }
-        if !options.dry_run {
+        if options.dry_run {
+            let readiness = database::spend_counter_readiness(database.pool()).await?;
+            tracing::info!(
+                missing_balances = readiness.missing_balances,
+                incomplete = readiness.incomplete,
+                "spend counter readiness"
+            );
+        } else {
             database::ensure_spend_counters_ready(database.pool()).await?;
         }
     }
-    if options.dry_run && drifted > 0 {
-        bail!("spend counter drift found in {drifted} organizations; nothing was applied");
+    if options.dry_run && pending > 0 {
+        bail!("{pending} organizations are not reconciled ({drifted} with drift); nothing was applied");
     }
-    tracing::info!(drifted, "spend counter backfill complete");
+    tracing::info!(pending, drifted, "spend counter backfill complete");
     Ok(())
 }
 
+/// What one organization's snapshot showed.
+struct OrganizationCheck {
+    /// Unreconciled or drifted: applying would change something.
+    pending: bool,
+    /// Counters trail raw history.
+    drifted: bool,
+}
+
 /// Reconcile (or, in a dry run, only measure) one organization.
-/// Returns whether its counters differed from raw history.
 async fn reconcile_one(
     database: &Database,
     organization_id: Uuid,
     options: &Options,
-) -> Result<bool> {
+) -> Result<OrganizationCheck> {
     let pool = database.pool();
     let prepared = if options.include_ready {
         PreparedSpendBackfill::prepare_including_ready(
@@ -94,15 +113,22 @@ async fn reconcile_one(
         prepared
     } else {
         tracing::info!(%organization_id, "spend counters already ready");
-        return Ok(false);
+        return Ok(OrganizationCheck {
+            pending: false,
+            drifted: false,
+        });
     };
+    let drift = prepared.drift();
     let SpendDrift {
         inference_spent,
         service_spent,
         key_count,
-    } = prepared.drift();
-    let drifted = !prepared.drift().is_zero();
-    if drifted {
+    } = drift;
+    let check = OrganizationCheck {
+        pending: prepared.needs_apply(),
+        drifted: !drift.is_zero(),
+    };
+    if check.drifted {
         tracing::warn!(
             %organization_id,
             inference_spent,
@@ -111,8 +137,8 @@ async fn reconcile_one(
             "spend counters trail raw history"
         );
     }
-    if options.dry_run || !prepared.needs_apply() {
-        return Ok(drifted);
+    if options.dry_run || !check.pending {
+        return Ok(check);
     }
     match prepared.apply().await? {
         SpendBackfillOutcome::Applied { key_count } => {
@@ -122,7 +148,7 @@ async fn reconcile_one(
             tracing::info!(%organization_id, "spend counters completed by another worker");
         }
     }
-    Ok(drifted)
+    Ok(check)
 }
 
 fn parse_args(args: Vec<String>) -> Result<Option<Options>> {

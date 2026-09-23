@@ -266,67 +266,139 @@ async fn cli_dry_run_reports_drift_without_applying() -> anyhow::Result<()> {
     .await
 }
 
+/// V0081__add_spend_counters introduces the counters and V0082 the readiness
+/// marker; keep this at the schema version immediately before them.
+const LAST_SCHEMA_BEFORE_SPEND_COUNTERS: i32 = 80;
+
 /// The production deploy: a database on the last schema before spend counters
-/// (V0080) takes the full current migration set, with no reconciliation yet.
+/// takes the full current migration set, with no reconciliation yet.
 #[tokio::test]
 async fn deploy_from_pre_counter_schema_serves_raw_then_counters() -> anyhow::Result<()> {
-    run_backfill_test_at(Some(80), |database| async move {
+    run_backfill_test_at(
+        Some(LAST_SCHEMA_BEFORE_SPEND_COUNTERS),
+        |database| async move {
+            let pool = database.pool.clone();
+            let fixture = fixture(&pool).await?;
+            insert_inference(&pool, &fixture, fixture.mixed_key, 100 * USD).await?;
+            insert_service(&pool, &fixture, fixture.mixed_key, 40 * USD).await?;
+            insert_service(&pool, &fixture, fixture.service_key, 60 * USD).await?;
+
+            migrations::run(&pool).await?;
+            let readiness = spend_counter_readiness(&pool).await?;
+            assert_eq!((readiness.missing_balances, readiness.incomplete), (0, 1));
+
+            // Usage posted by a new writer before reconciliation is counted and raw.
+            OrganizationUsageRepository::new(pool.clone())
+                .record_usage(inference_request(&fixture, 5 * USD))
+                .await?;
+            let mut expected = vec![
+                (fixture.mixed_key, 145 * USD),
+                (fixture.service_key, 60 * USD),
+                (fixture.empty_key, 0),
+            ];
+            expected.sort();
+            let usage = OrganizationUsageRepository::new(pool.clone());
+            let analytics = PgAnalyticsRepository::new(pool.clone());
+            assert_eq!(usage.get_api_key_spend(fixture.mixed_key).await?, 105 * USD);
+            assert_eq!(key_usages(&pool, &fixture).await?, expected);
+            let summary = analytics.get_billing_summary().await?;
+            assert_eq!(
+                (summary.inference_consumed_usd, summary.service_consumed_usd),
+                (105.0, 100.0)
+            );
+
+            let output = run_cli(&database.database_name, &[]).await?;
+            assert!(
+                output.status.success(),
+                "backfill failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(spend_counter_readiness(&pool).await?.is_ready());
+
+            // Same answers, now from the counters.
+            assert_eq!(usage.get_api_key_spend(fixture.mixed_key).await?, 105 * USD);
+            assert_eq!(key_usages(&pool, &fixture).await?, expected);
+            let summary = analytics.get_billing_summary().await?;
+            assert_eq!(
+                (summary.inference_consumed_usd, summary.service_consumed_usd),
+                (105.0, 100.0)
+            );
+            assert_eq!(
+                counted(&pool, fixture.organization_id, fixture.mixed_key).await?,
+                (105 * USD, 105 * USD)
+            );
+            let verify =
+                run_cli(&database.database_name, &["--include-ready", "--dry-run"]).await?;
+            assert!(
+                verify.status.success(),
+                "post-backfill verification found drift: {}",
+                String::from_utf8_lossy(&verify.stderr)
+            );
+            Ok(())
+        },
+    )
+    .await
+}
+
+/// A balance row is created with its organization (V0004), so a missing one is
+/// an anomaly, not an empty organization: raw history may still exist.
+#[tokio::test]
+async fn readers_with_missing_organization_balance_row_use_raw_history() -> anyhow::Result<()> {
+    run_backfill_test(|database| async move {
         let pool = database.pool.clone();
         let fixture = fixture(&pool).await?;
         insert_inference(&pool, &fixture, fixture.mixed_key, 100 * USD).await?;
-        insert_service(&pool, &fixture, fixture.mixed_key, 40 * USD).await?;
         insert_service(&pool, &fixture, fixture.service_key, 60 * USD).await?;
-
-        migrations::run(&pool).await?;
-        let readiness = spend_counter_readiness(&pool).await?;
-        assert_eq!((readiness.missing_balances, readiness.incomplete), (0, 1));
-
-        // Usage posted by a new writer before reconciliation is counted and raw.
-        OrganizationUsageRepository::new(pool.clone())
-            .record_usage(inference_request(&fixture, 5 * USD))
+        pool.get()
+            .await?
+            .execute(
+                "DELETE FROM organization_balance WHERE organization_id = $1",
+                &[&fixture.organization_id],
+            )
             .await?;
+
+        let usage = OrganizationUsageRepository::new(pool.clone());
+        assert_eq!(usage.get_api_key_spend(fixture.mixed_key).await?, 100 * USD);
         let mut expected = vec![
-            (fixture.mixed_key, 145 * USD),
+            (fixture.mixed_key, 100 * USD),
             (fixture.service_key, 60 * USD),
             (fixture.empty_key, 0),
         ];
         expected.sort();
-        let usage = OrganizationUsageRepository::new(pool.clone());
-        let analytics = PgAnalyticsRepository::new(pool.clone());
-        assert_eq!(usage.get_api_key_spend(fixture.mixed_key).await?, 105 * USD);
         assert_eq!(key_usages(&pool, &fixture).await?, expected);
-        let summary = analytics.get_billing_summary().await?;
+        let summary = PgAnalyticsRepository::new(pool.clone())
+            .get_billing_summary()
+            .await?;
         assert_eq!(
             (summary.inference_consumed_usd, summary.service_consumed_usd),
-            (105.0, 100.0)
+            (100.0, 60.0)
         );
+        Ok(())
+    })
+    .await
+}
 
-        let output = run_cli(&database.database_name, &[]).await?;
-        assert!(
-            output.status.success(),
-            "backfill failed: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-        assert!(spend_counter_readiness(&pool).await?.is_ready());
+/// An unreconciled organization with no usage has zero drift but is not done;
+/// a dry run used as the rollout gate must not pass while it remains.
+#[tokio::test]
+async fn cli_dry_run_fails_while_organizations_remain_unreconciled() -> anyhow::Result<()> {
+    run_backfill_test(|database| async move {
+        let fixture = fixture(&database.pool).await?;
+        set_ready(&database.pool, fixture.organization_id, false).await?;
 
-        // Same answers, now from the counters.
-        assert_eq!(usage.get_api_key_spend(fixture.mixed_key).await?, 105 * USD);
-        assert_eq!(key_usages(&pool, &fixture).await?, expected);
-        let summary = analytics.get_billing_summary().await?;
-        assert_eq!(
-            (summary.inference_consumed_usd, summary.service_consumed_usd),
-            (105.0, 100.0)
-        );
-        assert_eq!(
-            counted(&pool, fixture.organization_id, fixture.mixed_key).await?,
-            (105 * USD, 105 * USD)
-        );
-        let verify = run_cli(&database.database_name, &["--include-ready", "--dry-run"]).await?;
+        let output = run_cli(&database.database_name, &["--include-ready", "--dry-run"]).await?;
+        let stderr = String::from_utf8_lossy(&output.stderr);
         assert!(
-            verify.status.success(),
-            "post-backfill verification found drift: {}",
-            String::from_utf8_lossy(&verify.stderr)
+            !output.status.success(),
+            "unreconciled organization must fail a dry run"
         );
+        assert!(
+            stderr.contains("not reconciled"),
+            "dry-run stderr: {stderr}"
+        );
+        assert!(ready_at(&database.pool, fixture.organization_id)
+            .await?
+            .is_none());
         Ok(())
     })
     .await

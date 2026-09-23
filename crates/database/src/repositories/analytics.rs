@@ -554,7 +554,16 @@ impl AnalyticsRepository for PgAnalyticsRepository {
                     COALESCE(SUM(total_spent), 0)::bigint as total_nano,
                     COALESCE(SUM(inference_spent), 0)::bigint as inference_nano,
                     COALESCE(SUM(service_spent), 0)::bigint as service_nano,
-                    COUNT(*) FILTER (WHERE spend_counters_ready_at IS NULL) as unready
+                    (
+                        COUNT(*) FILTER (WHERE spend_counters_ready_at IS NULL)
+                        + (
+                            SELECT COUNT(*) FROM organizations AS organization
+                            WHERE NOT EXISTS (
+                                SELECT 1 FROM organization_balance AS balance
+                                WHERE balance.organization_id = organization.id
+                            )
+                        )
+                    )::bigint as unready
                 FROM organization_balance
                 "#,
                 &[],

@@ -342,7 +342,7 @@ impl PreparedSpendBackfill {
             .context("marking organization spend counters ready")?;
         if updated != 1 {
             bail!(
-                "organization {} disappeared before spend readiness update",
+                "spend readiness update for organization {} matched {updated} rows, expected 1",
                 self.organization_id
             );
         }
@@ -382,6 +382,9 @@ pub async fn ensure_spend_counters_ready(pool: &DbPool) -> Result<()> {
     Ok(())
 }
 
+/// Report how many organizations lack a balance row and how many have
+/// unreconciled spend counters, without failing -- unlike
+/// [`ensure_spend_counters_ready`], which treats incompleteness as an error.
 pub async fn spend_counter_readiness(pool: &DbPool) -> Result<SpendCounterReadiness> {
     let client = pool
         .get()

@@ -728,6 +728,9 @@ pub struct MockProvider {
     /// order. Lets lifecycle tests assert the signature-fetch routing pin was
     /// released. `std::sync::Mutex` because the trait method is synchronous.
     unpinned_chat_ids: Arc<std::sync::Mutex<Vec<String>>>,
+    /// `signing_algo` of every [`InferenceProvider::get_attestation_report`]
+    /// call, in call order, so tests can assert what the gateway forwarded.
+    attestation_signing_algos: Arc<std::sync::Mutex<Vec<Option<String>>>>,
 }
 
 impl MockProvider {
@@ -776,6 +779,7 @@ impl MockProvider {
             supports_chat_signatures: true,
             per_request_public_key: None,
             unpinned_chat_ids: Arc::new(std::sync::Mutex::new(Vec::new())),
+            attestation_signing_algos: Arc::new(std::sync::Mutex::new(Vec::new())),
             responses_handler: None,
         }
     }
@@ -805,6 +809,7 @@ impl MockProvider {
             supports_chat_signatures: true,
             per_request_public_key: None,
             unpinned_chat_ids: Arc::new(std::sync::Mutex::new(Vec::new())),
+            attestation_signing_algos: Arc::new(std::sync::Mutex::new(Vec::new())),
             responses_handler: None,
         }
     }
@@ -832,6 +837,7 @@ impl MockProvider {
             supports_chat_signatures: true,
             per_request_public_key: None,
             unpinned_chat_ids: Arc::new(std::sync::Mutex::new(Vec::new())),
+            attestation_signing_algos: Arc::new(std::sync::Mutex::new(Vec::new())),
             responses_handler: None,
         }
     }
@@ -901,6 +907,15 @@ impl MockProvider {
         self.unpinned_chat_ids
             .lock()
             .map(|ids| ids.clone())
+            .unwrap_or_default()
+    }
+
+    /// `signing_algo` of every attestation-report call, in call order.
+    /// Includes the calls pool registration makes to fetch signing keys.
+    pub fn attestation_signing_algos(&self) -> Vec<Option<String>> {
+        self.attestation_signing_algos
+            .lock()
+            .map(|algos| algos.clone())
             .unwrap_or_default()
     }
 
@@ -1649,12 +1664,22 @@ impl crate::InferenceProvider for MockProvider {
         _signing_address: Option<String>,
         _include_tls_fingerprint: bool,
     ) -> Result<serde_json::Map<String, serde_json::Value>, AttestationError> {
+        if let Ok(mut algos) = self.attestation_signing_algos.lock() {
+            algos.push(signing_algo.clone());
+        }
         if self
             .fail_attestation
             .load(std::sync::atomic::Ordering::Relaxed)
         {
             return Err(AttestationError::FetchError(
                 "Mock attestation failure (simulating blocked backend)".to_string(),
+            ));
+        }
+        // Same check as inference-proxy: only the exact lowercase names pass.
+        if !matches!(signing_algo.as_deref(), None | Some("ecdsa" | "ed25519")) {
+            return Err(AttestationError::FetchError(
+                "HTTP 400 Bad Request: Invalid signing algorithm. Must be 'ed25519' or 'ecdsa'"
+                    .to_string(),
             ));
         }
         let mut report = serde_json::Map::new();

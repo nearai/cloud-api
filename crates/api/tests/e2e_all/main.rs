@@ -27,6 +27,7 @@ mod admin_services;
 mod admin_token_permissions;
 mod api_keys;
 mod attestation_auth;
+mod attestation_report_params;
 mod audio_image;
 mod audio_transcriptions;
 mod auth_tokens;

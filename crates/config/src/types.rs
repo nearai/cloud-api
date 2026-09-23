@@ -2388,6 +2388,8 @@ pub struct ExternalProvidersConfig {
     pub anthropic_denied_betas: Vec<String>,
     /// Google Gemini API key
     pub gemini_api_key: Option<String>,
+    /// TypeSafe System One API key.
+    pub typesafe_api_key: Option<String>,
     /// Default timeout for external provider requests (seconds)
     pub timeout_seconds: i64,
     /// Interval in seconds for refreshing external providers from the database.
@@ -2416,6 +2418,13 @@ impl ExternalProvidersConfig {
     /// Load from environment variables
     /// Keys can be provided directly via env vars or through file paths
     pub fn from_env() -> Self {
+        let typesafe_api_key = if let Ok(path) = env::var("TYPESAFE_API_KEY_FILE") {
+            std::fs::read_to_string(path)
+                .ok()
+                .map(|s| s.trim().to_string())
+        } else {
+            env::var("TYPESAFE_API_KEY").ok()
+        };
         // OpenAI API key
         let openai_api_key = if let Ok(path) = env::var("OPENAI_API_KEY_FILE") {
             std::fs::read_to_string(path)
@@ -2569,6 +2578,7 @@ impl ExternalProvidersConfig {
             enable_anthropic_messages,
             anthropic_denied_betas,
             gemini_api_key,
+            typesafe_api_key,
             timeout_seconds,
             refresh_interval_secs,
             enable_chutes,
@@ -2585,6 +2595,7 @@ impl ExternalProvidersConfig {
             "openai_compatible" => self.openai_api_key.as_deref(),
             "anthropic" => self.anthropic_api_key.as_deref(),
             "gemini" => self.gemini_api_key.as_deref(),
+            "typesafe" => self.typesafe_api_key.as_deref(),
             _ => None,
         }
     }

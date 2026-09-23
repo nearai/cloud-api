@@ -66,6 +66,7 @@ pub mod responses_raw;
 pub mod rotation;
 pub mod spki_verifier;
 pub mod sse_parser;
+pub mod systemone;
 pub mod thought_signature;
 
 // Attested NEAR-AI fleet provider. Use the module path (`nearai::Provider`,
@@ -103,6 +104,7 @@ pub use models::{
 pub use sse_parser::{
     new_external_sse_parser, new_sse_parser, BufferedSSEParser, SSEEvent, SSEEventParser, SSEParser,
 };
+pub use systemone::{SystemOneRequest, SystemOneResponse, SystemOneResponseWithBytes};
 // Chunk builder for external provider parsers
 pub use chunk_builder::ChunkContext;
 
@@ -288,6 +290,21 @@ pub trait InferenceProvider {
         &self,
         params: CompletionParams,
     ) -> Result<StreamingResult, CompletionError>;
+
+    /// Typed decisions via the System One protocol, independent of provider trust tier.
+    async fn systemone(
+        &self,
+        _request: SystemOneRequest,
+        _request_hash: String,
+    ) -> Result<SystemOneResponseWithBytes, CompletionError> {
+        Err(CompletionError::CompletionError(
+            "System One is unavailable for this provider".into(),
+        ))
+    }
+
+    fn supports_systemone(&self) -> bool {
+        false
+    }
 
     /// Performs an image generation request
     ///

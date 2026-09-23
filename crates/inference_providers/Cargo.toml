@@ -6,7 +6,11 @@ authors.workspace = true
 license.workspace = true
 description.workspace = true
 
+[features]
+openapi = ["dep:utoipa"]
+
 [dependencies]
+utoipa = { version = "5", optional = true }
 anthropic_compat = { path = "../anthropic_compat" }
 async-trait = "0.1"
 base64 = "0.22"

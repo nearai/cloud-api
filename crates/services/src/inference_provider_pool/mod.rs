@@ -32,7 +32,7 @@ mod provider_attribution;
 use provider_attribution::{served_provider_attribution, ServedProviderResult};
 pub use provider_attribution::{
     AttributedAnthropicRawResponse, AttributedChatCompletion, AttributedChatCompletionStream,
-    AttributedImageEdit, AttributedImageGeneration,
+    AttributedImageEdit, AttributedImageGeneration, AttributedSystemOne,
 };
 
 type InferenceProviderTrait = dyn InferenceProvider + Send + Sync;
@@ -2867,6 +2867,20 @@ impl InferenceProviderPool {
 
         let providers = Self::filter_streaming_capable(providers, operation_name);
         let providers = Self::filter_client_e2ee_capable(providers, needs_client_e2ee);
+        let providers = if operation_name == "systemone" {
+            let capable: Vec<_> = providers
+                .into_iter()
+                .filter(|provider| provider.supports_systemone())
+                .collect();
+            if capable.is_empty() {
+                return Err(CompletionError::CompletionError(
+                    "No System One provider available for this model".into(),
+                ));
+            }
+            capable
+        } else {
+            providers
+        };
         let has_near_primary = providers
             .iter()
             .any(|provider| provider.tier() == inference_providers::ProviderTier::Near);
@@ -3879,6 +3893,66 @@ impl InferenceProviderPool {
             .response)
     }
 
+    pub async fn systemone_with_attribution(
+        &self,
+        request: inference_providers::SystemOneRequest,
+        request_hash: String,
+        fallback_disabled: bool,
+    ) -> Result<AttributedSystemOne, CompletionError> {
+        let hints = ChatRoutingHints {
+            fallback_disabled,
+            ..Default::default()
+        };
+        let served = self
+            .retry_with_fallback_caps(
+                &request.model,
+                "systemone",
+                None,
+                false,
+                &hints,
+                |provider| {
+                    let request = request.clone();
+                    let request_hash = request_hash.clone();
+                    async move {
+                        let response = provider.systemone(request, request_hash).await?;
+                        if provider.tier().is_attested() && provider.supports_chat_signatures() {
+                            response.provider_signature_id()?;
+                        }
+                        Ok(response)
+                    }
+                },
+            )
+            .await?;
+        // Classify the provider that actually served this call, including fallback.
+        // Catalog flags and the trait's historical signature default are insufficient.
+        let provider_signs =
+            served.provider.tier().is_attested() && served.provider.supports_chat_signatures();
+        let (signature_id, signature_kind) = if provider_signs {
+            (
+                served.value.provider_signature_id()?.to_owned(),
+                crate::attestation::SignatureKind::ProviderTee,
+            )
+        } else {
+            (
+                format!("decision-{}", uuid::Uuid::new_v4()),
+                crate::attestation::SignatureKind::Gateway,
+            )
+        };
+        if provider_signs {
+            served
+                .provider
+                .pin_chat_connection(&request_hash, &signature_id);
+            self.store_chat_id_mapping(signature_id.clone(), served.provider)
+                .await;
+        }
+        Ok(AttributedSystemOne {
+            response: served.value,
+            provider_attribution: served.provider_attribution,
+            signature_id,
+            signature_kind,
+        })
+    }
+
     pub async fn image_generation_with_attribution(
         &self,
         mut params: ImageGenerationParams,
@@ -4413,6 +4487,7 @@ impl InferenceProviderPool {
             ProviderConfig::OpenAiCompatible { .. } => "openai_compatible".to_string(),
             ProviderConfig::Anthropic { .. } => "anthropic".to_string(),
             ProviderConfig::Gemini { .. } => "gemini".to_string(),
+            ProviderConfig::TypeSafe { .. } => "typesafe".to_string(),
         };
 
         let api_key = per_model_api_key
@@ -4424,7 +4499,7 @@ impl InferenceProviderPool {
             .ok_or_else(|| {
                 format!(
                     "No API key configured for backend type '{}'. \
-                     Set the appropriate environment variable (e.g., OPENAI_API_KEY, ANTHROPIC_API_KEY, GEMINI_API_KEY) \
+                     Set the appropriate environment variable (e.g., OPENAI_API_KEY, ANTHROPIC_API_KEY, GEMINI_API_KEY, TYPESAFE_API_KEY) \
                      or include 'api_key' in the model's providerConfig",
                     backend_type
                 )

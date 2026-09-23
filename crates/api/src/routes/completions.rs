@@ -217,7 +217,7 @@ fn build_image_usage_request(
 /// Record usage synchronously with timeout, falling back to async retry.
 /// Used for non-streaming operations (image gen/edit) where usage should be
 /// persisted before the HTTP response is returned.
-async fn record_usage_with_sync_fallback(
+pub(super) async fn record_usage_with_sync_fallback(
     usage_service: Arc<dyn services::usage::UsageServiceTrait + Send + Sync>,
     request: services::usage::RecordUsageServiceRequest,
     operation_label: &str,

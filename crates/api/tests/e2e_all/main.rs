@@ -90,6 +90,7 @@ mod serving_provider;
 mod session_logout;
 mod signature_verification;
 mod spend_counters;
+mod systemone;
 mod usage_chat_completions;
 mod usage_provider_attribution;
 mod usage_recording;

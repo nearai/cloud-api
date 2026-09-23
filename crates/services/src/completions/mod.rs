@@ -1739,6 +1739,15 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
             }
         };
 
+        if model.output_modalities.as_ref().is_some_and(|modalities| {
+            modalities
+                .iter()
+                .any(|modality| modality == inference_providers::systemone::OUTPUT_MODALITY)
+        }) {
+            return Err(ports::CompletionError::InvalidParams(
+                "Decision models require /v1/systemone".into(),
+            ));
+        }
         let canonical_name = &model.model_name;
         let cache_write_cost_per_token = Self::anthropic_cache_write_rate(&model)?;
         let requested_service_tier =
@@ -1925,6 +1934,15 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
             }
         };
 
+        if model.output_modalities.as_ref().is_some_and(|modalities| {
+            modalities
+                .iter()
+                .any(|modality| modality == inference_providers::systemone::OUTPUT_MODALITY)
+        }) {
+            return Err(ports::CompletionError::InvalidParams(
+                "Decision models require /v1/systemone".into(),
+            ));
+        }
         let canonical_name = &model.model_name;
         let cache_write_cost_per_token = Self::anthropic_cache_write_rate(&model)?;
         let requested_service_tier =

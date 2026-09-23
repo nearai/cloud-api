@@ -1287,6 +1287,59 @@ where
 
 #[async_trait]
 impl InferenceProvider for Fleet {
+    fn supports_systemone(&self) -> bool {
+        true
+    }
+
+    async fn systemone(
+        &self,
+        request: SystemOneRequest,
+        request_hash: String,
+    ) -> Result<SystemOneResponseWithBytes, CompletionError> {
+        let mut headers = self
+            .build_headers()
+            .map_err(CompletionError::CompletionError)?;
+        headers.insert(
+            "X-Request-Hash",
+            HeaderValue::from_str(&request_hash)
+                .map_err(|_| CompletionError::CompletionError("Invalid request hash".into()))?,
+        );
+        // Use the same verified backend and signature affinity as non-streaming
+        // chat. An empty prefix is appropriate for independent decision calls.
+        let lease = self.acquire_index(&[], None);
+        let (client, url) = if let Some(lease) = &lease {
+            let index = lease.index();
+            (
+                self.get_or_verify_index_client(index).await?,
+                self.rotation_url(index as u64, "/v1/systemone")
+                    .unwrap_or_else(|| format!("{}/v1/systemone", self.config.base_url)),
+            )
+        } else {
+            (
+                self.fallback_client.clone(),
+                format!("{}/v1/systemone", self.config.base_url),
+            )
+        };
+        let timeout_seconds = self.config.completion_timeout_seconds.max(1) as u64;
+        let response = client
+            .post(url)
+            .headers(headers)
+            .json(&request)
+            .timeout(Duration::from_secs(timeout_seconds))
+            .send()
+            .await
+            .map_err(|e| crate::systemone::transport_error(e, timeout_seconds))?;
+        let response = crate::systemone::read_response(response, &request, false).await?;
+        let id = response.provider_signature_id()?;
+        if let Some(lease) = &lease {
+            self.signature_rotation
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(id.to_owned(), lease.index() as u64);
+        }
+        Ok(response)
+    }
+
     /// NEAR's own attested fleet. `Provider` (which wraps `Fleet`) is what the pool
     /// actually registers, but mirror the tier here too so the verifiable filter can
     /// never misclassify a `Fleet` as plaintext if one is ever pooled directly.
@@ -2501,6 +2554,18 @@ impl InferenceProvider for Fleet {
 /// to its Fleet, which holds all NEAR-AI model-proxy state and logic.
 #[async_trait]
 impl InferenceProvider for Provider {
+    fn supports_systemone(&self) -> bool {
+        true
+    }
+
+    async fn systemone(
+        &self,
+        request: SystemOneRequest,
+        request_hash: String,
+    ) -> Result<SystemOneResponseWithBytes, CompletionError> {
+        self.fleet.systemone(request, request_hash).await
+    }
+
     /// NEAR AI's own attested TEE fleet — the primary tier for any model NEAR
     /// serves; an attested third party (Chutes) sits behind it as fallback.
     fn tier(&self) -> crate::ProviderTier {

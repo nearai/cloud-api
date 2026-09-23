@@ -455,7 +455,9 @@ pub async fn get_organization_usage_history(
         .get_usage_history(organization_id, Some(query.limit), Some(query.offset))
         .await
         .map_err(|error| match error {
-            services::usage::UsageError::ReportingTimeout => usage_query_timeout_error(),
+            services::usage::UsageError::ReportingTimeout => {
+                usage_query_timeout_error(organization_id)
+            }
             _ => {
                 tracing::error!("Failed to get usage history");
                 (
@@ -518,7 +520,9 @@ async fn get_filtered_organization_usage_history(
         .list_inference_usage_history(report_query)
         .await
         .map_err(|error| match error {
-            services::usage::UsageError::ReportingTimeout => usage_query_timeout_error(),
+            services::usage::UsageError::ReportingTimeout => {
+                usage_query_timeout_error(organization_id)
+            }
             _ => internal_usage_history_error("Failed to retrieve usage history"),
         })?;
 
@@ -721,8 +725,8 @@ fn internal_usage_history_error(message: &str) -> UsageError {
 }
 
 /// The database cancelled a usage query at the reporting statement timeout.
-fn usage_query_timeout_error() -> UsageError {
-    tracing::warn!("Usage query timed out");
+fn usage_query_timeout_error(organization_id: Uuid) -> UsageError {
+    tracing::warn!(%organization_id, "Usage query timed out");
     (
         StatusCode::GATEWAY_TIMEOUT,
         ResponseJson(ErrorResponse::new(
@@ -1644,7 +1648,9 @@ pub async fn get_organization_usage_by_model(
         .get_usage_by_model(organization_id, start_date)
         .await
         .map_err(|e| match e {
-            services::usage::UsageError::ReportingTimeout => usage_query_timeout_error(),
+            services::usage::UsageError::ReportingTimeout => {
+                usage_query_timeout_error(organization_id)
+            }
             _ => {
                 tracing::error!(error = ?e, "Failed to get usage by model");
                 (

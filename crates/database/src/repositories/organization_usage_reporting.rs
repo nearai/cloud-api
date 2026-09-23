@@ -5,7 +5,7 @@ use services::common::RepositoryError;
 use services::usage::{
     InferenceUsageHistoryQuery, InferenceUsageReportQuery, InferenceUsageReportRow,
 };
-use tokio_postgres::Row;
+use tokio_postgres::{IsolationLevel, Row};
 
 impl OrganizationUsageRepository {
     pub async fn list_inference_usage_report(
@@ -111,9 +111,9 @@ impl OrganizationUsageRepository {
         Ok(rows.iter().map(row_to_report).collect())
     }
 
-    /// Filtered usage history page plus the exact filtered count. Both queries run
-    /// under the reporting statement timeout: the count reads every matching row,
-    /// and an abandoned request must not keep scanning.
+    /// Filtered usage history page plus the exact filtered count, from one snapshot.
+    /// Both queries share the reporting deadline: the count reads every matching
+    /// row, and an abandoned request must not keep scanning.
     pub async fn list_inference_usage_history(
         &self,
         query: InferenceUsageHistoryQuery,
@@ -135,6 +135,7 @@ impl OrganizationUsageRepository {
             let transaction = client
                 .build_transaction()
                 .read_only(true)
+                .isolation_level(IsolationLevel::RepeatableRead)
                 .start()
                 .await
                 .map_err(map_db_error)?;
@@ -196,6 +197,13 @@ impl OrganizationUsageRepository {
                 .await
                 .map_err(map_db_error)?;
 
+            // statement_timeout applies per statement: give the count only what is
+            // left of the deadline, not a fresh budget.
+            crate::repositories::reporting_query::configure_reporting_transaction(
+                &transaction,
+                crate::repositories::reporting_query::remaining_statement_timeout(deadline)?,
+            )
+            .await?;
             let count = transaction
                 .query_one(
                     r#"

@@ -15,7 +15,7 @@ use services::common::RepositoryError;
 use services::responses::models::ResponseId;
 use std::collections::HashMap;
 use std::time::Duration;
-use tokio_postgres::Row;
+use tokio_postgres::{IsolationLevel, Row};
 use uuid::Uuid;
 
 #[derive(Debug, Clone)]
@@ -416,9 +416,11 @@ impl OrganizationUsageRepository {
                 .context("Failed to get database connection")
                 .map_err(RepositoryError::PoolError)?;
 
+            // One snapshot for the page and the total.
             let transaction = client
                 .build_transaction()
                 .read_only(true)
+                .isolation_level(IsolationLevel::RepeatableRead)
                 .start()
                 .await
                 .map_err(map_db_error)?;

@@ -364,7 +364,7 @@ async fn spend_readiness_checks_missing_and_inactive_organizations() -> anyhow::
             .await?;
         migration_tx
             .batch_execute(include_str!(
-                "../src/migrations/sql/V0082__add_spend_counters_readiness.sql"
+                "../src/migrations/sql/V0081__add_spend_counters.sql"
             ))
             .await?;
         let legacy = migration_tx

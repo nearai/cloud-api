@@ -44,6 +44,10 @@ async fn scoped_pool() -> anyhow::Result<(DbPool, DbPool, String)> {
                     deleted_at TIMESTAMPTZ,
                     spend_limit BIGINT
                 );
+                CREATE TABLE {schema}.workspaces (
+                    id UUID PRIMARY KEY,
+                    organization_id UUID NOT NULL
+                );
                 CREATE TABLE {schema}.api_key_spend (
                     api_key_id UUID PRIMARY KEY,
                     inference_spent BIGINT NOT NULL,
@@ -107,6 +111,32 @@ where
     cleanup
 }
 
+/// A workspace in a ready organization: readers must take the counter path.
+async fn insert_ready_workspace(pool: &DbPool, workspace_id: Uuid) -> anyhow::Result<()> {
+    let organization_id = Uuid::new_v4();
+    let client = pool.get().await?;
+    client
+        .execute(
+            "INSERT INTO organizations (id, is_active) VALUES ($1, true)",
+            &[&organization_id],
+        )
+        .await?;
+    client
+        .execute(
+            "INSERT INTO organization_balance (organization_id, total_spent, inference_spent, service_spent)
+             VALUES ($1, 0, 0, 0)",
+            &[&organization_id],
+        )
+        .await?;
+    client
+        .execute(
+            "INSERT INTO workspaces (id, organization_id) VALUES ($1, $2)",
+            &[&workspace_id, &organization_id],
+        )
+        .await?;
+    Ok(())
+}
+
 async fn insert_key(
     pool: &DbPool,
     workspace_id: Uuid,
@@ -154,6 +184,8 @@ async fn key_list_reads_counter_cohort_with_stable_pagination() -> anyhow::Resul
         let deleted = Uuid::new_v4();
         let other_workspace = Uuid::new_v4();
         let other_workspace_key = Uuid::new_v4();
+        insert_ready_workspace(&pool, workspace_id).await?;
+        insert_ready_workspace(&pool, other_workspace).await?;
         insert_key(&pool, workspace_id, zero, "zero", 0, 0, false).await?;
         insert_key(&pool, workspace_id, inference, "inference", 30, 0, false).await?;
         insert_key(&pool, workspace_id, service, "service", 0, 40, false).await?;
@@ -245,31 +277,31 @@ async fn key_list_reads_counter_cohort_with_stable_pagination() -> anyhow::Resul
 async fn admission_spend_reads_inference_counter_and_excludes_service_counter() -> anyhow::Result<()>
 {
     with_scoped_pool(|pool| async move {
-    let inference_key = Uuid::new_v4();
-    let service_key = Uuid::new_v4();
-    let now = chrono::Utc::now();
-    let client = pool.get().await?;
-    for (key_id, inference_spent, service_spent) in [
-        (inference_key, 321_i64, 0_i64),
-        (service_key, 0_i64, 654_i64),
-    ] {
-        client
-            .execute(
-                "INSERT INTO api_key_spend (api_key_id, inference_spent, service_spent, updated_at) VALUES ($1, $2, $3, $4)",
-                &[&key_id, &inference_spent, &service_spent, &now],
-            )
-            .await?;
-    }
-    drop(client);
+        let inference_key = Uuid::new_v4();
+        let service_key = Uuid::new_v4();
+        let workspace_id = Uuid::new_v4();
+        insert_ready_workspace(&pool, workspace_id).await?;
+        insert_key(
+            &pool,
+            workspace_id,
+            inference_key,
+            "inference",
+            321,
+            0,
+            false,
+        )
+        .await?;
+        insert_key(&pool, workspace_id, service_key, "service", 0, 654, false).await?;
 
-    ensure_spend_counters_ready(&pool).await?;
-    let repository = OrganizationUsageRepository::new(pool.clone());
-    assert_eq!(repository.get_api_key_spend(inference_key).await?, 321);
-    assert_eq!(repository.get_api_key_spend(service_key).await?, 0);
-    assert_eq!(repository.get_api_key_spend(Uuid::new_v4()).await?, 0);
+        ensure_spend_counters_ready(&pool).await?;
+        let repository = OrganizationUsageRepository::new(pool.clone());
+        assert_eq!(repository.get_api_key_spend(inference_key).await?, 321);
+        assert_eq!(repository.get_api_key_spend(service_key).await?, 0);
+        assert_eq!(repository.get_api_key_spend(Uuid::new_v4()).await?, 0);
 
-    Ok(())
-    }).await
+        Ok(())
+    })
+    .await
 }
 
 #[tokio::test]

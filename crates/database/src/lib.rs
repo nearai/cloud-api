@@ -23,7 +23,8 @@ pub use repositories::{
 };
 pub use shutdown_coordinator::{ShutdownCoordinator, ShutdownStage, ShutdownStageResult};
 pub use spend_counters_backfill::{
-    ensure_spend_counters_ready, PreparedSpendBackfill, SpendBackfillOutcome,
+    ensure_spend_counters_ready, spend_counter_readiness, PreparedSpendBackfill,
+    SpendBackfillOutcome, SpendCounterReadiness, SpendDrift,
 };
 pub use usage_reporting_indexes::ensure_usage_reporting_indexes;
 

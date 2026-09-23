@@ -206,7 +206,7 @@ fn cli_command(database_name: &str) -> Command {
     command
 }
 
-async fn run_cli(database_name: &str, args: &[&str]) -> anyhow::Result<Output> {
+pub(super) async fn run_cli(database_name: &str, args: &[&str]) -> anyhow::Result<Output> {
     let mut command = cli_command(database_name);
     command.args(args).kill_on_drop(true);
     Ok(timeout(Duration::from_secs(60), command.output()).await??)

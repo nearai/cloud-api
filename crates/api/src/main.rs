@@ -27,9 +27,16 @@ async fn main() {
             .await
             .expect("Usage reporting index prerequisites are not satisfied");
     }
-    database::ensure_spend_counters_ready(database.pool())
+    let spend_counters = database::spend_counter_readiness(database.pool())
         .await
-        .expect("Spend counters are incomplete; run the spend-counter backfill before starting Cloud API");
+        .expect("Failed to check spend counter readiness");
+    if !spend_counters.is_ready() {
+        tracing::warn!(
+            missing_balances = spend_counters.missing_balances,
+            incomplete = spend_counters.incomplete,
+            "Spend counters are incomplete; readers use raw usage for these organizations until backfill-spend-counters completes"
+        );
+    }
     let auth_components = init_auth_services(database.clone(), &config);
 
     // Initialize OpenTelemetry pipeline

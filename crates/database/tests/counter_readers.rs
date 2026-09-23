@@ -44,6 +44,10 @@ async fn scoped_pool() -> anyhow::Result<(DbPool, DbPool, String)> {
                     deleted_at TIMESTAMPTZ,
                     spend_limit BIGINT
                 );
+                CREATE TABLE {schema}.workspaces (
+                    id UUID PRIMARY KEY,
+                    organization_id UUID NOT NULL
+                );
                 CREATE TABLE {schema}.api_key_spend (
                     api_key_id UUID PRIMARY KEY,
                     inference_spent BIGINT NOT NULL,

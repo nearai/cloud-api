@@ -57,7 +57,7 @@ impl OrganizationUsageRepository {
 
     /// Get inference-only spend for a specific API key for admission-limit checks.
     pub async fn get_api_key_spend(&self, api_key_id: Uuid) -> Result<i64> {
-        let row = retry_db!("get_api_key_spend", {
+        let inference_spend = retry_db!("get_api_key_spend", {
             let client = self
                 .pool
                 .get()
@@ -65,21 +65,48 @@ impl OrganizationUsageRepository {
                 .context("Failed to get database connection")
                 .map_err(RepositoryError::PoolError)?;
 
-            client
+            let row = client
                 .query_one(
                     r#"
-                    SELECT COALESCE(
-                        (SELECT inference_spent FROM api_key_spend WHERE api_key_id = $1),
-                        0
-                    )::BIGINT as inference_spend
+                    SELECT
+                        (
+                            SELECT balance.spend_counters_ready_at IS NOT NULL
+                            FROM api_keys AS key
+                            JOIN workspaces AS workspace ON workspace.id = key.workspace_id
+                            JOIN organization_balance AS balance
+                              ON balance.organization_id = workspace.organization_id
+                            WHERE key.id = $1
+                        ) AS counters_ready,
+                        COALESCE(
+                            (SELECT inference_spent FROM api_key_spend WHERE api_key_id = $1),
+                            0
+                        )::BIGINT AS inference_spend
                     "#,
                     &[&api_key_id],
                 )
                 .await
-                .map_err(map_db_error)
+                .map_err(map_db_error)?;
+            // ponytail: raw fallback for organizations whose spend counters are not yet reconciled
+            // (spend_counters_ready_at IS NULL). Delete once backfill-spend-counters has completed
+            // in every environment and spend_counter_readiness reports ready at startup.
+            if row.get::<_, Option<bool>>("counters_ready") == Some(false) {
+                client
+                    .query_one(
+                        r#"
+                        SELECT COALESCE(SUM(total_cost), 0)::BIGINT
+                        FROM organization_usage_log
+                        WHERE api_key_id = $1
+                        "#,
+                        &[&api_key_id],
+                    )
+                    .await
+                    .map(|row| row.get::<_, i64>(0))
+                    .map_err(map_db_error)
+            } else {
+                Ok(row.get::<_, i64>("inference_spend"))
+            }
         })?;
 
-        let inference_spend: i64 = row.get("inference_spend");
         Ok(inference_spend)
     }
 

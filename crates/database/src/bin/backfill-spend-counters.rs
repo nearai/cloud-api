@@ -1,6 +1,7 @@
 use anyhow::{bail, Context, Result};
 use database::spend_counters_backfill::{
-    incomplete_organizations, PreparedSpendBackfill, SpendBackfillOutcome,
+    all_organizations, incomplete_organizations, PreparedSpendBackfill, SpendBackfillOutcome,
+    SpendDrift,
 };
 use database::Database;
 use std::time::Duration;
@@ -13,6 +14,8 @@ const DEFAULT_TIMEOUT_SECONDS: u64 = 300;
 struct Options {
     organization_id: Option<Uuid>,
     statement_timeout: Duration,
+    include_ready: bool,
+    dry_run: bool,
 }
 
 #[tokio::main]
@@ -35,40 +38,82 @@ async fn main() -> Result<()> {
         .context("connecting to database")?;
     tracing::info!(
         statement_timeout_seconds = options.statement_timeout.as_secs(),
+        include_ready = options.include_ready,
+        dry_run = options.dry_run,
         "starting spend counter backfill; all writers must maintain counters and raw history must not be rewritten"
     );
 
+    let mut drifted = 0_u64;
     if let Some(organization_id) = options.organization_id {
-        reconcile_one(&database, organization_id, options.statement_timeout).await?;
+        drifted += u64::from(reconcile_one(&database, organization_id, &options).await?);
     } else {
         let mut after = None;
         loop {
-            let ids = incomplete_organizations(database.pool(), after, BATCH_SIZE).await?;
+            let ids = if options.include_ready {
+                all_organizations(database.pool(), after, BATCH_SIZE).await?
+            } else {
+                incomplete_organizations(database.pool(), after, BATCH_SIZE).await?
+            };
             if ids.is_empty() {
                 break;
             }
             after = ids.last().copied();
             for organization_id in ids {
-                reconcile_one(&database, organization_id, options.statement_timeout).await?;
+                drifted += u64::from(reconcile_one(&database, organization_id, &options).await?);
             }
         }
-        database::ensure_spend_counters_ready(database.pool()).await?;
+        if !options.dry_run {
+            database::ensure_spend_counters_ready(database.pool()).await?;
+        }
     }
-    tracing::info!("spend counter backfill complete");
+    if options.dry_run && drifted > 0 {
+        bail!("spend counter drift found in {drifted} organizations; nothing was applied");
+    }
+    tracing::info!(drifted, "spend counter backfill complete");
     Ok(())
 }
 
+/// Reconcile (or, in a dry run, only measure) one organization.
+/// Returns whether its counters differed from raw history.
 async fn reconcile_one(
     database: &Database,
     organization_id: Uuid,
-    statement_timeout: Duration,
-) -> Result<()> {
-    let Some(prepared) =
-        PreparedSpendBackfill::prepare(database.pool(), organization_id, statement_timeout).await?
-    else {
+    options: &Options,
+) -> Result<bool> {
+    let pool = database.pool();
+    let prepared = if options.include_ready {
+        PreparedSpendBackfill::prepare_including_ready(
+            pool,
+            organization_id,
+            options.statement_timeout,
+        )
+        .await?
+    } else if let Some(prepared) =
+        PreparedSpendBackfill::prepare(pool, organization_id, options.statement_timeout).await?
+    {
+        prepared
+    } else {
         tracing::info!(%organization_id, "spend counters already ready");
-        return Ok(());
+        return Ok(false);
     };
+    let SpendDrift {
+        inference_spent,
+        service_spent,
+        key_count,
+    } = prepared.drift();
+    let drifted = !prepared.drift().is_zero();
+    if drifted {
+        tracing::warn!(
+            %organization_id,
+            inference_spent,
+            service_spent,
+            key_count,
+            "spend counters trail raw history"
+        );
+    }
+    if options.dry_run || !prepared.needs_apply() {
+        return Ok(drifted);
+    }
     match prepared.apply().await? {
         SpendBackfillOutcome::Applied { key_count } => {
             tracing::info!(%organization_id, key_count, "reconciled spend counters");
@@ -77,7 +122,7 @@ async fn reconcile_one(
             tracing::info!(%organization_id, "spend counters completed by another worker");
         }
     }
-    Ok(())
+    Ok(drifted)
 }
 
 fn parse_args(args: Vec<String>) -> Result<Option<Options>> {
@@ -87,6 +132,8 @@ fn parse_args(args: Vec<String>) -> Result<Option<Options>> {
     }
     let mut organization_id = None;
     let mut timeout_seconds = DEFAULT_TIMEOUT_SECONDS;
+    let mut include_ready = false;
+    let mut dry_run = false;
     let mut args = args.into_iter();
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -113,22 +160,32 @@ fn parse_args(args: Vec<String>) -> Result<Option<Options>> {
                     );
                 }
             }
+            "--include-ready" => include_ready = true,
+            "--dry-run" => dry_run = true,
             unknown => bail!("unknown argument {unknown}; use --help"),
         }
     }
     Ok(Some(Options {
         organization_id,
         statement_timeout: Duration::from_secs(timeout_seconds),
+        include_ready,
+        dry_run,
     }))
 }
 
 fn print_help() {
     println!(
-        "Usage: backfill-spend-counters [--organization UUID] [--statement-timeout-seconds N]\n\n\
-Reconciles incomplete organization spend counters. Deploy counter writers (#1116)\n\
-to every process and drain all older writers first. Do not rewrite or delete raw usage history\n\
-while this process runs. The statement timeout applies to the repeatable-read snapshot;\n\
-apply and accounting-lock statements remain capped at 5 seconds. The command does not run migrations."
+        "Usage: backfill-spend-counters [--organization UUID] [--statement-timeout-seconds N]\n\
+                              [--include-ready] [--dry-run]\n\n\
+Reconciles incomplete organization spend counters. Run it after every process maintains\n\
+the counters (#1116); readers fall back to raw usage for an organization until it is ready.\n\
+Do not rewrite or delete raw usage history while this process runs.\n\n\
+--include-ready  also re-check organizations already marked ready and repair any drift,\n\
+                 e.g. usage posted by an older writer during a rolling deploy.\n\
+--dry-run        report drift (organization ID and nano-USD amounts) without applying it;\n\
+                 exits nonzero if any organization's counters trail its raw history.\n\n\
+The statement timeout applies to the repeatable-read snapshot; apply and accounting-lock\n\
+statements remain capped at 5 seconds. The command does not run migrations."
     );
 }
 
@@ -205,6 +262,18 @@ mod tests {
         ])
         .unwrap_err();
         assert!(error.to_string().contains("must produce a timeout"));
+    }
+
+    #[test]
+    fn parse_args_accepts_include_ready_and_dry_run() {
+        let options = parse_args(vec!["--include-ready".to_string(), "--dry-run".to_string()])
+            .unwrap()
+            .unwrap();
+        assert!(options.include_ready);
+        assert!(options.dry_run);
+        let defaults = parse_args(Vec::new()).unwrap().unwrap();
+        assert!(!defaults.include_ready);
+        assert!(!defaults.dry_run);
     }
 
     #[test]

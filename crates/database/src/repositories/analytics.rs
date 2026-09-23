@@ -553,7 +553,8 @@ impl AnalyticsRepository for PgAnalyticsRepository {
                 SELECT
                     COALESCE(SUM(total_spent), 0)::bigint as total_nano,
                     COALESCE(SUM(inference_spent), 0)::bigint as inference_nano,
-                    COALESCE(SUM(service_spent), 0)::bigint as service_nano
+                    COALESCE(SUM(service_spent), 0)::bigint as service_nano,
+                    COUNT(*) FILTER (WHERE spend_counters_ready_at IS NULL) as unready
                 FROM organization_balance
                 "#,
                 &[],
@@ -561,8 +562,27 @@ impl AnalyticsRepository for PgAnalyticsRepository {
             .await
             .map_err(|e| log_billing_summary_db_error("consumed_totals", e))?;
         let total_consumed_usd = nano_to_usd(consumed_row.get::<_, i64>(0));
-        let inference_consumed_usd = nano_to_usd(consumed_row.get::<_, i64>(1));
-        let service_consumed_usd = nano_to_usd(consumed_row.get::<_, i64>(2));
+        // ponytail: raw fallback for organizations whose spend counters are not yet reconciled
+        // (spend_counters_ready_at IS NULL). Delete once backfill-spend-counters has completed
+        // in every environment and spend_counter_readiness reports ready at startup.
+        let (inference_nano, service_nano): (i64, i64) = if consumed_row.get::<_, i64>(3) > 0 {
+            let raw = client
+                .query_one(
+                    r#"
+                    SELECT
+                        (SELECT COALESCE(SUM(total_cost), 0) FROM organization_usage_log)::bigint,
+                        (SELECT COALESCE(SUM(total_cost), 0) FROM organization_service_usage_log)::bigint
+                    "#,
+                    &[],
+                )
+                .await
+                .map_err(|e| log_billing_summary_db_error("consumed_raw_splits", e))?;
+            (raw.get(0), raw.get(1))
+        } else {
+            (consumed_row.get(1), consumed_row.get(2))
+        };
+        let inference_consumed_usd = nano_to_usd(inference_nano);
+        let service_consumed_usd = nano_to_usd(service_nano);
 
         // Active prepaid credit limit broken down by funding source (active orgs only).
         // Contract postpay ceilings are intentionally not part of this cash-like metric.

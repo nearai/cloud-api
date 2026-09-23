@@ -17,7 +17,7 @@ struct KeyCorrection {
     service_spent: i64,
 }
 
-/// A repeatable-read snapshot of one incomplete organization's correction.
+/// A repeatable-read snapshot of one organization's raw-minus-counted correction.
 ///
 /// The fields are intentionally private: callers can only obtain corrections
 /// from the database snapshot and apply them through the guarded method below.
@@ -25,6 +25,8 @@ struct KeyCorrection {
 pub struct PreparedSpendBackfill {
     pool: DbPool,
     organization_id: Uuid,
+    /// Readiness marker seen by the snapshot; apply only commits if it is unchanged.
+    snapshot_ready_at: Option<DateTime<Utc>>,
     key_corrections: Vec<KeyCorrection>,
     inference_spent: i64,
     service_spent: i64,
@@ -36,13 +38,63 @@ pub enum SpendBackfillOutcome {
     AlreadyComplete,
 }
 
+/// How far an organization's counters trail its raw history (nano-USD).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SpendDrift {
+    pub inference_spent: i64,
+    pub service_spent: i64,
+    pub key_count: usize,
+}
+
+impl SpendDrift {
+    pub fn is_zero(&self) -> bool {
+        *self == Self::default()
+    }
+}
+
 impl PreparedSpendBackfill {
-    /// Capture one organization's raw/counter delta without holding its
-    /// accounting lock. The snapshot transaction commits before apply.
+    /// Capture one incomplete organization's raw/counter delta without holding
+    /// its accounting lock. Returns `None` if the organization is already ready.
     pub async fn prepare(
         pool: &DbPool,
         organization_id: Uuid,
         statement_timeout: Duration,
+    ) -> Result<Option<Self>> {
+        Self::snapshot(pool, organization_id, statement_timeout, false).await
+    }
+
+    /// Like `prepare`, but also snapshots ready organizations so drift left by a
+    /// writer that skipped the counters can be measured and repaired.
+    pub async fn prepare_including_ready(
+        pool: &DbPool,
+        organization_id: Uuid,
+        statement_timeout: Duration,
+    ) -> Result<Self> {
+        Self::snapshot(pool, organization_id, statement_timeout, true)
+            .await?
+            .context("snapshot including ready organizations always returns a correction")
+    }
+
+    /// Whether applying would change anything: an incomplete organization still
+    /// needs its readiness marker even when its counters already match.
+    pub fn needs_apply(&self) -> bool {
+        self.snapshot_ready_at.is_none() || !self.drift().is_zero()
+    }
+
+    /// The correction this snapshot would apply.
+    pub fn drift(&self) -> SpendDrift {
+        SpendDrift {
+            inference_spent: self.inference_spent,
+            service_spent: self.service_spent,
+            key_count: self.key_corrections.len(),
+        }
+    }
+
+    async fn snapshot(
+        pool: &DbPool,
+        organization_id: Uuid,
+        statement_timeout: Duration,
+        include_ready: bool,
     ) -> Result<Option<Self>> {
         validate_timeout(statement_timeout)?;
         let mut client = pool
@@ -80,8 +132,8 @@ impl PreparedSpendBackfill {
             }
             bail!("organization {organization_id} does not exist");
         };
-        let ready_at: Option<DateTime<Utc>> = balance.get("spend_counters_ready_at");
-        if ready_at.is_some() {
+        let snapshot_ready_at: Option<DateTime<Utc>> = balance.get("spend_counters_ready_at");
+        if snapshot_ready_at.is_some() && !include_ready {
             transaction
                 .commit()
                 .await
@@ -190,6 +242,7 @@ impl PreparedSpendBackfill {
         Ok(Some(Self {
             pool: pool.clone(),
             organization_id,
+            snapshot_ready_at,
             key_corrections,
             inference_spent,
             service_spent,
@@ -197,7 +250,9 @@ impl PreparedSpendBackfill {
     }
 
     /// Apply the prepared delta under the existing organization accounting lock.
-    /// The completion marker and every counter correction commit atomically.
+    /// The completion marker and every counter correction commit atomically, and
+    /// only if the marker is unchanged since the snapshot: a concurrent run that
+    /// already applied this correction moved it, so each correction lands once.
     pub async fn apply(self) -> Result<SpendBackfillOutcome> {
         let mut client = self
             .pool
@@ -222,7 +277,7 @@ impl PreparedSpendBackfill {
             .await
             .context("rechecking organization spend readiness")?
             .get(0);
-        if ready_at.is_some() {
+        if ready_at != self.snapshot_ready_at {
             transaction
                 .commit()
                 .await
@@ -273,12 +328,14 @@ impl PreparedSpendBackfill {
                     service_spent = service_spent + $3,
                     spend_counters_ready_at = NOW(),
                     updated_at = NOW()
-                WHERE organization_id = $1 AND spend_counters_ready_at IS NULL
+                WHERE organization_id = $1
+                  AND spend_counters_ready_at IS NOT DISTINCT FROM $4
                 "#,
                 &[
                     &self.organization_id,
                     &self.inference_spent,
                     &self.service_spent,
+                    &self.snapshot_ready_at,
                 ],
             )
             .await
@@ -298,9 +355,34 @@ impl PreparedSpendBackfill {
     }
 }
 
+/// Organizations whose split counters do not yet include their raw history.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SpendCounterReadiness {
+    pub missing_balances: i64,
+    pub incomplete: i64,
+}
+
+impl SpendCounterReadiness {
+    pub fn is_ready(&self) -> bool {
+        self.missing_balances == 0 && self.incomplete == 0
+    }
+}
+
 /// Fail unless every organization, including inactive ones, has a balance row
 /// with a completed historical spend snapshot.
 pub async fn ensure_spend_counters_ready(pool: &DbPool) -> Result<()> {
+    let readiness = spend_counter_readiness(pool).await?;
+    if !readiness.is_ready() {
+        bail!(
+            "spend counters are incomplete: {} organizations lack balances, {} remain unreconciled",
+            readiness.missing_balances,
+            readiness.incomplete
+        );
+    }
+    Ok(())
+}
+
+pub async fn spend_counter_readiness(pool: &DbPool) -> Result<SpendCounterReadiness> {
     let client = pool
         .get()
         .await
@@ -322,20 +404,34 @@ pub async fn ensure_spend_counters_ready(pool: &DbPool) -> Result<()> {
         )
         .await
         .context("checking spend counter readiness")?;
-    let missing_balances: i64 = row.get(0);
-    let incomplete: i64 = row.get(1);
-    if missing_balances != 0 || incomplete != 0 {
-        bail!(
-            "spend counters are incomplete: {missing_balances} organizations lack balances, {incomplete} remain unreconciled"
-        );
-    }
-    Ok(())
+    Ok(SpendCounterReadiness {
+        missing_balances: row.get(0),
+        incomplete: row.get(1),
+    })
 }
 
 pub async fn incomplete_organizations(
     pool: &DbPool,
     after: Option<Uuid>,
     limit: i64,
+) -> Result<Vec<Uuid>> {
+    organizations(pool, after, limit, false).await
+}
+
+/// Every organization in keyset order, ready or not, for drift verification.
+pub async fn all_organizations(
+    pool: &DbPool,
+    after: Option<Uuid>,
+    limit: i64,
+) -> Result<Vec<Uuid>> {
+    organizations(pool, after, limit, true).await
+}
+
+async fn organizations(
+    pool: &DbPool,
+    after: Option<Uuid>,
+    limit: i64,
+    include_ready: bool,
 ) -> Result<Vec<Uuid>> {
     let client = pool
         .get()
@@ -349,11 +445,11 @@ pub async fn incomplete_organizations(
             LEFT JOIN organization_balance AS balance
               ON balance.organization_id = organization.id
             WHERE ($1::UUID IS NULL OR organization.id > $1)
-              AND (balance.organization_id IS NULL OR balance.spend_counters_ready_at IS NULL)
+              AND ($3 OR balance.organization_id IS NULL OR balance.spend_counters_ready_at IS NULL)
             ORDER BY organization.id
             LIMIT $2
             "#,
-            &[&after, &limit],
+            &[&after, &limit, &include_ready],
         )
         .await
         .context("listing incomplete spend organizations")?;

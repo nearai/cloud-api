@@ -14,6 +14,8 @@ use uuid::Uuid;
 
 #[path = "spend_counter_backfill/coverage.rs"]
 mod coverage;
+#[path = "spend_counter_backfill/rollout.rs"]
+mod rollout;
 
 struct TestDatabase {
     pool: DbPool,

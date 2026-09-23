@@ -110,11 +110,9 @@ impl services::usage::ports::UsageRepository for OrganizationUsageRepository {
         limit: Option<i64>,
         offset: Option<i64>,
     ) -> anyhow::Result<(Vec<UsageLogEntry>, i64)> {
-        let logs = self
+        let (logs, total) = self
             .get_usage_history(organization_id, limit, offset)
             .await?;
-
-        let total = self.count_usage_history(organization_id).await?;
 
         let entries = logs
             .into_iter()

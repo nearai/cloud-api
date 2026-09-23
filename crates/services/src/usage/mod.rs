@@ -830,7 +830,13 @@ impl UsageServiceTrait for UsageServiceImpl {
             .usage_repository
             .get_usage_history(organization_id, limit, offset)
             .await
-            .map_err(|e| UsageError::InternalError(format!("Failed to get usage history: {e}")))?;
+            .map_err(|e| {
+                if crate::common::is_query_timeout(&e) {
+                    UsageError::ReportingTimeout
+                } else {
+                    UsageError::InternalError(format!("Failed to get usage history: {e}"))
+                }
+            })?;
 
         Ok((logs, total))
     }
@@ -972,7 +978,13 @@ impl UsageServiceTrait for UsageServiceImpl {
         self.usage_repository
             .get_usage_by_model(organization_id, start_date)
             .await
-            .map_err(|e| UsageError::InternalError(format!("Failed to get usage by model: {e}")))
+            .map_err(|e| {
+                if crate::common::is_query_timeout(&e) {
+                    UsageError::ReportingTimeout
+                } else {
+                    UsageError::InternalError(format!("Failed to get usage by model: {e}"))
+                }
+            })
     }
 
     async fn list_inference_usage_report(
@@ -1001,7 +1013,13 @@ impl UsageServiceTrait for UsageServiceImpl {
             .list_inference_usage_history(query)
             .await
             .map_err(|e| {
-                UsageError::InternalError(format!("Failed to list inference usage history: {e}"))
+                if crate::common::is_query_timeout(&e) {
+                    UsageError::ReportingTimeout
+                } else {
+                    UsageError::InternalError(format!(
+                        "Failed to list inference usage history: {e}"
+                    ))
+                }
             })
     }
 }

@@ -858,7 +858,7 @@ async fn settlement_funds_oldest_overages_first() -> anyhow::Result<()> {
         .await?;
 
     set_limit(&limits, org.org_id, "grant", 4).await?;
-    let history = usage_repository
+    let (history, _) = usage_repository
         .get_usage_history(org.org_id, Some(10), Some(0))
         .await?;
     let first_history = history.iter().find(|row| row.id == first.id).unwrap();

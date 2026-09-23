@@ -111,21 +111,39 @@ impl OrganizationUsageRepository {
         Ok(rows.iter().map(row_to_report).collect())
     }
 
+    /// Filtered usage history page plus the exact filtered count. Both queries run
+    /// under the reporting statement timeout: the count reads every matching row,
+    /// and an abandoned request must not keep scanning.
     pub async fn list_inference_usage_history(
         &self,
         query: InferenceUsageHistoryQuery,
     ) -> Result<(Vec<InferenceUsageReportRow>, i64)> {
         validate_history_query(&query)?;
+        let deadline = crate::repositories::reporting_query::reporting_deadline(
+            self.reporting_statement_timeout,
+            None,
+        )?;
 
         let (rows, total) = retry_db!("list_inference_usage_history", {
-            let client = self
+            let mut client = self
                 .pool
                 .get()
                 .await
                 .context("Failed to get database connection")
                 .map_err(RepositoryError::PoolError)?;
 
-            let rows = client
+            let transaction = client
+                .build_transaction()
+                .read_only(true)
+                .start()
+                .await
+                .map_err(map_db_error)?;
+            crate::repositories::reporting_query::configure_reporting_transaction(
+                &transaction,
+                crate::repositories::reporting_query::remaining_statement_timeout(deadline)?,
+            )
+            .await?;
+            let rows = transaction
                 .query(
                     r#"
                     SELECT
@@ -178,7 +196,7 @@ impl OrganizationUsageRepository {
                 .await
                 .map_err(map_db_error)?;
 
-            let count = client
+            let count = transaction
                 .query_one(
                     r#"
                     SELECT COUNT(*)::BIGINT AS count
@@ -205,6 +223,7 @@ impl OrganizationUsageRepository {
                 )
                 .await
                 .map_err(map_db_error)?;
+            transaction.commit().await.map_err(map_db_error)?;
 
             Ok::<(Vec<Row>, i64), RepositoryError>((rows, count.get("count")))
         })?;

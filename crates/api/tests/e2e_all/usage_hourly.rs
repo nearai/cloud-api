@@ -212,3 +212,127 @@ async fn day_parity_ok_after_recompute_and_flags_rows_added_later() {
     assert!(!parity.is_ok());
     assert_eq!(parity.raw.request_count - parity.aggregate.request_count, 1);
 }
+
+async fn delete_org_future_rows(
+    f: &crate::admin_provider_attribution_support::PlatformProviderUsageFixture,
+) {
+    let client = f.database.pool().get().await.unwrap();
+    client
+        .execute(
+            "DELETE FROM organization_usage_log WHERE organization_id = $1",
+            &[&f.organization_id],
+        )
+        .await
+        .unwrap();
+    client
+        .execute(
+            "DELETE FROM usage_hourly WHERE organization_id = $1",
+            &[&f.organization_id],
+        )
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn serial_progress_reports_max_hour_and_next_raw_hour() {
+    let f = setup_platform_provider_usage_fixture().await;
+    let repo = UsageHourlyRepositoryImpl::new(f.database.pool().clone());
+    let base = repo
+        .progress()
+        .await
+        .unwrap()
+        .max_hour
+        .unwrap_or_else(Utc::now)
+        .max(Utc::now());
+    let a = services::usage::trunc_hour(base) + Duration::days(4000);
+    let b = a + Duration::days(3);
+    insert_raw(
+        &f,
+        a + Duration::minutes(15),
+        1,
+        1,
+        None,
+        None,
+        Some("external"),
+    )
+    .await;
+    insert_raw(
+        &f,
+        b + Duration::minutes(15),
+        1,
+        1,
+        None,
+        None,
+        Some("external"),
+    )
+    .await;
+
+    repo.recompute(a, a + Duration::hours(1), true)
+        .await
+        .unwrap();
+    let progress = repo.progress().await.unwrap();
+    assert_eq!(progress.max_hour, Some(a));
+    assert_eq!(progress.next_raw_hour, Some(b)); // jumps the empty span between a+1h and b
+
+    delete_org_future_rows(&f).await;
+}
+
+#[tokio::test]
+async fn serial_concurrent_ticks_write_each_hour_once() {
+    let f = setup_platform_provider_usage_fixture().await;
+    let repo: std::sync::Arc<dyn UsageHourlyRepository> =
+        std::sync::Arc::new(UsageHourlyRepositoryImpl::new(f.database.pool().clone()));
+    let base = repo
+        .progress()
+        .await
+        .unwrap()
+        .max_hour
+        .unwrap_or_else(Utc::now)
+        .max(Utc::now());
+    let h = services::usage::trunc_hour(base) + Duration::days(4000);
+    // Anchor progress just before h so the planned window is deterministic regardless of
+    // other tests' rows: max_hour = h-2h, next_raw_hour = h.
+    insert_raw(
+        &f,
+        h - Duration::hours(2),
+        1,
+        1,
+        None,
+        None,
+        Some("external"),
+    )
+    .await;
+    repo.recompute(h - Duration::hours(2), h - Duration::hours(1), true)
+        .await
+        .unwrap();
+    insert_raw(
+        &f,
+        h + Duration::minutes(1),
+        3,
+        1,
+        None,
+        None,
+        Some("external"),
+    )
+    .await;
+    // Clock so that h is inside the steady 3-hour re-read window: plan = [h-1h, h+2h).
+    let now = h + Duration::hours(2) + Duration::minutes(5);
+
+    let a = services::usage::UsageHourlyScheduler::new(repo.clone());
+    let b = services::usage::UsageHourlyScheduler::new(repo.clone());
+    let (ra, rb) = tokio::join!(a.run_once(now), b.run_once(now));
+    let (ra, rb) = (ra.unwrap(), rb.unwrap());
+    assert!(
+        !ra.skipped || !rb.skipped,
+        "at least one replica recomputes"
+    );
+    assert_eq!(
+        org_rows(&f).await,
+        vec![
+            (h - Duration::hours(2), Some("external".into()), 1, 1, 0, 0),
+            (h, Some("external".into()), 1, 3, 0, 0),
+        ]
+    );
+
+    delete_org_future_rows(&f).await;
+}

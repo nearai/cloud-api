@@ -178,7 +178,7 @@ async fn usage_provider_attribution_round_trips() {
     assert_eq!(legacy.served_provider_tier, None);
     assert!(!legacy.served_via_fallback);
 
-    let rows = repository
+    let (rows, _) = repository
         .get_usage_history(fixture.organization_id, Some(10), Some(0))
         .await
         .expect("usage history should read");

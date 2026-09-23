@@ -15,7 +15,7 @@ use services::common::RepositoryError;
 use services::responses::models::ResponseId;
 use std::collections::HashMap;
 use std::time::Duration;
-use tokio_postgres::Row;
+use tokio_postgres::{IsolationLevel, Row};
 use uuid::Uuid;
 
 #[derive(Debug, Clone)]
@@ -385,51 +385,51 @@ impl OrganizationUsageRepository {
         Ok(row_opt.map(|row| self.row_to_balance(&row)))
     }
 
-    /// Count total usage history records for an organization
-    pub async fn count_usage_history(&self, organization_id: Uuid) -> Result<i64> {
-        let row = retry_db!("count_organization_usage_history", {
-            let client = self
-                .pool
-                .get()
-                .await
-                .context("Failed to get database connection")
-                .map_err(RepositoryError::PoolError)?;
-
-            client
-                .query_one(
-                    r#"
-                    SELECT COUNT(*) as count
-                    FROM organization_usage_log
-                    WHERE organization_id = $1
-                    "#,
-                    &[&organization_id],
-                )
-                .await
-                .map_err(map_db_error)
-        })?;
-
-        Ok(row.get::<_, i64>("count"))
-    }
-
-    /// Get usage history for an organization
+    /// Get one page of an organization's usage history, newest first, with the
+    /// organization's total record count.
+    ///
+    /// The total is `organization_balance.total_requests`, which every inference
+    /// usage insert increments in the same transaction, rather than a `COUNT(*)`
+    /// over the organization's rows: that scan grows with the organization's whole
+    /// history and outlasts client timeouts for large organizations. The counter
+    /// can only over-count: the V0045 duplicate cleanup deleted rows without
+    /// decrementing it. The page query runs under the reporting statement timeout,
+    /// so a deep offset cannot keep scanning after the client has given up.
     pub async fn get_usage_history(
         &self,
         organization_id: Uuid,
         limit: Option<i64>,
         offset: Option<i64>,
-    ) -> Result<Vec<OrganizationUsageLog>> {
+    ) -> Result<(Vec<OrganizationUsageLog>, i64)> {
         let limit = limit.unwrap_or(100);
         let offset = offset.unwrap_or(0);
+        let deadline = crate::repositories::reporting_query::reporting_deadline(
+            self.reporting_statement_timeout,
+            None,
+        )?;
 
-        let rows = retry_db!("get_organization_usage_history", {
-            let client = self
+        let (rows, total) = retry_db!("get_organization_usage_history", {
+            let mut client = self
                 .pool
                 .get()
                 .await
                 .context("Failed to get database connection")
                 .map_err(RepositoryError::PoolError)?;
 
-            client
+            // One snapshot for the page and the total.
+            let transaction = client
+                .build_transaction()
+                .read_only(true)
+                .isolation_level(IsolationLevel::RepeatableRead)
+                .start()
+                .await
+                .map_err(map_db_error)?;
+            crate::repositories::reporting_query::configure_reporting_transaction(
+                &transaction,
+                crate::repositories::reporting_query::remaining_statement_timeout(deadline)?,
+            )
+            .await?;
+            let rows = transaction
                 .query(
                     r#"
                     SELECT ul.*,
@@ -450,12 +450,29 @@ impl OrganizationUsageRepository {
                     &[&organization_id, &limit, &offset],
                 )
                 .await
-                .map_err(map_db_error)
+                .map_err(map_db_error)?;
+            let total: i64 = transaction
+                .query_one(
+                    r#"
+                    SELECT COALESCE(
+                        (SELECT total_requests FROM organization_balance WHERE organization_id = $1),
+                        0
+                    )::BIGINT
+                    "#,
+                    &[&organization_id],
+                )
+                .await
+                .map_err(map_db_error)?
+                .get(0);
+            transaction.commit().await.map_err(map_db_error)?;
+            Ok::<_, RepositoryError>((rows, total))
         })?;
 
-        rows.iter()
+        let logs = rows
+            .iter()
             .map(|row| self.row_to_usage_log(row, true, None))
-            .collect()
+            .collect::<Result<Vec<_>>>()?;
+        Ok((logs, total))
     }
 
     /// Count total usage history records for an API key
@@ -591,20 +608,39 @@ impl OrganizationUsageRepository {
     }
 
     /// Aggregate usage by model for an organization since `start_date`.
+    ///
+    /// Runs under the reporting statement timeout: the aggregate reads every row
+    /// in the window, and an abandoned dashboard request must not keep scanning.
     pub async fn get_usage_by_model_since(
         &self,
         organization_id: Uuid,
         start_date: chrono::DateTime<Utc>,
     ) -> Result<Vec<UsageByModel>> {
+        let deadline = crate::repositories::reporting_query::reporting_deadline(
+            self.reporting_statement_timeout,
+            None,
+        )?;
+
         let rows = retry_db!("get_organization_usage_by_model", {
-            let client = self
+            let mut client = self
                 .pool
                 .get()
                 .await
                 .context("Failed to get database connection")
                 .map_err(RepositoryError::PoolError)?;
 
-            client
+            let transaction = client
+                .build_transaction()
+                .read_only(true)
+                .start()
+                .await
+                .map_err(map_db_error)?;
+            crate::repositories::reporting_query::configure_reporting_transaction(
+                &transaction,
+                crate::repositories::reporting_query::remaining_statement_timeout(deadline)?,
+            )
+            .await?;
+            let rows = transaction
                 .query(
                     r#"
                     SELECT
@@ -623,7 +659,9 @@ impl OrganizationUsageRepository {
                     &[&organization_id, &start_date],
                 )
                 .await
-                .map_err(map_db_error)
+                .map_err(map_db_error)?;
+            transaction.commit().await.map_err(map_db_error)?;
+            Ok::<_, RepositoryError>(rows)
         })?;
 
         Ok(rows

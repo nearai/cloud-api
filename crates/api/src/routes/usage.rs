@@ -267,6 +267,9 @@ pub struct UsageHistoryEntryResponse {
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub struct UsageHistoryResponse {
     pub data: Vec<UsageHistoryEntryResponse>,
+    /// Number of matching records. Without filters this is the organization's
+    /// recorded request count (`total_requests` in the balance), which can exceed
+    /// the rows still stored, so a final page may come back short or empty.
     pub total: usize,
     pub limit: i64,
     pub offset: i64,
@@ -416,7 +419,8 @@ pub async fn get_organization_balance(
         (status = 200, description = "Usage history", body = UsageHistoryResponse),
         (status = 401, description = "Unauthorized", body = ErrorResponse),
         (status = 403, description = "Forbidden", body = ErrorResponse),
-        (status = 500, description = "Internal server error", body = ErrorResponse)
+        (status = 500, description = "Internal server error", body = ErrorResponse),
+        (status = 504, description = "Usage query timed out", body = ErrorResponse)
     ),
     security(
         ("session_token" = [])
@@ -450,15 +454,20 @@ pub async fn get_organization_usage_history(
         .usage_service
         .get_usage_history(organization_id, Some(query.limit), Some(query.offset))
         .await
-        .map_err(|_| {
-            tracing::error!("Failed to get usage history");
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                ResponseJson(ErrorResponse::new(
-                    "Failed to retrieve usage history".to_string(),
-                    "internal_server_error".to_string(),
-                )),
-            )
+        .map_err(|error| match error {
+            services::usage::UsageError::ReportingTimeout => {
+                usage_query_timeout_error(organization_id)
+            }
+            _ => {
+                tracing::error!("Failed to get usage history");
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    ResponseJson(ErrorResponse::new(
+                        "Failed to retrieve usage history".to_string(),
+                        "internal_server_error".to_string(),
+                    )),
+                )
+            }
         })?;
 
     let data = history
@@ -510,7 +519,12 @@ async fn get_filtered_organization_usage_history(
         .usage_service
         .list_inference_usage_history(report_query)
         .await
-        .map_err(|_| internal_usage_history_error("Failed to retrieve usage history"))?;
+        .map_err(|error| match error {
+            services::usage::UsageError::ReportingTimeout => {
+                usage_query_timeout_error(organization_id)
+            }
+            _ => internal_usage_history_error("Failed to retrieve usage history"),
+        })?;
 
     let data = history
         .into_iter()
@@ -706,6 +720,18 @@ fn internal_usage_history_error(message: &str) -> UsageError {
         ResponseJson(ErrorResponse::new(
             message.to_string(),
             "internal_server_error".to_string(),
+        )),
+    )
+}
+
+/// The database cancelled a usage query at the reporting statement timeout.
+fn usage_query_timeout_error(organization_id: Uuid) -> UsageError {
+    tracing::warn!(%organization_id, "Usage query timed out");
+    (
+        StatusCode::GATEWAY_TIMEOUT,
+        ResponseJson(ErrorResponse::new(
+            "Usage query timed out".to_string(),
+            "usage_query_timeout".to_string(),
         )),
     )
 }
@@ -1601,7 +1627,8 @@ pub struct UsageByModelResponse {
         (status = 200, description = "Per-model usage breakdown", body = UsageByModelResponse),
         (status = 401, description = "Unauthorized", body = ErrorResponse),
         (status = 403, description = "Forbidden", body = ErrorResponse),
-        (status = 500, description = "Internal server error", body = ErrorResponse)
+        (status = 500, description = "Internal server error", body = ErrorResponse),
+        (status = 504, description = "Usage query timed out", body = ErrorResponse)
     ),
     security(
         ("session_token" = [])
@@ -1620,15 +1647,20 @@ pub async fn get_organization_usage_by_model(
         .usage_service
         .get_usage_by_model(organization_id, start_date)
         .await
-        .map_err(|e| {
-            tracing::error!(error = ?e, "Failed to get usage by model");
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                ResponseJson(ErrorResponse::new(
-                    "Failed to retrieve usage breakdown".to_string(),
-                    "internal_server_error".to_string(),
-                )),
-            )
+        .map_err(|e| match e {
+            services::usage::UsageError::ReportingTimeout => {
+                usage_query_timeout_error(organization_id)
+            }
+            _ => {
+                tracing::error!(error = ?e, "Failed to get usage by model");
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    ResponseJson(ErrorResponse::new(
+                        "Failed to retrieve usage breakdown".to_string(),
+                        "internal_server_error".to_string(),
+                    )),
+                )
+            }
         })?;
 
     let data = entries

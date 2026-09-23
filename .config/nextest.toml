@@ -44,17 +44,7 @@ test-group = "e2e-db"
 threads-required = "num-test-threads"
 
 [[profile.default.overrides]]
-filter = 'package(api) & binary(e2e_all) & test(/^admin_analytics::test_admin_platform_billing_summary$/)'
-test-group = "e2e-db"
-# Exact before/after platform totals require exclusive access to the shared DB.
-threads-required = "num-test-threads"
-
-[[profile.default.overrides]]
 filter = "package(api) & binary(e2e_all)"
-test-group = "e2e-db"
-
-[[profile.default.overrides]]
-filter = "package(database) & (binary(spend_counter_backfill) | binary(counter_readers))"
 test-group = "e2e-db"
 
 [[profile.default.scripts]]

@@ -86,6 +86,30 @@ fn get_input_bucket(token_count: i32) -> &'static str {
     }
 }
 
+/// True when a streaming chunk carries model-generated output (message
+/// content, reasoning, or a tool-call delta) rather than pure metadata — a
+/// role-only delta, a usage-only frame, an Anthropic `message_start`-shaped
+/// chunk (role + input usage only), or a finish-reason-only frame all return
+/// false. TTFT/ITL tracking in `InterceptStream::poll_next` gates on this so
+/// "time to first token" means time to the first generated output, not time
+/// to the first parsed SSE chunk.
+fn chunk_has_generated_output(chunk: &StreamChunk) -> bool {
+    match chunk {
+        StreamChunk::Chat(chunk) => chunk.choices.iter().any(|choice| {
+            choice.delta.as_ref().is_some_and(|delta| {
+                delta.content.as_deref().is_some_and(|s| !s.is_empty())
+                    || delta
+                        .reasoning_content
+                        .as_deref()
+                        .is_some_and(|s| !s.is_empty())
+                    || delta.reasoning.as_deref().is_some_and(|s| !s.is_empty())
+                    || delta.tool_calls.as_ref().is_some_and(|tc| !tc.is_empty())
+            })
+        }),
+        StreamChunk::Text(chunk) => chunk.choices.iter().any(|choice| !choice.text.is_empty()),
+    }
+}
+
 struct InterceptStream<S>
 where
     S: Stream<Item = Result<SSEEvent, inference_providers::CompletionError>> + Unpin,
@@ -106,7 +130,11 @@ where
     provider_start_time: Instant,
     first_token_received: bool,
     first_token_time: Option<Instant>,
-    /// Time to first token in milliseconds (captured for DB storage)
+    /// Time to first GENERATED output in milliseconds (captured for DB storage
+    /// in `organization_usage_log` and fed to `latency_reporter` for routing).
+    /// Set on the first chunk for which `chunk_has_generated_output` is true —
+    /// role-only deltas, usage-only frames, and Anthropic `message_start`
+    /// (role + input usage only) do not set it.
     ttft_ms: Option<i32>,
     /// Token count for ITL calculation
     token_count: i32,
@@ -268,12 +296,21 @@ where
         )
         .entered();
 
-        // A stream that never produced a first token otherwise vanishes from every
-        // TTFT histogram entirely (TTFT is only recorded on the first chunk), which
-        // biases TTFT percentiles optimistic exactly when things are going wrong.
-        // Record it here, before any early return below, so it always runs once per
+        // A stream that ends without any chunk carrying generated output (content,
+        // reasoning, or tool-call delta — see `chunk_has_generated_output`;
+        // metadata-only chunks like role deltas, usage, or an Anthropic
+        // message_start do not count) otherwise vanishes from every TTFT histogram
+        // entirely (TTFT is only recorded on a chunk with output), which biases
+        // TTFT percentiles optimistic exactly when things are going wrong. Record
+        // it here, before any early return below, so it always runs once per
         // stream (this function is only ever called from `Drop`, which runs once).
         if !self.first_token_received {
+            // `interrupted` also covers client-initiated cancellation: a stream
+            // dropped before the first output has no error and
+            // stream_completed == false, indistinguishable here from an upstream
+            // stall. Don't treat every `interrupted` sample as an SLA breach —
+            // use the paired wait histogram (below) and count a breach only when
+            // the wait exceeded the SLA threshold.
             let reason = if self.last_error.is_some() {
                 REASON_STREAM_ERROR
             } else if !self.stream_completed {
@@ -594,31 +631,42 @@ where
 
                         let now = Instant::now();
 
-                        if !self.first_token_received {
-                            self.first_token_received = true;
-                            self.first_token_time = Some(now);
-                            let backend_ttft = now.duration_since(self.provider_start_time);
-                            let e2e_ttft = now.duration_since(self.service_start_time);
-                            self.ttft_ms = Some(e2e_ttft.as_millis() as i32);
-                            self.last_token_time = Some(now);
-                            let tags_str: Vec<&str> =
-                                self.metric_tags.iter().map(|s| s.as_str()).collect();
-                            self.metrics_service.record_latency(
-                                METRIC_LATENCY_TTFT,
-                                backend_ttft,
-                                &tags_str,
-                            );
-                            self.metrics_service.record_latency(
-                                METRIC_LATENCY_TTFT_TOTAL,
-                                e2e_ttft,
-                                &tags_str,
-                            );
-                        } else if let Some(last_time) = self.last_token_time {
-                            // Calculate inter-token latency.
-                            let itl = now.duration_since(last_time);
-                            self.total_itl_ms += itl.as_secs_f64() * 1000.0;
-                            self.token_count += 1;
-                            self.last_token_time = Some(now);
+                        // TTFT/ITL must track the first GENERATED output, not the first
+                        // parsed chunk: a metadata-only chunk (role-only delta, usage-only
+                        // frame, Anthropic message_start) arriving before any real content
+                        // must not start the TTFT clock or the ITL window — otherwise an
+                        // error right after one records an optimistic TTFT and the stream
+                        // wrongly skips `no_first_token`.
+                        let has_output =
+                            event.chunk.as_ref().is_some_and(chunk_has_generated_output);
+
+                        if has_output {
+                            if !self.first_token_received {
+                                self.first_token_received = true;
+                                self.first_token_time = Some(now);
+                                let backend_ttft = now.duration_since(self.provider_start_time);
+                                let e2e_ttft = now.duration_since(self.service_start_time);
+                                self.ttft_ms = Some(e2e_ttft.as_millis() as i32);
+                                self.last_token_time = Some(now);
+                                let tags_str: Vec<&str> =
+                                    self.metric_tags.iter().map(|s| s.as_str()).collect();
+                                self.metrics_service.record_latency(
+                                    METRIC_LATENCY_TTFT,
+                                    backend_ttft,
+                                    &tags_str,
+                                );
+                                self.metrics_service.record_latency(
+                                    METRIC_LATENCY_TTFT_TOTAL,
+                                    e2e_ttft,
+                                    &tags_str,
+                                );
+                            } else if let Some(last_time) = self.last_token_time {
+                                // Calculate inter-token latency.
+                                let itl = now.duration_since(last_time);
+                                self.total_itl_ms += itl.as_secs_f64() * 1000.0;
+                                self.token_count += 1;
+                                self.last_token_time = Some(now);
+                            }
                         }
 
                         if let Some(StreamChunk::Chat(ref chat_chunk)) = event.chunk {
@@ -2485,7 +2533,9 @@ mod tests {
     use crate::test_utils::{MockAttestationService, MockUsageService};
     use bytes::Bytes;
     use futures::{stream, StreamExt};
-    use inference_providers::models::{ChatChoice, ChatCompletionChunk, FinishReason, TokenUsage};
+    use inference_providers::models::{
+        ChatChoice, ChatCompletionChunk, ChatDelta, FinishReason, TokenUsage,
+    };
     use std::time::Duration;
 
     fn terminal_test_stream(
@@ -2532,6 +2582,120 @@ mod tests {
             requested_service_tier: None,
             provider_service_tier: None,
             latency_reporter: None,
+        }
+    }
+
+    /// Like `terminal_test_stream`, but for the no-first-token tests, which need
+    /// to assert on what got recorded after the stream is dropped.
+    /// `terminal_test_stream` builds its own `CapturingMetricsService` internally
+    /// and never hands back a usable handle to it, so it can't be reused here
+    /// without changing its signature (and every existing caller with it).
+    fn no_first_token_test_stream(
+        metrics_service: Arc<CapturingMetricsService>,
+        events: Vec<Result<SSEEvent, inference_providers::CompletionError>>,
+    ) -> InterceptStream<
+        impl Stream<Item = Result<SSEEvent, inference_providers::CompletionError>> + Unpin,
+    > {
+        let now = Instant::now();
+        let organization_id = Uuid::new_v4();
+        InterceptStream {
+            inner: stream::iter(events),
+            attestation_service: Arc::new(MockAttestationService),
+            usage_service: Arc::new(MockUsageService),
+            metrics_service,
+            request_id: Uuid::new_v4(),
+            organization_id,
+            workspace_id: Uuid::new_v4(),
+            api_key_id: Uuid::new_v4(),
+            model_id: Uuid::new_v4(),
+            model_name: "test-model".to_string(),
+            inference_type: crate::usage::ports::InferenceType::ChatCompletionStream,
+            service_start_time: now,
+            provider_start_time: now,
+            first_token_received: false,
+            first_token_time: None,
+            ttft_ms: None,
+            token_count: 0,
+            last_token_time: None,
+            total_itl_ms: 0.0,
+            metric_tags: CompletionServiceImpl::create_metric_tags("test-model", organization_id),
+            concurrent_counter: None,
+            last_usage_stats: None,
+            last_chat_id: None,
+            stream_completed: false,
+            saw_upstream_done_marker: false,
+            response_id: None,
+            last_finish_reason: None,
+            last_error: None,
+            state: StreamState::Streaming,
+            attestation_supported: true,
+            store_provider_chat_signature: true,
+            provider_attribution: crate::usage::ProviderAttribution::default(),
+            cache_write_cost_per_token: None,
+            requested_service_tier: None,
+            provider_service_tier: None,
+            latency_reporter: None,
+        }
+    }
+
+    /// A chat chunk with a role-only delta (Anthropic `message_start`-shaped):
+    /// no content, reasoning, or tool-call output.
+    fn role_only_chunk() -> SSEEvent {
+        SSEEvent {
+            raw_bytes: Bytes::from("data: ..."),
+            raw_passthrough: true,
+            chunk: Some(StreamChunk::Chat(ChatCompletionChunk {
+                id: "chat-1".to_string(),
+                object: "chat.completion.chunk".to_string(),
+                created: 1234567890,
+                model: "test-model".to_string(),
+                choices: vec![ChatChoice {
+                    index: 0,
+                    delta: Some(ChatDelta {
+                        role: Some(inference_providers::models::MessageRole::Assistant),
+                        ..Default::default()
+                    }),
+                    logprobs: None,
+                    finish_reason: None,
+                    token_ids: None,
+                }],
+                usage: None,
+                service_tier: None,
+                prompt_token_ids: None,
+                system_fingerprint: None,
+                modality: None,
+                extra: Default::default(),
+            })),
+        }
+    }
+
+    /// A chat chunk carrying real generated content.
+    fn content_chunk(text: &str) -> SSEEvent {
+        SSEEvent {
+            raw_bytes: Bytes::from("data: ..."),
+            raw_passthrough: true,
+            chunk: Some(StreamChunk::Chat(ChatCompletionChunk {
+                id: "chat-1".to_string(),
+                object: "chat.completion.chunk".to_string(),
+                created: 1234567890,
+                model: "test-model".to_string(),
+                choices: vec![ChatChoice {
+                    index: 0,
+                    delta: Some(ChatDelta {
+                        content: Some(text.to_string()),
+                        ..Default::default()
+                    }),
+                    logprobs: None,
+                    finish_reason: None,
+                    token_ids: None,
+                }],
+                usage: None,
+                service_tier: None,
+                prompt_token_ids: None,
+                system_fingerprint: None,
+                modality: None,
+                extra: Default::default(),
+            })),
         }
     }
 
@@ -2656,7 +2820,9 @@ mod tests {
         let api_key_id = Uuid::new_v4();
         let model_id = Uuid::new_v4();
 
-        // Create a stream with a content chunk and a usage chunk
+        // Create a stream with a content chunk (real generated output, so it
+        // sets first_token_received/TTFT under the generated-output semantics)
+        // and a usage chunk (metadata-only: delta: None).
         let content_chunk = SSEEvent {
             raw_bytes: Bytes::from("data: ..."),
             raw_passthrough: true,
@@ -2665,7 +2831,16 @@ mod tests {
                 object: "chat.completion.chunk".to_string(),
                 created: 1234567890,
                 model: "test-model".to_string(),
-                choices: vec![],
+                choices: vec![ChatChoice {
+                    index: 0,
+                    delta: Some(ChatDelta {
+                        content: Some("hello".to_string()),
+                        ..Default::default()
+                    }),
+                    logprobs: None,
+                    finish_reason: None,
+                    token_ids: None,
+                }],
                 usage: None,
                 service_tier: None,
                 prompt_token_ids: None,
@@ -2965,7 +3140,9 @@ mod tests {
         let api_key_id = Uuid::new_v4();
         let model_id = Uuid::new_v4();
 
-        // Create multiple content chunks to test ITL calculation
+        // Create multiple content chunks to test ITL calculation. Each carries a
+        // real content delta (generated output) so it counts as a token under
+        // the generated-output TTFT/ITL semantics.
         let chunk1 = SSEEvent {
             raw_bytes: Bytes::from("data: chunk1"),
             raw_passthrough: true,
@@ -2974,7 +3151,16 @@ mod tests {
                 object: "chat.completion.chunk".to_string(),
                 created: 1234567890,
                 model: "test-model".to_string(),
-                choices: vec![],
+                choices: vec![ChatChoice {
+                    index: 0,
+                    delta: Some(ChatDelta {
+                        content: Some("chunk1".to_string()),
+                        ..Default::default()
+                    }),
+                    logprobs: None,
+                    finish_reason: None,
+                    token_ids: None,
+                }],
                 usage: None,
                 service_tier: None,
                 prompt_token_ids: None,
@@ -2992,7 +3178,16 @@ mod tests {
                 object: "chat.completion.chunk".to_string(),
                 created: 1234567890,
                 model: "test-model".to_string(),
-                choices: vec![],
+                choices: vec![ChatChoice {
+                    index: 0,
+                    delta: Some(ChatDelta {
+                        content: Some("chunk2".to_string()),
+                        ..Default::default()
+                    }),
+                    logprobs: None,
+                    finish_reason: None,
+                    token_ids: None,
+                }],
                 usage: None,
                 service_tier: None,
                 prompt_token_ids: None,
@@ -3114,8 +3309,7 @@ mod tests {
     #[tokio::test]
     async fn test_create_metric_tags_includes_model_and_environment() {
         // A random org id has no configured `METRICS_CLIENT_ORG_LABELS` entry
-        // (the OnceLock-backed lookup is env-independent here, see
-        // `client_label::tests::client_label_falls_back_to_other_when_env_unset`),
+        // (see `client_label::tests::client_label_is_other_for_unmapped_org`),
         // so it must collapse to the bounded "other" label.
         let tags = CompletionServiceImpl::create_metric_tags("gpt-4", Uuid::new_v4());
 
@@ -3139,7 +3333,8 @@ mod tests {
         let api_key_id = Uuid::new_v4();
         let model_id = Uuid::new_v4();
 
-        // Single chunk with usage (no inter-token latency to measure)
+        // Single chunk with both a real content delta (the only generated
+        // token — no inter-token latency to measure) and usage.
         let usage_chunk = SSEEvent {
             raw_bytes: Bytes::from("data: usage"),
             raw_passthrough: true,
@@ -3150,7 +3345,10 @@ mod tests {
                 model: "test-model".to_string(),
                 choices: vec![ChatChoice {
                     index: 0,
-                    delta: None,
+                    delta: Some(ChatDelta {
+                        content: Some("hi".to_string()),
+                        ..Default::default()
+                    }),
                     logprobs: None,
                     finish_reason: Some(FinishReason::Stop),
                     token_ids: None,
@@ -3232,57 +3430,14 @@ mod tests {
     #[tokio::test]
     async fn test_no_first_token_error_records_no_first_token_metric_not_ttft() {
         let metrics_service = Arc::new(CapturingMetricsService::new());
-        let attestation_service = Arc::new(MockAttestationService);
-        let usage_service = Arc::new(MockUsageService);
-
-        let organization_id = Uuid::new_v4();
-        let now = Instant::now();
 
         // A provider error arrives before any chunk was ever produced.
-        let stream = stream::iter(vec![Err(
-            inference_providers::CompletionError::CompletionError(
+        let intercept_stream = no_first_token_test_stream(
+            metrics_service.clone(),
+            vec![Err(inference_providers::CompletionError::CompletionError(
                 "provider error before any token".to_string(),
-            ),
-        )]);
-
-        let intercept_stream = InterceptStream {
-            inner: stream,
-            attestation_service,
-            usage_service,
-            metrics_service: metrics_service.clone(),
-            request_id: Uuid::new_v4(),
-            organization_id,
-            workspace_id: Uuid::new_v4(),
-            api_key_id: Uuid::new_v4(),
-            model_id: Uuid::new_v4(),
-            model_name: "test-model".to_string(),
-            inference_type: crate::usage::ports::InferenceType::ChatCompletionStream,
-            service_start_time: now,
-            provider_start_time: now,
-            first_token_received: false,
-            first_token_time: None,
-            ttft_ms: None,
-            token_count: 0,
-            last_token_time: None,
-            total_itl_ms: 0.0,
-            metric_tags: CompletionServiceImpl::create_metric_tags("test-model", organization_id),
-            concurrent_counter: None,
-            last_usage_stats: None,
-            last_chat_id: None,
-            stream_completed: false,
-            saw_upstream_done_marker: false,
-            response_id: None,
-            last_finish_reason: None,
-            last_error: None,
-            state: StreamState::Streaming,
-            attestation_supported: true,
-            store_provider_chat_signature: true,
-            provider_attribution: crate::usage::ProviderAttribution::default(),
-            cache_write_cost_per_token: None,
-            requested_service_tier: None,
-            provider_service_tier: None,
-            latency_reporter: None,
-        };
+            ))],
+        );
 
         let _ = intercept_stream.collect::<Vec<_>>().await;
         // record_usage_and_metrics runs synchronously in Drop (it only spawns
@@ -3314,82 +3469,91 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_no_first_token_metadata_only_chunk_then_error_records_no_first_token_not_ttft() {
+        let metrics_service = Arc::new(CapturingMetricsService::new());
+
+        // Role-only delta (Anthropic message_start-shaped), then a provider
+        // error — no chunk ever carried generated output.
+        let mut intercept_stream = no_first_token_test_stream(
+            metrics_service.clone(),
+            vec![
+                Ok(role_only_chunk()),
+                Err(inference_providers::CompletionError::CompletionError(
+                    "provider error after metadata-only chunk".to_string(),
+                )),
+            ],
+        );
+
+        let _ = intercept_stream.by_ref().collect::<Vec<_>>().await;
+        assert!(
+            !intercept_stream.first_token_received,
+            "a role-only delta must not count as the first token"
+        );
+        assert!(intercept_stream.ttft_ms.is_none());
+        drop(intercept_stream);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let metrics = metrics_service.get_metrics();
+
+        let no_first_token = metrics
+            .iter()
+            .find(|m| m.name == METRIC_STREAMING_NO_FIRST_TOKEN)
+            .expect("no_first_token metric missing");
+        assert!(matches!(no_first_token.value, MetricValue::Count(1)));
+        assert!(no_first_token
+            .tags
+            .contains(&format!("{TAG_REASON}:{REASON_STREAM_ERROR}")));
+
+        assert!(
+            !metrics.iter().any(|m| m.name == METRIC_LATENCY_TTFT),
+            "a metadata-only chunk must not record TTFT"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_ttft_recorded_once_at_content_chunk_after_role_only_chunk() {
+        let metrics_service = Arc::new(CapturingMetricsService::new());
+
+        let mut intercept_stream = no_first_token_test_stream(
+            metrics_service.clone(),
+            vec![Ok(role_only_chunk()), Ok(content_chunk("hello"))],
+        );
+
+        let _ = intercept_stream.by_ref().collect::<Vec<_>>().await;
+        assert!(
+            intercept_stream.first_token_received,
+            "the content chunk must count as the first token"
+        );
+        assert!(intercept_stream.ttft_ms.is_some());
+        drop(intercept_stream);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let metrics = metrics_service.get_metrics();
+        let ttft_samples: Vec<_> = metrics
+            .iter()
+            .filter(|m| m.name == METRIC_LATENCY_TTFT)
+            .collect();
+        assert_eq!(
+            ttft_samples.len(),
+            1,
+            "exactly one TTFT sample, recorded at the content chunk, not the role-only chunk"
+        );
+        assert!(
+            !metrics
+                .iter()
+                .any(|m| m.name == METRIC_STREAMING_NO_FIRST_TOKEN),
+            "a stream that eventually produced output must not record no_first_token"
+        );
+    }
+
+    #[tokio::test]
     async fn test_no_first_token_metric_not_recorded_when_a_token_arrives() {
         let metrics_service = Arc::new(CapturingMetricsService::new());
-        let attestation_service = Arc::new(MockAttestationService);
-        let usage_service = Arc::new(MockUsageService);
 
-        let organization_id = Uuid::new_v4();
-        let now = Instant::now();
-
-        let usage_chunk = SSEEvent {
-            raw_bytes: Bytes::from("data: usage"),
-            raw_passthrough: true,
-            chunk: Some(StreamChunk::Chat(ChatCompletionChunk {
-                id: "chat-1".to_string(),
-                object: "chat.completion.chunk".to_string(),
-                created: 1234567890,
-                model: "test-model".to_string(),
-                choices: vec![ChatChoice {
-                    index: 0,
-                    delta: None,
-                    logprobs: None,
-                    finish_reason: Some(FinishReason::Stop),
-                    token_ids: None,
-                }],
-                usage: Some(TokenUsage {
-                    prompt_tokens: 5,
-                    completion_tokens: 1,
-                    total_tokens: 6,
-                    prompt_tokens_details: None,
-                }),
-                service_tier: None,
-                prompt_token_ids: None,
-                modality: None,
-                system_fingerprint: None,
-                extra: Default::default(),
-            })),
-        };
-
-        let stream = stream::iter(vec![Ok(usage_chunk)]);
-        let intercept_stream = InterceptStream {
-            inner: stream,
-            attestation_service,
-            usage_service,
-            metrics_service: metrics_service.clone(),
-            request_id: Uuid::new_v4(),
-            organization_id,
-            workspace_id: Uuid::new_v4(),
-            api_key_id: Uuid::new_v4(),
-            model_id: Uuid::new_v4(),
-            model_name: "test-model".to_string(),
-            inference_type: crate::usage::ports::InferenceType::ChatCompletionStream,
-            service_start_time: now,
-            provider_start_time: now,
-            first_token_received: false,
-            first_token_time: None,
-            ttft_ms: None,
-            token_count: 0,
-            last_token_time: None,
-            total_itl_ms: 0.0,
-            metric_tags: CompletionServiceImpl::create_metric_tags("test-model", organization_id),
-            concurrent_counter: None,
-            last_usage_stats: None,
-            last_chat_id: None,
-            stream_completed: false,
-            saw_upstream_done_marker: false,
-            response_id: None,
-            last_finish_reason: None,
-            last_error: None,
-            state: StreamState::Streaming,
-            attestation_supported: true,
-            store_provider_chat_signature: true,
-            provider_attribution: crate::usage::ProviderAttribution::default(),
-            cache_write_cost_per_token: None,
-            requested_service_tier: None,
-            provider_service_tier: None,
-            latency_reporter: None,
-        };
+        // A real content delta, not a usage-only/role-only frame: this is what
+        // must count as "a token arrived" under the generated-output semantics.
+        let intercept_stream =
+            no_first_token_test_stream(metrics_service.clone(), vec![Ok(content_chunk("hi"))]);
 
         let _ = intercept_stream.collect::<Vec<_>>().await;
         tokio::time::sleep(Duration::from_millis(100)).await;

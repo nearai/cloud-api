@@ -1,5 +1,5 @@
 pub mod capturing;
-pub mod client_label;
+mod client_label;
 pub mod consts;
 
 pub use client_label::client_label;

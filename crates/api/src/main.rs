@@ -58,6 +58,11 @@ async fn main() {
     let metrics_service =
         Arc::new(OtlpMetricsService::new(&meter_provider)) as Arc<dyn MetricsServiceTrait>;
 
+    // Eagerly resolve METRICS_CLIENT_ORG_LABELS now so a malformed env var
+    // (and the one-time "labels initialized" info log) surface at startup,
+    // not on the first request that happens to hit `create_metric_tags`.
+    services::metrics::client_label(uuid::Uuid::nil());
+
     let domain_services = init_domain_services(
         database.clone(),
         &config,

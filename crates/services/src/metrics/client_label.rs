@@ -11,6 +11,7 @@
 //! several org ids (e.g. `brave=96c6...,brave=fb0f...`).
 
 use std::collections::HashMap;
+use std::env::VarError;
 use std::sync::OnceLock;
 
 use uuid::Uuid;
@@ -21,12 +22,30 @@ const OTHER_LABEL: &str = "other";
 /// Hard cap on distinct labels, to keep the `client` tag low-cardinality.
 const MAX_DISTINCT_LABELS: usize = 16;
 
+/// Read `METRICS_CLIENT_ORG_LABELS`, treating both "unset" and "set but not
+/// valid Unicode" as an empty config (the latter warns first — an env var
+/// that can't even be decoded is almost certainly a deployment mistake, not
+/// an intentional empty value).
+fn read_env() -> String {
+    match std::env::var("METRICS_CLIENT_ORG_LABELS") {
+        Ok(raw) => raw,
+        Err(VarError::NotPresent) => String::new(),
+        Err(VarError::NotUnicode(_)) => {
+            tracing::warn!("METRICS_CLIENT_ORG_LABELS: value is not valid Unicode, ignoring");
+            String::new()
+        }
+    }
+}
+
 /// Parse `METRICS_CLIENT_ORG_LABELS` into an org id -> label map.
 ///
 /// Invalid entries (bad label syntax, unparseable uuid, the reserved `other`
-/// label, or a distinct label beyond the cardinality cap) are skipped with a
-/// `tracing::warn!` rather than failing the whole parse — one bad entry
-/// should not take down every other configured client label.
+/// label, a duplicate mapping for an org id already seen, or a distinct label
+/// beyond the cardinality cap) are skipped with a `tracing::warn!` rather than
+/// failing the whole parse — one bad entry should not take down every other
+/// configured client label. When the same org id is listed twice, the FIRST
+/// mapping wins; the later entry is skipped and never burns a slot in the
+/// distinct-label cap.
 fn parse_client_org_labels(raw: &str) -> HashMap<Uuid, String> {
     let mut labels: HashMap<Uuid, String> = HashMap::new();
     let mut distinct_labels: std::collections::HashSet<String> = std::collections::HashSet::new();
@@ -64,6 +83,16 @@ fn parse_client_org_labels(raw: &str) -> HashMap<Uuid, String> {
             continue;
         };
 
+        if let Some(existing_label) = labels.get(&org_id) {
+            tracing::warn!(
+                %org_id,
+                existing_label,
+                skipped_label = label,
+                "METRICS_CLIENT_ORG_LABELS: org id already mapped, first mapping wins"
+            );
+            continue;
+        }
+
         if !distinct_labels.contains(label) && distinct_labels.len() >= MAX_DISTINCT_LABELS {
             tracing::warn!(
                 label,
@@ -93,8 +122,23 @@ fn is_valid_label(label: &str) -> bool {
 fn client_org_labels() -> &'static HashMap<Uuid, String> {
     static LABELS: OnceLock<HashMap<Uuid, String>> = OnceLock::new();
     LABELS.get_or_init(|| {
-        let raw = std::env::var("METRICS_CLIENT_ORG_LABELS").unwrap_or_default();
-        parse_client_org_labels(&raw)
+        let raw = read_env();
+        let labels = parse_client_org_labels(&raw);
+
+        // Log once. `main.rs` calls `client_label` eagerly right after the
+        // metrics service is built, so this fires at startup and a malformed
+        // env var is visible immediately rather than discovered mid-request.
+        // No org ids here — labels only.
+        let mut distinct_labels: Vec<&str> = labels.values().map(String::as_str).collect();
+        distinct_labels.sort_unstable();
+        distinct_labels.dedup();
+        tracing::info!(
+            mapped_orgs = labels.len(),
+            labels = ?distinct_labels,
+            "METRICS_CLIENT_ORG_LABELS initialized"
+        );
+
+        labels
     })
 }
 
@@ -182,10 +226,29 @@ mod tests {
     }
 
     #[test]
-    fn client_label_falls_back_to_other_when_env_unset() {
-        // The OnceLock-backed path does not depend on the process env var
-        // being set in this test process; regardless of its value, an
-        // unmapped random org id must fall back to "other".
+    fn duplicate_org_id_keeps_first_mapping_and_does_not_burn_a_cap_slot() {
+        let org = Uuid::new_v4();
+        // Same org id mapped to two different labels: the first wins. Fill the
+        // rest of the cap afterwards to prove the skipped second entry never
+        // consumed a distinct-label slot.
+        let mut raw = format!("brave={org},openrouter={org}");
+        let mut orgs = Vec::new();
+        for i in 0..(MAX_DISTINCT_LABELS - 1) {
+            let extra_org = Uuid::new_v4();
+            orgs.push(extra_org);
+            raw.push_str(&format!(",label{i}={extra_org}"));
+        }
+
+        let labels = parse_client_org_labels(&raw);
+        assert_eq!(labels.get(&org).map(String::as_str), Some("brave"));
+        assert_eq!(labels.len(), MAX_DISTINCT_LABELS);
+        for extra_org in &orgs {
+            assert!(labels.contains_key(extra_org));
+        }
+    }
+
+    #[test]
+    fn client_label_is_other_for_unmapped_org() {
         assert_eq!(client_label(Uuid::new_v4()), "other");
     }
 }

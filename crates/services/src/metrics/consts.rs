@@ -35,10 +35,13 @@ pub const TAG_RESULT: &str = "result";
 
 // Usage/engagement metrics
 pub const METRIC_REQUEST_COUNT: &str = "cloud_api.request.count";
-// Streams that ended (Drop) without ever producing a first token. Without
-// this, those streams simply vanish from the TTFT histograms, which biases
-// TTFT percentiles optimistic during an outage (the worst streams never
-// report a TTFT sample at all). Tagged `reason` (error|interrupted|empty).
+// A stream ended (Drop) without any chunk carrying generated output (content,
+// reasoning, or tool-call delta); metadata-only chunks (role, usage, Anthropic
+// message_start) do not count. Without this, those streams simply vanish from
+// the TTFT histograms, which biases TTFT percentiles optimistic during an
+// outage (the worst streams never report a TTFT sample at all). Tagged
+// `reason` (error|interrupted|empty) — see the reason consts below for what
+// each means and how to use `reason` in an SLA query.
 pub const METRIC_STREAMING_NO_FIRST_TOKEN: &str = "cloud_api.streaming.no_first_token";
 pub const METRIC_TOKENS_INPUT: &str = "cloud_api.tokens.input";
 pub const METRIC_TOKENS_OUTPUT: &str = "cloud_api.tokens.output";
@@ -120,7 +123,14 @@ pub const REASON_REPOSITORY_ERROR: &str = "repository_error";
 pub const REASON_TOKEN_OVERFLOW: &str = "overflow";
 pub const REASON_MISSING_USAGE: &str = "missing_usage";
 
-// Reasons for cloud_api.streaming.no_first_token
+// Reasons for cloud_api.streaming.no_first_token. `interrupted` includes
+// client-initiated cancellation: a stream dropped before the first output has
+// no error and stream_completed == false, which is indistinguishable inside
+// Drop from an upstream stall. Do not treat every `interrupted` sample as an
+// SLA breach — a client hanging up in the first 50ms is not a failure. Count
+// a no-first-token stream as a breach only when its wait (the paired
+// `cloud_api.latency.streaming_no_first_token_wait` histogram) exceeded the
+// SLA threshold.
 pub const REASON_STREAM_ERROR: &str = "error";
 pub const REASON_STREAM_INTERRUPTED: &str = "interrupted";
 pub const REASON_STREAM_EMPTY: &str = "empty";

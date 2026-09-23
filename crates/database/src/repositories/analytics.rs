@@ -2,6 +2,7 @@
 //!
 //! All costs use fixed scale 9 (nano-dollars) and USD currency.
 
+mod pagination;
 mod provider_attribution;
 
 use super::{reporting_query, utils::map_db_error};
@@ -661,26 +662,6 @@ impl AnalyticsRepository for PgAnalyticsRepository {
         "#;
         let model_like = query.model_search.as_ref().map(|s| format!("%{s}%"));
 
-        // Total = number of matching model groups (correct even when offset >= total).
-        let count_sql = format!(
-            "SELECT COUNT(*)::bigint FROM (SELECT 1 FROM organization_usage_log ul \
-             LEFT JOIN models m ON m.id = ul.model_id {where_clause} GROUP BY ul.model_name) t"
-        );
-        let total: i64 = client
-            .query_one(
-                &count_sql,
-                &[
-                    &query.start,
-                    &query.end,
-                    &query.verifiable,
-                    &query.provider_type,
-                    &model_like,
-                ],
-            )
-            .await
-            .map_err(|e| RepositoryError::DatabaseError(e.into()))?
-            .get(0);
-
         let data_sql = format!(
             r#"
             SELECT
@@ -694,7 +675,8 @@ impl AnalyticsRepository for PgAnalyticsRepository {
                 AVG(ul.ttft_ms)::double precision as avg_ttft_ms,
                 PERCENTILE_CONT(0.95) WITHIN GROUP (ORDER BY ul.ttft_ms)::double precision as p95_ttft_ms,
                 COUNT(*) FILTER (WHERE ul.served_via_fallback)::bigint as fallback_requests,
-                COALESCE(SUM(ul.total_cost) FILTER (WHERE ul.served_via_fallback), 0)::bigint as fallback_cost_nano
+                COALESCE(SUM(ul.total_cost) FILTER (WHERE ul.served_via_fallback), 0)::bigint as fallback_cost_nano,
+                COUNT(*) OVER ()::bigint as total_groups
             FROM organization_usage_log ul
             LEFT JOIN models m ON m.id = ul.model_id
             {where_clause}
@@ -718,6 +700,24 @@ impl AnalyticsRepository for PgAnalyticsRepository {
             )
             .await
             .map_err(|e| RepositoryError::DatabaseError(e.into()))?;
+        let count_sql = format!(
+            "SELECT COUNT(*)::bigint FROM (SELECT 1 FROM organization_usage_log ul \
+             LEFT JOIN models m ON m.id = ul.model_id {where_clause} GROUP BY ul.model_name) t"
+        );
+        let total = pagination::page_total(
+            &client,
+            &rows,
+            query.offset,
+            &count_sql,
+            &[
+                &query.start,
+                &query.end,
+                &query.verifiable,
+                &query.provider_type,
+                &model_like,
+            ],
+        )
+        .await?;
 
         let mut data: Vec<ModelRevenueEntry> = rows
             .iter()
@@ -793,7 +793,8 @@ impl AnalyticsRepository for PgAnalyticsRepository {
                 (COALESCE(SUM(ul.input_tokens), 0) + COALESCE(SUM(ul.output_tokens), 0))::bigint as tokens,
                 COUNT(DISTINCT ul.model_name)::bigint as models_used,
                 BOOL_OR(p.organization_id IS NOT NULL) as is_paying,
-                MAX(ul.created_at) as last_usage_at
+                MAX(ul.created_at) as last_usage_at,
+                COUNT(*) OVER ()::bigint as total_groups
             FROM organizations o
             INNER JOIN organization_usage_log ul ON ul.organization_id = o.id
                 AND ul.created_at >= $1 AND ul.created_at < $2
@@ -803,17 +804,6 @@ impl AnalyticsRepository for PgAnalyticsRepository {
             GROUP BY o.id, o.name
             HAVING ($3::bool IS NULL OR BOOL_OR(p.organization_id IS NOT NULL) = $3)
         "#;
-
-        // Total = matching org groups after HAVING (correct when offset >= total).
-        let count_sql = format!("SELECT COUNT(*)::bigint FROM ({cte_and_from}) t");
-        let total: i64 = client
-            .query_one(
-                &count_sql,
-                &[&query.start, &query.end, &query.paying, &org_like],
-            )
-            .await
-            .map_err(|e| RepositoryError::DatabaseError(e.into()))?
-            .get(0);
 
         let data_sql = format!("{cte_and_from} ORDER BY {sort_col} DESC LIMIT $5 OFFSET $6");
         let rows = client
@@ -830,6 +820,15 @@ impl AnalyticsRepository for PgAnalyticsRepository {
             )
             .await
             .map_err(|e| RepositoryError::DatabaseError(e.into()))?;
+        let count_sql = format!("SELECT COUNT(*)::bigint FROM ({cte_and_from}) t");
+        let total = pagination::page_total(
+            &client,
+            &rows,
+            query.offset,
+            &count_sql,
+            &[&query.start, &query.end, &query.paying, &org_like],
+        )
+        .await?;
 
         let data: Vec<OrgRevenueEntry> = rows
             .iter()

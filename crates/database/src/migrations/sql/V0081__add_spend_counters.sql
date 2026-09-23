@@ -12,10 +12,21 @@ SET LOCAL lock_timeout = '3s';
 
 -- Idempotent, so an image rollback only needs this migration's history row
 -- removed; the next deploy re-applies it without touching the existing columns.
+-- IF NOT EXISTS only compares names. That is safe here: the columns can only
+-- exist from an earlier apply of this migration.
 ALTER TABLE organization_balance
     ADD COLUMN IF NOT EXISTS inference_spent BIGINT NOT NULL DEFAULT 0,
     ADD COLUMN IF NOT EXISTS service_spent BIGINT NOT NULL DEFAULT 0,
     ADD COLUMN IF NOT EXISTS spend_counters_ready_at TIMESTAMPTZ;
+
+-- A re-apply means a pre-counter image served traffic since the last apply. It
+-- recorded usage without updating the counters, and the default below stamped
+-- any balance row it created as reconciled. Clear readiness so readers use raw
+-- history until backfill-spend-counters reconciles each organization again.
+-- Matches no rows on the first apply, where the column was just added.
+UPDATE organization_balance
+SET spend_counters_ready_at = NULL
+WHERE spend_counters_ready_at IS NOT NULL;
 
 -- Mark whether an organization's split spend counters include its historical logs.
 -- Existing organizations remain NULL until the backfill operator completes them.

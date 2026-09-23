@@ -340,6 +340,96 @@ async fn deploy_from_pre_counter_schema_serves_raw_then_counters() -> anyhow::Re
     .await
 }
 
+/// A bare organization; the V0004 trigger creates its balance row.
+async fn insert_organization(pool: &DbPool) -> anyhow::Result<Uuid> {
+    let organization_id = Uuid::new_v4();
+    pool.get()
+        .await?
+        .execute(
+            "INSERT INTO organizations (id, name, created_at, updated_at)
+             VALUES ($1, $2, NOW(), NOW())",
+            &[
+                &organization_id,
+                &format!("org-{}", organization_id.simple()),
+            ],
+        )
+        .await?;
+    Ok(organization_id)
+}
+
+/// Rolling back to a pre-counter image deletes V0081's history row so the old
+/// image starts, and the next deploy re-applies V0081. Nothing the old image
+/// wrote reached the counters, so the re-apply must send readers back to raw
+/// history until the backfill reconciles again.
+#[tokio::test]
+async fn redeploy_after_rollback_resets_readiness_until_backfill() -> anyhow::Result<()> {
+    run_backfill_test(|database| async move {
+        let pool = database.pool.clone();
+        let fixture = fixture(&pool).await?;
+        OrganizationUsageRepository::new(pool.clone())
+            .record_usage(inference_request(&fixture, 5 * USD))
+            .await?;
+        assert!(ready_at(&pool, fixture.organization_id).await?.is_some());
+
+        pool.get()
+            .await?
+            .execute(
+                "DELETE FROM refinery_schema_history WHERE version = 81",
+                &[],
+            )
+            .await?;
+        // The pre-counter image records usage without counting it, and the
+        // surviving default stamps the balance rows of organizations it creates.
+        insert_inference(&pool, &fixture, fixture.mixed_key, 100 * USD).await?;
+        let created_during_rollback = insert_organization(&pool).await?;
+        assert!(ready_at(&pool, created_during_rollback).await?.is_some());
+
+        migrations::run(&pool).await?;
+        let reapplied: i64 = pool
+            .get()
+            .await?
+            .query_one(
+                "SELECT COUNT(*) FROM refinery_schema_history WHERE version = 81",
+                &[],
+            )
+            .await?
+            .get(0);
+        assert_eq!(reapplied, 1);
+        assert!(ready_at(&pool, fixture.organization_id).await?.is_none());
+        assert!(ready_at(&pool, created_during_rollback).await?.is_none());
+        assert_eq!(
+            counted(&pool, fixture.organization_id, fixture.mixed_key).await?,
+            (5 * USD, 5 * USD),
+            "the re-apply must leave the counters alone"
+        );
+        let usage = OrganizationUsageRepository::new(pool.clone());
+        assert_eq!(usage.get_api_key_spend(fixture.mixed_key).await?, 105 * USD);
+        let created_after_redeploy = insert_organization(&pool).await?;
+        assert!(ready_at(&pool, created_after_redeploy).await?.is_some());
+
+        let output = run_cli(&database.database_name, &[]).await?;
+        assert!(
+            output.status.success(),
+            "backfill failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(spend_counter_readiness(&pool).await?.is_ready());
+        assert_eq!(
+            counted(&pool, fixture.organization_id, fixture.mixed_key).await?,
+            (105 * USD, 105 * USD)
+        );
+        assert_eq!(usage.get_api_key_spend(fixture.mixed_key).await?, 105 * USD);
+        let verify = run_cli(&database.database_name, &["--include-ready", "--dry-run"]).await?;
+        assert!(
+            verify.status.success(),
+            "post-backfill verification found drift: {}",
+            String::from_utf8_lossy(&verify.stderr)
+        );
+        Ok(())
+    })
+    .await
+}
+
 /// A balance row is created with its organization (V0004), so a missing one is
 /// an anomaly, not an empty organization: raw history may still exist.
 #[tokio::test]

@@ -1,3 +1,4 @@
+use crate::repositories::credit_allocation::aggregate_credit_capacity;
 use crate::repositories::OrganizationLimitsRepository;
 use services::usage::ports::{OrganizationCreditLimit, OrganizationLimit};
 use uuid::Uuid;
@@ -19,16 +20,12 @@ impl services::usage::ports::OrganizationLimitsRepository for OrganizationLimits
         // All active types, including postpay, authorize usage. Postpay is a
         // contract safety ceiling rather than prepaid cash, but excluding it
         // here would leave a postpay-only organization unable to run requests.
-        let total_spend_limit = limits
-            .iter()
-            .map(|status| status.limit.spend_limit)
-            .fold(0_i64, i64::saturating_add);
-        let available = limits
-            .iter()
-            .map(|status| status.available)
-            .fold(0_i64, i64::saturating_add)
-            .saturating_sub(unattributed)
-            .max(0);
+        let (total_spend_limit, available) = aggregate_credit_capacity(
+            limits
+                .iter()
+                .map(|status| (status.limit.spend_limit, status.consumed)),
+            unattributed,
+        );
         Ok(Some(OrganizationLimit {
             spend_limit: total_spend_limit,
             available,

@@ -51,8 +51,7 @@ impl StakingFarmPreflightSync for services::staking_farm::StakingFarmService {
 pub struct UsageState {
     pub usage_service: Arc<dyn UsageServiceTrait + Send + Sync>,
     pub staking_farm_service: Arc<services::staking_farm::StakingFarmService>,
-    pub usage_repository: Arc<database::repositories::OrganizationUsageRepository>,
-    pub api_key_repository: Arc<database::repositories::ApiKeyRepository>,
+    pub admission: Arc<services::usage::admission::AdmissionCoordinator>,
 }
 
 pub async fn check_usage_for_api_key(
@@ -67,34 +66,33 @@ pub async fn check_usage_for_api_key(
         organization_id, api_key_id.0
     );
 
-    // First, check API key spend limit if one is set
-    if let Some(api_key_limit) = api_key.api_key.spend_limit {
-        let api_key_uuid = uuid::Uuid::parse_str(&api_key_id.0).map_err(|_| {
-            tracing::error!("Failed to parse API key ID");
+    // Spend limits belong to admission state, not the authentication key cache.
+    let api_key_uuid = uuid::Uuid::parse_str(&api_key_id.0).map_err(|_| {
+        tracing::error!("Failed to parse API key ID");
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            axum::Json(ErrorResponse::new(
+                "Internal error".to_string(),
+                "internal_server_error".to_string(),
+            )),
+        )
+    })?;
+    let snapshot = state
+        .admission
+        .key_snapshot(organization_id, api_key_uuid)
+        .await
+        .map_err(|_| {
+            tracing::error!("Failed to get API key spend");
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 axum::Json(ErrorResponse::new(
-                    "Internal error".to_string(),
+                    "Failed to check API key spend".to_string(),
                     "internal_server_error".to_string(),
                 )),
             )
         })?;
-
-        let api_key_spend = state
-            .usage_repository
-            .get_api_key_spend(api_key_uuid)
-            .await
-            .map_err(|_| {
-                tracing::error!("Failed to get API key spend");
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    axum::Json(ErrorResponse::new(
-                        "Failed to check API key spend".to_string(),
-                        "internal_server_error".to_string(),
-                    )),
-                )
-            })?;
-
+    if let Some(api_key_limit) = snapshot.spend_limit {
+        let api_key_spend = snapshot.inference_spent;
         if api_key_spend >= api_key_limit {
             warn!(
                 "API key exceeded spend limit. Spent: {}, Limit: {}",

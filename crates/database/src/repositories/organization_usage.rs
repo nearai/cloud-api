@@ -4,8 +4,8 @@ use crate::models::{
 };
 use crate::pool::DbPool;
 use crate::repositories::credit_allocation::{
-    allocate_usage, load_allocations, lock_organization_accounting, CreditAllocationPolicy,
-    UsageAllocationParent,
+    allocate_usage, bump_admission_revision, load_allocations, lock_organization_accounting,
+    CreditAllocationPolicy, UsageAllocationParent,
 };
 use crate::repositories::utils::map_db_error;
 use crate::retry_db;
@@ -53,62 +53,6 @@ impl OrganizationUsageRepository {
             reporting_statement_timeout: statement_timeout,
             allocation_policy: CreditAllocationPolicy::from(config),
         }
-    }
-
-    /// Get inference-only spend for a specific API key for admission-limit checks.
-    pub async fn get_api_key_spend(&self, api_key_id: Uuid) -> Result<i64> {
-        let inference_spend = retry_db!("get_api_key_spend", {
-            let client = self
-                .pool
-                .get()
-                .await
-                .context("Failed to get database connection")
-                .map_err(RepositoryError::PoolError)?;
-
-            let row = client
-                .query_one(
-                    r#"
-                    SELECT
-                        (
-                            SELECT balance.spend_counters_ready_at IS NOT NULL
-                            FROM api_keys AS key
-                            LEFT JOIN workspaces AS workspace ON workspace.id = key.workspace_id
-                            LEFT JOIN organization_balance AS balance
-                              ON balance.organization_id = workspace.organization_id
-                            WHERE key.id = $1
-                        ) AS counters_ready,
-                        COALESCE(
-                            (SELECT inference_spent FROM api_key_spend WHERE api_key_id = $1),
-                            0
-                        )::BIGINT AS inference_spend
-                    "#,
-                    &[&api_key_id],
-                )
-                .await
-                .map_err(map_db_error)?;
-            // ponytail: raw fallback for organizations whose spend counters are not yet reconciled
-            // (spend_counters_ready_at IS NULL). Delete once backfill-spend-counters has completed
-            // in every environment and spend_counter_readiness reports ready at startup.
-            // NULL means the key does not exist, so it has no usage: the counter's 0 is exact.
-            if row.get::<_, Option<bool>>("counters_ready") == Some(false) {
-                client
-                    .query_one(
-                        r#"
-                        SELECT COALESCE(SUM(total_cost), 0)::BIGINT
-                        FROM organization_usage_log
-                        WHERE api_key_id = $1
-                        "#,
-                        &[&api_key_id],
-                    )
-                    .await
-                    .map(|row| row.get::<_, i64>(0))
-                    .map_err(map_db_error)
-            } else {
-                Ok(row.get::<_, i64>("inference_spend"))
-            }
-        })?;
-
-        Ok(inference_spend)
     }
 
     /// Record usage and update balance atomically.
@@ -268,6 +212,7 @@ impl OrganizationUsageRepository {
                         )
                         .await
                         .map_err(map_db_error)?;
+                    bump_admission_revision(&transaction, request.organization_id).await?;
 
                     transaction.commit().await.map_err(map_db_error)?;
                     (row, true, Some(allocation.allocations))

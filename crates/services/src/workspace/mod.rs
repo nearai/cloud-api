@@ -6,13 +6,16 @@ use std::sync::Arc;
 use crate::auth::ports::UserId;
 use crate::common::RepositoryError;
 use crate::organization::{OrganizationId, OrganizationServiceTrait};
+use crate::usage::admission::AdmissionCoordinator;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
+use uuid::Uuid;
 
 pub struct WorkspaceServiceImpl {
     workspace_repository: Arc<dyn WorkspaceRepository>,
     api_key_repository: Arc<dyn ApiKeyRepository>,
     organization_service: Arc<dyn OrganizationServiceTrait>,
+    admission_coordinator: Arc<AdmissionCoordinator>,
 }
 
 impl WorkspaceServiceImpl {
@@ -20,11 +23,13 @@ impl WorkspaceServiceImpl {
         workspace_repository: Arc<dyn WorkspaceRepository>,
         api_key_repository: Arc<dyn ApiKeyRepository>,
         organization_service: Arc<dyn OrganizationServiceTrait>,
+        admission_coordinator: Arc<AdmissionCoordinator>,
     ) -> Self {
         Self {
             workspace_repository,
             api_key_repository,
             organization_service,
+            admission_coordinator,
         }
     }
 
@@ -350,7 +355,8 @@ impl WorkspaceServiceTrait for WorkspaceServiceImpl {
         spend_limit: Option<i64>,
     ) -> Result<ApiKey, WorkspaceError> {
         // Check permissions
-        self.check_workspace_permission(workspace_id.clone(), requester_id)
+        let (_, organization) = self
+            .check_workspace_permission(workspace_id.clone(), requester_id)
             .await?;
 
         // Verify the API key belongs to this workspace
@@ -365,13 +371,23 @@ impl WorkspaceServiceTrait for WorkspaceServiceImpl {
             return Err(WorkspaceError::ApiKeyNotFound);
         }
 
+        let key_uuid = Uuid::parse_str(&api_key.id.0).map_err(|error| {
+            WorkspaceError::InternalError(format!("Invalid API key identifier: {error}"))
+        })?;
+
         // Update the spend limit
-        self.api_key_repository
+        let updated = self
+            .api_key_repository
             .update_spend_limit(api_key_id, spend_limit)
             .await
             .map_err(|e| {
                 WorkspaceError::InternalError(format!("Failed to update API key spend limit: {e}"))
-            })
+            })?;
+
+        self.admission_coordinator
+            .refresh_key(organization.id.0, key_uuid)
+            .await;
+        Ok(updated)
     }
 
     async fn update_api_key(
@@ -385,7 +401,8 @@ impl WorkspaceServiceTrait for WorkspaceServiceImpl {
         is_active: Option<bool>,
     ) -> Result<ApiKey, WorkspaceError> {
         // Check permissions
-        self.check_workspace_permission(workspace_id.clone(), requester_id)
+        let (_, organization) = self
+            .check_workspace_permission(workspace_id.clone(), requester_id)
             .await?;
 
         // Verify the API key belongs to this workspace
@@ -399,6 +416,10 @@ impl WorkspaceServiceTrait for WorkspaceServiceImpl {
         if api_key.workspace_id.0 != workspace_id.0 {
             return Err(WorkspaceError::ApiKeyNotFound);
         }
+
+        let key_uuid = Uuid::parse_str(&api_key.id.0).map_err(|error| {
+            WorkspaceError::InternalError(format!("Invalid API key identifier: {error}"))
+        })?;
 
         // If updating the name, check for duplicates
         if let Some(ref new_name) = name {
@@ -416,11 +437,21 @@ impl WorkspaceServiceTrait for WorkspaceServiceImpl {
             }
         }
 
+        let updates_spend_limit = spend_limit.is_some();
+
         // Update the API key
-        self.api_key_repository
+        let updated = self
+            .api_key_repository
             .update(api_key_id, name, expires_at, spend_limit, is_active)
             .await
-            .map_err(Self::map_repository_error)
+            .map_err(Self::map_repository_error)?;
+
+        if updates_spend_limit {
+            self.admission_coordinator
+                .refresh_key(organization.id.0, key_uuid)
+                .await;
+        }
+        Ok(updated)
     }
 
     async fn can_manage_api_keys(

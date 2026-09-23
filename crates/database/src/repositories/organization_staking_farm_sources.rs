@@ -328,6 +328,11 @@ impl StakingFarmRepository for OrganizationStakingFarmSourcesRepository {
                 &self.allocation_policy,
             )
             .await?;
+            crate::repositories::credit_allocation::bump_admission_revision(
+                &transaction,
+                organization_id,
+            )
+            .await?;
 
             transaction.commit().await.map_err(map_db_error)?;
             Ok::<(), RepositoryError>(())

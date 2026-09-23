@@ -1,8 +1,8 @@
 use crate::models::OrganizationServiceUsageLog;
 use crate::pool::DbPool;
 use crate::repositories::credit_allocation::{
-    allocate_usage, load_allocations, lock_organization_accounting, CreditAllocationPolicy,
-    UsageAllocationParent,
+    allocate_usage, bump_admission_revision, load_allocations, lock_organization_accounting,
+    CreditAllocationPolicy, UsageAllocationParent,
 };
 use crate::repositories::utils::map_db_error;
 use crate::retry_db;
@@ -394,6 +394,7 @@ impl OrganizationServiceUsageRepository {
                         )
                         .await
                         .map_err(map_db_error)?;
+                    bump_admission_revision(&transaction, request.organization_id).await?;
 
                     transaction.commit().await.map_err(map_db_error)?;
                     (r, Some(allocation.allocations))

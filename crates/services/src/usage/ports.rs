@@ -366,9 +366,6 @@ pub trait UsageRepository: Send + Sync {
         offset: Option<i64>,
     ) -> anyhow::Result<(Vec<UsageLogEntry>, i64)>;
 
-    /// Get inference-only spend for a specific API key
-    async fn get_api_key_spend(&self, api_key_id: Uuid) -> anyhow::Result<i64>;
-
     /// Get costs by inference IDs (for HuggingFace billing integration)
     /// Returns costs for each inference_id that was found and belongs to the organization
     async fn get_costs_by_inference_ids(
@@ -622,7 +619,7 @@ pub struct ModelPricing {
 
 /// Organization spending limit
 /// All amounts use fixed scale of 9 (nano-dollars) and USD currency
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OrganizationLimit {
     pub spend_limit: i64,
     /// Remaining attributed capacity across active credit types.

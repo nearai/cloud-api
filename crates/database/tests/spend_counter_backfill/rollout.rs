@@ -2,10 +2,13 @@
 //! drift left by writers that skipped the counters can be found and repaired.
 use super::coverage::run_cli;
 use super::*;
-use database::repositories::{ApiKeyRepository, PgAnalyticsRepository};
+use database::repositories::{
+    ApiKeyRepository, PgAdmissionSnapshotRepository, PgAnalyticsRepository,
+};
 use database::spend_counters_backfill::spend_counter_readiness;
 use database::{SpendBackfillOutcome, SpendDrift};
 use services::admin::AnalyticsRepository;
+use services::usage::admission::AdmissionSnapshotRepository;
 
 const USD: i64 = 1_000_000_000;
 
@@ -97,9 +100,21 @@ async fn unreconciled_readers_fall_back_to_raw_history() -> anyhow::Result<()> {
         insert_service(&pool, &fixture, fixture.service_key, 60 * USD).await?;
         set_ready(&pool, fixture.organization_id, false).await?;
 
-        let usage = OrganizationUsageRepository::new(pool.clone());
-        assert_eq!(usage.get_api_key_spend(fixture.mixed_key).await?, 100 * USD);
-        assert_eq!(usage.get_api_key_spend(fixture.service_key).await?, 0);
+        let usage = PgAdmissionSnapshotRepository::new(pool.clone(), Duration::from_secs(5));
+        assert_eq!(
+            usage
+                .load_key(fixture.organization_id, fixture.mixed_key)
+                .await?
+                .inference_spent,
+            100 * USD
+        );
+        assert_eq!(
+            usage
+                .load_key(fixture.organization_id, fixture.service_key)
+                .await?
+                .inference_spent,
+            0
+        );
         let mut expected = vec![
             (fixture.mixed_key, 140 * USD),
             (fixture.service_key, 60 * USD),
@@ -115,7 +130,13 @@ async fn unreconciled_readers_fall_back_to_raw_history() -> anyhow::Result<()> {
 
         // Once marked ready, the same readers trust the (still zero) counters.
         set_ready(&pool, fixture.organization_id, true).await?;
-        assert_eq!(usage.get_api_key_spend(fixture.mixed_key).await?, 0);
+        assert_eq!(
+            usage
+                .load_key(fixture.organization_id, fixture.mixed_key)
+                .await?
+                .inference_spent,
+            0
+        );
         assert!(key_usages(&pool, &fixture)
             .await?
             .iter()
@@ -180,9 +201,10 @@ async fn include_ready_reconciliation_repairs_drift() -> anyhow::Result<()> {
             (105 * USD, 105 * USD)
         );
         assert_eq!(
-            OrganizationUsageRepository::new(pool.clone())
-                .get_api_key_spend(fixture.mixed_key)
-                .await?,
+            PgAdmissionSnapshotRepository::new(pool.clone(), Duration::from_secs(5))
+                .load_key(fixture.organization_id, fixture.mixed_key)
+                .await?
+                .inference_spent,
             105 * USD
         );
         assert!(ready_at(&pool, fixture.organization_id).await? > before);
@@ -297,9 +319,15 @@ async fn deploy_from_pre_counter_schema_serves_raw_then_counters() -> anyhow::Re
                 (fixture.empty_key, 0),
             ];
             expected.sort();
-            let usage = OrganizationUsageRepository::new(pool.clone());
+            let usage = PgAdmissionSnapshotRepository::new(pool.clone(), Duration::from_secs(5));
             let analytics = PgAnalyticsRepository::new(pool.clone());
-            assert_eq!(usage.get_api_key_spend(fixture.mixed_key).await?, 105 * USD);
+            assert_eq!(
+                usage
+                    .load_key(fixture.organization_id, fixture.mixed_key)
+                    .await?
+                    .inference_spent,
+                105 * USD
+            );
             assert_eq!(key_usages(&pool, &fixture).await?, expected);
             let summary = analytics.get_billing_summary().await?;
             assert_eq!(
@@ -316,7 +344,13 @@ async fn deploy_from_pre_counter_schema_serves_raw_then_counters() -> anyhow::Re
             assert!(spend_counter_readiness(&pool).await?.is_ready());
 
             // Same answers, now from the counters.
-            assert_eq!(usage.get_api_key_spend(fixture.mixed_key).await?, 105 * USD);
+            assert_eq!(
+                usage
+                    .load_key(fixture.organization_id, fixture.mixed_key)
+                    .await?
+                    .inference_spent,
+                105 * USD
+            );
             assert_eq!(key_usages(&pool, &fixture).await?, expected);
             let summary = analytics.get_billing_summary().await?;
             assert_eq!(
@@ -402,8 +436,14 @@ async fn redeploy_after_rollback_resets_readiness_until_backfill() -> anyhow::Re
             (5 * USD, 5 * USD),
             "the re-apply must leave the counters alone"
         );
-        let usage = OrganizationUsageRepository::new(pool.clone());
-        assert_eq!(usage.get_api_key_spend(fixture.mixed_key).await?, 105 * USD);
+        let usage = PgAdmissionSnapshotRepository::new(pool.clone(), Duration::from_secs(5));
+        assert_eq!(
+            usage
+                .load_key(fixture.organization_id, fixture.mixed_key)
+                .await?
+                .inference_spent,
+            105 * USD
+        );
         let created_after_redeploy = insert_organization(&pool).await?;
         assert!(ready_at(&pool, created_after_redeploy).await?.is_some());
 
@@ -418,7 +458,13 @@ async fn redeploy_after_rollback_resets_readiness_until_backfill() -> anyhow::Re
             counted(&pool, fixture.organization_id, fixture.mixed_key).await?,
             (105 * USD, 105 * USD)
         );
-        assert_eq!(usage.get_api_key_spend(fixture.mixed_key).await?, 105 * USD);
+        assert_eq!(
+            usage
+                .load_key(fixture.organization_id, fixture.mixed_key)
+                .await?
+                .inference_spent,
+            105 * USD
+        );
         let verify = run_cli(&database.database_name, &["--include-ready", "--dry-run"]).await?;
         assert!(
             verify.status.success(),
@@ -447,8 +493,14 @@ async fn readers_with_missing_organization_balance_row_use_raw_history() -> anyh
             )
             .await?;
 
-        let usage = OrganizationUsageRepository::new(pool.clone());
-        assert_eq!(usage.get_api_key_spend(fixture.mixed_key).await?, 100 * USD);
+        let usage = PgAdmissionSnapshotRepository::new(pool.clone(), Duration::from_secs(5));
+        assert_eq!(
+            usage
+                .load_key(fixture.organization_id, fixture.mixed_key)
+                .await?
+                .inference_spent,
+            100 * USD
+        );
         let mut expected = vec![
             (fixture.mixed_key, 100 * USD),
             (fixture.service_key, 60 * USD),

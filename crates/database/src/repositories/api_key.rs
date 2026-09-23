@@ -478,20 +478,40 @@ impl ApiKeyRepository {
         spend_limit: Option<i64>,
     ) -> Result<ApiKey, RepositoryError> {
         let row = retry_db!("update_api_key_spend_limit", {
-            let client = self
+            let mut client = self
                 .pool
                 .get()
                 .await
                 .context("Failed to get database connection")
                 .map_err(RepositoryError::PoolError)?;
 
-            client
-                .query_one(
-                    "UPDATE api_keys SET spend_limit = $1 WHERE id = $2 RETURNING *",
+            let transaction = client.transaction().await.map_err(map_db_error)?;
+            let organization = transaction
+                .query_opt(
+                    "SELECT w.organization_id FROM api_keys k JOIN workspaces w ON w.id = k.workspace_id JOIN organizations o ON o.id = w.organization_id WHERE k.id = $1 FOR UPDATE OF o",
+                    &[&id],
+                )
+                .await
+                .map_err(map_db_error)?
+                .ok_or_else(|| RepositoryError::NotFound("API key".to_string()))?;
+            transaction
+                .execute(
+                    "UPDATE api_keys SET spend_limit = $1 WHERE id = $2",
                     &[&spend_limit, &id],
                 )
                 .await
-                .map_err(map_db_error)
+                .map_err(map_db_error)?;
+            let row = transaction
+                .query_one("SELECT * FROM api_keys WHERE id = $1", &[&id])
+                .await
+                .map_err(map_db_error)?;
+            crate::repositories::credit_allocation::bump_admission_revision(
+                &transaction,
+                organization.get("organization_id"),
+            )
+            .await?;
+            transaction.commit().await.map_err(map_db_error)?;
+            Ok::<_, RepositoryError>(row)
         })?;
 
         debug!("Updated spend limit for API key: {}", id);
@@ -554,17 +574,40 @@ impl ApiKeyRepository {
         params.push(&id);
 
         let row = retry_db!("update_api_key", {
-            let client = self
+            let mut client = self
                 .pool
                 .get()
                 .await
                 .context("Failed to get database connection")
                 .map_err(RepositoryError::PoolError)?;
 
-            client
-                .query_one(&query, &params[..])
-                .await
-                .map_err(map_db_error)
+            if spend_limit.is_none() {
+                client
+                    .query_one(&query, &params[..])
+                    .await
+                    .map_err(map_db_error)
+            } else {
+                let transaction = client.transaction().await.map_err(map_db_error)?;
+                let organization = transaction
+                    .query_opt(
+                        "SELECT w.organization_id FROM api_keys k JOIN workspaces w ON w.id = k.workspace_id JOIN organizations o ON o.id = w.organization_id WHERE k.id = $1 FOR UPDATE OF o",
+                        &[&id],
+                    )
+                    .await
+                    .map_err(map_db_error)?
+                    .ok_or_else(|| RepositoryError::NotFound("API key".to_string()))?;
+                let row = transaction
+                    .query_one(&query, &params[..])
+                    .await
+                    .map_err(map_db_error)?;
+                crate::repositories::credit_allocation::bump_admission_revision(
+                    &transaction,
+                    organization.get("organization_id"),
+                )
+                .await?;
+                transaction.commit().await.map_err(map_db_error)?;
+                Ok::<_, RepositoryError>(row)
+            }
         })?;
 
         debug!("Updated API key: {}", id);

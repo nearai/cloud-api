@@ -1,5 +1,6 @@
 pub mod ports;
 
+use crate::usage::admission::AdmissionCoordinator;
 pub use ports::ServiceUsageServiceTrait;
 use ports::{
     RecordServiceUsageParams, RecordServiceUsageWithPricingParams, ServiceUsageReportEntry,
@@ -24,11 +25,18 @@ pub enum ServiceUsageError {
 #[derive(Clone)]
 pub struct ServiceUsageService {
     repo: Arc<dyn ServiceUsageRepositoryTrait>,
+    admission_coordinator: Arc<AdmissionCoordinator>,
 }
 
 impl ServiceUsageService {
-    pub fn new(repo: Arc<dyn ServiceUsageRepositoryTrait>) -> Self {
-        Self { repo }
+    pub fn new(
+        repo: Arc<dyn ServiceUsageRepositoryTrait>,
+        admission_coordinator: Arc<AdmissionCoordinator>,
+    ) -> Self {
+        Self {
+            repo,
+            admission_coordinator,
+        }
     }
 }
 
@@ -64,6 +72,10 @@ impl ServiceUsageServiceTrait for ServiceUsageService {
             })
             .await
             .map_err(|e| ServiceUsageError::InternalError(e.to_string()))?;
+
+        self.admission_coordinator
+            .refresh_after_usage(params.organization_id, params.api_key_id)
+            .await;
 
         Ok(())
     }

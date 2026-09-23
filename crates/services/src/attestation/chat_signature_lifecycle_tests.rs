@@ -207,10 +207,6 @@ impl UsageRepository for NoopUsageRepository {
         Ok((Vec::new(), 0))
     }
 
-    async fn get_api_key_spend(&self, _api_key_id: Uuid) -> anyhow::Result<i64> {
-        Ok(0)
-    }
-
     async fn get_costs_by_inference_ids(
         &self,
         _organization_id: Uuid,

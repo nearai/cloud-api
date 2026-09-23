@@ -1,9 +1,7 @@
 #[allow(dead_code)]
 mod support;
 
-use database::repositories::{
-    ApiKeyRepository, OrganizationUsageRepository, PgAnalyticsRepository,
-};
+use database::repositories::{ApiKeyRepository, PgAnalyticsRepository};
 use database::{ensure_spend_counters_ready, DbPool};
 use deadpool::Runtime;
 use deadpool_postgres::{Config, PoolConfig};
@@ -267,37 +265,6 @@ async fn key_list_reads_counter_cohort_with_stable_pagination() -> anyhow::Resul
             .await?;
         assert!(past_end.is_empty());
         assert!(!first_page.iter().any(|key| key.id == other_workspace_key));
-
-        Ok(())
-    })
-    .await
-}
-
-#[tokio::test]
-async fn admission_spend_reads_inference_counter_and_excludes_service_counter() -> anyhow::Result<()>
-{
-    with_scoped_pool(|pool| async move {
-        let inference_key = Uuid::new_v4();
-        let service_key = Uuid::new_v4();
-        let workspace_id = Uuid::new_v4();
-        insert_ready_workspace(&pool, workspace_id).await?;
-        insert_key(
-            &pool,
-            workspace_id,
-            inference_key,
-            "inference",
-            321,
-            0,
-            false,
-        )
-        .await?;
-        insert_key(&pool, workspace_id, service_key, "service", 0, 654, false).await?;
-
-        ensure_spend_counters_ready(&pool).await?;
-        let repository = OrganizationUsageRepository::new(pool.clone());
-        assert_eq!(repository.get_api_key_spend(inference_key).await?, 321);
-        assert_eq!(repository.get_api_key_spend(service_key).await?, 0);
-        assert_eq!(repository.get_api_key_spend(Uuid::new_v4()).await?, 0);
 
         Ok(())
     })

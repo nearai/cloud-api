@@ -227,10 +227,6 @@ impl services::usage::ports::UsageRepository for OrganizationUsageRepository {
         Ok((entries, total))
     }
 
-    async fn get_api_key_spend(&self, api_key_id: Uuid) -> anyhow::Result<i64> {
-        self.get_api_key_spend(api_key_id).await
-    }
-
     async fn get_costs_by_inference_ids(
         &self,
         organization_id: Uuid,

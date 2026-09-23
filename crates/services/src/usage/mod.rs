@@ -1,3 +1,4 @@
+pub mod admission;
 pub mod ports;
 pub mod provider_attribution;
 pub mod reporting;
@@ -18,6 +19,8 @@ pub use reporting::*;
 use std::sync::Arc;
 pub use text_pricing::*;
 use uuid::Uuid;
+
+use crate::usage::admission::AdmissionCoordinator;
 
 /// Dedicated UUID v5 namespace for `inference_id`s derived from external `id`s
 /// submitted via `POST /v1/internal/usage`. The internal inference pipeline hashes
@@ -179,6 +182,7 @@ pub struct UsageServiceImpl {
     limits_repository: Arc<dyn OrganizationLimitsRepository>,
     workspace_service: Arc<dyn crate::workspace::WorkspaceServiceTrait>,
     metrics_service: Arc<dyn MetricsServiceTrait>,
+    admission_coordinator: Arc<AdmissionCoordinator>,
 }
 
 impl UsageServiceImpl {
@@ -188,6 +192,7 @@ impl UsageServiceImpl {
         limits_repository: Arc<dyn OrganizationLimitsRepository>,
         workspace_service: Arc<dyn crate::workspace::WorkspaceServiceTrait>,
         metrics_service: Arc<dyn MetricsServiceTrait>,
+        admission_coordinator: Arc<AdmissionCoordinator>,
     ) -> Self {
         Self {
             usage_repository,
@@ -195,6 +200,7 @@ impl UsageServiceImpl {
             limits_repository,
             workspace_service,
             metrics_service,
+            admission_coordinator,
         }
     }
 }
@@ -522,6 +528,13 @@ impl UsageServiceTrait for UsageServiceImpl {
             );
         }
 
+        // The database write is committed before refreshing replaceable admission state.
+        // Refresh failures are deliberately bounded and cannot turn a successful billing
+        // write into an apparent request failure.
+        self.admission_coordinator
+            .refresh_after_usage(request.organization_id, request.api_key_id)
+            .await;
+
         Ok(log)
     }
 
@@ -744,58 +757,9 @@ impl UsageServiceTrait for UsageServiceImpl {
     /// Organizations must have credits (positive balance) to make API calls.
     /// All organizations start with $0, and requests are denied until credits are added.
     async fn check_can_use(&self, organization_id: Uuid) -> Result<UsageCheckResult, UsageError> {
-        // Get current balance
-        let balance = self
-            .usage_repository
-            .get_balance(organization_id)
+        self.admission_coordinator
+            .check_organization(organization_id)
             .await
-            .map_err(|e| UsageError::InternalError(format!("Failed to get balance: {e}")))?;
-
-        // Get current limits
-        let limit = self
-            .limits_repository
-            .get_current_limits(organization_id)
-            .await
-            .map_err(|e| UsageError::InternalError(format!("Failed to get limits: {e}")))?;
-
-        match (balance, limit) {
-            (Some(balance), Some(limit)) => {
-                // An already-recorded overage is an accounting debt, not
-                // ordinary spend that a later top-up may silently absorb.
-                if limit.unfunded > 0 || limit.available == 0 {
-                    Ok(UsageCheckResult::LimitExceeded {
-                        spent: balance.total_spent,
-                        limit: limit.spend_limit,
-                    })
-                } else {
-                    Ok(UsageCheckResult::Allowed {
-                        remaining: limit.available,
-                    })
-                }
-            }
-            (Some(_balance), None) => {
-                // Has spent money but no limit set - DENY
-                // Organizations must have limits set to use the API
-                Ok(UsageCheckResult::NoLimitSet)
-            }
-            (None, Some(limit)) => {
-                // No usage yet, but limit exists
-                // Check if limit is > 0 (has credits)
-                if limit.unfunded == 0 && limit.available > 0 {
-                    Ok(UsageCheckResult::Allowed {
-                        remaining: limit.available,
-                    })
-                } else {
-                    // Limit is set to 0 - no credits
-                    Ok(UsageCheckResult::NoCredits)
-                }
-            }
-            (None, None) => {
-                // No balance and no limit - DENY (no credits)
-                // Organizations must purchase credits before using the API
-                Ok(UsageCheckResult::NoCredits)
-            }
-        }
     }
 
     /// Get current balance for an organization

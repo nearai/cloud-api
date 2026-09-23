@@ -10,10 +10,14 @@
 
 use thiserror::Error;
 
+pub mod admission_cache;
+pub mod api;
 pub mod ita;
 pub mod types;
 
 // Re-export all configuration types
+pub use admission_cache::*;
+pub use api::ApiConfig;
 pub use ita::*;
 pub use types::*;
 

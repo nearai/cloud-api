@@ -39,6 +39,27 @@ pub struct AllocationResult {
     pub unfunded_amount: i64,
 }
 
+/// Aggregate active credit capacity with the same saturating arithmetic used
+/// by credit summaries and admission reads.
+pub fn aggregate_credit_capacity<I>(rows: I, legacy_unattributed: i64) -> (i64, i64)
+where
+    I: IntoIterator<Item = (i64, i64)>,
+{
+    let (spend_limit, available) = rows.into_iter().fold(
+        (0_i64, 0_i64),
+        |(limit_total, available_total), (limit, consumed)| {
+            (
+                limit_total.saturating_add(limit),
+                available_total.saturating_add(limit.saturating_sub(consumed).max(0)),
+            )
+        },
+    );
+    (
+        spend_limit,
+        available.saturating_sub(legacy_unattributed).max(0),
+    )
+}
+
 /// Serialize all accounting writers for one organization on its durable row.
 /// Limit changes and staking syncs take the same lock.
 pub async fn lock_organization_accounting(
@@ -57,6 +78,28 @@ pub async fn lock_organization_accounting(
         .await
         .map_err(map_db_error)?;
     if row.is_none() {
+        return Err(RepositoryError::NotFound(format!(
+            "Organization not found: {organization_id}"
+        )));
+    }
+    Ok(())
+}
+
+/// Advance the durable admission revision while the accounting lock is held.
+/// Callers must invoke this only after the transaction has made a semantic
+/// change to organization admission state.
+pub async fn bump_admission_revision(
+    transaction: &Transaction<'_>,
+    organization_id: Uuid,
+) -> Result<(), RepositoryError> {
+    let updated = transaction
+        .execute(
+            "UPDATE organizations SET admission_revision = admission_revision + 1 WHERE id = $1",
+            &[&organization_id],
+        )
+        .await
+        .map_err(map_db_error)?;
+    if updated != 1 {
         return Err(RepositoryError::NotFound(format!(
             "Organization not found: {organization_id}"
         )));
@@ -478,4 +521,18 @@ pub async fn load_allocations<C: GenericClient + Sync>(
             policy_version: row.get("policy_version"),
         })
         .collect())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::aggregate_credit_capacity;
+
+    #[test]
+    fn aggregate_credit_capacity_saturates_and_applies_legacy_debt() {
+        assert_eq!(
+            aggregate_credit_capacity([(i64::MAX, 0), (i64::MAX, i64::MAX), (10, 20)], 7,),
+            (i64::MAX, i64::MAX - 7)
+        );
+        assert_eq!(aggregate_credit_capacity([(5, 10)], 100), (5, 0));
+    }
 }

@@ -60,3 +60,8 @@ test-group = "e2e-db"
 [[profile.default.scripts]]
 filter = "package(api) & binary(e2e_all)"
 setup = "e2e-db-bootstrap"
+
+[[profile.default.overrides]]
+filter = 'package(database) & binary(admission_snapshot)'
+test-group = "e2e-db"
+threads-required = "num-test-threads"

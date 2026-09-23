@@ -199,7 +199,7 @@ jobs:
         cache-key: e2e
 
     - name: Run e2e tests
-      run: cargo nextest run --test e2e_all --test spend_counter_backfill --test counter_readers
+      run: cargo nextest run --test e2e_all --test spend_counter_backfill --test counter_readers --test admission_snapshot
       env:
         POSTGRES_PRIMARY_APP_ID: ${{ secrets.POSTGRES_PRIMARY_APP_ID }}
         DATABASE_HOST: localhost

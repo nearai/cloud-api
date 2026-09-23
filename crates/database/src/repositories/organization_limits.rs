@@ -1,6 +1,8 @@
 use crate::models::{OrganizationLimitsHistory, UpdateOrganizationLimitsDbRequest};
 use crate::pool::DbPool;
-use crate::repositories::credit_allocation::{settle_unfunded_usage, CreditAllocationPolicy};
+use crate::repositories::credit_allocation::{
+    bump_admission_revision, settle_unfunded_usage, CreditAllocationPolicy,
+};
 use crate::repositories::utils::map_db_error;
 use crate::retry_db;
 use anyhow::{Context, Result};
@@ -120,6 +122,7 @@ impl OrganizationLimitsRepository {
                 .map_err(map_db_error)?;
 
             settle_unfunded_usage(&transaction, organization_id, &self.allocation_policy).await?;
+            bump_admission_revision(&transaction, organization_id).await?;
 
             transaction.commit().await.map_err(map_db_error)?;
 

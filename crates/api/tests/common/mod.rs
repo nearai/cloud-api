@@ -77,6 +77,8 @@ pub fn test_config() -> ApiConfig {
                 .unwrap_or(0),
             // Tests drive the pricing scheduler's run_once() directly.
             pricing_change_apply_interval_secs: 0,
+            // Tests drive UsageHourlyScheduler::run_once() directly.
+            usage_hourly_interval_secs: 0,
             ohttp_enabled: false,
         },
         inference_api_key: std::env::var("INFERENCE_API_KEY")

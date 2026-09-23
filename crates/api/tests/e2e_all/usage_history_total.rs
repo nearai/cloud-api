@@ -106,3 +106,47 @@ async fn usage_history_total_reads_the_request_counter_not_the_log() {
     assert_eq!(page.total, 7);
     assert_eq!(page.data.len(), 3);
 }
+
+#[tokio::test]
+async fn usage_history_total_is_zero_for_an_organization_without_usage() {
+    // A new organization gets its balance row from the V0004 trigger, with
+    // total_requests = 0, so this goes through the ordinary counter path.
+    let fixture = setup_platform_provider_usage_fixture().await;
+
+    let page = history(&fixture, 10, 0).await;
+    assert_eq!(page.total, 0);
+    assert!(page.data.is_empty());
+}
+
+#[tokio::test]
+async fn usage_history_total_never_undercounts_the_returned_page() {
+    // A missing balance row (not produced by any writer, but not prevented
+    // either) must not make the UI hide rows the page already returned. An
+    // empty page past the end proves nothing, so it cannot raise the total.
+    let fixture = setup_platform_provider_usage_fixture().await;
+    record_usage(&fixture, 3).await;
+    fixture
+        .database
+        .pool()
+        .get()
+        .await
+        .expect("db connection")
+        .execute(
+            "DELETE FROM organization_balance WHERE organization_id = $1",
+            &[&fixture.organization_id],
+        )
+        .await
+        .expect("remove the balance row");
+
+    let first = history(&fixture, 10, 0).await;
+    assert_eq!(first.data.len(), 3);
+    assert_eq!(first.total, 3);
+
+    let second = history(&fixture, 2, 2).await;
+    assert_eq!(second.data.len(), 1);
+    assert_eq!(second.total, 3);
+
+    let past_end = history(&fixture, 2, 10).await;
+    assert!(past_end.data.is_empty());
+    assert_eq!(past_end.total, 0, "an empty page proves no rows exist");
+}

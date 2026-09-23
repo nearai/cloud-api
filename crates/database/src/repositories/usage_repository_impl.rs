@@ -119,11 +119,24 @@ impl services::usage::ports::UsageRepository for OrganizationUsageRepository {
         // COUNT(*) over the organization's usage log (a multi-GB scan for large
         // organizations that timed the Usage page out). It can exceed the row count
         // where V0045's one-time dedupe deleted duplicates, which only adds empty
-        // trailing pages. Exact alternative: keyset pages with `has_more`, no total.
+        // trailing pages. Filtered requests (dates, workspace, API key, credit type)
+        // take `list_inference_usage_history`, which still counts per page. Exact
+        // alternative for both: keyset pages with `has_more`, no total.
+        //
+        // Read after the page on its own connection, so the two are not one
+        // snapshot; the counter only grows, and the floor below means `total`
+        // never undercounts rows this page returned (an empty page proves none).
+        let returned = logs.len() as i64;
+        let proven = if returned == 0 {
+            0
+        } else {
+            offset.unwrap_or(0) + returned
+        };
         let total = self
             .get_balance(organization_id)
             .await?
-            .map_or(0, |balance| balance.total_requests);
+            .map_or(0, |balance| balance.total_requests)
+            .max(proven);
 
         let entries = logs
             .into_iter()

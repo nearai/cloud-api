@@ -266,8 +266,8 @@ async fn cli_dry_run_reports_drift_without_applying() -> anyhow::Result<()> {
     .await
 }
 
-/// V0081__add_spend_counters introduces the counters and V0082 the readiness
-/// marker; keep this at the schema version immediately before them.
+/// V0081__add_spend_counters introduces the counters and the readiness marker;
+/// keep this at the schema version immediately before it.
 const LAST_SCHEMA_BEFORE_SPEND_COUNTERS: i32 = 80;
 
 /// The production deploy: a database on the last schema before spend counters

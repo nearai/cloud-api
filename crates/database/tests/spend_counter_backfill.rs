@@ -362,11 +362,15 @@ async fn spend_readiness_checks_missing_and_inactive_organizations() -> anyhow::
              INSERT INTO organization_balance (organization_id) VALUES (uuid_generate_v4());",
             )
             .await?;
-        migration_tx
-            .batch_execute(include_str!(
-                "../src/migrations/sql/V0082__add_spend_counters_readiness.sql"
-            ))
-            .await?;
+        // Apply it twice: rolling an image back removes this migration's
+        // history row, and the next deploy must re-apply it harmlessly.
+        for _ in 0..2 {
+            migration_tx
+                .batch_execute(include_str!(
+                    "../src/migrations/sql/V0081__add_spend_counters.sql"
+                ))
+                .await?;
+        }
         let legacy = migration_tx
             .query_one(
                 "SELECT spend_counters_ready_at FROM organization_balance LIMIT 1",

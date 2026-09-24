@@ -1088,6 +1088,15 @@ mod tests {
             super::UsageDiscount::from_fraction(0.12345),
             Err(UsageError::ValidationError(_))
         ));
+        // Below 1 but rounding to 10_000 bp would record free rows.
+        assert!(matches!(
+            super::UsageDiscount::from_fraction(0.999_999_999_95),
+            Err(UsageError::ValidationError(_))
+        ));
+        assert!(matches!(
+            super::UsageDiscount::from_fraction(0.99995),
+            Err(UsageError::ValidationError(_))
+        ));
     }
 
     #[test]

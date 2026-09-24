@@ -616,6 +616,14 @@ fn parse_internal_usage_max_discount(raw: Option<&str>) -> Result<f64, String> {
     if !value.is_finite() || !(0.0..1.0).contains(&value) {
         return Err(invalid());
     }
+    // Discounts are compared in basis points, so a ceiling finer than one
+    // basis point would silently allow the next value up.
+    let scaled = value * 10_000.0;
+    if (scaled - scaled.round()).abs() > 1e-6 {
+        return Err(format!(
+            "{INTERNAL_USAGE_MAX_DISCOUNT_ENV} must have at most four decimal places"
+        ));
+    }
     Ok(value)
 }
 
@@ -2750,7 +2758,9 @@ mod internal_usage_max_discount_tests {
 
     #[test]
     fn rejects_everything_else() {
-        for bad in ["1", "1.5", "-0.1", "nan", "inf", "twenty"] {
+        for bad in [
+            "1", "1.5", "-0.1", "nan", "inf", "twenty", "0.12345", "0.10005",
+        ] {
             assert!(
                 parse_internal_usage_max_discount(Some(bad)).is_err(),
                 "{bad}"

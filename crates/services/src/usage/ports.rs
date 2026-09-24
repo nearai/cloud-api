@@ -673,6 +673,13 @@ impl UsageDiscount {
         }
         let scaled = fraction * DISCOUNT_BASIS_POINTS_PER_UNIT as f64;
         let rounded = scaled.round();
+        // A fraction just below 1 (e.g. 0.99999999995) passes the range check
+        // but rounds to 10_000 bp, which would record every amount as zero.
+        if rounded >= DISCOUNT_BASIS_POINTS_PER_UNIT as f64 {
+            return Err(UsageError::ValidationError(
+                "discount_to_user must stay below 1 (a 100% discount is not allowed)".into(),
+            ));
+        }
         if (scaled - rounded).abs() > 1e-6 {
             return Err(UsageError::ValidationError(
                 "discount_to_user must have at most four decimal places".into(),
@@ -717,6 +724,12 @@ impl UsageDiscount {
     /// Discount the priced input and output amounts, recompute the total from
     /// the discounted parts, and record the list amounts under
     /// `billing_details.discount`, merged into any existing pricing snapshot.
+    ///
+    /// Each component is rounded on its own, so `total_cost` can differ by one
+    /// nano-dollar from rounding the list total once. Any pricing snapshot
+    /// already in `billing_details` (for example a profiled row's
+    /// `rounding.rounded_total`) keeps its list-price figures; the `discount`
+    /// block is what explains the net amounts on the row.
     pub fn apply_to_costs(
         &self,
         list_input_cost: i64,

@@ -1150,8 +1150,11 @@ fn resolve_internal_usage_discount(
     let discount = services::usage::UsageDiscount::from_fraction(fraction)
         .map_err(|error| validation_error(error.to_string()))?;
     if let Some(discount) = discount {
-        // Compare in basis points so a ceiling like `0.2` accepts exactly 0.2.
-        let ceiling_bp = (max_discount * 10_000.0).round();
+        // Compare in whole basis points so a ceiling like `0.2` accepts
+        // exactly 0.2. The ceiling is floored (with a tolerance for float
+        // representation) so a value between two basis points never admits
+        // the one above it.
+        let ceiling_bp = (max_discount * 10_000.0 + 1e-6).floor();
         if f64::from(discount.basis_points()) > ceiling_bp {
             return Err(validation_error(format!(
                 "discount_to_user {} exceeds the configured maximum {}",
@@ -1801,6 +1804,17 @@ mod internal_usage_tests {
         // A ceiling of zero refuses every non-zero discount.
         let err = resolve_internal_usage_discount(Some(0.0001), 0.0).unwrap_err();
         assert_eq!(err.0, StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn discount_ceiling_between_basis_points_floors() {
+        // 0.10005 is 1000.5 bp: 0.1001 must be refused, 0.1 accepted.
+        let err = resolve_internal_usage_discount(Some(0.1001), 0.10005).unwrap_err();
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+        let ok = resolve_internal_usage_discount(Some(0.1), 0.10005)
+            .unwrap()
+            .expect("10% is a discount");
+        assert_eq!(ok.basis_points(), 1_000);
     }
 
     #[test]

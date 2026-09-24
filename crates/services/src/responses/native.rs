@@ -65,7 +65,7 @@ pub fn selected(models: &[String], canonical_model: &str, body: &Value) -> bool 
 
 impl NativeResponsesService {
     /// Resolve aliases before checking the canonical allowlist. Non-selected
-    /// requests retain legacy validation and error handling.
+    /// requests use the typed stateless compatibility path.
     pub async fn selected_model(&self, body: &Value) -> Option<ModelWithPricing> {
         if self.models.is_empty() || !inference_providers::responses_raw::is_stateless(body) {
             return None;
@@ -88,6 +88,15 @@ impl NativeResponsesService {
         if !selected(&self.models, &model.model_name, &body) {
             return Err(NativeResponsesError::InvalidRequest(
                 "Native Responses is not enabled for this stateless request",
+            ));
+        }
+        if model
+            .output_modalities
+            .as_ref()
+            .is_some_and(|modalities| modalities.iter().any(|modality| modality == "image"))
+        {
+            return Err(NativeResponsesError::InvalidRequest(
+                "Image generation and image editing are not supported by /v1/responses. Use /v1/images/generations or /v1/images/edits.",
             ));
         }
         validate(&body).map_err(NativeResponsesError::InvalidRequest)?;

@@ -6,7 +6,7 @@ use inference_providers::rotation;
 use inference_providers::spki_verifier::{FingerprintState, SharedTlsRoots};
 use inference_providers::{
     is_client_audio_input_status,
-    models::{AttestationError, CompletionError},
+    models::{AttestationError, CompletionError, RequestPriority},
     AnthropicRawError, AnthropicRawRequest, AudioTranscriptionError, AudioTranscriptionParams,
     AudioTranscriptionResponse, ChatCompletionParams, ExternalProvider, ExternalProviderConfig,
     ImageEditError, ImageEditParams, ImageEditResponseWithBytes, ImageGenerationError,
@@ -242,6 +242,17 @@ pub struct ChatRoutingHints {
     /// Exclude providers explicitly registered as secondary fallbacks.
     /// This does not affect load balancing or retries within the primary fleet.
     pub fallback_disabled: bool,
+    /// The requesting organization's scheduler priority
+    /// (`organizations.request_priority`; negative = deprioritized). Defaults
+    /// to `0`, today's behavior. Below `0`, the provider-attempt retry loop
+    /// (`retry_with_fallback_caps`) pins the request to the single NEAR
+    /// context tier its estimated size selects — see
+    /// `context_routing::pin_near_tier_for_low_priority` — so a saturated
+    /// tier's RETRYABLE error (5xx/timeout/queue-full) surfaces to the
+    /// client instead of spilling onto the other NEAR tier. The existing
+    /// context-length-400 fall-through to a larger declared NEAR sibling is
+    /// unaffected by the pin (see `context_routing` module docs).
+    pub request_priority: RequestPriority,
 }
 
 /// Callback for reporting observed TTFT (ms) back to the pool for future routing.
@@ -2910,6 +2921,92 @@ impl InferenceProviderPool {
                 .any(|cap| cap.is_some_and(|cap| req > cap))
         });
 
+        // Negative-priority organizations never fall back to the OTHER NEAR
+        // context tier on a RETRYABLE error (module docs on
+        // `context_routing::pin_near_tier_for_low_priority`). Computed here
+        // from the UNPRUNED `providers`/`ctx_caps` above (so the
+        // `context_tier` tag and the context-length-400 self-heal below,
+        // which both read `ctx_caps`, are unaffected by the pin) and
+        // enforced per-attempt in the provider loop below, not by narrowing
+        // the candidate list — that would also suppress the self-heal.
+        let pinned_near_capacity = hints
+            .estimated_tokens
+            .filter(|_| hints.request_priority < 0)
+            .and_then(|estimated_tokens| {
+                let candidates: Vec<(bool, Option<u32>)> = providers
+                    .iter()
+                    .map(|p| {
+                        let is_near = p.tier() == inference_providers::ProviderTier::Near;
+                        let cap = ctx_caps
+                            .get(&(Arc::as_ptr(p) as *const () as usize))
+                            .copied()
+                            .flatten();
+                        (is_near, cap)
+                    })
+                    .collect();
+                context_routing::pin_near_tier_for_low_priority(&candidates, estimated_tokens)
+            });
+        if let Some(pinned) = pinned_near_capacity {
+            let dropped = providers
+                .iter()
+                .filter(|p| {
+                    p.tier() == inference_providers::ProviderTier::Near
+                        && ctx_caps
+                            .get(&(Arc::as_ptr(p) as *const () as usize))
+                            .copied()
+                            .flatten()
+                            .is_some_and(|cap| cap != pinned)
+                })
+                .count();
+            if dropped > 0 {
+                // Numbers only — never content (see CLAUDE.md logging rules).
+                tracing::info!(
+                    model_id = %model_id,
+                    request_priority = hints.request_priority,
+                    estimated_tokens = hints.estimated_tokens,
+                    pinned_capacity = pinned,
+                    dropped,
+                    "Pinning low-priority request to its selected NEAR context tier; \
+                     retryable errors will not fall back to the other tier"
+                );
+            }
+        }
+
+        let attempt_order = if let Some(pinned) = pinned_near_capacity {
+            if let Some(last_pinned) = providers.iter().rposition(|provider| {
+                provider.tier() == inference_providers::ProviderTier::Near
+                    && ctx_caps
+                        .get(&(Arc::as_ptr(provider) as *const () as usize))
+                        .copied()
+                        .flatten()
+                        == Some(pinned)
+            }) {
+                let mut ordered = Vec::with_capacity(providers.len());
+                let mut deferred = Vec::new();
+                for (index, provider) in providers.iter().enumerate() {
+                    let unpinned_near = provider.tier() == inference_providers::ProviderTier::Near
+                        && ctx_caps
+                            .get(&(Arc::as_ptr(provider) as *const () as usize))
+                            .copied()
+                            .flatten()
+                            .is_some_and(|capacity| capacity != pinned);
+                    if index < last_pinned && unpinned_near {
+                        deferred.push(index);
+                    } else {
+                        ordered.push(index);
+                        if index == last_pinned {
+                            ordered.append(&mut deferred);
+                        }
+                    }
+                }
+                ordered
+            } else {
+                (0..providers.len()).collect()
+            }
+        } else {
+            (0..providers.len()).collect()
+        };
+
         tracing::info!(
             model_id = %model_id,
             providers_count = providers.len(),
@@ -2954,8 +3051,28 @@ impl InferenceProviderPool {
             .unwrap_or(0);
 
         loop {
+            let mut allow_larger_near = false;
+            let mut allow_any_near = false;
             // Try each provider in order until one succeeds
-            for (attempt, provider) in providers.iter().enumerate() {
+            for (attempt, &provider_index) in attempt_order.iter().enumerate() {
+                let provider = &providers[provider_index];
+                if let Some(pinned) = pinned_near_capacity {
+                    if provider.tier() == inference_providers::ProviderTier::Near {
+                        if let Some(cap) = ctx_caps
+                            .get(&(Arc::as_ptr(provider) as *const () as usize))
+                            .copied()
+                            .flatten()
+                        {
+                            let is_pinned_tier = cap == pinned;
+                            let allowed_fall_through =
+                                allow_any_near || (allow_larger_near && cap > pinned);
+                            if !is_pinned_tier && !allowed_fall_through {
+                                continue;
+                            }
+                        }
+                    }
+                }
+
                 total_attempts += 1;
                 tracing::debug!(
                     model_id = %model_id,
@@ -3141,6 +3258,19 @@ impl InferenceProviderPool {
                         // loop, and the terminal "All providers failed" log.
                         let retry_decision = Self::classify_retry_decision(&e);
                         let is_retryable_error = retry_decision.starts_with("retryable_");
+                        if let Some(pinned) = pinned_near_capacity {
+                            let is_pinned_tier_provider = provider.tier()
+                                == inference_providers::ProviderTier::Near
+                                && ctx_caps
+                                    .get(&(Arc::as_ptr(provider) as *const () as usize))
+                                    .copied()
+                                    .flatten()
+                                    == Some(pinned);
+                            if is_pinned_tier_provider {
+                                allow_larger_near |= context_400_fell_through;
+                                allow_any_near |= !context_400_fell_through && !is_retryable_error;
+                            }
+                        }
 
                         // A System One 2xx with an invalid body/receipt has already
                         // performed inference. A read timeout is likewise ambiguous.
@@ -9833,6 +9963,411 @@ mod tests {
             vec![ptr(&long), ptr(&base), ptr(&chutes)],
             "all-overflow: biggest window first within the NEAR tier"
         );
+    }
+
+    /// `get_providers_with_fallback` must NOT prune or reorder candidates
+    /// based on `request_priority` — the negative-priority pin (module docs
+    /// on `context_routing::pin_near_tier_for_low_priority`) is enforced
+    /// per-attempt by the PROVIDER-ATTEMPT RETRY LOOP instead (see
+    /// `low_priority_retry_does_not_fall_back_across_near_tiers` and
+    /// `low_priority_context_400_still_falls_through_to_larger_near_tier`
+    /// below). Pruning here, before the retry loop's `ctx_caps` snapshot is
+    /// taken, was review finding 1 on #1117: it silently deleted the
+    /// context-length-400 self-heal for every negative-priority request,
+    /// because the dropped sibling's declared capacity was no longer visible
+    /// to `larger_ctx_sibling_exists`.
+    #[tokio::test]
+    async fn get_providers_with_fallback_ignores_request_priority() {
+        use inference_providers::mock::MockProvider;
+        use inference_providers::ProviderTier;
+
+        let pool = InferenceProviderPool::new(None, ExternalProvidersConfig::default());
+        let model = "z-ai/glm-5.3-flash".to_string();
+
+        let base: Arc<InferenceProviderTrait> =
+            Arc::new(MockProvider::new().with_tier(ProviderTier::Near));
+        let long: Arc<InferenceProviderTrait> =
+            Arc::new(MockProvider::new().with_tier(ProviderTier::Near));
+        let chutes: Arc<InferenceProviderTrait> =
+            Arc::new(MockProvider::new().with_tier(ProviderTier::Attested3p));
+
+        {
+            let mut m = pool.provider_mappings.write().await;
+            m.model_to_providers.insert(
+                model.clone(),
+                vec![long.clone(), chutes.clone(), base.clone()],
+            );
+        }
+        {
+            let mut states = pool
+                .provider_load_state
+                .write()
+                .unwrap_or_else(|e| e.into_inner());
+            states
+                .entry(Arc::as_ptr(&base) as *const () as usize)
+                .or_default()
+                .max_context_tokens = Some(262_144);
+            states
+                .entry(Arc::as_ptr(&long) as *const () as usize)
+                .or_default()
+                .max_context_tokens = Some(1_048_576);
+            states
+                .entry(Arc::as_ptr(&chutes) as *const () as usize)
+                .or_default()
+                .max_context_tokens = Some(1_048_576);
+        }
+
+        let ptr = |p: &Arc<InferenceProviderTrait>| Arc::as_ptr(p) as *const () as usize;
+
+        // Short request (fits base) and oversized-for-base request (fits
+        // only long): both must return the SAME candidate list, in the SAME
+        // best-fit order, whether priority is -2 or 0.
+        for estimated_tokens in [10_000, 300_000] {
+            let mut orders = Vec::new();
+            for request_priority in [-2, 0] {
+                let providers = pool
+                    .get_providers_with_fallback(
+                        &model,
+                        None,
+                        &ChatRoutingHints {
+                            request_priority,
+                            estimated_tokens: Some(estimated_tokens),
+                            ..Default::default()
+                        },
+                    )
+                    .await
+                    .expect("providers");
+                orders.push(providers.iter().map(&ptr).collect::<Vec<_>>());
+            }
+            assert_eq!(
+                orders[0], orders[1],
+                "estimated_tokens={estimated_tokens}: request_priority must not \
+                 change get_providers_with_fallback's candidate list or order"
+            );
+            assert_eq!(
+                orders[0].len(),
+                3,
+                "estimated_tokens={estimated_tokens}: no candidate may be dropped here"
+            );
+        }
+    }
+
+    /// End-to-end: a negative-priority request whose selected (long) NEAR
+    /// tier 503s must NOT fall through to the base fleet — the retryable
+    /// error surfaces to the client instead of spilling onto the
+    /// interactive fleet (the 2026-09-21 incident this change fixes).
+    /// Contrasts with `context_400_fall_through_does_not_clobber_retryable_error`
+    /// above, which exercises the SAME fixture at the default (>= 0)
+    /// priority and asserts the opposite: base IS tried.
+    #[tokio::test]
+    async fn low_priority_retry_does_not_fall_back_across_near_tiers() {
+        use inference_providers::mock::MockProvider;
+        use inference_providers::{CompletionError, ProviderTier};
+
+        let pool = InferenceProviderPool::new(None, ExternalProvidersConfig::default());
+        let model_id = "z-ai/glm-5.2".to_string();
+
+        let long = Arc::new(MockProvider::new_accept_all().with_tier(ProviderTier::Near));
+        long.set_error_override(Some(CompletionError::HttpError {
+            status_code: 503,
+            message: "queue full".to_string(),
+            is_external: true,
+        }))
+        .await;
+        let base = Arc::new(MockProvider::new_accept_all().with_tier(ProviderTier::Near));
+        base.set_error_override(Some(CompletionError::HttpError {
+            status_code: 400,
+            message: "This model's maximum context length is 262144 tokens.".to_string(),
+            is_external: true,
+        }))
+        .await;
+
+        {
+            let mut m = pool.provider_mappings.write().await;
+            m.model_to_providers.insert(
+                model_id.clone(),
+                vec![
+                    base.clone() as Arc<InferenceProviderTrait>,
+                    long.clone() as Arc<InferenceProviderTrait>,
+                ],
+            );
+        }
+        {
+            let mut states = pool
+                .provider_load_state
+                .write()
+                .unwrap_or_else(|e| e.into_inner());
+            states
+                .entry(Arc::as_ptr(&base) as *const () as usize)
+                .or_default()
+                .max_context_tokens = Some(262_144);
+            states
+                .entry(Arc::as_ptr(&long) as *const () as usize)
+                .or_default()
+                .max_context_tokens = Some(1_048_576);
+        }
+
+        // Same ~1.2MB fixture as the priority-agnostic test above: the
+        // internally-computed requirement (~360k) selects the long tier.
+        let mut params = fallback_params(&model_id);
+        params.messages[0].content = Some(serde_json::Value::String("a".repeat(1_200_000)));
+
+        let result = pool
+            .chat_completion_with_attribution_and_hints(
+                params,
+                "test-hash".to_string(),
+                ChatRoutingHints {
+                    request_priority: -2,
+                    ..Default::default()
+                },
+            )
+            .await;
+        let err = match result {
+            Err(e) => e,
+            Ok(_) => panic!("the long tier's 503 must surface, not a base success"),
+        };
+
+        assert!(
+            long.last_chat_params().await.is_some(),
+            "the size-selected (long) tier must still be tried"
+        );
+        assert!(
+            base.last_chat_params().await.is_none(),
+            "negative priority: the base tier must NEVER be tried as a fallback"
+        );
+        match err {
+            CompletionError::HttpError { status_code, .. } => {
+                assert_eq!(
+                    status_code, 503,
+                    "the long tier's retryable error must surface"
+                )
+            }
+            other => panic!("expected the long tier's HttpError(503), got: {other}"),
+        }
+    }
+
+    /// Regression test for review finding 1 on #1117: the negative-priority
+    /// pin must block only the RETRYABLE-error spill between NEAR tiers
+    /// (previous test), never the existing context-length-400 self-heal. A
+    /// request whose ESTIMATE fits the pinned (base) tier but whose ACTUAL
+    /// size does not — a byte-heuristic under-estimate, or an E2EE request
+    /// that skips the exact tokenize count — must still fall through to the
+    /// larger declared NEAR sibling, exactly as it would at priority >= 0
+    /// (`context_400_fall_through_does_not_clobber_retryable_error` above).
+    #[tokio::test]
+    async fn low_priority_context_400_still_falls_through_to_larger_near_tier() {
+        use inference_providers::mock::MockProvider;
+        use inference_providers::{CompletionError, ProviderTier};
+
+        let pool = InferenceProviderPool::new(None, ExternalProvidersConfig::default());
+        let model_id = "z-ai/glm-5.2".to_string();
+
+        let base = Arc::new(MockProvider::new_accept_all().with_tier(ProviderTier::Near));
+        base.set_error_override(Some(CompletionError::HttpError {
+            status_code: 400,
+            message: "This model's maximum context length is 262144 tokens.".to_string(),
+            is_external: true,
+        }))
+        .await;
+        // No error override: the long tier serves successfully.
+        let long = Arc::new(MockProvider::new_accept_all().with_tier(ProviderTier::Near));
+
+        {
+            let mut m = pool.provider_mappings.write().await;
+            m.model_to_providers.insert(
+                model_id.clone(),
+                vec![
+                    base.clone() as Arc<InferenceProviderTrait>,
+                    long.clone() as Arc<InferenceProviderTrait>,
+                ],
+            );
+        }
+        {
+            let mut states = pool
+                .provider_load_state
+                .write()
+                .unwrap_or_else(|e| e.into_inner());
+            states
+                .entry(Arc::as_ptr(&base) as *const () as usize)
+                .or_default()
+                .max_context_tokens = Some(262_144);
+            states
+                .entry(Arc::as_ptr(&long) as *const () as usize)
+                .or_default()
+                .max_context_tokens = Some(1_048_576);
+        }
+        pool.provider_failure_counts
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(Arc::as_ptr(&base) as *const () as usize, 10);
+
+        // ~833KB of text -> internally-computed requirement is ~250k,
+        // comfortably inside base's 262144 window, so the pin selects base —
+        // but base still 400s on the actual (under-estimated) request.
+        let mut params = fallback_params(&model_id);
+        params.messages[0].content = Some(serde_json::Value::String("a".repeat(833_334)));
+
+        let result = pool
+            .chat_completion_with_attribution_and_hints(
+                params,
+                "test-hash".to_string(),
+                ChatRoutingHints {
+                    request_priority: -2,
+                    ..Default::default()
+                },
+            )
+            .await;
+
+        match result {
+            Ok(_) => {}
+            Err(e) => panic!(
+                "the long provider must be attempted and serve the \
+                 context-400 fall-through, got error: {e}"
+            ),
+        }
+        assert!(
+            base.last_chat_params().await.is_some(),
+            "the pinned (base) tier must still be tried first"
+        );
+        assert!(
+            long.last_chat_params().await.is_some(),
+            "the larger declared NEAR sibling must be tried after the pinned \
+             tier's context-length 400, even at negative priority"
+        );
+    }
+
+    #[tokio::test]
+    async fn low_priority_model_not_found_can_fall_through_to_other_near_tier() {
+        use inference_providers::mock::MockProvider;
+        use inference_providers::{CompletionError, ProviderTier};
+
+        let pool = InferenceProviderPool::new(None, ExternalProvidersConfig::default());
+        let model_id = "z-ai/glm-5.2".to_string();
+        let base = Arc::new(MockProvider::new_accept_all().with_tier(ProviderTier::Near));
+        base.set_error_override(Some(CompletionError::HttpError {
+            status_code: 404,
+            message: "model not found".to_string(),
+            is_external: true,
+        }))
+        .await;
+        let long = Arc::new(MockProvider::new_accept_all().with_tier(ProviderTier::Near));
+        {
+            let mut mappings = pool.provider_mappings.write().await;
+            mappings.model_to_providers.insert(
+                model_id.clone(),
+                vec![
+                    base.clone() as Arc<InferenceProviderTrait>,
+                    long.clone() as Arc<InferenceProviderTrait>,
+                ],
+            );
+        }
+        {
+            let mut states = pool
+                .provider_load_state
+                .write()
+                .unwrap_or_else(|e| e.into_inner());
+            states
+                .entry(Arc::as_ptr(&base) as *const () as usize)
+                .or_default()
+                .max_context_tokens = Some(262_144);
+            states
+                .entry(Arc::as_ptr(&long) as *const () as usize)
+                .or_default()
+                .max_context_tokens = Some(1_048_576);
+        }
+        let mut params = fallback_params(&model_id);
+        params.messages[0].content = Some(serde_json::Value::String("a".repeat(833_334)));
+        let result = pool
+            .chat_completion_with_attribution_and_hints(
+                params,
+                "test-hash".to_string(),
+                ChatRoutingHints {
+                    request_priority: -2,
+                    ..Default::default()
+                },
+            )
+            .await;
+        if let Err(error) = result {
+            panic!("model-not-found fall-through should reach the other NEAR tier: {error}");
+        }
+        assert!(base.last_chat_params().await.is_some());
+        assert!(long.last_chat_params().await.is_some());
+    }
+
+    #[tokio::test]
+    async fn low_priority_context_400_survives_same_tier_retryable_failure() {
+        use inference_providers::mock::MockProvider;
+        use inference_providers::{CompletionError, ProviderTier};
+
+        let pool = InferenceProviderPool::new(None, ExternalProvidersConfig::default());
+        let model_id = "z-ai/glm-5.2".to_string();
+        let base_rejects = Arc::new(MockProvider::new_accept_all().with_tier(ProviderTier::Near));
+        base_rejects
+            .set_error_override(Some(CompletionError::HttpError {
+                status_code: 400,
+                message: "This model's maximum context length is 262144 tokens.".to_string(),
+                is_external: true,
+            }))
+            .await;
+        let base_busy = Arc::new(MockProvider::new_accept_all().with_tier(ProviderTier::Near));
+        base_busy
+            .set_error_override(Some(CompletionError::HttpError {
+                status_code: 503,
+                message: "queue full".to_string(),
+                is_external: true,
+            }))
+            .await;
+        let long = Arc::new(MockProvider::new_accept_all().with_tier(ProviderTier::Near));
+        {
+            let mut mappings = pool.provider_mappings.write().await;
+            mappings.model_to_providers.insert(
+                model_id.clone(),
+                vec![
+                    base_rejects.clone() as Arc<InferenceProviderTrait>,
+                    base_busy.clone() as Arc<InferenceProviderTrait>,
+                    long.clone() as Arc<InferenceProviderTrait>,
+                ],
+            );
+        }
+        {
+            let mut states = pool
+                .provider_load_state
+                .write()
+                .unwrap_or_else(|e| e.into_inner());
+            for provider in [&base_rejects, &base_busy] {
+                states
+                    .entry(Arc::as_ptr(provider) as *const () as usize)
+                    .or_default()
+                    .max_context_tokens = Some(262_144);
+            }
+            states
+                .entry(Arc::as_ptr(&long) as *const () as usize)
+                .or_default()
+                .max_context_tokens = Some(1_048_576);
+        }
+        pool.provider_failure_counts
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(Arc::as_ptr(&base_busy) as *const () as usize, 10);
+
+        let mut params = fallback_params(&model_id);
+        params.messages[0].content = Some(serde_json::Value::String("a".repeat(833_334)));
+        let result = pool
+            .chat_completion_with_attribution_and_hints(
+                params,
+                "test-hash".to_string(),
+                ChatRoutingHints {
+                    request_priority: -2,
+                    ..Default::default()
+                },
+            )
+            .await;
+        if let Err(error) = result {
+            panic!("context fall-through should survive a busy same-tier provider: {error}");
+        }
+        assert!(base_rejects.last_chat_params().await.is_some());
+        assert!(base_busy.last_chat_params().await.is_some());
+        assert!(long.last_chat_params().await.is_some());
     }
 
     /// The requirement refinement only activates for models whose providers

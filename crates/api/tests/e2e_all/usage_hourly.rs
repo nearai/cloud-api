@@ -1,5 +1,8 @@
-//! usage_hourly repository: recompute, day parity, progress. Parallel-safe tests use a
-//! UUID-scoped fixture org and random far-past hours; recompute(wait=true) serializes.
+//! usage_hourly repository: recompute, day parity, progress. Most tests use a UUID-scoped
+//! fixture org and random far-past hours; they run in parallel but each recompute(wait=true)
+//! blocks on the one global usage_hourly advisory lock, so recomputes serialize. `serial_`
+//! tests move global progress, so they use a far-future namespace (+4000 days) and run alone
+//! under the serialized nextest override in .config/nextest.toml.
 
 use crate::admin_provider_attribution_support::setup_platform_provider_usage_fixture;
 use chrono::{DateTime, Duration, TimeZone, Utc};
@@ -403,6 +406,29 @@ async fn day_parity_ok_after_recompute_and_flags_rows_added_later() {
     assert_eq!(parity.raw.request_count - parity.aggregate.request_count, 1);
 }
 
+/// A failed earlier run skips its end-of-test cleanup and leaves far-future rows that would
+/// anchor global progress (MAX(hour)) for every later run. Only the serialized `serial_` tests
+/// use that namespace, so each one clears it first.
+async fn delete_leftover_far_future_rows(
+    f: &crate::admin_provider_attribution_support::PlatformProviderUsageFixture,
+) {
+    let client = f.database.pool().get().await.unwrap();
+    client
+        .execute(
+            "DELETE FROM usage_hourly WHERE hour > NOW() + INTERVAL '1000 days'",
+            &[],
+        )
+        .await
+        .unwrap();
+    client
+        .execute(
+            "DELETE FROM organization_usage_log WHERE created_at > NOW() + INTERVAL '1000 days'",
+            &[],
+        )
+        .await
+        .unwrap();
+}
+
 async fn delete_org_future_rows(
     f: &crate::admin_provider_attribution_support::PlatformProviderUsageFixture,
 ) {
@@ -426,6 +452,7 @@ async fn delete_org_future_rows(
 #[tokio::test]
 async fn serial_progress_reports_max_hour_and_next_raw_hour() {
     let f = setup_platform_provider_usage_fixture().await;
+    delete_leftover_far_future_rows(&f).await;
     let repo = UsageHourlyRepositoryImpl::new(f.database.pool().clone());
     let base = repo
         .progress()
@@ -470,6 +497,7 @@ async fn serial_progress_reports_max_hour_and_next_raw_hour() {
 #[tokio::test]
 async fn serial_concurrent_ticks_write_each_hour_once() {
     let f = setup_platform_provider_usage_fixture().await;
+    delete_leftover_far_future_rows(&f).await;
     let repo: std::sync::Arc<dyn UsageHourlyRepository> =
         std::sync::Arc::new(UsageHourlyRepositoryImpl::new(f.database.pool().clone()));
     let base = repo

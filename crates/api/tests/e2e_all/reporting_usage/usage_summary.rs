@@ -1,17 +1,91 @@
 use super::{
     bearer, create_reporting_token, setup_reporting_usage_server,
     usage_export_fixture::{
-        assert_no_private_export_fields, seed_export_fixture, url_ts, ExportFixture,
+        assert_no_private_export_fields, seed_export_fixture, ts, url_ts, ExportFixture,
     },
 };
 use crate::common::{create_org, setup_test_server_with_config_and_database, MOCK_USER_AGENT};
 use chrono::{DateTime, Duration, Utc};
 use serde_json::Value;
+use uuid::Uuid;
+
+/// The export fixture plus a recompute of its two inference hours: without `credit_type`,
+/// summaries read usage_hourly (spec §6.2).
+async fn seed_summary_fixture(
+    server: &axum_test::TestServer,
+    database: &std::sync::Arc<database::Database>,
+) -> ExportFixture {
+    let fixture = seed_export_fixture(server, database).await;
+    for day in [1, 2] {
+        let hour = ts(2026, 7, day);
+        crate::usage_hourly::recompute_usage_hours(hour, hour + Duration::hours(1)).await;
+    }
+    fixture
+}
+
+/// A raw inference row with a saved `payment` allocation of `cost` nano-USD, never recomputed.
+async fn allocated_inference_row(
+    database: &std::sync::Arc<database::Database>,
+    fixture: &ExportFixture,
+    created_at: DateTime<Utc>,
+    cost: i64,
+) {
+    let client = database.pool().get().await.expect("db connection");
+    let org = Uuid::parse_str(&fixture.org_id).unwrap();
+    let model_id: Uuid = client
+        .query_one(
+            "SELECT id FROM models WHERE model_name = $1",
+            &[&fixture.model],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    let usage_id: Uuid = client
+        .query_one(
+            "INSERT INTO organization_usage_log (
+                organization_id, workspace_id, api_key_id, model_id, model_name,
+                input_tokens, output_tokens, cache_read_tokens, total_tokens,
+                input_cost, output_cost, total_cost, request_type, inference_type, created_at)
+             VALUES ($1, $2, $3, $4, $5, 1, 0, 0, 1, $6, 0, $6, NULL, 'chat_completion', $7)
+             RETURNING id",
+            &[
+                &org,
+                &Uuid::parse_str(&fixture.workspace_id).unwrap(),
+                &Uuid::parse_str(&fixture.api_key_id).unwrap(),
+                &model_id,
+                &fixture.model,
+                &cost,
+                &created_at,
+            ],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    let limit_id: Uuid = client
+        .query_one(
+            "INSERT INTO organization_limits_history (organization_id, credit_type, spend_limit, effective_until)
+             VALUES ($1, 'payment', 0, NOW()) RETURNING id",
+            &[&org],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    client
+        .execute(
+            "INSERT INTO usage_credit_allocations
+             (organization_id, inference_usage_id, credit_type, amount, organization_limit_id,
+              policy_version, priority_position, allocation_phase)
+             VALUES ($1, $2, 'payment', $3, $4, 'test', 0, 'posting')",
+            &[&org, &usage_id, &cost, &limit_id],
+        )
+        .await
+        .unwrap();
+}
 
 #[tokio::test]
 async fn usage_summary_returns_all_source_breakdowns_and_reconciles_cost() {
     let (server, database) = setup_reporting_usage_server().await;
-    let fixture = seed_export_fixture(&server, &database).await;
+    let fixture = seed_summary_fixture(&server, &database).await;
 
     let response = server
         .get(default_summary_url(&fixture, "source=all").as_str())
@@ -70,9 +144,9 @@ async fn usage_summary_database_timeout_returns_504() {
         .expect("blocking database connection");
     let transaction = blocker.transaction().await.expect("blocking transaction");
     transaction
-        .batch_execute("LOCK TABLE organization_usage_log IN ACCESS EXCLUSIVE MODE")
+        .batch_execute("LOCK TABLE usage_hourly IN ACCESS EXCLUSIVE MODE")
         .await
-        .expect("exclusive test lock");
+        .expect("exclusive test lock on the table the inference summary reads");
 
     let response = server
         .get(
@@ -97,7 +171,7 @@ async fn usage_summary_database_timeout_returns_504() {
 #[tokio::test]
 async fn usage_summary_applies_source_specific_zero_and_empty_contracts() {
     let (server, database) = setup_reporting_usage_server().await;
-    let fixture = seed_export_fixture(&server, &database).await;
+    let fixture = seed_summary_fixture(&server, &database).await;
 
     let inference = get_default_summary(&server, &fixture, "source=inference").await;
     assert_totals(
@@ -140,7 +214,7 @@ async fn usage_summary_applies_source_specific_zero_and_empty_contracts() {
 #[tokio::test]
 async fn usage_summary_honors_date_boundaries_and_filters() {
     let (server, database) = setup_reporting_usage_server().await;
-    let fixture = seed_export_fixture(&server, &database).await;
+    let fixture = seed_summary_fixture(&server, &database).await;
     let query = format!(
         "source=all&start_time={}&end_time={}&workspace_id={}&api_key_id={}",
         url_ts(2026, 7, 2),
@@ -166,12 +240,18 @@ async fn usage_summary_honors_date_boundaries_and_filters() {
     );
     assert_eq!(json["by_day"].as_array().expect("by_day").len(), 1);
     assert_day(&json, "2026-07-02", 1, 1, 700, 200);
+    // The single instant widens to its hour; the echo keeps end_time inclusive (spec §6.1).
+    assert_eq!(json_timestamp(&json, "start_time"), ts(2026, 7, 2));
+    assert_eq!(
+        json_timestamp(&json, "end_time"),
+        ts(2026, 7, 2) + Duration::hours(1) - Duration::microseconds(1)
+    );
 }
 
 #[tokio::test]
 async fn usage_summary_normalizes_open_ended_range_defaults() {
     let (server, database) = setup_reporting_usage_server().await;
-    let fixture = seed_export_fixture(&server, &database).await;
+    let fixture = seed_summary_fixture(&server, &database).await;
     let before_request = Utc::now();
 
     let response = server
@@ -184,9 +264,16 @@ async fn usage_summary_normalizes_open_ended_range_defaults() {
     let json = response.json::<Value>();
     let start_time = json_timestamp(&json, "start_time");
     let end_time = json_timestamp(&json, "end_time");
-    assert!(end_time >= before_request);
-    assert!(end_time <= after_request);
-    assert_eq!(end_time - start_time, Duration::days(366));
+    // Hour-normalized (spec §6.1, §6.4): whole UTC hours, inclusive end 1 µs before the hour.
+    let end_exclusive = end_time + Duration::microseconds(1);
+    assert_eq!(start_time, services::usage::trunc_hour(start_time));
+    assert_eq!(end_exclusive, services::usage::trunc_hour(end_exclusive));
+    assert!(end_exclusive > before_request);
+    assert!(end_exclusive <= services::usage::trunc_hour(after_request) + Duration::hours(1));
+    assert_eq!(
+        end_exclusive - start_time,
+        Duration::days(366) + Duration::hours(1)
+    );
     assert_totals(
         &json,
         ExpectedTotals {
@@ -245,6 +332,69 @@ async fn usage_summary_rejects_invalid_range_org_mismatch_and_revoked_token() {
         .add_header("Authorization", bearer("rpt-revoked-or-malformed"))
         .await;
     assert_eq!(revoked.status_code(), 401, "{}", revoked.text());
+}
+
+#[tokio::test]
+async fn usage_summary_widens_to_whole_hours_unless_the_reader_is_exact() {
+    let (server, database) = setup_reporting_usage_server().await;
+    let fixture = seed_summary_fixture(&server, &database).await;
+    let range = "start_time=2026-07-02T00:15:00Z&end_time=2026-07-02T00:20:00Z";
+
+    // source=all without credit_type: both parts serve [00:00, 01:00) and echo it.
+    let all = get_summary(&server, &fixture, &format!("source=all&{range}")).await;
+    assert_eq!(json_timestamp(&all, "start_time"), ts(2026, 7, 2));
+    assert_eq!(
+        json_timestamp(&all, "end_time"),
+        ts(2026, 7, 2) + Duration::hours(1) - Duration::microseconds(1)
+    );
+    assert_eq!(all["totals"]["request_count"], 1);
+    assert_eq!(all["totals"]["service_usage_count"], 1);
+
+    // Review Focus 1: a service-only summary is exact, so the same range holds nothing.
+    let service = get_summary(&server, &fixture, &format!("source=service&{range}")).await;
+    assert_eq!(
+        json_timestamp(&service, "start_time"),
+        ts(2026, 7, 2) + Duration::minutes(15)
+    );
+    assert_eq!(
+        json_timestamp(&service, "end_time"),
+        ts(2026, 7, 2) + Duration::minutes(20)
+    );
+    assert_eq!(service["totals"]["service_usage_count"], 0);
+}
+
+#[tokio::test]
+async fn usage_summary_credit_type_reads_raw_usage_live_over_the_exact_range() {
+    let (server, database) = setup_reporting_usage_server().await;
+    let fixture = seed_summary_fixture(&server, &database).await;
+    allocated_inference_row(
+        &database,
+        &fixture,
+        ts(2026, 7, 2) + Duration::minutes(10),
+        250,
+    )
+    .await;
+    allocated_inference_row(
+        &database,
+        &fixture,
+        ts(2026, 7, 2) + Duration::minutes(50),
+        400,
+    )
+    .await;
+
+    let json = get_summary(
+        &server,
+        &fixture,
+        "source=inference&credit_type=payment&start_time=2026-07-02T00:00:00Z&end_time=2026-07-02T00:30:00Z",
+    )
+    .await;
+    assert_eq!(json_timestamp(&json, "start_time"), ts(2026, 7, 2));
+    assert_eq!(
+        json_timestamp(&json, "end_time"),
+        ts(2026, 7, 2) + Duration::minutes(30)
+    );
+    assert_eq!(json["totals"]["request_count"], 1);
+    assert_eq!(json["totals"]["inference_cost_nano_usd"], 250);
 }
 
 async fn get_default_summary(

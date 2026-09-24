@@ -1,22 +1,31 @@
 use super::{
     ReportingApiKeySummary, ReportingDaySummary, ReportingModelSummary, ReportingServiceSummary,
-    ReportingUsageQuery, ReportingUsageSummaryResponse, ReportingUsageTotals,
+    ReportingUsageSource, ReportingUsageSummaryResponse, ReportingUsageTotals,
     ReportingWorkspaceSummary,
 };
 use chrono::{DateTime, Utc};
-use services::reporting_usage::{InferenceUsageSummary, ServiceUsageSummary};
+use services::reporting_usage::{
+    InferenceUsageSummary, ReportingUsageSummary, ServiceUsageSummary,
+};
 use std::collections::BTreeMap;
 use uuid::Uuid;
 
+/// Builds the response from what the repository served; the echoed range is the served
+/// range, which is hour-normalized unless the summary is exact (spec §6.1).
 pub(super) fn summary_response(
-    query: ReportingUsageQuery,
-    inference: InferenceUsageSummary,
-    service: ServiceUsageSummary,
+    source: ReportingUsageSource,
+    summary: ReportingUsageSummary,
 ) -> ReportingUsageSummaryResponse {
+    let ReportingUsageSummary {
+        inference,
+        service,
+        start_time,
+        end_time,
+    } = summary;
     ReportingUsageSummaryResponse {
-        source: query.source,
-        start_time: query.start_time.unwrap_or(DateTime::<Utc>::UNIX_EPOCH),
-        end_time: query.end_time.unwrap_or_else(Utc::now),
+        source,
+        start_time: start_time.unwrap_or(DateTime::<Utc>::UNIX_EPOCH),
+        end_time: end_time.unwrap_or_else(Utc::now),
         totals: totals(&inference, &service),
         by_workspace: by_workspace(&inference, &service),
         by_api_key: by_api_key(&inference, &service),

@@ -1319,7 +1319,6 @@ pub fn build_app_with_config_and_options(
         app_state.clone(),
         &auth_components.auth_state_middleware,
         usage_state.clone(),
-        rate_limit_state.clone(),
     );
 
     let internal_routes = build_internal_routes(app_state.clone());
@@ -2086,12 +2085,19 @@ pub fn build_reporting_usage_routes(
 }
 
 /// Build gateway routes for external model gateways to validate API keys.
-/// Reuses the same auth, rate limiting, and usage check middleware as completions.
+///
+/// `/v1/check_api_key` runs the same API-key auth and credit (usage) check
+/// middleware as completions, but deliberately not the per-key request
+/// limiter (`api_key_rate_limit_middleware`). A gateway validates the caller's
+/// key once per request, before its own admission decision, so key checks
+/// arrive at the caller's full request rate; counting them against the
+/// per-key limit turns caller bursts into 429s unrelated to backend load
+/// (nearai/infra#242). Key checks do not spend the key's inference allowance
+/// either.
 pub fn build_gateway_routes(
     app_state: AppState,
     auth_state_middleware: &AuthState,
     usage_state: middleware::UsageState,
-    rate_limit_state: middleware::RateLimitState,
 ) -> Router {
     Router::new()
         .route(
@@ -2102,10 +2108,6 @@ pub fn build_gateway_routes(
         .layer(from_fn_with_state(
             usage_state,
             middleware::usage_check_middleware,
-        ))
-        .layer(from_fn_with_state(
-            rate_limit_state,
-            middleware::api_key_rate_limit_middleware,
         ))
         .layer(from_fn_with_state(
             auth_state_middleware.clone(),

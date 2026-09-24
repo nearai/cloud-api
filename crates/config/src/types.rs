@@ -854,6 +854,10 @@ pub struct ServerConfig {
     /// Interval in seconds between scheduled-pricing-change apply passes.
     /// Set to 0 to disable the background scheduler. Default: 60.
     pub pricing_change_apply_interval_secs: u64,
+    /// Interval in seconds between usage_hourly aggregate ticks. After deploy, ticks catch up
+    /// every 60 s until current. Then 3600 (the default) runs at HH:05 UTC; any other value
+    /// runs on the plain interval with no clock alignment. Set to 0 to disable.
+    pub usage_hourly_interval_secs: u64,
     /// Enable the OHTTP gateway (RFC 9458).  Set OHTTP_ENABLED=true to enable.
     pub ohttp_enabled: bool,
 }
@@ -871,6 +875,10 @@ impl ServerConfig {
                 .unwrap_or_else(|_| "60".to_string())
                 .parse()
                 .map_err(|_| "PRICING_CHANGE_APPLY_INTERVAL_SECS must be a non-negative integer")?,
+            usage_hourly_interval_secs: env::var("USAGE_HOURLY_INTERVAL_SECS")
+                .unwrap_or_else(|_| "3600".to_string())
+                .parse()
+                .map_err(|_| "USAGE_HOURLY_INTERVAL_SECS must be a non-negative integer")?,
             ohttp_enabled: env::var("OHTTP_ENABLED")
                 .map(|v| v == "true" || v == "1")
                 .unwrap_or(false),

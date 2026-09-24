@@ -30,9 +30,10 @@ slow-timeout = { period = "60s", terminate-after = 2 }
 max-threads = 4
 
 # These tests intentionally touch database-wide state (DDL, broad encryption
-# scans, or ACCESS EXCLUSIVE locks), so they must not overlap any other test.
+# scans, ACCESS EXCLUSIVE locks, the global usage_hourly advisory lock, or global
+# usage_hourly progress), so they must not overlap any other test.
 [[profile.default.overrides]]
-filter = 'package(api) & binary(e2e_all) & (test(/^database_encryption::/) | test(/^reporting_usage::usage_export::usage_export_database_timeout_returns_504_and_stops_query$/) | test(/^reporting_usage::usage_summary::usage_summary_database_timeout_returns_504$/))'
+filter = 'package(api) & binary(e2e_all) & (test(/^database_encryption::/) | test(/^reporting_usage::usage_export::usage_export_database_timeout_returns_504_and_stops_query$/) | test(/^reporting_usage::usage_summary::usage_summary_database_timeout_returns_504$/) | test(/^usage_hourly::/))'
 test-group = "e2e-db"
 threads-required = "num-test-threads"
 

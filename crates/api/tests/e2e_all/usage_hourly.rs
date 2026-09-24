@@ -1,13 +1,11 @@
-//! usage_hourly repository: recompute, day parity, progress. Most tests use a UUID-scoped
-//! fixture org and random far-past hours; they run in parallel but each recompute(wait=true)
-//! blocks on the one global usage_hourly advisory lock, so recomputes serialize. `serial_`
-//! tests move global progress, so they use a far-future namespace (+4000 days) and run alone
-//! under the serialized nextest override in .config/nextest.toml.
+//! usage_hourly repository: recompute, day parity, progress. Tests share a global advisory lock
+//! and day parity compares all organizations, so nextest runs this module serially. `serial_`
+//! tests move global progress, so they use a far-future namespace (+4000 days) and clean it up.
 
 use crate::admin_provider_attribution_support::setup_platform_provider_usage_fixture;
 use chrono::{DateTime, Duration, TimeZone, Utc};
 use database::repositories::UsageHourlyRepositoryImpl;
-use services::usage::ports::UsageHourlyRepository;
+use services::usage::ports::{AggregateLockBehavior, UsageHourlyRepository};
 
 pub(crate) fn random_past_hour() -> DateTime<Utc> {
     let hours = (uuid::Uuid::new_v4().as_u128() % (20 * 365 * 24)) as i64;
@@ -102,16 +100,16 @@ async fn org_rows(
 
 /// Recompute `usage_hourly` for `[from, to)` so reports see the rows a test seeded. Both
 /// bounds must be whole UTC hours (PR B's recompute rejects anything else). Readers serve
-/// only what `usage_hourly` holds (spec §6); `wait = true` serializes with every other
+/// only what `usage_hourly` holds (spec §6); `Wait` serializes with every other
 /// recompute, and replace semantics over append-only raw rows mean a later recompute never
 /// drops another test's rows.
 pub(crate) async fn recompute_usage_hours(from: DateTime<Utc>, to: DateTime<Utc>) {
     let pool = crate::common::db_setup::create_test_pool().await;
     UsageHourlyRepositoryImpl::new(pool)
-        .recompute(from, to, true)
+        .recompute(from, to, AggregateLockBehavior::Wait)
         .await
         .expect("recompute usage_hourly")
-        .expect("wait = true always recomputes");
+        .expect("Wait always recomputes");
 }
 
 /// Recompute the hours a test's live requests landed in: from ten minutes ago through the
@@ -156,7 +154,7 @@ async fn recompute_aggregates_exactly_by_utc_hour_including_null_dimensions() {
     .await;
 
     let report = repo
-        .recompute(h, h + Duration::hours(2), true)
+        .recompute(h, h + Duration::hours(2), AggregateLockBehavior::Wait)
         .await
         .unwrap()
         .unwrap();
@@ -254,7 +252,7 @@ async fn recompute_computes_every_aggregate_column_and_excludes_the_upper_bound(
         insert_raw_row(&f, h + offset, row).await;
     }
 
-    repo.recompute(h, h + Duration::hours(1), true)
+    repo.recompute(h, h + Duration::hours(1), AggregateLockBehavior::Wait)
         .await
         .unwrap()
         .unwrap();
@@ -315,10 +313,10 @@ async fn recompute_is_idempotent_and_picks_up_late_rows() {
     let repo = UsageHourlyRepositoryImpl::new(f.database.pool().clone());
     let h = random_past_hour();
     insert_raw(&f, h, 10, 1, None, None, Some("external")).await;
-    repo.recompute(h, h + Duration::hours(1), true)
+    repo.recompute(h, h + Duration::hours(1), AggregateLockBehavior::Wait)
         .await
         .unwrap();
-    repo.recompute(h, h + Duration::hours(1), true)
+    repo.recompute(h, h + Duration::hours(1), AggregateLockBehavior::Wait)
         .await
         .unwrap();
     assert_eq!(
@@ -336,7 +334,7 @@ async fn recompute_is_idempotent_and_picks_up_late_rows() {
         Some("external"),
     )
     .await;
-    repo.recompute(h, h + Duration::hours(1), true)
+    repo.recompute(h, h + Duration::hours(1), AggregateLockBehavior::Wait)
         .await
         .unwrap();
     assert_eq!(
@@ -360,13 +358,13 @@ async fn recompute_without_wait_returns_none_when_lock_is_held() {
 
     let h = random_past_hour();
     assert!(repo
-        .recompute(h, h + Duration::hours(1), false)
+        .recompute(h, h + Duration::hours(1), AggregateLockBehavior::SkipIfBusy)
         .await
         .unwrap()
         .is_none());
     tx.rollback().await.unwrap();
     assert!(repo
-        .recompute(h, h + Duration::hours(1), false)
+        .recompute(h, h + Duration::hours(1), AggregateLockBehavior::SkipIfBusy)
         .await
         .unwrap()
         .is_some());
@@ -383,7 +381,7 @@ async fn recompute_rejects_bounds_not_on_whole_utc_hours() {
         (h + Duration::milliseconds(1), h + Duration::hours(1)),
     ] {
         let err = repo
-            .recompute(from, to, true)
+            .recompute(from, to, AggregateLockBehavior::Wait)
             .await
             .expect_err("unaligned bound must be rejected");
         assert!(
@@ -410,9 +408,13 @@ async fn day_parity_ok_after_recompute_and_flags_rows_added_later() {
         Some("external"),
     )
     .await;
-    repo.recompute(day_start, day_start + Duration::days(1), true)
-        .await
-        .unwrap();
+    repo.recompute(
+        day_start,
+        day_start + Duration::days(1),
+        AggregateLockBehavior::Wait,
+    )
+    .await
+    .unwrap();
 
     let parity = repo.day_parity(day_start.date_naive()).await.unwrap();
     assert!(parity.is_ok(), "{parity:?}");
@@ -510,7 +512,7 @@ async fn serial_progress_reports_max_hour_and_next_raw_hour() {
     )
     .await;
 
-    repo.recompute(a, a + Duration::hours(1), true)
+    repo.recompute(a, a + Duration::hours(1), AggregateLockBehavior::Wait)
         .await
         .unwrap();
     let progress = repo.progress().await.unwrap();
@@ -546,9 +548,13 @@ async fn serial_concurrent_ticks_write_each_hour_once() {
         Some("external"),
     )
     .await;
-    repo.recompute(h - Duration::hours(2), h - Duration::hours(1), true)
-        .await
-        .unwrap();
+    repo.recompute(
+        h - Duration::hours(2),
+        h - Duration::hours(1),
+        AggregateLockBehavior::Wait,
+    )
+    .await
+    .unwrap();
     insert_raw(
         &f,
         h + Duration::minutes(1),

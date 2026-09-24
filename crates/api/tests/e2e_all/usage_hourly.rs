@@ -175,6 +175,27 @@ async fn recompute_without_wait_returns_none_when_lock_is_held() {
 }
 
 #[tokio::test]
+async fn recompute_rejects_bounds_not_on_whole_utc_hours() {
+    let f = setup_platform_provider_usage_fixture().await;
+    let repo = UsageHourlyRepositoryImpl::new(f.database.pool().clone());
+    let h = random_past_hour();
+    for (from, to) in [
+        (h + Duration::minutes(30), h + Duration::hours(2)),
+        (h, h + Duration::hours(1) + Duration::seconds(1)),
+        (h + Duration::milliseconds(1), h + Duration::hours(1)),
+    ] {
+        let err = repo
+            .recompute(from, to, true)
+            .await
+            .expect_err("unaligned bound must be rejected");
+        assert!(
+            err.to_string().contains("whole UTC hours"),
+            "from={from} to={to}: {err}"
+        );
+    }
+}
+
+#[tokio::test]
 async fn day_parity_ok_after_recompute_and_flags_rows_added_later() {
     let f = setup_platform_provider_usage_fixture().await;
     let repo = UsageHourlyRepositoryImpl::new(f.database.pool().clone());

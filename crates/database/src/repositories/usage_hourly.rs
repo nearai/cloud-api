@@ -7,6 +7,7 @@ use crate::repositories::utils::map_db_error;
 use anyhow::Context;
 use chrono::{DateTime, NaiveDate, Utc};
 use services::usage::ports::{DayParity, DayTotals, HourlyProgress, RecomputeReport};
+use services::usage::trunc_hour;
 use std::time::Duration;
 
 /// Distinct from database_encryption's GLOBAL_WORKER_LOCK_KEY (0x4e454152444245).
@@ -115,6 +116,10 @@ impl services::usage::ports::UsageHourlyRepository for UsageHourlyRepositoryImpl
         wait: bool,
     ) -> anyhow::Result<Option<RecomputeReport>> {
         anyhow::ensure!(from < to, "usage_hourly recompute: empty window");
+        anyhow::ensure!(
+            trunc_hour(from) == from && trunc_hour(to) == to,
+            "usage_hourly recompute: bounds must be whole UTC hours"
+        );
         let mut client = self
             .pool
             .get()

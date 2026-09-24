@@ -1,3 +1,4 @@
+pub(crate) mod concurrency;
 pub mod ports;
 
 use crate::attestation::ports::AttestationServiceTrait;
@@ -11,7 +12,6 @@ use crate::usage::{
 };
 use inference_providers::{ChatMessage, MessageRole, SSEEvent, StreamChunk, StreamingResult};
 use moka::future::Cache;
-use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 use uuid::Uuid;
 
@@ -116,7 +116,8 @@ where
     total_itl_ms: f64,
     // Pre-allocated low-cardinality metric tags (for Datadog/OTLP)
     metric_tags: Vec<String>,
-    concurrent_counter: Option<Arc<AtomicU32>>,
+    /// Concurrency slot for this request, released when the stream is dropped.
+    concurrent_slot: Option<concurrency::ConcurrencySlot>,
     /// Last received usage stats from streaming chunks
     last_usage_stats: Option<inference_providers::TokenUsage>,
     /// Last chat ID from streaming chunks (for attestation and inference_id)
@@ -684,10 +685,12 @@ where
     S: Stream<Item = Result<SSEEvent, inference_providers::CompletionError>> + Unpin,
 {
     fn drop(&mut self) {
-        // Decrement concurrent counter if present
-        if let Some(counter) = &self.concurrent_counter {
-            counter.fetch_sub(1, Ordering::Release);
-        }
+        // The request no longer occupies a concurrency slot once its stream is
+        // gone. Dropping the slot here (rather than leaving it to the implicit
+        // field drop after this body) keeps the release at exactly the point the
+        // old counter decrement happened; the usage/metrics recording below does
+        // not need it.
+        std::mem::drop(self.concurrent_slot.take());
 
         // Every successful finalization path reaches `StreamState::Done` only
         // after it has stored a provider signature or explicitly released the
@@ -731,31 +734,21 @@ where
 
 /// RAII guard for concurrent request slots.
 /// Automatically releases the slot when dropped, ensuring proper cleanup even if the request panics.
-/// Use `disarm()` to take ownership of the counter without decrementing (e.g., to transfer it
-/// to an `InterceptStream` that will handle decrement on drop).
+/// Use `disarm()` to take ownership of the slot without releasing it (e.g., to transfer it
+/// to an `InterceptStream` that will release it on drop).
 struct ConcurrentSlotGuard {
-    counter: Option<Arc<std::sync::atomic::AtomicU32>>,
+    slot: Option<concurrency::ConcurrencySlot>,
 }
 
 impl ConcurrentSlotGuard {
-    fn new(counter: Arc<AtomicU32>) -> Self {
-        Self {
-            counter: Some(counter),
-        }
+    fn new(slot: concurrency::ConcurrencySlot) -> Self {
+        Self { slot: Some(slot) }
     }
 
-    /// Disarm the guard and return the counter without decrementing.
-    /// Used when transferring counter ownership to `InterceptStream`.
-    fn disarm(&mut self) -> Option<Arc<AtomicU32>> {
-        self.counter.take()
-    }
-}
-
-impl Drop for ConcurrentSlotGuard {
-    fn drop(&mut self) {
-        if let Some(counter) = &self.counter {
-            counter.fetch_sub(1, Ordering::Release);
-        }
+    /// Disarm the guard and return the slot without releasing it.
+    /// Used when transferring slot ownership to `InterceptStream`.
+    fn disarm(&mut self) -> Option<concurrency::ConcurrencySlot> {
+        self.slot.take()
     }
 }
 
@@ -765,7 +758,10 @@ pub struct CompletionServiceImpl {
     pub usage_service: Arc<dyn UsageServiceTrait + Send + Sync>,
     pub metrics_service: Arc<dyn MetricsServiceTrait>,
     pub models_repository: Arc<dyn ModelsRepository>,
-    concurrent_counts: Cache<(Uuid, Uuid), Arc<AtomicU32>>,
+    /// Live per-(organization, model) concurrency slots. Entries exist only while
+    /// a request holds one, so a counter can never be reset out from under
+    /// in-flight requests.
+    concurrent_slots: Arc<concurrency::ConcurrencySlots>,
     concurrent_limit: u32,
     /// Cache for per-organization concurrent limits (5-minute TTL)
     org_concurrent_limits: Cache<Uuid, u32>,
@@ -775,14 +771,6 @@ pub struct CompletionServiceImpl {
 
 /// TTL for organization concurrent limit cache (5 minutes)
 const ORG_LIMIT_CACHE_TTL_SECS: u64 = 300;
-
-/// TTL for concurrent count cache entries (10 minutes).
-/// Safety net: if a counter gets stuck (e.g., due to a panic or proxy not propagating
-/// client disconnection), the entry expires and is replaced with a fresh zero counter.
-///
-/// Trade-off: if legitimate long-running requests are still in-flight when the TTL fires,
-/// the limit can be temporarily exceeded until those old requests complete.
-const CONCURRENT_COUNT_TTL_SECS: u64 = 600;
 
 /// Compute a prefix hash from the first PREFIX_HASH_MESSAGES messages for cache-hit routing.
 /// We only hash text content (not image URLs) since only text lands in the KV cache.
@@ -868,10 +856,11 @@ impl CompletionServiceImpl {
         models_repository: Arc<dyn ModelsRepository>,
         organization_limit_repository: Arc<dyn ports::OrganizationConcurrentLimitRepository>,
     ) -> Self {
-        let concurrent_counts = Cache::builder()
-            .max_capacity(100_000)
-            .time_to_live(Duration::from_secs(CONCURRENT_COUNT_TTL_SECS))
-            .build();
+        // Live concurrency slots. No TTL and no capacity bound: an entry only
+        // exists while a request holds it, and a periodic monitor reports slots
+        // held long enough to look like a leak instead of resetting them.
+        let concurrent_slots = concurrency::ConcurrencySlots::new();
+        concurrency::spawn_slot_monitor(&concurrent_slots, metrics_service.clone());
 
         // Cache for per-organization concurrent limits with 5-minute TTL
         let org_concurrent_limits = Cache::builder()
@@ -885,7 +874,7 @@ impl CompletionServiceImpl {
             usage_service,
             metrics_service,
             models_repository,
-            concurrent_counts,
+            concurrent_slots,
             concurrent_limit: DEFAULT_CONCURRENT_LIMIT,
             org_concurrent_limits,
             organization_limit_repository,
@@ -1516,20 +1505,16 @@ impl CompletionServiceImpl {
         organization_id: Uuid,
         model_id: Uuid,
         model_name: &str,
-    ) -> Result<Arc<AtomicU32>, ports::CompletionError> {
+    ) -> Result<concurrency::ConcurrencySlot, ports::CompletionError> {
         // Get the dynamic limit for this organization (cached with 5-min TTL)
         let limit = self.get_org_concurrent_limit(organization_id).await;
 
-        let counter = self
-            .concurrent_counts
-            .get_with((organization_id, model_id), async {
-                Arc::new(AtomicU32::new(0))
-            })
-            .await;
-
-        loop {
-            let current = counter.load(Ordering::Acquire);
-            if current >= limit {
+        match self
+            .concurrent_slots
+            .try_acquire((organization_id, model_id), limit)
+        {
+            Ok(slot) => Ok(slot),
+            Err(current) => {
                 tracing::warn!(
                     organization_id = %organization_id,
                     model_id = %model_id,
@@ -1546,13 +1531,7 @@ impl CompletionServiceImpl {
                     &ports::CompletionError::RateLimitExceeded(msg.clone()),
                     Some(model_name),
                 );
-                return Err(ports::CompletionError::RateLimitExceeded(msg));
-            }
-            if counter
-                .compare_exchange_weak(current, current + 1, Ordering::AcqRel, Ordering::Acquire)
-                .is_ok()
-            {
-                return Ok(counter);
+                Err(ports::CompletionError::RateLimitExceeded(msg))
             }
         }
     }
@@ -1571,7 +1550,7 @@ impl CompletionServiceImpl {
         inference_type: crate::usage::ports::InferenceType,
         service_start_time: Instant,
         provider_start_time: Instant,
-        concurrent_counter: Option<Arc<AtomicU32>>,
+        concurrent_slot: Option<concurrency::ConcurrencySlot>,
         response_id: Option<ResponseId>,
         attestation_supported: bool,
         store_provider_chat_signature: bool,
@@ -1612,7 +1591,7 @@ impl CompletionServiceImpl {
             last_token_time: None,
             total_itl_ms: 0.0,
             metric_tags,
-            concurrent_counter,
+            concurrent_slot,
             last_usage_stats: None,
             last_chat_id: None,
             stream_completed: false,
@@ -1755,13 +1734,13 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
         }
         Self::apply_deepseek_v4_flash_thinking_compat(canonical_name, &mut chat_params);
 
-        let counter = self
+        let slot = self
             .try_acquire_concurrent_slot(organization_id, model.id, canonical_name)
             .await?;
 
         // RAII guard protects against panics during stream creation.
-        // On success, disarm and transfer counter ownership to InterceptStream.
-        let mut guard = ConcurrentSlotGuard::new(counter);
+        // On success, disarm and transfer slot ownership to InterceptStream.
+        let mut guard = ConcurrentSlotGuard::new(slot);
 
         Self::reject_e2ee_if_unsupported(
             model.attestation_supported,
@@ -1792,7 +1771,7 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
         {
             Ok(pair) => pair,
             Err(e) => {
-                // Guard will decrement counter on drop
+                // Guard will release the slot on drop
                 let err = Self::map_provider_error(
                     &request.model,
                     &e,
@@ -1807,8 +1786,8 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
         let provider_attribution = attributed_stream.provider_attribution;
         let latency_reporter = attributed_stream.latency_reporter;
 
-        // Transfer counter ownership to InterceptStream (which decrements on drop)
-        let counter = guard.disarm();
+        // Transfer slot ownership to InterceptStream (which releases it on drop)
+        let concurrent_slot = guard.disarm();
 
         let inference_type = if is_streaming {
             crate::usage::ports::InferenceType::ChatCompletionStream
@@ -1830,7 +1809,7 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
                 inference_type,
                 service_start_time,
                 provider_start_time,
-                counter,
+                concurrent_slot,
                 request.response_id,
                 model.attestation_supported,
                 !request.skip_provider_chat_signature,
@@ -1951,12 +1930,12 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
         Self::apply_deepseek_v4_flash_thinking_compat(canonical_name, &mut chat_params);
 
         let organization_id = request.organization_id;
-        let counter = self
+        let slot = self
             .try_acquire_concurrent_slot(organization_id, model.id, canonical_name)
             .await?;
 
         // RAII guard ensures slot is released on drop (panic, error, or success)
-        let _guard = ConcurrentSlotGuard::new(counter);
+        let _guard = ConcurrentSlotGuard::new(slot);
 
         Self::reject_e2ee_if_unsupported(
             model.attestation_supported,
@@ -2144,12 +2123,12 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
         request_hash: String,
     ) -> Result<inference_providers::AudioTranscriptionResponse, ports::CompletionError> {
         // Acquire concurrent request slot to enforce organization limits
-        let counter = self
+        let slot = self
             .try_acquire_concurrent_slot(organization_id, model_id, model_name)
             .await?;
 
         // RAII guard ensures slot is released on drop (panic, error, or success)
-        let _guard = ConcurrentSlotGuard::new(counter);
+        let _guard = ConcurrentSlotGuard::new(slot);
 
         // Call inference provider pool with timeout protection
         let timeout_duration = std::time::Duration::from_secs(120); // 2 minute timeout for audio
@@ -2208,12 +2187,12 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
         params: inference_providers::RerankParams,
     ) -> Result<inference_providers::RerankResponse, ports::CompletionError> {
         // Acquire concurrent request slot to enforce organization limits
-        let counter = self
+        let slot = self
             .try_acquire_concurrent_slot(organization_id, model_id, model_name)
             .await?;
 
         // Create RAII guard to ensure slot is released on drop (panic, error, or success)
-        let _guard = ConcurrentSlotGuard::new(counter);
+        let _guard = ConcurrentSlotGuard::new(slot);
 
         // Call inference provider pool
         // The guard will automatically release the slot when this function returns or panics
@@ -2260,10 +2239,10 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
         body: bytes::Bytes,
         extra: std::collections::HashMap<String, serde_json::Value>,
     ) -> Result<bytes::Bytes, ports::CompletionError> {
-        let counter = self
+        let slot = self
             .try_acquire_concurrent_slot(organization_id, model_id, model_name)
             .await?;
-        let _guard = ConcurrentSlotGuard::new(counter);
+        let _guard = ConcurrentSlotGuard::new(slot);
 
         self.inference_provider_pool
             .embeddings(model_name, body, extra)
@@ -2308,10 +2287,10 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
         body: bytes::Bytes,
         extra: std::collections::HashMap<String, serde_json::Value>,
     ) -> Result<bytes::Bytes, ports::CompletionError> {
-        let counter = self
+        let slot = self
             .try_acquire_concurrent_slot(organization_id, model_id, model_name)
             .await?;
-        let _guard = ConcurrentSlotGuard::new(counter);
+        let _guard = ConcurrentSlotGuard::new(slot);
 
         self.inference_provider_pool
             .privacy_classify(model_name, body, extra)
@@ -2357,12 +2336,12 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
         params: inference_providers::ScoreParams,
     ) -> Result<inference_providers::ScoreResponse, ports::CompletionError> {
         // Acquire concurrent request slot to enforce organization limits
-        let counter = self
+        let slot = self
             .try_acquire_concurrent_slot(organization_id, model_id, model_name)
             .await?;
 
         // Create RAII guard to ensure slot is released on drop (panic, error, or success)
-        let _guard = ConcurrentSlotGuard::new(counter);
+        let _guard = ConcurrentSlotGuard::new(slot);
 
         // Call inference provider pool
         // The guard will automatically release the slot when this function returns or panics
@@ -2464,7 +2443,7 @@ mod tests {
             last_token_time: None,
             total_itl_ms: 0.0,
             metric_tags: CompletionServiceImpl::create_metric_tags("test-model"),
-            concurrent_counter: None,
+            concurrent_slot: None,
             last_usage_stats: None,
             last_chat_id: None,
             stream_completed: false,
@@ -2681,7 +2660,7 @@ mod tests {
             last_token_time: None,
             total_itl_ms: 0.0,
             metric_tags,
-            concurrent_counter: None,
+            concurrent_slot: None,
             last_usage_stats: None,
             last_chat_id: None,
             stream_completed: false,
@@ -2854,7 +2833,7 @@ mod tests {
             last_token_time: None,
             total_itl_ms: 0.0,
             metric_tags: CompletionServiceImpl::create_metric_tags("test-model"),
-            concurrent_counter: None,
+            concurrent_slot: None,
             last_usage_stats: None,
             last_chat_id: None,
             stream_completed: false,
@@ -3008,7 +2987,7 @@ mod tests {
             last_token_time: None,
             total_itl_ms: 0.0,
             metric_tags,
-            concurrent_counter: None,
+            concurrent_slot: None,
             last_usage_stats: None,
             last_chat_id: None,
             stream_completed: false,
@@ -3136,7 +3115,7 @@ mod tests {
             last_token_time: None,
             total_itl_ms: 0.0,
             metric_tags,
-            concurrent_counter: None,
+            concurrent_slot: None,
             last_usage_stats: None,
             last_chat_id: None,
             stream_completed: false,
@@ -3168,109 +3147,6 @@ mod tests {
             req.avg_itl_ms.is_none(),
             "avg_itl_ms should be None for single chunk, got {:?}",
             req.avg_itl_ms
-        );
-    }
-
-    #[tokio::test]
-    async fn test_concurrent_limit_state() {
-        let cache: Cache<(Uuid, Uuid), Arc<AtomicU32>> =
-            Cache::builder().max_capacity(1000).build();
-
-        let org_id = Uuid::new_v4();
-        let model_id = Uuid::new_v4();
-        let key = (org_id, model_id);
-        let limit: u32 = 3;
-
-        let mut counters = Vec::new();
-        for i in 0..3 {
-            let counter = cache
-                .get_with(key, async { Arc::new(AtomicU32::new(0)) })
-                .await;
-            loop {
-                let current = counter.load(Ordering::Acquire);
-                assert!(
-                    current < limit,
-                    "Request {} should be under limit, got count {}",
-                    i,
-                    current
-                );
-                if counter
-                    .compare_exchange_weak(
-                        current,
-                        current + 1,
-                        Ordering::AcqRel,
-                        Ordering::Acquire,
-                    )
-                    .is_ok()
-                {
-                    break;
-                }
-            }
-            counters.push(counter);
-        }
-
-        // 4th request should be over limit
-        let counter = cache
-            .get_with(key, async { Arc::new(AtomicU32::new(0)) })
-            .await;
-        let current = counter.load(Ordering::Acquire);
-        assert!(
-            current >= limit,
-            "4th request should be over limit, got count {}",
-            current
-        );
-
-        // Release one slot
-        counters[0].fetch_sub(1, Ordering::Release);
-
-        // Now another request should succeed
-        let counter = cache
-            .get_with(key, async { Arc::new(AtomicU32::new(0)) })
-            .await;
-        let current = counter.load(Ordering::Acquire);
-        assert!(
-            current < limit,
-            "Request after release should succeed, got count {}",
-            current
-        );
-    }
-
-    #[tokio::test]
-    async fn test_concurrent_limit_different_orgs_and_models_independent() {
-        let cache: Cache<(Uuid, Uuid), Arc<AtomicU32>> =
-            Cache::builder().max_capacity(1000).build();
-
-        let org1 = Uuid::new_v4();
-        let org2 = Uuid::new_v4();
-        let model_a = Uuid::new_v4();
-        let model_b = Uuid::new_v4();
-
-        // Fill up org1 + model_a's limit
-        let counter1 = cache
-            .get_with((org1, model_a), async { Arc::new(AtomicU32::new(0)) })
-            .await;
-        counter1.fetch_add(64, Ordering::AcqRel);
-
-        // org1 + model_b should still be able to make requests (different model)
-        let counter2 = cache
-            .get_with((org1, model_b), async { Arc::new(AtomicU32::new(0)) })
-            .await;
-        let current = counter2.load(Ordering::Acquire);
-        assert_eq!(
-            current, 0,
-            "org1+model_b should start at 0, got {}",
-            current
-        );
-
-        // org2 + model_a should still be able to make requests (different org)
-        let counter3 = cache
-            .get_with((org2, model_a), async { Arc::new(AtomicU32::new(0)) })
-            .await;
-        let current = counter3.load(Ordering::Acquire);
-        assert_eq!(
-            current, 0,
-            "org2+model_a should start at 0, got {}",
-            current
         );
     }
 
@@ -3313,66 +3189,301 @@ mod tests {
         );
     }
 
+    /// Build an `InterceptStream` over `inner` holding `slot`, mirroring the
+    /// production construction in `handle_stream_with_context`.
+    fn intercept_stream_with_slot<S>(
+        inner: S,
+        slot: Option<concurrency::ConcurrencySlot>,
+    ) -> InterceptStream<S>
+    where
+        S: Stream<Item = Result<SSEEvent, inference_providers::CompletionError>> + Unpin,
+    {
+        let now = Instant::now();
+        InterceptStream {
+            inner,
+            attestation_service: Arc::new(MockAttestationService),
+            usage_service: Arc::new(MockUsageService),
+            metrics_service: Arc::new(CapturingMetricsService::new()),
+            request_id: Uuid::new_v4(),
+            organization_id: Uuid::new_v4(),
+            workspace_id: Uuid::new_v4(),
+            api_key_id: Uuid::new_v4(),
+            model_id: Uuid::new_v4(),
+            model_name: "test-model".to_string(),
+            inference_type: crate::usage::ports::InferenceType::ChatCompletionStream,
+            service_start_time: now,
+            provider_start_time: now,
+            first_token_received: false,
+            first_token_time: None,
+            ttft_ms: None,
+            token_count: 0,
+            last_token_time: None,
+            total_itl_ms: 0.0,
+            metric_tags: vec![],
+            concurrent_slot: slot,
+            last_usage_stats: None,
+            last_chat_id: None,
+            stream_completed: false,
+            saw_upstream_done_marker: false,
+            response_id: None,
+            last_finish_reason: None,
+            last_error: None,
+            state: StreamState::Streaming,
+            attestation_supported: true,
+            store_provider_chat_signature: true,
+            provider_attribution: crate::usage::ProviderAttribution::default(),
+            cache_write_cost_per_token: None,
+            requested_service_tier: None,
+            provider_service_tier: None,
+            latency_reporter: None,
+        }
+    }
+
+    fn content_chunk_event(raw: &'static str) -> SSEEvent {
+        SSEEvent {
+            raw_bytes: Bytes::from_static(raw.as_bytes()),
+            raw_passthrough: true,
+            chunk: Some(StreamChunk::Chat(ChatCompletionChunk {
+                id: "chat-1".to_string(),
+                object: "chat.completion.chunk".to_string(),
+                created: 1234567890,
+                model: "test-model".to_string(),
+                choices: vec![],
+                usage: None,
+                service_tier: None,
+                prompt_token_ids: None,
+                system_fingerprint: None,
+                modality: None,
+                extra: Default::default(),
+            })),
+        }
+    }
+
     #[tokio::test]
-    async fn test_intercept_stream_decrements_on_drop() {
-        // Test that InterceptStream decrements the counter when dropped
-        let counter = Arc::new(AtomicU32::new(1)); // Start at 1 (simulating acquired slot)
+    async fn test_intercept_stream_releases_slot_on_drop() {
+        let registry = concurrency::ConcurrencySlots::new();
+        let key = (Uuid::new_v4(), Uuid::new_v4());
+        let slot = registry
+            .try_acquire(key, 3)
+            .expect("slot should be admitted");
+        assert_eq!(registry.in_use_for(key), 1);
 
         {
-            let metrics_service = Arc::new(CapturingMetricsService::new());
-            let attestation_service = Arc::new(MockAttestationService);
-            let usage_service = Arc::new(MockUsageService);
-
             let stream =
                 stream::iter::<Vec<Result<SSEEvent, inference_providers::CompletionError>>>(vec![]);
-
-            let _intercept_stream = InterceptStream {
-                inner: stream,
-                attestation_service,
-                usage_service,
-                metrics_service,
-                request_id: Uuid::new_v4(),
-                organization_id: Uuid::new_v4(),
-                workspace_id: Uuid::new_v4(),
-                api_key_id: Uuid::new_v4(),
-                model_id: Uuid::new_v4(),
-                model_name: "test-model".to_string(),
-                inference_type: crate::usage::ports::InferenceType::ChatCompletionStream,
-                service_start_time: Instant::now(),
-                provider_start_time: Instant::now(),
-                first_token_received: false,
-                first_token_time: None,
-                ttft_ms: None,
-                token_count: 0,
-                last_token_time: None,
-                total_itl_ms: 0.0,
-                metric_tags: vec![],
-                concurrent_counter: Some(counter.clone()),
-                last_usage_stats: None,
-                last_chat_id: None,
-                stream_completed: false,
-                saw_upstream_done_marker: false,
-                response_id: None,
-                last_finish_reason: None,
-                last_error: None,
-                state: StreamState::Streaming,
-                attestation_supported: true,
-                store_provider_chat_signature: true,
-                provider_attribution: crate::usage::ProviderAttribution::default(),
-                cache_write_cost_per_token: None,
-                requested_service_tier: None,
-                provider_service_tier: None,
-                latency_reporter: None,
-            };
+            let _intercept_stream = intercept_stream_with_slot(stream, Some(slot));
             // InterceptStream goes out of scope here and Drop is called
         }
 
-        // Counter should be decremented to 0
         assert_eq!(
-            counter.load(Ordering::Relaxed),
+            registry.in_use_for(key),
             0,
-            "Counter should be 0 after stream dropped"
+            "slot should be released after the stream is dropped"
         );
+        assert_eq!(registry.tracked_keys(), 0, "idle key should be reclaimed");
+    }
+
+    /// A client that disconnects mid-stream drops the `InterceptStream` before
+    /// it terminates; the slot must not stay held.
+    #[tokio::test]
+    async fn dropping_intercept_stream_midway_releases_slot() {
+        let registry = concurrency::ConcurrencySlots::new();
+        let key = (Uuid::new_v4(), Uuid::new_v4());
+        let slot = registry
+            .try_acquire(key, 3)
+            .expect("slot should be admitted");
+
+        let events: Vec<Result<SSEEvent, inference_providers::CompletionError>> = vec![
+            Ok(content_chunk_event("data: chunk1")),
+            Ok(content_chunk_event("data: chunk2")),
+            Ok(content_chunk_event("data: chunk3")),
+        ];
+        let mut intercept_stream = intercept_stream_with_slot(stream::iter(events), Some(slot));
+
+        let first = intercept_stream.next().await;
+        assert!(first.is_some(), "first chunk should be forwarded");
+        assert_eq!(
+            registry.in_use_for(key),
+            1,
+            "slot stays held while the stream is alive"
+        );
+
+        drop(intercept_stream);
+        assert_eq!(
+            registry.in_use_for(key),
+            0,
+            "dropping a partially consumed stream must release the slot"
+        );
+    }
+
+    /// Service-level counterpart of the registry test: the limit must hold even
+    /// when requests outlive the 600 s TTL the old moka cache used, which is what
+    /// let an organization exceed its cap.
+    #[tokio::test(start_paused = true)]
+    async fn service_limit_holds_for_requests_held_past_600s_and_900s() {
+        let model_name = "z-ai/glm-5.1";
+        let limit = 3;
+        let (service, _usage) =
+            super::provider_attribution_tests::completion_service_with_concurrent_limit(
+                model_name, false, false, limit,
+            )
+            .await;
+        let model_id = service
+            .models_repository
+            .resolve_and_get_model(model_name)
+            .await
+            .expect("model lookup should succeed")
+            .expect("model should exist")
+            .id;
+        let organization_id = Uuid::new_v4();
+        let key = (organization_id, model_id);
+
+        let mut slots = Vec::new();
+        for _ in 0..limit {
+            slots.push(
+                service
+                    .try_acquire_concurrent_slot(organization_id, model_id, model_name)
+                    .await
+                    .expect("requests under the limit should be admitted"),
+            );
+        }
+        assert_eq!(service.concurrent_slots.in_use_for(key), limit as usize);
+
+        tokio::time::advance(Duration::from_secs(601)).await;
+        let rejected = service
+            .try_acquire_concurrent_slot(organization_id, model_id, model_name)
+            .await;
+        assert!(
+            matches!(rejected, Err(ports::CompletionError::RateLimitExceeded(_))),
+            "the cap must hold past the old 600 s TTL, got {rejected:?}"
+        );
+        assert_eq!(service.concurrent_slots.in_use_for(key), limit as usize);
+
+        tokio::time::advance(Duration::from_secs(400)).await;
+        let rejected = service
+            .try_acquire_concurrent_slot(organization_id, model_id, model_name)
+            .await;
+        assert!(
+            matches!(rejected, Err(ports::CompletionError::RateLimitExceeded(_))),
+            "the cap must still hold past 900 s, got {rejected:?}"
+        );
+
+        // Releasing one slot admits exactly one more request.
+        slots.pop();
+        let admitted = service
+            .try_acquire_concurrent_slot(organization_id, model_id, model_name)
+            .await;
+        assert!(admitted.is_ok(), "a released slot should admit one request");
+        let rejected = service
+            .try_acquire_concurrent_slot(organization_id, model_id, model_name)
+            .await;
+        assert!(
+            matches!(rejected, Err(ports::CompletionError::RateLimitExceeded(_))),
+            "no second request may slip through, got {rejected:?}"
+        );
+    }
+
+    /// A provider failure before the first chunk returns `Err` from
+    /// `create_chat_completion_stream`; the guard must release the slot.
+    #[tokio::test]
+    async fn provider_error_before_first_chunk_releases_slot() {
+        let model_name = "z-ai/glm-5.1";
+        let (service, _usage) =
+            super::provider_attribution_tests::completion_service_with_mock_providers(
+                model_name, true, true,
+            )
+            .await;
+
+        let request = super::provider_attribution_tests::completion_request(model_name);
+        let result = service.create_chat_completion_stream(request).await;
+
+        assert!(
+            result.is_err(),
+            "both providers fail, so the call must fail"
+        );
+        assert_eq!(
+            service.concurrent_slots.in_use(),
+            0,
+            "a failed stream creation must not leak a slot"
+        );
+        assert_eq!(service.concurrent_slots.tracked_keys(), 0);
+    }
+
+    /// The success path hands the slot to the stream: it stays held while the
+    /// stream is alive and is released when the stream is dropped.
+    #[tokio::test]
+    async fn successful_stream_holds_slot_until_dropped() {
+        let model_name = "z-ai/glm-5.1";
+        let (service, _usage) =
+            super::provider_attribution_tests::completion_service_with_mock_providers(
+                model_name, false, false,
+            )
+            .await;
+
+        let request = super::provider_attribution_tests::completion_request(model_name);
+        let stream = service
+            .create_chat_completion_stream(request)
+            .await
+            .expect("mock provider should serve the stream");
+
+        assert_eq!(
+            service.concurrent_slots.in_use(),
+            1,
+            "the live stream must hold the slot"
+        );
+
+        drop(stream);
+        assert_eq!(
+            service.concurrent_slots.in_use(),
+            0,
+            "dropping the stream must release the slot"
+        );
+        assert_eq!(service.concurrent_slots.tracked_keys(), 0);
+    }
+
+    #[tokio::test]
+    async fn panic_in_guarded_scope_releases_slot() {
+        let registry = concurrency::ConcurrencySlots::new();
+        let key = (Uuid::new_v4(), Uuid::new_v4());
+        let slot = registry
+            .try_acquire(key, 3)
+            .expect("slot should be admitted");
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = ConcurrentSlotGuard::new(slot);
+            panic!("boom");
+        }));
+
+        assert!(result.is_err(), "the closure should have panicked");
+        assert_eq!(
+            registry.in_use_for(key),
+            0,
+            "a panic inside the guarded scope must release the slot"
+        );
+        assert_eq!(registry.tracked_keys(), 0);
+    }
+
+    #[tokio::test]
+    async fn panic_in_spawned_task_releases_slot() {
+        let registry = concurrency::ConcurrencySlots::new();
+        let key = (Uuid::new_v4(), Uuid::new_v4());
+        let slot = registry
+            .try_acquire(key, 3)
+            .expect("slot should be admitted");
+
+        let handle = tokio::spawn(async move {
+            let _guard = ConcurrentSlotGuard::new(slot);
+            panic!("boom");
+        });
+        let join_error = handle.await.expect_err("the task should have panicked");
+        assert!(join_error.is_panic());
+
+        assert_eq!(
+            registry.in_use_for(key),
+            0,
+            "a panicking task must release its slot"
+        );
+        assert_eq!(registry.tracked_keys(), 0);
     }
 
     // ============================================
@@ -4286,5 +4397,121 @@ mod tests {
             result.is_ok(),
             "n=5 on self-hosted model must be allowed, self-hosted supports n>1"
         );
+    }
+
+    /// End-to-end regression test through the real public entry point
+    /// (`create_chat_completion_stream`, model resolution + mock provider
+    /// round trip included) rather than the registry directly: the cap must
+    /// still hold for streams kept open long past the old moka-cache 600s/900s
+    /// windows, and releasing exactly one must admit exactly one more.
+    ///
+    /// What keeps the three admitted streams "open": `MockProvider::chat_completion_stream`
+    /// builds its SSE events eagerly into a `futures::stream::iter`, which is a
+    /// `Stream` like any other — it only produces `Poll::Ready(None)` (ends) once
+    /// polled to exhaustion. `chat_completion_stream_with_attribution` peeks
+    /// (`Peekable::peek`, not `.next()`) the very first event to check for a
+    /// leading control/error marker, which does not remove it from the stream.
+    /// This test never polls the returned streams at all, so they never make
+    /// progress and never end — exactly like a real client's SSE connection
+    /// that is simply never read to completion. The `ConcurrencySlot` each one
+    /// owns (via the wrapping `InterceptStream`) therefore stays held for as
+    /// long as the `StreamingResult` value itself is kept alive, and is only
+    /// released by `Drop` when the test explicitly drops it.
+    #[tokio::test(start_paused = true)]
+    async fn streaming_cap_holds_past_600s_through_create_chat_completion_stream() {
+        let model_name = "z-ai/glm-5.1";
+        let limit = 3;
+        let (service, _usage) =
+            super::provider_attribution_tests::completion_service_with_concurrent_limit(
+                model_name, false, false, limit,
+            )
+            .await;
+
+        // Every request below must share one (organization, model) key, unlike
+        // `provider_attribution_tests::completion_request`, which mints a fresh
+        // random organization_id per call.
+        let organization_id = Uuid::new_v4();
+        let model_id = service
+            .models_repository
+            .resolve_and_get_model(model_name)
+            .await
+            .expect("model lookup should succeed")
+            .expect("model should exist")
+            .id;
+        let key = (organization_id, model_id);
+
+        let new_request = || {
+            let mut request = super::provider_attribution_tests::completion_request(model_name);
+            request.organization_id = organization_id;
+            request
+        };
+
+        // Fill the cap with `limit` never-polled streams.
+        let mut streams = Vec::new();
+        for _ in 0..limit {
+            streams.push(
+                service
+                    .create_chat_completion_stream(new_request())
+                    .await
+                    .expect("requests under the limit should be admitted"),
+            );
+        }
+        assert_eq!(service.concurrent_slots.in_use_for(key), limit as usize);
+
+        // Past the old 600s moka TTL: a 4th request must still be rejected.
+        tokio::time::advance(Duration::from_secs(700)).await;
+        let rejected = service
+            .create_chat_completion_stream(new_request())
+            .await
+            .map(|_| ());
+        assert!(
+            matches!(rejected, Err(ports::CompletionError::RateLimitExceeded(_))),
+            "the cap must hold for streams kept open past the old 600s TTL, got {rejected:?}"
+        );
+        assert_eq!(service.concurrent_slots.in_use_for(key), limit as usize);
+
+        // Past 900s total: still rejected, still no leaked or reset counter.
+        tokio::time::advance(Duration::from_secs(300)).await;
+        let rejected = service
+            .create_chat_completion_stream(new_request())
+            .await
+            .map(|_| ());
+        assert!(
+            matches!(rejected, Err(ports::CompletionError::RateLimitExceeded(_))),
+            "the cap must hold past 900s total, got {rejected:?}"
+        );
+        assert_eq!(service.concurrent_slots.in_use_for(key), limit as usize);
+
+        // Dropping one long-lived stream frees exactly one slot.
+        drop(streams.pop().expect("`limit` streams were pushed above"));
+        assert_eq!(
+            service.concurrent_slots.in_use_for(key),
+            (limit - 1) as usize
+        );
+
+        let admitted = service
+            .create_chat_completion_stream(new_request())
+            .await
+            .expect("one released slot should admit exactly one request");
+        assert_eq!(service.concurrent_slots.in_use_for(key), limit as usize);
+
+        let rejected = service
+            .create_chat_completion_stream(new_request())
+            .await
+            .map(|_| ());
+        assert!(
+            matches!(rejected, Err(ports::CompletionError::RateLimitExceeded(_))),
+            "no second request may slip through the freed slot, got {rejected:?}"
+        );
+
+        // Drop everything: the registry must fully drain and reclaim the key.
+        streams.push(admitted);
+        drop(streams);
+        assert_eq!(
+            service.concurrent_slots.in_use(),
+            0,
+            "every slot must be released once all streams are dropped"
+        );
+        assert_eq!(service.concurrent_slots.tracked_keys(), 0);
     }
 }

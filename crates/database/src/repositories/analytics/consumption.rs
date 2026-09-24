@@ -1,63 +1,78 @@
-//! Per-model consumption and performance timeseries for admin dashboards.
+//! Per-model consumption and performance timeseries for admin dashboards over the exact
+//! requested range, read from `usage_rows`.
 
-use super::nano_to_usd;
+use super::{approx_percentile, arm, nano_to_usd};
+use crate::repositories::usage_hourly::with_usage_rows;
+use crate::repositories::utils::map_db_error;
 use services::admin::{
     ModelConsumptionPoint, ModelConsumptionTimeseries, ModelConsumptionTimeseriesQuery,
     PerformancePoint, PerformanceTimeseries, PerformanceTimeseriesQuery,
 };
 use services::common::RepositoryError;
+use std::time::Instant;
+use tokio_postgres::Transaction;
 
 pub(super) async fn get_model_consumption_timeseries(
-    client: &tokio_postgres::Client,
+    tx: &Transaction<'_>,
+    deadline: Instant,
     query: ModelConsumptionTimeseriesQuery,
 ) -> Result<ModelConsumptionTimeseries, RepositoryError> {
+    let (start, end) = (query.start, query.end);
     // granularity is already an allowlisted &'static str from the handler
     let date_trunc = query.granularity.as_str();
 
     // Step 1: identify the top-N model_ids by total cost in the period.
     // We use model_id (UUID) as the grouping key to survive model renames.
-    let top_ids_rows = client
+    arm(tx, deadline).await?;
+    let top_ids_rows = tx
         .query(
-            r#"
+            &with_usage_rows(
+                "$1",
+                "$2",
+                r#"
                 SELECT model_id
-                FROM organization_usage_log
-                WHERE created_at >= $1 AND created_at < $2
+                FROM usage_rows
                 GROUP BY model_id
                 ORDER BY SUM(total_cost) DESC
                 LIMIT $3
                 "#,
-            &[&query.start, &query.end, &query.top_n],
+            ),
+            &[&start, &end, &query.top_n],
         )
         .await
-        .map_err(|e| RepositoryError::DatabaseError(e.into()))?;
+        .map_err(map_db_error)?;
 
     let top_ids: Vec<uuid::Uuid> = top_ids_rows.iter().map(|r| r.get(0)).collect();
 
     // Step 2: time-bucketed aggregation. Models in top_ids get their current
     // canonical name from models.model_name; all others collapse to "Other".
-    let bucket_query = format!(
-        r#"
+    let bucket_query = with_usage_rows(
+        "$1",
+        "$2",
+        &format!(
+            r#"
             SELECT
-                DATE_TRUNC('{date_trunc}', ul.created_at)::text AS bucket,
+                DATE_TRUNC('{date_trunc}', uh.hour)::text AS bucket,
                 CASE
-                    WHEN ul.model_id = ANY($3) THEN COALESCE(m.model_name, ul.model_name)
+                    WHEN uh.model_id = ANY($3) THEN COALESCE(m.model_name, uh.model_name)
                     ELSE 'Other'
                 END AS model_label,
-                COALESCE(SUM(ul.total_cost), 0)::bigint AS cost_nano,
-                COUNT(*)::bigint AS requests,
-                COALESCE(SUM(ul.total_tokens), 0)::bigint AS tokens
-            FROM organization_usage_log ul
-            LEFT JOIN models m ON m.id = ul.model_id
-            WHERE ul.created_at >= $1 AND ul.created_at < $2
+                COALESCE(SUM(uh.total_cost), 0)::bigint AS cost_nano,
+                COALESCE(SUM(uh.request_count), 0)::bigint AS requests,
+                COALESCE(SUM(uh.total_tokens), 0)::bigint AS tokens
+            FROM usage_rows uh
+            LEFT JOIN models m ON m.id = uh.model_id
             GROUP BY 1, 2
             ORDER BY 1 ASC, cost_nano DESC
             "#
+        ),
     );
 
-    let rows = client
-        .query(&bucket_query, &[&query.start, &query.end, &top_ids])
+    arm(tx, deadline).await?;
+    let rows = tx
+        .query(&bucket_query, &[&start, &end, &top_ids])
         .await
-        .map_err(|e| RepositoryError::DatabaseError(e.into()))?;
+        .map_err(map_db_error)?;
 
     // Accumulate total cost per label across all buckets, then sort descending
     // so model_labels reflects true global top-N rank (not first-bucket order).
@@ -93,8 +108,8 @@ pub(super) async fn get_model_consumption_timeseries(
     });
 
     Ok(ModelConsumptionTimeseries {
-        period_start: query.start,
-        period_end: query.end,
+        period_start: start,
+        period_end: end,
         granularity: query.granularity,
         model_labels: model_labels_ordered,
         data,
@@ -102,40 +117,51 @@ pub(super) async fn get_model_consumption_timeseries(
 }
 
 pub(super) async fn get_performance_timeseries(
-    client: &tokio_postgres::Client,
+    tx: &Transaction<'_>,
+    deadline: Instant,
     query: PerformanceTimeseriesQuery,
 ) -> Result<PerformanceTimeseries, RepositoryError> {
+    let (start, end) = (query.start, query.end);
     let date_trunc = query.granularity.as_str();
+    let p50_ttft = approx_percentile("uh.ttft_p50_ms", "uh.ttft_count");
+    let p95_ttft = approx_percentile("uh.ttft_p95_ms", "uh.ttft_count");
+    let p99_ttft = approx_percentile("uh.ttft_p99_ms", "uh.ttft_count");
 
-    // Optional model_name filter: $3::text IS NULL OR ul.model_name = $3
-    let sql = format!(
-        r#"
+    // Optional model_name filter: $3::text IS NULL OR uh.model_name = $3. The error rate
+    // counts provider_error, timeout (error_count) and incomplete (incomplete_count) over
+    // rows with a recorded stop_reason.
+    let sql = with_usage_rows(
+        "$1",
+        "$2",
+        &format!(
+            r#"
             SELECT
-                DATE_TRUNC('{date_trunc}', ul.created_at)::text AS bucket,
-                COUNT(*)::bigint AS requests,
-                COALESCE(SUM(ul.total_tokens), 0)::bigint AS total_tokens,
-                COALESCE(SUM(ul.output_tokens), 0)::bigint AS output_tokens,
-                COUNT(*) FILTER (WHERE ul.ttft_ms IS NOT NULL)::bigint AS ttft_sample_count,
-                PERCENTILE_CONT(0.50) WITHIN GROUP (ORDER BY ul.ttft_ms)::double precision AS p50_ttft_ms,
-                PERCENTILE_CONT(0.95) WITHIN GROUP (ORDER BY ul.ttft_ms)::double precision AS p95_ttft_ms,
-                PERCENTILE_CONT(0.99) WITHIN GROUP (ORDER BY ul.ttft_ms)::double precision AS p99_ttft_ms,
+                DATE_TRUNC('{date_trunc}', uh.hour)::text AS bucket,
+                COALESCE(SUM(uh.request_count), 0)::bigint AS requests,
+                COALESCE(SUM(uh.total_tokens), 0)::bigint AS total_tokens,
+                COALESCE(SUM(uh.output_tokens), 0)::bigint AS output_tokens,
+                COALESCE(SUM(uh.ttft_count), 0)::bigint AS ttft_sample_count,
+                {p50_ttft} AS p50_ttft_ms,
+                {p95_ttft} AS p95_ttft_ms,
+                {p99_ttft} AS p99_ttft_ms,
                 CASE
-                    WHEN COUNT(*) FILTER (WHERE ul.stop_reason IS NOT NULL) = 0 THEN NULL
-                    ELSE COUNT(*) FILTER (WHERE ul.stop_reason IN ('provider_error', 'timeout', 'incomplete'))::float8
-                         / COUNT(*) FILTER (WHERE ul.stop_reason IS NOT NULL)::float8
+                    WHEN COALESCE(SUM(uh.stop_reason_count), 0) = 0 THEN NULL
+                    ELSE (SUM(uh.error_count) + SUM(uh.incomplete_count))::float8
+                         / SUM(uh.stop_reason_count)::float8
                 END AS error_rate
-            FROM organization_usage_log ul
-            WHERE ul.created_at >= $1 AND ul.created_at < $2
-              AND ($3::text IS NULL OR ul.model_name = $3)
+            FROM usage_rows uh
+            WHERE ($3::text IS NULL OR uh.model_name = $3)
             GROUP BY 1
             ORDER BY 1 ASC
             "#
+        ),
     );
 
-    let rows = client
-        .query(&sql, &[&query.start, &query.end, &query.model_name])
+    arm(tx, deadline).await?;
+    let rows = tx
+        .query(&sql, &[&start, &end, &query.model_name])
         .await
-        .map_err(|e| RepositoryError::DatabaseError(e.into()))?;
+        .map_err(map_db_error)?;
 
     let data: Vec<PerformancePoint> = rows
         .iter()
@@ -153,8 +179,8 @@ pub(super) async fn get_performance_timeseries(
         .collect();
 
     Ok(PerformanceTimeseries {
-        period_start: query.start,
-        period_end: query.end,
+        period_start: start,
+        period_end: end,
         granularity: query.granularity,
         model_filter: query.model_name,
         data,

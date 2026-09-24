@@ -7,6 +7,7 @@ use crate::repositories::credit_allocation::{
     allocate_usage, load_allocations, lock_organization_accounting, CreditAllocationPolicy,
     UsageAllocationParent,
 };
+use crate::repositories::usage_hourly::with_usage_rows;
 use crate::repositories::utils::map_db_error;
 use crate::retry_db;
 use anyhow::{Context, Result};
@@ -31,14 +32,6 @@ impl OrganizationUsageRepository {
             pool,
             reporting_statement_timeout:
                 crate::repositories::reporting_query::DEFAULT_REPORTING_STATEMENT_TIMEOUT,
-            allocation_policy: CreditAllocationPolicy::default(),
-        }
-    }
-
-    pub fn with_reporting_statement_timeout(pool: DbPool, statement_timeout: Duration) -> Self {
-        Self {
-            pool,
-            reporting_statement_timeout: statement_timeout,
             allocation_policy: CreditAllocationPolicy::default(),
         }
     }
@@ -504,47 +497,7 @@ impl OrganizationUsageRepository {
             .collect()
     }
 
-    /// Get usage statistics for a time period
-    pub async fn get_usage_stats(
-        &self,
-        organization_id: Uuid,
-        start_date: chrono::DateTime<Utc>,
-        end_date: chrono::DateTime<Utc>,
-    ) -> Result<UsageStats> {
-        let row = retry_db!("get_organization_usage_stats", {
-            let client = self
-                .pool
-                .get()
-                .await
-                .context("Failed to get database connection")
-                .map_err(RepositoryError::PoolError)?;
-
-            client
-                .query_one(
-                    r#"
-                    SELECT
-                        COUNT(*) as request_count,
-                        SUM(total_tokens) as total_tokens,
-                        SUM(total_cost) as total_cost
-                    FROM organization_usage_log
-                    WHERE organization_id = $1
-                      AND created_at >= $2
-                      AND created_at <= $3
-                    "#,
-                    &[&organization_id, &start_date, &end_date],
-                )
-                .await
-                .map_err(map_db_error)
-        })?;
-
-        Ok(UsageStats {
-            request_count: row.get::<_, i64>(0),
-            total_tokens: row.get::<_, Option<i64>>(1).unwrap_or(0),
-            total_cost: row.get::<_, Option<i64>>(2).unwrap_or(0),
-        })
-    }
-
-    /// Aggregate usage by model for an organization since `start_date`.
+    /// Aggregate usage by model for an organization since `start_date` (exact, via `usage_rows`).
     pub async fn get_usage_by_model_since(
         &self,
         organization_id: Uuid,
@@ -560,20 +513,23 @@ impl OrganizationUsageRepository {
 
             client
                 .query(
-                    r#"
+                    &with_usage_rows(
+                        "$2",
+                        "'infinity'::timestamptz",
+                        r#"
                     SELECT
                         model_name,
                         COALESCE(SUM(input_tokens), 0)::BIGINT  AS input_tokens,
                         COALESCE(SUM(output_tokens), 0)::BIGINT AS output_tokens,
                         COALESCE(SUM(total_tokens), 0)::BIGINT  AS total_tokens,
                         COALESCE(SUM(total_cost), 0)::BIGINT    AS total_cost,
-                        COUNT(*)::BIGINT                        AS request_count
-                    FROM organization_usage_log
+                        COALESCE(SUM(request_count), 0)::BIGINT AS request_count
+                    FROM usage_rows
                     WHERE organization_id = $1
-                      AND created_at >= $2
                     GROUP BY model_name
                     ORDER BY total_cost DESC
                     "#,
+                    ),
                     &[&organization_id, &start_date],
                 )
                 .await
@@ -797,13 +753,6 @@ impl OrganizationUsageRepository {
             )
             .collect())
     }
-}
-
-#[derive(Debug, Clone)]
-pub struct UsageStats {
-    pub request_count: i64,
-    pub total_tokens: i64,
-    pub total_cost: i64,
 }
 
 #[derive(Debug, Clone)]

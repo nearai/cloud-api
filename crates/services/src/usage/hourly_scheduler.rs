@@ -7,6 +7,10 @@ use chrono::{DateTime, NaiveDate, TimeDelta, Timelike, Utc};
 use tracing::{error, info, warn};
 
 use super::ports::{AggregateLockBehavior, DayParity, HourlyProgress, UsageHourlyRepository};
+use crate::metrics::{
+    consts::{get_environment, METRIC_USAGE_HOURLY_LAG_SECONDS, TAG_ENVIRONMENT},
+    MetricsServiceTrait,
+};
 
 pub const REREAD_HOURS: i64 = 3;
 pub const CATCH_UP_DAYS: i64 = 3;
@@ -101,13 +105,18 @@ pub struct TickOutcome {
 /// transaction-scoped try-lock, so at most one replica writes per tick; losers log `skipped`.
 pub struct UsageHourlyScheduler {
     repository: Arc<dyn UsageHourlyRepository>,
+    metrics_service: Arc<dyn MetricsServiceTrait>,
     task_handle: tokio::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
 
 impl UsageHourlyScheduler {
-    pub fn new(repository: Arc<dyn UsageHourlyRepository>) -> Self {
+    pub fn new(
+        repository: Arc<dyn UsageHourlyRepository>,
+        metrics_service: Arc<dyn MetricsServiceTrait>,
+    ) -> Self {
         Self {
             repository,
+            metrics_service,
             task_handle: tokio::sync::Mutex::new(None),
         }
     }
@@ -160,6 +169,24 @@ impl UsageHourlyScheduler {
     pub async fn run_once(&self, now: DateTime<Utc>) -> anyhow::Result<TickOutcome> {
         let started = std::time::Instant::now();
         let progress = self.repository.progress().await?;
+        // Freshness (spec §9): seconds since the start of the oldest raw hour not yet aggregated
+        // (the current hour when none is pending). Hours with no raw usage are not lag, so a
+        // quiet span does not look like a stalled job. Recorded on every tick (catch-up,
+        // skipped or steady); an alert fires above 3 hours. Nothing to record while the table
+        // is still empty.
+        if progress.max_hour.is_some() {
+            let current_hour = trunc_hour(now);
+            let pending_from = progress
+                .next_raw_hour
+                .map_or(current_hour, |hour| hour.min(current_hour));
+            let lag = now - pending_from;
+            let env_tag = format!("{TAG_ENVIRONMENT}:{}", get_environment());
+            self.metrics_service.record_histogram(
+                METRIC_USAGE_HOURLY_LAG_SECONDS,
+                lag.as_seconds_f64(),
+                &[env_tag.as_str()],
+            );
+        }
         let (from, to) = plan_window(progress, now);
         let caught_up = from == trunc_hour(now) - TimeDelta::hours(REREAD_HOURS);
 
@@ -223,11 +250,75 @@ impl UsageHourlyScheduler {
     }
 }
 
+/// Largest window one admin repair may recompute.
+pub const MAX_REPAIR_DAYS: i64 = 31;
+
+/// Rejects repair windows that are not whole, ordered UTC hours within `MAX_REPAIR_DAYS`.
+pub fn validate_repair_window(from: DateTime<Utc>, to: DateTime<Utc>) -> Result<(), String> {
+    if trunc_hour(from) != from || trunc_hour(to) != to {
+        return Err("start and end must be whole UTC hours".to_string());
+    }
+    if from >= to {
+        return Err("start must be before end".to_string());
+    }
+    if to - from > TimeDelta::days(MAX_REPAIR_DAYS) {
+        return Err(format!("window must not exceed {MAX_REPAIR_DAYS} days"));
+    }
+    Ok(())
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RepairReport {
+    pub rows_written: u64,
+    /// Raw vs aggregate totals for every UTC day the window touches, after the recompute.
+    pub days: Vec<DayParity>,
+}
+
+/// Explicit operator repair for rows that reached raw after their hour left the scheduler's
+/// 3-hour re-read (backfill, clock skew, a day flagged by parity): recomputes [from, to) one
+/// UTC day per transaction, waiting for the aggregate lock, then reports each touched day's
+/// parity.
+pub async fn repair(
+    repository: &dyn UsageHourlyRepository,
+    from: DateTime<Utc>,
+    to: DateTime<Utc>,
+) -> anyhow::Result<RepairReport> {
+    validate_repair_window(from, to).map_err(anyhow::Error::msg)?;
+    let mut rows_written = 0;
+    let mut chunk_start = from;
+    while chunk_start < to {
+        let chunk_end = (trunc_day(chunk_start) + TimeDelta::days(1)).min(to);
+        let report = repository
+            .recompute(chunk_start, chunk_end, AggregateLockBehavior::Wait)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("usage_hourly repair: Wait returned no recompute"))?;
+        rows_written += report.rows_written;
+        chunk_start = chunk_end;
+    }
+    let mut days = Vec::new();
+    let mut day = trunc_day(from);
+    while day < to {
+        days.push(repository.day_parity(day.date_naive()).await?);
+        day += TimeDelta::days(1);
+    }
+    info!(
+        from = %from,
+        to = %to,
+        rows_written,
+        days = days.len(),
+        mismatched_days = days.iter().filter(|p| !p.is_ok()).count(),
+        "usage_hourly repair"
+    );
+    Ok(RepairReport { rows_written, days })
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Mutex;
 
     use super::*;
+    use crate::metrics::capturing::{CapturingMetricsService, MetricValue};
+    use crate::metrics::consts::{get_environment, METRIC_USAGE_HOURLY_LAG_SECONDS};
     use crate::usage::ports::{DayTotals, RecomputeReport};
 
     fn t(s: &str) -> DateTime<Utc> {
@@ -484,7 +575,8 @@ mod tests {
     async fn tick_recomputes_planned_window_then_checks_parity_days() {
         let repo = Arc::new(FakeRepo::default());
         *repo.progress.lock().unwrap() = Some(p(None, Some("2026-05-01T14:00:00Z")));
-        let scheduler = UsageHourlyScheduler::new(repo.clone());
+        let scheduler =
+            UsageHourlyScheduler::new(repo.clone(), Arc::new(crate::metrics::MockMetricsService));
         let outcome = scheduler.run_once(t("2026-09-24T10:05:00Z")).await.unwrap();
         assert!(!outcome.skipped);
         assert_eq!(outcome.rows_written, 7);
@@ -505,10 +597,11 @@ mod tests {
             ..Default::default()
         });
         *repo.progress.lock().unwrap() = Some(p(None, Some("2026-05-01T14:00:00Z")));
-        let outcome = UsageHourlyScheduler::new(repo.clone())
-            .run_once(t("2026-09-24T10:05:00Z"))
-            .await
-            .unwrap();
+        let outcome =
+            UsageHourlyScheduler::new(repo.clone(), Arc::new(crate::metrics::MockMetricsService))
+                .run_once(t("2026-09-24T10:05:00Z"))
+                .await
+                .unwrap();
         assert_eq!(outcome.parity.len(), 3);
         assert!(outcome.parity.iter().all(|day| !day.is_ok()));
     }
@@ -520,10 +613,11 @@ mod tests {
             ..Default::default()
         });
         *repo.progress.lock().unwrap() = Some(p(None, Some("2026-05-01T14:00:00Z")));
-        let outcome = UsageHourlyScheduler::new(repo.clone())
-            .run_once(t("2026-09-24T03:05:00Z"))
-            .await
-            .unwrap();
+        let outcome =
+            UsageHourlyScheduler::new(repo.clone(), Arc::new(crate::metrics::MockMetricsService))
+                .run_once(t("2026-09-24T03:05:00Z"))
+                .await
+                .unwrap();
         assert!(outcome.skipped);
         assert!(repo.parity_calls.lock().unwrap().is_empty());
     }
@@ -532,17 +626,116 @@ mod tests {
     async fn tick_reports_caught_up_only_on_the_reread_window() {
         let repo = Arc::new(FakeRepo::default());
         *repo.progress.lock().unwrap() = Some(p(None, Some("2026-05-01T14:00:00Z")));
-        let behind = UsageHourlyScheduler::new(repo.clone())
-            .run_once(t("2026-09-24T10:05:00Z"))
-            .await
-            .unwrap();
+        let behind =
+            UsageHourlyScheduler::new(repo.clone(), Arc::new(crate::metrics::MockMetricsService))
+                .run_once(t("2026-09-24T10:05:00Z"))
+                .await
+                .unwrap();
         assert!(!behind.caught_up);
         *repo.progress.lock().unwrap() = Some(p(Some("2026-09-24T09:00:00Z"), None));
-        let current = UsageHourlyScheduler::new(repo.clone())
+        let current =
+            UsageHourlyScheduler::new(repo.clone(), Arc::new(crate::metrics::MockMetricsService))
+                .run_once(t("2026-09-24T10:05:00Z"))
+                .await
+                .unwrap();
+        assert!(current.caught_up);
+    }
+
+    #[tokio::test]
+    async fn tick_records_no_lag_across_a_quiet_span() {
+        // Newest aggregate hour 02:00, no raw usage again until 10:00: the job is caught up,
+        // so lag is measured from the pending 10:00 hour, not from 03:00 (7h05m).
+        let repo = Arc::new(FakeRepo::default());
+        *repo.progress.lock().unwrap() = Some(p(
+            Some("2026-09-24T02:00:00Z"),
+            Some("2026-09-24T10:00:00Z"),
+        ));
+        let metrics = Arc::new(CapturingMetricsService::new());
+        UsageHourlyScheduler::new(repo, metrics.clone())
             .run_once(t("2026-09-24T10:05:00Z"))
             .await
             .unwrap();
-        assert!(current.caught_up);
+        let recorded = metrics.get_metrics();
+        assert_eq!(recorded.len(), 1);
+        assert!(matches!(recorded[0].value, MetricValue::Histogram(v) if v == 300.0));
+    }
+
+    #[tokio::test]
+    async fn tick_records_lag_from_the_oldest_pending_raw_hour_when_stalled() {
+        // Newest aggregate hour 02:00 with raw usage every hour since: stalled for 7h05m.
+        let repo = Arc::new(FakeRepo::default());
+        *repo.progress.lock().unwrap() = Some(p(
+            Some("2026-09-24T02:00:00Z"),
+            Some("2026-09-24T03:00:00Z"),
+        ));
+        let metrics = Arc::new(CapturingMetricsService::new());
+        UsageHourlyScheduler::new(repo, metrics.clone())
+            .run_once(t("2026-09-24T10:05:00Z"))
+            .await
+            .unwrap();
+        let recorded = metrics.get_metrics();
+        assert_eq!(recorded.len(), 1);
+        assert!(matches!(recorded[0].value, MetricValue::Histogram(v) if v == 25_500.0));
+    }
+
+    #[tokio::test]
+    async fn tick_records_lag_from_the_current_hour_when_nothing_is_pending() {
+        let repo = Arc::new(FakeRepo::default());
+        *repo.progress.lock().unwrap() = Some(p(Some("2026-09-24T09:00:00Z"), None));
+        let metrics = Arc::new(CapturingMetricsService::new());
+        UsageHourlyScheduler::new(repo, metrics.clone())
+            .run_once(t("2026-09-24T10:05:00Z"))
+            .await
+            .unwrap();
+        let recorded = metrics.get_metrics();
+        assert_eq!(recorded.len(), 1);
+        assert_eq!(recorded[0].name, METRIC_USAGE_HOURLY_LAG_SECONDS);
+        assert_eq!(
+            recorded[0].tags,
+            vec![format!("{TAG_ENVIRONMENT}:{}", get_environment())]
+        );
+        // Nothing pending after 09:00: now − current hour = 10:05 − 10:00.
+        assert!(matches!(recorded[0].value, MetricValue::Histogram(v) if v == 300.0));
+    }
+
+    #[tokio::test]
+    async fn tick_records_no_lag_before_the_first_aggregate() {
+        let repo = Arc::new(FakeRepo::default());
+        *repo.progress.lock().unwrap() = Some(p(None, Some("2026-05-01T14:00:00Z")));
+        let metrics = Arc::new(CapturingMetricsService::new());
+        UsageHourlyScheduler::new(repo, metrics.clone())
+            .run_once(t("2026-09-24T10:05:00Z"))
+            .await
+            .unwrap();
+        assert!(metrics.get_metrics().is_empty());
+    }
+
+    #[tokio::test]
+    async fn tick_records_lag_while_catching_up_and_when_skipped() {
+        // Catch-up tick (months behind) and a tick that loses the lock both report freshness.
+        for lock_busy in [false, true] {
+            let repo = Arc::new(FakeRepo {
+                lock_busy,
+                ..Default::default()
+            });
+            *repo.progress.lock().unwrap() = Some(p(
+                Some("2026-05-03T20:00:00Z"),
+                Some("2026-05-13T07:00:00Z"),
+            ));
+            let metrics = Arc::new(CapturingMetricsService::new());
+            let outcome = UsageHourlyScheduler::new(repo, metrics.clone())
+                .run_once(t("2026-09-24T10:05:00Z"))
+                .await
+                .unwrap();
+            assert!(!outcome.caught_up, "lock_busy={lock_busy}");
+            assert_eq!(outcome.skipped, lock_busy);
+            let recorded = metrics.get_metrics();
+            assert_eq!(recorded.len(), 1, "lock_busy={lock_busy}");
+            assert_eq!(recorded[0].name, METRIC_USAGE_HOURLY_LAG_SECONDS);
+            // 09-24 10:05 − 05-13 07:00 (oldest pending raw hour; the empty span before it is
+            // not lag) = 134 days 3 h 5 min.
+            assert!(matches!(recorded[0].value, MetricValue::Histogram(v) if v == 11_588_700.0));
+        }
     }
 
     #[test]
@@ -555,5 +748,64 @@ mod tests {
             next_regular_delay(t("2026-09-24T10:30:00Z"), 120).as_secs(),
             120
         );
+    }
+
+    #[test]
+    fn repair_window_must_be_whole_ordered_hours_within_the_cap() {
+        assert!(
+            validate_repair_window(t("2026-09-01T00:00:00Z"), t("2026-09-01T01:00:00Z")).is_ok()
+        );
+        assert!(
+            validate_repair_window(t("2026-09-01T00:30:00Z"), t("2026-09-01T01:00:00Z")).is_err()
+        );
+        assert!(
+            validate_repair_window(t("2026-09-01T00:00:00Z"), t("2026-09-01T01:00:01Z")).is_err()
+        );
+        assert!(
+            validate_repair_window(t("2026-09-01T01:00:00Z"), t("2026-09-01T01:00:00Z")).is_err()
+        );
+        assert!(
+            validate_repair_window(t("2026-09-01T00:00:00Z"), t("2026-10-02T00:00:00Z")).is_ok()
+        );
+        assert!(
+            validate_repair_window(t("2026-09-01T00:00:00Z"), t("2026-10-02T01:00:00Z")).is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn repair_recomputes_one_utc_day_per_transaction_and_reports_parity_per_day() {
+        let repo = FakeRepo {
+            parity_mismatch: true,
+            ..FakeRepo::default()
+        };
+        let report = repair(&repo, t("2026-09-01T22:00:00Z"), t("2026-09-03T02:00:00Z"))
+            .await
+            .unwrap();
+        assert_eq!(
+            *repo.recomputes.lock().unwrap(),
+            vec![
+                (t("2026-09-01T22:00:00Z"), t("2026-09-02T00:00:00Z")),
+                (t("2026-09-02T00:00:00Z"), t("2026-09-03T00:00:00Z")),
+                (t("2026-09-03T00:00:00Z"), t("2026-09-03T02:00:00Z")),
+            ]
+        );
+        assert_eq!(report.rows_written, 21);
+        let days: Vec<NaiveDate> = report.days.iter().map(|p| p.day).collect();
+        assert_eq!(
+            days,
+            vec![d("2026-09-01"), d("2026-09-02"), d("2026-09-03")]
+        );
+        assert!(report.days.iter().all(|p| !p.is_ok()));
+    }
+
+    #[tokio::test]
+    async fn repair_rejects_an_invalid_window_without_touching_the_repository() {
+        let repo = FakeRepo::default();
+        assert!(
+            repair(&repo, t("2026-09-01T00:30:00Z"), t("2026-09-01T02:00:00Z"))
+                .await
+                .is_err()
+        );
+        assert!(repo.recomputes.lock().unwrap().is_empty());
     }
 }

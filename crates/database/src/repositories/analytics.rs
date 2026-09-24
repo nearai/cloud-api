@@ -2,6 +2,7 @@
 //!
 //! All costs use fixed scale 9 (nano-dollars) and USD currency. This impl owns client
 //! acquisition, transactions and timeouts; report SQL lives in one file per report family.
+//! Every report runs in one read-only transaction under one statement budget (spec §6.3).
 
 mod consumption;
 mod organization;
@@ -22,34 +23,89 @@ use services::admin::{
     TimeSeriesMetrics,
 };
 use services::common::RepositoryError;
-use std::time::Duration;
+use std::time::{Duration, Instant};
+use tokio_postgres::Transaction;
 use uuid::Uuid;
+
+/// Budget for one analytics report (spec §6.3), shared by all of its statements.
+const ANALYTICS_STATEMENT_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Revenue density stays on raw per-minute buckets over up to 90 days (spec §8). This is a
+/// runaway guard, not a latency target, so it is a fixed constant rather than the seam.
+const REVENUE_DENSITY_STATEMENT_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// PostgreSQL implementation of the analytics repository
 pub struct PgAnalyticsRepository {
     pool: DbPool,
-    filtered_metrics_timeout: Duration,
+    statement_timeout: Duration,
 }
 
 impl PgAnalyticsRepository {
     pub fn new(pool: DbPool) -> Self {
-        Self::with_filtered_metrics_timeout(
-            pool,
-            reporting_query::DEFAULT_REPORTING_STATEMENT_TIMEOUT,
-        )
+        Self::with_statement_timeout(pool, ANALYTICS_STATEMENT_TIMEOUT)
     }
 
-    pub fn with_filtered_metrics_timeout(pool: DbPool, filtered_metrics_timeout: Duration) -> Self {
+    /// Injects the budget for every report except revenue density. Tests pass a short one
+    /// to force `RepositoryError::QueryTimeout`.
+    pub fn with_statement_timeout(pool: DbPool, statement_timeout: Duration) -> Self {
         Self {
             pool,
-            filtered_metrics_timeout,
+            statement_timeout,
         }
+    }
+
+    /// Runs one report in its own read-only transaction under a deadline of `budget` from
+    /// now. The deadline starts before the pool wait, so the wait counts against it. The
+    /// report arms the deadline (`arm`) before each of its statements.
+    async fn run_report<T>(
+        &self,
+        budget: Duration,
+        report: impl AsyncFnOnce(&Transaction<'_>, Instant) -> Result<T, RepositoryError>,
+    ) -> Result<T, RepositoryError> {
+        let deadline = reporting_query::reporting_deadline(budget, None)?;
+        let mut client = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| RepositoryError::PoolError(e.into()))?;
+        let transaction = client
+            .build_transaction()
+            .read_only(true)
+            .start()
+            .await
+            .map_err(map_db_error)?;
+        let result = report(&transaction, deadline).await?;
+        transaction.commit().await.map_err(map_db_error)?;
+        Ok(result)
     }
 }
 
 /// Convert nano-dollars (scale 9) to USD
 fn nano_to_usd(nano: i64) -> f64 {
     nano as f64 / 1_000_000_000.0
+}
+
+/// Re-arms the transaction-local `statement_timeout` with what is left of the report's
+/// deadline, so one budget covers every statement of a report, and pins UTC. `SET LOCAL`
+/// semantics: nothing leaks onto the pooled connection.
+async fn arm(tx: &Transaction<'_>, deadline: Instant) -> Result<(), RepositoryError> {
+    reporting_query::configure_reporting_transaction(
+        tx,
+        reporting_query::remaining_statement_timeout(deadline)?,
+    )
+    .await
+}
+
+/// Count-weighted combination of per-hour percentiles (spec §4): exact within one
+/// `usage_hourly` row, approximate across rows (documented as approx. in the API). NULL
+/// when no row has samples, as `PERCENTILE_CONT` over no values is.
+fn approx_percentile(percentile: &str, samples: &str) -> String {
+    format!("(SUM({percentile} * {samples}) / NULLIF(SUM({samples}), 0)::double precision)")
+}
+
+/// Exact mean from per-hour sums and sample counts; NULL when there are no samples.
+fn weighted_mean(sum: &str, samples: &str) -> String {
+    format!("(SUM({sum})::double precision / NULLIF(SUM({samples}), 0)::double precision)")
 }
 
 #[async_trait]
@@ -61,44 +117,16 @@ impl AnalyticsRepository for PgAnalyticsRepository {
         end: DateTime<Utc>,
         credit_type: Option<&str>,
     ) -> Result<OrganizationMetrics, RepositoryError> {
-        let deadline = if credit_type.is_some() {
-            Some(reporting_query::reporting_deadline(
-                self.filtered_metrics_timeout,
-                None,
-            )?)
-        } else {
-            None
-        };
-        let mut client = self
-            .pool
-            .get()
-            .await
-            .map_err(|e| RepositoryError::PoolError(e.into()))?;
-        if let Some(deadline) = deadline {
-            let transaction = client
-                .build_transaction()
-                .read_only(true)
-                .start()
-                .await
-                .map_err(map_db_error)?;
-            let result = organization::get_organization_metrics_with_client(
-                &*transaction,
-                (org_id, start, end),
-                credit_type,
-                Some((&transaction, deadline)),
-            )
-            .await?;
-            transaction.commit().await.map_err(map_db_error)?;
-            Ok(result)
-        } else {
+        self.run_report(self.statement_timeout, async |tx, deadline| {
             organization::get_organization_metrics_with_client(
-                &**client,
+                tx,
+                deadline,
                 (org_id, start, end),
                 credit_type,
-                None,
             )
             .await
-        }
+        })
+        .await
     }
 
     async fn get_platform_metrics(
@@ -106,12 +134,10 @@ impl AnalyticsRepository for PgAnalyticsRepository {
         start: DateTime<Utc>,
         end: DateTime<Utc>,
     ) -> Result<PlatformMetrics, RepositoryError> {
-        let client = self
-            .pool
-            .get()
-            .await
-            .map_err(|e| RepositoryError::PoolError(e.into()))?;
-        platform::get_platform_metrics(&client, start, end).await
+        self.run_report(self.statement_timeout, async |tx, deadline| {
+            platform::get_platform_metrics(tx, deadline, start, end).await
+        })
+        .await
     }
 
     async fn get_organization_timeseries(
@@ -122,46 +148,17 @@ impl AnalyticsRepository for PgAnalyticsRepository {
         granularity: &str,
         credit_type: Option<&str>,
     ) -> Result<TimeSeriesMetrics, RepositoryError> {
-        let deadline = if credit_type.is_some() {
-            Some(reporting_query::reporting_deadline(
-                self.filtered_metrics_timeout,
-                None,
-            )?)
-        } else {
-            None
-        };
-        let mut client = self
-            .pool
-            .get()
-            .await
-            .map_err(|e| RepositoryError::PoolError(e.into()))?;
-        if let Some(deadline) = deadline {
-            let transaction = client
-                .build_transaction()
-                .read_only(true)
-                .start()
-                .await
-                .map_err(map_db_error)?;
-            let result = organization::get_organization_timeseries_with_client(
-                &*transaction,
-                (org_id, start, end),
-                granularity,
-                credit_type,
-                Some((&transaction, deadline)),
-            )
-            .await?;
-            transaction.commit().await.map_err(map_db_error)?;
-            Ok(result)
-        } else {
+        self.run_report(self.statement_timeout, async |tx, deadline| {
             organization::get_organization_timeseries_with_client(
-                &**client,
+                tx,
+                deadline,
                 (org_id, start, end),
                 granularity,
                 credit_type,
-                None,
             )
             .await
-        }
+        })
+        .await
     }
 
     async fn get_platform_timeseries(
@@ -170,80 +167,66 @@ impl AnalyticsRepository for PgAnalyticsRepository {
         end: DateTime<Utc>,
         granularity: &str,
     ) -> Result<PlatformTimeSeriesMetrics, RepositoryError> {
-        let client = self
-            .pool
-            .get()
-            .await
-            .map_err(|e| RepositoryError::PoolError(e.into()))?;
-        platform::get_platform_timeseries(&client, start, end, granularity).await
+        self.run_report(self.statement_timeout, async |tx, deadline| {
+            platform::get_platform_timeseries(tx, deadline, start, end, granularity).await
+        })
+        .await
     }
 
     async fn get_billing_summary(&self) -> Result<BillingSummary, RepositoryError> {
-        let client = self
-            .pool
-            .get()
-            .await
-            .map_err(|e| RepositoryError::PoolError(e.into()))?;
-        revenue::get_billing_summary(&client).await
+        self.run_report(self.statement_timeout, async |tx, deadline| {
+            revenue::get_billing_summary(tx, deadline).await
+        })
+        .await
     }
 
     async fn get_model_revenue(
         &self,
         query: ModelRevenueQuery,
     ) -> Result<ModelRevenueReport, RepositoryError> {
-        let client = self
-            .pool
-            .get()
-            .await
-            .map_err(|e| RepositoryError::PoolError(e.into()))?;
-        revenue::get_model_revenue(&client, query).await
+        self.run_report(self.statement_timeout, async |tx, deadline| {
+            revenue::get_model_revenue(tx, deadline, query).await
+        })
+        .await
     }
 
     async fn get_org_revenue(
         &self,
         query: OrgRevenueQuery,
     ) -> Result<OrgRevenueReport, RepositoryError> {
-        let client = self
-            .pool
-            .get()
-            .await
-            .map_err(|e| RepositoryError::PoolError(e.into()))?;
-        revenue::get_org_revenue(&client, query).await
+        self.run_report(self.statement_timeout, async |tx, deadline| {
+            revenue::get_org_revenue(tx, deadline, query).await
+        })
+        .await
     }
 
     async fn get_model_consumption_timeseries(
         &self,
         query: ModelConsumptionTimeseriesQuery,
     ) -> Result<ModelConsumptionTimeseries, RepositoryError> {
-        let client = self
-            .pool
-            .get()
-            .await
-            .map_err(|e| RepositoryError::PoolError(e.into()))?;
-        consumption::get_model_consumption_timeseries(&client, query).await
+        self.run_report(self.statement_timeout, async |tx, deadline| {
+            consumption::get_model_consumption_timeseries(tx, deadline, query).await
+        })
+        .await
     }
 
     async fn get_performance_timeseries(
         &self,
         query: PerformanceTimeseriesQuery,
     ) -> Result<PerformanceTimeseries, RepositoryError> {
-        let client = self
-            .pool
-            .get()
-            .await
-            .map_err(|e| RepositoryError::PoolError(e.into()))?;
-        consumption::get_performance_timeseries(&client, query).await
+        self.run_report(self.statement_timeout, async |tx, deadline| {
+            consumption::get_performance_timeseries(tx, deadline, query).await
+        })
+        .await
     }
 
     async fn get_revenue_density(
         &self,
         query: RevenueDensityQuery,
     ) -> Result<RevenueDensityReport, RepositoryError> {
-        let client = self
-            .pool
-            .get()
-            .await
-            .map_err(|e| RepositoryError::PoolError(e.into()))?;
-        revenue::get_revenue_density(&client, query).await
+        self.run_report(REVENUE_DENSITY_STATEMENT_TIMEOUT, async |tx, deadline| {
+            revenue::get_revenue_density(tx, deadline, query).await
+        })
+        .await
     }
 }

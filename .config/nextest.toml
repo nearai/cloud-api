@@ -37,6 +37,12 @@ filter = 'package(api) & binary(e2e_all) & (test(/^database_encryption::/) | tes
 test-group = "e2e-db"
 threads-required = "num-test-threads"
 
+# The billing summary sums usage_hourly platform-wide; its delta check needs no concurrent writers.
+[[profile.default.overrides]]
+filter = 'package(api) & binary(e2e_all) & test(/^admin_revenue_totals::serial_/)'
+test-group = "e2e-db"
+threads-required = "num-test-threads"
+
 # The scheduler claims from a database-global due queue rather than one batch,
 # so producers of due rows and scheduler passes cannot safely overlap.
 [[profile.default.overrides]]

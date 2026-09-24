@@ -191,17 +191,16 @@ pub(super) fn model_provider_breakdown<'a>(
 pub(super) async fn isolated_provider_usage_window(
     fixture: &PlatformProviderUsageFixture,
 ) -> ProviderUsageWindow {
-    // Allocate compact, non-overlapping slots from PostgreSQL's cluster-wide
-    // transaction counter. A random start at microsecond precision is not enough:
-    // two distinct starts can still make the queried time ranges overlap.
+    // Allocate whole, non-overlapping far-past UTC hours from PostgreSQL's cluster-wide
+    // transaction counter. Platform reports read usage_hourly at hour grain (spec §6.1), so
+    // a test's cohort must own its entire hour. The 1900s stay clear of live traffic and of
+    // the 2001-2021 hours that org-scoped tests pick at random.
     //
     // The occupancy check also handles a restored database, transaction-ID wrap,
     // and rows retained from older versions of this test helper.
     const MAX_ATTEMPTS: usize = 64;
-    const SLOT_COUNT: i64 = 1_000_000_000;
-    const SLOT_SECONDS: i64 = 10;
-    const WINDOW_SECONDS: i64 = 8;
-    let base = chrono::DateTime::parse_from_rfc3339("2400-01-01T00:00:00Z")
+    const SLOT_COUNT: i64 = 876_000; // hours from 1900-01-01, all before 2000
+    let base = chrono::DateTime::parse_from_rfc3339("1900-01-01T00:00:00Z")
         .expect("provider usage window base is valid")
         .with_timezone(&chrono::Utc);
     let client = fixture.database.pool().get().await.expect("db connection");
@@ -213,8 +212,8 @@ pub(super) async fn isolated_provider_usage_window(
             .expect("allocate provider usage window")
             .get(0);
         let slot = allocation_id.rem_euclid(SLOT_COUNT);
-        let start = base + chrono::Duration::seconds(slot * SLOT_SECONDS);
-        let end = start + chrono::Duration::seconds(WINDOW_SECONDS);
+        let start = base + chrono::Duration::hours(slot);
+        let end = start + chrono::Duration::hours(1);
         let occupied: bool = client
             .query_one(
                 r#"

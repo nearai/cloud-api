@@ -29,6 +29,7 @@ enum AgentLoopResult {
 /// Context for processing a response stream
 struct ProcessStreamContext {
     request: models::CreateResponseRequest,
+    model: Option<crate::models::ModelWithPricing>,
     user_id: crate::UserId,
     api_key_id: String,
     request_id: uuid::Uuid,
@@ -175,6 +176,20 @@ impl ports::ResponseServiceTrait for ResponseServiceImpl {
             ));
         }
 
+        // Reuse the lookup needed for image dispatch, but perform it before
+        // starting the stream or tools so endpoint errors remain HTTP 400s.
+        let model = self
+            .completion_service
+            .get_model(&request.model)
+            .await
+            .ok()
+            .flatten();
+        if let Some(model) = &model {
+            model
+                .validate_endpoint(crate::models::InferenceEndpoint::Responses)
+                .map_err(|message| errors::ResponseError::InvalidParams(message.into()))?;
+        }
+
         // Create a channel for streaming events
         let (mut tx, rx) = mpsc::unbounded::<models::ResponseStreamEvent>();
 
@@ -214,6 +229,7 @@ impl ports::ResponseServiceTrait for ResponseServiceImpl {
 
             let context = ProcessStreamContext {
                 request,
+                model,
                 user_id,
                 api_key_id,
                 request_id,
@@ -1112,16 +1128,13 @@ impl ResponseServiceImpl {
         }
 
         // Check if this is an image model and handle it specially
-        if let Ok(Some(model)) = context
-            .completion_service
-            .get_model(&context.request.model)
-            .await
-        {
-            if Self::has_image_generation_capability(&model.output_modalities) {
+        if let Some(model) = &context.model {
+            if model.has_output_modality("image") {
                 tracing::info!(
                     "Image generation model detected, handling image operation: {}",
                     model.model_name
                 );
+                context.request.model = model.model_name.clone();
 
                 // Handle image generation/editing and return early
                 let image_result = Self::process_image_operation(
@@ -3262,14 +3275,6 @@ impl ResponseServiceImpl {
         let _ = tx.send(event).await;
 
         Ok(())
-    }
-
-    /// Check if a model has image generation capability based on output_modalities
-    fn has_image_generation_capability(output_modalities: &Option<Vec<String>>) -> bool {
-        output_modalities
-            .as_ref()
-            .map(|modalities| modalities.contains(&"image".to_string()))
-            .unwrap_or(false)
     }
 
     /// Process image generation or editing operations

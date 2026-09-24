@@ -1,4 +1,6 @@
+mod capabilities;
 pub mod ports;
+pub use capabilities::InferenceEndpoint;
 
 use std::collections::HashMap;
 use std::future::Future;
@@ -258,6 +260,39 @@ mod tests {
 
     fn test_catalog_model(model_name: &str) -> ModelWithPricing {
         test_catalog_model_with_output(model_name, Some(1024))
+    }
+
+    #[test]
+    fn systemone_endpoint_compatibility_preserves_other_modalities() {
+        let mut model = test_catalog_model("fixture");
+        for modalities in [
+            None,
+            Some(vec![]),
+            Some(vec!["text".into()]),
+            Some(vec!["image".into()]),
+            Some(vec!["text".into(), "audio".into()]),
+        ] {
+            model.output_modalities = modalities;
+            assert!(model
+                .validate_endpoint(InferenceEndpoint::ChatCompletions)
+                .is_ok());
+            assert!(model
+                .validate_endpoint(InferenceEndpoint::Responses)
+                .is_ok());
+            assert!(model
+                .validate_endpoint(InferenceEndpoint::SystemOne)
+                .is_err());
+        }
+        model.output_modalities = Some(vec!["decisions".into()]);
+        assert!(model
+            .validate_endpoint(InferenceEndpoint::ChatCompletions)
+            .is_err());
+        assert!(model
+            .validate_endpoint(InferenceEndpoint::Responses)
+            .is_err());
+        assert!(model
+            .validate_endpoint(InferenceEndpoint::SystemOne)
+            .is_ok());
     }
 
     fn test_catalog_model_with_output(

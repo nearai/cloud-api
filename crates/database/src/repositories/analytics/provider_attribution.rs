@@ -43,14 +43,14 @@ pub(super) async fn get_platform_provider_usage(
                 served_via_fallback,
                 served_provider_type,
                 served_provider_tier,
-                COUNT(*)::bigint as requests,
+                COALESCE(SUM(request_count), 0)::bigint as requests,
                 COALESCE(SUM(input_tokens), 0)::bigint as input_tokens,
                 COALESCE(SUM(output_tokens), 0)::bigint as output_tokens,
                 (COALESCE(SUM(input_tokens), 0) + COALESCE(SUM(output_tokens), 0))::bigint as total_tokens,
                 COALESCE(SUM(cache_read_tokens), 0)::bigint as cache_read_tokens,
                 COALESCE(SUM(total_cost), 0)::bigint as cost_nano
-            FROM organization_usage_log
-            WHERE created_at >= $1 AND created_at < $2
+            FROM usage_hourly
+            WHERE hour >= $1 AND hour < $2
             GROUP BY GROUPING SETS (
                 (served_via_fallback),
                 (served_provider_type),

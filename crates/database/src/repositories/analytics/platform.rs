@@ -1,7 +1,9 @@
-//! Platform-wide reports for admin dashboards.
+//! Platform-wide reports for admin dashboards, served from `usage_hourly` over the
+//! hour-normalized range (spec §6.1). Sign-up counts come from `users`/`organizations`
+//! over the same widened range, so each response describes one range.
 
-use super::arm;
-use super::{nano_to_usd, provider_attribution};
+use super::hour_range::hour_range;
+use super::{approx_percentile, arm, nano_to_usd, provider_attribution};
 use crate::repositories::utils::map_db_error;
 use chrono::{DateTime, Utc};
 use services::admin::{
@@ -19,30 +21,32 @@ pub(super) async fn get_platform_metrics(
     start: DateTime<Utc>,
     end: DateTime<Utc>,
 ) -> Result<PlatformMetrics, RepositoryError> {
+    let (start, end) = hour_range(start, end);
+
     // Counts: total active users/orgs (snapshot) + new signups (within the period) +
     // paying-org count (orgs with an active prepaid or contract credit).
     arm(tx, deadline).await?;
     let counts_row = tx
-            .query_one(
-                r#"
-                SELECT
-                    (SELECT COUNT(*) FROM users WHERE is_active = true)::bigint as total_users,
-                    (SELECT COUNT(*) FROM organizations WHERE is_active = true)::bigint as total_organizations,
-                    (SELECT COUNT(*) FROM users
-                        WHERE created_at >= $1 AND created_at < $2)::bigint as new_users,
-                    (SELECT COUNT(*) FROM organizations
-                        WHERE created_at >= $1 AND created_at < $2)::bigint as new_organizations,
-                    (SELECT COUNT(DISTINCT olh.organization_id)
-                        FROM organization_limits_history olh
-                        JOIN organizations o ON o.id = olh.organization_id AND o.is_active = true
-                        WHERE (olh.credit_type = 'payment'
-                            OR (olh.credit_type = 'postpay' AND olh.spend_limit > 0))
-                            AND olh.effective_until IS NULL)::bigint as paying_organizations
-                "#,
-                &[&start, &end],
-            )
-            .await
-            .map_err(map_db_error)?;
+        .query_one(
+            r#"
+            SELECT
+                (SELECT COUNT(*) FROM users WHERE is_active = true)::bigint as total_users,
+                (SELECT COUNT(*) FROM organizations WHERE is_active = true)::bigint as total_organizations,
+                (SELECT COUNT(*) FROM users
+                    WHERE created_at >= $1 AND created_at < $2)::bigint as new_users,
+                (SELECT COUNT(*) FROM organizations
+                    WHERE created_at >= $1 AND created_at < $2)::bigint as new_organizations,
+                (SELECT COUNT(DISTINCT olh.organization_id)
+                    FROM organization_limits_history olh
+                    JOIN organizations o ON o.id = olh.organization_id AND o.is_active = true
+                    WHERE (olh.credit_type = 'payment'
+                        OR (olh.credit_type = 'postpay' AND olh.spend_limit > 0))
+                        AND olh.effective_until IS NULL)::bigint as paying_organizations
+            "#,
+            &[&start, &end],
+        )
+        .await
+        .map_err(map_db_error)?;
 
     let total_users: i64 = counts_row.get(0);
     let total_organizations: i64 = counts_row.get(1);
@@ -50,34 +54,36 @@ pub(super) async fn get_platform_metrics(
     let new_organizations: i64 = counts_row.get(3);
     let paying_organizations: i64 = counts_row.get(4);
 
-    // Single-scan usage summary over the period: totals, the paid-vs-granted split
-    // (attributed by org class), the verifiable-vs-external split (join models), the
-    // error rate, and p95 TTFT. Verifiable split joins models on verifiability.
+    // One scan of the hourly aggregate: totals, the verifiable-vs-external split (join
+    // models on verifiability), error and incomplete counts, and an approximate p95 TTFT.
+    let p95_ttft = approx_percentile("uh.ttft_p95_ms", "uh.ttft_count");
     arm(tx, deadline).await?;
     let summary_row = tx
-            .query_one(
+        .query_one(
+            &format!(
                 r#"
-                SELECT
-                    COUNT(*)::bigint as requests,
-                    COALESCE(SUM(ul.total_cost), 0)::bigint as revenue_nano,
-                    (COALESCE(SUM(ul.input_tokens), 0) + COALESCE(SUM(ul.output_tokens), 0))::bigint as total_tokens,
-                    COALESCE(SUM(ul.cache_read_tokens), 0)::bigint as cache_read_tokens,
-                    COUNT(DISTINCT ul.organization_id)::bigint as active_organizations,
-                    COALESCE(SUM(ul.total_cost) FILTER (WHERE COALESCE(m.verifiable, false)), 0)::bigint as verifiable_nano,
-                    COUNT(*) FILTER (WHERE COALESCE(m.verifiable, false))::bigint as verifiable_requests,
-                    COALESCE(SUM(ul.total_cost) FILTER (WHERE NOT COALESCE(m.verifiable, false)), 0)::bigint as external_nano,
-                    COUNT(*) FILTER (WHERE NOT COALESCE(m.verifiable, false))::bigint as external_requests,
-                    COUNT(*) FILTER (WHERE ul.stop_reason IN ('provider_error', 'timeout'))::bigint as error_count,
-                    PERCENTILE_CONT(0.95) WITHIN GROUP (ORDER BY ul.ttft_ms)::double precision as p95_ttft_ms,
-                    COUNT(*) FILTER (WHERE ul.stop_reason = 'incomplete')::bigint as incomplete_count
-                FROM organization_usage_log ul
-                LEFT JOIN models m ON m.id = ul.model_id
-                WHERE ul.created_at >= $1 AND ul.created_at < $2
-                "#,
-                &[&start, &end],
-            )
-            .await
-            .map_err(map_db_error)?;
+            SELECT
+                COALESCE(SUM(uh.request_count), 0)::bigint as requests,
+                COALESCE(SUM(uh.total_cost), 0)::bigint as revenue_nano,
+                (COALESCE(SUM(uh.input_tokens), 0) + COALESCE(SUM(uh.output_tokens), 0))::bigint as total_tokens,
+                COALESCE(SUM(uh.cache_read_tokens), 0)::bigint as cache_read_tokens,
+                COUNT(DISTINCT uh.organization_id)::bigint as active_organizations,
+                COALESCE(SUM(uh.total_cost) FILTER (WHERE COALESCE(m.verifiable, false)), 0)::bigint as verifiable_nano,
+                COALESCE(SUM(uh.request_count) FILTER (WHERE COALESCE(m.verifiable, false)), 0)::bigint as verifiable_requests,
+                COALESCE(SUM(uh.total_cost) FILTER (WHERE NOT COALESCE(m.verifiable, false)), 0)::bigint as external_nano,
+                COALESCE(SUM(uh.request_count) FILTER (WHERE NOT COALESCE(m.verifiable, false)), 0)::bigint as external_requests,
+                COALESCE(SUM(uh.error_count), 0)::bigint as error_count,
+                {p95_ttft} as p95_ttft_ms,
+                COALESCE(SUM(uh.incomplete_count), 0)::bigint as incomplete_count
+            FROM usage_hourly uh
+            LEFT JOIN models m ON m.id = uh.model_id
+            WHERE uh.hour >= $1 AND uh.hour < $2
+            "#
+            ),
+            &[&start, &end],
+        )
+        .await
+        .map_err(map_db_error)?;
 
     let total_requests: i64 = summary_row.get(0);
     let total_consumed_usd = nano_to_usd(summary_row.get::<_, i64>(1));
@@ -105,26 +111,25 @@ pub(super) async fn get_platform_metrics(
     let provider_usage =
         provider_attribution::get_platform_provider_usage(tx, deadline, start, end).await?;
 
-    // Get top 10 models by request count
+    // Top 10 models by request count
     arm(tx, deadline).await?;
     let top_models_rows = tx
         .query(
             r#"
-                SELECT 
-                    model_name,
-                    COUNT(*)::bigint as requests,
-                    COALESCE(SUM(total_cost), 0)::bigint as revenue_nano
-                FROM organization_usage_log
-                WHERE created_at >= $1 AND created_at < $2
-                GROUP BY model_name
-                ORDER BY requests DESC
-                LIMIT 10
-                "#,
+            SELECT
+                uh.model_name,
+                COALESCE(SUM(uh.request_count), 0)::bigint as requests,
+                COALESCE(SUM(uh.total_cost), 0)::bigint as revenue_nano
+            FROM usage_hourly uh
+            WHERE uh.hour >= $1 AND uh.hour < $2
+            GROUP BY uh.model_name
+            ORDER BY requests DESC
+            LIMIT 10
+            "#,
             &[&start, &end],
         )
         .await
         .map_err(map_db_error)?;
-
     let top_models: Vec<TopModelMetrics> = top_models_rows
         .iter()
         .map(|row| TopModelMetrics {
@@ -134,28 +139,27 @@ pub(super) async fn get_platform_metrics(
         })
         .collect();
 
-    // Get top 10 organizations by spend
+    // Top 10 organizations by spend
     arm(tx, deadline).await?;
     let top_orgs_rows = tx
         .query(
             r#"
-                SELECT 
-                    o.id as organization_id,
-                    o.name as organization_name,
-                    COUNT(ul.id)::bigint as requests,
-                    COALESCE(SUM(ul.total_cost), 0)::bigint as spend_nano
-                FROM organizations o
-                INNER JOIN organization_usage_log ul ON ul.organization_id = o.id
-                WHERE ul.created_at >= $1 AND ul.created_at < $2
-                GROUP BY o.id, o.name
-                ORDER BY spend_nano DESC
-                LIMIT 10
-                "#,
+            SELECT
+                o.id as organization_id,
+                o.name as organization_name,
+                COALESCE(SUM(uh.request_count), 0)::bigint as requests,
+                COALESCE(SUM(uh.total_cost), 0)::bigint as spend_nano
+            FROM organizations o
+            INNER JOIN usage_hourly uh ON uh.organization_id = o.id
+            WHERE uh.hour >= $1 AND uh.hour < $2
+            GROUP BY o.id, o.name
+            ORDER BY spend_nano DESC
+            LIMIT 10
+            "#,
             &[&start, &end],
         )
         .await
         .map_err(map_db_error)?;
-
     let top_organizations: Vec<TopOrganizationMetrics> = top_orgs_rows
         .iter()
         .map(|row| TopOrganizationMetrics {
@@ -200,6 +204,7 @@ pub(super) async fn get_platform_timeseries(
     end: DateTime<Utc>,
     granularity: &str,
 ) -> Result<PlatformTimeSeriesMetrics, RepositoryError> {
+    let (start, end) = hour_range(start, end);
     let date_trunc = match granularity {
         "hour" => "hour",
         "week" => "week",
@@ -208,41 +213,39 @@ pub(super) async fn get_platform_timeseries(
     };
 
     // Usage-derived buckets: requests, tokens, cost + verifiable/external split +
-    // active orgs. One scan over usage_log joined to models.
+    // active orgs. One scan of the hourly aggregate joined to models.
     let usage_query = format!(
         r#"
-            SELECT
-                DATE_TRUNC('{date_trunc}', ul.created_at)::text as bucket,
-                COUNT(*)::bigint as requests,
-                (COALESCE(SUM(ul.input_tokens), 0) + COALESCE(SUM(ul.output_tokens), 0))::bigint as tokens,
-                COALESCE(SUM(ul.total_cost), 0)::bigint as cost_nano,
-                COALESCE(SUM(ul.total_cost) FILTER (WHERE COALESCE(m.verifiable, false)), 0)::bigint as verifiable_nano,
-                COALESCE(SUM(ul.total_cost) FILTER (WHERE NOT COALESCE(m.verifiable, false)), 0)::bigint as external_nano,
-                COUNT(DISTINCT ul.organization_id)::bigint as active_orgs
-            FROM organization_usage_log ul
-            LEFT JOIN models m ON m.id = ul.model_id
-            WHERE ul.created_at >= $1 AND ul.created_at < $2
-            GROUP BY DATE_TRUNC('{date_trunc}', ul.created_at)
-            ORDER BY bucket ASC
-            "#
+        SELECT
+            DATE_TRUNC('{date_trunc}', uh.hour)::text as bucket,
+            COALESCE(SUM(uh.request_count), 0)::bigint as requests,
+            (COALESCE(SUM(uh.input_tokens), 0) + COALESCE(SUM(uh.output_tokens), 0))::bigint as tokens,
+            COALESCE(SUM(uh.total_cost), 0)::bigint as cost_nano,
+            COALESCE(SUM(uh.total_cost) FILTER (WHERE COALESCE(m.verifiable, false)), 0)::bigint as verifiable_nano,
+            COALESCE(SUM(uh.total_cost) FILTER (WHERE NOT COALESCE(m.verifiable, false)), 0)::bigint as external_nano,
+            COUNT(DISTINCT uh.organization_id)::bigint as active_orgs
+        FROM usage_hourly uh
+        LEFT JOIN models m ON m.id = uh.model_id
+        WHERE uh.hour >= $1 AND uh.hour < $2
+        GROUP BY DATE_TRUNC('{date_trunc}', uh.hour)
+        ORDER BY bucket ASC
+        "#
     );
-
     let new_orgs_query = format!(
         r#"
-            SELECT DATE_TRUNC('{date_trunc}', created_at)::text as bucket, COUNT(*)::bigint
-            FROM organizations
-            WHERE created_at >= $1 AND created_at < $2
-            GROUP BY DATE_TRUNC('{date_trunc}', created_at)
-            "#
+        SELECT DATE_TRUNC('{date_trunc}', created_at)::text as bucket, COUNT(*)::bigint
+        FROM organizations
+        WHERE created_at >= $1 AND created_at < $2
+        GROUP BY DATE_TRUNC('{date_trunc}', created_at)
+        "#
     );
-
     let new_users_query = format!(
         r#"
-            SELECT DATE_TRUNC('{date_trunc}', created_at)::text as bucket, COUNT(*)::bigint
-            FROM users
-            WHERE created_at >= $1 AND created_at < $2
-            GROUP BY DATE_TRUNC('{date_trunc}', created_at)
-            "#
+        SELECT DATE_TRUNC('{date_trunc}', created_at)::text as bucket, COUNT(*)::bigint
+        FROM users
+        WHERE created_at >= $1 AND created_at < $2
+        GROUP BY DATE_TRUNC('{date_trunc}', created_at)
+        "#
     );
 
     arm(tx, deadline).await?;

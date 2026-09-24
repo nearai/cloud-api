@@ -267,14 +267,6 @@ pub fn validate_repair_window(from: DateTime<Utc>, to: DateTime<Utc>) -> Result<
     Ok(())
 }
 
-/// Latest `from` a repair may start at without leaving uncomputed raw hours below it. Readers
-/// and the scheduler treat every hour below `max_hour + 1h` as final, so a repair that starts
-/// past the next uncomputed raw hour would move `max_hour` over hours nothing ever computes,
-/// and readers would serve them from an empty aggregate. `None` means no raw hour is pending.
-pub fn repair_frontier(progress: HourlyProgress) -> Option<DateTime<Utc>> {
-    progress.next_raw_hour
-}
-
 #[derive(Debug, thiserror::Error)]
 pub enum RepairError {
     #[error("{0}")]
@@ -298,17 +290,20 @@ pub struct RepairReport {
 /// Explicit operator repair for rows that reached raw after their hour left the scheduler's
 /// 3-hour re-read (backfill, clock skew, a day flagged by parity): recomputes [from, to) one
 /// UTC day per transaction, waiting for the aggregate lock, then reports each touched day's
-/// parity. Refuses windows that start past `repair_frontier`.
+/// parity. Refuses windows that start past the next uncomputed raw hour.
 pub async fn repair(
     repository: &dyn UsageHourlyRepository,
     from: DateTime<Utc>,
     to: DateTime<Utc>,
 ) -> Result<RepairReport, RepairError> {
     validate_repair_window(from, to).map_err(RepairError::InvalidWindow)?;
+    // `next_raw_hour` is the latest `from` a repair may start at: readers and the scheduler
+    // treat every hour below `max_hour + 1h` as final, so starting past the next uncomputed raw
+    // hour would move `max_hour` over hours nothing ever computes. `None`: nothing is pending.
     // Checked outside the aggregate lock. A raw row written below `from` after this check (a
     // backfill or a clock-skewed writer) is stranded like any late row below MAX(hour); the
     // lock would not prevent that, since raw inserts never take it. Repair that window again.
-    if let Some(frontier) = repair_frontier(repository.progress().await?) {
+    if let Some(frontier) = repository.progress().await?.next_raw_hour {
         if from > frontier {
             return Err(RepairError::AheadOfAggregate { frontier });
         }

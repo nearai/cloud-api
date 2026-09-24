@@ -75,7 +75,13 @@ pub async fn recompute_usage_hourly(
         .map_err(|error| {
             let (status, code) = match &error {
                 RepairError::InvalidWindow(_) => (StatusCode::BAD_REQUEST, "invalid_request"),
-                RepairError::AheadOfAggregate { .. } => (StatusCode::CONFLICT, "conflict"),
+                RepairError::AheadOfAggregate { frontier } => {
+                    tracing::warn!(
+                        %frontier,
+                        "usage_hourly repair window starts past the aggregate frontier"
+                    );
+                    (StatusCode::CONFLICT, "conflict")
+                }
                 RepairError::Failed(error) => {
                     tracing::error!(error = %error, "usage_hourly repair failed");
                     return (

@@ -342,7 +342,7 @@ async fn admin_metrics_credit_type_timeout_is_shared_and_transaction_local() {
         .await
         .unwrap();
     drop(client);
-    let repo = database::repositories::PgAnalyticsRepository::with_filtered_metrics_timeout(
+    let repo = database::repositories::PgAnalyticsRepository::with_statement_timeout(
         pool.clone(),
         Duration::from_millis(400),
     );
@@ -388,18 +388,19 @@ async fn admin_metrics_credit_type_timeout_is_shared_and_transaction_local() {
         "SET LOCAL must not leak after errors"
     );
     drop(client);
+
+    // Successful requests must also restore the pooled connection. The budget now covers
+    // unfiltered reports too (spec §6.3), so both run under a budget they fit in.
+    let repo = database::repositories::PgAnalyticsRepository::with_statement_timeout(
+        pool.clone(),
+        Duration::from_secs(5),
+    );
     let unfiltered = repo
         .get_organization_metrics(fixture.organization_id, start, end, None)
         .await
         .unwrap();
     assert_eq!(unfiltered.summary.total_requests, 1);
     assert_eq!(unfiltered.summary.total_cost_usd, 1.0);
-
-    // A successful filtered request must also restore the pooled connection.
-    let repo = database::repositories::PgAnalyticsRepository::with_filtered_metrics_timeout(
-        pool.clone(),
-        Duration::from_secs(5),
-    );
     let filtered = repo
         .get_organization_timeseries(fixture.organization_id, start, end, "day", Some("postpay"))
         .await

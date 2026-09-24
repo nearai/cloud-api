@@ -1,6 +1,8 @@
 //! Platform-wide reports for admin dashboards.
 
+use super::arm;
 use super::{nano_to_usd, provider_attribution};
+use crate::repositories::utils::map_db_error;
 use chrono::{DateTime, Utc};
 use services::admin::{
     PlatformMetrics, PlatformTimeSeriesMetrics, PlatformTimeSeriesPoint, TopModelMetrics,
@@ -8,15 +10,19 @@ use services::admin::{
 };
 use services::common::RepositoryError;
 use std::collections::BTreeMap;
+use std::time::Instant;
+use tokio_postgres::Transaction;
 
 pub(super) async fn get_platform_metrics(
-    client: &tokio_postgres::Client,
+    tx: &Transaction<'_>,
+    deadline: Instant,
     start: DateTime<Utc>,
     end: DateTime<Utc>,
 ) -> Result<PlatformMetrics, RepositoryError> {
     // Counts: total active users/orgs (snapshot) + new signups (within the period) +
     // paying-org count (orgs with an active prepaid or contract credit).
-    let counts_row = client
+    arm(tx, deadline).await?;
+    let counts_row = tx
             .query_one(
                 r#"
                 SELECT
@@ -36,7 +42,7 @@ pub(super) async fn get_platform_metrics(
                 &[&start, &end],
             )
             .await
-            .map_err(|e| RepositoryError::DatabaseError(e.into()))?;
+            .map_err(map_db_error)?;
 
     let total_users: i64 = counts_row.get(0);
     let total_organizations: i64 = counts_row.get(1);
@@ -47,7 +53,8 @@ pub(super) async fn get_platform_metrics(
     // Single-scan usage summary over the period: totals, the paid-vs-granted split
     // (attributed by org class), the verifiable-vs-external split (join models), the
     // error rate, and p95 TTFT. Verifiable split joins models on verifiability.
-    let summary_row = client
+    arm(tx, deadline).await?;
+    let summary_row = tx
             .query_one(
                 r#"
                 SELECT
@@ -70,7 +77,7 @@ pub(super) async fn get_platform_metrics(
                 &[&start, &end],
             )
             .await
-            .map_err(|e| RepositoryError::DatabaseError(e.into()))?;
+            .map_err(map_db_error)?;
 
     let total_requests: i64 = summary_row.get(0);
     let total_consumed_usd = nano_to_usd(summary_row.get::<_, i64>(1));
@@ -96,10 +103,11 @@ pub(super) async fn get_platform_metrics(
     };
 
     let provider_usage =
-        provider_attribution::get_platform_provider_usage(client, start, end).await?;
+        provider_attribution::get_platform_provider_usage(tx, deadline, start, end).await?;
 
     // Get top 10 models by request count
-    let top_models_rows = client
+    arm(tx, deadline).await?;
+    let top_models_rows = tx
         .query(
             r#"
                 SELECT 
@@ -115,7 +123,7 @@ pub(super) async fn get_platform_metrics(
             &[&start, &end],
         )
         .await
-        .map_err(|e| RepositoryError::DatabaseError(e.into()))?;
+        .map_err(map_db_error)?;
 
     let top_models: Vec<TopModelMetrics> = top_models_rows
         .iter()
@@ -127,7 +135,8 @@ pub(super) async fn get_platform_metrics(
         .collect();
 
     // Get top 10 organizations by spend
-    let top_orgs_rows = client
+    arm(tx, deadline).await?;
+    let top_orgs_rows = tx
         .query(
             r#"
                 SELECT 
@@ -145,7 +154,7 @@ pub(super) async fn get_platform_metrics(
             &[&start, &end],
         )
         .await
-        .map_err(|e| RepositoryError::DatabaseError(e.into()))?;
+        .map_err(map_db_error)?;
 
     let top_organizations: Vec<TopOrganizationMetrics> = top_orgs_rows
         .iter()
@@ -185,7 +194,8 @@ pub(super) async fn get_platform_metrics(
 }
 
 pub(super) async fn get_platform_timeseries(
-    client: &tokio_postgres::Client,
+    tx: &Transaction<'_>,
+    deadline: Instant,
     start: DateTime<Utc>,
     end: DateTime<Utc>,
     granularity: &str,
@@ -235,18 +245,21 @@ pub(super) async fn get_platform_timeseries(
             "#
     );
 
-    let usage_rows = client
+    arm(tx, deadline).await?;
+    let usage_rows = tx
         .query(&usage_query, &[&start, &end])
         .await
-        .map_err(|e| RepositoryError::DatabaseError(e.into()))?;
-    let new_orgs_rows = client
+        .map_err(map_db_error)?;
+    arm(tx, deadline).await?;
+    let new_orgs_rows = tx
         .query(&new_orgs_query, &[&start, &end])
         .await
-        .map_err(|e| RepositoryError::DatabaseError(e.into()))?;
-    let new_users_rows = client
+        .map_err(map_db_error)?;
+    arm(tx, deadline).await?;
+    let new_users_rows = tx
         .query(&new_users_query, &[&start, &end])
         .await
-        .map_err(|e| RepositoryError::DatabaseError(e.into()))?;
+        .map_err(map_db_error)?;
 
     // Merge the three result sets by bucket key. BTreeMap keeps ISO date keys sorted.
     let mut points: BTreeMap<String, PlatformTimeSeriesPoint> = BTreeMap::new();

@@ -11,6 +11,7 @@ mod common;
 mod admin_activation_pricing_gate;
 mod admin_analytics;
 mod admin_analytics_range_hygiene;
+mod admin_analytics_statement_budget;
 mod admin_deprecate_model;
 mod admin_invitation_email_deliveries;
 mod admin_list_models;

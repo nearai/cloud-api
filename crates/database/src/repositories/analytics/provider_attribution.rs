@@ -1,4 +1,6 @@
+use super::arm;
 use super::nano_to_usd;
+use crate::repositories::utils::map_db_error;
 use chrono::{DateTime, Utc};
 use services::admin::{
     ModelProviderRevenueBreakdown, ModelRevenueEntry, ModelRevenueQuery, PlatformProviderUsage,
@@ -6,6 +8,8 @@ use services::admin::{
 };
 use services::common::RepositoryError;
 use std::collections::BTreeMap;
+use std::time::Instant;
+use tokio_postgres::Transaction;
 
 fn provider_usage_totals_from_row(row: &tokio_postgres::Row) -> ProviderUsageTotals {
     ProviderUsageTotals {
@@ -25,11 +29,13 @@ const BY_PROVIDER_TYPE: i32 = 0b101;
 const BY_PROVIDER_TIER: i32 = 0b110;
 
 pub(super) async fn get_platform_provider_usage(
-    client: &tokio_postgres::Client,
+    tx: &Transaction<'_>,
+    deadline: Instant,
     start: DateTime<Utc>,
     end: DateTime<Utc>,
 ) -> Result<PlatformProviderUsage, RepositoryError> {
-    let rows = client
+    arm(tx, deadline).await?;
+    let rows = tx
         .query(
             r#"
             SELECT
@@ -58,7 +64,7 @@ pub(super) async fn get_platform_provider_usage(
             &[&start, &end],
         )
         .await
-        .map_err(|e| RepositoryError::DatabaseError(e.into()))?;
+        .map_err(map_db_error)?;
 
     let mut usage = PlatformProviderUsage {
         fallback: ProviderUsageTotals::default(),
@@ -105,7 +111,8 @@ pub(super) async fn get_platform_provider_usage(
 }
 
 pub(super) async fn load_model_provider_breakdowns(
-    client: &tokio_postgres::Client,
+    tx: &Transaction<'_>,
+    deadline: Instant,
     query: &ModelRevenueQuery,
     where_clause: &str,
     model_like: &Option<String>,
@@ -134,7 +141,8 @@ pub(super) async fn load_model_provider_breakdowns(
         ORDER BY ul.model_name, ul.served_provider_type NULLS FIRST, ul.served_provider_tier NULLS FIRST, ul.served_via_fallback
         "#
     );
-    let breakdown_rows = client
+    arm(tx, deadline).await?;
+    let breakdown_rows = tx
         .query(
             &breakdown_sql,
             &[
@@ -147,7 +155,7 @@ pub(super) async fn load_model_provider_breakdowns(
             ],
         )
         .await
-        .map_err(|e| RepositoryError::DatabaseError(e.into()))?;
+        .map_err(map_db_error)?;
 
     let mut breakdowns_by_model: BTreeMap<String, Vec<ModelProviderRevenueBreakdown>> =
         BTreeMap::new();

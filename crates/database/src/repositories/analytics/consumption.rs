@@ -1,14 +1,19 @@
 //! Per-model consumption and performance timeseries for admin dashboards.
 
+use super::arm;
 use super::nano_to_usd;
+use crate::repositories::utils::map_db_error;
 use services::admin::{
     ModelConsumptionPoint, ModelConsumptionTimeseries, ModelConsumptionTimeseriesQuery,
     PerformancePoint, PerformanceTimeseries, PerformanceTimeseriesQuery,
 };
 use services::common::RepositoryError;
+use std::time::Instant;
+use tokio_postgres::Transaction;
 
 pub(super) async fn get_model_consumption_timeseries(
-    client: &tokio_postgres::Client,
+    tx: &Transaction<'_>,
+    deadline: Instant,
     query: ModelConsumptionTimeseriesQuery,
 ) -> Result<ModelConsumptionTimeseries, RepositoryError> {
     // granularity is already an allowlisted &'static str from the handler
@@ -16,7 +21,8 @@ pub(super) async fn get_model_consumption_timeseries(
 
     // Step 1: identify the top-N model_ids by total cost in the period.
     // We use model_id (UUID) as the grouping key to survive model renames.
-    let top_ids_rows = client
+    arm(tx, deadline).await?;
+    let top_ids_rows = tx
         .query(
             r#"
                 SELECT model_id
@@ -29,7 +35,7 @@ pub(super) async fn get_model_consumption_timeseries(
             &[&query.start, &query.end, &query.top_n],
         )
         .await
-        .map_err(|e| RepositoryError::DatabaseError(e.into()))?;
+        .map_err(map_db_error)?;
 
     let top_ids: Vec<uuid::Uuid> = top_ids_rows.iter().map(|r| r.get(0)).collect();
 
@@ -54,10 +60,11 @@ pub(super) async fn get_model_consumption_timeseries(
             "#
     );
 
-    let rows = client
+    arm(tx, deadline).await?;
+    let rows = tx
         .query(&bucket_query, &[&query.start, &query.end, &top_ids])
         .await
-        .map_err(|e| RepositoryError::DatabaseError(e.into()))?;
+        .map_err(map_db_error)?;
 
     // Accumulate total cost per label across all buckets, then sort descending
     // so model_labels reflects true global top-N rank (not first-bucket order).
@@ -102,7 +109,8 @@ pub(super) async fn get_model_consumption_timeseries(
 }
 
 pub(super) async fn get_performance_timeseries(
-    client: &tokio_postgres::Client,
+    tx: &Transaction<'_>,
+    deadline: Instant,
     query: PerformanceTimeseriesQuery,
 ) -> Result<PerformanceTimeseries, RepositoryError> {
     let date_trunc = query.granularity.as_str();
@@ -132,10 +140,11 @@ pub(super) async fn get_performance_timeseries(
             "#
     );
 
-    let rows = client
+    arm(tx, deadline).await?;
+    let rows = tx
         .query(&sql, &[&query.start, &query.end, &query.model_name])
         .await
-        .map_err(|e| RepositoryError::DatabaseError(e.into()))?;
+        .map_err(map_db_error)?;
 
     let data: Vec<PerformancePoint> = rows
         .iter()

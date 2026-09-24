@@ -1,6 +1,8 @@
 //! Revenue and billing reports for admin dashboards.
 
+use super::arm;
 use super::{nano_to_usd, pagination, provider_attribution};
+use crate::repositories::utils::map_db_error;
 use chrono::Utc;
 use services::admin::{
     BillingSourceBreakdown, BillingSummary, ModelRevenueEntry, ModelRevenueQuery,
@@ -8,7 +10,9 @@ use services::admin::{
     RevenueDensityQuery, RevenueDensityReport, RevenueSort,
 };
 use services::common::RepositoryError;
+use std::time::Instant;
 use tokio_postgres::Error as PostgresError;
+use tokio_postgres::Transaction;
 
 fn log_billing_summary_db_error(stage: &'static str, err: PostgresError) -> RepositoryError {
     if let Some(db_error) = err.as_db_error() {
@@ -31,17 +35,19 @@ fn log_billing_summary_db_error(stage: &'static str, err: PostgresError) -> Repo
         );
     }
 
-    RepositoryError::DatabaseError(err.into())
+    map_db_error(err)
 }
 
 pub(super) async fn get_billing_summary(
-    client: &tokio_postgres::Client,
+    tx: &Transaction<'_>,
+    deadline: Instant,
 ) -> Result<BillingSummary, RepositoryError> {
     // Active credit LIMITS (caps) by type + paying/granted org counts. Postpay
     // identifies a paying organization, but its safety ceiling is deliberately
     // excluded from active_paid_credit_limit_usd because it is not prepaid cash.
     // Joined to active organizations so soft-deleted orgs aren't counted.
-    let limits_row = client
+    arm(tx, deadline).await?;
+    let limits_row = tx
             .query_one(
                 r#"
                 SELECT
@@ -69,7 +75,8 @@ pub(super) async fn get_billing_summary(
     // All-time consumed cost. `total` (from the cached balance) is ALL usage
     // (inference + services); the inference/service splits come from their logs
     // and reconcile to the total.
-    let consumed_row = client
+    arm(tx, deadline).await?;
+    let consumed_row = tx
             .query_one(
                 r#"
                 SELECT
@@ -87,7 +94,8 @@ pub(super) async fn get_billing_summary(
 
     // Active prepaid credit limit broken down by funding source (active orgs only).
     // Contract postpay ceilings are intentionally not part of this cash-like metric.
-    let source_rows = client
+    arm(tx, deadline).await?;
+    let source_rows = tx
         .query(
             r#"
                 SELECT
@@ -128,7 +136,8 @@ pub(super) async fn get_billing_summary(
 }
 
 pub(super) async fn get_model_revenue(
-    client: &tokio_postgres::Client,
+    tx: &Transaction<'_>,
+    deadline: Instant,
     query: ModelRevenueQuery,
 ) -> Result<ModelRevenueReport, RepositoryError> {
     // Sort column from a fixed allowlist (never interpolate user input).
@@ -180,16 +189,15 @@ pub(super) async fn get_model_revenue(
         &query.limit,
         &query.offset,
     ];
-    let rows = client
-        .query(&data_sql, &params)
-        .await
-        .map_err(|e| RepositoryError::DatabaseError(e.into()))?;
+    arm(tx, deadline).await?;
+    let rows = tx.query(&data_sql, &params).await.map_err(map_db_error)?;
     let count_sql = format!(
         "SELECT COUNT(*)::bigint FROM (SELECT 1 FROM organization_usage_log ul \
              LEFT JOIN models m ON m.id = ul.model_id {where_clause} GROUP BY ul.model_name) t"
     );
     let total = pagination::page_total(
-        client,
+        tx,
+        deadline,
         &rows,
         (query.limit, query.offset),
         &count_sql,
@@ -216,7 +224,8 @@ pub(super) async fn get_model_revenue(
         .collect();
 
     provider_attribution::load_model_provider_breakdowns(
-        client,
+        tx,
+        deadline,
         &query,
         where_clause,
         &model_like,
@@ -235,7 +244,8 @@ pub(super) async fn get_model_revenue(
 }
 
 pub(super) async fn get_org_revenue(
-    client: &tokio_postgres::Client,
+    tx: &Transaction<'_>,
+    deadline: Instant,
     query: OrgRevenueQuery,
 ) -> Result<OrgRevenueReport, RepositoryError> {
     let sort_col = match query.sort {
@@ -287,13 +297,12 @@ pub(super) async fn get_org_revenue(
         &query.limit,
         &query.offset,
     ];
-    let rows = client
-        .query(&data_sql, &params)
-        .await
-        .map_err(|e| RepositoryError::DatabaseError(e.into()))?;
+    arm(tx, deadline).await?;
+    let rows = tx.query(&data_sql, &params).await.map_err(map_db_error)?;
     let count_sql = format!("SELECT COUNT(*)::bigint FROM ({cte_and_from}) t");
     let total = pagination::page_total(
-        client,
+        tx,
+        deadline,
         &rows,
         (query.limit, query.offset),
         &count_sql,
@@ -328,7 +337,8 @@ pub(super) async fn get_org_revenue(
 }
 
 pub(super) async fn get_revenue_density(
-    client: &tokio_postgres::Client,
+    tx: &Transaction<'_>,
+    deadline: Instant,
     query: RevenueDensityQuery,
 ) -> Result<RevenueDensityReport, RepositoryError> {
     const NANO_TO_USD: f64 = 1.0 / 1_000_000_000.0;
@@ -338,7 +348,8 @@ pub(super) async fn get_revenue_density(
     // ── Platform-wide percentiles ─────────────────────────────────────────
     // Inner CTE: one row per minute bucket with sum(cost) = nano-USD/min.
     // Outer query: PERCENTILE_CONT + MAX over active minutes only (cost > 0).
-    let platform_row = client
+    arm(tx, deadline).await?;
+    let platform_row = tx
         .query_one(
             r#"
                 WITH per_minute AS (
@@ -373,7 +384,7 @@ pub(super) async fn get_revenue_density(
             &[&query.start, &query.end, &query.provider_type],
         )
         .await
-        .map_err(|e| RepositoryError::DatabaseError(e.into()))?;
+        .map_err(map_db_error)?;
 
     let p50_nano: f64 = platform_row.get(0);
     let p95_nano: f64 = platform_row.get(1);
@@ -388,7 +399,8 @@ pub(super) async fn get_revenue_density(
     let peak = peak_nano * NANO_TO_USD;
 
     // ── Per-model percentiles ─────────────────────────────────────────────
-    let model_rows = client
+    arm(tx, deadline).await?;
+    let model_rows = tx
         .query(
             r#"
                 WITH per_minute AS (
@@ -427,7 +439,7 @@ pub(super) async fn get_revenue_density(
             &[&query.start, &query.end, &query.provider_type],
         )
         .await
-        .map_err(|e| RepositoryError::DatabaseError(e.into()))?;
+        .map_err(map_db_error)?;
 
     let by_model: Vec<RevenueDensityModelRow> = model_rows
         .iter()

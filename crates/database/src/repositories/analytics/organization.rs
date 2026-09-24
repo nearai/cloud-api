@@ -1,7 +1,7 @@
 //! Organization metrics and timeseries (admin and customer routes).
 
-use super::nano_to_usd;
-use crate::repositories::{reporting_query, utils::map_db_error};
+use super::{arm, nano_to_usd};
+use crate::repositories::utils::map_db_error;
 use chrono::{DateTime, Utc};
 use services::admin::{
     ApiKeyMetrics, MetricsSummary, ModelMetrics, OrganizationMetrics, TimeSeriesMetrics,
@@ -9,7 +9,7 @@ use services::admin::{
 };
 use services::common::RepositoryError;
 use std::time::Instant;
-use tokio_postgres::{GenericClient, Transaction};
+use tokio_postgres::Transaction;
 use uuid::Uuid;
 
 // Keep one row per inference request, even when posting and settlement both
@@ -48,30 +48,17 @@ fn organization_usage_metrics_cte(credit_type: Option<&str>) -> &'static str {
     }
 }
 
-async fn configure_metrics_timeout(
-    timeout: Option<(&Transaction<'_>, Instant)>,
-) -> Result<(), RepositoryError> {
-    if let Some((transaction, deadline)) = timeout {
-        reporting_query::configure_reporting_transaction(
-            transaction,
-            reporting_query::remaining_statement_timeout(deadline)?,
-        )
-        .await?;
-    }
-    Ok(())
-}
-
-pub(super) async fn get_organization_metrics_with_client<C: GenericClient + Sync>(
-    client: &C,
+pub(super) async fn get_organization_metrics_with_client(
+    tx: &Transaction<'_>,
+    deadline: Instant,
     window: (Uuid, DateTime<Utc>, DateTime<Utc>),
     credit_type: Option<&str>,
-    timeout: Option<(&Transaction<'_>, Instant)>,
 ) -> Result<OrganizationMetrics, RepositoryError> {
     let (org_id, start, end) = window;
     let usage_cte = organization_usage_metrics_cte(credit_type);
     // Get organization name
-    configure_metrics_timeout(timeout).await?;
-    let org_row = client
+    arm(tx, deadline).await?;
+    let org_row = tx
         .query_opt("SELECT name FROM organizations WHERE id = $1", &[&org_id])
         .await
         .map_err(map_db_error)?
@@ -79,8 +66,8 @@ pub(super) async fn get_organization_metrics_with_client<C: GenericClient + Sync
     let org_name: String = org_row.get(0);
 
     // Get summary metrics including unique API keys
-    configure_metrics_timeout(timeout).await?;
-    let summary_row = client
+    arm(tx, deadline).await?;
+    let summary_row = tx
         .query_one(
             &format!(
                 r#"{usage_cte}
@@ -109,8 +96,8 @@ pub(super) async fn get_organization_metrics_with_client<C: GenericClient + Sync
     };
 
     // Get metrics by workspace
-    configure_metrics_timeout(timeout).await?;
-    let workspace_rows = client
+    arm(tx, deadline).await?;
+    let workspace_rows = tx
         .query(
             &format!(
                 r#"{usage_cte}
@@ -148,8 +135,8 @@ pub(super) async fn get_organization_metrics_with_client<C: GenericClient + Sync
         .collect();
 
     // Get metrics by API key
-    configure_metrics_timeout(timeout).await?;
-    let api_key_rows = client
+    arm(tx, deadline).await?;
+    let api_key_rows = tx
         .query(
             &format!(
                 r#"{usage_cte}
@@ -183,8 +170,8 @@ pub(super) async fn get_organization_metrics_with_client<C: GenericClient + Sync
         .collect();
 
     // Get metrics by model (including latency metrics: TTFT and ITL)
-    configure_metrics_timeout(timeout).await?;
-    let model_rows = client
+    arm(tx, deadline).await?;
+    let model_rows = tx
             .query(
                 &format!(r#"{usage_cte}
                 SELECT
@@ -235,18 +222,18 @@ pub(super) async fn get_organization_metrics_with_client<C: GenericClient + Sync
     })
 }
 
-pub(super) async fn get_organization_timeseries_with_client<C: GenericClient + Sync>(
-    client: &C,
+pub(super) async fn get_organization_timeseries_with_client(
+    tx: &Transaction<'_>,
+    deadline: Instant,
     window: (Uuid, DateTime<Utc>, DateTime<Utc>),
     granularity: &str,
     credit_type: Option<&str>,
-    timeout: Option<(&Transaction<'_>, Instant)>,
 ) -> Result<TimeSeriesMetrics, RepositoryError> {
     let (org_id, start, end) = window;
     let usage_cte = organization_usage_metrics_cte(credit_type);
     // Get organization name
-    configure_metrics_timeout(timeout).await?;
-    let org_row = client
+    arm(tx, deadline).await?;
+    let org_row = tx
         .query_opt("SELECT name FROM organizations WHERE id = $1", &[&org_id])
         .await
         .map_err(map_db_error)?
@@ -276,8 +263,8 @@ pub(super) async fn get_organization_timeseries_with_client<C: GenericClient + S
             "#
     );
 
-    configure_metrics_timeout(timeout).await?;
-    let rows = client
+    arm(tx, deadline).await?;
+    let rows = tx
         .query(&query, &[&org_id, &start, &end, &credit_type])
         .await
         .map_err(map_db_error)?;

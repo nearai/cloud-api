@@ -939,3 +939,177 @@ async fn test_record_input_only_usage_rejects_zero_tokens() {
         response.text()
     );
 }
+
+/// Fetch the org's usage history and return the entry recorded under
+/// `provider_request_id`. The internal endpoint writes the row before it
+/// answers, so no polling is needed.
+async fn usage_history_entry(
+    server: &axum_test::TestServer,
+    org_id: &str,
+    provider_request_id: &str,
+) -> api::routes::usage::UsageHistoryEntryResponse {
+    let resp = server
+        .get(&format!(
+            "/v1/organizations/{org_id}/usage/history?limit=20&offset=0"
+        ))
+        .add_header("Authorization", format!("Bearer {}", get_session_id()))
+        .add_header("User-Agent", MOCK_USER_AGENT)
+        .await;
+    assert_eq!(resp.status_code(), 200, "{}", resp.text());
+    let history: api::routes::usage::UsageHistoryResponse = resp.json();
+    history
+        .data
+        .into_iter()
+        .find(|e| e.provider_request_id.as_deref() == Some(provider_request_id))
+        .unwrap_or_else(|| panic!("no usage row recorded under {provider_request_id}"))
+}
+
+/// A trusted reporter can carry the `discount_to_user` an aggregator lane
+/// publishes. The row is priced at list and then discounted on every
+/// component; the list amounts stay in `billing_details` for auditing.
+#[tokio::test]
+async fn test_record_chat_completion_usage_with_discount() {
+    let server = enable_internal_usage_server().await;
+    setup_qwen_model(&server).await;
+    let id = provision_identity(&server).await;
+
+    let response = post_internal_usage(
+        &server,
+        &id,
+        serde_json::json!({
+            "type": "chat_completion",
+            "model": "Qwen/Qwen3-30B-A3B-Instruct-2507",
+            "input_tokens": 100,
+            "output_tokens": 50,
+            "id": "test-chat-completion-discount-001",
+            "discount_to_user": 0.2
+        }),
+    )
+    .await;
+    assert_eq!(response.status_code(), 200, "{}", response.text());
+    let body: serde_json::Value = response.json();
+
+    // List: 100 * 1_000_000 input + 50 * 2_000_000 output = 200_000_000; 20% off.
+    assert_eq!(body["input_cost"], 80_000_000i64);
+    assert_eq!(body["output_cost"], 80_000_000i64);
+    assert_eq!(body["total_cost"], 160_000_000i64);
+    assert_eq!(body["input_tokens"], 100);
+    assert_eq!(body["output_tokens"], 50);
+
+    let entry = usage_history_entry(&server, &id.org_id, "test-chat-completion-discount-001").await;
+    assert_eq!(entry.total_cost, 160_000_000i64);
+    let details = entry
+        .billing_details
+        .expect("discounted rows carry billing_details");
+    assert_eq!(details["discount"]["discount_to_user"], 0.2);
+    assert_eq!(details["discount"]["basis_points"], 2000);
+    assert_eq!(details["discount"]["list_input_cost"], 100_000_000i64);
+    assert_eq!(details["discount"]["list_output_cost"], 100_000_000i64);
+    assert_eq!(details["discount"]["list_total_cost"], 200_000_000i64);
+}
+
+/// `discount_to_user: 0` (the aggregator's "no discount") records the row at
+/// list price without a discount block.
+#[tokio::test]
+async fn test_internal_usage_discount_zero_bills_list_price() {
+    let server = enable_internal_usage_server().await;
+    setup_qwen_model(&server).await;
+    let id = provision_identity(&server).await;
+
+    let response = post_internal_usage(
+        &server,
+        &id,
+        serde_json::json!({
+            "type": "chat_completion",
+            "model": "Qwen/Qwen3-30B-A3B-Instruct-2507",
+            "input_tokens": 100,
+            "output_tokens": 50,
+            "id": "test-chat-completion-discount-zero",
+            "discount_to_user": 0
+        }),
+    )
+    .await;
+    assert_eq!(response.status_code(), 200, "{}", response.text());
+    let body: serde_json::Value = response.json();
+    assert_eq!(body["total_cost"], 200_000_000i64);
+
+    let entry =
+        usage_history_entry(&server, &id.org_id, "test-chat-completion-discount-zero").await;
+    assert!(
+        entry
+            .billing_details
+            .map(|d| d.get("discount").is_none())
+            .unwrap_or(true),
+        "a zero discount must not leave a discount block"
+    );
+}
+
+/// Discounts outside `[0, 1)`, finer than a basis point, or not a number are
+/// rejected before anything is recorded.
+#[tokio::test]
+async fn test_internal_usage_rejects_invalid_discount() {
+    let server = enable_internal_usage_server().await;
+    setup_qwen_model(&server).await;
+    let id = provision_identity(&server).await;
+
+    for (raw, why) in [
+        (serde_json::json!(1.0), "100% off"),
+        (serde_json::json!(-0.1), "negative"),
+        (serde_json::json!(0.12345), "finer than a basis point"),
+        (serde_json::json!("0.2"), "a string"),
+    ] {
+        let response = post_internal_usage(
+            &server,
+            &id,
+            serde_json::json!({
+                "type": "chat_completion",
+                "model": "Qwen/Qwen3-30B-A3B-Instruct-2507",
+                "input_tokens": 100,
+                "output_tokens": 50,
+                "id": format!("test-chat-completion-bad-discount-{why}"),
+                "discount_to_user": raw
+            }),
+        )
+        .await;
+        assert_eq!(response.status_code(), 400, "{why}: {}", response.text());
+    }
+}
+
+/// The operator ceiling (`INTERNAL_USAGE_MAX_DISCOUNT`) bounds what a
+/// reporter can record: above it is a 400, at it is accepted.
+#[tokio::test]
+async fn test_internal_usage_rejects_discount_above_ceiling() {
+    let server = setup_test_server_with_config(|c| {
+        c.internal_usage_token = Some(INTERNAL_USAGE_TOKEN.to_string());
+        c.internal_usage_max_discount = 0.1;
+    })
+    .await;
+    setup_qwen_model(&server).await;
+    let id = provision_identity(&server).await;
+
+    let usage = |suffix: &str, discount: f64| {
+        serde_json::json!({
+            "type": "chat_completion",
+            "model": "Qwen/Qwen3-30B-A3B-Instruct-2507",
+            "input_tokens": 100,
+            "output_tokens": 50,
+            "id": format!("test-chat-completion-ceiling-{suffix}"),
+            "discount_to_user": discount
+        })
+    };
+
+    let rejected = post_internal_usage(&server, &id, usage("above", 0.2)).await;
+    assert_eq!(rejected.status_code(), 400, "{}", rejected.text());
+    assert!(
+        rejected.text().contains("exceeds the configured maximum"),
+        "{}",
+        rejected.text()
+    );
+
+    let accepted = post_internal_usage(&server, &id, usage("at", 0.1)).await;
+    assert_eq!(accepted.status_code(), 200, "{}", accepted.text());
+    let body: serde_json::Value = accepted.json();
+    assert_eq!(body["input_cost"], 90_000_000i64);
+    assert_eq!(body["output_cost"], 90_000_000i64);
+    assert_eq!(body["total_cost"], 180_000_000i64);
+}

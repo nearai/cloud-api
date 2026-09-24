@@ -437,6 +437,7 @@ where
 
                         if usage_service
                             .record_usage(RecordUsageServiceRequest {
+                                discount: None,
                                 organization_id,
                                 workspace_id,
                                 api_key_id,
@@ -2090,6 +2091,7 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
 
         usage_service
             .record_usage(RecordUsageServiceRequest {
+                discount: None,
                 organization_id,
                 workspace_id,
                 api_key_id,

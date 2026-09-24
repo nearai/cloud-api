@@ -10,7 +10,7 @@ use crate::{
         CostBreakdown, InferenceType, InferenceUsageHistoryQuery, InferenceUsageReportQuery,
         InferenceUsageReportRow, OrganizationBalanceInfo, OrganizationCreditLimit,
         OrganizationLimit, ProviderAttribution, RecordUsageApiRequest, RecordUsageServiceRequest,
-        UsageCheckResult, UsageError, UsageLogEntry, UsageServiceTrait,
+        UsageCheckResult, UsageDiscount, UsageError, UsageLogEntry, UsageServiceTrait,
     },
 };
 use async_trait::async_trait;
@@ -152,6 +152,7 @@ impl UsageServiceTrait for MockUsageService {
         workspace_id: Uuid,
         api_key_id: Uuid,
         request: RecordUsageApiRequest,
+        _discount: Option<UsageDiscount>,
     ) -> Result<UsageLogEntry, UsageError> {
         let (model, input_tokens, output_tokens, cache_read_tokens, image_count, inference_type) =
             match &request {
@@ -432,6 +433,7 @@ impl UsageServiceTrait for CapturingUsageService {
         workspace_id: Uuid,
         api_key_id: Uuid,
         request: RecordUsageApiRequest,
+        _discount: Option<UsageDiscount>,
     ) -> Result<UsageLogEntry, UsageError> {
         let (model, input_tokens, output_tokens, cache_read_tokens, image_count, inference_type) =
             match &request {

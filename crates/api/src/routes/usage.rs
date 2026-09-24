@@ -1090,11 +1090,13 @@ fn build_record_usage_response(entry: services::usage::UsageLogEntry) -> RecordU
 //   (inference-proxy CVMs) and is rotated alongside other service secrets.
 //
 // The body shape is the existing `RecordUsageApiRequest` flattened under a
-// wrapper that adds the three identity fields, so reporters keep one builder.
+// wrapper that adds the three identity fields and the optional
+// `discount_to_user`, so reporters keep one builder.
 
 /// Request body for `POST /v1/internal/usage`. The `usage` field is
 /// flattened, so the on-the-wire shape is `RecordUsageApiRequest` JSON with
-/// three extra top-level keys.
+/// four extra top-level keys: the three identity fields and the optional
+/// `discount_to_user`.
 ///
 /// `ToSchema` is intentionally not derived: `RecordUsageApiRequest`
 /// doesn't implement `PartialSchema` (its OpenAPI doc was hand-rolled via
@@ -1122,8 +1124,8 @@ pub struct RecordUsageInternalRequest {
     /// `discount_to_user` an aggregator lane publishes in its models
     /// document. Applied to every priced component after catalog pricing;
     /// the list amounts are kept in the row's `billing_details`. Must be in
-    /// `[0, 1)`, have at most four decimal places and not exceed
-    /// `INTERNAL_USAGE_MAX_DISCOUNT`. Omitted or `0` bills at list price.
+    /// `[0, 1)`, be a multiple of `0.0001` (whole basis points) and not
+    /// exceed `INTERNAL_USAGE_MAX_DISCOUNT`. Omitted or `0` bills at list price.
     pub discount_to_user: Option<f64>,
     /// The standard usage payload.
     #[serde(flatten)]
@@ -1786,7 +1788,7 @@ mod internal_usage_tests {
         let err = resolve_internal_usage_discount(Some(0.12345), 0.9).unwrap_err();
         assert_eq!(err.0, StatusCode::BAD_REQUEST);
         assert!(
-            err.1 .0.error.message.contains("four decimal places"),
+            err.1 .0.error.message.contains("multiple of 0.0001"),
             "{}",
             err.1 .0.error.message
         );

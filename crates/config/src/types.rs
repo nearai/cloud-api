@@ -621,7 +621,7 @@ fn parse_internal_usage_max_discount(raw: Option<&str>) -> Result<f64, String> {
     let scaled = value * 10_000.0;
     if (scaled - scaled.round()).abs() > 1e-6 {
         return Err(format!(
-            "{INTERNAL_USAGE_MAX_DISCOUNT_ENV} must have at most four decimal places"
+            "{INTERNAL_USAGE_MAX_DISCOUNT_ENV} must be a multiple of 0.0001"
         ));
     }
     Ok(value)

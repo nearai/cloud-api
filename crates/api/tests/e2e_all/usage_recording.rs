@@ -1073,6 +1073,23 @@ async fn test_internal_usage_rejects_invalid_discount() {
         .await;
         assert_eq!(response.status_code(), 400, "{why}: {}", response.text());
     }
+
+    // The org is fresh, so a rejected submission must leave its ledger empty.
+    let resp = server
+        .get(&format!(
+            "/v1/organizations/{}/usage/history?limit=20&offset=0",
+            id.org_id
+        ))
+        .add_header("Authorization", format!("Bearer {}", get_session_id()))
+        .add_header("User-Agent", MOCK_USER_AGENT)
+        .await;
+    assert_eq!(resp.status_code(), 200, "{}", resp.text());
+    let history: api::routes::usage::UsageHistoryResponse = resp.json();
+    assert!(
+        history.data.is_empty(),
+        "rejected discounts must not record usage: {:?}",
+        history.data.len()
+    );
 }
 
 /// The operator ceiling (`INTERNAL_USAGE_MAX_DISCOUNT`) bounds what a

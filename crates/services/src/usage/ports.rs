@@ -663,8 +663,9 @@ impl UsageDiscount {
     ///
     /// Returns `Ok(None)` for `0` (no discount). Rejects non-finite values,
     /// anything outside `[0, 1)` (a discount of 100% or more would record
-    /// free or negative rows) and fractions finer than one basis point, so
-    /// a row is never recorded at a rate the reporter did not mean.
+    /// free or negative rows) and fractions that are not a multiple of
+    /// `0.0001` within a small float tolerance, so a row is never recorded
+    /// at a rate the reporter did not mean.
     pub fn from_fraction(fraction: f64) -> Result<Option<Self>, UsageError> {
         if !fraction.is_finite() || !(0.0..1.0).contains(&fraction) {
             return Err(UsageError::ValidationError(
@@ -682,7 +683,7 @@ impl UsageDiscount {
         }
         if (scaled - rounded).abs() > 1e-6 {
             return Err(UsageError::ValidationError(
-                "discount_to_user must have at most four decimal places".into(),
+                "discount_to_user must be a multiple of 0.0001".into(),
             ));
         }
         // `rounded` is in [0, 10_000) here, so the narrowing cast is exact.

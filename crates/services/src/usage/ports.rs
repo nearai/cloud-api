@@ -445,16 +445,24 @@ impl DayParity {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AggregateLockBehavior {
+    /// Return `Ok(None)` when another transaction holds the aggregate lock.
+    SkipIfBusy,
+    /// Wait for the aggregate lock. The transaction statement timeout still applies.
+    Wait,
+}
+
 #[async_trait::async_trait]
 pub trait UsageHourlyRepository: Send + Sync {
     async fn progress(&self) -> anyhow::Result<HourlyProgress>;
-    /// Replace usage_hourly rows for [from, to) from raw. `wait = false` returns Ok(None)
+    /// Replace usage_hourly rows for [from, to) from raw. `SkipIfBusy` returns `Ok(None)`
     /// when another transaction holds the aggregate lock.
     async fn recompute(
         &self,
         from: DateTime<Utc>,
         to: DateTime<Utc>,
-        wait: bool,
+        lock_behavior: AggregateLockBehavior,
     ) -> anyhow::Result<Option<RecomputeReport>>;
     async fn day_parity(&self, day: chrono::NaiveDate) -> anyhow::Result<DayParity>;
 }

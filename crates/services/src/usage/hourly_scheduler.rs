@@ -6,7 +6,7 @@ use std::sync::Arc;
 use chrono::{DateTime, NaiveDate, TimeDelta, Timelike, Utc};
 use tracing::{error, info, warn};
 
-use super::ports::{DayParity, HourlyProgress, UsageHourlyRepository};
+use super::ports::{AggregateLockBehavior, DayParity, HourlyProgress, UsageHourlyRepository};
 
 pub const REREAD_HOURS: i64 = 3;
 pub const CATCH_UP_DAYS: i64 = 3;
@@ -43,8 +43,9 @@ pub fn plan_window(progress: HourlyProgress, now: DateTime<Utc>) -> (DateTime<Ut
 }
 
 /// UTC days whose parity to check after recomputing [from, to), sorted and deduplicated.
-/// The nightly 03:xx check adds yesterday only once it has been recomputed (its end <= `to`),
-/// so a tick still catching up far behind never checks a day it has not written yet.
+/// The nightly 03:xx check assumes the default hourly cadence; custom intervals may miss it.
+/// It adds yesterday only once it has been recomputed (its end <= `to`), so a tick still catching
+/// up far behind never checks a day it has not written yet.
 pub fn parity_days(from: DateTime<Utc>, to: DateTime<Utc>, now: DateTime<Utc>) -> Vec<NaiveDate> {
     let horizon = trunc_hour(now);
     let mut days = std::collections::BTreeSet::new();
@@ -122,20 +123,20 @@ impl UsageHourlyScheduler {
         let handle = tokio::spawn({
             let scheduler = self.clone();
             async move {
-                // Fast catch-up: while behind, tick again after CATCH_UP_TICK_SECS; once caught up
-                // (or on error), wait for the next HH:05 on the regular cadence.
+                // Fast catch-up: while behind, retry after CATCH_UP_TICK_SECS, including after a
+                // failed tick. Once caught up, wait for the regular cadence.
                 let mut delay = std::time::Duration::from_secs(CATCH_UP_TICK_SECS);
+                let mut catching_up = true;
                 loop {
                     tokio::time::sleep(delay).await;
-                    delay = match scheduler.run_once(Utc::now()).await {
-                        Ok(outcome) if !outcome.caught_up => {
-                            std::time::Duration::from_secs(CATCH_UP_TICK_SECS)
-                        }
-                        Ok(_) => next_regular_delay(Utc::now(), interval_secs),
-                        Err(e) => {
-                            error!(error = %e, "usage_hourly tick failed");
-                            next_regular_delay(Utc::now(), interval_secs)
-                        }
+                    match scheduler.run_once(Utc::now()).await {
+                        Ok(outcome) => catching_up = !outcome.caught_up,
+                        Err(e) => error!(error = %e, "usage_hourly tick failed"),
+                    }
+                    delay = if catching_up {
+                        std::time::Duration::from_secs(CATCH_UP_TICK_SECS)
+                    } else {
+                        next_regular_delay(Utc::now(), interval_secs)
                     };
                 }
             }
@@ -162,7 +163,14 @@ impl UsageHourlyScheduler {
         let (from, to) = plan_window(progress, now);
         let caught_up = from == trunc_hour(now) - TimeDelta::hours(REREAD_HOURS);
 
-        let Some(report) = self.repository.recompute(from, to, false).await? else {
+        let Some(report) = self
+            .repository
+            .recompute(from, to, AggregateLockBehavior::SkipIfBusy)
+            .await
+            .map_err(|error| {
+                anyhow::anyhow!("usage_hourly recompute [{from}, {to}) failed: {error:#}")
+            })?
+        else {
             info!(%from, %to, skipped = true, "usage_hourly tick");
             return Ok(TickOutcome {
                 from,
@@ -450,7 +458,7 @@ mod tests {
             &self,
             from: DateTime<Utc>,
             to: DateTime<Utc>,
-            _wait: bool,
+            _lock_behavior: AggregateLockBehavior,
         ) -> anyhow::Result<Option<RecomputeReport>> {
             if self.lock_busy {
                 return Ok(None);

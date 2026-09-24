@@ -5,7 +5,7 @@ use chrono::{Duration, Utc};
 use database::repositories::PgAnalyticsRepository;
 use services::admin::{
     AnalyticsRepository, ModelConsumptionTimeseriesQuery, ModelRevenueQuery, OrgRevenueQuery,
-    RevenueDensityQuery, RevenueSort,
+    PerformanceTimeseriesQuery, RevenueDensityQuery, RevenueSort,
 };
 use services::common::RepositoryError;
 use std::time::Duration as StdDuration;
@@ -55,6 +55,7 @@ async fn every_analytics_report_is_cancelled_at_the_statement_budget() {
             "organizations",
             "models",
             "organization_limits_history",
+            "organization_usage_log",
         ],
         0.5,
     )
@@ -117,6 +118,16 @@ async fn every_analytics_report_is_cancelled_at_the_statement_budget() {
         })
         .await,
         "model consumption",
+    );
+    assert_timeout(
+        repo.get_performance_timeseries(PerformanceTimeseriesQuery {
+            start,
+            end,
+            granularity: "day".to_string(),
+            model_name: None,
+        })
+        .await,
+        "performance timeseries",
     );
 
     let client = pool.get().await.unwrap();

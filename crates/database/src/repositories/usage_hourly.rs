@@ -9,11 +9,15 @@ use chrono::{DateTime, NaiveDate, Utc};
 use services::usage::ports::{DayParity, DayTotals, HourlyProgress, RecomputeReport};
 use services::usage::trunc_hour;
 use std::time::Duration;
+use tokio_postgres::IsolationLevel;
 
 /// Distinct from database_encryption's GLOBAL_WORKER_LOCK_KEY (0x4e454152444245).
 pub const USAGE_HOURLY_LOCK_KEY: i64 = 0x55534147454852; // "USAGEHR"
 const RECOMPUTE_TIMEOUT: Duration = Duration::from_secs(120);
 const READ_TIMEOUT: Duration = Duration::from_secs(30);
+/// Catch-up windows read ~390 MB of cold rows on prod; stay single-worker to leave parallel
+/// workers for serving traffic.
+const SINGLE_WORKER: &str = "SET LOCAL max_parallel_workers_per_gather = 0";
 
 const RECOMPUTE_INSERT: &str = r#"
 INSERT INTO usage_hourly (
@@ -127,6 +131,9 @@ impl services::usage::ports::UsageHourlyRepository for UsageHourlyRepositoryImpl
             .context("usage_hourly recompute: connection")?;
         let tx = client.transaction().await.map_err(map_db_error)?;
         configure_reporting_transaction(&tx, RECOMPUTE_TIMEOUT).await?;
+        tx.batch_execute(SINGLE_WORKER)
+            .await
+            .map_err(map_db_error)?;
         if wait {
             tx.execute(
                 "SELECT pg_advisory_xact_lock($1)",
@@ -170,8 +177,18 @@ impl services::usage::ports::UsageHourlyRepository for UsageHourlyRepositoryImpl
             .get()
             .await
             .context("usage_hourly parity: connection")?;
-        let tx = client.transaction().await.map_err(map_db_error)?;
+        // One snapshot for both statements: a commit between them must not look like drift.
+        let tx = client
+            .build_transaction()
+            .isolation_level(IsolationLevel::RepeatableRead)
+            .read_only(true)
+            .start()
+            .await
+            .map_err(map_db_error)?;
         configure_reporting_transaction(&tx, READ_TIMEOUT).await?;
+        tx.batch_execute(SINGLE_WORKER)
+            .await
+            .map_err(map_db_error)?;
         let raw = tx
             .query_one(DAY_TOTALS_RAW, &[&start, &end])
             .await

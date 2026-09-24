@@ -331,9 +331,12 @@ impl UsageServiceTrait for MockUsageService {
     async fn get_usage_by_model(
         &self,
         _organization_id: Uuid,
-        _start_date: chrono::DateTime<chrono::Utc>,
-    ) -> Result<Vec<crate::usage::UsageByModelEntry>, UsageError> {
-        Ok(vec![])
+        start_date: chrono::DateTime<chrono::Utc>,
+    ) -> Result<crate::usage::UsageByModelReport, UsageError> {
+        Ok(crate::usage::UsageByModelReport {
+            start: start_date,
+            entries: vec![],
+        })
     }
 
     async fn list_inference_usage_report(
@@ -611,9 +614,12 @@ impl UsageServiceTrait for CapturingUsageService {
     async fn get_usage_by_model(
         &self,
         _organization_id: Uuid,
-        _start_date: chrono::DateTime<chrono::Utc>,
-    ) -> Result<Vec<crate::usage::UsageByModelEntry>, UsageError> {
-        Ok(vec![])
+        start_date: chrono::DateTime<chrono::Utc>,
+    ) -> Result<crate::usage::UsageByModelReport, UsageError> {
+        Ok(crate::usage::UsageByModelReport {
+            start: start_date,
+            entries: vec![],
+        })
     }
 
     async fn list_inference_usage_report(

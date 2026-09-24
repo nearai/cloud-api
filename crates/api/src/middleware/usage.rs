@@ -278,7 +278,7 @@ mod tests {
     use services::usage::{
         CostBreakdown, InferenceCost, InferenceUsageHistoryQuery, InferenceUsageReportQuery,
         InferenceUsageReportRow, OrganizationBalanceInfo, OrganizationCreditLimit,
-        OrganizationLimit, RecordUsageApiRequest, RecordUsageServiceRequest, UsageByModelEntry,
+        OrganizationLimit, RecordUsageApiRequest, RecordUsageServiceRequest, UsageByModelReport,
         UsageError, UsageLogEntry,
     };
     use std::sync::Mutex;
@@ -425,7 +425,7 @@ mod tests {
             &self,
             _organization_id: Uuid,
             _start_date: chrono::DateTime<chrono::Utc>,
-        ) -> Result<Vec<UsageByModelEntry>, UsageError> {
+        ) -> Result<UsageByModelReport, UsageError> {
             unimplemented!()
         }
 

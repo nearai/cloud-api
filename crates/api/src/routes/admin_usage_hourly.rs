@@ -7,6 +7,7 @@ use axum::{extract::Extension, http::StatusCode, response::Json as ResponseJson,
 use chrono::{DateTime, NaiveDate, Utc};
 use serde::{Deserialize, Serialize};
 use services::usage::ports::UsageHourlyRepository;
+use services::usage::RepairError;
 use std::sync::Arc;
 use utoipa::ToSchema;
 
@@ -48,7 +49,8 @@ pub struct UsageHourlyRepairResponse {
 /// aggregate parity for every day the window touches. Parity always covers the whole UTC day,
 /// so a window covering part of a day can report `ok: false` from hours outside it; repair
 /// whole days to clear a day's parity. Use it after a backfill or when the nightly parity check
-/// warns; the scheduler only re-reads the last 3 hours.
+/// warns; the scheduler only re-reads the last 3 hours. A window must not start past the next
+/// hour the scheduler has yet to compute (409), or the hours in between would never be computed.
 #[utoipa::path(
     post,
     path = "/v1/admin/usage-hourly/recompute",
@@ -57,6 +59,7 @@ pub struct UsageHourlyRepairResponse {
     responses(
         (status = 200, description = "Window recomputed", body = UsageHourlyRepairResponse),
         (status = 400, description = "Invalid window", body = ErrorResponse),
+        (status = 409, description = "Window starts past the hours usage_hourly has computed", body = ErrorResponse),
         (status = 401, description = "Unauthorized", body = ErrorResponse),
         (status = 500, description = "Internal server error", body = ErrorResponse)
     ),
@@ -67,22 +70,32 @@ pub async fn recompute_usage_hourly(
     Extension(_admin_user): Extension<AdminUser>,
     Json(request): Json<UsageHourlyRepairRequest>,
 ) -> Result<ResponseJson<UsageHourlyRepairResponse>, (StatusCode, ResponseJson<ErrorResponse>)> {
-    services::usage::validate_repair_window(request.start, request.end).map_err(|message| {
-        (
-            StatusCode::BAD_REQUEST,
-            ResponseJson(ErrorResponse::new(message, "invalid_request".to_string())),
-        )
-    })?;
     let report = services::usage::repair(state.repository.as_ref(), request.start, request.end)
         .await
         .map_err(|error| {
-            tracing::error!(error = %error, "usage_hourly repair failed");
+            let (status, code) = match &error {
+                RepairError::InvalidWindow(_) => (StatusCode::BAD_REQUEST, "invalid_request"),
+                RepairError::AheadOfAggregate { frontier } => {
+                    tracing::warn!(
+                        %frontier,
+                        "usage_hourly repair window starts past the aggregate frontier"
+                    );
+                    (StatusCode::CONFLICT, "conflict")
+                }
+                RepairError::Failed(error) => {
+                    tracing::error!(error = %error, "usage_hourly repair failed");
+                    return (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        ResponseJson(ErrorResponse::new(
+                            "Failed to recompute usage_hourly".to_string(),
+                            "internal_server_error".to_string(),
+                        )),
+                    );
+                }
+            };
             (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                ResponseJson(ErrorResponse::new(
-                    "Failed to recompute usage_hourly".to_string(),
-                    "internal_server_error".to_string(),
-                )),
+                status,
+                ResponseJson(ErrorResponse::new(error.to_string(), code.to_string())),
             )
         })?;
     Ok(ResponseJson(UsageHourlyRepairResponse {

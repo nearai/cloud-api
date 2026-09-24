@@ -536,8 +536,14 @@ async fn serial_concurrent_ticks_write_each_hour_once() {
     // Clock so that h is inside the steady 3-hour re-read window: plan = [h-1h, h+2h).
     let now = h + Duration::hours(2) + Duration::minutes(5);
 
-    let a = services::usage::UsageHourlyScheduler::new(repo.clone());
-    let b = services::usage::UsageHourlyScheduler::new(repo.clone());
+    let a = services::usage::UsageHourlyScheduler::new(
+        repo.clone(),
+        std::sync::Arc::new(services::metrics::MockMetricsService),
+    );
+    let b = services::usage::UsageHourlyScheduler::new(
+        repo.clone(),
+        std::sync::Arc::new(services::metrics::MockMetricsService),
+    );
     let (ra, rb) = tokio::join!(a.run_once(now), b.run_once(now));
     let (ra, rb) = (ra.unwrap(), rb.unwrap());
     assert!(

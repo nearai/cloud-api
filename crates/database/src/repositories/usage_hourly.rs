@@ -158,10 +158,7 @@ impl services::usage::ports::UsageHourlyRepository for UsageHourlyRepositoryImpl
     }
 
     async fn day_parity(&self, day: NaiveDate) -> anyhow::Result<DayParity> {
-        let start = day
-            .and_hms_opt(0, 0, 0)
-            .expect("midnight is valid")
-            .and_utc();
+        let start = day.and_time(chrono::NaiveTime::MIN).and_utc();
         let end = start + chrono::TimeDelta::days(1);
         let mut client = self
             .pool

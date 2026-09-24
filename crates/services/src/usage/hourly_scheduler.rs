@@ -1,7 +1,7 @@
 //! Maintains `usage_hourly`: plans each tick from data-derived progress and drives the
 //! `UsageHourlyRepository` port. Planning is pure so it is unit-tested without a database.
 
-use chrono::{DateTime, DurationRound, NaiveDate, TimeDelta, Timelike, Utc};
+use chrono::{DateTime, NaiveDate, TimeDelta, Timelike, Utc};
 
 use std::sync::Arc;
 use tracing::{error, info, warn};
@@ -13,14 +13,18 @@ pub const CATCH_UP_DAYS: i64 = 3;
 pub const NIGHTLY_PARITY_HOUR: u32 = 3;
 pub const TICK_MINUTE: u32 = 5;
 
+/// Floor to the UTC boundary of `unit_secs`; rem_euclid keeps pre-epoch times flooring down.
+fn trunc_secs(t: DateTime<Utc>, unit_secs: i64) -> DateTime<Utc> {
+    t - TimeDelta::seconds(t.timestamp().rem_euclid(unit_secs))
+        - TimeDelta::nanoseconds(i64::from(t.timestamp_subsec_nanos()))
+}
+
 pub fn trunc_hour(t: DateTime<Utc>) -> DateTime<Utc> {
-    t.duration_trunc(TimeDelta::hours(1))
-        .expect("UTC timestamps within chrono range truncate to the hour")
+    trunc_secs(t, 3600)
 }
 
 pub fn trunc_day(t: DateTime<Utc>) -> DateTime<Utc> {
-    t.duration_trunc(TimeDelta::days(1))
-        .expect("UTC timestamps within chrono range truncate to the day")
+    trunc_secs(t, 86_400)
 }
 
 /// One data-derived cursor (spec §5.3). `from` resumes at the next raw hour after the last
@@ -65,6 +69,7 @@ pub fn initial_delay(now: DateTime<Utc>) -> std::time::Duration {
     if next <= now {
         next += TimeDelta::hours(1);
     }
+    // Invariant: next > now by construction above, so the delta is positive.
     (next - now).to_std().expect("next tick is in the future")
 }
 
@@ -404,6 +409,16 @@ mod tests {
             t("2026-09-24T04:05:00Z")
         )
         .is_empty());
+    }
+
+    #[test]
+    fn trunc_uses_utc_boundaries_before_epoch_and_with_subseconds() {
+        let x = t("1969-12-31T23:59:59.999999999Z");
+        assert_eq!(trunc_hour(x), t("1969-12-31T23:00:00Z"));
+        assert_eq!(trunc_day(x), t("1969-12-31T00:00:00Z"));
+        let y = t("2026-09-24T10:07:03.25Z");
+        assert_eq!(trunc_hour(y), t("2026-09-24T10:00:00Z"));
+        assert_eq!(trunc_day(y), t("2026-09-24T00:00:00Z"));
     }
 
     #[test]

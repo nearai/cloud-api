@@ -3,7 +3,7 @@ use crate::repositories::OrganizationUsageRepository;
 use chrono::{DateTime, Utc};
 use services::usage::ports::{
     InferenceCost, InferenceUsageHistoryQuery, InferenceUsageReportQuery, InferenceUsageReportRow,
-    OrganizationBalanceInfo, UsageByModelEntry, UsageLogEntry,
+    OrganizationBalanceInfo, UsageByModelEntry, UsageByModelReport, UsageLogEntry,
 };
 use uuid::Uuid;
 
@@ -259,22 +259,25 @@ impl services::usage::ports::UsageRepository for OrganizationUsageRepository {
         &self,
         organization_id: Uuid,
         start_date: DateTime<Utc>,
-    ) -> anyhow::Result<Vec<UsageByModelEntry>> {
-        let rows = self
+    ) -> anyhow::Result<UsageByModelReport> {
+        let (start, rows) = self
             .get_usage_by_model_since(organization_id, start_date)
             .await?;
 
-        Ok(rows
-            .into_iter()
-            .map(|r| UsageByModelEntry {
-                model: r.model,
-                input_tokens: r.input_tokens,
-                output_tokens: r.output_tokens,
-                total_tokens: r.total_tokens,
-                total_cost: r.total_cost,
-                request_count: r.request_count,
-            })
-            .collect())
+        Ok(UsageByModelReport {
+            start,
+            entries: rows
+                .into_iter()
+                .map(|r| UsageByModelEntry {
+                    model: r.model,
+                    input_tokens: r.input_tokens,
+                    output_tokens: r.output_tokens,
+                    total_tokens: r.total_tokens,
+                    total_cost: r.total_cost,
+                    request_count: r.request_count,
+                })
+                .collect(),
+        })
     }
 
     async fn list_inference_usage_report(

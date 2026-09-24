@@ -1585,10 +1585,11 @@ pub struct UsageByModelResponse {
 
 /// Get organization usage broken down by model.
 ///
-/// Returns one row per model, summed over a rolling window ending now:
+/// Returns one row per model, summed over the closed UTC hours of a rolling window:
 /// `day` = last 24h, `week` = last 7 days, `month` = last 30 days (NOT calendar
-/// day/week/month-to-date). Used by the dashboard pie chart to show which models
-/// drive spend.
+/// day/week/month-to-date). `start_date` echoes the first hour served; the window ends at
+/// the start of the current hour, so figures lag by up to ~65 minutes. Used by the
+/// dashboard pie chart to show which models drive spend.
 #[utoipa::path(
     get,
     path = "/v1/organizations/{org_id}/usage/by-model",
@@ -1614,11 +1615,9 @@ pub async fn get_organization_usage_by_model(
     Query(query): Query<UsageByModelQuery>,
 ) -> Result<ResponseJson<UsageByModelResponse>, (StatusCode, ResponseJson<ErrorResponse>)> {
     let organization_id = check_org_membership(&app_state, user, &org_id).await?;
-    let start_date = query.period.since();
-
-    let entries = app_state
+    let report = app_state
         .usage_service
-        .get_usage_by_model(organization_id, start_date)
+        .get_usage_by_model(organization_id, query.period.since())
         .await
         .map_err(|e| {
             tracing::error!(error = ?e, "Failed to get usage by model");
@@ -1631,7 +1630,8 @@ pub async fn get_organization_usage_by_model(
             )
         })?;
 
-    let data = entries
+    let data = report
+        .entries
         .into_iter()
         .map(|e| UsageByModelEntryResponse {
             model: e.model,
@@ -1646,7 +1646,7 @@ pub async fn get_organization_usage_by_model(
 
     Ok(ResponseJson(UsageByModelResponse {
         period: query.period.as_str().to_string(),
-        start_date: start_date.to_rfc3339(),
+        start_date: report.start.to_rfc3339(),
         data,
     }))
 }

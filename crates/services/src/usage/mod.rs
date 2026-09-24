@@ -970,7 +970,7 @@ impl UsageServiceTrait for UsageServiceImpl {
         &self,
         organization_id: Uuid,
         start_date: chrono::DateTime<chrono::Utc>,
-    ) -> Result<Vec<UsageByModelEntry>, UsageError> {
+    ) -> Result<UsageByModelReport, UsageError> {
         self.usage_repository
             .get_usage_by_model(organization_id, start_date)
             .await

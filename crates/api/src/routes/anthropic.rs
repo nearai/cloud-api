@@ -1865,7 +1865,7 @@ redact-thinking-2026-02-12";
             &self,
             _organization_id: Uuid,
             _start_date: chrono::DateTime<chrono::Utc>,
-        ) -> Result<Vec<services::usage::UsageByModelEntry>, services::usage::UsageError> {
+        ) -> Result<services::usage::UsageByModelReport, services::usage::UsageError> {
             unimplemented!()
         }
 

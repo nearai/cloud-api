@@ -90,6 +90,7 @@ mod score;
 mod serving_provider;
 mod session_logout;
 mod signature_verification;
+mod usage_by_model_hourly;
 mod usage_chat_completions;
 mod usage_hourly;
 mod usage_provider_attribution;

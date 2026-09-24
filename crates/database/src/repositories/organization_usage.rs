@@ -13,6 +13,7 @@ use anyhow::{Context, Result};
 use chrono::Utc;
 use services::common::RepositoryError;
 use services::responses::models::ResponseId;
+use services::usage::trunc_hour;
 use std::collections::HashMap;
 use std::time::Duration;
 use tokio_postgres::Row;
@@ -544,12 +545,16 @@ impl OrganizationUsageRepository {
         })
     }
 
-    /// Aggregate usage by model for an organization since `start_date`.
+    /// Aggregate usage by model for an organization over the closed UTC hours since
+    /// `since` (spec §6.1): `[trunc_hour(since), trunc_hour(now))` from `usage_hourly`.
+    /// Returns the served start with the rows; the open current hour is never aggregated.
     pub async fn get_usage_by_model_since(
         &self,
         organization_id: Uuid,
-        start_date: chrono::DateTime<Utc>,
-    ) -> Result<Vec<UsageByModel>> {
+        since: chrono::DateTime<Utc>,
+    ) -> Result<(chrono::DateTime<Utc>, Vec<UsageByModel>)> {
+        let start = trunc_hour(since);
+        let end = trunc_hour(Utc::now());
         let rows = retry_db!("get_organization_usage_by_model", {
             let client = self
                 .pool
@@ -567,30 +572,32 @@ impl OrganizationUsageRepository {
                         COALESCE(SUM(output_tokens), 0)::BIGINT AS output_tokens,
                         COALESCE(SUM(total_tokens), 0)::BIGINT  AS total_tokens,
                         COALESCE(SUM(total_cost), 0)::BIGINT    AS total_cost,
-                        COUNT(*)::BIGINT                        AS request_count
-                    FROM organization_usage_log
+                        COALESCE(SUM(request_count), 0)::BIGINT AS request_count
+                    FROM usage_hourly
                     WHERE organization_id = $1
-                      AND created_at >= $2
+                      AND hour >= $2 AND hour < $3
                     GROUP BY model_name
                     ORDER BY total_cost DESC
                     "#,
-                    &[&organization_id, &start_date],
+                    &[&organization_id, &start, &end],
                 )
                 .await
                 .map_err(map_db_error)
         })?;
 
-        Ok(rows
-            .into_iter()
-            .map(|row| UsageByModel {
-                model: row.get("model_name"),
-                input_tokens: row.get("input_tokens"),
-                output_tokens: row.get("output_tokens"),
-                total_tokens: row.get("total_tokens"),
-                total_cost: row.get("total_cost"),
-                request_count: row.get("request_count"),
-            })
-            .collect())
+        Ok((
+            start,
+            rows.into_iter()
+                .map(|row| UsageByModel {
+                    model: row.get("model_name"),
+                    input_tokens: row.get("input_tokens"),
+                    output_tokens: row.get("output_tokens"),
+                    total_tokens: row.get("total_tokens"),
+                    total_cost: row.get("total_cost"),
+                    request_count: row.get("request_count"),
+                })
+                .collect(),
+        ))
     }
 
     fn row_to_usage_log(

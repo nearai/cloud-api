@@ -1807,6 +1807,33 @@ mod internal_usage_tests {
     }
 
     #[test]
+    fn internal_request_body_carries_discount_to_user() {
+        // `usage` is flattened, so pin that the sibling field survives serde's
+        // flatten buffering for both a float and an integer zero.
+        let mut body = serde_json::json!({
+            "organization_id": "11111111-1111-1111-1111-111111111111",
+            "workspace_id": "22222222-2222-2222-2222-222222222222",
+            "api_key_id": "33333333-3333-3333-3333-333333333333",
+            "type": "chat_completion",
+            "model": "m",
+            "input_tokens": 1,
+            "output_tokens": 1,
+            "id": "x",
+            "discount_to_user": 0.2
+        });
+        let parsed: super::RecordUsageInternalRequest =
+            serde_json::from_value(body.clone()).unwrap();
+        assert_eq!(parsed.discount_to_user, Some(0.2));
+        body["discount_to_user"] = serde_json::json!(0);
+        let parsed: super::RecordUsageInternalRequest =
+            serde_json::from_value(body.clone()).unwrap();
+        assert_eq!(parsed.discount_to_user, Some(0.0));
+        body.as_object_mut().unwrap().remove("discount_to_user");
+        let parsed: super::RecordUsageInternalRequest = serde_json::from_value(body).unwrap();
+        assert_eq!(parsed.discount_to_user, None);
+    }
+
+    #[test]
     fn discount_ceiling_between_basis_points_floors() {
         // 0.10005 is 1000.5 bp: 0.1001 must be refused, 0.1 accepted.
         let err = resolve_internal_usage_discount(Some(0.1001), 0.10005).unwrap_err();

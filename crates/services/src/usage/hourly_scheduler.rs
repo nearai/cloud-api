@@ -1,9 +1,9 @@
 //! Maintains `usage_hourly`: plans each tick from data-derived progress and drives the
 //! `UsageHourlyRepository` port. Planning is pure so it is unit-tested without a database.
 
-use chrono::{DateTime, NaiveDate, TimeDelta, Timelike, Utc};
-
 use std::sync::Arc;
+
+use chrono::{DateTime, NaiveDate, TimeDelta, Timelike, Utc};
 use tracing::{error, info, warn};
 
 use super::ports::{DayParity, HourlyProgress, UsageHourlyRepository};
@@ -217,7 +217,10 @@ impl UsageHourlyScheduler {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Mutex;
+
     use super::*;
+    use crate::usage::ports::{DayTotals, RecomputeReport};
 
     fn t(s: &str) -> DateTime<Utc> {
         DateTime::parse_from_rfc3339(s).unwrap().with_timezone(&Utc)
@@ -427,13 +430,13 @@ mod tests {
         assert_eq!(initial_delay(t("2026-09-24T10:05:00Z")).as_secs(), 3600);
         assert_eq!(initial_delay(t("2026-09-24T10:30:00Z")).as_secs(), 35 * 60);
     }
-    use crate::usage::ports::{DayParity, DayTotals, RecomputeReport, UsageHourlyRepository};
-    use std::sync::{Arc, Mutex};
 
     #[derive(Default)]
     struct FakeRepo {
         progress: Mutex<Option<HourlyProgress>>,
         lock_busy: bool,
+        /// Raw totals differ from the aggregate on every checked day.
+        parity_mismatch: bool,
         recomputes: Mutex<Vec<(DateTime<Utc>, DateTime<Utc>)>>,
         parity_calls: Mutex<Vec<NaiveDate>>,
     }
@@ -457,9 +460,13 @@ mod tests {
         }
         async fn day_parity(&self, day: NaiveDate) -> anyhow::Result<DayParity> {
             self.parity_calls.lock().unwrap().push(day);
+            let raw = DayTotals {
+                request_count: i64::from(self.parity_mismatch),
+                ..DayTotals::default()
+            };
             Ok(DayParity {
                 day,
-                raw: DayTotals::default(),
+                raw,
                 aggregate: DayTotals::default(),
             })
         }
@@ -481,6 +488,21 @@ mod tests {
             *repo.parity_calls.lock().unwrap(),
             vec![d("2026-05-01"), d("2026-05-02"), d("2026-05-03")]
         );
+    }
+
+    #[tokio::test]
+    async fn tick_reports_parity_mismatch_in_the_outcome() {
+        let repo = Arc::new(FakeRepo {
+            parity_mismatch: true,
+            ..Default::default()
+        });
+        *repo.progress.lock().unwrap() = Some(p(None, Some("2026-05-01T14:00:00Z")));
+        let outcome = UsageHourlyScheduler::new(repo.clone())
+            .run_once(t("2026-09-24T10:05:00Z"))
+            .await
+            .unwrap();
+        assert_eq!(outcome.parity.len(), 3);
+        assert!(outcome.parity.iter().all(|day| !day.is_ok()));
     }
 
     #[tokio::test]

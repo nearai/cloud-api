@@ -1739,15 +1739,9 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
             }
         };
 
-        if model.output_modalities.as_ref().is_some_and(|modalities| {
-            modalities
-                .iter()
-                .any(|modality| modality == inference_providers::systemone::OUTPUT_MODALITY)
-        }) {
-            return Err(ports::CompletionError::InvalidParams(
-                "Decision models require /v1/systemone".into(),
-            ));
-        }
+        model
+            .validate_endpoint(crate::models::InferenceEndpoint::ChatCompletions)
+            .map_err(|message| ports::CompletionError::InvalidParams(message.into()))?;
         let canonical_name = &model.model_name;
         let cache_write_cost_per_token = Self::anthropic_cache_write_rate(&model)?;
         let requested_service_tier =
@@ -1934,15 +1928,9 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
             }
         };
 
-        if model.output_modalities.as_ref().is_some_and(|modalities| {
-            modalities
-                .iter()
-                .any(|modality| modality == inference_providers::systemone::OUTPUT_MODALITY)
-        }) {
-            return Err(ports::CompletionError::InvalidParams(
-                "Decision models require /v1/systemone".into(),
-            ));
-        }
+        model
+            .validate_endpoint(crate::models::InferenceEndpoint::ChatCompletions)
+            .map_err(|message| ports::CompletionError::InvalidParams(message.into()))?;
         let canonical_name = &model.model_name;
         let cache_write_cost_per_token = Self::anthropic_cache_write_rate(&model)?;
         let requested_service_tier =
@@ -2426,7 +2414,9 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
         &self,
         model_name: &str,
     ) -> Result<Option<crate::models::ModelWithPricing>, anyhow::Error> {
-        self.models_repository.get_model_by_name(model_name).await
+        self.models_repository
+            .resolve_and_get_model(model_name)
+            .await
     }
 
     fn get_inference_provider_pool(

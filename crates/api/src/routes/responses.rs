@@ -259,29 +259,6 @@ pub async fn create_response(
 ) -> axum::response::Response {
     // Keep the original JSON for legacy typed extraction (including its errors).
     let body = serde_json::from_str::<serde_json::Value>(raw.get()).ok();
-    if let Some(identifier) = body.as_ref().and_then(|body| body["model"].as_str()) {
-        if let Ok(model) = state
-            .native_service
-            .models_service
-            .resolve_and_get_model(identifier)
-            .await
-        {
-            if model.output_modalities.as_ref().is_some_and(|modalities| {
-                modalities
-                    .iter()
-                    .any(|modality| modality == inference_providers::systemone::OUTPUT_MODALITY)
-            }) {
-                return (
-                    StatusCode::BAD_REQUEST,
-                    ResponseJson(ErrorResponse::new(
-                        "Decision models require /v1/systemone".into(),
-                        "invalid_request_error".into(),
-                    )),
-                )
-                    .into_response();
-            }
-        }
-    }
     let native = if let Some(body) = body.as_ref() {
         state.native_service.selected_model(body).await
     } else {

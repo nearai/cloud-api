@@ -257,13 +257,17 @@ pub(crate) async fn read_response(
 }
 
 pub(crate) fn transport_error(error: reqwest::Error, timeout_seconds: u64) -> CompletionError {
-    if error.is_timeout() {
+    if error.is_connect() {
+        CompletionError::CompletionError("System One connection error".into())
+    } else if error.is_timeout() {
         CompletionError::Timeout {
             operation: "systemone".into(),
             timeout_seconds,
         }
     } else {
-        CompletionError::CompletionError("System One connection error".into())
+        // Once connected, a send/read failure may follow completed inference.
+        // Keep it terminal instead of retrying an ambiguous paid operation.
+        CompletionError::InvalidResponse("System One transport failed after connecting".into())
     }
 }
 

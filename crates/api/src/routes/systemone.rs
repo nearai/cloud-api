@@ -76,15 +76,8 @@ pub async fn systemone(
         }
         Err(_) => return error(StatusCode::INTERNAL_SERVER_ERROR, "Failed to resolve model"),
     };
-    if !model.output_modalities.as_ref().is_some_and(|modalities| {
-        modalities
-            .iter()
-            .any(|modality| modality == inference_providers::systemone::OUTPUT_MODALITY)
-    }) {
-        return error(
-            StatusCode::BAD_REQUEST,
-            "This model does not support the decisions output modality",
-        );
+    if let Err(message) = model.validate_endpoint(services::models::InferenceEndpoint::SystemOne) {
+        return error(StatusCode::BAD_REQUEST, message);
     }
     let alias = if request.model != model.model_name {
         if common::no_aliasing_requested(&headers) {
@@ -112,6 +105,9 @@ pub async fn systemone(
         .await
     {
         Ok(slot) => slot,
+        Err(services::completions::CompletionError::RateLimitExceeded(message)) => {
+            return error(StatusCode::TOO_MANY_REQUESTS, &message);
+        }
         Err(err) => {
             return error(
                 common::map_domain_error_to_status(&err),
@@ -204,11 +200,15 @@ pub async fn systemone(
                 "System One"
             ),
         );
-        let tier = match served.provider_attribution.served_provider_tier {
-            Some(ServedProviderTier::Near) => "near",
-            Some(ServedProviderTier::Attested3p) => "attested_3p",
-            _ => "non-attested",
-        };
+        let tier = completions::provider_tier_to_str(
+            match served.provider_attribution.served_provider_tier {
+                Some(ServedProviderTier::Near) => inference_providers::ProviderTier::Near,
+                Some(ServedProviderTier::Attested3p) => {
+                    inference_providers::ProviderTier::Attested3p
+                }
+                _ => inference_providers::ProviderTier::NonAttested,
+            },
+        );
         let mut response = Response::builder()
             .header(header::CONTENT_TYPE, "application/json")
             .header(HEADER_SIGNATURE_ID, id)
@@ -249,6 +249,22 @@ fn error(status: StatusCode, message: &str) -> Response {
 }
 
 fn provider_error(err: CompletionError) -> Response {
+    if matches!(
+        err,
+        CompletionError::HttpError {
+            status_code: 429,
+            ..
+        }
+    ) {
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            Json(ErrorResponse::new(
+                "System One provider is rate limited".into(),
+                "upstream_rate_limit_exceeded".into(),
+            )),
+        )
+            .into_response();
+    }
     let status = match err {
         CompletionError::HttpError {
             status_code: 401 | 403,
@@ -267,6 +283,22 @@ fn provider_error(err: CompletionError) -> Response {
 #[cfg(test)]
 mod tests {
     use utoipa::OpenApi;
+
+    #[tokio::test]
+    async fn systemone_upstream_rate_limit_is_distinct_from_gateway_limit() {
+        let response = super::provider_error(inference_providers::CompletionError::HttpError {
+            status_code: 429,
+            message: "private upstream body".into(),
+            is_external: true,
+        });
+        assert_eq!(response.status(), axum::http::StatusCode::TOO_MANY_REQUESTS);
+        let body = axum::body::to_bytes(response.into_body(), 1024)
+            .await
+            .unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(value["error"]["type"], "upstream_rate_limit_exceeded");
+        assert!(!value.to_string().contains("private upstream body"));
+    }
 
     #[test]
     fn systemone_openapi_keeps_usage_schemas_distinct() {

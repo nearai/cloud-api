@@ -32,6 +32,19 @@ back to plaintext. Signature selection uses the **actual serving provider's**
 trust tier and signature capability, including fallback, rather than catalog flags.
 An attested provider without per-response signatures receives a gateway receipt.
 
+Self-hosted decision requests use request-key routing with bounded spillover
+across verified fleet backends. Retryable HTTP errors and connection failures
+can try another instance; its response ID pins subsequent signature retrieval
+to that instance. Invalid successful responses, invalid TEE receipt IDs and
+ambiguous transport/read timeouts stop both instance and provider fallback to
+avoid issuing another paid inference.
+
+Endpoint compatibility is checked against an already resolved model, including
+aliases. Chat Completions and legacy Completions share the same service check.
+Legacy Responses reuses its image-dispatch lookup, and native Responses checks
+its already selected model. Neither path forwards decision models; both return
+400 directing clients to `/v1/systemone`. Existing image/audio behavior is retained.
+
 ## Configure hosted Jev
 
 Set `TYPESAFE_API_KEY` or mount a secret through `TYPESAFE_API_KEY_FILE` (takes
@@ -114,7 +127,8 @@ alias warning is injected into the body:
   `ed25519`. Hosted TypeSafe has no response ID; the gateway mints a unique ID
   for each call. External upstream IDs never control gateway receipt IDs.
 - `Inference-Id`: UUID derived from that signature ID, used by `/v1/billing/costs`.
-- `X-Serving-Provider`: actual serving tier.
+- `X-Serving-Provider`: actual serving tier, using the shared `near` / `chutes` /
+  `non-attested` header values (`chutes` is the existing attested-third-party label).
 - `X-Model-Alias-Resolved`: present when a catalog alias resolves. Set
   `X-No-Aliasing: true` to reject alias resolution before inference.
 
@@ -133,6 +147,10 @@ concurrency limits apply. Usage is recorded as `decisions`, with the configured
 input/output token rates and actual provider attribution. Provider errors retain
 their HTTP status (provider authentication failures become 502); upstream error
 bodies are not echoed because validation errors can contain client state.
+Upstream 429 responses use `error.type: upstream_rate_limit_exceeded`, distinct
+from the gateway's `rate_limit_exceeded`; concurrency errors include the model
+and configured limit. HTTP 429 remains retryable by client SDKs according to
+their own retry policies.
 
 ## Self-hosted TEE contract
 
@@ -154,15 +172,19 @@ Cloud API does not add System One support to the model server itself.
 
 ## Scope and validation
 
-`/v1/responses` and chat completions reject decision models with a pointer to
+`/v1/responses`, `/v1/chat/completions`, and `/v1/completions` reject decision models with a pointer to
 `/v1/systemone`. There is no streaming, E2EE, or key-pinned routing contract for
 this endpoint yet; encryption/routing-key headers are explicitly rejected.
+Unknown request fields are rejected until their behavior is explicitly supported;
+unknown fields on otherwise valid upstream responses are preserved verbatim.
 The existing image receipt issue is tracked separately in
 [#1125](https://github.com/nearai/cloud-api/issues/1125).
 
 Tests cover wire compatibility, model overrides, raw bytes, sanitized upstream
 errors, both receipt algorithms, billing/catalog discovery, alias and modality
-validation, missing TEE IDs, invalid usage, and trust-preserving fallback.
+validation, missing TEE IDs, invalid usage, and trust-preserving fallback. Fleet
+tests cover distribution, concurrent spillover, instance failover, signature
+affinity, and stopping retries after invalid responses or ambiguous timeouts.
 No live TypeSafe or OpenRouter call is needed:
 
 ```sh

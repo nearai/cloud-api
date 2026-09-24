@@ -111,7 +111,7 @@ const HEADER_SERVING_PROVIDER: &str = "x-serving-provider";
 
 /// Map a [`inference_providers::ProviderTier`] to the string value emitted in
 /// the `x-serving-provider` response header.
-fn provider_tier_to_str(tier: inference_providers::ProviderTier) -> &'static str {
+pub(super) fn provider_tier_to_str(tier: inference_providers::ProviderTier) -> &'static str {
     match tier {
         inference_providers::ProviderTier::Near => "near",
         inference_providers::ProviderTier::Attested3p => "chutes",

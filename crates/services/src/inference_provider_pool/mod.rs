@@ -2797,6 +2797,8 @@ impl InferenceProviderPool {
     /// capability-incapable provider is dropped only when a capable sibling exists,
     /// so it can't mask the primary's failure / suppress retry, while a model whose
     /// only provider lacks the capability still surfaces that provider's clear error.
+    /// System One requires an explicit capability: unlike chat variants, there
+    /// is no compatible default transport, so an empty capable set fails here.
     async fn retry_with_fallback_caps<T, F, Fut>(
         &self,
         model_id: &str,
@@ -2873,9 +2875,9 @@ impl InferenceProviderPool {
                 .filter(|provider| provider.supports_systemone())
                 .collect();
             if capable.is_empty() {
-                return Err(CompletionError::CompletionError(
-                    "No System One provider available for this model".into(),
-                ));
+                return Err(CompletionError::CompletionError(format!(
+                    "No System One provider available for model '{model_id}'"
+                )));
             }
             capable
         } else {
@@ -3139,6 +3141,34 @@ impl InferenceProviderPool {
                         // loop, and the terminal "All providers failed" log.
                         let retry_decision = Self::classify_retry_decision(&e);
                         let is_retryable_error = retry_decision.starts_with("retryable_");
+
+                        // A System One 2xx with an invalid body/receipt has already
+                        // performed inference. A read timeout is likewise ambiguous.
+                        // Do not issue another paid inference on a sibling or let a
+                        // later error turn either failure into a whole-round retry.
+                        if operation_name == "systemone"
+                            && matches!(
+                                e,
+                                CompletionError::InvalidResponse(_)
+                                    | CompletionError::Timeout { .. }
+                            )
+                        {
+                            record_provider_attempt(
+                                self.metrics_service.get(),
+                                ProviderAttemptMetric {
+                                    model_id,
+                                    provider_tier: tier,
+                                    provider_source,
+                                    is_fallback,
+                                    operation_name,
+                                    attempt_result: ProviderAttemptResult::ShortCircuited,
+                                    retry_decision,
+                                    retry_round: retry_count,
+                                    attempt_index: attempt + 1,
+                                },
+                            );
+                            return Err(Self::sanitize_completion_error(e, model_id));
+                        }
 
                         // Short-circuit on client-media-fetch failures the same
                         // way as the 4xx fast-return above: the bad client URL
@@ -3939,6 +3969,9 @@ impl InferenceProviderPool {
             )
         };
         if provider_signs {
+            // Providers may promote a pending request pin here. NEAR's System
+            // One transport already pinned the successful response ID directly,
+            // so its implementation is a no-op for this call.
             served
                 .provider
                 .pin_chat_connection(&request_hash, &signature_id);

@@ -1,5 +1,7 @@
 mod fleet;
 mod prefix_router;
+#[cfg(test)]
+mod systemone_tests;
 
 use crate::spki_verifier::{FingerprintState, SharedTlsRoots};
 use crate::{
@@ -1304,40 +1306,79 @@ impl InferenceProvider for Fleet {
             HeaderValue::from_str(&request_hash)
                 .map_err(|_| CompletionError::CompletionError("Invalid request hash".into()))?,
         );
-        // Use the same verified backend and signature affinity as non-streaming
-        // chat. An empty prefix is appropriate for independent decision calls.
-        let lease = self.acquire_index(&[], None);
-        let (client, url) = if let Some(lease) = &lease {
-            let index = lease.index();
-            (
-                self.get_or_verify_index_client(index).await?,
-                self.rotation_url(index as u64, "/v1/systemone")
-                    .unwrap_or_else(|| format!("{}/v1/systemone", self.config.base_url)),
-            )
-        } else {
-            (
-                self.fallback_client.clone(),
-                format!("{}/v1/systemone", self.config.base_url),
-            )
+        let mut lease = self.acquire_systemone_index(&request_hash);
+        let route_key = lease.as_ref().map(|lease| lease.route_key());
+        let indices = match &lease {
+            Some(lease) => std::iter::once(lease.index())
+                .chain(self.fallback_indices_for(lease.index(), None))
+                .map(Some)
+                .collect::<Vec<_>>(),
+            None => vec![None],
         };
         let timeout_seconds = self.config.completion_timeout_seconds.max(1) as u64;
-        let response = client
-            .post(url)
-            .headers(headers)
-            .json(&request)
-            .timeout(Duration::from_secs(timeout_seconds))
-            .send()
-            .await
-            .map_err(|e| crate::systemone::transport_error(e, timeout_seconds))?;
-        let response = crate::systemone::read_response(response, &request, false).await?;
-        let id = response.provider_signature_id()?;
-        if let Some(lease) = &lease {
-            self.signature_rotation
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .insert(id.to_owned(), lease.index() as u64);
+        let mut last_error = None;
+        for index in indices {
+            let _lease = lease.take().or_else(|| {
+                index
+                    .zip(route_key)
+                    .map(|(index, key)| self.reserve_index(key, index))
+            });
+            let attempt = async {
+                let (client, url) = match index {
+                    Some(index) => (
+                        self.get_or_verify_index_client(index).await?,
+                        self.rotation_url(index as u64, "/v1/systemone")
+                            .expect("rotation lease requires a rotation URL"),
+                    ),
+                    None => (
+                        self.fallback_client.clone(),
+                        format!("{}/v1/systemone", self.config.base_url),
+                    ),
+                };
+                let response = client
+                    .post(url)
+                    .headers(headers.clone())
+                    .json(&request)
+                    .timeout(Duration::from_secs(timeout_seconds))
+                    .send()
+                    .await
+                    .map_err(|e| crate::systemone::transport_error(e, timeout_seconds))?;
+                let response = crate::systemone::read_response(response, &request, false).await?;
+                let id = response.provider_signature_id()?;
+                if let Some(index) = index {
+                    self.signature_rotation
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .insert(id.to_owned(), index as u64);
+                }
+                Ok(response)
+            }
+            .await;
+            match attempt {
+                Ok(response) => return Ok(response),
+                Err(error) => {
+                    // Never replay a successful but malformed response or an
+                    // ambiguous read timeout. Those may already have incurred cost.
+                    let retryable = match &error {
+                        CompletionError::HttpError { status_code, .. } => {
+                            Self::is_rotation_retryable_status(*status_code)
+                        }
+                        CompletionError::CompletionError(_) => true,
+                        _ => false,
+                    };
+                    if !retryable {
+                        return Err(error);
+                    }
+                    if let Some(index) = index {
+                        if matches!(error, CompletionError::CompletionError(_)) {
+                            self.clear_index(index);
+                        }
+                    }
+                    last_error = Some(error);
+                }
+            }
         }
-        Ok(response)
+        Err(last_error.expect("at least one System One backend was attempted"))
     }
 
     /// NEAR's own attested fleet. `Provider` (which wraps `Fleet`) is what the pool

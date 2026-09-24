@@ -36,6 +36,16 @@ async fn catalog(
 ) -> (String, String) {
     let model = format!("typesafe/jev-{}", uuid::Uuid::new_v4());
     let alias = format!("jev-alias-{}", uuid::Uuid::new_v4());
+    catalog_with_names(server, provider, active, model, alias).await
+}
+
+async fn catalog_with_names(
+    server: &axum_test::TestServer,
+    provider: Option<Value>,
+    active: bool,
+    model: String,
+    alias: String,
+) -> (String, String) {
     let mut config = json!({
         "inputCostPerToken":{"amount":3,"currency":"USD"},
         "outputCostPerToken":{"amount":2,"currency":"USD"},
@@ -214,7 +224,7 @@ async fn systemone_uses_actual_provider_trust_and_signature_capability() {
             response.header("x-serving-provider"),
             match tier {
                 ProviderTier::Near => "near",
-                ProviderTier::Attested3p => "attested_3p",
+                ProviderTier::Attested3p => "chutes",
                 ProviderTier::NonAttested => "non-attested",
             }
         );
@@ -301,11 +311,26 @@ async fn systemone_rejects_invalid_requests_before_inference() {
             response.text()
         );
     }
-    for stream in [false, true] {
-        server.post("/v1/chat/completions")
+    for identifier in [&model, &alias] {
+        for stream in [false, true] {
+            server.post("/v1/chat/completions")
             .add_header("Authorization", format!("Bearer {key}"))
-            .json(&json!({"model":model,"messages":[{"role":"user","content":"decision"}],"stream":stream}))
+            .json(&json!({"model":identifier,"messages":[{"role":"user","content":"decision"}],"stream":stream}))
             .await.assert_status_bad_request();
+            server
+                .post("/v1/completions")
+                .add_header("Authorization", format!("Bearer {key}"))
+                .json(&json!({"model":identifier,"prompt":"decision","stream":stream}))
+                .await
+                .assert_status_bad_request();
+            let response = server
+                .post("/v1/responses")
+                .add_header("Authorization", format!("Bearer {key}"))
+                .json(&json!({"model":identifier,"input":"decision","stream":stream}))
+                .await;
+            assert_eq!(response.status_code(), 400, "{}", response.text());
+            assert!(response.text().contains("/v1/systemone"));
+        }
     }
     server
         .post("/v1/systemone")
@@ -326,12 +351,6 @@ async fn systemone_rejects_invalid_requests_before_inference() {
         .json(&request(&model))
         .await
         .assert_status_bad_request();
-    let response = server
-        .post("/v1/responses")
-        .add_header("Authorization", format!("Bearer {key}"))
-        .json(&json!({"model":model,"input":"Should use System One"}))
-        .await;
-    assert_eq!(response.status_code(), 400, "{}", response.text());
     assert_eq!(calls.load(Ordering::SeqCst), 0);
 }
 
@@ -401,6 +420,12 @@ async fn systemone_enforces_credit_and_concurrency_limits_and_releases_slot() {
         .json(&request(&model))
         .await;
     assert_eq!(concurrent.status_code(), 429, "{}", concurrent.text());
+    assert!(concurrent.text().contains(&model));
+    assert!(concurrent.text().contains("Organization limit: 1"));
+    assert_eq!(
+        concurrent.json::<Value>()["error"]["type"],
+        "rate_limit_exceeded"
+    );
     assert_eq!(first.await.unwrap().status(), 200);
     server
         .post("/v1/systemone")
@@ -537,4 +562,96 @@ async fn systemone_fallback_respects_trust_and_organization_policy() {
         .await
         .is_err());
     assert_eq!(hits.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn systemone_invalid_success_and_timeout_never_invoke_a_second_provider() {
+    let (_, pool, _, _) = setup_test_server_with_pool().await;
+    for scenario in ["invalid_payload", "missing_receipt", "timeout"] {
+        let model = format!("systemone-no-replay-{}", uuid::Uuid::new_v4());
+        let primary_calls = Arc::new(AtomicUsize::new(0));
+        let calls = primary_calls.clone();
+        pool.register_provider(
+            model.clone(),
+            Arc::new(
+                MockProvider::new_accept_all()
+                    .with_tier(ProviderTier::Near)
+                    .with_systemone_handler(move |req| {
+                        calls.fetch_add(1, Ordering::SeqCst);
+                        if scenario == "timeout" {
+                            Err(CompletionError::Timeout {
+                                operation: "systemone".into(),
+                                timeout_seconds: 1,
+                            })
+                        } else {
+                            let mut body =
+                                result((scenario != "missing_receipt").then_some("tee-id"));
+                            if scenario == "invalid_payload" {
+                                body["answers"]["billing"]["noul"] = json!(2.0);
+                            }
+                            SystemOneResponseWithBytes::parse(
+                                serde_json::to_vec(&body).unwrap(),
+                                &req,
+                            )
+                        }
+                    }),
+            ),
+        )
+        .await;
+        pool.register_pinned_secondary_provider(
+            model.clone(),
+            Arc::new(
+                MockProvider::new_accept_all()
+                    .with_tier(ProviderTier::Attested3p)
+                    .with_systemone_handler(|_| panic!("must not issue a second paid inference")),
+            ),
+            None,
+        )
+        .await;
+        let error = pool
+            .systemone_with_attribution(
+                serde_json::from_value(request(&model)).unwrap(),
+                "hash".into(),
+                false,
+            )
+            .await
+            .err()
+            .expect("invalid System One responses must fail without fallback");
+        assert!(matches!(
+            error,
+            CompletionError::InvalidResponse(_) | CompletionError::Timeout { .. }
+        ));
+        assert_eq!(primary_calls.load(Ordering::SeqCst), 1);
+    }
+}
+
+#[tokio::test]
+async fn systemone_is_rejected_by_native_responses_even_when_allowlisted() {
+    let model = format!("native-decision-{}", uuid::Uuid::new_v4());
+    let alias = format!("native-decision-alias-{}", uuid::Uuid::new_v4());
+    let (server, pool, _, _) = setup_test_server_with_pool_and_config(|config| {
+        config.native_responses_models = vec![model.clone()];
+    })
+    .await;
+    catalog_with_names(&server, None, true, model.clone(), alias.clone()).await;
+    pool.register_provider(
+        model.clone(),
+        Arc::new(
+            MockProvider::new_accept_all()
+                .with_responses_handler(|_| panic!("decisions must not reach native Responses")),
+        ),
+    )
+    .await;
+    let key = auth(&server).await;
+    for identifier in [&model, &alias] {
+        for stream in [false, true] {
+            let response = server
+                .post("/v1/responses")
+                .add_header("Authorization", format!("Bearer {key}"))
+                .json(&json!({"model":identifier,"store":false,"input":"decision","stream":stream}))
+                .await;
+            assert_eq!(response.status_code(), 400, "{}", response.text());
+            assert!(response.text().contains("/v1/systemone"));
+        }
+    }
 }

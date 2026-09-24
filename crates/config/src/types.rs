@@ -2419,12 +2419,19 @@ impl ExternalProvidersConfig {
     /// Keys can be provided directly via env vars or through file paths
     pub fn from_env() -> Self {
         let typesafe_api_key = if let Ok(path) = env::var("TYPESAFE_API_KEY_FILE") {
-            std::fs::read_to_string(path)
-                .ok()
-                .map(|s| s.trim().to_string())
+            match std::fs::read_to_string(&path) {
+                Ok(value) => Some(value.trim().to_string()),
+                Err(error) => {
+                    eprintln!("WARN: failed to read TYPESAFE_API_KEY_FILE ({path}): {error}");
+                    None
+                }
+            }
         } else {
-            env::var("TYPESAFE_API_KEY").ok()
-        };
+            env::var("TYPESAFE_API_KEY")
+                .ok()
+                .map(|value| value.trim().to_string())
+        }
+        .filter(|value| !value.is_empty());
         // OpenAI API key
         let openai_api_key = if let Ok(path) = env::var("OPENAI_API_KEY_FILE") {
             std::fs::read_to_string(path)

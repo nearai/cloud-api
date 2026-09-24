@@ -9,7 +9,7 @@ use inference_providers::{self as ip, mock::MockProvider, InferenceProvider};
 use super::{
     chat_signature_lifecycle_tests::{lifecycle_service, FailingRepository, RecordingRepository},
     ports::{AttestationRepository, AttestationServiceTrait},
-    AttestationError, AttestationService, ChatSignature, SignatureKind,
+    AttestationError, AttestationService, ChatSignature, SignatureKind, SignatureLookupResult,
     STREAM_SIGNATURE_STORE_TIMEOUT,
 };
 use crate::{
@@ -337,7 +337,7 @@ async fn provider_stalled_second_fetch_flushes_first_before_stream_timeout() {
 }
 
 #[tokio::test(start_paused = true)]
-async fn provider_stalled_first_fetch_unpins_without_an_empty_write() {
+async fn provider_stalled_ecdsa_fetch_preserves_ed25519_signature() {
     let chat_id = "chatcmpl-provider-first-timeout";
     let repository = RecordingRepository::default();
     let (service, provider, metrics) = provider_service(
@@ -355,8 +355,16 @@ async fn provider_stalled_first_fetch_unpins_without_an_empty_write() {
     assert!(
         matches!(result, Err(AttestationError::ProviderError(message)) if message.contains("Timed out"))
     );
-    assert!(repository.batch_sizes().is_empty());
-    assert!(repository.stored().is_empty());
+    assert_eq!(repository.batch_sizes(), vec![1]);
+    assert_eq!(repository.stored()[0].1.signing_algo, "ed25519");
+    let lookup = service
+        .get_chat_signature(chat_id, Some("ed25519".to_string()))
+        .await
+        .unwrap();
+    assert!(matches!(
+        lookup,
+        SignatureLookupResult::Found(signature) if signature.signing_algo == "ed25519"
+    ));
     assert_eq!(
         provider.inner.unpinned_chat_ids(),
         vec![chat_id.to_string()]

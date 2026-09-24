@@ -655,3 +655,148 @@ async fn systemone_is_rejected_by_native_responses_even_when_allowlisted() {
         }
     }
 }
+
+#[tokio::test]
+async fn systemone_finalization_survives_client_disconnect() {
+    use std::time::Duration;
+    use tower::ServiceExt;
+
+    let (server, router, pool, _, database) = setup_test_server_with_pool_and_router().await;
+    let (model, _) = catalog(&server, None, true).await;
+    let org = setup_org_with_credits(&server, 10_000_000_000).await;
+    let key = get_api_key_for_org(&server, org.id.clone()).await;
+    server
+        .patch(&format!(
+            "/v1/admin/organizations/{}/concurrent-limit",
+            org.id
+        ))
+        .add_header("Authorization", format!("Bearer {}", get_session_id()))
+        .add_header("User-Agent", MOCK_USER_AGENT)
+        .json(&json!({"concurrentLimit": 1}))
+        .await
+        .assert_status_ok();
+
+    let id = format!("decision-{}", uuid::Uuid::new_v4());
+    let response_id = id.clone();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let counter = calls.clone();
+    let provider = Arc::new(
+        MockProvider::new_accept_all()
+            .with_tier(ProviderTier::Near)
+            .with_systemone_handler(move |req| {
+                let attempt = counter.fetch_add(1, Ordering::SeqCst);
+                let id = if attempt == 0 {
+                    response_id.clone()
+                } else {
+                    format!("{response_id}-{attempt}")
+                };
+                SystemOneResponseWithBytes::parse(
+                    serde_json::to_vec(&result(Some(&id))).unwrap(),
+                    &req,
+                )
+            }),
+    );
+    pool.register_provider(model.clone(), provider.clone())
+        .await;
+    let request_text = serde_json::to_string(&request(&model)).unwrap();
+
+    // A real database barrier makes cancellation deterministic: inference has
+    // succeeded and receipt persistence is pending, rather than merely delayed
+    // in the upstream request. Nextest serializes this table-locking test.
+    let mut blocker = database.pool().get().await.unwrap();
+    let transaction = blocker.transaction().await.unwrap();
+    transaction
+        .batch_execute("LOCK TABLE chat_signatures IN ACCESS EXCLUSIVE MODE")
+        .await
+        .unwrap();
+    let request = axum::http::Request::builder()
+        .method("POST")
+        .uri("/v1/systemone")
+        .header("Authorization", format!("Bearer {key}"))
+        .header("Content-Type", "application/json")
+        .body(axum::body::Body::from(request_text.clone()))
+        .unwrap();
+    let pending = tokio::spawn(async move { router.oneshot(request).await.unwrap() });
+    tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            transaction.batch_execute("SELECT pg_stat_clear_snapshot()").await.unwrap();
+            let blocked: bool = transaction.query_one(
+                "SELECT EXISTS(SELECT 1 FROM pg_stat_activity WHERE datname = current_database() AND pg_backend_pid() = ANY(pg_blocking_pids(pid)) AND query ILIKE '%INSERT INTO chat_signatures%')",
+                &[],
+            ).await.unwrap().get(0);
+            if blocked { break; }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }).await.expect("receipt write should reach the storage barrier");
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    assert!(!pending.is_finished());
+    pending.abort();
+    assert!(pending.await.unwrap_err().is_cancelled());
+    assert!(!provider.unpinned_chat_ids().contains(&id));
+
+    // Cancelling the caller must not release its slot before persistence ends.
+    server
+        .post("/v1/systemone")
+        .add_header("Authorization", format!("Bearer {key}"))
+        .json(&serde_json::from_str::<Value>(&request_text).unwrap())
+        .await
+        .assert_status_too_many_requests();
+    transaction.rollback().await.unwrap();
+    drop(blocker);
+
+    let client = database.pool().get().await.unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let receipts: i64 = client
+                .query_one(
+                    "SELECT COUNT(*) FROM chat_signatures WHERE chat_id = $1",
+                    &[&id],
+                )
+                .await
+                .unwrap()
+                .get(0);
+            let usage_count: i64 = client
+                .query_one(
+                    "SELECT COUNT(*) FROM organization_usage_log WHERE provider_request_id = $1",
+                    &[&id],
+                )
+                .await
+                .unwrap()
+                .get(0);
+            if receipts == 2 && usage_count == 1 && provider.unpinned_chat_ids().contains(&id) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("detached finalization should persist both receipts and unpin");
+    let row = client.query_one(
+        "SELECT COUNT(*), SUM(input_tokens)::BIGINT, SUM(output_tokens)::BIGINT FROM organization_usage_log WHERE provider_request_id = $1",
+        &[&id],
+    ).await.unwrap();
+    assert_eq!(row.get::<_, i64>(0), 1);
+    assert_eq!(row.get::<_, i64>(1), 10);
+    assert_eq!(row.get::<_, i64>(2), 3);
+    for algorithm in ["ecdsa", "ed25519"] {
+        let expected = provider
+            .get_signature(&id, Some(algorithm.into()))
+            .await
+            .unwrap();
+        let stored: Value = server
+            .get(&format!("/v1/signature/{id}?signing_algo={algorithm}"))
+            .add_header("Authorization", format!("Bearer {key}"))
+            .await
+            .json();
+        assert_eq!(stored["signature"], expected.signature);
+        assert_eq!(stored["text"], expected.text);
+        assert_eq!(stored["signature_kind"], "provider_tee");
+    }
+    server
+        .post("/v1/systemone")
+        .add_header("Authorization", format!("Bearer {key}"))
+        .json(&serde_json::from_str::<Value>(&request_text).unwrap())
+        .await
+        .assert_status_ok();
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+}

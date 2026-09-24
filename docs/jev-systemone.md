@@ -160,7 +160,7 @@ The underlying TEE server/model proxy must implement:
 
 1. `POST /v1/systemone` with the same typed request/response protocol.
 2. Respect `X-Request-Hash` as the original client body hash, as for chat.
-3. Add a globally unique response `id` consisting of 1–256 ASCII letters,
+3. Add a globally unique response `id` consisting of 1–255 ASCII letters,
    digits, hyphens, or underscores.
 4. Expose the existing `/v1/signature/{id}` contract for both algorithms,
    signing the original request hash and the exact response bytes.
@@ -182,15 +182,17 @@ The existing image receipt issue is tracked separately in
 
 Tests cover wire compatibility, model overrides, raw bytes, sanitized upstream
 errors, both receipt algorithms, billing/catalog discovery, alias and modality
-validation, missing TEE IDs, invalid usage, and trust-preserving fallback. Fleet
+validation, TEE ID storage boundaries, invalid usage, trust-preserving fallback,
+and receipt/billing finalization after client disconnect. Fleet
 tests cover distribution, concurrent spillover, instance failover, signature
 affinity, and stopping retries after invalid responses or ambiguous timeouts.
 No live TypeSafe or OpenRouter call is needed:
 
 ```sh
 cargo test -p inference_providers systemone --locked
+cargo test -p api --lib systemone --locked
 DEV=true BRAVE_SEARCH_PRO_API_KEY=unused-test-fixture \
-  TEST_DATABASE_NAME=cloud_api_jev_e2e cargo test -p api systemone --locked
+  TEST_DATABASE_NAME=cloud_api_jev_e2e cargo nextest run -p api --test e2e_all --locked -E 'test(systemone)'
 ```
 
 Configure the test database through the existing `DATABASE_*` environment

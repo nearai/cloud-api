@@ -149,7 +149,7 @@ impl SystemOneResponseWithBytes {
             .as_deref()
             .filter(|id| {
                 !id.is_empty()
-                    && id.len() <= 256
+                    && id.len() <= 255
                     && id
                         .bytes()
                         .all(|c| c.is_ascii_alphanumeric() || c == b'-' || c == b'_')

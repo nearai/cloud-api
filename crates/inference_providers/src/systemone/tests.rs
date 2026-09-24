@@ -99,3 +99,20 @@ fn tee_ids_are_safe_header_values_and_path_segments() {
         SystemOneResponseWithBytes::parse(serde_json::to_vec(&value).unwrap(), &request()).unwrap();
     assert_eq!(parsed.provider_signature_id().unwrap(), "decision-123_abc");
 }
+
+#[test]
+fn tee_ids_fit_receipt_and_usage_database_columns() {
+    for (length, valid) in [(255, true), (256, false)] {
+        let id = "a".repeat(length);
+        let mut value = response();
+        value["id"] = json!(id);
+        let parsed =
+            SystemOneResponseWithBytes::parse(serde_json::to_vec(&value).unwrap(), &request())
+                .unwrap();
+        assert_eq!(
+            parsed.provider_signature_id().is_ok(),
+            valid,
+            "length {length}"
+        );
+    }
+}

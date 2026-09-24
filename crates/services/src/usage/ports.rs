@@ -244,12 +244,14 @@ pub trait UsageServiceTrait: Send + Sync {
 
     /// Record usage from the public API endpoint.
     /// Resolves model by name, validates per-variant fields, and delegates to `record_usage`.
+    /// `discount` is applied after catalog pricing (see [`UsageDiscount`]).
     async fn record_usage_from_api(
         &self,
         organization_id: Uuid,
         workspace_id: Uuid,
         api_key_id: Uuid,
         request: RecordUsageApiRequest,
+        discount: Option<UsageDiscount>,
     ) -> Result<UsageLogEntry, UsageError>;
 
     /// Check if organization can make an API call (pre-flight check)
@@ -623,6 +625,157 @@ pub struct RecordUsageServiceRequest {
     /// Number of images generated (for image generation requests)
     pub image_count: Option<i32>,
     pub provider_attribution: ProviderAttribution,
+    /// Provider-side discount applied after catalog pricing (see
+    /// [`UsageDiscount`]). `None` records the row at list price.
+    pub discount: Option<UsageDiscount>,
+}
+
+/// Basis points in one whole (100%).
+const DISCOUNT_BASIS_POINTS_PER_UNIT: i128 = 10_000;
+
+/// A provider-side discount applied to one usage row after pricing, held in
+/// basis points (1 bp = 0.01%).
+///
+/// Trusted reporters carry it on `POST /v1/internal/usage` as
+/// `discount_to_user`: the same fraction an aggregator lane publishes in its
+/// models document, so the price a user is shown and the amount the ledger
+/// records come from one setting. The catalog rate stays the list price; the
+/// discounted amounts are what the row is recorded (and credit-allocated)
+/// at, and the list amounts are kept in `billing_details` so every invoice
+/// line can be traced back.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UsageDiscount {
+    basis_points: u16,
+}
+
+/// Costs after [`UsageDiscount::apply_to_costs`], plus the `billing_details`
+/// document carrying the list amounts.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DiscountedCosts {
+    pub input_cost: i64,
+    pub output_cost: i64,
+    pub total_cost: i64,
+    pub billing_details: serde_json::Value,
+}
+
+impl UsageDiscount {
+    /// Parse a fraction of the list price such as `0.2` (20% off).
+    ///
+    /// Returns `Ok(None)` for `0` (no discount). Rejects non-finite values,
+    /// anything outside `[0, 1)` (a discount of 100% or more would record
+    /// free or negative rows) and fractions that are not a multiple of
+    /// `0.0001` within a small float tolerance, so a row is never recorded
+    /// at a rate the reporter did not mean.
+    pub fn from_fraction(fraction: f64) -> Result<Option<Self>, UsageError> {
+        if !fraction.is_finite() || !(0.0..1.0).contains(&fraction) {
+            return Err(UsageError::ValidationError(
+                "discount_to_user must be a number in the range [0, 1)".into(),
+            ));
+        }
+        let scaled = fraction * DISCOUNT_BASIS_POINTS_PER_UNIT as f64;
+        let rounded = scaled.round();
+        // A fraction just below 1 (e.g. 0.99999999995) passes the range check
+        // but rounds to 10_000 bp, which would record every amount as zero.
+        if rounded >= DISCOUNT_BASIS_POINTS_PER_UNIT as f64 {
+            return Err(UsageError::ValidationError(
+                "discount_to_user must stay below 1 (a 100% discount is not allowed)".into(),
+            ));
+        }
+        if (scaled - rounded).abs() > 1e-6 {
+            return Err(UsageError::ValidationError(
+                "discount_to_user must be a multiple of 0.0001".into(),
+            ));
+        }
+        // `rounded` is in [0, 10_000) here, so the narrowing cast is exact.
+        let basis_points = rounded as u16;
+        if basis_points == 0 {
+            return Ok(None);
+        }
+        Ok(Some(Self { basis_points }))
+    }
+
+    /// The discount in basis points (`2_000` = 20% off).
+    pub fn basis_points(&self) -> u16 {
+        self.basis_points
+    }
+
+    /// The discount as a fraction of the list price (`0.2` = 20% off).
+    pub fn fraction(&self) -> f64 {
+        self.basis_points as f64 / DISCOUNT_BASIS_POINTS_PER_UNIT as f64
+    }
+
+    /// Discount one non-negative nano-dollar amount, rounding half up.
+    pub fn apply(&self, list_amount: i64) -> Result<i64, UsageError> {
+        if list_amount < 0 {
+            return Err(UsageError::ValidationError(
+                "amounts must be non-negative before discounting".into(),
+            ));
+        }
+        let keep = DISCOUNT_BASIS_POINTS_PER_UNIT - i128::from(self.basis_points);
+        let discounted = (i128::from(list_amount) * keep + DISCOUNT_BASIS_POINTS_PER_UNIT / 2)
+            / DISCOUNT_BASIS_POINTS_PER_UNIT;
+        i64::try_from(discounted).map_err(|_| {
+            UsageError::CostCalculationOverflow(format!(
+                "Discounted amount overflow: {list_amount} at {} bp",
+                self.basis_points
+            ))
+        })
+    }
+
+    /// Discount the priced input and output amounts, recompute the total from
+    /// the discounted parts, and record the list amounts under
+    /// `billing_details.discount`, merged into any existing pricing snapshot.
+    ///
+    /// Each component is rounded on its own, so `total_cost` can differ by one
+    /// nano-dollar from rounding the list total once. Any pricing snapshot
+    /// already in `billing_details` (for example a profiled row's
+    /// `rounding.rounded_total`) keeps its list-price figures; the `discount`
+    /// block is what explains the net amounts on the row.
+    pub fn apply_to_costs(
+        &self,
+        list_input_cost: i64,
+        list_output_cost: i64,
+        billing_details: Option<serde_json::Value>,
+    ) -> Result<DiscountedCosts, UsageError> {
+        let input_cost = self.apply(list_input_cost)?;
+        let output_cost = self.apply(list_output_cost)?;
+        let total_cost = input_cost.checked_add(output_cost).ok_or_else(|| {
+            UsageError::CostCalculationOverflow(format!(
+                "Discounted total overflow: {input_cost} + {output_cost}"
+            ))
+        })?;
+        let list_total_cost = list_input_cost
+            .checked_add(list_output_cost)
+            .ok_or_else(|| {
+                UsageError::CostCalculationOverflow(format!(
+                    "List total overflow: {list_input_cost} + {list_output_cost}"
+                ))
+            })?;
+        let discount = serde_json::json!({
+            "discount_to_user": self.fraction(),
+            "basis_points": self.basis_points,
+            "list_input_cost": list_input_cost,
+            "list_output_cost": list_output_cost,
+            "list_total_cost": list_total_cost,
+        });
+        let billing_details = match billing_details {
+            Some(serde_json::Value::Object(mut snapshot)) => {
+                snapshot.insert("discount".to_string(), discount);
+                serde_json::Value::Object(snapshot)
+            }
+            // The column is constrained to JSON objects, so a non-object
+            // snapshot cannot come from the database; keep it rather than
+            // drop it if a caller ever passes one.
+            Some(other) => serde_json::json!({ "snapshot": other, "discount": discount }),
+            None => serde_json::json!({ "discount": discount }),
+        };
+        Ok(DiscountedCosts {
+            input_cost,
+            output_cost,
+            total_cost,
+            billing_details,
+        })
+    }
 }
 
 /// Request to record usage (database layer)

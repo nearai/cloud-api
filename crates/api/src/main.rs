@@ -89,9 +89,12 @@ async fn main() {
 
     // Maintain the usage_hourly aggregate. Safe on every instance: recompute takes a
     // transaction-scoped try-lock, so one replica writes per tick.
-    let usage_hourly_scheduler = Arc::new(services::usage::UsageHourlyScheduler::new(Arc::new(
-        database::repositories::UsageHourlyRepositoryImpl::new(database.pool().clone()),
-    )));
+    let usage_hourly_scheduler = Arc::new(services::usage::UsageHourlyScheduler::new(
+        Arc::new(database::repositories::UsageHourlyRepositoryImpl::new(
+            database.pool().clone(),
+        )),
+        domain_services.metrics_service.clone(),
+    ));
     usage_hourly_scheduler
         .clone()
         .start(config.server.usage_hourly_interval_secs)

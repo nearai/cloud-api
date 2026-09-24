@@ -7,6 +7,10 @@ use chrono::{DateTime, NaiveDate, TimeDelta, Timelike, Utc};
 use tracing::{error, info, warn};
 
 use super::ports::{DayParity, HourlyProgress, UsageHourlyRepository};
+use crate::metrics::{
+    consts::{get_environment, METRIC_USAGE_HOURLY_LAG_SECONDS, TAG_ENVIRONMENT},
+    MetricsServiceTrait,
+};
 
 pub const REREAD_HOURS: i64 = 3;
 pub const CATCH_UP_DAYS: i64 = 3;
@@ -100,13 +104,18 @@ pub struct TickOutcome {
 /// transaction-scoped try-lock, so at most one replica writes per tick; losers log `skipped`.
 pub struct UsageHourlyScheduler {
     repository: Arc<dyn UsageHourlyRepository>,
+    metrics_service: Arc<dyn MetricsServiceTrait>,
     task_handle: tokio::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
 
 impl UsageHourlyScheduler {
-    pub fn new(repository: Arc<dyn UsageHourlyRepository>) -> Self {
+    pub fn new(
+        repository: Arc<dyn UsageHourlyRepository>,
+        metrics_service: Arc<dyn MetricsServiceTrait>,
+    ) -> Self {
         Self {
             repository,
+            metrics_service,
             task_handle: tokio::sync::Mutex::new(None),
         }
     }
@@ -159,6 +168,18 @@ impl UsageHourlyScheduler {
     pub async fn run_once(&self, now: DateTime<Utc>) -> anyhow::Result<TickOutcome> {
         let started = std::time::Instant::now();
         let progress = self.repository.progress().await?;
+        // Freshness (spec §9): seconds since the end of the newest aggregated hour. Recorded on
+        // every tick (catch-up, skipped or steady); an alert fires above 3 hours. Nothing to
+        // record while the table is still empty.
+        if let Some(max_hour) = progress.max_hour {
+            let lag = now - (max_hour + TimeDelta::hours(1));
+            let env_tag = format!("{TAG_ENVIRONMENT}:{}", get_environment());
+            self.metrics_service.record_histogram(
+                METRIC_USAGE_HOURLY_LAG_SECONDS,
+                lag.as_seconds_f64(),
+                &[env_tag.as_str()],
+            );
+        }
         let (from, to) = plan_window(progress, now);
         let caught_up = from == trunc_hour(now) - TimeDelta::hours(REREAD_HOURS);
 
@@ -220,6 +241,8 @@ mod tests {
     use std::sync::Mutex;
 
     use super::*;
+    use crate::metrics::capturing::{CapturingMetricsService, MetricValue};
+    use crate::metrics::consts::{get_environment, METRIC_USAGE_HOURLY_LAG_SECONDS};
     use crate::usage::ports::{DayTotals, RecomputeReport};
 
     fn t(s: &str) -> DateTime<Utc> {
@@ -476,7 +499,8 @@ mod tests {
     async fn tick_recomputes_planned_window_then_checks_parity_days() {
         let repo = Arc::new(FakeRepo::default());
         *repo.progress.lock().unwrap() = Some(p(None, Some("2026-05-01T14:00:00Z")));
-        let scheduler = UsageHourlyScheduler::new(repo.clone());
+        let scheduler =
+            UsageHourlyScheduler::new(repo.clone(), Arc::new(crate::metrics::MockMetricsService));
         let outcome = scheduler.run_once(t("2026-09-24T10:05:00Z")).await.unwrap();
         assert!(!outcome.skipped);
         assert_eq!(outcome.rows_written, 7);
@@ -497,10 +521,11 @@ mod tests {
             ..Default::default()
         });
         *repo.progress.lock().unwrap() = Some(p(None, Some("2026-05-01T14:00:00Z")));
-        let outcome = UsageHourlyScheduler::new(repo.clone())
-            .run_once(t("2026-09-24T10:05:00Z"))
-            .await
-            .unwrap();
+        let outcome =
+            UsageHourlyScheduler::new(repo.clone(), Arc::new(crate::metrics::MockMetricsService))
+                .run_once(t("2026-09-24T10:05:00Z"))
+                .await
+                .unwrap();
         assert_eq!(outcome.parity.len(), 3);
         assert!(outcome.parity.iter().all(|day| !day.is_ok()));
     }
@@ -512,10 +537,11 @@ mod tests {
             ..Default::default()
         });
         *repo.progress.lock().unwrap() = Some(p(None, Some("2026-05-01T14:00:00Z")));
-        let outcome = UsageHourlyScheduler::new(repo.clone())
-            .run_once(t("2026-09-24T03:05:00Z"))
-            .await
-            .unwrap();
+        let outcome =
+            UsageHourlyScheduler::new(repo.clone(), Arc::new(crate::metrics::MockMetricsService))
+                .run_once(t("2026-09-24T03:05:00Z"))
+                .await
+                .unwrap();
         assert!(outcome.skipped);
         assert!(repo.parity_calls.lock().unwrap().is_empty());
     }
@@ -524,17 +550,78 @@ mod tests {
     async fn tick_reports_caught_up_only_on_the_reread_window() {
         let repo = Arc::new(FakeRepo::default());
         *repo.progress.lock().unwrap() = Some(p(None, Some("2026-05-01T14:00:00Z")));
-        let behind = UsageHourlyScheduler::new(repo.clone())
-            .run_once(t("2026-09-24T10:05:00Z"))
-            .await
-            .unwrap();
+        let behind =
+            UsageHourlyScheduler::new(repo.clone(), Arc::new(crate::metrics::MockMetricsService))
+                .run_once(t("2026-09-24T10:05:00Z"))
+                .await
+                .unwrap();
         assert!(!behind.caught_up);
         *repo.progress.lock().unwrap() = Some(p(Some("2026-09-24T09:00:00Z"), None));
-        let current = UsageHourlyScheduler::new(repo.clone())
+        let current =
+            UsageHourlyScheduler::new(repo.clone(), Arc::new(crate::metrics::MockMetricsService))
+                .run_once(t("2026-09-24T10:05:00Z"))
+                .await
+                .unwrap();
+        assert!(current.caught_up);
+    }
+
+    #[tokio::test]
+    async fn tick_records_lag_from_the_end_of_the_newest_hour() {
+        let repo = Arc::new(FakeRepo::default());
+        *repo.progress.lock().unwrap() = Some(p(Some("2026-09-24T09:00:00Z"), None));
+        let metrics = Arc::new(CapturingMetricsService::new());
+        UsageHourlyScheduler::new(repo, metrics.clone())
             .run_once(t("2026-09-24T10:05:00Z"))
             .await
             .unwrap();
-        assert!(current.caught_up);
+        let recorded = metrics.get_metrics();
+        assert_eq!(recorded.len(), 1);
+        assert_eq!(recorded[0].name, METRIC_USAGE_HOURLY_LAG_SECONDS);
+        assert_eq!(
+            recorded[0].tags,
+            vec![format!("{TAG_ENVIRONMENT}:{}", get_environment())]
+        );
+        // now − (max_hour + 1h) = 10:05 − 10:00.
+        assert!(matches!(recorded[0].value, MetricValue::Histogram(v) if v == 300.0));
+    }
+
+    #[tokio::test]
+    async fn tick_records_no_lag_before_the_first_aggregate() {
+        let repo = Arc::new(FakeRepo::default());
+        *repo.progress.lock().unwrap() = Some(p(None, Some("2026-05-01T14:00:00Z")));
+        let metrics = Arc::new(CapturingMetricsService::new());
+        UsageHourlyScheduler::new(repo, metrics.clone())
+            .run_once(t("2026-09-24T10:05:00Z"))
+            .await
+            .unwrap();
+        assert!(metrics.get_metrics().is_empty());
+    }
+
+    #[tokio::test]
+    async fn tick_records_lag_while_catching_up_and_when_skipped() {
+        // Catch-up tick (months behind) and a tick that loses the lock both report freshness.
+        for lock_busy in [false, true] {
+            let repo = Arc::new(FakeRepo {
+                lock_busy,
+                ..Default::default()
+            });
+            *repo.progress.lock().unwrap() = Some(p(
+                Some("2026-05-03T20:00:00Z"),
+                Some("2026-05-13T07:00:00Z"),
+            ));
+            let metrics = Arc::new(CapturingMetricsService::new());
+            let outcome = UsageHourlyScheduler::new(repo, metrics.clone())
+                .run_once(t("2026-09-24T10:05:00Z"))
+                .await
+                .unwrap();
+            assert!(!outcome.caught_up, "lock_busy={lock_busy}");
+            assert_eq!(outcome.skipped, lock_busy);
+            let recorded = metrics.get_metrics();
+            assert_eq!(recorded.len(), 1, "lock_busy={lock_busy}");
+            assert_eq!(recorded[0].name, METRIC_USAGE_HOURLY_LAG_SECONDS);
+            // 09-24 10:05 − (05-03 20:00 + 1h) = 143 days 13 h 5 min.
+            assert!(matches!(recorded[0].value, MetricValue::Histogram(v) if v == 12_402_300.0));
+        }
     }
 
     #[test]

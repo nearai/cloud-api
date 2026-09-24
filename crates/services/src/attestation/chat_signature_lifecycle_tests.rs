@@ -165,7 +165,7 @@ impl ModelsRepository for EmptyModelsRepository {
     }
 }
 
-struct NoopMetricsService;
+pub(super) struct NoopMetricsService;
 
 impl MetricsServiceTrait for NoopMetricsService {
     fn record_latency(&self, _name: &str, _duration: std::time::Duration, _tags: &[&str]) {}
@@ -173,7 +173,7 @@ impl MetricsServiceTrait for NoopMetricsService {
     fn record_histogram(&self, _name: &str, _value: f64, _tags: &[&str]) {}
 }
 
-struct NoopUsageRepository;
+pub(super) struct NoopUsageRepository;
 
 #[async_trait]
 impl UsageRepository for NoopUsageRepository {

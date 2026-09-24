@@ -267,6 +267,27 @@ pub fn validate_repair_window(from: DateTime<Utc>, to: DateTime<Utc>) -> Result<
     Ok(())
 }
 
+/// Latest `from` a repair may start at without leaving uncomputed raw hours below it. Readers
+/// and the scheduler treat every hour below `max_hour + 1h` as final, so a repair that starts
+/// past the next uncomputed raw hour would move `max_hour` over hours nothing ever computes,
+/// and readers would serve them from an empty aggregate. `None` means no raw hour is pending.
+pub fn repair_frontier(progress: HourlyProgress) -> Option<DateTime<Utc>> {
+    progress.next_raw_hour
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum RepairError {
+    #[error("{0}")]
+    InvalidWindow(String),
+    #[error(
+        "usage_hourly has not been computed up to {frontier}; start the repair at or before it, \
+         or wait for the scheduler to catch up"
+    )]
+    AheadOfAggregate { frontier: DateTime<Utc> },
+    #[error(transparent)]
+    Failed(#[from] anyhow::Error),
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RepairReport {
     pub rows_written: u64,
@@ -277,13 +298,19 @@ pub struct RepairReport {
 /// Explicit operator repair for rows that reached raw after their hour left the scheduler's
 /// 3-hour re-read (backfill, clock skew, a day flagged by parity): recomputes [from, to) one
 /// UTC day per transaction, waiting for the aggregate lock, then reports each touched day's
-/// parity.
+/// parity. Refuses windows that start past `repair_frontier`.
 pub async fn repair(
     repository: &dyn UsageHourlyRepository,
     from: DateTime<Utc>,
     to: DateTime<Utc>,
-) -> anyhow::Result<RepairReport> {
-    validate_repair_window(from, to).map_err(anyhow::Error::msg)?;
+) -> Result<RepairReport, RepairError> {
+    validate_repair_window(from, to).map_err(RepairError::InvalidWindow)?;
+    // The scheduler only moves the frontier forward, so a check outside the lock stays valid.
+    if let Some(frontier) = repair_frontier(repository.progress().await?) {
+        if from > frontier {
+            return Err(RepairError::AheadOfAggregate { frontier });
+        }
+    }
     let mut rows_written = 0;
     let mut chunk_start = from;
     while chunk_start < to {
@@ -778,6 +805,10 @@ mod tests {
             parity_mismatch: true,
             ..FakeRepo::default()
         };
+        *repo.progress.lock().unwrap() = Some(p(
+            Some("2026-09-24T09:00:00Z"),
+            Some("2026-09-24T10:00:00Z"),
+        ));
         let report = repair(&repo, t("2026-09-01T22:00:00Z"), t("2026-09-03T02:00:00Z"))
             .await
             .unwrap();
@@ -801,11 +832,61 @@ mod tests {
     #[tokio::test]
     async fn repair_rejects_an_invalid_window_without_touching_the_repository() {
         let repo = FakeRepo::default();
-        assert!(
-            repair(&repo, t("2026-09-01T00:30:00Z"), t("2026-09-01T02:00:00Z"))
-                .await
-                .is_err()
-        );
+        assert!(matches!(
+            repair(&repo, t("2026-09-01T00:30:00Z"), t("2026-09-01T02:00:00Z")).await,
+            Err(RepairError::InvalidWindow(_))
+        ));
         assert!(repo.recomputes.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn repair_rejects_a_window_that_starts_past_the_next_uncomputed_raw_hour() {
+        // Catch-up has computed through March 10 and the next raw hour is 11:00. Repairing
+        // September would move max_hour past March 10 11:00 .. September, which nothing computes.
+        let repo = FakeRepo::default();
+        *repo.progress.lock().unwrap() = Some(p(
+            Some("2026-03-10T10:00:00Z"),
+            Some("2026-03-10T11:00:00Z"),
+        ));
+        let result = repair(&repo, t("2026-09-20T00:00:00Z"), t("2026-09-27T00:00:00Z")).await;
+        assert!(matches!(
+            result,
+            Err(RepairError::AheadOfAggregate { frontier }) if frontier == t("2026-03-10T11:00:00Z")
+        ));
+        assert!(repo.recomputes.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn repair_may_start_at_or_before_the_frontier_or_anywhere_when_nothing_is_pending() {
+        for (progress, from) in [
+            // Starting exactly at the next uncomputed raw hour extends the aggregate contiguously.
+            (
+                p(Some("2026-03-10T10:00:00Z"), Some("2026-03-10T11:00:00Z")),
+                "2026-03-10T11:00:00Z",
+            ),
+            // The empty span after max_hour holds no raw rows, so starting inside it leaves no hole.
+            (
+                p(Some("2026-03-10T10:00:00Z"), Some("2026-03-20T07:00:00Z")),
+                "2026-03-15T00:00:00Z",
+            ),
+            // Empty aggregate: the repair must start at or before the oldest raw hour.
+            (
+                p(None, Some("2026-01-01T05:00:00Z")),
+                "2026-01-01T00:00:00Z",
+            ),
+            // No raw hour pending: every raw row is already below max_hour + 1h.
+            (
+                p(Some("2026-09-24T09:00:00Z"), None),
+                "2026-09-25T00:00:00Z",
+            ),
+        ] {
+            let repo = FakeRepo::default();
+            *repo.progress.lock().unwrap() = Some(progress);
+            let from = t(from);
+            repair(&repo, from, from + TimeDelta::hours(2))
+                .await
+                .unwrap_or_else(|error| panic!("{progress:?} from {from}: {error}"));
+            assert_eq!(repo.recomputes.lock().unwrap()[0].0, from);
+        }
     }
 }

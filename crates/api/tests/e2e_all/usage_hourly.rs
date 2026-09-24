@@ -592,3 +592,56 @@ async fn serial_concurrent_ticks_write_each_hour_once() {
 
     delete_org_future_rows(&f).await;
 }
+
+async fn post_repair(
+    f: &crate::admin_provider_attribution_support::PlatformProviderUsageFixture,
+    start: DateTime<Utc>,
+    end: DateTime<Utc>,
+) -> axum_test::TestResponse {
+    f.server
+        .post("/v1/admin/usage-hourly/recompute")
+        .add_header(
+            "Authorization",
+            format!("Bearer {}", crate::common::get_session_id()),
+        )
+        .add_header("User-Agent", crate::common::MOCK_USER_AGENT)
+        .json(&serde_json::json!({ "start": start, "end": end }))
+        .await
+}
+
+/// A repair that starts past the next uncomputed raw hour would move max_hour over hours nothing
+/// ever computes, and readers would serve them as empty. It must be refused without writing.
+#[tokio::test]
+async fn serial_repair_refuses_a_window_past_the_next_uncomputed_raw_hour() {
+    let f = setup_platform_provider_usage_fixture().await;
+    delete_leftover_far_future_rows(&f).await;
+    let repo = UsageHourlyRepositoryImpl::new(f.database.pool().clone());
+    let base = repo
+        .progress()
+        .await
+        .unwrap()
+        .max_hour
+        .unwrap_or_else(Utc::now)
+        .max(Utc::now());
+    let a = services::usage::trunc_hour(base) + Duration::days(4000);
+    // Computed through a; raw usage at a+2h is still pending.
+    insert_raw(&f, a + Duration::minutes(15), 1, 1, None, None, None).await;
+    repo.recompute(a, a + Duration::hours(1), AggregateLockBehavior::Wait)
+        .await
+        .unwrap();
+    let pending = a + Duration::hours(2);
+    insert_raw(&f, pending + Duration::minutes(15), 2, 1, None, None, None).await;
+
+    let ahead = pending + Duration::days(3);
+    let response = post_repair(&f, ahead, ahead + Duration::hours(1)).await;
+    assert_eq!(response.status_code(), 409, "{}", response.text());
+    let progress = repo.progress().await.unwrap();
+    assert_eq!(progress.max_hour, Some(a));
+    assert_eq!(progress.next_raw_hour, Some(pending));
+
+    let response = post_repair(&f, pending, pending + Duration::hours(1)).await;
+    assert_eq!(response.status_code(), 200, "{}", response.text());
+    assert_eq!(repo.progress().await.unwrap().max_hour, Some(pending));
+
+    delete_org_future_rows(&f).await;
+}

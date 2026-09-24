@@ -442,6 +442,7 @@ async fn test_admin_get_platform_metrics_with_usage() {
 
     // Wait for usage recording
     tokio::time::sleep(tokio::time::Duration::from_millis(1000)).await;
+    crate::usage_hourly::recompute_recent_usage().await;
 
     // Get platform metrics
     let response = server
@@ -471,8 +472,6 @@ async fn test_admin_get_platform_metrics_with_usage() {
     // They may be empty if the data doesn't meet threshold criteria
     println!("Top models: {:?}", metrics.top_models);
     println!("Top organizations: {:?}", metrics.top_organizations);
-
-    println!("✅ Admin get platform metrics with usage works correctly");
 }
 
 #[tokio::test]
@@ -939,6 +938,7 @@ async fn test_admin_platform_metrics_splits_reconcile() {
         .await;
     assert_eq!(response.status_code(), 200);
     tokio::time::sleep(tokio::time::Duration::from_millis(1000)).await;
+    crate::usage_hourly::recompute_recent_usage().await;
 
     let response = server
         .get("/v1/admin/platform/metrics")
@@ -970,8 +970,6 @@ async fn test_admin_platform_metrics_splits_reconcile() {
         (0.0..=1.0).contains(&m.incomplete_stream_rate),
         "incomplete_stream_rate in [0,1]"
     );
-
-    println!("✅ Platform metrics verifiable split reconciles to total");
 }
 #[tokio::test]
 async fn test_admin_platform_timeseries() {

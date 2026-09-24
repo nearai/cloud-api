@@ -348,6 +348,7 @@ mod tests {
             _workspace_id: Uuid,
             _api_key_id: Uuid,
             _request: RecordUsageApiRequest,
+            _discount: Option<services::usage::UsageDiscount>,
         ) -> Result<UsageLogEntry, UsageError> {
             unimplemented!()
         }

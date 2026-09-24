@@ -1,4 +1,5 @@
 pub mod admin;
+pub mod admin_usage_hourly;
 pub mod anthropic;
 pub mod api;
 pub mod attestation;

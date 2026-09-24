@@ -210,6 +210,7 @@ fn build_image_usage_request(
         stop_reason: Some(services::usage::StopReason::Completed),
         response_id: None,
         image_count: Some(record.image_count),
+        discount: None,
         provider_attribution: record.provider_attribution,
     }
 }
@@ -882,6 +883,7 @@ async fn bill_auto_redact_classify(
         stop_reason: Some(services::usage::StopReason::Completed),
         response_id: None,
         image_count: None,
+        discount: None,
         provider_attribution: services::usage::ProviderAttribution::default(),
     };
 
@@ -5430,6 +5432,7 @@ pub async fn audio_transcriptions(
                 stop_reason: Some(services::usage::StopReason::Completed),
                 response_id: None,
                 image_count: None,
+                discount: None,
                 provider_attribution: services::usage::ProviderAttribution::default(),
             };
 
@@ -6283,6 +6286,7 @@ pub async fn rerank(
                 stop_reason: Some(services::usage::StopReason::Completed),
                 response_id: None,
                 image_count: None,
+                discount: None,
                 provider_attribution: services::usage::ProviderAttribution::default(),
             };
 
@@ -6631,6 +6635,7 @@ pub async fn embeddings(
                 stop_reason: Some(services::usage::StopReason::Completed),
                 response_id: None,
                 image_count: None,
+                discount: None,
                 provider_attribution: services::usage::ProviderAttribution::default(),
             };
 
@@ -6966,6 +6971,7 @@ pub async fn privacy_classify(
                 stop_reason: Some(services::usage::StopReason::Completed),
                 response_id: None,
                 image_count: None,
+                discount: None,
                 provider_attribution: services::usage::ProviderAttribution::default(),
             };
 
@@ -7494,6 +7500,7 @@ pub async fn privacy_redact(
         stop_reason: Some(services::usage::StopReason::Completed),
         response_id: None,
         image_count: None,
+        discount: None,
         provider_attribution: services::usage::ProviderAttribution::default(),
     };
 
@@ -7707,6 +7714,7 @@ pub async fn score(
                 stop_reason: Some(services::usage::StopReason::Completed),
                 response_id: None,
                 image_count: None,
+                discount: None,
                 provider_attribution: services::usage::ProviderAttribution::default(),
             };
 
@@ -7745,6 +7753,7 @@ pub async fn score(
                         stop_reason: Some(services::usage::StopReason::Completed),
                         response_id: None,
                         image_count: None,
+                        discount: None,
                         provider_attribution: services::usage::ProviderAttribution::default(),
                     };
                     tokio::spawn(async move {
@@ -7786,6 +7795,7 @@ pub async fn score(
                         stop_reason: Some(services::usage::StopReason::Completed),
                         response_id: None,
                         image_count: None,
+                        discount: None,
                         provider_attribution: services::usage::ProviderAttribution::default(),
                     };
                     tokio::spawn(async move {

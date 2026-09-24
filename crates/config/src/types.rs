@@ -15,6 +15,12 @@ pub struct ApiConfig {
     /// `/v1/internal/usage` endpoint is disabled and returns 503, so reporters
     /// cannot submit usage until an operator sets the secret.
     pub internal_usage_token: Option<String>,
+    /// Ceiling for the `discount_to_user` fraction accepted on
+    /// `POST /v1/internal/usage` (`INTERNAL_USAGE_MAX_DISCOUNT`, default
+    /// [`DEFAULT_INTERNAL_USAGE_MAX_DISCOUNT`]). Rows are never recorded
+    /// below `(1 - ceiling)` of the list price, however a reporter is
+    /// configured; `0` refuses every non-zero discount.
+    pub internal_usage_max_discount: f64,
     pub logging: LoggingConfig,
     pub dstack_client: DstackClientConfig,
     pub auth: AuthConfig,
@@ -62,6 +68,9 @@ impl ApiConfig {
             internal_usage_token: env::var("CLOUD_API_USAGE_TOKEN")
                 .ok()
                 .filter(|s| !s.is_empty()),
+            internal_usage_max_discount: parse_internal_usage_max_discount(
+                non_empty_env(INTERNAL_USAGE_MAX_DISCOUNT_ENV).as_deref(),
+            )?,
             logging: LoggingConfig::from_env()?,
             dstack_client: DstackClientConfig::from_env()?,
             staking_farm: StakingFarmConfig::from_env(&auth.near),
@@ -589,6 +598,35 @@ impl InfraConfig {
     }
 }
 
+/// Env var holding the ceiling for reporter-supplied usage discounts.
+pub const INTERNAL_USAGE_MAX_DISCOUNT_ENV: &str = "INTERNAL_USAGE_MAX_DISCOUNT";
+
+/// Default ceiling for reporter-supplied usage discounts (50% off).
+pub const DEFAULT_INTERNAL_USAGE_MAX_DISCOUNT: f64 = 0.5;
+
+/// Parse `INTERNAL_USAGE_MAX_DISCOUNT`: unset means the default; a set value
+/// must be a finite number in `[0, 1)`.
+fn parse_internal_usage_max_discount(raw: Option<&str>) -> Result<f64, String> {
+    let Some(raw) = raw else {
+        return Ok(DEFAULT_INTERNAL_USAGE_MAX_DISCOUNT);
+    };
+    let invalid =
+        || format!("{INTERNAL_USAGE_MAX_DISCOUNT_ENV} must be a number in the range [0, 1)");
+    let value = raw.trim().parse::<f64>().map_err(|_| invalid())?;
+    if !value.is_finite() || !(0.0..1.0).contains(&value) {
+        return Err(invalid());
+    }
+    // Discounts are compared in basis points, so a ceiling finer than one
+    // basis point would silently allow the next value up.
+    let scaled = value * 10_000.0;
+    if (scaled - scaled.round()).abs() > 1e-6 {
+        return Err(format!(
+            "{INTERNAL_USAGE_MAX_DISCOUNT_ENV} must be a multiple of 0.0001"
+        ));
+    }
+    Ok(value)
+}
+
 fn parse_nonnegative_finite_env(key: &str) -> Result<f64, String> {
     let Some(raw) = env::var(key).ok() else {
         return Ok(0.0);
@@ -854,6 +892,10 @@ pub struct ServerConfig {
     /// Interval in seconds between scheduled-pricing-change apply passes.
     /// Set to 0 to disable the background scheduler. Default: 60.
     pub pricing_change_apply_interval_secs: u64,
+    /// Interval in seconds between usage_hourly aggregate ticks. After deploy, ticks catch up
+    /// every 60 s until current. Then 3600 (the default) runs at HH:05 UTC; any other value
+    /// runs on the plain interval with no clock alignment. Set to 0 to disable.
+    pub usage_hourly_interval_secs: u64,
     /// Enable the OHTTP gateway (RFC 9458).  Set OHTTP_ENABLED=true to enable.
     pub ohttp_enabled: bool,
 }
@@ -871,6 +913,10 @@ impl ServerConfig {
                 .unwrap_or_else(|_| "60".to_string())
                 .parse()
                 .map_err(|_| "PRICING_CHANGE_APPLY_INTERVAL_SECS must be a non-negative integer")?,
+            usage_hourly_interval_secs: env::var("USAGE_HOURLY_INTERVAL_SECS")
+                .unwrap_or_else(|_| "3600".to_string())
+                .parse()
+                .map_err(|_| "USAGE_HOURLY_INTERVAL_SECS must be a non-negative integer")?,
             ohttp_enabled: env::var("OHTTP_ENABLED")
                 .map(|v| v == "true" || v == "1")
                 .unwrap_or(false),
@@ -2700,5 +2746,43 @@ mod native_responses_config_tests {
             parse_native_responses_models(" openai/gpt-6-astra,custom/model,openai/gpt-6-astra,,"),
             vec!["custom/model", "openai/gpt-6-astra"]
         );
+    }
+}
+
+#[cfg(test)]
+mod internal_usage_max_discount_tests {
+    use super::{parse_internal_usage_max_discount, DEFAULT_INTERNAL_USAGE_MAX_DISCOUNT};
+
+    #[test]
+    fn unset_uses_the_default() {
+        assert_eq!(
+            parse_internal_usage_max_discount(None).unwrap(),
+            DEFAULT_INTERNAL_USAGE_MAX_DISCOUNT
+        );
+    }
+
+    #[test]
+    fn accepts_values_in_the_unit_interval() {
+        assert_eq!(parse_internal_usage_max_discount(Some("0")).unwrap(), 0.0);
+        assert_eq!(
+            parse_internal_usage_max_discount(Some(" 0.25 ")).unwrap(),
+            0.25
+        );
+        assert_eq!(
+            parse_internal_usage_max_discount(Some("0.9999")).unwrap(),
+            0.9999
+        );
+    }
+
+    #[test]
+    fn rejects_everything_else() {
+        for bad in [
+            "1", "1.5", "-0.1", "nan", "inf", "twenty", "0.12345", "0.10005",
+        ] {
+            assert!(
+                parse_internal_usage_max_discount(Some(bad)).is_err(),
+                "{bad}"
+            );
+        }
     }
 }

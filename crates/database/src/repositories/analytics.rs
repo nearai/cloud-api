@@ -54,8 +54,29 @@ impl PgAnalyticsRepository {
         }
     }
 
-    fn deadline(&self) -> Result<Instant, RepositoryError> {
-        reporting_query::reporting_deadline(self.statement_timeout, None)
+    /// Runs one report in its own read-only transaction under a deadline of `budget` from
+    /// now. The deadline starts before the pool wait, so the wait counts against it. The
+    /// report arms the deadline (`arm`) before each of its statements.
+    async fn run_report<T>(
+        &self,
+        budget: Duration,
+        report: impl AsyncFnOnce(&Transaction<'_>, Instant) -> Result<T, RepositoryError>,
+    ) -> Result<T, RepositoryError> {
+        let deadline = reporting_query::reporting_deadline(budget, None)?;
+        let mut client = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| RepositoryError::PoolError(e.into()))?;
+        let transaction = client
+            .build_transaction()
+            .read_only(true)
+            .start()
+            .await
+            .map_err(map_db_error)?;
+        let result = report(&transaction, deadline).await?;
+        transaction.commit().await.map_err(map_db_error)?;
+        Ok(result)
     }
 }
 
@@ -84,27 +105,16 @@ impl AnalyticsRepository for PgAnalyticsRepository {
         end: DateTime<Utc>,
         credit_type: Option<&str>,
     ) -> Result<OrganizationMetrics, RepositoryError> {
-        let deadline = self.deadline()?;
-        let mut client = self
-            .pool
-            .get()
+        self.run_report(self.statement_timeout, async |tx, deadline| {
+            organization::get_organization_metrics_with_client(
+                tx,
+                deadline,
+                (org_id, start, end),
+                credit_type,
+            )
             .await
-            .map_err(|e| RepositoryError::PoolError(e.into()))?;
-        let transaction = client
-            .build_transaction()
-            .read_only(true)
-            .start()
-            .await
-            .map_err(map_db_error)?;
-        let report = organization::get_organization_metrics_with_client(
-            &transaction,
-            deadline,
-            (org_id, start, end),
-            credit_type,
-        )
-        .await?;
-        transaction.commit().await.map_err(map_db_error)?;
-        Ok(report)
+        })
+        .await
     }
 
     async fn get_platform_metrics(
@@ -112,21 +122,10 @@ impl AnalyticsRepository for PgAnalyticsRepository {
         start: DateTime<Utc>,
         end: DateTime<Utc>,
     ) -> Result<PlatformMetrics, RepositoryError> {
-        let deadline = self.deadline()?;
-        let mut client = self
-            .pool
-            .get()
-            .await
-            .map_err(|e| RepositoryError::PoolError(e.into()))?;
-        let transaction = client
-            .build_transaction()
-            .read_only(true)
-            .start()
-            .await
-            .map_err(map_db_error)?;
-        let report = platform::get_platform_metrics(&transaction, deadline, start, end).await?;
-        transaction.commit().await.map_err(map_db_error)?;
-        Ok(report)
+        self.run_report(self.statement_timeout, async |tx, deadline| {
+            platform::get_platform_metrics(tx, deadline, start, end).await
+        })
+        .await
     }
 
     async fn get_organization_timeseries(
@@ -137,28 +136,17 @@ impl AnalyticsRepository for PgAnalyticsRepository {
         granularity: &str,
         credit_type: Option<&str>,
     ) -> Result<TimeSeriesMetrics, RepositoryError> {
-        let deadline = self.deadline()?;
-        let mut client = self
-            .pool
-            .get()
+        self.run_report(self.statement_timeout, async |tx, deadline| {
+            organization::get_organization_timeseries_with_client(
+                tx,
+                deadline,
+                (org_id, start, end),
+                granularity,
+                credit_type,
+            )
             .await
-            .map_err(|e| RepositoryError::PoolError(e.into()))?;
-        let transaction = client
-            .build_transaction()
-            .read_only(true)
-            .start()
-            .await
-            .map_err(map_db_error)?;
-        let report = organization::get_organization_timeseries_with_client(
-            &transaction,
-            deadline,
-            (org_id, start, end),
-            granularity,
-            credit_type,
-        )
-        .await?;
-        transaction.commit().await.map_err(map_db_error)?;
-        Ok(report)
+        })
+        .await
     }
 
     async fn get_platform_timeseries(
@@ -167,147 +155,66 @@ impl AnalyticsRepository for PgAnalyticsRepository {
         end: DateTime<Utc>,
         granularity: &str,
     ) -> Result<PlatformTimeSeriesMetrics, RepositoryError> {
-        let deadline = self.deadline()?;
-        let mut client = self
-            .pool
-            .get()
-            .await
-            .map_err(|e| RepositoryError::PoolError(e.into()))?;
-        let transaction = client
-            .build_transaction()
-            .read_only(true)
-            .start()
-            .await
-            .map_err(map_db_error)?;
-        let report =
-            platform::get_platform_timeseries(&transaction, deadline, start, end, granularity)
-                .await?;
-        transaction.commit().await.map_err(map_db_error)?;
-        Ok(report)
+        self.run_report(self.statement_timeout, async |tx, deadline| {
+            platform::get_platform_timeseries(tx, deadline, start, end, granularity).await
+        })
+        .await
     }
 
     async fn get_billing_summary(&self) -> Result<BillingSummary, RepositoryError> {
-        let deadline = self.deadline()?;
-        let mut client = self
-            .pool
-            .get()
-            .await
-            .map_err(|e| RepositoryError::PoolError(e.into()))?;
-        let transaction = client
-            .build_transaction()
-            .read_only(true)
-            .start()
-            .await
-            .map_err(map_db_error)?;
-        let report = revenue::get_billing_summary(&transaction, deadline).await?;
-        transaction.commit().await.map_err(map_db_error)?;
-        Ok(report)
+        self.run_report(self.statement_timeout, async |tx, deadline| {
+            revenue::get_billing_summary(tx, deadline).await
+        })
+        .await
     }
 
     async fn get_model_revenue(
         &self,
         query: ModelRevenueQuery,
     ) -> Result<ModelRevenueReport, RepositoryError> {
-        let deadline = self.deadline()?;
-        let mut client = self
-            .pool
-            .get()
-            .await
-            .map_err(|e| RepositoryError::PoolError(e.into()))?;
-        let transaction = client
-            .build_transaction()
-            .read_only(true)
-            .start()
-            .await
-            .map_err(map_db_error)?;
-        let report = revenue::get_model_revenue(&transaction, deadline, query).await?;
-        transaction.commit().await.map_err(map_db_error)?;
-        Ok(report)
+        self.run_report(self.statement_timeout, async |tx, deadline| {
+            revenue::get_model_revenue(tx, deadline, query).await
+        })
+        .await
     }
 
     async fn get_org_revenue(
         &self,
         query: OrgRevenueQuery,
     ) -> Result<OrgRevenueReport, RepositoryError> {
-        let deadline = self.deadline()?;
-        let mut client = self
-            .pool
-            .get()
-            .await
-            .map_err(|e| RepositoryError::PoolError(e.into()))?;
-        let transaction = client
-            .build_transaction()
-            .read_only(true)
-            .start()
-            .await
-            .map_err(map_db_error)?;
-        let report = revenue::get_org_revenue(&transaction, deadline, query).await?;
-        transaction.commit().await.map_err(map_db_error)?;
-        Ok(report)
+        self.run_report(self.statement_timeout, async |tx, deadline| {
+            revenue::get_org_revenue(tx, deadline, query).await
+        })
+        .await
     }
 
     async fn get_model_consumption_timeseries(
         &self,
         query: ModelConsumptionTimeseriesQuery,
     ) -> Result<ModelConsumptionTimeseries, RepositoryError> {
-        let deadline = self.deadline()?;
-        let mut client = self
-            .pool
-            .get()
-            .await
-            .map_err(|e| RepositoryError::PoolError(e.into()))?;
-        let transaction = client
-            .build_transaction()
-            .read_only(true)
-            .start()
-            .await
-            .map_err(map_db_error)?;
-        let report =
-            consumption::get_model_consumption_timeseries(&transaction, deadline, query).await?;
-        transaction.commit().await.map_err(map_db_error)?;
-        Ok(report)
+        self.run_report(self.statement_timeout, async |tx, deadline| {
+            consumption::get_model_consumption_timeseries(tx, deadline, query).await
+        })
+        .await
     }
 
     async fn get_performance_timeseries(
         &self,
         query: PerformanceTimeseriesQuery,
     ) -> Result<PerformanceTimeseries, RepositoryError> {
-        let deadline = self.deadline()?;
-        let mut client = self
-            .pool
-            .get()
-            .await
-            .map_err(|e| RepositoryError::PoolError(e.into()))?;
-        let transaction = client
-            .build_transaction()
-            .read_only(true)
-            .start()
-            .await
-            .map_err(map_db_error)?;
-        let report = consumption::get_performance_timeseries(&transaction, deadline, query).await?;
-        transaction.commit().await.map_err(map_db_error)?;
-        Ok(report)
+        self.run_report(self.statement_timeout, async |tx, deadline| {
+            consumption::get_performance_timeseries(tx, deadline, query).await
+        })
+        .await
     }
 
     async fn get_revenue_density(
         &self,
         query: RevenueDensityQuery,
     ) -> Result<RevenueDensityReport, RepositoryError> {
-        let deadline =
-            reporting_query::reporting_deadline(REVENUE_DENSITY_STATEMENT_TIMEOUT, None)?;
-        let mut client = self
-            .pool
-            .get()
-            .await
-            .map_err(|e| RepositoryError::PoolError(e.into()))?;
-        let transaction = client
-            .build_transaction()
-            .read_only(true)
-            .start()
-            .await
-            .map_err(map_db_error)?;
-        let report = revenue::get_revenue_density(&transaction, deadline, query).await?;
-        transaction.commit().await.map_err(map_db_error)?;
-        Ok(report)
+        self.run_report(REVENUE_DENSITY_STATEMENT_TIMEOUT, async |tx, deadline| {
+            revenue::get_revenue_density(tx, deadline, query).await
+        })
+        .await
     }
 }

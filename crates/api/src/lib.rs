@@ -2093,7 +2093,9 @@ pub fn build_reporting_usage_routes(
 /// arrive at the caller's full request rate; counting them against the
 /// per-key limit turns caller bursts into 429s unrelated to backend load
 /// (nearai/infra#242). Key checks do not spend the key's inference allowance
-/// either.
+/// either. Without a per-key cap here, a valid key holder can call this
+/// route at any rate, the same as the other authenticated non-inference
+/// routes; how those routes are bounded is tracked in nearai/cloud-api#1142.
 pub fn build_gateway_routes(
     app_state: AppState,
     auth_state_middleware: &AuthState,

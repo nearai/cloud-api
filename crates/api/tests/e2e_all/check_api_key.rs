@@ -126,37 +126,53 @@ async fn test_check_api_key_burst_above_per_key_rate_limit() {
         );
     }
 
-    // The key checks left the key's inference bucket untouched: the same key
-    // still gets exactly `limit` inference requests in this window. An empty
-    // body is rejected with 400 by the handler after the limiter has counted
-    // the request, so no model is needed.
-    for attempt in 1..=limit {
-        let response = server
+    // The key checks left the key's inference bucket untouched. An empty body
+    // is rejected with 400 by the handler after the limiter has counted the
+    // request, so no model is needed. The bucket's 60 s window starts at the
+    // first counted inference request, so on a slow run the counter can
+    // expire and restart mid-drain: tolerate a reset while still proving the
+    // bucket was untouched and still enforces the limit.
+    let inference = || {
+        server
             .post("/v1/chat/completions")
             .add_header("Authorization", authorization.clone())
             .json(&serde_json::json!({}))
-            .await;
-        assert_eq!(
-            response.status_code(),
-            400,
-            "inference request {attempt} is within the per-key limit ({limit}/min): {}",
-            response.text()
-        );
-    }
-    let response = server
-        .post("/v1/chat/completions")
-        .add_header("Authorization", authorization.clone())
-        .json(&serde_json::json!({}))
-        .await;
+    };
+    let response = inference().await;
     assert_eq!(
         response.status_code(),
-        429,
-        "inference request {} must hit the per-key limit: {}",
-        limit + 1,
+        400,
+        "inference request 1 must be admitted (the key checks did not spend the bucket): {}",
         response.text()
     );
-    let error: api::models::ErrorResponse = response.json();
-    assert_eq!(error.error.r#type, "rate_limit_exceeded");
+    let mut first_429 = None;
+    for attempt in 2..=2 * limit {
+        let response = inference().await;
+        match response.status_code().as_u16() {
+            400 => {}
+            429 => {
+                let error: api::models::ErrorResponse = response.json();
+                assert_eq!(error.error.r#type, "rate_limit_exceeded");
+                first_429 = Some(attempt);
+                break;
+            }
+            other => panic!(
+                "inference request {attempt}: unexpected status {other}: {}",
+                response.text()
+            ),
+        }
+    }
+    let first_429 = first_429.unwrap_or_else(|| {
+        panic!(
+            "no 429 within {} inference requests: the per-key limit is not enforced",
+            2 * limit
+        )
+    });
+    assert!(
+        first_429 > limit,
+        "inference request {first_429} was rate limited before the per-key limit \
+         ({limit}/min) was reached: the key checks spent the bucket"
+    );
 
     // An exhausted inference bucket does not block key checks either.
     let response = server

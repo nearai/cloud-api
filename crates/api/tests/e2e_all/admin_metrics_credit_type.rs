@@ -132,21 +132,18 @@ async fn admin_metrics_credit_type_uses_saved_allocations() {
          VALUES ($1,$2,'postpay',1000000000,$3,'test',0)",
         &[&org, &service_usage, &limits["postpay"]],
     ).await.unwrap();
-    // Unfiltered reports read usage_hourly (spec §6.2): recompute every seeded hour.
-    for date in [
-        "2026-09-01T00:00:00Z",
-        "2026-09-02T00:00:00Z",
-        "2026-09-03T00:00:00Z",
-        "2026-09-04T00:00:00Z",
-        "2026-09-05T00:00:00Z",
-        "2026-09-22T00:00:00Z",
-        "2026-08-31T23:00:00Z",
-    ] {
-        let hour = chrono::DateTime::parse_from_rfc3339(date)
+    // Unfiltered reports read usage_hourly (spec §6.2): recompute every seeded hour, from
+    // the "before start" row through the "exclusive end" row, in one pass.
+    let hour = |t: &str| {
+        chrono::DateTime::parse_from_rfc3339(t)
             .unwrap()
-            .with_timezone(&Utc);
-        crate::usage_hourly::recompute_usage_hours(hour, hour + chrono::Duration::hours(1)).await;
-    }
+            .with_timezone(&Utc)
+    };
+    crate::usage_hourly::recompute_usage_hours(
+        hour("2026-08-31T23:00:00Z"),
+        hour("2026-09-22T01:00:00Z"),
+    )
+    .await;
     // Two sources for postpay, but only two matching inference requests.
     let range = "start=2026-09-01T00:00:00Z&end=2026-09-22T00:00:00Z";
     for (filter, cost, requests, days) in [
@@ -463,8 +460,8 @@ async fn org_reports_read_usage_hourly_over_whole_hours() {
     let fixture = setup_platform_provider_usage_fixture().await;
     let org = fixture.organization_id;
     let hour = chrono::Duration::hours(1);
-    let h = services::usage::trunc_day(crate::usage_hourly::random_past_hour())
-        + chrono::Duration::hours(5);
+    // Two hours no other test recomputes, so "not aggregated yet" is deterministic.
+    let (h, _) = crate::admin_provider_attribution_support::isolated_usage_hours(&fixture, 2).await;
     for (at, cost, ttft) in [
         (h + chrono::Duration::minutes(10), 1_000_000_000_i64, 100),
         (h + chrono::Duration::minutes(20), 1_000_000_000, 200),
@@ -568,7 +565,8 @@ async fn org_credit_type_reports_stay_raw_live_and_exact() {
     use services::admin::{OrganizationMetrics, TimeSeriesMetrics};
     let fixture = setup_platform_provider_usage_fixture().await;
     let org = fixture.organization_id;
-    let h = crate::usage_hourly::random_past_hour();
+    // An hour no other test recomputes, so "not recomputed yet" is deterministic.
+    let (h, _) = crate::admin_provider_attribution_support::isolated_usage_hours(&fixture, 1).await;
     let client = fixture.database.pool().get().await.unwrap();
     let limit_id: Uuid = client
         .query_one(

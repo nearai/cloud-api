@@ -100,14 +100,15 @@ async fn org_rows(
         .collect()
 }
 
-/// Recompute `usage_hourly` for `[trunc_hour(from), to)` so reports see the rows a test
-/// seeded. `to` must be an hour boundary. Readers serve only what `usage_hourly` holds
-/// (spec §6); `wait = true` serializes with every other recompute, and replace semantics
-/// over append-only raw rows mean a later recompute never drops another test's rows.
+/// Recompute `usage_hourly` for `[from, to)` so reports see the rows a test seeded. Both
+/// bounds must be whole UTC hours (PR B's recompute rejects anything else). Readers serve
+/// only what `usage_hourly` holds (spec §6); `wait = true` serializes with every other
+/// recompute, and replace semantics over append-only raw rows mean a later recompute never
+/// drops another test's rows.
 pub(crate) async fn recompute_usage_hours(from: DateTime<Utc>, to: DateTime<Utc>) {
     let pool = crate::common::db_setup::create_test_pool().await;
     UsageHourlyRepositoryImpl::new(pool)
-        .recompute(services::usage::trunc_hour(from), to, true)
+        .recompute(from, to, true)
         .await
         .expect("recompute usage_hourly")
         .expect("wait = true always recomputes");
@@ -119,7 +120,7 @@ pub(crate) async fn recompute_usage_hours(from: DateTime<Utc>, to: DateTime<Utc>
 pub(crate) async fn recompute_recent_usage() {
     let now = Utc::now();
     recompute_usage_hours(
-        now - Duration::minutes(10),
+        services::usage::trunc_hour(now - Duration::minutes(10)),
         services::usage::trunc_hour(now) + Duration::hours(1),
     )
     .await;

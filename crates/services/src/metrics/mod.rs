@@ -172,7 +172,7 @@ impl MetricsServiceTrait for OtlpMetricsService {
                     "percent",
                 ),
                 consts::METRIC_USAGE_HOURLY_LAG_SECONDS => (
-                    "Seconds from the end of the newest usage_hourly hour to the scheduler tick",
+                    "Seconds from the oldest raw hour not yet in usage_hourly to the scheduler tick",
                     "s",
                 ),
                 _ => ("Value distribution", ""),

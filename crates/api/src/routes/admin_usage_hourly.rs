@@ -45,8 +45,10 @@ pub struct UsageHourlyRepairResponse {
 /// Recompute usage_hourly for a UTC window (Admin only)
 ///
 /// Rebuilds `[start, end)` from raw usage one UTC day per transaction, then reports raw vs
-/// aggregate parity for every day the window touches. Use it after a backfill or when the
-/// nightly parity check warns; the scheduler only re-reads the last 3 hours.
+/// aggregate parity for every day the window touches. Parity always covers the whole UTC day,
+/// so a window covering part of a day can report `ok: false` from hours outside it; repair
+/// whole days to clear a day's parity. Use it after a backfill or when the nightly parity check
+/// warns; the scheduler only re-reads the last 3 hours.
 #[utoipa::path(
     post,
     path = "/v1/admin/usage-hourly/recompute",

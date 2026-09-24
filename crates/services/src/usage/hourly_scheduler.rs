@@ -169,11 +169,17 @@ impl UsageHourlyScheduler {
     pub async fn run_once(&self, now: DateTime<Utc>) -> anyhow::Result<TickOutcome> {
         let started = std::time::Instant::now();
         let progress = self.repository.progress().await?;
-        // Freshness (spec §9): seconds since the end of the newest aggregated hour. Recorded on
-        // every tick (catch-up, skipped or steady); an alert fires above 3 hours. Nothing to
-        // record while the table is still empty.
-        if let Some(max_hour) = progress.max_hour {
-            let lag = now - (max_hour + TimeDelta::hours(1));
+        // Freshness (spec §9): seconds since the start of the oldest raw hour not yet aggregated
+        // (the current hour when none is pending). Hours with no raw usage are not lag, so a
+        // quiet span does not look like a stalled job. Recorded on every tick (catch-up,
+        // skipped or steady); an alert fires above 3 hours. Nothing to record while the table
+        // is still empty.
+        if progress.max_hour.is_some() {
+            let current_hour = trunc_hour(now);
+            let pending_from = progress
+                .next_raw_hour
+                .map_or(current_hour, |hour| hour.min(current_hour));
+            let lag = now - pending_from;
             let env_tag = format!("{TAG_ENVIRONMENT}:{}", get_environment());
             self.metrics_service.record_histogram(
                 METRIC_USAGE_HOURLY_LAG_SECONDS,
@@ -636,7 +642,44 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn tick_records_lag_from_the_end_of_the_newest_hour() {
+    async fn tick_records_no_lag_across_a_quiet_span() {
+        // Newest aggregate hour 02:00, no raw usage again until 10:00: the job is caught up,
+        // so lag is measured from the pending 10:00 hour, not from 03:00 (7h05m).
+        let repo = Arc::new(FakeRepo::default());
+        *repo.progress.lock().unwrap() = Some(p(
+            Some("2026-09-24T02:00:00Z"),
+            Some("2026-09-24T10:00:00Z"),
+        ));
+        let metrics = Arc::new(CapturingMetricsService::new());
+        UsageHourlyScheduler::new(repo, metrics.clone())
+            .run_once(t("2026-09-24T10:05:00Z"))
+            .await
+            .unwrap();
+        let recorded = metrics.get_metrics();
+        assert_eq!(recorded.len(), 1);
+        assert!(matches!(recorded[0].value, MetricValue::Histogram(v) if v == 300.0));
+    }
+
+    #[tokio::test]
+    async fn tick_records_lag_from_the_oldest_pending_raw_hour_when_stalled() {
+        // Newest aggregate hour 02:00 with raw usage every hour since: stalled for 7h05m.
+        let repo = Arc::new(FakeRepo::default());
+        *repo.progress.lock().unwrap() = Some(p(
+            Some("2026-09-24T02:00:00Z"),
+            Some("2026-09-24T03:00:00Z"),
+        ));
+        let metrics = Arc::new(CapturingMetricsService::new());
+        UsageHourlyScheduler::new(repo, metrics.clone())
+            .run_once(t("2026-09-24T10:05:00Z"))
+            .await
+            .unwrap();
+        let recorded = metrics.get_metrics();
+        assert_eq!(recorded.len(), 1);
+        assert!(matches!(recorded[0].value, MetricValue::Histogram(v) if v == 25_500.0));
+    }
+
+    #[tokio::test]
+    async fn tick_records_lag_from_the_current_hour_when_nothing_is_pending() {
         let repo = Arc::new(FakeRepo::default());
         *repo.progress.lock().unwrap() = Some(p(Some("2026-09-24T09:00:00Z"), None));
         let metrics = Arc::new(CapturingMetricsService::new());
@@ -651,7 +694,7 @@ mod tests {
             recorded[0].tags,
             vec![format!("{TAG_ENVIRONMENT}:{}", get_environment())]
         );
-        // now − (max_hour + 1h) = 10:05 − 10:00.
+        // Nothing pending after 09:00: now − current hour = 10:05 − 10:00.
         assert!(matches!(recorded[0].value, MetricValue::Histogram(v) if v == 300.0));
     }
 
@@ -689,8 +732,9 @@ mod tests {
             let recorded = metrics.get_metrics();
             assert_eq!(recorded.len(), 1, "lock_busy={lock_busy}");
             assert_eq!(recorded[0].name, METRIC_USAGE_HOURLY_LAG_SECONDS);
-            // 09-24 10:05 − (05-03 20:00 + 1h) = 143 days 13 h 5 min.
-            assert!(matches!(recorded[0].value, MetricValue::Histogram(v) if v == 12_402_300.0));
+            // 09-24 10:05 − 05-13 07:00 (oldest pending raw hour; the empty span before it is
+            // not lag) = 134 days 3 h 5 min.
+            assert!(matches!(recorded[0].value, MetricValue::Histogram(v) if v == 11_588_700.0));
         }
     }
 

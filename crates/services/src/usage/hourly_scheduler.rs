@@ -39,18 +39,22 @@ pub fn plan_window(progress: HourlyProgress, now: DateTime<Utc>) -> (DateTime<Ut
 }
 
 /// UTC days whose parity to check after recomputing [from, to), sorted and deduplicated.
+/// The nightly 03:xx check adds yesterday only once it has been recomputed (its end <= `to`),
+/// so a tick still catching up far behind never checks a day it has not written yet.
 pub fn parity_days(from: DateTime<Utc>, to: DateTime<Utc>, now: DateTime<Utc>) -> Vec<NaiveDate> {
     let horizon = trunc_hour(now);
     let mut days = std::collections::BTreeSet::new();
+    // Starts after `from` (trunc_day(from) <= from), so every day_end satisfies from < day_end.
     let mut day_end = trunc_day(from) + TimeDelta::days(1);
     while day_end <= to {
-        if day_end > from && day_end + TimeDelta::hours(REREAD_HOURS) <= horizon {
+        if day_end + TimeDelta::hours(REREAD_HOURS) <= horizon {
             days.insert((day_end - TimeDelta::days(1)).date_naive());
         }
         day_end += TimeDelta::days(1);
     }
-    if now.hour() == NIGHTLY_PARITY_HOUR {
-        days.insert((trunc_day(now) - TimeDelta::days(1)).date_naive());
+    let yesterday_start = trunc_day(now) - TimeDelta::days(1);
+    if now.hour() == NIGHTLY_PARITY_HOUR && yesterday_start + TimeDelta::days(1) <= to {
+        days.insert(yesterday_start.date_naive());
     }
     days.into_iter().collect()
 }
@@ -350,6 +354,56 @@ mod tests {
             ),
             vec![d("2026-09-23")]
         );
+    }
+
+    #[test]
+    fn nightly_parity_skips_yesterday_while_catching_up_far_behind() {
+        // 03:05 tick still catching up months back: yesterday is not recomputed yet.
+        assert_eq!(
+            parity_days(
+                t("2026-05-04T00:00:00Z"),
+                t("2026-05-07T00:00:00Z"),
+                t("2026-09-24T03:05:00Z")
+            ),
+            vec![d("2026-05-04"), d("2026-05-05"), d("2026-05-06")]
+        );
+    }
+
+    #[test]
+    fn nightly_parity_checks_yesterday_on_the_steady_03_tick() {
+        assert_eq!(
+            parity_days(
+                t("2026-09-24T00:00:00Z"),
+                t("2026-09-24T03:00:00Z"),
+                t("2026-09-24T03:05:00Z")
+            ),
+            vec![d("2026-09-23")]
+        );
+    }
+
+    #[test]
+    fn nightly_parity_and_catch_up_day_are_deduplicated() {
+        // Outage catch-up at 03:05 ending on the re-read boundary (00:00): the per-day loop
+        // and the nightly rule both pick 09-23; it is checked once.
+        assert_eq!(
+            parity_days(
+                t("2026-09-22T05:00:00Z"),
+                t("2026-09-24T00:00:00Z"),
+                t("2026-09-24T03:05:00Z")
+            ),
+            vec![d("2026-09-22"), d("2026-09-23")]
+        );
+    }
+
+    #[test]
+    fn non_03_tick_adds_no_nightly_day() {
+        // Yesterday is already recomputed (its end 00:00 <= to), but only 03:xx adds it.
+        assert!(parity_days(
+            t("2026-09-24T01:00:00Z"),
+            t("2026-09-24T04:00:00Z"),
+            t("2026-09-24T04:05:00Z")
+        )
+        .is_empty());
     }
 
     #[test]

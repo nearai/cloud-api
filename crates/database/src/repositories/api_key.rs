@@ -253,8 +253,8 @@ impl ApiKeyRepository {
         Ok(row.get::<_, i64>("count"))
     }
 
-    /// List API keys for a workspace with usage data.
-    /// This is the primary method to list API keys, using the spend counter JOIN.
+    /// List API keys for a workspace with usage data
+    /// This is the primary method to list API keys, using an efficient JOIN query
     pub async fn list_by_workspace_paginated(
         &self,
         workspace_id: Uuid,
@@ -287,14 +287,11 @@ impl ApiKeyRepository {
                 .context("Failed to get database connection")
                 .map_err(RepositoryError::PoolError)?;
 
-            // ponytail: raw fallback for organizations whose spend counters are not yet reconciled
-            // (spend_counters_ready_at IS NULL, or no balance row). Delete once
-            // backfill-spend-counters has completed in every environment and
-            // spend_counter_readiness reports ready at startup.
-            let list = |usage: &str, usage_source: &str| {
-                format!(
-                    r#"
-                SELECT
+            client
+                .query(
+                    &format!(
+                        r#"
+                SELECT 
                     ak.id,
                     ak.key_hash,
                     ak.key_prefix,
@@ -307,41 +304,12 @@ impl ApiKeyRepository {
                     ak.is_active,
                     ak.deleted_at,
                     ak.spend_limit,
-                    ({usage})::BIGINT as usage,
-                    readiness.spend_counters_ready_at IS NOT NULL AS counters_ready
+                    (
+                        COALESCE(inference_usage.total_cost, 0)
+                        + COALESCE(service_usage.total_cost, 0)
+                    )::BIGINT as usage
                 FROM api_keys ak
-                LEFT JOIN workspaces workspace ON workspace.id = ak.workspace_id
-                LEFT JOIN organization_balance readiness
-                  ON readiness.organization_id = workspace.organization_id
-                {usage_source}
-                WHERE ak.workspace_id = $1 AND ak.deleted_at IS NULL
-                ORDER BY {order_by_column} {order_dir}{tie_breaker}
-                LIMIT $2 OFFSET $3
-                "#
-                )
-            };
-
-            let rows = client
-                .query(
-                    &list(
-                        "COALESCE(spend.inference_spent, 0) + COALESCE(spend.service_spent, 0)",
-                        "LEFT JOIN api_key_spend spend ON ak.id = spend.api_key_id",
-                    ),
-                    &[&workspace_id, &limit, &offset],
-                )
-                .await
-                .map_err(map_db_error)?;
-            if rows
-                .first()
-                .is_none_or(|row| row.get::<_, bool>("counters_ready"))
-            {
-                return Ok(rows);
-            }
-            client
-                .query(
-                    &list(
-                        "COALESCE(inference_usage.total_cost, 0) + COALESCE(service_usage.total_cost, 0)",
-                        r#"LEFT JOIN (
+                LEFT JOIN (
                     SELECT api_key_id, COALESCE(SUM(total_cost), 0)::BIGINT AS total_cost
                     FROM organization_usage_log
                     WHERE workspace_id = $1
@@ -352,7 +320,11 @@ impl ApiKeyRepository {
                     FROM organization_service_usage_log
                     WHERE workspace_id = $1
                     GROUP BY api_key_id
-                ) service_usage ON ak.id = service_usage.api_key_id"#,
+                ) service_usage ON ak.id = service_usage.api_key_id
+                WHERE ak.workspace_id = $1 AND ak.deleted_at IS NULL
+                ORDER BY {order_by_column} {order_dir}{tie_breaker}
+                LIMIT $2 OFFSET $3
+                "#
                     ),
                     &[&workspace_id, &limit, &offset],
                 )

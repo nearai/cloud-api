@@ -172,3 +172,28 @@ async fn revenue_density_keeps_its_exact_range_in_a_transaction_local_budget() {
         "SET LOCAL must not leak after success"
     );
 }
+
+/// A report cancelled at its budget reaches the client as a 504 (spec §6.3): repository
+/// QueryTimeout → AnalyticsService → AdminError::Timeout → route helper.
+#[tokio::test]
+async fn analytics_timeout_surfaces_as_gateway_timeout() {
+    let (pool, _) = pool_with_slow_tables(&["users", "organizations"], 0.5).await;
+    let service = services::admin::AnalyticsService::new(std::sync::Arc::new(
+        PgAnalyticsRepository::with_statement_timeout(pool, BUDGET),
+    ));
+    let error = service
+        .get_platform_metrics(Utc::now() - Duration::days(1), Utc::now())
+        .await
+        .expect_err("the budget is exceeded");
+    assert!(
+        matches!(error, services::admin::AdminError::Timeout),
+        "{error:?}"
+    );
+    let (status, body) = api::routes::common::analytics_error_response(
+        error,
+        "Failed to retrieve platform metrics",
+        true,
+    );
+    assert_eq!(status, axum::http::StatusCode::GATEWAY_TIMEOUT);
+    assert_eq!(body.0.error.r#type, "analytics_request_timeout");
+}

@@ -1,7 +1,10 @@
 use crate::{
     middleware::AuthenticatedUser,
     models::{CreditType, ErrorResponse},
-    routes::{api::AppState, common::format_amount},
+    routes::{
+        api::AppState,
+        common::{analytics_error_response, format_amount},
+    },
 };
 use axum::{
     extract::{Path, Query, State},
@@ -1357,19 +1360,24 @@ fn parse_datetime_or_default(
     }
 }
 
+/// Organization usage metrics.
+///
+/// Served from the hourly usage aggregate: the range widens to whole UTC hours and the
+/// widened range is echoed; figures lag by up to ~65 minutes and exclude the current hour.
 #[utoipa::path(
     get,
     path = "/v1/organizations/{org_id}/usage/metrics",
     tag = "Usage",
     params(
         ("org_id" = String, Path, description = "Organization ID"),
-        ("start" = Option<String>, Query, description = "Start date (ISO 8601, default: 30 days ago)"),
-        ("end" = Option<String>, Query, description = "End date (ISO 8601, default: now)")
+        ("start" = Option<String>, Query, description = "Start date (ISO 8601, default: 30 days ago). Rounded down to the UTC hour."),
+        ("end" = Option<String>, Query, description = "End date (ISO 8601, default: now). Rounded up to the UTC hour.")
     ),
     responses(
         (status = 200, description = "Organization usage metrics", body = UserOrganizationMetrics),
         (status = 401, description = "Unauthorized", body = ErrorResponse),
         (status = 403, description = "Forbidden", body = ErrorResponse),
+        (status = 504, description = "Analytics statement budget exceeded", body = ErrorResponse),
         (status = 500, description = "Internal server error", body = ErrorResponse)
     ),
     security(
@@ -1395,14 +1403,7 @@ pub async fn get_user_organization_metrics(
         .get_organization_metrics(organization_id, start, end, None)
         .await
         .map_err(|e| {
-            tracing::error!("Failed to get organization metrics: {}", e);
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                ResponseJson(ErrorResponse::new(
-                    "Failed to retrieve organization metrics".to_string(),
-                    "internal_server_error".to_string(),
-                )),
-            )
+            analytics_error_response(e, "Failed to retrieve organization metrics", false)
         })?;
 
     Ok(ResponseJson(UserOrganizationMetrics {
@@ -1444,20 +1445,25 @@ pub async fn get_user_organization_metrics(
     }))
 }
 
+/// Organization usage timeseries.
+///
+/// Served from the hourly usage aggregate: the range widens to whole UTC hours and the
+/// widened range is echoed; figures lag by up to ~65 minutes and exclude the current hour.
 #[utoipa::path(
     get,
     path = "/v1/organizations/{org_id}/usage/timeseries",
     tag = "Usage",
     params(
         ("org_id" = String, Path, description = "Organization ID"),
-        ("start" = Option<String>, Query, description = "Start date (ISO 8601, default: 30 days ago)"),
-        ("end" = Option<String>, Query, description = "End date (ISO 8601, default: now)"),
+        ("start" = Option<String>, Query, description = "Start date (ISO 8601, default: 30 days ago). Rounded down to the UTC hour."),
+        ("end" = Option<String>, Query, description = "End date (ISO 8601, default: now). Rounded up to the UTC hour."),
         ("granularity" = Option<String>, Query, description = "Time bucket size: hour, day, week (default: day)")
     ),
     responses(
         (status = 200, description = "Organization usage timeseries", body = UserTimeSeriesMetrics),
         (status = 401, description = "Unauthorized", body = ErrorResponse),
         (status = 403, description = "Forbidden", body = ErrorResponse),
+        (status = 504, description = "Analytics statement budget exceeded", body = ErrorResponse),
         (status = 500, description = "Internal server error", body = ErrorResponse)
     ),
     security(
@@ -1494,14 +1500,7 @@ pub async fn get_user_organization_timeseries(
         .get_organization_timeseries(organization_id, start, end, granularity, None)
         .await
         .map_err(|e| {
-            tracing::error!("Failed to get organization timeseries: {}", e);
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                ResponseJson(ErrorResponse::new(
-                    "Failed to retrieve organization timeseries".to_string(),
-                    "internal_server_error".to_string(),
-                )),
-            )
+            analytics_error_response(e, "Failed to retrieve organization timeseries", false)
         })?;
 
     Ok(ResponseJson(UserTimeSeriesMetrics {

@@ -202,6 +202,7 @@ async fn test_admin_get_organization_metrics_with_usage() {
 
     // Wait for async usage recording to complete
     tokio::time::sleep(tokio::time::Duration::from_millis(1000)).await;
+    crate::usage_hourly::recompute_recent_usage().await;
 
     // Get organization metrics
     let response = server
@@ -254,8 +255,6 @@ async fn test_admin_get_organization_metrics_with_usage() {
 
     // Verify API key breakdown
     assert!(!metrics.by_api_key.is_empty(), "Should have API key data");
-
-    println!("✅ Admin get organization metrics with usage works correctly");
 }
 
 #[tokio::test]
@@ -292,16 +291,18 @@ async fn test_admin_get_organization_metrics_with_time_range() {
         metrics.period_start < metrics.period_end,
         "Period start should be before period end"
     );
-    assert_eq!(metrics.period_start, week_ago);
-    assert_eq!(metrics.period_end, now);
+    // Hour-normalized echo (spec §6.1, §6.4): start rounds down, end rounds up.
+    assert_eq!(metrics.period_start, services::usage::trunc_hour(week_ago));
+    assert_eq!(
+        metrics.period_end,
+        services::usage::trunc_hour(now) + chrono::Duration::hours(1)
+    );
 
     assert_eq!(
         metrics.organization_id.to_string(),
         org.id,
         "Organization ID should match"
     );
-
-    println!("✅ Admin get organization metrics with time range works correctly");
 }
 
 #[tokio::test]
@@ -600,6 +601,7 @@ async fn test_admin_get_organization_timeseries_with_usage() {
 
     // Wait for usage recording
     tokio::time::sleep(tokio::time::Duration::from_millis(1000)).await;
+    crate::usage_hourly::recompute_recent_usage().await;
 
     // Get timeseries
     let response = server
@@ -623,8 +625,6 @@ async fn test_admin_get_organization_timeseries_with_usage() {
         // The data point should have some values
         assert!(!today_data.date.is_empty(), "Date should be present");
     }
-
-    println!("✅ Admin get organization timeseries with usage works correctly");
 }
 
 #[tokio::test]
@@ -818,6 +818,7 @@ async fn test_admin_metrics_model_latency_tracking() {
 
     // Wait for usage recording
     tokio::time::sleep(tokio::time::Duration::from_millis(1500)).await;
+    crate::usage_hourly::recompute_recent_usage().await;
 
     // Get organization metrics
     let response = server
@@ -844,8 +845,6 @@ async fn test_admin_metrics_model_latency_tracking() {
         // Latency fields should be present (may be None for mock provider)
         // Just verify the structure exists
     }
-
-    println!("✅ Admin metrics include model latency tracking fields");
 }
 
 #[tokio::test]
@@ -884,6 +883,7 @@ async fn test_admin_metrics_unique_api_keys_tracking() {
 
     // Wait for usage recording
     tokio::time::sleep(tokio::time::Duration::from_millis(1000)).await;
+    crate::usage_hourly::recompute_recent_usage().await;
 
     // Get organization metrics
     let response = server
@@ -912,8 +912,6 @@ async fn test_admin_metrics_unique_api_keys_tracking() {
         metrics.by_api_key.len() >= 2,
         "Should have breakdown for at least 2 API keys"
     );
-
-    println!("✅ Admin metrics correctly track unique API keys");
 }
 
 // ============================================

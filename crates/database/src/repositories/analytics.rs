@@ -5,6 +5,7 @@
 //! Every report runs in one read-only transaction under one statement budget (spec §6.3).
 
 mod consumption;
+pub(super) mod hour_range;
 mod organization;
 mod pagination;
 mod platform;
@@ -94,6 +95,18 @@ async fn arm(tx: &Transaction<'_>, deadline: Instant) -> Result<(), RepositoryEr
         reporting_query::remaining_statement_timeout(deadline)?,
     )
     .await
+}
+
+/// Count-weighted combination of per-hour percentiles (spec §4): exact within one
+/// `usage_hourly` row, approximate across rows (documented as approx. in the API). NULL
+/// when no row has samples, as `PERCENTILE_CONT` over no values is.
+fn approx_percentile(percentile: &str, samples: &str) -> String {
+    format!("(SUM({percentile} * {samples}) / NULLIF(SUM({samples}), 0)::double precision)")
+}
+
+/// Exact mean from per-hour sums and sample counts; NULL when there are no samples.
+fn weighted_mean(sum: &str, samples: &str) -> String {
+    format!("(SUM({sum})::double precision / NULLIF(SUM({samples}), 0)::double precision)")
 }
 
 #[async_trait]

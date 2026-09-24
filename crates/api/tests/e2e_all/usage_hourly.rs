@@ -9,7 +9,7 @@ use chrono::{DateTime, Duration, TimeZone, Utc};
 use database::repositories::UsageHourlyRepositoryImpl;
 use services::usage::ports::UsageHourlyRepository;
 
-fn random_past_hour() -> DateTime<Utc> {
+pub(crate) fn random_past_hour() -> DateTime<Utc> {
     let hours = (uuid::Uuid::new_v4().as_u128() % (20 * 365 * 24)) as i64;
     Utc.with_ymd_and_hms(2001, 1, 1, 0, 0, 0).unwrap() + Duration::hours(hours)
 }
@@ -63,7 +63,7 @@ async fn insert_raw_row(
         .unwrap();
 }
 
-async fn insert_raw(
+pub(crate) async fn insert_raw(
     f: &crate::admin_provider_attribution_support::PlatformProviderUsageFixture,
     created_at: DateTime<Utc>,
     total_cost: i64,
@@ -98,6 +98,32 @@ async fn org_rows(
         .iter()
         .map(|r| (r.get(0), r.get(1), r.get(2), r.get(3), r.get(4), r.get(5)))
         .collect()
+}
+
+/// Recompute `usage_hourly` for `[from, to)` so reports see the rows a test seeded. Both
+/// bounds must be whole UTC hours (PR B's recompute rejects anything else). Readers serve
+/// only what `usage_hourly` holds (spec §6); `wait = true` serializes with every other
+/// recompute, and replace semantics over append-only raw rows mean a later recompute never
+/// drops another test's rows.
+pub(crate) async fn recompute_usage_hours(from: DateTime<Utc>, to: DateTime<Utc>) {
+    let pool = crate::common::db_setup::create_test_pool().await;
+    UsageHourlyRepositoryImpl::new(pool)
+        .recompute(from, to, true)
+        .await
+        .expect("recompute usage_hourly")
+        .expect("wait = true always recomputes");
+}
+
+/// Recompute the hours a test's live requests landed in: from ten minutes ago through the
+/// current (open) hour. Every e2e test finishes well within ten minutes (nextest
+/// terminates at 120 s).
+pub(crate) async fn recompute_recent_usage() {
+    let now = Utc::now();
+    recompute_usage_hours(
+        services::usage::trunc_hour(now - Duration::minutes(10)),
+        services::usage::trunc_hour(now) + Duration::hours(1),
+    )
+    .await;
 }
 
 #[tokio::test]

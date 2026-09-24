@@ -58,11 +58,11 @@ pub struct ModelMetrics {
     pub cache_read_tokens: i64,
     /// Average time to first token in milliseconds
     pub avg_ttft_ms: Option<f64>,
-    /// 95th percentile time to first token in milliseconds
+    /// 95th percentile time to first token in milliseconds (approx.: per-hour values weighted by sample count; exact with credit_type)
     pub p95_ttft_ms: Option<f64>,
     /// Average inter-token latency in milliseconds
     pub avg_itl_ms: Option<f64>,
-    /// 95th percentile inter-token latency in milliseconds
+    /// 95th percentile inter-token latency in milliseconds (approx.: per-hour values weighted by sample count; exact with credit_type)
     pub p95_itl_ms: Option<f64>,
     /// Cost in USD
     pub cost_usd: f64,
@@ -126,7 +126,7 @@ pub struct PlatformMetrics {
     pub provider_error_or_timeout_rate: f64,
     /// Share of requests whose stop_reason is incomplete, 0.0-1.0
     pub incomplete_stream_rate: f64,
-    /// 95th percentile time-to-first-token across the platform (ms)
+    /// 95th percentile time-to-first-token across the platform (ms; approx.: per-hour values weighted by sample count)
     pub p95_ttft_ms: Option<f64>,
     pub provider_usage: PlatformProviderUsage,
     pub top_models: Vec<TopModelMetrics>,
@@ -219,13 +219,13 @@ pub struct BillingSummary {
     pub active_paid_credit_limit_usd: f64,
     /// Sum of active grant-type spend limits (caps), USD
     pub active_grant_credit_limit_usd: f64,
-    /// All-time consumed cost across all orgs, USD — **all usage** (from
-    /// organization_balance: inference + services). `inference_consumed_usd +
-    /// service_consumed_usd` reconcile to this.
+    /// All-time consumed cost across all orgs, USD — **all usage**, live (from
+    /// organization_balance: inference + services). The splits below need not add up to
+    /// it: the inference split lags and excludes historical duplicate rows (V0045).
     pub total_consumed_usd: f64,
-    /// All-time inference consumed cost, USD (organization_usage_log)
+    /// All-time inference consumed cost, USD (hourly usage aggregate; lags by up to ~65 minutes)
     pub inference_consumed_usd: f64,
-    /// All-time service consumed cost, USD (organization_service_usage_log, e.g. web_search)
+    /// All-time service consumed cost, USD (organization_service_usage_log, e.g. web_search; live)
     pub service_consumed_usd: f64,
     pub paying_org_count: i64,
     pub granted_org_count: i64,
@@ -245,6 +245,7 @@ pub struct ModelRevenueEntry {
     pub verifiable: bool,
     pub provider_type: Option<String>,
     pub avg_ttft_ms: Option<f64>,
+    /// Approx.: per-hour p95 values weighted by sample count.
     pub p95_ttft_ms: Option<f64>,
     pub served_provider_breakdown: Vec<ModelProviderRevenueBreakdown>,
     pub fallback_requests: i64,
@@ -454,11 +455,11 @@ pub struct PerformancePoint {
     /// Number of requests with ttft_ms recorded (streaming only). Use this as the
     /// denominator when interpreting TTFT percentiles.
     pub ttft_sample_count: i64,
-    /// 50th-percentile TTFT, ms (streaming requests only; None if no samples)
+    /// 50th-percentile TTFT, ms (streaming requests only; None if no samples). Approx. across hours: per-hour values weighted by sample count.
     pub p50_ttft_ms: Option<f64>,
-    /// 95th-percentile TTFT, ms (streaming requests only; None if no samples)
+    /// 95th-percentile TTFT, ms (streaming requests only; None if no samples). Approx. across hours: per-hour values weighted by sample count.
     pub p95_ttft_ms: Option<f64>,
-    /// 99th-percentile TTFT, ms (streaming requests only; None if no samples)
+    /// 99th-percentile TTFT, ms (streaming requests only; None if no samples). Approx. across hours: per-hour values weighted by sample count.
     pub p99_ttft_ms: Option<f64>,
     /// stop_reason IN ('provider_error','timeout','incomplete') / requests WHERE stop_reason IS NOT NULL.
     /// Excludes pre-V0037 rows (stop_reason IS NULL) from both numerator and denominator.

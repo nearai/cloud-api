@@ -280,18 +280,31 @@ impl ApiKeyRepository {
         };
 
         let rows = retry_db!("list_api_keys_by_workspace_paginated", {
-            let client = self
+            let mut client = self
                 .pool
                 .get()
                 .await
                 .context("Failed to get database connection")
                 .map_err(RepositoryError::PoolError)?;
-
-            client
+            // One statement under the reporting budget (spec §6.3): lifetime inference usage
+            // from usage_hourly (lags by up to ~65 minutes; spend-limit admission stays live
+            // on raw) plus live raw service usage.
+            let transaction = client
+                .build_transaction()
+                .read_only(true)
+                .start()
+                .await
+                .map_err(map_db_error)?;
+            super::reporting_query::configure_reporting_transaction(
+                &transaction,
+                super::reporting_query::DEFAULT_REPORTING_STATEMENT_TIMEOUT,
+            )
+            .await?;
+            let rows = transaction
                 .query(
                     &format!(
                         r#"
-                SELECT 
+                SELECT
                     ak.id,
                     ak.key_hash,
                     ak.key_prefix,
@@ -311,7 +324,7 @@ impl ApiKeyRepository {
                 FROM api_keys ak
                 LEFT JOIN (
                     SELECT api_key_id, COALESCE(SUM(total_cost), 0)::BIGINT AS total_cost
-                    FROM organization_usage_log
+                    FROM usage_hourly
                     WHERE workspace_id = $1
                     GROUP BY api_key_id
                 ) inference_usage ON ak.id = inference_usage.api_key_id
@@ -329,7 +342,9 @@ impl ApiKeyRepository {
                     &[&workspace_id, &limit, &offset],
                 )
                 .await
-                .map_err(map_db_error)
+                .map_err(map_db_error)?;
+            transaction.commit().await.map_err(map_db_error)?;
+            Ok::<_, RepositoryError>(rows)
         })?;
 
         rows.into_iter()

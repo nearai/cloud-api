@@ -158,6 +158,7 @@ pub async fn systemone(
             response_id: None,
             image_count: None,
             provider_attribution: served.provider_attribution,
+            discount: None,
         };
         let signature = async {
             let result = tokio::time::timeout(std::time::Duration::from_secs(5), async {

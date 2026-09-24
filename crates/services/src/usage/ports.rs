@@ -31,6 +31,8 @@ pub enum InferenceType {
     Embedding,
     /// Privacy classification (PII span detection)
     PrivacyClassify,
+    /// Typed decisions through the System One protocol.
+    Decisions,
 }
 
 impl InferenceType {
@@ -46,6 +48,7 @@ impl InferenceType {
             InferenceType::Score => "score",
             InferenceType::Embedding => "embedding",
             InferenceType::PrivacyClassify => "privacy_classify",
+            InferenceType::Decisions => "decisions",
         }
     }
 }
@@ -70,6 +73,7 @@ impl std::str::FromStr for InferenceType {
             "score" => Ok(InferenceType::Score),
             "embedding" => Ok(InferenceType::Embedding),
             "privacy_classify" => Ok(InferenceType::PrivacyClassify),
+            "decisions" => Ok(InferenceType::Decisions),
             _ => Err(format!("Unknown inference type: {}", s)),
         }
     }

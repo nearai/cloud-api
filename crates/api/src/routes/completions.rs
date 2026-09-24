@@ -111,7 +111,7 @@ const HEADER_SERVING_PROVIDER: &str = "x-serving-provider";
 
 /// Map a [`inference_providers::ProviderTier`] to the string value emitted in
 /// the `x-serving-provider` response header.
-fn provider_tier_to_str(tier: inference_providers::ProviderTier) -> &'static str {
+pub(super) fn provider_tier_to_str(tier: inference_providers::ProviderTier) -> &'static str {
     match tier {
         inference_providers::ProviderTier::Near => "near",
         inference_providers::ProviderTier::Attested3p => "chutes",
@@ -218,7 +218,7 @@ fn build_image_usage_request(
 /// Record usage synchronously with timeout, falling back to async retry.
 /// Used for non-streaming operations (image gen/edit) where usage should be
 /// persisted before the HTTP response is returned.
-async fn record_usage_with_sync_fallback(
+pub(super) async fn record_usage_with_sync_fallback(
     usage_service: Arc<dyn services::usage::UsageServiceTrait + Send + Sync>,
     request: services::usage::RecordUsageServiceRequest,
     operation_label: &str,

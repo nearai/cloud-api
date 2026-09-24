@@ -28,6 +28,7 @@ pub mod backend;
 pub mod content;
 pub mod gemini;
 pub mod openai_compatible;
+pub mod typesafe;
 
 #[cfg(test)]
 mod routing_policy_tests;
@@ -50,6 +51,7 @@ pub use anthropic::AnthropicBackend;
 pub use backend::BackendConfig as ExternalBackendConfig;
 pub use gemini::GeminiBackend;
 pub use openai_compatible::OpenAiCompatibleBackend;
+pub use typesafe::TypeSafeBackend;
 
 /// Strip cloud-api internal keys from `extra` before forwarding params to
 /// external providers.
@@ -125,7 +127,7 @@ pub fn validate_external_provider_config(config: &serde_json::Value) -> Result<(
             "api_key",
         ],
         "anthropic" => &["backend", "base_url", "version", "model_name", "api_key"],
-        "gemini" => &["backend", "base_url", "model_name", "api_key"],
+        "gemini" | "typesafe" => &["backend", "base_url", "model_name", "api_key"],
         _ => return Err("unsupported external provider backend"),
     };
     if config
@@ -188,6 +190,14 @@ pub fn validate_external_provider_config(config: &serde_json::Value) -> Result<(
 #[derive(Debug, Clone, Deserialize)]
 #[serde(tag = "backend")]
 pub enum ProviderConfig {
+    /// TypeSafe System One (also supported by OpenRouter's /v1/systemone API).
+    #[serde(rename = "typesafe")]
+    TypeSafe {
+        /// Versioned API root, e.g. https://api.typesafe.ai/v1.
+        base_url: String,
+        #[serde(default)]
+        model_name: Option<String>,
+    },
     /// OpenAI-compatible providers (OpenAI, Azure, Together, Groq, Fireworks, OpenRouter, etc.)
     #[serde(rename = "openai_compatible")]
     OpenAiCompatible {
@@ -290,6 +300,20 @@ impl ExternalProvider {
             Option<String>,
             std::collections::HashMap<String, serde_json::Value>,
         ) = match provider_config {
+            ProviderConfig::TypeSafe {
+                base_url,
+                model_name: config_model_name,
+            } => (
+                Arc::new(TypeSafeBackend::default()),
+                BackendConfig {
+                    base_url,
+                    api_key,
+                    timeout_seconds,
+                    ..Default::default()
+                },
+                config_model_name,
+                std::collections::HashMap::new(),
+            ),
             ProviderConfig::OpenAiCompatible {
                 base_url,
                 organization_id,
@@ -407,6 +431,20 @@ impl ExternalProvider {
 
 #[async_trait]
 impl InferenceProvider for ExternalProvider {
+    fn supports_systemone(&self) -> bool {
+        self.backend.backend_type() == "typesafe"
+    }
+
+    async fn systemone(
+        &self,
+        request: crate::SystemOneRequest,
+        _request_hash: String,
+    ) -> Result<crate::SystemOneResponseWithBytes, CompletionError> {
+        self.backend
+            .systemone(&self.config, &self.model_name, request)
+            .await
+    }
+
     fn provider_source(&self) -> crate::ProviderSource {
         crate::ProviderSource::External
     }

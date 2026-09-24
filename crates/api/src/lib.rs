@@ -1673,6 +1673,7 @@ pub fn build_completion_routes(
         .route("/rerank", post(rerank))
         .route("/embeddings", post(embeddings))
         .route("/score", post(score))
+        .route("/systemone", post(routes::systemone::systemone))
         // Override the router-level audio limit (25 MB) for privacy/classify: this is a
         // text-only endpoint, so a 256 KB cap is more appropriate.
         .route(

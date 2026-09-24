@@ -84,6 +84,9 @@ impl NativeResponsesService {
         mut body: Value,
         context: NativeResponsesContext,
     ) -> Result<NativeResponse, NativeResponsesError> {
+        model
+            .validate_endpoint(crate::models::InferenceEndpoint::Responses)
+            .map_err(NativeResponsesError::InvalidRequest)?;
         // Recheck the allowlist at the service boundary, independent of HTTP routing.
         if !selected(&self.models, &model.model_name, &body) {
             return Err(NativeResponsesError::InvalidRequest(

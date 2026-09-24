@@ -183,6 +183,8 @@ Once all checks pass, you're ready to commit!
 
 ## API Documentation
 
+For Jev and self-hosted decision models, see [System One integration](docs/jev-systemone.md).
+
 Interactive API documentation is available when running the server:
 
 - **Scalar UI**: `http://localhost:3000/docs` - Modern, beautiful API documentation with interactive playground

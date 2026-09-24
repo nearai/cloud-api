@@ -24,6 +24,7 @@ pub mod reporting_usage;
 pub mod responses;
 pub mod services;
 pub mod staking_farm;
+pub mod systemone;
 pub mod unsupported;
 pub mod usage;
 pub mod users;

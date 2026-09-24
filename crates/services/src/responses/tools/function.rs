@@ -130,7 +130,7 @@ impl ToolExecutor for FunctionToolExecutor {
 
                 // Store the function call in the database
                 if let Some(repo) = &event_ctx.response_items_repository {
-                    if let Err(e) = repo
+                    if repo
                         .create(
                             event_ctx.stream_ctx.response_id.clone(),
                             event_ctx.stream_ctx.api_key_id,
@@ -138,14 +138,23 @@ impl ToolExecutor for FunctionToolExecutor {
                             function_call.clone(),
                         )
                         .await
+                        .is_err()
                     {
-                        tracing::warn!("Failed to store function call: {}", e);
+                        tracing::warn!(
+                            response_id = %event_ctx.stream_ctx.response_id_str,
+                            call_id = %call_id,
+                            "Failed to store function call"
+                        );
                     }
                 }
 
                 // Emit function call event
-                if let Err(e) = event_ctx.emit_item_added(function_call).await {
-                    tracing::debug!("Failed to emit function call event: {}", e);
+                if event_ctx.emit_item_added(function_call).await.is_err() {
+                    tracing::debug!(
+                        response_id = %event_ctx.stream_ctx.response_id_str,
+                        call_id = %call_id,
+                        "Failed to emit function call event"
+                    );
                 }
 
                 // Return None to signal that we need to pause and wait for client

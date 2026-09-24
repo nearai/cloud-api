@@ -253,7 +253,7 @@ impl WebSearchProviderTrait for BraveWebSearchProvider {
         if !status.is_success() {
             tracing::warn!(
                 endpoint = "web_search",
-                status = status.as_u16(),
+                status_code = status.as_u16(),
                 elapsed_ms = started_at.elapsed().as_millis() as u64,
                 "Brave API error response"
             );
@@ -273,10 +273,9 @@ impl WebSearchProviderTrait for BraveWebSearchProvider {
         // Parse JSON
         let brave_response: BraveSearchResponse =
             serde_json::from_str(&response_text).map_err(|e| {
-                // serde_json::Error Display contains category and location only, not the body.
                 tracing::error!(
                     endpoint = "web_search",
-                    error = %e,
+                    error_category = "invalid_json",
                     elapsed_ms = started_at.elapsed().as_millis() as u64,
                     "Failed to parse Brave response"
                 );
@@ -301,7 +300,7 @@ impl WebSearchProviderTrait for BraveWebSearchProvider {
         let (snippet_count, total_snippet_chars) = super::web_search_result_stats(&results);
         tracing::debug!(
             endpoint = "web_search",
-            status = 200_u16,
+            status_code = 200_u16,
             requested_count = ?requested_count,
             result_count = results.len(),
             snippet_count,
@@ -404,7 +403,7 @@ impl WebContextSearchProviderTrait for BraveWebSearchProvider {
         if !status.is_success() {
             tracing::warn!(
                 endpoint = "llm_context",
-                status = status.as_u16(),
+                status_code = status.as_u16(),
                 elapsed_ms = started_at.elapsed().as_millis() as u64,
                 "Brave API error response"
             );
@@ -423,10 +422,9 @@ impl WebContextSearchProviderTrait for BraveWebSearchProvider {
 
         let context_response: BraveContextResponse =
             serde_json::from_str(&response_text).map_err(|e| {
-                // serde_json::Error Display contains category and location only, not the body.
                 tracing::error!(
                     endpoint = "llm_context",
-                    error = %e,
+                    error_category = "invalid_json",
                     elapsed_ms = started_at.elapsed().as_millis() as u64,
                     "Failed to parse Brave response"
                 );
@@ -437,7 +435,7 @@ impl WebContextSearchProviderTrait for BraveWebSearchProvider {
         let (snippet_count, total_snippet_chars) = super::web_search_result_stats(&results);
         tracing::debug!(
             endpoint = "llm_context",
-            status = 200_u16,
+            status_code = 200_u16,
             requested_spellcheck = ?requested_spellcheck,
             requested_count = ?requested_count,
             requested_max_urls = ?requested_max_urls,

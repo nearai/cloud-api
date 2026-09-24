@@ -213,6 +213,9 @@ async fn admin_platform_reports_serve_whole_hours_from_usage_hourly() {
     for (offset, cost, fallback) in [
         (chrono::Duration::seconds(1), 3_000_000_000_i64, false),
         (chrono::Duration::minutes(50), 7_000_000_000, true),
+        // Same dimensions as the row above: both collapse into one usage_hourly row with
+        // request_count = 2, so request totals must sum request_count, not count rows.
+        (chrono::Duration::minutes(55), 1_000_000_000, true),
     ] {
         insert_platform_provider_usage_row(
             &fixture,
@@ -247,22 +250,22 @@ async fn admin_platform_reports_serve_whole_hours_from_usage_hourly() {
     let metrics: PlatformMetrics =
         admin_json(&fixture, &format!("/v1/admin/platform/metrics?{query}")).await;
     assert_eq!((metrics.period_start, metrics.period_end), (start, end));
-    assert_eq!(metrics.total_requests, 2);
-    assert_eq!(metrics.total_tokens, 60);
-    assert!((metrics.total_consumed_usd - 10.0).abs() < COST_EPSILON);
+    assert_eq!(metrics.total_requests, 3);
+    assert_eq!(metrics.total_tokens, 90);
+    assert!((metrics.total_consumed_usd - 11.0).abs() < COST_EPSILON);
     assert_eq!(metrics.active_organizations, 1);
     assert_eq!(
-        metrics.verifiable_requests, 2,
+        metrics.verifiable_requests, 3,
         "fixture model is verifiable"
     );
-    assert_eq!(metrics.provider_usage.fallback.requests, 1);
+    assert_eq!(metrics.provider_usage.fallback.requests, 2);
     assert_eq!(metrics.top_models[0].model_name, fixture.model_name);
-    assert_eq!(metrics.top_models[0].requests, 2);
+    assert_eq!(metrics.top_models[0].requests, 3);
     assert_eq!(
         metrics.top_organizations[0].organization_id,
         fixture.organization_id
     );
-    assert_eq!(metrics.top_organizations[0].requests, 2);
+    assert_eq!(metrics.top_organizations[0].requests, 3);
 
     let series: PlatformTimeSeriesMetrics = admin_json(
         &fixture,
@@ -275,7 +278,7 @@ async fn admin_platform_reports_serve_whole_hours_from_usage_hourly() {
         series.data[0].date,
         start.format("%Y-%m-%d %H:%M:%S+00").to_string()
     );
-    assert_eq!(series.data[0].requests, 2);
-    assert_eq!(series.data[0].tokens, 60);
+    assert_eq!(series.data[0].requests, 3);
+    assert_eq!(series.data[0].tokens, 90);
     assert_eq!(series.data[0].active_organizations, 1);
 }

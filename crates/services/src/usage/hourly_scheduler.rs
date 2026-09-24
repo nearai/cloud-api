@@ -7,7 +7,10 @@ use chrono::{DateTime, NaiveDate, TimeDelta, Timelike, Utc};
 use tracing::{error, info, warn};
 
 use super::ports::{DayParity, HourlyProgress, UsageHourlyRepository};
-use crate::metrics::{consts::METRIC_USAGE_HOURLY_LAG_SECONDS, MetricsServiceTrait};
+use crate::metrics::{
+    consts::{get_environment, METRIC_USAGE_HOURLY_LAG_SECONDS, TAG_ENVIRONMENT},
+    MetricsServiceTrait,
+};
 
 pub const REREAD_HOURS: i64 = 3;
 pub const CATCH_UP_DAYS: i64 = 3;
@@ -101,18 +104,18 @@ pub struct TickOutcome {
 /// transaction-scoped try-lock, so at most one replica writes per tick; losers log `skipped`.
 pub struct UsageHourlyScheduler {
     repository: Arc<dyn UsageHourlyRepository>,
-    metrics: Arc<dyn MetricsServiceTrait>,
+    metrics_service: Arc<dyn MetricsServiceTrait>,
     task_handle: tokio::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
 
 impl UsageHourlyScheduler {
     pub fn new(
         repository: Arc<dyn UsageHourlyRepository>,
-        metrics: Arc<dyn MetricsServiceTrait>,
+        metrics_service: Arc<dyn MetricsServiceTrait>,
     ) -> Self {
         Self {
             repository,
-            metrics,
+            metrics_service,
             task_handle: tokio::sync::Mutex::new(None),
         }
     }
@@ -170,10 +173,11 @@ impl UsageHourlyScheduler {
         // record while the table is still empty.
         if let Some(max_hour) = progress.max_hour {
             let lag = now - (max_hour + TimeDelta::hours(1));
-            self.metrics.record_histogram(
+            let env_tag = format!("{TAG_ENVIRONMENT}:{}", get_environment());
+            self.metrics_service.record_histogram(
                 METRIC_USAGE_HOURLY_LAG_SECONDS,
-                lag.num_milliseconds() as f64 / 1000.0,
-                &[],
+                lag.as_seconds_f64(),
+                &[env_tag.as_str()],
             );
         }
         let (from, to) = plan_window(progress, now);
@@ -238,7 +242,7 @@ mod tests {
 
     use super::*;
     use crate::metrics::capturing::{CapturingMetricsService, MetricValue};
-    use crate::metrics::consts::METRIC_USAGE_HOURLY_LAG_SECONDS;
+    use crate::metrics::consts::{get_environment, METRIC_USAGE_HOURLY_LAG_SECONDS};
     use crate::usage::ports::{DayTotals, RecomputeReport};
 
     fn t(s: &str) -> DateTime<Utc> {
@@ -573,6 +577,10 @@ mod tests {
         let recorded = metrics.get_metrics();
         assert_eq!(recorded.len(), 1);
         assert_eq!(recorded[0].name, METRIC_USAGE_HOURLY_LAG_SECONDS);
+        assert_eq!(
+            recorded[0].tags,
+            vec![format!("{TAG_ENVIRONMENT}:{}", get_environment())]
+        );
         // now − (max_hour + 1h) = 10:05 − 10:00.
         assert!(matches!(recorded[0].value, MetricValue::Histogram(v) if v == 300.0));
     }

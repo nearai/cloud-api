@@ -2909,6 +2909,7 @@ mod tests {
             },
             inference_api_key: Some("test-key".to_string()),
             internal_usage_token: None,
+            internal_usage_max_discount: config::DEFAULT_INTERNAL_USAGE_MAX_DISCOUNT,
             native_responses_models: Vec::new(),
             logging: config::LoggingConfig {
                 level: "info".to_string(),
@@ -3029,6 +3030,7 @@ mod tests {
             },
             inference_api_key: Some("test-key".to_string()),
             internal_usage_token: None,
+            internal_usage_max_discount: config::DEFAULT_INTERNAL_USAGE_MAX_DISCOUNT,
             native_responses_models: Vec::new(),
             logging: config::LoggingConfig {
                 level: "info".to_string(),

@@ -90,6 +90,7 @@ async fn admin_model_revenue_filters_chutes_served_usage() {
         )
         .await;
     }
+    crate::usage_hourly::recompute_recent_usage().await;
 
     let start =
         (now - chrono::Duration::hours(1)).to_rfc3339_opts(chrono::SecondsFormat::Nanos, true);

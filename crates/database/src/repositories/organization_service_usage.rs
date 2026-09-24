@@ -42,14 +42,6 @@ impl OrganizationServiceUsageRepository {
         }
     }
 
-    pub fn with_reporting_statement_timeout(pool: DbPool, statement_timeout: Duration) -> Self {
-        Self {
-            pool,
-            reporting_statement_timeout: statement_timeout,
-            allocation_policy: CreditAllocationPolicy::default(),
-        }
-    }
-
     pub fn with_accounting_config(
         pool: DbPool,
         statement_timeout: Duration,
@@ -362,26 +354,12 @@ impl OrganizationServiceUsageRepository {
                     transaction
                         .execute(
                             r#"
-                            WITH balance_upsert AS (
-                                INSERT INTO organization_balance (
-                                    organization_id, total_spent, inference_spent, service_spent,
-                                    last_usage_at, total_requests, total_tokens, updated_at
-                                ) VALUES ($1, $2, 0, $2, $3, 0, 0, $4)
-                                ON CONFLICT (organization_id) DO UPDATE SET
-                                    total_spent = organization_balance.total_spent + $2,
-                                    service_spent = organization_balance.service_spent + $2,
-                                    last_usage_at = $3,
-                                    updated_at = $4
-                                RETURNING organization_id
-                            )
-                            INSERT INTO api_key_spend (
-                                api_key_id, inference_spent, service_spent, updated_at
-                            )
-                            SELECT $5, 0, $2, $4
-                            FROM balance_upsert
-                            WHERE TRUE
-                            ON CONFLICT (api_key_id) DO UPDATE SET
-                                service_spent = api_key_spend.service_spent + $2,
+                            INSERT INTO organization_balance (
+                                organization_id, total_spent, last_usage_at, total_requests, total_tokens, updated_at
+                            ) VALUES ($1, $2, $3, 0, 0, $4)
+                            ON CONFLICT (organization_id) DO UPDATE SET
+                                total_spent = organization_balance.total_spent + $2,
+                                last_usage_at = $3,
                                 updated_at = $4
                             "#,
                             &[
@@ -389,7 +367,6 @@ impl OrganizationServiceUsageRepository {
                                 &request.total_cost,
                                 &now,
                                 &now,
-                                &request.api_key_id,
                             ],
                         )
                         .await

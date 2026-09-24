@@ -11,15 +11,23 @@ fn random_past_hour() -> DateTime<Utc> {
     Utc.with_ymd_and_hms(2001, 1, 1, 0, 0, 0).unwrap() + Duration::hours(hours)
 }
 
-#[allow(clippy::too_many_arguments)]
-async fn insert_raw(
+/// One raw usage row; total_tokens is input + output.
+#[derive(Default)]
+struct RawRow<'a> {
+    input_tokens: i32,
+    output_tokens: i32,
+    cache_read_tokens: i32,
+    total_cost: i64,
+    ttft_ms: Option<i32>,
+    avg_itl_ms: Option<f64>,
+    stop_reason: Option<&'a str>,
+    served_provider_type: Option<&'a str>,
+}
+
+async fn insert_raw_row(
     f: &crate::admin_provider_attribution_support::PlatformProviderUsageFixture,
     created_at: DateTime<Utc>,
-    total_cost: i64,
-    tokens: i32,
-    ttft_ms: Option<i32>,
-    stop_reason: Option<&str>,
-    served_provider_type: Option<&str>,
+    r: RawRow<'_>,
 ) {
     let client = f.database.pool().get().await.unwrap();
     client
@@ -29,24 +37,47 @@ async fn insert_raw(
                 input_tokens, output_tokens, total_tokens, cache_read_tokens,
                 input_cost, output_cost, total_cost, request_type, inference_type, created_at,
                 ttft_ms, avg_itl_ms, stop_reason, served_provider_type, served_via_fallback)
-             VALUES ($1,$2,$3,$4,$5,$6,0,$6,0,$7,0,$7,'chat_completion','chat_completion',$8,
-                     $9,NULL,$10,$11,false)",
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$6::INTEGER + $7::INTEGER,$8,$9,0,$9,'chat_completion','chat_completion',$10,
+                     $11,$12,$13,$14,false)",
             &[
                 &f.organization_id,
                 &f.workspace_id,
                 &f.api_key_id,
                 &f.model_id,
                 &f.model_name,
-                &tokens,
-                &total_cost,
+                &r.input_tokens,
+                &r.output_tokens,
+                &r.cache_read_tokens,
+                &r.total_cost,
                 &created_at,
-                &ttft_ms,
-                &stop_reason,
-                &served_provider_type,
+                &r.ttft_ms,
+                &r.avg_itl_ms,
+                &r.stop_reason,
+                &r.served_provider_type,
             ],
         )
         .await
         .unwrap();
+}
+
+async fn insert_raw(
+    f: &crate::admin_provider_attribution_support::PlatformProviderUsageFixture,
+    created_at: DateTime<Utc>,
+    total_cost: i64,
+    tokens: i32,
+    ttft_ms: Option<i32>,
+    stop_reason: Option<&str>,
+    served_provider_type: Option<&str>,
+) {
+    let row = RawRow {
+        input_tokens: tokens,
+        total_cost,
+        ttft_ms,
+        stop_reason,
+        served_provider_type,
+        ..Default::default()
+    };
+    insert_raw_row(f, created_at, row).await;
 }
 
 async fn org_rows(
@@ -108,6 +139,144 @@ async fn recompute_aggregates_exactly_by_utc_hour_including_null_dimensions() {
             (h, Some("external".into()), 2, 150, 1, 1),
             (h + Duration::hours(1), Some("external".into()), 1, 1, 0, 0),
         ]
+    );
+}
+
+#[tokio::test]
+async fn recompute_computes_every_aggregate_column_and_excludes_the_upper_bound() {
+    let f = setup_platform_provider_usage_fixture().await;
+    let repo = UsageHourlyRepositoryImpl::new(f.database.pool().clone());
+    let h = random_past_hour();
+    let ext = Some("external");
+    let rows = [
+        (
+            Duration::zero(),
+            10,
+            20,
+            3,
+            100,
+            Some(100),
+            Some(10.0),
+            None,
+        ),
+        (
+            Duration::minutes(10),
+            5,
+            7,
+            0,
+            50,
+            Some(200),
+            Some(20.0),
+            Some("incomplete"),
+        ),
+        (
+            Duration::minutes(20),
+            1,
+            2,
+            1,
+            10,
+            Some(300),
+            None,
+            Some("timeout"),
+        ),
+        (
+            Duration::minutes(30),
+            4,
+            0,
+            0,
+            5,
+            Some(400),
+            Some(40.0),
+            Some("completed"),
+        ),
+        (
+            Duration::milliseconds(3_599_500),
+            0,
+            1,
+            0,
+            1,
+            None,
+            None,
+            None,
+        ),
+        // Exactly `to`: outside [h, h+1h), must not be counted or written.
+        (
+            Duration::hours(1),
+            1000,
+            1000,
+            1000,
+            1000,
+            Some(9999),
+            Some(999.0),
+            Some("timeout"),
+        ),
+    ];
+    for (offset, input, output, cache, cost, ttft, itl, stop) in rows {
+        let row = RawRow {
+            input_tokens: input,
+            output_tokens: output,
+            cache_read_tokens: cache,
+            total_cost: cost,
+            ttft_ms: ttft,
+            avg_itl_ms: itl,
+            stop_reason: stop,
+            served_provider_type: ext,
+        };
+        insert_raw_row(&f, h + offset, row).await;
+    }
+
+    repo.recompute(h, h + Duration::hours(1), true)
+        .await
+        .unwrap()
+        .unwrap();
+
+    let client = f.database.pool().get().await.unwrap();
+    let got = client
+        .query(
+            "SELECT hour, request_count, input_tokens, output_tokens, cache_read_tokens,
+                    total_tokens, total_cost, error_count, incomplete_count, stop_reason_count,
+                    ttft_count, ttft_sum_ms, ttft_p50_ms, ttft_p95_ms, ttft_p99_ms,
+                    itl_count, itl_sum_ms, itl_p95_ms, last_usage_at
+             FROM usage_hourly WHERE organization_id = $1",
+            &[&f.organization_id],
+        )
+        .await
+        .unwrap();
+    assert_eq!(got.len(), 1, "only hour h is written");
+    let r = &got[0];
+    assert_eq!(r.get::<_, DateTime<Utc>>("hour"), h);
+    let ints: Vec<i64> = [
+        "request_count",
+        "input_tokens",
+        "output_tokens",
+        "cache_read_tokens",
+        "total_tokens",
+        "total_cost",
+        "error_count",
+        "incomplete_count",
+        "stop_reason_count",
+        "ttft_count",
+        "ttft_sum_ms",
+        "itl_count",
+    ]
+    .iter()
+    .map(|c| r.get(*c))
+    .collect();
+    assert_eq!(ints, vec![5, 20, 30, 4, 50, 166, 1, 1, 3, 4, 1000, 3]);
+    // PERCENTILE_CONT interpolates at p*(n-1): ttft [100,200,300,400], itl [10,20,40].
+    for (col, want) in [
+        ("ttft_p50_ms", 250.0),
+        ("ttft_p95_ms", 385.0),
+        ("ttft_p99_ms", 397.0),
+        ("itl_sum_ms", 70.0),
+        ("itl_p95_ms", 38.0),
+    ] {
+        let got: f64 = r.get(col);
+        assert!((got - want).abs() < 1e-9, "{col}: got {got}, want {want}");
+    }
+    assert_eq!(
+        r.get::<_, DateTime<Utc>>("last_usage_at"),
+        h + Duration::milliseconds(3_599_500)
     );
 }
 

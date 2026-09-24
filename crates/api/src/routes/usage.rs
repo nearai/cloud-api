@@ -1395,13 +1395,10 @@ pub async fn get_user_organization_metrics(
         .get_organization_metrics(organization_id, start, end, None)
         .await
         .map_err(|e| {
-            tracing::error!("Failed to get organization metrics: {}", e);
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                ResponseJson(ErrorResponse::new(
-                    "Failed to retrieve organization metrics".to_string(),
-                    "internal_server_error".to_string(),
-                )),
+            crate::routes::common::analytics_error_response(
+                e,
+                "Failed to retrieve organization metrics",
+                false,
             )
         })?;
 
@@ -1494,13 +1491,10 @@ pub async fn get_user_organization_timeseries(
         .get_organization_timeseries(organization_id, start, end, granularity, None)
         .await
         .map_err(|e| {
-            tracing::error!("Failed to get organization timeseries: {}", e);
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                ResponseJson(ErrorResponse::new(
-                    "Failed to retrieve organization timeseries".to_string(),
-                    "internal_server_error".to_string(),
-                )),
+            crate::routes::common::analytics_error_response(
+                e,
+                "Failed to retrieve organization timeseries",
+                false,
             )
         })?;
 

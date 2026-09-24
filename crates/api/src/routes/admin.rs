@@ -2419,6 +2419,11 @@ fn admin_error_to_response(
             StatusCode::UNAUTHORIZED,
             ResponseJson(ErrorResponse::new(msg, "unauthorized".to_string())),
         ),
+        services::admin::AdminError::Timeout => crate::routes::common::analytics_error_response(
+            services::admin::AdminError::Timeout,
+            "Admin operation failed",
+            true,
+        ),
         services::admin::AdminError::InternalError(msg) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             ResponseJson(ErrorResponse::new(
@@ -3822,23 +3827,7 @@ pub async fn get_organization_metrics(
         .get_organization_metrics(organization_id, start, end, credit_type.as_deref())
         .await
         .map_err(|e| {
-            error!("Failed to get organization metrics, error: {:?}", e);
-            match e {
-                services::admin::AdminError::OrganizationNotFound(msg) => (
-                    StatusCode::NOT_FOUND,
-                    ResponseJson(ErrorResponse::new(
-                        msg,
-                        "organization_not_found".to_string(),
-                    )),
-                ),
-                _ => (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    ResponseJson(ErrorResponse::new(
-                        format!("Failed to retrieve metrics: {e}"),
-                        "internal_server_error".to_string(),
-                    )),
-                ),
-            }
+            crate::routes::common::analytics_error_response(e, "Failed to retrieve metrics", true)
         })?;
 
     Ok(ResponseJson(metrics))
@@ -3893,13 +3882,10 @@ pub async fn get_platform_metrics(
         .get_platform_metrics(start, end)
         .await
         .map_err(|e| {
-            error!("Failed to get platform metrics, error: {:?}", e);
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                ResponseJson(ErrorResponse::new(
-                    format!("Failed to retrieve platform metrics: {e}"),
-                    "internal_server_error".to_string(),
-                )),
+            crate::routes::common::analytics_error_response(
+                e,
+                "Failed to retrieve platform metrics",
+                true,
             )
         })?;
 
@@ -3970,13 +3956,10 @@ pub async fn get_platform_timeseries(
         .get_platform_timeseries(start, end, granularity)
         .await
         .map_err(|e| {
-            error!("Failed to get platform timeseries, error: {:?}", e);
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                ResponseJson(ErrorResponse::new(
-                    format!("Failed to retrieve platform timeseries: {e}"),
-                    "internal_server_error".to_string(),
-                )),
+            crate::routes::common::analytics_error_response(
+                e,
+                "Failed to retrieve platform timeseries",
+                true,
             )
         })?;
 
@@ -4013,13 +3996,10 @@ pub async fn get_billing_summary(
         .get_billing_summary()
         .await
         .map_err(|e| {
-            error!("Failed to get billing summary, error: {:?}", e);
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                ResponseJson(ErrorResponse::new(
-                    format!("Failed to retrieve billing summary: {e}"),
-                    "internal_server_error".to_string(),
-                )),
+            crate::routes::common::analytics_error_response(
+                e,
+                "Failed to retrieve billing summary",
+                true,
             )
         })?;
 
@@ -4118,13 +4098,10 @@ pub async fn get_model_revenue(
         })
         .await
         .map_err(|e| {
-            error!("Failed to get model revenue, error: {:?}", e);
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                ResponseJson(ErrorResponse::new(
-                    format!("Failed to retrieve model revenue: {e}"),
-                    "internal_server_error".to_string(),
-                )),
+            crate::routes::common::analytics_error_response(
+                e,
+                "Failed to retrieve model revenue",
+                true,
             )
         })?;
 
@@ -4212,13 +4189,10 @@ pub async fn get_org_revenue(
         })
         .await
         .map_err(|e| {
-            error!("Failed to get org revenue, error: {:?}", e);
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                ResponseJson(ErrorResponse::new(
-                    format!("Failed to retrieve org revenue: {e}"),
-                    "internal_server_error".to_string(),
-                )),
+            crate::routes::common::analytics_error_response(
+                e,
+                "Failed to retrieve org revenue",
+                true,
             )
         })?;
 
@@ -4359,13 +4333,10 @@ pub async fn get_model_consumption_timeseries(
         })
         .await
         .map_err(|e| {
-            error!("Failed to get model consumption timeseries: {:?}", e);
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                ResponseJson(ErrorResponse::new(
-                    format!("Failed to retrieve model consumption timeseries: {e}"),
-                    "internal_server_error".to_string(),
-                )),
+            crate::routes::common::analytics_error_response(
+                e,
+                "Failed to retrieve model consumption timeseries",
+                true,
             )
         })?;
 
@@ -4429,13 +4400,10 @@ pub async fn get_performance_timeseries(
         })
         .await
         .map_err(|e| {
-            error!("Failed to get performance timeseries: {:?}", e);
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                ResponseJson(ErrorResponse::new(
-                    format!("Failed to retrieve performance timeseries: {e}"),
-                    "internal_server_error".to_string(),
-                )),
+            crate::routes::common::analytics_error_response(
+                e,
+                "Failed to retrieve performance timeseries",
+                true,
             )
         })?;
 
@@ -4500,13 +4468,10 @@ pub async fn get_revenue_density(
         })
         .await
         .map_err(|e| {
-            error!("Failed to get revenue density: {:?}", e);
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                ResponseJson(ErrorResponse::new(
-                    format!("Failed to retrieve revenue density: {e}"),
-                    "internal_server_error".to_string(),
-                )),
+            crate::routes::common::analytics_error_response(
+                e,
+                "Failed to retrieve revenue density",
+                true,
             )
         })?;
 
@@ -4602,23 +4567,11 @@ pub async fn get_organization_timeseries(
         )
         .await
         .map_err(|e| {
-            error!("Failed to get organization timeseries, error: {:?}", e);
-            match e {
-                services::admin::AdminError::OrganizationNotFound(msg) => (
-                    StatusCode::NOT_FOUND,
-                    ResponseJson(ErrorResponse::new(
-                        msg,
-                        "organization_not_found".to_string(),
-                    )),
-                ),
-                _ => (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    ResponseJson(ErrorResponse::new(
-                        format!("Failed to retrieve timeseries metrics: {e}"),
-                        "internal_server_error".to_string(),
-                    )),
-                ),
-            }
+            crate::routes::common::analytics_error_response(
+                e,
+                "Failed to retrieve timeseries metrics",
+                true,
+            )
         })?;
 
     Ok(ResponseJson(metrics))

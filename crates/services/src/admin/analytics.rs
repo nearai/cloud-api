@@ -639,7 +639,7 @@ impl AnalyticsService {
         self.repository
             .get_organization_metrics(org_id, start, end, credit_type)
             .await
-            .map_err(|e| super::AdminError::InternalError(e.to_string()))
+            .map_err(analytics_error)
     }
 
     /// Get platform-wide metrics for admin dashboard
@@ -657,7 +657,7 @@ impl AnalyticsService {
         self.repository
             .get_platform_metrics(start, end)
             .await
-            .map_err(|e| super::AdminError::InternalError(e.to_string()))
+            .map_err(analytics_error)
     }
 
     /// Get time series metrics for an organization
@@ -674,7 +674,7 @@ impl AnalyticsService {
         self.repository
             .get_organization_timeseries(org_id, start, end, granularity, credit_type)
             .await
-            .map_err(|e| super::AdminError::InternalError(e.to_string()))
+            .map_err(analytics_error)
     }
 
     /// Get platform-wide time series for growth/mix trend charts
@@ -687,7 +687,7 @@ impl AnalyticsService {
         self.repository
             .get_platform_timeseries(start, end, granularity)
             .await
-            .map_err(|e| super::AdminError::InternalError(e.to_string()))
+            .map_err(analytics_error)
     }
 
     /// Get the platform billing summary (credit limits + consumption)
@@ -695,7 +695,7 @@ impl AnalyticsService {
         self.repository
             .get_billing_summary()
             .await
-            .map_err(|e| super::AdminError::InternalError(e.to_string()))
+            .map_err(analytics_error)
     }
 
     /// Get a paginated/filtered per-model consumption ranking
@@ -706,7 +706,7 @@ impl AnalyticsService {
         self.repository
             .get_model_revenue(query)
             .await
-            .map_err(|e| super::AdminError::InternalError(e.to_string()))
+            .map_err(analytics_error)
     }
 
     /// Get a paginated/filtered per-organization consumption ranking
@@ -717,7 +717,7 @@ impl AnalyticsService {
         self.repository
             .get_org_revenue(query)
             .await
-            .map_err(|e| super::AdminError::InternalError(e.to_string()))
+            .map_err(analytics_error)
     }
 
     /// Per-model consumption timeseries (top-N + "Other")
@@ -728,7 +728,7 @@ impl AnalyticsService {
         self.repository
             .get_model_consumption_timeseries(query)
             .await
-            .map_err(|e| super::AdminError::InternalError(e.to_string()))
+            .map_err(analytics_error)
     }
 
     /// Platform-wide (or per-model) performance timeseries
@@ -739,7 +739,7 @@ impl AnalyticsService {
         self.repository
             .get_performance_timeseries(query)
             .await
-            .map_err(|e| super::AdminError::InternalError(e.to_string()))
+            .map_err(analytics_error)
     }
 
     /// Revenue density percentiles (p50/p95/p99/peak USD/s)
@@ -750,6 +750,32 @@ impl AnalyticsService {
         self.repository
             .get_revenue_density(query)
             .await
-            .map_err(|e| super::AdminError::InternalError(e.to_string()))
+            .map_err(analytics_error)
+    }
+}
+
+/// Statement-budget cancellations become `Timeout` (HTTP 504), following
+/// `ReportingUsageError::Timeout`; every other repository error stays internal.
+fn analytics_error(error: RepositoryError) -> super::AdminError {
+    match error {
+        RepositoryError::QueryTimeout => super::AdminError::Timeout,
+        other => super::AdminError::InternalError(other.to_string()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn query_timeout_becomes_admin_timeout() {
+        assert!(matches!(
+            analytics_error(RepositoryError::QueryTimeout),
+            crate::admin::AdminError::Timeout
+        ));
+        assert!(matches!(
+            analytics_error(RepositoryError::NotFound("x".to_string())),
+            crate::admin::AdminError::InternalError(_)
+        ));
     }
 }

@@ -598,6 +598,47 @@ pub fn map_organization_error(
     }
 }
 
+/// Maps an analytics service error to its HTTP response (spec §6.3). A statement-budget
+/// cancellation is a 504 with a structured body, like `reporting_request_timeout`. Admins
+/// see the internal error text in a 500; customers see only `failure`.
+pub fn analytics_error_response(
+    error: services::admin::AdminError,
+    failure: &str,
+    include_detail: bool,
+) -> (StatusCode, ResponseJson<ErrorResponse>) {
+    tracing::error!(error = %error, "{failure}");
+    match error {
+        services::admin::AdminError::Timeout => (
+            StatusCode::GATEWAY_TIMEOUT,
+            ResponseJson(ErrorResponse::new(
+                "Analytics request timed out".to_string(),
+                "analytics_request_timeout".to_string(),
+            )),
+        ),
+        services::admin::AdminError::OrganizationNotFound(message) => (
+            StatusCode::NOT_FOUND,
+            ResponseJson(ErrorResponse::new(
+                message,
+                "organization_not_found".to_string(),
+            )),
+        ),
+        other => {
+            let message = if include_detail {
+                format!("{failure}: {other}")
+            } else {
+                failure.to_string()
+            };
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                ResponseJson(ErrorResponse::new(
+                    message,
+                    "internal_server_error".to_string(),
+                )),
+            )
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -893,5 +934,33 @@ mod tests {
         // Non-JSON / non-object payloads (e.g. E2EE blobs) must be left alone.
         assert!(inject_warning_field(b"not json", "w").is_none());
         assert!(inject_warning_field(b"[1,2,3]", "w").is_none());
+    }
+
+    #[test]
+    fn analytics_timeout_maps_to_gateway_timeout() {
+        let (status, body) = analytics_error_response(
+            services::admin::AdminError::Timeout,
+            "Failed to retrieve platform metrics",
+            true,
+        );
+        assert_eq!(status, StatusCode::GATEWAY_TIMEOUT);
+        assert_eq!(body.0.error.r#type, "analytics_request_timeout");
+    }
+
+    #[test]
+    fn analytics_internal_errors_hide_detail_from_customers() {
+        let failure = || services::admin::AdminError::InternalError("db down".to_string());
+        let (status, customer) =
+            analytics_error_response(failure(), "Failed to retrieve organization metrics", false);
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(
+            customer.0.error.message,
+            "Failed to retrieve organization metrics"
+        );
+        let (_, admin) = analytics_error_response(failure(), "Failed to retrieve metrics", true);
+        assert_eq!(
+            admin.0.error.message,
+            "Failed to retrieve metrics: Internal error: db down"
+        );
     }
 }

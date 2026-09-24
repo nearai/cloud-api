@@ -1,3 +1,4 @@
+pub mod hourly_scheduler;
 pub mod ports;
 pub mod provider_attribution;
 pub mod reporting;
@@ -12,6 +13,7 @@ use crate::metrics::{
     },
     MetricsServiceTrait,
 };
+pub use hourly_scheduler::*;
 pub use ports::*;
 pub use provider_attribution::*;
 pub use reporting::*;

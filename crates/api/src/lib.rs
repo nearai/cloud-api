@@ -2505,7 +2505,23 @@ fn build_admin_routes_with_options(
             "/admin/access-tokens/{token_id}",
             axum::routing::delete(delete_admin_access_token),
         )
-        .with_state(admin_app_state);
+        .with_state(admin_app_state)
+        .merge(
+            Router::new()
+                .route(
+                    "/admin/usage-hourly/recompute",
+                    axum::routing::post(crate::routes::admin_usage_hourly::recompute_usage_hourly),
+                )
+                .layer(axum::Extension(
+                    crate::routes::admin_usage_hourly::UsageHourlyRepairState {
+                        repository: Arc::new(
+                            database::repositories::UsageHourlyRepositoryImpl::new(
+                                database.pool().clone(),
+                            ),
+                        ),
+                    },
+                )),
+        );
 
     let admin_routes = if let Some(database_encryption_state) = database_encryption_state {
         if build_options.start_database_encryption_recovery {
@@ -2888,6 +2904,7 @@ mod tests {
                 host: "127.0.0.1".to_string(),
                 port: 0, // Use port 0 for testing to get a random available port
                 pricing_change_apply_interval_secs: 0,
+                usage_hourly_interval_secs: 0,
                 ohttp_enabled: false,
             },
             inference_api_key: Some("test-key".to_string()),
@@ -3008,6 +3025,7 @@ mod tests {
                 host: "127.0.0.1".to_string(),
                 port: 0,
                 pricing_change_apply_interval_secs: 0,
+                usage_hourly_interval_secs: 0,
                 ohttp_enabled: false,
             },
             inference_api_key: Some("test-key".to_string()),

@@ -411,6 +411,64 @@ pub trait UsageRepository: Send + Sync {
     ) -> anyhow::Result<(Vec<InferenceUsageReportRow>, i64)>;
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HourlyProgress {
+    /// Latest `hour` present in usage_hourly (None when the table is empty).
+    pub max_hour: Option<DateTime<Utc>>,
+    /// First raw UTC hour at or after `max_hour + 1h` (or the oldest raw hour when max_hour is None).
+    pub next_raw_hour: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RecomputeReport {
+    pub rows_written: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct DayTotals {
+    pub request_count: i64,
+    pub total_tokens: i64,
+    pub total_cost: i64,
+    pub ttft_count: i64,
+    pub error_count: i64,
+    pub incomplete_count: i64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DayParity {
+    pub day: chrono::NaiveDate,
+    pub raw: DayTotals,
+    pub aggregate: DayTotals,
+}
+
+impl DayParity {
+    pub fn is_ok(&self) -> bool {
+        self.raw == self.aggregate
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AggregateLockBehavior {
+    /// Return `Ok(None)` when another transaction holds the aggregate lock.
+    SkipIfBusy,
+    /// Wait for the aggregate lock. The transaction statement timeout still applies.
+    Wait,
+}
+
+#[async_trait::async_trait]
+pub trait UsageHourlyRepository: Send + Sync {
+    async fn progress(&self) -> anyhow::Result<HourlyProgress>;
+    /// Replace usage_hourly rows for [from, to) from raw. `SkipIfBusy` returns `Ok(None)`
+    /// when another transaction holds the aggregate lock.
+    async fn recompute(
+        &self,
+        from: DateTime<Utc>,
+        to: DateTime<Utc>,
+        lock_behavior: AggregateLockBehavior,
+    ) -> anyhow::Result<Option<RecomputeReport>>;
+    async fn day_parity(&self, day: chrono::NaiveDate) -> anyhow::Result<DayParity>;
+}
+
 #[async_trait::async_trait]
 pub trait ModelRepository: Send + Sync {
     /// Get model by name

@@ -197,6 +197,7 @@ async fn test_list_workspace_api_keys_orders_by_usage() {
         )
         .await
         .unwrap();
+    crate::usage_hourly::recompute_recent_usage().await;
 
     let default_response = server
         .get(format!("/v1/workspaces/{}/api-keys?limit=3", workspace.id).as_str())
@@ -714,6 +715,7 @@ async fn test_list_workspace_api_keys_with_usage() {
 
     // Wait for async usage recording to complete
     tokio::time::sleep(tokio::time::Duration::from_millis(1000)).await;
+    crate::usage_hourly::recompute_recent_usage().await;
 
     // List all API keys for the workspace
     let response = server
@@ -757,8 +759,6 @@ async fn test_list_workspace_api_keys_with_usage() {
     if let Some(unused_usage) = &unused_key.usage {
         assert_eq!(unused_usage.amount, 0, "Unused API key should have 0 usage");
     }
-
-    println!("✓ Successfully verified list_workspace_api_keys includes usage");
 }
 
 #[tokio::test]
@@ -810,6 +810,7 @@ async fn test_api_key_usage_isolated_between_keys() {
 
     // Wait for usage recording
     tokio::time::sleep(tokio::time::Duration::from_millis(1000)).await;
+    crate::usage_hourly::recompute_recent_usage().await;
 
     // List API keys and verify each has its own usage
     let response = server
@@ -838,10 +839,6 @@ async fn test_api_key_usage_isolated_between_keys() {
     assert!(usage2.amount > 0, "Key 2 should have usage");
 
     // Usage should be different (because different requests)
-    println!("Key 1 usage: {} nano-dollars", usage1.amount);
-    println!("Key 2 usage: {} nano-dollars", usage2.amount);
-
-    println!("✓ API keys have isolated usage tracking");
 }
 
 // ============================================

@@ -1,4 +1,7 @@
+use super::arm;
 use super::nano_to_usd;
+use crate::repositories::usage_hourly::with_usage_rows;
+use crate::repositories::utils::map_db_error;
 use chrono::{DateTime, Utc};
 use services::admin::{
     ModelProviderRevenueBreakdown, ModelRevenueEntry, ModelRevenueQuery, PlatformProviderUsage,
@@ -6,6 +9,8 @@ use services::admin::{
 };
 use services::common::RepositoryError;
 use std::collections::BTreeMap;
+use std::time::Instant;
+use tokio_postgres::Transaction;
 
 fn provider_usage_totals_from_row(row: &tokio_postgres::Row) -> ProviderUsageTotals {
     ProviderUsageTotals {
@@ -25,26 +30,30 @@ const BY_PROVIDER_TYPE: i32 = 0b101;
 const BY_PROVIDER_TIER: i32 = 0b110;
 
 pub(super) async fn get_platform_provider_usage(
-    client: &tokio_postgres::Client,
+    tx: &Transaction<'_>,
+    deadline: Instant,
     start: DateTime<Utc>,
     end: DateTime<Utc>,
 ) -> Result<PlatformProviderUsage, RepositoryError> {
-    let rows = client
+    arm(tx, deadline).await?;
+    let rows = tx
         .query(
-            r#"
+            &with_usage_rows(
+                "$1",
+                "$2",
+                r#"
             SELECT
                 GROUPING(served_via_fallback, served_provider_type, served_provider_tier) as grouping_set,
                 served_via_fallback,
                 served_provider_type,
                 served_provider_tier,
-                COUNT(*)::bigint as requests,
+                COALESCE(SUM(request_count), 0)::bigint as requests,
                 COALESCE(SUM(input_tokens), 0)::bigint as input_tokens,
                 COALESCE(SUM(output_tokens), 0)::bigint as output_tokens,
                 (COALESCE(SUM(input_tokens), 0) + COALESCE(SUM(output_tokens), 0))::bigint as total_tokens,
                 COALESCE(SUM(cache_read_tokens), 0)::bigint as cache_read_tokens,
                 COALESCE(SUM(total_cost), 0)::bigint as cost_nano
-            FROM organization_usage_log
-            WHERE created_at >= $1 AND created_at < $2
+            FROM usage_rows
             GROUP BY GROUPING SETS (
                 (served_via_fallback),
                 (served_provider_type),
@@ -55,10 +64,11 @@ pub(super) async fn get_platform_provider_usage(
                 served_provider_type NULLS FIRST,
                 served_provider_tier NULLS FIRST
             "#,
+            ),
             &[&start, &end],
         )
         .await
-        .map_err(|e| RepositoryError::DatabaseError(e.into()))?;
+        .map_err(map_db_error)?;
 
     let mut usage = PlatformProviderUsage {
         fallback: ProviderUsageTotals::default(),
@@ -104,8 +114,11 @@ pub(super) async fn get_platform_provider_usage(
     Ok(usage)
 }
 
+/// `where_clause` is the model-revenue WHERE over `usage_rows uh` joined to `models m`
+/// (binds `$3`-`$5`; `$1`/`$2` are the range).
 pub(super) async fn load_model_provider_breakdowns(
-    client: &tokio_postgres::Client,
+    tx: &Transaction<'_>,
+    deadline: Instant,
     query: &ModelRevenueQuery,
     where_clause: &str,
     model_like: &Option<String>,
@@ -116,25 +129,30 @@ pub(super) async fn load_model_provider_breakdowns(
     }
 
     let model_names: Vec<String> = data.iter().map(|entry| entry.model_name.clone()).collect();
-    let breakdown_sql = format!(
-        r#"
+    let breakdown_sql = with_usage_rows(
+        "$1",
+        "$2",
+        &format!(
+            r#"
         SELECT
-            ul.model_name,
-            ul.served_provider_type,
-            ul.served_provider_tier,
-            ul.served_via_fallback,
-            COUNT(*)::bigint as requests,
-            (COALESCE(SUM(ul.input_tokens), 0) + COALESCE(SUM(ul.output_tokens), 0))::bigint as tokens,
-            COALESCE(SUM(ul.total_cost), 0)::bigint as cost_nano
-        FROM organization_usage_log ul
-        LEFT JOIN models m ON m.id = ul.model_id
+            uh.model_name,
+            uh.served_provider_type,
+            uh.served_provider_tier,
+            uh.served_via_fallback,
+            COALESCE(SUM(uh.request_count), 0)::bigint as requests,
+            (COALESCE(SUM(uh.input_tokens), 0) + COALESCE(SUM(uh.output_tokens), 0))::bigint as tokens,
+            COALESCE(SUM(uh.total_cost), 0)::bigint as cost_nano
+        FROM usage_rows uh
+        LEFT JOIN models m ON m.id = uh.model_id
         {where_clause}
-          AND ul.model_name = ANY($6)
-        GROUP BY ul.model_name, ul.served_provider_type, ul.served_provider_tier, ul.served_via_fallback
-        ORDER BY ul.model_name, ul.served_provider_type NULLS FIRST, ul.served_provider_tier NULLS FIRST, ul.served_via_fallback
+          AND uh.model_name = ANY($6)
+        GROUP BY uh.model_name, uh.served_provider_type, uh.served_provider_tier, uh.served_via_fallback
+        ORDER BY uh.model_name, uh.served_provider_type NULLS FIRST, uh.served_provider_tier NULLS FIRST, uh.served_via_fallback
         "#
+        ),
     );
-    let breakdown_rows = client
+    arm(tx, deadline).await?;
+    let breakdown_rows = tx
         .query(
             &breakdown_sql,
             &[
@@ -147,7 +165,7 @@ pub(super) async fn load_model_provider_breakdowns(
             ],
         )
         .await
-        .map_err(|e| RepositoryError::DatabaseError(e.into()))?;
+        .map_err(map_db_error)?;
 
     let mut breakdowns_by_model: BTreeMap<String, Vec<ModelProviderRevenueBreakdown>> =
         BTreeMap::new();

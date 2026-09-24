@@ -6,7 +6,9 @@ use crate::repositories::reporting_query::configure_reporting_transaction;
 use crate::repositories::utils::map_db_error;
 use anyhow::Context;
 use chrono::{DateTime, NaiveDate, Utc};
-use services::usage::ports::{DayParity, DayTotals, HourlyProgress, RecomputeReport};
+use services::usage::ports::{
+    AggregateLockBehavior, DayParity, DayTotals, HourlyProgress, RecomputeReport,
+};
 use services::usage::trunc_hour;
 use std::time::Duration;
 use tokio_postgres::IsolationLevel;
@@ -50,17 +52,22 @@ GROUP BY 1, 2, 3, 4, 5, 6, 7, 8, 9, 10
 "#;
 
 const DAY_TOTALS_RAW: &str = r#"
-SELECT COUNT(*)::BIGINT, COALESCE(SUM(total_tokens), 0)::BIGINT, COALESCE(SUM(total_cost), 0)::BIGINT,
-       COUNT(ttft_ms)::BIGINT,
-       COUNT(*) FILTER (WHERE stop_reason IN ('provider_error', 'timeout'))::BIGINT,
-       COUNT(*) FILTER (WHERE stop_reason = 'incomplete')::BIGINT
+SELECT COUNT(*)::BIGINT AS request_count,
+       COALESCE(SUM(total_tokens), 0)::BIGINT AS total_tokens,
+       COALESCE(SUM(total_cost), 0)::BIGINT AS total_cost,
+       COUNT(ttft_ms)::BIGINT AS ttft_count,
+       COUNT(*) FILTER (WHERE stop_reason IN ('provider_error', 'timeout'))::BIGINT AS error_count,
+       COUNT(*) FILTER (WHERE stop_reason = 'incomplete')::BIGINT AS incomplete_count
 FROM organization_usage_log WHERE created_at >= $1 AND created_at < $2
 "#;
 
 const DAY_TOTALS_AGGREGATE: &str = r#"
-SELECT COALESCE(SUM(request_count), 0)::BIGINT, COALESCE(SUM(total_tokens), 0)::BIGINT,
-       COALESCE(SUM(total_cost), 0)::BIGINT, COALESCE(SUM(ttft_count), 0)::BIGINT,
-       COALESCE(SUM(error_count), 0)::BIGINT, COALESCE(SUM(incomplete_count), 0)::BIGINT
+SELECT COALESCE(SUM(request_count), 0)::BIGINT AS request_count,
+       COALESCE(SUM(total_tokens), 0)::BIGINT AS total_tokens,
+       COALESCE(SUM(total_cost), 0)::BIGINT AS total_cost,
+       COALESCE(SUM(ttft_count), 0)::BIGINT AS ttft_count,
+       COALESCE(SUM(error_count), 0)::BIGINT AS error_count,
+       COALESCE(SUM(incomplete_count), 0)::BIGINT AS incomplete_count
 FROM usage_hourly WHERE hour >= $1 AND hour < $2
 "#;
 
@@ -76,12 +83,12 @@ impl UsageHourlyRepositoryImpl {
 
 fn totals(row: &tokio_postgres::Row) -> DayTotals {
     DayTotals {
-        request_count: row.get(0),
-        total_tokens: row.get(1),
-        total_cost: row.get(2),
-        ttft_count: row.get(3),
-        error_count: row.get(4),
-        incomplete_count: row.get(5),
+        request_count: row.get("request_count"),
+        total_tokens: row.get("total_tokens"),
+        total_cost: row.get("total_cost"),
+        ttft_count: row.get("ttft_count"),
+        error_count: row.get("error_count"),
+        incomplete_count: row.get("incomplete_count"),
     }
 }
 
@@ -117,7 +124,7 @@ impl services::usage::ports::UsageHourlyRepository for UsageHourlyRepositoryImpl
         &self,
         from: DateTime<Utc>,
         to: DateTime<Utc>,
-        wait: bool,
+        lock_behavior: AggregateLockBehavior,
     ) -> anyhow::Result<Option<RecomputeReport>> {
         anyhow::ensure!(from < to, "usage_hourly recompute: empty window");
         anyhow::ensure!(
@@ -134,7 +141,7 @@ impl services::usage::ports::UsageHourlyRepository for UsageHourlyRepositoryImpl
         tx.batch_execute(SINGLE_WORKER)
             .await
             .map_err(map_db_error)?;
-        if wait {
+        if lock_behavior == AggregateLockBehavior::Wait {
             tx.execute(
                 "SELECT pg_advisory_xact_lock($1)",
                 &[&USAGE_HOURLY_LOCK_KEY],

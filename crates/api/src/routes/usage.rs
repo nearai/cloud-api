@@ -1,7 +1,10 @@
 use crate::{
     middleware::AuthenticatedUser,
     models::{CreditType, ErrorResponse},
-    routes::{api::AppState, common::format_amount},
+    routes::{
+        api::AppState,
+        common::{analytics_error_response, format_amount},
+    },
 };
 use axum::{
     extract::{Path, Query, State},
@@ -1395,11 +1398,7 @@ pub async fn get_user_organization_metrics(
         .get_organization_metrics(organization_id, start, end, None)
         .await
         .map_err(|e| {
-            crate::routes::common::analytics_error_response(
-                e,
-                "Failed to retrieve organization metrics",
-                false,
-            )
+            analytics_error_response(e, "Failed to retrieve organization metrics", false)
         })?;
 
     Ok(ResponseJson(UserOrganizationMetrics {
@@ -1491,11 +1490,7 @@ pub async fn get_user_organization_timeseries(
         .get_organization_timeseries(organization_id, start, end, granularity, None)
         .await
         .map_err(|e| {
-            crate::routes::common::analytics_error_response(
-                e,
-                "Failed to retrieve organization timeseries",
-                false,
-            )
+            analytics_error_response(e, "Failed to retrieve organization timeseries", false)
         })?;
 
     Ok(ResponseJson(UserTimeSeriesMetrics {

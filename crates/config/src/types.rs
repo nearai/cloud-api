@@ -855,7 +855,8 @@ pub struct ServerConfig {
     /// Set to 0 to disable the background scheduler. Default: 60.
     pub pricing_change_apply_interval_secs: u64,
     /// Interval in seconds between usage_hourly aggregate ticks. After deploy, ticks catch up
-    /// every 60 s until current, then run at HH:05 UTC hourly. Set to 0 to disable. Default: 3600.
+    /// every 60 s until current. Then 3600 (the default) runs at HH:05 UTC; any other value
+    /// runs on the plain interval with no clock alignment. Set to 0 to disable.
     pub usage_hourly_interval_secs: u64,
     /// Enable the OHTTP gateway (RFC 9458).  Set OHTTP_ENABLED=true to enable.
     pub ohttp_enabled: bool,

@@ -66,7 +66,7 @@ pub use organization_service_usage::{
     OrganizationServiceUsageRepository, RecordServiceUsageRequest,
 };
 pub use organization_staking_farm_sources::OrganizationStakingFarmSourcesRepository;
-pub use organization_usage::{OrganizationUsageRepository, UsageStats};
+pub use organization_usage::OrganizationUsageRepository;
 pub use reporting_usage_summary::PostgresReportingUsageSummaryRepository;
 pub use response::PgResponseRepository;
 pub use response_item::PgResponseItemsRepository;

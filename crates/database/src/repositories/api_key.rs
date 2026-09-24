@@ -420,44 +420,6 @@ impl ApiKeyRepository {
         Ok(rows_affected as i64)
     }
 
-    /// Get workspace info for an API key - used for auth resolution
-    pub async fn get_workspace_for_api_key(
-        &self,
-        api_key: &ApiKey,
-    ) -> Result<Option<crate::models::Workspace>> {
-        let row = retry_db!("get_workspace_info_for_api_key", {
-            let client = self
-                .pool
-                .get()
-                .await
-                .context("Failed to get database connection")
-                .map_err(RepositoryError::PoolError)?;
-
-            client
-                .query_opt(
-                    "SELECT * FROM workspaces WHERE id = $1 AND is_active = true",
-                    &[&api_key.workspace_id],
-                )
-                .await
-                .map_err(map_db_error)
-        })?;
-
-        match row {
-            Some(row) => Ok(Some(crate::models::Workspace {
-                id: row.get("id"),
-                name: row.get("name"),
-                description: row.get("description"),
-                organization_id: row.get("organization_id"),
-                created_by_user_id: row.get("created_by_user_id"),
-                created_at: row.get("created_at"),
-                updated_at: row.get("updated_at"),
-                is_active: row.get("is_active"),
-                settings: row.get("settings"),
-            })),
-            None => Ok(None),
-        }
-    }
-
     /// Update spend limit for an API key
     pub async fn update_spend_limit(
         &self,

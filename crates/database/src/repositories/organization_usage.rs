@@ -36,14 +36,6 @@ impl OrganizationUsageRepository {
         }
     }
 
-    pub fn with_reporting_statement_timeout(pool: DbPool, statement_timeout: Duration) -> Self {
-        Self {
-            pool,
-            reporting_statement_timeout: statement_timeout,
-            allocation_policy: CreditAllocationPolicy::default(),
-        }
-    }
-
     pub fn with_accounting_config(
         pool: DbPool,
         statement_timeout: Duration,
@@ -505,46 +497,6 @@ impl OrganizationUsageRepository {
             .collect()
     }
 
-    /// Get usage statistics for a time period
-    pub async fn get_usage_stats(
-        &self,
-        organization_id: Uuid,
-        start_date: chrono::DateTime<Utc>,
-        end_date: chrono::DateTime<Utc>,
-    ) -> Result<UsageStats> {
-        let row = retry_db!("get_organization_usage_stats", {
-            let client = self
-                .pool
-                .get()
-                .await
-                .context("Failed to get database connection")
-                .map_err(RepositoryError::PoolError)?;
-
-            client
-                .query_one(
-                    r#"
-                    SELECT
-                        COUNT(*) as request_count,
-                        SUM(total_tokens) as total_tokens,
-                        SUM(total_cost) as total_cost
-                    FROM organization_usage_log
-                    WHERE organization_id = $1
-                      AND created_at >= $2
-                      AND created_at <= $3
-                    "#,
-                    &[&organization_id, &start_date, &end_date],
-                )
-                .await
-                .map_err(map_db_error)
-        })?;
-
-        Ok(UsageStats {
-            request_count: row.get::<_, i64>(0),
-            total_tokens: row.get::<_, Option<i64>>(1).unwrap_or(0),
-            total_cost: row.get::<_, Option<i64>>(2).unwrap_or(0),
-        })
-    }
-
     /// Aggregate usage by model for an organization over the closed UTC hours since
     /// `since` (spec §6.1): `[trunc_hour(since), trunc_hour(now))` from `usage_hourly`.
     /// Returns the served start with the rows; the open current hour is never aggregated.
@@ -804,13 +756,6 @@ impl OrganizationUsageRepository {
             )
             .collect())
     }
-}
-
-#[derive(Debug, Clone)]
-pub struct UsageStats {
-    pub request_count: i64,
-    pub total_tokens: i64,
-    pub total_cost: i64,
 }
 
 #[derive(Debug, Clone)]

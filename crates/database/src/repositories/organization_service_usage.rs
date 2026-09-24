@@ -42,14 +42,6 @@ impl OrganizationServiceUsageRepository {
         }
     }
 
-    pub fn with_reporting_statement_timeout(pool: DbPool, statement_timeout: Duration) -> Self {
-        Self {
-            pool,
-            reporting_statement_timeout: statement_timeout,
-            allocation_policy: CreditAllocationPolicy::default(),
-        }
-    }
-
     pub fn with_accounting_config(
         pool: DbPool,
         statement_timeout: Duration,

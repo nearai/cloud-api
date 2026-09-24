@@ -1,6 +1,6 @@
 use crate::{
     conversions::authenticated_user_to_user_id,
-    middleware::{auth::AuthenticatedApiKey, AuthenticatedUser},
+    middleware::AuthenticatedUser,
     models::{
         ApiKeyResponse, CreateApiKeyRequest, ErrorResponse, ListApiKeysResponse,
         UpdateApiKeyRequest, UpdateApiKeySpendLimitRequest,
@@ -982,62 +982,6 @@ pub async fn revoke_workspace_api_key(
     let user_id = authenticated_user_to_user_id(user.clone());
     let workspace_id_typed = services::workspace::WorkspaceId(workspace_id);
     let api_key_id_typed = services::workspace::ApiKeyId(api_key_id.to_string());
-
-    // Revoke API key using service (includes permission checking and validation)
-    match app_state
-        .workspace_service
-        .revoke_api_key(workspace_id_typed, api_key_id_typed, user_id)
-        .await
-    {
-        Ok(true) => Ok(StatusCode::NO_CONTENT),
-        Ok(false) | Err(services::workspace::WorkspaceError::NotFound) => Err((
-            StatusCode::NOT_FOUND,
-            Json(ErrorResponse::new(
-                "Workspace not found".to_string(),
-                "not_found".to_string(),
-            )),
-        )),
-        Err(services::workspace::WorkspaceError::ApiKeyNotFound) => Err((
-            StatusCode::NOT_FOUND,
-            Json(ErrorResponse::new(
-                "API key not found".to_string(),
-                "not_found".to_string(),
-            )),
-        )),
-        Err(services::workspace::WorkspaceError::Unauthorized(msg)) => Err((
-            StatusCode::FORBIDDEN,
-            Json(ErrorResponse::new(msg, "forbidden".to_string())),
-        )),
-        Err(_) => {
-            error!("Failed to revoke API key");
-            Err((
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ErrorResponse::new(
-                    "Failed to revoke API key".to_string(),
-                    "internal_server_error".to_string(),
-                )),
-            ))
-        }
-    }
-}
-
-/// Revoke API key using workspace context from middleware
-///
-/// This route uses the workspace context from authenticated API keys to validate
-/// and revoke keys. Used when the API key itself provides workspace context.
-pub async fn revoke_api_key_with_context(
-    State(app_state): State<AppState>,
-    Extension(api_key_context): Extension<AuthenticatedApiKey>,
-    Path(api_key_id): Path<Uuid>,
-) -> Result<StatusCode, (StatusCode, Json<ErrorResponse>)> {
-    debug!(
-        "Revoking API key: {} with workspace context: {}",
-        api_key_id, api_key_context.workspace.id.0
-    );
-
-    let workspace_id_typed = api_key_context.workspace.id.clone();
-    let api_key_id_typed = services::workspace::ApiKeyId(api_key_id.to_string());
-    let user_id = api_key_context.api_key.created_by_user_id.clone();
 
     // Revoke API key using service (includes permission checking and validation)
     match app_state

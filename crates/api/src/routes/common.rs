@@ -599,8 +599,8 @@ pub fn map_organization_error(
 }
 
 /// Maps an analytics service error to its HTTP response (spec §6.3). A statement-budget
-/// cancellation is a 504 with a structured body, like `reporting_request_timeout`. Admins
-/// see the internal error text in a 500; customers see only `failure`.
+/// cancellation is a 504 with a structured body, like `reporting_request_timeout`. Every
+/// other error is a 500: admins see the internal error text, customers see only `failure`.
 pub fn analytics_error_response(
     error: services::admin::AdminError,
     failure: &str,
@@ -613,13 +613,6 @@ pub fn analytics_error_response(
             ResponseJson(ErrorResponse::new(
                 "Analytics request timed out".to_string(),
                 "analytics_request_timeout".to_string(),
-            )),
-        ),
-        services::admin::AdminError::OrganizationNotFound(message) => (
-            StatusCode::NOT_FOUND,
-            ResponseJson(ErrorResponse::new(
-                message,
-                "organization_not_found".to_string(),
             )),
         ),
         other => {

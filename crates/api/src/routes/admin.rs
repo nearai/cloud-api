@@ -2419,11 +2419,9 @@ fn admin_error_to_response(
             StatusCode::UNAUTHORIZED,
             ResponseJson(ErrorResponse::new(msg, "unauthorized".to_string())),
         ),
-        services::admin::AdminError::Timeout => analytics_error_response(
-            services::admin::AdminError::Timeout,
-            "Admin operation failed",
-            true,
-        ),
+        err @ services::admin::AdminError::Timeout => {
+            analytics_error_response(err, "Admin operation failed", true)
+        }
         services::admin::AdminError::InternalError(msg) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             ResponseJson(ErrorResponse::new(
@@ -3768,8 +3766,8 @@ fn parse_metrics_credit_type(
 ///
 /// Without `credit_type`, served from the hourly usage aggregate: the range widens to whole
 /// UTC hours and the widened range is echoed; figures lag by up to ~65 minutes and exclude
-/// the current hour; percentiles across hours are count-weighted approximations. With
-/// `credit_type`, figures are live and exact over the requested range.
+/// the current hour; percentiles across hours are approximate (sample-weighted means of
+/// hourly percentiles). With `credit_type`, figures are live and exact over the requested range.
 #[utoipa::path(
     get,
     path = "/v1/admin/organizations/{org_id}/metrics",
@@ -3847,7 +3845,7 @@ pub async fn get_organization_metrics(
 ///
 /// Served from the hourly usage aggregate: the range widens to whole UTC hours and the
 /// widened range is echoed. Figures lag by up to ~65 minutes and exclude the current hour;
-/// percentiles across hours are count-weighted approximations.
+/// percentiles across hours are approximate (sample-weighted means of hourly percentiles).
 #[utoipa::path(
     get,
     path = "/v1/admin/platform/metrics",
@@ -3902,7 +3900,7 @@ pub async fn get_platform_metrics(
 ///
 /// Served from the hourly usage aggregate: the range widens to whole UTC hours and the
 /// widened range is echoed. Figures lag by up to ~65 minutes and exclude the current hour;
-/// percentiles across hours are count-weighted approximations.
+/// percentiles across hours are approximate (sample-weighted means of hourly percentiles).
 #[utoipa::path(
     get,
     path = "/v1/admin/platform/metrics/timeseries",
@@ -4034,7 +4032,7 @@ pub struct ModelRevenueQueryParams {
 ///
 /// Served from the hourly usage aggregate: the range widens to whole UTC hours and the
 /// widened range is echoed. Figures lag by up to ~65 minutes and exclude the current hour;
-/// percentiles across hours are count-weighted approximations.
+/// percentiles across hours are approximate (sample-weighted means of hourly percentiles).
 #[utoipa::path(
     get,
     path = "/v1/admin/platform/model-revenue",
@@ -4134,7 +4132,7 @@ pub struct OrgRevenueQueryParams {
 ///
 /// Served from the hourly usage aggregate: the range widens to whole UTC hours and the
 /// widened range is echoed. Figures lag by up to ~65 minutes and exclude the current hour;
-/// percentiles across hours are count-weighted approximations.
+/// percentiles across hours are approximate (sample-weighted means of hourly percentiles).
 #[utoipa::path(
     get,
     path = "/v1/admin/platform/org-revenue",
@@ -4288,7 +4286,7 @@ pub struct PerformanceTimeseriesParams {
 ///
 /// Served from the hourly usage aggregate: the range widens to whole UTC hours and the
 /// widened range is echoed. Figures lag by up to ~65 minutes and exclude the current hour;
-/// percentiles across hours are count-weighted approximations.
+/// percentiles across hours are approximate (sample-weighted means of hourly percentiles).
 #[utoipa::path(
     get,
     path = "/v1/admin/platform/model-consumption-timeseries",
@@ -4358,7 +4356,7 @@ pub async fn get_model_consumption_timeseries(
 ///
 /// Served from the hourly usage aggregate: the range widens to whole UTC hours and the
 /// widened range is echoed. Figures lag by up to ~65 minutes and exclude the current hour;
-/// percentiles across hours are count-weighted approximations.
+/// percentiles across hours are approximate (sample-weighted means of hourly percentiles).
 #[utoipa::path(
     get,
     path = "/v1/admin/platform/performance-timeseries",
@@ -4484,8 +4482,8 @@ pub async fn get_revenue_density(
 ///
 /// Without `credit_type`, served from the hourly usage aggregate: the range widens to whole
 /// UTC hours and the widened range is echoed; figures lag by up to ~65 minutes and exclude
-/// the current hour; percentiles across hours are count-weighted approximations. With
-/// `credit_type`, figures are live and exact over the requested range.
+/// the current hour; percentiles across hours are approximate (sample-weighted means of
+/// hourly percentiles). With `credit_type`, figures are live and exact over the requested range.
 #[utoipa::path(
     get,
     path = "/v1/admin/organizations/{org_id}/metrics/timeseries",

@@ -58,11 +58,11 @@ pub struct ModelMetrics {
     pub cache_read_tokens: i64,
     /// Average time to first token in milliseconds
     pub avg_ttft_ms: Option<f64>,
-    /// 95th percentile time to first token in milliseconds (approx.: per-hour values weighted by sample count; exact with credit_type)
+    /// 95th percentile time to first token in milliseconds (approx. across hours: sample-weighted mean of hourly p95s; exact with credit_type)
     pub p95_ttft_ms: Option<f64>,
     /// Average inter-token latency in milliseconds
     pub avg_itl_ms: Option<f64>,
-    /// 95th percentile inter-token latency in milliseconds (approx.: per-hour values weighted by sample count; exact with credit_type)
+    /// 95th percentile inter-token latency in milliseconds (approx. across hours: sample-weighted mean of hourly p95s; exact with credit_type)
     pub p95_itl_ms: Option<f64>,
     /// Cost in USD
     pub cost_usd: f64,
@@ -126,7 +126,7 @@ pub struct PlatformMetrics {
     pub provider_error_or_timeout_rate: f64,
     /// Share of requests whose stop_reason is incomplete, 0.0-1.0
     pub incomplete_stream_rate: f64,
-    /// 95th percentile time-to-first-token across the platform (ms; approx.: per-hour values weighted by sample count)
+    /// 95th percentile time-to-first-token across the platform (ms; approx. across hours: sample-weighted mean of hourly p95s)
     pub p95_ttft_ms: Option<f64>,
     pub provider_usage: PlatformProviderUsage,
     pub top_models: Vec<TopModelMetrics>,
@@ -245,7 +245,7 @@ pub struct ModelRevenueEntry {
     pub verifiable: bool,
     pub provider_type: Option<String>,
     pub avg_ttft_ms: Option<f64>,
-    /// Approx.: per-hour p95 values weighted by sample count.
+    /// Approx. across hours: sample-weighted mean of hourly p95s.
     pub p95_ttft_ms: Option<f64>,
     pub served_provider_breakdown: Vec<ModelProviderRevenueBreakdown>,
     pub fallback_requests: i64,
@@ -455,11 +455,11 @@ pub struct PerformancePoint {
     /// Number of requests with ttft_ms recorded (streaming only). Use this as the
     /// denominator when interpreting TTFT percentiles.
     pub ttft_sample_count: i64,
-    /// 50th-percentile TTFT, ms (streaming requests only; None if no samples). Approx. across hours: per-hour values weighted by sample count.
+    /// 50th-percentile TTFT, ms (streaming requests only; None if no samples). Approx. across hours: sample-weighted mean of hourly p50s.
     pub p50_ttft_ms: Option<f64>,
-    /// 95th-percentile TTFT, ms (streaming requests only; None if no samples). Approx. across hours: per-hour values weighted by sample count.
+    /// 95th-percentile TTFT, ms (streaming requests only; None if no samples). Approx. across hours: sample-weighted mean of hourly p95s.
     pub p95_ttft_ms: Option<f64>,
-    /// 99th-percentile TTFT, ms (streaming requests only; None if no samples). Approx. across hours: per-hour values weighted by sample count.
+    /// 99th-percentile TTFT, ms (streaming requests only; None if no samples). Approx. across hours: sample-weighted mean of hourly p99s.
     pub p99_ttft_ms: Option<f64>,
     /// stop_reason IN ('provider_error','timeout','incomplete') / requests WHERE stop_reason IS NOT NULL.
     /// Excludes pre-V0037 rows (stop_reason IS NULL) from both numerator and denominator.

@@ -1,9 +1,11 @@
 //! `total` on the paginated revenue reports must count every matching group,
 //! on any page and under the HAVING-based `paying` filter.
 use crate::admin_provider_attribution_support::{
-    setup_platform_provider_usage_fixture, PlatformProviderUsageFixture,
+    isolated_provider_usage_window, isolated_usage_hours, setup_platform_provider_usage_fixture,
+    PlatformProviderUsageFixture,
 };
 use crate::common::*;
+use crate::usage_hourly::{insert_raw, recompute_usage_hours};
 use chrono::{DateTime, Utc};
 use database::repositories::PgAnalyticsRepository;
 use services::admin::{
@@ -102,6 +104,11 @@ async fn org_revenue_total_counts_matching_orgs_on_every_page() {
     let first = org_with_usage(&fixture, &tag, "a", 3 * USD, at).await;
     let second = org_with_usage(&fixture, &tag, "b", 2 * USD, at).await;
     let third = org_with_usage(&fixture, &tag, "c", USD, at).await;
+    recompute_usage_hours(
+        services::usage::trunc_hour(at),
+        services::usage::trunc_hour(at) + chrono::Duration::hours(1),
+    )
+    .await;
     fixture
         .database
         .pool()
@@ -174,4 +181,152 @@ async fn revenue_reports_total_zero_when_nothing_matches() {
         .expect("model revenue");
     assert!(models.data.is_empty());
     assert_eq!(models.total, 0);
+}
+
+fn assert_close(actual: Option<f64>, expected: f64) {
+    let actual = actual.expect("value present");
+    assert!((actual - expected).abs() < 1e-6, "{actual} != {expected}");
+}
+
+#[tokio::test]
+async fn model_and_org_revenue_serve_usage_hourly_over_whole_hours() {
+    let fixture = setup_platform_provider_usage_fixture().await;
+    let tag = format!("revenue-hourly-{}", Uuid::new_v4().simple());
+    fixture
+        .database
+        .pool()
+        .get()
+        .await
+        .expect("db connection")
+        .execute(
+            "UPDATE organizations SET name = $2 WHERE id = $1",
+            &[&fixture.organization_id, &tag],
+        )
+        .await
+        .expect("rename organization");
+    let (h, slot_end) = isolated_usage_hours(&fixture, 2).await;
+    for (minutes, cost, ttft, provider) in [
+        (10, USD, 100, "external"),
+        (20, 2 * USD, 200, "external"),
+        (70, 4 * USD, 1000, "chutes"),
+    ] {
+        insert_raw(
+            &fixture,
+            h + chrono::Duration::minutes(minutes),
+            cost,
+            10,
+            Some(ttft),
+            None,
+            Some(provider),
+        )
+        .await;
+    }
+    recompute_usage_hours(h, slot_end).await;
+    let repository = PgAnalyticsRepository::new(fixture.database.pool().clone());
+    // Sub-hour bounds widen to [h, h + 2h) (spec §6.1).
+    let (start, end) = (
+        h + chrono::Duration::minutes(15),
+        h + chrono::Duration::minutes(75),
+    );
+
+    let models = repository
+        .get_model_revenue(ModelRevenueQuery {
+            start,
+            end,
+            verifiable: None,
+            provider_type: None,
+            model_search: Some(fixture.model_name.clone()),
+            sort: RevenueSort::Revenue,
+            limit: 10,
+            offset: 0,
+        })
+        .await
+        .expect("model revenue");
+    assert_eq!(
+        (models.period_start, models.period_end),
+        (h, h + chrono::Duration::hours(2))
+    );
+    assert_eq!(models.total, 1);
+    let entry = &models.data[0];
+    assert_eq!(
+        (entry.requests, entry.tokens, entry.unique_orgs),
+        (3, 30, 1)
+    );
+    assert_eq!(entry.consumed_cost_usd, 7.0);
+    // Hour h: p95 of [100, 200] = 195 over 2 samples; hour h+1: 1000 over 1 sample.
+    assert_close(entry.avg_ttft_ms, 1300.0 / 3.0);
+    assert_close(entry.p95_ttft_ms, 1390.0 / 3.0);
+    let chutes: Vec<_> = entry
+        .served_provider_breakdown
+        .iter()
+        .filter(|b| b.provider_type.as_deref() == Some("chutes"))
+        .collect();
+    assert_eq!(chutes.len(), 1);
+    assert_eq!(chutes[0].requests, 1);
+
+    let orgs = repository
+        .get_org_revenue(OrgRevenueQuery {
+            start,
+            end,
+            paying: None,
+            search: Some(tag),
+            sort: RevenueSort::Revenue,
+            limit: 10,
+            offset: 0,
+        })
+        .await
+        .expect("org revenue");
+    assert_eq!(
+        (orgs.period_start, orgs.period_end),
+        (h, h + chrono::Duration::hours(2))
+    );
+    assert_eq!(orgs.total, 1);
+    assert_eq!(orgs.data[0].organization_id, fixture.organization_id);
+    assert_eq!((orgs.data[0].requests, orgs.data[0].models_used), (3, 1));
+    assert_eq!(
+        orgs.data[0].last_usage_at,
+        Some(h + chrono::Duration::minutes(70)),
+        "last usage stays an exact instant"
+    );
+}
+
+/// Platform-global sums: runs under a serialized nextest override, so no other test writes
+/// between the two reads.
+#[tokio::test]
+async fn serial_billing_summary_inference_split_reads_usage_hourly() {
+    let fixture = setup_platform_provider_usage_fixture().await;
+    let (hour, end) = isolated_provider_usage_window(&fixture).await;
+    insert_raw(
+        &fixture,
+        hour + chrono::Duration::minutes(1),
+        7 * USD,
+        1,
+        None,
+        None,
+        Some("external"),
+    )
+    .await;
+    let repository = PgAnalyticsRepository::new(fixture.database.pool().clone());
+
+    let before = repository
+        .get_billing_summary()
+        .await
+        .expect("billing summary");
+    recompute_usage_hours(hour, end).await;
+    let after = repository
+        .get_billing_summary()
+        .await
+        .expect("billing summary");
+
+    assert!(
+        (after.inference_consumed_usd - before.inference_consumed_usd - 7.0).abs() < 1e-6,
+        "inference split moves with usage_hourly: {} -> {}",
+        before.inference_consumed_usd,
+        after.inference_consumed_usd
+    );
+    assert_eq!(after.service_consumed_usd, before.service_consumed_usd);
+    assert_eq!(
+        after.total_consumed_usd, before.total_consumed_usd,
+        "total stays on the live organization_balance (spec §6.2, §6.4)"
+    );
 }

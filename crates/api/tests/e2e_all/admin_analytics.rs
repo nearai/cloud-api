@@ -1115,6 +1115,7 @@ async fn test_admin_platform_model_revenue() {
     record_model_revenue_usage(&server, &api_key, lower_revenue_model).await;
     record_model_revenue_usage(&server, &api_key, higher_revenue_model).await;
     record_model_revenue_usage(&server, &api_key, higher_revenue_model).await;
+    crate::usage_hourly::recompute_recent_usage().await;
 
     let model_revenue_url = format!("/v1/admin/platform/model-revenue?model_search={model_search}");
     let response = server
@@ -1166,8 +1167,6 @@ async fn test_admin_platform_model_revenue() {
     assert_eq!(paged.total, 2);
     assert_eq!(paged.data[0].model_name, *higher_revenue_model);
     assert_eq!(paged.data[0].requests, 2);
-
-    println!("✅ Platform model-revenue works, sorts, and paginates");
 }
 
 #[tokio::test]
@@ -1199,6 +1198,7 @@ async fn test_admin_platform_org_revenue() {
         }))
         .await;
     assert_eq!(response.status_code(), 200);
+    crate::usage_hourly::recompute_recent_usage().await;
 
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
     let query_start = (chrono::Utc::now() - chrono::Duration::minutes(5))
@@ -1295,8 +1295,6 @@ async fn test_admin_platform_org_revenue() {
         prev = o.consumed_cost_usd;
     }
     assert!(report.total >= report.data.len() as i64);
-
-    println!("✅ Platform org-revenue works, reconciles, and paginates");
 }
 
 #[tokio::test]
@@ -1388,6 +1386,7 @@ async fn test_admin_platform_model_revenue_offset_beyond_total() {
     let api_key = get_api_key_for_org(&server, org.id.clone()).await;
 
     record_model_revenue_usage(&server, &api_key, model_name).await;
+    crate::usage_hourly::recompute_recent_usage().await;
 
     let model_revenue_path =
         format!("/v1/admin/platform/model-revenue?limit=10&offset=0&model_search={model_search}");
@@ -1427,6 +1426,4 @@ async fn test_admin_platform_model_revenue_offset_beyond_total() {
         serde_json::from_str(&resp.text()).expect("parse ModelRevenueReport");
     assert!(report.data.is_empty(), "page beyond end should be empty");
     assert_eq!(report.total, 1, "total must reflect the matching model");
-
-    println!("✅ model-revenue reports correct total on an out-of-range page");
 }

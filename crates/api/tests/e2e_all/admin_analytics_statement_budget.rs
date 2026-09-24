@@ -56,6 +56,7 @@ async fn every_analytics_report_is_cancelled_at_the_statement_budget() {
             "models",
             "organization_limits_history",
             "organization_usage_log",
+            "usage_hourly",
         ],
         0.5,
     )

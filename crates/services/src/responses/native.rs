@@ -286,6 +286,7 @@ impl Billing {
         let id = usage.id.clone();
         if let Some(tokens) = usage.tokens {
             let request = RecordUsageServiceRequest {
+                discount: None,
                 organization_id: self.organization_id,
                 workspace_id: self.workspace_id,
                 api_key_id: self.api_key_id,

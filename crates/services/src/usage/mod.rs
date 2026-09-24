@@ -427,6 +427,23 @@ impl UsageServiceTrait for UsageServiceImpl {
             }
         };
 
+        // A reporter-supplied discount is applied after pricing so every SKU
+        // (input, cache read/write, output, image) gets the same multiplier,
+        // and the list amounts stay in `billing_details` for auditing.
+        let (input_cost, output_cost, total_cost, billing_details) = match request.discount {
+            Some(discount) => {
+                let discounted =
+                    discount.apply_to_costs(input_cost, output_cost, billing_details)?;
+                (
+                    discounted.input_cost,
+                    discounted.output_cost,
+                    discounted.total_cost,
+                    Some(discounted.billing_details),
+                )
+            }
+            None => (input_cost, output_cost, total_cost, billing_details),
+        };
+
         // Create database request with model UUID and name (denormalized).
         // Note: `cache_read_tokens` is persisted for observability across all inference types,
         // but it currently only affects billing for token-based chat-style models. For other
@@ -535,6 +552,7 @@ impl UsageServiceTrait for UsageServiceImpl {
         workspace_id: Uuid,
         api_key_id: Uuid,
         request: RecordUsageApiRequest,
+        discount: Option<UsageDiscount>,
     ) -> Result<UsageLogEntry, UsageError> {
         let (
             model_name,
@@ -736,6 +754,7 @@ impl UsageServiceTrait for UsageServiceImpl {
             response_id: None,
             image_count,
             provider_attribution,
+            discount,
         };
 
         self.record_usage(service_request).await
@@ -1034,6 +1053,112 @@ mod tests {
 
     fn unwrap_cost(result: Result<CostBreakdown, UsageError>) -> CostBreakdown {
         result.expect("cost calculation should not overflow in this test")
+    }
+
+    fn discount(fraction: f64) -> super::UsageDiscount {
+        super::UsageDiscount::from_fraction(fraction)
+            .expect("valid fraction")
+            .expect("non-zero discount")
+    }
+
+    #[test]
+    fn usage_discount_parses_fractions_to_basis_points() {
+        assert_eq!(discount(0.2).basis_points(), 2_000);
+        assert_eq!(discount(0.15).basis_points(), 1_500);
+        assert_eq!(discount(0.0001).basis_points(), 1);
+        assert_eq!(discount(0.9999).basis_points(), 9_999);
+        assert_eq!(discount(0.2).fraction(), 0.2);
+        // Zero is "no discount", not a discount of zero.
+        assert_eq!(super::UsageDiscount::from_fraction(0.0).unwrap(), None);
+    }
+
+    #[test]
+    fn usage_discount_rejects_unusable_fractions() {
+        for bad in [1.0, 2.0, -0.2, f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            assert!(
+                matches!(
+                    super::UsageDiscount::from_fraction(bad),
+                    Err(UsageError::ValidationError(_))
+                ),
+                "{bad}"
+            );
+        }
+        // Finer than a basis point would silently bill a different rate.
+        assert!(matches!(
+            super::UsageDiscount::from_fraction(0.12345),
+            Err(UsageError::ValidationError(_))
+        ));
+        // Below 1 but rounding to 10_000 bp would record free rows.
+        assert!(matches!(
+            super::UsageDiscount::from_fraction(0.999_999_999_95),
+            Err(UsageError::ValidationError(_))
+        ));
+        assert!(matches!(
+            super::UsageDiscount::from_fraction(0.99995),
+            Err(UsageError::ValidationError(_))
+        ));
+    }
+
+    #[test]
+    fn usage_discount_rounds_half_up_in_nano_dollars() {
+        // The GLM 5.3 Flash list rates (nano-dollars per token) at 20% off.
+        assert_eq!(discount(0.2).apply(150).unwrap(), 120);
+        assert_eq!(discount(0.2).apply(500).unwrap(), 400);
+        assert_eq!(discount(0.2).apply(35).unwrap(), 28);
+        // 15% off 35 = 29.75 → 30; half up: 50% of 1 = 0.5 → 1, 50% of 3 = 1.5 → 2.
+        assert_eq!(discount(0.15).apply(35).unwrap(), 30);
+        assert_eq!(discount(0.5).apply(1).unwrap(), 1);
+        assert_eq!(discount(0.5).apply(3).unwrap(), 2);
+        assert_eq!(discount(0.2).apply(0).unwrap(), 0);
+        // Large amounts do not overflow the intermediate product.
+        assert_eq!(
+            discount(0.2).apply(i64::MAX).unwrap(),
+            7_378_697_629_483_820_646
+        );
+        assert!(matches!(
+            discount(0.2).apply(-1),
+            Err(UsageError::ValidationError(_))
+        ));
+    }
+
+    #[test]
+    fn usage_discount_records_list_amounts_in_billing_details() {
+        let discounted = discount(0.2)
+            .apply_to_costs(100_000_000, 100_000_000, None)
+            .unwrap();
+        assert_eq!(discounted.input_cost, 80_000_000);
+        assert_eq!(discounted.output_cost, 80_000_000);
+        assert_eq!(discounted.total_cost, 160_000_000);
+        assert_eq!(
+            discounted.billing_details,
+            serde_json::json!({
+                "discount": {
+                    "discount_to_user": 0.2,
+                    "basis_points": 2000,
+                    "list_input_cost": 100_000_000i64,
+                    "list_output_cost": 100_000_000i64,
+                    "list_total_cost": 200_000_000i64,
+                }
+            })
+        );
+    }
+
+    #[test]
+    fn usage_discount_merges_into_an_existing_pricing_snapshot() {
+        let snapshot = serde_json::json!({ "actual_tier": "default", "context_band": "short" });
+        let discounted = discount(0.25)
+            .apply_to_costs(400, 0, Some(snapshot))
+            .unwrap();
+        assert_eq!(discounted.input_cost, 300);
+        assert_eq!(discounted.output_cost, 0);
+        assert_eq!(discounted.total_cost, 300);
+        assert_eq!(discounted.billing_details["actual_tier"], "default");
+        assert_eq!(discounted.billing_details["context_band"], "short");
+        assert_eq!(discounted.billing_details["discount"]["basis_points"], 2500);
+        assert_eq!(
+            discounted.billing_details["discount"]["list_total_cost"],
+            400
+        );
     }
 
     #[test]

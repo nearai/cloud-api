@@ -44,7 +44,23 @@ async fn api_key_list_inference_usage_is_exact_without_waiting_for_the_rollup() 
 
     // A row that lands in an already-settled hour (older than the re-read window) is served
     // from usage_hourly, so it counts once that hour is recomputed (the admin repair path).
-    let (hour, hour_end) = isolated_usage_hours(&fixture, 1).await;
+    // Aggregating the slot's second hour first puts `hour` below the watermark no matter
+    // what the shared database already holds.
+    let (hour, slot_end) = isolated_usage_hours(&fixture, 2).await;
+    let hour_end = hour + Duration::hours(1);
+    insert_raw(
+        &fixture,
+        hour_end + Duration::minutes(5),
+        1_000_000_000,
+        1,
+        None,
+        None,
+        Some("external"),
+    )
+    .await;
+    recompute_usage_hours(hour_end, slot_end).await;
+    assert_eq!(listed_usage(&fixture).await, Some(4_000_000_000));
+
     insert_raw(
         &fixture,
         hour + Duration::minutes(5),
@@ -55,7 +71,7 @@ async fn api_key_list_inference_usage_is_exact_without_waiting_for_the_rollup() 
         Some("external"),
     )
     .await;
-    assert_eq!(listed_usage(&fixture).await, Some(3_000_000_000));
+    assert_eq!(listed_usage(&fixture).await, Some(4_000_000_000));
     recompute_usage_hours(hour, hour_end).await;
-    assert_eq!(listed_usage(&fixture).await, Some(8_000_000_000));
+    assert_eq!(listed_usage(&fixture).await, Some(9_000_000_000));
 }

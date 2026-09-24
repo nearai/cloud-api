@@ -31,19 +31,15 @@ impl ReportingUsageSummaryState {
 /// Summarize organization usage and costs.
 ///
 /// Requires a reporting token scoped to the organization in the path. Totals
-/// include inference and platform service usage by default. Without `credit_type`, the
-/// range widens to whole UTC hours and the served range is echoed (`end_time` stays
-/// inclusive, ending 1 µs before the next hour); inference figures lag by up to ~65
-/// minutes and exclude the current hour. With `credit_type`, or for `source=service`, the
-/// requested range is served exactly and live.
+/// include inference and platform service usage by default.
 #[utoipa::path(
     get,
     path = "/v1/organizations/{org_id}/usage/summary",
     tag = "Reporting",
     params(
         ("org_id" = Uuid, Path, description = "Organization ID"),
-        ("start_time" = Option<String>, Query, description = "Inclusive RFC3339 start timestamp. Defaults to 366 days before the effective end_time. Rounded down to the UTC hour unless credit_type is set or source=service."),
-        ("end_time" = Option<String>, Query, description = "Inclusive RFC3339 end timestamp. Defaults to the request time. The effective range must not exceed 366 days. Extended to the end of its UTC hour unless credit_type is set or source=service."),
+        ("start_time" = Option<String>, Query, description = "Inclusive RFC3339 start timestamp. Defaults to 366 days before the effective end_time."),
+        ("end_time" = Option<String>, Query, description = "Inclusive RFC3339 end timestamp. Defaults to the request time. The effective range must not exceed 366 days."),
         ("source" = Option<ReportingUsageSource>, Query, description = "Usage source to summarize. Defaults to all."),
         ("workspace_id" = Option<Uuid>, Query, description = "Filter by workspace ID."),
         ("api_key_id" = Option<Uuid>, Query, description = "Filter by API key ID."),
@@ -91,8 +87,9 @@ pub async fn summary_usage(
         })?;
 
     Ok(Json(super::summary_merge::summary_response(
-        query.source,
-        summary,
+        query,
+        summary.inference,
+        summary.service,
     )))
 }
 

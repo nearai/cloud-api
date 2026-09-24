@@ -21,14 +21,18 @@ const READ_TIMEOUT: Duration = Duration::from_secs(30);
 /// workers for serving traffic.
 const SINGLE_WORKER: &str = "SET LOCAL max_parallel_workers_per_gather = 0";
 
-const RECOMPUTE_INSERT: &str = r#"
-INSERT INTO usage_hourly (
-    hour, organization_id, workspace_id, api_key_id, model_id, model_name,
-    inference_type, served_provider_type, served_provider_tier, served_via_fallback,
-    request_count, input_tokens, output_tokens, cache_read_tokens, total_tokens, total_cost,
-    error_count, incomplete_count, stop_reason_count,
-    ttft_count, ttft_sum_ms, ttft_p50_ms, ttft_p95_ms, ttft_p99_ms,
-    itl_count, itl_sum_ms, itl_p95_ms, last_usage_at)
+/// usage_hourly's columns in table order; `RAW_HOURLY_SELECT` produces the same shape.
+const USAGE_HOURLY_COLUMNS: &str = "hour, organization_id, workspace_id, api_key_id, model_id, \
+    model_name, inference_type, served_provider_type, served_provider_tier, served_via_fallback, \
+    request_count, input_tokens, output_tokens, cache_read_tokens, total_tokens, total_cost, \
+    error_count, incomplete_count, stop_reason_count, \
+    ttft_count, ttft_sum_ms, ttft_p50_ms, ttft_p95_ms, ttft_p99_ms, \
+    itl_count, itl_sum_ms, itl_p95_ms, last_usage_at";
+
+/// One usage_hourly row per UTC hour and grain from raw rows; callers add FROM, WHERE and
+/// `GROUP BY 1..10`. The recompute and `usage_rows_cte` share it, so aggregate hours and
+/// raw-served hours can never disagree.
+const RAW_HOURLY_SELECT: &str = r#"
 SELECT
     date_trunc('hour', created_at, 'UTC'), organization_id, workspace_id, api_key_id, model_id, model_name,
     inference_type, served_provider_type, served_provider_tier, served_via_fallback,
@@ -46,10 +50,59 @@ SELECT
     COUNT(avg_itl_ms), COALESCE(SUM(avg_itl_ms), 0)::DOUBLE PRECISION,
     PERCENTILE_CONT(0.95) WITHIN GROUP (ORDER BY avg_itl_ms),
     MAX(created_at)
-FROM organization_usage_log
-WHERE created_at >= $1 AND created_at < $2
-GROUP BY 1, 2, 3, 4, 5, 6, 7, 8, 9, 10
 "#;
+
+fn recompute_insert() -> String {
+    format!(
+        "INSERT INTO usage_hourly ({USAGE_HOURLY_COLUMNS}) {RAW_HOURLY_SELECT} \
+         FROM organization_usage_log WHERE created_at >= $1 AND created_at < $2 \
+         GROUP BY 1, 2, 3, 4, 5, 6, 7, 8, 9, 10"
+    )
+}
+
+/// CTEs `usage_bounds, usage_rows`: rows shaped like usage_hourly that cover exactly
+/// `[start, end)` (SQL expressions, usually `$n` parameters). Whole hours below the
+/// watermark come from usage_hourly; the partial edge hours and everything at or after the
+/// watermark come from raw rows grouped by `RAW_HOURLY_SELECT`. The watermark is the earlier
+/// of the last computed hour + 1h and the start of the scheduler's re-read window, so sums,
+/// counts and costs equal a raw read of the same range; only cross-hour percentiles are
+/// approximate. Raw reads are bounded to the edges plus the re-read tail (an empty aggregate,
+/// as during catch-up, reads the whole range raw). Readers select from `usage_rows` without
+/// a time predicate of their own.
+fn usage_rows_cte(start: &str, end: &str) -> String {
+    let reread_hours = services::usage::REREAD_HOURS;
+    format!(
+        r#"usage_bounds AS MATERIALIZED (
+    SELECT agg_from,
+           GREATEST(agg_from, LEAST(date_trunc('hour', ({end})::timestamptz, 'UTC'), watermark)) AS agg_to
+    FROM (
+        SELECT LEAST(
+                   CASE WHEN date_trunc('hour', ({start})::timestamptz, 'UTC') = ({start})::timestamptz
+                        THEN ({start})::timestamptz
+                        ELSE date_trunc('hour', ({start})::timestamptz, 'UTC') + INTERVAL '1 hour'
+                   END,
+                   ({end})::timestamptz) AS agg_from,
+               LEAST(COALESCE((SELECT MAX(hour) FROM usage_hourly) + INTERVAL '1 hour',
+                              '-infinity'::timestamptz),
+                     date_trunc('hour', now(), 'UTC') - INTERVAL '{reread_hours} hours') AS watermark
+    ) bounds
+),
+usage_rows AS (
+    SELECT {USAGE_HOURLY_COLUMNS} FROM usage_hourly
+    WHERE hour >= (SELECT agg_from FROM usage_bounds) AND hour < (SELECT agg_to FROM usage_bounds)
+    UNION ALL
+    {RAW_HOURLY_SELECT}
+    FROM (
+        SELECT * FROM organization_usage_log
+        WHERE created_at >= ({start})::timestamptz AND created_at < (SELECT agg_from FROM usage_bounds)
+        UNION ALL
+        SELECT * FROM organization_usage_log
+        WHERE created_at >= (SELECT agg_to FROM usage_bounds) AND created_at < ({end})::timestamptz
+    ) raw
+    GROUP BY 1, 2, 3, 4, 5, 6, 7, 8, 9, 10
+)"#
+    )
+}
 
 const DAY_TOTALS_RAW: &str = r#"
 SELECT COUNT(*)::BIGINT AS request_count,
@@ -70,6 +123,16 @@ SELECT COALESCE(SUM(request_count), 0)::BIGINT AS request_count,
        COALESCE(SUM(incomplete_count), 0)::BIGINT AS incomplete_count
 FROM usage_hourly WHERE hour >= $1 AND hour < $2
 "#;
+
+/// `sql` with the `usage_rows` CTEs over `[start, end)` prepended, merged into `sql`'s own
+/// leading `WITH` when it has one.
+pub(crate) fn with_usage_rows(start: &str, end: &str, sql: &str) -> String {
+    let cte = usage_rows_cte(start, end);
+    match sql.trim_start().strip_prefix("WITH ") {
+        Some(rest) => format!("WITH {cte},\n{rest}"),
+        None => format!("WITH {cte}\n{sql}"),
+    }
+}
 
 pub struct UsageHourlyRepositoryImpl {
     pool: DbPool,
@@ -169,7 +232,7 @@ impl services::usage::ports::UsageHourlyRepository for UsageHourlyRepositoryImpl
         .await
         .map_err(map_db_error)?;
         let rows_written = tx
-            .execute(RECOMPUTE_INSERT, &[&from, &to])
+            .execute(&recompute_insert(), &[&from, &to])
             .await
             .map_err(map_db_error)?;
         tx.commit().await.map_err(map_db_error)?;

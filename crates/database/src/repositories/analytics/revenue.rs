@@ -1,8 +1,8 @@
 //! Revenue and billing reports for admin dashboards.
 
-use super::hour_range::hour_range;
 use super::{approx_percentile, arm, weighted_mean};
 use super::{nano_to_usd, pagination, provider_attribution};
+use crate::repositories::usage_hourly::with_usage_rows;
 use crate::repositories::utils::map_db_error;
 use chrono::Utc;
 use services::admin::{
@@ -74,18 +74,22 @@ pub(super) async fn get_billing_summary(
     let granted_org_count: i64 = limits_row.get(3);
 
     // All-time consumed cost. `total` comes from the live cached balance (all usage). The
-    // inference split sums usage_hourly, so it lags by up to ~65 minutes and excludes raw
+    // inference split sums `usage_rows` over all time (exact, like a raw sum) but excludes raw
     // rows V0045 deduplicated that the balance still counts (spec §6.2); the service split
     // is live raw. The splits therefore need not add up to the total.
     arm(tx, deadline).await?;
     let consumed_row = tx
         .query_one(
-            r#"
+            &with_usage_rows(
+                "'-infinity'::timestamptz",
+                "'infinity'::timestamptz",
+                r#"
             SELECT
                 (SELECT COALESCE(SUM(total_spent), 0) FROM organization_balance)::bigint as total_nano,
-                (SELECT COALESCE(SUM(total_cost), 0) FROM usage_hourly)::bigint as inference_nano,
+                (SELECT COALESCE(SUM(total_cost), 0) FROM usage_rows)::bigint as inference_nano,
                 (SELECT COALESCE(SUM(total_cost), 0) FROM organization_service_usage_log)::bigint as service_nano
             "#,
+            ),
             &[],
         )
         .await
@@ -142,14 +146,6 @@ pub(super) async fn get_model_revenue(
     deadline: Instant,
     query: ModelRevenueQuery,
 ) -> Result<ModelRevenueReport, RepositoryError> {
-    // usage_hourly holds whole UTC hours: serve and echo the widened range (spec §6.1).
-    let (start, end) = hour_range(query.start, query.end);
-    let query = ModelRevenueQuery {
-        start,
-        end,
-        ..query
-    };
-
     // Sort column from a fixed allowlist (never interpolate user input).
     let sort_col = match query.sort {
         RevenueSort::Revenue => "revenue_nano",
@@ -159,8 +155,7 @@ pub(super) async fn get_model_revenue(
     // Shared WHERE; optional filters via `$n::type IS NULL OR …`. `model_search`
     // is a case-insensitive substring (the `%…%` wrapping is the bind value).
     let where_clause = r#"
-        WHERE uh.hour >= $1 AND uh.hour < $2
-          AND ($3::bool IS NULL OR COALESCE(m.verifiable, false) = $3)
+        WHERE ($3::bool IS NULL OR COALESCE(m.verifiable, false) = $3)
           AND ($4::text IS NULL OR COALESCE(uh.served_provider_type, m.provider_type) = $4)
           AND ($5::text IS NULL OR uh.model_name ILIKE $5)
     "#;
@@ -168,8 +163,11 @@ pub(super) async fn get_model_revenue(
     let avg_ttft = weighted_mean("uh.ttft_sum_ms", "uh.ttft_count");
     let p95_ttft = approx_percentile("uh.ttft_p95_ms", "uh.ttft_count");
 
-    let data_sql = format!(
-        r#"
+    let data_sql = with_usage_rows(
+        "$1",
+        "$2",
+        &format!(
+            r#"
         SELECT
             uh.model_name,
             COALESCE(SUM(uh.total_cost), 0)::bigint as revenue_nano,
@@ -183,13 +181,14 @@ pub(super) async fn get_model_revenue(
             COALESCE(SUM(uh.request_count) FILTER (WHERE uh.served_via_fallback), 0)::bigint as fallback_requests,
             COALESCE(SUM(uh.total_cost) FILTER (WHERE uh.served_via_fallback), 0)::bigint as fallback_cost_nano,
             COUNT(*) OVER ()::bigint as total_groups
-        FROM usage_hourly uh
+        FROM usage_rows uh
         LEFT JOIN models m ON m.id = uh.model_id
         {where_clause}
         GROUP BY uh.model_name
         ORDER BY {sort_col} DESC
         LIMIT $6 OFFSET $7
         "#
+        ),
     );
     // One bind list: the count shares the data query's filters ($1-$5).
     let params: [&(dyn tokio_postgres::types::ToSql + Sync); 7] = [
@@ -203,9 +202,13 @@ pub(super) async fn get_model_revenue(
     ];
     arm(tx, deadline).await?;
     let rows = tx.query(&data_sql, &params).await.map_err(map_db_error)?;
-    let count_sql = format!(
-        "SELECT COUNT(*)::bigint FROM (SELECT 1 FROM usage_hourly uh \
-         LEFT JOIN models m ON m.id = uh.model_id {where_clause} GROUP BY uh.model_name) t"
+    let count_sql = with_usage_rows(
+        "$1",
+        "$2",
+        &format!(
+            "SELECT COUNT(*)::bigint FROM (SELECT 1 FROM usage_rows uh \
+             LEFT JOIN models m ON m.id = uh.model_id {where_clause} GROUP BY uh.model_name) t"
+        ),
     );
     let total = pagination::page_total(
         tx,
@@ -260,8 +263,7 @@ pub(super) async fn get_org_revenue(
     deadline: Instant,
     query: OrgRevenueQuery,
 ) -> Result<OrgRevenueReport, RepositoryError> {
-    // usage_hourly holds whole UTC hours: serve and echo the widened range (spec §6.1).
-    let (start, end) = hour_range(query.start, query.end);
+    let (start, end) = (query.start, query.end);
     let sort_col = match query.sort {
         RevenueSort::Revenue => "revenue_nano",
         RevenueSort::Requests => "requests",
@@ -293,8 +295,7 @@ pub(super) async fn get_org_revenue(
             MAX(uh.last_usage_at) as last_usage_at,
             COUNT(*) OVER ()::bigint as total_groups
         FROM organizations o
-        INNER JOIN usage_hourly uh ON uh.organization_id = o.id
-            AND uh.hour >= $1 AND uh.hour < $2
+        INNER JOIN usage_rows uh ON uh.organization_id = o.id
         LEFT JOIN models m ON m.id = uh.model_id
         LEFT JOIN paying p ON p.organization_id = o.id
         WHERE ($4::text IS NULL OR o.name ILIKE $4)
@@ -302,6 +303,7 @@ pub(super) async fn get_org_revenue(
         HAVING ($3::bool IS NULL OR BOOL_OR(p.organization_id IS NOT NULL) = $3)
     "#;
 
+    let cte_and_from = with_usage_rows("$1", "$2", cte_and_from);
     let data_sql = format!("{cte_and_from} ORDER BY {sort_col} DESC LIMIT $5 OFFSET $6");
     // One bind list: the count shares the data query's filters ($1-$4).
     let params: [&(dyn tokio_postgres::types::ToSql + Sync); 6] = [

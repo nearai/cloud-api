@@ -1,9 +1,8 @@
-//! Organization metrics and timeseries (admin and customer routes). Without `credit_type`
-//! they read `usage_hourly` over the hour-normalized range and echo it (spec §6.1); with
-//! it, they read raw `organization_usage_log` over the exact range.
+//! Organization metrics and timeseries (admin and customer routes) over the exact requested
+//! range. Without `credit_type` they read `usage_rows`; with it, raw `organization_usage_log`.
 
-use super::hour_range::hour_range;
 use super::{approx_percentile, arm, nano_to_usd, weighted_mean};
+use crate::repositories::usage_hourly::with_usage_rows;
 use crate::repositories::utils::map_db_error;
 use chrono::{DateTime, Utc};
 use services::admin::{
@@ -41,14 +40,17 @@ struct MetricsSql {
     by_model: String,
 }
 
-/// `usage_hourly` for organization `$1` over whole hours `[$2, $3)`.
+/// `usage_rows` for organization `$1` over the exact range `[$2, $3)`.
 fn hourly_metrics_sql() -> MetricsSql {
     let avg_ttft = weighted_mean("uh.ttft_sum_ms", "uh.ttft_count");
     let p95_ttft = approx_percentile("uh.ttft_p95_ms", "uh.ttft_count");
     let avg_itl = weighted_mean("uh.itl_sum_ms", "uh.itl_count");
     let p95_itl = approx_percentile("uh.itl_p95_ms", "uh.itl_count");
     MetricsSql {
-        summary: r#"
+        summary: with_usage_rows(
+            "$2",
+            "$3",
+            r#"
             SELECT
                 COALESCE(SUM(request_count), 0)::bigint as requests,
                 COALESCE(SUM(input_tokens), 0)::bigint as input_tokens,
@@ -56,11 +58,14 @@ fn hourly_metrics_sql() -> MetricsSql {
                 COALESCE(SUM(cache_read_tokens), 0)::bigint as cache_read_tokens,
                 COALESCE(SUM(total_cost), 0)::bigint as cost_nano,
                 COUNT(DISTINCT api_key_id)::bigint as unique_api_keys
-            FROM usage_hourly
-            WHERE organization_id = $1 AND hour >= $2 AND hour < $3
-            "#
-        .to_string(),
-        by_workspace: r#"
+            FROM usage_rows
+            WHERE organization_id = $1
+            "#,
+        ),
+        by_workspace: with_usage_rows(
+            "$2",
+            "$3",
+            r#"
             SELECT
                 w.id as workspace_id,
                 w.name as workspace_name,
@@ -70,31 +75,37 @@ fn hourly_metrics_sql() -> MetricsSql {
                 COALESCE(SUM(uh.cache_read_tokens), 0)::bigint as cache_read_tokens,
                 COALESCE(SUM(uh.total_cost), 0)::bigint as cost_nano
             FROM workspaces w
-            LEFT JOIN usage_hourly uh ON uh.workspace_id = w.id
-                AND uh.organization_id = $1 AND uh.hour >= $2 AND uh.hour < $3
+            LEFT JOIN usage_rows uh ON uh.workspace_id = w.id
+                AND uh.organization_id = $1
             WHERE w.organization_id = $1
             GROUP BY w.id, w.name
             ORDER BY requests DESC
-            "#
-        .to_string(),
-        by_api_key: r#"
+            "#,
+        ),
+        by_api_key: with_usage_rows(
+            "$2",
+            "$3",
+            r#"
             SELECT
                 ak.id as api_key_id,
                 ak.name as api_key_name,
                 COALESCE(SUM(uh.request_count), 0)::bigint as requests,
                 COALESCE(SUM(uh.total_cost), 0)::bigint as cost_nano
             FROM api_keys ak
-            LEFT JOIN usage_hourly uh ON uh.api_key_id = ak.id
-                AND uh.organization_id = $1 AND uh.hour >= $2 AND uh.hour < $3
+            LEFT JOIN usage_rows uh ON uh.api_key_id = ak.id
+                AND uh.organization_id = $1
             WHERE ak.workspace_id IN (
                 SELECT id FROM workspaces WHERE organization_id = $1
             )
             GROUP BY ak.id, ak.name
             ORDER BY requests DESC
-            "#
-        .to_string(),
-        by_model: format!(
-            r#"
+            "#,
+        ),
+        by_model: with_usage_rows(
+            "$2",
+            "$3",
+            &format!(
+                r#"
             SELECT
                 uh.model_name,
                 COALESCE(SUM(uh.request_count), 0)::bigint as requests,
@@ -106,11 +117,12 @@ fn hourly_metrics_sql() -> MetricsSql {
                 {p95_ttft} as p95_ttft_ms,
                 {avg_itl} as avg_itl_ms,
                 {p95_itl} as p95_itl_ms
-            FROM usage_hourly uh
-            WHERE uh.organization_id = $1 AND uh.hour >= $2 AND uh.hour < $3
+            FROM usage_rows uh
+            WHERE uh.organization_id = $1
             GROUP BY uh.model_name
             ORDER BY requests DESC
             "#
+            ),
         ),
     }
 }
@@ -226,10 +238,10 @@ pub(super) async fn get_organization_metrics_with_client(
     credit_type: Option<&str>,
 ) -> Result<OrganizationMetrics, RepositoryError> {
     let (org_id, start, end) = window;
-    let ((start, end), sql) = match credit_type {
-        None => (hour_range(start, end), hourly_metrics_sql()),
+    let sql = match credit_type {
+        None => hourly_metrics_sql(),
         // Raw credit_type body: see the ponytail on credit_type_metrics_sql.
-        Some(_) => ((start, end), credit_type_metrics_sql()),
+        Some(_) => credit_type_metrics_sql(),
     };
     let params = bind(&org_id, &start, &end, &credit_type);
     let org_name = organization_name(tx, deadline, org_id).await?;
@@ -328,10 +340,11 @@ pub(super) async fn get_organization_timeseries_with_client(
         "week" => "week",
         _ => "day", // default to day
     };
-    let ((start, end), query) = match credit_type {
-        None => (
-            hour_range(start, end),
-            format!(
+    let query = match credit_type {
+        None => with_usage_rows(
+            "$2",
+            "$3",
+            &format!(
                 r#"
             SELECT
                 DATE_TRUNC('{date_trunc}', hour)::text as date,
@@ -340,8 +353,8 @@ pub(super) async fn get_organization_timeseries_with_client(
                 COALESCE(SUM(output_tokens), 0)::bigint as output_tokens,
                 COALESCE(SUM(cache_read_tokens), 0)::bigint as cache_read_tokens,
                 COALESCE(SUM(total_cost), 0)::bigint as cost_nano
-            FROM usage_hourly
-            WHERE organization_id = $1 AND hour >= $2 AND hour < $3
+            FROM usage_rows
+            WHERE organization_id = $1
             GROUP BY DATE_TRUNC('{date_trunc}', hour)
             ORDER BY date ASC
             "#
@@ -353,10 +366,8 @@ pub(super) async fn get_organization_timeseries_with_client(
         // allocation-aware aggregate recomputed after settlement, once settlement has a completion signal.
         Some(_) => {
             let cte = CREDIT_TYPE_USAGE_CTE;
-            (
-                (start, end),
-                format!(
-                    r#"{cte}
+            format!(
+                r#"{cte}
             SELECT
                 DATE_TRUNC('{date_trunc}', created_at)::text as date,
                 COUNT(*)::bigint as requests,
@@ -368,7 +379,6 @@ pub(super) async fn get_organization_timeseries_with_client(
             GROUP BY DATE_TRUNC('{date_trunc}', created_at)
             ORDER BY date ASC
             "#
-                ),
             )
         }
     };

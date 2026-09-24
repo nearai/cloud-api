@@ -202,7 +202,6 @@ async fn test_admin_get_organization_metrics_with_usage() {
 
     // Wait for async usage recording to complete
     tokio::time::sleep(tokio::time::Duration::from_millis(1000)).await;
-    crate::usage_hourly::recompute_recent_usage().await;
 
     // Get organization metrics
     let response = server
@@ -255,6 +254,8 @@ async fn test_admin_get_organization_metrics_with_usage() {
 
     // Verify API key breakdown
     assert!(!metrics.by_api_key.is_empty(), "Should have API key data");
+
+    println!("✅ Admin get organization metrics with usage works correctly");
 }
 
 #[tokio::test]
@@ -291,18 +292,16 @@ async fn test_admin_get_organization_metrics_with_time_range() {
         metrics.period_start < metrics.period_end,
         "Period start should be before period end"
     );
-    // Hour-normalized echo (spec §6.1, §6.4): start rounds down, end rounds up.
-    assert_eq!(metrics.period_start, services::usage::trunc_hour(week_ago));
-    assert_eq!(
-        metrics.period_end,
-        services::usage::trunc_hour(now) + chrono::Duration::hours(1)
-    );
+    assert_eq!(metrics.period_start, week_ago);
+    assert_eq!(metrics.period_end, now);
 
     assert_eq!(
         metrics.organization_id.to_string(),
         org.id,
         "Organization ID should match"
     );
+
+    println!("✅ Admin get organization metrics with time range works correctly");
 }
 
 #[tokio::test]
@@ -442,7 +441,6 @@ async fn test_admin_get_platform_metrics_with_usage() {
 
     // Wait for usage recording
     tokio::time::sleep(tokio::time::Duration::from_millis(1000)).await;
-    crate::usage_hourly::recompute_recent_usage().await;
 
     // Get platform metrics
     let response = server
@@ -472,6 +470,8 @@ async fn test_admin_get_platform_metrics_with_usage() {
     // They may be empty if the data doesn't meet threshold criteria
     println!("Top models: {:?}", metrics.top_models);
     println!("Top organizations: {:?}", metrics.top_organizations);
+
+    println!("✅ Admin get platform metrics with usage works correctly");
 }
 
 #[tokio::test]
@@ -600,7 +600,6 @@ async fn test_admin_get_organization_timeseries_with_usage() {
 
     // Wait for usage recording
     tokio::time::sleep(tokio::time::Duration::from_millis(1000)).await;
-    crate::usage_hourly::recompute_recent_usage().await;
 
     // Get timeseries
     let response = server
@@ -624,6 +623,8 @@ async fn test_admin_get_organization_timeseries_with_usage() {
         // The data point should have some values
         assert!(!today_data.date.is_empty(), "Date should be present");
     }
+
+    println!("✅ Admin get organization timeseries with usage works correctly");
 }
 
 #[tokio::test]
@@ -817,7 +818,6 @@ async fn test_admin_metrics_model_latency_tracking() {
 
     // Wait for usage recording
     tokio::time::sleep(tokio::time::Duration::from_millis(1500)).await;
-    crate::usage_hourly::recompute_recent_usage().await;
 
     // Get organization metrics
     let response = server
@@ -844,6 +844,8 @@ async fn test_admin_metrics_model_latency_tracking() {
         // Latency fields should be present (may be None for mock provider)
         // Just verify the structure exists
     }
+
+    println!("✅ Admin metrics include model latency tracking fields");
 }
 
 #[tokio::test]
@@ -882,7 +884,6 @@ async fn test_admin_metrics_unique_api_keys_tracking() {
 
     // Wait for usage recording
     tokio::time::sleep(tokio::time::Duration::from_millis(1000)).await;
-    crate::usage_hourly::recompute_recent_usage().await;
 
     // Get organization metrics
     let response = server
@@ -911,6 +912,8 @@ async fn test_admin_metrics_unique_api_keys_tracking() {
         metrics.by_api_key.len() >= 2,
         "Should have breakdown for at least 2 API keys"
     );
+
+    println!("✅ Admin metrics correctly track unique API keys");
 }
 
 // ============================================
@@ -938,7 +941,6 @@ async fn test_admin_platform_metrics_splits_reconcile() {
         .await;
     assert_eq!(response.status_code(), 200);
     tokio::time::sleep(tokio::time::Duration::from_millis(1000)).await;
-    crate::usage_hourly::recompute_recent_usage().await;
 
     let response = server
         .get("/v1/admin/platform/metrics")
@@ -970,6 +972,8 @@ async fn test_admin_platform_metrics_splits_reconcile() {
         (0.0..=1.0).contains(&m.incomplete_stream_rate),
         "incomplete_stream_rate in [0,1]"
     );
+
+    println!("✅ Platform metrics verifiable split reconciles to total");
 }
 #[tokio::test]
 async fn test_admin_platform_timeseries() {
@@ -1115,7 +1119,6 @@ async fn test_admin_platform_model_revenue() {
     record_model_revenue_usage(&server, &api_key, lower_revenue_model).await;
     record_model_revenue_usage(&server, &api_key, higher_revenue_model).await;
     record_model_revenue_usage(&server, &api_key, higher_revenue_model).await;
-    crate::usage_hourly::recompute_recent_usage().await;
 
     let model_revenue_url = format!("/v1/admin/platform/model-revenue?model_search={model_search}");
     let response = server
@@ -1167,6 +1170,8 @@ async fn test_admin_platform_model_revenue() {
     assert_eq!(paged.total, 2);
     assert_eq!(paged.data[0].model_name, *higher_revenue_model);
     assert_eq!(paged.data[0].requests, 2);
+
+    println!("✅ Platform model-revenue works, sorts, and paginates");
 }
 
 #[tokio::test]
@@ -1198,7 +1203,6 @@ async fn test_admin_platform_org_revenue() {
         }))
         .await;
     assert_eq!(response.status_code(), 200);
-    crate::usage_hourly::recompute_recent_usage().await;
 
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
     let query_start = (chrono::Utc::now() - chrono::Duration::minutes(5))
@@ -1295,6 +1299,8 @@ async fn test_admin_platform_org_revenue() {
         prev = o.consumed_cost_usd;
     }
     assert!(report.total >= report.data.len() as i64);
+
+    println!("✅ Platform org-revenue works, reconciles, and paginates");
 }
 
 #[tokio::test]
@@ -1386,7 +1392,6 @@ async fn test_admin_platform_model_revenue_offset_beyond_total() {
     let api_key = get_api_key_for_org(&server, org.id.clone()).await;
 
     record_model_revenue_usage(&server, &api_key, model_name).await;
-    crate::usage_hourly::recompute_recent_usage().await;
 
     let model_revenue_path =
         format!("/v1/admin/platform/model-revenue?limit=10&offset=0&model_search={model_search}");
@@ -1426,4 +1431,6 @@ async fn test_admin_platform_model_revenue_offset_beyond_total() {
         serde_json::from_str(&resp.text()).expect("parse ModelRevenueReport");
     assert!(report.data.is_empty(), "page beyond end should be empty");
     assert_eq!(report.total, 1, "total must reflect the matching model");
+
+    println!("✅ model-revenue reports correct total on an out-of-range page");
 }

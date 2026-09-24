@@ -816,7 +816,7 @@ pub async fn create_workspace_api_key(
 
 /// List API keys for workspace
 ///
-/// Returns a paginated list of all API keys for a workspace with lifetime usage. Inference usage comes from the hourly usage aggregate and lags by up to ~65 minutes (the current hour is not included); service usage and spend-limit enforcement are live.
+/// Returns a paginated list of all API keys for a workspace with usage information.
 #[utoipa::path(
     get,
     path = "/v1/workspaces/{workspace_id}/api-keys",

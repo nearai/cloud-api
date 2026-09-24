@@ -223,7 +223,7 @@ pub struct BillingSummary {
     /// organization_balance: inference + services). The splits below need not add up to
     /// it: the inference split lags and excludes historical duplicate rows (V0045).
     pub total_consumed_usd: f64,
-    /// All-time inference consumed cost, USD (hourly usage aggregate; lags by up to ~65 minutes)
+    /// All-time inference consumed cost, USD
     pub inference_consumed_usd: f64,
     /// All-time service consumed cost, USD (organization_service_usage_log, e.g. web_search; live)
     pub service_consumed_usd: f64,

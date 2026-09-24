@@ -232,14 +232,9 @@ async fn admin_platform_reports_serve_whole_hours_from_usage_hourly() {
         )
         .await;
     }
-    // A sub-hour query widens to the whole hour and echoes it (spec §6.1).
-    let query = format!(
-        "start={}&end={}",
-        url_time(start + chrono::Duration::minutes(10)),
-        url_time(start + chrono::Duration::minutes(20))
-    );
+    let query = format!("start={}&end={}", url_time(start), url_time(end));
 
-    // Review Focus 4: an hour not yet aggregated reads as empty, with the hour echoed.
+    // A settled hour not recomputed yet (the late-row case the repair endpoint covers): empty.
     let before: PlatformMetrics =
         admin_json(&fixture, &format!("/v1/admin/platform/metrics?{query}")).await;
     assert_eq!((before.period_start, before.period_end), (start, end));

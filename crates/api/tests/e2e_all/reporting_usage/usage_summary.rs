@@ -240,12 +240,8 @@ async fn usage_summary_honors_date_boundaries_and_filters() {
     );
     assert_eq!(json["by_day"].as_array().expect("by_day").len(), 1);
     assert_day(&json, "2026-07-02", 1, 1, 700, 200);
-    // The single instant widens to its hour; the echo keeps end_time inclusive (spec §6.1).
     assert_eq!(json_timestamp(&json, "start_time"), ts(2026, 7, 2));
-    assert_eq!(
-        json_timestamp(&json, "end_time"),
-        ts(2026, 7, 2) + Duration::hours(1) - Duration::microseconds(1)
-    );
+    assert_eq!(json_timestamp(&json, "end_time"), ts(2026, 7, 2));
 }
 
 #[tokio::test]
@@ -264,16 +260,9 @@ async fn usage_summary_normalizes_open_ended_range_defaults() {
     let json = response.json::<Value>();
     let start_time = json_timestamp(&json, "start_time");
     let end_time = json_timestamp(&json, "end_time");
-    // Hour-normalized (spec §6.1, §6.4): whole UTC hours, inclusive end 1 µs before the hour.
-    let end_exclusive = end_time + Duration::microseconds(1);
-    assert_eq!(start_time, services::usage::trunc_hour(start_time));
-    assert_eq!(end_exclusive, services::usage::trunc_hour(end_exclusive));
-    assert!(end_exclusive > before_request);
-    assert!(end_exclusive <= services::usage::trunc_hour(after_request) + Duration::hours(1));
-    assert_eq!(
-        end_exclusive - start_time,
-        Duration::days(366) + Duration::hours(1)
-    );
+    assert!(end_time >= before_request);
+    assert!(end_time <= after_request);
+    assert_eq!(end_time - start_time, Duration::days(366));
     assert_totals(
         &json,
         ExpectedTotals {
@@ -332,35 +321,6 @@ async fn usage_summary_rejects_invalid_range_org_mismatch_and_revoked_token() {
         .add_header("Authorization", bearer("rpt-revoked-or-malformed"))
         .await;
     assert_eq!(revoked.status_code(), 401, "{}", revoked.text());
-}
-
-#[tokio::test]
-async fn usage_summary_widens_to_whole_hours_unless_the_reader_is_exact() {
-    let (server, database) = setup_reporting_usage_server().await;
-    let fixture = seed_summary_fixture(&server, &database).await;
-    let range = "start_time=2026-07-02T00:15:00Z&end_time=2026-07-02T00:20:00Z";
-
-    // source=all without credit_type: both parts serve [00:00, 01:00) and echo it.
-    let all = get_summary(&server, &fixture, &format!("source=all&{range}")).await;
-    assert_eq!(json_timestamp(&all, "start_time"), ts(2026, 7, 2));
-    assert_eq!(
-        json_timestamp(&all, "end_time"),
-        ts(2026, 7, 2) + Duration::hours(1) - Duration::microseconds(1)
-    );
-    assert_eq!(all["totals"]["request_count"], 1);
-    assert_eq!(all["totals"]["service_usage_count"], 1);
-
-    // Review Focus 1: a service-only summary is exact, so the same range holds nothing.
-    let service = get_summary(&server, &fixture, &format!("source=service&{range}")).await;
-    assert_eq!(
-        json_timestamp(&service, "start_time"),
-        ts(2026, 7, 2) + Duration::minutes(15)
-    );
-    assert_eq!(
-        json_timestamp(&service, "end_time"),
-        ts(2026, 7, 2) + Duration::minutes(20)
-    );
-    assert_eq!(service["totals"]["service_usage_count"], 0);
 }
 
 #[tokio::test]

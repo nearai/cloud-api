@@ -3728,7 +3728,7 @@ pub struct MetricsQueryParams {
     pub end: Option<String>,
 }
 
-const CREDIT_TYPE_QUERY_DESCRIPTION: &str = "Filter consumed inference usage by grant, staking_farm, payment, or postpay. Costs include only saved matching allocations, including settlements. Each matching request and its full tokens count once; counts are not additive across credit types. Unattributed historical usage is excluded. Period totals may increase until outstanding unfunded usage is settled. Omit for all usage. With credit_type, figures are live and exact over the requested range; without it, they come from the hourly usage aggregate.";
+const CREDIT_TYPE_QUERY_DESCRIPTION: &str = "Filter consumed inference usage by grant, staking_farm, payment, or postpay. Costs include only saved matching allocations, including settlements. Each matching request and its full tokens count once; counts are not additive across credit types. Unattributed historical usage is excluded. Period totals may increase until outstanding unfunded usage is settled. Omit for all usage.";
 
 #[derive(Debug, serde::Deserialize)]
 pub struct OrganizationMetricsQueryParams {
@@ -3764,25 +3764,21 @@ fn parse_metrics_credit_type(
 /// Returns usage metrics for an organization including summary totals,
 /// and breakdowns by workspace, API key, and model.
 ///
-/// Without `credit_type`, served from the hourly usage aggregate: the range widens to whole
-/// UTC hours and the widened range is echoed; figures lag by up to ~65 minutes and exclude
-/// the current hour; percentiles across hours are approximate (sample-weighted means of
-/// hourly percentiles). With `credit_type`, figures are live and exact over the requested range.
+/// Percentiles across hours are approximate (sample-weighted means of hourly percentiles).
 #[utoipa::path(
     get,
     path = "/v1/admin/organizations/{org_id}/metrics",
     tag = "Admin",
     params(
         ("org_id" = String, Path, description = "Organization ID to get metrics for"),
-        ("start" = Option<String>, Query, description = "Start of time range (ISO 8601). Defaults to 30 days ago. Window may not exceed 366 days. Rounded down to the UTC hour unless credit_type is set."),
-        ("end" = Option<String>, Query, description = "End of time range (ISO 8601). Defaults to now. Window may not exceed 366 days. Rounded up to the UTC hour unless credit_type is set."),
+        ("start" = Option<String>, Query, description = "Start of time range (ISO 8601). Defaults to 30 days ago. Window may not exceed 366 days."),
+        ("end" = Option<String>, Query, description = "End of time range (ISO 8601). Defaults to now. Window may not exceed 366 days."),
         ("credit_type" = Option<CreditType>, Query, description = CREDIT_TYPE_QUERY_DESCRIPTION)
     ),
     responses(
         (status = 200, description = "Organization metrics retrieved successfully"),
         (status = 400, description = "Invalid request", body = ErrorResponse),
         (status = 401, description = "Unauthorized", body = ErrorResponse),
-        (status = 404, description = "Organization not found", body = ErrorResponse),
         (status = 504, description = "Analytics statement budget exceeded", body = ErrorResponse),
         (status = 500, description = "Internal server error", body = ErrorResponse)
     ),
@@ -3843,16 +3839,14 @@ pub async fn get_organization_metrics(
 /// - Top models by usage
 /// - Top organizations by spend
 ///
-/// Served from the hourly usage aggregate: the range widens to whole UTC hours and the
-/// widened range is echoed. Figures lag by up to ~65 minutes and exclude the current hour;
-/// percentiles across hours are approximate (sample-weighted means of hourly percentiles).
+/// Percentiles across hours are approximate (sample-weighted means of hourly percentiles).
 #[utoipa::path(
     get,
     path = "/v1/admin/platform/metrics",
     tag = "Admin",
     params(
-        ("start" = Option<String>, Query, description = "Start of time range (ISO 8601). Defaults to 30 days ago. Rounded down to the UTC hour."),
-        ("end" = Option<String>, Query, description = "End of time range (ISO 8601). Defaults to now. Rounded up to the UTC hour.")
+        ("start" = Option<String>, Query, description = "Start of time range (ISO 8601). Defaults to 30 days ago."),
+        ("end" = Option<String>, Query, description = "End of time range (ISO 8601). Defaults to now.")
     ),
     responses(
         (status = 200, description = "Platform metrics retrieved successfully", body = services::admin::PlatformMetrics),
@@ -3897,17 +3891,13 @@ pub async fn get_platform_metrics(
 ///
 /// Returns per-bucket requests, tokens, cost (paid/granted + verifiable/external splits),
 /// active organizations, and new signups for growth/mix trend charts.
-///
-/// Served from the hourly usage aggregate: the range widens to whole UTC hours and the
-/// widened range is echoed. Figures lag by up to ~65 minutes and exclude the current hour;
-/// percentiles across hours are approximate (sample-weighted means of hourly percentiles).
 #[utoipa::path(
     get,
     path = "/v1/admin/platform/metrics/timeseries",
     tag = "Admin",
     params(
-        ("start" = Option<String>, Query, description = "Start of time range (ISO 8601). Defaults to 30 days ago. Rounded down to the UTC hour."),
-        ("end" = Option<String>, Query, description = "End of time range (ISO 8601). Defaults to now. Rounded up to the UTC hour."),
+        ("start" = Option<String>, Query, description = "Start of time range (ISO 8601). Defaults to 30 days ago."),
+        ("end" = Option<String>, Query, description = "End of time range (ISO 8601). Defaults to now."),
         ("granularity" = Option<String>, Query, description = "Time granularity: hour, day (default), week, or month")
     ),
     responses(
@@ -3972,9 +3962,8 @@ pub async fn get_platform_timeseries(
 /// credit limits, total consumed, paying/granted org counts, and a breakdown by funding
 /// source. Real money-in lives in the billing service, not cloud-api.
 ///
-/// `inference_consumed_usd` sums the hourly usage aggregate, so it lags by up to ~65 minutes
-/// and can differ from `total_consumed_usd` (the live balance) by that lag and by historical
-/// duplicate-row cleanup; `service_consumed_usd` is live.
+/// `inference_consumed_usd` can differ from `total_consumed_usd` (the live balance) by
+/// historical duplicate-row cleanup.
 #[utoipa::path(
     get,
     path = "/v1/admin/platform/billing-summary",
@@ -4030,16 +4019,14 @@ pub struct ModelRevenueQueryParams {
 /// Models for the selected period ranked by consumed cost, with requests, tokens,
 /// unique orgs, verifiable flag, provider type, and latency. Paginated and filterable.
 ///
-/// Served from the hourly usage aggregate: the range widens to whole UTC hours and the
-/// widened range is echoed. Figures lag by up to ~65 minutes and exclude the current hour;
-/// percentiles across hours are approximate (sample-weighted means of hourly percentiles).
+/// Percentiles across hours are approximate (sample-weighted means of hourly percentiles).
 #[utoipa::path(
     get,
     path = "/v1/admin/platform/model-revenue",
     tag = "Admin",
     params(
-        ("start" = Option<String>, Query, description = "Start of time range (ISO 8601). Defaults to 30 days ago. Rounded down to the UTC hour."),
-        ("end" = Option<String>, Query, description = "End of time range (ISO 8601). Defaults to now. Rounded up to the UTC hour."),
+        ("start" = Option<String>, Query, description = "Start of time range (ISO 8601). Defaults to 30 days ago."),
+        ("end" = Option<String>, Query, description = "End of time range (ISO 8601). Defaults to now."),
         ("limit" = Option<i64>, Query, description = "Page size (1-1000, default 100)"),
         ("offset" = Option<i64>, Query, description = "Page offset (default 0)"),
         ("verifiable" = Option<bool>, Query, description = "Filter to verifiable (true) or non-verifiable (false) models"),
@@ -4129,17 +4116,13 @@ pub struct OrgRevenueQueryParams {
 /// Organizations with usage in the selected period ranked by consumed cost, with the
 /// verifiable/external split, requests, tokens, models used, a current paying flag, and
 /// last-usage timestamp. Paginated and filterable — full attribution of usage/spend per org.
-///
-/// Served from the hourly usage aggregate: the range widens to whole UTC hours and the
-/// widened range is echoed. Figures lag by up to ~65 minutes and exclude the current hour;
-/// percentiles across hours are approximate (sample-weighted means of hourly percentiles).
 #[utoipa::path(
     get,
     path = "/v1/admin/platform/org-revenue",
     tag = "Admin",
     params(
-        ("start" = Option<String>, Query, description = "Start of time range (ISO 8601). Defaults to 30 days ago. Rounded down to the UTC hour."),
-        ("end" = Option<String>, Query, description = "End of time range (ISO 8601). Defaults to now. Rounded up to the UTC hour."),
+        ("start" = Option<String>, Query, description = "Start of time range (ISO 8601). Defaults to 30 days ago."),
+        ("end" = Option<String>, Query, description = "End of time range (ISO 8601). Defaults to now."),
         ("limit" = Option<i64>, Query, description = "Page size (1-1000, default 100)"),
         ("offset" = Option<i64>, Query, description = "Page offset (default 0)"),
         ("paying" = Option<bool>, Query, description = "Filter to current paying (true) / non-paying (false) orgs"),
@@ -4283,17 +4266,13 @@ pub struct PerformanceTimeseriesParams {
 /// must impute zeros for models absent from a bucket.
 ///
 /// Consumed cost = metered inference cost, NOT cash revenue (includes grant credits).
-///
-/// Served from the hourly usage aggregate: the range widens to whole UTC hours and the
-/// widened range is echoed. Figures lag by up to ~65 minutes and exclude the current hour;
-/// percentiles across hours are approximate (sample-weighted means of hourly percentiles).
 #[utoipa::path(
     get,
     path = "/v1/admin/platform/model-consumption-timeseries",
     tag = "Admin",
     params(
-        ("start" = Option<String>, Query, description = "Start of time range (ISO 8601). Defaults to 30 days ago. Rounded down to the UTC hour."),
-        ("end" = Option<String>, Query, description = "End of time range (ISO 8601). Defaults to now. Rounded up to the UTC hour."),
+        ("start" = Option<String>, Query, description = "Start of time range (ISO 8601). Defaults to 30 days ago."),
+        ("end" = Option<String>, Query, description = "End of time range (ISO 8601). Defaults to now."),
         ("granularity" = Option<String>, Query, description = "Time granularity: hour (≤31d), day (≤366d, default), week (≤3y), month (≤5y)"),
         ("top_n" = Option<i64>, Query, description = "Top-N models to return as separate series (1-20, default 15); rest → 'Other'")
     ),
@@ -4354,16 +4333,14 @@ pub async fn get_model_consumption_timeseries(
 /// with a recorded `stop_reason`. Pre-V0037 rows (stop_reason IS NULL) are excluded from
 /// both numerator and denominator.
 ///
-/// Served from the hourly usage aggregate: the range widens to whole UTC hours and the
-/// widened range is echoed. Figures lag by up to ~65 minutes and exclude the current hour;
-/// percentiles across hours are approximate (sample-weighted means of hourly percentiles).
+/// Percentiles across hours are approximate (sample-weighted means of hourly percentiles).
 #[utoipa::path(
     get,
     path = "/v1/admin/platform/performance-timeseries",
     tag = "Admin",
     params(
-        ("start" = Option<String>, Query, description = "Start of time range (ISO 8601). Defaults to 30 days ago. Rounded down to the UTC hour."),
-        ("end" = Option<String>, Query, description = "End of time range (ISO 8601). Defaults to now. Rounded up to the UTC hour."),
+        ("start" = Option<String>, Query, description = "Start of time range (ISO 8601). Defaults to 30 days ago."),
+        ("end" = Option<String>, Query, description = "End of time range (ISO 8601). Defaults to now."),
         ("granularity" = Option<String>, Query, description = "Time granularity: hour (≤31d), day (≤366d, default), week (≤3y), month (≤5y)"),
         ("model_name" = Option<String>, Query, description = "Filter to a single model name (platform-wide if omitted)")
     ),
@@ -4479,19 +4456,14 @@ pub async fn get_revenue_density(
 ///
 /// Returns daily/weekly/hourly aggregations for charting:
 /// requests, tokens, and cost per time period.
-///
-/// Without `credit_type`, served from the hourly usage aggregate: the range widens to whole
-/// UTC hours and the widened range is echoed; figures lag by up to ~65 minutes and exclude
-/// the current hour; percentiles across hours are approximate (sample-weighted means of
-/// hourly percentiles). With `credit_type`, figures are live and exact over the requested range.
 #[utoipa::path(
     get,
     path = "/v1/admin/organizations/{org_id}/metrics/timeseries",
     tag = "Admin",
     params(
         ("org_id" = String, Path, description = "Organization ID to get metrics for"),
-        ("start" = Option<String>, Query, description = "Start of time range (ISO 8601). Defaults to 30 days ago. Rounded down to the UTC hour unless credit_type is set."),
-        ("end" = Option<String>, Query, description = "End of time range (ISO 8601). Defaults to now. Rounded up to the UTC hour unless credit_type is set."),
+        ("start" = Option<String>, Query, description = "Start of time range (ISO 8601). Defaults to 30 days ago."),
+        ("end" = Option<String>, Query, description = "End of time range (ISO 8601). Defaults to now."),
         ("granularity" = Option<String>, Query, description = "Time granularity: hour, day (default), or week"),
         ("credit_type" = Option<CreditType>, Query, description = CREDIT_TYPE_QUERY_DESCRIPTION)
     ),
@@ -4499,7 +4471,6 @@ pub async fn get_revenue_density(
         (status = 200, description = "Time series metrics retrieved successfully"),
         (status = 400, description = "Invalid request", body = ErrorResponse),
         (status = 401, description = "Unauthorized", body = ErrorResponse),
-        (status = 404, description = "Organization not found", body = ErrorResponse),
         (status = 504, description = "Analytics statement budget exceeded", body = ErrorResponse),
         (status = 500, description = "Internal server error", body = ErrorResponse)
     ),

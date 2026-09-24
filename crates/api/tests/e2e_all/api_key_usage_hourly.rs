@@ -1,5 +1,5 @@
-//! The workspace API-key list reads lifetime inference usage from usage_hourly (lagged,
-//! spec §6.2) and service usage live from raw, in one statement.
+//! The workspace API-key list reads exact lifetime inference usage from `usage_rows`:
+//! settled hours from usage_hourly, recent hours from raw.
 
 use crate::admin_provider_attribution_support::{
     isolated_usage_hours, setup_platform_provider_usage_fixture, PlatformProviderUsageFixture,
@@ -27,9 +27,23 @@ async fn listed_usage(fixture: &PlatformProviderUsageFixture) -> Option<i64> {
 }
 
 #[tokio::test]
-async fn api_key_list_inference_usage_reads_usage_hourly() {
+async fn api_key_list_inference_usage_is_exact_without_waiting_for_the_rollup() {
     let fixture = setup_platform_provider_usage_fixture().await;
-    // An exclusive far-past hour: no other test recomputes it, so "not aggregated yet" holds.
+    // A row in the re-read window is served from raw immediately, with no recompute.
+    insert_raw(
+        &fixture,
+        chrono::Utc::now() - Duration::minutes(1),
+        3_000_000_000,
+        1,
+        None,
+        None,
+        Some("external"),
+    )
+    .await;
+    assert_eq!(listed_usage(&fixture).await, Some(3_000_000_000));
+
+    // A row that lands in an already-settled hour (older than the re-read window) is served
+    // from usage_hourly, so it counts once that hour is recomputed (the admin repair path).
     let (hour, hour_end) = isolated_usage_hours(&fixture, 1).await;
     insert_raw(
         &fixture,
@@ -41,10 +55,7 @@ async fn api_key_list_inference_usage_reads_usage_hourly() {
         Some("external"),
     )
     .await;
-
-    // Not aggregated yet: the documented lag (spec §6.4) shows as no inference usage.
-    assert!(matches!(listed_usage(&fixture).await, None | Some(0)));
-
+    assert_eq!(listed_usage(&fixture).await, Some(3_000_000_000));
     recompute_usage_hours(hour, hour_end).await;
-    assert_eq!(listed_usage(&fixture).await, Some(5_000_000_000));
+    assert_eq!(listed_usage(&fixture).await, Some(8_000_000_000));
 }

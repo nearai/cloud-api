@@ -39,7 +39,7 @@ fn assert_close(actual: Option<f64>, expected: f64) {
 }
 
 #[tokio::test]
-async fn model_consumption_ranks_the_widened_hour_and_follows_renames() {
+async fn model_consumption_ranks_models_and_follows_renames() {
     let fixture = setup_platform_provider_usage_fixture().await;
     let other = setup_platform_provider_usage_fixture().await;
     let (hour, end) = isolated_provider_usage_window(&fixture).await;
@@ -76,8 +76,8 @@ async fn model_consumption_ranks_the_widened_hour_and_follows_renames() {
     recompute_usage_hours(hour, end).await;
     let path = format!(
         "/v1/admin/platform/model-consumption-timeseries?start={}&end={}&granularity=hour&top_n=1",
-        url_time(hour + Duration::minutes(5)),
-        url_time(hour + Duration::minutes(10))
+        url_time(hour),
+        url_time(end)
     );
 
     let report: ModelConsumptionTimeseries = admin_json(&fixture, &path).await;
@@ -171,8 +171,8 @@ async fn performance_combines_hourly_percentiles_by_sample_count() {
         &fixture,
         &format!(
             "/v1/admin/platform/performance-timeseries?start={}&end={}&granularity=day&model_name={}",
-            url_time(h + Duration::minutes(5)),
-            url_time(h + Duration::minutes(90)),
+            url_time(h),
+            url_time(end),
             fixture.model_name
         ),
     )

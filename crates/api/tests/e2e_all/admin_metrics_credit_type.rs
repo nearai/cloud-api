@@ -474,14 +474,10 @@ async fn org_reports_read_usage_hourly_over_whole_hours() {
         crate::usage_hourly::insert_raw(&fixture, at, cost, 10, Some(ttft), None, Some("external"))
             .await;
     }
-    // Sub-hour bounds: the report widens them to [h, h + 2h) and echoes that (spec §6.1).
-    let range = format!(
-        "start={}&end={}",
-        url_time(h + chrono::Duration::minutes(15)),
-        url_time(h + hour + chrono::Duration::minutes(15))
-    );
+    // Whole settled hours are served from usage_hourly.
+    let range = format!("start={}&end={}", url_time(h), url_time(h + hour * 2));
 
-    // Review Focus 4: not aggregated yet, so the report is empty, with the hours echoed.
+    // Settled hours not recomputed yet (the late-row case the repair endpoint covers): empty.
     let before: OrganizationMetrics = session_json(
         &fixture.server,
         &format!("/v1/admin/organizations/{org}/metrics?{range}"),
@@ -541,7 +537,7 @@ async fn org_reports_read_usage_hourly_over_whole_hours() {
         ]
     );
 
-    // Customer routes read the same bodies and echo the widened range as RFC 3339.
+    // Customer routes read the same bodies and echo the range as RFC 3339.
     let customer: serde_json::Value = session_json(
         &fixture.server,
         &format!("/v1/organizations/{org}/usage/metrics?{range}"),
@@ -559,7 +555,8 @@ async fn org_reports_read_usage_hourly_over_whole_hours() {
     assert_eq!(customer_series["data"].as_array().unwrap().len(), 2);
 }
 
-/// Review Focus 1: `credit_type` reports stay raw, live and exact while unfiltered ones lag.
+/// `credit_type` reports read raw; unfiltered ones read usage_rows. Both are exact over the
+/// requested range.
 #[tokio::test]
 async fn org_credit_type_reports_stay_raw_live_and_exact() {
     use services::admin::{OrganizationMetrics, TimeSeriesMetrics};
@@ -638,14 +635,10 @@ async fn org_credit_type_reports_stay_raw_live_and_exact() {
         &format!("/v1/admin/organizations/{org}/metrics?{range}"),
     )
     .await;
-    assert_eq!(
-        (unfiltered.period_start, unfiltered.period_end),
-        (h, h + chrono::Duration::hours(1))
-    );
-    assert_eq!(
-        unfiltered.summary.total_requests, 0,
-        "unfiltered reads usage_hourly, not recomputed yet"
-    );
+    // A sub-hour range reads raw rows, so it is exact without a recompute.
+    assert_eq!((unfiltered.period_start, unfiltered.period_end), (h, end));
+    assert_eq!(unfiltered.summary.total_requests, 1);
+    assert_eq!(unfiltered.summary.total_cost_usd, 3.0);
 }
 
 #[tokio::test]

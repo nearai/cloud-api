@@ -244,6 +244,68 @@ impl UsageHourlyScheduler {
     }
 }
 
+/// Largest window one admin repair may recompute.
+pub const MAX_REPAIR_DAYS: i64 = 31;
+
+/// Rejects repair windows that are not whole, ordered UTC hours within `MAX_REPAIR_DAYS`.
+pub fn validate_repair_window(from: DateTime<Utc>, to: DateTime<Utc>) -> Result<(), String> {
+    if trunc_hour(from) != from || trunc_hour(to) != to {
+        return Err("start and end must be whole UTC hours".to_string());
+    }
+    if from >= to {
+        return Err("start must be before end".to_string());
+    }
+    if to - from > TimeDelta::days(MAX_REPAIR_DAYS) {
+        return Err(format!("window must not exceed {MAX_REPAIR_DAYS} days"));
+    }
+    Ok(())
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RepairReport {
+    pub rows_written: u64,
+    /// Raw vs aggregate totals for every UTC day the window touches, after the recompute.
+    pub days: Vec<DayParity>,
+}
+
+/// Explicit operator repair for rows that reached raw after their hour left the scheduler's
+/// 3-hour re-read (backfill, clock skew, a day flagged by parity): recomputes [from, to) one
+/// UTC day per transaction, waiting for the aggregate lock, then reports each touched day's
+/// parity.
+pub async fn repair(
+    repository: &dyn UsageHourlyRepository,
+    from: DateTime<Utc>,
+    to: DateTime<Utc>,
+) -> anyhow::Result<RepairReport> {
+    validate_repair_window(from, to).map_err(anyhow::Error::msg)?;
+    let mut rows_written = 0;
+    let mut chunk_start = from;
+    while chunk_start < to {
+        let chunk_end = (trunc_day(chunk_start) + TimeDelta::days(1)).min(to);
+        let report = repository
+            .recompute(chunk_start, chunk_end, AggregateLockBehavior::Wait)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("usage_hourly repair: Wait returned no recompute"))?;
+        rows_written += report.rows_written;
+        chunk_start = chunk_end;
+    }
+    let mut days = Vec::new();
+    let mut day = trunc_day(from);
+    while day < to {
+        days.push(repository.day_parity(day.date_naive()).await?);
+        day += TimeDelta::days(1);
+    }
+    info!(
+        from = %from,
+        to = %to,
+        rows_written,
+        days = days.len(),
+        mismatched_days = days.iter().filter(|p| !p.is_ok()).count(),
+        "usage_hourly repair"
+    );
+    Ok(RepairReport { rows_written, days })
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Mutex;
@@ -642,5 +704,64 @@ mod tests {
             next_regular_delay(t("2026-09-24T10:30:00Z"), 120).as_secs(),
             120
         );
+    }
+
+    #[test]
+    fn repair_window_must_be_whole_ordered_hours_within_the_cap() {
+        assert!(
+            validate_repair_window(t("2026-09-01T00:00:00Z"), t("2026-09-01T01:00:00Z")).is_ok()
+        );
+        assert!(
+            validate_repair_window(t("2026-09-01T00:30:00Z"), t("2026-09-01T01:00:00Z")).is_err()
+        );
+        assert!(
+            validate_repair_window(t("2026-09-01T00:00:00Z"), t("2026-09-01T01:00:01Z")).is_err()
+        );
+        assert!(
+            validate_repair_window(t("2026-09-01T01:00:00Z"), t("2026-09-01T01:00:00Z")).is_err()
+        );
+        assert!(
+            validate_repair_window(t("2026-09-01T00:00:00Z"), t("2026-10-02T00:00:00Z")).is_ok()
+        );
+        assert!(
+            validate_repair_window(t("2026-09-01T00:00:00Z"), t("2026-10-02T01:00:00Z")).is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn repair_recomputes_one_utc_day_per_transaction_and_reports_parity_per_day() {
+        let repo = FakeRepo {
+            parity_mismatch: true,
+            ..FakeRepo::default()
+        };
+        let report = repair(&repo, t("2026-09-01T22:00:00Z"), t("2026-09-03T02:00:00Z"))
+            .await
+            .unwrap();
+        assert_eq!(
+            *repo.recomputes.lock().unwrap(),
+            vec![
+                (t("2026-09-01T22:00:00Z"), t("2026-09-02T00:00:00Z")),
+                (t("2026-09-02T00:00:00Z"), t("2026-09-03T00:00:00Z")),
+                (t("2026-09-03T00:00:00Z"), t("2026-09-03T02:00:00Z")),
+            ]
+        );
+        assert_eq!(report.rows_written, 21);
+        let days: Vec<NaiveDate> = report.days.iter().map(|p| p.day).collect();
+        assert_eq!(
+            days,
+            vec![d("2026-09-01"), d("2026-09-02"), d("2026-09-03")]
+        );
+        assert!(report.days.iter().all(|p| !p.is_ok()));
+    }
+
+    #[tokio::test]
+    async fn repair_rejects_an_invalid_window_without_touching_the_repository() {
+        let repo = FakeRepo::default();
+        assert!(
+            repair(&repo, t("2026-09-01T00:30:00Z"), t("2026-09-01T02:00:00Z"))
+                .await
+                .is_err()
+        );
+        assert!(repo.recomputes.lock().unwrap().is_empty());
     }
 }

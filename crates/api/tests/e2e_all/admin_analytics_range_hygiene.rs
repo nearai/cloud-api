@@ -126,18 +126,9 @@ async fn organization_metrics_uses_30_day_default_and_366_day_maximum() {
     .await;
     assert_eq!(default.status_code(), 200, "{}", default.text());
     let metrics = default.json::<OrganizationMetrics>();
-    // Hour-normalized (spec §6.1, §6.4): the 30-day default widens to whole UTC hours.
-    assert_eq!(
-        metrics.period_start,
-        services::usage::trunc_hour(metrics.period_start)
-    );
-    assert_eq!(
-        metrics.period_end,
-        services::usage::trunc_hour(metrics.period_end)
-    );
     assert_eq!(
         metrics.period_end - metrics.period_start,
-        chrono::Duration::days(30) + chrono::Duration::hours(1)
+        chrono::Duration::days(30)
     );
 
     let at_max = admin_get(

@@ -223,11 +223,7 @@ async fn model_and_org_revenue_serve_usage_hourly_over_whole_hours() {
     }
     recompute_usage_hours(h, slot_end).await;
     let repository = PgAnalyticsRepository::new(fixture.database.pool().clone());
-    // Sub-hour bounds widen to [h, h + 2h) (spec §6.1).
-    let (start, end) = (
-        h + chrono::Duration::minutes(15),
-        h + chrono::Duration::minutes(75),
-    );
+    let (start, end) = (h, h + chrono::Duration::hours(2));
 
     let models = repository
         .get_model_revenue(ModelRevenueQuery {

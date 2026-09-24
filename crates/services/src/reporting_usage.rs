@@ -128,10 +128,6 @@ pub struct ServiceDaySummary {
 pub struct ReportingUsageSummary {
     pub inference: InferenceUsageSummary,
     pub service: ServiceUsageSummary,
-    /// Inclusive range the summary served (spec §6.1): hour-normalized when the inference
-    /// part reads `usage_hourly`, the request range otherwise. The route echoes it.
-    pub start_time: Option<DateTime<Utc>>,
-    pub end_time: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug, Error)]

@@ -313,14 +313,13 @@ pub trait UsageServiceTrait: Send + Sync {
         inference_ids: Vec<Uuid>,
     ) -> Result<Vec<InferenceCost>, UsageError>;
 
-    /// Get per-model usage aggregation for an organization over closed UTC hours since
-    /// `start_date`.
+    /// Get per-model usage aggregation for an organization since `start_date`.
     /// Returns one row per model: summed tokens, summed cost (nano-dollars), and request count.
     async fn get_usage_by_model(
         &self,
         organization_id: Uuid,
         start_date: DateTime<Utc>,
-    ) -> Result<UsageByModelReport, UsageError>;
+    ) -> Result<Vec<UsageByModelEntry>, UsageError>;
 
     async fn list_inference_usage_report(
         &self,
@@ -392,13 +391,12 @@ pub trait UsageRepository: Send + Sync {
         provider_request_id: &str,
     ) -> anyhow::Result<Option<StopReason>>;
 
-    /// Get per-model usage aggregation for an organization over closed UTC hours since
-    /// `start_date`.
+    /// Get per-model usage aggregation for an organization since `start_date`.
     async fn get_usage_by_model(
         &self,
         organization_id: Uuid,
         start_date: DateTime<Utc>,
-    ) -> anyhow::Result<UsageByModelReport>;
+    ) -> anyhow::Result<Vec<UsageByModelEntry>>;
 
     async fn list_inference_usage_report(
         &self,
@@ -766,14 +764,6 @@ pub struct UsageByModelEntry {
     pub total_tokens: i64,
     pub total_cost: i64,
     pub request_count: i64,
-}
-
-/// Per-model usage over closed UTC hours; `start` is the first hour served (the route
-/// echoes it). The window ends at the start of the current hour.
-#[derive(Debug, Clone)]
-pub struct UsageByModelReport {
-    pub start: DateTime<Utc>,
-    pub entries: Vec<UsageByModelEntry>,
 }
 
 /// Usage log entry

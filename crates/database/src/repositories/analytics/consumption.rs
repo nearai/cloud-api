@@ -1,8 +1,8 @@
-//! Per-model consumption and performance timeseries for admin dashboards, served from
-//! `usage_hourly` over the hour-normalized range (spec §6.1).
+//! Per-model consumption and performance timeseries for admin dashboards over the exact
+//! requested range, read from `usage_rows`.
 
-use super::hour_range::hour_range;
 use super::{approx_percentile, arm, nano_to_usd};
+use crate::repositories::usage_hourly::with_usage_rows;
 use crate::repositories::utils::map_db_error;
 use services::admin::{
     ModelConsumptionPoint, ModelConsumptionTimeseries, ModelConsumptionTimeseriesQuery,
@@ -17,7 +17,7 @@ pub(super) async fn get_model_consumption_timeseries(
     deadline: Instant,
     query: ModelConsumptionTimeseriesQuery,
 ) -> Result<ModelConsumptionTimeseries, RepositoryError> {
-    let (start, end) = hour_range(query.start, query.end);
+    let (start, end) = (query.start, query.end);
     // granularity is already an allowlisted &'static str from the handler
     let date_trunc = query.granularity.as_str();
 
@@ -26,14 +26,17 @@ pub(super) async fn get_model_consumption_timeseries(
     arm(tx, deadline).await?;
     let top_ids_rows = tx
         .query(
-            r#"
+            &with_usage_rows(
+                "$1",
+                "$2",
+                r#"
                 SELECT model_id
-                FROM usage_hourly
-                WHERE hour >= $1 AND hour < $2
+                FROM usage_rows
                 GROUP BY model_id
                 ORDER BY SUM(total_cost) DESC
                 LIMIT $3
                 "#,
+            ),
             &[&start, &end, &query.top_n],
         )
         .await
@@ -43,8 +46,11 @@ pub(super) async fn get_model_consumption_timeseries(
 
     // Step 2: time-bucketed aggregation. Models in top_ids get their current
     // canonical name from models.model_name; all others collapse to "Other".
-    let bucket_query = format!(
-        r#"
+    let bucket_query = with_usage_rows(
+        "$1",
+        "$2",
+        &format!(
+            r#"
             SELECT
                 DATE_TRUNC('{date_trunc}', uh.hour)::text AS bucket,
                 CASE
@@ -54,12 +60,12 @@ pub(super) async fn get_model_consumption_timeseries(
                 COALESCE(SUM(uh.total_cost), 0)::bigint AS cost_nano,
                 COALESCE(SUM(uh.request_count), 0)::bigint AS requests,
                 COALESCE(SUM(uh.total_tokens), 0)::bigint AS tokens
-            FROM usage_hourly uh
+            FROM usage_rows uh
             LEFT JOIN models m ON m.id = uh.model_id
-            WHERE uh.hour >= $1 AND uh.hour < $2
             GROUP BY 1, 2
             ORDER BY 1 ASC, cost_nano DESC
             "#
+        ),
     );
 
     arm(tx, deadline).await?;
@@ -115,7 +121,7 @@ pub(super) async fn get_performance_timeseries(
     deadline: Instant,
     query: PerformanceTimeseriesQuery,
 ) -> Result<PerformanceTimeseries, RepositoryError> {
-    let (start, end) = hour_range(query.start, query.end);
+    let (start, end) = (query.start, query.end);
     let date_trunc = query.granularity.as_str();
     let p50_ttft = approx_percentile("uh.ttft_p50_ms", "uh.ttft_count");
     let p95_ttft = approx_percentile("uh.ttft_p95_ms", "uh.ttft_count");
@@ -124,8 +130,11 @@ pub(super) async fn get_performance_timeseries(
     // Optional model_name filter: $3::text IS NULL OR uh.model_name = $3. The error rate
     // counts provider_error, timeout (error_count) and incomplete (incomplete_count) over
     // rows with a recorded stop_reason.
-    let sql = format!(
-        r#"
+    let sql = with_usage_rows(
+        "$1",
+        "$2",
+        &format!(
+            r#"
             SELECT
                 DATE_TRUNC('{date_trunc}', uh.hour)::text AS bucket,
                 COALESCE(SUM(uh.request_count), 0)::bigint AS requests,
@@ -140,12 +149,12 @@ pub(super) async fn get_performance_timeseries(
                     ELSE (SUM(uh.error_count) + SUM(uh.incomplete_count))::float8
                          / SUM(uh.stop_reason_count)::float8
                 END AS error_rate
-            FROM usage_hourly uh
-            WHERE uh.hour >= $1 AND uh.hour < $2
-              AND ($3::text IS NULL OR uh.model_name = $3)
+            FROM usage_rows uh
+            WHERE ($3::text IS NULL OR uh.model_name = $3)
             GROUP BY 1
             ORDER BY 1 ASC
             "#
+        ),
     );
 
     arm(tx, deadline).await?;

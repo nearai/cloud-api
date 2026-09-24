@@ -7,13 +7,13 @@ use crate::repositories::credit_allocation::{
     allocate_usage, load_allocations, lock_organization_accounting, CreditAllocationPolicy,
     UsageAllocationParent,
 };
+use crate::repositories::usage_hourly::with_usage_rows;
 use crate::repositories::utils::map_db_error;
 use crate::retry_db;
 use anyhow::{Context, Result};
 use chrono::Utc;
 use services::common::RepositoryError;
 use services::responses::models::ResponseId;
-use services::usage::trunc_hour;
 use std::collections::HashMap;
 use std::time::Duration;
 use tokio_postgres::Row;
@@ -497,16 +497,12 @@ impl OrganizationUsageRepository {
             .collect()
     }
 
-    /// Aggregate usage by model for an organization over the closed UTC hours since
-    /// `since` (spec §6.1): `[trunc_hour(since), trunc_hour(now))` from `usage_hourly`.
-    /// Returns the served start with the rows; the open current hour is never aggregated.
+    /// Aggregate usage by model for an organization since `start_date` (exact, via `usage_rows`).
     pub async fn get_usage_by_model_since(
         &self,
         organization_id: Uuid,
-        since: chrono::DateTime<Utc>,
-    ) -> Result<(chrono::DateTime<Utc>, Vec<UsageByModel>)> {
-        let start = trunc_hour(since);
-        let end = trunc_hour(Utc::now());
+        start_date: chrono::DateTime<Utc>,
+    ) -> Result<Vec<UsageByModel>> {
         let rows = retry_db!("get_organization_usage_by_model", {
             let client = self
                 .pool
@@ -517,7 +513,10 @@ impl OrganizationUsageRepository {
 
             client
                 .query(
-                    r#"
+                    &with_usage_rows(
+                        "$2",
+                        "'infinity'::timestamptz",
+                        r#"
                     SELECT
                         model_name,
                         COALESCE(SUM(input_tokens), 0)::BIGINT  AS input_tokens,
@@ -525,31 +524,29 @@ impl OrganizationUsageRepository {
                         COALESCE(SUM(total_tokens), 0)::BIGINT  AS total_tokens,
                         COALESCE(SUM(total_cost), 0)::BIGINT    AS total_cost,
                         COALESCE(SUM(request_count), 0)::BIGINT AS request_count
-                    FROM usage_hourly
+                    FROM usage_rows
                     WHERE organization_id = $1
-                      AND hour >= $2 AND hour < $3
                     GROUP BY model_name
                     ORDER BY total_cost DESC
                     "#,
-                    &[&organization_id, &start, &end],
+                    ),
+                    &[&organization_id, &start_date],
                 )
                 .await
                 .map_err(map_db_error)
         })?;
 
-        Ok((
-            start,
-            rows.into_iter()
-                .map(|row| UsageByModel {
-                    model: row.get("model_name"),
-                    input_tokens: row.get("input_tokens"),
-                    output_tokens: row.get("output_tokens"),
-                    total_tokens: row.get("total_tokens"),
-                    total_cost: row.get("total_cost"),
-                    request_count: row.get("request_count"),
-                })
-                .collect(),
-        ))
+        Ok(rows
+            .into_iter()
+            .map(|row| UsageByModel {
+                model: row.get("model_name"),
+                input_tokens: row.get("input_tokens"),
+                output_tokens: row.get("output_tokens"),
+                total_tokens: row.get("total_tokens"),
+                total_cost: row.get("total_cost"),
+                request_count: row.get("request_count"),
+            })
+            .collect())
     }
 
     fn row_to_usage_log(

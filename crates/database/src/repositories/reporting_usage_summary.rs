@@ -1,7 +1,6 @@
 use super::{
     organization_service_usage_reporting_summary::summarize_service_usage,
-    organization_usage_reporting_summary::{served_range, summarize_inference_usage},
-    utils::map_db_error,
+    organization_usage_reporting_summary::summarize_inference_usage, utils::map_db_error,
 };
 use crate::{pool::DbPool, retry_db};
 use anyhow::{Context, Result};
@@ -41,12 +40,6 @@ impl PostgresReportingUsageSummaryRepository {
     ) -> Result<ReportingUsageSummary> {
         let deadline =
             super::reporting_query::reporting_deadline(self.statement_timeout, filters.deadline)?;
-        let (start_time, end_time) = served_range(filters)?;
-        let filters = &ReportingUsageSummaryFilters {
-            start_time,
-            end_time,
-            ..filters.clone()
-        };
         let summary = retry_db!("summarize_reporting_usage", {
             let mut client = self
                 .pool
@@ -85,12 +78,7 @@ impl PostgresReportingUsageSummaryRepository {
             };
 
             transaction.commit().await.map_err(map_db_error)?;
-            Ok::<_, RepositoryError>(ReportingUsageSummary {
-                inference,
-                service,
-                start_time,
-                end_time,
-            })
+            Ok::<_, RepositoryError>(ReportingUsageSummary { inference, service })
         })?;
         Ok(summary)
     }

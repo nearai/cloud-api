@@ -1,5 +1,6 @@
 use super::arm;
 use super::nano_to_usd;
+use crate::repositories::usage_hourly::with_usage_rows;
 use crate::repositories::utils::map_db_error;
 use chrono::{DateTime, Utc};
 use services::admin::{
@@ -37,7 +38,10 @@ pub(super) async fn get_platform_provider_usage(
     arm(tx, deadline).await?;
     let rows = tx
         .query(
-            r#"
+            &with_usage_rows(
+                "$1",
+                "$2",
+                r#"
             SELECT
                 GROUPING(served_via_fallback, served_provider_type, served_provider_tier) as grouping_set,
                 served_via_fallback,
@@ -49,8 +53,7 @@ pub(super) async fn get_platform_provider_usage(
                 (COALESCE(SUM(input_tokens), 0) + COALESCE(SUM(output_tokens), 0))::bigint as total_tokens,
                 COALESCE(SUM(cache_read_tokens), 0)::bigint as cache_read_tokens,
                 COALESCE(SUM(total_cost), 0)::bigint as cost_nano
-            FROM usage_hourly
-            WHERE hour >= $1 AND hour < $2
+            FROM usage_rows
             GROUP BY GROUPING SETS (
                 (served_via_fallback),
                 (served_provider_type),
@@ -61,6 +64,7 @@ pub(super) async fn get_platform_provider_usage(
                 served_provider_type NULLS FIRST,
                 served_provider_tier NULLS FIRST
             "#,
+            ),
             &[&start, &end],
         )
         .await
@@ -110,8 +114,8 @@ pub(super) async fn get_platform_provider_usage(
     Ok(usage)
 }
 
-/// `where_clause` is the model-revenue WHERE over `usage_hourly uh` joined to `models m`
-/// (binds `$1`-`$5`); `query` already carries the hour-widened range.
+/// `where_clause` is the model-revenue WHERE over `usage_rows uh` joined to `models m`
+/// (binds `$3`-`$5`; `$1`/`$2` are the range).
 pub(super) async fn load_model_provider_breakdowns(
     tx: &Transaction<'_>,
     deadline: Instant,
@@ -125,8 +129,11 @@ pub(super) async fn load_model_provider_breakdowns(
     }
 
     let model_names: Vec<String> = data.iter().map(|entry| entry.model_name.clone()).collect();
-    let breakdown_sql = format!(
-        r#"
+    let breakdown_sql = with_usage_rows(
+        "$1",
+        "$2",
+        &format!(
+            r#"
         SELECT
             uh.model_name,
             uh.served_provider_type,
@@ -135,13 +142,14 @@ pub(super) async fn load_model_provider_breakdowns(
             COALESCE(SUM(uh.request_count), 0)::bigint as requests,
             (COALESCE(SUM(uh.input_tokens), 0) + COALESCE(SUM(uh.output_tokens), 0))::bigint as tokens,
             COALESCE(SUM(uh.total_cost), 0)::bigint as cost_nano
-        FROM usage_hourly uh
+        FROM usage_rows uh
         LEFT JOIN models m ON m.id = uh.model_id
         {where_clause}
           AND uh.model_name = ANY($6)
         GROUP BY uh.model_name, uh.served_provider_type, uh.served_provider_tier, uh.served_via_fallback
         ORDER BY uh.model_name, uh.served_provider_type NULLS FIRST, uh.served_provider_tier NULLS FIRST, uh.served_via_fallback
         "#
+        ),
     );
     arm(tx, deadline).await?;
     let breakdown_rows = tx

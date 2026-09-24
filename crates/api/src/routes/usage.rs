@@ -1361,17 +1361,14 @@ fn parse_datetime_or_default(
 }
 
 /// Organization usage metrics.
-///
-/// Served from the hourly usage aggregate: the range widens to whole UTC hours and the
-/// widened range is echoed; figures lag by up to ~65 minutes and exclude the current hour.
 #[utoipa::path(
     get,
     path = "/v1/organizations/{org_id}/usage/metrics",
     tag = "Usage",
     params(
         ("org_id" = String, Path, description = "Organization ID"),
-        ("start" = Option<String>, Query, description = "Start date (ISO 8601, default: 30 days ago). Rounded down to the UTC hour."),
-        ("end" = Option<String>, Query, description = "End date (ISO 8601, default: now). Rounded up to the UTC hour.")
+        ("start" = Option<String>, Query, description = "Start date (ISO 8601, default: 30 days ago)"),
+        ("end" = Option<String>, Query, description = "End date (ISO 8601, default: now)")
     ),
     responses(
         (status = 200, description = "Organization usage metrics", body = UserOrganizationMetrics),
@@ -1446,17 +1443,14 @@ pub async fn get_user_organization_metrics(
 }
 
 /// Organization usage timeseries.
-///
-/// Served from the hourly usage aggregate: the range widens to whole UTC hours and the
-/// widened range is echoed; figures lag by up to ~65 minutes and exclude the current hour.
 #[utoipa::path(
     get,
     path = "/v1/organizations/{org_id}/usage/timeseries",
     tag = "Usage",
     params(
         ("org_id" = String, Path, description = "Organization ID"),
-        ("start" = Option<String>, Query, description = "Start date (ISO 8601, default: 30 days ago). Rounded down to the UTC hour."),
-        ("end" = Option<String>, Query, description = "End date (ISO 8601, default: now). Rounded up to the UTC hour."),
+        ("start" = Option<String>, Query, description = "Start date (ISO 8601, default: 30 days ago)"),
+        ("end" = Option<String>, Query, description = "End date (ISO 8601, default: now)"),
         ("granularity" = Option<String>, Query, description = "Time bucket size: hour, day, week (default: day)")
     ),
     responses(
@@ -1584,11 +1578,10 @@ pub struct UsageByModelResponse {
 
 /// Get organization usage broken down by model.
 ///
-/// Returns one row per model, summed over the closed UTC hours of a rolling window:
+/// Returns one row per model, summed over a rolling window ending now:
 /// `day` = last 24h, `week` = last 7 days, `month` = last 30 days (NOT calendar
-/// day/week/month-to-date). `start_date` echoes the first hour served; the window ends at
-/// the start of the current hour, so figures lag by up to ~65 minutes. Used by the
-/// dashboard pie chart to show which models drive spend.
+/// day/week/month-to-date). Used by the dashboard pie chart to show which models
+/// drive spend.
 #[utoipa::path(
     get,
     path = "/v1/organizations/{org_id}/usage/by-model",
@@ -1614,9 +1607,11 @@ pub async fn get_organization_usage_by_model(
     Query(query): Query<UsageByModelQuery>,
 ) -> Result<ResponseJson<UsageByModelResponse>, (StatusCode, ResponseJson<ErrorResponse>)> {
     let organization_id = check_org_membership(&app_state, user, &org_id).await?;
-    let report = app_state
+    let start_date = query.period.since();
+
+    let entries = app_state
         .usage_service
-        .get_usage_by_model(organization_id, query.period.since())
+        .get_usage_by_model(organization_id, start_date)
         .await
         .map_err(|e| {
             tracing::error!(error = ?e, "Failed to get usage by model");
@@ -1629,8 +1624,7 @@ pub async fn get_organization_usage_by_model(
             )
         })?;
 
-    let data = report
-        .entries
+    let data = entries
         .into_iter()
         .map(|e| UsageByModelEntryResponse {
             model: e.model,
@@ -1645,7 +1639,7 @@ pub async fn get_organization_usage_by_model(
 
     Ok(ResponseJson(UsageByModelResponse {
         period: query.period.as_str().to_string(),
-        start_date: report.start.to_rfc3339(),
+        start_date: start_date.to_rfc3339(),
         data,
     }))
 }

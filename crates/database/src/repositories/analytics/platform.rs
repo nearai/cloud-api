@@ -1,9 +1,8 @@
-//! Platform-wide reports for admin dashboards, served from `usage_hourly` over the
-//! hour-normalized range (spec §6.1). Sign-up counts come from `users`/`organizations`
-//! over the same widened range, so each response describes one range.
+//! Platform-wide reports for admin dashboards over the exact requested range, read from
+//! `usage_rows` (usage_hourly for settled whole hours, raw for the rest).
 
-use super::hour_range::hour_range;
 use super::{approx_percentile, arm, nano_to_usd, provider_attribution};
+use crate::repositories::usage_hourly::with_usage_rows;
 use crate::repositories::utils::map_db_error;
 use chrono::{DateTime, Utc};
 use services::admin::{
@@ -21,8 +20,6 @@ pub(super) async fn get_platform_metrics(
     start: DateTime<Utc>,
     end: DateTime<Utc>,
 ) -> Result<PlatformMetrics, RepositoryError> {
-    let (start, end) = hour_range(start, end);
-
     // Counts: total active users/orgs (snapshot) + new signups (within the period) +
     // paying-org count (orgs with an active prepaid or contract credit).
     arm(tx, deadline).await?;
@@ -60,8 +57,11 @@ pub(super) async fn get_platform_metrics(
     arm(tx, deadline).await?;
     let summary_row = tx
         .query_one(
-            &format!(
-                r#"
+            &with_usage_rows(
+                "$1",
+                "$2",
+                &format!(
+                    r#"
             SELECT
                 COALESCE(SUM(uh.request_count), 0)::bigint as requests,
                 COALESCE(SUM(uh.total_cost), 0)::bigint as revenue_nano,
@@ -75,10 +75,10 @@ pub(super) async fn get_platform_metrics(
                 COALESCE(SUM(uh.error_count), 0)::bigint as error_count,
                 {p95_ttft} as p95_ttft_ms,
                 COALESCE(SUM(uh.incomplete_count), 0)::bigint as incomplete_count
-            FROM usage_hourly uh
+            FROM usage_rows uh
             LEFT JOIN models m ON m.id = uh.model_id
-            WHERE uh.hour >= $1 AND uh.hour < $2
             "#
+                ),
             ),
             &[&start, &end],
         )
@@ -115,17 +115,20 @@ pub(super) async fn get_platform_metrics(
     arm(tx, deadline).await?;
     let top_models_rows = tx
         .query(
-            r#"
+            &with_usage_rows(
+                "$1",
+                "$2",
+                r#"
             SELECT
                 uh.model_name,
                 COALESCE(SUM(uh.request_count), 0)::bigint as requests,
                 COALESCE(SUM(uh.total_cost), 0)::bigint as revenue_nano
-            FROM usage_hourly uh
-            WHERE uh.hour >= $1 AND uh.hour < $2
+            FROM usage_rows uh
             GROUP BY uh.model_name
             ORDER BY requests DESC
             LIMIT 10
             "#,
+            ),
             &[&start, &end],
         )
         .await
@@ -143,19 +146,22 @@ pub(super) async fn get_platform_metrics(
     arm(tx, deadline).await?;
     let top_orgs_rows = tx
         .query(
-            r#"
+            &with_usage_rows(
+                "$1",
+                "$2",
+                r#"
             SELECT
                 o.id as organization_id,
                 o.name as organization_name,
                 COALESCE(SUM(uh.request_count), 0)::bigint as requests,
                 COALESCE(SUM(uh.total_cost), 0)::bigint as spend_nano
             FROM organizations o
-            INNER JOIN usage_hourly uh ON uh.organization_id = o.id
-            WHERE uh.hour >= $1 AND uh.hour < $2
+            INNER JOIN usage_rows uh ON uh.organization_id = o.id
             GROUP BY o.id, o.name
             ORDER BY spend_nano DESC
             LIMIT 10
             "#,
+            ),
             &[&start, &end],
         )
         .await
@@ -204,7 +210,6 @@ pub(super) async fn get_platform_timeseries(
     end: DateTime<Utc>,
     granularity: &str,
 ) -> Result<PlatformTimeSeriesMetrics, RepositoryError> {
-    let (start, end) = hour_range(start, end);
     let date_trunc = match granularity {
         "hour" => "hour",
         "week" => "week",
@@ -214,8 +219,11 @@ pub(super) async fn get_platform_timeseries(
 
     // Usage-derived buckets: requests, tokens, cost + verifiable/external split +
     // active orgs. One scan of the hourly aggregate joined to models.
-    let usage_query = format!(
-        r#"
+    let usage_query = with_usage_rows(
+        "$1",
+        "$2",
+        &format!(
+            r#"
         SELECT
             DATE_TRUNC('{date_trunc}', uh.hour)::text as bucket,
             COALESCE(SUM(uh.request_count), 0)::bigint as requests,
@@ -224,12 +232,12 @@ pub(super) async fn get_platform_timeseries(
             COALESCE(SUM(uh.total_cost) FILTER (WHERE COALESCE(m.verifiable, false)), 0)::bigint as verifiable_nano,
             COALESCE(SUM(uh.total_cost) FILTER (WHERE NOT COALESCE(m.verifiable, false)), 0)::bigint as external_nano,
             COUNT(DISTINCT uh.organization_id)::bigint as active_orgs
-        FROM usage_hourly uh
+        FROM usage_rows uh
         LEFT JOIN models m ON m.id = uh.model_id
-        WHERE uh.hour >= $1 AND uh.hour < $2
         GROUP BY DATE_TRUNC('{date_trunc}', uh.hour)
         ORDER BY bucket ASC
         "#
+        ),
     );
     let new_orgs_query = format!(
         r#"

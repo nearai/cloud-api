@@ -5,7 +5,6 @@
 //! Every report runs in one read-only transaction under one statement budget (spec §6.3).
 
 mod consumption;
-pub(super) mod hour_range;
 mod organization;
 mod pagination;
 mod platform;

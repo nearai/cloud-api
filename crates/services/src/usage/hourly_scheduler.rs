@@ -305,7 +305,9 @@ pub async fn repair(
     to: DateTime<Utc>,
 ) -> Result<RepairReport, RepairError> {
     validate_repair_window(from, to).map_err(RepairError::InvalidWindow)?;
-    // The scheduler only moves the frontier forward, so a check outside the lock stays valid.
+    // Checked outside the aggregate lock. A raw row written below `from` after this check (a
+    // backfill or a clock-skewed writer) is stranded like any late row below MAX(hour); the
+    // lock would not prevent that, since raw inserts never take it. Repair that window again.
     if let Some(frontier) = repair_frontier(repository.progress().await?) {
         if from > frontier {
             return Err(RepairError::AheadOfAggregate { frontier });

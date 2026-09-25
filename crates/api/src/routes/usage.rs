@@ -1,7 +1,10 @@
 use crate::{
     middleware::AuthenticatedUser,
     models::{CreditType, ErrorResponse},
-    routes::{api::AppState, common::format_amount},
+    routes::{
+        api::AppState,
+        common::{analytics_error_response, format_amount},
+    },
 };
 use axum::{
     extract::{Path, Query, State},
@@ -1077,7 +1080,9 @@ fn build_record_usage_response(entry: services::usage::UsageLogEntry) -> RecordU
 // that key submit arbitrary usage rows on the org's behalf — and instead
 // requires a shared `CLOUD_API_USAGE_TOKEN` service secret and carries the
 // subject identity (`organization_id`, `workspace_id`, `api_key_id`) in
-// the body.
+// the body. The body may also carry `discount_to_user`, the fraction an
+// aggregator lane publishes in its models document; it is applied after
+// catalog pricing and capped by `INTERNAL_USAGE_MAX_DISCOUNT`.
 //
 // Threat model:
 // - Anyone holding `CLOUD_API_USAGE_TOKEN` can submit usage rows for any
@@ -1085,11 +1090,13 @@ fn build_record_usage_response(entry: services::usage::UsageLogEntry) -> RecordU
 //   (inference-proxy CVMs) and is rotated alongside other service secrets.
 //
 // The body shape is the existing `RecordUsageApiRequest` flattened under a
-// wrapper that adds the three identity fields, so reporters keep one builder.
+// wrapper that adds the three identity fields and the optional
+// `discount_to_user`, so reporters keep one builder.
 
 /// Request body for `POST /v1/internal/usage`. The `usage` field is
 /// flattened, so the on-the-wire shape is `RecordUsageApiRequest` JSON with
-/// three extra top-level keys.
+/// four extra top-level keys: the three identity fields and the optional
+/// `discount_to_user`.
 ///
 /// `ToSchema` is intentionally not derived: `RecordUsageApiRequest`
 /// doesn't implement `PartialSchema` (its OpenAPI doc was hand-rolled via
@@ -1112,9 +1119,53 @@ pub struct RecordUsageInternalRequest {
     /// UUID of the API key the usage should be attributed to (for
     /// per-key analytics). Trusted as provided.
     pub api_key_id: String,
+    /// Optional provider-side discount as the fraction of the list price the
+    /// subject is *not* charged (`0.2` = 20% off), mirroring the
+    /// `discount_to_user` an aggregator lane publishes in its models
+    /// document. Applied to every priced component after catalog pricing;
+    /// the list amounts are kept in the row's `billing_details`. Must be in
+    /// `[0, 1)`, be a multiple of `0.0001` (whole basis points) and not
+    /// exceed `INTERNAL_USAGE_MAX_DISCOUNT`. Omitted or `0` bills at list price.
+    pub discount_to_user: Option<f64>,
     /// The standard usage payload.
     #[serde(flatten)]
     pub usage: services::usage::RecordUsageApiRequest,
+}
+
+/// Turn the optional `discount_to_user` fraction into a validated
+/// [`services::usage::UsageDiscount`], enforcing the operator ceiling
+/// `INTERNAL_USAGE_MAX_DISCOUNT` so a misconfigured reporter cannot record
+/// rows far below list price. `None` and `0` mean list price.
+fn resolve_internal_usage_discount(
+    discount_to_user: Option<f64>,
+    max_discount: f64,
+) -> Result<Option<services::usage::UsageDiscount>, UsageError> {
+    let Some(fraction) = discount_to_user else {
+        return Ok(None);
+    };
+    let validation_error = |message: String| {
+        (
+            StatusCode::BAD_REQUEST,
+            ResponseJson(ErrorResponse::new(message, "validation_error".to_string())),
+        )
+    };
+    let discount = services::usage::UsageDiscount::from_fraction(fraction)
+        .map_err(|error| validation_error(error.to_string()))?;
+    if let Some(discount) = discount {
+        // Compare in whole basis points so a ceiling like `0.2` accepts
+        // exactly 0.2. The ceiling is floored (with a tolerance for float
+        // representation) so a value between two basis points never admits
+        // the one above it.
+        let ceiling_bp = (max_discount * 10_000.0 + 1e-6).floor();
+        if f64::from(discount.basis_points()) > ceiling_bp {
+            return Err(validation_error(format!(
+                "discount_to_user {} exceeds the configured maximum {}",
+                discount.fraction(),
+                max_discount
+            )));
+        }
+    }
+    Ok(discount)
 }
 
 /// Validate the `Authorization: Bearer …` header against the configured
@@ -1198,10 +1249,20 @@ pub async fn record_usage_internal(
     let organization_id = parse_uuid(&request.organization_id, "organization_id")?;
     let workspace_id = parse_uuid(&request.workspace_id, "workspace_id")?;
     let api_key_id = parse_uuid(&request.api_key_id, "api_key_id")?;
+    let discount = resolve_internal_usage_discount(
+        request.discount_to_user,
+        app_state.config.internal_usage_max_discount,
+    )?;
 
     let entry = app_state
         .usage_service
-        .record_usage_from_api(organization_id, workspace_id, api_key_id, request.usage)
+        .record_usage_from_api(
+            organization_id,
+            workspace_id,
+            api_key_id,
+            request.usage,
+            discount,
+        )
         .await
         .map_err(|e| match &e {
             services::usage::UsageError::ModelNotFound(_) => (
@@ -1357,6 +1418,7 @@ fn parse_datetime_or_default(
     }
 }
 
+/// Organization usage metrics.
 #[utoipa::path(
     get,
     path = "/v1/organizations/{org_id}/usage/metrics",
@@ -1370,6 +1432,7 @@ fn parse_datetime_or_default(
         (status = 200, description = "Organization usage metrics", body = UserOrganizationMetrics),
         (status = 401, description = "Unauthorized", body = ErrorResponse),
         (status = 403, description = "Forbidden", body = ErrorResponse),
+        (status = 504, description = "Analytics statement budget exceeded", body = ErrorResponse),
         (status = 500, description = "Internal server error", body = ErrorResponse)
     ),
     security(
@@ -1395,14 +1458,7 @@ pub async fn get_user_organization_metrics(
         .get_organization_metrics(organization_id, start, end, None)
         .await
         .map_err(|e| {
-            tracing::error!("Failed to get organization metrics: {}", e);
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                ResponseJson(ErrorResponse::new(
-                    "Failed to retrieve organization metrics".to_string(),
-                    "internal_server_error".to_string(),
-                )),
-            )
+            analytics_error_response(e, "Failed to retrieve organization metrics", false)
         })?;
 
     Ok(ResponseJson(UserOrganizationMetrics {
@@ -1444,6 +1500,7 @@ pub async fn get_user_organization_metrics(
     }))
 }
 
+/// Organization usage timeseries.
 #[utoipa::path(
     get,
     path = "/v1/organizations/{org_id}/usage/timeseries",
@@ -1458,6 +1515,7 @@ pub async fn get_user_organization_metrics(
         (status = 200, description = "Organization usage timeseries", body = UserTimeSeriesMetrics),
         (status = 401, description = "Unauthorized", body = ErrorResponse),
         (status = 403, description = "Forbidden", body = ErrorResponse),
+        (status = 504, description = "Analytics statement budget exceeded", body = ErrorResponse),
         (status = 500, description = "Internal server error", body = ErrorResponse)
     ),
     security(
@@ -1494,14 +1552,7 @@ pub async fn get_user_organization_timeseries(
         .get_organization_timeseries(organization_id, start, end, granularity, None)
         .await
         .map_err(|e| {
-            tracing::error!("Failed to get organization timeseries: {}", e);
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                ResponseJson(ErrorResponse::new(
-                    "Failed to retrieve organization timeseries".to_string(),
-                    "internal_server_error".to_string(),
-                )),
-            )
+            analytics_error_response(e, "Failed to retrieve organization timeseries", false)
         })?;
 
     Ok(ResponseJson(UserTimeSeriesMetrics {
@@ -1694,6 +1745,105 @@ mod internal_usage_tests {
         h.insert("authorization", HeaderValue::from_static("svc-token"));
         let err = verify_internal_usage_token(&h, Some("svc-token")).unwrap_err();
         assert_eq!(err.0, StatusCode::UNAUTHORIZED);
+    }
+
+    #[test]
+    fn discount_absent_or_zero_means_list_price() {
+        assert_eq!(resolve_internal_usage_discount(None, 0.5).unwrap(), None);
+        assert_eq!(
+            resolve_internal_usage_discount(Some(0.0), 0.5).unwrap(),
+            None
+        );
+        // A ceiling of zero still lets a reporter send an explicit `0`.
+        assert_eq!(
+            resolve_internal_usage_discount(Some(0.0), 0.0).unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn discount_within_ceiling_is_accepted() {
+        let discount = resolve_internal_usage_discount(Some(0.2), 0.5)
+            .unwrap()
+            .expect("20% is a discount");
+        assert_eq!(discount.basis_points(), 2_000);
+        // Exactly at the ceiling is allowed.
+        let at_ceiling = resolve_internal_usage_discount(Some(0.2), 0.2)
+            .unwrap()
+            .expect("20% is a discount");
+        assert_eq!(at_ceiling.basis_points(), 2_000);
+    }
+
+    #[test]
+    fn discount_outside_unit_interval_is_a_400() {
+        for bad in [1.0, 1.5, -0.1, f64::NAN, f64::INFINITY] {
+            let err = resolve_internal_usage_discount(Some(bad), 0.9).unwrap_err();
+            assert_eq!(err.0, StatusCode::BAD_REQUEST, "{bad}");
+            assert_eq!(err.1 .0.error.r#type, "validation_error");
+        }
+    }
+
+    #[test]
+    fn discount_finer_than_a_basis_point_is_a_400() {
+        let err = resolve_internal_usage_discount(Some(0.12345), 0.9).unwrap_err();
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+        assert!(
+            err.1 .0.error.message.contains("multiple of 0.0001"),
+            "{}",
+            err.1 .0.error.message
+        );
+    }
+
+    #[test]
+    fn discount_above_ceiling_is_a_400() {
+        let err = resolve_internal_usage_discount(Some(0.3), 0.25).unwrap_err();
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+        assert!(
+            err.1 .0.error.message.contains("exceeds"),
+            "{}",
+            err.1 .0.error.message
+        );
+        // A ceiling of zero refuses every non-zero discount.
+        let err = resolve_internal_usage_discount(Some(0.0001), 0.0).unwrap_err();
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn internal_request_body_carries_discount_to_user() {
+        // `usage` is flattened, so pin that the sibling field survives serde's
+        // flatten buffering for both a float and an integer zero.
+        let mut body = serde_json::json!({
+            "organization_id": "11111111-1111-1111-1111-111111111111",
+            "workspace_id": "22222222-2222-2222-2222-222222222222",
+            "api_key_id": "33333333-3333-3333-3333-333333333333",
+            "type": "chat_completion",
+            "model": "m",
+            "input_tokens": 1,
+            "output_tokens": 1,
+            "id": "x",
+            "discount_to_user": 0.2
+        });
+        let parsed: super::RecordUsageInternalRequest =
+            serde_json::from_value(body.clone()).unwrap();
+        assert_eq!(parsed.discount_to_user, Some(0.2));
+        body["discount_to_user"] = serde_json::json!(0);
+        let parsed: super::RecordUsageInternalRequest =
+            serde_json::from_value(body.clone()).unwrap();
+        assert_eq!(parsed.discount_to_user, Some(0.0));
+        body.as_object_mut().unwrap().remove("discount_to_user");
+        let parsed: super::RecordUsageInternalRequest = serde_json::from_value(body).unwrap();
+        assert_eq!(parsed.discount_to_user, None);
+    }
+
+    #[test]
+    fn discount_ceiling_between_basis_points_floors() {
+        // 0.10005 is 1000.5 bp: 0.1001 must be refused, 0.1 accepted.
+        let err = resolve_internal_usage_discount(Some(0.1001), 0.10005).unwrap_err();
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+        let ok = resolve_internal_usage_discount(Some(0.1), 0.10005)
+            .unwrap()
+            .expect("10% is a discount");
+        assert_eq!(ok.basis_points(), 1_000);
     }
 
     #[test]

@@ -172,16 +172,17 @@ pub fn allowlisted_date_trunc(
 /// - `start >= end` → 400
 /// - per-granularity absolute caps prevent unbounded full-table scans:
 ///   - `hour`  → max `max_hour_days` days (caller-specified)
-///   - `day`   → max 366 days
+///   - `day`   → max `max_day_days` days
 ///   - `week`  → max 3 years (1096 days)
 ///   - `month` → max 5 years (1826 days)
-///   - `None`  → max 366 days (non-timeseries endpoints)
+///   - `None`  → max `max_day_days` days (non-timeseries endpoints)
 #[allow(clippy::type_complexity)]
 pub fn parse_metrics_range(
     start: Option<&str>,
     end: Option<&str>,
     granularity: Option<&str>,
     max_hour_days: i64,
+    max_day_days: i64,
 ) -> Result<
     (chrono::DateTime<chrono::Utc>, chrono::DateTime<chrono::Utc>),
     (StatusCode, ResponseJson<ErrorResponse>),
@@ -242,12 +243,12 @@ pub fn parse_metrics_range(
                 ));
             }
         }
-        // "day" or None: absolute cap of 366 days
+        // "day" or None: caller-configured cap for non-hour ranges.
         _ => {
-            if window > chrono::Duration::days(366) {
-                return Err(range_err(
-                    "'day' granularity is limited to 366 days".to_string(),
-                ));
+            if window > chrono::Duration::days(max_day_days) {
+                return Err(range_err(format!(
+                    "'day' granularity is limited to {max_day_days} days"
+                )));
             }
         }
     }
@@ -597,6 +598,40 @@ pub fn map_organization_error(
     }
 }
 
+/// Maps an analytics service error to its HTTP response (spec §6.3). A statement-budget
+/// cancellation is a 504 with a structured body, like `reporting_request_timeout`. Every
+/// other error is a 500: admins see the internal error text, customers see only `failure`.
+pub fn analytics_error_response(
+    error: services::admin::AdminError,
+    failure: &str,
+    include_detail: bool,
+) -> (StatusCode, ResponseJson<ErrorResponse>) {
+    tracing::error!(error = %error, "{failure}");
+    match error {
+        services::admin::AdminError::Timeout => (
+            StatusCode::GATEWAY_TIMEOUT,
+            ResponseJson(ErrorResponse::new(
+                "Analytics request timed out".to_string(),
+                "analytics_request_timeout".to_string(),
+            )),
+        ),
+        other => {
+            let message = if include_detail {
+                format!("{failure}: {other}")
+            } else {
+                failure.to_string()
+            };
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                ResponseJson(ErrorResponse::new(
+                    message,
+                    "internal_server_error".to_string(),
+                )),
+            )
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -892,5 +927,33 @@ mod tests {
         // Non-JSON / non-object payloads (e.g. E2EE blobs) must be left alone.
         assert!(inject_warning_field(b"not json", "w").is_none());
         assert!(inject_warning_field(b"[1,2,3]", "w").is_none());
+    }
+
+    #[test]
+    fn analytics_timeout_maps_to_gateway_timeout() {
+        let (status, body) = analytics_error_response(
+            services::admin::AdminError::Timeout,
+            "Failed to retrieve platform metrics",
+            true,
+        );
+        assert_eq!(status, StatusCode::GATEWAY_TIMEOUT);
+        assert_eq!(body.0.error.r#type, "analytics_request_timeout");
+    }
+
+    #[test]
+    fn analytics_internal_errors_hide_detail_from_customers() {
+        let failure = || services::admin::AdminError::InternalError("db down".to_string());
+        let (status, customer) =
+            analytics_error_response(failure(), "Failed to retrieve organization metrics", false);
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(
+            customer.0.error.message,
+            "Failed to retrieve organization metrics"
+        );
+        let (_, admin) = analytics_error_response(failure(), "Failed to retrieve metrics", true);
+        assert_eq!(
+            admin.0.error.message,
+            "Failed to retrieve metrics: Internal error: db down"
+        );
     }
 }

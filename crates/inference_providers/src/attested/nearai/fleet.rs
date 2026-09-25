@@ -317,6 +317,24 @@ impl Fleet {
         if has_history {
             return Some(self.reserve_index(route_key, candidates[0]));
         }
+        Some(self.acquire_candidates(route_key, count, &candidates))
+    }
+
+    /// Independent decision requests have no chat prefix. Hash the original
+    /// request key and use the same bounded spillover as first-turn chat.
+    pub(super) fn acquire_systemone_index(&self, request_hash: &str) -> Option<RouteLease> {
+        let count = self.rotation_count();
+        if count == 0 {
+            return None;
+        }
+        let digest = Sha256::digest(request_hash.as_bytes());
+        let route_key =
+            u64::from_be_bytes(digest[..8].try_into().expect("SHA-256 has eight bytes"));
+        let candidates = self.candidate_indices(route_key, count, None);
+        Some(self.acquire_candidates(route_key, count, &candidates))
+    }
+
+    fn acquire_candidates(&self, route_key: u64, count: usize, candidates: &[usize]) -> RouteLease {
         let mut loads = lock(&self.prefix_loads);
         let counts = loads.entry(route_key).or_insert_with(|| vec![0; count]);
         if counts.len() < count {
@@ -336,11 +354,11 @@ impl Fleet {
             });
         counts[index] = counts[index].saturating_add(1);
         drop(loads);
-        Some(RouteLease {
+        RouteLease {
             route_key,
             index,
             prefix_loads: self.prefix_loads.clone(),
-        })
+        }
     }
 
     /// Reserve an explicit fallback index for the same prefix key.

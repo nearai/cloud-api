@@ -437,6 +437,7 @@ where
 
                         if usage_service
                             .record_usage(RecordUsageServiceRequest {
+                                discount: None,
                                 organization_id,
                                 workspace_id,
                                 api_key_id,
@@ -1739,6 +1740,9 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
             }
         };
 
+        model
+            .validate_endpoint(crate::models::InferenceEndpoint::ChatCompletions)
+            .map_err(|message| ports::CompletionError::InvalidParams(message.into()))?;
         let canonical_name = &model.model_name;
         let cache_write_cost_per_token = Self::anthropic_cache_write_rate(&model)?;
         let requested_service_tier =
@@ -1778,6 +1782,7 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
             prefix_hash: Some(compute_prefix_hash(&chat_params.messages)),
             estimated_tokens: Some(estimate_input_tokens(&chat_params.messages)),
             fallback_disabled: !request.fallback_enabled,
+            request_priority: chat_params.request_priority,
         };
 
         // Get the LLM stream
@@ -1925,6 +1930,9 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
             }
         };
 
+        model
+            .validate_endpoint(crate::models::InferenceEndpoint::ChatCompletions)
+            .map_err(|message| ports::CompletionError::InvalidParams(message.into()))?;
         let canonical_name = &model.model_name;
         let cache_write_cost_per_token = Self::anthropic_cache_write_rate(&model)?;
         let requested_service_tier =
@@ -1967,6 +1975,8 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
         Self::reject_n_gt_1_if_unsupported(model.attestation_supported, request.n, canonical_name)?;
 
         let provider_start_time = Instant::now();
+        // Read before `chat_params` moves into the call below.
+        let request_priority = chat_params.request_priority;
         let result = self
             .inference_provider_pool
             .chat_completion_with_attribution_and_hints(
@@ -1974,6 +1984,7 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
                 request.body_hash.clone(),
                 super::inference_provider_pool::ChatRoutingHints {
                     fallback_disabled: !request.fallback_enabled,
+                    request_priority,
                     ..Default::default()
                 },
             )
@@ -2090,6 +2101,7 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
 
         usage_service
             .record_usage(RecordUsageServiceRequest {
+                discount: None,
                 organization_id,
                 workspace_id,
                 api_key_id,
@@ -2408,7 +2420,9 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
         &self,
         model_name: &str,
     ) -> Result<Option<crate::models::ModelWithPricing>, anyhow::Error> {
-        self.models_repository.get_model_by_name(model_name).await
+        self.models_repository
+            .resolve_and_get_model(model_name)
+            .await
     }
 
     fn get_inference_provider_pool(

@@ -20,6 +20,7 @@ use utoipa::{Modify, OpenApi};
     tags(
         (name = "Chat", description = "Chat completion endpoints for AI model inference"),
         (name = "Images", description = "Image generation endpoints"),
+        (name = "Decisions", description = "Typed decisions through the System One protocol"),
         (name = "Audio", description = "Audio transcription endpoints"),
         (name = "Rerank", description = "Document reranking endpoints"),
         (name = "Score", description = "Text similarity scoring endpoints"),
@@ -47,6 +48,7 @@ use utoipa::{Modify, OpenApi};
         // Chat completion endpoints (most important for users)
         crate::routes::completions::chat_completions,
         crate::routes::completions::image_generations,
+        crate::routes::systemone::systemone,
         crate::routes::completions::audio_transcriptions,
         crate::routes::completions::image_edits,
         crate::routes::completions::rerank,
@@ -180,6 +182,8 @@ use utoipa::{Modify, OpenApi};
         crate::routes::admin::get_platform_timeseries,
         crate::routes::admin::get_billing_summary,
         crate::routes::admin::get_model_revenue,
+        crate::routes::admin::get_revenue_density,
+        crate::routes::admin_usage_hourly::recompute_usage_hourly,
         crate::routes::admin::get_org_revenue,
         crate::routes::admin::get_infra_summary,
         crate::routes::admin::list_invitation_email_deliveries,
@@ -224,6 +228,10 @@ use utoipa::{Modify, OpenApi};
             CreateOrganizationRequest, OrganizationResponse,
             UpdateOrganizationRequest, CreateApiKeyRequest, ApiKeyResponse,
             UpdateApiKeySpendLimitRequest, UpdateApiKeyRequest,
+            // usage_hourly repair models
+            crate::routes::admin_usage_hourly::UsageHourlyRepairRequest,
+            crate::routes::admin_usage_hourly::UsageHourlyRepairResponse,
+            crate::routes::admin_usage_hourly::UsageHourlyDayParity,
             // Workspace models
             crate::routes::workspaces::CreateWorkspaceRequest,
             crate::routes::workspaces::UpdateWorkspaceRequest,

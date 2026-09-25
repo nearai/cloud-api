@@ -1,5 +1,7 @@
 mod fleet;
 mod prefix_router;
+#[cfg(test)]
+mod systemone_tests;
 
 use crate::spki_verifier::{FingerprintState, SharedTlsRoots};
 use crate::{
@@ -1287,6 +1289,98 @@ where
 
 #[async_trait]
 impl InferenceProvider for Fleet {
+    fn supports_systemone(&self) -> bool {
+        true
+    }
+
+    async fn systemone(
+        &self,
+        request: SystemOneRequest,
+        request_hash: String,
+    ) -> Result<SystemOneResponseWithBytes, CompletionError> {
+        let mut headers = self
+            .build_headers()
+            .map_err(CompletionError::CompletionError)?;
+        headers.insert(
+            "X-Request-Hash",
+            HeaderValue::from_str(&request_hash)
+                .map_err(|_| CompletionError::CompletionError("Invalid request hash".into()))?,
+        );
+        let mut lease = self.acquire_systemone_index(&request_hash);
+        let route_key = lease.as_ref().map(|lease| lease.route_key());
+        let indices = match &lease {
+            Some(lease) => std::iter::once(lease.index())
+                .chain(self.fallback_indices_for(lease.index(), None))
+                .map(Some)
+                .collect::<Vec<_>>(),
+            None => vec![None],
+        };
+        let timeout_seconds = self.config.completion_timeout_seconds.max(1) as u64;
+        let mut last_error = None;
+        for index in indices {
+            let _lease = lease.take().or_else(|| {
+                index
+                    .zip(route_key)
+                    .map(|(index, key)| self.reserve_index(key, index))
+            });
+            let attempt = async {
+                let (client, url) = match index {
+                    Some(index) => (
+                        self.get_or_verify_index_client(index).await?,
+                        self.rotation_url(index as u64, "/v1/systemone")
+                            .expect("rotation lease requires a rotation URL"),
+                    ),
+                    None => (
+                        self.fallback_client.clone(),
+                        format!("{}/v1/systemone", self.config.base_url),
+                    ),
+                };
+                let response = client
+                    .post(url)
+                    .headers(headers.clone())
+                    .json(&request)
+                    .timeout(Duration::from_secs(timeout_seconds))
+                    .send()
+                    .await
+                    .map_err(|e| crate::systemone::transport_error(e, timeout_seconds))?;
+                let response = crate::systemone::read_response(response, &request, false).await?;
+                let id = response.provider_signature_id()?;
+                if let Some(index) = index {
+                    self.signature_rotation
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .insert(id.to_owned(), index as u64);
+                }
+                Ok(response)
+            }
+            .await;
+            match attempt {
+                Ok(response) => return Ok(response),
+                Err(error) => {
+                    // Never replay a successful but malformed response or an
+                    // ambiguous read timeout. Those may already have incurred cost.
+                    let retryable = match &error {
+                        CompletionError::HttpError { status_code, .. } => {
+                            Self::is_rotation_retryable_status(*status_code)
+                        }
+                        CompletionError::CompletionError(_) => true,
+                        _ => false,
+                    };
+                    if !retryable {
+                        return Err(error);
+                    }
+                    if let Some(index) = index {
+                        if matches!(error, CompletionError::CompletionError(_)) {
+                            self.clear_index(index);
+                        }
+                    }
+                    last_error = Some(error);
+                }
+            }
+        }
+        Err(last_error.expect("at least one System One backend was attempted"))
+    }
+
     /// NEAR's own attested fleet. `Provider` (which wraps `Fleet`) is what the pool
     /// actually registers, but mirror the tier here too so the verifiable filter can
     /// never misclassify a `Fleet` as plaintext if one is ever pooled directly.
@@ -2501,6 +2595,18 @@ impl InferenceProvider for Fleet {
 /// to its Fleet, which holds all NEAR-AI model-proxy state and logic.
 #[async_trait]
 impl InferenceProvider for Provider {
+    fn supports_systemone(&self) -> bool {
+        true
+    }
+
+    async fn systemone(
+        &self,
+        request: SystemOneRequest,
+        request_hash: String,
+    ) -> Result<SystemOneResponseWithBytes, CompletionError> {
+        self.fleet.systemone(request, request_hash).await
+    }
+
     /// NEAR AI's own attested TEE fleet — the primary tier for any model NEAR
     /// serves; an attested third party (Chutes) sits behind it as fallback.
     fn tier(&self) -> crate::ProviderTier {

@@ -1,3 +1,16 @@
+//! Per-API-key request limiter: a fixed 60-second window per key, counted in
+//! process. It runs after API-key auth and keys on the resolved `api_key_id`,
+//! so it only throttles valid key holders and does not protect against
+//! invalid keys.
+//!
+//! The inference routes share one bucket per key: the OpenAI-compatible and
+//! Responses routes through [`api_key_rate_limit_middleware`], native
+//! Anthropic Messages and MCP tool calls through
+//! [`check_rate_limit_for_api_key`]. Anthropic token counting has its own
+//! scoped bucket. `/v1/check_api_key` has no per-key limit: a gateway calls it
+//! once per request it receives, so a limit there turns caller bursts into
+//! 429s unrelated to backend load (see `build_gateway_routes` in `lib.rs`).
+
 use axum::{
     extract::{Request, State},
     http::{header::RETRY_AFTER, HeaderName, HeaderValue, StatusCode},
@@ -18,7 +31,9 @@ use super::auth::AuthenticatedApiKey;
 use crate::models::AnthropicErrorResponse;
 use crate::models::ErrorResponse;
 
-const DEFAULT_API_KEY_RATE_LIMIT: u32 = 1000; // requests per minute
+/// Requests per minute per API key in the shared inference bucket. Public so
+/// e2e tests can burst past it.
+pub const DEFAULT_API_KEY_RATE_LIMIT: u32 = 1000;
 const RATE_LIMIT_WINDOW_SECS: u64 = 60;
 const RATE_LIMIT_CACHE_MAX_CAPACITY: u64 = 50_000;
 const ANTHROPIC_COUNT_TOKENS_SCOPE: &str = "anthropic_count_tokens";

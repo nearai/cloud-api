@@ -1,13 +1,13 @@
 #!/bin/bash
 # Test signature fetching on cloud-api
-# Usage: ./test_signature.sh <base_url> <api_key>
+# Usage: ./test_signature.sh <base_url> [api_key]  (or API_KEY=<key>)
 #
 # Reproduces the signature error: makes a completion, waits, then
 # checks if the signature was stored. Before the fix, multi-instance
 # models (Qwen3.5) fail ~83% of the time (5/6 chance of wrong backend).
 
 BASE_URL="${1:-https://cloud-stg-api.near.ai}"
-API_KEY="${2:-sk-75593ebd8f72433b8421e2090e5fb217}"
+API_KEY="${2:-${API_KEY:?Set API_KEY or pass the key as the second argument}}"
 MODEL="${3:-Qwen/Qwen3.5-122B-A10B}"
 ATTEMPTS="${4:-5}"
 

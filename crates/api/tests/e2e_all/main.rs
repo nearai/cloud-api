@@ -31,6 +31,7 @@ mod admin_usage_hourly_repair;
 mod api_key_usage_hourly;
 mod api_keys;
 mod attestation_auth;
+mod attestation_report_params;
 mod audio_image;
 mod audio_transcriptions;
 mod auth_tokens;

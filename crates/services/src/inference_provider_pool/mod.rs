@@ -3540,6 +3540,10 @@ impl InferenceProviderPool {
 
     /// `provider_filter`: when `Some`, only providers whose `tier()` matches are
     /// tried. `None` preserves the existing behaviour (first successful wins).
+    ///
+    /// `signing_algo` is forwarded to each backend verbatim. Backends accept
+    /// only lowercase `ecdsa` / `ed25519`, so callers must pass a normalized
+    /// value (the attestation service does).
     pub async fn get_attestation_report(
         &self,
         model: String,

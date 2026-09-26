@@ -121,6 +121,22 @@ mod tests {
     }
 
     #[test]
+    fn unknown_report_model_is_400_like_chat_completions() {
+        let (status, ResponseJson(body)) = attestation_report_error_response(
+            AttestationError::UnknownModel("test-org/no-such-model".to_string()),
+        );
+
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(
+            body.error.message,
+            "Model 'test-org/no-such-model' not found. It's not a valid model name or alias."
+        );
+        assert_eq!(body.error.r#type, "invalid_request_error");
+        assert_eq!(body.error.param.as_deref(), Some("model"));
+        assert_eq!(body.error.code, None);
+    }
+
+    #[test]
     fn invalid_signature_algorithm_is_rejected_before_lookup() {
         let (status, ResponseJson(body)) =
             validate_signing_algo(Some("rsa")).expect_err("rsa must be rejected");

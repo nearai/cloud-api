@@ -32,3 +32,17 @@ pub const DEFAULT_MAX_RUNNING: f64 = 40.0;
 /// The minimum speed multiplier `score.rs` divides by, so a replica with a
 /// very low (or zero) `gen_tps` sample doesn't blow the score up to infinity.
 pub const SPEED_FLOOR: f64 = 0.2;
+
+/// Bounded-load affinity tolerance: stay on the affinity home/pin while its
+/// score is within this fraction of the best eligible score.
+pub const AFFINITY_EPS: f64 = 0.25;
+
+/// Absolute slack added to the relative `AFFINITY_EPS` bound (see
+/// `affinity::within_bound`), so affinity is not lost to a proportionally
+/// large-looking gap when the whole fleet is near idle and `best` is close
+/// to 0 (a relative-only bound would otherwise collapse to ~0 there).
+pub const AFFINITY_ABS_SLACK: f64 = 0.1;
+
+/// How long a follow pin stays valid after it's written, in milliseconds.
+/// 10 minutes, matching OpenRouter's sticky-session TTL.
+pub const PIN_TTL_MS: u64 = 600_000;

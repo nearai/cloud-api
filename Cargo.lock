@@ -5120,6 +5120,8 @@ dependencies = [
  "base64 0.22.1",
  "ed25519-dalek",
  "hex",
+ "hmac 0.13.0",
+ "rand 0.10.1",
  "serde",
  "serde_json",
  "sha2 0.11.0",

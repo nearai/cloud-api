@@ -12,6 +12,7 @@ use std::collections::HashMap;
 
 use ed25519_dalek::VerifyingKey;
 
+use crate::affinity::PinTable;
 use crate::consts::SUPPORTED_SCHEMA;
 use crate::frame::{self, Envelope, FrameError, ReplicaReport};
 
@@ -50,14 +51,12 @@ pub struct RoutedCounts {
 }
 
 /// A point-in-time view the placer scores against.
-///
-/// `pins` (Task 5's `PinTable`) is intentionally not present yet; it will be
-/// added as a fourth field once Task 5 defines `PinTable`.
 #[derive(Default)]
 pub struct Snapshot {
     pub built_ms: u64,
     pub replicas: Vec<ReplicaView>,
     pub routed: HashMap<(String, String), RoutedCounts>,
+    pub pins: PinTable,
 }
 
 /// Why a frame was not accepted into the snapshot.

@@ -16,6 +16,7 @@
 //! error kinds and counts are logged or measured.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -74,6 +75,12 @@ pub const METRIC_SNAPSHOT_AGE_MS: &str = "cloud_api.placement.snapshot_age_ms";
 /// `outcome:{place|legacy}` plus `selection:{..}` (place) or `reason:{..}`
 /// (legacy). Never host or request ids.
 pub const METRIC_DECISIONS: &str = "cloud_api.placement.decisions";
+/// Replicas excluded per decision, by eligibility rule (`rule:{..}`).
+pub const METRIC_EXCLUDED: &str = "cloud_api.placement.excluded";
+/// One per decision, tagged `affinity:{client|prefix|none}` and `outcome:{..}`.
+pub const METRIC_AFFINITY: &str = "cloud_api.placement.affinity";
+/// Prefill backlog (tokens) on the chosen host, per placed request.
+pub const METRIC_CHOSEN_BACKLOG: &str = "cloud_api.placement.chosen_backlog_tokens";
 
 /// Everything a provider's `Fleet` needs to place covered-model requests.
 /// `hosts` is the same `ArcSwap` the [`PlacementIo`] reader resolves frame
@@ -191,6 +198,9 @@ pub struct PlacementIo {
     pub snapshot: Arc<ArcSwap<Snapshot>>,
     writes: mpsc::Sender<Write>,
     metrics: Arc<dyn PlacementMetrics>,
+    /// Set by the first `Fleet::set_placement`: one handle set per Fleet, so
+    /// each hosts `ArcSwap` has exactly one writer.
+    installed: AtomicBool,
 }
 
 impl PlacementIo {
@@ -229,6 +239,7 @@ impl PlacementIo {
             snapshot: Arc::new(ArcSwap::from_pointee(Snapshot::default())),
             writes: tx,
             metrics,
+            installed: AtomicBool::new(false),
         };
         (io, rx)
     }
@@ -247,6 +258,12 @@ impl PlacementIo {
     /// placement hook reports through the same adapter.
     pub fn metrics(&self) -> &dyn PlacementMetrics {
         self.metrics.as_ref()
+    }
+
+    /// Claims this handle for one Fleet. `false` when it was already
+    /// installed elsewhere.
+    pub(crate) fn claim_install(&self) -> bool {
+        !self.installed.swap(true, Ordering::AcqRel)
     }
 
     /// Queues `w` without waiting. A full queue drops it and increments
@@ -316,7 +333,18 @@ fn should_warn(last: Option<Instant>, now: Instant) -> bool {
     last.is_none_or(|t| now.duration_since(t) >= WARN_EVERY)
 }
 
-async fn connect(client: &redis::Client) -> ConnectionManager {
+/// `true` once only the background task still holds `hosts`: the Fleet that
+/// owned these handles was dropped (discovery replaced its provider), so the
+/// task stops instead of polling Valkey for the life of the process.
+fn orphaned(hosts: &Arc<ArcSwap<BackendHosts>>) -> bool {
+    Arc::strong_count(hosts) == 1
+}
+
+/// Connects with backoff; `None` once the handles are orphaned.
+async fn connect(
+    client: &redis::Client,
+    hosts: &Arc<ArcSwap<BackendHosts>>,
+) -> Option<ConnectionManager> {
     let config = ConnectionManagerConfig::new()
         .set_connection_timeout(Duration::from_secs(2))
         .set_response_timeout(Duration::from_secs(1))
@@ -324,10 +352,13 @@ async fn connect(client: &redis::Client) -> ConnectionManager {
     let mut delay = CONNECT_RETRY_MIN;
     let mut last_warn: Option<Instant> = None;
     loop {
+        if orphaned(hosts) {
+            return None;
+        }
         match ConnectionManager::new_with_config(client.clone(), config.clone()).await {
             Ok(conn) => {
                 tracing::info!("Placement Valkey connected");
-                return conn;
+                return Some(conn);
             }
             Err(e) => {
                 if should_warn(last_warn, Instant::now()) {
@@ -351,7 +382,9 @@ async fn run(
     rx: mpsc::Receiver<Write>,
     metrics: Arc<dyn PlacementMetrics>,
 ) {
-    let conn = connect(&client).await;
+    let Some(conn) = connect(&client, &hosts).await else {
+        return;
+    };
     tokio::spawn(writer(conn.clone(), rx, metrics.clone()));
     reader(conn, hosts, slot, metrics).await;
 }
@@ -401,6 +434,10 @@ async fn reader(
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
         ticker.tick().await;
+        if orphaned(&hosts) {
+            tracing::info!("Placement handles dropped; Valkey reader stopping");
+            return;
+        }
         let hosts_now = hosts.load();
         let reg = &hosts_now.keys;
         let result = read_cycle(&mut conn, &mut state, reg, metrics.as_ref()).await;
@@ -995,6 +1032,21 @@ mod tests {
     }
 
     #[test]
+    fn reader_is_orphaned_once_the_handles_are_dropped() {
+        let metrics: Arc<dyn PlacementMetrics> = Arc::new(FakeMetrics::default());
+        let (io, _rx) = PlacementIo::for_test(metrics);
+        let hosts = Arc::new(ArcSwap::from_pointee(BackendHosts::default()));
+        let handles = PlacementHandles {
+            placer: Arc::new(Placer::new([0u8; 32])),
+            io,
+            hosts: hosts.clone(),
+        };
+        assert!(!orphaned(&hosts));
+        drop(handles);
+        assert!(orphaned(&hosts));
+    }
+
+    #[test]
     fn stale_after_error_ages_out() {
         let t0 = 10_000_000u64;
         let metrics = FakeMetrics::default();
@@ -1427,7 +1479,9 @@ mod tests {
             .map(|p| std::fs::read_to_string(p).unwrap());
         install_crypto_provider();
         let client = client(&url, ca.as_deref(), None).unwrap();
-        let mut conn = connect(&client).await;
+        let held = Arc::new(ArcSwap::from_pointee(BackendHosts::default()));
+        let _owner = held.clone();
+        let mut conn = connect(&client, &held).await.expect("not orphaned");
 
         // A host id unique to this run keeps the keys test-owned.
         let host = format!("test-{}", uuid::Uuid::new_v4());

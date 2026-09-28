@@ -5606,7 +5606,8 @@ mod tests {
         use super::{role_msg, rotation_provider, user_msg, Provider};
         use crate::attested::nearai::fleet::PlacementRequest;
         use crate::placement_io::{
-            PlacementHandles, PlacementIo, PlacementMetrics, Write, METRIC_DECISIONS,
+            PlacementHandles, PlacementIo, PlacementMetrics, Write, METRIC_AFFINITY,
+            METRIC_DECISIONS,
         };
         use crate::BackendHosts;
         use arc_swap::ArcSwap;
@@ -5654,6 +5655,13 @@ mod tests {
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
                 .as_millis() as u64
+        }
+
+        /// A `built_ms` / sample time that stays fresh however long the test
+        /// stalls: the placer reads the wall clock, and a future timestamp
+        /// counts as age 0, so a slow CI runner cannot flip it to `Stale`.
+        fn fresh_ms() -> u64 {
+            now_ms() + 600_000
         }
 
         fn ready_view(host: &str, now: u64) -> ReplicaView {
@@ -5704,6 +5712,16 @@ mod tests {
         /// A 4-backend rotation provider with placement installed: `host_map`
         /// becomes the verified host map, `snap` the current snapshot.
         fn harness(host_map: &[(&str, usize)], snap: Snapshot) -> Harness {
+            harness_with_count(host_map, 4, snap)
+        }
+
+        /// Like [`harness`], but the pushed host map claims `hosts_count`
+        /// backends while the Fleet itself has 4.
+        fn harness_with_count(
+            host_map: &[(&str, usize)],
+            hosts_count: usize,
+            snap: Snapshot,
+        ) -> Harness {
             let provider = rotation_provider(4);
             let metrics = Arc::new(FakeMetrics::default());
             let (io, writes) = PlacementIo::for_test(metrics.clone());
@@ -5717,7 +5735,7 @@ mod tests {
             provider.fleet.set_backend_hosts(BackendHosts {
                 index_by_host: host_map.iter().map(|(h, i)| (h.to_string(), *i)).collect(),
                 keys: Default::default(),
-                count: 4,
+                count: hosts_count,
             });
             // Discovery's push lands in the map the Valkey reader also reads.
             assert_eq!(hosts.load().index_by_host.len(), host_map.len());
@@ -5789,7 +5807,7 @@ mod tests {
         fn placed_host_maps_to_its_index() {
             let h = harness(
                 &[("h-a", 2)],
-                snapshot("h-a", now_ms(), PinTable::default()),
+                snapshot("h-a", fresh_ms(), PinTable::default()),
             );
             let messages = messages_avoiding(2);
             let req = request(COVERED_MODELS[0]);
@@ -5804,7 +5822,7 @@ mod tests {
         fn not_covered_model_uses_existing_path_unchanged() {
             let mut h = harness(
                 &[("h-a", 2)],
-                snapshot("h-a", now_ms(), PinTable::default()),
+                snapshot("h-a", fresh_ms(), PinTable::default()),
             );
             let messages = messages_avoiding(2);
             let req = request("some-org/not-covered");
@@ -5831,7 +5849,7 @@ mod tests {
         fn unmapped_host_falls_back() {
             let mut h = harness(
                 &[("h-a", 2)],
-                snapshot("h-z", now_ms(), PinTable::default()),
+                snapshot("h-z", fresh_ms(), PinTable::default()),
             );
             let messages = messages_avoiding(2);
             let req = request(COVERED_MODELS[0]);
@@ -5841,6 +5859,76 @@ mod tests {
             );
             assert_eq!(h.metrics.decisions_tagged("reason:host_unmapped"), 12);
             assert!(h.writes.try_recv().is_err(), "legacy writes nothing");
+        }
+
+        #[test]
+        fn host_map_for_another_backend_count_is_unmapped() {
+            // The pushed map was built for 3 backends but the Fleet now has 4:
+            // its host -> index binding is stale, so the host is unmapped.
+            let mut h = harness_with_count(
+                &[("h-a", 2)],
+                3,
+                snapshot("h-a", fresh_ms(), PinTable::default()),
+            );
+            let messages = messages_avoiding(2);
+            let req = request(COVERED_MODELS[0]);
+            assert_eq!(
+                placed_indices(&h.provider, &messages, None, &req),
+                legacy_indices(&messages, None, None)
+            );
+            assert_eq!(h.metrics.decisions_tagged("reason:host_unmapped"), 12);
+            assert!(h.writes.try_recv().is_err(), "legacy writes nothing");
+        }
+
+        #[test]
+        #[cfg_attr(debug_assertions, should_panic(expected = "already installed"))]
+        fn second_install_of_the_same_handles_is_refused() {
+            let metrics = Arc::new(FakeMetrics::default());
+            let (io, _writes) = PlacementIo::for_test(metrics);
+            let handles = PlacementHandles {
+                placer: Arc::new(Placer::new(PIN_SECRET)),
+                io,
+                hosts: Arc::new(ArcSwap::from_pointee(BackendHosts::default())),
+            };
+            let first = rotation_provider(4);
+            let second = rotation_provider(4);
+            first.fleet.set_placement(handles.clone());
+            // Release builds ignore the second install and keep legacy routing.
+            second.fleet.set_placement(handles);
+            let messages = messages_avoiding(2);
+            let req = request(COVERED_MODELS[0]);
+            assert_eq!(
+                placed_indices(&second, &messages, None, &req),
+                legacy_indices(&messages, None, None)
+            );
+        }
+
+        #[test]
+        fn decision_metrics_use_static_tags() {
+            let h = harness(
+                &[("h-a", 2)],
+                snapshot("h-a", fresh_ms(), PinTable::default()),
+            );
+            let messages = messages_avoiding(2);
+            let req = request(COVERED_MODELS[0]);
+            placed_indices(&h.provider, &messages, None, &req);
+            let counts = h.metrics.counts.lock().unwrap();
+            let decision = counts
+                .iter()
+                .find(|(n, _, _)| n == METRIC_DECISIONS)
+                .expect("decision metric");
+            assert_eq!(
+                decision.2,
+                vec![
+                    "outcome:place".to_string(),
+                    "selection:best_of_two".to_string()
+                ]
+            );
+            let backlog = counts
+                .iter()
+                .filter(|(n, _, _)| n == METRIC_AFFINITY)
+                .count();
+            assert_eq!(backlog, 12, "one affinity count per decision");
         }
 
         #[test]
@@ -5861,7 +5949,7 @@ mod tests {
             let keys = HashMap::from([("key-a".to_string(), vec![0, 1])]);
             let mut h = harness(
                 &[("h-a", 2)],
-                snapshot("h-a", now_ms(), PinTable::default()),
+                snapshot("h-a", fresh_ms(), PinTable::default()),
             );
             h.provider.fleet.set_backend_keys(keys.clone());
             let messages = vec![
@@ -5881,7 +5969,7 @@ mod tests {
         fn placement_records_routed_write() {
             let mut h = harness(
                 &[("h-a", 2)],
-                snapshot("h-a", now_ms(), PinTable::default()),
+                snapshot("h-a", fresh_ms(), PinTable::default()),
             );
             // 40 text bytes -> 10 estimated prompt tokens.
             let messages = vec![user_msg(&"x".repeat(40))];
@@ -5923,7 +6011,7 @@ mod tests {
             let now = now_ms();
             let mut pins = PinTable::default();
             pins.insert(id, "h-gone".to_string(), now);
-            let mut h = harness(&[("h-a", 2)], snapshot("h-a", now, pins));
+            let mut h = harness(&[("h-a", 2)], snapshot("h-a", fresh_ms(), pins));
             let messages = vec![user_msg("keyed request")];
             let mut req = request(COVERED_MODELS[0]);
             req.affinity = Some(key);

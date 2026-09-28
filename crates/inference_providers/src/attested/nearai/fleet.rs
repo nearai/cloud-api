@@ -14,7 +14,10 @@
 
 use super::prefix_router::PrefixRouter;
 use super::{placement_headers, tracing_headers, Config};
-use crate::placement_io::{PlacementHandles, Write, METRIC_DECISIONS};
+use crate::placement_io::{
+    PlacementHandles, Write, METRIC_AFFINITY, METRIC_CHOSEN_BACKLOG, METRIC_DECISIONS,
+    METRIC_EXCLUDED,
+};
 use crate::rotation;
 use crate::spki_verifier::FingerprintState;
 use crate::BackendHosts;
@@ -23,6 +26,7 @@ use arc_swap::{ArcSwap, ArcSwapOption};
 use placement::affinity::AffinityKey;
 use placement::consts::COVERED_MODELS;
 use placement::decision::{AffinitySource, Decision, DecisionRecord, LegacyReason, PlaceInput};
+use placement::rules::Rule;
 use placement::score::Pending;
 use reqwest::Client;
 use sha2::{Digest, Sha256};
@@ -79,6 +83,9 @@ pub(super) fn update_ema(stat: &mut BackendStat, ttft_ms: f64) {
 
 /// Poison-tolerant lock: a panicked holder shouldn't wedge routing — we only
 /// ever mutate small maps under it, so recovering the inner value is safe.
+/// Placed (req, tok) per host, keyed by unix second.
+type PlacementLedger = HashMap<u64, HashMap<String, Pending>>;
+
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
 }
@@ -187,9 +194,9 @@ pub(super) struct Fleet {
     placement: ArcSwapOption<PlacementHandles>,
     /// This node's own placed (req, tok) per host, bucketed by unix second.
     /// Only the current and previous second are kept, the same window the
-    /// Valkey routed hash covers. Held only for a map update or a copy, never
-    /// across `place()`.
-    placement_ledger: Mutex<HashMap<u64, HashMap<String, Pending>>>,
+    /// Valkey routed hash covers. Held from reading it into `place()` to
+    /// reserving the chosen host (see `try_place`), never across an await.
+    placement_ledger: Mutex<PlacementLedger>,
     /// Epoch-ms of the last `UnknownKey` warning, so a client stuck on a stale
     /// attestation cannot flood the log from the request hot path.
     last_unknown_key_warn_ms: AtomicU64,
@@ -631,7 +638,22 @@ impl Fleet {
 
     /// Install smart placement. The current host map is copied into
     /// `handles.hosts` so a map pushed before installation is not lost.
+    ///
+    /// Each handle set belongs to exactly one Fleet (its hosts `ArcSwap` must
+    /// have one writer). Installing handles already installed elsewhere is a
+    /// wiring bug: it is refused (this Fleet stays on the legacy path).
     pub(super) fn set_placement(&self, handles: PlacementHandles) {
+        if !handles.io.claim_install() {
+            tracing::warn!(
+                error_kind = "already_installed",
+                "Placement handles refused; this provider stays on the legacy path"
+            );
+            debug_assert!(
+                false,
+                "placement handles already installed on another Fleet"
+            );
+            return;
+        }
         let handles = Arc::new(handles);
         self.placement.store(Some(handles.clone()));
         if !Arc::ptr_eq(&handles.hosts, &self.backend_hosts) {
@@ -666,7 +688,8 @@ impl Fleet {
         if !COVERED_MODELS.contains(&request.model.as_str()) {
             return None;
         }
-        let handles = self.placement.load_full()?;
+        let guard = self.placement.load();
+        let handles = guard.as_ref()?;
         let count = self.rotation_count();
         if count == 0 {
             return None;
@@ -685,52 +708,63 @@ impl Fleet {
             long_context_hosts: Vec::new(),
             now_ms,
         };
-        let mine = self.placement_mine(now_s);
-        let decision = {
-            let snapshot = handles.io.snapshot.load();
-            handles
-                .placer
-                .place(&input, &snapshot, &mine, &mut rand::rng())
+        let key_group = self.resolve_key_group(pinned_pub_key, count);
+
+        // One critical section from reading this node's own pending load to
+        // reserving the chosen host in it, so concurrent requests on this
+        // node each see the others' reservations and do not herd onto the
+        // same "least loaded" host. `place()` is synchronous and O(replicas),
+        // and nothing here awaits, so holding the ledger lock across it is
+        // cheap. Logging and Valkey writes happen after the lock is released.
+        let placed = {
+            let mut ledger = lock(&self.placement_ledger);
+            let mine = mine_in(&ledger, now_s);
+            let decision = {
+                let snapshot = handles.io.snapshot.load();
+                handles
+                    .placer
+                    .place(&input, &snapshot, &mine, &mut rand::rng())
+            };
+            match decision {
+                Decision::Legacy { record, .. } => Err(record),
+                Decision::Place {
+                    host,
+                    mut record,
+                    pin_write,
+                } => match self.index_for_host(&host, count) {
+                    None => {
+                        demote(&mut record, LegacyReason::HostUnmapped);
+                        Err(record)
+                    }
+                    Some(index)
+                        if key_group
+                            .indices()
+                            .is_some_and(|group| !group.contains(&index)) =>
+                    {
+                        demote(&mut record, LegacyReason::KeyGroup);
+                        Err(record)
+                    }
+                    Some(index) => {
+                        ledger_add(&mut ledger, host.clone(), input.prompt_tokens_est, now_s);
+                        Ok((host, index, record, pin_write))
+                    }
+                },
+            }
         };
-        let (host, mut record, pin_write) = match decision {
-            Decision::Place {
-                host,
-                record,
-                pin_write,
-            } => (host, record, pin_write),
-            Decision::Legacy { record, .. } => {
-                report_decision(&handles, &record, request);
+        let (host, index, record, pin_write) = match placed {
+            Ok(placed) => placed,
+            Err(record) => {
+                report_decision(handles, &record, request);
                 return None;
             }
         };
-        let index = self
-            .backend_hosts
-            .load()
-            .index_by_host
-            .get(&host)
-            .copied()
-            .filter(|index| *index < count);
-        let Some(index) = index else {
-            demote(&mut record, LegacyReason::HostUnmapped);
-            report_decision(&handles, &record, request);
-            return None;
-        };
-        let key_group = self.resolve_key_group(pinned_pub_key, count);
-        if key_group
-            .indices()
-            .is_some_and(|group| !group.contains(&index))
-        {
-            demote(&mut record, LegacyReason::KeyGroup);
-            report_decision(&handles, &record, request);
-            return None;
-        }
         if matches!(key_group, KeyGroup::UnknownKey) {
             self.warn_unknown_key(pinned_pub_key);
         }
 
         let lease = self.reserve_index(self.route_key(messages), index);
         handles.io.record(Write::Routed {
-            host: host.clone(),
+            host,
             replica: None,
             tok: input.prompt_tokens_est,
             sec: now_s,
@@ -742,32 +776,29 @@ impl Fleet {
                 at_ms: now_ms,
             });
         }
-        self.ledger_add(host, input.prompt_tokens_est, now_s);
-        report_decision(&handles, &record, request);
+        report_decision(handles, &record, request);
         Some(lease)
     }
 
-    /// This node's own placed load per host over `{now_s - 1, now_s}`.
-    pub(super) fn placement_mine(&self, now_s: u64) -> HashMap<String, Pending> {
-        let ledger = lock(&self.placement_ledger);
-        let mut mine: HashMap<String, Pending> = HashMap::new();
-        let window = now_s.saturating_sub(1)..=now_s;
-        for (_, hosts) in ledger.iter().filter(|(sec, _)| window.contains(*sec)) {
-            for (host, pending) in hosts {
-                let entry = mine.entry(host.clone()).or_default();
-                entry.req = entry.req.saturating_add(pending.req);
-                entry.tok = entry.tok.saturating_add(pending.tok);
-            }
+    /// The backend index `host` is bound to, when the pushed host map was
+    /// built for this Fleet's current backend count (otherwise the binding
+    /// is stale) and the index is within the rotation fan-out.
+    fn index_for_host(&self, host: &str, count: usize) -> Option<usize> {
+        let hosts = self.backend_hosts.load();
+        if hosts.count != self.backend_count() {
+            return None;
         }
-        mine
+        hosts
+            .index_by_host
+            .get(host)
+            .copied()
+            .filter(|index| *index < count)
     }
 
-    fn ledger_add(&self, host: String, tok: u64, now_s: u64) {
-        let mut ledger = lock(&self.placement_ledger);
-        ledger.retain(|sec, _| sec.saturating_add(1) >= now_s);
-        let pending = ledger.entry(now_s).or_default().entry(host).or_default();
-        pending.req = pending.req.saturating_add(1);
-        pending.tok = pending.tok.saturating_add(tok);
+    /// This node's own placed load per host over `{now_s - 1, now_s}`.
+    #[cfg(test)]
+    pub(super) fn placement_mine(&self, now_s: u64) -> HashMap<String, Pending> {
+        mine_in(&lock(&self.placement_ledger), now_s)
     }
 
     /// Rate-limited warning for a pinned key that discovery does not know.
@@ -915,6 +946,29 @@ fn prompt_tokens_est(messages: &[crate::ChatMessage]) -> u64 {
     u64::try_from(bytes / 4).unwrap_or(u64::MAX)
 }
 
+/// This node's own placed load per host over `{now_s - 1, now_s}`.
+fn mine_in(ledger: &PlacementLedger, now_s: u64) -> HashMap<String, Pending> {
+    let mut mine: HashMap<String, Pending> = HashMap::new();
+    let window = now_s.saturating_sub(1)..=now_s;
+    for (_, hosts) in ledger.iter().filter(|(sec, _)| window.contains(*sec)) {
+        for (host, pending) in hosts {
+            let entry = mine.entry(host.clone()).or_default();
+            entry.req = entry.req.saturating_add(pending.req);
+            entry.tok = entry.tok.saturating_add(pending.tok);
+        }
+    }
+    mine
+}
+
+/// Reserves one placed request of `tok` tokens on `host` in second `now_s`,
+/// dropping seconds that left the window.
+fn ledger_add(ledger: &mut PlacementLedger, host: String, tok: u64, now_s: u64) {
+    ledger.retain(|sec, _| sec.saturating_add(1) >= now_s);
+    let pending = ledger.entry(now_s).or_default().entry(host).or_default();
+    pending.req = pending.req.saturating_add(1);
+    pending.tok = pending.tok.saturating_add(tok);
+}
+
 /// Turns a `Place` record into the `Legacy` one the caller fell back with.
 fn demote(record: &mut DecisionRecord, reason: LegacyReason) {
     record.outcome = "legacy";
@@ -923,23 +977,28 @@ fn demote(record: &mut DecisionRecord, reason: LegacyReason) {
     record.rank = None;
 }
 
-/// One metric and one info line per decision. IDs and numbers only: never
-/// the affinity key, pin id or content. Metric tags stay low-cardinality.
+/// Decision metrics and one info line per decision. IDs and numbers only:
+/// never the affinity key, pin id or content. Metric tags are static strings
+/// (no per-decision allocation) and stay low-cardinality.
 fn report_decision(
     handles: &PlacementHandles,
     record: &DecisionRecord,
     request: &PlacementRequest,
 ) {
-    let outcome_tag = format!("outcome:{}", record.outcome);
-    let detail_tag = match (record.reason, record.selection) {
-        (Some(reason), _) => format!("reason:{reason}"),
-        (None, Some(selection)) => format!("selection:{selection}"),
-        (None, None) => "reason:unknown".to_string(),
-    };
-    handles
-        .io
-        .metrics()
-        .record_count(METRIC_DECISIONS, 1, &[&outcome_tag, &detail_tag]);
+    let metrics = handles.io.metrics();
+    let outcome = outcome_tag(record.outcome);
+    metrics.record_count(METRIC_DECISIONS, 1, &[outcome, detail_tag(record)]);
+    metrics.record_count(
+        METRIC_AFFINITY,
+        1,
+        &[affinity_tag(record.affinity), outcome],
+    );
+    for (rule, n) in record.excluded.iter().filter(|(_, n)| *n > 0) {
+        metrics.record_count(METRIC_EXCLUDED, i64::from(*n), &[rule_tag(*rule)]);
+    }
+    if let Some(backlog) = record.chosen_backlog_tokens {
+        metrics.record_histogram(METRIC_CHOSEN_BACKLOG, backlog as f64, &[]);
+    }
     let excluded = record
         .excluded
         .iter()
@@ -968,6 +1027,57 @@ fn report_decision(
         backlog_tokens = ?record.chosen_backlog_tokens,
         "Placement decision"
     );
+}
+
+fn outcome_tag(outcome: &str) -> &'static str {
+    match outcome {
+        "place" => "outcome:place",
+        "legacy" => "outcome:legacy",
+        _ => "outcome:unknown",
+    }
+}
+
+/// `reason:{..}` for a legacy record, `selection:{..}` for a placed one.
+fn detail_tag(record: &DecisionRecord) -> &'static str {
+    match (record.reason, record.selection) {
+        (Some(reason), _) => match reason {
+            "not_covered" => "reason:not_covered",
+            "no_state" => "reason:no_state",
+            "stale" => "reason:stale",
+            "none_eligible" => "reason:none_eligible",
+            "host_unmapped" => "reason:host_unmapped",
+            "error" => "reason:error",
+            "key_group" => "reason:key_group",
+            _ => "reason:unknown",
+        },
+        (None, Some(selection)) => match selection {
+            "pinned" => "selection:pinned",
+            "home" => "selection:home",
+            "spill" => "selection:spill",
+            "best_of_two" => "selection:best_of_two",
+            _ => "selection:unknown",
+        },
+        (None, None) => "reason:unknown",
+    }
+}
+
+fn affinity_tag(affinity: &str) -> &'static str {
+    match affinity {
+        "client" => "affinity:client",
+        "prefix" => "affinity:prefix",
+        "none" => "affinity:none",
+        _ => "affinity:unknown",
+    }
+}
+
+fn rule_tag(rule: Rule) -> &'static str {
+    match rule {
+        Rule::Model => "rule:model",
+        Rule::Lifecycle => "rule:lifecycle",
+        Rule::Freshness => "rule:freshness",
+        Rule::Capacity => "rule:capacity",
+        Rule::Context => "rule:context",
+    }
 }
 
 fn route_index_score(route_key: u64, index: usize) -> u64 {

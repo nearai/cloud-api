@@ -33,7 +33,9 @@ pub(crate) fn seal(report: &ReplicaReport, key: &SigningKey) -> Envelope {
 }
 
 /// A `ReplicaView` that passes every eligibility rule as of `NOW`: `Ready`,
-/// freshly sampled, empty load, and serving `TEST_MODEL`.
+/// freshly sampled, idle (`running`/`queued` both `Some(0)`, so it also
+/// clears `Rule::Capacity`'s fail-closed "no counts at all" check), and
+/// serving `TEST_MODEL`.
 pub(crate) fn view_ready() -> ReplicaView {
     ReplicaView {
         host_id: TEST_HOST.into(),
@@ -51,7 +53,11 @@ pub(crate) fn view_ready() -> ReplicaView {
             engine: "sglang".into(),
             engine_version: None,
             limits: Limits { max_running: None },
-            load: Load::default(),
+            load: Load {
+                running: Some(0),
+                queued: Some(0),
+                ..Load::default()
+            },
             proxy_inflight: 0,
             report_key_id: "test-key".into(),
         },

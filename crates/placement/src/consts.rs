@@ -20,3 +20,15 @@ pub const KV_MAX: f64 = 0.95;
 /// Models eligible for smart routing; everything else falls back to
 /// `Fleet::acquire_index`, unchanged. Confirm the exact model id in Task 12.
 pub const COVERED_MODELS: &[&str] = &["zai-org/GLM-5.3-Flash"];
+
+/// Normalizer for a replica's prefill backlog (queued + pending tokens),
+/// converting a token count into a `fullness`-comparable unit for `score.rs`.
+pub const PREFILL_NORM_TOKENS: f64 = 16_000.0;
+
+/// Fallback denominator for `fullness` when a replica reports no
+/// `limits.max_running`.
+pub const DEFAULT_MAX_RUNNING: f64 = 40.0;
+
+/// The minimum speed multiplier `score.rs` divides by, so a replica with a
+/// very low (or zero) `gen_tps` sample doesn't blow the score up to infinity.
+pub const SPEED_FLOOR: f64 = 0.2;

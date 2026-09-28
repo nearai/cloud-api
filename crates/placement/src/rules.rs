@@ -72,6 +72,13 @@ impl Rule {
                 _ => Err(Exclusion(self)),
             },
             Rule::Capacity => {
+                // Fail closed: a replica reporting neither `running` nor
+                // `queued` gives no evidence it's idle, so treating both as
+                // 0 would make it look falsely attractive. Exclude it
+                // instead of guessing.
+                if r.report.load.running.is_none() && r.report.load.queued.is_none() {
+                    return Err(Exclusion(self));
+                }
                 if let Some(kv) = r.report.load.kv_usage {
                     if kv >= KV_MAX {
                         return Err(Exclusion(self));
@@ -156,6 +163,17 @@ mod tests {
         assert_eq!(
             first_exclusion(&v, &input(), NOW),
             Some(Exclusion(Rule::Freshness))
+        );
+    }
+
+    #[test]
+    fn capacity_excludes_countless_replica() {
+        let mut v = view_ready();
+        v.report.load.running = None;
+        v.report.load.queued = None;
+        assert_eq!(
+            first_exclusion(&v, &input(), NOW),
+            Some(Exclusion(Rule::Capacity))
         );
     }
 

@@ -25,8 +25,8 @@ The NEAR AI Cloud API is a **multi-tenant AI inference platform** running in a *
 
 2. **Data Plane** (API Key Auth)
    - OpenAI-compatible chat completions
-   - Platform-specific response API
-   - Conversation management
+   - Stateless Responses compatibility API
+   - Temporary Conversation/File views and retained per-resource deletion
    - TEE attestation
 
 ### Authentication Model
@@ -60,7 +60,7 @@ graph TB
     end
     
     %% External Actors
-    WebApp["<b>Web Application</b><br/>[Browser/SPA]<br/><br/>Interactive UI for<br/>managing organizations<br/>and conversations"]
+    WebApp["<b>Web Application</b><br/>[Browser/SPA]<br/><br/>Interactive UI for<br/>managing organizations<br/>and viewing legacy migration data"]
     
     APIClient["<b>API Client</b><br/>[External Application]<br/><br/>Third-party applications<br/>using API keys for<br/>programmatic access"]
     
@@ -68,10 +68,10 @@ graph TB
     
     OrgAdmin["<b>Organization Admin</b><br/>[Person]<br/><br/>Manages organization,<br/>workspaces, and<br/>team members"]
     
-    EndUser["<b>End User</b><br/>[Person]<br/><br/>Uses AI inference<br/>capabilities through<br/>conversations"]
+    EndUser["<b>End User</b><br/>[Person]<br/><br/>Uses AI inference<br/>capabilities through<br/>client applications"]
     
     %% External Systems
-    PostgreSQL["<b>PostgreSQL Database</b><br/>[Database System]<br/><br/>Stores organizations,<br/>users, conversations,<br/>and usage data"]
+    PostgreSQL["<b>PostgreSQL Database</b><br/>[Database System]<br/><br/>Stores organizations,<br/>users, legacy conversation data,<br/>and usage data"]
     
     GitHubOAuth["<b>GitHub OAuth</b><br/>[Identity Provider]<br/><br/>Provides authentication<br/>via GitHub accounts"]
     
@@ -613,9 +613,6 @@ sequenceDiagram
     
     Note over ProviderPool: Ready to handle completion requests<br/>with round-robin load balancing
     
-    alt Model already in use
-        ProviderPool->>ProviderPool: Keep existing sticky routes<br/>(chat_id -> provider mapping)
-    end
 ```
 
 ### 7. Organization Invitation Flow
@@ -908,18 +905,9 @@ flowchart TD
     ParseResponse --> CreateProviders[Create vLLM Provider<br/>Instances]
     CreateProviders --> UpdateCache[Update Provider Pool]
     
-    CheckCache -->|Yes| CheckConversation{Conversation ID<br/>Provided?}
-    UpdateCache --> CheckConversation
-    
-    CheckConversation -->|Yes| CheckSticky{Sticky Route<br/>Exists?}
-    CheckSticky -->|Yes| UseSticky[Use Existing Provider<br/>for Consistency]
-    CheckSticky -->|No| RoundRobin[Round-Robin Selection]
-    RoundRobin --> SaveSticky[Save Sticky Route<br/>conversation_id -> provider]
-    
-    CheckConversation -->|No| RoundRobin
-    
-    UseSticky --> CheckHealth{Provider<br/>Healthy?}
-    SaveSticky --> CheckHealth
+    CheckCache -->|Yes| RoundRobin[Round-Robin Selection]
+    UpdateCache --> RoundRobin
+    RoundRobin --> CheckHealth{Provider<br/>Healthy?}
     
     CheckHealth -->|No| RemoveProvider[Remove from Pool]
     RemoveProvider --> RoundRobin
@@ -930,7 +918,6 @@ flowchart TD
     UpdateStats --> End([Response Complete])
     
     style CheckCache fill:#e3f2fd
-    style UseSticky fill:#fff3e0
     style RoundRobin fill:#e8f5e9
     style CheckHealth fill:#fce4ec
     style SendRequest fill:#c8e6c9
@@ -1062,8 +1049,8 @@ Database
    - SHA-256 hashed storage
    - Tracks last usage and expiration
    - Enforces organization limits
-   - **Used for**: AI completions, conversations, responses, attestation
-   - **Endpoints**: `/v1/chat/completions`, `/v1/completions`, `/v1/conversations/*`, `/v1/responses/*`, `/v1/attestation/*`
+   - **Used for**: AI completions, stateless Responses, temporary Conversation/File migration views and retained per-resource deletion, attestation
+   - **Endpoints**: `/v1/chat/completions`, `/v1/completions`, `/v1/responses`, temporary `/v1/conversations/*` and `/v1/files/*` views/deletions, `/v1/attestation/*`
 
 **Key Principle**: These auth methods are **mutually exclusive**. Management operations use session tokens, AI operations use API keys.
 
@@ -1081,13 +1068,13 @@ POST /v1/completions
 - Usage tracked automatically
 - **Event Stream Format**: Standard OpenAI format with `[DONE]` terminator
 
-#### B. Response API (Platform-specific)
+#### B. Responses API (Stateless Compatibility)
 ```
 POST /v1/responses
 ```
-- Platform-specific conversation management
-- Links to conversation history
-- Richer metadata support
+- Stateless compatibility layer over Chat Completions for the default model path
+- Client-managed context; no response or conversation-history persistence
+- Responses event shape and richer metadata support
 - **Event Types**:
   - `response.created` - Initial response metadata
   - `response.output_text.delta` - Incremental text chunks
@@ -1132,7 +1119,6 @@ The system discovers available models dynamically:
 - No hardcoded model configuration
 - Automatic scaling with new inference servers
 - Round-robin load balancing
-- Sticky routing for conversations (chat_id → provider)
 
 ### 6. Trusted Execution Environment (TEE)
 
@@ -1292,7 +1278,7 @@ erDiagram
 |------|-------------|
 | **Organization Owner** | Full control: manage members, workspaces, API keys, settings |
 | **Organization Admin** | Manage members, create workspaces, manage API keys |
-| **Organization Member** | Use API keys, create conversations, view organization |
+| **Organization Member** | Use API keys and view organization |
 | **API Key** | Scoped to workspace, inherits organization limits |
 
 ### Rate Limiting & Usage Control
@@ -1466,13 +1452,12 @@ The NEAR AI Cloud API is a modern, multi-tenant AI inference platform built with
 
 **Separation of Concerns:**
 - **Management Plane** (Session Auth): Organization, workspace, user, and API key management
-- **Data Plane** (API Key Auth): AI completions, conversations, responses, and attestation
+- **Data Plane** (API Key Auth): AI completions, stateless Responses, temporary Conversation/File views and retained per-resource deletion, and attestation
 - This separation enables secure multi-tenant operations with clear boundaries
 
 **Scalability:**
 - Dynamic model discovery enables horizontal scaling of inference capacity
 - Round-robin load balancing across multiple vLLM providers
-- Sticky routing for conversations ensures consistency
 
 **Security:**
 - All sensitive operations run in TEE with attestation

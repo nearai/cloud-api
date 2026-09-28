@@ -1211,10 +1211,7 @@ impl ResponseServiceImpl {
         // here preserves the Responses endpoint check and the resolved model name.
         if let Some(model) = &context.model {
             if model.has_output_modality("image") {
-                tracing::info!(
-                    "Image generation model detected, handling image operation: {}",
-                    model.model_name
-                );
+                tracing::info!("Image generation model detected, handling image operation");
                 context.request.model = model.model_name.clone();
 
                 // Handle image generation/editing and return early

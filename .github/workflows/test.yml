@@ -136,6 +136,12 @@ jobs:
         BRAVE_SEARCH_PRO_API_KEY: ${{ secrets.BRAVE_SEARCH_PRO_API_KEY }}
         DEV: "true"
 
+    # This source-level regression test scans every Responses tracing call for
+    # customer-data fields. Clippy compiles integration-test targets but does not
+    # execute them, so keep this explicit run in the required test suite.
+    - name: Run Responses tracing privacy regression test
+      run: cargo nextest run -p api --test response_logging_privacy
+
   # vLLM provider integration tests. Uses MockProvider by default
   # (USE_REAL_VLLM is not set), so these run without external dependencies
   # and without PostgreSQL. Kept as a separate job so a flake here doesn't

@@ -12,6 +12,7 @@ use std::collections::HashMap;
 
 use ed25519_dalek::VerifyingKey;
 
+use crate::consts::SUPPORTED_SCHEMA;
 use crate::frame::{self, Envelope, FrameError, ReplicaReport};
 
 /// One attested signing key for a host, naming which replicas and model it
@@ -92,14 +93,17 @@ fn map_frame_error(e: FrameError) -> Reject {
     }
 }
 
-const SUPPORTED_SCHEMA: u8 = 1;
-
 /// Per-replica ingest state: the last accepted boot, seq and engine time,
 /// keyed by the Redis key tuple `(host_id, replica_id)` — never by the
 /// frame's own claimed identity.
+///
+/// The remembered engine time is `None` until some accepted frame has
+/// reported one (`engine_sampled_at_ms` is `None` until a replica has been
+/// read once). It never moves backwards: a frame with a `None` engine time
+/// is accepted without an engine-time check and never lowers what's stored.
 #[derive(Default)]
 pub struct Ingest {
-    last: HashMap<(String, String), (String, u64, u64)>,
+    last: HashMap<(String, String), (String, u64, Option<u64>)>,
 }
 
 impl Ingest {
@@ -124,6 +128,9 @@ impl Ingest {
         now_ms: u64,
     ) -> Result<ReplicaView, Reject> {
         let keys = reg.by_host.get(redis_host).ok_or(Reject::UnknownKey)?;
+        if keys.is_empty() {
+            return Err(Reject::UnknownKey);
+        }
 
         let mut verified: Option<(ReplicaReport, &HostKey)> = None;
         let mut last_err = FrameError::BadSig;
@@ -150,20 +157,44 @@ impl Ingest {
             return Err(Reject::Mismatch);
         }
 
-        let engine_ms = report.engine_sampled_at_ms.unwrap_or(0);
         let key = (redis_host.to_string(), redis_replica.to_string());
-        if let Some((last_boot, last_seq, last_engine_ms)) = self.last.get(&key) {
-            if report.boot_id == *last_boot {
-                if report.seq <= *last_seq || engine_ms < *last_engine_ms {
+        let prev = self.last.get(&key).cloned();
+
+        if let Some((last_boot, last_seq, last_engine_ms)) = &prev {
+            // `seq` only resets on a boot change; within the same boot it
+            // must strictly increase.
+            if report.boot_id == *last_boot && report.seq <= *last_seq {
+                return Err(Reject::Regressed);
+            }
+            // Engine time must never regress, in either boot case — but only
+            // when both this frame and the remembered state have one. A
+            // replica's first frame after a (re)boot reports `None` until
+            // it's been read once; `Rule::Freshness` (Task 3) excludes
+            // `None`-time replicas from routing anyway, so it's safe to
+            // admit them here rather than reject them as regressed.
+            if let (Some(engine_ms), Some(last_engine_ms)) =
+                (report.engine_sampled_at_ms, last_engine_ms)
+            {
+                if engine_ms < *last_engine_ms {
                     return Err(Reject::Regressed);
                 }
-            } else if engine_ms < *last_engine_ms {
-                return Err(Reject::Regressed);
             }
         }
 
+        // Never lower the remembered engine time: keep the max of what was
+        // known and what this frame reports, and keep the previous value
+        // when this frame's is `None`.
+        let stored_engine_ms = match (
+            report.engine_sampled_at_ms,
+            prev.as_ref().and_then(|(_, _, e)| *e),
+        ) {
+            (Some(new), Some(old)) => Some(new.max(old)),
+            (Some(new), None) => Some(new),
+            (None, old) => old,
+        };
+
         self.last
-            .insert(key, (report.boot_id.clone(), report.seq, engine_ms));
+            .insert(key, (report.boot_id.clone(), report.seq, stored_engine_ms));
 
         Ok(ReplicaView {
             host_id: redis_host.to_string(),
@@ -308,6 +339,69 @@ mod tests {
         assert_eq!(
             ingest.accept(HOST, REPLICA, &env, &reg, 2_000).unwrap_err(),
             Reject::Regressed
+        );
+    }
+
+    #[test]
+    fn new_boot_first_frame_without_engine_time_accepted() {
+        let mut ingest = Ingest::new();
+        let reg = registry();
+
+        let mut first = report();
+        first.engine_sampled_at_ms = Some(5_000);
+        let env = seal(&first, &signing_key());
+        ingest.accept(HOST, REPLICA, &env, &reg, 1_000).unwrap();
+
+        let mut rebooted = report();
+        rebooted.boot_id = "boot-b".into();
+        rebooted.seq = 1; // fresh boot restarts seq
+        rebooted.engine_sampled_at_ms = None; // not read yet since the reboot
+        let env = seal(&rebooted, &signing_key());
+        let view = ingest
+            .accept(HOST, REPLICA, &env, &reg, 2_000)
+            .expect("a reboot's first frame with unknown engine time is accepted");
+        assert_eq!(view.report.boot_id, "boot-b");
+    }
+
+    #[test]
+    fn none_engine_time_does_not_lower_last() {
+        let mut ingest = Ingest::new();
+        let reg = registry();
+
+        let mut first = report();
+        first.seq = 1;
+        first.engine_sampled_at_ms = Some(5_000);
+        let env = seal(&first, &signing_key());
+        ingest.accept(HOST, REPLICA, &env, &reg, 1_000).unwrap();
+
+        let mut second = report();
+        second.seq = 2;
+        second.engine_sampled_at_ms = None;
+        let env = seal(&second, &signing_key());
+        ingest
+            .accept(HOST, REPLICA, &env, &reg, 2_000)
+            .expect("unknown engine time is accepted and doesn't lower the remembered one");
+
+        let mut third = report();
+        third.seq = 3;
+        third.engine_sampled_at_ms = Some(4_000); // regresses vs the remembered 5_000
+        let env = seal(&third, &signing_key());
+        assert_eq!(
+            ingest.accept(HOST, REPLICA, &env, &reg, 3_000).unwrap_err(),
+            Reject::Regressed
+        );
+    }
+
+    #[test]
+    fn host_with_no_keys_is_unknown_key() {
+        let mut ingest = Ingest::new();
+        let mut by_host = HashMap::new();
+        by_host.insert(HOST.to_string(), Vec::new());
+        let reg = KeyRegistry { by_host };
+        let env = seal(&report(), &signing_key());
+        assert_eq!(
+            ingest.accept(HOST, REPLICA, &env, &reg, 1_000).unwrap_err(),
+            Reject::UnknownKey
         );
     }
 

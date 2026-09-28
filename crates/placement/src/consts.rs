@@ -6,3 +6,6 @@
 /// signing key's public half. Matches inference-proxy's
 /// `replica_state::report_key::REPORT_KEY_EVENT`.
 pub const KEY_EVENT: &str = "nearai-replica-report-key-v1";
+
+/// The only `ReplicaReport.schema` value this crate understands.
+pub const SUPPORTED_SCHEMA: u8 = 1;

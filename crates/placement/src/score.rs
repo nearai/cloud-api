@@ -98,19 +98,23 @@ pub fn fleet_median_tps(views: &[&ReplicaView]) -> f64 {
 ///
 /// `routed` is the fleet-wide routed count for the host over the reader's
 /// sliding window (the `{now-1s, now}` routed hashes) and already includes
-/// this placer's own routed requests; `mine` is this placer's own count over
-/// the same window. The result is `max(routed, mine)` component-wise:
-/// `routed` covers every node including this one, and `mine` covers this
-/// node's writes that may not have reached Valkey yet. There is deliberately
-/// no freshness gate against the frame's `reported_at_ms`: frames arrive
-/// every 500 ms, so such a gate would discard other nodes' load almost
-/// always. Over-counting load a frame already reflects is preferred to
-/// missing it.
+/// this placer's own routed requests that reached Valkey; `mine` is this
+/// placer's own count over the same window, including writes Valkey has not
+/// seen yet. The result is `routed + mine` component-wise (saturating).
+///
+/// The two sources overlap by an unknown amount (this node's writes already
+/// visible in `routed`), so any subtraction or `max` can drop real load: 10
+/// requests from other nodes plus 1 local write not yet visible must count as
+/// at least 11. Summing double-counts only this node's own visible share,
+/// which over-estimates load on hosts this node just used. Over-counting is
+/// preferred to missing load. There is deliberately no freshness gate against
+/// the frame's `reported_at_ms`: frames arrive every 500 ms, so such a gate
+/// would discard other nodes' load almost always.
 pub fn pending_for(routed: Option<&RoutedCounts>, mine: Pending) -> Pending {
     match routed {
         Some(rc) => Pending {
-            req: rc.req.max(mine.req),
-            tok: rc.tok.max(mine.tok),
+            req: rc.req.saturating_add(mine.req),
+            tok: rc.tok.saturating_add(mine.tok),
         },
         None => mine,
     }
@@ -211,17 +215,18 @@ mod tests {
     }
 
     #[test]
-    fn pending_does_not_double_count() {
-        // E18: `routed` already includes this node's own routed load, so the
-        // result is max(routed, mine) component-wise, never routed + mine.
-        let mine = Pending { req: 2, tok: 500 };
+    fn pending_never_drops_disjoint_load() {
+        // 10 requests from other nodes plus 1 local write Valkey hasn't seen
+        // yet must count as at least 11: the two sources can be disjoint, so
+        // they are summed (over-counting this node's visible share is fine).
+        let mine = Pending { req: 1, tok: 500 };
         let routed = RoutedCounts {
-            req: 5,
+            req: 10,
             tok: 300,
             since_ms: 0,
         };
         let pending = pending_for(Some(&routed), mine);
-        assert_eq!(pending, Pending { req: 5, tok: 500 });
+        assert_eq!(pending, Pending { req: 11, tok: 800 });
     }
 
     #[test]

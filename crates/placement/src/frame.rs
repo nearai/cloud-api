@@ -8,7 +8,7 @@
 //! must agree with it and with the key that verified the signature.
 
 use base64::Engine as _;
-use ed25519_dalek::{Signature, Verifier, VerifyingKey};
+use ed25519_dalek::{Signature, VerifyingKey};
 use serde::{Deserialize, Serialize};
 use sha2::Digest;
 
@@ -111,7 +111,10 @@ pub fn open(env: &Envelope, pk: &VerifyingKey) -> Result<ReplicaReport, FrameErr
     let sig = Signature::from_bytes(
         &<[u8; 64]>::try_from(raw.as_slice()).map_err(|_| FrameError::Encoding)?,
     );
-    pk.verify(&message(&env.frame), &sig)
+    // `verify_strict` rejects weak (low-order) public keys and malleable
+    // signatures, which plain `verify` would accept: with a low-order key a
+    // forged signature can verify arbitrary frame bytes.
+    pk.verify_strict(&message(&env.frame), &sig)
         .map_err(|_| FrameError::BadSig)?;
     let r: ReplicaReport = serde_json::from_str(&env.frame).map_err(|_| FrameError::Parse)?;
     if r.report_key_id != env.key_id || r.report_key_id != key_id(pk) {
@@ -158,6 +161,22 @@ mod tests {
         let mut e = fixture();
         e.key_id = "0000000000000000".into();
         assert_eq!(open(&e, &pk()), Err(FrameError::KeyIdMismatch));
+    }
+
+    #[test]
+    fn low_order_key_forgery_is_rejected() {
+        // The compressed identity point decodes as a valid (but weak)
+        // VerifyingKey; with R = identity and s = 0 a plain `verify` would
+        // accept this signature for any message.
+        let mut identity = [0u8; 32];
+        identity[0] = 1;
+        let weak = VerifyingKey::from_bytes(&identity).expect("identity decodes");
+        assert!(weak.is_weak());
+        let mut forged_sig = [0u8; 64];
+        forged_sig[..32].copy_from_slice(&identity);
+        let mut e = fixture();
+        e.sig = base64::engine::general_purpose::STANDARD.encode(forged_sig);
+        assert_eq!(open(&e, &weak), Err(FrameError::BadSig));
     }
 
     #[test]

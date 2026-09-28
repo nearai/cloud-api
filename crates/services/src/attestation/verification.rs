@@ -1052,7 +1052,7 @@ mod tests {
             public_key_hex: hex::encode(vk.as_bytes()),
             boot_id: boot_id.to_string(),
             host_id: "host-1".to_string(),
-            model: "zai-org/GLM-5.3-Flash".to_string(),
+            model: "z-ai/glm-5.3-flash".to_string(),
             replica_ids: vec!["r1".to_string(), "r2".to_string()],
         }
     }

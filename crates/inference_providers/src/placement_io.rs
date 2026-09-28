@@ -31,11 +31,23 @@ use tokio::sync::mpsc;
 
 use crate::BackendHosts;
 
-/// Placement Valkey endpoint (TLS, ACL user `router`). The host literal is
-/// replaced with the Elastic IP in Task 12; the password is supplied at
-/// runtime and never embedded here.
+/// Placement Valkey endpoint (TLS, ACL user `router`). The password comes
+/// from `PLACEMENT_REDIS_PASSWORD` at runtime and is never embedded here.
+///
+/// PLACEHOLDER until infra-aws#15 is applied. To fill it in:
+/// 1. Replace `VALKEY_EIP` with the Elastic IP literal that the apply outputs
+///    for the placement Valkey, e.g. `"rediss://router@203.0.113.7:6379"`.
+///    Use the IP, not a DNS name: the server certificate's SAN is
+///    `IP:<EIP>`, so TLS hostname verification only passes against the IP.
+/// 2. Replace the contents of `placement_valkey_ca.pem` (next to this file)
+///    with the private CA certificate PEM from the same apply's output (the
+///    CA that signed that server certificate, not the server certificate).
+///
+/// While either is a placeholder, [`PlacementIo::start`] logs the error
+/// kind at warn and stays inert, so every request takes the legacy path.
 pub const VALKEY_ENDPOINT: &str = "rediss://router@VALKEY_EIP:6379";
-/// Private CA that signs the placement Valkey's certificate.
+/// Private CA that signs the placement Valkey's certificate. Placeholder
+/// until infra-aws#15 is applied; see [`VALKEY_ENDPOINT`] to fill it in.
 pub const VALKEY_CA_PEM: &str = include_str!("placement_valkey_ca.pem");
 
 /// How often the reader builds a new snapshot.
@@ -90,6 +102,22 @@ pub struct PlacementHandles {
     pub placer: Arc<placement::decision::Placer>,
     pub io: Arc<PlacementIo>,
     pub hosts: Arc<ArcSwap<BackendHosts>>,
+}
+
+impl PlacementHandles {
+    /// Starts a [`PlacementIo`] with a fresh host map for exactly one
+    /// `Fleet` (see `InferenceProvider::set_placement`): each installed Fleet
+    /// gets its own hosts `ArcSwap`, written only by that Fleet. The reader
+    /// stops once the Fleet (and so these handles) is dropped.
+    pub fn start<M: PlacementMetrics + ?Sized + 'static>(
+        password: String,
+        placer: Arc<placement::decision::Placer>,
+        metrics: Arc<M>,
+    ) -> Self {
+        let hosts = Arc::new(ArcSwap::from_pointee(BackendHosts::default()));
+        let io = PlacementIo::start(password, hosts.clone(), metrics);
+        Self { placer, io, hosts }
+    }
 }
 
 /// The metrics this module emits. Same method shapes as
@@ -210,9 +238,9 @@ impl PlacementIo {
     /// snapshot stays empty. Must be called inside a Tokio runtime.
     ///
     /// The reader and writer tasks are detached: the writer ends once every
-    /// handle (and so the channel sender) is dropped, but the reader lives
-    /// for the life of the process. `PlacementIo` is meant to be a process
-    /// singleton; do not call `start` per request or per provider.
+    /// handle (and so the channel sender) is dropped, and the reader once
+    /// only it still holds `hosts`. Start one per placement-enabled provider
+    /// (see [`PlacementHandles::start`]), never per request.
     pub fn start<M: PlacementMetrics + ?Sized + 'static>(
         password: String,
         hosts: Arc<ArcSwap<BackendHosts>>,

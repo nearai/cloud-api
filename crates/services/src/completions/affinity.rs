@@ -229,6 +229,29 @@ fn hashed_key(
     AffinityKey::from_bytes(out)
 }
 
+/// HKDF `info` for the affinity-key HMAC secret (see [`derive`]).
+const AFFINITY_SECRET_INFO: &[u8] = b"nearai-placement-affinity-v1";
+/// HKDF `info` for the follow-pin HMAC secret (`placement::decision::Placer`).
+const PIN_SECRET_INFO: &[u8] = b"nearai-placement-pin-v1";
+
+/// Derives `(affinity_secret, pin_secret)` from the placement Valkey
+/// password with HKDF-SHA256: the password is the input key material, there
+/// is no salt (HKDF then uses a zero-filled salt; the password is already a
+/// high-entropy secret, and every cloud-api node must derive the same keys),
+/// and the two `info` strings domain-separate the outputs. Deterministic, so
+/// all nodes agree on affinity keys and pin ids without sharing more state.
+/// Never log the password or either output.
+pub fn secrets_from(password: &str) -> ([u8; 32], [u8; 32]) {
+    let hk = hkdf::Hkdf::<Sha256>::new(None, password.as_bytes());
+    let mut affinity = [0u8; 32];
+    let mut pin = [0u8; 32];
+    hk.expand(AFFINITY_SECRET_INFO, &mut affinity)
+        .expect("32 bytes is a valid HKDF-SHA256 output length");
+    hk.expand(PIN_SECRET_INFO, &mut pin)
+        .expect("32 bytes is a valid HKDF-SHA256 output length");
+    (affinity, pin)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -255,6 +278,20 @@ mod tests {
             msg(MessageRole::System, "you are a helpful assistant"),
             msg(MessageRole::User, "hello there"),
         ]
+    }
+
+    #[test]
+    fn secrets_are_deterministic_and_distinct() {
+        let (affinity, pin) = secrets_from("router-password");
+        assert_eq!(secrets_from("router-password"), (affinity, pin));
+        assert_ne!(
+            affinity, pin,
+            "affinity and pin secrets are domain-separated"
+        );
+        let (other_affinity, other_pin) = secrets_from("another-password");
+        assert_ne!(affinity, other_affinity);
+        assert_ne!(pin, other_pin);
+        assert_ne!(affinity, [0u8; 32]);
     }
 
     #[test]

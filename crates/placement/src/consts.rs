@@ -18,8 +18,16 @@ pub const FRESH_MAX_MS: u64 = 3_000;
 pub const KV_MAX: f64 = 0.95;
 
 /// Models eligible for smart routing; everything else falls back to
-/// `Fleet::acquire_index`, unchanged. Confirm the exact model id in Task 12.
-pub const COVERED_MODELS: &[&str] = &["zai-org/GLM-5.3-Flash"];
+/// `Fleet::acquire_index`, unchanged.
+///
+/// Entries are catalog `model_name`s: the completions service rewrites
+/// `params.model` to the catalog `model_name` before the pool, so this is what
+/// `Fleet` sees. It must also equal the `model` inference-proxy signs into
+/// every replica frame and key event (`rules::Rule::Model` and
+/// `snapshot` compare them byte for byte). For GLM-5.3 Flash both are the
+/// SGLang `--served-model-name` / inference-proxy `MODEL_NAME`,
+/// `z-ai/glm-5.3-flash`, not the Hugging Face path `zai-org/GLM-5.3-Flash`.
+pub const COVERED_MODELS: &[&str] = &["z-ai/glm-5.3-flash"];
 
 /// Normalizer for a replica's prefill backlog (queued + pending tokens),
 /// converting a token count into a `fullness`-comparable unit for `score.rs`.

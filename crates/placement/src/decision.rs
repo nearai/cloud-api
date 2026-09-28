@@ -384,7 +384,7 @@ mod tests {
     use rand::rngs::StdRng;
     use rand::SeedableRng;
 
-    const MODEL: &str = "zai-org/GLM-5.3-Flash";
+    const MODEL: &str = "z-ai/glm-5.3-flash";
 
     fn signing_key() -> SigningKey {
         SigningKey::from_bytes(&[7u8; 32])

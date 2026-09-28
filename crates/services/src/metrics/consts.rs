@@ -78,6 +78,20 @@ pub const METRIC_BILLING_PRICING_FALLBACK: &str = "cloud_api.billing.pricing_fal
 pub const METRIC_PROVIDER_TOKEN_ANOMALIES: &str = "cloud_api.provider.token_anomalies";
 pub const METRIC_PROVIDER_ZERO_TOKENS: &str = "cloud_api.provider.zero_tokens";
 
+// Smart placement metrics. Emitted from `inference_providers` (which cannot
+// depend on this crate), so the names are defined once there and re-exported.
+pub use inference_providers::placement_io::{
+    METRIC_AFFINITY as METRIC_PLACEMENT_AFFINITY,
+    METRIC_CHOSEN_BACKLOG as METRIC_PLACEMENT_CHOSEN_BACKLOG,
+    METRIC_DECISIONS as METRIC_PLACEMENT_DECISIONS, METRIC_EXCLUDED as METRIC_PLACEMENT_EXCLUDED,
+    METRIC_FRAMES_REJECTED as METRIC_PLACEMENT_FRAMES_REJECTED,
+    METRIC_PINS_MALFORMED as METRIC_PLACEMENT_PINS_MALFORMED,
+    METRIC_READ_ERRORS as METRIC_PLACEMENT_READ_ERRORS,
+    METRIC_SNAPSHOT_AGE_MS as METRIC_PLACEMENT_SNAPSHOT_AGE,
+    METRIC_WRITES_DROPPED as METRIC_PLACEMENT_WRITES_DROPPED,
+    METRIC_WRITE_ERRORS as METRIC_PLACEMENT_WRITE_ERRORS,
+};
+
 // HTTP metrics
 pub const METRIC_HTTP_REQUESTS: &str = "cloud_api.http.requests";
 pub const METRIC_HTTP_DURATION: &str = "cloud_api.http.duration";

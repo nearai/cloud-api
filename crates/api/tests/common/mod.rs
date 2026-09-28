@@ -158,6 +158,7 @@ pub fn test_config() -> ApiConfig {
         },
         credit_allocation: config::CreditAllocationConfig::default(),
         ita: config::ItaAttestationConfig::default(),
+        placement: config::PlacementConfig::default(),
     }
 }
 
@@ -243,8 +244,9 @@ async fn build_test_server_components_with_real_providers(
     let auth_components = init_auth_services(database.clone(), &config);
 
     // Use real inference providers from database
-    let inference_provider_pool = api::init_inference_providers(database.clone(), &config).await;
     let metrics_service = Arc::new(services::metrics::MockMetricsService);
+    let inference_provider_pool =
+        api::init_inference_providers(database.clone(), &config, metrics_service.clone()).await;
     let domain_services = api::init_domain_services_with_pool(
         database.clone(),
         &config,

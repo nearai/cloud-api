@@ -316,7 +316,8 @@ pub async fn init_domain_services(
     organization_service: Arc<dyn services::organization::OrganizationServiceTrait + Send + Sync>,
     metrics_service: Arc<dyn services::metrics::MetricsServiceTrait>,
 ) -> DomainServices {
-    let inference_provider_pool = init_inference_providers(database.clone(), config).await;
+    let inference_provider_pool =
+        init_inference_providers(database.clone(), config, metrics_service.clone()).await;
     init_domain_services_with_pool(
         database,
         config,
@@ -460,14 +461,22 @@ pub async fn init_domain_services_with_pool(
         as Arc<dyn services::completions::ports::OrganizationConcurrentLimitRepository>;
 
     // Create completion service with usage tracking (needs usage_service)
-    let completion_service = Arc::new(services::CompletionServiceImpl::new(
+    let mut completion_service = services::CompletionServiceImpl::new(
         inference_provider_pool.clone(),
         attestation_service.clone(),
         usage_service.clone(),
         metrics_service.clone(),
         models_repo.clone() as Arc<dyn services::models::ModelsRepository>,
         org_limit_repository,
-    ));
+    );
+    // Affinity keys only matter to a pool that places requests.
+    if inference_provider_pool.has_placement() {
+        if let Some(password) = config.placement.redis_password.as_deref() {
+            let (affinity_secret, _) = services::completions::affinity::secrets_from(password);
+            completion_service = completion_service.with_affinity_secret(affinity_secret);
+        }
+    }
+    let completion_service = Arc::new(completion_service);
 
     let brave_search_provider =
         Arc::new(services::responses::tools::brave::BraveWebSearchProvider::new());
@@ -929,13 +938,36 @@ async fn ensure_chutes_catalog_row(
     }
 }
 
+/// Enables smart placement on `pool` when `PLACEMENT_REDIS_PASSWORD` is set,
+/// returning the affinity secret for the completion service. Without the
+/// secret there is no placement state and every request routes as before
+/// (this is not a mode flag). Both HMAC secrets are derived from the
+/// password (`secrets_from`); none of them is ever logged.
+pub fn install_placement(
+    pool: &services::inference_provider_pool::InferenceProviderPool,
+    placement: &config::PlacementConfig,
+) -> Option<[u8; 32]> {
+    let Some(password) = placement.redis_password.as_deref() else {
+        tracing::info!("Placement secret not configured; smart placement off, legacy routing");
+        return None;
+    };
+    let (affinity_secret, pin_secret) = services::completions::affinity::secrets_from(password);
+    pool.set_placement(password.to_string(), pin_secret);
+    tracing::info!("Smart placement enabled for covered models");
+    Some(affinity_secret)
+}
+
 /// Initialize inference provider pool
 ///
 /// Loads inference_url models and external providers from the database,
-/// then starts a periodic refresh task to keep them in sync.
+/// then starts a periodic refresh task to keep them in sync. The metrics
+/// sink and smart placement are attached before the first load, so
+/// providers created at startup get them exactly like those created by
+/// later discovery refreshes.
 pub async fn init_inference_providers(
     database: Arc<Database>,
     config: &ApiConfig,
+    metrics_service: Arc<dyn services::metrics::MetricsServiceTrait>,
 ) -> Arc<services::inference_provider_pool::InferenceProviderPool> {
     let api_key = config.inference_api_key.clone();
 
@@ -945,6 +977,8 @@ pub async fn init_inference_providers(
             config.external_providers.clone(),
         ),
     );
+    pool.set_metrics_service(metrics_service);
+    install_placement(&pool, &config.placement);
 
     let models_repo = Arc::new(database::repositories::ModelRepository::new(
         database.pool().clone(),
@@ -2899,6 +2933,35 @@ mod tests {
         assert!(!properties.contains_key("resultJson"));
     }
 
+    #[test]
+    fn missing_password_means_no_placement() {
+        let pool = services::inference_provider_pool::InferenceProviderPool::new(
+            None,
+            config::ExternalProvidersConfig::default(),
+        );
+        let affinity = install_placement(&pool, &config::PlacementConfig::default());
+        assert!(
+            affinity.is_none(),
+            "no affinity secret without the password"
+        );
+        assert!(!pool.has_placement(), "no placement without the password");
+    }
+
+    #[test]
+    fn placement_password_installs_placement_and_affinity() {
+        let pool = services::inference_provider_pool::InferenceProviderPool::new(
+            None,
+            config::ExternalProvidersConfig::default(),
+        );
+        let placement = config::PlacementConfig {
+            redis_password: Some("router-password".to_string()),
+        };
+        let affinity = install_placement(&pool, &placement);
+        assert!(pool.has_placement());
+        let (expected, _) = services::completions::affinity::secrets_from("router-password");
+        assert_eq!(affinity, Some(expected));
+    }
+
     /// Example of how to set up the application for E2E testing
     #[tokio::test]
     #[ignore] // Remove ignore to run with a real database and Patroni cluster
@@ -2975,6 +3038,7 @@ mod tests {
             usage_reporting: config::UsageReportingConfig::default(),
             credit_allocation: config::CreditAllocationConfig::default(),
             ita: config::ItaAttestationConfig::default(),
+            placement: config::PlacementConfig::default(),
         };
 
         // Initialize services
@@ -3096,6 +3160,7 @@ mod tests {
             usage_reporting: config::UsageReportingConfig::default(),
             credit_allocation: config::CreditAllocationConfig::default(),
             ita: config::ItaAttestationConfig::default(),
+            placement: config::PlacementConfig::default(),
         };
 
         let auth_components = init_auth_services(database.clone(), &config);

@@ -704,6 +704,13 @@ impl ProviderMappings {
     }
 }
 
+/// What the pool needs to start placement for a provider. Holds the Valkey
+/// password, so it intentionally has no `Debug`.
+struct PoolPlacement {
+    password: String,
+    placer: Arc<placement::decision::Placer>,
+}
+
 #[derive(Clone)]
 pub struct InferenceProviderPool {
     /// Optional API key for authenticating with inference backends
@@ -766,6 +773,11 @@ pub struct InferenceProviderPool {
     /// is the only layer that knows which trust tier served a request and whether
     /// it was a fallback, so the per-tier / fallback counter is emitted from here.
     metrics_service: std::sync::OnceLock<Arc<dyn crate::metrics::MetricsServiceTrait>>,
+    /// Smart-placement install state, set once at startup when the placement
+    /// secret is configured ([`Self::set_placement`]). Applied to every
+    /// covered base-tier provider this pool creates, at startup and on later
+    /// discovery refreshes alike. Unset: every provider stays legacy.
+    placement: Arc<std::sync::OnceLock<PoolPlacement>>,
     /// Providers explicitly registered as fallbacks, keyed by model id. This
     /// role is configuration metadata rather than an inference from whichever
     /// providers happen to be live, so it survives primary discovery failures
@@ -1070,8 +1082,57 @@ impl InferenceProviderPool {
             pinned_models: Arc::new(std::sync::RwLock::new(std::collections::HashSet::new())),
             pinned_providers: Arc::new(std::sync::RwLock::new(HashMap::new())),
             metrics_service: std::sync::OnceLock::new(),
+            placement: Arc::new(std::sync::OnceLock::new()),
             fallback_providers: Arc::new(std::sync::RwLock::new(HashMap::new())),
         }
+    }
+
+    /// Enable smart placement for covered models: `password` authenticates
+    /// to the placement Valkey and `pin_secret` keys follow-pin ids. Call
+    /// once at startup, before models load, and only when the secret is
+    /// configured. A second call is a no-op.
+    pub fn set_placement(&self, password: String, pin_secret: [u8; 32]) {
+        let _ = self.placement.set(PoolPlacement {
+            password,
+            placer: Arc::new(placement::decision::Placer::new(pin_secret)),
+        });
+    }
+
+    /// Whether [`Self::set_placement`] was called.
+    pub fn has_placement(&self) -> bool {
+        self.placement.get().is_some()
+    }
+
+    /// A new handle set (own `PlacementIo` and host map) for one provider,
+    /// or `None` when placement is not configured. Starts background tasks,
+    /// so call it only for a provider that will install the handles.
+    fn placement_handles(&self) -> Option<inference_providers::placement_io::PlacementHandles> {
+        let install = self.placement.get()?;
+        let metrics: Arc<dyn crate::metrics::MetricsServiceTrait> = self
+            .metrics_service
+            .get()
+            .cloned()
+            .unwrap_or_else(|| Arc::new(crate::metrics::MockMetricsService));
+        Some(inference_providers::placement_io::PlacementHandles::start(
+            install.password.clone(),
+            install.placer.clone(),
+            metrics,
+        ))
+    }
+
+    /// The `(model, inference_url)` entries that get smart placement: the
+    /// base tier of each covered model. `expand_inference_endpoints` emits a
+    /// row's base entry first and any long-context entry after it under the
+    /// same model id, and every caller keeps that order, so the first entry
+    /// per model id is the base tier.
+    fn placement_targets(models: &[(String, String, Option<u32>)]) -> HashSet<(String, String)> {
+        let mut seen: HashSet<&str> = HashSet::new();
+        models
+            .iter()
+            .filter(|(model, _, _)| seen.insert(model.as_str()))
+            .filter(|(model, _, _)| placement::consts::COVERED_MODELS.contains(&model.as_str()))
+            .map(|(model, url, _)| (model.clone(), url.clone()))
+            .collect()
     }
 
     /// Attach a metrics sink for tiered-routing/fallback visibility. Set once
@@ -4964,9 +5025,16 @@ impl InferenceProviderPool {
         let verifier = self.attestation_verifier.clone();
         let tls_roots = self.tls_roots.clone();
         let metrics_service = self.metrics_service.get().cloned();
+        let placement_targets = Self::placement_targets(&models);
         let endpoint_futures: Vec<_> = needs_creation
             .iter()
             .map(|(model_name, url, context_length)| {
+                // Only a covered model's base-tier provider gets placement,
+                // each with its own handle set (one writer per host map).
+                let placement = placement_targets
+                    .contains(&(model_name.clone(), url.clone()))
+                    .then(|| self.placement_handles())
+                    .flatten();
                 let model_name = model_name.clone();
                 let url = url.clone();
                 let context_length = *context_length;
@@ -5019,6 +5087,10 @@ impl InferenceProviderPool {
                     serving_provider.set_backend_count(outcome.backend_count);
                     serving_provider.set_backend_keys(outcome.key_index_map());
                     serving_provider.set_backend_hosts(outcome.backend_hosts());
+                    if let Some(handles) = placement {
+                        serving_provider.set_placement(handles);
+                        info!(model = %model_name, "Smart placement installed on base-tier provider");
+                    }
 
                     // Store the configured context length so latency routing can
                     // filter out providers that can't serve oversized requests.
@@ -6322,7 +6394,7 @@ mod tests {
             public_key_hex: hex::encode(verifying_key.to_bytes()),
             boot_id: "boot-1".to_string(),
             host_id: host_id.to_string(),
-            model: "zai-org/GLM-5.3-Flash".to_string(),
+            model: "z-ai/glm-5.3-flash".to_string(),
             replica_ids: vec!["r1".to_string(), "r2".to_string()],
         }
     }
@@ -8058,6 +8130,50 @@ mod tests {
         // the partial-batch safety the admin PATCH path depends on.
         assert!(!merged.contains_key("other-pinned"));
         assert_eq!(merged.len(), 1);
+    }
+
+    /// Placement installs only on a covered model's base tier: the first
+    /// entry `expand_inference_endpoints` emits for its catalog row, never
+    /// the long-context entry registered under the same model id.
+    #[test]
+    fn placement_targets_are_covered_base_tier_entries() {
+        let covered = placement::consts::COVERED_MODELS[0].to_string();
+        let long_context = serde_json::json!({"long_context": {
+            "inference_url": "https://long.example",
+            "max_context_tokens": 1_048_576,
+            "base_max_context_tokens": 100_000,
+        }});
+        let mut models =
+            expand_inference_endpoints("other/model", "https://other.example", None, None);
+        models.extend(expand_inference_endpoints(
+            &covered,
+            "https://base.example",
+            Some(1_048_576),
+            Some(&long_context),
+        ));
+        assert_eq!(models.len(), 3, "covered row expands into base + long");
+
+        let targets = InferenceProviderPool::placement_targets(&models);
+        assert_eq!(
+            targets,
+            HashSet::from([(covered, "https://base.example".to_string())])
+        );
+    }
+
+    #[tokio::test]
+    async fn placement_handles_need_the_secret() {
+        let pool = InferenceProviderPool::new(None, ExternalProvidersConfig::default());
+        assert!(!pool.has_placement());
+        assert!(pool.placement_handles().is_none());
+
+        pool.set_placement("router-password".to_string(), [7u8; 32]);
+        assert!(pool.has_placement());
+        // Each call starts a separate handle set (one per base-tier Fleet).
+        // The placeholder endpoint/CA keep it inert: no network is touched.
+        let first = pool.placement_handles().expect("handles");
+        let second = pool.placement_handles().expect("handles");
+        assert!(!Arc::ptr_eq(&first.hosts, &second.hosts));
+        assert!(Arc::ptr_eq(&first.placer, &second.placer));
     }
 
     /// The refresh failure-counter prune (review round 3, Pierre's blocking) must

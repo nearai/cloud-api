@@ -6600,6 +6600,7 @@ dependencies = [
  "futures",
  "futures-util",
  "hex",
+ "hkdf 0.13.0",
  "hmac 0.13.0",
  "inference_providers",
  "jsonwebtoken",

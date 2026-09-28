@@ -37,7 +37,7 @@ fn mixed_questions_preserve_exact_response_bytes_and_extensions() {
     let parsed = SystemOneResponseWithBytes::parse(raw.clone(), &req).unwrap();
     assert_eq!(parsed.raw_bytes, raw);
     assert!(parsed.response.id.is_none());
-    assert!(parsed.provider_signature_id().is_err());
+    assert!(parsed.provider_decision_id().is_err());
 }
 
 #[test]
@@ -84,35 +84,44 @@ fn rejects_unbillable_or_mismatched_provider_results() {
 }
 
 #[test]
-fn tee_ids_are_safe_header_values_and_path_segments() {
-    for id in ["", "../signature", "a/b", "q?x=y", "id\r\ninjected:yes"] {
+fn generation_ids_preserve_opaque_values() {
+    for id in [
+        "decision-123_abc",
+        "gen.abc",
+        "urn:decision:123",
+        "a/b",
+        "q?x=y",
+    ] {
         let mut value = response();
         value["id"] = json!(id);
-        let parsed =
-            SystemOneResponseWithBytes::parse(serde_json::to_vec(&value).unwrap(), &request())
-                .unwrap();
-        assert!(parsed.provider_signature_id().is_err());
+        let raw = serde_json::to_vec(&value).unwrap();
+        let parsed = SystemOneResponseWithBytes::parse(raw.clone(), &request()).unwrap();
+        assert_eq!(parsed.decision_id.as_deref(), Some(id));
+        assert_eq!(parsed.provider_decision_id().unwrap(), id);
+        assert_eq!(parsed.raw_bytes, raw);
     }
-    let mut value = response();
-    value["id"] = json!("decision-123_abc");
-    let parsed =
-        SystemOneResponseWithBytes::parse(serde_json::to_vec(&value).unwrap(), &request()).unwrap();
-    assert_eq!(parsed.provider_signature_id().unwrap(), "decision-123_abc");
 }
 
 #[test]
-fn tee_ids_fit_receipt_and_usage_database_columns() {
+fn generation_ids_require_nonempty_http_header_values() {
+    for id in ["", "id\r\ninjected:yes", "id\0"] {
+        let mut value = response();
+        value["id"] = json!(id);
+        assert!(
+            SystemOneResponseWithBytes::parse(serde_json::to_vec(&value).unwrap(), &request())
+                .is_err()
+        );
+    }
+}
+
+#[test]
+fn generation_ids_fit_receipt_and_usage_database_columns() {
     for (length, valid) in [(255, true), (256, false)] {
         let id = "a".repeat(length);
         let mut value = response();
         value["id"] = json!(id);
         let parsed =
-            SystemOneResponseWithBytes::parse(serde_json::to_vec(&value).unwrap(), &request())
-                .unwrap();
-        assert_eq!(
-            parsed.provider_signature_id().is_ok(),
-            valid,
-            "length {length}"
-        );
+            SystemOneResponseWithBytes::parse(serde_json::to_vec(&value).unwrap(), &request());
+        assert_eq!(parsed.is_ok(), valid, "length {length}");
     }
 }

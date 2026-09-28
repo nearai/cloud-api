@@ -4,8 +4,9 @@ use crate::{
     routes::{
         api::AppState,
         common::{
-            alias_warning_message, inject_warning_field, map_domain_error_to_status,
-            no_aliasing_requested, HEADER_MODEL_ALIAS_RESOLVED, HEADER_NO_ALIASING,
+            alias_warning_message, inject_chat_warning_field, inject_warning_field,
+            map_domain_error_to_status, no_aliasing_requested, HEADER_MODEL_ALIAS_RESOLVED,
+            HEADER_NO_ALIASING,
         },
         extractors::OpenAiJson,
         files::MAX_FILE_SIZE,
@@ -2061,6 +2062,22 @@ async fn chat_completions_inner(
                                         }
                                     }
 
+                                    // This chunk is re-serialized, so usage it still
+                                    // carries (e.g. continuous usage stats on an alias
+                                    // or auto-redact stream) also reports the reasoning
+                                    // count where OpenAI-compatible clients read it.
+                                    let chunk_usage = match &mut chunk {
+                                        inference_providers::StreamChunk::Chat(chat) => {
+                                            chat.usage.as_mut()
+                                        }
+                                        inference_providers::StreamChunk::Text(text) => {
+                                            text.usage.as_mut()
+                                        }
+                                    };
+                                    if let Some(usage) = chunk_usage {
+                                        usage.ensure_standard_reasoning_details();
+                                    }
+
                                     if auto_redact_enabled {
                                         // Swap minted placeholders in this
                                         // chunk's text deltas back to originals.
@@ -2490,11 +2507,13 @@ async fn chat_completions_inner(
                 // auto-redact — it deliberately gives up raw-bytes hash
                 // verification for these responses; clients that need the
                 // raw-bytes guarantee should send the canonical model name
-                // (or x-no-aliasing). E2EE bodies are opaque and are left
-                // untouched (inject_warning_field returns None for them, and
-                // we don't attempt it) — the header below is the signal.
+                // (or x-no-aliasing). Since the body is rewritten, the
+                // reasoning count is also mirrored into the standard usage
+                // field. E2EE bodies are opaque and are left untouched
+                // (inject_chat_warning_field returns None for them, and we
+                // don't attempt it) — the header below is the signal.
                 let body_bytes = match &alias_canonical {
-                    Some(canonical) if !e2ee_active => inject_warning_field(
+                    Some(canonical) if !e2ee_active => inject_chat_warning_field(
                         &body_bytes,
                         &alias_warning_message(&request.model, canonical),
                     )

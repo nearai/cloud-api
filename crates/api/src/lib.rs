@@ -2755,6 +2755,45 @@ mod tests {
         assert!(spec.servers.is_none() || spec.servers.as_ref().unwrap().is_empty());
     }
 
+    #[test]
+    fn test_openapi_chat_completion_details_are_optional() {
+        // Chat-completion usage details are independently optional (a provider
+        // may report only `audio_tokens`), while the Responses API usage keeps
+        // OpenAI's required `output_tokens_details.reasoning_tokens`.
+        let spec = serde_json::to_value(ApiDoc::openapi()).unwrap();
+        let schemas = &spec["components"]["schemas"];
+        let details = &schemas["CompletionUsage"]["properties"]["completion_tokens_details"];
+        assert!(
+            details
+                .to_string()
+                .contains("#/components/schemas/CompletionTokensDetails"),
+            "completion_tokens_details should use CompletionTokensDetails: {details}"
+        );
+        let completion_details = &schemas["CompletionTokensDetails"];
+        for field in [
+            "reasoning_tokens",
+            "audio_tokens",
+            "accepted_prediction_tokens",
+            "rejected_prediction_tokens",
+        ] {
+            assert!(
+                completion_details["properties"].get(field).is_some(),
+                "CompletionTokensDetails should document {field}"
+            );
+        }
+        assert!(
+            completion_details
+                .get("required")
+                .and_then(serde_json::Value::as_array)
+                .is_none_or(Vec::is_empty),
+            "no CompletionTokensDetails field is required: {completion_details}"
+        );
+        assert_eq!(
+            schemas["OutputTokensDetails"]["required"],
+            serde_json::json!(["reasoning_tokens"])
+        );
+    }
+
     fn assert_reporting_path_security(
         spec: &serde_json::Value,
         path: &str,

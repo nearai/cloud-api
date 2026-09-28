@@ -591,8 +591,9 @@ impl TokenUsage {
     /// Reasoning tokens the provider reported: the standard
     /// `completion_tokens_details.reasoning_tokens`, else SGLang's top-level
     /// `reasoning_tokens`. `None` when the provider reported neither.
-    /// Clamped to `[0, completion_tokens]`, since reasoning is a subset of the
-    /// completion.
+    /// For internal use, the count is clamped to `[0, completion_tokens]`,
+    /// since reasoning is a subset of the completion. The wire keeps the
+    /// provider's own values (see `ensure_standard_reasoning_details`).
     pub fn reasoning_tokens(&self) -> Option<i32> {
         self.completion_tokens_details
             .as_ref()
@@ -603,8 +604,10 @@ impl TokenUsage {
 
     /// Fill `completion_tokens_details.reasoning_tokens`, where OpenAI-compatible
     /// clients read the count, when the provider reported one only in SGLang's
-    /// top-level field. An existing standard value is left as is, the legacy
-    /// field is kept, and nothing is added when the provider reported no count.
+    /// top-level field. The provider's value is copied unmodified, so both
+    /// fields carry the same number; a negative value is not copied. An
+    /// existing standard value is left as is, the legacy field is kept, and
+    /// nothing is added when the provider reported no count.
     pub fn ensure_standard_reasoning_details(&mut self) {
         if self
             .completion_tokens_details
@@ -613,7 +616,7 @@ impl TokenUsage {
         {
             return;
         }
-        let Some(tokens) = self.reasoning_tokens() else {
+        let Some(tokens) = self.reasoning_tokens.filter(|tokens| *tokens >= 0) else {
             return;
         };
         self.completion_tokens_details
@@ -2198,6 +2201,36 @@ mod tests {
                 ..Default::default()
             })
         );
+    }
+
+    #[test]
+    fn ensure_standard_reasoning_details_copies_the_raw_value() {
+        // The wire carries the provider's number in both fields, even when it
+        // is inconsistent; only the internal accessor clamps.
+        let mut usage: TokenUsage = serde_json::from_value(serde_json::json!({
+            "prompt_tokens": 1,
+            "completion_tokens": 100,
+            "total_tokens": 101,
+            "reasoning_tokens": 150
+        }))
+        .unwrap();
+        usage.ensure_standard_reasoning_details();
+        let wire = serde_json::to_value(&usage).unwrap();
+        assert_eq!(wire["completion_tokens_details"]["reasoning_tokens"], 150);
+        assert_eq!(wire["reasoning_tokens"], 150);
+        assert_eq!(usage.reasoning_tokens(), Some(100));
+
+        // A negative count is not copied into the standard field.
+        let mut usage: TokenUsage = serde_json::from_value(serde_json::json!({
+            "prompt_tokens": 1,
+            "completion_tokens": 100,
+            "total_tokens": 101,
+            "reasoning_tokens": -3
+        }))
+        .unwrap();
+        usage.ensure_standard_reasoning_details();
+        assert_eq!(usage.completion_tokens_details, None);
+        assert_eq!(usage.reasoning_tokens, Some(-3));
     }
 
     #[test]

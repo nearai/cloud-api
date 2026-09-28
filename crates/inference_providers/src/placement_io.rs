@@ -53,6 +53,9 @@ pub const PINS_WARMUP_COUNT: usize = 50_000;
 pub const PINS_READ_COUNT: usize = 1_000;
 /// Prune expired pins every this many reader cycles (~10 s).
 const PRUNE_EVERY_CYCLES: u64 = 20;
+/// Pins written further than this into the future (clock skew between
+/// cloud-api nodes) are ignored, so a bad clock cannot pin for longer than TTL.
+const PIN_MAX_FUTURE_MS: u64 = 5_000;
 /// Max writes sent in one pipeline.
 const WRITE_BATCH: usize = 128;
 /// Connect backoff bounds.
@@ -181,6 +184,11 @@ impl PlacementIo {
     /// `password`. Never panics and never blocks: if the endpoint or CA is
     /// invalid it logs the error kind and returns an inert handle whose
     /// snapshot stays empty. Must be called inside a Tokio runtime.
+    ///
+    /// The reader and writer tasks are detached: the writer ends once every
+    /// handle (and so the channel sender) is dropped, but the reader lives
+    /// for the life of the process. `PlacementIo` is meant to be a process
+    /// singleton; do not call `start` per request or per provider.
     pub fn start<M: PlacementMetrics + ?Sized + 'static>(
         password: String,
         hosts: Arc<ArcSwap<BackendHosts>>,
@@ -429,8 +437,10 @@ pub(crate) struct PinEntry {
 
 /// Everything one reader cycle fetched, aligned with its [`ReadTargets`].
 pub(crate) struct RawRead {
-    /// Envelope JSON per `targets.replicas` entry; `None` when the key is gone.
-    frames: Vec<Option<String>>,
+    /// Raw `MGET` element per `targets.replicas` entry (`Nil` when the key is
+    /// gone). Decoded one by one, so a single bad value (a compromised proxy
+    /// can write anything to its own key) never fails the whole cycle.
+    frames: Vec<redis::Value>,
     /// `(req, tok)` summed over the last two seconds per `targets.hosts` entry.
     routed: Vec<(u64, u64)>,
     /// New pins stream entries, oldest first.
@@ -444,12 +454,50 @@ pub(crate) struct RawRead {
 #[derive(Default)]
 pub(crate) struct ReaderState {
     ingest: Ingest,
-    /// Last accepted `(envelope JSON, view)` per `(host, replica)` key.
-    views: HashMap<(String, String), (String, ReplicaView)>,
+    /// Last accepted frame per `(host, replica)` key.
+    views: HashMap<(String, String), Accepted>,
+    /// Last rejected raw value per key and why (`None`: not a valid
+    /// envelope), so identical repeats are neither re-verified nor re-counted.
+    rejected: HashMap<(String, String), (Vec<u8>, Option<Reject>)>,
     pins: Arc<PinTable>,
     /// Last pins stream id read; `None` until warm-up has run.
     last_pin_id: Option<String>,
     cycles: u64,
+}
+
+/// A replica's last accepted frame: its raw JSON, the envelope's key id, and
+/// the verified view.
+#[derive(Clone)]
+struct Accepted {
+    json: String,
+    key_id: String,
+    view: ReplicaView,
+}
+
+/// Decodes one `MGET` element: `Ok(None)` when the key is gone, `Err` when
+/// the value is not a UTF-8 string.
+fn decode_frame(v: redis::Value) -> Result<Option<String>, ()> {
+    match v {
+        redis::Value::Nil => Ok(None),
+        v => redis::from_owned_redis_value::<String>(v)
+            .map(Some)
+            .map_err(|_| ()),
+    }
+}
+
+/// Sums `req` and `tok` of routed-counter `HGETALL` replies. An element that
+/// is not a hash of strings contributes nothing, as does an unparsable field.
+fn routed_sum(hashes: impl IntoIterator<Item = redis::Value>) -> (u64, u64) {
+    let mut req = 0u64;
+    let mut tok = 0u64;
+    for v in hashes {
+        let Ok(h) = redis::from_owned_redis_value::<HashMap<String, String>>(v) else {
+            continue;
+        };
+        req = req.saturating_add(h.get("req").and_then(|v| v.parse().ok()).unwrap_or(0));
+        tok = tok.saturating_add(h.get("tok").and_then(|v| v.parse().ok()).unwrap_or(0));
+    }
+    (req, tok)
 }
 
 /// Outcome of applying one cycle's reads.
@@ -479,7 +527,8 @@ impl ReaderState {
     }
 
     /// Applies pins stream entries (oldest first, so a newer pin for the same
-    /// id wins), skipping expired and malformed ones, and advances the
+    /// id wins), skipping expired, future-dated (beyond `PIN_MAX_FUTURE_MS`)
+    /// and malformed ones, and advances the
     /// `XREAD` cursor. Copies the shared table only when something changed.
     /// Returns the malformed count.
     fn apply_pins(&mut self, entries: Vec<PinEntry>, now_ms: u64) -> u32 {
@@ -487,7 +536,9 @@ impl ReaderState {
         for entry in entries {
             match parse_pin(&entry.fields) {
                 Some((id, host, at_ms)) => {
-                    if now_ms < at_ms.saturating_add(PIN_TTL_MS) {
+                    let live = now_ms < at_ms.saturating_add(PIN_TTL_MS);
+                    let skewed = at_ms > now_ms.saturating_add(PIN_MAX_FUTURE_MS);
+                    if live && !skewed {
                         Arc::make_mut(&mut self.pins).insert(id, host, at_ms);
                     }
                 }
@@ -511,37 +562,69 @@ impl ReaderState {
         let mut rejects = Vec::new();
         let mut bad_envelopes = 0;
         let mut views = HashMap::with_capacity(targets.replicas.len());
+        let mut rejected = HashMap::new();
         for ((host, replica), value) in targets.replicas.iter().zip(raw.frames) {
             let key = (host.clone(), replica.clone());
-            let Some(json) = value else {
-                continue; // key expired: the replica drops out
-            };
             let prev = self.views.remove(&key);
-            if let Some((prev_json, view)) = prev.as_ref() {
-                if *prev_json == json {
-                    views.insert(key, (json, view.clone()));
-                    continue; // same frame read again; not a reject
+            let last_reject = self.rejected.remove(&key);
+            let json = match decode_frame(value) {
+                Ok(Some(json)) => json,
+                Ok(None) => continue, // key expired: the replica drops out
+                Err(()) => {
+                    // Not a string: an unusable envelope, dropped (not
+                    // remembered, it is rare and cheap to recount).
+                    bad_envelopes += 1;
+                    continue;
+                }
+            };
+            // The same frame read again (the reader outpaces the publisher):
+            // reuse the view, provided its signing key is still attested.
+            if let Some(acc) = prev.as_ref() {
+                let still_attested = reg
+                    .by_host
+                    .get(host)
+                    .is_some_and(|keys| keys.iter().any(|k| k.key_id == acc.key_id));
+                if acc.json == json && still_attested {
+                    views.insert(key, acc.clone());
+                    continue;
+                }
+            }
+            // The same rejected value again: keep its outcome without
+            // re-verifying or re-counting.
+            if let Some((bytes, reason)) = last_reject {
+                if bytes == json.as_bytes() {
+                    if reason == Some(Reject::Regressed) {
+                        if let Some(acc) = prev {
+                            views.insert(key.clone(), acc);
+                        }
+                    }
+                    rejected.insert(key, (bytes, reason));
+                    continue;
                 }
             }
             let Ok(env) = serde_json::from_str::<Envelope>(&json) else {
                 bad_envelopes += 1;
+                rejected.insert(key, (json.into_bytes(), None));
                 continue;
             };
             match self.ingest.accept(host, replica, &env, reg, now_ms) {
                 Ok(view) => {
-                    views.insert(key, (json, view));
+                    let key_id = env.key_id;
+                    views.insert(key, Accepted { json, key_id, view });
                 }
                 Err(r) => {
                     rejects.push(r);
                     if r == Reject::Regressed {
-                        if let Some(prev) = prev {
-                            views.insert(key, prev);
+                        if let Some(acc) = prev {
+                            views.insert(key.clone(), acc);
                         }
                     }
+                    rejected.insert(key, (json.into_bytes(), Some(r)));
                 }
             }
         }
         self.views = views;
+        self.rejected = rejected;
 
         let since_ms = raw.now_s.saturating_sub(1).saturating_mul(1000);
         let routed = targets
@@ -567,7 +650,7 @@ impl ReaderState {
             Arc::make_mut(&mut self.pins).prune(now_ms);
         }
 
-        let mut replicas: Vec<ReplicaView> = self.views.values().map(|(_, v)| v.clone()).collect();
+        let mut replicas: Vec<ReplicaView> = self.views.values().map(|a| a.view.clone()).collect();
         replicas.sort_by(|a, b| (&a.host_id, &a.replica_id).cmp(&(&b.host_id, &b.replica_id)));
         Applied {
             snapshot: Snapshot {
@@ -700,21 +783,20 @@ async fn fetch(
         })
     };
 
-    let frames: Vec<Option<String>> = if targets.replicas.is_empty() {
+    let frames: Vec<redis::Value> = if targets.replicas.is_empty() {
         Vec::new()
     } else {
         redis::from_owned_redis_value(next()?)?
     };
+    if frames.len() != targets.replicas.len() {
+        return Err(redis::RedisError::from((
+            redis::ErrorKind::TypeError,
+            "MGET reply length mismatch",
+        )));
+    }
     let mut routed = Vec::with_capacity(targets.hosts.len());
     for _ in &targets.hosts {
-        let mut req = 0u64;
-        let mut tok = 0u64;
-        for _ in 0..2 {
-            let h: HashMap<String, String> = redis::from_owned_redis_value(next()?)?;
-            req = req.saturating_add(h.get("req").and_then(|v| v.parse().ok()).unwrap_or(0));
-            tok = tok.saturating_add(h.get("tok").and_then(|v| v.parse().ok()).unwrap_or(0));
-        }
-        routed.push((req, tok));
+        routed.push(routed_sum([next()?, next()?]));
     }
     let xread: Option<redis::streams::StreamReadReply> = redis::from_owned_redis_value(next()?)?;
     let pins = xread
@@ -841,7 +923,14 @@ mod tests {
 
     fn raw(frames: Vec<Option<String>>, now_ms: u64) -> RawRead {
         RawRead {
-            frames,
+            frames: frames
+                .into_iter()
+                .map(|f| {
+                    f.map_or(redis::Value::Nil, |s| {
+                        redis::Value::BulkString(s.into_bytes())
+                    })
+                })
+                .collect(),
             routed: vec![(0, 0)],
             pins: Vec::new(),
             now_s: now_ms / 1000,
@@ -1058,6 +1147,164 @@ mod tests {
             .unwrap()
             .iter()
             .all(|(_, _, tags)| tags.iter().all(|t| !t.contains(HOST))));
+    }
+
+    #[test]
+    fn non_utf8_value_is_isolated_to_its_replica() {
+        let t0 = 10_000_000u64;
+        let metrics = FakeMetrics::default();
+        let mut reg = registry();
+        reg.by_host.get_mut(HOST).unwrap()[0]
+            .replica_ids
+            .push("r2".to_string());
+        let targets = ReadTargets::from_registry(&reg);
+        let slot = ArcSwap::from_pointee(Snapshot::default());
+        let mut state = ReaderState::default();
+        let mut r = raw(vec![Some(sealed_json(&report(1, t0)))], t0);
+        // r2's key holds bytes that are not a UTF-8 string.
+        r.frames
+            .push(redis::Value::BulkString(vec![0xff, 0xfe, 0x00]));
+        publish_cycle(&mut state, &slot, Ok((targets, r)), &reg, t0, &metrics).unwrap();
+        let snap = slot.load();
+        assert_eq!(snap.built_ms, t0);
+        assert_eq!(snap.replicas.len(), 1);
+        assert_eq!(snap.replicas[0].replica_id, REPLICA);
+        assert_eq!(
+            metrics.total(METRIC_FRAMES_REJECTED, Some("reason:envelope")),
+            1
+        );
+    }
+
+    #[test]
+    fn bad_routed_hash_contributes_nothing() {
+        let good = redis::Value::Map(vec![
+            (
+                redis::Value::BulkString(b"req".to_vec()),
+                redis::Value::BulkString(b"2".to_vec()),
+            ),
+            (
+                redis::Value::BulkString(b"tok".to_vec()),
+                redis::Value::BulkString(b"50".to_vec()),
+            ),
+        ]);
+        let bad = redis::Value::BulkString(vec![0xff]);
+        assert_eq!(routed_sum([good, bad]), (2, 50));
+        let unparsable = redis::Value::Map(vec![(
+            redis::Value::BulkString(b"req".to_vec()),
+            redis::Value::BulkString(b"lots".to_vec()),
+        )]);
+        assert_eq!(routed_sum([unparsable, redis::Value::Nil]), (0, 0));
+    }
+
+    #[test]
+    fn future_dated_pins_ignored() {
+        let now = 10_000_000u64;
+        let secret = [3u8; 32];
+        let ok = pin_id(&AffinityKey::from_bytes([1u8; 16]), &secret);
+        let skewed = pin_id(&AffinityKey::from_bytes([2u8; 16]), &secret);
+        let late = pin_id(&AffinityKey::from_bytes([3u8; 16]), &secret);
+        let mut state = ReaderState::default();
+        state.warm_up(
+            vec![
+                pin_entry(
+                    "2-0",
+                    &skewed.to_hex(),
+                    "gpu02",
+                    now + PIN_MAX_FUTURE_MS + 1,
+                ),
+                pin_entry("1-0", &ok.to_hex(), "gpu01", now + PIN_MAX_FUTURE_MS),
+            ],
+            now,
+        );
+        assert_eq!(state.pins.len(), 1);
+        assert!(state.pins.get(&ok, now).is_some());
+        assert_eq!(state.pins.get(&skewed, now), None);
+        state.apply_pins(
+            vec![pin_entry("3-0", &late.to_hex(), "gpu03", now + 60_000)],
+            now,
+        );
+        assert_eq!(state.pins.get(&late, now + 60_000), None);
+        assert_eq!(state.last_pin_id.as_deref(), Some("3-0"));
+    }
+
+    #[test]
+    fn duplicate_frame_dropped_once_its_key_is_no_longer_attested() {
+        let t0 = 10_000_000u64;
+        let metrics = FakeMetrics::default();
+        let reg = registry();
+        let slot = ArcSwap::from_pointee(Snapshot::default());
+        let mut state = ReaderState::default();
+        let f = sealed_json(&report(1, t0));
+        let targets = ReadTargets::from_registry(&reg);
+        let r = raw(vec![Some(f.clone())], t0);
+        publish_cycle(&mut state, &slot, Ok((targets, r)), &reg, t0, &metrics).unwrap();
+        assert_eq!(slot.load().replicas.len(), 1);
+
+        // The host re-attests with a different key; the old frame is re-read.
+        let rotated = SigningKey::from_bytes(&[9u8; 32]).verifying_key();
+        let mut reg2 = registry();
+        let hk = &mut reg2.by_host.get_mut(HOST).unwrap()[0];
+        hk.key = rotated;
+        hk.key_id = frame::key_id(&rotated);
+        let targets = ReadTargets::from_registry(&reg2);
+        let r = raw(vec![Some(f)], t0 + 500);
+        publish_cycle(
+            &mut state,
+            &slot,
+            Ok((targets, r)),
+            &reg2,
+            t0 + 500,
+            &metrics,
+        )
+        .unwrap();
+        assert!(slot.load().replicas.is_empty());
+    }
+
+    #[test]
+    fn identical_rejected_repeats_are_not_recounted() {
+        let t0 = 10_000_000u64;
+        let metrics = FakeMetrics::default();
+        let reg = registry();
+        let slot = ArcSwap::from_pointee(Snapshot::default());
+        let mut state = ReaderState::default();
+        let cycle = |state: &mut ReaderState, frames, now| {
+            let targets = ReadTargets::from_registry(&reg);
+            publish_cycle(
+                state,
+                &slot,
+                Ok((targets, raw(frames, now))),
+                &reg,
+                now,
+                &metrics,
+            )
+            .unwrap();
+        };
+        cycle(&mut state, vec![Some(sealed_json(&report(2, t0)))], t0);
+        let old = sealed_json(&report(1, t0));
+        cycle(&mut state, vec![Some(old.clone())], t0 + 500);
+        cycle(&mut state, vec![Some(old)], t0 + 1_000);
+        assert_eq!(
+            metrics.total(METRIC_FRAMES_REJECTED, Some("reason:regressed")),
+            1
+        );
+        // The last accepted view survives the repeated regressed read.
+        assert_eq!(slot.load().replicas.len(), 1);
+        assert_eq!(slot.load().replicas[0].report.seq, 2);
+
+        cycle(&mut state, vec![Some("junk".into())], t0 + 1_500);
+        cycle(&mut state, vec![Some("junk".into())], t0 + 2_000);
+        assert_eq!(
+            metrics.total(METRIC_FRAMES_REJECTED, Some("reason:envelope")),
+            1
+        );
+        // Once the key disappears the memory clears: the same junk counts again.
+        cycle(&mut state, vec![None], t0 + 2_500);
+        assert!(state.rejected.is_empty());
+        cycle(&mut state, vec![Some("junk".into())], t0 + 3_000);
+        assert_eq!(
+            metrics.total(METRIC_FRAMES_REJECTED, Some("reason:envelope")),
+            2
+        );
     }
 
     fn args(cmd: &redis::Cmd) -> Vec<String> {

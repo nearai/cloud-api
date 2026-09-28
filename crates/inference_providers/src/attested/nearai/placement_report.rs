@@ -90,6 +90,21 @@ pub(super) fn report_decision(
     if let Some(backlog) = record.chosen_backlog_tokens {
         metrics.record_histogram(METRIC_CHOSEN_BACKLOG, backlog as f64, &[]);
     }
+    if logs_at_debug(record) {
+        // Placement has no usable state (Valkey unreachable, placeholder
+        // endpoint, stale snapshot): every covered request would log the same
+        // line. The decision metric above still counts each one.
+        tracing::debug!(
+            request_id = %request.request_id,
+            org_id = %request.org_id,
+            model = %request.model,
+            outcome = record.outcome,
+            reason = record.reason.unwrap_or(""),
+            snapshot_age_ms = record.snapshot_age_ms,
+            "Placement decision"
+        );
+        return;
+    }
     let excluded = record
         .excluded
         .iter()
@@ -118,6 +133,13 @@ pub(super) fn report_decision(
         backlog_tokens = ?record.chosen_backlog_tokens,
         "Placement decision"
     );
+}
+
+/// Legacy decisions made because placement has no usable snapshot are logged at
+/// debug; they would otherwise repeat on every covered request while the
+/// shared state is down or unconfigured.
+fn logs_at_debug(record: &DecisionRecord) -> bool {
+    record.outcome == "legacy" && matches!(record.reason, Some("no_state" | "stale"))
 }
 
 fn outcome_tag(outcome: &str) -> &'static str {
@@ -168,5 +190,49 @@ fn rule_tag(rule: Rule) -> &'static str {
         Rule::Freshness => "rule:freshness",
         Rule::Capacity => "rule:capacity",
         Rule::Context => "rule:context",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::logs_at_debug;
+    use placement::decision::{AffinitySource, Decision, DecisionRecord, PlaceInput, Placer};
+    use placement::snapshot::Snapshot;
+    use std::collections::HashMap;
+
+    fn no_state_record() -> DecisionRecord {
+        let input = PlaceInput {
+            model: placement::consts::COVERED_MODELS[0].to_string(),
+            prompt_tokens_est: 10,
+            affinity: None,
+            affinity_source: AffinitySource::None,
+            long_context_hosts: Vec::new(),
+            now_ms: 10_000,
+        };
+        let mut rng = rand::rng();
+        match Placer::new([1u8; 32]).place(&input, &Snapshot::default(), &HashMap::new(), &mut rng)
+        {
+            Decision::Legacy { record, .. } => record,
+            Decision::Place { .. } => panic!("an empty snapshot never places"),
+        }
+    }
+
+    #[test]
+    fn no_state_and_stale_decisions_log_at_debug() {
+        let mut record = no_state_record();
+        assert_eq!(record.reason, Some("no_state"));
+        assert!(logs_at_debug(&record));
+        record.reason = Some("stale");
+        assert!(logs_at_debug(&record));
+    }
+
+    #[test]
+    fn other_decisions_log_at_info() {
+        let mut record = no_state_record();
+        record.reason = Some("incomplete");
+        assert!(!logs_at_debug(&record));
+        record.outcome = "place";
+        record.reason = None;
+        assert!(!logs_at_debug(&record));
     }
 }

@@ -1344,7 +1344,7 @@ impl InferenceProvider for Fleet {
                     .await
                     .map_err(|e| crate::systemone::transport_error(e, timeout_seconds))?;
                 let response = crate::systemone::read_response(response, &request, false).await?;
-                let id = response.provider_signature_id()?;
+                let id = response.provider_chat_id()?;
                 if let Some(index) = index {
                     self.signature_rotation
                         .lock()

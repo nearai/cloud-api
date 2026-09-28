@@ -111,7 +111,7 @@ async fn fleet_case(status: u16, malformed: bool, timeout: bool) {
     let response = provider.systemone(request, "original-hash".into()).await;
     if retry {
         let id = format!("decision-tee-{next}");
-        assert_eq!(response.unwrap().provider_signature_id().unwrap(), id);
+        assert_eq!(response.unwrap().provider_chat_id().unwrap(), id);
         assert_eq!(
             provider.fleet.signature_rotation.lock().unwrap().get(&id),
             Some(&(next as u64))

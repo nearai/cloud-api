@@ -28,7 +28,7 @@ pub struct AttributedImageEdit {
 pub struct AttributedSystemOne {
     pub response: inference_providers::SystemOneResponseWithBytes,
     pub provider_attribution: crate::usage::ProviderAttribution,
-    pub signature_id: String,
+    pub chat_id: String,
     pub signature_kind: crate::attestation::SignatureKind,
 }
 

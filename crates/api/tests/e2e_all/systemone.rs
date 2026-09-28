@@ -110,7 +110,11 @@ async fn systemone_external_catalog_alias_billing_and_gateway_signatures() {
         .and(body_partial_json(
             json!({"model":"jev-1.13.0","state":{"message":"Please refund this charge"}}),
         ))
-        .respond_with(ResponseTemplate::new(200).set_body_raw(raw.clone(), "application/json"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("x-typesafe-request-id", "shared-trace-id")
+                .set_body_raw(raw.clone(), "application/json"),
+        )
         .expect(2)
         .mount(&upstream)
         .await;
@@ -152,10 +156,11 @@ async fn systemone_external_catalog_alias_billing_and_gateway_signatures() {
             format!("{alias} -> {model}").as_str()
         );
         let id = response
-            .header("x-signature-id")
+            .header("x-generation-id")
             .to_str()
             .unwrap()
             .to_owned();
+        assert!(id.starts_with("decision-"));
         assert_ne!(Some(&id), previous_id.as_ref());
         previous_id = Some(id.clone());
         assert_signatures(&server, &key, &id, "gateway", &request_text, &raw).await;
@@ -183,6 +188,54 @@ async fn systemone_external_catalog_alias_billing_and_gateway_signatures() {
             .json();
         assert_eq!(costs["requests"][0]["costNanoUsd"], 36);
     }
+}
+
+#[tokio::test]
+async fn systemone_external_generation_header_indexes_gateway_signatures() {
+    let upstream = MockServer::start().await;
+    let upstream_id = format!("gen-dec-{}", uuid::Uuid::new_v4());
+    let raw = serde_json::to_string_pretty(&result(None)).unwrap();
+    Mock::given(method("POST"))
+        .and(path("/v1/systemone"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("x-generation-id", upstream_id.as_str())
+                .insert_header("x-typesafe-request-id", "trace-only")
+                .set_body_raw(raw.clone(), "application/json"),
+        )
+        .expect(1)
+        .mount(&upstream)
+        .await;
+    let (server, _, _, _) = setup_test_server_with_pool().await;
+    let (model, _) = catalog(
+        &server,
+        Some(json!({
+            "backend":"typesafe","base_url":format!("{}/v1",upstream.uri()),
+            "model_name":"jev-1.13.0","api_key":"fixture-typesafe-key"
+        })),
+        true,
+    )
+    .await;
+    let key = auth(&server).await;
+    let request_text = serde_json::to_string(&request(&model)).unwrap();
+    let response = server
+        .post("/v1/systemone")
+        .add_header("Authorization", format!("Bearer {key}"))
+        .add_header("Content-Type", "application/json")
+        .bytes(Bytes::from(request_text.clone()))
+        .await;
+    response.assert_status_ok();
+    assert_eq!(response.text(), raw);
+    assert_eq!(response.header("x-generation-id"), upstream_id.as_str());
+    assert!(response
+        .header("access-control-expose-headers")
+        .to_str()
+        .unwrap()
+        .split(',')
+        .any(
+            |header| header.trim() == "*" || header.trim().eq_ignore_ascii_case("x-generation-id")
+        ));
+    assert_signatures(&server, &key, &upstream_id, "gateway", &request_text, &raw).await;
 }
 
 #[tokio::test]
@@ -229,11 +282,11 @@ async fn systemone_uses_actual_provider_trust_and_signature_capability() {
             }
         );
         let id = response
-            .header("x-signature-id")
+            .header("x-generation-id")
             .to_str()
             .unwrap()
             .to_owned();
-        assert_eq!(id == upstream_id, kind == "provider_tee");
+        assert_eq!(id, upstream_id);
         if kind == "provider_tee" {
             // MockProvider emits deterministic placeholder signatures. For TEE
             // receipts, assert verbatim preservation; gateway receipts below

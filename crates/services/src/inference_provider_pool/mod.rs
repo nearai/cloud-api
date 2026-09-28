@@ -4076,7 +4076,7 @@ impl InferenceProviderPool {
                     async move {
                         let response = provider.systemone(request, request_hash).await?;
                         if provider.tier().is_attested() && provider.supports_chat_signatures() {
-                            response.provider_signature_id()?;
+                            response.provider_chat_id()?;
                         }
                         Ok(response)
                     }
@@ -4087,14 +4087,18 @@ impl InferenceProviderPool {
         // Catalog flags and the trait's historical signature default are insufficient.
         let provider_signs =
             served.provider.tier().is_attested() && served.provider.supports_chat_signatures();
-        let (signature_id, signature_kind) = if provider_signs {
+        let (chat_id, signature_kind) = if provider_signs {
             (
-                served.value.provider_signature_id()?.to_owned(),
+                served.value.provider_chat_id()?.to_owned(),
                 crate::attestation::SignatureKind::ProviderTee,
             )
         } else {
             (
-                format!("decision-{}", uuid::Uuid::new_v4()),
+                served
+                    .value
+                    .chat_id
+                    .clone()
+                    .unwrap_or_else(|| format!("decision-{}", uuid::Uuid::new_v4())),
                 crate::attestation::SignatureKind::Gateway,
             )
         };
@@ -4102,16 +4106,14 @@ impl InferenceProviderPool {
             // Providers may promote a pending request pin here. NEAR's System
             // One transport already pinned the successful response ID directly,
             // so its implementation is a no-op for this call.
-            served
-                .provider
-                .pin_chat_connection(&request_hash, &signature_id);
-            self.store_chat_id_mapping(signature_id.clone(), served.provider)
+            served.provider.pin_chat_connection(&request_hash, &chat_id);
+            self.store_chat_id_mapping(chat_id.clone(), served.provider)
                 .await;
         }
         Ok(AttributedSystemOne {
             response: served.value,
             provider_attribution: served.provider_attribution,
-            signature_id,
+            chat_id,
             signature_kind,
         })
     }

@@ -94,28 +94,71 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn systemone_transport_rewrites_model_and_preserves_bytes() {
+    async fn systemone_transport_selects_generation_id_and_preserves_bytes() {
+        for (body_id, header_id, expected) in [
+            (Some("body-id"), None, Some("body-id")),
+            (None, Some("header-id"), Some("header-id")),
+            (Some("body-id"), Some("header-id"), Some("body-id")),
+            (None, None, None),
+        ] {
+            let server = MockServer::start().await;
+            let mut body = json!({"model":"jev-1.13.0",
+                "answers":{"q":{"type":"noul","noul":0.8}},
+                "usage":{"input_tokens":7,"output_tokens":1},"extra":true});
+            if let Some(id) = body_id {
+                body["id"] = json!(id);
+            }
+            let raw = serde_json::to_string_pretty(&body).unwrap();
+            let mut template = ResponseTemplate::new(200)
+                .insert_header("x-typesafe-request-id", "shared-trace-id")
+                .set_body_raw(raw.clone(), "application/json");
+            if let Some(id) = header_id {
+                template = template.insert_header("x-generation-id", id);
+            }
+            Mock::given(method("POST"))
+                .and(path("/v1/systemone"))
+                .and(header("authorization", "Bearer fixture-key"))
+                .and(body_partial_json(
+                    json!({"model":"jev-latest","state":["text",{"x":1}]}),
+                ))
+                .respond_with(template)
+                .expect(1)
+                .mount(&server)
+                .await;
+            let provider = provider(format!("{}/v1/", server.uri()));
+            let response = provider
+                .systemone(request(), "client-hash".into())
+                .await
+                .unwrap();
+            assert_eq!(response.raw_bytes, raw.as_bytes());
+            assert_eq!(response.response.id.as_deref(), body_id);
+            assert_eq!(response.chat_id.as_deref(), expected);
+            // A generation header alone does not satisfy the self-hosted TEE contract.
+            assert_eq!(response.provider_chat_id().is_ok(), body_id.is_some());
+        }
+    }
+
+    #[tokio::test]
+    async fn systemone_transport_rejects_invalid_generation_headers() {
         let server = MockServer::start().await;
-        let raw = r#"{ "model":"jev-1.13.0", "answers":{"q":{"type":"noul","noul":0.8}},
-            "usage":{"input_tokens":7,"output_tokens":1}, "extra":true }"#;
         Mock::given(method("POST"))
             .and(path("/v1/systemone"))
-            .and(header("authorization", "Bearer fixture-key"))
-            .and(body_partial_json(
-                json!({"model":"jev-latest","state":["text",{"x":1}]}),
-            ))
-            .respond_with(ResponseTemplate::new(200).set_body_raw(raw, "application/json"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("x-generation-id", "not/a/generation-id")
+                    .set_body_json(
+                        json!({"model":"jev", "answers":{"q":{"type":"noul","noul":0.8}},
+                        "usage":{"input_tokens":7,"output_tokens":1}}),
+                    ),
+            )
             .expect(1)
             .mount(&server)
             .await;
-        let provider = provider(format!("{}/v1/", server.uri()));
-        assert!(provider.supports_systemone());
-        assert_eq!(provider.tier(), crate::ProviderTier::NonAttested);
-        let response = provider
-            .systemone(request(), "client-hash".into())
+        let error = provider(format!("{}/v1", server.uri()))
+            .systemone(request(), "hash".into())
             .await
-            .unwrap();
-        assert_eq!(response.raw_bytes, raw.as_bytes());
+            .unwrap_err();
+        assert!(matches!(error, CompletionError::InvalidResponse(_)));
     }
 
     #[tokio::test]
@@ -163,10 +206,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.raw_bytes, raw.as_bytes());
-        assert_eq!(
-            response.provider_signature_id().unwrap(),
-            "decision-tee-123"
-        );
+        assert_eq!(response.provider_chat_id().unwrap(), "decision-tee-123");
         assert_eq!(near.tier(), crate::ProviderTier::Near);
     }
 }

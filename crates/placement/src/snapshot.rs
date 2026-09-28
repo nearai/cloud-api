@@ -34,13 +34,12 @@ pub struct KeyRegistry {
 }
 
 /// A single replica's most recently accepted report, tagged with the Redis
-/// key it was read from and when it was received.
+/// key it was read from.
 #[derive(Clone, Debug)]
 pub struct ReplicaView {
     pub host_id: String,
     pub replica_id: String,
     pub report: ReplicaReport,
-    pub received_ms: u64,
 }
 
 /// Routed-request counters for one (host, replica), used to estimate pending
@@ -146,7 +145,6 @@ impl Ingest {
         redis_replica: &str,
         env: &Envelope,
         reg: &KeyRegistry,
-        now_ms: u64,
     ) -> Result<ReplicaView, Reject> {
         let keys = reg.by_host.get(redis_host).ok_or(Reject::UnknownKey)?;
         if keys.is_empty() {
@@ -221,7 +219,6 @@ impl Ingest {
             host_id: redis_host.to_string(),
             replica_id: redis_replica.to_string(),
             report,
-            received_ms: now_ms,
         })
     }
 }
@@ -281,11 +278,10 @@ mod tests {
         let mut ingest = Ingest::new();
         let env = seal(&report(), &signing_key());
         let view = ingest
-            .accept(HOST, REPLICA, &env, &registry(), 5_000)
+            .accept(HOST, REPLICA, &env, &registry())
             .expect("valid frame accepted");
         assert_eq!(view.host_id, HOST);
         assert_eq!(view.replica_id, REPLICA);
-        assert_eq!(view.received_ms, 5_000);
         assert_eq!(view.report.seq, 1);
     }
 
@@ -297,9 +293,7 @@ mod tests {
         // key hasn't reached the host map yet).
         let empty = KeyRegistry::default();
         assert_eq!(
-            ingest
-                .accept(HOST, REPLICA, &env, &empty, 1_000)
-                .unwrap_err(),
+            ingest.accept(HOST, REPLICA, &env, &empty).unwrap_err(),
             Reject::UnknownKey
         );
     }
@@ -310,13 +304,13 @@ mod tests {
         let reg = registry();
 
         let first = seal(&report(), &signing_key());
-        ingest.accept(HOST, REPLICA, &first, &reg, 1_000).unwrap();
+        ingest.accept(HOST, REPLICA, &first, &reg).unwrap();
 
         let mut regressed = report();
         regressed.seq = 1; // not > last.seq
         let env = seal(&regressed, &signing_key());
         assert_eq!(
-            ingest.accept(HOST, REPLICA, &env, &reg, 2_000).unwrap_err(),
+            ingest.accept(HOST, REPLICA, &env, &reg).unwrap_err(),
             Reject::Regressed
         );
     }
@@ -330,14 +324,14 @@ mod tests {
         first.seq = 5;
         first.engine_sampled_at_ms = Some(2_000);
         let env = seal(&first, &signing_key());
-        ingest.accept(HOST, REPLICA, &env, &reg, 1_000).unwrap();
+        ingest.accept(HOST, REPLICA, &env, &reg).unwrap();
 
         let mut regressed = report();
         regressed.seq = 6; // seq advances...
         regressed.engine_sampled_at_ms = Some(1_500); // ...but engine time regresses
         let env = seal(&regressed, &signing_key());
         assert_eq!(
-            ingest.accept(HOST, REPLICA, &env, &reg, 2_000).unwrap_err(),
+            ingest.accept(HOST, REPLICA, &env, &reg).unwrap_err(),
             Reject::Regressed
         );
     }
@@ -350,7 +344,7 @@ mod tests {
         let mut first = report();
         first.engine_sampled_at_ms = Some(5_000);
         let env = seal(&first, &signing_key());
-        ingest.accept(HOST, REPLICA, &env, &reg, 1_000).unwrap();
+        ingest.accept(HOST, REPLICA, &env, &reg).unwrap();
 
         let mut rebooted = report();
         rebooted.boot_id = "boot-b".into();
@@ -358,7 +352,7 @@ mod tests {
         rebooted.engine_sampled_at_ms = Some(4_000); // but engine time regresses
         let env = seal(&rebooted, &signing_key());
         assert_eq!(
-            ingest.accept(HOST, REPLICA, &env, &reg, 2_000).unwrap_err(),
+            ingest.accept(HOST, REPLICA, &env, &reg).unwrap_err(),
             Reject::Regressed
         );
     }
@@ -371,7 +365,7 @@ mod tests {
         let mut first = report();
         first.engine_sampled_at_ms = Some(5_000);
         let env = seal(&first, &signing_key());
-        ingest.accept(HOST, REPLICA, &env, &reg, 1_000).unwrap();
+        ingest.accept(HOST, REPLICA, &env, &reg).unwrap();
 
         let mut rebooted = report();
         rebooted.boot_id = "boot-b".into();
@@ -379,7 +373,7 @@ mod tests {
         rebooted.engine_sampled_at_ms = None; // not read yet since the reboot
         let env = seal(&rebooted, &signing_key());
         let view = ingest
-            .accept(HOST, REPLICA, &env, &reg, 2_000)
+            .accept(HOST, REPLICA, &env, &reg)
             .expect("a reboot's first frame with unknown engine time is accepted");
         assert_eq!(view.report.boot_id, "boot-b");
     }
@@ -393,14 +387,14 @@ mod tests {
         first.seq = 1;
         first.engine_sampled_at_ms = Some(5_000);
         let env = seal(&first, &signing_key());
-        ingest.accept(HOST, REPLICA, &env, &reg, 1_000).unwrap();
+        ingest.accept(HOST, REPLICA, &env, &reg).unwrap();
 
         let mut second = report();
         second.seq = 2;
         second.engine_sampled_at_ms = None;
         let env = seal(&second, &signing_key());
         ingest
-            .accept(HOST, REPLICA, &env, &reg, 2_000)
+            .accept(HOST, REPLICA, &env, &reg)
             .expect("unknown engine time is accepted and doesn't lower the remembered one");
 
         let mut third = report();
@@ -408,8 +402,22 @@ mod tests {
         third.engine_sampled_at_ms = Some(4_000); // regresses vs the remembered 5_000
         let env = seal(&third, &signing_key());
         assert_eq!(
-            ingest.accept(HOST, REPLICA, &env, &reg, 3_000).unwrap_err(),
+            ingest.accept(HOST, REPLICA, &env, &reg).unwrap_err(),
             Reject::Regressed
+        );
+    }
+
+    #[test]
+    fn unsupported_schema_rejected() {
+        // A correctly signed frame from an attested key, but with a schema
+        // this build doesn't understand, is rejected (not guessed at).
+        let mut ingest = Ingest::new();
+        let mut future = report();
+        future.schema = SUPPORTED_SCHEMA + 1;
+        let env = seal(&future, &signing_key());
+        assert_eq!(
+            ingest.accept(HOST, REPLICA, &env, &registry()).unwrap_err(),
+            Reject::Schema
         );
     }
 
@@ -421,7 +429,7 @@ mod tests {
         let reg = KeyRegistry { by_host };
         let env = seal(&report(), &signing_key());
         assert_eq!(
-            ingest.accept(HOST, REPLICA, &env, &reg, 1_000).unwrap_err(),
+            ingest.accept(HOST, REPLICA, &env, &reg).unwrap_err(),
             Reject::UnknownKey
         );
     }
@@ -446,7 +454,7 @@ mod tests {
         let reg = KeyRegistry { by_host };
         let env = seal(&report(), &signing_key());
         assert_eq!(
-            ingest.accept(HOST, "r2", &env, &reg, 1_000).unwrap_err(),
+            ingest.accept(HOST, "r2", &env, &reg).unwrap_err(),
             Reject::Mismatch
         );
     }
@@ -468,7 +476,7 @@ mod tests {
         let reg = KeyRegistry { by_host };
         let env = seal(&report(), &signing_key());
         assert_eq!(
-            ingest.accept(HOST, REPLICA, &env, &reg, 1_000).unwrap_err(),
+            ingest.accept(HOST, REPLICA, &env, &reg).unwrap_err(),
             Reject::Mismatch
         );
     }

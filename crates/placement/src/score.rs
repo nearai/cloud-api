@@ -26,7 +26,7 @@ pub struct Pending {
 ///
 /// - `fullness = (running + queued + pending.req) / max_running.unwrap_or(DEFAULT_MAX_RUNNING)`
 /// - `prefill = (prefill_backlog_tokens.unwrap_or(queued * 2000) + pending.tok) / PREFILL_NORM_TOKENS`
-/// - `speed = max(SPEED_FLOOR, gen_tps.unwrap_or(fleet_median_tps) / fleet_median_tps)`
+/// - `speed = clamp(gen_tps.unwrap_or(fleet_median_tps) / fleet_median_tps, SPEED_FLOOR, 1 / SPEED_FLOOR)`
 /// - `score = (fullness + prefill) / speed`
 ///
 /// `running`/`queued` missing (`None`) are treated as 0 here; a replica with
@@ -52,7 +52,9 @@ pub fn replica_score(r: &ReplicaView, pending: Pending, fleet_median_tps: f64) -
     let prefill = (backlog + pending.tok as f64) / PREFILL_NORM_TOKENS;
 
     let gen_tps = load.gen_tps.unwrap_or(fleet_median_tps);
-    let speed = (gen_tps / fleet_median_tps).max(SPEED_FLOOR);
+    // Clamped on both sides: a self-reported huge `gen_tps` must not drive
+    // the score to ~0 and win every decision.
+    let speed = (gen_tps / fleet_median_tps).clamp(SPEED_FLOOR, 1.0 / SPEED_FLOOR);
 
     (fullness + prefill) / speed
 }
@@ -94,31 +96,23 @@ pub fn fleet_median_tps(views: &[&ReplicaView]) -> f64 {
 /// publishes one `RoutedCounts` per host, since the host's own proxy
 /// balances its own replicas).
 ///
-/// `routed` is only trusted when it's fresher than the frame being scored
-/// (`routed.since_ms > frame_reported_ms`); a `routed` counter sealed before
-/// the frame can't reflect anything the frame's own load hasn't already
-/// counted, so treating it as 0 avoids double counting. When trusted, the
-/// result is `(routed - mine).saturating + mine` component-wise: since
-/// `routed` already includes this placer's own routed requests, subtracting
-/// `mine` first and adding it back avoids counting it twice while still
-/// including it. Because `routed >= mine` in the steady state, this is
-/// effectively `max(routed, mine)` per component when fresh, and `mine` when
-/// stale or absent.
-pub fn pending_for(
-    routed: Option<&RoutedCounts>,
-    mine: Pending,
-    frame_reported_ms: u64,
-) -> Pending {
-    let others = match routed {
-        Some(rc) if rc.since_ms > frame_reported_ms => Pending {
-            req: rc.req.saturating_sub(mine.req),
-            tok: rc.tok.saturating_sub(mine.tok),
+/// `routed` is the fleet-wide routed count for the host over the reader's
+/// sliding window (the `{now-1s, now}` routed hashes) and already includes
+/// this placer's own routed requests; `mine` is this placer's own count over
+/// the same window. The result is `max(routed, mine)` component-wise:
+/// `routed` covers every node including this one, and `mine` covers this
+/// node's writes that may not have reached Valkey yet. There is deliberately
+/// no freshness gate against the frame's `reported_at_ms`: frames arrive
+/// every 500 ms, so such a gate would discard other nodes' load almost
+/// always. Over-counting load a frame already reflects is preferred to
+/// missing it.
+pub fn pending_for(routed: Option<&RoutedCounts>, mine: Pending) -> Pending {
+    match routed {
+        Some(rc) => Pending {
+            req: rc.req.max(mine.req),
+            tok: rc.tok.max(mine.tok),
         },
-        _ => Pending::default(),
-    };
-    Pending {
-        req: others.req.saturating_add(mine.req),
-        tok: others.tok.saturating_add(mine.tok),
+        None => mine,
     }
 }
 
@@ -218,40 +212,55 @@ mod tests {
 
     #[test]
     fn pending_does_not_double_count() {
-        // E18: a routed counter sealed before the frame it's paired with
-        // counts as 0, not as extra load on top of `mine`.
+        // E18: `routed` already includes this node's own routed load, so the
+        // result is max(routed, mine) component-wise, never routed + mine.
         let mine = Pending { req: 2, tok: 500 };
         let routed = RoutedCounts {
             req: 5,
-            tok: 3_000,
-            since_ms: 900,
+            tok: 300,
+            since_ms: 0,
         };
-        let frame_reported_ms = 1_000; // routed.since_ms (900) is not > this
-        let pending = pending_for(Some(&routed), mine, frame_reported_ms);
-        assert_eq!(pending.req, mine.req);
-        assert_eq!(pending.tok, mine.tok);
+        let pending = pending_for(Some(&routed), mine);
+        assert_eq!(pending, Pending { req: 5, tok: 500 });
     }
 
     #[test]
-    fn pending_for_uses_fresher_routed_minus_mine() {
-        let mine = Pending { req: 2, tok: 500 };
+    fn pending_for_ignores_routed_window_start() {
+        // Other nodes' routed load counts regardless of `since_ms`: frames
+        // arrive every 500 ms, so a gate against the frame's reported_at_ms
+        // would practically never open.
         let routed = RoutedCounts {
-            req: 5,
-            tok: 3_000,
-            since_ms: 1_500,
+            req: 4,
+            tok: 1_000,
+            since_ms: 1,
         };
-        let frame_reported_ms = 1_000; // routed is fresher than the frame
-        let pending = pending_for(Some(&routed), mine, frame_reported_ms);
-        // (routed - mine) + mine == max(routed, mine) component-wise here.
-        assert_eq!(pending.req, 5);
-        assert_eq!(pending.tok, 3_000);
+        let pending = pending_for(Some(&routed), Pending::default());
+        assert_eq!(pending, Pending { req: 4, tok: 1_000 });
     }
 
     #[test]
     fn pending_for_none_routed_is_mine_only() {
         let mine = Pending { req: 3, tok: 7 };
-        assert_eq!(pending_for(None, mine, 1_000).req, mine.req);
-        assert_eq!(pending_for(None, mine, 1_000).tok, mine.tok);
+        assert_eq!(pending_for(None, mine), mine);
+    }
+
+    #[test]
+    fn speed_is_clamped_above() {
+        // A self-reported absurd gen_tps can't drive the score to ~0.
+        let mut honest = view_ready();
+        honest.report.load.running = Some(20);
+        honest.report.load.gen_tps = Some(100.0);
+        let mut liar = honest.clone();
+        liar.report.load.gen_tps = Some(1.0e12);
+
+        let base = replica_score(&honest, Pending::default(), 100.0);
+        let score = replica_score(&liar, Pending::default(), 100.0);
+        let clamped = base * SPEED_FLOOR;
+        assert!(score > 0.0);
+        assert!(
+            (score - clamped).abs() < 1e-9,
+            "score={score} expected clamp at {clamped}"
+        );
     }
 
     #[test]

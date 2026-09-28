@@ -61,7 +61,6 @@ pub(crate) fn view_ready() -> ReplicaView {
             proxy_inflight: 0,
             report_key_id: "test-key".into(),
         },
-        received_ms: NOW,
     }
 }
 
@@ -69,7 +68,6 @@ pub(crate) fn view_ready() -> ReplicaView {
 /// long-context hosts.
 pub(crate) fn input() -> PlaceInput {
     PlaceInput {
-        request_id: "test-request".into(),
         model: TEST_MODEL.into(),
         prompt_tokens_est: 100,
         affinity: None,

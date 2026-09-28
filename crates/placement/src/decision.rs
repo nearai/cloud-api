@@ -21,7 +21,6 @@ use crate::snapshot::{ReplicaView, Snapshot};
 /// `impl` below) rather than deriving it.
 #[derive(Clone)]
 pub struct PlaceInput {
-    pub request_id: String,
     pub model: String,
     pub prompt_tokens_est: u64,
     /// The caller-derived affinity key (e.g. from a conversation id), if
@@ -37,7 +36,6 @@ pub struct PlaceInput {
 impl std::fmt::Debug for PlaceInput {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("PlaceInput")
-            .field("request_id", &self.request_id)
             .field("model", &self.model)
             .field("prompt_tokens_est", &self.prompt_tokens_est)
             .field("affinity", &self.affinity.is_some())
@@ -76,11 +74,13 @@ pub enum LegacyReason {
     NoneEligible,
     /// Reserved for the caller: the chosen host isn't in its host map.
     HostUnmapped,
-    /// Reserved for the caller: a placer error.
-    Error,
     /// Reserved for the caller: the chosen host's index is outside the
     /// E2EE-pinned model key's backend group.
     KeyGroup,
+    /// Reserved for the caller: the host map does not cover every backend,
+    /// or a mapped host has no replica view in the snapshot. Placing then
+    /// would starve the hosts the placer cannot see.
+    Incomplete,
 }
 
 impl LegacyReason {
@@ -92,8 +92,8 @@ impl LegacyReason {
             LegacyReason::Stale => "stale",
             LegacyReason::NoneEligible => "none_eligible",
             LegacyReason::HostUnmapped => "host_unmapped",
-            LegacyReason::Error => "error",
             LegacyReason::KeyGroup => "key_group",
+            LegacyReason::Incomplete => "incomplete",
         }
     }
 }
@@ -200,14 +200,9 @@ fn score_hosts(
     let mut host_pending: HashMap<String, Pending> = HashMap::new();
     for (host, views) in eligible_by_host {
         let n_eligible = views.len();
-        let min_reported_at_ms = views
-            .iter()
-            .map(|v| v.report.reported_at_ms)
-            .min()
-            .expect("non-empty per-host group");
         let mine_pending = mine.get(host).copied().unwrap_or_default();
         let routed = snap.routed.get(&(host.clone(), HOST_REPLICA.to_string()));
-        let pending = pending_for(routed, mine_pending, min_reported_at_ms);
+        let pending = pending_for(routed, mine_pending);
         let split = split_pending(pending, n_eligible);
         let pairs: Vec<(&ReplicaView, Pending)> = views.iter().map(|v| (*v, split)).collect();
         let score = host_score(&pairs, median);
@@ -392,7 +387,6 @@ mod tests {
 
     fn base_input() -> PlaceInput {
         PlaceInput {
-            request_id: "req-1".into(),
             model: MODEL.into(),
             prompt_tokens_est: 100,
             affinity: None,
@@ -429,7 +423,6 @@ mod tests {
                 proxy_inflight: 0,
                 report_key_id: crate::frame::key_id(&pk),
             },
-            received_ms: NOW,
         }
     }
 
@@ -450,6 +443,7 @@ mod tests {
     fn caller_legacy_reasons_have_stable_names() {
         assert_eq!(LegacyReason::HostUnmapped.as_str(), "host_unmapped");
         assert_eq!(LegacyReason::KeyGroup.as_str(), "key_group");
+        assert_eq!(LegacyReason::Incomplete.as_str(), "incomplete");
     }
 
     #[test]
@@ -886,7 +880,9 @@ mod tests {
                 RoutedCounts {
                     req: 5,
                     tok: 100,
-                    since_ms: NOW + 1,
+                    // As the reader builds it: the window starts a second
+                    // before now, i.e. before the frame's reported_at_ms.
+                    since_ms: NOW - 1_000,
                 },
             );
             s
@@ -898,6 +894,29 @@ mod tests {
                 assert_eq!(record.pending_req, 5);
             }
             Decision::Legacy { .. } => panic!("expected Place"),
+        }
+    }
+
+    #[test]
+    fn other_nodes_routed_load_shifts_decision() {
+        // Two identical idle hosts. Another node routed load to gpu-a in the
+        // current window (this node's own ledger is empty), so gpu-a must
+        // score worse and the placer must pick gpu-b — for every rng seed.
+        let mut snap = snap_with(vec![ready_view("gpu-a", "r1"), ready_view("gpu-b", "r1")]);
+        snap.routed.insert(
+            ("gpu-a".to_string(), HOST_REPLICA.to_string()),
+            RoutedCounts {
+                req: 8,
+                tok: 40_000,
+                since_ms: NOW - 1_000,
+            },
+        );
+        for seed in 0..32 {
+            let mut rng = StdRng::seed_from_u64(seed);
+            match placer().place(&base_input(), &snap, &HashMap::new(), &mut rng) {
+                Decision::Place { host, .. } => assert_eq!(host, "gpu-b", "seed {seed}"),
+                Decision::Legacy { .. } => panic!("expected Place"),
+            }
         }
     }
 }

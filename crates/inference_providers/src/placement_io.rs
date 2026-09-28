@@ -63,7 +63,12 @@ pub const PINS_MAXLEN: usize = 200_000;
 /// Newest pins read on start.
 pub const PINS_WARMUP_COUNT: usize = 50_000;
 /// Max pins read per reader cycle.
-pub const PINS_READ_COUNT: usize = 1_000;
+///
+/// Throughput ceiling: one cycle every [`READ_INTERVAL`] (500 ms) reads at
+/// most this many entries, so the reader keeps up with at most ~10,000 pin
+/// writes/s fleet-wide (summed over every cloud-api node). Above that, pins
+/// fall behind (the stream cursor lags) until the write rate drops.
+pub const PINS_READ_COUNT: usize = 5_000;
 /// Prune expired pins every this many reader cycles (~10 s).
 const PRUNE_EVERY_CYCLES: u64 = 20;
 /// Pins written further than this into the future (clock skew between
@@ -702,7 +707,7 @@ impl ReaderState {
                 rejected.insert(key, (json.into_bytes(), None));
                 continue;
             };
-            match self.ingest.accept(host, replica, &env, reg, now_ms) {
+            match self.ingest.accept(host, replica, &env, reg) {
                 Ok(view) => {
                     let key_id = env.key_id;
                     views.insert(key, Accepted { json, key_id, view });
@@ -914,6 +919,43 @@ async fn fetch(
     ))
 }
 
+/// Runs one reader cycle's `apply` over what Valkey would hold: `frames`
+/// maps `(host, replica)` to the raw envelope JSON a proxy wrote to
+/// `replica:{host}:{replica}`, `routed` maps a host to the `(req, tok)` summed
+/// over its two routed hashes. Targets come from `reg` exactly as in `read`,
+/// so this exercises the production decode/verify/snapshot path without a
+/// Valkey connection. For cross-module contract tests.
+#[cfg(test)]
+pub(crate) fn snapshot_from_valkey_values(
+    reg: &KeyRegistry,
+    frames: &HashMap<(String, String), String>,
+    routed: &HashMap<String, (u64, u64)>,
+    now_ms: u64,
+) -> Snapshot {
+    let targets = ReadTargets::from_registry(reg);
+    let raw = RawRead {
+        frames: targets
+            .replicas
+            .iter()
+            .map(|key| {
+                frames.get(key).map_or(redis::Value::Nil, |json| {
+                    redis::Value::BulkString(json.clone().into_bytes())
+                })
+            })
+            .collect(),
+        routed: targets
+            .hosts
+            .iter()
+            .map(|host| routed.get(host).copied().unwrap_or((0, 0)))
+            .collect(),
+        pins: Vec::new(),
+        now_s: now_ms / 1000,
+    };
+    ReaderState::default()
+        .apply(&targets, raw, reg, now_ms)
+        .snapshot
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1047,7 +1089,6 @@ mod tests {
 
     fn place(snap: &Snapshot, now_ms: u64) -> Decision {
         let input = PlaceInput {
-            request_id: "req".into(),
             model: COVERED_MODELS[0].into(),
             prompt_tokens_est: 100,
             affinity: None,

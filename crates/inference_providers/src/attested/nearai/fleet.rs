@@ -28,10 +28,11 @@ use placement::consts::COVERED_MODELS;
 use placement::decision::{AffinitySource, Decision, DecisionRecord, LegacyReason, PlaceInput};
 use placement::rules::Rule;
 use placement::score::Pending;
+use placement::snapshot::Snapshot;
 use reqwest::Client;
 use sha2::{Digest, Sha256};
 use std::cmp::Reverse;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -665,8 +666,8 @@ impl Fleet {
     /// through to `acquire_index` unchanged. Placement is skipped entirely
     /// (no decision, log or metric) when it is not installed, the model is
     /// not covered, or rotation is unavailable. A `Legacy` decision, an
-    /// unmapped host, or a host outside the pinned E2EE key group all run the
-    /// existing path.
+    /// incomplete host map or snapshot, an unmapped host, or a host outside
+    /// the pinned E2EE key group all run the existing path.
     pub(super) fn acquire_index_placed(
         &self,
         messages: &[crate::ChatMessage],
@@ -697,7 +698,6 @@ impl Fleet {
         let now_ms = epoch_ms();
         let now_s = now_ms / 1_000;
         let input = PlaceInput {
-            request_id: request.request_id.clone(),
             model: request.model.clone(),
             prompt_tokens_est: prompt_tokens_est(messages),
             affinity: request.affinity.clone(),
@@ -719,14 +719,21 @@ impl Fleet {
         let placed = {
             let mut ledger = lock(&self.placement_ledger);
             let mine = mine_in(&ledger, now_s);
-            let decision = {
+            let (decision, incomplete) = {
                 let snapshot = handles.io.snapshot.load();
-                handles
+                let decision = handles
                     .placer
-                    .place(&input, &snapshot, &mine, &mut rand::rng())
+                    .place(&input, &snapshot, &mine, &mut rand::rng());
+                let incomplete = matches!(decision, Decision::Place { .. })
+                    && self.host_map_incomplete(&snapshot);
+                (decision, incomplete)
             };
             match decision {
                 Decision::Legacy { record, .. } => Err(record),
+                Decision::Place { mut record, .. } if incomplete => {
+                    demote(&mut record, LegacyReason::Incomplete);
+                    Err(record)
+                }
                 Decision::Place {
                     host,
                     mut record,
@@ -778,6 +785,27 @@ impl Fleet {
         }
         report_decision(handles, &record, request);
         Some(lease)
+    }
+
+    /// True when placing would starve hosts the placer cannot see: the host
+    /// map covers fewer hosts than this Fleet has backends (a partial proxy
+    /// rollout, or indices without a replica key), or a mapped host has no
+    /// replica view in `snapshot` (e.g. a restarted proxy whose new key is
+    /// not discovered yet). O(hosts + replicas); no allocation beyond one set.
+    fn host_map_incomplete(&self, snapshot: &Snapshot) -> bool {
+        let hosts = self.backend_hosts.load();
+        if hosts.index_by_host.len() < self.backend_count() {
+            return true;
+        }
+        let seen: HashSet<&str> = snapshot
+            .replicas
+            .iter()
+            .map(|v| v.host_id.as_str())
+            .collect();
+        hosts
+            .index_by_host
+            .keys()
+            .any(|host| !seen.contains(host.as_str()))
     }
 
     /// The backend index `host` is bound to, when the pushed host map was
@@ -1046,8 +1074,8 @@ fn detail_tag(record: &DecisionRecord) -> &'static str {
             "stale" => "reason:stale",
             "none_eligible" => "reason:none_eligible",
             "host_unmapped" => "reason:host_unmapped",
-            "error" => "reason:error",
             "key_group" => "reason:key_group",
+            "incomplete" => "reason:incomplete",
             _ => "reason:unknown",
         },
         (None, Some(selection)) => match selection {

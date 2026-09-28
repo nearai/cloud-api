@@ -5689,7 +5689,6 @@ mod tests {
                     proxy_inflight: 0,
                     report_key_id: "test-key".into(),
                 },
-                received_ms: now,
             }
         }
 
@@ -5717,8 +5716,37 @@ mod tests {
 
         /// Like [`harness`], but the pushed host map claims `hosts_count`
         /// backends while the Fleet itself has 4.
+        ///
+        /// Placement only runs on a complete picture, so the map is filled
+        /// to the Fleet's 4 backends with filler hosts, and every mapped host
+        /// without a view in `snap` gets a draining (ineligible) one. The
+        /// hosts `host_map` and `snap` name are the only eligible ones.
         fn harness_with_count(
             host_map: &[(&str, usize)],
+            hosts_count: usize,
+            mut snap: Snapshot,
+        ) -> Harness {
+            let mut full: Vec<(String, usize)> =
+                host_map.iter().map(|(h, i)| (h.to_string(), *i)).collect();
+            for index in 0..4 {
+                if !full.iter().any(|(_, i)| *i == index) {
+                    full.push((format!("h-fill-{index}"), index));
+                }
+            }
+            for (host, _) in &full {
+                if !snap.replicas.iter().any(|v| &v.host_id == host) {
+                    let mut view = ready_view(host, snap.built_ms);
+                    view.report.lifecycle_state = Lifecycle::Draining;
+                    snap.replicas.push(view);
+                }
+            }
+            harness_exact(&full, hosts_count, snap)
+        }
+
+        /// A 4-backend rotation provider with exactly `host_map` pushed and
+        /// `snap` as the current snapshot (no filling).
+        fn harness_exact(
+            host_map: &[(String, usize)],
             hosts_count: usize,
             snap: Snapshot,
         ) -> Harness {
@@ -5733,7 +5761,7 @@ mod tests {
                 hosts: hosts.clone(),
             });
             provider.fleet.set_backend_hosts(BackendHosts {
-                index_by_host: host_map.iter().map(|(h, i)| (h.to_string(), *i)).collect(),
+                index_by_host: host_map.iter().map(|(h, i)| (h.clone(), *i)).collect(),
                 keys: Default::default(),
                 count: hosts_count,
             });
@@ -5858,6 +5886,56 @@ mod tests {
                 legacy_indices(&messages, None, None)
             );
             assert_eq!(h.metrics.decisions_tagged("reason:host_unmapped"), 12);
+            assert!(h.writes.try_recv().is_err(), "legacy writes nothing");
+        }
+
+        #[test]
+        fn partial_host_map_goes_legacy() {
+            // Only one of the Fleet's 4 backends publishes (partial proxy
+            // rollout): placing would starve the other three, so legacy.
+            let mut h = harness_exact(
+                &[("h-a".to_string(), 2)],
+                4,
+                snapshot("h-a", fresh_ms(), PinTable::default()),
+            );
+            let messages = messages_avoiding(2);
+            let req = request(COVERED_MODELS[0]);
+            assert_eq!(
+                placed_indices(&h.provider, &messages, None, &req),
+                legacy_indices(&messages, None, None)
+            );
+            assert_eq!(h.metrics.decisions_tagged("reason:incomplete"), 12);
+            assert!(h.writes.try_recv().is_err(), "legacy writes nothing");
+        }
+
+        #[test]
+        fn mapped_host_without_frames_goes_legacy() {
+            // Every backend is mapped, but h-d has no replica view (e.g. its
+            // proxy restarted with a key not discovered yet): legacy.
+            let map: Vec<(String, usize)> = ["h-a", "h-b", "h-c", "h-d"]
+                .iter()
+                .enumerate()
+                .map(|(i, h)| (h.to_string(), i))
+                .collect();
+            let built = fresh_ms();
+            let snap = Snapshot {
+                built_ms: built,
+                replicas: vec![
+                    ready_view("h-a", built),
+                    ready_view("h-b", built),
+                    ready_view("h-c", built),
+                ],
+                routed: HashMap::new(),
+                pins: Arc::new(PinTable::default()),
+            };
+            let mut h = harness_exact(&map, 4, snap);
+            let messages = messages_avoiding(2);
+            let req = request(COVERED_MODELS[0]);
+            assert_eq!(
+                placed_indices(&h.provider, &messages, None, &req),
+                legacy_indices(&messages, None, None)
+            );
+            assert_eq!(h.metrics.decisions_tagged("reason:incomplete"), 12);
             assert!(h.writes.try_recv().is_err(), "legacy writes nothing");
         }
 
@@ -6037,6 +6115,176 @@ mod tests {
                     assert!(at_ms >= now);
                 }
                 Write::Routed { .. } => panic!("expected a pin write"),
+            }
+        }
+
+        /// Cross-task contract: proxy key -> registry -> proxy-sealed frame
+        /// -> reader `apply` -> `Snapshot` -> `Placer` / `Fleet`.
+        mod contract {
+            use super::*;
+            use base64::Engine as _;
+            use ed25519_dalek::{Signer, SigningKey};
+            use placement::decision::Decision;
+            use placement::frame::{key_id, SIGNING_DOMAIN};
+            use placement::snapshot::{HostKey, KeyRegistry};
+            use rand::rngs::StdRng;
+            use rand::SeedableRng;
+
+            /// The golden fixture's host, replica and signing key.
+            const GOLDEN_HOST: &str = "glm53-gpu03";
+            const GOLDEN_SEED: [u8; 32] = [7u8; 32];
+
+            /// The fields of an attested `ReplicaReportKey` event, as the
+            /// proxy emits it (hex public key, derived key id).
+            struct ProxyKey {
+                key_id: String,
+                public_key_hex: String,
+                host_id: String,
+                model: String,
+                replica_ids: Vec<String>,
+            }
+
+            fn proxy_key(signing: &SigningKey, host: &str) -> ProxyKey {
+                let vk = signing.verifying_key();
+                ProxyKey {
+                    key_id: key_id(&vk),
+                    public_key_hex: hex::encode(vk.to_bytes()),
+                    host_id: host.to_string(),
+                    model: COVERED_MODELS[0].to_string(),
+                    replica_ids: vec!["r1".to_string()],
+                }
+            }
+
+            /// Builds the registry the way the pool's `backend_hosts()`
+            /// does (it lives in `services`, which this crate cannot depend
+            /// on): hex-decode the attested public key, verify it is a valid
+            /// ed25519 point, keep key id, replica ids and model.
+            fn registry(keys: &[ProxyKey]) -> KeyRegistry {
+                let mut by_host: HashMap<String, Vec<HostKey>> = HashMap::new();
+                for k in keys {
+                    let bytes: [u8; 32] =
+                        hex::decode(&k.public_key_hex).unwrap().try_into().unwrap();
+                    by_host.entry(k.host_id.clone()).or_default().push(HostKey {
+                        key_id: k.key_id.clone(),
+                        key: ed25519_dalek::VerifyingKey::from_bytes(&bytes).unwrap(),
+                        replica_ids: k.replica_ids.clone(),
+                        model: k.model.clone(),
+                    });
+                }
+                KeyRegistry { by_host }
+            }
+
+            /// Envelope JSON sealed exactly as inference-proxy seals it.
+            fn proxy_seal(report: &ReplicaReport, signing: &SigningKey) -> String {
+                let frame = serde_json::to_string(report).unwrap();
+                let mut msg = SIGNING_DOMAIN.to_vec();
+                msg.extend_from_slice(frame.as_bytes());
+                serde_json::json!({
+                    "frame": frame,
+                    "sig": base64::engine::general_purpose::STANDARD
+                        .encode(signing.sign(&msg).to_bytes()),
+                    "key_id": report.report_key_id,
+                })
+                .to_string()
+            }
+
+            fn frame_for(host: &str, signing: &SigningKey, at_ms: u64, ready: bool) -> String {
+                let mut view = ready_view(host, at_ms);
+                view.report.report_key_id = key_id(&signing.verifying_key());
+                if !ready {
+                    view.report.lifecycle_state = Lifecycle::Draining;
+                }
+                proxy_seal(&view.report, signing)
+            }
+
+            #[test]
+            fn golden_frame_through_reader_places_its_host() {
+                let signing = SigningKey::from_bytes(&GOLDEN_SEED);
+                let reg = registry(&[proxy_key(&signing, GOLDEN_HOST)]);
+                let golden = include_str!("../../../../placement/tests/fixtures/envelope_ok.json");
+                let frames = HashMap::from([(
+                    (GOLDEN_HOST.to_string(), "r1".to_string()),
+                    golden.to_string(),
+                )]);
+                // The fixture's own clock: reported at 1790000000123.
+                let now = 1_790_000_000_500;
+                let snap = crate::placement_io::snapshot_from_valkey_values(
+                    &reg,
+                    &frames,
+                    &HashMap::new(),
+                    now,
+                );
+                assert_eq!(snap.replicas.len(), 1, "golden frame accepted");
+                let input = placement::decision::PlaceInput {
+                    model: COVERED_MODELS[0].into(),
+                    prompt_tokens_est: 100,
+                    affinity: None,
+                    affinity_source: AffinitySource::None,
+                    long_context_hosts: Vec::new(),
+                    now_ms: now,
+                };
+                let mut rng = StdRng::seed_from_u64(1);
+                match Placer::new(PIN_SECRET).place(&input, &snap, &HashMap::new(), &mut rng) {
+                    Decision::Place { host, .. } => assert_eq!(host, GOLDEN_HOST),
+                    Decision::Legacy { reason, .. } => panic!("legacy: {}", reason.as_str()),
+                }
+            }
+
+            /// Four backends: h-a (0) and h-b (1) ready, h-c and h-d
+            /// draining, all publishing fresh proxy-sealed frames; `routed`
+            /// is what the other nodes' routed hashes hold per host.
+            fn fleet_index(routed: HashMap<String, (u64, u64)>) -> usize {
+                let signing = SigningKey::from_bytes(&GOLDEN_SEED);
+                let hosts = [("h-a", true), ("h-b", true), ("h-c", false), ("h-d", false)];
+                let keys: Vec<ProxyKey> =
+                    hosts.iter().map(|(h, _)| proxy_key(&signing, h)).collect();
+                let reg = registry(&keys);
+                let at = fresh_ms();
+                let frames: HashMap<(String, String), String> = hosts
+                    .iter()
+                    .map(|(h, ready)| {
+                        (
+                            (h.to_string(), "r1".to_string()),
+                            frame_for(h, &signing, at, *ready),
+                        )
+                    })
+                    .collect();
+                let snap =
+                    crate::placement_io::snapshot_from_valkey_values(&reg, &frames, &routed, at);
+                assert_eq!(snap.replicas.len(), 4, "every proxy frame accepted");
+                let map: Vec<(String, usize)> = hosts
+                    .iter()
+                    .enumerate()
+                    .map(|(i, (h, _))| (h.to_string(), i))
+                    .collect();
+                let h = harness_exact(&map, 4, snap);
+                let req = request(COVERED_MODELS[0]);
+                let lease = h
+                    .provider
+                    .fleet
+                    .acquire_index_placed(&messages_avoiding(0), None, &req)
+                    .expect("rotation active");
+                assert_eq!(h.metrics.decisions_tagged("outcome:place"), 1);
+                lease.index()
+            }
+
+            #[test]
+            fn proxy_frames_through_reader_place_on_the_fleet() {
+                let index = fleet_index(HashMap::new());
+                assert!([0, 1].contains(&index), "placed on a ready host: {index}");
+            }
+
+            #[test]
+            fn routed_counts_through_reader_shift_the_fleet_decision() {
+                // Other nodes routed heavy load to h-a in the current window:
+                // the fleet must place on h-b, and vice versa.
+                let heavy = (20, 200_000);
+                let to_a = HashMap::from([("h-a".to_string(), heavy)]);
+                let to_b = HashMap::from([("h-b".to_string(), heavy)]);
+                for _ in 0..8 {
+                    assert_eq!(fleet_index(to_a.clone()), 1);
+                    assert_eq!(fleet_index(to_b.clone()), 0);
+                }
             }
         }
 

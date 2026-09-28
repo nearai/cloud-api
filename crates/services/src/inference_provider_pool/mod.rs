@@ -1,9 +1,11 @@
-use crate::attestation::AttestationVerifier;
+use crate::attestation::{AttestationVerifier, BackendAttestationVerifier};
 use crate::common::encryption_headers;
 use config::ExternalProvidersConfig;
 use inference_providers::nearai;
 use inference_providers::rotation;
-use inference_providers::spki_verifier::{FingerprintState, SharedTlsRoots};
+use inference_providers::spki_verifier::{
+    peer_spki_fingerprint, spki_fingerprint_matches, FingerprintState, SharedTlsRoots,
+};
 use inference_providers::{
     is_client_audio_input_status,
     models::{AttestationError, CompletionError, RequestPriority},
@@ -25,6 +27,8 @@ use tracing::{debug, info, warn};
 mod context_routing;
 pub use context_routing::expand_inference_endpoints;
 
+#[cfg(test)]
+mod channel_binding_tests;
 #[cfg(test)]
 mod chutes_routing_tests;
 
@@ -187,6 +191,75 @@ fn record_backend_key_divergence(
             );
         }
     }
+}
+
+/// Result of comparing the certificate a backend presented on the connection
+/// that carried its attestation report with the TLS fingerprint that the
+/// verified report attests.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ChannelBinding {
+    /// The connection presented the attested key.
+    Match,
+    /// The connection presented a different key, or the report attests none.
+    Mismatch,
+    /// The connection's peer certificate could not be read.
+    Missing,
+}
+
+impl ChannelBinding {
+    fn check(observed: &Result<String, String>, attested: Option<&str>) -> Self {
+        match (observed, attested) {
+            (Err(_), _) => Self::Missing,
+            (Ok(observed), Some(attested)) if spki_fingerprint_matches(observed, attested) => {
+                Self::Match
+            }
+            (Ok(_), _) => Self::Mismatch,
+        }
+    }
+
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Match => "match",
+            Self::Mismatch => "mismatch",
+            Self::Missing => "missing",
+        }
+    }
+}
+
+/// `path` tag values of [`record_channel_binding`].
+const CHANNEL_BINDING_PATH_INLINE_VERIFY: &str = "inline_verify";
+const CHANNEL_BINDING_PATH_DISCOVERY: &str = "discovery";
+
+fn record_channel_binding(
+    metrics: Option<&dyn crate::metrics::MetricsServiceTrait>,
+    model_name: &str,
+    path: &'static str,
+    result: ChannelBinding,
+) {
+    if let Some(metrics) = metrics {
+        let model_tag = format!("model:{model_name}");
+        let path_tag = format!("path:{path}");
+        let result_tag = format!("result:{}", result.as_str());
+        metrics.record_count(
+            crate::metrics::consts::METRIC_BACKEND_CHANNEL_BINDING,
+            1,
+            &[&model_tag, &path_tag, &result_tag],
+        );
+    }
+}
+
+/// Observed and attested fingerprints shortened for log lines and errors.
+fn channel_binding_log_fields(
+    observed: &Result<String, String>,
+    attested: Option<&str>,
+) -> (String, String) {
+    let prefix = |fp: &str| fp.chars().take(16).collect::<String>();
+    let observed = match observed {
+        Ok(fp) => prefix(fp),
+        Err(e) => format!("unavailable ({e})"),
+    };
+    let attested = attested.map(prefix).unwrap_or_else(|| "none".to_string());
+    (observed, attested)
 }
 
 /// Upper bound on leading SSE control events (keepalive comments, blank
@@ -684,7 +757,9 @@ pub struct InferenceProviderPool {
     /// construction via [`Self::set_metrics_service`]; absent in tests). The pool
     /// is the only layer that knows which trust tier served a request and whether
     /// it was a fallback, so the per-tier / fallback counter is emitted from here.
-    metrics_service: std::sync::OnceLock<Arc<dyn crate::metrics::MetricsServiceTrait>>,
+    /// Shared with each `PoolBackendVerifier`, which is created by the initial
+    /// model load, before the sink is attached.
+    metrics_service: Arc<std::sync::OnceLock<Arc<dyn crate::metrics::MetricsServiceTrait>>>,
     /// Providers explicitly registered as fallbacks, keyed by model id. This
     /// role is configuration metadata rather than an inference from whichever
     /// providers happen to be live, so it survives primary discovery failures
@@ -725,10 +800,13 @@ struct PoolBackendVerifier {
     api_key: Option<String>,
     model_name: String,
     tls_roots: SharedTlsRoots,
-    attestation_verifier: Arc<AttestationVerifier>,
+    attestation_verifier: Arc<dyn BackendAttestationVerifier>,
     /// Shared fingerprint state — newly discovered fingerprints are pinned here
     /// so other providers and discovery cycles benefit.
     fingerprint_state: Arc<std::sync::RwLock<FingerprintState>>,
+    /// The pool's metrics sink, read when a counter is emitted (it can be
+    /// attached after this verifier is created).
+    metrics_service: Arc<std::sync::OnceLock<Arc<dyn crate::metrics::MetricsServiceTrait>>>,
 }
 
 #[async_trait::async_trait]
@@ -783,7 +861,9 @@ impl inference_providers::BackendVerifier for PoolBackendVerifier {
             .map_err(|e| format!("Failed to build HTTP client: {e}"))?;
 
         // 2. Fetch attestation report — this establishes the H2 connection.
-        //    Nonce must be 32-byte hex (same format as discover_model).
+        //    Nonce must be 32-byte hex (same format as discover_model). No
+        //    bearer token: the attestation endpoint is unauthenticated, and
+        //    this connection has not been checked yet.
         let nonce_bytes: [u8; 32] = rand::random();
         let nonce = hex::encode(nonce_bytes);
 
@@ -796,11 +876,7 @@ impl inference_providers::BackendVerifier for PoolBackendVerifier {
         .map_err(|e| format!("Failed to build query string: {e}"))?;
 
         let url = format!("{base_url}/v1/attestation/report?{qs}");
-        let mut request = client.get(&url);
-        if let Some(ref key) = self.api_key {
-            request = request.header("Authorization", format!("Bearer {key}"));
-        }
-        let response = tokio::time::timeout(Duration::from_secs(10), request.send())
+        let response = tokio::time::timeout(Duration::from_secs(10), client.get(&url).send())
             .await
             .map_err(|_| "Attestation request timed out".to_string())?
             .map_err(|e| format!("Attestation request failed: {e}"))?;
@@ -814,6 +890,10 @@ impl inference_providers::BackendVerifier for PoolBackendVerifier {
             return Err(format!("Attestation HTTP {status}: {body}"));
         }
 
+        // The certificate the server presented on this connection. Read it
+        // before `.json()` consumes the response.
+        let observed_fingerprint = peer_spki_fingerprint(&response);
+
         let report: serde_json::Map<String, serde_json::Value> = response
             .json()
             .await
@@ -826,7 +906,43 @@ impl inference_providers::BackendVerifier for PoolBackendVerifier {
             .await
             .map_err(|e| format!("Attestation verification failed: {e}"))?;
 
-        // 4. Pin the verified fingerprint in BOTH the shared state (so other
+        // 4. Channel binding: the report must attest the key of the certificate
+        //    presented on this connection. The connection was accepted under
+        //    Bootstrap (any WebPKI-valid certificate) and stays in the returned
+        //    client's pool to carry inference, so the attested fingerprint is
+        //    only meaningful for it if the two match. On a mismatch, or when the
+        //    peer certificate cannot be read, nothing is pinned and the client
+        //    is dropped.
+        let binding = ChannelBinding::check(
+            &observed_fingerprint,
+            verified.tls_cert_fingerprint.as_deref(),
+        );
+        record_channel_binding(
+            self.metrics_service.get().map(Arc::as_ref),
+            &self.model_name,
+            CHANNEL_BINDING_PATH_INLINE_VERIFY,
+            binding,
+        );
+        if binding != ChannelBinding::Match {
+            let (observed, attested) = channel_binding_log_fields(
+                &observed_fingerprint,
+                verified.tls_cert_fingerprint.as_deref(),
+            );
+            tracing::error!(
+                model = %self.model_name,
+                url = %base_url,
+                result = binding.as_str(),
+                observed_fingerprint = %observed,
+                attested_fingerprint = %attested,
+                "Attested TLS fingerprint does not match the certificate on the attestation connection; backend not pinned"
+            );
+            return Err(format!(
+                "TLS channel binding {}: connection SPKI {observed}, attested SPKI {attested}",
+                binding.as_str()
+            ));
+        }
+
+        // 5. Pin the verified fingerprint in BOTH the shared state (so other
         //    providers benefit) AND the client's own state (so reconnections
         //    to a different backend are rejected — forces re-verification).
         if let Some(ref fp) = verified.tls_cert_fingerprint {
@@ -856,8 +972,10 @@ impl inference_providers::BackendVerifier for PoolBackendVerifier {
                 .add_fingerprint(fp.clone());
         }
 
-        // 5. Return the client — its H2 connection is to the verified backend,
-        //    and its TLS verifier only accepts that backend on reconnection.
+        // 6. Return the client. Its pooled connection is the one that carried
+        //    the report, and step 4 checked that it presented the attested key.
+        //    A reconnect must present that same key (client state is now
+        //    Pinned({fp}) and TLS session resumption is disabled).
         Ok(client)
     }
 }
@@ -882,6 +1000,9 @@ impl PoolBackendVerifier {
             Duration::from_secs(nearai::Config::completion_timeout_from_env().max(0) as u64);
         let builder = reqwest::Client::builder()
             .use_preconfigured_tls(self.tls_roots.build_config(state))
+            // Exposes the peer certificate on each response; the slow path
+            // compares it with the attested fingerprint.
+            .tls_info(true)
             .pool_max_idle_per_host(1)
             .http2_adaptive_window(true)
             .connect_timeout(Duration::from_secs(5))
@@ -988,7 +1109,7 @@ impl InferenceProviderPool {
             attestation_verifier: Arc::new(AttestationVerifier::near_with_pccs(pccs_url)),
             pinned_models: Arc::new(std::sync::RwLock::new(std::collections::HashSet::new())),
             pinned_providers: Arc::new(std::sync::RwLock::new(HashMap::new())),
-            metrics_service: std::sync::OnceLock::new(),
+            metrics_service: Arc::new(std::sync::OnceLock::new()),
             fallback_providers: Arc::new(std::sync::RwLock::new(HashMap::new())),
         }
     }
@@ -1685,11 +1806,11 @@ impl InferenceProviderPool {
 
     async fn discover_model(
         url: &str,
-        api_key: &Option<String>,
         model_name: &str,
         fingerprint_state: Arc<std::sync::RwLock<FingerprintState>>,
         tls_roots: &SharedTlsRoots,
         verifier: &AttestationVerifier,
+        metrics: Option<&dyn crate::metrics::MetricsServiceTrait>,
     ) -> DiscoveryOutcome {
         const PER_CALL_TIMEOUT: Duration = Duration::from_secs(10);
         const COUNT_TIMEOUT: Duration = Duration::from_secs(3);
@@ -1797,7 +1918,6 @@ impl InferenceProviderPool {
             .into_iter()
             .map(|(backend_index, signing_algo)| {
                 let parts = parts.clone();
-                let api_key = api_key.clone();
                 let model = model_name.to_string();
                 let tls_roots = tls_roots.clone();
                 let algo = signing_algo.to_string();
@@ -1808,6 +1928,7 @@ impl InferenceProviderPool {
 
                     let client = match reqwest::Client::builder()
                         .use_preconfigured_tls(rustls_config)
+                        .tls_info(true)
                         .connect_timeout(Duration::from_secs(5))
                         .read_timeout(PER_CALL_TIMEOUT)
                         .build()
@@ -1845,10 +1966,8 @@ impl InferenceProviderPool {
                     };
                     request_url.set_query(Some(&qs));
 
-                    let mut req = client.get(request_url.clone());
-                    if let Some(key) = api_key.as_ref() {
-                        req = req.header("Authorization", format!("Bearer {}", key));
-                    }
+                    // No bearer token: the attestation endpoint is unauthenticated.
+                    let req = client.get(request_url.clone());
 
                     let start = std::time::Instant::now();
                     let res = tokio::time::timeout(PER_CALL_TIMEOUT, req.send()).await;
@@ -1905,6 +2024,8 @@ impl InferenceProviderPool {
                         );
                         return Err(format!("status: {status}"));
                     }
+                    // Read before `.json()` consumes the response.
+                    let observed_fingerprint = peer_spki_fingerprint(&resp);
                     let report: serde_json::Map<String, serde_json::Value> = match resp.json().await
                     {
                         Ok(r) => r,
@@ -1926,7 +2047,7 @@ impl InferenceProviderPool {
                         elapsed_ms,
                         "Discovery call succeeded"
                     );
-                    Ok((report, nonce, algo, backend_index))
+                    Ok((report, nonce, algo, backend_index, observed_fingerprint))
                 }
             })
             .collect::<Vec<_>>();
@@ -1941,7 +2062,7 @@ impl InferenceProviderPool {
         let mut verify_failures = 0usize;
 
         for r in results {
-            let (report, nonce, algo, backend_index) = match r {
+            let (report, nonce, algo, backend_index, observed_fingerprint) = match r {
                 Ok(t) => t,
                 Err(reason) => {
                     failed_calls += 1;
@@ -1953,6 +2074,38 @@ impl InferenceProviderPool {
 
             match verifier.verify_attestation_report(&report, &nonce).await {
                 Ok(verified) => {
+                    // Same channel-binding comparison as the inline
+                    // verification path, but report-only: the pin comes from
+                    // the verified report and the probe connection is dropped
+                    // without carrying inference, so discovery stays fail-open.
+                    // A mismatch here typically means a renewed certificate is
+                    // attested while the old one is still being served.
+                    let binding = ChannelBinding::check(
+                        &observed_fingerprint,
+                        verified.tls_cert_fingerprint.as_deref(),
+                    );
+                    record_channel_binding(
+                        metrics,
+                        model_name,
+                        CHANNEL_BINDING_PATH_DISCOVERY,
+                        binding,
+                    );
+                    if binding != ChannelBinding::Match {
+                        let (observed, attested) = channel_binding_log_fields(
+                            &observed_fingerprint,
+                            verified.tls_cert_fingerprint.as_deref(),
+                        );
+                        warn!(
+                            model = %model_name,
+                            url = %url,
+                            backend_index,
+                            algo = %algo,
+                            result = binding.as_str(),
+                            observed_fingerprint = %observed,
+                            attested_fingerprint = %attested,
+                            "Discovery probe: attested TLS fingerprint does not match the certificate on the probe connection"
+                        );
+                    }
                     if let Some(ref vfp) = verified.tls_cert_fingerprint {
                         observed_fingerprints.push(vfp.clone());
                         verified_this_round.insert(vfp.clone());
@@ -4882,6 +5035,7 @@ impl InferenceProviderPool {
         let verifier = self.attestation_verifier.clone();
         let tls_roots = self.tls_roots.clone();
         let metrics_service = self.metrics_service.get().cloned();
+        let metrics_sink = self.metrics_service.clone();
         let endpoint_futures: Vec<_> = needs_creation
             .iter()
             .map(|(model_name, url, context_length)| {
@@ -4893,17 +5047,18 @@ impl InferenceProviderPool {
                 let tls_roots = tls_roots.clone();
                 let pool_load_state = pool_load_state.clone();
                 let metrics_service = metrics_service.clone();
+                let metrics_sink = metrics_sink.clone();
                 async move {
                     let state =
                         Arc::new(std::sync::RwLock::new(FingerprintState::Bootstrap));
 
                     let outcome = Self::discover_model(
                         &url,
-                        &api_key,
                         &model_name,
                         state.clone(),
                         &tls_roots,
                         &verifier,
+                        metrics_service.as_deref(),
                     )
                     .await;
                     record_backend_key_divergence(
@@ -4922,6 +5077,7 @@ impl InferenceProviderPool {
                         tls_roots: tls_roots.clone(),
                         attestation_verifier: verifier.clone(),
                         fingerprint_state: state.clone(),
+                        metrics_service: metrics_sink,
                     });
                     let serving_provider =
                         Arc::new(nearai::Provider::new_with_verifier(
@@ -5177,7 +5333,7 @@ impl InferenceProviderPool {
                         let model_name = model_name.clone();
                         let url = url.clone();
                         let provider = provider.clone();
-                        let api_key = api_key.clone();
+                        let metrics_service = metrics_service.clone();
                         let verifier = verifier.clone();
                         let tls_roots = tls_roots.clone();
                         // No inter-model stagger: rotation routes each call
@@ -5188,11 +5344,11 @@ impl InferenceProviderPool {
                             async move {
                                 let outcome = Self::discover_model(
                                     &url,
-                                    &api_key,
                                     &model_name,
                                     state,
                                     &tls_roots,
                                     &verifier,
+                                    metrics_service.as_deref(),
                                 )
                                 .await;
                                 (model_name, url, provider, outcome)
@@ -9160,6 +9316,7 @@ mod tests {
             tls_roots: SharedTlsRoots::load(),
             attestation_verifier: Arc::new(AttestationVerifier::new(HashSet::new(), None, false)),
             fingerprint_state: Arc::new(std::sync::RwLock::new(state)),
+            metrics_service: Default::default(),
         }
     }
 

@@ -93,6 +93,32 @@ pub fn compute_spki_fingerprint_from_der(cert_der: &[u8]) -> Result<String, Stri
     Ok(hex::encode(hash))
 }
 
+/// SPKI fingerprint of the leaf certificate the server presented on the
+/// connection that carried `resp`.
+///
+/// The client must be built with `reqwest::ClientBuilder::tls_info(true)`;
+/// without it, or on a plain-HTTP response, there is no `TlsInfo` and this
+/// returns an error.
+pub fn peer_spki_fingerprint(resp: &reqwest::Response) -> Result<String, String> {
+    let tls_info = resp
+        .extensions()
+        .get::<reqwest::tls::TlsInfo>()
+        .ok_or_else(|| "response carries no TLS session information".to_string())?;
+    let leaf = tls_info
+        .peer_certificate()
+        .ok_or_else(|| "TLS session has no peer certificate".to_string())?;
+    compute_spki_fingerprint_from_der(leaf)
+}
+
+/// Compare a fingerprint computed from a live certificate (lowercase hex, as
+/// returned by [`compute_spki_fingerprint_from_der`]) with one taken from an
+/// attestation report. The report value is accepted in the same forms the
+/// report_data binding check accepts: optional `0x` prefix, either hex case.
+pub fn spki_fingerprint_matches(observed: &str, attested: &str) -> bool {
+    let attested = attested.strip_prefix("0x").unwrap_or(attested);
+    observed.eq_ignore_ascii_case(attested)
+}
+
 /// A TLS certificate verifier that wraps WebPKI verification and additionally
 /// checks the server certificate's SPKI SHA-256 fingerprint against a typed state.
 pub struct SpkiFingerprintVerifier {
@@ -205,6 +231,12 @@ impl SharedTlsRoots {
         for cert in native.certs {
             root_store.add(cert).ok();
         }
+        Self::from_root_store(root_store)
+    }
+
+    /// Use a caller-supplied root store instead of the native roots, e.g. a
+    /// local test CA.
+    pub fn from_root_store(root_store: rustls::RootCertStore) -> Self {
         Self {
             root_store: Arc::new(root_store),
             provider: Arc::new(rustls::crypto::aws_lc_rs::default_provider()),
@@ -212,6 +244,13 @@ impl SharedTlsRoots {
     }
 
     /// Build a `rustls::ClientConfig` with SPKI fingerprint verification.
+    ///
+    /// TLS session resumption is disabled. A resumed handshake does not call
+    /// `verify_server_cert`, so a session established while the state was
+    /// `Bootstrap` would let a later reconnect skip the pin check. Without
+    /// resumption, every new connection is checked against the current state.
+    /// A full TLS 1.3 handshake takes the same number of round trips as a
+    /// resumed one; the added cost is the certificate check.
     pub fn build_config(&self, state: Arc<RwLock<FingerprintState>>) -> rustls::ClientConfig {
         let default_verifier = rustls::client::WebPkiServerVerifier::builder_with_provider(
             self.root_store.clone(),
@@ -230,6 +269,7 @@ impl SharedTlsRoots {
             .with_no_client_auth();
 
         config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+        config.resumption = rustls::client::Resumption::disabled();
         config
     }
 }
@@ -344,5 +384,152 @@ mod tests {
         state.replace_with(HashSet::new());
         assert!(matches!(state, FingerprintState::Pinned(_)));
         assert_eq!(state.pinned_count(), 0);
+    }
+
+    #[test]
+    fn spki_fingerprint_matches_accepts_report_encodings() {
+        let observed = "ab01cd";
+        assert!(spki_fingerprint_matches(observed, "ab01cd"));
+        assert!(spki_fingerprint_matches(observed, "AB01CD"));
+        assert!(spki_fingerprint_matches(observed, "0xab01cd"));
+        assert!(!spki_fingerprint_matches(observed, "ab01ce"));
+        assert!(!spki_fingerprint_matches(observed, "ab01"));
+        assert!(!spki_fingerprint_matches(observed, ""));
+    }
+
+    #[test]
+    fn peer_spki_fingerprint_errors_without_tls_info() {
+        let resp = reqwest::Response::from(http::Response::new(Vec::<u8>::new()));
+        let err = peer_spki_fingerprint(&resp).expect_err("no TlsInfo on this response");
+        assert!(err.contains("no TLS session information"), "got: {err}");
+    }
+
+    mod tls {
+        use super::super::*;
+        use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
+        use rustls::HandshakeKind;
+        use std::net::SocketAddr;
+        use std::sync::Mutex;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        /// A local CA and one leaf certificate for 127.0.0.1 signed by it.
+        struct TestPki {
+            roots: SharedTlsRoots,
+            leaf: CertificateDer<'static>,
+            leaf_key: PrivateKeyDer<'static>,
+        }
+
+        fn test_pki() -> TestPki {
+            let ca_key = rcgen::KeyPair::generate().unwrap();
+            let mut ca_params = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
+            ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+            ca_params.key_usages = vec![rcgen::KeyUsagePurpose::KeyCertSign];
+            let ca_cert = ca_params.self_signed(&ca_key).unwrap();
+            let issuer = rcgen::Issuer::new(ca_params, ca_key);
+
+            let leaf_key = rcgen::KeyPair::generate().unwrap();
+            let leaf_params = rcgen::CertificateParams::new(vec!["127.0.0.1".to_string()]).unwrap();
+            let leaf = leaf_params.signed_by(&leaf_key, &issuer).unwrap();
+
+            let mut store = rustls::RootCertStore::empty();
+            store.add(ca_cert.der().clone()).unwrap();
+            TestPki {
+                roots: SharedTlsRoots::from_root_store(store),
+                leaf: leaf.der().clone(),
+                leaf_key: PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(leaf_key.serialize_der())),
+            }
+        }
+
+        /// TLS server that answers each request with a fixed HTTP/1.1 response
+        /// and then closes the connection, so every request opens a new one.
+        /// Records the kind of each handshake it completes.
+        async fn start_server(pki: &TestPki) -> (SocketAddr, Arc<Mutex<Vec<HandshakeKind>>>) {
+            let config = rustls::ServerConfig::builder_with_provider(Arc::new(
+                rustls::crypto::aws_lc_rs::default_provider(),
+            ))
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .with_no_client_auth()
+            .with_single_cert(vec![pki.leaf.clone()], pki.leaf_key.clone_key())
+            .unwrap();
+            let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(config));
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let handshakes = Arc::new(Mutex::new(Vec::new()));
+            let seen = handshakes.clone();
+            tokio::spawn(async move {
+                while let Ok((tcp, _)) = listener.accept().await {
+                    let acceptor = acceptor.clone();
+                    let seen = seen.clone();
+                    tokio::spawn(async move {
+                        let Ok(mut tls) = acceptor.accept(tcp).await else {
+                            return;
+                        };
+                        if let Some(kind) = tls.get_ref().1.handshake_kind() {
+                            seen.lock().unwrap().push(kind);
+                        }
+                        let mut head = Vec::new();
+                        let mut chunk = [0u8; 1024];
+                        while !head.windows(4).any(|w| w == b"\r\n\r\n") {
+                            match tls.read(&mut chunk).await {
+                                Ok(0) | Err(_) => return,
+                                Ok(n) => head.extend_from_slice(&chunk[..n]),
+                            }
+                        }
+                        let _ = tls
+                            .write_all(
+                                b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\nconnection: close\r\n\r\nok",
+                            )
+                            .await;
+                        let _ = tls.shutdown().await;
+                    });
+                }
+            });
+            (addr, handshakes)
+        }
+
+        fn client(pki: &TestPki, tls_info: bool) -> reqwest::Client {
+            let state = Arc::new(RwLock::new(FingerprintState::Bootstrap));
+            reqwest::Client::builder()
+                .use_preconfigured_tls(pki.roots.build_config(state))
+                .tls_info(tls_info)
+                .build()
+                .unwrap()
+        }
+
+        #[tokio::test]
+        async fn peer_spki_fingerprint_reads_the_presented_leaf() {
+            let pki = test_pki();
+            let (addr, _) = start_server(&pki).await;
+            let url = format!("https://{addr}/");
+            let expected = compute_spki_fingerprint_from_der(pki.leaf.as_ref()).unwrap();
+
+            let resp = client(&pki, true).get(&url).send().await.unwrap();
+            assert_eq!(peer_spki_fingerprint(&resp).unwrap(), expected);
+
+            // Without `tls_info(true)` the certificate is not exposed.
+            let resp = client(&pki, false).get(&url).send().await.unwrap();
+            assert!(peer_spki_fingerprint(&resp).is_err());
+        }
+
+        #[tokio::test]
+        async fn reconnects_do_not_resume_the_tls_session() {
+            let pki = test_pki();
+            let (addr, handshakes) = start_server(&pki).await;
+            let url = format!("https://{addr}/");
+            let client = client(&pki, true);
+            for _ in 0..3 {
+                let resp = client.get(&url).send().await.unwrap();
+                assert!(resp.status().is_success());
+                resp.bytes().await.unwrap();
+            }
+            let handshakes = handshakes.lock().unwrap().clone();
+            assert_eq!(handshakes.len(), 3, "the server closes every connection");
+            assert!(
+                handshakes.iter().all(|k| *k != HandshakeKind::Resumed),
+                "every reconnect must run a full handshake (and the certificate check): {handshakes:?}"
+            );
+        }
     }
 }

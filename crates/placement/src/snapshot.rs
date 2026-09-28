@@ -14,7 +14,7 @@ use std::sync::Arc;
 use ed25519_dalek::VerifyingKey;
 
 use crate::affinity::PinTable;
-use crate::consts::SUPPORTED_SCHEMA;
+use crate::consts::{MAX_FUTURE_SKEW_MS, SUPPORTED_SCHEMA};
 use crate::frame::{self, Envelope, FrameError, ReplicaReport};
 
 /// One attested signing key for a host, naming which replicas and model it
@@ -86,6 +86,10 @@ pub enum Reject {
     Mismatch,
     /// `seq` or `engine_sampled_at_ms` moved backwards for this replica.
     Regressed,
+    /// `engine_sampled_at_ms` is further in the future than
+    /// `MAX_FUTURE_SKEW_MS` (a skewed replica clock). Rejected so it can never
+    /// become the stored maximum that later, correct frames would regress from.
+    Future,
 }
 
 impl Reject {
@@ -100,6 +104,7 @@ impl Reject {
             Reject::Schema => "schema",
             Reject::Mismatch => "mismatch",
             Reject::Regressed => "regressed",
+            Reject::Future => "future",
         }
     }
 }
@@ -139,12 +144,16 @@ impl Ingest {
     /// `redis_host`/`redis_replica` come from the Valkey key name, never the
     /// frame: an attacker who compromises one replica's key cannot claim to be
     /// another replica by lying inside a validly-signed frame.
+    ///
+    /// `now_ms` is this node's clock; a frame whose engine time is more than
+    /// `MAX_FUTURE_SKEW_MS` ahead of it is rejected as [`Reject::Future`].
     pub fn accept(
         &mut self,
         redis_host: &str,
         redis_replica: &str,
         env: &Envelope,
         reg: &KeyRegistry,
+        now_ms: u64,
     ) -> Result<ReplicaView, Reject> {
         let keys = reg.by_host.get(redis_host).ok_or(Reject::UnknownKey)?;
         if keys.is_empty() {
@@ -174,6 +183,13 @@ impl Ingest {
             || !hk.replica_ids.iter().any(|r| r == redis_replica)
         {
             return Err(Reject::Mismatch);
+        }
+
+        if report
+            .engine_sampled_at_ms
+            .is_some_and(|t| t > now_ms.saturating_add(MAX_FUTURE_SKEW_MS))
+        {
+            return Err(Reject::Future);
         }
 
         let key = (redis_host.to_string(), redis_replica.to_string());
@@ -231,6 +247,8 @@ mod tests {
 
     const HOST: &str = "glm53-gpu03";
     const REPLICA: &str = "r1";
+    /// This node's clock in tests: later than every fixture engine time.
+    const T_NOW: u64 = 10_000;
     const MODEL: &str = "z-ai/glm-5.3-flash";
 
     fn signing_key() -> SigningKey {
@@ -278,7 +296,7 @@ mod tests {
         let mut ingest = Ingest::new();
         let env = seal(&report(), &signing_key());
         let view = ingest
-            .accept(HOST, REPLICA, &env, &registry())
+            .accept(HOST, REPLICA, &env, &registry(), T_NOW)
             .expect("valid frame accepted");
         assert_eq!(view.host_id, HOST);
         assert_eq!(view.replica_id, REPLICA);
@@ -293,7 +311,9 @@ mod tests {
         // key hasn't reached the host map yet).
         let empty = KeyRegistry::default();
         assert_eq!(
-            ingest.accept(HOST, REPLICA, &env, &empty).unwrap_err(),
+            ingest
+                .accept(HOST, REPLICA, &env, &empty, T_NOW)
+                .unwrap_err(),
             Reject::UnknownKey
         );
     }
@@ -304,13 +324,13 @@ mod tests {
         let reg = registry();
 
         let first = seal(&report(), &signing_key());
-        ingest.accept(HOST, REPLICA, &first, &reg).unwrap();
+        ingest.accept(HOST, REPLICA, &first, &reg, T_NOW).unwrap();
 
         let mut regressed = report();
         regressed.seq = 1; // not > last.seq
         let env = seal(&regressed, &signing_key());
         assert_eq!(
-            ingest.accept(HOST, REPLICA, &env, &reg).unwrap_err(),
+            ingest.accept(HOST, REPLICA, &env, &reg, T_NOW).unwrap_err(),
             Reject::Regressed
         );
     }
@@ -324,14 +344,14 @@ mod tests {
         first.seq = 5;
         first.engine_sampled_at_ms = Some(2_000);
         let env = seal(&first, &signing_key());
-        ingest.accept(HOST, REPLICA, &env, &reg).unwrap();
+        ingest.accept(HOST, REPLICA, &env, &reg, T_NOW).unwrap();
 
         let mut regressed = report();
         regressed.seq = 6; // seq advances...
         regressed.engine_sampled_at_ms = Some(1_500); // ...but engine time regresses
         let env = seal(&regressed, &signing_key());
         assert_eq!(
-            ingest.accept(HOST, REPLICA, &env, &reg).unwrap_err(),
+            ingest.accept(HOST, REPLICA, &env, &reg, T_NOW).unwrap_err(),
             Reject::Regressed
         );
     }
@@ -344,7 +364,7 @@ mod tests {
         let mut first = report();
         first.engine_sampled_at_ms = Some(5_000);
         let env = seal(&first, &signing_key());
-        ingest.accept(HOST, REPLICA, &env, &reg).unwrap();
+        ingest.accept(HOST, REPLICA, &env, &reg, T_NOW).unwrap();
 
         let mut rebooted = report();
         rebooted.boot_id = "boot-b".into();
@@ -352,7 +372,7 @@ mod tests {
         rebooted.engine_sampled_at_ms = Some(4_000); // but engine time regresses
         let env = seal(&rebooted, &signing_key());
         assert_eq!(
-            ingest.accept(HOST, REPLICA, &env, &reg).unwrap_err(),
+            ingest.accept(HOST, REPLICA, &env, &reg, T_NOW).unwrap_err(),
             Reject::Regressed
         );
     }
@@ -365,7 +385,7 @@ mod tests {
         let mut first = report();
         first.engine_sampled_at_ms = Some(5_000);
         let env = seal(&first, &signing_key());
-        ingest.accept(HOST, REPLICA, &env, &reg).unwrap();
+        ingest.accept(HOST, REPLICA, &env, &reg, T_NOW).unwrap();
 
         let mut rebooted = report();
         rebooted.boot_id = "boot-b".into();
@@ -373,7 +393,7 @@ mod tests {
         rebooted.engine_sampled_at_ms = None; // not read yet since the reboot
         let env = seal(&rebooted, &signing_key());
         let view = ingest
-            .accept(HOST, REPLICA, &env, &reg)
+            .accept(HOST, REPLICA, &env, &reg, T_NOW)
             .expect("a reboot's first frame with unknown engine time is accepted");
         assert_eq!(view.report.boot_id, "boot-b");
     }
@@ -387,14 +407,14 @@ mod tests {
         first.seq = 1;
         first.engine_sampled_at_ms = Some(5_000);
         let env = seal(&first, &signing_key());
-        ingest.accept(HOST, REPLICA, &env, &reg).unwrap();
+        ingest.accept(HOST, REPLICA, &env, &reg, T_NOW).unwrap();
 
         let mut second = report();
         second.seq = 2;
         second.engine_sampled_at_ms = None;
         let env = seal(&second, &signing_key());
         ingest
-            .accept(HOST, REPLICA, &env, &reg)
+            .accept(HOST, REPLICA, &env, &reg, T_NOW)
             .expect("unknown engine time is accepted and doesn't lower the remembered one");
 
         let mut third = report();
@@ -402,9 +422,46 @@ mod tests {
         third.engine_sampled_at_ms = Some(4_000); // regresses vs the remembered 5_000
         let env = seal(&third, &signing_key());
         assert_eq!(
-            ingest.accept(HOST, REPLICA, &env, &reg).unwrap_err(),
+            ingest.accept(HOST, REPLICA, &env, &reg, T_NOW).unwrap_err(),
             Reject::Regressed
         );
+    }
+
+    #[test]
+    fn far_future_frame_is_rejected_and_does_not_lock_out_later_frames() {
+        // A replica clock jumps ahead, publishes one frame, then is corrected.
+        let mut ingest = Ingest::new();
+        let reg = registry();
+
+        let mut skewed = report();
+        skewed.seq = 1;
+        skewed.engine_sampled_at_ms = Some(T_NOW + MAX_FUTURE_SKEW_MS + 60_000);
+        let env = seal(&skewed, &signing_key());
+        assert_eq!(
+            ingest.accept(HOST, REPLICA, &env, &reg, T_NOW).unwrap_err(),
+            Reject::Future
+        );
+
+        // The skewed frame never became the stored max, so a correct frame
+        // right after it is accepted rather than rejected as Regressed.
+        let mut corrected = report();
+        corrected.seq = 2;
+        corrected.engine_sampled_at_ms = Some(T_NOW - 100);
+        let env = seal(&corrected, &signing_key());
+        ingest
+            .accept(HOST, REPLICA, &env, &reg, T_NOW)
+            .expect("a correct frame after a rejected future frame is accepted");
+    }
+
+    #[test]
+    fn small_future_skew_is_tolerated() {
+        let mut ingest = Ingest::new();
+        let mut ahead = report();
+        ahead.engine_sampled_at_ms = Some(T_NOW + MAX_FUTURE_SKEW_MS);
+        let env = seal(&ahead, &signing_key());
+        ingest
+            .accept(HOST, REPLICA, &env, &registry(), T_NOW)
+            .expect("skew within MAX_FUTURE_SKEW_MS is accepted");
     }
 
     #[test]
@@ -416,7 +473,9 @@ mod tests {
         future.schema = SUPPORTED_SCHEMA + 1;
         let env = seal(&future, &signing_key());
         assert_eq!(
-            ingest.accept(HOST, REPLICA, &env, &registry()).unwrap_err(),
+            ingest
+                .accept(HOST, REPLICA, &env, &registry(), T_NOW)
+                .unwrap_err(),
             Reject::Schema
         );
     }
@@ -429,7 +488,7 @@ mod tests {
         let reg = KeyRegistry { by_host };
         let env = seal(&report(), &signing_key());
         assert_eq!(
-            ingest.accept(HOST, REPLICA, &env, &reg).unwrap_err(),
+            ingest.accept(HOST, REPLICA, &env, &reg, T_NOW).unwrap_err(),
             Reject::UnknownKey
         );
     }
@@ -454,7 +513,7 @@ mod tests {
         let reg = KeyRegistry { by_host };
         let env = seal(&report(), &signing_key());
         assert_eq!(
-            ingest.accept(HOST, "r2", &env, &reg).unwrap_err(),
+            ingest.accept(HOST, "r2", &env, &reg, T_NOW).unwrap_err(),
             Reject::Mismatch
         );
     }
@@ -476,7 +535,7 @@ mod tests {
         let reg = KeyRegistry { by_host };
         let env = seal(&report(), &signing_key());
         assert_eq!(
-            ingest.accept(HOST, REPLICA, &env, &reg).unwrap_err(),
+            ingest.accept(HOST, REPLICA, &env, &reg, T_NOW).unwrap_err(),
             Reject::Mismatch
         );
     }

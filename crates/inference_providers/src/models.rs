@@ -443,12 +443,25 @@ where
     T: serde::de::DeserializeOwned,
 {
     let value = serde_json::Value::deserialize(deserializer)?;
-    // No usage field is an array, and serde would map one onto a struct's
-    // fields by position.
-    if value.is_array() {
+    if value.is_null() {
         return Ok(None);
     }
-    Ok(serde_json::from_value(value).ok())
+    // No usage field is an array, and serde would map one onto a struct's
+    // fields by position.
+    let parsed = if value.is_array() {
+        None
+    } else {
+        serde_json::from_value(value).ok()
+    };
+    if parsed.is_none() {
+        // Distinguishes "reported a count we could not parse" from "reported
+        // none". The value itself is not logged.
+        tracing::debug!(
+            detail_type = std::any::type_name::<T>(),
+            "Discarding malformed usage detail"
+        );
+    }
+    Ok(parsed)
 }
 
 /// OpenAI's `usage.completion_tokens_details`, a breakdown of
@@ -500,8 +513,9 @@ pub struct TokenUsage {
         skip_serializing_if = "Option::is_none"
     )]
     pub completion_tokens_details: Option<CompletionTokensDetails>,
-    /// SGLang's top-level reasoning count. Deprecated alias of
-    /// `completion_tokens_details.reasoning_tokens`, kept for existing readers.
+    /// SGLang's top-level reasoning count, as the provider sent it. Deprecated
+    /// alias of `completion_tokens_details.reasoning_tokens`, kept for existing
+    /// readers. For the effective, clamped count use `reasoning_tokens()`.
     #[serde(
         default,
         deserialize_with = "deserialize_lenient",

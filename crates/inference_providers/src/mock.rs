@@ -353,12 +353,13 @@ impl ResponseTemplate {
         requested_service_tier: Option<String>,
     ) -> ChatCompletionResponse {
         let model = self.model_override.clone().unwrap_or(model);
-        // Output tokens are the word count of the reasoning plus the content,
-        // like the streamed chunks (reasoning is part of the completion).
+        // Reasoning is part of the completion. Count it like the streamed
+        // chunks do: one token per `' '`-separated segment (see
+        // `generate_chunks`), so both modes report the same reasoning count.
         let reasoning_tokens = self
             .reasoning_content
             .as_deref()
-            .map_or(0, |reasoning| reasoning.split_whitespace().count() as i32);
+            .map_or(0, |reasoning| reasoning.split(' ').count() as i32);
         let output_tokens = self.content.split_whitespace().count() as i32 + reasoning_tokens;
 
         // Convert tool calls if present

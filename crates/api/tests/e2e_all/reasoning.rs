@@ -188,11 +188,16 @@ fn sse_json_events(body: &str) -> Vec<serde_json::Value> {
         .collect()
 }
 
-async fn ecdsa_signature(
+/// Fetch the ECDSA signature stored for `chat_id` and check that it has the
+/// expected `kind` and covers exactly the request and response bytes.
+async fn assert_signature_covers(
     server: &axum_test::TestServer,
     api_key: &str,
     chat_id: &str,
-) -> serde_json::Value {
+    kind: &str,
+    request_json: &str,
+    response_body: &str,
+) {
     let response = server
         .get(format!("/v1/signature/{chat_id}?signing_algo=ecdsa").as_str())
         .add_header("Authorization", format!("Bearer {api_key}"))
@@ -203,7 +208,17 @@ async fn ecdsa_signature(
         "signature should be available: {}",
         response.text()
     );
-    response.json::<serde_json::Value>()
+    let signature = response.json::<serde_json::Value>();
+    assert_eq!(signature["signature_kind"], kind);
+    assert_eq!(
+        signature["text"],
+        format!(
+            "{}:{}",
+            compute_sha256(request_json),
+            compute_sha256(response_body)
+        ),
+        "the {kind} signature must cover the exact request and response bytes"
+    );
 }
 
 /// Issue #1015: OpenAI-compatible clients (e.g. the Vercel AI SDK) read the
@@ -270,17 +285,7 @@ async fn test_streaming_final_usage_chunk_reports_reasoning_tokens() {
     );
 
     let chat_id = final_chunk["id"].as_str().expect("chunk should have an id");
-    let signature = ecdsa_signature(&server, &api_key, chat_id).await;
-    assert_eq!(signature["signature_kind"], "gateway");
-    assert_eq!(
-        signature["text"],
-        format!(
-            "{}:{}",
-            compute_sha256(&request_json),
-            compute_sha256(&body)
-        ),
-        "gateway signature must cover the exact rewritten stream"
-    );
+    assert_signature_covers(&server, &api_key, chat_id, "gateway", &request_json, &body).await;
 }
 
 /// Non-streaming self-hosted bodies are the model TEE's signed bytes. cloud-api
@@ -327,17 +332,15 @@ async fn test_non_streaming_self_hosted_usage_is_passed_through_unchanged() {
     })
     .await
     .expect("provider signature should be stored");
-    let signature = ecdsa_signature(&server, &api_key, chat_id).await;
-    assert_eq!(signature["signature_kind"], "provider_tee");
-    assert_eq!(
-        signature["text"],
-        format!(
-            "{}:{}",
-            compute_sha256(&request_json),
-            compute_sha256(&body_text)
-        ),
-        "the returned body must be the provider-signed bytes"
-    );
+    assert_signature_covers(
+        &server,
+        &api_key,
+        chat_id,
+        "provider_tee",
+        &request_json,
+        &body_text,
+    )
+    .await;
 }
 
 /// Auto-redact re-serializes the non-streaming body (the gateway signs it
@@ -387,14 +390,13 @@ async fn test_auto_redact_non_streaming_reports_reasoning_tokens() {
     assert_eq!(body["usage"]["reasoning_tokens"], expected);
 
     let chat_id = body["id"].as_str().expect("completion should have an id");
-    let signature = ecdsa_signature(&server, &api_key, chat_id).await;
-    assert_eq!(signature["signature_kind"], "gateway");
-    assert_eq!(
-        signature["text"],
-        format!(
-            "{}:{}",
-            compute_sha256(&request_json),
-            compute_sha256(&body_text)
-        )
-    );
+    assert_signature_covers(
+        &server,
+        &api_key,
+        chat_id,
+        "gateway",
+        &request_json,
+        &body_text,
+    )
+    .await;
 }

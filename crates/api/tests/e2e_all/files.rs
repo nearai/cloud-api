@@ -99,6 +99,14 @@ async fn all_file_mutations_except_delete_remain_gone_after_authentication() {
             "/v1/files/file-00000000-0000-0000-0000-000000000000",
         ),
         (
+            Method::GET,
+            "/v1/files/file-00000000-0000-0000-0000-000000000000/",
+        ),
+        (
+            Method::DELETE,
+            "/v1/files/file-00000000-0000-0000-0000-000000000000/",
+        ),
+        (
             Method::DELETE,
             "/v1/files/file-00000000-0000-0000-0000-000000000000/content",
         ),

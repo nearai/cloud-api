@@ -51,18 +51,32 @@ impl PlacementRequest {
 }
 
 /// Estimated prompt tokens: total message text bytes / 4. Text is a string
-/// content or the `text` fields of content parts.
+/// content, the `text` fields of content parts, each tool call's
+/// `function.arguments`, and any echoed `reasoning_content` — all of it is
+/// serialized upstream, so leaving tool calls or reasoning out of the
+/// estimate would systematically undercount agent/tool-heavy traffic (image
+/// or other non-text content parts cannot be estimated from bytes and stay
+/// excluded).
 pub(super) fn prompt_tokens_est(messages: &[crate::ChatMessage]) -> u64 {
     let bytes = messages
         .iter()
-        .map(|message| match message.content.as_ref() {
-            Some(serde_json::Value::String(text)) => text.len(),
-            Some(serde_json::Value::Array(parts)) => parts
-                .iter()
-                .filter_map(|part| part.get("text").and_then(|text| text.as_str()))
-                .map(str::len)
-                .fold(0usize, usize::saturating_add),
-            _ => 0,
+        .map(|message| {
+            let mut bytes = match message.content.as_ref() {
+                Some(serde_json::Value::String(text)) => text.len(),
+                Some(serde_json::Value::Array(parts)) => parts
+                    .iter()
+                    .filter_map(|part| part.get("text").and_then(|text| text.as_str()))
+                    .map(str::len)
+                    .fold(0usize, usize::saturating_add),
+                _ => 0,
+            };
+            if let Some(calls) = &message.tool_calls {
+                for call in calls {
+                    bytes = bytes
+                        .saturating_add(call.function.arguments.as_deref().map_or(0, str::len));
+                }
+            }
+            bytes.saturating_add(message.reasoning_content.as_deref().map_or(0, str::len))
         })
         .fold(0usize, usize::saturating_add);
     u64::try_from(bytes / 4).unwrap_or(u64::MAX)
@@ -195,7 +209,9 @@ fn rule_tag(rule: Rule) -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use super::logs_at_debug;
+    use super::{logs_at_debug, prompt_tokens_est};
+    use crate::models::{FunctionCall, ToolCall};
+    use crate::{ChatMessage, MessageRole};
     use placement::decision::{AffinitySource, Decision, DecisionRecord, PlaceInput, Placer};
     use placement::snapshot::Snapshot;
     use std::collections::HashMap;
@@ -234,5 +250,39 @@ mod tests {
         record.outcome = "place";
         record.reason = None;
         assert!(!logs_at_debug(&record));
+    }
+
+    #[test]
+    fn prompt_tokens_est_counts_tool_call_arguments_and_reasoning_content() {
+        let text_only = vec![ChatMessage {
+            role: MessageRole::User,
+            content: Some(serde_json::Value::String("a".repeat(40))),
+            name: None,
+            tool_call_id: None,
+            tool_calls: None,
+            reasoning_content: None,
+        }];
+        let with_tool_and_reasoning = vec![ChatMessage {
+            role: MessageRole::Assistant,
+            content: Some(serde_json::Value::String("a".repeat(40))),
+            name: None,
+            tool_call_id: None,
+            tool_calls: Some(vec![ToolCall {
+                id: Some("call-1".to_string()),
+                type_: Some("function".to_string()),
+                function: FunctionCall {
+                    name: Some("lookup".to_string()),
+                    arguments: Some("b".repeat(40)),
+                },
+                index: None,
+                thought_signature: None,
+            }]),
+            reasoning_content: Some("c".repeat(40)),
+        }];
+
+        // Then: the estimate grows to include the tool call arguments and
+        // the reasoning content bytes, not just the text content.
+        assert_eq!(prompt_tokens_est(&text_only), 10);
+        assert_eq!(prompt_tokens_est(&with_tool_and_reasoning), 30);
     }
 }

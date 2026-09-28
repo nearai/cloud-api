@@ -130,10 +130,12 @@ pub(crate) mod encryption_headers {
 /// placement affinity key (see `services::completions::affinity::derive`)
 /// down to a later placement-routing consumer. Routing-only, like
 /// `encryption_headers::MODEL_PUB_KEY`: never forwarded to an upstream
-/// provider and never logged. `pub(crate)` so other providers (Chutes,
-/// external) can strip the same constants instead of hardcoding the
-/// strings.
-pub(crate) mod placement_headers {
+/// provider and never logged. `pub` (not `pub(crate)`) so both other
+/// providers in this crate (Chutes, external) and `services::completions::
+/// affinity` can reference these constants directly instead of each
+/// re-declaring the same string literals, which would let the two sides
+/// silently drift apart.
+pub mod placement_headers {
     /// Lowercase hex of the derived affinity key.
     pub const AFFINITY: &str = "x_placement_affinity";
     /// The affinity key's source (`"client"` or `"prefix"`).

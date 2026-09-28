@@ -775,9 +775,11 @@ pub struct CompletionServiceImpl {
     organization_limit_repository: Arc<dyn ports::OrganizationConcurrentLimitRepository>,
     /// HMAC secret for deriving per-request placement affinity keys (see
     /// `affinity::derive`). `None` until wired up (HKDF from the Valkey
-    /// password), in which case affinity derivation is skipped entirely and
-    /// `params.extra` is left unchanged — behavior is byte-identical to
-    /// before this field existed. Never logged.
+    /// password), in which case affinity derivation is skipped — but
+    /// client-supplied `x_placement_affinity`/`x_placement_affinity_source`
+    /// keys are still stripped from `params.extra` unconditionally, so a
+    /// request carrying forged keys is not byte-identical to pre-placement
+    /// behavior. Never logged.
     affinity_secret: Option<[u8; 32]>,
 }
 

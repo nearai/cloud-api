@@ -326,6 +326,17 @@ fn client(
     ca_pem: Option<&str>,
     password: Option<String>,
 ) -> Result<redis::Client, String> {
+    // `VALKEY_ENDPOINT` still carries its placeholder host until infra-aws#15
+    // is applied. Unlike a real unreachable host, `"VALKEY_EIP"` parses as a
+    // perfectly valid hostname, so without this check `client()` would
+    // succeed and `connect()` would retry forever on a 1-30s backoff instead
+    // of staying inert — the CA placeholder is the only thing that short-
+    // circuits today, and the two placeholders can be filled in at different
+    // times. Same inert contract as `ca_pem_empty` below: one warn, no
+    // connect loop, every placement Legacy.
+    if url.contains("VALKEY_EIP") {
+        return Err("endpoint_placeholder".to_string());
+    }
     use redis::IntoConnectionInfo;
     let mut info = url
         .into_connection_info()
@@ -1519,6 +1530,30 @@ mod tests {
         install_crypto_provider();
         assert!(client(VALKEY_ENDPOINT, Some(VALKEY_CA_PEM), Some("pw".into())).is_err());
         assert!(client("not a url", None, None).is_err());
+    }
+
+    #[test]
+    fn placeholder_endpoint_is_rejected_with_its_own_error_kind() {
+        // Given: the endpoint still carries its placeholder host
+        // (`VALKEY_EIP`), which — unlike a real unreachable host — parses
+        // as a perfectly valid hostname. Without an explicit check,
+        // `client()` would succeed here and `connect()` would loop forever
+        // on its backoff instead of staying inert, and the two placeholders
+        // (endpoint, CA) can be filled in at different times, so this must
+        // be caught independent of the CA outcome.
+        install_crypto_provider();
+
+        // Then: the endpoint check fires before URL parsing or the CA check
+        // and reports its own, distinguishable error kind — never silently
+        // falling through to a real connection attempt.
+        assert_eq!(
+            client(VALKEY_ENDPOINT, None, Some("pw".into())).unwrap_err(),
+            "endpoint_placeholder"
+        );
+        assert_eq!(
+            client(VALKEY_ENDPOINT, Some(VALKEY_CA_PEM), Some("pw".into())).unwrap_err(),
+            "endpoint_placeholder"
+        );
     }
 
     #[tokio::test]

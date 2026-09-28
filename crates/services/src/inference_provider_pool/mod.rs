@@ -613,6 +613,47 @@ impl DiscoveryOutcome {
             let Some(replica_key) = probe.replica_key.as_ref() else {
                 continue;
             };
+
+            // Parse the key before consuming the index: a malformed key on
+            // one algo's probe then falls through to the sibling probe at
+            // the same index instead of masking it. This also keeps us from
+            // creating an empty `keys` entry for a host whose only probe
+            // failed to parse, since the `keys` entry is only inserted below
+            // once a key has successfully parsed.
+            let key_bytes = match hex::decode(&replica_key.public_key_hex) {
+                Ok(bytes) => bytes,
+                Err(_) => {
+                    debug!(
+                        host_id = %replica_key.host_id,
+                        key_id = %replica_key.key_id,
+                        why = "hex_decode",
+                        "replica-report key failed to parse; probe excluded from the placement registry"
+                    );
+                    continue;
+                }
+            };
+            let Ok(key_bytes) = <[u8; 32]>::try_from(key_bytes.as_slice()) else {
+                debug!(
+                    host_id = %replica_key.host_id,
+                    key_id = %replica_key.key_id,
+                    why = "length",
+                    "replica-report key failed to parse; probe excluded from the placement registry"
+                );
+                continue;
+            };
+            let verifying_key = match ed25519_dalek::VerifyingKey::from_bytes(&key_bytes) {
+                Ok(key) => key,
+                Err(_) => {
+                    debug!(
+                        host_id = %replica_key.host_id,
+                        key_id = %replica_key.key_id,
+                        why = "point",
+                        "replica-report key failed to parse; probe excluded from the placement registry"
+                    );
+                    continue;
+                }
+            };
+
             if !seen_indices.insert(probe.index) {
                 continue;
             }
@@ -638,18 +679,6 @@ impl DiscoveryOutcome {
             {
                 continue;
             }
-            let Ok(key_bytes) = <[u8; 32]>::try_from(
-                match hex::decode(&replica_key.public_key_hex) {
-                    Ok(bytes) => bytes,
-                    Err(_) => continue,
-                }
-                .as_slice(),
-            ) else {
-                continue;
-            };
-            let Ok(verifying_key) = ed25519_dalek::VerifyingKey::from_bytes(&key_bytes) else {
-                continue;
-            };
             host_keys.push(placement::snapshot::HostKey {
                 key_id: replica_key.key_id.clone(),
                 key: verifying_key,
@@ -6949,6 +6978,34 @@ mod tests {
         // Then.
         assert_eq!(hosts.index_by_host.get("glm53-gpu03"), Some(&0));
         assert_eq!(view.report.seq, 7);
+    }
+
+    #[test]
+    fn malformed_key_falls_through_to_sibling_probe_at_same_index() {
+        // Given: two probes at the same index (the two algos), the first
+        // carrying a key that fails to parse and the second carrying a
+        // valid key for the same host.
+        let key = ed25519_dalek::SigningKey::from_bytes(&[9u8; 32]);
+        let mut bad_key = fake_replica_report_key(&key, "host-a");
+        bad_key.public_key_hex = "not-hex".to_string();
+        let good_key = fake_replica_report_key(&key, "host-a");
+        let outcome = discovery_outcome_with_probes(
+            1,
+            vec![
+                backend_probe_with_key(0, "ecdsa", "key-a", bad_key),
+                backend_probe_with_key(0, "ed25519", "key-a", good_key),
+            ],
+        );
+
+        // When.
+        let hosts = outcome.backend_hosts();
+
+        // Then: the malformed probe does not mask its sibling — the host
+        // ends up mapped, with the valid key in the registry.
+        assert_eq!(hosts.index_by_host.get("host-a"), Some(&0));
+        let keys = hosts.keys.by_host.get("host-a").expect("host key present");
+        assert_eq!(keys.len(), 1);
+        assert_eq!(keys[0].key, key.verifying_key());
     }
 
     #[test]

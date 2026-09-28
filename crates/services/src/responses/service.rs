@@ -1474,6 +1474,12 @@ impl ResponseServiceImpl {
             }
 
             // Create completion request (names not included - tracked via database analytics)
+            // `session_hint` is intentionally always None: /responses does not read or
+            // forward `x-session-id` (unlike /chat/completions, see routes/completions.rs).
+            // Covered-model traffic entering through /responses therefore only ever gets
+            // `client` affinity by falling through to prefix-based derivation (or none
+            // under E2EE). This is an intentional scope cut, not an oversight: the
+            // Response API is deprecated and will not receive client affinity wiring.
             let completion_request = CompletionRequest {
                 request_priority: process_context.request_priority,
                 session_hint: None,
@@ -3149,6 +3155,9 @@ impl ResponseServiceImpl {
         // Generate title using completion service (names not included - tracked via database)
         let title_model = std::env::var("TITLE_GENERATION_MODEL")
             .unwrap_or_else(|_| "Qwen/Qwen3-30B-A3B-Instruct-2507".to_string());
+        // `session_hint: None` here too: this is the internal title-generation
+        // request, issued by the deprecated /responses API, which does not forward
+        // `x-session-id`. See the comment on the other CompletionRequest above.
         let completion_request = crate::completions::ports::CompletionRequest {
             request_id,
             session_hint: None,

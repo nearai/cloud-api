@@ -663,6 +663,20 @@ impl Fleet {
             return;
         }
         let handles = Arc::new(handles);
+        // Seed the reader's map before publishing, then re-seed after: this
+        // closes a check-then-act race with a concurrent `set_backend_hosts`.
+        // If that call's newest map lands in `self.backend_hosts` (and, since
+        // `self.placement` isn't populated yet, is not mirrored into
+        // `handles.hosts`) strictly between the check above and a single
+        // post-publish copy, the single copy could overwrite the fresh map
+        // with a stale snapshot taken before it. Seeding twice means any
+        // push that isn't picked up by the pre-publish copy is guaranteed to
+        // be picked up by the post-publish one, since `set_backend_hosts`
+        // itself starts mirroring into `handles.hosts` the moment
+        // `self.placement` is populated by the `store` below.
+        if !Arc::ptr_eq(&handles.hosts, &self.backend_hosts) {
+            handles.hosts.store(self.backend_hosts.load_full());
+        }
         self.placement.store(Some(handles.clone()));
         if !Arc::ptr_eq(&handles.hosts, &self.backend_hosts) {
             handles.hosts.store(self.backend_hosts.load_full());
@@ -959,6 +973,19 @@ fn demote(record: &mut DecisionRecord, reason: LegacyReason) {
     record.reason = Some(reason.as_str());
     record.selection = None;
     record.rank = None;
+    // The candidate was rejected: nothing below may describe a host this
+    // request did not use, or `METRIC_CHOSEN_BACKLOG` ("chosen host, per
+    // placed request") samples a record that was never placed. `eligible`
+    // and `excluded` are left as-is: they still describe the scoring that
+    // was actually done. Matches the shape of `DecisionRecord::legacy`.
+    record.host = None;
+    record.home = None;
+    record.pinned = None;
+    record.chosen_score = None;
+    record.home_score = None;
+    record.best_score = None;
+    record.pending_req = 0;
+    record.chosen_backlog_tokens = None;
 }
 
 fn route_index_score(route_key: u64, index: usize) -> u64 {
@@ -985,4 +1012,56 @@ fn key_affinity_enabled() -> bool {
         let value = std::env::var("E2EE_BACKEND_KEY_AFFINITY").ok();
         key_affinity_value_enabled(value.as_deref())
     })
+}
+
+#[cfg(test)]
+mod demote_tests {
+    use super::*;
+    use placement::rules::RULES;
+
+    #[test]
+    fn demote_clears_the_rejected_candidate_shape() {
+        // Given: a fully populated `Place` decision, as if the placer had
+        // chosen a host, right before the caller demotes it to legacy.
+        let mut record = DecisionRecord {
+            outcome: "place",
+            reason: None,
+            rank: Some(0),
+            affinity: "prefix",
+            selection: Some("primary"),
+            host: Some("host-a".to_string()),
+            home: Some("host-a".to_string()),
+            pinned: Some("pubkey-a".to_string()),
+            eligible: 3,
+            excluded: RULES.map(|r| (r, 0)),
+            chosen_score: Some(1.0),
+            home_score: Some(1.0),
+            best_score: Some(1.0),
+            snapshot_age_ms: 42,
+            pending_req: 5,
+            chosen_backlog_tokens: Some(1234),
+        };
+
+        // When: the caller falls back to the legacy path.
+        demote(&mut record, LegacyReason::HostUnmapped);
+
+        // Then: the record matches the shape of a placer-built `Legacy`
+        // record — no host, no backlog, nothing describing a candidate this
+        // request never used.
+        assert_eq!(record.outcome, "legacy");
+        assert_eq!(record.reason, Some(LegacyReason::HostUnmapped.as_str()));
+        assert_eq!(record.selection, None);
+        assert_eq!(record.rank, None);
+        assert_eq!(record.host, None);
+        assert_eq!(record.home, None);
+        assert_eq!(record.pinned, None);
+        assert_eq!(record.chosen_score, None);
+        assert_eq!(record.home_score, None);
+        assert_eq!(record.best_score, None);
+        assert_eq!(record.pending_req, 0);
+        assert_eq!(record.chosen_backlog_tokens, None);
+        // `eligible` and `excluded` are left untouched: they still describe
+        // the scoring that was actually done.
+        assert_eq!(record.eligible, 3);
+    }
 }

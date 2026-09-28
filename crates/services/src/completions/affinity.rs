@@ -29,11 +29,20 @@ const MAX_VALUE_BYTES: usize = 256;
 /// `params.extra` key carrying the derived affinity key, lowercase hex of
 /// the 16 key bytes. Stripped before the upstream provider request, the
 /// same way `x_model_pub_key` is.
-pub const AFFINITY_EXTRA_KEY: &str = "x_placement_affinity";
+///
+/// Defined once in `inference_providers` (`attested::nearai::
+/// placement_headers::AFFINITY`, which `placement_report.rs` also reads)
+/// and re-exported here rather than redeclared, so the derive side
+/// (`services`) and the strip/read side (`inference_providers`) cannot
+/// silently drift apart under a rename.
+pub const AFFINITY_EXTRA_KEY: &str =
+    inference_providers::attested::nearai::placement_headers::AFFINITY;
 /// `params.extra` key carrying the affinity key's source (`"client"` or
 /// `"prefix"`). Stripped before the upstream provider request alongside
-/// [`AFFINITY_EXTRA_KEY`].
-pub const AFFINITY_SOURCE_EXTRA_KEY: &str = "x_placement_affinity_source";
+/// [`AFFINITY_EXTRA_KEY`]. See that constant's doc for why this is
+/// re-exported rather than redeclared.
+pub const AFFINITY_SOURCE_EXTRA_KEY: &str =
+    inference_providers::attested::nearai::placement_headers::AFFINITY_SOURCE;
 
 /// Derive a per-request [`AffinityKey`] plus the [`AffinitySource`] it came
 /// from, or `None` when no usable signal exists.
@@ -256,6 +265,17 @@ const PIN_SECRET_INFO: &[u8] = b"nearai-placement-pin-v1";
 /// and the two `info` strings domain-separate the outputs. Deterministic, so
 /// all nodes agree on affinity keys and pin ids without sharing more state.
 /// Never log the password or either output.
+///
+/// # Rotation
+/// Changing `PLACEMENT_REDIS_PASSWORD` invalidates every derived affinity
+/// key and pin id cluster-wide: it is the sole input key material, so a new
+/// password produces entirely different HMAC secrets. Nodes restart at
+/// different times during a rollout, so they briefly disagree on the
+/// current secret and fall back to legacy routing until every node has
+/// picked up the new password. Treat rotation as a coordinated restart, not
+/// a routine config change. Because the password is the sole input key
+/// material, it must be high-entropy — its entropy is inherited directly by
+/// the derived HMAC secrets.
 pub fn secrets_from(password: &str) -> ([u8; 32], [u8; 32]) {
     let hk = hkdf::Hkdf::<Sha256>::new(None, password.as_bytes());
     let mut affinity = [0u8; 32];

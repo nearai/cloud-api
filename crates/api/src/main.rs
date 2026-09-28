@@ -15,6 +15,23 @@ mod telemetry;
 
 #[tokio::main]
 async fn main() {
+    // Install the process-wide rustls crypto provider unconditionally, as
+    // early as possible. Both `aws-lc-rs` and `ring` are enabled on rustls
+    // (needed for TLS support across the dependency graph), which removes
+    // rustls's implicit default provider for the whole binary: any rustls
+    // config built through that implicit default (today, `redis`'s
+    // `rediss://` TLS setup) would otherwise panic unless something already
+    // installed a provider first. `inference_providers::placement_io` also
+    // calls this lazily inside `PlacementIo::start` (kept below, since it's
+    // the one path that's guaranteed to run before that crate's own
+    // `rediss://` client is built) — installing it here too makes the
+    // default provider exist regardless of whether placement is configured.
+    // `install_crypto_provider` is idempotent: a second call is a no-op.
+    // The `database` crate separately installs `ring` as well; both calls
+    // race for "install_default" and only the first one wins, which is fine
+    // since they install the same provider.
+    inference_providers::placement_io::install_crypto_provider();
+
     // Load configuration and initialize logging
     let config = load_configuration();
     init_tracing(&config.logging);

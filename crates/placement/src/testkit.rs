@@ -7,7 +7,7 @@
 use base64::Engine as _;
 use ed25519_dalek::{Signer, SigningKey};
 
-use crate::decision::PlaceInput;
+use crate::decision::{AffinitySource, PlaceInput};
 use crate::frame::{Envelope, Lifecycle, Limits, Load, ReplicaReport, SIGNING_DOMAIN};
 use crate::snapshot::ReplicaView;
 
@@ -69,8 +69,12 @@ pub(crate) fn view_ready() -> ReplicaView {
 /// long-context hosts.
 pub(crate) fn input() -> PlaceInput {
     PlaceInput {
+        request_id: "test-request".into(),
         model: TEST_MODEL.into(),
         prompt_tokens_est: 100,
+        affinity: None,
+        affinity_source: AffinitySource::None,
         long_context_hosts: Vec::new(),
+        now_ms: NOW,
     }
 }

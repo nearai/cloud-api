@@ -5121,6 +5121,7 @@ dependencies = [
  "ed25519-dalek",
  "hex",
  "hmac 0.13.0",
+ "proptest",
  "rand 0.10.1",
  "serde",
  "serde_json",

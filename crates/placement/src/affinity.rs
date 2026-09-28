@@ -20,6 +20,7 @@ use crate::consts::{AFFINITY_ABS_SLACK, AFFINITY_EPS, PIN_TTL_MS};
 
 /// An opaque, unlinkable-by-inspection affinity key (e.g. derived from a
 /// conversation id). Intentionally has no `Debug`/`Display`/`Serialize`.
+#[derive(Clone)]
 pub struct AffinityKey([u8; 16]);
 
 impl AffinityKey {
@@ -65,14 +66,14 @@ pub struct PinTable {
 }
 
 impl PinTable {
-    /// The pinned host, if `id` has an entry that hasn't expired: valid
-    /// while `now_ms < at_ms + PIN_TTL_MS` (saturating, so an `at_ms` from
-    /// the far past or a clock skew never panics or wraps to "still
-    /// valid").
-    pub fn get(&self, id: &PinId, now_ms: u64) -> Option<&str> {
+    /// The pinned `(host, written-at ms)`, if `id` has an entry that hasn't
+    /// expired: valid while `now_ms < at_ms + PIN_TTL_MS` (saturating, so an
+    /// `at_ms` from the far past or a clock skew never panics or wraps to
+    /// "still valid").
+    pub fn get(&self, id: &PinId, now_ms: u64) -> Option<(&str, u64)> {
         let (host, at_ms) = self.entries.get(&id.0)?;
         if now_ms < at_ms.saturating_add(PIN_TTL_MS) {
-            Some(host.as_str())
+            Some((host.as_str(), *at_ms))
         } else {
             None
         }
@@ -254,6 +255,7 @@ mod tests {
     use super::*;
     use rand::rngs::StdRng;
     use rand::SeedableRng;
+    use std::collections::HashMap;
 
     fn find_key_with_rank(hosts: &[&str], want: &[&str]) -> AffinityKey {
         for seed in 0u128.. {
@@ -354,6 +356,10 @@ mod tests {
         let sel = select(Some(&key), Some("gpu05"), &scores, &mut rng).unwrap();
         assert_eq!(sel.host, "gpu02");
         assert_eq!(sel.selection, Selection::Home);
+        assert!(
+            sel.write_pin,
+            "an ignored pin (naming a now-ineligible host) must write a fresh pin at home"
+        );
     }
 
     #[test]
@@ -382,6 +388,49 @@ mod tests {
             assert_eq!(sel.home, None);
             assert!(!sel.write_pin);
         }
+    }
+
+    #[test]
+    fn keyless_best_of_two_with_four_hosts_is_not_always_global_min() {
+        // With 4+ hosts, BestOfTwo samples only 2 of them, so the pick is
+        // the lower-scored of the *sampled* pair — not necessarily the
+        // fleet-wide minimum. Assert both properties across seeds: every
+        // pick is a valid (sampled-pair) minimum, and at least one seed
+        // picks something other than the global min ("hostA").
+        let scores = vec![
+            ("hostA".to_string(), 0.1), // global min
+            ("hostB".to_string(), 0.5),
+            ("hostC".to_string(), 0.6),
+            ("hostD".to_string(), 0.7),
+        ];
+        let by_host: HashMap<&str, f64> = scores.iter().map(|(h, s)| (h.as_str(), *s)).collect();
+
+        let mut saw_non_global_min = false;
+        for seed in 0..50u64 {
+            let mut rng = StdRng::seed_from_u64(seed);
+            let sel = select(None, None, &scores, &mut rng).unwrap();
+            assert_eq!(sel.selection, Selection::BestOfTwo);
+            assert!(
+                by_host.contains_key(sel.host.as_str()),
+                "picked host must be one of the eligible hosts"
+            );
+            if sel.host != "hostA" {
+                saw_non_global_min = true;
+            }
+        }
+        assert!(
+            saw_non_global_min,
+            "with 4 hosts, best-of-two should sometimes miss the global min"
+        );
+    }
+
+    #[test]
+    fn hrw_rank_is_input_order_independent() {
+        let key = AffinityKey::from_bytes([11u8; 16]);
+        let hosts = ["gpu01", "gpu02", "gpu03", "gpu04"];
+        let mut reversed = hosts;
+        reversed.reverse();
+        assert_eq!(hrw_rank(&key, &hosts), hrw_rank(&key, &reversed));
     }
 
     #[test]
@@ -428,8 +477,11 @@ mod tests {
         let mut table = PinTable::default();
         let id = pin_id(&AffinityKey::from_bytes([3u8; 16]), &[1u8; 32]);
         table.insert(*id.as_bytes(), "gpu09".to_string(), 1_000);
-        assert_eq!(table.get(&id, 1_000), Some("gpu09"));
-        assert_eq!(table.get(&id, 1_000 + PIN_TTL_MS - 1), Some("gpu09"));
+        assert_eq!(table.get(&id, 1_000), Some(("gpu09", 1_000)));
+        assert_eq!(
+            table.get(&id, 1_000 + PIN_TTL_MS - 1),
+            Some(("gpu09", 1_000))
+        );
         assert_eq!(table.get(&id, 1_000 + PIN_TTL_MS), None);
     }
 }

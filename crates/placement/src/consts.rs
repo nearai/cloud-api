@@ -46,3 +46,8 @@ pub const AFFINITY_ABS_SLACK: f64 = 0.1;
 /// How long a follow pin stays valid after it's written, in milliseconds.
 /// 10 minutes, matching OpenRouter's sticky-session TTL.
 pub const PIN_TTL_MS: u64 = 600_000;
+
+/// The synthetic replica id under which host-level `RoutedCounts` are keyed
+/// in `Snapshot::routed`, since cloud-api's own routed counters are
+/// host-level (the host's inference-proxy balances its own replicas).
+pub const HOST_REPLICA: &str = "_host";

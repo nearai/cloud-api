@@ -757,8 +757,8 @@ pub struct InferenceProviderPool {
     /// construction via [`Self::set_metrics_service`]; absent in tests). The pool
     /// is the only layer that knows which trust tier served a request and whether
     /// it was a fallback, so the per-tier / fallback counter is emitted from here.
-    /// Shared with each `PoolBackendVerifier`, which is created by the initial
-    /// model load, before the sink is attached.
+    /// Shared with each `PoolBackendVerifier`, so a verifier created before the
+    /// sink is attached still reports to it.
     metrics_service: Arc<std::sync::OnceLock<Arc<dyn crate::metrics::MetricsServiceTrait>>>,
     /// Providers explicitly registered as fallbacks, keyed by model id. This
     /// role is configuration metadata rather than an inference from whichever

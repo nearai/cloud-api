@@ -2420,6 +2420,9 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
         &self,
         model_name: &str,
     ) -> Result<Option<crate::models::ModelWithPricing>, anyhow::Error> {
+        // Match the model resolution used by the completion path. Capability
+        // guards that run before dispatch (such as Responses rejecting image
+        // output) must apply to aliases as well as canonical model names.
         self.models_repository
             .resolve_and_get_model(model_name)
             .await

@@ -200,8 +200,10 @@ fn record_backend_key_divergence(
 enum ChannelBinding {
     /// The connection presented the attested key.
     Match,
-    /// The connection presented a different key, or the report attests none.
+    /// The connection presented a different key than the attested one.
     Mismatch,
+    /// The verified report attests no TLS fingerprint.
+    Unattested,
     /// The connection's peer certificate could not be read.
     Missing,
 }
@@ -210,10 +212,11 @@ impl ChannelBinding {
     fn check(observed: &Result<String, String>, attested: Option<&str>) -> Self {
         match (observed, attested) {
             (Err(_), _) => Self::Missing,
+            (Ok(_), None) => Self::Unattested,
             (Ok(observed), Some(attested)) if *observed == canonical_spki_fingerprint(attested) => {
                 Self::Match
             }
-            (Ok(_), _) => Self::Mismatch,
+            (Ok(_), Some(_)) => Self::Mismatch,
         }
     }
 
@@ -221,6 +224,7 @@ impl ChannelBinding {
         match self {
             Self::Match => "match",
             Self::Mismatch => "mismatch",
+            Self::Unattested => "unattested",
             Self::Missing => "missing",
         }
     }
@@ -910,9 +914,9 @@ impl inference_providers::BackendVerifier for PoolBackendVerifier {
         //    presented on this connection. The connection was accepted under
         //    Bootstrap (any WebPKI-valid certificate) and stays in the returned
         //    client's pool to carry inference, so the attested fingerprint is
-        //    only meaningful for it if the two match. On a mismatch, or when the
-        //    peer certificate cannot be read, nothing is pinned and the client
-        //    is dropped.
+        //    only meaningful for it if the two match. Otherwise (a different
+        //    key, no attested fingerprint, or no readable peer certificate)
+        //    nothing is pinned and the client is dropped.
         let binding = ChannelBinding::check(
             &observed_fingerprint,
             verified.tls_cert_fingerprint.as_deref(),

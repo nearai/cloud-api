@@ -52,6 +52,24 @@ impl BackendAttestationVerifier for AcceptReportVerifier {
     }
 }
 
+/// Accepts any report but attests no TLS fingerprint.
+struct NoFingerprintVerifier;
+
+#[async_trait::async_trait]
+impl BackendAttestationVerifier for NoFingerprintVerifier {
+    async fn verify_attestation_report(
+        &self,
+        attestation_report: &serde_json::Map<String, serde_json::Value>,
+        request_nonce: &str,
+    ) -> Result<VerifiedAttestation, AttestationVerificationError> {
+        let mut verified = AcceptReportVerifier
+            .verify_attestation_report(attestation_report, request_nonce)
+            .await?;
+        verified.tls_cert_fingerprint = None;
+        Ok(verified)
+    }
+}
+
 struct Leaf {
     cert: CertificateDer<'static>,
     key: PrivateKeyDer<'static>,
@@ -506,6 +524,34 @@ async fn attested_fingerprint_is_pinned_in_canonical_form() {
     assert_eq!(count(&genuine.counters.attestation_requests), 1);
 }
 
+/// A verified report that attests no TLS fingerprint is refused, and counted
+/// separately from a key mismatch.
+#[tokio::test]
+async fn report_without_fingerprint_is_refused() {
+    let pki = pki();
+    let genuine = start_backend(
+        "genuine",
+        &pki.genuine,
+        Transport::TlsH2,
+        &pki.genuine.fingerprint,
+    )
+    .await;
+    let state = Arc::new(std::sync::RwLock::new(FingerprintState::Bootstrap));
+    let metrics = Arc::new(CapturingMetricsService::new());
+    let verifier = PoolBackendVerifier {
+        attestation_verifier: Arc::new(NoFingerprintVerifier),
+        ..pool_verifier(&pki, state.clone(), metrics.clone())
+    };
+
+    let err = verifier
+        .create_verified_client(&genuine.base_url)
+        .await
+        .expect_err("a report without a TLS fingerprint must be refused");
+    assert!(err.contains("TLS channel binding unattested"), "{err}");
+    assert_eq!(pinned_set(&state), None);
+    assert_eq!(channel_binding_results(&metrics), vec!["result:unattested"]);
+}
+
 /// Without TLS there is no peer certificate to check: the backend is refused
 /// (fail closed) rather than pinned on the report alone.
 #[tokio::test]
@@ -557,7 +603,7 @@ fn channel_binding_check_classifies_outcomes() {
     );
     assert_eq!(
         ChannelBinding::check(&observed, None),
-        ChannelBinding::Mismatch
+        ChannelBinding::Unattested
     );
     assert_eq!(
         ChannelBinding::check(&Err("no TLS".to_string()), Some(&fp)),

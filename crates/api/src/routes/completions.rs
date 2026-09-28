@@ -588,12 +588,16 @@ fn rewritten_control_event_bytes(event: &inference_providers::SSEEvent) -> Optio
 }
 
 fn build_final_usage_chunk_bytes(
-    usage: inference_providers::TokenUsage,
+    mut usage: inference_providers::TokenUsage,
     template: &ChunkTemplate,
 ) -> Result<Option<Bytes>, serde_json::Error> {
     let Some((id, model, created, system_fingerprint)) = template else {
         return Ok(None);
     };
+    // OpenAI-compatible clients read the reasoning count only from
+    // `completion_tokens_details`; SGLang reports it top-level. This chunk is
+    // synthesized on the usage-rewrite path, which the gateway signs.
+    usage.ensure_standard_reasoning_details();
 
     let final_usage_chunk =
         inference_providers::StreamChunk::Chat(inference_providers::models::ChatCompletionChunk {
@@ -2449,6 +2453,13 @@ async fn chat_completions_inner(
                         &mut response_with_bytes.response,
                         &redaction_map,
                     );
+                    // This body is re-serialized, so no provider signature covers
+                    // it; expose the reasoning count where OpenAI-compatible
+                    // clients read it.
+                    response_with_bytes
+                        .response
+                        .usage
+                        .ensure_standard_reasoning_details();
                     match serde_json::to_vec(&response_with_bytes.response) {
                         Ok(b) => b,
                         Err(e) => {
@@ -3176,6 +3187,7 @@ fn chat_response_to_text_response(
             completion_tokens: response.usage.completion_tokens,
             completion_tokens_details: None,
             total_tokens: response.usage.total_tokens,
+            reasoning_tokens: None,
         },
     }
 }
@@ -4215,6 +4227,64 @@ mod tests {
         assert!(value["choices"].as_array().is_some_and(Vec::is_empty));
         assert_eq!(value["usage"]["prompt_tokens"], 10);
         assert_eq!(value["usage"]["completion_tokens"], 5);
+        // No reasoning count reported upstream, so none is invented.
+        assert!(value["usage"].get("completion_tokens_details").is_none());
+        assert!(value["usage"].get("reasoning_tokens").is_none());
+    }
+
+    #[test]
+    fn final_usage_chunk_reports_sglang_reasoning_count_in_standard_details() {
+        let template = Some((
+            "chatcmpl-test".to_string(),
+            "test-model".to_string(),
+            1234567890,
+            None,
+        ));
+        // Last cumulative usage from an SGLang stream (top-level count).
+        let mut chunk: inference_providers::models::ChatCompletionChunk =
+            serde_json::from_value(serde_json::json!({
+                "id": "chatcmpl-test",
+                "object": "chat.completion.chunk",
+                "created": 1234567890,
+                "model": "test-model",
+                "choices": [chat_stream_finish_choice()],
+                "usage": {
+                    "prompt_tokens": 20,
+                    "total_tokens": 120,
+                    "completion_tokens": 100,
+                    "prompt_tokens_details": { "cached_tokens": 4 },
+                    "reasoning_tokens": 14
+                }
+            }))
+            .expect("SGLang chunk should parse");
+        let mut final_usage = None;
+        assert!(prepare_chat_stream_chunk_for_client_with_state(
+            &mut chunk,
+            true,
+            &mut final_usage
+        ));
+
+        let bytes = build_final_usage_chunk_bytes(
+            final_usage.expect("usage should be kept for the final chunk"),
+            &template,
+        )
+        .expect("final usage chunk should serialize")
+        .expect("template should produce final usage chunk");
+        let body = String::from_utf8(bytes.to_vec()).expect("SSE bytes should be UTF-8");
+        let value: serde_json::Value =
+            serde_json::from_str(body.trim_start_matches("data: ").trim_end())
+                .expect("final usage payload should be JSON");
+        assert_eq!(
+            value["usage"],
+            serde_json::json!({
+                "prompt_tokens": 20,
+                "completion_tokens": 100,
+                "total_tokens": 120,
+                "prompt_tokens_details": { "cached_tokens": 4 },
+                "completion_tokens_details": { "reasoning_tokens": 14 },
+                "reasoning_tokens": 14
+            })
+        );
     }
 
     #[test]

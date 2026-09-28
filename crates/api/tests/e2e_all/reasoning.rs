@@ -10,8 +10,13 @@
 //!      the response (non-streaming and streaming), and
 //!   2. the `chat_template_kwargs` toggle is forwarded to the provider intact
 //!      (it rides in the `extra` passthrough map).
+//!
+//! The mock engine reports reasoning usage in SGLang's shape (a top-level
+//! `usage.reasoning_tokens`), which lets the usage tests below check where
+//! cloud-api exposes that count.
 
 use crate::common::*;
+use bytes::Bytes;
 use inference_providers::mock::{RequestMatcher, ResponseTemplate};
 use std::sync::Arc;
 
@@ -164,5 +169,232 @@ async fn test_chat_template_kwargs_forwarded() {
         kwargs.get("enable_thinking").and_then(|v| v.as_bool()),
         Some(false),
         "chat_template_kwargs.enable_thinking not preserved"
+    );
+}
+
+const REASONING: &str = "Let me think step by step about the question.";
+
+/// The mock engine reports one token per reasoning word.
+fn reasoning_token_count() -> i64 {
+    REASONING.split_whitespace().count() as i64
+}
+
+/// Parsed JSON payloads of every `data:` event except `[DONE]`.
+fn sse_json_events(body: &str) -> Vec<serde_json::Value> {
+    body.lines()
+        .filter_map(|line| line.strip_prefix("data: "))
+        .filter(|data| data.trim() != "[DONE]")
+        .map(|data| serde_json::from_str(data).expect("SSE data should be JSON"))
+        .collect()
+}
+
+async fn ecdsa_signature(
+    server: &axum_test::TestServer,
+    api_key: &str,
+    chat_id: &str,
+) -> serde_json::Value {
+    let response = server
+        .get(format!("/v1/signature/{chat_id}?signing_algo=ecdsa").as_str())
+        .add_header("Authorization", format!("Bearer {api_key}"))
+        .await;
+    assert_eq!(
+        response.status_code(),
+        200,
+        "signature should be available: {}",
+        response.text()
+    );
+    response.json::<serde_json::Value>()
+}
+
+/// Issue #1015: OpenAI-compatible clients (e.g. the Vercel AI SDK) read the
+/// reasoning count only from `usage.completion_tokens_details.reasoning_tokens`
+/// on the final usage chunk. SGLang reports it top-level, so the final usage
+/// chunk carries it in both places. The gateway synthesizes that chunk, so its
+/// signature covers the exact bytes the client received.
+#[tokio::test]
+async fn test_streaming_final_usage_chunk_reports_reasoning_tokens() {
+    let (server, mock, model, api_key) = setup().await;
+
+    mock.when(RequestMatcher::Any)
+        .respond_with(ResponseTemplate::new("The answer is 42.").with_reasoning(REASONING))
+        .await;
+
+    let request_json = serde_json::to_string(&serde_json::json!({
+        "model": model,
+        "messages": [{"role": "user", "content": "What is the answer?"}],
+        "max_tokens": 50,
+        "stream": true,
+        "stream_options": {"include_usage": true},
+    }))
+    .expect("request should serialize");
+    let response = server
+        .post("/v1/chat/completions")
+        .add_header("Authorization", format!("Bearer {api_key}"))
+        .content_type("application/json")
+        .bytes(Bytes::from(request_json.clone()))
+        .await;
+    assert_eq!(response.status_code(), 200, "{}", response.text());
+    let body = response.text();
+
+    let usage_events: Vec<serde_json::Value> = sse_json_events(&body)
+        .into_iter()
+        .filter(|event| event["usage"].is_object())
+        .collect();
+    assert_eq!(
+        usage_events.len(),
+        1,
+        "expected exactly one usage chunk: {body}"
+    );
+    let final_chunk = &usage_events[0];
+    assert!(
+        final_chunk["choices"]
+            .as_array()
+            .is_some_and(|choices| choices.is_empty()),
+        "usage must arrive on the final choices:[] chunk: {final_chunk}"
+    );
+    let usage = &final_chunk["usage"];
+    let expected = reasoning_token_count();
+    assert_eq!(
+        usage["completion_tokens_details"]["reasoning_tokens"], expected,
+        "standard reasoning count missing from the final usage chunk: {usage}"
+    );
+    assert_eq!(
+        usage["reasoning_tokens"], expected,
+        "legacy top-level reasoning count should be kept: {usage}"
+    );
+    assert!(
+        usage["completion_tokens"]
+            .as_i64()
+            .is_some_and(|completion| completion >= expected),
+        "reasoning is a subset of completion_tokens: {usage}"
+    );
+
+    let chat_id = final_chunk["id"].as_str().expect("chunk should have an id");
+    let signature = ecdsa_signature(&server, &api_key, chat_id).await;
+    assert_eq!(signature["signature_kind"], "gateway");
+    assert_eq!(
+        signature["text"],
+        format!(
+            "{}:{}",
+            compute_sha256(&request_json),
+            compute_sha256(&body)
+        ),
+        "gateway signature must cover the exact rewritten stream"
+    );
+}
+
+/// Non-streaming self-hosted bodies are the model TEE's signed bytes. cloud-api
+/// returns them unchanged, so the usage keeps the engine's shape here and the
+/// provider signature still verifies against the body the client received.
+#[tokio::test]
+async fn test_non_streaming_self_hosted_usage_is_passed_through_unchanged() {
+    let (server, mock, model, api_key) = setup().await;
+
+    mock.when(RequestMatcher::Any)
+        .respond_with(ResponseTemplate::new("The answer is 42.").with_reasoning(REASONING))
+        .await;
+
+    let request_json = serde_json::to_string(&serde_json::json!({
+        "model": model,
+        "messages": [{"role": "user", "content": "What is the answer?"}],
+        "max_tokens": 50,
+        "stream": false,
+    }))
+    .expect("request should serialize");
+    let response = server
+        .post("/v1/chat/completions")
+        .add_header("Authorization", format!("Bearer {api_key}"))
+        .content_type("application/json")
+        .bytes(Bytes::from(request_json.clone()))
+        .await;
+    assert_eq!(response.status_code(), 200, "{}", response.text());
+    let body_text = response.text();
+    let body: serde_json::Value =
+        serde_json::from_str(&body_text).expect("completion should be JSON");
+
+    assert_eq!(body["usage"]["reasoning_tokens"], reasoning_token_count());
+    assert!(
+        body["usage"].get("completion_tokens_details").is_none(),
+        "the provider-signed body must not be rewritten: {body}"
+    );
+
+    let chat_id = body["id"].as_str().expect("completion should have an id");
+    // Non-streaming provider signatures are collected asynchronously.
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while !mock.unpinned_chat_ids().iter().any(|id| id == chat_id) {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("provider signature should be stored");
+    let signature = ecdsa_signature(&server, &api_key, chat_id).await;
+    assert_eq!(signature["signature_kind"], "provider_tee");
+    assert_eq!(
+        signature["text"],
+        format!(
+            "{}:{}",
+            compute_sha256(&request_json),
+            compute_sha256(&body_text)
+        ),
+        "the returned body must be the provider-signed bytes"
+    );
+}
+
+/// Auto-redact re-serializes the non-streaming body (the gateway signs it
+/// instead of the provider), so that body also gets the standard field.
+#[tokio::test]
+async fn test_auto_redact_non_streaming_reports_reasoning_tokens() {
+    let (server, mock, model, api_key) = setup().await;
+    setup_privacy_filter_model(&server).await;
+
+    mock.when(RequestMatcher::Any)
+        .respond_with(
+            ResponseTemplate::new("I'll email redacted1@example.com shortly.")
+                .with_reasoning(REASONING),
+        )
+        .await;
+
+    let request_json = serde_json::to_string(&serde_json::json!({
+        "model": model,
+        "messages": [{"role": "user", "content": "Please reach out to alice@example.com"}],
+        "stream": false,
+    }))
+    .expect("request should serialize");
+    let response = server
+        .post("/v1/chat/completions")
+        .add_header("Authorization", format!("Bearer {api_key}"))
+        .add_header("User-Agent", MOCK_USER_AGENT)
+        .add_header("x-auto-redact", "on")
+        .content_type("application/json")
+        .bytes(Bytes::from(request_json.clone()))
+        .await;
+    assert_eq!(response.status_code(), 200, "{}", response.text());
+    let body_text = response.text();
+    let body: serde_json::Value =
+        serde_json::from_str(&body_text).expect("completion should be JSON");
+    assert!(
+        body["choices"][0]["message"]["content"]
+            .as_str()
+            .is_some_and(|content| content.contains("alice@example.com")),
+        "auto-redact should have restored the original PII: {body}"
+    );
+
+    let expected = reasoning_token_count();
+    assert_eq!(
+        body["usage"]["completion_tokens_details"]["reasoning_tokens"],
+        expected
+    );
+    assert_eq!(body["usage"]["reasoning_tokens"], expected);
+
+    let chat_id = body["id"].as_str().expect("completion should have an id");
+    let signature = ecdsa_signature(&server, &api_key, chat_id).await;
+    assert_eq!(signature["signature_kind"], "gateway");
+    assert_eq!(
+        signature["text"],
+        format!(
+            "{}:{}",
+            compute_sha256(&request_json),
+            compute_sha256(&body_text)
+        )
     );
 }

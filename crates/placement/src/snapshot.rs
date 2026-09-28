@@ -126,9 +126,25 @@ fn map_frame_error(e: FrameError) -> Reject {
 /// reported one (`engine_sampled_at_ms` is `None` until a replica has been
 /// read once). It never moves backwards: a frame with a `None` engine time
 /// is accepted without an engine-time check and never lowers what's stored.
+///
+/// Boots a replica has moved on from are remembered (up to
+/// `RETIRED_BOOTS`), so a replayed frame from an earlier boot is rejected even
+/// when its engine time does not regress (e.g. right after a reboot whose
+/// first frame had no engine time yet).
 #[derive(Default)]
 pub struct Ingest {
-    last: HashMap<(String, String), (String, u64, Option<u64>)>,
+    last: HashMap<(String, String), ReplicaState>,
+}
+
+/// How many superseded boot ids are remembered per replica.
+const RETIRED_BOOTS: usize = 8;
+
+#[derive(Clone, Default)]
+struct ReplicaState {
+    boot: String,
+    seq: u64,
+    engine_ms: Option<u64>,
+    retired: Vec<String>,
 }
 
 impl Ingest {
@@ -195,10 +211,15 @@ impl Ingest {
         let key = (redis_host.to_string(), redis_replica.to_string());
         let prev = self.last.get(&key).cloned();
 
-        if let Some((last_boot, last_seq, last_engine_ms)) = &prev {
+        if let Some(state) = &prev {
             // `seq` only resets on a boot change; within the same boot it
             // must strictly increase.
-            if report.boot_id == *last_boot && report.seq <= *last_seq {
+            if report.boot_id == state.boot && report.seq <= state.seq {
+                return Err(Reject::Regressed);
+            }
+            // A boot this replica already moved on from never comes back: a
+            // frame from it is a replay.
+            if state.retired.contains(&report.boot_id) {
                 return Err(Reject::Regressed);
             }
             // Engine time must never regress, in either boot case — but only
@@ -208,9 +229,9 @@ impl Ingest {
             // `None`-time replicas from routing anyway, so it's safe to
             // admit them here rather than reject them as regressed.
             if let (Some(engine_ms), Some(last_engine_ms)) =
-                (report.engine_sampled_at_ms, last_engine_ms)
+                (report.engine_sampled_at_ms, state.engine_ms)
             {
-                if engine_ms < *last_engine_ms {
+                if engine_ms < last_engine_ms {
                     return Err(Reject::Regressed);
                 }
             }
@@ -221,15 +242,32 @@ impl Ingest {
         // when this frame's is `None`.
         let stored_engine_ms = match (
             report.engine_sampled_at_ms,
-            prev.as_ref().and_then(|(_, _, e)| *e),
+            prev.as_ref().and_then(|s| s.engine_ms),
         ) {
             (Some(new), Some(old)) => Some(new.max(old)),
             (Some(new), None) => Some(new),
             (None, old) => old,
         };
 
-        self.last
-            .insert(key, (report.boot_id.clone(), report.seq, stored_engine_ms));
+        let mut retired = prev.as_ref().map(|s| s.retired.clone()).unwrap_or_default();
+        if let Some(state) = &prev {
+            if state.boot != report.boot_id {
+                retired.push(state.boot.clone());
+                if retired.len() > RETIRED_BOOTS {
+                    retired.remove(0);
+                }
+            }
+        }
+
+        self.last.insert(
+            key,
+            ReplicaState {
+                boot: report.boot_id.clone(),
+                seq: report.seq,
+                engine_ms: stored_engine_ms,
+                retired,
+            },
+        );
 
         Ok(ReplicaView {
             host_id: redis_host.to_string(),
@@ -423,6 +461,36 @@ mod tests {
         let env = seal(&third, &signing_key());
         assert_eq!(
             ingest.accept(HOST, REPLICA, &env, &reg, T_NOW).unwrap_err(),
+            Reject::Regressed
+        );
+    }
+
+    #[test]
+    fn replayed_frame_from_a_previous_boot_is_rejected() {
+        // Boot A runs, the replica reboots into B (first frame has no engine
+        // time yet), then A's last frame is replayed with an engine time that
+        // does not regress against the remembered max.
+        let mut ingest = Ingest::new();
+        let reg = registry();
+
+        let mut boot_a = report();
+        boot_a.boot_id = "boot-a".into();
+        boot_a.seq = 5;
+        boot_a.engine_sampled_at_ms = Some(5_000);
+        let env_a = seal(&boot_a, &signing_key());
+        ingest.accept(HOST, REPLICA, &env_a, &reg, T_NOW).unwrap();
+
+        let mut boot_b = report();
+        boot_b.boot_id = "boot-b".into();
+        boot_b.seq = 1;
+        boot_b.engine_sampled_at_ms = None;
+        let env_b = seal(&boot_b, &signing_key());
+        ingest.accept(HOST, REPLICA, &env_b, &reg, T_NOW).unwrap();
+
+        assert_eq!(
+            ingest
+                .accept(HOST, REPLICA, &env_a, &reg, T_NOW)
+                .unwrap_err(),
             Reject::Regressed
         );
     }

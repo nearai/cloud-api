@@ -1008,6 +1008,11 @@ impl PoolBackendVerifier {
             // Exposes the peer certificate on each response; the slow path
             // compares it with the attested fingerprint.
             .tls_info(true)
+            // Never follow redirects. A followed redirect would make the
+            // attestation response (and its certificate) come from another
+            // connection than the one to `base_url` that stays in the pool.
+            // Backends do not redirect these requests.
+            .redirect(reqwest::redirect::Policy::none())
             .pool_max_idle_per_host(1)
             .http2_adaptive_window(true)
             .connect_timeout(Duration::from_secs(5))
@@ -1934,6 +1939,8 @@ impl InferenceProviderPool {
                     let client = match reqwest::Client::builder()
                         .use_preconfigured_tls(rustls_config)
                         .tls_info(true)
+                        // The observed certificate must be the probed host's.
+                        .redirect(reqwest::redirect::Policy::none())
                         .connect_timeout(Duration::from_secs(5))
                         .read_timeout(PER_CALL_TIMEOUT)
                         .build()

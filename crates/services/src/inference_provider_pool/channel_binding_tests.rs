@@ -131,11 +131,17 @@ struct Backend {
 async fn handle(
     name: &'static str,
     report: Arc<String>,
+    redirect_to: Option<Arc<String>>,
     counters: Counters,
     req: Request<Incoming>,
 ) -> Result<Response<Full<Bytes>>, std::convert::Infallible> {
     let method = req.method().clone();
     let path = req.uri().path().to_string();
+    let path_and_query = req
+        .uri()
+        .path_and_query()
+        .map(|pq| pq.as_str().to_string())
+        .unwrap_or_default();
     let has_auth = req.headers().contains_key(hyper::header::AUTHORIZATION);
     let _ = req.into_body().collect().await;
     let (status, body) = match (method, path.as_str()) {
@@ -145,6 +151,13 @@ async fn handle(
                 counters
                     .attestation_requests_with_auth
                     .fetch_add(1, Ordering::SeqCst);
+            }
+            if let Some(target) = redirect_to {
+                return Ok(Response::builder()
+                    .status(StatusCode::TEMPORARY_REDIRECT)
+                    .header("location", format!("{target}{path_and_query}"))
+                    .body(Full::new(Bytes::new()))
+                    .unwrap());
             }
             (StatusCode::OK, report.as_str().to_string())
         }
@@ -175,6 +188,18 @@ async fn start_backend(
     leaf: &Leaf,
     transport: Transport,
     attested_fingerprint: &str,
+) -> Backend {
+    start_backend_with(name, leaf, transport, attested_fingerprint, None).await
+}
+
+/// Like [`start_backend`]; with `redirect_to`, the attestation request is
+/// answered with a 307 to the same path and query under `redirect_to`.
+async fn start_backend_with(
+    name: &'static str,
+    leaf: &Leaf,
+    transport: Transport,
+    attested_fingerprint: &str,
+    redirect_to: Option<String>,
 ) -> Backend {
     let acceptor = match transport {
         Transport::PlainHttp1 => None,
@@ -211,16 +236,25 @@ async fn start_backend(
         .to_string(),
     );
 
+    let redirect_to = redirect_to.map(Arc::new);
     let server_counters = counters.clone();
     tokio::spawn(async move {
         while let Ok((tcp, _)) = listener.accept().await {
             let acceptor = acceptor.clone();
             let counters = server_counters.clone();
             let report = report.clone();
+            let redirect_to = redirect_to.clone();
             tokio::spawn(async move {
                 let connections = counters.connections.clone();
-                let service =
-                    service_fn(move |req| handle(name, report.clone(), counters.clone(), req));
+                let service = service_fn(move |req| {
+                    handle(
+                        name,
+                        report.clone(),
+                        redirect_to.clone(),
+                        counters.clone(),
+                        req,
+                    )
+                });
                 let Some(acceptor) = acceptor else {
                     connections.fetch_add(1, Ordering::SeqCst);
                     let _ = hyper::server::conn::http1::Builder::new()
@@ -401,6 +435,44 @@ async fn attested_backend_is_pinned_and_keeps_its_connection_h2() {
 #[tokio::test]
 async fn attested_backend_is_pinned_and_keeps_its_connection_http1() {
     assert_genuine_accepted(Transport::TlsHttp1).await;
+}
+
+/// A backend that answers the attestation request with a redirect to the
+/// attested backend is refused. Following the redirect would take the report
+/// and its certificate from the redirect target's connection, while the
+/// connection to the redirecting backend stayed in the client's pool.
+#[tokio::test]
+async fn attestation_redirect_is_not_followed() {
+    let pki = pki();
+    let genuine = start_backend(
+        "genuine",
+        &pki.genuine,
+        Transport::TlsH2,
+        &pki.genuine.fingerprint,
+    )
+    .await;
+    let relay = start_backend_with(
+        "relay",
+        &pki.relay,
+        Transport::TlsH2,
+        &pki.genuine.fingerprint,
+        Some(genuine.base_url.clone()),
+    )
+    .await;
+    let state = Arc::new(std::sync::RwLock::new(FingerprintState::Bootstrap));
+    let metrics = Arc::new(CapturingMetricsService::new());
+    let verifier = pool_verifier(&pki, state.clone(), metrics.clone());
+
+    let err = verifier
+        .create_verified_client(&relay.base_url)
+        .await
+        .expect_err("a redirected attestation fetch must be refused");
+    assert!(err.contains("307"), "{err}");
+    assert_eq!(count(&relay.counters.attestation_requests), 1);
+    assert_eq!(count(&genuine.counters.attestation_requests), 0);
+    assert_eq!(count(&genuine.counters.connections), 0);
+    assert_eq!(pinned_set(&state), None);
+    assert!(channel_binding_results(&metrics).is_empty());
 }
 
 /// Reports may encode the fingerprint with a `0x` prefix or in upper case. The

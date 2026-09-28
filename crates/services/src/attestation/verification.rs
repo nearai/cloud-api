@@ -451,7 +451,18 @@ impl AttestationVerifier {
                     compose_hash = Some(event.event_payload.clone());
                 }
                 placement::consts::KEY_EVENT => {
-                    if let Some(key) = parse_replica_report_key(&event.event_payload) {
+                    // Only a runtime event's name and payload are bound into
+                    // RTMR3 by the replay above (the digest-validation branch
+                    // keyed on `DSTACK_RUNTIME_EVENT_TYPE`); a non-runtime
+                    // event's stored digest is chained as-is, with no check
+                    // that it actually corresponds to this name/payload. So
+                    // without this gate, an attacker could keep a genuine
+                    // non-runtime event's digest, relabel it as `KEY_EVENT`,
+                    // and supply an arbitrary key that would still pass
+                    // replay and self-validate via `key_id == hash(pk)`.
+                    if event.event_type != DSTACK_RUNTIME_EVENT_TYPE {
+                        tracing::debug!("replica report key event: not a runtime event");
+                    } else if let Some(key) = parse_replica_report_key(&event.event_payload) {
                         replica_report_key = Some(key);
                     }
                 }
@@ -1060,6 +1071,20 @@ mod tests {
         hex::encode(serde_json::to_vec(&value).unwrap())
     }
 
+    /// Compute the digest production uses for a runtime event:
+    /// `SHA384(event_type_le || ":" || event_name || ":" || payload_bytes)`.
+    fn compute_runtime_digest(event_type: u32, name: &str, payload_hex: &str) -> [u8; 48] {
+        use sha2::Sha384;
+        let payload_bytes = hex::decode(payload_hex).unwrap();
+        let mut hasher = Sha384::new();
+        sha2::Digest::update(&mut hasher, event_type.to_ne_bytes());
+        sha2::Digest::update(&mut hasher, b":");
+        sha2::Digest::update(&mut hasher, name.as_bytes());
+        sha2::Digest::update(&mut hasher, b":");
+        sha2::Digest::update(&mut hasher, &payload_bytes);
+        sha2::Digest::finalize(hasher).into()
+    }
+
     /// Build a runtime (dstack) event: digest omitted (empty), so the
     /// production code's optional stored-digest check is skipped and only
     /// the computed digest is chained into RTMR3, matching how the other
@@ -1074,8 +1099,38 @@ mod tests {
         }
     }
 
-    /// Replay RTMR3 exactly as `verify_rtmr3_and_extract` does, to produce a
-    /// `quoted_rtmr3` that a set of imr==3 runtime events will verify against.
+    /// Like [`runtime_event`], but with `digest` set to the correctly
+    /// computed value, so production's optional stored-digest-matches-payload
+    /// check actually runs (rather than being skipped on an empty digest).
+    fn runtime_event_with_digest(name: &str, payload_hex: &str) -> EventLogEntry {
+        let digest = compute_runtime_digest(DSTACK_RUNTIME_EVENT_TYPE, name, payload_hex);
+        EventLogEntry {
+            digest: hex::encode(digest),
+            event_type: DSTACK_RUNTIME_EVENT_TYPE,
+            event: name.to_string(),
+            event_payload: payload_hex.to_string(),
+            imr: 3,
+        }
+    }
+
+    /// Build a non-runtime imr==3 event (`event_type != DSTACK_RUNTIME_EVENT_TYPE`)
+    /// whose digest is chained into RTMR3 as-is, with no binding to
+    /// `event`/`event_payload` — the shape a malicious log author could reuse
+    /// (keeping a genuine digest) while relabeling name/payload.
+    fn non_runtime_event(name: &str, payload_hex: &str, digest_hex: &str) -> EventLogEntry {
+        EventLogEntry {
+            digest: digest_hex.to_string(),
+            event_type: 0,
+            event: name.to_string(),
+            event_payload: payload_hex.to_string(),
+            imr: 3,
+        }
+    }
+
+    /// Replay RTMR3 exactly as `verify_rtmr3_and_extract` does (both the
+    /// runtime-event computed-digest branch and the non-runtime
+    /// stored-digest-as-is branch), to produce a `quoted_rtmr3` that a set of
+    /// imr==3 events will verify against.
     fn replay_rtmr3(events: &[EventLogEntry]) -> [u8; 48] {
         use sha2::Sha384;
         let mut rtmr3 = [0u8; 48];
@@ -1083,18 +1138,16 @@ mod tests {
             if event.imr != 3 {
                 continue;
             }
-            let payload_bytes = hex::decode(&event.event_payload).unwrap();
-            let mut hasher = Sha384::new();
-            sha2::Digest::update(&mut hasher, DSTACK_RUNTIME_EVENT_TYPE.to_ne_bytes());
-            sha2::Digest::update(&mut hasher, b":");
-            sha2::Digest::update(&mut hasher, event.event.as_bytes());
-            sha2::Digest::update(&mut hasher, b":");
-            sha2::Digest::update(&mut hasher, &payload_bytes);
-            let digest: [u8; 48] = sha2::Digest::finalize(hasher).into();
+            let digest_bytes: Vec<u8> = if event.event_type == DSTACK_RUNTIME_EVENT_TYPE {
+                compute_runtime_digest(event.event_type, &event.event, &event.event_payload)
+                    .to_vec()
+            } else {
+                hex::decode(&event.digest).unwrap()
+            };
 
             let mut hasher = Sha384::new();
             sha2::Digest::update(&mut hasher, rtmr3);
-            sha2::Digest::update(&mut hasher, digest);
+            sha2::Digest::update(&mut hasher, digest_bytes);
             rtmr3.copy_from_slice(&sha2::Digest::finalize(hasher));
         }
         rtmr3
@@ -1132,8 +1185,10 @@ mod tests {
         let events = vec![
             runtime_event("os-image-hash", &hex::encode(b"image-hash-value")),
             runtime_event("compose-hash", &hex::encode(b"compose-hash-value")),
-            runtime_event(placement::consts::KEY_EVENT, &hex_payload(&stale)),
-            runtime_event(placement::consts::KEY_EVENT, &hex_payload(&current)),
+            // Digest set to the computed value, so the stored-digest-matches
+            // check runs alongside the key event, not just the computed one.
+            runtime_event_with_digest(placement::consts::KEY_EVENT, &hex_payload(&stale)),
+            runtime_event_with_digest(placement::consts::KEY_EVENT, &hex_payload(&current)),
         ];
         let rtmr3 = replay_rtmr3(&events);
         let report = event_log_report(&events);
@@ -1142,6 +1197,51 @@ mod tests {
             .verify_rtmr3_and_extract(&report, &rtmr3)
             .unwrap();
         assert_eq!(result.replica_report_key, Some(current));
+    }
+
+    #[test]
+    fn non_runtime_key_event_is_ignored() {
+        // Only a runtime event's name/payload are bound by the replay; a
+        // non-runtime event's stored digest is chained as-is. An attacker
+        // who keeps a genuine non-runtime event's digest but relabels its
+        // name/payload as a KEY_EVENT must NOT have that key accepted.
+        let vk = test_signing_key(7).verifying_key();
+        let key = replica_report_key_payload(&vk, "boot-1");
+        let payload_hex = hex_payload(&key);
+        // An arbitrary stored digest — as would appear for a genuine
+        // non-runtime event this attacker payload is riding along with.
+        let digest_hex = hex::encode(b"some-genuine-non-runtime-digest");
+        let events = vec![non_runtime_event(
+            placement::consts::KEY_EVENT,
+            &payload_hex,
+            &digest_hex,
+        )];
+        let rtmr3 = replay_rtmr3(&events);
+        let report = event_log_report(&events);
+
+        let result = verifier()
+            .verify_rtmr3_and_extract(&report, &rtmr3)
+            .unwrap();
+        assert_eq!(result.replica_report_key, None);
+    }
+
+    #[test]
+    fn key_event_outside_rtmr3_is_ignored() {
+        let vk = test_signing_key(7).verifying_key();
+        let key = replica_report_key_payload(&vk, "boot-1");
+        let mut imr2_key_event = runtime_event(placement::consts::KEY_EVENT, &hex_payload(&key));
+        imr2_key_event.imr = 2;
+        // At least one imr==3 event is required for replay to succeed.
+        let os_event = runtime_event("os-image-hash", &hex::encode(b"image-hash-value"));
+
+        let events = vec![imr2_key_event, os_event];
+        let rtmr3 = replay_rtmr3(&events);
+        let report = event_log_report(&events);
+
+        let result = verifier()
+            .verify_rtmr3_and_extract(&report, &rtmr3)
+            .unwrap();
+        assert_eq!(result.replica_report_key, None);
     }
 
     #[test]

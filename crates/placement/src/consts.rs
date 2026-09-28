@@ -14,6 +14,15 @@ pub const SUPPORTED_SCHEMA: u8 = 1;
 /// relative to now: 3x a 1s publish interval.
 pub const FRESH_MAX_MS: u64 = 3_000;
 
+/// How far into the future a replica's `engine_sampled_at_ms` may be, relative
+/// to this node's clock, before the frame is treated as clock skew. Such a
+/// frame is rejected at ingest and never counts as fresh, so one bad clock step
+/// on a GPU host cannot freeze that replica's view while it looks current.
+pub const MAX_FUTURE_SKEW_MS: u64 = 2_000;
+
+/// Prompts estimated above this many tokens need a long-context host.
+pub const LONG_CONTEXT_TOKENS: u64 = 100_000;
+
 /// KV cache usage at or above this fraction excludes a replica from routing.
 pub const KV_MAX: f64 = 0.95;
 

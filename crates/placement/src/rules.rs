@@ -5,7 +5,7 @@
 //! the replica is eligible. Callers use this to filter a snapshot down to
 //! the replicas a placement decision may pick from.
 
-use crate::consts::{FRESH_MAX_MS, KV_MAX};
+use crate::consts::{FRESH_MAX_MS, KV_MAX, LONG_CONTEXT_TOKENS, MAX_FUTURE_SKEW_MS};
 use crate::decision::PlaceInput;
 use crate::frame::Lifecycle;
 use crate::snapshot::ReplicaView;
@@ -65,10 +65,17 @@ impl Rule {
                 }
             }
             Rule::Freshness => match r.report.engine_sampled_at_ms {
-                // A future `t` counts as fresh: `saturating_sub` is 0.
-                Some(t) if now_ms.saturating_sub(t) <= FRESH_MAX_MS => Ok(()),
-                // `None`, or too old: a wedged engine keeps reporting an old
-                // `t` forever, so a missing sample time is stale too (E9).
+                // Fresh: no older than FRESH_MAX_MS and no further in the future
+                // than MAX_FUTURE_SKEW_MS (a skewed clock must not look current).
+                Some(t)
+                    if t <= now_ms.saturating_add(MAX_FUTURE_SKEW_MS)
+                        && now_ms.saturating_sub(t) <= FRESH_MAX_MS =>
+                {
+                    Ok(())
+                }
+                // `None`, too old, or too far in the future: a wedged engine
+                // keeps reporting an old `t` forever, so a missing sample time
+                // is stale too (E9).
                 _ => Err(Exclusion(self)),
             },
             Rule::Capacity => {
@@ -96,7 +103,7 @@ impl Rule {
                 Ok(())
             }
             Rule::Context => {
-                if input.prompt_tokens_est > 100_000
+                if input.prompt_tokens_est > LONG_CONTEXT_TOKENS
                     && !input.long_context_hosts.iter().any(|h| h == &r.host_id)
                 {
                     return Err(Exclusion(self));
@@ -143,6 +150,18 @@ mod tests {
             first_exclusion(&v, &input(), NOW),
             Some(Exclusion(Rule::Lifecycle))
         );
+    }
+
+    #[test]
+    fn far_future_sample_is_not_fresh() {
+        let mut v = view_ready();
+        v.report.engine_sampled_at_ms = Some(NOW + MAX_FUTURE_SKEW_MS + 1);
+        assert_eq!(
+            first_exclusion(&v, &input(), NOW),
+            Some(Exclusion(Rule::Freshness))
+        );
+        v.report.engine_sampled_at_ms = Some(NOW + MAX_FUTURE_SKEW_MS);
+        assert_eq!(first_exclusion(&v, &input(), NOW), None);
     }
 
     #[test]

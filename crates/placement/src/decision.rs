@@ -350,7 +350,7 @@ impl Placer {
             host: Some(selected.host.clone()),
             home: selected.home.clone(),
             pinned: pin_lookup.map(|(h, _)| h),
-            eligible: eligible_by_host.len() as u16,
+            eligible: u16::try_from(eligible_by_host.len()).unwrap_or(u16::MAX),
             excluded,
             chosen_score,
             home_score,

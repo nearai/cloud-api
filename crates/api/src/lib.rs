@@ -485,12 +485,12 @@ pub async fn init_domain_services_with_pool(
     // Create S3 storage and FileService for temporary authenticated read views
     // and retained per-file delete operations.
     let s3_storage: Arc<dyn services::files::storage::StorageTrait> = if config.s3.mock {
-        tracing::info!("Using mock S3 storage for temporary file views");
+        tracing::info!("Using mock S3 storage for temporary file views and deletes");
         Arc::new(services::files::storage::MockStorage::new(
             config.s3.encryption_key.clone(),
         ))
     } else {
-        tracing::info!("Using real S3 storage for temporary file views");
+        tracing::info!("Using real S3 storage for temporary file views and deletes");
         let s3_config = aws_config::load_from_env().await;
         let s3_client = aws_sdk_s3::Client::new(&s3_config);
 

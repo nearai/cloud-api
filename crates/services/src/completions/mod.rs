@@ -1,3 +1,4 @@
+pub mod affinity;
 pub mod ports;
 
 use crate::attestation::ports::AttestationServiceTrait;
@@ -772,6 +773,12 @@ pub struct CompletionServiceImpl {
     org_concurrent_limits: Cache<Uuid, u32>,
     /// Repository for fetching organization concurrent limits
     organization_limit_repository: Arc<dyn ports::OrganizationConcurrentLimitRepository>,
+    /// HMAC secret for deriving per-request placement affinity keys (see
+    /// `affinity::derive`). `None` until wired up (HKDF from the Valkey
+    /// password), in which case affinity derivation is skipped entirely and
+    /// `params.extra` is left unchanged — behavior is byte-identical to
+    /// before this field existed. Never logged.
+    affinity_secret: Option<[u8; 32]>,
 }
 
 /// TTL for organization concurrent limit cache (5 minutes)
@@ -890,7 +897,16 @@ impl CompletionServiceImpl {
             concurrent_limit: DEFAULT_CONCURRENT_LIMIT,
             org_concurrent_limits,
             organization_limit_repository,
+            affinity_secret: None,
         }
+    }
+
+    /// Set the placement-affinity HMAC secret (HKDF from the Valkey
+    /// password). Until this is called, affinity derivation is skipped and
+    /// `params.extra` carries no affinity keys. Never logged.
+    pub fn with_affinity_secret(mut self, secret: [u8; 32]) -> Self {
+        self.affinity_secret = Some(secret);
+        self
     }
 
     /// Extract tools and tool_choice from the extra HashMap if present and
@@ -1088,6 +1104,89 @@ impl CompletionServiceImpl {
             }
         }
         Ok(())
+    }
+
+    /// Derive the per-request placement affinity key (if any) and record it
+    /// in `chat_params.extra` for a later placement-routing task to read.
+    /// No-op while `affinity_secret` is `None` (unset until Task 12 wires
+    /// it up), so `extra` — and therefore behavior — is unchanged until
+    /// then. Never logs the key, its hex encoding, or its inputs.
+    fn apply_placement_affinity(
+        chat_params: &mut inference_providers::ChatCompletionParams,
+        organization_id: Uuid,
+        session_hint: Option<&str>,
+        affinity_secret: Option<[u8; 32]>,
+    ) {
+        // The request body is flattened into `extra` (see `ChatCompletionParams`),
+        // so a client can set `x_placement_affinity`/`x_placement_affinity_source`
+        // directly and forge routing. Strip any client-supplied value
+        // unconditionally, before checking the secret, the covered-model gate,
+        // or deriving anything, so a forged key can never survive even when
+        // derivation is skipped below — for every model, not just covered ones.
+        chat_params.extra.remove(affinity::AFFINITY_EXTRA_KEY);
+        chat_params
+            .extra
+            .remove(affinity::AFFINITY_SOURCE_EXTRA_KEY);
+
+        let Some(secret) = affinity_secret else {
+            return;
+        };
+        // The HMAC derivation below only matters for models smart placement
+        // actually covers; skip the per-request crypto work for every other
+        // model (`chat_params.model` is already the canonical name here).
+        if !placement::consts::COVERED_MODELS.contains(&chat_params.model.as_str()) {
+            return;
+        }
+        let is_e2ee = Self::extra_is_e2ee(&chat_params.extra);
+        let Some((key, source)) = affinity::derive(
+            &organization_id.to_string(),
+            &chat_params.model,
+            session_hint,
+            &chat_params.extra,
+            &chat_params.messages,
+            is_e2ee,
+            &secret,
+        ) else {
+            return;
+        };
+        chat_params.extra.insert(
+            affinity::AFFINITY_EXTRA_KEY.to_string(),
+            serde_json::Value::String(key.to_hex()),
+        );
+        chat_params.extra.insert(
+            affinity::AFFINITY_SOURCE_EXTRA_KEY.to_string(),
+            serde_json::Value::String(
+                match source {
+                    placement::decision::AffinitySource::Client => "client",
+                    placement::decision::AffinitySource::Prefix => "prefix",
+                    placement::decision::AffinitySource::None => "none",
+                }
+                .to_string(),
+            ),
+        );
+    }
+
+    /// Whether `extra` carries any client-facing E2EE marker: the model
+    /// pub-key routing pin, or any of the four encryption headers. Mirrors
+    /// the route's `e2ee_requested` (`crates/api/src/routes/completions.rs`,
+    /// near line 126), which checks the same four encryption headers off
+    /// the validated `EncryptionHeaders` struct before they're written into
+    /// `extra`; this checks `extra` directly (plus `MODEL_PUB_KEY`, which
+    /// `e2ee_requested` doesn't cover but `reject_e2ee_if_unsupported`
+    /// above does) since that's what's available here. Any one of them
+    /// present means the plaintext-derived prefix affinity source must not
+    /// be used.
+    fn extra_is_e2ee(extra: &std::collections::HashMap<String, serde_json::Value>) -> bool {
+        use crate::common::encryption_headers as eh;
+        [
+            eh::MODEL_PUB_KEY,
+            eh::SIGNING_ALGO,
+            eh::CLIENT_PUB_KEY,
+            eh::ENCRYPTION_VERSION,
+            eh::ENCRYPT_ALL_FIELDS,
+        ]
+        .iter()
+        .any(|key| extra.get(*key).and_then(|v| v.as_str()).is_some())
     }
 
     /// Reject `n > 1` requests for models that don't support multiple completions
@@ -1775,6 +1874,13 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
 
         Self::reject_n_gt_1_if_unsupported(model.attestation_supported, request.n, canonical_name)?;
 
+        Self::apply_placement_affinity(
+            &mut chat_params,
+            organization_id,
+            request.session_hint.as_deref(),
+            self.affinity_secret,
+        );
+
         let provider_start_time = Instant::now();
 
         // Compute routing hints from the request messages for adaptive load balancing.
@@ -1973,6 +2079,13 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
         )?;
 
         Self::reject_n_gt_1_if_unsupported(model.attestation_supported, request.n, canonical_name)?;
+
+        Self::apply_placement_affinity(
+            &mut chat_params,
+            organization_id,
+            request.session_hint.as_deref(),
+            self.affinity_secret,
+        );
 
         let provider_start_time = Instant::now();
         // Read before `chat_params` moves into the call below.
@@ -4300,5 +4413,216 @@ mod tests {
             result.is_ok(),
             "n=5 on self-hosted model must be allowed, self-hosted supports n>1"
         );
+    }
+
+    /// A covered model by default: most `apply_placement_affinity` tests
+    /// exercise derivation, which now only runs for
+    /// `placement::consts::COVERED_MODELS`.
+    fn minimal_chat_params() -> inference_providers::ChatCompletionParams {
+        serde_json::from_value(serde_json::json!({
+            "model": placement::consts::COVERED_MODELS[0],
+            "messages": [
+                {"role": "system", "content": "you are helpful"},
+                {"role": "user", "content": "hello"},
+            ],
+        }))
+        .unwrap()
+    }
+
+    const APPLY_AFFINITY_SECRET: [u8; 32] = [9u8; 32];
+
+    #[test]
+    fn apply_placement_affinity_forged_client_keys_are_removed_when_secret_is_none() {
+        let mut params = minimal_chat_params();
+        params.extra.insert(
+            affinity::AFFINITY_EXTRA_KEY.to_string(),
+            serde_json::json!("00112233445566778899aabbccddeeff"),
+        );
+        params.extra.insert(
+            affinity::AFFINITY_SOURCE_EXTRA_KEY.to_string(),
+            serde_json::json!("client"),
+        );
+
+        CompletionServiceImpl::apply_placement_affinity(&mut params, Uuid::new_v4(), None, None);
+
+        assert!(
+            !params.extra.contains_key(affinity::AFFINITY_EXTRA_KEY),
+            "a client-forged affinity key must be stripped even when derivation is skipped"
+        );
+        assert!(!params
+            .extra
+            .contains_key(affinity::AFFINITY_SOURCE_EXTRA_KEY));
+    }
+
+    #[test]
+    fn apply_placement_affinity_forged_client_keys_are_replaced_when_secret_is_some() {
+        let mut params = minimal_chat_params();
+        params.extra.insert(
+            affinity::AFFINITY_EXTRA_KEY.to_string(),
+            serde_json::json!("ffffffffffffffffffffffffffffffff"),
+        );
+        params.extra.insert(
+            affinity::AFFINITY_SOURCE_EXTRA_KEY.to_string(),
+            serde_json::json!("client"),
+        );
+
+        CompletionServiceImpl::apply_placement_affinity(
+            &mut params,
+            Uuid::new_v4(),
+            None,
+            Some(APPLY_AFFINITY_SECRET),
+        );
+
+        let derived = params
+            .extra
+            .get(affinity::AFFINITY_EXTRA_KEY)
+            .and_then(|v| v.as_str())
+            .expect("a real value must be derived from the message prefix");
+        assert_ne!(
+            derived, "ffffffffffffffffffffffffffffffff",
+            "the forged value must not survive — it must be overwritten by a derived one"
+        );
+    }
+
+    #[test]
+    fn apply_placement_affinity_none_secret_leaves_extra_otherwise_unchanged() {
+        let mut params = minimal_chat_params();
+        params
+            .extra
+            .insert("some_other_field".to_string(), serde_json::json!("kept"));
+
+        CompletionServiceImpl::apply_placement_affinity(&mut params, Uuid::new_v4(), None, None);
+
+        assert_eq!(
+            params.extra.get("some_other_field"),
+            Some(&serde_json::json!("kept"))
+        );
+        assert!(!params.extra.contains_key(affinity::AFFINITY_EXTRA_KEY));
+        assert!(!params
+            .extra
+            .contains_key(affinity::AFFINITY_SOURCE_EXTRA_KEY));
+    }
+
+    #[test]
+    fn apply_placement_affinity_some_secret_inserts_both_keys() {
+        let mut params = minimal_chat_params();
+
+        CompletionServiceImpl::apply_placement_affinity(
+            &mut params,
+            Uuid::new_v4(),
+            None,
+            Some(APPLY_AFFINITY_SECRET),
+        );
+
+        assert!(params.extra.contains_key(affinity::AFFINITY_EXTRA_KEY));
+        assert_eq!(
+            params.extra.get(affinity::AFFINITY_SOURCE_EXTRA_KEY),
+            Some(&serde_json::json!("prefix"))
+        );
+    }
+
+    #[test]
+    fn apply_placement_affinity_uncovered_model_gets_no_key_but_strips_forged() {
+        // "m" is not in `placement::consts::COVERED_MODELS`: derivation must
+        // be skipped (no HMAC work for models smart placement doesn't route),
+        // but a client-forged key must still be stripped for every model.
+        let mut params: inference_providers::ChatCompletionParams =
+            serde_json::from_value(serde_json::json!({
+                "model": "m",
+                "messages": [
+                    {"role": "system", "content": "you are helpful"},
+                    {"role": "user", "content": "hello"},
+                ],
+            }))
+            .unwrap();
+        params.extra.insert(
+            affinity::AFFINITY_EXTRA_KEY.to_string(),
+            serde_json::json!("ffffffffffffffffffffffffffffffff"),
+        );
+        params.extra.insert(
+            affinity::AFFINITY_SOURCE_EXTRA_KEY.to_string(),
+            serde_json::json!("client"),
+        );
+
+        CompletionServiceImpl::apply_placement_affinity(
+            &mut params,
+            Uuid::new_v4(),
+            None,
+            Some(APPLY_AFFINITY_SECRET),
+        );
+
+        assert!(
+            !params.extra.contains_key(affinity::AFFINITY_EXTRA_KEY),
+            "an uncovered model must get no derived key, and the forged one must be gone"
+        );
+        assert!(!params
+            .extra
+            .contains_key(affinity::AFFINITY_SOURCE_EXTRA_KEY));
+    }
+
+    #[test]
+    fn apply_placement_affinity_e2ee_suppresses_prefix_affinity() {
+        let mut params = minimal_chat_params();
+        params.extra.insert(
+            crate::common::encryption_headers::MODEL_PUB_KEY.to_string(),
+            serde_json::json!("some-model-pub-key"),
+        );
+
+        CompletionServiceImpl::apply_placement_affinity(
+            &mut params,
+            Uuid::new_v4(),
+            None,
+            Some(APPLY_AFFINITY_SECRET),
+        );
+
+        assert!(
+            !params.extra.contains_key(affinity::AFFINITY_EXTRA_KEY),
+            "no session/cache hint and E2EE active must yield no affinity at all"
+        );
+    }
+
+    #[test]
+    fn apply_placement_affinity_client_pub_key_alone_gives_no_prefix_affinity() {
+        // client_pub_key is one of the four encryption headers e2ee_requested
+        // (routes/completions.rs) checks, distinct from model_pub_key. It must
+        // independently suppress the prefix source here too.
+        let mut params = minimal_chat_params();
+        params.extra.insert(
+            crate::common::encryption_headers::CLIENT_PUB_KEY.to_string(),
+            serde_json::json!("some-client-pub-key"),
+        );
+
+        CompletionServiceImpl::apply_placement_affinity(
+            &mut params,
+            Uuid::new_v4(),
+            None,
+            Some(APPLY_AFFINITY_SECRET),
+        );
+
+        assert!(
+            !params.extra.contains_key(affinity::AFFINITY_EXTRA_KEY),
+            "client_pub_key alone must be treated as E2EE, suppressing the prefix source"
+        );
+    }
+
+    #[test]
+    fn extra_is_e2ee_checks_all_five_markers() {
+        for key in [
+            crate::common::encryption_headers::MODEL_PUB_KEY,
+            crate::common::encryption_headers::SIGNING_ALGO,
+            crate::common::encryption_headers::CLIENT_PUB_KEY,
+            crate::common::encryption_headers::ENCRYPTION_VERSION,
+            crate::common::encryption_headers::ENCRYPT_ALL_FIELDS,
+        ] {
+            let mut extra = std::collections::HashMap::new();
+            extra.insert(key.to_string(), serde_json::json!("value"));
+            assert!(
+                CompletionServiceImpl::extra_is_e2ee(&extra),
+                "{key} alone must be detected as E2EE"
+            );
+        }
+
+        let empty = std::collections::HashMap::new();
+        assert!(!CompletionServiceImpl::extra_is_e2ee(&empty));
     }
 }

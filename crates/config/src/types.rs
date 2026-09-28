@@ -47,6 +47,7 @@ pub struct ApiConfig {
     /// every attributed usage charge, so changing it never rewrites history.
     pub credit_allocation: CreditAllocationConfig,
     pub ita: ItaAttestationConfig,
+    pub placement: PlacementConfig,
 }
 
 impl ApiConfig {
@@ -97,6 +98,7 @@ impl ApiConfig {
             ita: ItaAttestationConfig::from_env()?,
             usage_reporting: UsageReportingConfig::from_env()?,
             credit_allocation: CreditAllocationConfig::from_env()?,
+            placement: PlacementConfig::from_env()?,
         })
     }
 }
@@ -1235,6 +1237,40 @@ impl S3Config {
     }
 }
 
+/// Smart placement. Its only runtime input is the placement Valkey password
+/// (`PLACEMENT_REDIS_PASSWORD`, or a file via `PLACEMENT_REDIS_PASSWORD_FILE`
+/// like every other secret); the endpoint, CA and every tunable are code
+/// constants. This is not a mode flag: without the secret there is simply no
+/// placement state, so every request takes the legacy routing path.
+#[derive(Clone, Default)]
+pub struct PlacementConfig {
+    /// Password of the Valkey `router` ACL user, and the input key material
+    /// for the affinity and pin HMAC secrets. Never logged.
+    pub redis_password: Option<String>,
+}
+
+impl std::fmt::Debug for PlacementConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PlacementConfig")
+            .field(
+                "redis_password",
+                &self.redis_password.as_ref().map(|_| "<redacted>"),
+            )
+            .finish()
+    }
+}
+
+impl PlacementConfig {
+    pub fn from_env() -> Result<Self, String> {
+        Ok(Self {
+            redis_password: read_optional_secret_env(
+                "PLACEMENT_REDIS_PASSWORD_FILE",
+                "PLACEMENT_REDIS_PASSWORD",
+            )?,
+        })
+    }
+}
+
 /// Email notification configuration for organization invitations.
 #[derive(Debug, Clone, Default)]
 pub struct InvitationEmailConfig {
@@ -1753,6 +1789,35 @@ mod tests {
         let debug = format!("{config:?}");
         assert!(debug.contains("<redacted>"));
         assert!(!debug.contains("grafana-secret-token"));
+    }
+
+    #[test]
+    fn placement_config_debug_redacts() {
+        let config = PlacementConfig {
+            redis_password: Some("valkey-router-secret".to_string()),
+        };
+        let debug = format!("{config:?}");
+        assert!(debug.contains("<redacted>"));
+        assert!(!debug.contains("valkey-router-secret"));
+
+        let unset = format!("{:?}", PlacementConfig::default());
+        assert!(unset.contains("None"));
+    }
+
+    #[test]
+    #[serial]
+    fn placement_config_reads_the_password_secret() {
+        std::env::remove_var("PLACEMENT_REDIS_PASSWORD_FILE");
+        std::env::remove_var("PLACEMENT_REDIS_PASSWORD");
+        assert!(PlacementConfig::from_env()
+            .unwrap()
+            .redis_password
+            .is_none());
+
+        std::env::set_var("PLACEMENT_REDIS_PASSWORD", "  pw  ");
+        let config = PlacementConfig::from_env().unwrap();
+        std::env::remove_var("PLACEMENT_REDIS_PASSWORD");
+        assert_eq!(config.redis_password.as_deref(), Some("pw"));
     }
 
     #[test]

@@ -62,6 +62,7 @@ pub mod chunk_builder;
 pub mod mock;
 pub mod models;
 pub mod non_attested;
+pub mod placement_io;
 pub mod responses_raw;
 pub mod rotation;
 pub mod spki_verifier;
@@ -277,6 +278,18 @@ impl StreamingResultExt for StreamingResult {
     fn peekable(self) -> PeekableStreamingResult {
         StreamExt::peekable(self)
     }
+}
+
+/// Verified `host_id -> backend index` map from the latest discovery cycle,
+/// plus the attested signing keys for those hosts. Built only from probes
+/// that carried a verified [`placement::snapshot::HostKey`]-worthy replica
+/// report key, so an unmapped host is never routed to by the placer — it
+/// falls open onto `Fleet::acquire_index` instead.
+#[derive(Clone, Default)]
+pub struct BackendHosts {
+    pub index_by_host: std::collections::HashMap<String, usize>,
+    pub keys: placement::KeyRegistry,
+    pub count: usize,
 }
 
 #[async_trait]
@@ -499,6 +512,19 @@ pub trait InferenceProvider {
     /// because a count change clears stale index bindings. Rotation providers
     /// override this default no-op.
     fn set_backend_keys(&self, _map: std::collections::HashMap<String, Vec<usize>>) {}
+
+    /// Update the provider's verified host map from discovery: which backend
+    /// index each attested host holds this cycle, and the attested keys for
+    /// those hosts. Default is a no-op — only providers that participate in
+    /// smart placement override it. Rebuilt every discovery cycle; a partial
+    /// cycle may omit hosts, which is accepted (the placer treats an unmapped
+    /// host as legacy and fails open).
+    fn set_backend_hosts(&self, _hosts: BackendHosts) {}
+
+    /// Install smart placement for covered models. Default is a no-op — only
+    /// providers that participate in smart placement override it; without
+    /// it every request takes the existing routing path.
+    fn set_placement(&self, _handles: placement_io::PlacementHandles) {}
 
     /// Exact input-token count via the backend's tokenizer (`POST /v1/tokenize`,
     /// proxied to the engine's native tokenize endpoint). The pool calls this

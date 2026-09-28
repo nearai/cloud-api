@@ -12,15 +12,23 @@
 //! per-index TTFT EMA so we can steer prefix-affinity routing away from a
 //! pathologically slow backend.
 
+use super::placement_report::{prompt_tokens_est, report_decision, PlacementRequest};
 use super::prefix_router::PrefixRouter;
 use super::Config;
+use crate::placement_io::{PlacementHandles, Write};
 use crate::rotation;
 use crate::spki_verifier::FingerprintState;
+use crate::BackendHosts;
 use crate::BackendVerifier;
+use arc_swap::{ArcSwap, ArcSwapOption};
+use placement::consts::COVERED_MODELS;
+use placement::decision::{Decision, DecisionRecord, LegacyReason, PlaceInput};
+use placement::score::Pending;
+use placement::snapshot::Snapshot;
 use reqwest::Client;
 use sha2::{Digest, Sha256};
 use std::cmp::Reverse;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -72,6 +80,9 @@ pub(super) fn update_ema(stat: &mut BackendStat, ttft_ms: f64) {
 
 /// Poison-tolerant lock: a panicked holder shouldn't wedge routing — we only
 /// ever mutate small maps under it, so recovering the inner value is safe.
+/// Placed (req, tok) per host, keyed by unix second.
+type PlacementLedger = HashMap<u64, HashMap<String, Pending>>;
+
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
 }
@@ -173,6 +184,21 @@ pub(super) struct Fleet {
     /// last discovery cycle. Empty means no restriction. A backend-count
     /// change clears this because the index-to-backend binding is then stale.
     backend_keys: Arc<RwLock<HashMap<String, Vec<usize>>>>,
+    /// Verified host map from the last discovery cycle (host_id -> backend
+    /// index, plus attested keys); empty until the first cycle. Rebuilt
+    /// wholesale each cycle. The placement hook maps a placed host to its
+    /// index through this map. Every update is mirrored into the installed
+    /// `PlacementHandles::hosts`, the map the Valkey reader verifies frames
+    /// against.
+    backend_hosts: Arc<ArcSwap<BackendHosts>>,
+    /// Smart-placement handles; `None` (every request on the legacy path)
+    /// until `set_placement`. Lock-free on the hot path.
+    placement: ArcSwapOption<PlacementHandles>,
+    /// This node's own placed (req, tok) per host, bucketed by unix second.
+    /// Only the current and previous second are kept, the same window the
+    /// Valkey routed hash covers. Held from reading it into `place()` to
+    /// reserving the chosen host (see `try_place`), never across an await.
+    placement_ledger: Mutex<PlacementLedger>,
     /// Epoch-ms of the last `UnknownKey` warning, so a client stuck on a stale
     /// attestation cannot flood the log from the request hot path.
     last_unknown_key_warn_ms: AtomicU64,
@@ -221,6 +247,9 @@ impl Fleet {
             ])),
             prefix_loads: Arc::new(Mutex::new(HashMap::new())),
             backend_keys: Arc::new(RwLock::new(HashMap::new())),
+            backend_hosts: Arc::new(ArcSwap::from_pointee(BackendHosts::default())),
+            placement: ArcSwapOption::empty(),
+            placement_ledger: Mutex::new(HashMap::new()),
             last_unknown_key_warn_ms: AtomicU64::new(0),
             config,
             client,
@@ -290,25 +319,7 @@ impl Fleet {
         }
         let key_group = self.resolve_key_group(pinned_pub_key, count);
         if matches!(key_group, KeyGroup::UnknownKey) {
-            let now_ms = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .map_or(0, |elapsed| {
-                    elapsed
-                        .as_secs()
-                        .saturating_mul(1_000)
-                        .saturating_add(u64::from(elapsed.subsec_millis()))
-                });
-            if self.should_warn_unknown_key(now_ms) {
-                let pub_key_prefix: String = pinned_pub_key
-                    .unwrap_or_default()
-                    .chars()
-                    .take(16)
-                    .collect();
-                tracing::warn!(
-                    pub_key_prefix = %pub_key_prefix,
-                    "No backend key group found for pinned model public key; routing unrestricted"
-                );
-            }
+            self.warn_unknown_key(pinned_pub_key);
         }
         let allowed = key_group.indices();
         let has_history = has_conversation_history(messages);
@@ -625,6 +636,225 @@ impl Fleet {
         *backend_keys = map;
     }
 
+    pub(super) fn set_backend_hosts(&self, hosts: BackendHosts) {
+        let hosts = Arc::new(hosts);
+        self.backend_hosts.store(hosts.clone());
+        if let Some(handles) = self.placement.load().as_ref() {
+            handles.hosts.store(hosts);
+        }
+    }
+
+    /// Install smart placement. The current host map is copied into
+    /// `handles.hosts` so a map pushed before installation is not lost.
+    ///
+    /// Each handle set belongs to exactly one Fleet (its hosts `ArcSwap` must
+    /// have one writer). Installing handles already installed elsewhere is a
+    /// wiring bug: it is refused (this Fleet stays on the legacy path).
+    pub(super) fn set_placement(&self, handles: PlacementHandles) {
+        if !handles.io.claim_install() {
+            tracing::warn!(
+                error_kind = "already_installed",
+                "Placement handles refused; this provider stays on the legacy path"
+            );
+            debug_assert!(
+                false,
+                "placement handles already installed on another Fleet"
+            );
+            return;
+        }
+        let handles = Arc::new(handles);
+        self.placement.store(Some(handles.clone()));
+        if !Arc::ptr_eq(&handles.hosts, &self.backend_hosts) {
+            handles.hosts.store(self.backend_hosts.load_full());
+        }
+    }
+
+    /// Place a covered-model request on the least-stalling host, or fall
+    /// through to `acquire_index` unchanged. Placement is skipped entirely
+    /// (no decision, log or metric) when it is not installed, the model is
+    /// not covered, or rotation is unavailable. A `Legacy` decision, an
+    /// incomplete host map or snapshot, an unmapped host, or a host outside
+    /// the pinned E2EE key group all run the existing path.
+    pub(super) fn acquire_index_placed(
+        &self,
+        messages: &[crate::ChatMessage],
+        pinned_pub_key: Option<&str>,
+        request: &PlacementRequest,
+    ) -> Option<RouteLease> {
+        if let Some(lease) = self.try_place(messages, pinned_pub_key, request) {
+            return Some(lease);
+        }
+        self.acquire_index(messages, pinned_pub_key)
+    }
+
+    fn try_place(
+        &self,
+        messages: &[crate::ChatMessage],
+        pinned_pub_key: Option<&str>,
+        request: &PlacementRequest,
+    ) -> Option<RouteLease> {
+        if !COVERED_MODELS.contains(&request.model.as_str()) {
+            return None;
+        }
+        let guard = self.placement.load();
+        let handles = guard.as_ref()?;
+        let count = self.rotation_count();
+        if count == 0 {
+            return None;
+        }
+        let now_ms = epoch_ms();
+        let now_s = now_ms / 1_000;
+        let input = PlaceInput {
+            model: request.model.clone(),
+            prompt_tokens_est: prompt_tokens_est(messages),
+            affinity: request.affinity.clone(),
+            affinity_source: request.affinity_source,
+            // Context tiers are separate providers (pool-level), so this
+            // Fleet has no host-level long-context knowledge: long prompts
+            // are NoneEligible and fail open to the legacy path.
+            long_context_hosts: Vec::new(),
+            now_ms,
+        };
+        let key_group = self.resolve_key_group(pinned_pub_key, count);
+
+        // `snapshot` and `host_map_incomplete` are read-only against
+        // lock-free state (an `ArcSwap` load and this Fleet's own backend
+        // map), independent of the placement ledger, so both are computed
+        // before taking the ledger lock below.
+        let snapshot = handles.io.snapshot.load();
+        let incomplete = self.host_map_incomplete(&snapshot);
+
+        // One critical section from reading this node's own pending load to
+        // reserving the chosen host in it, so concurrent requests on this
+        // node each see the others' reservations and do not herd onto the
+        // same "least loaded" host. `place()` is synchronous and O(replicas),
+        // and nothing here awaits, so holding the ledger lock across just
+        // that path (mine_in -> place -> index_for_host -> ledger_add) is
+        // cheap and is the only way to make concurrent requests on this node
+        // observe each other's reservations. Logging and Valkey writes
+        // happen after the lock is released.
+        let placed = {
+            let mut ledger = lock(&self.placement_ledger);
+            let mine = mine_in(&ledger, now_s);
+            let decision = handles
+                .placer
+                .place(&input, &snapshot, &mine, &mut rand::rng());
+            match decision {
+                Decision::Legacy { record, .. } => Err(record),
+                Decision::Place { mut record, .. } if incomplete => {
+                    demote(&mut record, LegacyReason::Incomplete);
+                    Err(record)
+                }
+                Decision::Place {
+                    host,
+                    mut record,
+                    pin_write,
+                } => match self.index_for_host(&host, count) {
+                    None => {
+                        demote(&mut record, LegacyReason::HostUnmapped);
+                        Err(record)
+                    }
+                    Some(index)
+                        if key_group
+                            .indices()
+                            .is_some_and(|group| !group.contains(&index)) =>
+                    {
+                        demote(&mut record, LegacyReason::KeyGroup);
+                        Err(record)
+                    }
+                    Some(index) => {
+                        ledger_add(&mut ledger, host.clone(), input.prompt_tokens_est, now_s);
+                        Ok((host, index, record, pin_write))
+                    }
+                },
+            }
+        };
+        let (host, index, record, pin_write) = match placed {
+            Ok(placed) => placed,
+            Err(record) => {
+                report_decision(handles, &record, request);
+                return None;
+            }
+        };
+        if matches!(key_group, KeyGroup::UnknownKey) {
+            self.warn_unknown_key(pinned_pub_key);
+        }
+
+        let lease = self.reserve_index(self.route_key(messages), index);
+        handles.io.record(Write::Routed {
+            host,
+            replica: None,
+            tok: input.prompt_tokens_est,
+            sec: now_s,
+        });
+        if let Some((pin_id, pin_host)) = pin_write {
+            handles.io.record(Write::Pin {
+                id_hex: pin_id.to_hex(),
+                host: pin_host,
+                at_ms: now_ms,
+            });
+        }
+        report_decision(handles, &record, request);
+        Some(lease)
+    }
+
+    /// True when placing would starve hosts the placer cannot see: the host
+    /// map covers fewer hosts than this Fleet has backends (a partial proxy
+    /// rollout, or indices without a replica key), or a mapped host has no
+    /// replica view in `snapshot` (e.g. a restarted proxy whose new key is
+    /// not discovered yet). O(hosts + replicas); no allocation beyond one set.
+    fn host_map_incomplete(&self, snapshot: &Snapshot) -> bool {
+        let hosts = self.backend_hosts.load();
+        if hosts.index_by_host.len() < self.backend_count() {
+            return true;
+        }
+        let seen: HashSet<&str> = snapshot
+            .replicas
+            .iter()
+            .map(|v| v.host_id.as_str())
+            .collect();
+        hosts
+            .index_by_host
+            .keys()
+            .any(|host| !seen.contains(host.as_str()))
+    }
+
+    /// The backend index `host` is bound to, when the pushed host map was
+    /// built for this Fleet's current backend count (otherwise the binding
+    /// is stale) and the index is within the rotation fan-out.
+    fn index_for_host(&self, host: &str, count: usize) -> Option<usize> {
+        let hosts = self.backend_hosts.load();
+        if hosts.count != self.backend_count() {
+            return None;
+        }
+        hosts
+            .index_by_host
+            .get(host)
+            .copied()
+            .filter(|index| *index < count)
+    }
+
+    /// This node's own placed load per host over `{now_s - 1, now_s}`.
+    #[cfg(test)]
+    pub(super) fn placement_mine(&self, now_s: u64) -> HashMap<String, Pending> {
+        mine_in(&lock(&self.placement_ledger), now_s)
+    }
+
+    /// Rate-limited warning for a pinned key that discovery does not know.
+    fn warn_unknown_key(&self, pinned_pub_key: Option<&str>) {
+        if self.should_warn_unknown_key(epoch_ms()) {
+            let pub_key_prefix: String = pinned_pub_key
+                .unwrap_or_default()
+                .chars()
+                .take(16)
+                .collect();
+            tracing::warn!(
+                pub_key_prefix = %pub_key_prefix,
+                "No backend key group found for pinned model public key; routing unrestricted"
+            );
+        }
+    }
+
     pub(super) fn should_warn_unknown_key(&self, now_ms: u64) -> bool {
         let mut last_warn_ms = self.last_unknown_key_warn_ms.load(Ordering::Relaxed);
         loop {
@@ -687,6 +917,48 @@ fn has_conversation_history(messages: &[crate::ChatMessage]) -> bool {
             crate::MessageRole::Assistant | crate::MessageRole::Tool
         )
     })
+}
+
+fn epoch_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |elapsed| {
+            elapsed
+                .as_secs()
+                .saturating_mul(1_000)
+                .saturating_add(u64::from(elapsed.subsec_millis()))
+        })
+}
+
+/// This node's own placed load per host over `{now_s - 1, now_s}`.
+fn mine_in(ledger: &PlacementLedger, now_s: u64) -> HashMap<String, Pending> {
+    let mut mine: HashMap<String, Pending> = HashMap::new();
+    let window = now_s.saturating_sub(1)..=now_s;
+    for (_, hosts) in ledger.iter().filter(|(sec, _)| window.contains(*sec)) {
+        for (host, pending) in hosts {
+            let entry = mine.entry(host.clone()).or_default();
+            entry.req = entry.req.saturating_add(pending.req);
+            entry.tok = entry.tok.saturating_add(pending.tok);
+        }
+    }
+    mine
+}
+
+/// Reserves one placed request of `tok` tokens on `host` in second `now_s`,
+/// dropping seconds that left the window.
+fn ledger_add(ledger: &mut PlacementLedger, host: String, tok: u64, now_s: u64) {
+    ledger.retain(|sec, _| sec.saturating_add(1) >= now_s);
+    let pending = ledger.entry(now_s).or_default().entry(host).or_default();
+    pending.req = pending.req.saturating_add(1);
+    pending.tok = pending.tok.saturating_add(tok);
+}
+
+/// Turns a `Place` record into the `Legacy` one the caller fell back with.
+fn demote(record: &mut DecisionRecord, reason: LegacyReason) {
+    record.outcome = "legacy";
+    record.reason = Some(reason.as_str());
+    record.selection = None;
+    record.rank = None;
 }
 
 fn route_index_score(route_key: u64, index: usize) -> u64 {

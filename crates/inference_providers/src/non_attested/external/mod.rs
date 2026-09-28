@@ -62,7 +62,7 @@ pub use typesafe::TypeSafeBackend;
 /// serialised as top-level JSON body fields — unknown fields that strict
 /// providers (Anthropic, Gemini) may reject with a 400/422.
 fn strip_internal_keys(extra: &mut std::collections::HashMap<String, serde_json::Value>) {
-    use crate::attested::nearai::{encryption_headers, tracing_headers};
+    use crate::attested::nearai::{encryption_headers, placement_headers, tracing_headers};
     extra.remove(tracing_headers::REQUEST_ID);
     extra.remove(tracing_headers::ORG_ID);
     extra.remove(tracing_headers::WORKSPACE_ID);
@@ -70,6 +70,10 @@ fn strip_internal_keys(extra: &mut std::collections::HashMap<String, serde_json:
     // pinned request should never select an external provider, but strip it here
     // so that guarantee is not load-bearing for request correctness.
     extra.remove(encryption_headers::MODEL_PUB_KEY);
+    // Placement affinity keys are routing-only (see placement_headers); an
+    // external, third-party provider must never see them.
+    extra.remove(placement_headers::AFFINITY);
+    extra.remove(placement_headers::AFFINITY_SOURCE);
 }
 
 fn merge_json_defaults(target: &mut serde_json::Value, defaults: &serde_json::Value) {
@@ -678,16 +682,21 @@ mod tests {
 
     #[test]
     fn strip_internal_keys_removes_routing_pin_and_tracing_keys() {
-        use crate::attested::nearai::{encryption_headers as eh, tracing_headers as th};
+        use crate::attested::nearai::{
+            encryption_headers as eh, placement_headers as ph, tracing_headers as th,
+        };
 
         // Given: request extras contain tracing metadata, the routing-only pin,
-        // and the client-E2EE fields external providers already receive.
+        // placement affinity keys, and the client-E2EE fields external
+        // providers already receive.
         let mut extra = HashMap::new();
         for key in [
             th::REQUEST_ID,
             th::ORG_ID,
             th::WORKSPACE_ID,
             eh::MODEL_PUB_KEY,
+            ph::AFFINITY,
+            ph::AFFINITY_SOURCE,
             eh::SIGNING_ALGO,
             eh::CLIENT_PUB_KEY,
             eh::ENCRYPTION_VERSION,
@@ -699,13 +708,16 @@ mod tests {
         // When: external-provider internal keys are stripped.
         strip_internal_keys(&mut extra);
 
-        // Then: tracing metadata and the routing pin are removed, while the
-        // pre-existing client-E2EE fields remain unchanged.
+        // Then: tracing metadata, the routing pin, and the placement affinity
+        // keys are removed, while the pre-existing client-E2EE fields remain
+        // unchanged.
         for key in [
             th::REQUEST_ID,
             th::ORG_ID,
             th::WORKSPACE_ID,
             eh::MODEL_PUB_KEY,
+            ph::AFFINITY,
+            ph::AFFINITY_SOURCE,
         ] {
             assert!(
                 !extra.contains_key(key),

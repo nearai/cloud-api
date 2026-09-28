@@ -998,8 +998,9 @@ fn channel_binding_check_classifies_outcomes() {
     );
 }
 
-/// The signing key and TEE identity of a discovery probe are only used when
-/// its channel check passed; the fingerprint is pinned either way.
+/// The signing key, TEE identity and replica-report key of a discovery probe
+/// are only used when its channel check passed; the fingerprint is pinned
+/// either way.
 #[test]
 fn discovery_uses_signing_keys_only_from_matching_probes() {
     let report = serde_json::json!({
@@ -1007,8 +1008,25 @@ fn discovery_uses_signing_keys_only_from_matching_probes() {
         "info": { "app_id": "app", "key_provider_info": { "id": "root" } },
     });
     let report = report.as_object().unwrap();
+    let signing_key = ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]);
+    let verifying_key = signing_key.verifying_key();
+    let replica_key = ReplicaReportKey {
+        key_id: placement::frame::key_id(&verifying_key),
+        public_key_hex: hex::encode(verifying_key.to_bytes()),
+        boot_id: "boot-1".to_string(),
+        host_id: "host-1".to_string(),
+        model: "model".to_string(),
+        replica_ids: vec!["r1".to_string()],
+    };
 
-    let probe = backend_probe(ChannelBinding::Match, report, 2, "ecdsa").unwrap();
+    let probe = backend_probe(
+        ChannelBinding::Match,
+        report,
+        2,
+        "ecdsa",
+        Some(&replica_key),
+    )
+    .unwrap();
     assert_eq!(probe.index, 2);
     assert_eq!(probe.algo, "ecdsa");
     assert_eq!(probe.pubkey, "04abcd");
@@ -1016,15 +1034,26 @@ fn discovery_uses_signing_keys_only_from_matching_probes() {
         probe.identity,
         Some(("root".to_string(), "app".to_string()))
     );
+    assert_eq!(
+        probe.replica_key.as_ref().map(|k| k.key_id.as_str()),
+        Some(replica_key.key_id.as_str())
+    );
 
     for binding in [
         ChannelBinding::Mismatch,
         ChannelBinding::Unattested,
         ChannelBinding::Missing,
     ] {
-        assert!(backend_probe(binding, report, 2, "ecdsa").is_none());
+        assert!(backend_probe(binding, report, 2, "ecdsa", Some(&replica_key)).is_none());
     }
 
     let no_key = serde_json::Map::new();
-    assert!(backend_probe(ChannelBinding::Match, &no_key, 2, "ecdsa").is_none());
+    assert!(backend_probe(
+        ChannelBinding::Match,
+        &no_key,
+        2,
+        "ecdsa",
+        Some(&replica_key)
+    )
+    .is_none());
 }

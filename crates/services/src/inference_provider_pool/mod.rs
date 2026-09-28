@@ -1,4 +1,4 @@
-use crate::attestation::{AttestationVerifier, BackendAttestationVerifier};
+use crate::attestation::{AttestationVerifier, BackendAttestationVerifier, ReplicaReportKey};
 use crate::common::encryption_headers;
 use config::ExternalProvidersConfig;
 use inference_providers::nearai;
@@ -418,6 +418,10 @@ struct BackendProbe {
     algo: String,
     pubkey: String,
     identity: Option<TeeIdentity>,
+    /// The host's attested per-boot replica-report signing key, if the
+    /// verified attestation carried one. Only ever `Some` from a verified
+    /// probe — `backend_probes` holds verified probes exclusively.
+    replica_key: Option<ReplicaReportKey>,
 }
 
 /// KMS root id and app id. Equal identities derive the same model keypair.
@@ -591,6 +595,80 @@ impl DiscoveryOutcome {
         }
         groups
     }
+
+    /// Verified `host_id -> backend index` map plus attested keys, built only
+    /// from probes carrying a verified replica-report key. The two algos per
+    /// index carry the same key, so this dedups per index before folding into
+    /// the host map. A host observed at two different indices is ambiguous
+    /// (e.g. a stale index binding mid-rotation), so it is dropped from both
+    /// the map and the key registry: its frames are then never accepted and
+    /// the model goes legacy until the next discovery resolves it.
+    fn backend_hosts(&self) -> inference_providers::BackendHosts {
+        let mut index_by_host: HashMap<String, usize> = HashMap::new();
+        let mut keys: HashMap<String, Vec<placement::snapshot::HostKey>> = HashMap::new();
+        let mut seen_indices: HashSet<usize> = HashSet::new();
+        let mut duplicates: HashSet<String> = HashSet::new();
+
+        for probe in &self.backend_probes {
+            let Some(replica_key) = probe.replica_key.as_ref() else {
+                continue;
+            };
+            if !seen_indices.insert(probe.index) {
+                continue;
+            }
+
+            if let Some(first_index) = index_by_host.get(&replica_key.host_id).copied() {
+                if first_index != probe.index {
+                    debug!(
+                        host_id = %replica_key.host_id,
+                        first_index,
+                        second_index = probe.index,
+                        "duplicate_host: host reported at two backend indices, dropping it"
+                    );
+                    duplicates.insert(replica_key.host_id.clone());
+                }
+            } else {
+                index_by_host.insert(replica_key.host_id.clone(), probe.index);
+            }
+
+            let host_keys = keys.entry(replica_key.host_id.clone()).or_default();
+            if host_keys
+                .iter()
+                .any(|existing| existing.key_id == replica_key.key_id)
+            {
+                continue;
+            }
+            let Ok(key_bytes) = <[u8; 32]>::try_from(
+                match hex::decode(&replica_key.public_key_hex) {
+                    Ok(bytes) => bytes,
+                    Err(_) => continue,
+                }
+                .as_slice(),
+            ) else {
+                continue;
+            };
+            let Ok(verifying_key) = ed25519_dalek::VerifyingKey::from_bytes(&key_bytes) else {
+                continue;
+            };
+            host_keys.push(placement::snapshot::HostKey {
+                key_id: replica_key.key_id.clone(),
+                key: verifying_key,
+                replica_ids: replica_key.replica_ids.clone(),
+                model: replica_key.model.clone(),
+            });
+        }
+
+        for host in &duplicates {
+            index_by_host.remove(host);
+            keys.remove(host);
+        }
+
+        inference_providers::BackendHosts {
+            index_by_host,
+            keys: placement::snapshot::KeyRegistry { by_host: keys },
+            count: self.backend_count,
+        }
+    }
 }
 
 fn tee_identity(report: &serde_json::Map<String, serde_json::Value>) -> Option<TeeIdentity> {
@@ -614,11 +692,15 @@ fn tee_identity(report: &serde_json::Map<String, serde_json::Value>) -> Option<T
 /// Signing key and TEE identity reported by a verified discovery probe. These
 /// report fields are not checked by the attestation verifier, so they are only
 /// taken from a probe whose connection presented the attested certificate.
+/// `replica_key` is the replica-report key from that same verified report; it
+/// is kept under the same gate so placement only trusts keys attested over the
+/// connection that carried the report.
 fn backend_probe(
     binding: ChannelBinding,
     report: &serde_json::Map<String, serde_json::Value>,
     index: usize,
     algo: &str,
+    replica_key: Option<&ReplicaReportKey>,
 ) -> Option<BackendProbe> {
     if binding != ChannelBinding::Match {
         return None;
@@ -629,6 +711,7 @@ fn backend_probe(
         algo: algo.to_string(),
         pubkey: pubkey.to_string(),
         identity: tee_identity(report),
+        replica_key: replica_key.cloned(),
     })
 }
 
@@ -721,6 +804,16 @@ impl ProviderMappings {
     }
 }
 
+/// What the pool needs to start placement for a provider. Holds the Valkey
+/// password, so it intentionally has no `Debug`.
+struct PoolPlacement {
+    password: String,
+    placer: Arc<placement::decision::Placer>,
+    /// Keys request affinity in the completion service. Derived here, once,
+    /// with the pin secret, so the two can never disagree.
+    affinity_secret: [u8; 32],
+}
+
 #[derive(Clone)]
 pub struct InferenceProviderPool {
     /// Optional API key for authenticating with inference backends
@@ -785,6 +878,11 @@ pub struct InferenceProviderPool {
     /// Shared with each `PoolBackendVerifier`, so a verifier created before the
     /// sink is attached still reports to it.
     metrics_service: Arc<std::sync::OnceLock<Arc<dyn crate::metrics::MetricsServiceTrait>>>,
+    /// Smart-placement install state, set once at startup when the placement
+    /// secret is configured ([`Self::set_placement`]). Applied to every
+    /// covered base-tier provider this pool creates, at startup and on later
+    /// discovery refreshes alike. Unset: every provider stays legacy.
+    placement: Arc<std::sync::OnceLock<PoolPlacement>>,
     /// Providers explicitly registered as fallbacks, keyed by model id. This
     /// role is configuration metadata rather than an inference from whichever
     /// providers happen to be live, so it survives primary discovery failures
@@ -1156,8 +1254,65 @@ impl InferenceProviderPool {
             pinned_models: Arc::new(std::sync::RwLock::new(std::collections::HashSet::new())),
             pinned_providers: Arc::new(std::sync::RwLock::new(HashMap::new())),
             metrics_service: Arc::new(std::sync::OnceLock::new()),
+            placement: Arc::new(std::sync::OnceLock::new()),
             fallback_providers: Arc::new(std::sync::RwLock::new(HashMap::new())),
         }
+    }
+
+    /// Enable smart placement for covered models: `password` authenticates
+    /// to the placement Valkey, and the pin and affinity secrets are derived
+    /// from it (`secrets_from`). Call once at startup, before models load,
+    /// and only when the secret is configured. A second call is a no-op.
+    pub fn set_placement(&self, password: String) {
+        let (affinity_secret, pin_secret) = crate::completions::affinity::secrets_from(&password);
+        let _ = self.placement.set(PoolPlacement {
+            password,
+            placer: Arc::new(placement::decision::Placer::new(pin_secret)),
+            affinity_secret,
+        });
+    }
+
+    /// Whether [`Self::set_placement`] was called.
+    pub fn has_placement(&self) -> bool {
+        self.placement.get().is_some()
+    }
+
+    /// The affinity secret derived by [`Self::set_placement`], or `None`
+    /// when placement is off. The single source for the completion service.
+    pub fn affinity_secret(&self) -> Option<[u8; 32]> {
+        self.placement.get().map(|p| p.affinity_secret)
+    }
+
+    /// A new handle set (own `PlacementIo` and host map) for one provider,
+    /// or `None` when placement is not configured. Starts background tasks,
+    /// so call it only for a provider that will install the handles.
+    fn placement_handles(&self) -> Option<inference_providers::placement_io::PlacementHandles> {
+        let install = self.placement.get()?;
+        let metrics: Arc<dyn crate::metrics::MetricsServiceTrait> = self
+            .metrics_service
+            .get()
+            .cloned()
+            .unwrap_or_else(|| Arc::new(crate::metrics::MockMetricsService));
+        Some(inference_providers::placement_io::PlacementHandles::start(
+            install.password.clone(),
+            install.placer.clone(),
+            metrics,
+        ))
+    }
+
+    /// The `(model, inference_url)` entries that get smart placement: the
+    /// base tier of each covered model. `expand_inference_endpoints` emits a
+    /// row's base entry first and any long-context entry after it under the
+    /// same model id, and every caller keeps that order, so the first entry
+    /// per model id is the base tier.
+    fn placement_targets(models: &[(String, String, Option<u32>)]) -> HashSet<(String, String)> {
+        let mut seen: HashSet<&str> = HashSet::new();
+        models
+            .iter()
+            .filter(|(model, _, _)| seen.insert(model.as_str()))
+            .filter(|(model, _, _)| placement::consts::COVERED_MODELS.contains(&model.as_str()))
+            .map(|(model, url, _)| (model.clone(), url.clone()))
+            .collect()
     }
 
     /// Attach a metrics sink for tiered-routing/fallback visibility. Set once
@@ -2168,7 +2323,13 @@ impl InferenceProviderPool {
                     }
                     // Keys are KMS-root-derived: replicas under different roots
                     // serve different keys for the same model and algorithm.
-                    if let Some(probe) = backend_probe(binding, &report, backend_index, &algo) {
+                    if let Some(probe) = backend_probe(
+                        binding,
+                        &report,
+                        backend_index,
+                        &algo,
+                        verified.replica_report_key.as_ref(),
+                    ) {
                         if probe.identity.is_none() {
                             warn!(
                                 model = %model_name,
@@ -5085,10 +5246,17 @@ impl InferenceProviderPool {
         let verifier = self.attestation_verifier.clone();
         let tls_roots = self.tls_roots.clone();
         let metrics_service = self.metrics_service.get().cloned();
+        let placement_targets = Self::placement_targets(&models);
         let metrics_sink = self.metrics_service.clone();
         let endpoint_futures: Vec<_> = needs_creation
             .iter()
             .map(|(model_name, url, context_length)| {
+                // Only a covered model's base-tier provider gets placement,
+                // each with its own handle set (one writer per host map).
+                let placement = placement_targets
+                    .contains(&(model_name.clone(), url.clone()))
+                    .then(|| self.placement_handles())
+                    .flatten();
                 let model_name = model_name.clone();
                 let url = url.clone();
                 let context_length = *context_length;
@@ -5142,6 +5310,11 @@ impl InferenceProviderPool {
                     // before any refresh cycle would skip rotation entirely.
                     serving_provider.set_backend_count(outcome.backend_count);
                     serving_provider.set_backend_keys(outcome.key_index_map());
+                    serving_provider.set_backend_hosts(outcome.backend_hosts());
+                    if let Some(handles) = placement {
+                        serving_provider.set_placement(handles);
+                        info!(model = %model_name, "Smart placement installed on base-tier provider");
+                    }
 
                     // Store the configured context length so latency routing can
                     // filter out providers that can't serve oversized requests.
@@ -5499,6 +5672,7 @@ impl InferenceProviderPool {
                 // backend healthy again.
                 provider.set_backend_count(outcome.backend_count);
                 provider.set_backend_keys(outcome.key_index_map());
+                provider.set_backend_hosts(outcome.backend_hosts());
 
                 let ptr = Arc::as_ptr(&provider) as *const () as usize;
                 let provider_has_any_pubkey_mapping = mapped_ptrs.contains(&ptr);
@@ -6415,6 +6589,37 @@ mod tests {
             algo: algo.to_string(),
             pubkey: pubkey.to_string(),
             identity: identity.map(|(root_id, app_id)| (root_id.to_string(), app_id.to_string())),
+            replica_key: None,
+        }
+    }
+
+    fn backend_probe_with_key(
+        index: usize,
+        algo: &str,
+        pubkey: &str,
+        replica_key: ReplicaReportKey,
+    ) -> BackendProbe {
+        BackendProbe {
+            index,
+            algo: algo.to_string(),
+            pubkey: pubkey.to_string(),
+            identity: None,
+            replica_key: Some(replica_key),
+        }
+    }
+
+    fn fake_replica_report_key(
+        signing_key: &ed25519_dalek::SigningKey,
+        host_id: &str,
+    ) -> ReplicaReportKey {
+        let verifying_key = signing_key.verifying_key();
+        ReplicaReportKey {
+            key_id: placement::frame::key_id(&verifying_key),
+            public_key_hex: hex::encode(verifying_key.to_bytes()),
+            boot_id: "boot-1".to_string(),
+            host_id: host_id.to_string(),
+            model: "z-ai/glm-5.3-flash".to_string(),
+            replica_ids: vec!["r1".to_string(), "r2".to_string()],
         }
     }
 
@@ -6675,6 +6880,107 @@ mod tests {
         assert_eq!(key_index_map.get("abcd"), Some(&vec![0, 2]));
         assert_eq!(key_index_map.get("efgh"), Some(&vec![1, 3]));
         assert_eq!(key_index_map.len(), 2);
+    }
+
+    #[test]
+    fn discovery_outcome_maps_host_to_index() {
+        // Given: two verified hosts, each probed under both algos (same key
+        // both times), plus one index with no verified key.
+        let key_a = ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]);
+        let key_b = ed25519_dalek::SigningKey::from_bytes(&[9u8; 32]);
+        let replica_key_a = fake_replica_report_key(&key_a, "host-a");
+        let replica_key_b = fake_replica_report_key(&key_b, "host-b");
+        let outcome = discovery_outcome_with_probes(
+            3,
+            vec![
+                backend_probe_with_key(0, "ecdsa", "key-a", replica_key_a.clone()),
+                backend_probe_with_key(0, "ed25519", "key-a", replica_key_a.clone()),
+                backend_probe_with_key(1, "ecdsa", "key-b", replica_key_b.clone()),
+                backend_probe_with_key(1, "ed25519", "key-b", replica_key_b.clone()),
+                backend_probe(2, "ecdsa", "key-c", None),
+                backend_probe(2, "ed25519", "key-c", None),
+            ],
+        );
+
+        // When: the verified host map is built for providers.
+        let hosts = outcome.backend_hosts();
+
+        // Then: only the two verified hosts are mapped, index 2 (no key) is
+        // absent, and each host has exactly one attested key despite two probes.
+        assert_eq!(hosts.index_by_host.get("host-a"), Some(&0));
+        assert_eq!(hosts.index_by_host.get("host-b"), Some(&1));
+        assert_eq!(hosts.index_by_host.len(), 2);
+        assert_eq!(hosts.keys.by_host.get("host-a").map(Vec::len), Some(1));
+        assert_eq!(hosts.keys.by_host.get("host-b").map(Vec::len), Some(1));
+        assert_eq!(hosts.count, 3);
+        assert_eq!(
+            hosts.keys.by_host.get("host-a").unwrap()[0].key,
+            key_a.verifying_key()
+        );
+    }
+
+    #[test]
+    fn backend_hosts_registry_verifies_the_proxy_golden_frame() {
+        // Given: the proxy's attested replica-report key (the golden
+        // fixture's key [7u8; 32]) observed at one backend.
+        let key = ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]);
+        let outcome = discovery_outcome_with_probes(
+            1,
+            vec![backend_probe_with_key(
+                0,
+                "ecdsa",
+                "key-a",
+                fake_replica_report_key(&key, "glm53-gpu03"),
+            )],
+        );
+        let golden: placement::frame::Envelope = serde_json::from_str(include_str!(
+            "../../../placement/tests/fixtures/envelope_ok.json"
+        ))
+        .unwrap();
+
+        // When: the pool's host map feeds ingest.
+        let hosts = outcome.backend_hosts();
+        let view = placement::snapshot::Ingest::new()
+            .accept("glm53-gpu03", "r1", &golden, &hosts.keys)
+            .expect("proxy-sealed frame verifies against the discovered key");
+
+        // Then.
+        assert_eq!(hosts.index_by_host.get("glm53-gpu03"), Some(&0));
+        assert_eq!(view.report.seq, 7);
+    }
+
+    #[test]
+    fn duplicate_host_is_dropped() {
+        // Given: the same attested host_id is reported at two different
+        // backend indices in the same discovery cycle (e.g. a stale index
+        // binding mid-rotation), next to an unambiguous host.
+        let key_a = ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]);
+        let key_b = ed25519_dalek::SigningKey::from_bytes(&[8u8; 32]);
+        let replica_key = fake_replica_report_key(&key_a, "host-a");
+        let outcome = discovery_outcome_with_probes(
+            3,
+            vec![
+                backend_probe_with_key(1, "ecdsa", "key-a", replica_key.clone()),
+                backend_probe_with_key(0, "ecdsa", "key-a", replica_key.clone()),
+                backend_probe_with_key(
+                    2,
+                    "ecdsa",
+                    "key-b",
+                    fake_replica_report_key(&key_b, "host-b"),
+                ),
+            ],
+        );
+
+        // When.
+        let hosts = outcome.backend_hosts();
+
+        // Then: the ambiguous host is gone from both the map and the key
+        // registry, regardless of probe order; the other host is kept.
+        assert_eq!(hosts.index_by_host.get("host-a"), None);
+        assert!(!hosts.keys.by_host.contains_key("host-a"));
+        assert_eq!(hosts.index_by_host.get("host-b"), Some(&2));
+        assert!(hosts.keys.by_host.contains_key("host-b"));
+        assert_eq!(hosts.index_by_host.len(), 1);
     }
 
     #[test]
@@ -8089,6 +8395,54 @@ mod tests {
         // the partial-batch safety the admin PATCH path depends on.
         assert!(!merged.contains_key("other-pinned"));
         assert_eq!(merged.len(), 1);
+    }
+
+    /// Placement installs only on a covered model's base tier: the first
+    /// entry `expand_inference_endpoints` emits for its catalog row, never
+    /// the long-context entry registered under the same model id.
+    #[test]
+    fn placement_targets_are_covered_base_tier_entries() {
+        let covered = placement::consts::COVERED_MODELS[0].to_string();
+        let long_context = serde_json::json!({"long_context": {
+            "inference_url": "https://long.example",
+            "max_context_tokens": 1_048_576,
+            "base_max_context_tokens": 100_000,
+        }});
+        let mut models =
+            expand_inference_endpoints("other/model", "https://other.example", None, None);
+        models.extend(expand_inference_endpoints(
+            &covered,
+            "https://base.example",
+            Some(1_048_576),
+            Some(&long_context),
+        ));
+        assert_eq!(models.len(), 3, "covered row expands into base + long");
+
+        let targets = InferenceProviderPool::placement_targets(&models);
+        assert_eq!(
+            targets,
+            HashSet::from([(covered, "https://base.example".to_string())])
+        );
+    }
+
+    #[tokio::test]
+    async fn placement_handles_need_the_secret() {
+        let pool = InferenceProviderPool::new(None, ExternalProvidersConfig::default());
+        assert!(!pool.has_placement());
+        assert!(pool.placement_handles().is_none());
+
+        assert!(pool.affinity_secret().is_none());
+
+        pool.set_placement("router-password".to_string());
+        assert!(pool.has_placement());
+        let (affinity, _) = crate::completions::affinity::secrets_from("router-password");
+        assert_eq!(pool.affinity_secret(), Some(affinity));
+        // Each call starts a separate handle set (one per base-tier Fleet).
+        // The placeholder endpoint/CA keep it inert: no network is touched.
+        let first = pool.placement_handles().expect("handles");
+        let second = pool.placement_handles().expect("handles");
+        assert!(!Arc::ptr_eq(&first.hosts, &second.hosts));
+        assert!(Arc::ptr_eq(&first.placer, &second.placer));
     }
 
     /// The refresh failure-counter prune (review round 3, Pierre's blocking) must

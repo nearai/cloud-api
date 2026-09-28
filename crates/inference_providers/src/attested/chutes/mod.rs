@@ -599,7 +599,9 @@ impl Provider {
 /// tracing identifiers and the client-facing-E2EE markers. `ChatCompletionParams`
 /// flattens `extra` into the top-level body, so these would otherwise leak.
 const INTERNAL_KEYS: &[&str] = {
-    use crate::attested::nearai::{encryption_headers as eh, tracing_headers as th};
+    use crate::attested::nearai::{
+        encryption_headers as eh, placement_headers as ph, tracing_headers as th,
+    };
     &[
         th::REQUEST_ID,
         th::ORG_ID,
@@ -609,6 +611,8 @@ const INTERNAL_KEYS: &[&str] = {
         eh::MODEL_PUB_KEY,
         eh::ENCRYPTION_VERSION,
         eh::ENCRYPT_ALL_FIELDS,
+        ph::AFFINITY,
+        ph::AFFINITY_SOURCE,
     ]
 };
 
@@ -2880,21 +2884,12 @@ mod tests {
 
     #[test]
     fn request_body_strips_internal_and_e2ee_keys() {
-        use crate::attested::nearai::{encryption_headers as eh, tracing_headers as th};
         let mut params: ChatCompletionParams =
             serde_json::from_value(json!({"model": "m", "messages": []})).unwrap();
-        // Internal identifiers + client-E2EE markers must never reach Chutes.
-        for k in [
-            th::REQUEST_ID,
-            th::ORG_ID,
-            th::WORKSPACE_ID,
-            eh::SIGNING_ALGO,
-            eh::CLIENT_PUB_KEY,
-            eh::MODEL_PUB_KEY,
-            eh::ENCRYPTION_VERSION,
-            eh::ENCRYPT_ALL_FIELDS,
-        ] {
-            params.extra.insert(k.to_string(), json!("leak"));
+        // Internal identifiers, client-E2EE markers, and placement affinity
+        // keys must never reach Chutes.
+        for k in INTERNAL_KEYS {
+            params.extra.insert((*k).to_string(), json!("leak"));
         }
         let body = request_body("m", &params, false).unwrap();
         let obj = body.as_object().unwrap();

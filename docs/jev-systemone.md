@@ -127,8 +127,8 @@ alias warning is injected into the body:
   `ed25519`. The gateway uses the upstream JSON `id` first, then the upstream
   `X-Generation-Id`. If neither is supplied, a gateway-signed response gets a
   new unique ID. Request-tracing headers such as `x-typesafe-request-id` are
-  not used. Upstream IDs must contain 1–255 ASCII letters, digits, hyphens, or
-  underscores.
+  not used. IDs are opaque strings, limited to 1–255 bytes and valid HTTP
+  header values. URL-encode the ID as a single path segment for signature lookup.
 - `Inference-Id`: UUID derived from that generation ID, used by `/v1/billing/costs`.
 - `X-Serving-Provider`: actual serving tier, using the shared `near` / `chutes` /
   `non-attested` header values (`chutes` is the existing attested-third-party label).

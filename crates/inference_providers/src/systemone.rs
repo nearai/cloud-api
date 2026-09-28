@@ -223,14 +223,9 @@ impl SystemOneResponseWithBytes {
     }
 }
 
-/// IDs are used in response headers, signature URL paths, and VARCHAR(255) columns.
+/// Treat IDs as opaque strings, subject to response-header and storage limits.
 fn parse_chat_id(id: &str) -> Result<String, CompletionError> {
-    if id.is_empty()
-        || id.len() > 255
-        || !id
-            .bytes()
-            .all(|c| c.is_ascii_alphanumeric() || c == b'-' || c == b'_')
-    {
+    if id.is_empty() || id.len() > 255 || http::HeaderValue::from_str(id).is_err() {
         return Err(CompletionError::InvalidResponse(
             "Invalid System One generation id".into(),
         ));

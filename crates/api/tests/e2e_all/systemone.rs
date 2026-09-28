@@ -81,9 +81,12 @@ async fn assert_signatures(
     res: &str,
 ) {
     let expected = format!("{}:{}", compute_sha256(req), compute_sha256(res));
+    let encoded_id = urlencoding::encode(id);
     for algorithm in ["ecdsa", "ed25519"] {
         let response = server
-            .get(&format!("/v1/signature/{id}?signing_algo={algorithm}"))
+            .get(&format!(
+                "/v1/signature/{encoded_id}?signing_algo={algorithm}"
+            ))
             .add_header("Authorization", format!("Bearer {key}"))
             .await;
         assert_eq!(response.status_code(), 200, "{}", response.text());
@@ -193,7 +196,7 @@ async fn systemone_external_catalog_alias_billing_and_gateway_signatures() {
 #[tokio::test]
 async fn systemone_external_generation_header_indexes_gateway_signatures() {
     let upstream = MockServer::start().await;
-    let upstream_id = format!("gen-dec-{}", uuid::Uuid::new_v4());
+    let upstream_id = format!("gen:decision.{}/result", uuid::Uuid::new_v4());
     let raw = serde_json::to_string_pretty(&result(None)).unwrap();
     Mock::given(method("POST"))
         .and(path("/v1/systemone"))

@@ -84,7 +84,7 @@ async fn fleet_case(status: u16, malformed: bool, timeout: bool) {
     let next = provider.fleet.fallback_indices_for(first, None)[0];
     let retry = matches!(status, 408 | 429 | 503);
     for index in 0..3 {
-        let id = format!("decision-tee-{index}");
+        let id = format!("decision:tee.{index}/receipt?version=1");
         let value = json!({"id":id,"model":"jev","answers":{"q":{"type":"noul","noul":0.8}},
             "usage":{"input_tokens":7,"output_tokens":1}});
         let mut template = ResponseTemplate::new(if index == first { status } else { 200 })
@@ -110,14 +110,14 @@ async fn fleet_case(status: u16, malformed: bool, timeout: bool) {
     .unwrap();
     let response = provider.systemone(request, "original-hash".into()).await;
     if retry {
-        let id = format!("decision-tee-{next}");
+        let id = format!("decision:tee.{next}/receipt?version=1");
         assert_eq!(response.unwrap().provider_chat_id().unwrap(), id);
         assert_eq!(
             provider.fleet.signature_rotation.lock().unwrap().get(&id),
             Some(&(next as u64))
         );
         Mock::given(method("GET"))
-            .and(path(format!("/v1/signature/{id}")))
+            .and(path(format!("/v1/signature/{}", urlencoding::encode(&id))))
             .and(header("host", format!("jev-i{next}.fleet.test:{port}")))
             .respond_with(
                 ResponseTemplate::new(200).set_body_json(json!({"text":"hash:hash",

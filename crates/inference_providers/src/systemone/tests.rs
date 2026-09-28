@@ -84,8 +84,27 @@ fn rejects_unbillable_or_mismatched_provider_results() {
 }
 
 #[test]
-fn generation_ids_are_safe_header_values_and_path_segments() {
-    for id in ["", "../signature", "a/b", "q?x=y", "id\r\ninjected:yes"] {
+fn generation_ids_preserve_opaque_values() {
+    for id in [
+        "decision-123_abc",
+        "gen.abc",
+        "urn:decision:123",
+        "a/b",
+        "q?x=y",
+    ] {
+        let mut value = response();
+        value["id"] = json!(id);
+        let raw = serde_json::to_vec(&value).unwrap();
+        let parsed = SystemOneResponseWithBytes::parse(raw.clone(), &request()).unwrap();
+        assert_eq!(parsed.chat_id.as_deref(), Some(id));
+        assert_eq!(parsed.provider_chat_id().unwrap(), id);
+        assert_eq!(parsed.raw_bytes, raw);
+    }
+}
+
+#[test]
+fn generation_ids_require_nonempty_http_header_values() {
+    for id in ["", "id\r\ninjected:yes", "id\0"] {
         let mut value = response();
         value["id"] = json!(id);
         assert!(
@@ -93,11 +112,6 @@ fn generation_ids_are_safe_header_values_and_path_segments() {
                 .is_err()
         );
     }
-    let mut value = response();
-    value["id"] = json!("decision-123_abc");
-    let parsed =
-        SystemOneResponseWithBytes::parse(serde_json::to_vec(&value).unwrap(), &request()).unwrap();
-    assert_eq!(parsed.provider_chat_id().unwrap(), "decision-123_abc");
 }
 
 #[test]

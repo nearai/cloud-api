@@ -99,6 +99,16 @@ mod tests {
             (Some("body-id"), None, Some("body-id")),
             (None, Some("header-id"), Some("header-id")),
             (Some("body-id"), Some("header-id"), Some("body-id")),
+            (
+                Some("urn:decision/123.abc"),
+                None,
+                Some("urn:decision/123.abc"),
+            ),
+            (
+                None,
+                Some("urn:decision/123.abc"),
+                Some("urn:decision/123.abc"),
+            ),
             (None, None, None),
         ] {
             let server = MockServer::start().await;
@@ -139,13 +149,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn systemone_transport_rejects_invalid_generation_headers() {
+    async fn systemone_transport_rejects_empty_generation_headers() {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/v1/systemone"))
             .respond_with(
                 ResponseTemplate::new(200)
-                    .insert_header("x-generation-id", "not/a/generation-id")
+                    .insert_header("x-generation-id", "")
                     .set_body_json(
                         json!({"model":"jev", "answers":{"q":{"type":"noul","noul":0.8}},
                         "usage":{"input_tokens":7,"output_tokens":1}}),

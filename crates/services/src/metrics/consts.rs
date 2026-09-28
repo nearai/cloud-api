@@ -52,6 +52,11 @@ pub const METRIC_PROVIDER_REQUESTS: &str = "cloud_api.provider.requests";
 
 pub const METRIC_PROVIDER_ATTEMPTS: &str = "cloud_api.provider.attempts";
 pub const METRIC_BACKEND_KEY_DIVERGENCE: &str = "cloud_api.backend.key_divergence";
+// Attested backends: whether the certificate presented on the connection that
+// carried an attestation report matches the TLS fingerprint the report attests.
+// Tagged `model`, `path` (inline_verify|discovery) and `result`
+// (match|mismatch|unattested|missing).
+pub const METRIC_BACKEND_CHANNEL_BINDING: &str = "cloud_api.backend.channel_binding";
 
 // Error metrics
 pub const METRIC_REQUEST_ERRORS: &str = "cloud_api.request.errors";

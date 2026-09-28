@@ -4,14 +4,18 @@
 //! Two local TLS backends present certificates for 127.0.0.1 from the same
 //! test CA: "genuine" and "relay". Both serve an attestation report whose TLS
 //! fingerprint is the genuine backend's, as a relay forwarding the genuine
-//! report would. The attestation verifier is a stub that accepts the report
-//! and returns the fingerprint it carries, so these tests exercise the
-//! connection handling only. Expected: the relay is refused and nothing is
-//! pinned; the genuine backend is pinned and the returned client keeps serving
-//! on the connection that carried the report.
+//! report would. Most tests use a stub verifier that accepts the report and
+//! returns the fingerprint it carries, so they exercise the connection
+//! handling only; `QuoteBoundVerifier` additionally runs the production
+//! report_data check. Expected: the relay is refused and nothing is pinned;
+//! the genuine backend is pinned and the returned client keeps serving on the
+//! connection that carried the report.
 
 use super::*;
-use crate::attestation::{AttestationVerificationError, VerifiedAttestation};
+use crate::attestation::{
+    AttestationVerificationError, ReportDataVerifier, StrictBoundReportDataVerifier,
+    VerifiedAttestation,
+};
 use crate::metrics::capturing::CapturingMetricsService;
 use bytes::Bytes;
 use http_body_util::{BodyExt, Full};
@@ -22,8 +26,12 @@ use hyper_util::rt::{TokioExecutor, TokioIo};
 use inference_providers::spki_verifier::compute_spki_fingerprint_from_der;
 use inference_providers::{BackendVerifier as _, BackendVerifyError};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
+use sha2::{Digest, Sha256};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use tokio::net::TcpListener;
+
+/// Signing address in the test reports.
+const SIGNING_ADDRESS: &str = "0x00000000000000000000000000000000000000aa";
 
 /// Stand-in for the TDX / GPU verification: accepts any report and returns
 /// the TLS fingerprint it carries, as `AttestationVerifier` does once the
@@ -37,18 +45,11 @@ impl BackendAttestationVerifier for AcceptReportVerifier {
         attestation_report: &serde_json::Map<String, serde_json::Value>,
         _request_nonce: &str,
     ) -> Result<VerifiedAttestation, AttestationVerificationError> {
-        Ok(VerifiedAttestation {
-            tls_cert_fingerprint: attestation_report
+        Ok(verified(
+            attestation_report
                 .get("tls_cert_fingerprint")
-                .and_then(|v| v.as_str())
-                .map(str::to_string),
-            signing_address: "0x0000000000000000000000000000000000000001".to_string(),
-            tcb_status: "UpToDate".to_string(),
-            advisory_ids: Vec::new(),
-            os_image_hash: None,
-            compose_hash: None,
-            gpu_verdict: None,
-        })
+                .and_then(|v| v.as_str()),
+        ))
     }
 }
 
@@ -59,14 +60,71 @@ struct NoFingerprintVerifier;
 impl BackendAttestationVerifier for NoFingerprintVerifier {
     async fn verify_attestation_report(
         &self,
-        attestation_report: &serde_json::Map<String, serde_json::Value>,
+        _attestation_report: &serde_json::Map<String, serde_json::Value>,
+        _request_nonce: &str,
+    ) -> Result<VerifiedAttestation, AttestationVerificationError> {
+        Ok(verified(None))
+    }
+}
+
+/// Runs the production report_data check against a quote whose report_data
+/// binds the genuine backend's key and the request nonce: the quote a relay
+/// obtains by forwarding the nonce to the genuine backend. The verified
+/// fingerprint is the report value that passed that check, as in
+/// `AttestationVerifier::verify_attestation_report`.
+struct QuoteBoundVerifier {
+    genuine_fingerprint: String,
+}
+
+#[async_trait::async_trait]
+impl BackendAttestationVerifier for QuoteBoundVerifier {
+    async fn verify_attestation_report(
+        &self,
+        report: &serde_json::Map<String, serde_json::Value>,
         request_nonce: &str,
     ) -> Result<VerifiedAttestation, AttestationVerificationError> {
-        let mut verified = AcceptReportVerifier
-            .verify_attestation_report(attestation_report, request_nonce)
-            .await?;
-        verified.tls_cert_fingerprint = None;
-        Ok(verified)
+        let mut report_data = [0u8; 64];
+        let mut binding = Sha256::new();
+        binding.update(hex::decode(SIGNING_ADDRESS.trim_start_matches("0x")).unwrap());
+        binding.update(hex::decode(&self.genuine_fingerprint).unwrap());
+        report_data[..32].copy_from_slice(&binding.finalize());
+        report_data[32..].copy_from_slice(&hex::decode(request_nonce).unwrap());
+
+        let address = report
+            .get("signing_address")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| AttestationVerificationError::MissingField("signing_address".into()))?;
+        let fingerprint = report.get("tls_cert_fingerprint").and_then(|v| v.as_str());
+        StrictBoundReportDataVerifier.verify(&report_data, address, fingerprint, request_nonce)?;
+        Ok(verified(fingerprint))
+    }
+}
+
+/// Returns a fixed verified fingerprint whatever the report says.
+struct FixedFingerprintVerifier {
+    fingerprint: String,
+}
+
+#[async_trait::async_trait]
+impl BackendAttestationVerifier for FixedFingerprintVerifier {
+    async fn verify_attestation_report(
+        &self,
+        _attestation_report: &serde_json::Map<String, serde_json::Value>,
+        _request_nonce: &str,
+    ) -> Result<VerifiedAttestation, AttestationVerificationError> {
+        Ok(verified(Some(&self.fingerprint)))
+    }
+}
+
+fn verified(tls_cert_fingerprint: Option<&str>) -> VerifiedAttestation {
+    VerifiedAttestation {
+        tls_cert_fingerprint: tls_cert_fingerprint.map(str::to_string),
+        signing_address: SIGNING_ADDRESS.to_string(),
+        tcb_status: "UpToDate".to_string(),
+        advisory_ids: Vec::new(),
+        os_image_hash: None,
+        compose_hash: None,
+        gpu_verdict: None,
     }
 }
 
@@ -127,6 +185,24 @@ enum Transport {
     PlainHttp1,
 }
 
+fn tls_acceptor(leaf: &Leaf, transport: Transport) -> Option<tokio_rustls::TlsAcceptor> {
+    let alpn = match transport {
+        Transport::PlainHttp1 => return None,
+        Transport::TlsH2 => vec![b"h2".to_vec(), b"http/1.1".to_vec()],
+        Transport::TlsHttp1 => vec![b"http/1.1".to_vec()],
+    };
+    let mut config = rustls::ServerConfig::builder_with_provider(Arc::new(
+        rustls::crypto::aws_lc_rs::default_provider(),
+    ))
+    .with_safe_default_protocol_versions()
+    .unwrap()
+    .with_no_client_auth()
+    .with_single_cert(vec![leaf.cert.clone()], leaf.key.clone_key())
+    .unwrap();
+    config.alpn_protocols = alpn;
+    Some(tokio_rustls::TlsAcceptor::from(Arc::new(config)))
+}
+
 #[derive(Clone, Default)]
 struct Counters {
     /// Completed TLS handshakes (accepted TCP connections for `PlainHttp1`).
@@ -146,10 +222,30 @@ struct Backend {
     counters: Counters,
 }
 
-async fn handle(
+/// How a test backend answers.
+struct Behavior {
     name: &'static str,
-    report: Arc<String>,
-    redirect_to: Option<Arc<String>>,
+    /// JSON served at `/v1/attestation/report`.
+    report: String,
+    /// Answer the attestation request with a 307 to the same path and query
+    /// under this base URL.
+    redirect_to: Option<String>,
+    /// Send `connection: close` on every (HTTP/1.1) response, so the client
+    /// cannot reuse a connection.
+    close_connections: bool,
+}
+
+/// Report JSON attesting `fingerprint`.
+fn report(fingerprint: &str, signing_address: &str) -> serde_json::Value {
+    serde_json::json!({
+        "tls_cert_fingerprint": fingerprint,
+        "signing_address": signing_address,
+        "intel_quote": "00",
+    })
+}
+
+async fn handle(
+    behavior: Arc<Behavior>,
     counters: Counters,
     req: Request<Incoming>,
 ) -> Result<Response<Full<Bytes>>, std::convert::Infallible> {
@@ -162,6 +258,10 @@ async fn handle(
         .unwrap_or_default();
     let has_auth = req.headers().contains_key(hyper::header::AUTHORIZATION);
     let _ = req.into_body().collect().await;
+    let mut response = Response::builder();
+    if behavior.close_connections {
+        response = response.header("connection", "close");
+    }
     let (status, body) = match (method, path.as_str()) {
         (Method::GET, "/v1/attestation/report") => {
             counters.attestation_requests.fetch_add(1, Ordering::SeqCst);
@@ -170,14 +270,14 @@ async fn handle(
                     .attestation_requests_with_auth
                     .fetch_add(1, Ordering::SeqCst);
             }
-            if let Some(target) = redirect_to {
-                return Ok(Response::builder()
+            if let Some(target) = &behavior.redirect_to {
+                return Ok(response
                     .status(StatusCode::TEMPORARY_REDIRECT)
                     .header("location", format!("{target}{path_and_query}"))
                     .body(Full::new(Bytes::new()))
                     .unwrap());
             }
-            (StatusCode::OK, report.as_str().to_string())
+            (StatusCode::OK, behavior.report.clone())
         }
         (Method::GET, "/v1/models") => {
             (StatusCode::OK, r#"{"object":"list","data":[]}"#.to_string())
@@ -186,12 +286,12 @@ async fn handle(
             counters.completion_requests.fetch_add(1, Ordering::SeqCst);
             (
                 StatusCode::OK,
-                serde_json::json!({ "served_by": name }).to_string(),
+                serde_json::json!({ "served_by": behavior.name }).to_string(),
             )
         }
         _ => (StatusCode::NOT_FOUND, "{}".to_string()),
     };
-    Ok(Response::builder()
+    Ok(response
         .status(status)
         .header("content-type", "application/json")
         .body(Full::new(Bytes::from(body)))
@@ -207,37 +307,21 @@ async fn start_backend(
     transport: Transport,
     attested_fingerprint: &str,
 ) -> Backend {
-    start_backend_with(name, leaf, transport, attested_fingerprint, None).await
+    start_backend_with(
+        leaf,
+        transport,
+        Behavior {
+            name,
+            report: report(attested_fingerprint, SIGNING_ADDRESS).to_string(),
+            redirect_to: None,
+            close_connections: false,
+        },
+    )
+    .await
 }
 
-/// Like [`start_backend`]; with `redirect_to`, the attestation request is
-/// answered with a 307 to the same path and query under `redirect_to`.
-async fn start_backend_with(
-    name: &'static str,
-    leaf: &Leaf,
-    transport: Transport,
-    attested_fingerprint: &str,
-    redirect_to: Option<String>,
-) -> Backend {
-    let acceptor = match transport {
-        Transport::PlainHttp1 => None,
-        Transport::TlsH2 | Transport::TlsHttp1 => {
-            let mut config = rustls::ServerConfig::builder_with_provider(Arc::new(
-                rustls::crypto::aws_lc_rs::default_provider(),
-            ))
-            .with_safe_default_protocol_versions()
-            .unwrap()
-            .with_no_client_auth()
-            .with_single_cert(vec![leaf.cert.clone()], leaf.key.clone_key())
-            .unwrap();
-            config.alpn_protocols = if transport == Transport::TlsH2 {
-                vec![b"h2".to_vec(), b"http/1.1".to_vec()]
-            } else {
-                vec![b"http/1.1".to_vec()]
-            };
-            Some(tokio_rustls::TlsAcceptor::from(Arc::new(config)))
-        }
-    };
+async fn start_backend_with(leaf: &Leaf, transport: Transport, behavior: Behavior) -> Backend {
+    let acceptor = tls_acceptor(leaf, transport);
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let base_url = match acceptor {
@@ -245,34 +329,17 @@ async fn start_backend_with(
         None => format!("http://{addr}"),
     };
     let counters = Counters::default();
-    let report = Arc::new(
-        serde_json::json!({
-            "tls_cert_fingerprint": attested_fingerprint,
-            "signing_address": "0x0000000000000000000000000000000000000001",
-            "intel_quote": "00",
-        })
-        .to_string(),
-    );
-
-    let redirect_to = redirect_to.map(Arc::new);
+    let behavior = Arc::new(behavior);
     let server_counters = counters.clone();
     tokio::spawn(async move {
         while let Ok((tcp, _)) = listener.accept().await {
             let acceptor = acceptor.clone();
             let counters = server_counters.clone();
-            let report = report.clone();
-            let redirect_to = redirect_to.clone();
+            let behavior = behavior.clone();
             tokio::spawn(async move {
                 let connections = counters.connections.clone();
-                let service = service_fn(move |req| {
-                    handle(
-                        name,
-                        report.clone(),
-                        redirect_to.clone(),
-                        counters.clone(),
-                        req,
-                    )
-                });
+                let service =
+                    service_fn(move |req| handle(behavior.clone(), counters.clone(), req));
                 let Some(acceptor) = acceptor else {
                     connections.fetch_add(1, Ordering::SeqCst);
                     let _ = hyper::server::conn::http1::Builder::new()
@@ -319,6 +386,18 @@ fn pool_verifier(
     }
 }
 
+fn pool_verifier_with(
+    pki: &Pki,
+    state: Arc<std::sync::RwLock<FingerprintState>>,
+    metrics: Arc<CapturingMetricsService>,
+    attestation_verifier: Arc<dyn BackendAttestationVerifier>,
+) -> PoolBackendVerifier {
+    PoolBackendVerifier {
+        attestation_verifier,
+        ..pool_verifier(pki, state, metrics)
+    }
+}
+
 /// Message of a channel-binding failure; panics on any other result.
 fn channel_binding_error(result: Result<reqwest::Client, BackendVerifyError>) -> String {
     match result {
@@ -359,6 +438,26 @@ fn pinned_set(state: &std::sync::RwLock<FingerprintState>) -> Option<HashSet<Str
     }
 }
 
+fn initial_state(pki: &Pki, genuine_already_pinned: bool) -> FingerprintState {
+    if genuine_already_pinned {
+        FingerprintState::Pinned(HashSet::from([pki.genuine.fingerprint.clone()]))
+    } else {
+        FingerprintState::Bootstrap
+    }
+}
+
+/// Full error chain of a reqwest error (the TLS reason is in a source).
+fn error_chain(error: &(dyn std::error::Error + 'static)) -> String {
+    let mut out = error.to_string();
+    let mut source = error.source();
+    while let Some(inner) = source {
+        out.push_str(" | ");
+        out.push_str(&inner.to_string());
+        source = inner.source();
+    }
+    out
+}
+
 /// A backend presenting a valid certificate that is not the attested one is
 /// refused, nothing is pinned, and no inference request reaches it. With
 /// `genuine_already_pinned`, the relay's certificate first fails the pinned
@@ -366,11 +465,7 @@ fn pinned_set(state: &std::sync::RwLock<FingerprintState>) -> Option<HashSet<Str
 async fn assert_relay_refused(transport: Transport, genuine_already_pinned: bool) {
     let pki = pki();
     let relay = start_backend("relay", &pki.relay, transport, &pki.genuine.fingerprint).await;
-    let initial = if genuine_already_pinned {
-        FingerprintState::Pinned(HashSet::from([pki.genuine.fingerprint.clone()]))
-    } else {
-        FingerprintState::Bootstrap
-    };
+    let initial = initial_state(&pki, genuine_already_pinned);
     let state = Arc::new(std::sync::RwLock::new(initial.clone()));
     let metrics = Arc::new(CapturingMetricsService::new());
     let verifier = pool_verifier(&pki, state.clone(), metrics.clone());
@@ -483,11 +578,14 @@ async fn attestation_redirect_is_not_followed() {
     )
     .await;
     let relay = start_backend_with(
-        "relay",
         &pki.relay,
         Transport::TlsH2,
-        &pki.genuine.fingerprint,
-        Some(genuine.base_url.clone()),
+        Behavior {
+            name: "relay",
+            report: report(&pki.genuine.fingerprint, SIGNING_ADDRESS).to_string(),
+            redirect_to: Some(genuine.base_url.clone()),
+            close_connections: false,
+        },
     )
     .await;
     let state = Arc::new(std::sync::RwLock::new(FingerprintState::Bootstrap));
@@ -548,10 +646,12 @@ async fn report_without_fingerprint_is_refused() {
     .await;
     let state = Arc::new(std::sync::RwLock::new(FingerprintState::Bootstrap));
     let metrics = Arc::new(CapturingMetricsService::new());
-    let verifier = PoolBackendVerifier {
-        attestation_verifier: Arc::new(NoFingerprintVerifier),
-        ..pool_verifier(&pki, state.clone(), metrics.clone())
-    };
+    let verifier = pool_verifier_with(
+        &pki,
+        state.clone(),
+        metrics.clone(),
+        Arc::new(NoFingerprintVerifier),
+    );
 
     let err = channel_binding_error(verifier.create_verified_client(&genuine.base_url).await);
     assert!(err.contains("TLS channel binding unattested"), "{err}");
@@ -583,6 +683,288 @@ async fn backend_without_peer_certificate_is_refused() {
         FingerprintState::Bootstrap
     ));
     assert_eq!(channel_binding_results(&metrics), vec!["result:missing"]);
+}
+
+// ---------------------------------------------------------------------------
+// Relays forwarding a genuinely bound report (production report_data check)
+// ---------------------------------------------------------------------------
+
+/// An HTTP/1.1-only relay forwarding the genuine, correctly bound report
+/// passes the report_data check and is refused by the channel check, from
+/// Bootstrap and after the fast path rejected it. The failure is typed as a
+/// channel-binding failure, which the provider does not retry.
+#[tokio::test]
+async fn relay_with_quote_bound_report_is_refused() {
+    for genuine_already_pinned in [false, true] {
+        let pki = pki();
+        let relay = start_backend(
+            "relay",
+            &pki.relay,
+            Transport::TlsHttp1,
+            &pki.genuine.fingerprint,
+        )
+        .await;
+        let initial = initial_state(&pki, genuine_already_pinned);
+        let state = Arc::new(std::sync::RwLock::new(initial.clone()));
+        let metrics = Arc::new(CapturingMetricsService::new());
+        let verifier = pool_verifier_with(
+            &pki,
+            state.clone(),
+            metrics.clone(),
+            Arc::new(QuoteBoundVerifier {
+                genuine_fingerprint: pki.genuine.fingerprint.clone(),
+            }),
+        );
+
+        let err = channel_binding_error(verifier.create_verified_client(&relay.base_url).await);
+        assert!(err.contains("TLS channel binding mismatch"), "{err}");
+        let c = &relay.counters;
+        assert_eq!(count(&c.attestation_requests), 1);
+        assert_eq!(count(&c.attestation_requests_with_auth), 0);
+        assert_eq!(count(&c.completion_requests), 0);
+        let expected =
+            genuine_already_pinned.then(|| HashSet::from([pki.genuine.fingerprint.clone()]));
+        assert_eq!(pinned_set(&state), expected);
+        assert_eq!(channel_binding_results(&metrics), vec!["result:mismatch"]);
+    }
+}
+
+/// An L4 splice passes the first connection through to the genuine backend,
+/// so the attestation and its channel check genuinely pass. The genuine
+/// backend closes that connection, and the splice terminates every later
+/// connection with the relay's own valid certificate. The returned client must
+/// refuse the relay on reconnect (its own pin is the attested key, and TLS
+/// session resumption is off), so no inference reaches the relay.
+#[tokio::test]
+async fn splicing_relay_cannot_take_over_a_verified_client() {
+    let pki = pki();
+    let genuine = start_backend_with(
+        &pki.genuine,
+        Transport::TlsHttp1,
+        Behavior {
+            name: "genuine",
+            report: report(&pki.genuine.fingerprint, SIGNING_ADDRESS).to_string(),
+            redirect_to: None,
+            close_connections: true,
+        },
+    )
+    .await;
+    let genuine_addr: std::net::SocketAddr = genuine
+        .base_url
+        .trim_start_matches("https://")
+        .parse()
+        .unwrap();
+
+    let relay_acceptor = tls_acceptor(&pki.relay, Transport::TlsHttp1).unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let splice_url = format!("https://{}", listener.local_addr().unwrap());
+    let accepted = Arc::new(AtomicUsize::new(0));
+    let relay_handshakes = Arc::new(AtomicUsize::new(0));
+    let relay_completions = Arc::new(AtomicUsize::new(0));
+    {
+        let accepted = accepted.clone();
+        let relay_handshakes = relay_handshakes.clone();
+        let relay_completions = relay_completions.clone();
+        tokio::spawn(async move {
+            while let Ok((mut tcp, _)) = listener.accept().await {
+                let n = accepted.fetch_add(1, Ordering::SeqCst);
+                let acceptor = relay_acceptor.clone();
+                let relay_handshakes = relay_handshakes.clone();
+                let relay_completions = relay_completions.clone();
+                tokio::spawn(async move {
+                    if n == 0 {
+                        // L4 passthrough to the genuine backend.
+                        let mut upstream =
+                            tokio::net::TcpStream::connect(genuine_addr).await.unwrap();
+                        let _ = tokio::io::copy_bidirectional(&mut tcp, &mut upstream).await;
+                        return;
+                    }
+                    let Ok(tls) = acceptor.accept(tcp).await else {
+                        return;
+                    };
+                    relay_handshakes.fetch_add(1, Ordering::SeqCst);
+                    let service = service_fn(move |req: Request<Incoming>| {
+                        let relay_completions = relay_completions.clone();
+                        async move {
+                            if req.uri().path() == "/v1/chat/completions" {
+                                relay_completions.fetch_add(1, Ordering::SeqCst);
+                            }
+                            let _ = req.into_body().collect().await;
+                            Ok::<_, std::convert::Infallible>(Response::new(Full::new(
+                                Bytes::from_static(br#"{"served_by":"relay"}"#),
+                            )))
+                        }
+                    });
+                    let _ = hyper::server::conn::http1::Builder::new()
+                        .serve_connection(TokioIo::new(tls), service)
+                        .await;
+                });
+            }
+        });
+    }
+
+    let state = Arc::new(std::sync::RwLock::new(FingerprintState::Bootstrap));
+    let metrics = Arc::new(CapturingMetricsService::new());
+    let verifier = pool_verifier_with(
+        &pki,
+        state.clone(),
+        metrics.clone(),
+        Arc::new(QuoteBoundVerifier {
+            genuine_fingerprint: pki.genuine.fingerprint.clone(),
+        }),
+    );
+    let client = verifier
+        .create_verified_client(&splice_url)
+        .await
+        .expect("the attestation passed through to the genuine backend must be accepted");
+    assert_eq!(channel_binding_results(&metrics), vec!["result:match"]);
+    assert_eq!(count(&genuine.counters.attestation_requests), 1);
+
+    // The genuine backend closed the attestation connection, so inference
+    // opens a new one, which the splice hands to the relay.
+    for _ in 0..2 {
+        let err = client
+            .post(format!("{splice_url}/v1/chat/completions"))
+            .json(&serde_json::json!({ "messages": [] }))
+            .send()
+            .await
+            .expect_err("the relay's certificate must be refused on reconnect");
+        let chain = error_chain(&err);
+        assert!(
+            chain.contains("does not match any attested fingerprint"),
+            "unexpected error: {chain}"
+        );
+    }
+    assert_eq!(relay_completions.load(Ordering::SeqCst), 0);
+    assert_eq!(relay_handshakes.load(Ordering::SeqCst), 0);
+    assert_eq!(accepted.load(Ordering::SeqCst), 3);
+    assert_eq!(count(&genuine.counters.completion_requests), 0);
+    assert_eq!(count(&genuine.counters.connections), 1);
+}
+
+/// A relay that rewrites the report to attest its own key fails the
+/// report_data check (the quote binds the genuine key) before the channel
+/// check: nothing is pinned and no channel-binding result is recorded.
+#[tokio::test]
+async fn report_attesting_the_relay_key_fails_verification() {
+    for genuine_already_pinned in [false, true] {
+        let pki = pki();
+        let relay = start_backend(
+            "relay",
+            &pki.relay,
+            Transport::TlsH2,
+            &pki.relay.fingerprint,
+        )
+        .await;
+        let state = Arc::new(std::sync::RwLock::new(initial_state(
+            &pki,
+            genuine_already_pinned,
+        )));
+        let metrics = Arc::new(CapturingMetricsService::new());
+        let verifier = pool_verifier_with(
+            &pki,
+            state.clone(),
+            metrics.clone(),
+            Arc::new(QuoteBoundVerifier {
+                genuine_fingerprint: pki.genuine.fingerprint.clone(),
+            }),
+        );
+
+        let err = other_error(verifier.create_verified_client(&relay.base_url).await);
+        assert!(err.contains("Attestation verification failed"), "{err}");
+        assert!(err.contains("report data binding mismatch"), "{err}");
+        assert!(channel_binding_results(&metrics).is_empty());
+        assert_eq!(count(&relay.counters.completion_requests), 0);
+        let expected =
+            genuine_already_pinned.then(|| HashSet::from([pki.genuine.fingerprint.clone()]));
+        assert_eq!(pinned_set(&state), expected);
+    }
+}
+
+/// The connection is compared with the verifier's output, not with the raw
+/// report: a report claiming the key the connection presents is refused when
+/// the verified fingerprint differs, and a report with a wrong field is
+/// accepted (and the verified value pinned) when the verified fingerprint
+/// matches the connection.
+#[tokio::test]
+async fn channel_check_uses_the_verified_fingerprint() {
+    let pki = pki();
+    let state = Arc::new(std::sync::RwLock::new(FingerprintState::Bootstrap));
+    let metrics = Arc::new(CapturingMetricsService::new());
+    let verifier = pool_verifier_with(
+        &pki,
+        state.clone(),
+        metrics.clone(),
+        Arc::new(FixedFingerprintVerifier {
+            fingerprint: pki.genuine.fingerprint.clone(),
+        }),
+    );
+
+    let relay = start_backend(
+        "relay",
+        &pki.relay,
+        Transport::TlsH2,
+        &pki.relay.fingerprint,
+    )
+    .await;
+    let err = channel_binding_error(verifier.create_verified_client(&relay.base_url).await);
+    assert!(err.contains("TLS channel binding mismatch"), "{err}");
+    assert_eq!(pinned_set(&state), None);
+
+    let genuine = start_backend(
+        "genuine",
+        &pki.genuine,
+        Transport::TlsH2,
+        &pki.relay.fingerprint,
+    )
+    .await;
+    verifier
+        .create_verified_client(&genuine.base_url)
+        .await
+        .expect("the connection presents the verified fingerprint");
+    assert_eq!(
+        pinned_set(&state),
+        Some(HashSet::from([pki.genuine.fingerprint.clone()]))
+    );
+}
+
+/// report_data binds `SHA256(signing_address || fingerprint)` without length
+/// framing, so bytes can be moved from the fingerprint into the address and
+/// the report_data check still passes. The resulting "verified" fingerprint is
+/// truncated and cannot equal the SPKI hash of any connection.
+#[tokio::test]
+async fn shifted_report_data_bytes_fail_the_channel_check() {
+    let pki = pki();
+    let genuine = &pki.genuine.fingerprint;
+    let shifted_address = format!("{SIGNING_ADDRESS}{}", &genuine[..16]);
+    let shifted_fingerprint = &genuine[16..];
+    let relay = start_backend_with(
+        &pki.relay,
+        Transport::TlsH2,
+        Behavior {
+            name: "relay",
+            report: report(shifted_fingerprint, &shifted_address).to_string(),
+            redirect_to: None,
+            close_connections: false,
+        },
+    )
+    .await;
+    let state = Arc::new(std::sync::RwLock::new(FingerprintState::Bootstrap));
+    let metrics = Arc::new(CapturingMetricsService::new());
+    let verifier = pool_verifier_with(
+        &pki,
+        state.clone(),
+        metrics.clone(),
+        Arc::new(QuoteBoundVerifier {
+            genuine_fingerprint: genuine.clone(),
+        }),
+    );
+
+    // The report_data check passed: the failure is the channel check.
+    let err = channel_binding_error(verifier.create_verified_client(&relay.base_url).await);
+    assert!(err.contains("TLS channel binding mismatch"), "{err}");
+    assert_eq!(pinned_set(&state), None);
+    assert_eq!(channel_binding_results(&metrics), vec!["result:mismatch"]);
 }
 
 #[test]

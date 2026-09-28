@@ -93,6 +93,15 @@ impl NativeResponsesService {
                 "Native Responses is not enabled for this stateless request",
             ));
         }
+        if model
+            .output_modalities
+            .as_ref()
+            .is_some_and(|modalities| modalities.iter().any(|modality| modality == "image"))
+        {
+            return Err(NativeResponsesError::InvalidRequest(
+                "Image generation and image editing are not supported by /v1/responses. Use /v1/images/generations or /v1/images/edits.",
+            ));
+        }
         validate(&body).map_err(NativeResponsesError::InvalidRequest)?;
         let guard = self
             .completion_service

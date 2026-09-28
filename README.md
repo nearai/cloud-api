@@ -205,9 +205,16 @@ and returns `Cache-Control: no-store`. Creation, upload, and every Conversation
 or File mutation other than the existing per-resource `DELETE` routes return
 `410 Gone`. The temporary routes will be removed after data migration.
 
-`POST /v1/responses` remains stateless (`store: false`) and does not accept a
-Conversation reference, response history, or File input. Clients must send any
-inference history needed for a request themselves.
+`POST /v1/responses` remains stateless and does not accept a Conversation
+reference, response history, or File input. The default typed adapter treats
+an omitted `store` as `false` and rejects `store: true`; native routing is
+selected only for an explicitly supplied `store: false`. Clients must send any
+inference history needed for a request themselves. The default typed adapter
+uses one Chat Completions inference; a canonical model explicitly configured
+through `NATIVE_RESPONSES_MODELS`, with an explicit `store: false` request,
+uses one native provider Responses inference instead. Both paths keep no
+response/item history, do not run an agent loop, and only support
+client-managed function tools.
 
 Interactive API documentation is available when running the server:
 

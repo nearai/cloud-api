@@ -21,6 +21,8 @@ struct ProcessStreamContext {
     request_id: uuid::Uuid,
     organization_id: uuid::Uuid,
     workspace_id: uuid::Uuid,
+    fallback_enabled: bool,
+    request_priority: inference_providers::models::RequestPriority,
     body_hash: String,
     signing_algo: Option<String>,
     client_pub_key: Option<String>,
@@ -85,6 +87,8 @@ impl ports::ResponseServiceTrait for ResponseServiceImpl {
         request_id: uuid::Uuid,
         organization_id: uuid::Uuid,
         workspace_id: uuid::Uuid,
+        fallback_enabled: bool,
+        request_priority: inference_providers::models::RequestPriority,
         body_hash: String,
         signing_algo: Option<String>,
         client_pub_key: Option<String>,
@@ -105,11 +109,22 @@ impl ports::ResponseServiceTrait for ResponseServiceImpl {
             .and_then(|_| request.validate_stateless())
             .map_err(errors::ResponseError::InvalidParams)?;
 
-        // Responses is deliberately a compatibility layer over one Chat
-        // Completions request. Image generation/editing used to take a
-        // separate direct-provider path here; reject image-output models so
-        // they cannot silently bypass that contract.
-        if let Ok(Some(model)) = self.completion_service.get_model(&request.model).await {
+        // Resolve once before spawning the worker. Endpoint validation must
+        // take precedence over the image guard: a decision-capable model,
+        // including one that also advertises image output, belongs on
+        // /v1/systemone and must return a direct HTTP 400 for both stream
+        // variants. The explicit NATIVE_RESPONSES_MODELS route is handled
+        // before this typed adapter.
+        let model = self
+            .completion_service
+            .get_model(&request.model)
+            .await
+            .ok()
+            .flatten();
+        if let Some(model) = &model {
+            model
+                .validate_endpoint(crate::models::InferenceEndpoint::Responses)
+                .map_err(|message| errors::ResponseError::InvalidParams(message.into()))?;
             if Self::has_image_generation_capability(&model.output_modalities) {
                 return Err(errors::ResponseError::InvalidParams(
                     "The stateless Responses API only supports a single /chat/completions request; image generation and image editing are not supported. Use /v1/images/generations or /v1/images/edits.".to_string(),
@@ -120,21 +135,6 @@ impl ports::ResponseServiceTrait for ResponseServiceImpl {
         let mut request = request;
         request.store = Some(false);
         request.background = Some(false);
-
-        // Validate the endpoint before spawning the worker so unsupported
-        // model types are reported as an HTTP 400 for both streaming and
-        // non-streaming requests, rather than as an SSE error after 200.
-        if let Some(model) = self
-            .completion_service
-            .get_model(&request.model)
-            .await
-            .ok()
-            .flatten()
-        {
-            model
-                .validate_endpoint(crate::models::InferenceEndpoint::Responses)
-                .map_err(|message| errors::ResponseError::InvalidParams(message.into()))?;
-        }
 
         // Create a channel for streaming events
         let (mut tx, rx) = mpsc::unbounded::<models::ResponseStreamEvent>();
@@ -166,6 +166,8 @@ impl ports::ResponseServiceTrait for ResponseServiceImpl {
                 request_id,
                 organization_id,
                 workspace_id,
+                fallback_enabled,
+                request_priority,
                 body_hash,
                 signing_algo: signing_algo_clone,
                 client_pub_key: client_pub_key_clone,
@@ -960,9 +962,10 @@ impl ResponseServiceImpl {
         let tools = tools::prepare_tools(&context.request);
         let tool_choice = tools::prepare_tool_choice(&context.request);
 
-        // Responses is a stateless compatibility layer over exactly one Chat
-        // Completions request. Client-defined functions are returned to the
-        // caller; Cloud never executes them or starts another completion.
+        // The default typed Responses adapter is a stateless compatibility
+        // layer over exactly one Chat Completions request. Client-defined
+        // functions are returned to the caller; Cloud never executes them or
+        // starts another completion.
         let one_shot_result: Result<(String, bool), errors::ResponseError> = async {
             let stream_result = Self::run_completion_once(
                 &mut ctx,
@@ -1122,7 +1125,7 @@ impl ResponseServiceImpl {
         Ok(())
     }
 
-    /// Execute exactly one Chat Completions request for a Responses call.
+    /// Execute exactly one Chat Completions request for the typed Responses adapter.
     #[allow(clippy::too_many_arguments)]
     async fn run_completion_once(
         ctx: &mut crate::responses::service_helpers::ResponseStreamContext,
@@ -1178,6 +1181,7 @@ impl ResponseServiceImpl {
         }
 
         let completion_request = CompletionRequest {
+            request_priority: process_context.request_priority,
             request_id: process_context.request_id,
             model: process_context.request.model.clone(),
             messages: messages.to_vec(),
@@ -1190,6 +1194,7 @@ impl ResponseServiceImpl {
             api_key_id: process_context.api_key_id.to_string(),
             organization_id: process_context.organization_id,
             workspace_id: process_context.workspace_id,
+            fallback_enabled: process_context.fallback_enabled,
             metadata: process_context.request.metadata.clone(),
             store: process_context.request.store,
             body_hash: process_context.body_hash.clone(),
@@ -1566,6 +1571,7 @@ impl ResponseServiceImpl {
                 content: serde_json::Value::String(String::new()),
                 tool_call_id: None,
                 tool_calls: None,
+                reasoning_content: None,
             }
         });
         message.tool_calls = Some(std::mem::take(pending_function_calls));
@@ -1609,6 +1615,7 @@ impl ResponseServiceImpl {
                     content: serde_json::Value::String(output.clone()),
                     tool_call_id: Some(call_id.clone()),
                     tool_calls: None,
+                    reasoning_content: None,
                 });
                 true
             }
@@ -1655,6 +1662,7 @@ impl ResponseServiceImpl {
                     content: serde_json::Value::String(prompt),
                     tool_call_id: None,
                     tool_calls: None,
+                    reasoning_content: None,
                 });
                 tracing::debug!("Prepended organization system prompt to messages");
             }
@@ -1680,6 +1688,7 @@ impl ResponseServiceImpl {
                 content: serde_json::Value::String(combined_instructions),
                 tool_call_id: None,
                 tool_calls: None,
+                reasoning_content: None,
             });
         } else {
             // Add language instruction and time context as a system message if no instructions provided
@@ -1689,6 +1698,7 @@ impl ResponseServiceImpl {
                 content: serde_json::Value::String(system_content),
                 tool_call_id: None,
                 tool_calls: None,
+                reasoning_content: None,
             });
         }
 
@@ -1773,6 +1783,7 @@ impl ResponseServiceImpl {
                             content: serde_json::Value::String(String::new()),
                             tool_call_id: None,
                             tool_calls: Some(std::mem::take(pending)),
+                            reasoning_content: None,
                         });
                         *pending_resp_id = None;
                     }
@@ -1843,6 +1854,7 @@ impl ResponseServiceImpl {
                                 content: serde_json::Value::String(text),
                                 tool_call_id: None,
                                 tool_calls: None,
+                                reasoning_content: None,
                             });
                         }
                     }
@@ -1886,6 +1898,7 @@ impl ResponseServiceImpl {
                             content: serde_json::Value::String(output),
                             tool_call_id: Some(call_id),
                             tool_calls: None,
+                            reasoning_content: None,
                         });
                     }
                     models::ResponseOutputItem::McpCall {
@@ -1934,6 +1947,7 @@ impl ResponseServiceImpl {
                                 content: serde_json::Value::String(tool_output),
                                 tool_call_id: Some(tool_call_id),
                                 tool_calls: None,
+                                reasoning_content: None,
                             });
                         }
                     }
@@ -1978,6 +1992,7 @@ impl ResponseServiceImpl {
                             ),
                             tool_call_id: Some(tc_id),
                             tool_calls: None,
+                            reasoning_content: None,
                         });
                     }
                     // Skip items that don't contribute to conversation context
@@ -2012,6 +2027,7 @@ impl ResponseServiceImpl {
                         content: serde_json::Value::String(text.clone()),
                         tool_call_id: None,
                         tool_calls: None,
+                        reasoning_content: None,
                     });
                 }
                 models::ResponseInput::Items(items) => {
@@ -2047,6 +2063,7 @@ impl ResponseServiceImpl {
                                     content,
                                     tool_call_id: None,
                                     tool_calls: None,
+                                    reasoning_content: None,
                                 };
                                 // An assistant message immediately before
                                 // replayed function calls belongs to the same

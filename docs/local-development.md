@@ -285,10 +285,17 @@ interactively and inspect request/response schemas.
 
 ### Stateless Responses and attestation retention
 
-`POST /v1/responses` accepts only `store: false` (an omitted value is treated
-as `false`). Cloud API does not retain raw request or response content,
-response items, or response history; clients must supply any needed prior
-context with each request.
+`POST /v1/responses` is stateless. The default typed adapter treats an omitted
+`store` as `false` and rejects `store: true`; the native allowlisted route is
+selected only when `store: false` is explicitly supplied. Cloud API does not
+retain raw request or response content, response items, or response history;
+clients must supply any needed prior context with each request.
+
+The default typed adapter makes one Chat Completions inference. A canonical
+model explicitly listed in `NATIVE_RESPONSES_MODELS`, with an explicit
+`store: false` request, instead makes one native provider Responses inference.
+That narrow exception remains stateless, writes no response/item history, and
+does not run an agent loop or execute built-in or remote MCP tools.
 
 Custom `function` tools are client-managed. Cloud returns a `function_call`
 item but does not execute it. To continue after running the function, the
@@ -298,7 +305,7 @@ client sends a fresh `store: false` request containing the original
 definitions again in `tools` on every request so the model can continue to
 call them if needed.
 
-This initial compatibility path accepts a raw `function_call` item from a
+The default typed compatibility path accepts a raw `function_call` item from a
 previous response, its matching `function_call_output`, and assistant
 `message` content parts of type `output_text` as caller-managed message
 history. It does not support reasoning items or arbitrary full
@@ -311,14 +318,17 @@ the signature material contains no raw request or response content. A stream
 that disconnects before completion creates no `resp_*` attestation record or
 legacy disconnect fallback.
 
-Only custom `function` tools are supported by `POST /v1/responses`.
+Only client-managed custom `function` tools are supported by
+`POST /v1/responses`, including the native allowlisted path.
 Server-executed tools are rejected locally: `web_search`,
 `web_context_search`, `file_search`, `code_interpreter`, `computer`, and
-remote `mcp` tools. Image-generation and image-editing models are also
-rejected so every successful Responses inference makes exactly one Chat
-Completions call. This does not affect the separate `POST /mcp` MCP server,
-which continues to expose its independent `web_search` tool, or the
-`/v1/images/*` endpoints.
+remote `mcp` tools. Image-generation and image-editing models are rejected on
+both paths. The default typed adapter's successful requests make exactly one
+Chat Completions call. This does not affect the separate `POST /mcp` MCP
+server, which continues to expose its independent `web_search` tool, or the
+`/v1/images/*` endpoints. Native allowlisted requests may preserve validated
+provider-native fields such as reasoning data rather than passing through the
+typed adapter.
 
 Responses itself rejects conversation linkage, response history, and file
 input. During the temporary migration/export window, the authenticated,

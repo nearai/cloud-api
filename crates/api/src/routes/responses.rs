@@ -27,11 +27,15 @@ use tracing::debug;
 /// prevents a completed inference response from being delivered.
 const RESPONSE_ATTESTATION_STORE_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// OpenAPI-only view of the stateless Responses request contract.
+/// OpenAPI view of the default typed stateless Responses adapter.
 ///
 /// The runtime request type keeps legacy variants so it can return a precise
-/// `invalid_request_error` for them. The public endpoint schema should instead
-/// show only the items accepted by the stateless implementation.
+/// `invalid_request_error` for them. The typed adapter normalizes an omitted
+/// `store` to `false`. A canonical model explicitly listed in
+/// `NATIVE_RESPONSES_MODELS` uses the provider's native Responses transport
+/// only when `store: false` is explicitly supplied. That exception remains
+/// stateless and permits only client-managed function tools, but can preserve
+/// validated provider-native fields that this typed schema does not model.
 #[derive(serde::Deserialize, utoipa::ToSchema)]
 pub struct StatelessCreateResponseRequestSchema {
     pub model: String,
@@ -431,13 +435,30 @@ pub async fn response_history_gone() -> axum::response::Response {
 /// Create response
 ///
 /// Generate a single-turn, stateless AI response with optional streaming.
+///
+/// The default typed adapter normalizes an omitted `store` to `false` and
+/// performs one Chat Completions inference. A canonical model explicitly
+/// allowlisted through `NATIVE_RESPONSES_MODELS` uses one native provider
+/// Responses inference only when `store: false` is explicitly supplied.
+/// Both paths keep no response/item history and never execute built-in,
+/// remote MCP, or agent-loop tools.
 #[utoipa::path(
     post,
     path = "/v1/responses",
     tag = "Responses",
-    request_body = StatelessCreateResponseRequestSchema,
+    request_body(
+        content = serde_json::Value,
+        description = "Polymorphic stateless JSON request. The default typed adapter accepts the StatelessCreateResponseRequestSchema component and normalizes an omitted store to false. A canonical model allowlisted through NATIVE_RESPONSES_MODELS with explicit store: false instead accepts validated provider-native Responses fields. Both paths remain stateless and reject built-in and remote MCP tools."
+    ),
     responses(
-        (status = 200, description = "Response created", body = ResponseObject),
+        (
+            status = 200,
+            description = "Polymorphic success response. The default typed adapter returns the ResponseObject schema as JSON for non-streaming requests. An allowlisted native request forwards its provider-native response shape, which can include native reasoning fields outside ResponseObject. Streaming requests use text/event-stream on either path.",
+            content(
+                (serde_json::Value = "application/json"),
+                ("text/event-stream")
+            )
+        ),
         (status = 400, description = "Invalid request", body = ErrorResponse),
         (status = 401, description = "Invalid or missing API key", body = ErrorResponse),
         (status = 402, description = "Insufficient credits", body = ErrorResponse),
@@ -473,8 +494,8 @@ pub async fn create_response(
         )
         .await;
     }
-    // All other requests keep the existing typed validation, defaults and
-    // stateful service. Native-only fields never pass through that conversion.
+    // All other requests use the typed stateless adapter and its validation.
+    // Native-only fields never pass through that conversion.
     let request = match axum::Json::<CreateResponseRequest>::from_bytes(raw.get().as_bytes()) {
         Ok(axum::Json(request)) => request,
         Err(e) => return super::extractors::OpenAiJsonRejection(e).into_response(),

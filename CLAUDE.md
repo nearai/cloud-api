@@ -201,6 +201,7 @@ POST /v1/responses
 - `store: false` is the only supported mode; an omitted `store` is treated as `false` and `store: true` is rejected
 - Clients send all needed prior context in each request. Conversations, `previous_response_id`, background responses, and response-history endpoints are retired or unsupported.
 - Raw request/response content, response items, and conversation history are not persisted.
+- The default typed adapter makes one Chat Completions inference. A canonical model explicitly allowlisted through `NATIVE_RESPONSES_MODELS`, with an explicit `store: false` request, instead makes one native provider Responses inference; both paths remain stateless and write no response/item history.
 - **Existing completed-response attestation is preserved best-effort**: when its signature write succeeds, `GET /v1/signature/resp_*` can retrieve the response ID and signatures over SHA-256 request/response digests. The signature material contains no raw request or response content. A disconnected stream has no completed `resp_*` attestation record or legacy disconnect fallback.
 - Event types: `response.created`, `response.output_text.delta`, `response.completed`, `response.failed`
 - Only custom `type: "function"` tools are supported. They are client-managed: Cloud returns a `function_call` but never executes it; the client sends the original call and its matching `function_call_output` in a later fresh `store: false` request with its own history.

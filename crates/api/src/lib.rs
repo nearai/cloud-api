@@ -2804,11 +2804,40 @@ mod tests {
     #[test]
     fn test_openapi_stateless_responses_request_excludes_rejected_inputs() {
         let spec = serde_json::to_value(ApiDoc::openapi()).unwrap();
-        let request_schema = &spec["paths"]["/v1/responses"]["post"]["requestBody"]["content"]
-            ["application/json"]["schema"];
-        assert_eq!(
-            request_schema["$ref"],
-            "#/components/schemas/StatelessCreateResponseRequestSchema"
+        let operation = &spec["paths"]["/v1/responses"]["post"];
+        let request_body = &operation["requestBody"];
+        let request_description = request_body["description"]
+            .as_str()
+            .expect("Responses request body must explain its polymorphic contract");
+        assert!(
+            request_description.contains("StatelessCreateResponseRequestSchema")
+                && request_description.contains("NATIVE_RESPONSES_MODELS"),
+            "Responses request body must distinguish the typed schema from the native exception"
+        );
+        let request_schema = &request_body["content"]["application/json"]["schema"];
+        assert_ne!(
+            request_schema["$ref"], "#/components/schemas/StatelessCreateResponseRequestSchema",
+            "the endpoint request schema must not falsely present the typed adapter as universal"
+        );
+
+        let response = &operation["responses"]["200"];
+        let response_description = response["description"]
+            .as_str()
+            .expect("Responses success response must explain its polymorphic contract");
+        assert!(
+            response_description.contains("ResponseObject")
+                && response_description.contains("provider-native")
+                && response_description.contains("text/event-stream"),
+            "Responses success response must distinguish typed JSON, native JSON, and streaming"
+        );
+        let json_response_schema = &response["content"]["application/json"]["schema"];
+        assert_ne!(
+            json_response_schema["$ref"], "#/components/schemas/ResponseObject",
+            "the endpoint response schema must not falsely present typed output as universal"
+        );
+        assert!(
+            response["content"].get("text/event-stream").is_some(),
+            "Responses OpenAPI must advertise its streaming media type"
         );
 
         let schemas = &spec["components"]["schemas"];
@@ -2953,16 +2982,16 @@ mod tests {
             "Responses create-request schema must reference only the client-managed tool schema"
         );
 
-        let response_tool_schema = &spec["components"]["schemas"]["ClientManagedResponseTool"];
+        let response_tool_schema = &spec["components"]["schemas"]["StatelessResponseToolSchema"];
         assert!(
             response_tool_schema.is_object(),
-            "Responses OpenAPI schema must describe its supported tool type"
+            "typed Responses OpenAPI schema must describe its supported tool type"
         );
 
         let serialized_tool_schema = serde_json::to_string(response_tool_schema).unwrap();
         assert!(
             serialized_tool_schema.contains("function"),
-            "Responses OpenAPI schema must retain custom function tools"
+            "typed Responses OpenAPI schema must retain custom function tools"
         );
         for server_executed_tool in [
             "web_search",
@@ -2974,7 +3003,7 @@ mod tests {
         ] {
             assert!(
                 !serialized_tool_schema.contains(server_executed_tool),
-                "Responses OpenAPI schema must not advertise the rejected {server_executed_tool} tool"
+                "typed Responses OpenAPI schema must not advertise the rejected {server_executed_tool} tool"
             );
         }
 
@@ -2985,10 +3014,15 @@ mod tests {
         let description = responses_tag["description"]
             .as_str()
             .expect("Responses tag must document its contract");
+        assert!(description.contains("accepts an omitted `store` as `false`"));
+        assert!(
+            description.contains("native routing requires an explicitly supplied `store: false`")
+        );
         assert!(description
-            .contains("successful Responses inference makes exactly one Chat Completions call"));
-        assert!(description.contains("Only custom `function` tools are supported"));
-        assert!(description.contains("image-generation/editing models are rejected"));
+            .contains("default typed adapter sends exactly one Chat Completions inference"));
+        assert!(description.contains("NATIVE_RESPONSES_MODELS"));
+        assert!(description.contains("Only client-managed `function` tools are supported"));
+        assert!(description.contains("Image-generation/editing models are rejected on both paths"));
         assert!(description.contains("POST /mcp"));
     }
 

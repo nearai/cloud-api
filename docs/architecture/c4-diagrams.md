@@ -323,7 +323,7 @@ graph TB
 | **Organization Service** | Multi-tenant organization & workspace management | Organization Repo, Workspace Repo |
 | **User Service** | User management, profile updates | User Repo, Session Repo |
 | **Conversation Service** | Temporary workspace-scoped views and per-resource deletion | Conversation Repo |
-| **Response Service** | One Chat Completions request per stateless Responses call | Completion Service, Usage Service |
+| **Response Service** | Default typed stateless adapter: one Chat Completions request; explicit native allowlist bypasses it | Completion Service, Usage Service |
 | **Completion Service** | Coordinates with inference providers | Provider Pool, Model Service |
 | **Model Service** | Manages model catalog & pricing | Model Repo |
 | **Usage Service** | Tracks token usage, enforces limits | Usage Repo, Organization Repo |
@@ -490,11 +490,18 @@ sequenceDiagram
     Note over Client,Database: Streaming provides real-time response<br/>while tracking usage
 ```
 
-### 4. Stateless Response Creation Flow (Platform-specific API)
+### 4. Default Typed Stateless Response Creation Flow (Platform-specific API)
 
-`POST /v1/responses` is a stateless compatibility API. Each successful request
-creates one Chat Completions inference request; it does not link to a
-Conversation or persist response/item history.
+`POST /v1/responses` is a stateless compatibility API. The default typed
+adapter normalizes an omitted `store` to `false`, then creates one Chat
+Completions inference request; it does not link to a Conversation or persist
+response/item history. A canonical model explicitly listed in
+`NATIVE_RESPONSES_MODELS`, with an explicitly supplied `store: false` request,
+is a narrow exception: it makes one native provider Responses request instead.
+That path remains stateless, writes no response/item history, and never runs a
+server-side agent loop or executes built-in/remote MCP tools. Image-generation
+and image-editing models are rejected on both paths. The diagram below
+describes the default typed adapter.
 
 ```mermaid
 sequenceDiagram
@@ -535,7 +542,7 @@ sequenceDiagram
     Note over Client,AttestationService: No responses/response_items row, response history,<br/>server tool execution, or agent loop is used
 ```
 
-### 5. Client-Managed Function Call Flow (Tool Use)
+### 5. Default Typed Client-Managed Function Call Flow (Tool Use)
 
 Multi-turn flow where the model requests a custom function and the client
 executes it. Only `type: "function"` tools are accepted by Responses;
@@ -781,7 +788,7 @@ stateDiagram-v2
     failed --> [*]: Error delivered
 
     note right of in_progress
-        One Chat Completions inference
+        Default typed adapter: one Chat Completions inference
         Streaming tokens and tracking usage
     end note
 
@@ -1417,7 +1424,7 @@ erDiagram
 > after the migration/export window and account-deletion lifecycle.
 
 **Responses (Platform-specific):**
-- `POST /v1/responses` - Stateless `store: false` inference; one Chat Completions call
+- `POST /v1/responses` - Stateless `store: false` inference; default typed adapter makes one Chat Completions call, while an explicit `NATIVE_RESPONSES_MODELS` allowlist uses one native provider Responses call
 - `GET`/`DELETE /v1/responses/{id}` - Authenticated `410 Gone` (history retired)
 - `POST /v1/responses/{id}/cancel` - Authenticated `410 Gone` (history retired)
 - `GET /v1/responses/{id}/input_items` - Authenticated `410 Gone` (history retired)

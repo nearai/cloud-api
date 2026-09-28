@@ -5,8 +5,8 @@ use crate::test_utils::{CapturingUsageService, MockAttestationService};
 use std::sync::Arc;
 use std::time::Duration;
 
-struct StaticModelsRepository {
-    model: ModelWithPricing,
+pub(super) struct StaticModelsRepository {
+    pub(super) model: ModelWithPricing,
 }
 
 #[async_trait::async_trait]
@@ -36,16 +36,18 @@ impl ModelsRepository for StaticModelsRepository {
     }
 }
 
-struct StaticOrganizationLimitRepository;
+pub(super) struct StaticOrganizationLimitRepository {
+    pub(super) limit: u32,
+}
 
 #[async_trait::async_trait]
 impl ports::OrganizationConcurrentLimitRepository for StaticOrganizationLimitRepository {
     async fn get_concurrent_limit(&self, _org_id: Uuid) -> Result<Option<u32>, anyhow::Error> {
-        Ok(Some(DEFAULT_CONCURRENT_LIMIT))
+        Ok(Some(self.limit))
     }
 }
 
-fn test_model(model_name: &str) -> ModelWithPricing {
+pub(super) fn test_model(model_name: &str) -> ModelWithPricing {
     ModelWithPricing {
         id: Uuid::new_v4(),
         model_name: model_name.to_string(),
@@ -80,7 +82,7 @@ fn test_model(model_name: &str) -> ModelWithPricing {
     }
 }
 
-fn completion_request(model: &str) -> ports::CompletionRequest {
+pub(super) fn completion_request(model: &str) -> ports::CompletionRequest {
     ports::CompletionRequest {
         request_priority: 0,
         request_id: Uuid::new_v4(),
@@ -134,10 +136,27 @@ async fn wait_for_usage_requests(
     })
 }
 
-async fn completion_service_with_mock_providers(
+pub(super) async fn completion_service_with_mock_providers(
     model_name: &str,
     near_fails: bool,
     chutes_fails: bool,
+) -> (CompletionServiceImpl, Arc<CapturingUsageService>) {
+    completion_service_with_concurrent_limit(
+        model_name,
+        near_fails,
+        chutes_fails,
+        DEFAULT_CONCURRENT_LIMIT,
+    )
+    .await
+}
+
+/// Same as [`completion_service_with_mock_providers`], with the organization's
+/// concurrent-request limit pinned to `concurrent_limit`.
+pub(super) async fn completion_service_with_concurrent_limit(
+    model_name: &str,
+    near_fails: bool,
+    chutes_fails: bool,
+    concurrent_limit: u32,
 ) -> (CompletionServiceImpl, Arc<CapturingUsageService>) {
     use inference_providers::mock::{MockProvider, RequestMatcher, ResponseTemplate};
     use inference_providers::{CompletionError, ProviderSource, ProviderTier};
@@ -197,7 +216,9 @@ async fn completion_service_with_mock_providers(
         Arc::new(StaticModelsRepository {
             model: test_model(model_name),
         }),
-        Arc::new(StaticOrganizationLimitRepository),
+        Arc::new(StaticOrganizationLimitRepository {
+            limit: concurrent_limit,
+        }),
     );
     (service, usage_service)
 }

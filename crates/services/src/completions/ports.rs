@@ -3,10 +3,6 @@ use crate::UserId;
 use async_trait::async_trait;
 use inference_providers::StreamingResult;
 use serde::{Deserialize, Serialize};
-use std::sync::{
-    atomic::{AtomicU32, Ordering},
-    Arc,
-};
 use uuid::Uuid;
 
 /// Default concurrent request limit per organization per model
@@ -15,21 +11,18 @@ pub const DEFAULT_CONCURRENT_LIMIT: u32 = 64;
 /// RAII lease for one organization/model concurrency slot.
 ///
 /// Routes that bypass the typed completion request path can hold this guard
-/// until their upstream response body completes or is dropped.
+/// until their upstream response body completes or is dropped. Dropping the
+/// inner slot releases it in the registry, so no manual `Drop` is needed here.
 #[derive(Debug)]
 pub struct ConcurrentRequestGuard {
-    counter: Arc<AtomicU32>,
+    // Held purely for its `Drop` side effect: releasing the registry slot.
+    #[allow(dead_code)]
+    slot: super::concurrency::ConcurrencySlot,
 }
 
 impl ConcurrentRequestGuard {
-    pub(crate) fn new(counter: Arc<AtomicU32>) -> Self {
-        Self { counter }
-    }
-}
-
-impl Drop for ConcurrentRequestGuard {
-    fn drop(&mut self) {
-        self.counter.fetch_sub(1, Ordering::Release);
+    pub(crate) fn new(slot: super::concurrency::ConcurrencySlot) -> Self {
+        Self { slot }
     }
 }
 

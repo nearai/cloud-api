@@ -31,13 +31,23 @@ pub struct VerifiedAttestation {
     /// GPU verification verdict (e.g., "PASS"), if GPU evidence was present.
     pub gpu_verdict: Option<String>,
     /// The host's per-boot replica-report signing key, extracted from the
-    /// `nearai-replica-report-key-v1` RTMR3 event, if present and valid.
+    /// `nearai-replica-report-key-v1` RTMR3 runtime event, if present and
+    /// well-formed. See [`ReplicaReportKey`] for what is and isn't checked.
     pub replica_report_key: Option<ReplicaReportKey>,
 }
 
 /// The host's per-boot ed25519 replica-report signing key, bound into RTMR3
 /// via the `nearai-replica-report-key-v1` dstack event. Mirrors the fields of
 /// the proxy's signed JSON payload for that event.
+///
+/// Trust boundary: the whole payload is bound into RTMR3, so it is exactly
+/// what the attested workload emitted. Attestation itself validates only the
+/// key: a valid, non-weak ed25519 point whose hash equals `key_id`.
+/// `boot_id`, `host_id`, `model` and `replica_ids` are the workload's own
+/// claims and are not checked against any request or discovery context here;
+/// consumers must cross-check them before trusting a report signed by this
+/// key (placement ingest compares them with the Valkey key it read and with
+/// the frame's own claims).
 ///
 /// `Debug` is safe here: every field is an ID or a public key, never customer
 /// content.
@@ -683,6 +693,12 @@ fn parse_replica_report_key(event_payload: &str) -> Option<ReplicaReportKey> {
             return None;
         }
     };
+    // A low-order (weak) key decodes fine but lets a forged signature verify
+    // arbitrary bytes; never accept one as a report signing key.
+    if verifying_key.is_weak() {
+        tracing::debug!("replica report key event: weak public key");
+        return None;
+    }
 
     if placement::frame::key_id(&verifying_key) != payload.key_id {
         tracing::debug!("replica report key event: key_id mismatch");
@@ -1330,6 +1346,20 @@ mod tests {
         let mut mismatched = valid;
         mismatched.key_id = "0000000000000000".to_string();
         assert_eq!(parse_replica_report_key(&hex_payload(&mismatched)), None);
+    }
+
+    #[test]
+    fn weak_public_key_is_rejected() {
+        // The compressed identity point decodes as a VerifyingKey but is
+        // low-order: a forged signature under it verifies arbitrary bytes.
+        let mut identity = [0u8; 32];
+        identity[0] = 1;
+        let weak = VerifyingKey::from_bytes(&identity).expect("identity decodes");
+        assert!(weak.is_weak());
+        // key_id is consistent with the key, so only the weak-key check can
+        // reject it.
+        let payload = replica_report_key_payload(&weak, "boot-1");
+        assert_eq!(parse_replica_report_key(&hex_payload(&payload)), None);
     }
 
     fn make_jwt(payload: serde_json::Value) -> String {

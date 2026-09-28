@@ -37,7 +37,7 @@ fn mixed_questions_preserve_exact_response_bytes_and_extensions() {
     let parsed = SystemOneResponseWithBytes::parse(raw.clone(), &req).unwrap();
     assert_eq!(parsed.raw_bytes, raw);
     assert!(parsed.response.id.is_none());
-    assert!(parsed.provider_chat_id().is_err());
+    assert!(parsed.provider_decision_id().is_err());
 }
 
 #[test]
@@ -96,8 +96,8 @@ fn generation_ids_preserve_opaque_values() {
         value["id"] = json!(id);
         let raw = serde_json::to_vec(&value).unwrap();
         let parsed = SystemOneResponseWithBytes::parse(raw.clone(), &request()).unwrap();
-        assert_eq!(parsed.chat_id.as_deref(), Some(id));
-        assert_eq!(parsed.provider_chat_id().unwrap(), id);
+        assert_eq!(parsed.decision_id.as_deref(), Some(id));
+        assert_eq!(parsed.provider_decision_id().unwrap(), id);
         assert_eq!(parsed.raw_bytes, raw);
     }
 }

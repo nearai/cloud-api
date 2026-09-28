@@ -142,9 +142,9 @@ mod tests {
                 .unwrap();
             assert_eq!(response.raw_bytes, raw.as_bytes());
             assert_eq!(response.response.id.as_deref(), body_id);
-            assert_eq!(response.chat_id.as_deref(), expected);
+            assert_eq!(response.decision_id.as_deref(), expected);
             // A generation header alone does not satisfy the self-hosted TEE contract.
-            assert_eq!(response.provider_chat_id().is_ok(), body_id.is_some());
+            assert_eq!(response.provider_decision_id().is_ok(), body_id.is_some());
         }
     }
 
@@ -216,7 +216,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.raw_bytes, raw.as_bytes());
-        assert_eq!(response.provider_chat_id().unwrap(), "decision-tee-123");
+        assert_eq!(response.provider_decision_id().unwrap(), "decision-tee-123");
         assert_eq!(near.tier(), crate::ProviderTier::Near);
     }
 }

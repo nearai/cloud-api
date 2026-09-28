@@ -141,12 +141,12 @@ pub struct SystemOneResponseWithBytes {
     pub raw_bytes: Vec<u8>,
     /// Upstream generation ID: response body first, then X-Generation-Id.
     /// Kept separately so a header-only ID does not change the response body.
-    pub chat_id: Option<String>,
+    pub decision_id: Option<String>,
 }
 
 impl SystemOneResponseWithBytes {
     /// The self-hosted TEE contract uses the response body's ID for signature lookup.
-    pub fn provider_chat_id(&self) -> Result<&str, CompletionError> {
+    pub fn provider_decision_id(&self) -> Result<&str, CompletionError> {
         self.response.id.as_deref().ok_or_else(|| {
             CompletionError::InvalidResponse(
                 "TEE System One response requires a body id for signature lookup".into(),
@@ -214,17 +214,17 @@ impl SystemOneResponseWithBytes {
                 return Err(invalid());
             }
         }
-        let chat_id = response.id.as_deref().map(parse_chat_id).transpose()?;
+        let decision_id = response.id.as_deref().map(parse_decision_id).transpose()?;
         Ok(Self {
             response,
             raw_bytes,
-            chat_id,
+            decision_id,
         })
     }
 }
 
 /// Treat IDs as opaque strings, subject to response-header and storage limits.
-fn parse_chat_id(id: &str) -> Result<String, CompletionError> {
+fn parse_decision_id(id: &str) -> Result<String, CompletionError> {
     if id.is_empty() || id.len() > 255 || http::HeaderValue::from_str(id).is_err() {
         return Err(CompletionError::InvalidResponse(
             "Invalid System One generation id".into(),
@@ -260,12 +260,12 @@ pub(crate) async fn read_response(
         raw_bytes.extend_from_slice(&chunk);
     }
     let mut parsed = SystemOneResponseWithBytes::parse(raw_bytes, request)?;
-    if parsed.chat_id.is_none() {
+    if parsed.decision_id.is_none() {
         if let Some(generation_id) = generation_id {
             let id = generation_id.to_str().map_err(|_| {
                 CompletionError::InvalidResponse("Invalid System One generation id".into())
             })?;
-            parsed.chat_id = Some(parse_chat_id(id)?);
+            parsed.decision_id = Some(parse_decision_id(id)?);
         }
     }
     Ok(parsed)

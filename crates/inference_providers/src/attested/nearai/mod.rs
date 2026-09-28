@@ -1420,12 +1420,12 @@ impl InferenceProvider for Fleet {
                     .await
                     .map_err(|e| crate::systemone::transport_error(e, timeout_seconds))?;
                 let response = crate::systemone::read_response(response, &request, false).await?;
-                let id = response.provider_chat_id()?;
+                let decision_id = response.provider_decision_id()?;
                 if let Some(index) = index {
                     self.signature_rotation
                         .lock()
                         .unwrap_or_else(|e| e.into_inner())
-                        .insert(id.to_owned(), index as u64);
+                        .insert(decision_id.to_owned(), index as u64);
                 }
                 Ok(response)
             }

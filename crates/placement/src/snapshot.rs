@@ -18,6 +18,7 @@ use crate::frame::{self, Envelope, FrameError, ReplicaReport};
 
 /// One attested signing key for a host, naming which replicas and model it
 /// is entitled to report for.
+#[derive(Clone)]
 pub struct HostKey {
     pub key_id: String,
     pub key: VerifyingKey,
@@ -26,7 +27,7 @@ pub struct HostKey {
 }
 
 /// Attested keys per host, built by the caller from attestation (Task 7).
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct KeyRegistry {
     pub by_host: HashMap<String, Vec<HostKey>>,
 }

@@ -2699,6 +2699,9 @@ impl InferenceProvider for Provider {
     fn set_backend_keys(&self, map: std::collections::HashMap<String, Vec<usize>>) {
         self.fleet.set_backend_keys(map)
     }
+    fn set_backend_hosts(&self, hosts: crate::BackendHosts) {
+        self.fleet.set_backend_hosts(hosts)
+    }
     async fn count_tokens(&self, model: &str, text: String) -> Option<u64> {
         self.fleet.count_tokens(model, text).await
     }

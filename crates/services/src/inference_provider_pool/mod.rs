@@ -1,4 +1,4 @@
-use crate::attestation::AttestationVerifier;
+use crate::attestation::{AttestationVerifier, ReplicaReportKey};
 use crate::common::encryption_headers;
 use config::ExternalProvidersConfig;
 use inference_providers::nearai;
@@ -341,6 +341,10 @@ struct BackendProbe {
     algo: String,
     pubkey: String,
     identity: Option<TeeIdentity>,
+    /// The host's attested per-boot replica-report signing key, if the
+    /// verified attestation carried one. Only ever `Some` from a verified
+    /// probe — `backend_probes` holds verified probes exclusively.
+    replica_key: Option<ReplicaReportKey>,
 }
 
 /// KMS root id and app id. Equal identities derive the same model keypair.
@@ -513,6 +517,83 @@ impl DiscoveryOutcome {
             indices.dedup();
         }
         groups
+    }
+
+    /// Verified `host_id -> backend index` map plus attested keys, built only
+    /// from probes carrying a verified replica-report key. The two algos per
+    /// index carry the same key, so this dedups per index before folding into
+    /// the host map. A host observed at two indices keeps the lower index —
+    /// see `key_index_map` doc for why a direct observation is trusted over
+    /// any inference.
+    fn backend_hosts(&self) -> inference_providers::BackendHosts {
+        let mut index_by_host: HashMap<String, usize> = HashMap::new();
+        let mut keys: HashMap<String, Vec<placement::snapshot::HostKey>> = HashMap::new();
+        let mut seen_indices: HashSet<usize> = HashSet::new();
+
+        for probe in &self.backend_probes {
+            let Some(replica_key) = probe.replica_key.as_ref() else {
+                continue;
+            };
+            if !seen_indices.insert(probe.index) {
+                continue;
+            }
+
+            match index_by_host.entry(replica_key.host_id.clone()) {
+                std::collections::hash_map::Entry::Vacant(entry) => {
+                    entry.insert(probe.index);
+                }
+                std::collections::hash_map::Entry::Occupied(mut entry) => {
+                    if probe.index < *entry.get() {
+                        debug!(
+                            host_id = %replica_key.host_id,
+                            kept_index = probe.index,
+                            dropped_index = *entry.get(),
+                            "duplicate_host: host reported at two backend indices, keeping the lower"
+                        );
+                        entry.insert(probe.index);
+                    } else if probe.index > *entry.get() {
+                        debug!(
+                            host_id = %replica_key.host_id,
+                            kept_index = *entry.get(),
+                            dropped_index = probe.index,
+                            "duplicate_host: host reported at two backend indices, keeping the lower"
+                        );
+                    }
+                }
+            }
+
+            let host_keys = keys.entry(replica_key.host_id.clone()).or_default();
+            if host_keys
+                .iter()
+                .any(|existing| existing.key_id == replica_key.key_id)
+            {
+                continue;
+            }
+            let Ok(key_bytes) = <[u8; 32]>::try_from(
+                match hex::decode(&replica_key.public_key_hex) {
+                    Ok(bytes) => bytes,
+                    Err(_) => continue,
+                }
+                .as_slice(),
+            ) else {
+                continue;
+            };
+            let Ok(verifying_key) = ed25519_dalek::VerifyingKey::from_bytes(&key_bytes) else {
+                continue;
+            };
+            host_keys.push(placement::snapshot::HostKey {
+                key_id: replica_key.key_id.clone(),
+                key: verifying_key,
+                replica_ids: replica_key.replica_ids.clone(),
+                model: replica_key.model.clone(),
+            });
+        }
+
+        inference_providers::BackendHosts {
+            index_by_host,
+            keys: placement::snapshot::KeyRegistry { by_host: keys },
+            count: self.backend_count,
+        }
     }
 }
 
@@ -1974,6 +2055,7 @@ impl InferenceProviderPool {
                             algo: algo.clone(),
                             pubkey: pk.to_string(),
                             identity,
+                            replica_key: verified.replica_report_key.clone(),
                         });
                     }
                 }
@@ -4936,6 +5018,7 @@ impl InferenceProviderPool {
                     // before any refresh cycle would skip rotation entirely.
                     serving_provider.set_backend_count(outcome.backend_count);
                     serving_provider.set_backend_keys(outcome.key_index_map());
+                    serving_provider.set_backend_hosts(outcome.backend_hosts());
 
                     // Store the configured context length so latency routing can
                     // filter out providers that can't serve oversized requests.
@@ -5293,6 +5376,7 @@ impl InferenceProviderPool {
                 // backend healthy again.
                 provider.set_backend_count(outcome.backend_count);
                 provider.set_backend_keys(outcome.key_index_map());
+                provider.set_backend_hosts(outcome.backend_hosts());
 
                 let ptr = Arc::as_ptr(&provider) as *const () as usize;
                 let provider_has_any_pubkey_mapping = mapped_ptrs.contains(&ptr);
@@ -6209,6 +6293,37 @@ mod tests {
             algo: algo.to_string(),
             pubkey: pubkey.to_string(),
             identity: identity.map(|(root_id, app_id)| (root_id.to_string(), app_id.to_string())),
+            replica_key: None,
+        }
+    }
+
+    fn backend_probe_with_key(
+        index: usize,
+        algo: &str,
+        pubkey: &str,
+        replica_key: ReplicaReportKey,
+    ) -> BackendProbe {
+        BackendProbe {
+            index,
+            algo: algo.to_string(),
+            pubkey: pubkey.to_string(),
+            identity: None,
+            replica_key: Some(replica_key),
+        }
+    }
+
+    fn fake_replica_report_key(
+        signing_key: &ed25519_dalek::SigningKey,
+        host_id: &str,
+    ) -> ReplicaReportKey {
+        let verifying_key = signing_key.verifying_key();
+        ReplicaReportKey {
+            key_id: placement::frame::key_id(&verifying_key),
+            public_key_hex: hex::encode(verifying_key.to_bytes()),
+            boot_id: "boot-1".to_string(),
+            host_id: host_id.to_string(),
+            model: "zai-org/GLM-5.3-Flash".to_string(),
+            replica_ids: vec!["r1".to_string(), "r2".to_string()],
         }
     }
 
@@ -6469,6 +6584,66 @@ mod tests {
         assert_eq!(key_index_map.get("abcd"), Some(&vec![0, 2]));
         assert_eq!(key_index_map.get("efgh"), Some(&vec![1, 3]));
         assert_eq!(key_index_map.len(), 2);
+    }
+
+    #[test]
+    fn discovery_outcome_maps_host_to_index() {
+        // Given: two verified hosts, each probed under both algos (same key
+        // both times), plus one index with no verified key.
+        let key_a = ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]);
+        let key_b = ed25519_dalek::SigningKey::from_bytes(&[9u8; 32]);
+        let replica_key_a = fake_replica_report_key(&key_a, "host-a");
+        let replica_key_b = fake_replica_report_key(&key_b, "host-b");
+        let outcome = discovery_outcome_with_probes(
+            3,
+            vec![
+                backend_probe_with_key(0, "ecdsa", "key-a", replica_key_a.clone()),
+                backend_probe_with_key(0, "ed25519", "key-a", replica_key_a.clone()),
+                backend_probe_with_key(1, "ecdsa", "key-b", replica_key_b.clone()),
+                backend_probe_with_key(1, "ed25519", "key-b", replica_key_b.clone()),
+                backend_probe(2, "ecdsa", "key-c", None),
+                backend_probe(2, "ed25519", "key-c", None),
+            ],
+        );
+
+        // When: the verified host map is built for providers.
+        let hosts = outcome.backend_hosts();
+
+        // Then: only the two verified hosts are mapped, index 2 (no key) is
+        // absent, and each host has exactly one attested key despite two probes.
+        assert_eq!(hosts.index_by_host.get("host-a"), Some(&0));
+        assert_eq!(hosts.index_by_host.get("host-b"), Some(&1));
+        assert_eq!(hosts.index_by_host.len(), 2);
+        assert_eq!(hosts.keys.by_host.get("host-a").map(Vec::len), Some(1));
+        assert_eq!(hosts.keys.by_host.get("host-b").map(Vec::len), Some(1));
+        assert_eq!(hosts.count, 3);
+        assert_eq!(
+            hosts.keys.by_host.get("host-a").unwrap()[0].key,
+            key_a.verifying_key()
+        );
+    }
+
+    #[test]
+    fn duplicate_host_keeps_lowest_index() {
+        // Given: the same attested host_id is reported at two different
+        // backend indices in the same discovery cycle (e.g. a stale index
+        // binding mid-rotation).
+        let key_a = ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]);
+        let replica_key = fake_replica_report_key(&key_a, "host-a");
+        let outcome = discovery_outcome_with_probes(
+            2,
+            vec![
+                backend_probe_with_key(1, "ecdsa", "key-a", replica_key.clone()),
+                backend_probe_with_key(0, "ecdsa", "key-a", replica_key.clone()),
+            ],
+        );
+
+        // When.
+        let hosts = outcome.backend_hosts();
+
+        // Then: the lower index wins regardless of probe order.
+        assert_eq!(hosts.index_by_host.get("host-a"), Some(&0));
+        assert_eq!(hosts.index_by_host.len(), 1);
     }
 
     #[test]

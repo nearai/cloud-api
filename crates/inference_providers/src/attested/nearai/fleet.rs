@@ -168,6 +168,13 @@ pub(super) struct Fleet {
     /// last discovery cycle. Empty means no restriction. A backend-count
     /// change clears this because the index-to-backend binding is then stale.
     backend_keys: Arc<RwLock<HashMap<String, Vec<usize>>>>,
+    /// Verified host map from the last discovery cycle (host_id -> backend
+    /// index, plus attested keys). `None` until the first cycle populates it.
+    /// Rebuilt wholesale each cycle. Not yet read anywhere — smart-placement
+    /// consumption lands in a later task; this just stops discovery's push
+    /// from being dropped on the floor.
+    #[allow(dead_code)]
+    backend_hosts: Arc<RwLock<Option<crate::BackendHosts>>>,
     /// Epoch-ms of the last `UnknownKey` warning, so a client stuck on a stale
     /// attestation cannot flood the log from the request hot path.
     last_unknown_key_warn_ms: AtomicU64,
@@ -214,6 +221,7 @@ impl Fleet {
             ])),
             prefix_loads: Arc::new(Mutex::new(HashMap::new())),
             backend_keys: Arc::new(RwLock::new(HashMap::new())),
+            backend_hosts: Arc::new(RwLock::new(None)),
             last_unknown_key_warn_ms: AtomicU64::new(0),
             config,
             client,
@@ -612,6 +620,13 @@ impl Fleet {
             *stat = BackendStat::default();
         }
         *backend_keys = map;
+    }
+
+    pub(super) fn set_backend_hosts(&self, hosts: crate::BackendHosts) {
+        *self
+            .backend_hosts
+            .write()
+            .unwrap_or_else(|e| e.into_inner()) = Some(hosts);
     }
 
     pub(super) fn should_warn_unknown_key(&self, now_ms: u64) -> bool {

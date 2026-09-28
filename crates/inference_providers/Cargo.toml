@@ -12,6 +12,7 @@ openapi = ["dep:utoipa"]
 [dependencies]
 utoipa = { version = "5", optional = true }
 anthropic_compat = { path = "../anthropic_compat" }
+placement = { path = "../placement" }
 async-trait = "0.1"
 base64 = "0.22"
 bytes = "1.11"

@@ -34,7 +34,10 @@ pub use measurement::MeasurementPolicy;
 pub use models::{AttestationError, ChatSignature, SignatureKind, SignatureLookupResult};
 pub(in crate::attestation) use report::{decode_nonce_hex, generate_nonce_hex};
 pub use report_data::{ReportDataVerifier, StrictBoundReportDataVerifier};
-pub use verification::{AttestationVerificationError, AttestationVerifier, VerifiedAttestation};
+pub use verification::{
+    AttestationVerificationError, AttestationVerifier, BackendAttestationVerifier,
+    VerifiedAttestation,
+};
 
 use crate::{
     attestation::{ita::ItaClient, models::VpcInfo, ports::AttestationRepository},

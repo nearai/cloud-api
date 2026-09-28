@@ -157,6 +157,11 @@ pub(super) struct Fleet {
     /// `rotation::MAX_FANOUT`. The provider fills/clears these slots via inline
     /// attestation; Fleet just owns the storage.
     pub(super) index_clients: Vec<Mutex<Option<Client>>>,
+    /// Per-index time of the last inline verification that failed the TLS
+    /// channel-binding check. Such a failure repeats for the same backend, so
+    /// the index is not verified again until the backoff has passed (see
+    /// `get_or_verify_index_client`). Same length as `index_clients`.
+    pub(super) channel_binding_failed_at: Vec<Mutex<Option<tokio::time::Instant>>>,
     /// Per-backend-index TTFT EMA for latency-aware steering. Index == rotation
     /// index. Arc so the stream-measurement wrapper can update it after the
     /// Fleet method returns. Sized to MAX_FANOUT.
@@ -201,6 +206,7 @@ impl Fleet {
         fingerprint_state: Arc<RwLock<FingerprintState>>,
         backend_verifier: Option<Arc<dyn BackendVerifier>>,
     ) -> Self {
+        let channel_binding_failed_at = index_clients.iter().map(|_| Mutex::new(None)).collect();
         Self {
             pending_rotation: Mutex::new(HashMap::new()),
             signature_rotation: Mutex::new(HashMap::new()),
@@ -208,6 +214,7 @@ impl Fleet {
             rotation_parts,
             prefix_router,
             index_clients,
+            channel_binding_failed_at,
             backend_stats: Arc::new(Mutex::new(vec![
                 BackendStat::default();
                 rotation::MAX_FANOUT
@@ -578,6 +585,10 @@ impl Fleet {
                 for slot in &self.index_clients {
                     *lock(slot) = None;
                 }
+            }
+            // Index `i` may now reach a different backend.
+            for failed_at in &self.channel_binding_failed_at {
+                *lock(failed_at) = None;
             }
             let mut stats = lock(&self.backend_stats);
             for s in stats.iter_mut() {

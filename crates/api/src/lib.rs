@@ -316,7 +316,8 @@ pub async fn init_domain_services(
     organization_service: Arc<dyn services::organization::OrganizationServiceTrait + Send + Sync>,
     metrics_service: Arc<dyn services::metrics::MetricsServiceTrait>,
 ) -> DomainServices {
-    let inference_provider_pool = init_inference_providers(database.clone(), config).await;
+    let inference_provider_pool =
+        init_inference_providers(database.clone(), config, Some(metrics_service.clone())).await;
     init_domain_services_with_pool(
         database,
         config,
@@ -932,10 +933,13 @@ async fn ensure_chutes_catalog_row(
 /// Initialize inference provider pool
 ///
 /// Loads inference_url models and external providers from the database,
-/// then starts a periodic refresh task to keep them in sync.
+/// then starts a periodic refresh task to keep them in sync. A metrics sink
+/// passed here is attached before the initial load, so counters emitted by
+/// the initial attestation discovery are recorded.
 pub async fn init_inference_providers(
     database: Arc<Database>,
     config: &ApiConfig,
+    metrics_service: Option<Arc<dyn services::metrics::MetricsServiceTrait>>,
 ) -> Arc<services::inference_provider_pool::InferenceProviderPool> {
     let api_key = config.inference_api_key.clone();
 
@@ -945,6 +949,9 @@ pub async fn init_inference_providers(
             config.external_providers.clone(),
         ),
     );
+    if let Some(metrics_service) = metrics_service {
+        pool.set_metrics_service(metrics_service);
+    }
 
     let models_repo = Arc::new(database::repositories::ModelRepository::new(
         database.pool().clone(),

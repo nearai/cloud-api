@@ -1120,8 +1120,9 @@ impl CompletionServiceImpl {
         // The request body is flattened into `extra` (see `ChatCompletionParams`),
         // so a client can set `x_placement_affinity`/`x_placement_affinity_source`
         // directly and forge routing. Strip any client-supplied value
-        // unconditionally, before checking the secret or deriving anything, so a
-        // forged key can never survive even when derivation is skipped below.
+        // unconditionally, before checking the secret, the covered-model gate,
+        // or deriving anything, so a forged key can never survive even when
+        // derivation is skipped below — for every model, not just covered ones.
         chat_params.extra.remove(affinity::AFFINITY_EXTRA_KEY);
         chat_params
             .extra
@@ -1130,6 +1131,12 @@ impl CompletionServiceImpl {
         let Some(secret) = affinity_secret else {
             return;
         };
+        // The HMAC derivation below only matters for models smart placement
+        // actually covers; skip the per-request crypto work for every other
+        // model (`chat_params.model` is already the canonical name here).
+        if !placement::consts::COVERED_MODELS.contains(&chat_params.model.as_str()) {
+            return;
+        }
         let is_e2ee = Self::extra_is_e2ee(&chat_params.extra);
         let Some((key, source)) = affinity::derive(
             &organization_id.to_string(),
@@ -4408,9 +4415,12 @@ mod tests {
         );
     }
 
+    /// A covered model by default: most `apply_placement_affinity` tests
+    /// exercise derivation, which now only runs for
+    /// `placement::consts::COVERED_MODELS`.
     fn minimal_chat_params() -> inference_providers::ChatCompletionParams {
         serde_json::from_value(serde_json::json!({
-            "model": "m",
+            "model": placement::consts::COVERED_MODELS[0],
             "messages": [
                 {"role": "system", "content": "you are helpful"},
                 {"role": "user", "content": "hello"},
@@ -4509,6 +4519,45 @@ mod tests {
             params.extra.get(affinity::AFFINITY_SOURCE_EXTRA_KEY),
             Some(&serde_json::json!("prefix"))
         );
+    }
+
+    #[test]
+    fn apply_placement_affinity_uncovered_model_gets_no_key_but_strips_forged() {
+        // "m" is not in `placement::consts::COVERED_MODELS`: derivation must
+        // be skipped (no HMAC work for models smart placement doesn't route),
+        // but a client-forged key must still be stripped for every model.
+        let mut params: inference_providers::ChatCompletionParams =
+            serde_json::from_value(serde_json::json!({
+                "model": "m",
+                "messages": [
+                    {"role": "system", "content": "you are helpful"},
+                    {"role": "user", "content": "hello"},
+                ],
+            }))
+            .unwrap();
+        params.extra.insert(
+            affinity::AFFINITY_EXTRA_KEY.to_string(),
+            serde_json::json!("ffffffffffffffffffffffffffffffff"),
+        );
+        params.extra.insert(
+            affinity::AFFINITY_SOURCE_EXTRA_KEY.to_string(),
+            serde_json::json!("client"),
+        );
+
+        CompletionServiceImpl::apply_placement_affinity(
+            &mut params,
+            Uuid::new_v4(),
+            None,
+            Some(APPLY_AFFINITY_SECRET),
+        );
+
+        assert!(
+            !params.extra.contains_key(affinity::AFFINITY_EXTRA_KEY),
+            "an uncovered model must get no derived key, and the forged one must be gone"
+        );
+        assert!(!params
+            .extra
+            .contains_key(affinity::AFFINITY_SOURCE_EXTRA_KEY));
     }
 
     #[test]

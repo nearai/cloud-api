@@ -122,24 +122,38 @@ fn extra_str<'a>(extra: &'a HashMap<String, serde_json::Value>, key: &str) -> Op
         .filter(|s| !s.is_empty())
 }
 
-/// Concatenate the `type: "text"` parts of a message's content, in order.
-/// A plain string content is used as-is. Image/audio parts (and any other
-/// non-text part) are skipped. Returns an empty string for absent content.
-fn message_text(content: &Option<serde_json::Value>) -> String {
+/// Concatenate the `type: "text"` parts of a message's content, in order,
+/// stopping once [`MAX_VALUE_BYTES`] bytes have been collected. A plain
+/// string content is sliced to the same bound directly. Image/audio parts
+/// (and any other non-text part) are skipped. Returns an empty buffer for
+/// absent content.
+///
+/// Bounding extraction here — instead of concatenating the full (possibly
+/// huge) message text and truncating afterward — avoids an allocation
+/// proportional to prompt size. The result is byte-identical to truncating
+/// the old full concatenation to `MAX_VALUE_BYTES`: truncation is
+/// byte-based (see [`truncate`]) and part order is preserved, so stopping
+/// early once the bound is hit yields the same leading bytes.
+fn message_text(content: &Option<serde_json::Value>) -> Vec<u8> {
     match content {
-        Some(serde_json::Value::String(s)) => s.clone(),
+        Some(serde_json::Value::String(s)) => truncate(s.as_bytes()).to_vec(),
         Some(serde_json::Value::Array(parts)) => {
-            let mut out = String::new();
+            let mut out = Vec::new();
             for part in parts {
+                if out.len() >= MAX_VALUE_BYTES {
+                    break;
+                }
                 if part.get("type").and_then(|t| t.as_str()) == Some("text") {
                     if let Some(text) = part.get("text").and_then(|t| t.as_str()) {
-                        out.push_str(text);
+                        let remaining = MAX_VALUE_BYTES - out.len();
+                        let bytes = text.as_bytes();
+                        out.extend_from_slice(&bytes[..bytes.len().min(remaining)]);
                     }
                 }
             }
             out
         }
-        _ => String::new(),
+        _ => Vec::new(),
     }
 }
 
@@ -179,11 +193,12 @@ fn prefix_value(messages: &[ChatMessage]) -> Option<Vec<u8>> {
 
     let mut buf = Vec::new();
     for (role, text) in [
-        (system_role, system_text.as_str()),
-        (user_role, user_text.as_str()),
+        (system_role, system_text.as_slice()),
+        (user_role, user_text.as_slice()),
     ] {
         write_length_prefixed(&mut buf, role.as_bytes());
-        write_length_prefixed(&mut buf, truncate(text.as_bytes()));
+        // `text` is already bounded to `MAX_VALUE_BYTES` by `message_text`.
+        write_length_prefixed(&mut buf, text);
     }
     Some(buf)
 }
@@ -568,6 +583,63 @@ mod tests {
             key_hex(&key_a),
             key_hex(&key_b),
             "different users sharing a long system prompt must still get distinct keys"
+        );
+    }
+
+    #[test]
+    fn huge_multipart_message_hashes_the_same_as_its_first_256_bytes() {
+        // `message_text` stops accumulating once MAX_VALUE_BYTES is hit
+        // instead of concatenating the whole (potentially huge) message
+        // first. The derived key must still be byte-identical to hashing
+        // exactly the first 256 bytes of the concatenated text parts — what
+        // "concatenate everything, then truncate" would have produced.
+        let full_text: String = "abcdefghij".repeat(10_000); // 100,000 bytes
+        let parts = serde_json::json!([
+            {"type": "text", "text": full_text},
+            {"type": "image_url", "image_url": {"url": "https://example.com/x.png"}},
+            {"type": "text", "text": "more text that must never be reached"},
+        ]);
+        let huge_msg = ChatMessage {
+            role: MessageRole::User,
+            content: Some(parts),
+            name: None,
+            tool_call_id: None,
+            tool_calls: None,
+            reasoning_content: None,
+        };
+        let messages_huge = vec![msg(MessageRole::System, "sys"), huge_msg];
+
+        let truncated_text = &full_text[..MAX_VALUE_BYTES];
+        let messages_truncated = vec![
+            msg(MessageRole::System, "sys"),
+            msg(MessageRole::User, truncated_text),
+        ];
+
+        let (key_huge, _) = derive(
+            "org-1",
+            "model-a",
+            None,
+            &HashMap::new(),
+            &messages_huge,
+            false,
+            &SECRET,
+        )
+        .expect("prefix available");
+        let (key_truncated, _) = derive(
+            "org-1",
+            "model-a",
+            None,
+            &HashMap::new(),
+            &messages_truncated,
+            false,
+            &SECRET,
+        )
+        .expect("prefix available");
+
+        assert_eq!(
+            key_hex(&key_huge),
+            key_hex(&key_truncated),
+            "a huge multi-part message must hash the same as its first 256 bytes"
         );
     }
 

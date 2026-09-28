@@ -710,24 +710,28 @@ impl Fleet {
         };
         let key_group = self.resolve_key_group(pinned_pub_key, count);
 
+        // `snapshot` and `host_map_incomplete` are read-only against
+        // lock-free state (an `ArcSwap` load and this Fleet's own backend
+        // map), independent of the placement ledger, so both are computed
+        // before taking the ledger lock below.
+        let snapshot = handles.io.snapshot.load();
+        let incomplete = self.host_map_incomplete(&snapshot);
+
         // One critical section from reading this node's own pending load to
         // reserving the chosen host in it, so concurrent requests on this
         // node each see the others' reservations and do not herd onto the
         // same "least loaded" host. `place()` is synchronous and O(replicas),
-        // and nothing here awaits, so holding the ledger lock across it is
-        // cheap. Logging and Valkey writes happen after the lock is released.
+        // and nothing here awaits, so holding the ledger lock across just
+        // that path (mine_in -> place -> index_for_host -> ledger_add) is
+        // cheap and is the only way to make concurrent requests on this node
+        // observe each other's reservations. Logging and Valkey writes
+        // happen after the lock is released.
         let placed = {
             let mut ledger = lock(&self.placement_ledger);
             let mine = mine_in(&ledger, now_s);
-            let (decision, incomplete) = {
-                let snapshot = handles.io.snapshot.load();
-                let decision = handles
-                    .placer
-                    .place(&input, &snapshot, &mine, &mut rand::rng());
-                let incomplete = matches!(decision, Decision::Place { .. })
-                    && self.host_map_incomplete(&snapshot);
-                (decision, incomplete)
-            };
+            let decision = handles
+                .placer
+                .place(&input, &snapshot, &mine, &mut rand::rng());
             match decision {
                 Decision::Legacy { record, .. } => Err(record),
                 Decision::Place { mut record, .. } if incomplete => {

@@ -83,7 +83,7 @@ pub fn fleet_median_tps(views: &[&ReplicaView]) -> f64 {
     if samples.is_empty() {
         return 1.0;
     }
-    samples.sort_by(|a, b| a.partial_cmp(b).expect("gen_tps is never NaN"));
+    samples.sort_by(|a, b| a.total_cmp(b));
     let n = samples.len();
     if n % 2 == 1 {
         samples[n / 2]

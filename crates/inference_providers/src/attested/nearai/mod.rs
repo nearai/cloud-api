@@ -6312,6 +6312,69 @@ mod tests {
             assert!(req.affinity.is_none());
             assert_eq!(req.affinity_source, AffinitySource::None);
         }
+
+        #[test]
+        fn concurrent_try_place_does_not_herd() {
+            use std::sync::Barrier;
+
+            // Two equally scored, eligible hosts (same lifecycle, same empty
+            // load): the placer has no deterministic reason to prefer one
+            // over the other, so any imbalance would come only from a race
+            // in the ledger read-then-reserve step this test targets.
+            let built = fresh_ms();
+            let snap = Snapshot {
+                built_ms: built,
+                replicas: vec![ready_view("h-a", built), ready_view("h-b", built)],
+                routed: HashMap::new(),
+                pins: Arc::new(PinTable::default()),
+            };
+            let h = harness(&[("h-a", 0), ("h-b", 1)], snap);
+            let fleet = h.provider.fleet.clone();
+            let messages = Arc::new(vec![user_msg("concurrent placement race")]);
+
+            const WORKERS: usize = 16;
+            let start = Arc::new(Barrier::new(WORKERS));
+            let (sender, receiver) = std::sync::mpsc::channel();
+            let workers: Vec<_> = (0..WORKERS)
+                .map(|_| {
+                    let fleet = fleet.clone();
+                    let messages = messages.clone();
+                    let start = start.clone();
+                    let sender = sender.clone();
+                    std::thread::spawn(move || {
+                        // Keyless requests: same model, no affinity, so every
+                        // thread reaches `try_place`'s ledger critical
+                        // section the same way.
+                        let req = request(COVERED_MODELS[0]);
+                        start.wait();
+                        let lease = fleet
+                            .acquire_index_placed(&messages, None, &req)
+                            .expect("placement active");
+                        sender.send(lease.index()).expect("send placed index");
+                    })
+                })
+                .collect();
+            drop(sender);
+            for worker in workers {
+                worker.join().expect("placement worker should not panic");
+            }
+
+            let mut counts = [0usize; 2];
+            for index in receiver.iter() {
+                counts[index] += 1;
+            }
+            // The ledger lock around `mine_in -> place -> index_for_host ->
+            // ledger_add` is what stops every concurrent request from
+            // reading the same "both hosts idle" view and piling onto one
+            // host. We don't assert an exact split — the placer's tie-break
+            // and OS thread scheduling aren't required to produce one — only
+            // that both equally scored hosts actually received traffic,
+            // which a herd (all N on one host) would fail.
+            assert!(
+                counts[0] > 0 && counts[1] > 0,
+                "placements herded onto one host: {counts:?}"
+            );
+        }
     }
 }
 

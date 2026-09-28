@@ -202,7 +202,10 @@ pub fn select(
         return None;
     }
     let best = scores.iter().map(|(_, s)| *s).fold(f64::INFINITY, f64::min);
-    let score_of = |host: &str| scores.iter().find(|(h, _)| h == host).map(|(_, s)| *s);
+    // Built once so the HRW walk below (and the pin/fallback lookups) are
+    // O(hosts) instead of a linear scan per lookup.
+    let by_host: HashMap<&str, f64> = scores.iter().map(|(h, s)| (h.as_str(), *s)).collect();
+    let score_of = |host: &str| by_host.get(host).copied();
 
     // The HRW rank, only computed when a key is present. Keyed selections
     // (Pinned/Home/Spill) always report `home = Some(rank[0])`; keyless

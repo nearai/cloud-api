@@ -3451,30 +3451,74 @@ mod tests {
         assert!(!extra.contains_key(placement_headers::AFFINITY));
         assert!(!extra.contains_key(placement_headers::AFFINITY_SOURCE));
 
-        let params = ImageGenerationParams {
-            model: "test-model".to_string(),
-            prompt: "test prompt".to_string(),
-            n: None,
-            size: None,
-            response_format: None,
-            quality: None,
-            style: None,
-            extra,
-        };
-
-        let json = serde_json::to_string(&params).unwrap();
-
-        assert!(
-            !json.contains("x_placement_affinity"),
-            "placement affinity keys must NOT appear in JSON after prepare_encryption_headers"
-        );
-        assert!(
-            json.contains("some_valid_param"),
-            "non-affinity extra fields should still be serialized"
+        // Non-affinity extra fields must be preserved.
+        assert_eq!(
+            extra.get("some_valid_param"),
+            Some(&serde_json::Value::String("value".to_string()))
         );
 
         // No affinity-related HTTP header should have been added either.
         assert!(headers.get("X-Placement-Affinity").is_none());
+    }
+
+    /// End-to-end regression: a forged/leftover `x_placement_affinity` /
+    /// `x_placement_affinity_source` in `params.extra` must never appear in
+    /// the actual bytes sent to the upstream vLLM backend. Unlike
+    /// `test_placement_affinity_keys_never_reach_upstream_body` above (which
+    /// checks `prepare_encryption_headers` in isolation), this drives a real
+    /// `ChatCompletionParams` through `Fleet::chat_completion`'s send path
+    /// against a mock HTTP server and inspects the exact request body that
+    /// left the process — the same kind of check as
+    /// `audio_transcription_sends_repeated_timestamp_granularity_fields`.
+    #[tokio::test]
+    async fn chat_completion_never_sends_placement_affinity_keys_upstream() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "chatcmpl-test",
+                "object": "chat.completion",
+                "created": 0,
+                "model": "test-model",
+                "choices": [],
+                "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let provider = Provider::new(Config::new(server.uri(), None, Some(5)));
+
+        let mut params: ChatCompletionParams = serde_json::from_value(serde_json::json!({
+            "model": "test-model",
+            "messages": [{"role": "user", "content": "hi"}],
+        }))
+        .unwrap();
+        params.extra.insert(
+            placement_headers::AFFINITY.to_string(),
+            serde_json::Value::String("00112233445566778899aabbccddeeff".to_string()),
+        );
+        params.extra.insert(
+            placement_headers::AFFINITY_SOURCE.to_string(),
+            serde_json::Value::String("client".to_string()),
+        );
+
+        let result = provider
+            .chat_completion(params, "test-hash".to_string())
+            .await;
+        assert!(
+            result.is_ok(),
+            "expected a successful completion, got: {:?}",
+            result.err()
+        );
+
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 1);
+        let body = String::from_utf8_lossy(&requests[0].body);
+        assert!(
+            !body.contains("x_placement_affinity"),
+            "placement affinity keys must never reach the upstream request body: {body}"
+        );
     }
 
     #[test]

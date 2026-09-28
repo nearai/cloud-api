@@ -65,21 +65,33 @@ pub fn derive(
 ) -> Option<(AffinityKey, AffinitySource)> {
     if let Some(hint) = non_empty(session_hint) {
         return Some((
-            hashed_key(secret, org_id, model, "client", hint.as_bytes()),
+            hashed_key(secret, org_id, model, "client", truncate(hint.as_bytes())),
             AffinitySource::Client,
         ));
     }
 
     if let Some(session_id) = extra_str(body_extra, "session_id") {
         return Some((
-            hashed_key(secret, org_id, model, "client", session_id.as_bytes()),
+            hashed_key(
+                secret,
+                org_id,
+                model,
+                "client",
+                truncate(session_id.as_bytes()),
+            ),
             AffinitySource::Client,
         ));
     }
 
     if let Some(prompt_cache_key) = extra_str(body_extra, "prompt_cache_key") {
         return Some((
-            hashed_key(secret, org_id, model, "client", prompt_cache_key.as_bytes()),
+            hashed_key(
+                secret,
+                org_id,
+                model,
+                "client",
+                truncate(prompt_cache_key.as_bytes()),
+            ),
             AffinitySource::Client,
         ));
     }
@@ -139,6 +151,14 @@ fn message_text(content: &Option<serde_json::Value>) -> String {
 /// first user-role message. A missing message contributes an empty role
 /// and empty text. Returns `None` when both texts are empty — there is
 /// nothing to key on.
+///
+/// The system and user texts are each truncated to [`MAX_VALUE_BYTES`]
+/// bytes *independently*, before framing — not the composed buffer as a
+/// whole. Truncating the whole buffer instead would let a long shared
+/// system prompt push the user message's bytes out of the truncation
+/// window entirely, so every conversation sharing that system prompt would
+/// collapse onto the same key (a routing hotspot) regardless of who the
+/// user is.
 fn prefix_value(messages: &[ChatMessage]) -> Option<Vec<u8>> {
     let system_msg = messages.iter().find(|m| m.role == MessageRole::System);
     let user_msg = messages.iter().find(|m| m.role == MessageRole::User);
@@ -154,15 +174,16 @@ fn prefix_value(messages: &[ChatMessage]) -> Option<Vec<u8>> {
         return None;
     }
 
-    let mut buf = Vec::new();
     let system_role = if system_msg.is_some() { "system" } else { "" };
     let user_role = if user_msg.is_some() { "user" } else { "" };
+
+    let mut buf = Vec::new();
     for (role, text) in [
         (system_role, system_text.as_str()),
         (user_role, user_text.as_str()),
     ] {
         write_length_prefixed(&mut buf, role.as_bytes());
-        write_length_prefixed(&mut buf, text.as_bytes());
+        write_length_prefixed(&mut buf, truncate(text.as_bytes()));
     }
     Some(buf)
 }
@@ -172,8 +193,19 @@ fn write_length_prefixed(buf: &mut Vec<u8>, field: &[u8]) {
     buf.extend_from_slice(field);
 }
 
-/// `HMAC-SHA256(secret, org_id ‖ 0 ‖ model ‖ 0 ‖ source ‖ 0 ‖ value)[..16]`,
-/// truncating `value` to [`MAX_VALUE_BYTES`] bytes first.
+/// Truncate `bytes` to [`MAX_VALUE_BYTES`], on a byte boundary (this hashes
+/// raw bytes, so a UTF-8 boundary is irrelevant and slicing `&[u8]` never
+/// panics, unlike slicing a `&str`).
+fn truncate(bytes: &[u8]) -> &[u8] {
+    &bytes[..bytes.len().min(MAX_VALUE_BYTES)]
+}
+
+/// `HMAC-SHA256(secret, org_id ‖ 0 ‖ model ‖ 0 ‖ source ‖ 0 ‖ value)[..16]`.
+/// `value` must already be bounded by the caller (see [`truncate`]) — each
+/// candidate value is truncated at its own natural boundary (the whole
+/// header/session_id/prompt_cache_key string, or each message's text
+/// independently for the prefix source) rather than uniformly after
+/// framing.
 fn hashed_key(
     secret: &[u8; 32],
     org_id: &str,
@@ -181,8 +213,6 @@ fn hashed_key(
     source: &str,
     value: &[u8],
 ) -> AffinityKey {
-    let truncated = &value[..value.len().min(MAX_VALUE_BYTES)];
-
     // A 32-byte key is always valid for HMAC-SHA256; this never fails.
     let mut mac = HmacSha256::new_from_slice(secret).expect("32-byte HMAC key is always valid");
     mac.update(org_id.as_bytes());
@@ -191,7 +221,7 @@ fn hashed_key(
     mac.update(&[0u8]);
     mac.update(source.as_bytes());
     mac.update(&[0u8]);
-    mac.update(truncated);
+    mac.update(value);
     let digest = mac.finalize().into_bytes();
 
     let mut out = [0u8; 16];
@@ -455,6 +485,53 @@ mod tests {
         )
         .unwrap();
         assert_ne!(key_hex(&key_a), key_hex(&key_c));
+    }
+
+    #[test]
+    fn long_system_prompt_still_distinguishes_users() {
+        // A system prompt over 256 bytes must not push the user message out
+        // of the key: system and user text are each truncated to 256 bytes
+        // independently, before framing. If the whole composed buffer were
+        // truncated instead, two different users sharing this long system
+        // prompt would collapse onto the same key (a routing hotspot).
+        let long_system = "s".repeat(400);
+        let messages_user_a = vec![
+            msg(MessageRole::System, &long_system),
+            msg(MessageRole::User, "alice's question"),
+        ];
+        let messages_user_b = vec![
+            msg(MessageRole::System, &long_system),
+            msg(MessageRole::User, "bob's totally different question"),
+        ];
+
+        let (key_a, source_a) = derive(
+            "org-1",
+            "model-a",
+            None,
+            &HashMap::new(),
+            &messages_user_a,
+            false,
+            &SECRET,
+        )
+        .expect("prefix available");
+        assert_eq!(source_a, AffinitySource::Prefix);
+
+        let (key_b, _) = derive(
+            "org-1",
+            "model-a",
+            None,
+            &HashMap::new(),
+            &messages_user_b,
+            false,
+            &SECRET,
+        )
+        .expect("prefix available");
+
+        assert_ne!(
+            key_hex(&key_a),
+            key_hex(&key_b),
+            "different users sharing a long system prompt must still get distinct keys"
+        );
     }
 
     #[test]

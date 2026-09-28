@@ -9,7 +9,7 @@
 
 use base64::Engine as _;
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use sha2::Digest;
 
 /// Domain-separation prefix prepended to `frame` bytes before signing.
@@ -23,7 +23,7 @@ pub struct Envelope {
     pub key_id: String,
 }
 
-#[derive(Deserialize, Clone, Copy, Debug, PartialEq)]
+#[derive(Deserialize, Serialize, Clone, Copy, Debug, PartialEq)]
 #[serde(rename_all = "snake_case")]
 pub enum Lifecycle {
     Warming,
@@ -36,12 +36,12 @@ pub enum Lifecycle {
     Unknown,
 }
 
-#[derive(Deserialize, Clone, Debug, PartialEq, Default)]
+#[derive(Deserialize, Serialize, Clone, Debug, PartialEq, Default)]
 pub struct Limits {
     pub max_running: Option<u32>,
 }
 
-#[derive(Deserialize, Clone, Debug, PartialEq, Default)]
+#[derive(Deserialize, Serialize, Clone, Debug, PartialEq, Default)]
 pub struct Load {
     pub running: Option<u32>,
     pub queued: Option<u32>,
@@ -55,7 +55,7 @@ pub struct Load {
     pub cached_token_ratio: Option<f64>,
 }
 
-#[derive(Deserialize, Clone, Debug, PartialEq)]
+#[derive(Deserialize, Serialize, Clone, Debug, PartialEq)]
 pub struct ReplicaReport {
     pub schema: u8,
     pub host_id: String,

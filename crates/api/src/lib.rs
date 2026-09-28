@@ -1849,10 +1849,13 @@ where
     H: axum::handler::Handler<T, S>,
     T: 'static,
 {
+    // Catch-all parameters never match an empty segment, so the trailing-slash
+    // form (which also covers `/batch/`) needs its own 410 route.
     let descendants = Router::new()
         .route("/", any(write_disabled.clone()))
         .route("/batch", batch)
         .route("/{conversation_id}", conversation)
+        .route("/{conversation_id}/", any(write_disabled.clone()))
         .route("/{conversation_id}/items", items)
         .route(
             "/{conversation_id}/{*legacy_path}",
@@ -1980,10 +1983,13 @@ where
     H: axum::handler::Handler<T, S>,
     T: 'static,
 {
+    // Catch-all parameters never match an empty segment, so the trailing-slash
+    // form needs its own 410 route.
     let descendants = Router::new()
         .route("/", any(write_disabled.clone()))
         .route("/{file_id}/content", content)
         .route("/{file_id}", file)
+        .route("/{file_id}/", any(write_disabled.clone()))
         .route("/{file_id}/{*legacy_path}", any(write_disabled));
 
     Router::new()
@@ -3151,7 +3157,11 @@ mod tests {
             ("GET", "/v1/conversations/"),
             ("GET", "/v1/conversations/batch"),
             ("DELETE", "/v1/conversations/batch"),
+            ("POST", "/v1/conversations/batch/"),
+            ("GET", "/v1/conversations/batch/"),
             ("POST", "/v1/conversations/conv_example"),
+            ("GET", "/v1/conversations/conv_example/"),
+            ("DELETE", "/v1/conversations/conv_example/"),
             ("POST", "/v1/conversations/conv_example/items"),
             ("POST", "/v1/conversations/conv_example/pin"),
             ("DELETE", "/v1/conversations/conv_example/pin"),
@@ -3160,6 +3170,8 @@ mod tests {
             ("POST", "/v1/files"),
             ("DELETE", "/v1/files"),
             ("GET", "/v1/files/"),
+            ("GET", "/v1/files/file_example/"),
+            ("DELETE", "/v1/files/file_example/"),
             ("DELETE", "/v1/files/file_example/content"),
             ("PUT", "/v1/files/legacy/nested/path"),
         ] {

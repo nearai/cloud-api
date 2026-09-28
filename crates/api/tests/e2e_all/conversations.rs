@@ -115,9 +115,18 @@ async fn all_conversation_mutations_except_delete_remain_gone_after_authenticati
         (Method::POST, "/v1/conversations"),
         (Method::GET, "/v1/conversations"),
         (Method::DELETE, "/v1/conversations/batch"),
+        (Method::POST, "/v1/conversations/batch/"),
         (
             Method::POST,
             "/v1/conversations/conv_00000000-0000-0000-0000-000000000000",
+        ),
+        (
+            Method::GET,
+            "/v1/conversations/conv_00000000-0000-0000-0000-000000000000/",
+        ),
+        (
+            Method::DELETE,
+            "/v1/conversations/conv_00000000-0000-0000-0000-000000000000/",
         ),
         (
             Method::POST,

@@ -368,6 +368,23 @@ impl Fleet {
     /// Maximum inline-verification retries when creating a verified index client.
     const INLINE_VERIFY_RETRIES: usize = 2;
 
+    /// How long an index is not verified again after inline verification
+    /// failed the TLS channel-binding check (a non-retryable failure). Bounds
+    /// the attestation load during a certificate-renewal skew, when every
+    /// request to the index would otherwise trigger a new attestation.
+    pub(super) const CHANNEL_BINDING_BACKOFF: Duration = Duration::from_secs(30);
+
+    /// Time left before `index` may be verified again after a channel-binding
+    /// failure, if any.
+    fn channel_binding_backoff_remaining(&self, index: usize) -> Option<Duration> {
+        let failed_at = (*self.channel_binding_failed_at[index]
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()))?;
+        Self::CHANNEL_BINDING_BACKOFF
+            .checked_sub(failed_at.elapsed())
+            .filter(|remaining| !remaining.is_zero())
+    }
+
     /// Spawn background tasks to pre-warm the per-index clients for the live
     /// backend indices (`0..rotation_count()`). No-op without a verifier or
     /// before any fingerprint is pinned (Bootstrap/Blocked) — every task would
@@ -408,7 +425,9 @@ impl Fleet {
     /// (`<canonical>-i<index>.<base>`) so the pinned H2 connection lands on
     /// backend `index`. Bounded by `verification_semaphore`; on exhausted
     /// retries falls back to `fallback_client` only once a fingerprint is
-    /// pinned (else fails closed).
+    /// pinned (else fails closed). A TLS channel-binding failure is not
+    /// retried, and the index is not verified again for
+    /// `CHANNEL_BINDING_BACKOFF`.
     pub(super) async fn get_or_verify_index_client(
         &self,
         index: usize,
@@ -445,6 +464,10 @@ impl Fleet {
             }
         };
 
+        if let Some(remaining) = self.channel_binding_backoff_remaining(index) {
+            return self.channel_binding_backoff(index, remaining);
+        }
+
         // Bound concurrent inline verifications (thundering-herd guard). The
         // permit is held for the whole retry loop; the first success fills the
         // index slot and subsequent waiters take the fast path after re-checking.
@@ -462,6 +485,11 @@ impl Fleet {
             if let Some(ref client) = *guard {
                 return Ok(client.clone());
             }
+        }
+        // A concurrent verification of this index may have just failed the
+        // channel-binding check while this task waited for the permit.
+        if let Some(remaining) = self.channel_binding_backoff_remaining(index) {
+            return self.channel_binding_backoff(index, remaining);
         }
 
         // Verify against the index's rotation SNI so the pinned connection lands
@@ -482,7 +510,9 @@ impl Fleet {
         };
 
         let mut last_err = None;
+        let mut attempts = 0;
         for _attempt in 0..=Self::INLINE_VERIFY_RETRIES {
+            attempts += 1;
             match verifier.create_verified_client(&verify_url).await {
                 Ok(client) => {
                     let mut guard = self.index_clients[index]
@@ -492,6 +522,9 @@ impl Fleet {
                         return Ok(existing.clone());
                     }
                     *guard = Some(client.clone());
+                    *self.channel_binding_failed_at[index]
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner()) = None;
                     return Ok(client);
                 }
                 Err(e) => {
@@ -502,30 +535,69 @@ impl Fleet {
                         return Ok(existing.clone());
                     }
                     drop(guard);
+                    if matches!(e, BackendVerifyError::ChannelBinding(_)) {
+                        // The report and the certificate came from the same
+                        // connection: another attempt reaches the same backend
+                        // and fails the same way, at the cost of a new
+                        // attestation.
+                        *self.channel_binding_failed_at[index]
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner()) = Some(tokio::time::Instant::now());
+                        tracing::warn!(
+                            index,
+                            error = %e,
+                            backoff_secs = Self::CHANNEL_BINDING_BACKOFF.as_secs(),
+                            "Inline backend verification failed the TLS channel binding check; not retrying"
+                        );
+                        last_err = Some(e);
+                        break;
+                    }
                     tracing::warn!(index, error = %e, "Inline backend verification failed, retrying");
                     last_err = Some(e);
                 }
             }
         }
 
-        // Retries exhausted. Fall back to the non-pinned client ONLY if a
-        // fingerprint is already pinned (its verifier still rejects unknown
-        // SPKIs); in Bootstrap, fail closed to avoid unauthenticated connections.
+        // Retries exhausted, or a non-retryable failure. Fall back to the
+        // non-pinned client ONLY if a fingerprint is already pinned (its
+        // verifier still rejects unknown SPKIs); in Bootstrap, fail closed to
+        // avoid unauthenticated connections.
         let err_msg = format!(
-            "Inline backend verification failed after {} attempts: {}",
-            Self::INLINE_VERIFY_RETRIES + 1,
-            last_err.unwrap_or_default()
+            "Inline backend verification failed after {attempts} attempt(s): {}",
+            last_err.map(|e| e.to_string()).unwrap_or_default()
         );
         if self.pinned_fingerprint_count() > 0 {
-            tracing::warn!(index, error = %err_msg, "Inline backend verification exhausted retries; serving with fallback client");
+            tracing::warn!(index, error = %err_msg, "Inline backend verification failed; serving with fallback client");
             Ok(self.fallback_client.clone())
         } else {
             tracing::warn!(
                 index,
                 error = %err_msg,
-                "Inline backend verification exhausted retries in Bootstrap state; \
+                "Inline backend verification failed in Bootstrap state; \
                  refusing fallback to prevent unauthenticated connections"
             );
+            Err(CompletionError::CompletionError(err_msg))
+        }
+    }
+
+    /// `get_or_verify_index_client` for an index that is backing off after a
+    /// channel-binding failure: no verification, straight to the same fallback
+    /// decision. Logged at debug level; the failure itself was logged once.
+    fn channel_binding_backoff(
+        &self,
+        index: usize,
+        remaining: Duration,
+    ) -> Result<Client, CompletionError> {
+        let err_msg = format!(
+            "Inline backend verification of index {index} failed the TLS channel binding check; \
+             not verifying it again for {}s",
+            remaining.as_secs().max(1)
+        );
+        if self.pinned_fingerprint_count() > 0 {
+            tracing::debug!(index, error = %err_msg, "Serving with fallback client");
+            Ok(self.fallback_client.clone())
+        } else {
+            tracing::debug!(index, error = %err_msg, "Refusing fallback in Bootstrap state");
             Err(CompletionError::CompletionError(err_msg))
         }
     }
@@ -3430,7 +3502,7 @@ mod tests {
             async fn create_verified_client(
                 &self,
                 _base_url: &str,
-            ) -> Result<reqwest::Client, String> {
+            ) -> Result<reqwest::Client, crate::BackendVerifyError> {
                 Ok(reqwest::Client::new())
             }
         }
@@ -3465,7 +3537,7 @@ mod tests {
             async fn create_verified_client(
                 &self,
                 _base_url: &str,
-            ) -> Result<reqwest::Client, String> {
+            ) -> Result<reqwest::Client, crate::BackendVerifyError> {
                 Ok(reqwest::Client::new())
             }
         }
@@ -3517,8 +3589,8 @@ mod tests {
             async fn create_verified_client(
                 &self,
                 _base_url: &str,
-            ) -> Result<reqwest::Client, String> {
-                Err("simulated attestation timeout".to_string())
+            ) -> Result<reqwest::Client, crate::BackendVerifyError> {
+                Err("simulated attestation timeout".to_string().into())
             }
         }
 
@@ -3563,8 +3635,8 @@ mod tests {
             async fn create_verified_client(
                 &self,
                 _base_url: &str,
-            ) -> Result<reqwest::Client, String> {
-                Err("simulated attestation timeout".to_string())
+            ) -> Result<reqwest::Client, crate::BackendVerifyError> {
+                Err("simulated attestation timeout".to_string().into())
             }
         }
 
@@ -3611,8 +3683,8 @@ mod tests {
             async fn create_verified_client(
                 &self,
                 _base_url: &str,
-            ) -> Result<reqwest::Client, String> {
-                Err("simulated attestation failure".to_string())
+            ) -> Result<reqwest::Client, crate::BackendVerifyError> {
+                Err("simulated attestation failure".to_string().into())
             }
         }
 
@@ -3644,6 +3716,135 @@ mod tests {
         );
     }
 
+    /// Verifier that fails every call with the given error and counts calls.
+    struct FailingVerifier {
+        calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        error: crate::BackendVerifyError,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::BackendVerifier for FailingVerifier {
+        async fn create_verified_client(
+            &self,
+            _base_url: &str,
+        ) -> Result<reqwest::Client, crate::BackendVerifyError> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            // Yield so that concurrent callers queue on the permit.
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            Err(self.error.clone())
+        }
+    }
+
+    fn provider_with_failing_verifier(
+        error: crate::BackendVerifyError,
+        concurrency: usize,
+    ) -> (Provider, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let provider = Provider::new_with_verifier_and_concurrency(
+            Config {
+                base_url: "http://localhost".to_string(),
+                api_key: None,
+                completion_timeout_seconds: 30,
+                control_timeout_seconds: 30,
+            },
+            std::sync::Arc::new(std::sync::RwLock::new(
+                crate::spki_verifier::FingerprintState::Bootstrap,
+            )),
+            std::sync::Arc::new(FailingVerifier {
+                calls: calls.clone(),
+                error,
+            }),
+            concurrency,
+        );
+        (provider, calls)
+    }
+
+    fn channel_binding_mismatch() -> crate::BackendVerifyError {
+        crate::BackendVerifyError::ChannelBinding(
+            "TLS channel binding mismatch: peer SPKI aaaa, attested SPKI bbbb".to_string(),
+        )
+    }
+
+    /// A channel-binding failure repeats for the same backend, so it is not
+    /// retried, and the index is not verified again during the backoff: under a
+    /// persistent mismatch, repeated requests cost one attestation per index per
+    /// backoff period. The fallback decision is unchanged (fallback client once
+    /// a fingerprint is pinned, fail closed before).
+    #[tokio::test(start_paused = true)]
+    async fn channel_binding_failure_is_not_retried_and_backs_off() {
+        use std::sync::atomic::Ordering;
+        for pinned in [false, true] {
+            let (provider, calls) = provider_with_failing_verifier(channel_binding_mismatch(), 4);
+            if pinned {
+                provider.add_verified_fingerprint("deadbeef".to_string());
+            }
+
+            for _ in 0..5 {
+                let result = provider.fleet.get_or_verify_index_client(0).await;
+                assert_eq!(result.is_ok(), pinned, "pinned={pinned}: {result:?}");
+                if let Err(CompletionError::CompletionError(msg)) = result {
+                    assert!(msg.contains("TLS channel binding"), "{msg}");
+                }
+            }
+            assert_eq!(calls.load(Ordering::SeqCst), 1, "pinned={pinned}");
+            assert!(provider.fleet.index_clients[0].lock().unwrap().is_none());
+
+            // Other indices are verified independently.
+            let _ = provider.fleet.get_or_verify_index_client(1).await;
+            assert_eq!(calls.load(Ordering::SeqCst), 2, "pinned={pinned}");
+
+            // After the backoff, the index is verified again.
+            tokio::time::advance(Fleet::CHANNEL_BINDING_BACKOFF).await;
+            let _ = provider.fleet.get_or_verify_index_client(0).await;
+            assert_eq!(calls.load(Ordering::SeqCst), 3, "pinned={pinned}");
+
+            // A backend-count change remaps indices and ends the backoff.
+            let _ = provider.fleet.get_or_verify_index_client(0).await;
+            assert_eq!(calls.load(Ordering::SeqCst), 3, "pinned={pinned}");
+            provider.fleet.store_backend_count(2);
+            let _ = provider.fleet.get_or_verify_index_client(0).await;
+            assert_eq!(calls.load(Ordering::SeqCst), 4, "pinned={pinned}");
+        }
+    }
+
+    /// Requests that queued on the verification permit while a channel-binding
+    /// failure was being recorded do not verify the index again.
+    #[tokio::test(start_paused = true)]
+    async fn concurrent_requests_share_one_channel_binding_failure() {
+        let (provider, calls) = provider_with_failing_verifier(channel_binding_mismatch(), 1);
+        let provider = std::sync::Arc::new(provider);
+        let mut handles = Vec::new();
+        for _ in 0..8 {
+            let provider = provider.clone();
+            handles.push(tokio::spawn(async move {
+                provider.fleet.get_or_verify_index_client(0).await
+            }));
+        }
+        for handle in handles {
+            assert!(
+                handle.await.unwrap().is_err(),
+                "Bootstrap state fails closed"
+            );
+        }
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    /// Other verification failures may be transient: they are still retried,
+    /// and they do not start a backoff.
+    #[tokio::test(start_paused = true)]
+    async fn other_verification_failures_are_retried_without_backoff() {
+        use std::sync::atomic::Ordering;
+        let (provider, calls) = provider_with_failing_verifier(
+            crate::BackendVerifyError::Other("Attestation request timed out".to_string()),
+            4,
+        );
+        let attempts = Fleet::INLINE_VERIFY_RETRIES + 1;
+        assert!(provider.fleet.get_or_verify_index_client(0).await.is_err());
+        assert_eq!(calls.load(Ordering::SeqCst), attempts);
+        assert!(provider.fleet.get_or_verify_index_client(0).await.is_err());
+        assert_eq!(calls.load(Ordering::SeqCst), 2 * attempts);
+    }
+
     /// Fix 1: the semaphore serialises concurrent verifications so that only
     /// N attempts run at once. When the first succeeds and fills the bucket,
     /// later waiters take the fast path (bucket already filled) rather than
@@ -3669,7 +3870,7 @@ mod tests {
             async fn create_verified_client(
                 &self,
                 _base_url: &str,
-            ) -> Result<reqwest::Client, String> {
+            ) -> Result<reqwest::Client, crate::BackendVerifyError> {
                 self.count.fetch_add(1, Ordering::SeqCst);
                 Ok(reqwest::Client::new())
             }
@@ -3759,7 +3960,7 @@ mod tests {
             async fn create_verified_client(
                 &self,
                 _base_url: &str,
-            ) -> Result<reqwest::Client, String> {
+            ) -> Result<reqwest::Client, crate::BackendVerifyError> {
                 Ok(reqwest::Client::builder()
                     .build()
                     .expect("client builds in test"))
@@ -3872,7 +4073,7 @@ mod tests {
             async fn create_verified_client(
                 &self,
                 _base_url: &str,
-            ) -> Result<reqwest::Client, String> {
+            ) -> Result<reqwest::Client, crate::BackendVerifyError> {
                 self.count.fetch_add(1, Ordering::SeqCst);
                 Ok(reqwest::Client::new())
             }
@@ -3991,7 +4192,7 @@ mod tests {
             async fn create_verified_client(
                 &self,
                 _base_url: &str,
-            ) -> Result<reqwest::Client, String> {
+            ) -> Result<reqwest::Client, crate::BackendVerifyError> {
                 self.count.fetch_add(1, Ordering::SeqCst);
                 Ok(reqwest::Client::new())
             }
@@ -4255,7 +4456,7 @@ mod tests {
             async fn create_verified_client(
                 &self,
                 _base_url: &str,
-            ) -> Result<reqwest::Client, String> {
+            ) -> Result<reqwest::Client, crate::BackendVerifyError> {
                 Ok(reqwest::Client::new())
             }
         }
@@ -4953,7 +5154,7 @@ mod tests {
             async fn create_verified_client(
                 &self,
                 _base_url: &str,
-            ) -> Result<reqwest::Client, String> {
+            ) -> Result<reqwest::Client, crate::BackendVerifyError> {
                 Ok(reqwest::Client::new())
             }
         }

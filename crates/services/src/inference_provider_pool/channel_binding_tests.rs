@@ -20,7 +20,7 @@ use hyper::service::service_fn;
 use hyper::{Method, Request, Response, StatusCode};
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use inference_providers::spki_verifier::compute_spki_fingerprint_from_der;
-use inference_providers::BackendVerifier as _;
+use inference_providers::{BackendVerifier as _, BackendVerifyError};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use tokio::net::TcpListener;
@@ -319,6 +319,22 @@ fn pool_verifier(
     }
 }
 
+/// Message of a channel-binding failure; panics on any other result.
+fn channel_binding_error(result: Result<reqwest::Client, BackendVerifyError>) -> String {
+    match result {
+        Err(BackendVerifyError::ChannelBinding(message)) => message,
+        other => panic!("expected a channel-binding failure, got {other:?}"),
+    }
+}
+
+/// Message of any other verification failure; panics on any other result.
+fn other_error(result: Result<reqwest::Client, BackendVerifyError>) -> String {
+    match result {
+        Err(BackendVerifyError::Other(message)) => message,
+        other => panic!("expected a verification failure, got {other:?}"),
+    }
+}
+
 /// `result:` tags of the recorded channel-binding counters.
 fn channel_binding_results(metrics: &CapturingMetricsService) -> Vec<String> {
     metrics
@@ -359,10 +375,7 @@ async fn assert_relay_refused(transport: Transport, genuine_already_pinned: bool
     let metrics = Arc::new(CapturingMetricsService::new());
     let verifier = pool_verifier(&pki, state.clone(), metrics.clone());
 
-    let err = verifier
-        .create_verified_client(&relay.base_url)
-        .await
-        .expect_err("a backend whose certificate is not the attested one must be refused");
+    let err = channel_binding_error(verifier.create_verified_client(&relay.base_url).await);
     assert!(err.contains("TLS channel binding mismatch"), "{err}");
     assert!(err.contains(&pki.relay.fingerprint[..16]), "{err}");
     assert!(err.contains(&pki.genuine.fingerprint[..16]), "{err}");
@@ -481,10 +494,7 @@ async fn attestation_redirect_is_not_followed() {
     let metrics = Arc::new(CapturingMetricsService::new());
     let verifier = pool_verifier(&pki, state.clone(), metrics.clone());
 
-    let err = verifier
-        .create_verified_client(&relay.base_url)
-        .await
-        .expect_err("a redirected attestation fetch must be refused");
+    let err = other_error(verifier.create_verified_client(&relay.base_url).await);
     assert!(err.contains("307"), "{err}");
     assert_eq!(count(&relay.counters.attestation_requests), 1);
     assert_eq!(count(&genuine.counters.attestation_requests), 0);
@@ -543,10 +553,7 @@ async fn report_without_fingerprint_is_refused() {
         ..pool_verifier(&pki, state.clone(), metrics.clone())
     };
 
-    let err = verifier
-        .create_verified_client(&genuine.base_url)
-        .await
-        .expect_err("a report without a TLS fingerprint must be refused");
+    let err = channel_binding_error(verifier.create_verified_client(&genuine.base_url).await);
     assert!(err.contains("TLS channel binding unattested"), "{err}");
     assert_eq!(pinned_set(&state), None);
     assert_eq!(channel_binding_results(&metrics), vec!["result:unattested"]);
@@ -568,10 +575,7 @@ async fn backend_without_peer_certificate_is_refused() {
     let metrics = Arc::new(CapturingMetricsService::new());
     let verifier = pool_verifier(&pki, state.clone(), metrics.clone());
 
-    let err = verifier
-        .create_verified_client(&backend.base_url)
-        .await
-        .expect_err("no peer certificate means no channel binding");
+    let err = channel_binding_error(verifier.create_verified_client(&backend.base_url).await);
     assert!(err.contains("TLS channel binding missing"), "{err}");
     assert_eq!(count(&backend.counters.attestation_requests), 1);
     assert!(matches!(

@@ -201,7 +201,29 @@ impl ProviderTier {
 pub trait BackendVerifier: Send + Sync {
     /// Connect to `base_url`, verify the backend's attestation, and return a client
     /// whose H2 connection is pinned to that verified backend.
-    async fn create_verified_client(&self, base_url: &str) -> Result<Client, String>;
+    async fn create_verified_client(&self, base_url: &str) -> Result<Client, BackendVerifyError>;
+}
+
+/// Why [`BackendVerifier::create_verified_client`] failed.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum BackendVerifyError {
+    /// The attestation report was verified, but the certificate presented on
+    /// the connection that carried it is not the attested one (or the report
+    /// attests no fingerprint, or the certificate could not be read). Report
+    /// and certificate come from the same connection, so verifying the same
+    /// backend again gives the same result: callers should not retry.
+    #[error("{0}")]
+    ChannelBinding(String),
+    /// Any other failure (connection, HTTP status, report parsing, quote or
+    /// GPU evidence verification). May be transient.
+    #[error("{0}")]
+    Other(String),
+}
+
+impl From<String> for BackendVerifyError {
+    fn from(message: String) -> Self {
+        Self::Other(message)
+    }
 }
 
 /// Try to extract a human-readable error message from a JSON error response body.

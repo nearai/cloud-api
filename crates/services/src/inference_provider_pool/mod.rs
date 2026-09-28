@@ -815,7 +815,10 @@ struct PoolBackendVerifier {
 
 #[async_trait::async_trait]
 impl inference_providers::BackendVerifier for PoolBackendVerifier {
-    async fn create_verified_client(&self, base_url: &str) -> Result<reqwest::Client, String> {
+    async fn create_verified_client(
+        &self,
+        base_url: &str,
+    ) -> Result<reqwest::Client, inference_providers::BackendVerifyError> {
         // Fast path: if discovery has already pinned fingerprints for this
         // model's backends, skip the per-bucket attestation round-trip. The
         // shared `fingerprint_state` is updated every discovery cycle (~5 min)
@@ -891,7 +894,7 @@ impl inference_providers::BackendVerifier for PoolBackendVerifier {
                 .text()
                 .await
                 .unwrap_or_else(|_| "unknown".to_string());
-            return Err(format!("Attestation HTTP {status}: {body}"));
+            return Err(format!("Attestation HTTP {status}: {body}").into());
         }
 
         // The certificate the server presented on this connection. Read it
@@ -940,9 +943,13 @@ impl inference_providers::BackendVerifier for PoolBackendVerifier {
                 attested_fingerprint = %attested,
                 "Attested TLS fingerprint does not match the certificate on the attestation connection; backend not pinned"
             );
-            return Err(format!(
-                "TLS channel binding {}: connection SPKI {observed}, attested SPKI {attested}",
-                binding.as_str()
+            // Typed as non-retryable: the report and the certificate came from
+            // the same connection, so another attempt fails the same way.
+            return Err(inference_providers::BackendVerifyError::ChannelBinding(
+                format!(
+                    "TLS channel binding {}: peer SPKI {observed}, attested SPKI {attested}",
+                    binding.as_str()
+                ),
             ));
         }
 

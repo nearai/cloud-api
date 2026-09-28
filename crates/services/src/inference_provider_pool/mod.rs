@@ -611,6 +611,27 @@ fn tee_identity(report: &serde_json::Map<String, serde_json::Value>) -> Option<T
     Some((root_id, app_id))
 }
 
+/// Signing key and TEE identity reported by a verified discovery probe. These
+/// report fields are not checked by the attestation verifier, so they are only
+/// taken from a probe whose connection presented the attested certificate.
+fn backend_probe(
+    binding: ChannelBinding,
+    report: &serde_json::Map<String, serde_json::Value>,
+    index: usize,
+    algo: &str,
+) -> Option<BackendProbe> {
+    if binding != ChannelBinding::Match {
+        return None;
+    }
+    let pubkey = report.get("signing_public_key")?.as_str()?;
+    Some(BackendProbe {
+        index,
+        algo: algo.to_string(),
+        pubkey: pubkey.to_string(),
+        identity: tee_identity(report),
+    })
+}
+
 /// Outcome of applying the cycle's verified fingerprints to a
 /// `FingerprintState`. Split into its own type so the policy is testable
 /// without spinning up a real attestation pipeline.
@@ -941,7 +962,7 @@ impl inference_providers::BackendVerifier for PoolBackendVerifier {
                 result = binding.as_str(),
                 observed_fingerprint = %observed,
                 attested_fingerprint = %attested,
-                "Attested TLS fingerprint does not match the certificate on the attestation connection; backend not pinned"
+                "TLS channel binding check failed on the attestation connection; backend not pinned"
             );
             // Typed as non-retryable: the report and the certificate came from
             // the same connection, so another attempt fails the same way.
@@ -2104,11 +2125,13 @@ impl InferenceProviderPool {
             match verifier.verify_attestation_report(&report, &nonce).await {
                 Ok(verified) => {
                     // Same channel-binding comparison as the inline
-                    // verification path, but report-only: the pin comes from
-                    // the verified report and the probe connection is dropped
-                    // without carrying inference, so discovery stays fail-open.
-                    // A mismatch here typically means a renewed certificate is
-                    // attested while the old one is still being served.
+                    // verification path. Pinning stays fail-open: the pin comes
+                    // from the verified report and the probe connection is
+                    // dropped without carrying inference. A mismatch here
+                    // typically means a renewed certificate is attested while
+                    // the old one is still being served. The report's signing
+                    // key and TEE identity are not checked by the verifier, so
+                    // they are only used from probes that pass the check.
                     let binding = ChannelBinding::check(
                         &observed_fingerprint,
                         verified.tls_cert_fingerprint.as_deref(),
@@ -2132,7 +2155,7 @@ impl InferenceProviderPool {
                             result = binding.as_str(),
                             observed_fingerprint = %observed,
                             attested_fingerprint = %attested,
-                            "Discovery probe: attested TLS fingerprint does not match the certificate on the probe connection"
+                            "TLS channel binding check failed on a discovery probe; its signing key is not used"
                         );
                     }
                     if let Some(ref vfp) = verified
@@ -2145,9 +2168,8 @@ impl InferenceProviderPool {
                     }
                     // Keys are KMS-root-derived: replicas under different roots
                     // serve different keys for the same model and algorithm.
-                    if let Some(pk) = report.get("signing_public_key").and_then(|v| v.as_str()) {
-                        let identity = tee_identity(&report);
-                        if identity.is_none() {
+                    if let Some(probe) = backend_probe(binding, &report, backend_index, &algo) {
+                        if probe.identity.is_none() {
                             warn!(
                                 model = %model_name,
                                 backend_index,
@@ -2155,12 +2177,7 @@ impl InferenceProviderPool {
                                 "Attestation report has no parseable TEE identity; backend remains eligible for every key group"
                             );
                         }
-                        backend_probes.push(BackendProbe {
-                            index: backend_index,
-                            algo: algo.clone(),
-                            pubkey: pk.to_string(),
-                            identity,
-                        });
+                        backend_probes.push(probe);
                     }
                 }
                 Err(e) => {

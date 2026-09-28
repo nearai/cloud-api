@@ -996,3 +996,34 @@ fn channel_binding_check_classifies_outcomes() {
         ChannelBinding::Missing
     );
 }
+
+/// The signing key and TEE identity of a discovery probe are only used when
+/// its channel check passed; the fingerprint is pinned either way.
+#[test]
+fn discovery_uses_signing_keys_only_from_matching_probes() {
+    let report = serde_json::json!({
+        "signing_public_key": "04abcd",
+        "info": { "app_id": "app", "key_provider_info": { "id": "root" } },
+    });
+    let report = report.as_object().unwrap();
+
+    let probe = backend_probe(ChannelBinding::Match, report, 2, "ecdsa").unwrap();
+    assert_eq!(probe.index, 2);
+    assert_eq!(probe.algo, "ecdsa");
+    assert_eq!(probe.pubkey, "04abcd");
+    assert_eq!(
+        probe.identity,
+        Some(("root".to_string(), "app".to_string()))
+    );
+
+    for binding in [
+        ChannelBinding::Mismatch,
+        ChannelBinding::Unattested,
+        ChannelBinding::Missing,
+    ] {
+        assert!(backend_probe(binding, report, 2, "ecdsa").is_none());
+    }
+
+    let no_key = serde_json::Map::new();
+    assert!(backend_probe(ChannelBinding::Match, &no_key, 2, "ecdsa").is_none());
+}

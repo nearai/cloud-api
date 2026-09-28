@@ -499,6 +499,11 @@ pub trait InferenceProvider {
     /// host as legacy and fails open).
     fn set_backend_hosts(&self, _hosts: BackendHosts) {}
 
+    /// Install smart placement for covered models. Default is a no-op — only
+    /// providers that participate in smart placement override it; without
+    /// it every request takes the existing routing path.
+    fn set_placement(&self, _handles: placement_io::PlacementHandles) {}
+
     /// Exact input-token count via the backend's tokenizer (`POST /v1/tokenize`,
     /// proxied to the engine's native tokenize endpoint). The pool calls this
     /// only when a cheap byte-based estimate lands near a context-capacity

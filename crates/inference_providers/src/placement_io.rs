@@ -70,6 +70,20 @@ pub const METRIC_READ_ERRORS: &str = "cloud_api.placement.valkey_read_errors";
 pub const METRIC_FRAMES_REJECTED: &str = "cloud_api.placement.frames_rejected";
 pub const METRIC_PINS_MALFORMED: &str = "cloud_api.placement.pins_malformed";
 pub const METRIC_SNAPSHOT_AGE_MS: &str = "cloud_api.placement.snapshot_age_ms";
+/// One per placement decision on a covered model, tagged
+/// `outcome:{place|legacy}` plus `selection:{..}` (place) or `reason:{..}`
+/// (legacy). Never host or request ids.
+pub const METRIC_DECISIONS: &str = "cloud_api.placement.decisions";
+
+/// Everything a provider's `Fleet` needs to place covered-model requests.
+/// `hosts` is the same `ArcSwap` the [`PlacementIo`] reader resolves frame
+/// signing keys from, so discovery's host map is shared, not copied.
+#[derive(Clone)]
+pub struct PlacementHandles {
+    pub placer: Arc<placement::decision::Placer>,
+    pub io: Arc<PlacementIo>,
+    pub hosts: Arc<ArcSwap<BackendHosts>>,
+}
 
 /// The metrics this module emits. Same method shapes as
 /// `services::metrics::MetricsServiceTrait` (which this crate cannot depend
@@ -217,6 +231,22 @@ impl PlacementIo {
             metrics,
         };
         (io, rx)
+    }
+
+    /// A network-free handle for tests: the snapshot is set directly and
+    /// queued writes are read from the returned receiver.
+    #[cfg(test)]
+    pub(crate) fn for_test(
+        metrics: Arc<dyn PlacementMetrics>,
+    ) -> (Arc<Self>, mpsc::Receiver<Write>) {
+        let (io, rx) = Self::new(metrics);
+        (Arc::new(io), rx)
+    }
+
+    /// The metrics sink this handle was started with, so the request-path
+    /// placement hook reports through the same adapter.
+    pub fn metrics(&self) -> &dyn PlacementMetrics {
+        self.metrics.as_ref()
     }
 
     /// Queues `w` without waiting. A full queue drops it and increments

@@ -78,10 +78,14 @@ pub enum LegacyReason {
     HostUnmapped,
     /// Reserved for the caller: a placer error.
     Error,
+    /// Reserved for the caller: the chosen host's index is outside the
+    /// E2EE-pinned model key's backend group.
+    KeyGroup,
 }
 
 impl LegacyReason {
-    fn as_str(self) -> &'static str {
+    /// A stable, content-free name for logs and metric tags.
+    pub fn as_str(self) -> &'static str {
         match self {
             LegacyReason::NotCovered => "not_covered",
             LegacyReason::NoState => "no_state",
@@ -89,6 +93,7 @@ impl LegacyReason {
             LegacyReason::NoneEligible => "none_eligible",
             LegacyReason::HostUnmapped => "host_unmapped",
             LegacyReason::Error => "error",
+            LegacyReason::KeyGroup => "key_group",
         }
     }
 }
@@ -439,6 +444,12 @@ mod tests {
 
     fn placer() -> Placer {
         Placer::new([1u8; 32])
+    }
+
+    #[test]
+    fn caller_legacy_reasons_have_stable_names() {
+        assert_eq!(LegacyReason::HostUnmapped.as_str(), "host_unmapped");
+        assert_eq!(LegacyReason::KeyGroup.as_str(), "key_group");
     }
 
     #[test]

@@ -13,10 +13,17 @@
 //! pathologically slow backend.
 
 use super::prefix_router::PrefixRouter;
-use super::Config;
+use super::{placement_headers, tracing_headers, Config};
+use crate::placement_io::{PlacementHandles, Write, METRIC_DECISIONS};
 use crate::rotation;
 use crate::spki_verifier::FingerprintState;
+use crate::BackendHosts;
 use crate::BackendVerifier;
+use arc_swap::{ArcSwap, ArcSwapOption};
+use placement::affinity::AffinityKey;
+use placement::consts::COVERED_MODELS;
+use placement::decision::{AffinitySource, Decision, DecisionRecord, LegacyReason, PlaceInput};
+use placement::score::Pending;
 use reqwest::Client;
 use sha2::{Digest, Sha256};
 use std::cmp::Reverse;
@@ -169,12 +176,20 @@ pub(super) struct Fleet {
     /// change clears this because the index-to-backend binding is then stale.
     backend_keys: Arc<RwLock<HashMap<String, Vec<usize>>>>,
     /// Verified host map from the last discovery cycle (host_id -> backend
-    /// index, plus attested keys). `None` until the first cycle populates it.
-    /// Rebuilt wholesale each cycle. Not yet read anywhere — smart-placement
-    /// consumption lands in a later task; this just stops discovery's push
-    /// from being dropped on the floor.
-    #[allow(dead_code)]
-    backend_hosts: Arc<RwLock<Option<crate::BackendHosts>>>,
+    /// index, plus attested keys); empty until the first cycle. Rebuilt
+    /// wholesale each cycle. The placement hook maps a placed host to its
+    /// index through this map. Every update is mirrored into the installed
+    /// `PlacementHandles::hosts`, the map the Valkey reader verifies frames
+    /// against.
+    backend_hosts: Arc<ArcSwap<BackendHosts>>,
+    /// Smart-placement handles; `None` (every request on the legacy path)
+    /// until `set_placement`. Lock-free on the hot path.
+    placement: ArcSwapOption<PlacementHandles>,
+    /// This node's own placed (req, tok) per host, bucketed by unix second.
+    /// Only the current and previous second are kept, the same window the
+    /// Valkey routed hash covers. Held only for a map update or a copy, never
+    /// across `place()`.
+    placement_ledger: Mutex<HashMap<u64, HashMap<String, Pending>>>,
     /// Epoch-ms of the last `UnknownKey` warning, so a client stuck on a stale
     /// attestation cannot flood the log from the request hot path.
     last_unknown_key_warn_ms: AtomicU64,
@@ -221,7 +236,9 @@ impl Fleet {
             ])),
             prefix_loads: Arc::new(Mutex::new(HashMap::new())),
             backend_keys: Arc::new(RwLock::new(HashMap::new())),
-            backend_hosts: Arc::new(RwLock::new(None)),
+            backend_hosts: Arc::new(ArcSwap::from_pointee(BackendHosts::default())),
+            placement: ArcSwapOption::empty(),
+            placement_ledger: Mutex::new(HashMap::new()),
             last_unknown_key_warn_ms: AtomicU64::new(0),
             config,
             client,
@@ -291,25 +308,7 @@ impl Fleet {
         }
         let key_group = self.resolve_key_group(pinned_pub_key, count);
         if matches!(key_group, KeyGroup::UnknownKey) {
-            let now_ms = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .map_or(0, |elapsed| {
-                    elapsed
-                        .as_secs()
-                        .saturating_mul(1_000)
-                        .saturating_add(u64::from(elapsed.subsec_millis()))
-                });
-            if self.should_warn_unknown_key(now_ms) {
-                let pub_key_prefix: String = pinned_pub_key
-                    .unwrap_or_default()
-                    .chars()
-                    .take(16)
-                    .collect();
-                tracing::warn!(
-                    pub_key_prefix = %pub_key_prefix,
-                    "No backend key group found for pinned model public key; routing unrestricted"
-                );
-            }
+            self.warn_unknown_key(pinned_pub_key);
         }
         let allowed = key_group.indices();
         let has_history = has_conversation_history(messages);
@@ -622,11 +621,168 @@ impl Fleet {
         *backend_keys = map;
     }
 
-    pub(super) fn set_backend_hosts(&self, hosts: crate::BackendHosts) {
-        *self
+    pub(super) fn set_backend_hosts(&self, hosts: BackendHosts) {
+        let hosts = Arc::new(hosts);
+        self.backend_hosts.store(hosts.clone());
+        if let Some(handles) = self.placement.load().as_ref() {
+            handles.hosts.store(hosts);
+        }
+    }
+
+    /// Install smart placement. The current host map is copied into
+    /// `handles.hosts` so a map pushed before installation is not lost.
+    pub(super) fn set_placement(&self, handles: PlacementHandles) {
+        let handles = Arc::new(handles);
+        self.placement.store(Some(handles.clone()));
+        if !Arc::ptr_eq(&handles.hosts, &self.backend_hosts) {
+            handles.hosts.store(self.backend_hosts.load_full());
+        }
+    }
+
+    /// Place a covered-model request on the least-stalling host, or fall
+    /// through to `acquire_index` unchanged. Placement is skipped entirely
+    /// (no decision, log or metric) when it is not installed, the model is
+    /// not covered, or rotation is unavailable. A `Legacy` decision, an
+    /// unmapped host, or a host outside the pinned E2EE key group all run the
+    /// existing path.
+    pub(super) fn acquire_index_placed(
+        &self,
+        messages: &[crate::ChatMessage],
+        pinned_pub_key: Option<&str>,
+        request: &PlacementRequest,
+    ) -> Option<RouteLease> {
+        if let Some(lease) = self.try_place(messages, pinned_pub_key, request) {
+            return Some(lease);
+        }
+        self.acquire_index(messages, pinned_pub_key)
+    }
+
+    fn try_place(
+        &self,
+        messages: &[crate::ChatMessage],
+        pinned_pub_key: Option<&str>,
+        request: &PlacementRequest,
+    ) -> Option<RouteLease> {
+        if !COVERED_MODELS.contains(&request.model.as_str()) {
+            return None;
+        }
+        let handles = self.placement.load_full()?;
+        let count = self.rotation_count();
+        if count == 0 {
+            return None;
+        }
+        let now_ms = epoch_ms();
+        let now_s = now_ms / 1_000;
+        let input = PlaceInput {
+            request_id: request.request_id.clone(),
+            model: request.model.clone(),
+            prompt_tokens_est: prompt_tokens_est(messages),
+            affinity: request.affinity.clone(),
+            affinity_source: request.affinity_source,
+            // Context tiers are separate providers (pool-level), so this
+            // Fleet has no host-level long-context knowledge: long prompts
+            // are NoneEligible and fail open to the legacy path.
+            long_context_hosts: Vec::new(),
+            now_ms,
+        };
+        let mine = self.placement_mine(now_s);
+        let decision = {
+            let snapshot = handles.io.snapshot.load();
+            handles
+                .placer
+                .place(&input, &snapshot, &mine, &mut rand::rng())
+        };
+        let (host, mut record, pin_write) = match decision {
+            Decision::Place {
+                host,
+                record,
+                pin_write,
+            } => (host, record, pin_write),
+            Decision::Legacy { record, .. } => {
+                report_decision(&handles, &record, request);
+                return None;
+            }
+        };
+        let index = self
             .backend_hosts
-            .write()
-            .unwrap_or_else(|e| e.into_inner()) = Some(hosts);
+            .load()
+            .index_by_host
+            .get(&host)
+            .copied()
+            .filter(|index| *index < count);
+        let Some(index) = index else {
+            demote(&mut record, LegacyReason::HostUnmapped);
+            report_decision(&handles, &record, request);
+            return None;
+        };
+        let key_group = self.resolve_key_group(pinned_pub_key, count);
+        if key_group
+            .indices()
+            .is_some_and(|group| !group.contains(&index))
+        {
+            demote(&mut record, LegacyReason::KeyGroup);
+            report_decision(&handles, &record, request);
+            return None;
+        }
+        if matches!(key_group, KeyGroup::UnknownKey) {
+            self.warn_unknown_key(pinned_pub_key);
+        }
+
+        let lease = self.reserve_index(self.route_key(messages), index);
+        handles.io.record(Write::Routed {
+            host: host.clone(),
+            replica: None,
+            tok: input.prompt_tokens_est,
+            sec: now_s,
+        });
+        if let Some((pin_id, pin_host)) = pin_write {
+            handles.io.record(Write::Pin {
+                id_hex: pin_id.to_hex(),
+                host: pin_host,
+                at_ms: now_ms,
+            });
+        }
+        self.ledger_add(host, input.prompt_tokens_est, now_s);
+        report_decision(&handles, &record, request);
+        Some(lease)
+    }
+
+    /// This node's own placed load per host over `{now_s - 1, now_s}`.
+    pub(super) fn placement_mine(&self, now_s: u64) -> HashMap<String, Pending> {
+        let ledger = lock(&self.placement_ledger);
+        let mut mine: HashMap<String, Pending> = HashMap::new();
+        let window = now_s.saturating_sub(1)..=now_s;
+        for (_, hosts) in ledger.iter().filter(|(sec, _)| window.contains(*sec)) {
+            for (host, pending) in hosts {
+                let entry = mine.entry(host.clone()).or_default();
+                entry.req = entry.req.saturating_add(pending.req);
+                entry.tok = entry.tok.saturating_add(pending.tok);
+            }
+        }
+        mine
+    }
+
+    fn ledger_add(&self, host: String, tok: u64, now_s: u64) {
+        let mut ledger = lock(&self.placement_ledger);
+        ledger.retain(|sec, _| sec.saturating_add(1) >= now_s);
+        let pending = ledger.entry(now_s).or_default().entry(host).or_default();
+        pending.req = pending.req.saturating_add(1);
+        pending.tok = pending.tok.saturating_add(tok);
+    }
+
+    /// Rate-limited warning for a pinned key that discovery does not know.
+    fn warn_unknown_key(&self, pinned_pub_key: Option<&str>) {
+        if self.should_warn_unknown_key(epoch_ms()) {
+            let pub_key_prefix: String = pinned_pub_key
+                .unwrap_or_default()
+                .chars()
+                .take(16)
+                .collect();
+            tracing::warn!(
+                pub_key_prefix = %pub_key_prefix,
+                "No backend key group found for pinned model public key; routing unrestricted"
+            );
+        }
     }
 
     pub(super) fn should_warn_unknown_key(&self, now_ms: u64) -> bool {
@@ -691,6 +847,127 @@ fn has_conversation_history(messages: &[crate::ChatMessage]) -> bool {
             crate::MessageRole::Assistant | crate::MessageRole::Tool
         )
     })
+}
+
+fn epoch_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |elapsed| {
+            elapsed
+                .as_secs()
+                .saturating_mul(1_000)
+                .saturating_add(u64::from(elapsed.subsec_millis()))
+        })
+}
+
+/// Routing-only placement inputs read from `params.extra` before the
+/// tracing and encryption helpers strip it. Holds an [`AffinityKey`], so it
+/// has no `Debug`; the key is never logged.
+pub(super) struct PlacementRequest {
+    pub(super) model: String,
+    /// Tracing ids for the decision log line (empty when absent).
+    pub(super) request_id: String,
+    pub(super) org_id: String,
+    pub(super) affinity: Option<AffinityKey>,
+    pub(super) affinity_source: AffinitySource,
+}
+
+impl PlacementRequest {
+    /// Reads the affinity key (hex; invalid means none), its source and the
+    /// tracing ids from `extra` without removing anything.
+    pub(super) fn from_extra(model: &str, extra: &HashMap<String, serde_json::Value>) -> Self {
+        let text = |key: &str| extra.get(key).and_then(|value| value.as_str());
+        let affinity = text(placement_headers::AFFINITY).and_then(AffinityKey::from_hex);
+        let affinity_source = match (&affinity, text(placement_headers::AFFINITY_SOURCE)) {
+            (Some(_), Some("client")) => AffinitySource::Client,
+            (Some(_), Some("prefix")) => AffinitySource::Prefix,
+            _ => AffinitySource::None,
+        };
+        Self {
+            model: model.to_string(),
+            request_id: text(tracing_headers::REQUEST_ID)
+                .unwrap_or_default()
+                .to_string(),
+            org_id: text(tracing_headers::ORG_ID)
+                .unwrap_or_default()
+                .to_string(),
+            affinity,
+            affinity_source,
+        }
+    }
+}
+
+/// Estimated prompt tokens: total message text bytes / 4. Text is a string
+/// content or the `text` fields of content parts.
+fn prompt_tokens_est(messages: &[crate::ChatMessage]) -> u64 {
+    let bytes = messages
+        .iter()
+        .map(|message| match message.content.as_ref() {
+            Some(serde_json::Value::String(text)) => text.len(),
+            Some(serde_json::Value::Array(parts)) => parts
+                .iter()
+                .filter_map(|part| part.get("text").and_then(|text| text.as_str()))
+                .map(str::len)
+                .fold(0usize, usize::saturating_add),
+            _ => 0,
+        })
+        .fold(0usize, usize::saturating_add);
+    u64::try_from(bytes / 4).unwrap_or(u64::MAX)
+}
+
+/// Turns a `Place` record into the `Legacy` one the caller fell back with.
+fn demote(record: &mut DecisionRecord, reason: LegacyReason) {
+    record.outcome = "legacy";
+    record.reason = Some(reason.as_str());
+    record.selection = None;
+    record.rank = None;
+}
+
+/// One metric and one info line per decision. IDs and numbers only: never
+/// the affinity key, pin id or content. Metric tags stay low-cardinality.
+fn report_decision(
+    handles: &PlacementHandles,
+    record: &DecisionRecord,
+    request: &PlacementRequest,
+) {
+    let outcome_tag = format!("outcome:{}", record.outcome);
+    let detail_tag = match (record.reason, record.selection) {
+        (Some(reason), _) => format!("reason:{reason}"),
+        (None, Some(selection)) => format!("selection:{selection}"),
+        (None, None) => "reason:unknown".to_string(),
+    };
+    handles
+        .io
+        .metrics()
+        .record_count(METRIC_DECISIONS, 1, &[&outcome_tag, &detail_tag]);
+    let excluded = record
+        .excluded
+        .iter()
+        .map(|(rule, n)| format!("{}:{n}", rule.as_str()))
+        .collect::<Vec<_>>()
+        .join(",");
+    tracing::info!(
+        request_id = %request.request_id,
+        org_id = %request.org_id,
+        model = %request.model,
+        outcome = record.outcome,
+        reason = record.reason.unwrap_or(""),
+        selection = record.selection.unwrap_or(""),
+        rank = ?record.rank,
+        affinity = record.affinity,
+        host = record.host.as_deref().unwrap_or(""),
+        home = record.home.as_deref().unwrap_or(""),
+        pinned = record.pinned.as_deref().unwrap_or(""),
+        eligible = record.eligible,
+        excluded = %excluded,
+        chosen_score = ?record.chosen_score,
+        home_score = ?record.home_score,
+        best_score = ?record.best_score,
+        snapshot_age_ms = record.snapshot_age_ms,
+        pending_req = record.pending_req,
+        backlog_tokens = ?record.chosen_backlog_tokens,
+        "Placement decision"
+    );
 }
 
 fn route_index_score(route_key: u64, index: usize) -> u64 {

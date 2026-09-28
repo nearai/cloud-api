@@ -9,7 +9,7 @@ use crate::{
     PrivacyClassifyError, RerankError, ScoreError, *,
 };
 use async_trait::async_trait;
-use fleet::Fleet;
+use fleet::{Fleet, PlacementRequest};
 use prefix_router::PrefixRouter;
 use reqwest::{header::HeaderValue, Client};
 use serde::Serialize;
@@ -1843,6 +1843,9 @@ impl InferenceProvider for Fleet {
         headers.insert("X-Request-Hash", request_hash_value);
 
         Self::prepare_priority_header(&mut headers, &mut streaming_params);
+        // Read placement inputs before the helpers below strip them.
+        let placement_request =
+            PlacementRequest::from_extra(&streaming_params.model, &streaming_params.extra);
         // Prepare tracing headers (request_id, org_id, workspace_id)
         self.prepare_tracing_headers(&mut headers, &mut streaming_params.extra);
         // Prepare encryption headers
@@ -1856,23 +1859,26 @@ impl InferenceProvider for Fleet {
         // first count, or a non-rotation URL like `localhost`) — serve via the
         // canonical fallback path (no index, no per-backend measurement) so
         // those paths keep working unchanged.
-        let route_lease =
-            match self.acquire_index(&streaming_params.messages, pinned_pub_key.as_deref()) {
-                None => {
-                    let url = format!("{}/v1/chat/completions", self.config.base_url);
-                    let response = self
-                        .send_streaming_request(
-                            &url,
-                            headers.clone(),
-                            &streaming_params,
-                            Some(&self.fallback_client),
-                        )
-                        .await?;
-                    let sse_stream = new_sse_parser(response.bytes_stream(), true);
-                    return Ok(Box::pin(sse_stream));
-                }
-                Some(lease) => lease,
-            };
+        let route_lease = match self.acquire_index_placed(
+            &streaming_params.messages,
+            pinned_pub_key.as_deref(),
+            &placement_request,
+        ) {
+            None => {
+                let url = format!("{}/v1/chat/completions", self.config.base_url);
+                let response = self
+                    .send_streaming_request(
+                        &url,
+                        headers.clone(),
+                        &streaming_params,
+                        Some(&self.fallback_client),
+                    )
+                    .await?;
+                let sse_stream = new_sse_parser(response.bytes_stream(), true);
+                return Ok(Box::pin(sse_stream));
+            }
+            Some(lease) => lease,
+        };
         let index = route_lease.index();
         let route_key = route_lease.route_key();
 
@@ -2000,6 +2006,9 @@ impl InferenceProvider for Fleet {
         headers.insert("X-Request-Hash", request_hash_value);
 
         Self::prepare_priority_header(&mut headers, &mut non_streaming_params);
+        // Read placement inputs before the helpers below strip them.
+        let placement_request =
+            PlacementRequest::from_extra(&non_streaming_params.model, &non_streaming_params.extra);
         // Prepare tracing headers (request_id, org_id, workspace_id)
         self.prepare_tracing_headers(&mut headers, &mut non_streaming_params.extra);
         // Prepare encryption headers
@@ -2028,9 +2037,11 @@ impl InferenceProvider for Fleet {
         // affinity, stable conversation homes, and latency steering). `None`
         // → canonical fallback path (cold-start / non-rotation URL): one shot
         // via the non-pinned fallback client, no index recorded.
-        let route_lease = match self
-            .acquire_index(&non_streaming_params.messages, pinned_pub_key.as_deref())
-        {
+        let route_lease = match self.acquire_index_placed(
+            &non_streaming_params.messages,
+            pinned_pub_key.as_deref(),
+            &placement_request,
+        ) {
             None => {
                 let url = format!("{}/v1/chat/completions", self.config.base_url);
                 let response = self
@@ -2722,6 +2733,9 @@ impl InferenceProvider for Provider {
     }
     fn set_backend_hosts(&self, hosts: crate::BackendHosts) {
         self.fleet.set_backend_hosts(hosts)
+    }
+    fn set_placement(&self, handles: crate::placement_io::PlacementHandles) {
+        self.fleet.set_placement(handles)
     }
     async fn count_tokens(&self, model: &str, text: String) -> Option<u64> {
         self.fleet.count_tokens(model, text).await
@@ -5583,6 +5597,385 @@ mod tests {
             total_ms < 2_000,
             "total backoff {total_ms}ms must stay well under FINALIZE_TIMEOUT"
         );
+    }
+
+    /// Smart placement hook in front of `Fleet::acquire_index`. Every test
+    /// uses a single eligible host (or a keyed request) so `place()` is
+    /// deterministic regardless of the rng.
+    mod placement_hook {
+        use super::{role_msg, rotation_provider, user_msg, Provider};
+        use crate::attested::nearai::fleet::PlacementRequest;
+        use crate::placement_io::{
+            PlacementHandles, PlacementIo, PlacementMetrics, Write, METRIC_DECISIONS,
+        };
+        use crate::BackendHosts;
+        use arc_swap::ArcSwap;
+        use placement::affinity::{pin_id, AffinityKey, PinTable};
+        use placement::consts::COVERED_MODELS;
+        use placement::decision::{AffinitySource, Placer};
+        use placement::frame::{Lifecycle, Limits, Load, ReplicaReport};
+        use placement::snapshot::{ReplicaView, Snapshot};
+        use std::collections::HashMap;
+        use std::sync::{Arc, Mutex};
+        use tokio::sync::mpsc;
+
+        const PIN_SECRET: [u8; 32] = [9u8; 32];
+
+        #[derive(Default)]
+        struct FakeMetrics {
+            counts: Mutex<Vec<(String, i64, Vec<String>)>>,
+        }
+
+        impl FakeMetrics {
+            fn decisions_tagged(&self, tag: &str) -> i64 {
+                self.counts
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .filter(|(n, _, tags)| n == METRIC_DECISIONS && tags.iter().any(|t| t == tag))
+                    .map(|(_, v, _)| *v)
+                    .sum()
+            }
+        }
+
+        impl PlacementMetrics for FakeMetrics {
+            fn record_count(&self, name: &str, value: i64, tags: &[&str]) {
+                self.counts.lock().unwrap().push((
+                    name.to_string(),
+                    value,
+                    tags.iter().map(|t| t.to_string()).collect(),
+                ));
+            }
+            fn record_histogram(&self, _name: &str, _value: f64, _tags: &[&str]) {}
+        }
+
+        fn now_ms() -> u64 {
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_millis() as u64
+        }
+
+        fn ready_view(host: &str, now: u64) -> ReplicaView {
+            ReplicaView {
+                host_id: host.into(),
+                replica_id: "r1".into(),
+                report: ReplicaReport {
+                    schema: 1,
+                    host_id: host.into(),
+                    replica_id: "r1".into(),
+                    boot_id: "boot-a".into(),
+                    seq: 1,
+                    engine_sampled_at_ms: Some(now),
+                    reported_at_ms: now,
+                    lifecycle_state: Lifecycle::Ready,
+                    model: COVERED_MODELS[0].into(),
+                    engine: "sglang".into(),
+                    engine_version: None,
+                    limits: Limits { max_running: None },
+                    load: Load {
+                        running: Some(0),
+                        queued: Some(0),
+                        ..Load::default()
+                    },
+                    proxy_inflight: 0,
+                    report_key_id: "test-key".into(),
+                },
+                received_ms: now,
+            }
+        }
+
+        /// A snapshot built at `built_ms` with one ready replica on `host`.
+        fn snapshot(host: &str, built_ms: u64, pins: PinTable) -> Snapshot {
+            Snapshot {
+                built_ms,
+                replicas: vec![ready_view(host, built_ms)],
+                routed: HashMap::new(),
+                pins: Arc::new(pins),
+            }
+        }
+
+        struct Harness {
+            provider: Provider,
+            metrics: Arc<FakeMetrics>,
+            writes: mpsc::Receiver<Write>,
+        }
+
+        /// A 4-backend rotation provider with placement installed: `host_map`
+        /// becomes the verified host map, `snap` the current snapshot.
+        fn harness(host_map: &[(&str, usize)], snap: Snapshot) -> Harness {
+            let provider = rotation_provider(4);
+            let metrics = Arc::new(FakeMetrics::default());
+            let (io, writes) = PlacementIo::for_test(metrics.clone());
+            io.snapshot.store(Arc::new(snap));
+            let hosts = Arc::new(ArcSwap::from_pointee(BackendHosts::default()));
+            provider.fleet.set_placement(PlacementHandles {
+                placer: Arc::new(Placer::new(PIN_SECRET)),
+                io,
+                hosts: hosts.clone(),
+            });
+            provider.fleet.set_backend_hosts(BackendHosts {
+                index_by_host: host_map.iter().map(|(h, i)| (h.to_string(), *i)).collect(),
+                keys: Default::default(),
+                count: 4,
+            });
+            // Discovery's push lands in the map the Valkey reader also reads.
+            assert_eq!(hosts.load().index_by_host.len(), host_map.len());
+            Harness {
+                provider,
+                metrics,
+                writes,
+            }
+        }
+
+        fn request(model: &str) -> PlacementRequest {
+            PlacementRequest {
+                model: model.to_string(),
+                request_id: "req-1".to_string(),
+                org_id: "org-1".to_string(),
+                affinity: None,
+                affinity_source: AffinitySource::None,
+            }
+        }
+
+        /// Messages whose legacy index is not `avoid`, so a placed index can
+        /// be told apart from the legacy one.
+        fn messages_avoiding(avoid: usize) -> Vec<crate::ChatMessage> {
+            let legacy = rotation_provider(4);
+            (0..1_000)
+                .map(|i| vec![user_msg(&format!("placement prefix {i}"))])
+                .find(|m| legacy.fleet.select_index(m, None) != Some(avoid))
+                .expect("some prefix avoids the index")
+        }
+
+        fn legacy_indices(
+            messages: &[crate::ChatMessage],
+            pinned: Option<&str>,
+            keys: Option<HashMap<String, Vec<usize>>>,
+        ) -> Vec<usize> {
+            let provider = rotation_provider(4);
+            if let Some(keys) = keys {
+                provider.fleet.set_backend_keys(keys);
+            }
+            let leases: Vec<_> = (0..12)
+                .map(|_| {
+                    provider
+                        .fleet
+                        .acquire_index(messages, pinned)
+                        .expect("rotation active")
+                })
+                .collect();
+            leases.iter().map(|l| l.index()).collect()
+        }
+
+        fn placed_indices(
+            provider: &Provider,
+            messages: &[crate::ChatMessage],
+            pinned: Option<&str>,
+            req: &PlacementRequest,
+        ) -> Vec<usize> {
+            let leases: Vec<_> = (0..12)
+                .map(|_| {
+                    provider
+                        .fleet
+                        .acquire_index_placed(messages, pinned, req)
+                        .expect("rotation active")
+                })
+                .collect();
+            leases.iter().map(|l| l.index()).collect()
+        }
+
+        #[test]
+        fn placed_host_maps_to_its_index() {
+            let h = harness(
+                &[("h-a", 2)],
+                snapshot("h-a", now_ms(), PinTable::default()),
+            );
+            let messages = messages_avoiding(2);
+            let req = request(COVERED_MODELS[0]);
+            assert_eq!(
+                placed_indices(&h.provider, &messages, None, &req),
+                vec![2; 12]
+            );
+            assert_eq!(h.metrics.decisions_tagged("outcome:place"), 12);
+        }
+
+        #[test]
+        fn not_covered_model_uses_existing_path_unchanged() {
+            let mut h = harness(
+                &[("h-a", 2)],
+                snapshot("h-a", now_ms(), PinTable::default()),
+            );
+            let messages = messages_avoiding(2);
+            let req = request("some-org/not-covered");
+            assert_eq!(
+                placed_indices(&h.provider, &messages, None, &req),
+                legacy_indices(&messages, None, None)
+            );
+            assert!(h.writes.try_recv().is_err(), "no placement writes");
+            assert!(h.metrics.counts.lock().unwrap().is_empty());
+        }
+
+        #[test]
+        fn unconfigured_placement_uses_existing_path_unchanged() {
+            let provider = rotation_provider(4);
+            let messages = messages_avoiding(2);
+            let req = request(COVERED_MODELS[0]);
+            assert_eq!(
+                placed_indices(&provider, &messages, None, &req),
+                legacy_indices(&messages, None, None)
+            );
+        }
+
+        #[test]
+        fn unmapped_host_falls_back() {
+            let mut h = harness(
+                &[("h-a", 2)],
+                snapshot("h-z", now_ms(), PinTable::default()),
+            );
+            let messages = messages_avoiding(2);
+            let req = request(COVERED_MODELS[0]);
+            assert_eq!(
+                placed_indices(&h.provider, &messages, None, &req),
+                legacy_indices(&messages, None, None)
+            );
+            assert_eq!(h.metrics.decisions_tagged("reason:host_unmapped"), 12);
+            assert!(h.writes.try_recv().is_err(), "legacy writes nothing");
+        }
+
+        #[test]
+        fn stale_snapshot_falls_back() {
+            let stale = now_ms() - 60_000;
+            let h = harness(&[("h-a", 2)], snapshot("h-a", stale, PinTable::default()));
+            let messages = messages_avoiding(2);
+            let req = request(COVERED_MODELS[0]);
+            assert_eq!(
+                placed_indices(&h.provider, &messages, None, &req),
+                legacy_indices(&messages, None, None)
+            );
+            assert_eq!(h.metrics.decisions_tagged("reason:stale"), 12);
+        }
+
+        #[test]
+        fn e2ee_pinned_key_group_respected() {
+            let keys = HashMap::from([("key-a".to_string(), vec![0, 1])]);
+            let mut h = harness(
+                &[("h-a", 2)],
+                snapshot("h-a", now_ms(), PinTable::default()),
+            );
+            h.provider.fleet.set_backend_keys(keys.clone());
+            let messages = vec![
+                user_msg("synthetic initial turn"),
+                role_msg(crate::MessageRole::Assistant, "synthetic answer"),
+                user_msg("synthetic follow-up"),
+            ];
+            let req = request(COVERED_MODELS[0]);
+            let got = placed_indices(&h.provider, &messages, Some("key-a"), &req);
+            assert!(got.iter().all(|i| [0, 1].contains(i)), "{got:?}");
+            assert_eq!(got, legacy_indices(&messages, Some("key-a"), Some(keys)));
+            assert_eq!(h.metrics.decisions_tagged("reason:key_group"), 12);
+            assert!(h.writes.try_recv().is_err(), "legacy writes nothing");
+        }
+
+        #[test]
+        fn placement_records_routed_write() {
+            let mut h = harness(
+                &[("h-a", 2)],
+                snapshot("h-a", now_ms(), PinTable::default()),
+            );
+            // 40 text bytes -> 10 estimated prompt tokens.
+            let messages = vec![user_msg(&"x".repeat(40))];
+            let req = request(COVERED_MODELS[0]);
+            let before_s = now_ms() / 1000;
+            let lease = h
+                .provider
+                .fleet
+                .acquire_index_placed(&messages, None, &req)
+                .expect("rotation active");
+            assert_eq!(lease.index(), 2);
+            match h.writes.try_recv().expect("routed write queued") {
+                Write::Routed {
+                    host,
+                    replica,
+                    tok,
+                    sec,
+                } => {
+                    assert_eq!(host, "h-a");
+                    assert_eq!(replica, None);
+                    assert_eq!(tok, 10);
+                    assert!(sec >= before_s && sec <= now_ms() / 1000);
+                }
+                Write::Pin { .. } => panic!("keyless request writes no pin"),
+            }
+            assert!(h.writes.try_recv().is_err());
+            // This node's own routed count feeds the next decision.
+            let mine = h.provider.fleet.placement_mine(now_ms() / 1000);
+            assert_eq!(mine.get("h-a").map(|p| (p.req, p.tok)), Some((1, 10)));
+        }
+
+        #[test]
+        fn pin_write_is_recorded() {
+            let key = AffinityKey::from_bytes([5u8; 16]);
+            let pid_hex = pin_id(&key, &PIN_SECRET).to_hex();
+            let id: [u8; 16] = hex::decode(&pid_hex).unwrap().try_into().unwrap();
+            // An existing pin to a host that is no longer eligible: the placer
+            // re-homes the session and rewrites the pin.
+            let now = now_ms();
+            let mut pins = PinTable::default();
+            pins.insert(id, "h-gone".to_string(), now);
+            let mut h = harness(&[("h-a", 2)], snapshot("h-a", now, pins));
+            let messages = vec![user_msg("keyed request")];
+            let mut req = request(COVERED_MODELS[0]);
+            req.affinity = Some(key);
+            req.affinity_source = AffinitySource::Client;
+            let lease = h
+                .provider
+                .fleet
+                .acquire_index_placed(&messages, None, &req)
+                .expect("rotation active");
+            assert_eq!(lease.index(), 2);
+            assert!(matches!(
+                h.writes.try_recv().expect("routed write"),
+                Write::Routed { .. }
+            ));
+            match h.writes.try_recv().expect("pin write queued") {
+                Write::Pin {
+                    id_hex,
+                    host,
+                    at_ms,
+                } => {
+                    assert_eq!(id_hex, pid_hex);
+                    assert_eq!(host, "h-a");
+                    assert!(at_ms >= now);
+                }
+                Write::Routed { .. } => panic!("expected a pin write"),
+            }
+        }
+
+        #[test]
+        fn placement_request_reads_affinity_from_extra() {
+            let key = AffinityKey::from_bytes([3u8; 16]);
+            let extra: HashMap<String, serde_json::Value> = HashMap::from([
+                ("x_placement_affinity".to_string(), key.to_hex().into()),
+                ("x_placement_affinity_source".to_string(), "prefix".into()),
+                ("x_request_id".to_string(), "req-9".into()),
+                ("x_org_id".to_string(), "org-9".into()),
+            ]);
+            let req = PlacementRequest::from_extra("m", &extra);
+            assert_eq!(req.model, "m");
+            assert_eq!(req.request_id, "req-9");
+            assert_eq!(req.org_id, "org-9");
+            assert_eq!(req.affinity.map(|k| k.to_hex()), Some(key.to_hex()));
+            assert_eq!(req.affinity_source, AffinitySource::Prefix);
+
+            let bad: HashMap<String, serde_json::Value> = HashMap::from([
+                ("x_placement_affinity".to_string(), "not-hex".into()),
+                ("x_placement_affinity_source".to_string(), "client".into()),
+            ]);
+            let req = PlacementRequest::from_extra("m", &bad);
+            assert!(req.affinity.is_none());
+            assert_eq!(req.affinity_source, AffinitySource::None);
+        }
     }
 }
 

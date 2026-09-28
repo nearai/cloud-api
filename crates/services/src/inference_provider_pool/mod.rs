@@ -6941,7 +6941,9 @@ mod tests {
         // When: the pool's host map feeds ingest.
         let hosts = outcome.backend_hosts();
         let view = placement::snapshot::Ingest::new()
-            .accept("glm53-gpu03", "r1", &golden, &hosts.keys)
+            // Any clock after the fixture's engine time: this test is about
+            // key discovery, not freshness.
+            .accept("glm53-gpu03", "r1", &golden, &hosts.keys, u64::MAX)
             .expect("proxy-sealed frame verifies against the discovered key");
 
         // Then.

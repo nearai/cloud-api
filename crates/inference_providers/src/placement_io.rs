@@ -707,7 +707,7 @@ impl ReaderState {
                 rejected.insert(key, (json.into_bytes(), None));
                 continue;
             };
-            match self.ingest.accept(host, replica, &env, reg) {
+            match self.ingest.accept(host, replica, &env, reg, now_ms) {
                 Ok(view) => {
                     let key_id = env.key_id;
                     views.insert(key, Accepted { json, key_id, view });

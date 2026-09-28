@@ -5922,11 +5922,12 @@ mod tests {
                 .as_millis() as u64
         }
 
-        /// A `built_ms` / sample time that stays fresh however long the test
-        /// stalls: the placer reads the wall clock, and a future timestamp
-        /// counts as age 0, so a slow CI runner cannot flip it to `Stale`.
+        /// A `built_ms` / sample time that stays fresh for about
+        /// `MAX_FUTURE_SKEW_MS + FRESH_MAX_MS` (5 s) of test stall: it sits at
+        /// the edge of the allowed future skew (further ahead is rejected as
+        /// clock skew), and counts as age 0 until the wall clock passes it.
         fn fresh_ms() -> u64 {
-            now_ms() + 600_000
+            now_ms() + placement::consts::MAX_FUTURE_SKEW_MS
         }
 
         fn ready_view(host: &str, now: u64) -> ReplicaView {

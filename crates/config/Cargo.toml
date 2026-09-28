@@ -10,7 +10,7 @@ description = "Configuration management for cloud-api"
 dotenvy = "0.15.7"
 serde = { version = "1.0", features = ["derive"] }
 thiserror = "2.0"
-uuid = { version = "1.23", features = ["serde"] }
+uuid = { version = "1.23", features = ["serde", "v4"] }
 
 [dev-dependencies]
 tempfile = "3.27"

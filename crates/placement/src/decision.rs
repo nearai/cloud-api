@@ -588,7 +588,7 @@ mod tests {
             },
             ready_view("gpu02", "r1"),
         ]);
-        snap_b.pins.insert(*pin_id_val.as_bytes(), pinned_host, NOW);
+        std::sync::Arc::make_mut(&mut snap_b.pins).insert(*pin_id_val.as_bytes(), pinned_host, NOW);
 
         let b = Placer::new(secret);
         let mut input_b = input.clone();
@@ -651,7 +651,7 @@ mod tests {
 
         // Pin inserted just over half the TTL ago: must refresh.
         let mut snap_old = snap_with(snap_views.clone());
-        snap_old.pins.insert(
+        std::sync::Arc::make_mut(&mut snap_old.pins).insert(
             *pid.as_bytes(),
             "gpu01".to_string(),
             NOW - (PIN_TTL_MS / 2 + 1),
@@ -670,9 +670,11 @@ mod tests {
 
         // Pin inserted recently: no refresh needed.
         let mut snap_fresh = snap_with(snap_views);
-        snap_fresh
-            .pins
-            .insert(*pid.as_bytes(), "gpu01".to_string(), NOW - 1_000);
+        std::sync::Arc::make_mut(&mut snap_fresh.pins).insert(
+            *pid.as_bytes(),
+            "gpu01".to_string(),
+            NOW - 1_000,
+        );
         let mut rng2 = StdRng::seed_from_u64(1);
         match p.place(&input, &snap_fresh, &HashMap::new(), &mut rng2) {
             Decision::Place {
@@ -699,8 +701,11 @@ mod tests {
         // `pin_lookup`) actually runs, instead of trivially passing on a
         // Legacy or keyless decision that never touches key material.
         let mut snap = snap_with(vec![ready_view("gpu01", "r1"), ready_view("gpu02", "r1")]);
-        snap.pins
-            .insert(*pid.as_bytes(), "gpu01".to_string(), NOW - 1_000);
+        std::sync::Arc::make_mut(&mut snap.pins).insert(
+            *pid.as_bytes(),
+            "gpu01".to_string(),
+            NOW - 1_000,
+        );
 
         let mut rng = StdRng::seed_from_u64(1);
         let decision = Placer::new(secret).place(&input, &snap, &HashMap::new(), &mut rng);
@@ -811,7 +816,7 @@ mod tests {
             let mut snap = snap_with(views);
             if has_pin && has_affinity {
                 let pid = pin_id(&AffinityKey::from_bytes(key_bytes), &[1u8; 32]);
-                snap.pins.insert(*pid.as_bytes(), "gpu0".to_string(), NOW - 1_000);
+                std::sync::Arc::make_mut(&mut snap.pins).insert(*pid.as_bytes(), "gpu0".to_string(), NOW - 1_000);
             }
 
             let mut mine = HashMap::new();

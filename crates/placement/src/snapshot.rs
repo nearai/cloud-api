@@ -9,6 +9,7 @@
 //! never move a routing decision backwards.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use ed25519_dalek::VerifyingKey;
 
@@ -52,12 +53,16 @@ pub struct RoutedCounts {
 }
 
 /// A point-in-time view the placer scores against.
+///
+/// `pins` sits behind an `Arc` because the table is large (up to the pins
+/// stream cap) and mostly unchanged between reader cycles: the reader shares
+/// it across snapshots and copies it only when a cycle actually changes it.
 #[derive(Default)]
 pub struct Snapshot {
     pub built_ms: u64,
     pub replicas: Vec<ReplicaView>,
     pub routed: HashMap<(String, String), RoutedCounts>,
-    pub pins: PinTable,
+    pub pins: Arc<PinTable>,
 }
 
 /// Why a frame was not accepted into the snapshot.
@@ -82,6 +87,22 @@ pub enum Reject {
     Mismatch,
     /// `seq` or `engine_sampled_at_ms` moved backwards for this replica.
     Regressed,
+}
+
+impl Reject {
+    /// snake_case name, for low-cardinality metric tags.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Reject::UnknownKey => "unknown_key",
+            Reject::BadSig => "bad_sig",
+            Reject::Encoding => "encoding",
+            Reject::Parse => "parse",
+            Reject::KeyIdMismatch => "key_id_mismatch",
+            Reject::Schema => "schema",
+            Reject::Mismatch => "mismatch",
+            Reject::Regressed => "regressed",
+        }
+    }
 }
 
 fn map_frame_error(e: FrameError) -> Reject {

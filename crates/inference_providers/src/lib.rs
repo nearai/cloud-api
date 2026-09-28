@@ -62,6 +62,7 @@ pub mod chunk_builder;
 pub mod mock;
 pub mod models;
 pub mod non_attested;
+pub mod placement_io;
 pub mod responses_raw;
 pub mod rotation;
 pub mod spki_verifier;

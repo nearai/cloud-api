@@ -79,7 +79,10 @@ pub fn pin_id(key: &AffinityKey, pin_secret: &[u8; 32]) -> PinId {
 /// In-memory follow-pin table: pin id -> (host, written-at ms). The caller
 /// loads this from Valkey and persists writes back; this crate never talks
 /// to Valkey directly.
-#[derive(Default)]
+///
+/// `Clone` so a reader can copy-on-write it behind an `Arc` (see
+/// `Snapshot::pins`).
+#[derive(Clone, Default)]
 pub struct PinTable {
     entries: HashMap<[u8; 16], (String, u64)>,
 }
@@ -101,6 +104,22 @@ impl PinTable {
     /// Write (or overwrite) the pin for `id`.
     pub fn insert(&mut self, id: [u8; 16], host: String, at_ms: u64) {
         self.entries.insert(id, (host, at_ms));
+    }
+
+    /// Drop every entry [`Self::get`] would already treat as expired at
+    /// `now_ms`, so a long-lived table stays bounded.
+    pub fn prune(&mut self, now_ms: u64) {
+        self.entries
+            .retain(|_, (_, at_ms)| now_ms < at_ms.saturating_add(PIN_TTL_MS));
+    }
+
+    /// Number of entries, expired or not.
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
     }
 }
 
@@ -518,5 +537,17 @@ mod tests {
             Some(("gpu09", 1_000))
         );
         assert_eq!(table.get(&id, 1_000 + PIN_TTL_MS), None);
+    }
+
+    #[test]
+    fn pin_table_prune_drops_only_expired() {
+        use crate::consts::PIN_TTL_MS;
+        let mut table = PinTable::default();
+        table.insert([1u8; 16], "old".to_string(), 1_000);
+        table.insert([2u8; 16], "new".to_string(), 5_000);
+        table.prune(1_000 + PIN_TTL_MS);
+        assert_eq!(table.len(), 1);
+        let new_id = PinId([2u8; 16]);
+        assert_eq!(table.get(&new_id, 1_000 + PIN_TTL_MS), Some(("new", 5_000)));
     }
 }

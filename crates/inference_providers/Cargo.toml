@@ -13,7 +13,7 @@ openapi = ["dep:utoipa"]
 utoipa = { version = "5", optional = true }
 anthropic_compat = { path = "../anthropic_compat" }
 async-trait = "0.1"
-base64 = "0.22"
+base64 = "0.23"
 bytes = "1.11"
 chrono = { version = "0.4", features = ["serde"] }
 uuid = { version = "1", features = ["v4"] }
@@ -44,7 +44,7 @@ urlencoding = "2.1"
 # floated minor could change the KEM wire encoding and silently break interop.
 ml-kem = { version = "=0.3.2", features = ["getrandom"] }
 hkdf = "0.13"
-chacha20poly1305 = "0.10"
+chacha20poly1305 = "0.11"
 flate2 = "1"
 getrandom = "0.4"
 async-stream = "0.3"
@@ -54,7 +54,7 @@ async-stream = "0.3"
 futures-util = "0.3"
 tokio-test = "0.4"
 dotenvy = "0.15.7"
-serial_test = "3.4"
+serial_test = "4.0"
 wiremock = "0.6"
 rcgen = "0.14"
 tokio-rustls = "0.26"

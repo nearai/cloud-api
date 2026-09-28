@@ -1,4 +1,5 @@
 mod fleet;
+mod placement_report;
 mod prefix_router;
 #[cfg(test)]
 mod systemone_tests;
@@ -9,7 +10,8 @@ use crate::{
     PrivacyClassifyError, RerankError, ScoreError, *,
 };
 use async_trait::async_trait;
-use fleet::{Fleet, PlacementRequest};
+use fleet::Fleet;
+use placement_report::PlacementRequest;
 use prefix_router::PrefixRouter;
 use reqwest::{header::HeaderValue, Client};
 use serde::Serialize;
@@ -5604,7 +5606,7 @@ mod tests {
     /// deterministic regardless of the rng.
     mod placement_hook {
         use super::{role_msg, rotation_provider, user_msg, Provider};
-        use crate::attested::nearai::fleet::PlacementRequest;
+        use crate::attested::nearai::placement_report::PlacementRequest;
         use crate::placement_io::{
             PlacementHandles, PlacementIo, PlacementMetrics, Write, METRIC_AFFINITY,
             METRIC_DECISIONS,

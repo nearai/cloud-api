@@ -4,7 +4,7 @@ use config::ExternalProvidersConfig;
 use inference_providers::nearai;
 use inference_providers::rotation;
 use inference_providers::spki_verifier::{
-    peer_spki_fingerprint, spki_fingerprint_matches, FingerprintState, SharedTlsRoots,
+    canonical_spki_fingerprint, peer_spki_fingerprint, FingerprintState, SharedTlsRoots,
 };
 use inference_providers::{
     is_client_audio_input_status,
@@ -210,7 +210,7 @@ impl ChannelBinding {
     fn check(observed: &Result<String, String>, attested: Option<&str>) -> Self {
         match (observed, attested) {
             (Err(_), _) => Self::Missing,
-            (Ok(observed), Some(attested)) if spki_fingerprint_matches(observed, attested) => {
+            (Ok(observed), Some(attested)) if *observed == canonical_spki_fingerprint(attested) => {
                 Self::Match
             }
             (Ok(_), _) => Self::Mismatch,
@@ -945,7 +945,12 @@ impl inference_providers::BackendVerifier for PoolBackendVerifier {
         // 5. Pin the verified fingerprint in BOTH the shared state (so other
         //    providers benefit) AND the client's own state (so reconnections
         //    to a different backend are rejected — forces re-verification).
-        if let Some(ref fp) = verified.tls_cert_fingerprint {
+        //    Pinned in canonical form, which is what the TLS verifier compares.
+        if let Some(ref fp) = verified
+            .tls_cert_fingerprint
+            .as_deref()
+            .map(canonical_spki_fingerprint)
+        {
             // Shared state
             {
                 let mut shared = self
@@ -2106,7 +2111,11 @@ impl InferenceProviderPool {
                             "Discovery probe: attested TLS fingerprint does not match the certificate on the probe connection"
                         );
                     }
-                    if let Some(ref vfp) = verified.tls_cert_fingerprint {
+                    if let Some(ref vfp) = verified
+                        .tls_cert_fingerprint
+                        .as_deref()
+                        .map(canonical_spki_fingerprint)
+                    {
                         observed_fingerprints.push(vfp.clone());
                         verified_this_round.insert(vfp.clone());
                     }

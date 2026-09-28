@@ -148,6 +148,9 @@ async fn handle(
             }
             (StatusCode::OK, report.as_str().to_string())
         }
+        (Method::GET, "/v1/models") => {
+            (StatusCode::OK, r#"{"object":"list","data":[]}"#.to_string())
+        }
         (Method::POST, "/v1/chat/completions") => {
             counters.completion_requests.fetch_add(1, Ordering::SeqCst);
             (
@@ -164,8 +167,9 @@ async fn handle(
         .unwrap())
 }
 
-/// Start a backend that serves `/v1/chat/completions` and an attestation
-/// report attesting `attested_fingerprint`, presenting `leaf` over TLS.
+/// Start a backend that serves `/v1/models`, `/v1/chat/completions` and an
+/// attestation report attesting `attested_fingerprint`, presenting `leaf`
+/// over TLS.
 async fn start_backend(
     name: &'static str,
     leaf: &Leaf,
@@ -399,6 +403,37 @@ async fn attested_backend_is_pinned_and_keeps_its_connection_http1() {
     assert_genuine_accepted(Transport::TlsHttp1).await;
 }
 
+/// Reports may encode the fingerprint with a `0x` prefix or in upper case. The
+/// pin must be stored in the canonical form the TLS verifier computes, or
+/// every later handshake to the same backend would be rejected.
+#[tokio::test]
+async fn attested_fingerprint_is_pinned_in_canonical_form() {
+    let pki = pki();
+    let reported = format!("0x{}", pki.genuine.fingerprint.to_uppercase());
+    let genuine = start_backend("genuine", &pki.genuine, Transport::TlsH2, &reported).await;
+    let state = Arc::new(std::sync::RwLock::new(FingerprintState::Bootstrap));
+    let metrics = Arc::new(CapturingMetricsService::new());
+    let verifier = pool_verifier(&pki, state.clone(), metrics.clone());
+
+    verifier
+        .create_verified_client(&genuine.base_url)
+        .await
+        .expect("the attested backend must be accepted");
+    assert_eq!(
+        pinned_set(&state),
+        Some(HashSet::from([pki.genuine.fingerprint.clone()]))
+    );
+
+    // With a pin in place, the next client takes the fast path: a new
+    // connection whose handshake is checked against the pin set.
+    verifier
+        .create_verified_client(&genuine.base_url)
+        .await
+        .expect("the pinned fast path must accept the attested backend");
+    assert_eq!(count(&genuine.counters.connections), 2);
+    assert_eq!(count(&genuine.counters.attestation_requests), 1);
+}
+
 /// Without TLS there is no peer certificate to check: the backend is refused
 /// (fail closed) rather than pinned on the report alone.
 #[tokio::test]
@@ -438,6 +473,10 @@ fn channel_binding_check_classifies_outcomes() {
     );
     assert_eq!(
         ChannelBinding::check(&observed, Some(&fp.to_uppercase())),
+        ChannelBinding::Match
+    );
+    assert_eq!(
+        ChannelBinding::check(&observed, Some(&format!("0x{fp}"))),
         ChannelBinding::Match
     );
     assert_eq!(

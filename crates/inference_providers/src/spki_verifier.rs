@@ -110,13 +110,16 @@ pub fn peer_spki_fingerprint(resp: &reqwest::Response) -> Result<String, String>
     compute_spki_fingerprint_from_der(leaf)
 }
 
-/// Compare a fingerprint computed from a live certificate (lowercase hex, as
-/// returned by [`compute_spki_fingerprint_from_der`]) with one taken from an
-/// attestation report. The report value is accepted in the same forms the
-/// report_data binding check accepts: optional `0x` prefix, either hex case.
-pub fn spki_fingerprint_matches(observed: &str, attested: &str) -> bool {
-    let attested = attested.strip_prefix("0x").unwrap_or(attested);
-    observed.eq_ignore_ascii_case(attested)
+/// Canonical form of an SPKI fingerprint: lowercase hex without a `0x`
+/// prefix, as returned by [`compute_spki_fingerprint_from_der`] and compared
+/// by [`SpkiFingerprintVerifier`]. Attestation reports may use either hex case
+/// and an optional `0x` prefix (the report_data binding check accepts both),
+/// so report values are converted before they are compared or pinned.
+pub fn canonical_spki_fingerprint(fingerprint: &str) -> String {
+    fingerprint
+        .strip_prefix("0x")
+        .unwrap_or(fingerprint)
+        .to_ascii_lowercase()
 }
 
 /// A TLS certificate verifier that wraps WebPKI verification and additionally
@@ -387,14 +390,11 @@ mod tests {
     }
 
     #[test]
-    fn spki_fingerprint_matches_accepts_report_encodings() {
-        let observed = "ab01cd";
-        assert!(spki_fingerprint_matches(observed, "ab01cd"));
-        assert!(spki_fingerprint_matches(observed, "AB01CD"));
-        assert!(spki_fingerprint_matches(observed, "0xab01cd"));
-        assert!(!spki_fingerprint_matches(observed, "ab01ce"));
-        assert!(!spki_fingerprint_matches(observed, "ab01"));
-        assert!(!spki_fingerprint_matches(observed, ""));
+    fn canonical_spki_fingerprint_normalizes_report_encodings() {
+        assert_eq!(canonical_spki_fingerprint("ab01cd"), "ab01cd");
+        assert_eq!(canonical_spki_fingerprint("AB01CD"), "ab01cd");
+        assert_eq!(canonical_spki_fingerprint("0xAb01cD"), "ab01cd");
+        assert_eq!(canonical_spki_fingerprint(""), "");
     }
 
     #[test]

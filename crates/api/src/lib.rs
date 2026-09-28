@@ -316,7 +316,8 @@ pub async fn init_domain_services(
     organization_service: Arc<dyn services::organization::OrganizationServiceTrait + Send + Sync>,
     metrics_service: Arc<dyn services::metrics::MetricsServiceTrait>,
 ) -> DomainServices {
-    let inference_provider_pool = init_inference_providers(database.clone(), config).await;
+    let inference_provider_pool =
+        init_inference_providers(database.clone(), config, Some(metrics_service.clone())).await;
     init_domain_services_with_pool(
         database,
         config,
@@ -932,10 +933,13 @@ async fn ensure_chutes_catalog_row(
 /// Initialize inference provider pool
 ///
 /// Loads inference_url models and external providers from the database,
-/// then starts a periodic refresh task to keep them in sync.
+/// then starts a periodic refresh task to keep them in sync. A metrics sink
+/// passed here is attached before the initial load, so counters emitted by
+/// the initial attestation discovery are recorded.
 pub async fn init_inference_providers(
     database: Arc<Database>,
     config: &ApiConfig,
+    metrics_service: Option<Arc<dyn services::metrics::MetricsServiceTrait>>,
 ) -> Arc<services::inference_provider_pool::InferenceProviderPool> {
     let api_key = config.inference_api_key.clone();
 
@@ -945,6 +949,9 @@ pub async fn init_inference_providers(
             config.external_providers.clone(),
         ),
     );
+    if let Some(metrics_service) = metrics_service {
+        pool.set_metrics_service(metrics_service);
+    }
 
     let models_repo = Arc::new(database::repositories::ModelRepository::new(
         database.pool().clone(),
@@ -1319,7 +1326,6 @@ pub fn build_app_with_config_and_options(
         app_state.clone(),
         &auth_components.auth_state_middleware,
         usage_state.clone(),
-        rate_limit_state.clone(),
     );
 
     let internal_routes = build_internal_routes(app_state.clone());
@@ -1674,6 +1680,7 @@ pub fn build_completion_routes(
         .route("/rerank", post(rerank))
         .route("/embeddings", post(embeddings))
         .route("/score", post(score))
+        .route("/systemone", post(routes::systemone::systemone))
         // Override the router-level audio limit (25 MB) for privacy/classify: this is a
         // text-only endpoint, so a 256 KB cap is more appropriate.
         .route(
@@ -2086,12 +2093,21 @@ pub fn build_reporting_usage_routes(
 }
 
 /// Build gateway routes for external model gateways to validate API keys.
-/// Reuses the same auth, rate limiting, and usage check middleware as completions.
+///
+/// `/v1/check_api_key` runs the same API-key auth and credit (usage) check
+/// middleware as completions, but deliberately not the per-key request
+/// limiter (`api_key_rate_limit_middleware`). A gateway validates the caller's
+/// key once per request, before its own admission decision, so key checks
+/// arrive at the caller's full request rate; counting them against the
+/// per-key limit turns caller bursts into 429s unrelated to backend load
+/// (nearai/infra#242). Key checks do not spend the key's inference allowance
+/// either. Without a per-key cap here, a valid key holder can call this
+/// route at any rate, the same as the other authenticated non-inference
+/// routes; how those routes are bounded is tracked in nearai/cloud-api#1142.
 pub fn build_gateway_routes(
     app_state: AppState,
     auth_state_middleware: &AuthState,
     usage_state: middleware::UsageState,
-    rate_limit_state: middleware::RateLimitState,
 ) -> Router {
     Router::new()
         .route(
@@ -2102,10 +2118,6 @@ pub fn build_gateway_routes(
         .layer(from_fn_with_state(
             usage_state,
             middleware::usage_check_middleware,
-        ))
-        .layer(from_fn_with_state(
-            rate_limit_state,
-            middleware::api_key_rate_limit_middleware,
         ))
         .layer(from_fn_with_state(
             auth_state_middleware.clone(),
@@ -2505,7 +2517,23 @@ fn build_admin_routes_with_options(
             "/admin/access-tokens/{token_id}",
             axum::routing::delete(delete_admin_access_token),
         )
-        .with_state(admin_app_state);
+        .with_state(admin_app_state)
+        .merge(
+            Router::new()
+                .route(
+                    "/admin/usage-hourly/recompute",
+                    axum::routing::post(crate::routes::admin_usage_hourly::recompute_usage_hourly),
+                )
+                .layer(axum::Extension(
+                    crate::routes::admin_usage_hourly::UsageHourlyRepairState {
+                        repository: Arc::new(
+                            database::repositories::UsageHourlyRepositoryImpl::new(
+                                database.pool().clone(),
+                            ),
+                        ),
+                    },
+                )),
+        );
 
     let admin_routes = if let Some(database_encryption_state) = database_encryption_state {
         if build_options.start_database_encryption_recovery {
@@ -2888,10 +2916,12 @@ mod tests {
                 host: "127.0.0.1".to_string(),
                 port: 0, // Use port 0 for testing to get a random available port
                 pricing_change_apply_interval_secs: 0,
+                usage_hourly_interval_secs: 0,
                 ohttp_enabled: false,
             },
             inference_api_key: Some("test-key".to_string()),
             internal_usage_token: None,
+            internal_usage_max_discount: config::DEFAULT_INTERNAL_USAGE_MAX_DISCOUNT,
             native_responses_models: Vec::new(),
             logging: config::LoggingConfig {
                 level: "info".to_string(),
@@ -3007,10 +3037,12 @@ mod tests {
                 host: "127.0.0.1".to_string(),
                 port: 0,
                 pricing_change_apply_interval_secs: 0,
+                usage_hourly_interval_secs: 0,
                 ohttp_enabled: false,
             },
             inference_api_key: Some("test-key".to_string()),
             internal_usage_token: None,
+            internal_usage_max_discount: config::DEFAULT_INTERNAL_USAGE_MAX_DISCOUNT,
             native_responses_models: Vec::new(),
             logging: config::LoggingConfig {
                 level: "info".to_string(),

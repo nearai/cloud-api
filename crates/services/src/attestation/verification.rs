@@ -58,6 +58,18 @@ struct EventLogEntry {
     imr: u32,
 }
 
+/// Verification of a backend attestation report, as used by the inference
+/// provider pool. Implemented by [`AttestationVerifier`]; the trait lets the
+/// pool's connection handling be tested without real TDX quotes.
+#[async_trait::async_trait]
+pub trait BackendAttestationVerifier: Send + Sync {
+    async fn verify_attestation_report(
+        &self,
+        attestation_report: &serde_json::Map<String, serde_json::Value>,
+        request_nonce: &str,
+    ) -> Result<VerifiedAttestation, AttestationVerificationError>;
+}
+
 /// Configuration for attestation verification.
 #[derive(Clone)]
 pub struct AttestationVerifier {
@@ -578,6 +590,19 @@ impl AttestationVerifier {
         }
 
         Ok(Some(verdict))
+    }
+}
+
+#[async_trait::async_trait]
+impl BackendAttestationVerifier for AttestationVerifier {
+    async fn verify_attestation_report(
+        &self,
+        attestation_report: &serde_json::Map<String, serde_json::Value>,
+        request_nonce: &str,
+    ) -> Result<VerifiedAttestation, AttestationVerificationError> {
+        // Inherent method (inherent methods take precedence over trait methods).
+        AttestationVerifier::verify_attestation_report(self, attestation_report, request_nonce)
+            .await
     }
 }
 

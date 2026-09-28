@@ -77,6 +77,8 @@ pub fn test_config() -> ApiConfig {
                 .unwrap_or(0),
             // Tests drive the pricing scheduler's run_once() directly.
             pricing_change_apply_interval_secs: 0,
+            // Tests drive UsageHourlyScheduler::run_once() directly.
+            usage_hourly_interval_secs: 0,
             ohttp_enabled: false,
         },
         inference_api_key: std::env::var("INFERENCE_API_KEY")
@@ -84,6 +86,7 @@ pub fn test_config() -> ApiConfig {
             .ok()
             .or(Some("test_api_key".to_string())),
         internal_usage_token: None,
+        internal_usage_max_discount: config::DEFAULT_INTERNAL_USAGE_MAX_DISCOUNT,
         native_responses_models: Vec::new(),
         logging: config::LoggingConfig {
             level: "debug".to_string(),
@@ -240,7 +243,8 @@ async fn build_test_server_components_with_real_providers(
     let auth_components = init_auth_services(database.clone(), &config);
 
     // Use real inference providers from database
-    let inference_provider_pool = api::init_inference_providers(database.clone(), &config).await;
+    let inference_provider_pool =
+        api::init_inference_providers(database.clone(), &config, None).await;
     let metrics_service = Arc::new(services::metrics::MockMetricsService);
     let domain_services = api::init_domain_services_with_pool(
         database.clone(),

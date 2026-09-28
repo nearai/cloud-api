@@ -6,7 +6,11 @@ authors.workspace = true
 license.workspace = true
 description.workspace = true
 
+[features]
+openapi = ["dep:utoipa"]
+
 [dependencies]
+utoipa = { version = "5", optional = true }
 anthropic_compat = { path = "../anthropic_compat" }
 async-trait = "0.1"
 base64 = "0.22"
@@ -51,3 +55,5 @@ tokio-test = "0.4"
 dotenvy = "0.15.7"
 serial_test = "3.4"
 wiremock = "0.6"
+rcgen = "0.14"
+tokio-rustls = "0.26"

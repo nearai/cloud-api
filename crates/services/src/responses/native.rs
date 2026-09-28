@@ -84,6 +84,9 @@ impl NativeResponsesService {
         mut body: Value,
         context: NativeResponsesContext,
     ) -> Result<NativeResponse, NativeResponsesError> {
+        model
+            .validate_endpoint(crate::models::InferenceEndpoint::Responses)
+            .map_err(NativeResponsesError::InvalidRequest)?;
         // Recheck the allowlist at the service boundary, independent of HTTP routing.
         if !selected(&self.models, &model.model_name, &body) {
             return Err(NativeResponsesError::InvalidRequest(
@@ -286,6 +289,7 @@ impl Billing {
         let id = usage.id.clone();
         if let Some(tokens) = usage.tokens {
             let request = RecordUsageServiceRequest {
+                discount: None,
                 organization_id: self.organization_id,
                 workspace_id: self.workspace_id,
                 api_key_id: self.api_key_id,

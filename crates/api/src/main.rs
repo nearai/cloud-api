@@ -87,6 +87,19 @@ async fn main() {
         .start(config.server.pricing_change_apply_interval_secs)
         .await;
 
+    // Maintain the usage_hourly aggregate. Safe on every instance: recompute takes a
+    // transaction-scoped try-lock, so one replica writes per tick.
+    let usage_hourly_scheduler = Arc::new(services::usage::UsageHourlyScheduler::new(
+        Arc::new(database::repositories::UsageHourlyRepositoryImpl::new(
+            database.pool().clone(),
+        )),
+        domain_services.metrics_service.clone(),
+    ));
+    usage_hourly_scheduler
+        .clone()
+        .start(config.server.usage_hourly_interval_secs)
+        .await;
+
     // Start server with graceful shutdown handling
     start_server(
         app,
@@ -94,6 +107,7 @@ async fn main() {
         database,
         domain_services.inference_provider_pool,
         pricing_scheduler,
+        usage_hourly_scheduler,
     )
     .await;
 }
@@ -116,6 +130,7 @@ async fn start_server(
     database: Arc<Database>,
     inference_provider_pool: Arc<InferenceProviderPool>,
     pricing_scheduler: Arc<ModelPricingScheduler>,
+    usage_hourly_scheduler: Arc<services::usage::UsageHourlyScheduler>,
 ) {
     let bind_address = format!("{}:{}", config.server.host, config.server.port);
     let listener = tokio::net::TcpListener::bind(&bind_address)
@@ -137,13 +152,23 @@ async fn start_server(
     match server.await {
         Ok(_) => {
             tracing::info!("Server shutdown successfully, initiating coordinated cleanup");
-            perform_coordinated_shutdown(database, inference_provider_pool, pricing_scheduler)
-                .await;
+            perform_coordinated_shutdown(
+                database,
+                inference_provider_pool,
+                pricing_scheduler,
+                usage_hourly_scheduler,
+            )
+            .await;
         }
         Err(e) => {
             tracing::error!("Server error: {}", e);
-            perform_coordinated_shutdown(database, inference_provider_pool, pricing_scheduler)
-                .await;
+            perform_coordinated_shutdown(
+                database,
+                inference_provider_pool,
+                pricing_scheduler,
+                usage_hourly_scheduler,
+            )
+            .await;
             std::process::exit(1);
         }
     }
@@ -154,6 +179,7 @@ async fn perform_coordinated_shutdown(
     database: Arc<Database>,
     inference_provider_pool: Arc<InferenceProviderPool>,
     pricing_scheduler: Arc<ModelPricingScheduler>,
+    usage_hourly_scheduler: Arc<services::usage::UsageHourlyScheduler>,
 ) {
     let mut coordinator = ShutdownCoordinator::new(Duration::from_secs(30));
     coordinator.start();
@@ -173,6 +199,8 @@ async fn perform_coordinated_shutdown(
                 inference_provider_pool.shutdown().await;
                 tracing::info!("Step 1.2: Cancelling pricing change scheduler task");
                 pricing_scheduler.shutdown().await;
+                tracing::info!("Step 1.3: Cancelling usage_hourly scheduler task");
+                usage_hourly_scheduler.shutdown().await;
                 tracing::debug!("All background tasks cancelled");
             },
         )

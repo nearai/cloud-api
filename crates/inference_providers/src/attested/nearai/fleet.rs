@@ -157,6 +157,11 @@ pub(super) struct Fleet {
     /// `rotation::MAX_FANOUT`. The provider fills/clears these slots via inline
     /// attestation; Fleet just owns the storage.
     pub(super) index_clients: Vec<Mutex<Option<Client>>>,
+    /// Per-index time of the last inline verification that failed the TLS
+    /// channel-binding check. Such a failure repeats for the same backend, so
+    /// the index is not verified again until the backoff has passed (see
+    /// `get_or_verify_index_client`). Same length as `index_clients`.
+    pub(super) channel_binding_failed_at: Vec<Mutex<Option<tokio::time::Instant>>>,
     /// Per-backend-index TTFT EMA for latency-aware steering. Index == rotation
     /// index. Arc so the stream-measurement wrapper can update it after the
     /// Fleet method returns. Sized to MAX_FANOUT.
@@ -201,6 +206,7 @@ impl Fleet {
         fingerprint_state: Arc<RwLock<FingerprintState>>,
         backend_verifier: Option<Arc<dyn BackendVerifier>>,
     ) -> Self {
+        let channel_binding_failed_at = index_clients.iter().map(|_| Mutex::new(None)).collect();
         Self {
             pending_rotation: Mutex::new(HashMap::new()),
             signature_rotation: Mutex::new(HashMap::new()),
@@ -208,6 +214,7 @@ impl Fleet {
             rotation_parts,
             prefix_router,
             index_clients,
+            channel_binding_failed_at,
             backend_stats: Arc::new(Mutex::new(vec![
                 BackendStat::default();
                 rotation::MAX_FANOUT
@@ -317,6 +324,24 @@ impl Fleet {
         if has_history {
             return Some(self.reserve_index(route_key, candidates[0]));
         }
+        Some(self.acquire_candidates(route_key, count, &candidates))
+    }
+
+    /// Independent decision requests have no chat prefix. Hash the original
+    /// request key and use the same bounded spillover as first-turn chat.
+    pub(super) fn acquire_systemone_index(&self, request_hash: &str) -> Option<RouteLease> {
+        let count = self.rotation_count();
+        if count == 0 {
+            return None;
+        }
+        let digest = Sha256::digest(request_hash.as_bytes());
+        let route_key =
+            u64::from_be_bytes(digest[..8].try_into().expect("SHA-256 has eight bytes"));
+        let candidates = self.candidate_indices(route_key, count, None);
+        Some(self.acquire_candidates(route_key, count, &candidates))
+    }
+
+    fn acquire_candidates(&self, route_key: u64, count: usize, candidates: &[usize]) -> RouteLease {
         let mut loads = lock(&self.prefix_loads);
         let counts = loads.entry(route_key).or_insert_with(|| vec![0; count]);
         if counts.len() < count {
@@ -336,11 +361,11 @@ impl Fleet {
             });
         counts[index] = counts[index].saturating_add(1);
         drop(loads);
-        Some(RouteLease {
+        RouteLease {
             route_key,
             index,
             prefix_loads: self.prefix_loads.clone(),
-        })
+        }
     }
 
     /// Reserve an explicit fallback index for the same prefix key.
@@ -560,6 +585,10 @@ impl Fleet {
                 for slot in &self.index_clients {
                     *lock(slot) = None;
                 }
+            }
+            // Index `i` may now reach a different backend.
+            for failed_at in &self.channel_binding_failed_at {
+                *lock(failed_at) = None;
             }
             let mut stats = lock(&self.backend_stats);
             for s in stats.iter_mut() {

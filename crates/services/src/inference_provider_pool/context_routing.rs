@@ -28,6 +28,26 @@
 //!
 //! Without a `long_context` block this is the identity expansion — every
 //! other model registers exactly as before.
+//!
+//! Organizations at negative scheduler priority (`ChatRoutingHints.request_priority
+//! < 0`) never fall back to the OTHER NEAR tier on a RETRYABLE error (5xx,
+//! timeout, queue-full): [`pin_near_tier_for_low_priority`] computes the single
+//! NEAR capacity the request's estimated size selects, and the retry loop in
+//! `mod.rs` (`get_providers_with_fallback` / the provider-attempt loop) skips
+//! NEAR candidates outside that capacity (the attested third-party fallback,
+//! e.g. Chutes, is unaffected). This keeps a burst of oversized low-priority
+//! requests from spilling a saturated long-context host's retryable errors
+//! onto the interactive base fleet.
+//!
+//! The pin does NOT block the existing context-length-400 self-heal: a
+//! request that context-400s on its pinned tier but has a strictly larger
+//! declared NEAR sibling still falls through to it, exactly as for
+//! priority >= 0 requests (see `mod.rs`'s `larger_ctx_sibling_exists` /
+//! `ctx_400_falls_through`). Such a 400 means the request was mis-sized (byte
+//! heuristic error, or an E2EE request that skips the exact tokenize count) —
+//! not genuinely oversized — so it deserves the same self-heal as any other
+//! priority, never a hard client error for a request the other tier would
+//! have served.
 
 use std::sync::OnceLock;
 
@@ -245,6 +265,54 @@ pub(crate) fn concat_prompt_text(params: &ChatCompletionParams) -> String {
     text
 }
 
+/// Decide the single NEAR capacity a negative-priority request's estimated
+/// size selects (module docs above). `candidates` is `(is_near_tier,
+/// declared_max_context_tokens)` per provider, in the pool's existing
+/// candidate order.
+///
+/// Mirrors `refine_context_requirement`'s `distinct` set: only DECLARED
+/// capacities create tiers. A NEAR candidate with no declared
+/// `max_context_tokens` (`None`) never counts toward the tier decision and
+/// is not represented in the returned capacity — callers must keep such a
+/// candidate regardless of the result (it may be the model's only usable
+/// NEAR provider, or a not-yet-warmed one). A model whose DECLARED NEAR
+/// capacities are all equal (or number fewer than two) has nothing to pin
+/// between: returns `None`, and the caller must not filter anything.
+///
+/// Otherwise returns `Some` of the smallest declared capacity that is `>=
+/// estimated_tokens` (the tier the request's size selects), or the largest
+/// declared capacity if the estimate doesn't fit any of them — mirroring the
+/// "nothing fits: closest first" rule the capacity sort already applies.
+///
+/// Pure and pool-free so it can be unit-tested directly. The caller (the
+/// retry loop in `mod.rs`) skips NEAR candidates whose declared capacity
+/// differs from the returned one, with an exception for the existing
+/// context-length-400 fall-through (module docs above).
+pub(crate) fn pin_near_tier_for_low_priority(
+    candidates: &[(bool, Option<u32>)],
+    estimated_tokens: u32,
+) -> Option<u32> {
+    let mut near_capacities: Vec<u32> = candidates
+        .iter()
+        .filter(|(is_near, _)| *is_near)
+        .filter_map(|(_, cap)| *cap)
+        .collect();
+    near_capacities.sort_unstable();
+    near_capacities.dedup();
+
+    if near_capacities.len() < 2 {
+        return None;
+    }
+
+    Some(
+        near_capacities
+            .iter()
+            .copied()
+            .find(|&cap| cap >= estimated_tokens)
+            .unwrap_or_else(|| *near_capacities.last().expect("checked len >= 2 above")),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -404,5 +472,56 @@ mod tests {
         assert_eq!(after.uncounted_tokens, before.uncounted_tokens);
         assert!(concat_prompt_text(&with_reasoning).contains(&"x".repeat(4_000)));
         assert!(!concat_prompt_text(&base).contains("xxxx"));
+    }
+
+    #[test]
+    fn pin_near_tier_keeps_smallest_fitting_near_capacity() {
+        let candidates = [
+            (true, Some(262_144)),
+            (true, Some(1_048_576)),
+            (false, Some(1_048_576)),
+        ];
+        assert_eq!(
+            pin_near_tier_for_low_priority(&candidates, 10_000),
+            Some(262_144)
+        );
+    }
+
+    #[test]
+    fn pin_near_tier_keeps_largest_capacity_when_nothing_fits() {
+        let candidates = [
+            (true, Some(262_144)),
+            (true, Some(1_048_576)),
+            (false, Some(1_048_576)),
+        ];
+        assert_eq!(
+            pin_near_tier_for_low_priority(&candidates, 2_000_000),
+            Some(1_048_576)
+        );
+    }
+
+    #[test]
+    fn pin_near_tier_is_noop_with_one_distinct_near_capacity() {
+        // Two NEAR candidates at the same capacity: nothing to pin between.
+        let candidates = [(true, Some(262_144)), (true, Some(262_144)), (false, None)];
+        assert_eq!(pin_near_tier_for_low_priority(&candidates, 10_000), None);
+    }
+
+    #[test]
+    fn pin_near_tier_is_noop_with_a_single_near_candidate() {
+        let candidates = [(true, Some(262_144)), (false, Some(1_048_576))];
+        assert_eq!(pin_near_tier_for_low_priority(&candidates, 10_000), None);
+    }
+
+    #[test]
+    fn pin_near_tier_ignores_undeclared_capacity_phantom_tier() {
+        // A NEAR candidate with NO declared capacity must never be treated as
+        // a distinct (u32::MAX) tier to pin away from — only declared
+        // capacities create tiers (mirrors `refine_context_requirement`'s
+        // `distinct` set). With only one DECLARED NEAR capacity here, there
+        // is nothing to pin between, regardless of the estimate, and the
+        // caller must keep the undeclared-capacity candidate.
+        let candidates = [(true, Some(262_144)), (true, None)];
+        assert_eq!(pin_near_tier_for_low_priority(&candidates, 2_000_000), None);
     }
 }

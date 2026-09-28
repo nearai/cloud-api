@@ -66,6 +66,7 @@ pub mod responses_raw;
 pub mod rotation;
 pub mod spki_verifier;
 pub mod sse_parser;
+pub mod systemone;
 pub mod thought_signature;
 
 // Attested NEAR-AI fleet provider. Use the module path (`nearai::Provider`,
@@ -103,6 +104,7 @@ pub use models::{
 pub use sse_parser::{
     new_external_sse_parser, new_sse_parser, BufferedSSEParser, SSEEvent, SSEEventParser, SSEParser,
 };
+pub use systemone::{SystemOneRequest, SystemOneResponse, SystemOneResponseWithBytes};
 // Chunk builder for external provider parsers
 pub use chunk_builder::ChunkContext;
 
@@ -199,7 +201,29 @@ impl ProviderTier {
 pub trait BackendVerifier: Send + Sync {
     /// Connect to `base_url`, verify the backend's attestation, and return a client
     /// whose H2 connection is pinned to that verified backend.
-    async fn create_verified_client(&self, base_url: &str) -> Result<Client, String>;
+    async fn create_verified_client(&self, base_url: &str) -> Result<Client, BackendVerifyError>;
+}
+
+/// Why [`BackendVerifier::create_verified_client`] failed.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum BackendVerifyError {
+    /// The attestation report was verified, but the certificate presented on
+    /// the connection that carried it is not the attested one (or the report
+    /// attests no fingerprint, or the certificate could not be read). Report
+    /// and certificate come from the same connection, so verifying the same
+    /// backend again gives the same result: callers should not retry.
+    #[error("{0}")]
+    ChannelBinding(String),
+    /// Any other failure (connection, HTTP status, report parsing, quote or
+    /// GPU evidence verification). May be transient.
+    #[error("{0}")]
+    Other(String),
+}
+
+impl From<String> for BackendVerifyError {
+    fn from(message: String) -> Self {
+        Self::Other(message)
+    }
 }
 
 /// Try to extract a human-readable error message from a JSON error response body.
@@ -288,6 +312,21 @@ pub trait InferenceProvider {
         &self,
         params: CompletionParams,
     ) -> Result<StreamingResult, CompletionError>;
+
+    /// Typed decisions via the System One protocol, independent of provider trust tier.
+    async fn systemone(
+        &self,
+        _request: SystemOneRequest,
+        _request_hash: String,
+    ) -> Result<SystemOneResponseWithBytes, CompletionError> {
+        Err(CompletionError::CompletionError(
+            "System One is unavailable for this provider".into(),
+        ))
+    }
+
+    fn supports_systemone(&self) -> bool {
+        false
+    }
 
     /// Performs an image generation request
     ///

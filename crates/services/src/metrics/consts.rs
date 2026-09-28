@@ -52,6 +52,11 @@ pub const METRIC_PROVIDER_REQUESTS: &str = "cloud_api.provider.requests";
 
 pub const METRIC_PROVIDER_ATTEMPTS: &str = "cloud_api.provider.attempts";
 pub const METRIC_BACKEND_KEY_DIVERGENCE: &str = "cloud_api.backend.key_divergence";
+// Attested backends: whether the certificate presented on the connection that
+// carried an attestation report matches the TLS fingerprint the report attests.
+// Tagged `model`, `path` (inline_verify|discovery) and `result`
+// (match|mismatch|unattested|missing).
+pub const METRIC_BACKEND_CHANNEL_BINDING: &str = "cloud_api.backend.channel_binding";
 
 // Error metrics
 pub const METRIC_REQUEST_ERRORS: &str = "cloud_api.request.errors";
@@ -81,6 +86,9 @@ pub const METRIC_PROVIDER_ZERO_TOKENS: &str = "cloud_api.provider.zero_tokens";
 // HTTP metrics
 pub const METRIC_HTTP_REQUESTS: &str = "cloud_api.http.requests";
 pub const METRIC_HTTP_DURATION: &str = "cloud_api.http.duration";
+
+// Usage aggregate freshness: seconds from the oldest raw hour not yet in usage_hourly to the tick.
+pub const METRIC_USAGE_HOURLY_LAG_SECONDS: &str = "cloud_api.usage_hourly.lag_seconds";
 
 // Low-cardinality tags only (NO org/workspace/api_key - those go to database analytics)
 pub const TAG_MODEL: &str = "model";

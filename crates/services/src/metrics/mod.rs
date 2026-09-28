@@ -171,6 +171,10 @@ impl MetricsServiceTrait for OtlpMetricsService {
                     "Per-request prefix-cache hit rate (cache-read / prompt tokens)",
                     "percent",
                 ),
+                consts::METRIC_USAGE_HOURLY_LAG_SECONDS => (
+                    "Seconds from the oldest raw hour not yet in usage_hourly to the scheduler tick",
+                    "s",
+                ),
                 _ => ("Value distribution", ""),
             };
 

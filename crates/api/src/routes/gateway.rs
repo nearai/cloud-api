@@ -26,11 +26,13 @@ pub struct CheckApiKeyResponse {
 
 /// Check API key validity
 ///
-/// Validates the provided API key (via Bearer token), checks rate limits,
-/// and verifies the organization has sufficient credits.
+/// Validates the provided API key (via Bearer token) and verifies the
+/// organization has sufficient credits.
 ///
 /// This endpoint is designed for external model gateways to authenticate
-/// user requests before forwarding to inference engines.
+/// user requests before forwarding to inference engines. It is not subject to
+/// the per-key request rate limit of the inference endpoints, so a gateway can
+/// call it once per request; admission control is the gateway's job.
 #[utoipa::path(
     post,
     path = "/v1/check_api_key",
@@ -39,7 +41,6 @@ pub struct CheckApiKeyResponse {
         (status = 200, description = "API key is valid and has sufficient credits", body = CheckApiKeyResponse),
         (status = 401, description = "Invalid or missing API key", body = ErrorResponse),
         (status = 402, description = "Insufficient credits or spend limit exceeded", body = ErrorResponse),
-        (status = 429, description = "Rate limit exceeded", body = ErrorResponse),
         (status = 500, description = "Internal server error", body = ErrorResponse)
     ),
     security(

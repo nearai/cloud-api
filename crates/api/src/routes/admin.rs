@@ -28,7 +28,7 @@ use crate::models::{
     UpdateOrganizationLimitsResponse, UpdateOrganizationMemberRequest,
     UpdateOrganizationPriorityRequest, UpdateServiceRequest, UpsertAmlAllowlistEntryRequest,
 };
-use crate::routes::common::format_amount;
+use crate::routes::common::{analytics_error_response, format_amount};
 use crate::routes::usage::{compute_organization_balance_response, OrganizationBalanceResponse};
 use axum::{
     extract::{Json, Path, Query, State},
@@ -2419,6 +2419,9 @@ fn admin_error_to_response(
             StatusCode::UNAUTHORIZED,
             ResponseJson(ErrorResponse::new(msg, "unauthorized".to_string())),
         ),
+        err @ services::admin::AdminError::Timeout => {
+            analytics_error_response(err, "Admin operation failed", true)
+        }
         services::admin::AdminError::InternalError(msg) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             ResponseJson(ErrorResponse::new(
@@ -3760,6 +3763,8 @@ fn parse_metrics_credit_type(
 ///
 /// Returns usage metrics for an organization including summary totals,
 /// and breakdowns by workspace, API key, and model.
+///
+/// Percentiles across hours are approximate (sample-weighted means of hourly percentiles).
 #[utoipa::path(
     get,
     path = "/v1/admin/organizations/{org_id}/metrics",
@@ -3774,7 +3779,7 @@ fn parse_metrics_credit_type(
         (status = 200, description = "Organization metrics retrieved successfully"),
         (status = 400, description = "Invalid request", body = ErrorResponse),
         (status = 401, description = "Unauthorized", body = ErrorResponse),
-        (status = 404, description = "Organization not found", body = ErrorResponse),
+        (status = 504, description = "Analytics statement budget exceeded", body = ErrorResponse),
         (status = 500, description = "Internal server error", body = ErrorResponse)
     ),
     security(
@@ -3821,25 +3826,7 @@ pub async fn get_organization_metrics(
         .analytics_service
         .get_organization_metrics(organization_id, start, end, credit_type.as_deref())
         .await
-        .map_err(|e| {
-            error!("Failed to get organization metrics, error: {:?}", e);
-            match e {
-                services::admin::AdminError::OrganizationNotFound(msg) => (
-                    StatusCode::NOT_FOUND,
-                    ResponseJson(ErrorResponse::new(
-                        msg,
-                        "organization_not_found".to_string(),
-                    )),
-                ),
-                _ => (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    ResponseJson(ErrorResponse::new(
-                        format!("Failed to retrieve metrics: {e}"),
-                        "internal_server_error".to_string(),
-                    )),
-                ),
-            }
-        })?;
+        .map_err(|e| analytics_error_response(e, "Failed to retrieve metrics", true))?;
 
     Ok(ResponseJson(metrics))
 }
@@ -3851,6 +3838,8 @@ pub async fn get_organization_metrics(
 /// - Total requests and revenue
 /// - Top models by usage
 /// - Top organizations by spend
+///
+/// Percentiles across hours are approximate (sample-weighted means of hourly percentiles).
 #[utoipa::path(
     get,
     path = "/v1/admin/platform/metrics",
@@ -3862,6 +3851,7 @@ pub async fn get_organization_metrics(
     responses(
         (status = 200, description = "Platform metrics retrieved successfully", body = services::admin::PlatformMetrics),
         (status = 401, description = "Unauthorized", body = ErrorResponse),
+        (status = 504, description = "Analytics statement budget exceeded", body = ErrorResponse),
         (status = 500, description = "Internal server error", body = ErrorResponse)
     ),
     security(
@@ -3892,16 +3882,7 @@ pub async fn get_platform_metrics(
         .analytics_service
         .get_platform_metrics(start, end)
         .await
-        .map_err(|e| {
-            error!("Failed to get platform metrics, error: {:?}", e);
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                ResponseJson(ErrorResponse::new(
-                    format!("Failed to retrieve platform metrics: {e}"),
-                    "internal_server_error".to_string(),
-                )),
-            )
-        })?;
+        .map_err(|e| analytics_error_response(e, "Failed to retrieve platform metrics", true))?;
 
     Ok(ResponseJson(metrics))
 }
@@ -3923,6 +3904,7 @@ pub async fn get_platform_metrics(
         (status = 200, description = "Platform time series retrieved successfully", body = services::admin::PlatformTimeSeriesMetrics),
         (status = 400, description = "Invalid request", body = ErrorResponse),
         (status = 401, description = "Unauthorized", body = ErrorResponse),
+        (status = 504, description = "Analytics statement budget exceeded", body = ErrorResponse),
         (status = 500, description = "Internal server error", body = ErrorResponse)
     ),
     security(
@@ -3969,16 +3951,7 @@ pub async fn get_platform_timeseries(
         .analytics_service
         .get_platform_timeseries(start, end, granularity)
         .await
-        .map_err(|e| {
-            error!("Failed to get platform timeseries, error: {:?}", e);
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                ResponseJson(ErrorResponse::new(
-                    format!("Failed to retrieve platform timeseries: {e}"),
-                    "internal_server_error".to_string(),
-                )),
-            )
-        })?;
+        .map_err(|e| analytics_error_response(e, "Failed to retrieve platform timeseries", true))?;
 
     Ok(ResponseJson(metrics))
 }
@@ -3988,6 +3961,9 @@ pub async fn get_platform_timeseries(
 /// Credit LIMITS (caps) and consumption — NOT payments/cash. Returns active paid/grant
 /// credit limits, total consumed, paying/granted org counts, and a breakdown by funding
 /// source. Real money-in lives in the billing service, not cloud-api.
+///
+/// `inference_consumed_usd` can differ from `total_consumed_usd` (the live balance) by
+/// historical duplicate-row cleanup.
 #[utoipa::path(
     get,
     path = "/v1/admin/platform/billing-summary",
@@ -3995,6 +3971,7 @@ pub async fn get_platform_timeseries(
     responses(
         (status = 200, description = "Billing summary retrieved successfully", body = services::admin::BillingSummary),
         (status = 401, description = "Unauthorized", body = ErrorResponse),
+        (status = 504, description = "Analytics statement budget exceeded", body = ErrorResponse),
         (status = 500, description = "Internal server error", body = ErrorResponse)
     ),
     security(
@@ -4012,16 +3989,7 @@ pub async fn get_billing_summary(
         .analytics_service
         .get_billing_summary()
         .await
-        .map_err(|e| {
-            error!("Failed to get billing summary, error: {:?}", e);
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                ResponseJson(ErrorResponse::new(
-                    format!("Failed to retrieve billing summary: {e}"),
-                    "internal_server_error".to_string(),
-                )),
-            )
-        })?;
+        .map_err(|e| analytics_error_response(e, "Failed to retrieve billing summary", true))?;
 
     Ok(ResponseJson(summary))
 }
@@ -4050,6 +4018,8 @@ pub struct ModelRevenueQueryParams {
 ///
 /// Models for the selected period ranked by consumed cost, with requests, tokens,
 /// unique orgs, verifiable flag, provider type, and latency. Paginated and filterable.
+///
+/// Percentiles across hours are approximate (sample-weighted means of hourly percentiles).
 #[utoipa::path(
     get,
     path = "/v1/admin/platform/model-revenue",
@@ -4067,6 +4037,7 @@ pub struct ModelRevenueQueryParams {
         (status = 200, description = "Model revenue retrieved successfully", body = services::admin::ModelRevenueReport),
         (status = 400, description = "Invalid request", body = ErrorResponse),
         (status = 401, description = "Unauthorized", body = ErrorResponse),
+        (status = 504, description = "Analytics statement budget exceeded", body = ErrorResponse),
         (status = 500, description = "Internal server error", body = ErrorResponse)
     ),
     security(
@@ -4117,16 +4088,7 @@ pub async fn get_model_revenue(
             offset: params.offset,
         })
         .await
-        .map_err(|e| {
-            error!("Failed to get model revenue, error: {:?}", e);
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                ResponseJson(ErrorResponse::new(
-                    format!("Failed to retrieve model revenue: {e}"),
-                    "internal_server_error".to_string(),
-                )),
-            )
-        })?;
+        .map_err(|e| analytics_error_response(e, "Failed to retrieve model revenue", true))?;
 
     Ok(ResponseJson(report))
 }
@@ -4170,6 +4132,7 @@ pub struct OrgRevenueQueryParams {
         (status = 200, description = "Org revenue retrieved successfully", body = services::admin::OrgRevenueReport),
         (status = 400, description = "Invalid request", body = ErrorResponse),
         (status = 401, description = "Unauthorized", body = ErrorResponse),
+        (status = 504, description = "Analytics statement budget exceeded", body = ErrorResponse),
         (status = 500, description = "Internal server error", body = ErrorResponse)
     ),
     security(
@@ -4211,16 +4174,7 @@ pub async fn get_org_revenue(
             offset: params.offset,
         })
         .await
-        .map_err(|e| {
-            error!("Failed to get org revenue, error: {:?}", e);
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                ResponseJson(ErrorResponse::new(
-                    format!("Failed to retrieve org revenue: {e}"),
-                    "internal_server_error".to_string(),
-                )),
-            )
-        })?;
+        .map_err(|e| analytics_error_response(e, "Failed to retrieve org revenue", true))?;
 
     Ok(ResponseJson(report))
 }
@@ -4326,6 +4280,7 @@ pub struct PerformanceTimeseriesParams {
         (status = 200, description = "Model consumption timeseries retrieved successfully", body = services::admin::ModelConsumptionTimeseries),
         (status = 400, description = "Invalid request", body = ErrorResponse),
         (status = 401, description = "Unauthorized", body = ErrorResponse),
+        (status = 504, description = "Analytics statement budget exceeded", body = ErrorResponse),
         (status = 500, description = "Internal server error", body = ErrorResponse)
     ),
     security(("session_token" = []))
@@ -4359,14 +4314,7 @@ pub async fn get_model_consumption_timeseries(
         })
         .await
         .map_err(|e| {
-            error!("Failed to get model consumption timeseries: {:?}", e);
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                ResponseJson(ErrorResponse::new(
-                    format!("Failed to retrieve model consumption timeseries: {e}"),
-                    "internal_server_error".to_string(),
-                )),
-            )
+            analytics_error_response(e, "Failed to retrieve model consumption timeseries", true)
         })?;
 
     Ok(ResponseJson(result))
@@ -4384,6 +4332,8 @@ pub async fn get_model_consumption_timeseries(
 /// **Error rate** = `stop_reason IN ('provider_error','timeout','incomplete')` / requests
 /// with a recorded `stop_reason`. Pre-V0037 rows (stop_reason IS NULL) are excluded from
 /// both numerator and denominator.
+///
+/// Percentiles across hours are approximate (sample-weighted means of hourly percentiles).
 #[utoipa::path(
     get,
     path = "/v1/admin/platform/performance-timeseries",
@@ -4398,6 +4348,7 @@ pub async fn get_model_consumption_timeseries(
         (status = 200, description = "Performance timeseries retrieved successfully", body = services::admin::PerformanceTimeseries),
         (status = 400, description = "Invalid request", body = ErrorResponse),
         (status = 401, description = "Unauthorized", body = ErrorResponse),
+        (status = 504, description = "Analytics statement budget exceeded", body = ErrorResponse),
         (status = 500, description = "Internal server error", body = ErrorResponse)
     ),
     security(("session_token" = []))
@@ -4429,14 +4380,7 @@ pub async fn get_performance_timeseries(
         })
         .await
         .map_err(|e| {
-            error!("Failed to get performance timeseries: {:?}", e);
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                ResponseJson(ErrorResponse::new(
-                    format!("Failed to retrieve performance timeseries: {e}"),
-                    "internal_server_error".to_string(),
-                )),
-            )
+            analytics_error_response(e, "Failed to retrieve performance timeseries", true)
         })?;
 
     Ok(ResponseJson(result))
@@ -4457,6 +4401,9 @@ pub struct RevenueDensityParams {
 /// then returns P50/P95/P99/peak over active buckets — platform-wide and per model.
 /// Use the annualized figures to estimate potential revenue if a given demand
 /// rate were sustained continuously.
+///
+/// Reads raw usage at minute grain over the exact requested range, under a 120 s statement
+/// budget.
 #[utoipa::path(
     get,
     path = "/v1/admin/platform/revenue-density",
@@ -4470,6 +4417,7 @@ pub struct RevenueDensityParams {
         (status = 200, description = "Revenue density retrieved successfully", body = services::admin::RevenueDensityReport),
         (status = 400, description = "Invalid request", body = ErrorResponse),
         (status = 401, description = "Unauthorized", body = ErrorResponse),
+        (status = 504, description = "Analytics statement budget exceeded", body = ErrorResponse),
         (status = 500, description = "Internal server error", body = ErrorResponse)
     ),
     security(("session_token" = []))
@@ -4499,16 +4447,7 @@ pub async fn get_revenue_density(
             provider_type: params.provider_type,
         })
         .await
-        .map_err(|e| {
-            error!("Failed to get revenue density: {:?}", e);
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                ResponseJson(ErrorResponse::new(
-                    format!("Failed to retrieve revenue density: {e}"),
-                    "internal_server_error".to_string(),
-                )),
-            )
-        })?;
+        .map_err(|e| analytics_error_response(e, "Failed to retrieve revenue density", true))?;
 
     Ok(ResponseJson(result))
 }
@@ -4532,7 +4471,7 @@ pub async fn get_revenue_density(
         (status = 200, description = "Time series metrics retrieved successfully"),
         (status = 400, description = "Invalid request", body = ErrorResponse),
         (status = 401, description = "Unauthorized", body = ErrorResponse),
-        (status = 404, description = "Organization not found", body = ErrorResponse),
+        (status = 504, description = "Analytics statement budget exceeded", body = ErrorResponse),
         (status = 500, description = "Internal server error", body = ErrorResponse)
     ),
     security(
@@ -4601,25 +4540,7 @@ pub async fn get_organization_timeseries(
             credit_type.as_deref(),
         )
         .await
-        .map_err(|e| {
-            error!("Failed to get organization timeseries, error: {:?}", e);
-            match e {
-                services::admin::AdminError::OrganizationNotFound(msg) => (
-                    StatusCode::NOT_FOUND,
-                    ResponseJson(ErrorResponse::new(
-                        msg,
-                        "organization_not_found".to_string(),
-                    )),
-                ),
-                _ => (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    ResponseJson(ErrorResponse::new(
-                        format!("Failed to retrieve timeseries metrics: {e}"),
-                        "internal_server_error".to_string(),
-                    )),
-                ),
-            }
-        })?;
+        .map_err(|e| analytics_error_response(e, "Failed to retrieve timeseries metrics", true))?;
 
     Ok(ResponseJson(metrics))
 }

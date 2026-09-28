@@ -688,10 +688,16 @@ impl MockExpectationBuilder {
 
 type ResponsesHandler =
     Arc<dyn Fn(serde_json::Value) -> crate::responses_raw::ResponsesRawResponse + Send + Sync>;
+type SystemOneHandler = Arc<
+    dyn Fn(crate::SystemOneRequest) -> Result<crate::SystemOneResponseWithBytes, CompletionError>
+        + Send
+        + Sync,
+>;
 
 /// Mock provider that implements InferenceProvider for testing
 pub struct MockProvider {
     responses_handler: Option<ResponsesHandler>,
+    systemone_handler: Option<SystemOneHandler>,
     /// List of available mock models
     models: Vec<ModelInfo>,
     /// Map of chat_id to (request_hash, response_hash) for signature generation
@@ -731,6 +737,19 @@ pub struct MockProvider {
 }
 
 impl MockProvider {
+    pub fn with_systemone_handler(
+        mut self,
+        handler: impl Fn(
+                crate::SystemOneRequest,
+            ) -> Result<crate::SystemOneResponseWithBytes, CompletionError>
+            + Send
+            + Sync
+            + 'static,
+    ) -> Self {
+        self.systemone_handler = Some(Arc::new(handler));
+        self
+    }
+
     /// Install a native Responses fixture without affecting chat fixtures.
     pub fn with_responses_handler(
         mut self,
@@ -777,6 +796,7 @@ impl MockProvider {
             per_request_public_key: None,
             unpinned_chat_ids: Arc::new(std::sync::Mutex::new(Vec::new())),
             responses_handler: None,
+            systemone_handler: None,
         }
     }
 
@@ -806,6 +826,7 @@ impl MockProvider {
             per_request_public_key: None,
             unpinned_chat_ids: Arc::new(std::sync::Mutex::new(Vec::new())),
             responses_handler: None,
+            systemone_handler: None,
         }
     }
 
@@ -833,6 +854,7 @@ impl MockProvider {
             per_request_public_key: None,
             unpinned_chat_ids: Arc::new(std::sync::Mutex::new(Vec::new())),
             responses_handler: None,
+            systemone_handler: None,
         }
     }
 
@@ -1078,6 +1100,31 @@ impl Default for MockProvider {
 
 #[async_trait]
 impl crate::InferenceProvider for MockProvider {
+    fn supports_systemone(&self) -> bool {
+        self.systemone_handler.is_some()
+    }
+
+    async fn systemone(
+        &self,
+        request: crate::SystemOneRequest,
+        request_hash: String,
+    ) -> Result<crate::SystemOneResponseWithBytes, CompletionError> {
+        let handler = self
+            .systemone_handler
+            .as_ref()
+            .ok_or_else(|| CompletionError::CompletionError("No System One fixture".into()))?;
+        let response = handler(request)?;
+        if let Some(id) = &response.response.id {
+            self.register_signature_hashes(
+                id.clone(),
+                request_hash,
+                hex::encode(Sha256::digest(&response.raw_bytes)),
+            )
+            .await;
+        }
+        Ok(response)
+    }
+
     fn supports_responses_raw(&self) -> bool {
         self.responses_handler.is_some()
     }

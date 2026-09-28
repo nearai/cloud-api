@@ -36,7 +36,7 @@ pub(in crate::attestation) use report::{decode_nonce_hex, generate_nonce_hex};
 pub use report_data::{ReportDataVerifier, StrictBoundReportDataVerifier};
 pub use verification::{
     AttestationVerificationError, AttestationVerifier, BackendAttestationVerifier,
-    VerifiedAttestation,
+    ReplicaReportKey, VerifiedAttestation,
 };
 
 use crate::{

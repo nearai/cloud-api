@@ -3,6 +3,7 @@
 //! Verifies TDX quotes, report_data bindings (signing address + TLS fingerprint),
 //! image hashes, and GPU evidence from attestation reports returned by inference-proxy.
 
+use ed25519_dalek::VerifyingKey;
 use sha2::Digest;
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -29,12 +30,32 @@ pub struct VerifiedAttestation {
     pub compose_hash: Option<String>,
     /// GPU verification verdict (e.g., "PASS"), if GPU evidence was present.
     pub gpu_verdict: Option<String>,
+    /// The host's per-boot replica-report signing key, extracted from the
+    /// `nearai-replica-report-key-v1` RTMR3 event, if present and valid.
+    pub replica_report_key: Option<ReplicaReportKey>,
+}
+
+/// The host's per-boot ed25519 replica-report signing key, bound into RTMR3
+/// via the `nearai-replica-report-key-v1` dstack event. Mirrors the fields of
+/// the proxy's signed JSON payload for that event.
+///
+/// `Debug` is safe here: every field is an ID or a public key, never customer
+/// content.
+#[derive(Clone, Debug, PartialEq, serde::Deserialize)]
+pub struct ReplicaReportKey {
+    pub key_id: String,
+    pub public_key_hex: String,
+    pub boot_id: String,
+    pub host_id: String,
+    pub model: String,
+    pub replica_ids: Vec<String>,
 }
 
 /// Data extracted from the RTMR3-verified event log.
 struct EventLogData {
     os_image_hash: Option<String>,
     compose_hash: Option<String>,
+    replica_report_key: Option<ReplicaReportKey>,
 }
 
 /// dstack runtime event type constant (0x08000001).
@@ -237,6 +258,7 @@ impl AttestationVerifier {
             os_image_hash: event_log_data.os_image_hash,
             compose_hash: event_log_data.compose_hash,
             gpu_verdict,
+            replica_report_key: event_log_data.replica_report_key,
         })
     }
 
@@ -421,9 +443,14 @@ impl AttestationVerifier {
             )));
         }
 
-        // Event log is verified — extract os-image-hash and compose-hash
+        // Event log is verified — extract os-image-hash, compose-hash, and
+        // the replica report signing key. Iterated in log order; a later
+        // valid replica-report-key event overwrites an earlier one, but an
+        // invalid later event is ignored and does NOT clear a valid earlier
+        // one (last VALID event wins).
         let mut os_image_hash = None;
         let mut compose_hash = None;
+        let mut replica_report_key = None;
         for event in &events {
             if event.imr != 3 {
                 continue;
@@ -435,6 +462,22 @@ impl AttestationVerifier {
                 "compose-hash" => {
                     compose_hash = Some(event.event_payload.clone());
                 }
+                placement::consts::KEY_EVENT => {
+                    // Only a runtime event's name and payload are bound into
+                    // RTMR3 by the replay above (the digest-validation branch
+                    // keyed on `DSTACK_RUNTIME_EVENT_TYPE`); a non-runtime
+                    // event's stored digest is chained as-is, with no check
+                    // that it actually corresponds to this name/payload. So
+                    // without this gate, an attacker could keep a genuine
+                    // non-runtime event's digest, relabel it as `KEY_EVENT`,
+                    // and supply an arbitrary key that would still pass
+                    // replay and self-validate via `key_id == hash(pk)`.
+                    if event.event_type != DSTACK_RUNTIME_EVENT_TYPE {
+                        tracing::debug!("replica report key event: not a runtime event");
+                    } else if let Some(key) = parse_replica_report_key(&event.event_payload) {
+                        replica_report_key = Some(key);
+                    }
+                }
                 _ => {}
             }
         }
@@ -442,6 +485,7 @@ impl AttestationVerifier {
         Ok(EventLogData {
             os_image_hash,
             compose_hash,
+            replica_report_key,
         })
     }
 
@@ -591,6 +635,61 @@ impl AttestationVerifier {
 
         Ok(Some(verdict))
     }
+}
+
+/// Parse and validate a `nearai-replica-report-key-v1` event payload.
+///
+/// `event_payload` is the hex encoding of the proxy's signed JSON
+/// `{key_id, public_key_hex, boot_id, host_id, model, replica_ids}`. Returns
+/// `None` on any malformed input (bad hex, bad JSON, bad public key length,
+/// invalid curve point, or a `key_id` that doesn't hash back to the public
+/// key) — never fatal to attestation. Only the error *kind* is logged, never
+/// the payload.
+fn parse_replica_report_key(event_payload: &str) -> Option<ReplicaReportKey> {
+    let json_bytes = match hex::decode(event_payload) {
+        Ok(b) => b,
+        Err(_) => {
+            tracing::debug!("replica report key event: bad hex");
+            return None;
+        }
+    };
+
+    let payload: ReplicaReportKey = match serde_json::from_slice(&json_bytes) {
+        Ok(p) => p,
+        Err(_) => {
+            tracing::debug!("replica report key event: bad json");
+            return None;
+        }
+    };
+
+    let pk_bytes = match hex::decode(&payload.public_key_hex) {
+        Ok(b) => b,
+        Err(_) => {
+            tracing::debug!("replica report key event: bad public key hex");
+            return None;
+        }
+    };
+    let pk_array: [u8; 32] = match pk_bytes.try_into() {
+        Ok(a) => a,
+        Err(_) => {
+            tracing::debug!("replica report key event: invalid public key length");
+            return None;
+        }
+    };
+    let verifying_key = match VerifyingKey::from_bytes(&pk_array) {
+        Ok(vk) => vk,
+        Err(_) => {
+            tracing::debug!("replica report key event: invalid public key point");
+            return None;
+        }
+    };
+
+    if placement::frame::key_id(&verifying_key) != payload.key_id {
+        tracing::debug!("replica report key event: key_id mismatch");
+        return None;
+    }
+
+    Some(payload)
 }
 
 #[async_trait::async_trait]
@@ -962,7 +1061,276 @@ pub enum AttestationVerificationError {
 mod tests {
     use super::*;
     use base64::Engine;
+    use ed25519_dalek::SigningKey;
     use serde_json::json;
+
+    // --- Replica report key event (Task 7) ---------------------------------
+
+    /// Deterministic test keypair, per the brief.
+    fn test_signing_key(seed: u8) -> SigningKey {
+        SigningKey::from_bytes(&[seed; 32])
+    }
+
+    fn replica_report_key_payload(vk: &VerifyingKey, boot_id: &str) -> ReplicaReportKey {
+        ReplicaReportKey {
+            key_id: placement::frame::key_id(vk),
+            public_key_hex: hex::encode(vk.as_bytes()),
+            boot_id: boot_id.to_string(),
+            host_id: "host-1".to_string(),
+            model: "z-ai/glm-5.3-flash".to_string(),
+            replica_ids: vec!["r1".to_string(), "r2".to_string()],
+        }
+    }
+
+    /// `ReplicaReportKey` derives only `Deserialize` (matching the brief), so
+    /// tests build the wire JSON by hand rather than serializing the struct.
+    fn hex_payload(key: &ReplicaReportKey) -> String {
+        let value = json!({
+            "key_id": key.key_id,
+            "public_key_hex": key.public_key_hex,
+            "boot_id": key.boot_id,
+            "host_id": key.host_id,
+            "model": key.model,
+            "replica_ids": key.replica_ids,
+        });
+        hex::encode(serde_json::to_vec(&value).unwrap())
+    }
+
+    /// Compute the digest production uses for a runtime event:
+    /// `SHA384(event_type_le || ":" || event_name || ":" || payload_bytes)`.
+    fn compute_runtime_digest(event_type: u32, name: &str, payload_hex: &str) -> [u8; 48] {
+        use sha2::Sha384;
+        let payload_bytes = hex::decode(payload_hex).unwrap();
+        let mut hasher = Sha384::new();
+        sha2::Digest::update(&mut hasher, event_type.to_ne_bytes());
+        sha2::Digest::update(&mut hasher, b":");
+        sha2::Digest::update(&mut hasher, name.as_bytes());
+        sha2::Digest::update(&mut hasher, b":");
+        sha2::Digest::update(&mut hasher, &payload_bytes);
+        sha2::Digest::finalize(hasher).into()
+    }
+
+    /// Build a runtime (dstack) event: digest omitted (empty), so the
+    /// production code's optional stored-digest check is skipped and only
+    /// the computed digest is chained into RTMR3, matching how the other
+    /// tests in this module build fixtures.
+    fn runtime_event(name: &str, payload_hex: &str) -> EventLogEntry {
+        EventLogEntry {
+            digest: String::new(),
+            event_type: DSTACK_RUNTIME_EVENT_TYPE,
+            event: name.to_string(),
+            event_payload: payload_hex.to_string(),
+            imr: 3,
+        }
+    }
+
+    /// Like [`runtime_event`], but with `digest` set to the correctly
+    /// computed value, so production's optional stored-digest-matches-payload
+    /// check actually runs (rather than being skipped on an empty digest).
+    fn runtime_event_with_digest(name: &str, payload_hex: &str) -> EventLogEntry {
+        let digest = compute_runtime_digest(DSTACK_RUNTIME_EVENT_TYPE, name, payload_hex);
+        EventLogEntry {
+            digest: hex::encode(digest),
+            event_type: DSTACK_RUNTIME_EVENT_TYPE,
+            event: name.to_string(),
+            event_payload: payload_hex.to_string(),
+            imr: 3,
+        }
+    }
+
+    /// Build a non-runtime imr==3 event (`event_type != DSTACK_RUNTIME_EVENT_TYPE`)
+    /// whose digest is chained into RTMR3 as-is, with no binding to
+    /// `event`/`event_payload` — the shape a malicious log author could reuse
+    /// (keeping a genuine digest) while relabeling name/payload.
+    fn non_runtime_event(name: &str, payload_hex: &str, digest_hex: &str) -> EventLogEntry {
+        EventLogEntry {
+            digest: digest_hex.to_string(),
+            event_type: 0,
+            event: name.to_string(),
+            event_payload: payload_hex.to_string(),
+            imr: 3,
+        }
+    }
+
+    /// Replay RTMR3 exactly as `verify_rtmr3_and_extract` does (both the
+    /// runtime-event computed-digest branch and the non-runtime
+    /// stored-digest-as-is branch), to produce a `quoted_rtmr3` that a set of
+    /// imr==3 events will verify against.
+    fn replay_rtmr3(events: &[EventLogEntry]) -> [u8; 48] {
+        use sha2::Sha384;
+        let mut rtmr3 = [0u8; 48];
+        for event in events {
+            if event.imr != 3 {
+                continue;
+            }
+            let digest_bytes: Vec<u8> = if event.event_type == DSTACK_RUNTIME_EVENT_TYPE {
+                compute_runtime_digest(event.event_type, &event.event, &event.event_payload)
+                    .to_vec()
+            } else {
+                hex::decode(&event.digest).unwrap()
+            };
+
+            let mut hasher = Sha384::new();
+            sha2::Digest::update(&mut hasher, rtmr3);
+            sha2::Digest::update(&mut hasher, digest_bytes);
+            rtmr3.copy_from_slice(&sha2::Digest::finalize(hasher));
+        }
+        rtmr3
+    }
+
+    fn verifier() -> AttestationVerifier {
+        AttestationVerifier::new(HashSet::new(), None, false)
+    }
+
+    fn event_log_report(events: &[EventLogEntry]) -> serde_json::Map<String, serde_json::Value> {
+        let entries: Vec<serde_json::Value> = events
+            .iter()
+            .map(|e| {
+                json!({
+                    "digest": e.digest,
+                    "event_type": e.event_type,
+                    "event": e.event,
+                    "event_payload": e.event_payload,
+                    "imr": e.imr,
+                })
+            })
+            .collect();
+        let mut report = serde_json::Map::new();
+        report.insert("event_log".to_string(), json!(entries));
+        report
+    }
+
+    #[test]
+    fn replica_key_event_is_parsed_and_last_wins() {
+        let vk_stale = test_signing_key(7).verifying_key();
+        let vk_current = test_signing_key(9).verifying_key();
+        let stale = replica_report_key_payload(&vk_stale, "boot-stale");
+        let current = replica_report_key_payload(&vk_current, "boot-current");
+
+        let events = vec![
+            runtime_event("os-image-hash", &hex::encode(b"image-hash-value")),
+            runtime_event("compose-hash", &hex::encode(b"compose-hash-value")),
+            // Digest set to the computed value, so the stored-digest-matches
+            // check runs alongside the key event, not just the computed one.
+            runtime_event_with_digest(placement::consts::KEY_EVENT, &hex_payload(&stale)),
+            runtime_event_with_digest(placement::consts::KEY_EVENT, &hex_payload(&current)),
+        ];
+        let rtmr3 = replay_rtmr3(&events);
+        let report = event_log_report(&events);
+
+        let result = verifier()
+            .verify_rtmr3_and_extract(&report, &rtmr3)
+            .unwrap();
+        assert_eq!(result.replica_report_key, Some(current));
+    }
+
+    #[test]
+    fn non_runtime_key_event_is_ignored() {
+        // Only a runtime event's name/payload are bound by the replay; a
+        // non-runtime event's stored digest is chained as-is. An attacker
+        // who keeps a genuine non-runtime event's digest but relabels its
+        // name/payload as a KEY_EVENT must NOT have that key accepted.
+        let vk = test_signing_key(7).verifying_key();
+        let key = replica_report_key_payload(&vk, "boot-1");
+        let payload_hex = hex_payload(&key);
+        // An arbitrary stored digest — as would appear for a genuine
+        // non-runtime event this attacker payload is riding along with.
+        let digest_hex = hex::encode(b"some-genuine-non-runtime-digest");
+        let events = vec![non_runtime_event(
+            placement::consts::KEY_EVENT,
+            &payload_hex,
+            &digest_hex,
+        )];
+        let rtmr3 = replay_rtmr3(&events);
+        let report = event_log_report(&events);
+
+        let result = verifier()
+            .verify_rtmr3_and_extract(&report, &rtmr3)
+            .unwrap();
+        assert_eq!(result.replica_report_key, None);
+    }
+
+    #[test]
+    fn key_event_outside_rtmr3_is_ignored() {
+        let vk = test_signing_key(7).verifying_key();
+        let key = replica_report_key_payload(&vk, "boot-1");
+        let mut imr2_key_event = runtime_event(placement::consts::KEY_EVENT, &hex_payload(&key));
+        imr2_key_event.imr = 2;
+        // At least one imr==3 event is required for replay to succeed.
+        let os_event = runtime_event("os-image-hash", &hex::encode(b"image-hash-value"));
+
+        let events = vec![imr2_key_event, os_event];
+        let rtmr3 = replay_rtmr3(&events);
+        let report = event_log_report(&events);
+
+        let result = verifier()
+            .verify_rtmr3_and_extract(&report, &rtmr3)
+            .unwrap();
+        assert_eq!(result.replica_report_key, None);
+    }
+
+    #[test]
+    fn unknown_event_still_verifies() {
+        let vk = test_signing_key(7).verifying_key();
+        let key = replica_report_key_payload(&vk, "boot-1");
+
+        let events = vec![
+            runtime_event("os-image-hash", &hex::encode(b"image-hash-value")),
+            runtime_event("compose-hash", &hex::encode(b"compose-hash-value")),
+            runtime_event("some-unrecognized-future-event", &hex::encode(b"anything")),
+            runtime_event(placement::consts::KEY_EVENT, &hex_payload(&key)),
+        ];
+        let rtmr3 = replay_rtmr3(&events);
+        let report = event_log_report(&events);
+
+        // P4: RTMR3 replay must still succeed with an extra, unknown event
+        // mixed into the log, and known extraction still works.
+        let result = verifier()
+            .verify_rtmr3_and_extract(&report, &rtmr3)
+            .unwrap();
+        assert_eq!(
+            result.os_image_hash.as_deref(),
+            Some(hex::encode(b"image-hash-value")).as_deref()
+        );
+        assert_eq!(result.replica_report_key, Some(key));
+    }
+
+    #[test]
+    fn malformed_key_payload_is_ignored_not_fatal() {
+        let vk = test_signing_key(7).verifying_key();
+        let valid = replica_report_key_payload(&vk, "boot-valid");
+
+        let events = vec![
+            runtime_event(placement::consts::KEY_EVENT, &hex_payload(&valid)),
+            // Later event: valid hex, but not valid JSON for ReplicaReportKey.
+            runtime_event(placement::consts::KEY_EVENT, &hex::encode(b"not json")),
+        ];
+        let rtmr3 = replay_rtmr3(&events);
+        let report = event_log_report(&events);
+
+        // Malformed payload must not be fatal to verification, and must not
+        // clear the earlier valid key (last VALID event wins).
+        let result = verifier()
+            .verify_rtmr3_and_extract(&report, &rtmr3)
+            .unwrap();
+        assert_eq!(result.replica_report_key, Some(valid));
+    }
+
+    #[test]
+    fn public_key_hashes_to_key_id() {
+        let vk = test_signing_key(7).verifying_key();
+        let valid = replica_report_key_payload(&vk, "boot-1");
+        assert_eq!(
+            parse_replica_report_key(&hex_payload(&valid)),
+            Some(valid.clone())
+        );
+
+        // A key_id that doesn't hash back to the public key is a mismatch,
+        // and must be ignored (-> None), not trusted.
+        let mut mismatched = valid;
+        mismatched.key_id = "0000000000000000".to_string();
+        assert_eq!(parse_replica_report_key(&hex_payload(&mismatched)), None);
+    }
 
     fn make_jwt(payload: serde_json::Value) -> String {
         let header = base64::engine::general_purpose::URL_SAFE_NO_PAD

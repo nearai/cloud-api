@@ -1024,6 +1024,10 @@ impl PoolBackendVerifier {
             // connection than the one to `base_url` that stays in the pool.
             // Backends do not redirect these requests.
             .redirect(reqwest::redirect::Policy::none())
+            // Always connect directly. Through an HTTP proxy tunnel reqwest
+            // exposes no TLS session information, so the check above would
+            // fail for every backend.
+            .no_proxy()
             .pool_max_idle_per_host(1)
             .http2_adaptive_window(true)
             .connect_timeout(Duration::from_secs(5))
@@ -1950,8 +1954,10 @@ impl InferenceProviderPool {
                     let client = match reqwest::Client::builder()
                         .use_preconfigured_tls(rustls_config)
                         .tls_info(true)
-                        // The observed certificate must be the probed host's.
+                        // The observed certificate must be the probed host's,
+                        // on a direct connection (see `build_bucket_client`).
                         .redirect(reqwest::redirect::Policy::none())
+                        .no_proxy()
                         .connect_timeout(Duration::from_secs(5))
                         .read_timeout(PER_CALL_TIMEOUT)
                         .build()

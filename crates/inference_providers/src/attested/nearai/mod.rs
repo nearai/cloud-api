@@ -685,9 +685,12 @@ impl Provider {
         let completion_timeout = config.completion_timeout();
         let control_timeout = config.control_timeout();
 
-        // General-purpose client for non-completion requests
+        // General-purpose client for non-completion requests. Like the fallback
+        // and bucket clients, it does not follow redirects: every request goes
+        // to a URL derived from `base_url`, and backends do not redirect.
         let client = Client::builder()
             .use_preconfigured_tls(tls_roots.build_config(fingerprint_state.clone()))
+            .redirect(reqwest::redirect::Policy::none())
             .connect_timeout(Duration::from_secs(5))
             .pool_idle_timeout(Duration::from_secs(90))
             .read_timeout(control_timeout)
@@ -699,6 +702,7 @@ impl Provider {
         // when inline bucket verification fails.
         let fallback_client = Client::builder()
             .use_preconfigured_tls(tls_roots.build_config(fingerprint_state.clone()))
+            .redirect(reqwest::redirect::Policy::none())
             .connect_timeout(Duration::from_secs(5))
             .pool_idle_timeout(Duration::from_secs(90))
             .read_timeout(completion_timeout)
@@ -5613,6 +5617,64 @@ mod tests {
             "1 initial fetch + one retry per backoff entry"
         );
         handle.abort();
+    }
+
+    /// The general and fallback clients return a backend redirect as an error
+    /// instead of following it.
+    #[tokio::test]
+    async fn general_and_fallback_clients_do_not_follow_redirects() {
+        use crate::InferenceProvider;
+        let server = MockServer::start().await;
+        let moved = format!("{}/moved", server.uri());
+        for (verb, route) in [
+            ("POST", "/v1/chat/completions"),
+            ("GET", "/v1/attestation/report"),
+        ] {
+            Mock::given(method(verb))
+                .and(path(route))
+                .respond_with(ResponseTemplate::new(307).insert_header("location", moved.as_str()))
+                .mount(&server)
+                .await;
+        }
+        Mock::given(path("/moved"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(0)
+            .mount(&server)
+            .await;
+        let provider = Provider::new(Config {
+            base_url: server.uri(),
+            api_key: None,
+            completion_timeout_seconds: 5,
+            control_timeout_seconds: 5,
+        });
+
+        // No rotation for an IP-literal URL: chat goes through the fallback client.
+        let params: ChatCompletionParams = serde_json::from_value(serde_json::json!({
+            "model": "test-model",
+            "messages": [{"role": "user", "content": "hi"}],
+        }))
+        .unwrap();
+        let chat = provider.chat_completion(params, "hash".to_string()).await;
+        assert!(
+            matches!(
+                chat,
+                Err(CompletionError::HttpError {
+                    status_code: 307,
+                    ..
+                })
+            ),
+            "{chat:?}"
+        );
+
+        // The attestation report is fetched with the general client.
+        let report = provider
+            .get_attestation_report("test-model".to_string(), None, None, None, false)
+            .await;
+        assert!(
+            matches!(&report, Err(AttestationError::FetchError(msg)) if msg.contains("307")),
+            "{report:?}"
+        );
+        server.verify().await;
     }
 
     #[tokio::test]

@@ -27,6 +27,25 @@ impl AffinityKey {
     pub fn from_bytes(b: [u8; 16]) -> Self {
         Self(b)
     }
+
+    /// Lowercase hex encoding of the 16 key bytes, for the caller to carry
+    /// the key through an opaque channel (e.g. `params.extra`) between the
+    /// request path that derives it and the placement decision that reads
+    /// it. This is an explicit, deliberate conversion — not a `Display`/
+    /// `Debug`/`Serialize` impl — so it never fires from a `{:?}`/log call;
+    /// callers must still never log the returned string.
+    pub fn to_hex(&self) -> String {
+        hex::encode(self.0)
+    }
+
+    /// Inverse of [`Self::to_hex`]: parses a lowercase (or uppercase) hex
+    /// string back into an `AffinityKey`. Returns `None` if `s` is not
+    /// exactly 32 hex characters.
+    pub fn from_hex(s: &str) -> Option<Self> {
+        let bytes = hex::decode(s).ok()?;
+        let arr: [u8; 16] = bytes.try_into().ok()?;
+        Some(Self(arr))
+    }
 }
 
 /// An opaque follow-pin identifier: `HMAC-SHA256(pin_secret, key)`,
@@ -456,6 +475,22 @@ mod tests {
         let reduced = hrw_rank(&key, &remaining);
         let expected: Vec<String> = full.into_iter().filter(|h| *h != removed).collect();
         assert_eq!(reduced, expected);
+    }
+
+    #[test]
+    fn affinity_key_hex_round_trips() {
+        let key = AffinityKey::from_bytes([0xabu8; 16]);
+        let hex = key.to_hex();
+        assert_eq!(hex.len(), 32);
+        assert_eq!(hex, "ab".repeat(16));
+        let decoded = AffinityKey::from_hex(&hex).expect("valid hex decodes");
+        assert_eq!(decoded.to_hex(), hex);
+    }
+
+    #[test]
+    fn affinity_key_from_hex_rejects_wrong_length_and_garbage() {
+        assert!(AffinityKey::from_hex("abcd").is_none());
+        assert!(AffinityKey::from_hex("not-hex-at-all-not-hex-at-all!!").is_none());
     }
 
     #[test]

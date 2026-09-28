@@ -83,6 +83,7 @@ fn test_model(model_name: &str) -> ModelWithPricing {
 fn completion_request(model: &str) -> ports::CompletionRequest {
     ports::CompletionRequest {
         request_priority: 0,
+        session_hint: None,
         request_id: Uuid::new_v4(),
         model: model.to_string(),
         messages: vec![ports::CompletionMessage {

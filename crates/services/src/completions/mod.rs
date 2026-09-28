@@ -1,3 +1,4 @@
+pub mod affinity;
 pub mod ports;
 
 use crate::attestation::ports::AttestationServiceTrait;
@@ -772,6 +773,12 @@ pub struct CompletionServiceImpl {
     org_concurrent_limits: Cache<Uuid, u32>,
     /// Repository for fetching organization concurrent limits
     organization_limit_repository: Arc<dyn ports::OrganizationConcurrentLimitRepository>,
+    /// HMAC secret for deriving per-request placement affinity keys (see
+    /// `affinity::derive`). `None` until wired up (HKDF from the Valkey
+    /// password), in which case affinity derivation is skipped entirely and
+    /// `params.extra` is left unchanged — behavior is byte-identical to
+    /// before this field existed. Never logged.
+    affinity_secret: Option<[u8; 32]>,
 }
 
 /// TTL for organization concurrent limit cache (5 minutes)
@@ -890,7 +897,16 @@ impl CompletionServiceImpl {
             concurrent_limit: DEFAULT_CONCURRENT_LIMIT,
             org_concurrent_limits,
             organization_limit_repository,
+            affinity_secret: None,
         }
+    }
+
+    /// Set the placement-affinity HMAC secret (HKDF from the Valkey
+    /// password). Until this is called, affinity derivation is skipped and
+    /// `params.extra` carries no affinity keys. Never logged.
+    pub fn with_affinity_secret(mut self, secret: [u8; 32]) -> Self {
+        self.affinity_secret = Some(secret);
+        self
     }
 
     /// Extract tools and tool_choice from the extra HashMap if present and
@@ -1088,6 +1104,53 @@ impl CompletionServiceImpl {
             }
         }
         Ok(())
+    }
+
+    /// Derive the per-request placement affinity key (if any) and record it
+    /// in `chat_params.extra` for a later placement-routing task to read.
+    /// No-op while `affinity_secret` is `None` (unset until Task 12 wires
+    /// it up), so `extra` — and therefore behavior — is unchanged until
+    /// then. Never logs the key, its hex encoding, or its inputs.
+    fn apply_placement_affinity(
+        chat_params: &mut inference_providers::ChatCompletionParams,
+        organization_id: Uuid,
+        session_hint: Option<&str>,
+        affinity_secret: Option<[u8; 32]>,
+    ) {
+        let Some(secret) = affinity_secret else {
+            return;
+        };
+        let is_e2ee = chat_params
+            .extra
+            .get(crate::common::encryption_headers::MODEL_PUB_KEY)
+            .and_then(|v| v.as_str())
+            .is_some();
+        let Some((key, source)) = affinity::derive(
+            &organization_id.to_string(),
+            &chat_params.model,
+            session_hint,
+            &chat_params.extra,
+            &chat_params.messages,
+            is_e2ee,
+            &secret,
+        ) else {
+            return;
+        };
+        chat_params.extra.insert(
+            affinity::AFFINITY_EXTRA_KEY.to_string(),
+            serde_json::Value::String(key.to_hex()),
+        );
+        chat_params.extra.insert(
+            affinity::AFFINITY_SOURCE_EXTRA_KEY.to_string(),
+            serde_json::Value::String(
+                match source {
+                    placement::decision::AffinitySource::Client => "client",
+                    placement::decision::AffinitySource::Prefix => "prefix",
+                    placement::decision::AffinitySource::None => "none",
+                }
+                .to_string(),
+            ),
+        );
     }
 
     /// Reject `n > 1` requests for models that don't support multiple completions
@@ -1775,6 +1838,13 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
 
         Self::reject_n_gt_1_if_unsupported(model.attestation_supported, request.n, canonical_name)?;
 
+        Self::apply_placement_affinity(
+            &mut chat_params,
+            organization_id,
+            request.session_hint.as_deref(),
+            self.affinity_secret,
+        );
+
         let provider_start_time = Instant::now();
 
         // Compute routing hints from the request messages for adaptive load balancing.
@@ -1973,6 +2043,13 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
         )?;
 
         Self::reject_n_gt_1_if_unsupported(model.attestation_supported, request.n, canonical_name)?;
+
+        Self::apply_placement_affinity(
+            &mut chat_params,
+            organization_id,
+            request.session_hint.as_deref(),
+            self.affinity_secret,
+        );
 
         let provider_start_time = Instant::now();
         // Read before `chat_params` moves into the call below.

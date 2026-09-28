@@ -124,6 +124,20 @@ pub(crate) mod encryption_headers {
     pub const ENCRYPT_ALL_FIELDS: &str = "x_encrypt_all_fields";
 }
 
+/// `params.extra` keys the completion service uses to carry the derived
+/// placement affinity key (see `services::completions::affinity::derive`)
+/// down to a later placement-routing consumer. Routing-only, like
+/// `encryption_headers::MODEL_PUB_KEY`: never forwarded to an upstream
+/// provider and never logged. `pub(crate)` so other providers (Chutes,
+/// external) can strip the same constants instead of hardcoding the
+/// strings.
+pub(crate) mod placement_headers {
+    /// Lowercase hex of the derived affinity key.
+    pub const AFFINITY: &str = "x_placement_affinity";
+    /// The affinity key's source (`"client"` or `"prefix"`).
+    pub const AFFINITY_SOURCE: &str = "x_placement_affinity_source";
+}
+
 /// Configuration for vLLM provider.
 ///
 /// Two timeouts are kept independent because they have very different shapes:
@@ -772,6 +786,13 @@ impl Fleet {
         let pinned_pub_key = extra
             .remove(encryption_headers::MODEL_PUB_KEY)
             .and_then(|value| value.as_str().map(str::to_string));
+
+        // Placement affinity keys are routing-only (consumed by the pool /
+        // Placer before a provider ever sees them): drop them here too so
+        // they never leak into the serialized request body sent upstream,
+        // and are never forwarded as HTTP headers either.
+        extra.remove(placement_headers::AFFINITY);
+        extra.remove(placement_headers::AFFINITY_SOURCE);
 
         // Extract and forward x_encryption_version as HTTP header, then remove from extra
         if let Some(version) = extra
@@ -3398,6 +3419,62 @@ mod tests {
             json.contains("some_valid_param"),
             "Non-encryption extra fields should still be serialized"
         );
+    }
+
+    /// Regression test: placement affinity keys (`x_placement_affinity`,
+    /// `x_placement_affinity_source`) are routing-only, like
+    /// `x_model_pub_key`, and must never reach the serialized upstream
+    /// request body.
+    #[test]
+    fn test_placement_affinity_keys_never_reach_upstream_body() {
+        let provider = create_test_provider();
+
+        let mut extra = std::collections::HashMap::new();
+        extra.insert(
+            placement_headers::AFFINITY.to_string(),
+            serde_json::Value::String("00112233445566778899aabbccddeeff".to_string()),
+        );
+        extra.insert(
+            placement_headers::AFFINITY_SOURCE.to_string(),
+            serde_json::Value::String("client".to_string()),
+        );
+        extra.insert(
+            "some_valid_param".to_string(),
+            serde_json::Value::String("value".to_string()),
+        );
+
+        let mut headers = reqwest::header::HeaderMap::new();
+        let _ = provider
+            .fleet
+            .prepare_encryption_headers(&mut headers, &mut extra);
+
+        assert!(!extra.contains_key(placement_headers::AFFINITY));
+        assert!(!extra.contains_key(placement_headers::AFFINITY_SOURCE));
+
+        let params = ImageGenerationParams {
+            model: "test-model".to_string(),
+            prompt: "test prompt".to_string(),
+            n: None,
+            size: None,
+            response_format: None,
+            quality: None,
+            style: None,
+            extra,
+        };
+
+        let json = serde_json::to_string(&params).unwrap();
+
+        assert!(
+            !json.contains("x_placement_affinity"),
+            "placement affinity keys must NOT appear in JSON after prepare_encryption_headers"
+        );
+        assert!(
+            json.contains("some_valid_param"),
+            "non-affinity extra fields should still be serialized"
+        );
+
+        // No affinity-related HTTP header should have been added either.
+        assert!(headers.get("X-Placement-Affinity").is_none());
     }
 
     #[test]

@@ -1476,6 +1476,7 @@ impl ResponseServiceImpl {
             // Create completion request (names not included - tracked via database analytics)
             let completion_request = CompletionRequest {
                 request_priority: process_context.request_priority,
+                session_hint: None,
                 request_id: process_context.request_id,
                 model: process_context.request.model.clone(),
                 messages: messages.clone(),
@@ -3150,6 +3151,7 @@ impl ResponseServiceImpl {
             .unwrap_or_else(|_| "Qwen/Qwen3-30B-A3B-Instruct-2507".to_string());
         let completion_request = crate::completions::ports::CompletionRequest {
             request_id,
+            session_hint: None,
             model: title_model,
             messages: vec![crate::completions::ports::CompletionMessage {
                 reasoning_content: None,

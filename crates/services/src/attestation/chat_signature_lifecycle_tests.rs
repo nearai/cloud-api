@@ -82,9 +82,15 @@ impl AttestationRepository for RecordingRepository {
         chat_id: &str,
         signing_algo: &str,
     ) -> Result<ChatSignature, AttestationError> {
-        Err(AttestationError::SignatureNotFound(format!(
-            "{chat_id}:{signing_algo}"
-        )))
+        self.stored
+            .lock()
+            .map_err(|_| AttestationError::InternalError("stored lock poisoned".to_string()))?
+            .iter()
+            .find(|(stored_chat_id, signature)| {
+                stored_chat_id == chat_id && signature.signing_algo == signing_algo
+            })
+            .map(|(_, signature)| signature.clone())
+            .ok_or_else(|| AttestationError::SignatureNotFound(format!("{chat_id}:{signing_algo}")))
     }
 }
 

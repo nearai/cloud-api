@@ -1167,6 +1167,22 @@ pub async fn init_inference_providers_with_mocks(
     (pool, mock_provider)
 }
 
+fn build_cors_layer(cors_config: config::CorsConfig) -> CorsLayer {
+    CorsLayer::new()
+        .allow_origin(AllowOrigin::predicate(
+            move |origin: &HeaderValue, _request_parts: &axum::http::request::Parts| {
+                let origin_str = match origin.to_str() {
+                    Ok(s) => s,
+                    Err(_) => return false,
+                };
+                is_origin_allowed(origin_str, &cors_config)
+            },
+        ))
+        .allow_methods(Any)
+        .allow_headers(Any)
+        .expose_headers(Any)
+}
+
 pub fn is_origin_allowed(origin_str: &str, cors_config: &config::CorsConfig) -> bool {
     if cors_config.exact_matches.iter().any(|o| o == origin_str) {
         return true;
@@ -1443,21 +1459,7 @@ pub fn build_app_with_config_and_options(
         metrics_service: domain_services.metrics_service.clone(),
     };
 
-    // Create CORS layer
-    let cors_config = config.cors.clone();
-    let cors = CorsLayer::new()
-        .allow_origin(AllowOrigin::predicate(
-            move |origin: &HeaderValue, _request_parts: &axum::http::request::Parts| {
-                let origin_str = match origin.to_str() {
-                    Ok(s) => s,
-                    Err(_) => return false,
-                };
-                is_origin_allowed(origin_str, &cors_config)
-            },
-        ))
-        .allow_methods(Any)
-        .allow_headers(Any)
-        .expose_headers(Any);
+    let cors = build_cors_layer(config.cors.clone());
 
     // OHTTP routes: `POST /ohttp` and `GET /.well-known/ohttp-gateway` are at the
     // root (not under /v1) so clients can reach them without version-prefixing.
@@ -3248,6 +3250,37 @@ mod tests {
         let config = test_cors_config();
         assert!(is_origin_allowed("https://preview-example.com", &config));
         assert!(is_origin_allowed("https://staging-example.com", &config));
+    }
+
+    #[tokio::test]
+    async fn cors_layer_preserves_origin_allowlist() {
+        use axum::http::header::{ACCESS_CONTROL_ALLOW_ORIGIN, ORIGIN};
+
+        for (origin, allowed) in [
+            ("https://example.com", true),
+            ("https://www.typingmind.com", false),
+        ] {
+            let app = Router::new()
+                .route("/ok", get(|| async { "ok" }))
+                .layer(build_cors_layer(test_cors_config()));
+            let response = app
+                .oneshot(
+                    HttpRequest::builder()
+                        .uri("/ok")
+                        .header(ORIGIN, origin)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(
+                response.headers().get(ACCESS_CONTROL_ALLOW_ORIGIN),
+                allowed
+                    .then(|| HeaderValue::from_str(origin).unwrap())
+                    .as_ref(),
+            );
+        }
     }
 
     // --- cache_control_layer tests -------------------------------------------

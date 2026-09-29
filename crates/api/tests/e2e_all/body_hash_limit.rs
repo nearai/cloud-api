@@ -124,3 +124,42 @@ async fn under_limit_unauthenticated_request_still_reaches_auth() {
     assert_eq!(status, 401);
     assert_eq!(consumed, 4 * MIB);
 }
+
+#[tokio::test]
+async fn image_edits_declared_length_over_file_limit_is_rejected_without_reading() {
+    let (_server, router) = setup_test_server_and_router().await;
+
+    // Declares one byte over the 512 MiB image-edits limit; the actual body
+    // is small, so a missing cap would read it and fall through to auth (401).
+    let (body, consumed) = counting_body(MIB);
+    let request = axum::http::Request::builder()
+        .method("POST")
+        .uri("/v1/images/edits")
+        .header("Content-Type", "multipart/form-data; boundary=x")
+        .header(
+            "Content-Length",
+            (api::routes::files::MAX_FILE_SIZE + 1).to_string(),
+        )
+        .header("User-Agent", MOCK_USER_AGENT)
+        .body(body)
+        .unwrap();
+    let response = router.oneshot(request).await.unwrap();
+
+    assert_eq!(response.status(), 413);
+    assert_eq!(consumed.load(Ordering::SeqCst), 0);
+    let bytes = response.into_body().collect().await.unwrap().to_bytes();
+    assert_too_large_envelope(&serde_json::from_slice(&bytes).unwrap());
+}
+
+#[tokio::test]
+async fn image_edits_body_above_text_limit_still_reaches_auth() {
+    let (_server, router) = setup_test_server_and_router().await;
+
+    // 30 MiB exceeds the 25 MiB text-inference cap but not the image-edits
+    // cap, so this group must not inherit the smaller limit.
+    let (status, _json, consumed) =
+        send_unauthenticated(router, "/v1/images/edits", 30 * MIB).await;
+
+    assert_eq!(status, 401);
+    assert_eq!(consumed, 30 * MIB);
+}

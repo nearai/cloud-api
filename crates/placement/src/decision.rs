@@ -15,7 +15,7 @@ use rand::Rng;
 use crate::affinity::{pin_id, select, AffinityKey, PinId, Selection};
 use crate::consts::{FRESH_MAX_MS, PIN_TTL_MS};
 use crate::policy::{classify, lane_admits, lane_view, Class, LaneView, PriorityBand, Tier};
-use crate::rules::{first_exclusion, Exclusion, Rule, ALL_RULES};
+use crate::rules::{first_exclusion, saturated, Exclusion, Rule, ALL_RULES};
 use crate::score::{
     effective_backlog, fleet_median_tps, known_idle, pending_for, replica_score, Pending,
 };
@@ -123,8 +123,9 @@ impl LegacyReason {
 /// this type intentionally does not derive `Debug`.
 ///
 /// `Legacy` means no usable state, so the caller falls back. `Refused`
-/// means there is state and every replica that survived stage 1 was
-/// excluded by the heavy lane (only possible for a heavy request).
+/// means there is state and no capacity for a heavy request: the heavy lane
+/// excluded every stage-1 survivor, or every live replica reported itself
+/// full (`rules::saturated`). A short request is never refused.
 pub enum Decision {
     Place {
         slot: SlotId,
@@ -165,7 +166,8 @@ impl Decision {
 pub struct DecisionRecord {
     /// `place`, `refused` or `legacy`.
     pub outcome: &'static str,
-    /// The legacy reason, or `lane_full`/`long_full` for a refusal.
+    /// The legacy reason, or for a refusal `lane_full`/`long_full` (the lane
+    /// excluded every survivor) or `capacity_full` (every live replica full).
     pub reason: Option<&'static str>,
     pub tier: Tier,
     pub class: Class,
@@ -282,8 +284,8 @@ impl Placer {
     /// ledger against `snap.routed_read_ms`; see
     /// [`crate::score::pending_for`]). `Legacy` when
     /// the snapshot is disabled, empty, stale or has no stage-1
-    /// survivor; `Refused` only when the heavy lane excluded every survivor;
-    /// otherwise `Place`. The record's `place_us` times the whole call.
+    /// survivor; `Refused` only for a heavy request with no capacity (see
+    /// [`Decision`]); otherwise `Place`. The record's `place_us` times the whole call.
     pub fn place(
         &self,
         input: &PlaceInput,
@@ -349,17 +351,6 @@ impl Placer {
             }
         }
 
-        // No stage-1 survivor (stale, not ready, over context, ...) is a
-        // state problem, never a capacity one: fall back, don't refuse.
-        if candidates.is_empty() {
-            return self.legacy(
-                input,
-                snap,
-                LegacyReason::NoneEligible,
-                Some(tally.record()),
-            );
-        }
-
         // Stage 2: the heavy lane, admitting stage-1 survivors against a view
         // of every live replica.
         let class = Class::of(input.heavy);
@@ -367,6 +358,26 @@ impl Placer {
             let survivors: Vec<&SlotId> = candidates.iter().map(|c| &c.view.slot).collect();
             lane_view(&live, &survivors)
         };
+
+        // No stage-1 survivor is a state problem (stale, not ready, over
+        // context, no load counts), so fall back, except when every live
+        // replica reported itself full: that is the same capacity answer as a
+        // full lane, and a heavy request is refused either way.
+        if candidates.is_empty() {
+            let all_full = !live.is_empty() && live.iter().all(|(v, _)| saturated(v));
+            return match class {
+                Class::Heavy if all_full => {
+                    self.refused(input, snap, &lane, class, "capacity_full", tally.record())
+                }
+                _ => self.legacy(
+                    input,
+                    snap,
+                    LegacyReason::NoneEligible,
+                    Some(tally.record()),
+                ),
+            };
+        }
+
         candidates.retain(|c| {
             let is_member = lane.members.contains(&c.view.slot);
             let admitted = lane_admits(
@@ -385,11 +396,13 @@ impl Placer {
         });
 
         if candidates.is_empty() {
-            // Only capacity excluded the survivors. `lane_admits` always
+            // Only the lane excluded the survivors. `lane_admits` always
             // admits a short request when anything survived stage 1, so this
             // is heavy in practice; a short request would still fall back.
             return match class {
-                Class::Heavy => self.refused(input, snap, &lane, class, tally.record()),
+                Class::Heavy => {
+                    self.refused(input, snap, &lane, class, self.lane_full(), tally.record())
+                }
                 Class::Short => self.legacy(
                     input,
                     snap,
@@ -531,26 +544,34 @@ impl Placer {
         Decision::Legacy { reason, record }
     }
 
-    /// Builds a `Decision::Refused`: `long_full` on the long tier (every
-    /// survivor over `LONG_BACKLOG_CAP`), `lane_full` on base.
+    /// Builds a `Decision::Refused` with `reason`: see
+    /// [`DecisionRecord::reason`] and [`Self::lane_full`].
     fn refused(
         &self,
         input: &PlaceInput,
         snap: &Snapshot,
         lane: &LaneView,
         class: Class,
+        reason: &'static str,
         excluded: [(Rule, u16); 5],
     ) -> Decision {
         let mut record = DecisionRecord::empty(input, snap, self.tier, "refused");
-        record.reason = Some(match self.tier {
-            Tier::Long => "long_full",
-            Tier::Base => "lane_full",
-        });
+        record.reason = Some(reason);
         record.strategy = Some(classify(self.tier, class, lane, None).as_str());
         record.lane_size = u16::try_from(lane.size).unwrap_or(u16::MAX);
         record.lane_cap = u16::try_from(lane.cap).unwrap_or(u16::MAX);
         record.excluded = excluded;
         Decision::Refused { record }
+    }
+
+    /// The refusal reason when the lane excluded every survivor: `long_full`
+    /// on the long tier (every survivor over `LONG_BACKLOG_CAP`), `lane_full`
+    /// on base.
+    const fn lane_full(&self) -> &'static str {
+        match self.tier {
+            Tier::Long => "long_full",
+            Tier::Base => "lane_full",
+        }
     }
 }
 
@@ -1187,6 +1208,58 @@ mod tests {
         assert_eq!(reason, LegacyReason::NoneEligible);
         assert_eq!(record.excluded[1], (Rule::Freshness, 8));
         assert_eq!(record.excluded[4], (Rule::Lane, 0));
+    }
+
+    #[test]
+    fn heavy_with_all_replicas_kv_full_is_refused_not_legacy() {
+        // Every live replica is out of capacity: one KV-full, one at the
+        // queue bound (2 x max_running in flight). That is the same capacity
+        // answer as a full lane, so a heavy request is refused, not sent to
+        // legacy routing (which would queue it on the same replicas).
+        let mut kv_full = ready_view("gpu01", 0);
+        kv_full.state.load.kv_usage = Some(crate::consts::KV_MAX);
+        let mut queue_full = ready_view("gpu01", 1);
+        queue_full.state.limits.max_running = Some(4);
+        queue_full.state.load.running = Some(8);
+        let mut draining = ready_view("gpu02", 0);
+        draining.state.lifecycle_state = crate::frame::Lifecycle::Draining;
+        let snap = snap_with(vec![kv_full.clone(), queue_full, draining]);
+        for tier in [Tier::Base, Tier::Long] {
+            let mut rng = StdRng::seed_from_u64(1);
+            let p = Placer::new([1u8; 32], tier);
+            let record = refused_record(p.place(&heavy(100_000), &snap, &HashMap::new(), &mut rng));
+            assert_eq!(record.outcome, "refused");
+            assert_eq!(record.strategy, Some("refuse"));
+            assert_eq!(record.reason, Some("capacity_full"));
+            assert_eq!(record.excluded[0], (Rule::Lifecycle, 1));
+            assert_eq!(record.excluded[2], (Rule::Capacity, 2));
+            assert_eq!(record.excluded[4], (Rule::Lane, 0));
+
+            // A short request never refuses: it falls back.
+            let (reason, _) =
+                legacy_reason(p.place(&base_input(), &snap, &HashMap::new(), &mut rng));
+            assert_eq!(reason, LegacyReason::NoneEligible);
+        }
+
+        let mut rng = StdRng::seed_from_u64(1);
+        // A live replica with no load counts at all is a state problem, not a
+        // full one: still legacy.
+        let mut countless = ready_view("gpu02", 1);
+        countless.state.load.running = None;
+        countless.state.load.queued = None;
+        let snap = snap_with(vec![kv_full.clone(), countless]);
+        let (reason, _) =
+            legacy_reason(placer().place(&heavy(100_000), &snap, &HashMap::new(), &mut rng));
+        assert_eq!(reason, LegacyReason::NoneEligible);
+
+        // So is a live replica the request does not fit (Context).
+        let mut small = ready_view("gpu02", 1);
+        small.state.limits.max_context_tokens = Some(64_000);
+        let mut input = heavy(100_000);
+        input.context_tokens = Some(120_000);
+        let snap = snap_with(vec![kv_full, small]);
+        let (reason, _) = legacy_reason(placer().place(&input, &snap, &HashMap::new(), &mut rng));
+        assert_eq!(reason, LegacyReason::NoneEligible);
     }
 
     #[test]

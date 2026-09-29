@@ -164,6 +164,12 @@ async fn resolve_all(
             let (text, stored_name) = match extracted.get(&key) {
                 Some(hit) => hit.clone(),
                 None => {
+                    // Reserve a worker slot first: with the pool full, fail
+                    // fast (429) before fetching and decrypting a stored file
+                    // or decoding a large inline payload.
+                    let slot = extractor
+                        .reserve()
+                        .map_err(|e| (FilePartError::Extract(e), param.clone()))?;
                     // Storage reads share the request deadline with extraction.
                     let (bytes, stored_name) = tokio::time::timeout_at(
                         deadline,
@@ -178,7 +184,7 @@ async fn resolve_all(
                     })?
                     .map_err(|e| (e, param.clone()))?;
                     let text = extractor
-                        .extract_text(bytes, deadline)
+                        .extract_text_in_slot(slot, bytes, deadline)
                         .await
                         .map_err(|e| (FilePartError::Extract(e), param.clone()))?;
                     extracted.insert(key, (text.clone(), stored_name.clone()));
@@ -306,7 +312,7 @@ mod tests {
     use async_trait::async_trait;
     use base64::Engine;
     use serde_json::json;
-    use services::files::extract::ExtractLimits;
+    use services::files::extract::{ExtractLimits, WorkerSlot};
     use services::files::{File, UploadFileParams};
     use services::metrics::MockMetricsService;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -331,6 +337,9 @@ mod tests {
             expires_at: None,
         }
     }
+
+    /// Counts how many times file *content* was downloaded.
+    static CONTENT_READS: AtomicUsize = AtomicUsize::new(0);
 
     struct Files;
     #[async_trait]
@@ -357,6 +366,7 @@ mod tests {
                 id, HUGE,
                 "oversize stored file must be rejected before download"
             );
+            CONTENT_READS.fetch_add(1, Ordering::SeqCst);
             Ok((self.get_file(id, ws).await?, b"stored-bytes".to_vec()))
         }
         async fn list_files(
@@ -380,6 +390,8 @@ mod tests {
     struct Echo {
         limits: ExtractLimits,
         calls: AtomicUsize,
+        reservations: AtomicUsize,
+        busy: bool,
         fail: Option<FileExtractError>,
     }
     impl Echo {
@@ -387,6 +399,8 @@ mod tests {
             Self {
                 limits: ExtractLimits::default(),
                 calls: AtomicUsize::new(0),
+                reservations: AtomicUsize::new(0),
+                busy: false,
                 fail: None,
             }
         }
@@ -396,8 +410,16 @@ mod tests {
         fn limits(&self) -> &ExtractLimits {
             &self.limits
         }
-        async fn extract_text(
+        fn reserve(&self) -> Result<WorkerSlot, FileExtractError> {
+            self.reservations.fetch_add(1, Ordering::SeqCst);
+            if self.busy {
+                return Err(FileExtractError::Busy);
+            }
+            Ok(WorkerSlot::unbounded())
+        }
+        async fn extract_text_in_slot(
             &self,
+            _: WorkerSlot,
             bytes: Vec<u8>,
             _: tokio::time::Instant,
         ) -> Result<String, FileExtractError> {
@@ -521,6 +543,40 @@ mod tests {
                 "File: stored.pdf\nContent:\nstored-bytes"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn full_worker_pool_rejects_before_any_download() {
+        // A saturated pool must answer 429 without first fetching and
+        // decrypting the stored file (up to 25 MiB per request).
+        let reads_before = CONTENT_READS.load(Ordering::SeqCst);
+        let echo = Echo {
+            busy: true,
+            ..Echo::new()
+        };
+        let mut messages = vec![msg(
+            json!([{"type": "file", "file": {"file_id": format!("file-{STORED}")}}]),
+        )];
+        let (status, body) = error_json(run(&mut messages, None, &echo).await.unwrap_err()).await;
+        assert_eq!(status, 429, "{body}");
+        assert_eq!(body["error"]["type"], "service_overloaded");
+        assert_eq!(echo.calls.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            CONTENT_READS.load(Ordering::SeqCst),
+            reads_before,
+            "no download when the pool is full"
+        );
+    }
+
+    #[tokio::test]
+    async fn repeated_source_reserves_one_slot() {
+        let echo = Echo::new();
+        let mut messages = vec![
+            msg(json!([inline("same", None)])),
+            msg(json!([inline("same", None)])),
+        ];
+        run(&mut messages, None, &echo).await.unwrap();
+        assert_eq!(echo.reservations.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]

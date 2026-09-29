@@ -131,15 +131,45 @@ impl From<WorkerFailure> for FileExtractError {
     }
 }
 
+/// A reserved worker-pool slot. Callers reserve one *before* loading a file's
+/// bytes so a full pool is reported (429) before any expensive download or
+/// decrypt, and hand it to `extract_text_in_slot`. Dropping it releases the
+/// slot.
+pub struct WorkerSlot {
+    permit: Option<OwnedSemaphorePermit>,
+}
+
+impl WorkerSlot {
+    /// A slot that reserves nothing, for extractors without a bounded pool.
+    pub fn unbounded() -> Self {
+        Self { permit: None }
+    }
+}
+
 #[async_trait]
 pub trait FileTextExtractor: Send + Sync {
     fn limits(&self) -> &ExtractLimits;
-    /// Plain text of a PDF. Fails fast with `Busy` when no worker slot is free.
+
+    /// Reserve a worker slot without doing any work; `Busy` when none is free.
+    fn reserve(&self) -> Result<WorkerSlot, FileExtractError>;
+
+    /// Plain text of a PDF, using a slot from `reserve`.
+    async fn extract_text_in_slot(
+        &self,
+        slot: WorkerSlot,
+        bytes: Vec<u8>,
+        deadline: tokio::time::Instant,
+    ) -> Result<String, FileExtractError>;
+
+    /// Reserve a slot and extract in one step; fails fast with `Busy`.
     async fn extract_text(
         &self,
         bytes: Vec<u8>,
         deadline: tokio::time::Instant,
-    ) -> Result<String, FileExtractError>;
+    ) -> Result<String, FileExtractError> {
+        let slot = self.reserve()?;
+        self.extract_text_in_slot(slot, bytes, deadline).await
+    }
 }
 
 pub struct WorkerPdfExtractor {
@@ -172,8 +202,19 @@ impl FileTextExtractor for WorkerPdfExtractor {
         &self.limits
     }
 
-    async fn extract_text(
+    fn reserve(&self) -> Result<WorkerSlot, FileExtractError> {
+        self.permits
+            .clone()
+            .try_acquire_owned()
+            .map(|permit| WorkerSlot {
+                permit: Some(permit),
+            })
+            .map_err(|_| FileExtractError::Busy)
+    }
+
+    async fn extract_text_in_slot(
         &self,
+        slot: WorkerSlot,
         bytes: Vec<u8>,
         deadline: tokio::time::Instant,
     ) -> Result<String, FileExtractError> {
@@ -186,11 +227,7 @@ impl FileTextExtractor for WorkerPdfExtractor {
         if tokio::time::Instant::now() >= deadline {
             return Err(FileExtractError::Timeout);
         }
-        let permit = self
-            .permits
-            .clone()
-            .try_acquire_owned()
-            .map_err(|_| FileExtractError::Busy)?;
+        let permit = slot.permit;
 
         // env_clear: the gateway's environment holds database, OAuth and
         // provider secrets; the worker needs none of them.
@@ -211,7 +248,7 @@ impl FileTextExtractor for WorkerPdfExtractor {
 
         let mut worker = LiveWorker {
             child: Some(child),
-            permit: Some(permit),
+            permit,
         };
         let cap = self.max_output_bytes();
         let child = worker.child.as_mut().ok_or(FileExtractError::Unavailable)?;
@@ -556,6 +593,38 @@ mod tests {
             );
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
+    }
+
+    #[tokio::test]
+    async fn reserved_slot_is_held_until_extraction_finishes() {
+        let limits = ExtractLimits {
+            max_workers: 1,
+            ..ExtractLimits::default()
+        };
+        let ex = sh(r#"cat >/dev/null; printf '{"ok":"t"}'"#, limits);
+        let slot = ex.reserve().expect("free pool reserves a slot");
+        // While reserved, the pool is full for everyone else: fail fast, no work.
+        assert!(matches!(ex.reserve(), Err(FileExtractError::Busy)));
+        assert_eq!(
+            ex.extract_text_in_slot(slot, FAKE_PDF.to_vec(), soon())
+                .await,
+            Ok("t".to_string())
+        );
+        assert!(
+            ex.reserve().is_ok(),
+            "slot is freed once the worker is reaped"
+        );
+    }
+
+    #[tokio::test]
+    async fn dropping_a_reservation_frees_the_slot() {
+        let limits = ExtractLimits {
+            max_workers: 1,
+            ..ExtractLimits::default()
+        };
+        let ex = sh("sleep 30", limits);
+        drop(ex.reserve().unwrap());
+        assert!(ex.reserve().is_ok());
     }
 
     #[tokio::test]

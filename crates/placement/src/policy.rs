@@ -105,7 +105,7 @@ pub struct LaneView {
 }
 
 /// Build the lane from the stage-1 survivors (Lifecycle..Context) and each
-/// one's load (`prefill_backlog_tokens.unwrap_or(0) + pending tokens`).
+/// one's load (`score::effective_backlog` plus pending tokens).
 pub fn lane_view(pre_lane: &[(&ReplicaView, u64)]) -> LaneView {
     let members: HashSet<SlotId> = pre_lane
         .iter()
@@ -122,16 +122,19 @@ pub fn lane_view(pre_lane: &[(&ReplicaView, u64)]) -> LaneView {
 }
 
 /// The single admission predicate, applied to each stage-1 survivor as
-/// `Rule::Lane`.
+/// `Rule::Lane`. `load` is the replica's lane load
+/// (`score::effective_backlog` plus pending tokens), and `idle` says that
+/// load is *known* to be zero: `score::known_idle` and nothing pending.
 ///
 /// - Heavy on the long tier: the replica's load plus the prompt must fit
-///   under `LONG_BACKLOG_CAP`, unless the replica is idle (`load == 0`).
+///   under `LONG_BACKLOG_CAP`, unless the replica is idle.
 /// - Heavy on the base tier: the same under `HEAVY_BACKLOG_CAP` (again
 ///   waived for an idle replica), and the replica must already be a member
 ///   or the lane must have room for one more.
 ///
 /// The idle waiver keeps a single prompt larger than the cap servable: the
-/// cap bounds queueing behind other work, and an idle replica has none. The
+/// cap bounds queueing behind other work, and an idle replica has none. It
+/// needs known load, so a replica that omits a load field never gets it. The
 /// engine's own context limit is `Rule::Context`'s job, not the lane's.
 /// - Short: a member is avoided while any clean replica survives; with none
 ///   clean, every survivor passes, so short requests are never refused.
@@ -139,14 +142,15 @@ pub fn lane_admits(
     tier: Tier,
     class: Class,
     load: u64,
+    idle: bool,
     prompt: u64,
     is_member: bool,
     lane: &LaneView,
 ) -> bool {
     match (tier, class) {
-        (Tier::Long, Class::Heavy) => load == 0 || load.saturating_add(prompt) <= LONG_BACKLOG_CAP,
+        (Tier::Long, Class::Heavy) => idle || load.saturating_add(prompt) <= LONG_BACKLOG_CAP,
         (Tier::Base, Class::Heavy) => {
-            (load == 0 || load.saturating_add(prompt) <= HEAVY_BACKLOG_CAP)
+            (idle || load.saturating_add(prompt) <= HEAVY_BACKLOG_CAP)
                 && (is_member || lane.size < lane.cap)
         }
         (_, Class::Short) => !is_member || !lane.any_clean,
@@ -268,6 +272,7 @@ mod tests {
             Tier::Base,
             Class::Heavy,
             70_000,
+            false,
             prompt,
             true,
             &lane
@@ -276,6 +281,7 @@ mod tests {
             Tier::Base,
             Class::Heavy,
             0,
+            true,
             prompt,
             false,
             &lane
@@ -287,6 +293,7 @@ mod tests {
             Tier::Base,
             Class::Heavy,
             0,
+            true,
             prompt,
             false,
             &lane
@@ -296,7 +303,7 @@ mod tests {
     #[test]
     fn heavy_admission_is_capped_by_tier() {
         let lane = lane_of(&[0, 0, 0, 0]);
-        let at = |tier, load| lane_admits(tier, Class::Heavy, load, 100_000, false, &lane);
+        let at = |tier, load| lane_admits(tier, Class::Heavy, load, false, 100_000, false, &lane);
         assert!(at(Tier::Base, HEAVY_BACKLOG_CAP - 100_000));
         assert!(!at(Tier::Base, HEAVY_BACKLOG_CAP - 99_999));
         assert!(at(Tier::Long, LONG_BACKLOG_CAP - 100_000));
@@ -307,6 +314,7 @@ mod tests {
             Tier::Long,
             Class::Heavy,
             0,
+            true,
             100_000,
             false,
             &full
@@ -316,6 +324,7 @@ mod tests {
             Tier::Long,
             Class::Heavy,
             u64::MAX,
+            false,
             1,
             true,
             &full
@@ -330,10 +339,29 @@ mod tests {
             Tier::Long,
             Class::Heavy,
             0,
+            true,
             prompt,
             false,
             &lane
         ));
+    }
+
+    #[test]
+    fn zero_load_without_known_idle_gets_no_waiver() {
+        // A zero lane load read from missing fields is not idleness.
+        let lane = lane_of(&[0, 0]);
+        let prompt = LONG_BACKLOG_CAP + 1;
+        for tier in [Tier::Base, Tier::Long] {
+            assert!(!lane_admits(
+                tier,
+                Class::Heavy,
+                0,
+                false,
+                prompt,
+                true,
+                &lane
+            ));
+        }
     }
 
     #[test]
@@ -344,6 +372,7 @@ mod tests {
             Tier::Base,
             Class::Heavy,
             0,
+            true,
             prompt,
             false,
             &room
@@ -354,6 +383,7 @@ mod tests {
             Tier::Base,
             Class::Heavy,
             0,
+            true,
             prompt,
             false,
             &full
@@ -367,6 +397,7 @@ mod tests {
             Tier::Long,
             Class::Heavy,
             1,
+            false,
             LONG_BACKLOG_CAP,
             false,
             &lane
@@ -375,6 +406,7 @@ mod tests {
             Tier::Base,
             Class::Heavy,
             1,
+            false,
             HEAVY_BACKLOG_CAP,
             false,
             &lane
@@ -385,6 +417,7 @@ mod tests {
             Tier::Base,
             Class::Heavy,
             LANE_LOAD_TOKENS,
+            false,
             prompt,
             true,
             &member
@@ -399,17 +432,19 @@ mod tests {
                 tier,
                 Class::Short,
                 LANE_LOAD_TOKENS,
+                false,
                 10,
                 true,
                 &lane
             ));
-            assert!(lane_admits(tier, Class::Short, 0, 10, false, &lane));
+            assert!(lane_admits(tier, Class::Short, 0, true, 10, false, &lane));
         }
         let no_clean = lane_of(&[LANE_LOAD_TOKENS, LANE_LOAD_TOKENS]);
         assert!(lane_admits(
             Tier::Base,
             Class::Short,
             u64::MAX,
+            false,
             10,
             true,
             &no_clean

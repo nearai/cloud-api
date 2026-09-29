@@ -33,9 +33,10 @@ pub(crate) fn seal(report: &HostReport, key: &SigningKey) -> Envelope {
 }
 
 /// A replica state that passes every eligibility rule as of `NOW`: `Ready`,
-/// freshly sampled, idle (`running`/`queued` both `Some(0)`, so it also
-/// clears `Rule::Capacity`'s fail-closed "no counts at all" check), and with
-/// no declared limits.
+/// freshly sampled, known idle (`running`, `queued` and
+/// `prefill_backlog_tokens` all `Some(0)`, so it clears `Rule::Capacity`'s
+/// fail-closed "no counts at all" check and gets the lane's idle waiver), and
+/// with no declared limits.
 pub(crate) fn replica_state(index: u32) -> ReplicaState {
     ReplicaState {
         index,
@@ -46,6 +47,7 @@ pub(crate) fn replica_state(index: u32) -> ReplicaState {
         load: Load {
             running: Some(0),
             queued: Some(0),
+            prefill_backlog_tokens: Some(0),
             ..Load::default()
         },
         proxy_inflight: 0,

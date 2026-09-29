@@ -31,6 +31,11 @@ pub const KV_MAX: f64 = 0.95;
 /// converting a token count into a `fullness`-comparable unit for `score.rs`.
 pub const PREFILL_NORM_TOKENS: f64 = 16_000.0;
 
+/// Tokens assumed per queued request when a replica reports `queued` but no
+/// `prefill_backlog_tokens` (see `score::effective_backlog`). Conservative on
+/// purpose: an unreported backlog must never read as an empty one.
+pub const QUEUED_TOKENS_ESTIMATE: u64 = 2_000;
+
 /// Fallback denominator for `fullness` when a replica reports no
 /// `limits.max_running`.
 pub const DEFAULT_MAX_RUNNING: f64 = 40.0;

@@ -15,7 +15,9 @@ use crate::affinity::{pin_id, select, AffinityKey, PinId, Selection};
 use crate::consts::{FRESH_MAX_MS, PIN_TTL_MS};
 use crate::policy::{classify, lane_admits, lane_view, Class, LaneView, PriorityBand, Tier};
 use crate::rules::{first_exclusion, Rule, ALL_RULES};
-use crate::score::{fleet_median_tps, pending_for, replica_score, Pending};
+use crate::score::{
+    effective_backlog, fleet_median_tps, known_idle, pending_for, replica_score, Pending,
+};
 use crate::snapshot::{ReplicaView, SlotId, Snapshot};
 
 /// Per-request inputs the eligibility rules (`rules.rs`) check a
@@ -251,12 +253,14 @@ impl Tally {
     }
 }
 
-/// A stage-1 survivor, the pending load it is scored with, and its lane
-/// load (`prefill_backlog_tokens.unwrap_or(0) + pending.tok`).
+/// A stage-1 survivor, the pending load it is scored with, its lane load
+/// (`effective_backlog + pending.tok`), and whether that load is known to be
+/// zero (`known_idle` with nothing pending), for the lane's idle waiver.
 struct Candidate<'a> {
     view: &'a ReplicaView,
     pending: Pending,
     load: u64,
+    idle: bool,
 }
 
 /// The pure placement decision-maker for one Fleet. Holds only the
@@ -322,16 +326,13 @@ impl Placer {
                         snap.routed.get(&view.slot),
                         mine.get(&view.slot).copied().unwrap_or_default(),
                     );
-                    let load = view
-                        .state
-                        .load
-                        .prefill_backlog_tokens
-                        .unwrap_or(0)
-                        .saturating_add(pending.tok);
+                    let load = effective_backlog(&view.state.load).saturating_add(pending.tok);
+                    let idle = known_idle(&view.state.load) && pending == Pending::default();
                     candidates.push(Candidate {
                         view,
                         pending,
                         load,
+                        idle,
                     });
                 }
                 Some(exclusion) => tally.add(exclusion.0),
@@ -362,6 +363,7 @@ impl Placer {
                 self.tier,
                 class,
                 c.load,
+                c.idle,
                 input.prompt_tokens,
                 is_member,
                 &lane,
@@ -1354,6 +1356,70 @@ mod tests {
         assert_eq!(chosen, slot("long01", 1));
         assert_eq!(record.strategy, Some("heavy_long"));
         assert_eq!(record.excluded[4], (Rule::Lane, 1));
+    }
+
+    #[test]
+    fn missing_backlog_counts_conservatively_in_lane() {
+        // No reported backlog, 40 queued: the score reads that as 80K tokens
+        // (`queued * QUEUED_TOKENS_ESTIMATE`), so the lane must too. It makes
+        // gpu01#0 a member, and short requests avoid it.
+        let mut unknown = ready_view("gpu01", 0);
+        unknown.state.load.queued = Some(40);
+        unknown.state.load.prefill_backlog_tokens = None;
+        let snap = snap_with(vec![
+            unknown.clone(),
+            ready_view("gpu01", 1),
+            ready_view("gpu02", 0),
+            ready_view("gpu02", 1),
+        ]);
+        for seed in 0..32 {
+            let mut rng = StdRng::seed_from_u64(seed);
+            let (chosen, record, _) =
+                placed(placer().place(&base_input(), &snap, &HashMap::new(), &mut rng));
+            assert_ne!(chosen, slot("gpu01", 0), "seed {seed}");
+            assert_eq!(record.lane_size, 1);
+            assert_eq!(record.excluded[4], (Rule::Lane, 1));
+        }
+
+        // On the long tier the same estimate counts toward the backlog cap:
+        // 150 queued is ~300K, so a 310K prompt no longer fits under 600K.
+        let long = Placer::new([1u8; 32], Tier::Long);
+        unknown.slot = slot("long01", 0);
+        unknown.state.load.queued = Some(150);
+        let snap = snap_with(vec![unknown]);
+        let mut rng = StdRng::seed_from_u64(1);
+        let record = refused_record(long.place(&heavy(310_000), &snap, &HashMap::new(), &mut rng));
+        assert_eq!(record.excluded[4], (Rule::Lane, 1));
+    }
+
+    #[test]
+    fn idle_waiver_requires_known_load() {
+        // A prompt over LONG_BACKLOG_CAP is admitted only on a replica whose
+        // load is known to be zero: running, queued and backlog all reported
+        // as 0. Missing any of them is not evidence of idleness.
+        let long = Placer::new([1u8; 32], Tier::Long);
+        let mut known = ready_view("long01", 0);
+        known.state.load.prefill_backlog_tokens = Some(0);
+        let mut no_backlog = ready_view("long01", 1);
+        no_backlog.state.load.prefill_backlog_tokens = None;
+        let mut no_running = ready_view("long01", 2);
+        no_running.state.load.running = None;
+        no_running.state.load.prefill_backlog_tokens = Some(0);
+        let prompt = LONG_BACKLOG_CAP + 100_000;
+
+        let snap = snap_with(vec![known, no_backlog.clone(), no_running.clone()]);
+        for seed in 0..8 {
+            let mut rng = StdRng::seed_from_u64(seed);
+            let (chosen, record, _) =
+                placed(long.place(&heavy(prompt), &snap, &HashMap::new(), &mut rng));
+            assert_eq!(chosen, slot("long01", 0), "seed {seed}");
+            assert_eq!(record.excluded[4], (Rule::Lane, 2));
+        }
+
+        let snap = snap_with(vec![no_backlog, no_running]);
+        let mut rng = StdRng::seed_from_u64(1);
+        let record = refused_record(long.place(&heavy(prompt), &snap, &HashMap::new(), &mut rng));
+        assert_eq!(record.excluded[4], (Rule::Lane, 2));
     }
 
     #[test]

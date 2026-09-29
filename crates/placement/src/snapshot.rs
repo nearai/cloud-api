@@ -72,9 +72,10 @@ pub struct RoutedCounts {
 /// `disabled` is set by the reader while the data-plane kill switch is
 /// present; every decision against such a snapshot is `Legacy(Disabled)`.
 ///
-/// `norefuse` is set by the reader while the data-plane no-refuse switch is
-/// present. The placer does not read it: the caller runs a `Refused`
-/// decision on its legacy path instead, and every other decision is unchanged.
+/// `refuse_on` is set by the reader while the data-plane refuse-on switch is
+/// present. The placer does not read it: while it is unset (the default) the
+/// caller runs a `Refused` decision on its legacy path instead; every other
+/// decision is unchanged.
 ///
 /// `routed_read_ms` is this node's clock when the reader *issued* the Valkey
 /// read that produced `routed` (not when it completed). A local write
@@ -89,7 +90,7 @@ pub struct Snapshot {
     pub routed_read_ms: u64,
     pub pins: Arc<PinTable>,
     pub disabled: bool,
-    pub norefuse: bool,
+    pub refuse_on: bool,
 }
 
 /// Why a frame was not accepted into the snapshot.

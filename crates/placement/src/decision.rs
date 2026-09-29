@@ -656,7 +656,7 @@ mod tests {
             routed_read_ms: 0,
             pins: Default::default(),
             disabled: false,
-            norefuse: false,
+            refuse_on: false,
         }
     }
 

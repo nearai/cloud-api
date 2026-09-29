@@ -7563,20 +7563,20 @@ mod tests {
                 params
             }
 
+            /// Refusals are opt-in: while the refuse-on key is set, a refusal
+            /// is a 429 (`CapacityRefused`) returned before any upstream
+            /// request.
             #[tokio::test]
-            async fn refused_maps_to_capacity_refused_without_dialing_upstream() {
+            async fn refuse_on_key_enables_429() {
                 let upstream = MockServer::start().await;
                 Mock::given(method("POST"))
                     .respond_with(respond(None))
                     .expect(0)
                     .mount(&upstream)
                     .await;
-                let h = harness_on(
-                    upstream_provider(&upstream),
-                    &[("h-a", 2)],
-                    4,
-                    saturated_snapshot(fresh_ms()),
-                );
+                let mut snap = saturated_snapshot(fresh_ms());
+                snap.refuse_on = true;
+                let h = harness_on(upstream_provider(&upstream), &[("h-a", 2)], 4, snap);
 
                 let json = h
                     .provider
@@ -7589,20 +7589,25 @@ mod tests {
                     .await;
                 assert!(matches!(sse, Err(crate::CompletionError::CapacityRefused)));
                 assert_eq!(h.metrics.decisions_tagged("outcome:refused"), 2);
+                assert_eq!(h.metrics.decisions_tagged("reason:refuse_off"), 0);
                 assert!(upstream.received_requests().await.unwrap().is_empty());
             }
 
-            /// The no-refuse switch: a refusal runs the legacy path (served,
-            /// tagged `reason:norefuse`, never counted as refused).
+            /// Without the refuse-on key a refusal runs the legacy path
+            /// (served, tagged `reason:refuse_off`, never counted as
+            /// refused); every other decision stays live.
             #[tokio::test]
-            async fn norefuse_key_turns_refusal_into_fallback() {
+            async fn refusal_is_fallback_by_default() {
                 let upstream = mock_upstream(None).await;
-                let mut snap = saturated_snapshot(fresh_ms());
-                snap.norefuse = true;
-                let h = harness_on(upstream_provider(&upstream), &[("h-a", 2)], 4, snap);
+                let h = harness_on(
+                    upstream_provider(&upstream),
+                    &[("h-a", 2)],
+                    4,
+                    saturated_snapshot(fresh_ms()),
+                );
                 send_both(&h.provider, heavy_params()).await;
 
-                assert_eq!(h.metrics.decisions_tagged("reason:norefuse"), 2);
+                assert_eq!(h.metrics.decisions_tagged("reason:refuse_off"), 2);
                 assert_eq!(h.metrics.decisions_tagged("outcome:legacy"), 2);
                 assert_eq!(h.metrics.decisions_tagged("outcome:refused"), 0);
                 let refused = h
@@ -7619,37 +7624,22 @@ mod tests {
                 assert_eq!(hints(&requests), vec![None; 2]);
             }
 
-            /// The kill switch takes precedence over no-refuse: with both
-            /// keys set, every request is Legacy(disabled).
+            /// The kill switch takes precedence over refuse-on: with both
+            /// keys set, every request is Legacy(disabled) and served.
             #[tokio::test]
-            async fn kill_switch_wins_over_norefuse() {
+            async fn kill_switch_wins_over_refuse_on() {
                 let upstream = mock_upstream(None).await;
                 let mut snap = saturated_snapshot(fresh_ms());
                 snap.disabled = true;
-                snap.norefuse = true;
+                snap.refuse_on = true;
                 let h = harness_on(upstream_provider(&upstream), &[("h-a", 2)], 4, snap);
                 send_both(&h.provider, heavy_params()).await;
 
                 assert_eq!(h.metrics.decisions_tagged("reason:disabled"), 2);
-                assert_eq!(h.metrics.decisions_tagged("reason:norefuse"), 0);
                 assert_eq!(h.metrics.decisions_tagged("outcome:refused"), 0);
                 let requests = upstream.received_requests().await.unwrap();
+                assert_eq!(requests.len(), 2, "every legacy request is served");
                 assert_eq!(hints(&requests), vec![None; 2]);
-            }
-
-            /// Only refusals change: every other decision still places.
-            #[tokio::test]
-            async fn norefuse_leaves_placement_live() {
-                let upstream = mock_upstream(None).await;
-                let mut snap = placed_snapshot(fresh_ms());
-                snap.norefuse = true;
-                let h = harness_on(upstream_provider(&upstream), &[("h-a", 2)], 4, snap);
-                send_both(&h.provider, params("z-ai/glm-5.3-flash")).await;
-
-                assert_eq!(h.metrics.decisions_tagged("outcome:place"), 2);
-                assert_eq!(h.metrics.decisions_tagged("reason:norefuse"), 0);
-                let requests = upstream.received_requests().await.unwrap();
-                assert_eq!(hints(&requests), vec![Some("3".to_string()); 2]);
             }
 
             /// A refusal passes the same fail-open gates as a placement: an
@@ -7658,24 +7648,26 @@ mod tests {
             #[tokio::test]
             async fn refused_with_incomplete_host_map_is_fallback_not_429() {
                 let upstream = mock_upstream(None).await;
+                // Refusals on, so only the gate demotes them.
+                let refusing = || {
+                    let mut snap = saturated_snapshot(fresh_ms());
+                    snap.refuse_on = true;
+                    snap
+                };
                 // Only h-a is mapped, of 4 backends.
                 let partial = install(
                     upstream_provider(&upstream),
                     &[("h-a".to_string(), 2)],
                     4,
-                    saturated_snapshot(fresh_ms()),
+                    refusing(),
                 );
                 send_both(&partial.provider, heavy_params()).await;
                 assert_eq!(partial.metrics.decisions_tagged("reason:incomplete"), 2);
                 assert_eq!(partial.metrics.decisions_tagged("outcome:refused"), 0);
 
                 // A complete map pushed for 3 backends while the Fleet has 4.
-                let stale_count = harness_on(
-                    upstream_provider(&upstream),
-                    &[("h-a", 2)],
-                    3,
-                    saturated_snapshot(fresh_ms()),
-                );
+                let stale_count =
+                    harness_on(upstream_provider(&upstream), &[("h-a", 2)], 3, refusing());
                 send_both(&stale_count.provider, heavy_params()).await;
                 assert_eq!(stale_count.metrics.decisions_tagged("reason:incomplete"), 2);
                 assert_eq!(stale_count.metrics.decisions_tagged("outcome:refused"), 0);

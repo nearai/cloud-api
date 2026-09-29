@@ -208,14 +208,15 @@ pub(super) fn size_tag(prompt_tokens: Option<u64>) -> &'static str {
 
 /// Legacy decisions made because placement has no usable snapshot, is
 /// switched off by the data-plane kill switch, or had its refusal turned
-/// into legacy by the no-refuse switch, are logged at debug; they would
-/// otherwise repeat on every such request while the shared state is down,
-/// unconfigured or a switch is on. The decision metric still counts each.
+/// into legacy because refusals are off (the default), are logged at debug;
+/// they would otherwise repeat on every such request while the shared state
+/// is down, unconfigured, a switch is on or refusals are off. The decision
+/// metric still counts each.
 fn logs_at_debug(record: &DecisionRecord) -> bool {
     record.outcome == "legacy"
         && matches!(
             record.reason,
-            Some("no_state" | "stale" | "disabled" | "norefuse")
+            Some("no_state" | "stale" | "disabled" | "refuse_off")
         )
 }
 
@@ -289,7 +290,7 @@ fn detail_tag(record: &DecisionRecord) -> &'static str {
             "incomplete" => "reason:incomplete",
             "lane_full" => "reason:lane_full",
             "long_full" => "reason:long_full",
-            "norefuse" => "reason:norefuse",
+            "refuse_off" => "reason:refuse_off",
             _ => "reason:unknown",
         },
         (None, Some(selection)) => selection_tag(selection),
@@ -528,7 +529,7 @@ mod observability_tests {
         .map(LegacyReason::as_str);
         for reason in legacy_reasons
             .into_iter()
-            .chain(["lane_full", "long_full", "norefuse"])
+            .chain(["lane_full", "long_full", "refuse_off"])
         {
             let tag = detail_tag(&legacy(reason));
             assert_eq!(tag, format!("reason:{reason}"), "{reason}");
@@ -731,7 +732,7 @@ mod observability_tests {
     #[test]
     fn decision_log_levels() {
         let h = handles(Arc::new(FakeMetrics::default()));
-        for reason in ["no_state", "stale", "disabled", "norefuse"] {
+        for reason in ["no_state", "stale", "disabled", "refuse_off"] {
             let out = captured(|| report_decision(&h, &legacy(reason), &request(None)));
             assert!(out.contains("DEBUG"), "{reason}: {out}");
             assert!(!out.contains("INFO"), "{reason}: {out}");

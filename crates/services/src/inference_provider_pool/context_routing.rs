@@ -182,10 +182,22 @@ pub(crate) fn base_capacity(caps: impl IntoIterator<Item = Option<u32>>) -> Opti
 }
 
 /// Whether a context requirement exceeds the base tier ([`base_capacity`]):
-/// the request's class for placement, the pool's `context_tier:long` tag,
-/// and the tier-refinement log. Never true for a single-tier model.
+/// the request's class for placement and the tier-refinement log. Never true
+/// for a single-tier model (the metric tag uses [`exceeds_declared_capacity`]).
 pub(crate) fn is_heavy(context_tokens: u64, caps: impl IntoIterator<Item = Option<u32>>) -> bool {
     base_capacity(caps).is_some_and(|base| context_tokens > u64::from(base))
+}
+
+/// Whether a context requirement exceeds at least one declared capacity. This
+/// is the `context_tier:long` metric tag's predicate: unlike [`is_heavy`] it
+/// also holds for an oversized request on a single-capacity model.
+pub(crate) fn exceeds_declared_capacity(
+    context_tokens: u64,
+    caps: impl IntoIterator<Item = Option<u32>>,
+) -> bool {
+    caps.into_iter()
+        .flatten()
+        .any(|cap| context_tokens > u64::from(cap))
 }
 
 /// The output reserve counted into the context requirement: the request's

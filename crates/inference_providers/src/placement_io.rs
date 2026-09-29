@@ -90,10 +90,24 @@ pub const METRIC_PINS_MALFORMED: &str = "cloud_api.placement.pins_malformed";
 pub const METRIC_SNAPSHOT_AGE_MS: &str = "cloud_api.placement.snapshot_age_ms";
 /// One per reader cycle that found [`KILL_SWITCH_KEY`] present.
 pub const METRIC_KILL_SWITCH_CYCLES: &str = "cloud_api.placement.kill_switch_cycles";
-/// One per placement decision on a covered model, tagged
-/// `outcome:{place|legacy}` plus `selection:{..}` (place) or `reason:{..}`
-/// (legacy). Never host or request ids.
+/// One per placement decision on a covered model, tagged `outcome`, `tier`,
+/// `class`, `strategy`, `priority_band` plus `selection:{..}` (place) or
+/// `reason:{..}` (legacy or refused). Never host or request ids.
 pub const METRIC_DECISIONS: &str = "cloud_api.placement.decisions";
+/// One per refused decision (a capacity refusal, answered as a 429), tagged
+/// `tier`, `class` and `priority_band`.
+pub const METRIC_REFUSED: &str = "cloud_api.placement.refused";
+/// Heavy-lane members and cap as seen by each decision, tagged `tier`.
+/// Histograms (no gauge primitive); dashboards read the max over the window.
+pub const METRIC_LANE_SIZE: &str = "cloud_api.placement.lane_size";
+pub const METRIC_LANE_CAP: &str = "cloud_api.placement.lane_cap";
+/// Time spent in `Placer::place`, in microseconds, tagged `tier`.
+pub const METRIC_PLACE_DURATION_US: &str = "cloud_api.placement.place_duration_us";
+/// Request sent to first streamed chunk, tagged `strategy` and `selection`
+/// (`legacy` for a request placement did not place).
+pub const METRIC_TTFT_MS: &str = "cloud_api.placement.ttft_ms";
+/// Request sent to end of stream, same tags as [`METRIC_TTFT_MS`].
+pub const METRIC_DURATION_MS: &str = "cloud_api.placement.duration_ms";
 /// Replicas excluded per decision, by eligibility rule (`rule:{..}`).
 pub const METRIC_EXCLUDED: &str = "cloud_api.placement.excluded";
 /// One per decision, tagged `affinity:{client|prefix|none}` and `outcome:{..}`.

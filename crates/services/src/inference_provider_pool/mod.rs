@@ -3331,7 +3331,7 @@ impl InferenceProviderPool {
                 .collect()
         };
         let context_tier_long = hints.estimated_tokens.is_some_and(|req| {
-            context_routing::is_heavy(u64::from(req), ctx_caps.values().copied())
+            context_routing::exceeds_declared_capacity(u64::from(req), ctx_caps.values().copied())
         });
 
         // Negative-priority organizations never fall back to the OTHER NEAR
@@ -3910,35 +3910,48 @@ impl InferenceProviderPool {
         // [URL_REDACTED] which would defeat the matcher's url-anchored regex).
         let retry_decision = last_retry_decision.unwrap_or("none");
         let elapsed_ms = started_at.elapsed().as_millis();
-        if let Some(pub_key) = model_pub_key {
-            tracing::error!(
-                model_id = %model_id,
-                model_pub_key_prefix = %pub_key.chars().take(16).collect::<String>(),
-                providers_tried = providers.len(),
-                model_provider_count,
-                pubkey_filtered = true,
-                total_attempts,
-                retry_count,
-                error_kind,
-                retry_decision,
-                elapsed_ms,
-                operation = operation_name,
-                "All providers failed for model with public key"
-            );
+        // A placement capacity refusal is expected load shedding (a 429 for
+        // the client), not a provider failure: warn, not error, so a burst
+        // of refusals does not page. Same ID-and-number fields either way.
+        let capacity_refused = matches!(last_error, Some(CompletionError::CapacityRefused));
+        macro_rules! all_providers_failed {
+            ($level:ident) => {
+                if let Some(pub_key) = model_pub_key {
+                    tracing::$level!(
+                        model_id = %model_id,
+                        model_pub_key_prefix = %pub_key.chars().take(16).collect::<String>(),
+                        providers_tried = providers.len(),
+                        model_provider_count,
+                        pubkey_filtered = true,
+                        total_attempts,
+                        retry_count,
+                        error_kind,
+                        retry_decision,
+                        elapsed_ms,
+                        operation = operation_name,
+                        "All providers failed for model with public key"
+                    );
+                } else {
+                    tracing::$level!(
+                        model_id = %model_id,
+                        providers_tried = providers.len(),
+                        model_provider_count,
+                        pubkey_filtered = false,
+                        total_attempts,
+                        retry_count,
+                        error_kind,
+                        retry_decision,
+                        elapsed_ms,
+                        operation = operation_name,
+                        "All providers failed for model"
+                    );
+                }
+            };
+        }
+        if capacity_refused {
+            all_providers_failed!(warn);
         } else {
-            tracing::error!(
-                model_id = %model_id,
-                providers_tried = providers.len(),
-                model_provider_count,
-                pubkey_filtered = false,
-                total_attempts,
-                retry_count,
-                error_kind,
-                retry_decision,
-                elapsed_ms,
-                operation = operation_name,
-                "All providers failed for model"
-            );
+            all_providers_failed!(error);
         }
 
         // Return the last error, preserving its HttpError variant for proper status code mapping
@@ -8675,8 +8688,7 @@ mod tests {
         }
     }
 
-    /// The pool's `context_tier:long` tag uses the same boundary: a
-    /// requirement over the base capacity, and never for a single-tier model.
+    /// `heavy` (placement's class) never applies to a single-tier model.
     #[test]
     fn context_tier_long_uses_base_capacity() {
         let two = [Some(262_144), None, Some(1_048_576)];
@@ -8684,6 +8696,25 @@ mod tests {
         assert!(context_routing::is_heavy(262_145, two));
         assert!(!context_routing::is_heavy(2_000_000, [Some(262_144)]));
         assert!(!context_routing::is_heavy(2_000_000, [None, None]));
+    }
+
+    /// The `context_tier:long` metric tag keeps its original predicate (the
+    /// requirement exceeds at least one declared capacity), so an oversized
+    /// request on a single-capacity model is still tagged, though it is not
+    /// heavy for placement.
+    #[test]
+    fn context_tier_tag_covers_single_capacity_oversized_request() {
+        let single = [Some(262_144), Some(262_144)];
+        assert!(context_routing::exceeds_declared_capacity(262_145, single));
+        assert!(!context_routing::is_heavy(262_145, single));
+        assert!(!context_routing::exceeds_declared_capacity(262_144, single));
+        assert!(!context_routing::exceeds_declared_capacity(
+            2_000_000,
+            [None, None]
+        ));
+        let two = [Some(262_144), None, Some(1_048_576)];
+        assert!(context_routing::exceeds_declared_capacity(262_145, two));
+        assert!(!context_routing::exceeds_declared_capacity(262_144, two));
     }
 
     #[tokio::test]
@@ -11633,6 +11664,53 @@ mod tests {
             0,
             "negative priority never reaches base"
         );
+    }
+
+    /// Refusals are expected load shedding: when every candidate refused,
+    /// the terminal "All providers failed" line is a warn (not an error),
+    /// with the same ID-and-number fields.
+    #[tokio::test]
+    async fn all_refused_final_log_is_warn() {
+        #[derive(Clone)]
+        struct Capture(Arc<std::sync::Mutex<Vec<u8>>>);
+        impl std::io::Write for Capture {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let (pool, base, long, params) = refusal_pool().await;
+        long.set_error_override(Some(CompletionError::CapacityRefused))
+            .await;
+        base.set_error_override(Some(CompletionError::CapacityRefused))
+            .await;
+
+        let buf = Capture(Arc::new(std::sync::Mutex::new(Vec::new())));
+        let writer = buf.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::DEBUG)
+            .with_ansi(false)
+            .with_writer(move || writer.clone())
+            .finish();
+        let guard = tracing::subscriber::set_default(subscriber);
+        let result = pool
+            .chat_completion_with_attribution_and_hints(params, "h".to_string(), priority(0))
+            .await;
+        drop(guard);
+        assert!(matches!(result, Err(CompletionError::CapacityRefused)));
+
+        let out = String::from_utf8(buf.0.lock().unwrap().clone()).unwrap();
+        let line = out
+            .lines()
+            .find(|l| l.contains("All providers failed for model"))
+            .unwrap_or_else(|| panic!("no terminal line: {out}"));
+        assert!(line.contains(" WARN "), "{line}");
+        assert!(line.contains("error_kind=\"capacity_refused\""), "{line}");
+        assert!(!out.contains(" ERROR "), "{out}");
     }
 
     /// A 503 from one candidate, then a refusal: the 503 stays the last

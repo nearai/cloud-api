@@ -201,6 +201,8 @@ pub struct DecisionRecord {
     pub best_score: Option<f64>,
     pub snapshot_age_ms: u64,
     pub pending_req: u32,
+    /// Pending prompt tokens on the chosen slot (0 when none chosen).
+    pub pending_tok: u64,
     pub chosen_backlog_tokens: Option<u64>,
 }
 
@@ -233,6 +235,7 @@ impl DecisionRecord {
             best_score: None,
             snapshot_age_ms: input.now_ms.saturating_sub(snap.built_ms),
             pending_req: 0,
+            pending_tok: 0,
             chosen_backlog_tokens: None,
         }
     }
@@ -500,6 +503,7 @@ impl Placer {
             best_score: Some(best_score),
             snapshot_age_ms: input.now_ms.saturating_sub(snap.built_ms),
             pending_req: chosen.map(|c| c.pending.req).unwrap_or(0),
+            pending_tok: chosen.map(|c| c.pending.tok).unwrap_or(0),
             chosen_backlog_tokens: chosen.and_then(|c| c.view.state.load.prefill_backlog_tokens),
         };
 

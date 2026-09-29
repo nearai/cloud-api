@@ -12,10 +12,10 @@
 //! per-index TTFT EMA so we can steer prefix-affinity routing away from a
 //! pathologically slow backend.
 
-use super::placement_report::{report_decision, PlacementRequest};
+use super::placement_report::{latency_tags, report_decision, PlacementRequest};
 use super::prefix_router::PrefixRouter;
 use super::Config;
-use crate::placement_io::{PlacementHandles, Write};
+use crate::placement_io::{PlacementHandles, Write, METRIC_DURATION_MS, METRIC_TTFT_MS};
 use crate::rotation;
 use crate::spki_verifier::FingerprintState;
 use crate::BackendHosts;
@@ -136,10 +136,42 @@ pub(super) struct RouteLease {
     /// The replica index placement chose on the backend at `index`; `None`
     /// for a legacy lease, which leaves the replica to the proxy.
     replica: Option<u32>,
+    /// Where and how to record this request's stream latency; set only for
+    /// covered-model requests while placement is installed.
+    latency: Option<LeaseLatency>,
     prefix_loads: Arc<Mutex<PrefixLoads>>,
 }
 
+/// Stream-latency reporting for one request: the placement metrics sink and
+/// the request's static `strategy`/`selection` tags.
+struct LeaseLatency {
+    handles: Arc<PlacementHandles>,
+    tags: [&'static str; 2],
+}
+
 impl RouteLease {
+    /// Records request-sent to first streamed chunk.
+    pub(super) fn record_ttft_ms(&self, ms: f64) {
+        if let Some(latency) = &self.latency {
+            latency
+                .handles
+                .io
+                .metrics()
+                .record_histogram(METRIC_TTFT_MS, ms, &latency.tags);
+        }
+    }
+
+    /// Records request-sent to end of stream.
+    pub(super) fn record_duration_ms(&self, ms: f64) {
+        if let Some(latency) = &self.latency {
+            latency
+                .handles
+                .io
+                .metrics()
+                .record_histogram(METRIC_DURATION_MS, ms, &latency.tags);
+        }
+    }
+
     pub(super) fn index(&self) -> usize {
         self.index
     }
@@ -403,6 +435,7 @@ impl Fleet {
             route_key,
             index,
             replica: None,
+            latency: None,
             prefix_loads: self.prefix_loads.clone(),
         }
     }
@@ -420,6 +453,7 @@ impl Fleet {
             route_key,
             index,
             replica: None,
+            latency: None,
             prefix_loads: self.prefix_loads.clone(),
         }
     }
@@ -730,7 +764,22 @@ impl Fleet {
         match self.try_place(messages, pinned_pub_key, request) {
             PlacedOutcome::Lease(lease) => Ok(Some(lease)),
             PlacedOutcome::Refused => Err(crate::CompletionError::CapacityRefused),
-            PlacedOutcome::Fallback => Ok(self.acquire_index(messages, pinned_pub_key)),
+            PlacedOutcome::Fallback => {
+                let mut lease = self.acquire_index(messages, pinned_pub_key);
+                // A covered request placement did not place: its latency is
+                // still recorded, as `legacy`, so the two paths compare.
+                if let Some(lease) = lease.as_mut() {
+                    if COVERED_MODELS.contains(&request.model.as_str()) {
+                        if let Some(handles) = self.placement.load().as_ref() {
+                            lease.latency = Some(LeaseLatency {
+                                handles: handles.clone(),
+                                tags: latency_tags(None),
+                            });
+                        }
+                    }
+                }
+                Ok(lease)
+            }
         }
     }
 
@@ -846,6 +895,10 @@ impl Fleet {
 
         let mut lease = self.reserve_index(self.route_key(messages), index);
         lease.replica = Some(slot.replica);
+        lease.latency = Some(LeaseLatency {
+            handles: handles.clone(),
+            tags: latency_tags(Some(&record)),
+        });
         handles.io.record(Write::Routed {
             slot,
             tok: input.prompt_tokens,

@@ -55,6 +55,7 @@ async-stream = "0.3"
 
 # Dev dependencies for testing and examples
 [dev-dependencies]
+tracing-subscriber = { version = "0.3", default-features = false, features = ["std", "fmt"] }
 futures-util = "0.3"
 tokio-test = "0.4"
 dotenvy = "0.15.7"

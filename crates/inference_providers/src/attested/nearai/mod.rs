@@ -1351,6 +1351,8 @@ struct TtftProbe<S> {
     index: usize,
     /// Send instant; `None` once the first content TTFT has been recorded.
     start: Option<std::time::Instant>,
+    /// Send instant, kept for the end-of-stream duration.
+    sent: std::time::Instant,
     /// Keeps this backend counted as live until the stream completes or the
     /// caller drops it. `None` is used only by focused unit tests.
     _route_lease: Option<fleet::RouteLease>,
@@ -1369,6 +1371,7 @@ impl<S> TtftProbe<S> {
             stats,
             index,
             start: Some(start),
+            sent: start,
             _route_lease: route_lease,
         }
     }
@@ -1391,6 +1394,9 @@ where
             if event.chunk.is_some() {
                 if let Some(start) = self.start.take() {
                     let ttft_ms = start.elapsed().as_millis() as f64;
+                    if let Some(lease) = self._route_lease.as_ref() {
+                        lease.record_ttft_ms(ttft_ms);
+                    }
                     let index = self.index;
                     let mut stats = self.stats.lock().unwrap_or_else(|e| e.into_inner());
                     if let Some(s) = stats.get_mut(index) {
@@ -1399,6 +1405,9 @@ where
                 }
             }
         } else if matches!(polled, std::task::Poll::Ready(None)) {
+            if let Some(lease) = self._route_lease.as_ref() {
+                lease.record_duration_ms(self.sent.elapsed().as_millis() as f64);
+            }
             self._route_lease.take();
         }
         polled
@@ -5941,9 +5950,21 @@ mod tests {
         #[derive(Default)]
         struct FakeMetrics {
             counts: Mutex<Vec<(String, i64, Vec<String>)>>,
+            histograms: Mutex<Vec<(String, f64, Vec<String>)>>,
         }
 
         impl FakeMetrics {
+            /// The tag sets of every sample recorded under histogram `name`.
+            fn histogram_tags(&self, name: &str) -> Vec<Vec<String>> {
+                self.histograms
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .filter(|(n, _, _)| n == name)
+                    .map(|(_, _, tags)| tags.clone())
+                    .collect()
+            }
+
             fn decisions_tagged(&self, tag: &str) -> i64 {
                 self.counts
                     .lock()
@@ -5963,7 +5984,13 @@ mod tests {
                     tags.iter().map(|t| t.to_string()).collect(),
                 ));
             }
-            fn record_histogram(&self, _name: &str, _value: f64, _tags: &[&str]) {}
+            fn record_histogram(&self, name: &str, value: f64, tags: &[&str]) {
+                self.histograms.lock().unwrap().push((
+                    name.to_string(),
+                    value,
+                    tags.iter().map(|t| t.to_string()).collect(),
+                ));
+            }
         }
 
         fn now_ms() -> u64 {
@@ -6348,6 +6375,10 @@ mod tests {
                 decision.2,
                 vec![
                     "outcome:place".to_string(),
+                    "tier:base".to_string(),
+                    "class:short".to_string(),
+                    "strategy:short_clean".to_string(),
+                    "priority_band:normal".to_string(),
                     "selection:best_of_two".to_string()
                 ]
             );
@@ -6872,6 +6903,68 @@ mod tests {
                     assert!(host.starts_with("glm-i2."), "sent to backend 2: {host}");
                 }
                 assert_eq!(h.metrics.decisions_tagged("outcome:place"), 2);
+            }
+
+            /// The stream path records TTFT and duration once per streamed
+            /// request, by strategy and selection (`legacy` when unplaced,
+            /// nothing for an uncovered model).
+            #[tokio::test]
+            async fn stream_latency_is_recorded_by_strategy() {
+                use crate::placement_io::{METRIC_DURATION_MS, METRIC_TTFT_MS};
+                let stream_once = |provider: Provider, model: &'static str| async move {
+                    let stream = provider
+                        .chat_completion_stream(params(model), "synthetic-hash-sse".into())
+                        .await
+                        .expect("sse completion");
+                    let _: Vec<_> = stream.try_collect().await.expect("sse stream");
+                };
+
+                let upstream = mock_upstream(None).await;
+                let h = harness_on(
+                    upstream_provider(&upstream),
+                    &[("h-a", 2)],
+                    4,
+                    placed_snapshot(fresh_ms()),
+                );
+                stream_once(h.provider, COVERED_MODELS[0]).await;
+                for name in [METRIC_TTFT_MS, METRIC_DURATION_MS] {
+                    let samples = h.metrics.histogram_tags(name);
+                    assert_eq!(samples.len(), 1, "{name}");
+                    assert_eq!(samples[0][0], "strategy:short_clean", "{name}");
+                    assert!(samples[0][1].starts_with("selection:"), "{name}");
+                    assert_ne!(samples[0][1], "selection:unknown", "{name}");
+                }
+
+                let upstream = mock_upstream(None).await;
+                let stale = now_ms() - 60_000;
+                let h = harness_on(
+                    upstream_provider(&upstream),
+                    &[("h-a", 2)],
+                    4,
+                    placed_snapshot(stale),
+                );
+                stream_once(h.provider, COVERED_MODELS[0]).await;
+                for name in [METRIC_TTFT_MS, METRIC_DURATION_MS] {
+                    assert_eq!(
+                        h.metrics.histogram_tags(name),
+                        vec![vec![
+                            "strategy:legacy".to_string(),
+                            "selection:legacy".to_string()
+                        ]],
+                        "{name}"
+                    );
+                }
+
+                let upstream = mock_upstream(None).await;
+                let h = harness_on(
+                    upstream_provider(&upstream),
+                    &[("h-a", 2)],
+                    4,
+                    placed_snapshot(fresh_ms()),
+                );
+                stream_once(h.provider, "some-org/not-covered").await;
+                assert!(h.metrics.histogram_tags(METRIC_TTFT_MS).is_empty());
+                assert!(h.metrics.histogram_tags(METRIC_DURATION_MS).is_empty());
             }
 
             #[tokio::test]

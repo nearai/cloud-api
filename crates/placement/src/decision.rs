@@ -1257,6 +1257,37 @@ mod tests {
     }
 
     #[test]
+    fn long_tier_third_oversized_prompt_in_burst_is_refused() {
+        // Two idle long replicas and three 310K prompts in a burst, each
+        // placement recorded in this node's ledger before the next. The long
+        // tier has no lane cap, only LONG_BACKLOG_CAP (600K): the first lands
+        // on an idle replica, the second can't join it (620K > 600K) and takes
+        // the other, and the third fits neither, so it is refused.
+        let long = Placer::new([1u8; 32], Tier::Long);
+        let snap = snap_with(vec![ready_view("long01", 0), ready_view("long01", 1)]);
+        let prompt = 310_000;
+        let mut mine: HashMap<SlotId, Pending> = HashMap::new();
+        let mut chosen = Vec::new();
+        for seed in 0..2 {
+            let mut rng = StdRng::seed_from_u64(seed);
+            let (slot_, record, _) = placed(long.place(&heavy(prompt), &snap, &mine, &mut rng));
+            assert_eq!(record.strategy, Some("heavy_long"));
+            assert_eq!(record.excluded[4], (Rule::Lane, seed as u16));
+            let p = mine.entry(slot_.clone()).or_default();
+            p.req += 1;
+            p.tok += prompt;
+            chosen.push(slot_);
+        }
+        assert_ne!(chosen[0], chosen[1], "one prompt per replica");
+
+        let mut rng = StdRng::seed_from_u64(2);
+        let record = refused_record(long.place(&heavy(prompt), &snap, &mine, &mut rng));
+        assert_eq!(record.reason, Some("long_full"));
+        assert_eq!(record.strategy, Some("refuse"));
+        assert_eq!(record.excluded[4], (Rule::Lane, 2));
+    }
+
+    #[test]
     fn heavy_with_all_replicas_stale_is_legacy_not_refused() {
         let views = eight_slots()
             .into_iter()

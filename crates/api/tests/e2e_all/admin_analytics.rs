@@ -142,6 +142,17 @@ async fn test_admin_get_organization_metrics_empty() {
         "Should have 0 unique API keys"
     );
 
+    // Review Focus 5: empty org reports zero TTFT counts, not null.
+    assert_eq!(
+        [
+            metrics.summary.ttft_measured_requests,
+            metrics.summary.ttft_under_5s_requests,
+            metrics.summary.ttft_under_10s_requests,
+            metrics.summary.ttft_under_60s_requests,
+        ],
+        [0, 0, 0, 0]
+    );
+
     // Verify breakdowns - workspaces may have the default workspace with 0 usage
     // API keys and models should be empty since no requests were made
     assert!(metrics.by_api_key.is_empty(), "Should have no API key data");

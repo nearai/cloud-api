@@ -18,6 +18,7 @@ use rand::{Rng, RngExt};
 use sha2::{Digest, Sha256};
 
 use crate::consts::{AFFINITY_ABS_SLACK, AFFINITY_EPS, PIN_TTL_MS};
+use crate::policy::Tier;
 use crate::snapshot::SlotId;
 
 /// An opaque, unlinkable-by-inspection affinity key (e.g. derived from a
@@ -67,10 +68,14 @@ impl PinId {
 
 type HmacSha256 = Hmac<Sha256>;
 
-/// Derive a [`PinId`] for `key`, keyed by the deployment's `pin_secret`.
-pub fn pin_id(key: &AffinityKey, pin_secret: &[u8; 32]) -> PinId {
+/// Derive a [`PinId`] for `key` on `tier`: `HMAC(pin_secret, tier ‖ 0x00 ‖
+/// key)`. The tier is in the MAC input so the base and long placers never
+/// read or overwrite each other's pins, though both share one pins stream.
+pub fn pin_id(tier: Tier, key: &AffinityKey, pin_secret: &[u8; 32]) -> PinId {
     // A 32-byte key is always valid for HMAC-SHA256; this never fails.
     let mut mac = HmacSha256::new_from_slice(pin_secret).expect("32-byte HMAC key is always valid");
+    mac.update(tier.as_str().as_bytes());
+    mac.update(&[0u8]);
     mac.update(&key.0);
     let digest = mac.finalize().into_bytes();
     let mut out = [0u8; 16];
@@ -318,6 +323,7 @@ pub fn select(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::policy::Tier;
     use crate::testkit::slot;
     use rand::rngs::StdRng;
     use rand::SeedableRng;
@@ -569,18 +575,32 @@ mod tests {
         let secret = [9u8; 32];
         let key1 = AffinityKey::from_bytes([1u8; 16]);
         let key2 = AffinityKey::from_bytes([2u8; 16]);
-        let id1 = pin_id(&key1, &secret);
-        let id1_again = pin_id(&key1, &secret);
-        let id2 = pin_id(&key2, &secret);
+        let id1 = pin_id(Tier::Base, &key1, &secret);
+        let id1_again = pin_id(Tier::Base, &key1, &secret);
+        let id2 = pin_id(Tier::Base, &key2, &secret);
         assert_eq!(id1.as_bytes(), id1_again.as_bytes());
         assert_ne!(id1.as_bytes(), id2.as_bytes());
         assert_eq!(id1.to_hex().len(), 32);
     }
 
     #[test]
+    fn pin_id_is_keyed_by_tier() {
+        let secret = [9u8; 32];
+        let key = AffinityKey::from_bytes([1u8; 16]);
+        let base = pin_id(Tier::Base, &key, &secret);
+        let long = pin_id(Tier::Long, &key, &secret);
+        assert_ne!(base.as_bytes(), long.as_bytes());
+        // HMAC(secret, tier || 0x00 || key), truncated to 16 bytes.
+        let mut mac = HmacSha256::new_from_slice(&secret).unwrap();
+        mac.update(b"long\x00");
+        mac.update(&[1u8; 16]);
+        assert_eq!(long.as_bytes()[..], mac.finalize().into_bytes()[..16]);
+    }
+
+    #[test]
     fn pin_table_expires_by_ttl() {
         let mut table = PinTable::default();
-        let id = pin_id(&AffinityKey::from_bytes([3u8; 16]), &[1u8; 32]);
+        let id = pin_id(Tier::Base, &AffinityKey::from_bytes([3u8; 16]), &[1u8; 32]);
         table.insert(*id.as_bytes(), slot("gpu09", 1), 1_000);
         assert_eq!(table.get(&id, 1_000), Some((&slot("gpu09", 1), 1_000)));
         assert_eq!(

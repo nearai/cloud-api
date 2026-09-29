@@ -60,6 +60,36 @@ impl Class {
     }
 }
 
+/// A request's priority, bucketed for the record: `neg` (< 0, never crosses
+/// to another tier), `normal` (0) and `high` (> 0).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PriorityBand {
+    Neg,
+    Normal,
+    High,
+}
+
+impl PriorityBand {
+    pub const fn of(priority: i32) -> Self {
+        if priority < 0 {
+            PriorityBand::Neg
+        } else if priority == 0 {
+            PriorityBand::Normal
+        } else {
+            PriorityBand::High
+        }
+    }
+
+    /// A stable, content-free name for logs and metric tags.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            PriorityBand::Neg => "neg",
+            PriorityBand::Normal => "normal",
+            PriorityBand::High => "high",
+        }
+    }
+}
+
 /// The heavy lane as of one decision, built from raw load only (a replica's
 /// prefill backlog plus its pending tokens), so a request whose size was
 /// underestimated still makes its replica a member.

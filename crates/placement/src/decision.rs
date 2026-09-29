@@ -7,12 +7,13 @@
 //! stages: the per-replica rules, then the heavy lane over their survivors.
 
 use std::collections::HashMap;
+use std::time::Instant;
 
 use rand::Rng;
 
 use crate::affinity::{pin_id, select, AffinityKey, PinId, Selection};
 use crate::consts::{COVERED_MODELS, FRESH_MAX_MS, PIN_TTL_MS};
-use crate::policy::{classify, lane_admits, lane_view, Class, LaneView, Tier};
+use crate::policy::{classify, lane_admits, lane_view, Class, LaneView, PriorityBand, Tier};
 use crate::rules::{first_exclusion, Rule, ALL_RULES};
 use crate::score::{fleet_median_tps, pending_for, replica_score, Pending};
 use crate::snapshot::{ReplicaView, SlotId, Snapshot};
@@ -138,14 +139,47 @@ pub enum Decision {
     },
 }
 
+impl Decision {
+    /// The decision's record, whatever the outcome.
+    pub fn record(&self) -> &DecisionRecord {
+        match self {
+            Decision::Place { record, .. }
+            | Decision::Refused { record }
+            | Decision::Legacy { record, .. } => record,
+        }
+    }
+
+    fn record_mut(&mut self) -> &mut DecisionRecord {
+        match self {
+            Decision::Place { record, .. }
+            | Decision::Refused { record }
+            | Decision::Legacy { record, .. } => record,
+        }
+    }
+}
+
 /// A content-free record of a placement decision, safe to log as-is (IDs
 /// and numbers only). Must never carry `AffinityKey` or `PinId` bytes/hex.
 #[derive(Clone, Debug)]
 pub struct DecisionRecord {
+    /// `place`, `refused` or `legacy`.
     pub outcome: &'static str,
+    /// The legacy reason, or `lane_full`/`long_full` for a refusal.
     pub reason: Option<&'static str>,
+    pub tier: Tier,
+    pub class: Class,
     /// `RoutePolicy::as_str`, for placed and refused decisions.
     pub strategy: Option<&'static str>,
+    /// `PriorityBand::as_str`.
+    pub priority_band: &'static str,
+    /// Lane members and the lane cap, as seen by this decision (0 when it
+    /// never got as far as the lane).
+    pub lane_size: u16,
+    pub lane_cap: u16,
+    pub prompt_tokens: u64,
+    pub context_tokens: Option<u64>,
+    /// Time spent in `Placer::place`, in microseconds.
+    pub place_us: u32,
     pub rank: Option<u8>,
     pub affinity: &'static str,
     pub selection: Option<&'static str>,
@@ -170,11 +204,20 @@ pub struct DecisionRecord {
 }
 
 impl DecisionRecord {
-    fn legacy(input: &PlaceInput, snap: &Snapshot, reason: LegacyReason) -> Self {
+    /// A record with the request's own fields filled in and nothing chosen.
+    fn empty(input: &PlaceInput, snap: &Snapshot, tier: Tier, outcome: &'static str) -> Self {
         DecisionRecord {
-            outcome: "legacy",
-            reason: Some(reason.as_str()),
+            outcome,
+            reason: None,
+            tier,
+            class: Class::of(input.heavy),
             strategy: None,
+            priority_band: PriorityBand::of(input.priority).as_str(),
+            lane_size: 0,
+            lane_cap: 0,
+            prompt_tokens: input.prompt_tokens,
+            context_tokens: input.context_tokens,
+            place_us: 0,
             rank: None,
             affinity: input.affinity_source.as_str(),
             selection: None,
@@ -194,22 +237,6 @@ impl DecisionRecord {
     }
 }
 
-/// Builds a `Decision::Legacy` for `reason`, optionally overriding the
-/// per-`Rule` exclusion tally (used once eligibility has already been
-/// computed, e.g. for `NoneEligible`).
-fn legacy(
-    input: &PlaceInput,
-    snap: &Snapshot,
-    reason: LegacyReason,
-    excluded: Option<[(Rule, u16); 5]>,
-) -> Decision {
-    let mut record = DecisionRecord::legacy(input, snap, reason);
-    if let Some(excluded) = excluded {
-        record.excluded = excluded;
-    }
-    Decision::Legacy { reason, record }
-}
-
 /// Exclusion tally, one counter per rule in `ALL_RULES` order.
 #[derive(Default)]
 struct Tally([u16; 5]);
@@ -222,12 +249,7 @@ impl Tally {
     }
 
     fn record(&self) -> [(Rule, u16); 5] {
-        let mut i = 0;
-        ALL_RULES.map(|r| {
-            let n = self.0[i];
-            i += 1;
-            (r, n)
-        })
+        std::array::from_fn(|i| (ALL_RULES[i], self.0[i]))
     }
 }
 
@@ -251,6 +273,11 @@ impl Placer {
         Self { pin_secret, tier }
     }
 
+    /// Decide where `input` goes on this Fleet, given the latest snapshot and
+    /// this node's own outstanding ledger (`mine`, per slot). `Legacy` when
+    /// the snapshot is disabled, uncovered, empty, stale or has no stage-1
+    /// survivor; `Refused` only when the heavy lane excluded every survivor;
+    /// otherwise `Place`. The record's `place_us` times the whole call.
     pub fn place(
         &self,
         input: &PlaceInput,
@@ -258,20 +285,34 @@ impl Placer {
         mine: &HashMap<SlotId, Pending>,
         rng: &mut impl Rng,
     ) -> Decision {
+        let started = Instant::now();
+        let mut decision = self.decide(input, snap, mine, rng);
+        decision.record_mut().place_us =
+            u32::try_from(started.elapsed().as_micros()).unwrap_or(u32::MAX);
+        decision
+    }
+
+    fn decide(
+        &self,
+        input: &PlaceInput,
+        snap: &Snapshot,
+        mine: &HashMap<SlotId, Pending>,
+        rng: &mut impl Rng,
+    ) -> Decision {
         if snap.disabled {
-            return legacy(input, snap, LegacyReason::Disabled, None);
+            return self.legacy(input, snap, LegacyReason::Disabled, None);
         }
 
         if !COVERED_MODELS.contains(&input.model.as_str()) {
-            return legacy(input, snap, LegacyReason::NotCovered, None);
+            return self.legacy(input, snap, LegacyReason::NotCovered, None);
         }
 
         if snap.replicas.is_empty() {
-            return legacy(input, snap, LegacyReason::NoState, None);
+            return self.legacy(input, snap, LegacyReason::NoState, None);
         }
 
         if input.now_ms.saturating_sub(snap.built_ms) > FRESH_MAX_MS {
-            return legacy(input, snap, LegacyReason::Stale, None);
+            return self.legacy(input, snap, LegacyReason::Stale, None);
         }
 
         // Stage 1: per-replica rules, tallying exclusions for the record.
@@ -303,7 +344,7 @@ impl Placer {
         // No stage-1 survivor (stale, not ready, over context, ...) is a
         // state problem, never a capacity one: fall back, don't refuse.
         if candidates.is_empty() {
-            return legacy(
+            return self.legacy(
                 input,
                 snap,
                 LegacyReason::NoneEligible,
@@ -340,7 +381,7 @@ impl Placer {
             // is heavy in practice; a short request would still fall back.
             return match class {
                 Class::Heavy => self.refused(input, snap, &lane, class, tally.record()),
-                Class::Short => legacy(
+                Class::Short => self.legacy(
                     input,
                     snap,
                     LegacyReason::NoneEligible,
@@ -368,7 +409,10 @@ impl Placer {
         let best_score = scores.iter().map(|(_, s)| *s).fold(f64::INFINITY, f64::min);
 
         // Pin lookup: only when this request carries an affinity key.
-        let pin_id_opt = input.affinity.as_ref().map(|k| pin_id(k, &self.pin_secret));
+        let pin_id_opt = input
+            .affinity
+            .as_ref()
+            .map(|k| pin_id(self.tier, k, &self.pin_secret));
         let pin_lookup: Option<(SlotId, u64)> = pin_id_opt.as_ref().and_then(|pid| {
             snap.pins
                 .get(pid, input.now_ms)
@@ -383,7 +427,7 @@ impl Placer {
         ) {
             Some(s) => s,
             None => {
-                return legacy(
+                return self.legacy(
                     input,
                     snap,
                     LegacyReason::NoneEligible,
@@ -418,7 +462,15 @@ impl Placer {
         let record = DecisionRecord {
             outcome: "place",
             reason: None,
+            tier: self.tier,
+            class,
             strategy: Some(classify(self.tier, class, &lane, Some(&selected.slot)).as_str()),
+            priority_band: PriorityBand::of(input.priority).as_str(),
+            lane_size: u16::try_from(lane.size).unwrap_or(u16::MAX),
+            lane_cap: u16::try_from(lane.cap).unwrap_or(u16::MAX),
+            prompt_tokens: input.prompt_tokens,
+            context_tokens: input.context_tokens,
+            place_us: 0,
             rank,
             affinity: input.affinity_source.as_str(),
             selection: Some(selected.selection.as_str()),
@@ -443,6 +495,26 @@ impl Placer {
         }
     }
 
+    /// Builds a `Decision::Legacy` for `reason`, optionally overriding the
+    /// per-`Rule` exclusion tally (used once eligibility has already been
+    /// computed, e.g. for `NoneEligible`).
+    fn legacy(
+        &self,
+        input: &PlaceInput,
+        snap: &Snapshot,
+        reason: LegacyReason,
+        excluded: Option<[(Rule, u16); 5]>,
+    ) -> Decision {
+        let mut record = DecisionRecord::empty(input, snap, self.tier, "legacy");
+        record.reason = Some(reason.as_str());
+        if let Some(excluded) = excluded {
+            record.excluded = excluded;
+        }
+        Decision::Legacy { reason, record }
+    }
+
+    /// Builds a `Decision::Refused`: `long_full` on the long tier (every
+    /// survivor over `LONG_BACKLOG_CAP`), `lane_full` on base.
     fn refused(
         &self,
         input: &PlaceInput,
@@ -451,10 +523,14 @@ impl Placer {
         class: Class,
         excluded: [(Rule, u16); 5],
     ) -> Decision {
-        let mut record = DecisionRecord::legacy(input, snap, LegacyReason::NoneEligible);
-        record.outcome = "refused";
-        record.reason = None;
+        let mut record = DecisionRecord::empty(input, snap, self.tier, "refused");
+        record.reason = Some(match self.tier {
+            Tier::Long => "long_full",
+            Tier::Base => "lane_full",
+        });
         record.strategy = Some(classify(self.tier, class, lane, None).as_str());
+        record.lane_size = u16::try_from(lane.size).unwrap_or(u16::MAX);
+        record.lane_cap = u16::try_from(lane.cap).unwrap_or(u16::MAX);
         record.excluded = excluded;
         Decision::Refused { record }
     }
@@ -465,7 +541,8 @@ mod tests {
     use super::*;
     use crate::affinity::{hrw_rank, AffinityKey};
     use crate::consts::{COVERED_MODELS, FRESH_MAX_MS, PIN_TTL_MS};
-    use crate::policy::Tier;
+    use crate::consts::{HEAVY_BACKLOG_CAP, LONG_BACKLOG_CAP};
+    use crate::policy::{Class, PriorityBand, Tier};
     use crate::snapshot::RoutedCounts;
     use crate::testkit::{input as base_input, slot, view as ready_view, NOW};
     use rand::rngs::StdRng;
@@ -696,7 +773,7 @@ mod tests {
         let secret = [4u8; 32];
         let slots = vec![slot("gpu01", 0), slot("gpu02", 0)];
         let key = find_key_with_home(&slots, &slot("gpu02", 0));
-        let pid = pin_id(&key, &secret);
+        let pid = pin_id(Tier::Base, &key, &secret);
         let mut snap = snap_with(vec![ready_view("gpu01", 0), ready_view("gpu02", 0)]);
         // The pin names gpu01#3, a replica index gone from gpu01's frame.
         std::sync::Arc::make_mut(&mut snap.pins).insert(
@@ -803,7 +880,7 @@ mod tests {
         let secret = [2u8; 32];
         let views = vec![ready_view("gpu01", 0), ready_view("gpu02", 0)];
         let input = keyed(AffinityKey::from_bytes(key_bytes));
-        let pid = pin_id(&AffinityKey::from_bytes(key_bytes), &secret);
+        let pid = pin_id(Tier::Base, &AffinityKey::from_bytes(key_bytes), &secret);
         let p = Placer::new(secret, Tier::Base);
 
         // Pin inserted just over half the TTL ago: must refresh.
@@ -868,7 +945,7 @@ mod tests {
     fn record_never_contains_key_material() {
         let key_bytes = [0xABu8; 16];
         let secret = [0xCDu8; 32];
-        let pid = pin_id(&AffinityKey::from_bytes(key_bytes), &secret);
+        let pid = pin_id(Tier::Base, &AffinityKey::from_bytes(key_bytes), &secret);
         let input = keyed(AffinityKey::from_bytes(key_bytes));
 
         // Give the request a live pin so the `Pinned` path (and its
@@ -948,6 +1025,8 @@ mod tests {
                 }
                 Decision::Refused { record } => {
                     assert_eq!(record.excluded[4], (Rule::Lane, 8));
+                    assert_eq!(record.reason, Some("lane_full"));
+                    assert_eq!((record.lane_size, record.lane_cap), (2, 2));
                     strategies.push(record.strategy.unwrap());
                 }
                 Decision::Legacy { reason, .. } => panic!("unexpected Legacy({reason:?})"),
@@ -1046,6 +1125,7 @@ mod tests {
         assert_eq!(record.outcome, "refused");
         assert_eq!(record.strategy, Some("refuse"));
         assert_eq!(record.excluded[4], (Rule::Lane, 2));
+        assert_eq!(record.reason, Some("long_full"));
 
         // One replica with room: placed there, and the long tier ignores
         // the base lane cap (both are "members").
@@ -1123,7 +1203,7 @@ mod tests {
             ready_view("gpu02", 0),
             with_backlog("gpu02", 1, 100_000),
         ]);
-        let pid = pin_id(&key, &secret);
+        let pid = pin_id(Tier::Base, &key, &secret);
         std::sync::Arc::make_mut(&mut snap.pins).insert(
             *pid.as_bytes(),
             pinned.clone(),
@@ -1152,7 +1232,7 @@ mod tests {
         let mut views = eight_slots();
         views[0].state.load.prefill_backlog_tokens = Some(100_000); // gpu01#0
         let mut snap = snap_with(views);
-        let pid = pin_id(&key, &secret);
+        let pid = pin_id(Tier::Base, &key, &secret);
         std::sync::Arc::make_mut(&mut snap.pins).insert(
             *pid.as_bytes(),
             pinned.clone(),
@@ -1168,6 +1248,197 @@ mod tests {
         assert_eq!(chosen, pinned);
         assert_eq!(record.selection, Some("pinned"));
         assert_eq!(record.strategy, Some("heavy_lane_admit"));
+    }
+
+    // --- Refused, tier-keyed pins and record fields ---
+
+    /// A heavy request on a saturated 4-slot base Fleet: every replica is a
+    /// member at the backlog cap, so a usable snapshot refuses it.
+    fn saturated_base() -> Snapshot {
+        snap_with(
+            (0..4)
+                .map(|r| with_backlog("gpu01", r, HEAVY_BACKLOG_CAP))
+                .collect(),
+        )
+    }
+
+    #[test]
+    fn refused_record_names_tier_class_and_lane() {
+        let mut input = heavy(100_000);
+        input.context_tokens = Some(120_000);
+        input.priority = -1;
+        let mut rng = StdRng::seed_from_u64(1);
+        let record =
+            refused_record(placer().place(&input, &saturated_base(), &HashMap::new(), &mut rng));
+        assert_eq!(record.outcome, "refused");
+        assert_eq!(record.reason, Some("lane_full"));
+        assert_eq!(record.strategy, Some("refuse"));
+        assert_eq!(record.tier, Tier::Base);
+        assert_eq!(record.class, Class::Heavy);
+        assert_eq!(record.priority_band, "neg");
+        assert_eq!((record.lane_size, record.lane_cap), (4, 1));
+        assert_eq!(record.prompt_tokens, 100_000);
+        assert_eq!(record.context_tokens, Some(120_000));
+        assert_eq!(record.eligible, 0);
+        assert_eq!(record.slot, None);
+
+        let long = Placer::new([1u8; 32], Tier::Long);
+        let snap = snap_with(vec![with_backlog("long01", 0, LONG_BACKLOG_CAP)]);
+        let record = refused_record(long.place(&input, &snap, &HashMap::new(), &mut rng));
+        assert_eq!(record.reason, Some("long_full"));
+        assert_eq!(record.tier, Tier::Long);
+    }
+
+    #[test]
+    fn placed_record_carries_request_numbers() {
+        let mut input = base_input();
+        input.prompt_tokens = 4_000;
+        input.context_tokens = Some(12_000);
+        input.priority = 3;
+        let snap = snap_with(eight_slots());
+        let mut rng = StdRng::seed_from_u64(1);
+        let (_, record, _) = placed(placer().place(&input, &snap, &HashMap::new(), &mut rng));
+        assert_eq!(record.outcome, "place");
+        assert_eq!(record.tier, Tier::Base);
+        assert_eq!(record.class, Class::Short);
+        assert_eq!(record.priority_band, "high");
+        assert_eq!((record.lane_size, record.lane_cap), (0, 2));
+        assert_eq!(record.prompt_tokens, 4_000);
+        assert_eq!(record.context_tokens, Some(12_000));
+    }
+
+    #[test]
+    fn refused_never_without_state() {
+        let stale = || {
+            let mut s = saturated_base();
+            s.built_ms = NOW - FRESH_MAX_MS - 1;
+            s
+        };
+        let not_ready = || {
+            let mut s = saturated_base();
+            for v in &mut s.replicas {
+                v.state.lifecycle_state = crate::frame::Lifecycle::Draining;
+            }
+            s
+        };
+        let cases: [(Snapshot, LegacyReason); 3] = [
+            (snap_with(vec![]), LegacyReason::NoState),
+            (stale(), LegacyReason::Stale),
+            (not_ready(), LegacyReason::NoneEligible),
+        ];
+        for (snap, want) in cases {
+            for tier in [Tier::Base, Tier::Long] {
+                let mut rng = StdRng::seed_from_u64(1);
+                let d = Placer::new([1u8; 32], tier).place(
+                    &heavy(250_000),
+                    &snap,
+                    &HashMap::new(),
+                    &mut rng,
+                );
+                let (reason, record) = legacy_reason(d);
+                assert_eq!(reason, want, "{tier:?}");
+                assert_eq!(record.outcome, "legacy");
+                assert_eq!(record.strategy, None);
+            }
+        }
+    }
+
+    #[test]
+    fn refused_never_when_disabled() {
+        let mut snap = saturated_base();
+        let mut rng = StdRng::seed_from_u64(1);
+        refused_record(placer().place(&heavy(100_000), &snap, &HashMap::new(), &mut rng));
+
+        snap.disabled = true;
+        let (reason, record) =
+            legacy_reason(placer().place(&heavy(100_000), &snap, &HashMap::new(), &mut rng));
+        assert_eq!(reason, LegacyReason::Disabled);
+        assert_eq!(record.tier, Tier::Base);
+        assert_eq!(record.class, Class::Heavy);
+    }
+
+    #[test]
+    fn priority_band_tags() {
+        assert_eq!(PriorityBand::of(i32::MIN).as_str(), "neg");
+        assert_eq!(PriorityBand::of(-1).as_str(), "neg");
+        assert_eq!(PriorityBand::of(0).as_str(), "normal");
+        assert_eq!(PriorityBand::of(1).as_str(), "high");
+        assert_eq!(PriorityBand::of(i32::MAX).as_str(), "high");
+
+        let mut input = base_input();
+        input.priority = -7;
+        let mut rng = StdRng::seed_from_u64(1);
+        let snap = snap_with(vec![ready_view("gpu01", 0)]);
+        let (_, record, _) = placed(placer().place(&input, &snap, &HashMap::new(), &mut rng));
+        assert_eq!(record.priority_band, "neg");
+        // Legacy records carry the band too.
+        let (_, record) =
+            legacy_reason(placer().place(&input, &snap_with(vec![]), &HashMap::new(), &mut rng));
+        assert_eq!(record.priority_band, "neg");
+    }
+
+    #[test]
+    fn pins_on_different_tiers_never_collide() {
+        let key = AffinityKey::from_bytes([33u8; 16]);
+        let secret = [6u8; 32];
+        let base_pid = pin_id(Tier::Base, &key, &secret);
+        let long_pid = pin_id(Tier::Long, &key, &secret);
+        assert_ne!(base_pid.as_bytes(), long_pid.as_bytes());
+
+        // A base-tier pin is invisible to the long placer, even when the
+        // pinned slot is one the long placer can see.
+        let slots = vec![slot("long01", 0), slot("long01", 1)];
+        let home = slot("long01", 0);
+        let key = find_key_with_home(&slots, &home);
+        let mut snap = snap_with(vec![ready_view("long01", 0), ready_view("long01", 1)]);
+        std::sync::Arc::make_mut(&mut snap.pins).insert(
+            *pin_id(Tier::Base, &key, &secret).as_bytes(),
+            slot("long01", 1),
+            NOW - 1_000,
+        );
+        let mut input = keyed(key.clone());
+        input.heavy = true;
+        let mut rng = StdRng::seed_from_u64(1);
+        let (chosen, record, pin_write) =
+            placed(Placer::new(secret, Tier::Long).place(&input, &snap, &HashMap::new(), &mut rng));
+        assert_eq!(chosen, home);
+        assert_eq!(record.selection, Some("home"));
+        assert_eq!(record.pinned, None);
+        assert!(pin_write.is_none());
+
+        // The base placer does honor it.
+        let (chosen, record, _) = placed(Placer::new(secret, Tier::Base).place(
+            &keyed(key),
+            &snap,
+            &HashMap::new(),
+            &mut rng,
+        ));
+        assert_eq!(chosen, slot("long01", 1));
+        assert_eq!(record.selection, Some("pinned"));
+    }
+
+    #[test]
+    fn refused_record_never_contains_key_material() {
+        let key_bytes = [0xABu8; 16];
+        let secret = [0xCDu8; 32];
+        let pid = pin_id(Tier::Base, &AffinityKey::from_bytes(key_bytes), &secret);
+        let mut snap = saturated_base();
+        std::sync::Arc::make_mut(&mut snap.pins).insert(
+            *pid.as_bytes(),
+            slot("gpu01", 0),
+            NOW - 1_000,
+        );
+        let mut input = keyed(AffinityKey::from_bytes(key_bytes));
+        input.heavy = true;
+        input.prompt_tokens = 100_000;
+        let mut rng = StdRng::seed_from_u64(1);
+        let record = refused_record(Placer::new(secret, Tier::Base).place(
+            &input,
+            &snap,
+            &HashMap::new(),
+            &mut rng,
+        ));
+        assert_no_key_material(&format!("{record:?}"), key_bytes, &pid);
     }
 
     use proptest::prelude::*;
@@ -1231,7 +1502,7 @@ mod tests {
 
             let mut snap = snap_with(views);
             if has_pin && has_affinity {
-                let pid = pin_id(&AffinityKey::from_bytes(key_bytes), &[1u8; 32]);
+                let pid = pin_id(Tier::Base, &AffinityKey::from_bytes(key_bytes), &[1u8; 32]);
                 std::sync::Arc::make_mut(&mut snap.pins).insert(*pid.as_bytes(), slot("gpu0", 0), NOW - 1_000);
             }
 

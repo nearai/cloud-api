@@ -43,7 +43,7 @@ pub struct VerifiedAttestation {
 /// Trust boundary: the whole payload is bound into RTMR3, so it is exactly
 /// what the attested workload emitted. Attestation itself validates only the
 /// key: a valid, non-weak ed25519 point whose hash equals `key_id`.
-/// `boot_id`, `host_id`, `model` and `replica_ids` are the workload's own
+/// `boot_id` and `host_id` are the workload's own
 /// claims and are not checked against any request or discovery context here;
 /// consumers must cross-check them before trusting a report signed by this
 /// key (placement ingest compares them with the Valkey key it read and with
@@ -57,8 +57,6 @@ pub struct ReplicaReportKey {
     pub public_key_hex: String,
     pub boot_id: String,
     pub host_id: String,
-    pub model: String,
-    pub replica_ids: Vec<String>,
 }
 
 /// Data extracted from the RTMR3-verified event log.
@@ -650,7 +648,7 @@ impl AttestationVerifier {
 /// Parse and validate a `nearai-replica-report-key-v1` event payload.
 ///
 /// `event_payload` is the hex encoding of the proxy's signed JSON
-/// `{key_id, public_key_hex, boot_id, host_id, model, replica_ids}`. Returns
+/// `{key_id, public_key_hex, boot_id, host_id}`. Returns
 /// `None` on any malformed input (bad hex, bad JSON, bad public key length,
 /// invalid curve point, or a `key_id` that doesn't hash back to the public
 /// key) — never fatal to attestation. Only the error *kind* is logged, never
@@ -1093,8 +1091,6 @@ mod tests {
             public_key_hex: hex::encode(vk.as_bytes()),
             boot_id: boot_id.to_string(),
             host_id: "host-1".to_string(),
-            model: "z-ai/glm-5.3-flash".to_string(),
-            replica_ids: vec!["r1".to_string(), "r2".to_string()],
         }
     }
 
@@ -1106,10 +1102,41 @@ mod tests {
             "public_key_hex": key.public_key_hex,
             "boot_id": key.boot_id,
             "host_id": key.host_id,
-            "model": key.model,
-            "replica_ids": key.replica_ids,
         });
         hex::encode(serde_json::to_vec(&value).unwrap())
+    }
+
+    /// The exact shape inference-proxy #274's `event_payload` emits.
+    #[test]
+    fn payload_from_proxy_274_parses() {
+        let vk = test_signing_key(7).verifying_key();
+        let json = json!({
+            "key_id": placement::frame::key_id(&vk),
+            "public_key_hex": hex::encode(vk.as_bytes()),
+            "boot_id": "boot-1",
+            "host_id": "host-a",
+        });
+        let parsed = parse_replica_report_key(&hex::encode(serde_json::to_vec(&json).unwrap()))
+            .expect("proxy payload parses");
+        assert_eq!(parsed.host_id, "host-a");
+        assert_eq!(parsed.boot_id, "boot-1");
+        assert_eq!(parsed.key_id, placement::frame::key_id(&vk));
+    }
+
+    #[test]
+    fn old_payload_with_model_still_parses_ignoring_extras() {
+        let vk = test_signing_key(8).verifying_key();
+        let json = json!({
+            "key_id": placement::frame::key_id(&vk),
+            "public_key_hex": hex::encode(vk.as_bytes()),
+            "boot_id": "boot-1",
+            "host_id": "host-a",
+            "model": "some/model",
+            "replica_ids": ["r1", "r2"],
+        });
+        let parsed = parse_replica_report_key(&hex::encode(serde_json::to_vec(&json).unwrap()))
+            .expect("old payload parses, extras ignored");
+        assert_eq!(parsed.host_id, "host-a");
     }
 
     /// Compute the digest production uses for a runtime event:

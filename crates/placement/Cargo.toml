@@ -4,7 +4,7 @@ edition.workspace = true
 version.workspace = true
 authors.workspace = true
 license.workspace = true
-description = "Smart-routing decision logic: picks a GPU host from signed per-replica load frames"
+description = "Smart-routing decision logic: picks a replica slot from signed host load frames"
 
 [dependencies]
 serde = { version = "1.0", features = ["derive"] }

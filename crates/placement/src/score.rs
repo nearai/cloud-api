@@ -1,13 +1,10 @@
-//! Prefill-aware host scoring.
+//! Prefill-aware replica scoring.
 //!
 //! Lower scores are better. A replica's score combines how full its running
 //! queue is (`fullness`), how deep its prefill backlog is (`prefill`), and
 //! how fast it's currently generating relative to the fleet (`speed`).
-//! `host_score` reports the *best* (lowest-scoring) eligible replica on the
-//! host (E14): cloud-api only picks the host, and the host's own
-//! inference-proxy then picks which replica actually serves the request
-//! using its own least-connections-plus-affinity logic, so the host is only
-//! as good as its best replica.
+//! Placement picks a replica slot, not just a host, so every slot is scored
+//! on its own state and its own pending load.
 
 use crate::consts::{DEFAULT_MAX_RUNNING, PREFILL_NORM_TOKENS, SPEED_FLOOR};
 use crate::snapshot::{ReplicaView, RoutedCounts};
@@ -33,12 +30,12 @@ pub struct Pending {
 /// *both* missing has already been excluded upstream by `Rule::Capacity`'s
 /// fail-closed check, so this function never has to guess for that case.
 pub fn replica_score(r: &ReplicaView, pending: Pending, fleet_median_tps: f64) -> f64 {
-    let load = &r.report.load;
+    let load = &r.state.load;
     let running = load.running.unwrap_or(0) as f64;
     let queued = load.queued.unwrap_or(0) as f64;
 
     let max_running = r
-        .report
+        .state
         .limits
         .max_running
         .map(|m| m as f64)
@@ -59,16 +56,6 @@ pub fn replica_score(r: &ReplicaView, pending: Pending, fleet_median_tps: f64) -
     (fullness + prefill) / speed
 }
 
-/// A host's score is its best (lowest) eligible replica's score (E14). A
-/// host with no eligible replicas scores `f64::INFINITY`, so it is never
-/// preferred over a host with at least one.
-pub fn host_score(replicas: &[(&ReplicaView, Pending)], fleet_median_tps: f64) -> f64 {
-    replicas
-        .iter()
-        .map(|(r, pending)| replica_score(r, *pending, fleet_median_tps))
-        .fold(f64::INFINITY, f64::min)
-}
-
 /// The fleet's median `gen_tps`, over replicas reporting `Some(tps) > 0.0`.
 /// Ties (an even sample count) use the average of the two middle values,
 /// rather than the lower one, so the median doesn't favor whichever half it
@@ -77,7 +64,7 @@ pub fn host_score(replicas: &[(&ReplicaView, Pending)], fleet_median_tps: f64) -
 pub fn fleet_median_tps(views: &[&ReplicaView]) -> f64 {
     let mut samples: Vec<f64> = views
         .iter()
-        .filter_map(|v| v.report.load.gen_tps)
+        .filter_map(|v| v.state.load.gen_tps)
         .filter(|tps| *tps > 0.0)
         .collect();
     if samples.is_empty() {
@@ -92,11 +79,10 @@ pub fn fleet_median_tps(views: &[&ReplicaView]) -> f64 {
     }
 }
 
-/// The `Pending` load for a host-level `routed` counter (E18/R3: cloud-api
-/// publishes one `RoutedCounts` per host, since the host's own proxy
-/// balances its own replicas).
+/// The `Pending` load for one slot's `routed` counter (cloud-api publishes
+/// one `RoutedCounts` per slot, since it picks the replica).
 ///
-/// `routed` is the fleet-wide routed count for the host over the reader's
+/// `routed` is the fleet-wide routed count for the slot over the reader's
 /// sliding window (the `{now-1s, now}` routed hashes) and already includes
 /// this placer's own routed requests that reached Valkey; `mine` is this
 /// placer's own count over the same window, including writes Valkey has not
@@ -120,20 +106,6 @@ pub fn pending_for(routed: Option<&RoutedCounts>, mine: Pending) -> Pending {
     }
 }
 
-/// Divide a host-level `Pending` evenly across `n_replicas`, using ceiling
-/// division so the sum of the parts never undercounts the host total.
-/// `n_replicas == 0` returns `host` unchanged (nothing to split across).
-pub fn split_pending(host: Pending, n_replicas: usize) -> Pending {
-    if n_replicas == 0 {
-        return host;
-    }
-    let n = n_replicas as u64;
-    Pending {
-        req: (host.req as u64).div_ceil(n) as u32,
-        tok: host.tok.div_ceil(n),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -151,11 +123,11 @@ mod tests {
         // 40k backlog token vs. 10 running (out of a default 40 max_running):
         // fullness only moves the score by 0.25, prefill by 2.5.
         let mut light_running = view_ready();
-        light_running.report.load.running = Some(10);
-        light_running.report.load.queued = Some(0);
+        light_running.state.load.running = Some(10);
+        light_running.state.load.queued = Some(0);
 
         let mut heavy_backlog = light_running.clone();
-        heavy_backlog.report.load.prefill_backlog_tokens = Some(40_000);
+        heavy_backlog.state.load.prefill_backlog_tokens = Some(40_000);
 
         let low = replica_score(&light_running, Pending::default(), 1.0);
         let high = replica_score(&heavy_backlog, Pending::default(), 1.0);
@@ -172,12 +144,12 @@ mod tests {
         // E13: identical load, gen_tps 180 vs 600 — the slower replica must
         // score worse (higher) under the shared fleet median.
         let mut slow = view_ready();
-        slow.report.load.running = Some(20);
-        slow.report.load.gen_tps = Some(180.0);
+        slow.state.load.running = Some(20);
+        slow.state.load.gen_tps = Some(180.0);
 
         let mut fast = view_ready();
-        fast.report.load.running = Some(20);
-        fast.report.load.gen_tps = Some(600.0);
+        fast.state.load.running = Some(20);
+        fast.state.load.gen_tps = Some(600.0);
 
         let median = fleet_median_tps(&[&slow, &fast]);
         let slow_score = replica_score(&slow, Pending::default(), median);
@@ -186,32 +158,6 @@ mod tests {
             slow_score > fast_score,
             "slow={slow_score} fast={fast_score}"
         );
-    }
-
-    #[test]
-    fn host_score_is_best_replica() {
-        // E14: the host's score tracks its best (lowest-scoring) replica.
-        let mut loaded = view_ready();
-        loaded.replica_id = "r1".into();
-        loaded.report.load.running = Some(30);
-
-        let mut idle = view_ready();
-        idle.replica_id = "r2".into();
-        idle.report.load.running = Some(0);
-
-        let pairs = [(&loaded, Pending::default()), (&idle, Pending::default())];
-        let host = host_score(&pairs, 1.0);
-        let idle_alone = replica_score(&idle, Pending::default(), 1.0);
-        assert!(
-            (host - idle_alone).abs() < 1e-9,
-            "host={host} idle_alone={idle_alone}"
-        );
-    }
-
-    #[test]
-    fn host_score_empty_is_infinite() {
-        let pairs: [(&ReplicaView, Pending); 0] = [];
-        assert_eq!(host_score(&pairs, 1.0), f64::INFINITY);
     }
 
     #[test]
@@ -253,10 +199,10 @@ mod tests {
     fn speed_is_clamped_above() {
         // A self-reported absurd gen_tps can't drive the score to ~0.
         let mut honest = view_ready();
-        honest.report.load.running = Some(20);
-        honest.report.load.gen_tps = Some(100.0);
+        honest.state.load.running = Some(20);
+        honest.state.load.gen_tps = Some(100.0);
         let mut liar = honest.clone();
-        liar.report.load.gen_tps = Some(1.0e12);
+        liar.state.load.gen_tps = Some(1.0e12);
 
         let base = replica_score(&honest, Pending::default(), 100.0);
         let score = replica_score(&liar, Pending::default(), 100.0);
@@ -271,9 +217,9 @@ mod tests {
     #[test]
     fn null_backlog_uses_queued_estimate() {
         let mut v = view_ready();
-        v.report.load.running = Some(0);
-        v.report.load.queued = Some(3);
-        v.report.load.prefill_backlog_tokens = None;
+        v.state.load.running = Some(0);
+        v.state.load.queued = Some(3);
+        v.state.load.prefill_backlog_tokens = None;
         let score = replica_score(&v, Pending::default(), 1.0);
         let expected_fullness = 3.0 / DEFAULT_MAX_RUNNING;
         let expected_prefill = (3.0 * 2_000.0) / PREFILL_NORM_TOKENS;
@@ -282,21 +228,5 @@ mod tests {
             (score - expected).abs() < 1e-9,
             "score={score} expected={expected}"
         );
-    }
-
-    #[test]
-    fn split_pending_ceils() {
-        let host = Pending { req: 3, tok: 101 };
-        let split = split_pending(host, 2);
-        assert_eq!(split.req, 2, "ceil(3/2) == 2");
-        assert_eq!(split.tok, 51, "ceil(101/2) == 51");
-    }
-
-    #[test]
-    fn split_pending_zero_replicas() {
-        let host = Pending { req: 7, tok: 999 };
-        let split = split_pending(host, 0);
-        assert_eq!(split.req, host.req);
-        assert_eq!(split.tok, host.tok);
     }
 }

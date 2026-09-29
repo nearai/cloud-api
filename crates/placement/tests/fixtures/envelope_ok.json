@@ -1,5 +1,0 @@
-{
-  "frame": "{\"schema\":1,\"host_id\":\"glm53-gpu03\",\"replica_id\":\"r1\",\"boot_id\":\"00000000-0000-4000-8000-000000000001\",\"seq\":7,\"engine_sampled_at_ms\":1790000000011,\"reported_at_ms\":1790000000123,\"lifecycle_state\":\"ready\",\"model\":\"z-ai/glm-5.3-flash\",\"engine\":\"sglang\",\"engine_version\":null,\"limits\":{\"max_running\":32},\"load\":{\"running\":14,\"queued\":0,\"prefill_backlog_tokens\":51200,\"kv_usage\":null,\"kv_used_tokens\":null,\"kv_capacity_tokens\":null,\"gen_tps\":null,\"cached_token_ratio\":null},\"proxy_inflight\":16,\"report_key_id\":\"fe812c12f3ab4ce6\"}",
-  "sig": "3Ka6yODHNE9Vf3ploWalHNbvdnS5HbrKS4Dv+NPkiTXFUJmvsIdO3/W0Cpi63EosCLDKbyYEVRANizYm21yGDA==",
-  "key_id": "fe812c12f3ab4ce6"
-}

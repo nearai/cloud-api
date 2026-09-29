@@ -8,7 +8,7 @@
 //! non-regressing `engine_sampled_at_ms` per replica, so a stale or replayed
 //! frame can never move a routing decision backwards.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
 
 use ed25519_dalek::VerifyingKey;
@@ -167,9 +167,14 @@ fn map_frame_error(e: FrameError) -> Reject {
 /// a replayed frame from an earlier boot is rejected even when its engine
 /// times do not regress (e.g. right after a reboot whose first frame had no
 /// engine time yet).
+///
+/// A host whose accepted `boot_id` changed is queued for
+/// [`Ingest::take_rebooted_hosts`], so the caller can drop pins to its now
+/// cold slots.
 #[derive(Default)]
 pub struct Ingest {
     hosts: HashMap<String, HostState>,
+    rebooted: BTreeSet<String>,
 }
 
 /// How many superseded boot ids are remembered per host.
@@ -324,13 +329,15 @@ impl Ingest {
         }
 
         let mut retired = prev.map(|h| h.retired.clone()).unwrap_or_default();
-        if let Some(host) = prev {
-            if host.boot != report.boot_id {
-                retired.push(host.boot.clone());
-                if retired.len() > RETIRED_BOOTS {
-                    retired.remove(0);
-                }
+        let boot_changed = prev.is_some_and(|host| host.boot != report.boot_id);
+        if let Some(host) = prev.filter(|_| boot_changed) {
+            retired.push(host.boot.clone());
+            if retired.len() > RETIRED_BOOTS {
+                retired.remove(0);
             }
+        }
+        if boot_changed {
+            self.rebooted.insert(redis_host.to_string());
         }
 
         let views = slots
@@ -355,6 +362,15 @@ impl Ingest {
         );
 
         Ok(views)
+    }
+
+    /// The hosts whose `boot_id` changed in an accepted frame since the last
+    /// call, sorted, each reported once. A host's first frame seen by this
+    /// `Ingest` is not a reboot (there is nothing to compare it with), nor is
+    /// a rejected frame. The caller drops pins to these hosts' slots
+    /// (`PinTable::drop_host`): a rebooted engine's prefix cache is cold.
+    pub fn take_rebooted_hosts(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.rebooted).into_iter().collect()
     }
 }
 
@@ -630,6 +646,41 @@ mod tests {
         let views = accept(&mut ingest, &third).unwrap();
         assert_eq!(views.len(), 1);
         assert_eq!(views[0].slot.replica, 1);
+    }
+
+    #[test]
+    fn boot_change_is_reported_once() {
+        let mut ingest = Ingest::new();
+
+        // A host's first frame is not a reboot, nor is a later frame of the
+        // same boot.
+        let mut first = report();
+        first.replicas = vec![replica(0, Some(1_000))];
+        accept(&mut ingest, &first).unwrap();
+        assert!(ingest.take_rebooted_hosts().is_empty());
+        first.seq = 2;
+        first.replicas = vec![replica(0, Some(2_000))];
+        accept(&mut ingest, &first).unwrap();
+        assert!(ingest.take_rebooted_hosts().is_empty());
+
+        // A rejected frame from a new boot reports nothing.
+        let mut rebooted = report();
+        rebooted.boot_id = "boot-b".into();
+        rebooted.replicas = vec![replica(0, Some(1_500))];
+        assert_eq!(
+            accept(&mut ingest, &rebooted).unwrap_err(),
+            Reject::Regressed
+        );
+        assert!(ingest.take_rebooted_hosts().is_empty());
+
+        // The accepted boot change is reported exactly once.
+        rebooted.replicas = vec![replica(0, Some(3_000))];
+        accept(&mut ingest, &rebooted).unwrap();
+        rebooted.seq = 2;
+        rebooted.replicas = vec![replica(0, Some(4_000))];
+        accept(&mut ingest, &rebooted).unwrap();
+        assert_eq!(ingest.take_rebooted_hosts(), vec![HOST.to_string()]);
+        assert!(ingest.take_rebooted_hosts().is_empty());
     }
 
     #[test]

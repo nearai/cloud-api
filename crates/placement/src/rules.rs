@@ -3,7 +3,7 @@
 //! Stage 1 is per replica: [`first_exclusion`] runs each [`Rule`] in
 //! [`RULES`] order against a [`ReplicaView`] and returns the first one that
 //! excludes it, or `None` if the replica survives. Stage 2 is `Rule::Lane`,
-//! which needs a view of every stage-1 survivor at once, so `Placer::place`
+//! which needs a view of every live replica at once, so `Placer::place`
 //! evaluates it after stage 1 (see `policy::lane_admits`). Exclusions from
 //! both stages are tallied per rule in [`ALL_RULES`] order.
 
@@ -93,19 +93,8 @@ impl Rule {
                 if r.state.load.running.is_none() && r.state.load.queued.is_none() {
                     return Err(Exclusion(self));
                 }
-                if let Some(kv) = r.state.load.kv_usage {
-                    if kv >= KV_MAX {
-                        return Err(Exclusion(self));
-                    }
-                }
-                if let Some(m) = r.state.limits.max_running {
-                    let running = r.state.load.running.unwrap_or(0);
-                    let queued = r.state.load.queued.unwrap_or(0);
-                    let in_flight = running.saturating_add(queued);
-                    let cap = m.saturating_mul(2);
-                    if in_flight >= cap {
-                        return Err(Exclusion(self));
-                    }
+                if saturated(r) {
+                    return Err(Exclusion(self));
                 }
                 Ok(())
             }
@@ -121,6 +110,21 @@ impl Rule {
             Rule::Lane => Ok(()),
         }
     }
+}
+
+/// Whether `r` reports itself out of capacity: KV usage at or above
+/// `KV_MAX`, or at least `2 * max_running` requests in flight. The part of
+/// `Rule::Capacity` that is evidence of a full replica, as opposed to its
+/// fail-closed exclusion of a replica that reports no counts at all.
+pub fn saturated(r: &ReplicaView) -> bool {
+    if r.state.load.kv_usage.is_some_and(|kv| kv >= KV_MAX) {
+        return true;
+    }
+    r.state.limits.max_running.is_some_and(|m| {
+        let running = r.state.load.running.unwrap_or(0);
+        let queued = r.state.load.queued.unwrap_or(0);
+        running.saturating_add(queued) >= m.saturating_mul(2)
+    })
 }
 
 /// Returns the first stage-1 rule (in `RULES` order) that excludes `r`, or

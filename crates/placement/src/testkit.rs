@@ -22,20 +22,27 @@ pub(crate) const TEST_MODEL: &str = "z-ai/glm-5.3-flash";
 /// inference-proxy uses to produce real frames.
 pub(crate) fn seal(report: &HostReport, key: &SigningKey) -> Envelope {
     let frame = serde_json::to_string(report).expect("report serializes");
+    seal_json(frame, &report.report_key_id, key)
+}
+
+/// Seal raw frame JSON (e.g. with fields `HostReport` doesn't know) under
+/// `key_id`, signed by `key`.
+pub(crate) fn seal_json(frame: String, key_id: &str, key: &SigningKey) -> Envelope {
     let mut message = SIGNING_DOMAIN.to_vec();
     message.extend_from_slice(frame.as_bytes());
     let sig = key.sign(&message);
     Envelope {
         frame,
         sig: base64::engine::general_purpose::STANDARD.encode(sig.to_bytes()),
-        key_id: report.report_key_id.clone(),
+        key_id: key_id.to_string(),
     }
 }
 
 /// A replica state that passes every eligibility rule as of `NOW`: `Ready`,
-/// freshly sampled, idle (`running`/`queued` both `Some(0)`, so it also
-/// clears `Rule::Capacity`'s fail-closed "no counts at all" check), and with
-/// no declared limits.
+/// freshly sampled, known idle (`running`, `queued` and
+/// `prefill_backlog_tokens` all `Some(0)`, so it clears `Rule::Capacity`'s
+/// fail-closed "no counts at all" check and gets the lane's idle waiver), and
+/// with no declared limits.
 pub(crate) fn replica_state(index: u32) -> ReplicaState {
     ReplicaState {
         index,
@@ -46,6 +53,7 @@ pub(crate) fn replica_state(index: u32) -> ReplicaState {
         load: Load {
             running: Some(0),
             queued: Some(0),
+            prefill_backlog_tokens: Some(0),
             ..Load::default()
         },
         proxy_inflight: 0,
@@ -94,6 +102,7 @@ pub(crate) fn input() -> PlaceInput {
         prompt_tokens: 100,
         context_tokens: None,
         heavy: false,
+        prefill_heavy: false,
         priority: 0,
         affinity: None,
         affinity_source: AffinitySource::None,

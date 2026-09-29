@@ -101,6 +101,13 @@ impl PinTable {
         self.entries.retain(|_, (slot, _)| keep(slot));
     }
 
+    /// Drop every pin to a slot on `host`: after the host reboots (see
+    /// `snapshot::Ingest::take_rebooted_hosts`) its replicas' prefix caches
+    /// are cold, so a pin there no longer buys a warm prefill.
+    pub fn drop_host(&mut self, host: &str) {
+        self.retain_slots(|slot| slot.host != host);
+    }
+
     /// Drop every entry [`Self::get`] would already treat as expired at
     /// `now_ms`, so a long-lived table stays bounded.
     pub fn prune(&mut self, now_ms: u64) {
@@ -204,10 +211,10 @@ fn within_bound(score: f64, best: f64) -> bool {
 /// host's frame) is ignored and the keyed HRW walk decides.
 ///
 /// `pin_ignores_bound` makes a pin to any slot in `scores` win whatever its
-/// score. The placer sets it for heavy requests, whose admission is already
-/// capped by the lane's backlog caps: a warm long conversation returns to its
-/// replica whenever that replica is admitted (caps take precedence over
-/// affinity, the score bound does not).
+/// score. The placer sets it for a prompt-heavy request whose pin passed its
+/// load test instead (`decision::heavy_pin_holds`: stay unless waiting on
+/// the pin costs more than a cold prefill elsewhere); a pin that fails that
+/// test is left out of `scores` altogether.
 pub fn select(
     key: Option<&AffinityKey>,
     pin: Option<&SlotId>,
@@ -233,8 +240,8 @@ pub fn select(
     });
     let home = rank.as_ref().map(|r| r[0].clone());
 
-    // Rule 1: an in-bound (or, for heavy requests, any eligible) pin wins
-    // outright.
+    // Rule 1: an in-bound pin (or one the caller vouched for with
+    // `pin_ignores_bound`) wins outright.
     if let Some(pin_slot) = pin {
         if let Some(score) = score_of(pin_slot) {
             if pin_ignores_bound || within_bound(score, best) {
@@ -334,6 +341,21 @@ mod tests {
             }
         }
         unreachable!("no key found within u128 search space")
+    }
+
+    #[test]
+    fn drop_host_removes_only_that_hosts_pins() {
+        let mut t = PinTable::default();
+        let slot = |host: &str, replica| SlotId {
+            host: host.into(),
+            replica,
+        };
+        t.insert([1u8; 16], slot("gpu01", 0), 0);
+        t.insert([2u8; 16], slot("gpu01", 1), 0);
+        t.insert([3u8; 16], slot("gpu02", 0), 0);
+        t.drop_host("gpu01");
+        assert_eq!(t.len(), 1);
+        assert!(t.entries.contains_key(&[3u8; 16]));
     }
 
     #[test]

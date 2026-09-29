@@ -445,15 +445,21 @@ impl Placer {
             Selection::Pinned | Selection::BestOfTwo => None,
         };
 
+        // A keyed heavy placement always (re)writes its pin: lane membership
+        // follows the prefill backlog, so once it drains, the survivor set
+        // and the HRW walk over it can change, and only a pin keeps the next
+        // turn on its warm replica. Short requests pin only on a move or a
+        // half-TTL refresh.
         let mut pin_write: Option<(PinId, SlotId)> = None;
         if let Some(pid) = pin_id_opt {
-            let should_write = match selected.selection {
-                Selection::Pinned => pin_lookup
-                    .as_ref()
-                    .map(|(_, at_ms)| input.now_ms.saturating_sub(*at_ms) > PIN_TTL_MS / 2)
-                    .unwrap_or(false),
-                _ => selected.write_pin,
-            };
+            let should_write = input.heavy
+                || match selected.selection {
+                    Selection::Pinned => pin_lookup
+                        .as_ref()
+                        .map(|(_, at_ms)| input.now_ms.saturating_sub(*at_ms) > PIN_TTL_MS / 2)
+                        .unwrap_or(false),
+                    _ => selected.write_pin,
+                };
             if should_write {
                 pin_write = Some((pid, selected.slot.clone()));
             }
@@ -1230,7 +1236,8 @@ mod tests {
             chosen_score > best + 1.0,
             "the pin must be outside the score bound here: {chosen_score} vs {best}"
         );
-        assert!(pin_write.is_none());
+        let (_, rewritten) = pin_write.expect("a heavy placement always refreshes its pin");
+        assert_eq!(rewritten, pinned);
     }
 
     #[test]
@@ -1273,6 +1280,69 @@ mod tests {
         ));
         assert_ne!(chosen, pinned);
         assert_eq!(record.strategy, Some("short_overflow"));
+    }
+
+    #[test]
+    fn heavy_home_placement_writes_pin() {
+        let secret = [8u8; 32];
+        let slots: Vec<SlotId> = eight_slots().iter().map(|v| v.slot.clone()).collect();
+        let home = slot("gpu03", 1);
+        let key = find_key_with_home(&slots, &home);
+        let snap = snap_with(eight_slots());
+        let mut input = keyed(key.clone());
+        input.heavy = true;
+        input.prompt_tokens = 150_000;
+        let mut rng = StdRng::seed_from_u64(1);
+        let (chosen, record, pin_write) =
+            placed(Placer::new(secret, Tier::Base).place(&input, &snap, &HashMap::new(), &mut rng));
+        assert_eq!(chosen, home);
+        assert_eq!(record.selection, Some("home"));
+        let (pid, pinned) = pin_write.expect("a keyed heavy Home placement writes a pin");
+        assert_eq!(pinned, home);
+        assert_eq!(pid.as_bytes(), pin_id(Tier::Base, &key, &secret).as_bytes());
+
+        // A fresh pin on the heavy Pinned path is refreshed too.
+        let mut snap = snap_with(eight_slots());
+        std::sync::Arc::make_mut(&mut snap.pins).insert(*pid.as_bytes(), home.clone(), NOW - 1_000);
+        let (_, record, pin_write) =
+            placed(Placer::new(secret, Tier::Base).place(&input, &snap, &HashMap::new(), &mut rng));
+        assert_eq!(record.selection, Some("pinned"));
+        assert!(pin_write.is_some());
+    }
+
+    #[test]
+    fn short_home_placement_writes_no_pin() {
+        // Today's short-request rule: Home with no prior pin writes nothing.
+        let slots: Vec<SlotId> = eight_slots().iter().map(|v| v.slot.clone()).collect();
+        let home = slot("gpu03", 1);
+        let key = find_key_with_home(&slots, &home);
+        let snap = snap_with(eight_slots());
+        let mut rng = StdRng::seed_from_u64(1);
+        let (chosen, record, pin_write) = placed(Placer::new([8u8; 32], Tier::Base).place(
+            &keyed(key),
+            &snap,
+            &HashMap::new(),
+            &mut rng,
+        ));
+        assert_eq!(chosen, home);
+        assert_eq!(record.selection, Some("home"));
+        assert!(pin_write.is_none());
+    }
+
+    #[test]
+    fn oversized_heavy_prompt_is_placed_on_an_idle_long_replica() {
+        let long = Placer::new([1u8; 32], Tier::Long);
+        let snap = snap_with(vec![
+            with_backlog("long01", 0, 100_000),
+            ready_view("long01", 1),
+        ]);
+        let mut input = heavy(LONG_BACKLOG_CAP + 100_000);
+        input.context_tokens = Some(LONG_BACKLOG_CAP + 120_000);
+        let mut rng = StdRng::seed_from_u64(1);
+        let (chosen, record, _) = placed(long.place(&input, &snap, &HashMap::new(), &mut rng));
+        assert_eq!(chosen, slot("long01", 1));
+        assert_eq!(record.strategy, Some("heavy_long"));
+        assert_eq!(record.excluded[4], (Rule::Lane, 1));
     }
 
     #[test]
@@ -1480,7 +1550,17 @@ mod tests {
         assert_eq!(chosen, home);
         assert_eq!(record.selection, Some("home"));
         assert_eq!(record.pinned, None);
-        assert!(pin_write.is_none());
+        // The long placer writes its own pin (heavy placements always pin),
+        // under its own tier's id: never the base pin's.
+        let (long_pid, _) = pin_write.expect("heavy placements pin");
+        assert_eq!(
+            long_pid.as_bytes(),
+            pin_id(Tier::Long, &key, &secret).as_bytes()
+        );
+        assert_ne!(
+            long_pid.as_bytes(),
+            pin_id(Tier::Base, &key, &secret).as_bytes()
+        );
 
         // The base placer does honor it.
         let (chosen, record, _) = placed(Placer::new(secret, Tier::Base).place(

@@ -1,7 +1,7 @@
 //! Valkey IO for smart placement: a background reader that turns signed
-//! replica frames, host-level routed counters and follow pins into a
-//! [`placement::snapshot::Snapshot`], and a bounded, fire-and-forget write
-//! queue for routed counters and pins.
+//! host frames, per-replica routed counters, follow pins and the data-plane
+//! kill switch into a [`placement::snapshot::Snapshot`], and a bounded,
+//! fire-and-forget write queue for routed counters and pins.
 //!
 //! Nothing here runs on the request path: the reader swaps a fresh snapshot
 //! into an [`ArcSwap`] every [`READ_INTERVAL`], and [`PlacementIo::record`]
@@ -22,10 +22,10 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use arc_swap::ArcSwap;
 use placement::affinity::PinTable;
-use placement::consts::{HOST_REPLICA, PIN_TTL_MS};
+use placement::consts::PIN_TTL_MS;
 use placement::frame::Envelope;
 use placement::snapshot::{Ingest, Reject, ReplicaView, RoutedCounts, Snapshot};
-use placement::KeyRegistry;
+use placement::{KeyRegistry, SlotId};
 use redis::aio::{ConnectionManager, ConnectionManagerConfig};
 use tokio::sync::mpsc;
 
@@ -88,6 +88,8 @@ pub const METRIC_READ_ERRORS: &str = "cloud_api.placement.valkey_read_errors";
 pub const METRIC_FRAMES_REJECTED: &str = "cloud_api.placement.frames_rejected";
 pub const METRIC_PINS_MALFORMED: &str = "cloud_api.placement.pins_malformed";
 pub const METRIC_SNAPSHOT_AGE_MS: &str = "cloud_api.placement.snapshot_age_ms";
+/// One per reader cycle that found [`KILL_SWITCH_KEY`] present.
+pub const METRIC_KILL_SWITCH_CYCLES: &str = "cloud_api.placement.kill_switch_cycles";
 /// One per placement decision on a covered model, tagged
 /// `outcome:{place|legacy}` plus `selection:{..}` (place) or `reason:{..}`
 /// (legacy). Never host or request ids.
@@ -147,33 +149,34 @@ impl<M: PlacementMetrics + ?Sized> PlacementMetrics for ErasedMetrics<M> {
     }
 }
 
-/// `replica:{host}:{replica}`: a replica's latest signed envelope (JSON
-/// string, `EX 5`), matching inference-proxy's `redis_sink::state_key`.
-pub fn replica_key(host: &str, replica: &str) -> String {
-    format!("replica:{host}:{replica}")
+/// `replica:{host}`: a host's latest signed frame envelope (JSON string,
+/// `EX 5`), matching inference-proxy's `redis_sink::state_key`.
+pub fn replica_key(host: &str) -> String {
+    format!("replica:{host}")
 }
 
 /// `routed:{host}:{replica}:{sec}`: per-second routed counters (`req`,
-/// `tok`). Host-level placement writes `replica = "_host"`.
-pub fn routed_key(host: &str, replica: &str, sec: u64) -> String {
-    format!("routed:{host}:{replica}:{sec}")
+/// `tok`) for one replica slot.
+pub fn routed_key(slot: &SlotId, sec: u64) -> String {
+    format!("routed:{}:{}:{sec}", slot.host, slot.replica)
 }
+
+/// The data-plane kill switch: while this key exists (any value), every
+/// snapshot is published `disabled`, so every placement is Legacy. Only its
+/// presence matters. It sits under `routed:*` so the router ACL can read it,
+/// but the router may only `HINCRBY`/`EXPIRE` there and the proxies' writer
+/// is scoped to `replica:*`, so only admin can set it.
+pub const KILL_SWITCH_KEY: &str = "routed:_placement_off";
 
 /// A fire-and-forget write. Holds a pin id, so it intentionally has no
 /// `Debug`.
 pub enum Write {
-    /// One routed request of `tok` tokens to `host` in unix second `sec`.
-    /// `replica: None` (host-level placement) writes under `"_host"`.
-    Routed {
-        host: String,
-        replica: Option<String>,
-        tok: u64,
-        sec: u64,
-    },
-    /// A follow pin: `id_hex` (32 hex chars) now points at `host`.
+    /// One routed request of `tok` tokens to `slot` in unix second `sec`.
+    Routed { slot: SlotId, tok: u64, sec: u64 },
+    /// A follow pin: `id_hex` (32 hex chars) now points at `slot`.
     Pin {
         id_hex: String,
-        host: String,
+        slot: SlotId,
         at_ms: u64,
     },
 }
@@ -191,20 +194,15 @@ impl Write {
 /// Appends `w`'s commands to `pipe`.
 fn push_write(pipe: &mut redis::Pipeline, w: &Write) {
     match w {
-        Write::Routed {
-            host,
-            replica,
-            tok,
-            sec,
-        } => {
-            let key = routed_key(host, replica.as_deref().unwrap_or(HOST_REPLICA), *sec);
+        Write::Routed { slot, tok, sec } => {
+            let key = routed_key(slot, *sec);
             pipe.cmd("HINCRBY").arg(&key).arg("req").arg(1).ignore();
             pipe.cmd("HINCRBY").arg(&key).arg("tok").arg(*tok).ignore();
             pipe.cmd("EXPIRE").arg(&key).arg(ROUTED_TTL_SECS).ignore();
         }
         Write::Pin {
             id_hex,
-            host,
+            slot,
             at_ms,
         } => {
             pipe.cmd("XADD")
@@ -216,7 +214,9 @@ fn push_write(pipe: &mut redis::Pipeline, w: &Write) {
                 .arg("k")
                 .arg(id_hex)
                 .arg("h")
-                .arg(host)
+                .arg(&slot.host)
+                .arg("r")
+                .arg(slot.replica)
                 .arg("t")
                 .arg(*at_ms)
                 .ignore();
@@ -511,32 +511,29 @@ async fn read_cycle(
         let entries = warm_up(conn).await?;
         count_malformed_pins(metrics, state.warm_up(entries, now_ms()));
     }
-    fetch(conn, ReadTargets::from_registry(reg), state, now_ms()).await
+    fetch(conn, ReadTargets::new(reg, state), state, now_ms()).await
 }
 
-/// What one reader cycle reads, derived from the attested key registry: the
-/// replica keys of every attested (host, replica), and every attested host's
-/// routed counters. Sorted for a stable pipeline layout.
+/// What one reader cycle reads: the frame key of every attested host (from
+/// the key registry), and the routed counters of every replica slot those
+/// hosts' last accepted frames carried. Sorted for a stable pipeline layout.
 pub(crate) struct ReadTargets {
-    replicas: Vec<(String, String)>,
     hosts: Vec<String>,
+    slots: Vec<SlotId>,
 }
 
 impl ReadTargets {
-    fn from_registry(reg: &KeyRegistry) -> Self {
+    fn new(reg: &KeyRegistry, state: &ReaderState) -> Self {
         let mut hosts: Vec<String> = reg.by_host.keys().cloned().collect();
         hosts.sort();
-        let mut replicas: Vec<(String, String)> = reg
-            .by_host
+        let mut slots: Vec<SlotId> = state
+            .hosts
             .iter()
-            .flat_map(|(h, keys)| {
-                keys.iter()
-                    .flat_map(move |k| k.replica_ids.iter().map(move |r| (h.clone(), r.clone())))
-            })
+            .filter(|(host, _)| reg.by_host.contains_key(*host))
+            .flat_map(|(_, acc)| acc.views.iter().map(|v| v.slot.clone()))
             .collect();
-        replicas.sort();
-        replicas.dedup();
-        Self { replicas, hosts }
+        slots.sort();
+        Self { hosts, slots }
     }
 }
 
@@ -548,11 +545,13 @@ pub(crate) struct PinEntry {
 
 /// Everything one reader cycle fetched, aligned with its [`ReadTargets`].
 pub(crate) struct RawRead {
-    /// Raw `MGET` element per `targets.replicas` entry (`Nil` when the key is
+    /// Raw `MGET` element per `targets.hosts` entry (`Nil` when the key is
     /// gone). Decoded one by one, so a single bad value (a compromised proxy
     /// can write anything to its own key) never fails the whole cycle.
     frames: Vec<redis::Value>,
-    /// `(req, tok)` summed over the last two seconds per `targets.hosts` entry.
+    /// [`KILL_SWITCH_KEY`] exists.
+    kill_switch: bool,
+    /// `(req, tok)` summed over the last two seconds per `targets.slots` entry.
     routed: Vec<(u64, u64)>,
     /// New pins stream entries, oldest first.
     pins: Vec<PinEntry>,
@@ -561,28 +560,28 @@ pub(crate) struct RawRead {
 }
 
 /// Reader-owned state that persists across cycles: monotonic ingest, the
-/// last accepted view per replica key, and the pin table.
+/// last accepted frame per host, and the pin table.
 #[derive(Default)]
 pub(crate) struct ReaderState {
     ingest: Ingest,
-    /// Last accepted frame per `(host, replica)` key.
-    views: HashMap<(String, String), Accepted>,
-    /// Last rejected raw value per key and why (`None`: not a valid
+    /// Last accepted frame per host.
+    hosts: HashMap<String, Accepted>,
+    /// Last rejected raw value per host and why (`None`: not a valid
     /// envelope), so identical repeats are neither re-verified nor re-counted.
-    rejected: HashMap<(String, String), (Vec<u8>, Option<Reject>)>,
+    rejected: HashMap<String, (Vec<u8>, Option<Reject>)>,
     pins: Arc<PinTable>,
     /// Last pins stream id read; `None` until warm-up has run.
     last_pin_id: Option<String>,
     cycles: u64,
 }
 
-/// A replica's last accepted frame: its raw JSON, the envelope's key id, and
-/// the verified view.
+/// A host's last accepted frame: its raw JSON, the envelope's key id, and
+/// the verified view of every replica it carried.
 #[derive(Clone)]
 struct Accepted {
     json: String,
     key_id: String,
-    view: ReplicaView,
+    views: Vec<ReplicaView>,
 }
 
 /// Decodes one `MGET` element: `Ok(None)` when the key is gone, `Err` when
@@ -646,11 +645,11 @@ impl ReaderState {
         let mut bad = 0;
         for entry in entries {
             match parse_pin(&entry.fields) {
-                Some((id, host, at_ms)) => {
+                Some((id, slot, at_ms)) => {
                     let live = now_ms < at_ms.saturating_add(PIN_TTL_MS);
                     let skewed = at_ms > now_ms.saturating_add(PIN_MAX_FUTURE_MS);
                     if live && !skewed {
-                        Arc::make_mut(&mut self.pins).insert(id, host, at_ms);
+                        Arc::make_mut(&mut self.pins).insert(id, slot, at_ms);
                     }
                 }
                 None => bad += 1,
@@ -660,9 +659,10 @@ impl ReaderState {
         bad
     }
 
-    /// Builds this cycle's snapshot from `raw`: replicas whose key is present
-    /// (a newly accepted frame, or the last accepted view when the frame is
-    /// a duplicate or regressed), host-level routed counts, and the pins.
+    /// Builds this cycle's snapshot from `raw`: the replicas of every host
+    /// whose key is present (a newly accepted frame replaces all of that
+    /// host's views; a duplicate or regressed frame keeps the last accepted
+    /// ones), per-slot routed counts, the pins, and the kill switch.
     fn apply(
         &mut self,
         targets: &ReadTargets,
@@ -672,15 +672,16 @@ impl ReaderState {
     ) -> Applied {
         let mut rejects = Vec::new();
         let mut bad_envelopes = 0;
-        let mut views = HashMap::with_capacity(targets.replicas.len());
+        let mut hosts = HashMap::with_capacity(targets.hosts.len());
         let mut rejected = HashMap::new();
-        for ((host, replica), value) in targets.replicas.iter().zip(raw.frames) {
-            let key = (host.clone(), replica.clone());
-            let prev = self.views.remove(&key);
-            let last_reject = self.rejected.remove(&key);
+        // Slots a host's newly accepted frame no longer carries.
+        let mut removed: Vec<SlotId> = Vec::new();
+        for (host, value) in targets.hosts.iter().zip(raw.frames) {
+            let prev = self.hosts.remove(host);
+            let last_reject = self.rejected.remove(host);
             let json = match decode_frame(value) {
                 Ok(Some(json)) => json,
-                Ok(None) => continue, // key expired: the replica drops out
+                Ok(None) => continue, // key expired: the host's views drop out
                 Err(()) => {
                     // Not a string: an unusable envelope, dropped (not
                     // remembered, it is rare and cheap to recount).
@@ -689,14 +690,14 @@ impl ReaderState {
                 }
             };
             // The same frame read again (the reader outpaces the publisher):
-            // reuse the view, provided its signing key is still attested.
+            // reuse the views, provided its signing key is still attested.
             if let Some(acc) = prev.as_ref() {
                 let still_attested = reg
                     .by_host
                     .get(host)
                     .is_some_and(|keys| keys.iter().any(|k| k.key_id == acc.key_id));
                 if acc.json == json && still_attested {
-                    views.insert(key, acc.clone());
+                    hosts.insert(host.clone(), acc.clone());
                     continue;
                 }
             }
@@ -706,46 +707,71 @@ impl ReaderState {
                 if bytes == json.as_bytes() {
                     if reason == Some(Reject::Regressed) {
                         if let Some(acc) = prev {
-                            views.insert(key.clone(), acc);
+                            hosts.insert(host.clone(), acc);
                         }
                     }
-                    rejected.insert(key, (bytes, reason));
+                    rejected.insert(host.clone(), (bytes, reason));
                     continue;
                 }
             }
             let Ok(env) = serde_json::from_str::<Envelope>(&json) else {
                 bad_envelopes += 1;
-                rejected.insert(key, (json.into_bytes(), None));
+                rejected.insert(host.clone(), (json.into_bytes(), None));
                 continue;
             };
-            match self.ingest.accept(host, replica, &env, reg, now_ms) {
-                Ok(view) => {
+            match self.ingest.accept(host, &env, reg, now_ms) {
+                Ok(views) => {
+                    if let Some(acc) = prev.as_ref() {
+                        removed.extend(
+                            acc.views
+                                .iter()
+                                .filter(|old| !views.iter().any(|v| v.slot == old.slot))
+                                .map(|old| old.slot.clone()),
+                        );
+                    }
                     let key_id = env.key_id;
-                    views.insert(key, Accepted { json, key_id, view });
+                    hosts.insert(
+                        host.clone(),
+                        Accepted {
+                            json,
+                            key_id,
+                            views,
+                        },
+                    );
                 }
                 Err(r) => {
                     rejects.push(r);
                     if r == Reject::Regressed {
                         if let Some(acc) = prev {
-                            views.insert(key.clone(), acc);
+                            hosts.insert(host.clone(), acc);
                         }
                     }
-                    rejected.insert(key, (json.into_bytes(), Some(r)));
+                    rejected.insert(host.clone(), (json.into_bytes(), Some(r)));
                 }
             }
         }
-        self.views = views;
+        self.hosts = hosts;
         self.rejected = rejected;
 
+        let mut replicas: Vec<ReplicaView> = self
+            .hosts
+            .values()
+            .flat_map(|acc| acc.views.iter().cloned())
+            .collect();
+        replicas.sort_by(|a, b| a.slot.cmp(&b.slot));
+
+        // Counts only for slots still in the snapshot: a slot the latest
+        // frame dropped takes its counters with it.
         let since_ms = raw.now_s.saturating_sub(1).saturating_mul(1000);
         let routed = targets
-            .hosts
+            .slots
             .iter()
             .zip(raw.routed)
             .filter(|(_, (req, tok))| *req > 0 || *tok > 0)
-            .map(|(host, (req, tok))| {
+            .filter(|(slot, _)| replicas.iter().any(|v| &v.slot == *slot))
+            .map(|(slot, (req, tok))| {
                 (
-                    (host.clone(), HOST_REPLICA.to_string()),
+                    slot.clone(),
                     RoutedCounts {
                         req: u32::try_from(req).unwrap_or(u32::MAX),
                         tok,
@@ -756,19 +782,21 @@ impl ReaderState {
             .collect();
 
         let bad_pins = self.apply_pins(raw.pins, now_ms);
+        if !removed.is_empty() {
+            Arc::make_mut(&mut self.pins).retain_slots(|slot| !removed.contains(slot));
+        }
         self.cycles = self.cycles.wrapping_add(1);
         if self.cycles.is_multiple_of(PRUNE_EVERY_CYCLES) {
             Arc::make_mut(&mut self.pins).prune(now_ms);
         }
 
-        let mut replicas: Vec<ReplicaView> = self.views.values().map(|a| a.view.clone()).collect();
-        replicas.sort_by(|a, b| (&a.host_id, &a.replica_id).cmp(&(&b.host_id, &b.replica_id)));
         Applied {
             snapshot: Snapshot {
                 built_ms: now_ms,
                 replicas,
                 routed,
                 pins: self.pins.clone(),
+                disabled: raw.kill_switch,
             },
             rejects,
             bad_envelopes,
@@ -777,12 +805,14 @@ impl ReaderState {
     }
 }
 
-/// Parses a pins stream entry: `k` (32 hex chars), `h` (host), `t` (ms).
-fn parse_pin(fields: &HashMap<String, String>) -> Option<([u8; 16], String, u64)> {
+/// Parses a pins stream entry: `k` (32 hex chars), `h` (host), `r` (replica
+/// index), `t` (ms). An entry without a valid `r` is malformed.
+fn parse_pin(fields: &HashMap<String, String>) -> Option<([u8; 16], SlotId, u64)> {
     let id: [u8; 16] = hex::decode(fields.get("k")?).ok()?.try_into().ok()?;
     let host = fields.get("h").filter(|h| !h.is_empty())?.clone();
+    let replica = fields.get("r")?.parse().ok()?;
     let at_ms = fields.get("t")?.parse().ok()?;
-    Some((id, host, at_ms))
+    Some((id, SlotId { host, replica }, at_ms))
 }
 
 fn count_malformed_pins(metrics: &dyn PlacementMetrics, bad: u32) {
@@ -822,6 +852,9 @@ fn publish_cycle(
         metrics.record_count(METRIC_FRAMES_REJECTED, n, &[&tag]);
     }
     count_malformed_pins(metrics, applied.bad_pins);
+    if applied.snapshot.disabled {
+        metrics.record_count(METRIC_KILL_SWITCH_CYCLES, 1, &[]);
+    }
     slot.store(Arc::new(applied.snapshot));
     Ok(())
 }
@@ -856,8 +889,9 @@ async fn warm_up(conn: &mut ConnectionManager) -> redis::RedisResult<Vec<PinEntr
     Ok(pin_entries(reply.ids))
 }
 
-/// One pipeline: `MGET` every replica key, `HGETALL` each host's routed
-/// hashes for `now_s-1` and `now_s`, and `XREAD` new pins.
+/// One pipeline: `MGET` every host's frame key plus [`KILL_SWITCH_KEY`],
+/// `HGETALL` each slot's routed hashes for `now_s-1` and `now_s`, and
+/// `XREAD` new pins.
 async fn fetch(
     conn: &mut ConnectionManager,
     targets: ReadTargets,
@@ -867,18 +901,13 @@ async fn fetch(
     let now_s = now_ms / 1000;
     let last_id = state.last_pin_id.as_deref().unwrap_or("0-0");
     let mut pipe = redis::pipe();
-    if !targets.replicas.is_empty() {
-        let keys: Vec<String> = targets
-            .replicas
-            .iter()
-            .map(|(h, r)| replica_key(h, r))
-            .collect();
-        pipe.cmd("MGET").arg(keys);
-    }
-    for h in &targets.hosts {
+    let mut keys: Vec<String> = targets.hosts.iter().map(|h| replica_key(h)).collect();
+    keys.push(KILL_SWITCH_KEY.to_string());
+    pipe.cmd("MGET").arg(keys);
+    for slot in &targets.slots {
         pipe.cmd("HGETALL")
-            .arg(routed_key(h, HOST_REPLICA, now_s.saturating_sub(1)));
-        pipe.cmd("HGETALL").arg(routed_key(h, HOST_REPLICA, now_s));
+            .arg(routed_key(slot, now_s.saturating_sub(1)));
+        pipe.cmd("HGETALL").arg(routed_key(slot, now_s));
     }
     pipe.cmd("XREAD")
         .arg("COUNT")
@@ -894,19 +923,16 @@ async fn fetch(
         })
     };
 
-    let frames: Vec<redis::Value> = if targets.replicas.is_empty() {
-        Vec::new()
-    } else {
-        redis::from_owned_redis_value(next()?)?
-    };
-    if frames.len() != targets.replicas.len() {
+    let mut frames: Vec<redis::Value> = redis::from_owned_redis_value(next()?)?;
+    if frames.len() != targets.hosts.len() + 1 {
         return Err(redis::RedisError::from((
             redis::ErrorKind::TypeError,
             "MGET reply length mismatch",
         )));
     }
-    let mut routed = Vec::with_capacity(targets.hosts.len());
-    for _ in &targets.hosts {
+    let kill_switch = !matches!(frames.pop(), Some(redis::Value::Nil) | None);
+    let mut routed = Vec::with_capacity(targets.slots.len());
+    for _ in &targets.slots {
         routed.push(routed_sum([next()?, next()?]));
     }
     let xread: Option<redis::streams::StreamReadReply> = redis::from_owned_redis_value(next()?)?;
@@ -923,6 +949,7 @@ async fn fetch(
         targets,
         RawRead {
             frames,
+            kill_switch,
             routed,
             pins,
             now_s,
@@ -930,41 +957,47 @@ async fn fetch(
     ))
 }
 
-/// Runs one reader cycle's `apply` over what Valkey would hold: `frames`
-/// maps `(host, replica)` to the raw envelope JSON a proxy wrote to
-/// `replica:{host}:{replica}`, `routed` maps a host to the `(req, tok)` summed
-/// over its two routed hashes. Targets come from `reg` exactly as in `read`,
-/// so this exercises the production decode/verify/snapshot path without a
-/// Valkey connection. For cross-module contract tests.
+/// Runs reader cycles' `apply` over what Valkey would hold: `frames` maps a
+/// host to the raw envelope JSON its proxy wrote to `replica:{host}`,
+/// `routed` maps a slot to the `(req, tok)` summed over its two routed
+/// hashes. Targets come from `reg` and the reader state exactly as in
+/// `read_cycle`, so this exercises the production decode/verify/snapshot
+/// path without a Valkey connection. Two cycles run, the way the reader
+/// learns a host's slots from its frame before it reads their counters.
+/// For cross-module contract tests.
 #[cfg(test)]
 pub(crate) fn snapshot_from_valkey_values(
     reg: &KeyRegistry,
-    frames: &HashMap<(String, String), String>,
-    routed: &HashMap<String, (u64, u64)>,
+    frames: &HashMap<String, String>,
+    routed: &HashMap<SlotId, (u64, u64)>,
     now_ms: u64,
 ) -> Snapshot {
-    let targets = ReadTargets::from_registry(reg);
-    let raw = RawRead {
-        frames: targets
-            .replicas
-            .iter()
-            .map(|key| {
-                frames.get(key).map_or(redis::Value::Nil, |json| {
-                    redis::Value::BulkString(json.clone().into_bytes())
+    let mut state = ReaderState::default();
+    let mut snapshot = Snapshot::default();
+    for _ in 0..2 {
+        let targets = ReadTargets::new(reg, &state);
+        let raw = RawRead {
+            frames: targets
+                .hosts
+                .iter()
+                .map(|host| {
+                    frames.get(host).map_or(redis::Value::Nil, |json| {
+                        redis::Value::BulkString(json.clone().into_bytes())
+                    })
                 })
-            })
-            .collect(),
-        routed: targets
-            .hosts
-            .iter()
-            .map(|host| routed.get(host).copied().unwrap_or((0, 0)))
-            .collect(),
-        pins: Vec::new(),
-        now_s: now_ms / 1000,
-    };
-    ReaderState::default()
-        .apply(&targets, raw, reg, now_ms)
-        .snapshot
+                .collect(),
+            kill_switch: false,
+            routed: targets
+                .slots
+                .iter()
+                .map(|slot| routed.get(slot).copied().unwrap_or((0, 0)))
+                .collect(),
+            pins: Vec::new(),
+            now_s: now_ms / 1000,
+        };
+        snapshot = state.apply(&targets, raw, reg, now_ms).snapshot;
+    }
+    snapshot
 }
 
 #[cfg(test)]
@@ -975,14 +1008,15 @@ mod tests {
     use placement::affinity::{pin_id, AffinityKey};
     use placement::consts::{COVERED_MODELS, FRESH_MAX_MS};
     use placement::decision::{AffinitySource, Decision, LegacyReason, PlaceInput, Placer};
-    use placement::frame::{self, Lifecycle, Limits, Load, ReplicaReport, SIGNING_DOMAIN};
+    use placement::frame::{self, HostReport, Lifecycle, Load, ReplicaState, SIGNING_DOMAIN};
+    use placement::policy::Tier;
     use placement::snapshot::HostKey;
     use rand::rngs::StdRng;
     use rand::SeedableRng;
     use std::sync::Mutex;
 
     const HOST: &str = "glm53-gpu03";
-    const REPLICA: &str = "r1";
+    const HOST_B: &str = "glm53-gpu04";
 
     #[derive(Default)]
     struct FakeMetrics {
@@ -1016,47 +1050,76 @@ mod tests {
         SigningKey::from_bytes(&[7u8; 32])
     }
 
-    fn registry() -> KeyRegistry {
-        let pk = signing_key().verifying_key();
-        let mut by_host = HashMap::new();
-        by_host.insert(
-            HOST.to_string(),
-            vec![HostKey {
-                key_id: frame::key_id(&pk),
-                key: pk,
-                replica_ids: vec![REPLICA.to_string()],
-                model: COVERED_MODELS[0].to_string(),
-            }],
-        );
+    fn host_key(sk: &SigningKey) -> HostKey {
+        let pk = sk.verifying_key();
+        HostKey {
+            key_id: frame::key_id(&pk),
+            key: pk,
+        }
+    }
+
+    /// Every host in `hosts` attested with [`signing_key`].
+    fn registry_for(hosts: &[&str]) -> KeyRegistry {
+        let by_host = hosts
+            .iter()
+            .map(|h| (h.to_string(), vec![host_key(&signing_key())]))
+            .collect();
         KeyRegistry { by_host }
     }
 
-    fn report(seq: u64, sampled_ms: u64) -> ReplicaReport {
-        ReplicaReport {
-            schema: 1,
-            host_id: HOST.into(),
-            replica_id: REPLICA.into(),
-            boot_id: "boot-a".into(),
-            seq,
+    fn registry() -> KeyRegistry {
+        registry_for(&[HOST])
+    }
+
+    fn sid(host: &str, replica: u32) -> SlotId {
+        SlotId {
+            host: host.into(),
+            replica,
+        }
+    }
+
+    /// A ready replica. `proxy_inflight` carries the frame's `seq`, so a test
+    /// can tell which frame a view came from.
+    fn replica(index: u32, seq: u64, sampled_ms: u64) -> ReplicaState {
+        ReplicaState {
+            index,
             engine_sampled_at_ms: Some(sampled_ms),
-            reported_at_ms: sampled_ms,
             lifecycle_state: Lifecycle::Ready,
-            model: COVERED_MODELS[0].into(),
-            engine: "sglang".into(),
             engine_version: None,
-            limits: Limits { max_running: None },
+            limits: Default::default(),
             load: Load {
                 running: Some(0),
                 queued: Some(0),
                 ..Load::default()
             },
-            proxy_inflight: 0,
-            report_key_id: frame::key_id(&signing_key().verifying_key()),
+            proxy_inflight: u32::try_from(seq).unwrap(),
         }
     }
 
-    /// Envelope JSON as inference-proxy writes it to `replica:{host}:{replica}`.
-    fn sealed_json(r: &ReplicaReport) -> String {
+    /// A frame for `host` carrying replica `indices`.
+    fn host_report(host: &str, seq: u64, sampled_ms: u64, indices: &[u32]) -> HostReport {
+        HostReport {
+            schema: 1,
+            host_id: host.into(),
+            boot_id: "boot-a".into(),
+            seq,
+            reported_at_ms: sampled_ms,
+            engine: "sglang".into(),
+            report_key_id: frame::key_id(&signing_key().verifying_key()),
+            replicas: indices
+                .iter()
+                .map(|i| replica(*i, seq, sampled_ms))
+                .collect(),
+        }
+    }
+
+    /// A one-replica frame for [`HOST`].
+    fn report(seq: u64, sampled_ms: u64) -> HostReport {
+        host_report(HOST, seq, sampled_ms, &[0])
+    }
+
+    /// Envelope JSON as inference-proxy writes it to `replica:{host}`.
+    fn sealed_json(r: &HostReport) -> String {
         let frame = serde_json::to_string(r).unwrap();
         let mut msg = SIGNING_DOMAIN.to_vec();
         msg.extend_from_slice(frame.as_bytes());
@@ -1069,7 +1132,9 @@ mod tests {
         .to_string()
     }
 
-    fn raw(frames: Vec<Option<String>>, now_ms: u64) -> RawRead {
+    /// One cycle's raw read for `targets`: `frames` per target host, no
+    /// routed counts, no kill switch.
+    fn raw(targets: &ReadTargets, frames: Vec<Option<String>>, now_ms: u64) -> RawRead {
         RawRead {
             frames: frames
                 .into_iter()
@@ -1079,18 +1144,20 @@ mod tests {
                     })
                 })
                 .collect(),
-            routed: vec![(0, 0)],
+            kill_switch: false,
+            routed: vec![(0, 0); targets.slots.len()],
             pins: Vec::new(),
             now_s: now_ms / 1000,
         }
     }
 
-    fn pin_entry(id: &str, k: &str, h: &str, t: u64) -> PinEntry {
+    fn pin_entry(id: &str, k: &str, h: &str, r: &str, t: u64) -> PinEntry {
         PinEntry {
             id: id.to_string(),
             fields: [
                 ("k".to_string(), k.to_string()),
                 ("h".to_string(), h.to_string()),
+                ("r".to_string(), r.to_string()),
                 ("t".to_string(), t.to_string()),
             ]
             .into_iter()
@@ -1098,17 +1165,45 @@ mod tests {
         }
     }
 
+    fn pid(seed: u8) -> placement::affinity::PinId {
+        pin_id(Tier::Base, &AffinityKey::from_bytes([seed; 16]), &[3u8; 32])
+    }
+
     fn place(snap: &Snapshot, now_ms: u64) -> Decision {
         let input = PlaceInput {
             model: COVERED_MODELS[0].into(),
-            prompt_tokens_est: 100,
+            prompt_tokens: 100,
+            context_tokens: None,
+            heavy: false,
+            priority: 0,
             affinity: None,
             affinity_source: AffinitySource::None,
-            long_context_hosts: Vec::new(),
             now_ms,
         };
         let mut rng = StdRng::seed_from_u64(1);
-        Placer::new([0u8; 32]).place(&input, snap, &HashMap::new(), &mut rng)
+        Placer::new([0u8; 32], Tier::Base).place(&input, snap, &HashMap::new(), &mut rng)
+    }
+
+    fn legacy_reason(d: Decision) -> LegacyReason {
+        match d {
+            Decision::Legacy { reason, .. } => reason,
+            Decision::Place { .. } => panic!("expected legacy, placed"),
+            Decision::Refused { .. } => panic!("expected legacy, refused"),
+        }
+    }
+
+    /// One `publish_cycle` for `reg` against `frames` (one per target host).
+    fn cycle(
+        state: &mut ReaderState,
+        slot: &ArcSwap<Snapshot>,
+        reg: &KeyRegistry,
+        frames: Vec<Option<String>>,
+        now: u64,
+        metrics: &FakeMetrics,
+    ) {
+        let targets = ReadTargets::new(reg, state);
+        let r = raw(&targets, frames, now);
+        publish_cycle(state, slot, Ok((targets, r)), reg, now, metrics).unwrap();
     }
 
     #[test]
@@ -1117,7 +1212,7 @@ mod tests {
         let (io, _rx) = PlacementIo::for_test(metrics);
         let hosts = Arc::new(ArcSwap::from_pointee(BackendHosts::default()));
         let handles = PlacementHandles {
-            placer: Arc::new(Placer::new([0u8; 32])),
+            placer: Arc::new(Placer::new([0u8; 32], Tier::Base)),
             io,
             hosts: hosts.clone(),
         };
@@ -1131,12 +1226,17 @@ mod tests {
         let t0 = 10_000_000u64;
         let metrics = FakeMetrics::default();
         let reg = registry();
-        let targets = ReadTargets::from_registry(&reg);
         let slot = ArcSwap::from_pointee(Snapshot::default());
         let mut state = ReaderState::default();
 
-        let ok = raw(vec![Some(sealed_json(&report(1, t0)))], t0);
-        publish_cycle(&mut state, &slot, Ok((targets, ok)), &reg, t0, &metrics).unwrap();
+        cycle(
+            &mut state,
+            &slot,
+            &reg,
+            vec![Some(sealed_json(&report(1, t0)))],
+            t0,
+            &metrics,
+        );
         assert_eq!(slot.load().built_ms, t0);
         assert_eq!(slot.load().replicas.len(), 1);
         assert!(matches!(
@@ -1151,10 +1251,10 @@ mod tests {
         assert_eq!(metrics.total(METRIC_READ_ERRORS, None), 1);
 
         // ...and ages out to Legacy once older than FRESH_MAX_MS.
-        match place(&slot.load(), t0 + FRESH_MAX_MS + 1) {
-            Decision::Legacy { reason, .. } => assert_eq!(reason, LegacyReason::Stale),
-            Decision::Place { .. } => panic!("stale snapshot must not place"),
-        }
+        assert_eq!(
+            legacy_reason(place(&slot.load(), t0 + FRESH_MAX_MS + 1)),
+            LegacyReason::Stale
+        );
     }
 
     #[test]
@@ -1166,45 +1266,51 @@ mod tests {
         let mut state = ReaderState::default();
         let f2 = sealed_json(&report(2, t0));
 
-        let cycle = |state: &mut ReaderState, frames, now| {
-            let targets = ReadTargets::from_registry(&reg);
-            publish_cycle(
-                state,
-                &slot,
-                Ok((targets, raw(frames, now))),
-                &reg,
-                now,
-                &metrics,
-            )
-            .unwrap();
-        };
-        cycle(&mut state, vec![Some(f2.clone())], t0);
+        cycle(
+            &mut state,
+            &slot,
+            &reg,
+            vec![Some(f2.clone())],
+            t0,
+            &metrics,
+        );
         // The same frame read again (reader runs faster than the publisher)
         // is a duplicate, not a reject.
-        cycle(&mut state, vec![Some(f2)], t0 + 500);
+        cycle(&mut state, &slot, &reg, vec![Some(f2)], t0 + 500, &metrics);
         assert_eq!(slot.load().replicas.len(), 1);
         assert_eq!(slot.load().built_ms, t0 + 500);
         assert_eq!(metrics.total(METRIC_FRAMES_REJECTED, None), 0);
 
         // An older seq is rejected as regressed, but the last view stays.
+        let f1 = sealed_json(&report(1, t0));
         cycle(
             &mut state,
-            vec![Some(sealed_json(&report(1, t0)))],
+            &slot,
+            &reg,
+            vec![Some(f1)],
             t0 + 1_000,
+            &metrics,
         );
         assert_eq!(slot.load().replicas.len(), 1);
-        assert_eq!(slot.load().replicas[0].report.seq, 2);
+        assert_eq!(slot.load().replicas[0].state.proxy_inflight, 2);
         assert_eq!(
             metrics.total(METRIC_FRAMES_REJECTED, Some("reason:regressed")),
             1
         );
 
-        // The key expired: the replica drops out.
-        cycle(&mut state, vec![None], t0 + 1_500);
+        // The key expired: the host's views drop out.
+        cycle(&mut state, &slot, &reg, vec![None], t0 + 1_500, &metrics);
         assert!(slot.load().replicas.is_empty());
 
         // A garbage value is counted, never trusted.
-        cycle(&mut state, vec![Some("not json".into())], t0 + 2_000);
+        cycle(
+            &mut state,
+            &slot,
+            &reg,
+            vec![Some("not json".into())],
+            t0 + 2_000,
+            &metrics,
+        );
         assert!(slot.load().replicas.is_empty());
         assert_eq!(
             metrics.total(METRIC_FRAMES_REJECTED, Some("reason:envelope")),
@@ -1213,47 +1319,200 @@ mod tests {
     }
 
     #[test]
-    fn routed_counts_are_host_level() {
-        let t0 = 10_000_500u64;
+    fn host_frame_expanding_to_three_replicas_creates_three_views() {
+        let t0 = 10_000_000u64;
+        let metrics = FakeMetrics::default();
         let reg = registry();
-        let targets = ReadTargets::from_registry(&reg);
+        let slot = ArcSwap::from_pointee(Snapshot::default());
         let mut state = ReaderState::default();
-        let mut r = raw(vec![None], t0);
-        r.routed = vec![(3, 900)];
+
+        cycle(
+            &mut state,
+            &slot,
+            &reg,
+            vec![Some(sealed_json(&host_report(HOST, 1, t0, &[0])))],
+            t0,
+            &metrics,
+        );
+        assert_eq!(slot.load().replicas.len(), 1);
+
+        cycle(
+            &mut state,
+            &slot,
+            &reg,
+            vec![Some(sealed_json(&host_report(HOST, 2, t0, &[2, 0, 1])))],
+            t0 + 500,
+            &metrics,
+        );
+        let snap = slot.load();
+        let slots: Vec<SlotId> = snap.replicas.iter().map(|v| v.slot.clone()).collect();
+        assert_eq!(slots, vec![sid(HOST, 0), sid(HOST, 1), sid(HOST, 2)]);
+        // The next cycle reads each new slot's routed counters.
+        let targets = ReadTargets::new(&reg, &state);
+        assert_eq!(targets.slots, slots);
+        assert_eq!(targets.hosts, vec![HOST.to_string()]);
+    }
+
+    #[test]
+    fn frame_shrinking_drops_removed_slots_and_their_routed_targets() {
+        let t0 = 10_000_500u64;
+        let metrics = FakeMetrics::default();
+        let reg = registry();
+        let slot = ArcSwap::from_pointee(Snapshot::default());
+        let mut state = ReaderState::default();
+        let pin_kept = pid(1);
+        let pin_gone = pid(2);
+        state.warm_up(
+            vec![
+                pin_entry("2-0", &pin_gone.to_hex(), HOST, "2", t0),
+                pin_entry("1-0", &pin_kept.to_hex(), HOST, "0", t0),
+            ],
+            t0,
+        );
+
+        cycle(
+            &mut state,
+            &slot,
+            &reg,
+            vec![Some(sealed_json(&host_report(HOST, 1, t0, &[0, 1, 2])))],
+            t0,
+            &metrics,
+        );
+        // The next cycle reads routed counters for all three slots, and the
+        // host's frame shrinks to replica 0 only.
+        let targets = ReadTargets::new(&reg, &state);
+        assert_eq!(targets.slots.len(), 3);
+        let mut r = raw(
+            &targets,
+            vec![Some(sealed_json(&host_report(HOST, 2, t0, &[0])))],
+            t0,
+        );
+        r.routed = vec![(1, 10), (2, 20), (3, 30)];
+        publish_cycle(&mut state, &slot, Ok((targets, r)), &reg, t0, &metrics).unwrap();
+
+        let snap = slot.load();
+        assert_eq!(snap.replicas.len(), 1);
+        assert_eq!(snap.replicas[0].slot, sid(HOST, 0));
+        // Only the surviving slot keeps its routed counts...
+        assert_eq!(snap.routed.len(), 1);
+        let rc = snap.routed[&sid(HOST, 0)];
+        assert_eq!((rc.req, rc.tok, rc.since_ms), (1, 10, 9_999_000));
+        // ...only it is read from now on...
+        assert_eq!(ReadTargets::new(&reg, &state).slots, vec![sid(HOST, 0)]);
+        // ...and a pin to a removed slot is dropped.
+        assert_eq!(
+            snap.pins.get(&pin_kept, t0).map(|(s, _)| s.clone()),
+            Some(sid(HOST, 0))
+        );
+        assert!(snap.pins.get(&pin_gone, t0).is_none());
+    }
+
+    #[test]
+    fn routed_counts_are_per_slot() {
+        let t0 = 10_000_500u64;
+        let metrics = FakeMetrics::default();
+        let reg = registry();
+        let slot = ArcSwap::from_pointee(Snapshot::default());
+        let mut state = ReaderState::default();
+        let f = sealed_json(&host_report(HOST, 1, t0, &[0, 1]));
+        cycle(&mut state, &slot, &reg, vec![Some(f.clone())], t0, &metrics);
+
+        let targets = ReadTargets::new(&reg, &state);
+        let mut r = raw(&targets, vec![Some(f)], t0);
+        r.routed = vec![(0, 0), (3, 900)];
         let applied = state.apply(&targets, r, &reg, t0);
-        let rc = applied.snapshot.routed[&(HOST.to_string(), HOST_REPLICA.to_string())];
+        assert!(!applied.snapshot.routed.contains_key(&sid(HOST, 0)));
+        let rc = applied.snapshot.routed[&sid(HOST, 1)];
         assert_eq!((rc.req, rc.tok, rc.since_ms), (3, 900, 9_999_000));
+    }
+
+    #[test]
+    fn kill_switch_key_disables_snapshot() {
+        let t0 = 10_000_000u64;
+        let metrics = FakeMetrics::default();
+        let reg = registry();
+        let slot = ArcSwap::from_pointee(Snapshot::default());
+        let mut state = ReaderState::default();
+        let f = sealed_json(&report(1, t0));
+
+        for i in 0..3u64 {
+            let now = t0 + i * 500;
+            let targets = ReadTargets::new(&reg, &state);
+            let mut r = raw(&targets, vec![Some(f.clone())], now);
+            r.kill_switch = true;
+            publish_cycle(&mut state, &slot, Ok((targets, r)), &reg, now, &metrics).unwrap();
+        }
+        // One count per cycle while the key is present; frames still ingest.
+        assert_eq!(metrics.total(METRIC_KILL_SWITCH_CYCLES, None), 3);
+        let snap = slot.load();
+        assert!(snap.disabled);
+        assert_eq!(snap.replicas.len(), 1);
+        assert_eq!(
+            legacy_reason(place(&snap, t0 + 1_000)),
+            LegacyReason::Disabled
+        );
+
+        // The key is deleted: the next cycle places again, uncounted.
+        cycle(&mut state, &slot, &reg, vec![Some(f)], t0 + 1_500, &metrics);
+        assert!(!slot.load().disabled);
+        assert!(matches!(
+            place(&slot.load(), t0 + 1_600),
+            Decision::Place { .. }
+        ));
+        assert_eq!(metrics.total(METRIC_KILL_SWITCH_CYCLES, None), 3);
     }
 
     #[test]
     fn pins_older_than_ttl_ignored_on_warmup() {
         let now = 10_000_000u64;
-        let fresh = AffinityKey::from_bytes([1u8; 16]);
-        let old = AffinityKey::from_bytes([2u8; 16]);
-        let secret = [3u8; 32];
-        let fresh_id = pin_id(&fresh, &secret);
-        let old_id = pin_id(&old, &secret);
+        let fresh_id = pid(1);
+        let old_id = pid(2);
         let mut state = ReaderState::default();
         let bad = state.warm_up(
             vec![
-                pin_entry("3-0", &fresh_id.to_hex(), "gpu02", now - 1_000),
-                pin_entry("2-0", "zz-not-hex", "gpu05", now - 1_000),
-                pin_entry("1-0", &old_id.to_hex(), "gpu01", now - PIN_TTL_MS),
+                pin_entry("3-0", &fresh_id.to_hex(), "gpu02", "1", now - 1_000),
+                pin_entry("2-0", "zz-not-hex", "gpu05", "0", now - 1_000),
+                pin_entry("1-0", &old_id.to_hex(), "gpu01", "0", now - PIN_TTL_MS),
             ],
             now,
         );
         assert_eq!(bad, 1);
         assert_eq!(state.pins.len(), 1);
-        assert_eq!(state.pins.get(&fresh_id, now), Some(("gpu02", now - 1_000)));
+        assert_eq!(
+            state.pins.get(&fresh_id, now),
+            Some((&sid("gpu02", 1), now - 1_000))
+        );
         assert_eq!(state.pins.get(&old_id, now), None);
         // XREAD resumes after the newest warm-up entry.
         assert_eq!(state.last_pin_id.as_deref(), Some("3-0"));
     }
 
     #[test]
+    fn pin_entry_without_replica_is_malformed() {
+        let now = 10_000_000u64;
+        let id = pid(4);
+        let mut no_replica = pin_entry("1-0", &id.to_hex(), "gpu01", "0", now);
+        no_replica.fields.remove("r");
+        let entries = vec![
+            no_replica,
+            pin_entry("2-0", &id.to_hex(), "gpu01", "", now),
+            pin_entry("3-0", &id.to_hex(), "gpu01", "-1", now),
+            pin_entry("4-0", &id.to_hex(), "gpu01", "r1", now),
+        ];
+        let metrics = FakeMetrics::default();
+        let mut state = ReaderState::default();
+        count_malformed_pins(&metrics, state.warm_up(Vec::new(), now));
+        count_malformed_pins(&metrics, state.apply_pins(entries, now));
+        assert_eq!(metrics.total(METRIC_PINS_MALFORMED, None), 4);
+        assert!(state.pins.is_empty());
+        // Skipped entries still advance the stream cursor.
+        assert_eq!(state.last_pin_id.as_deref(), Some("4-0"));
+    }
+
+    #[test]
     fn empty_warmup_reads_from_stream_start_and_pins_apply_incrementally() {
         let now = 10_000_000u64;
-        let id = pin_id(&AffinityKey::from_bytes([4u8; 16]), &[5u8; 32]);
+        let id = pid(4);
         let mut state = ReaderState::default();
         assert_eq!(state.warm_up(Vec::new(), now), 0);
         assert_eq!(state.last_pin_id.as_deref(), Some("0-0"));
@@ -1262,14 +1521,17 @@ mod tests {
         assert_eq!(
             state.apply_pins(
                 vec![
-                    pin_entry("5-0", &id.to_hex(), "gpu01", now),
-                    pin_entry("6-0", &id.to_hex(), "gpu07", now + 10),
+                    pin_entry("5-0", &id.to_hex(), "gpu01", "0", now),
+                    pin_entry("6-0", &id.to_hex(), "gpu07", "3", now + 10),
                 ],
                 now + 10,
             ),
             0
         );
-        assert_eq!(state.pins.get(&id, now + 10), Some(("gpu07", now + 10)));
+        assert_eq!(
+            state.pins.get(&id, now + 10),
+            Some((&sid("gpu07", 3), now + 10))
+        );
         assert_eq!(state.last_pin_id.as_deref(), Some("6-0"));
         // Copy-on-write: a snapshot holding the old table is unaffected.
         assert!(before.is_empty());
@@ -1285,8 +1547,7 @@ mod tests {
         let metrics = Arc::new(FakeMetrics::default());
         let (io, _rx) = PlacementIo::new(metrics.clone());
         let routed = || Write::Routed {
-            host: HOST.into(),
-            replica: None,
+            slot: sid(HOST, 0),
             tok: 10,
             sec: 1,
         };
@@ -1297,7 +1558,7 @@ mod tests {
         io.record(routed());
         io.record(Write::Pin {
             id_hex: "00".repeat(16),
-            host: HOST.into(),
+            slot: sid(HOST, 0),
             at_ms: 1,
         });
         assert_eq!(metrics.total(METRIC_WRITES_DROPPED, Some("kind:routed")), 1);
@@ -1312,25 +1573,23 @@ mod tests {
     }
 
     #[test]
-    fn non_utf8_value_is_isolated_to_its_replica() {
+    fn non_utf8_value_is_isolated_to_its_host() {
         let t0 = 10_000_000u64;
         let metrics = FakeMetrics::default();
-        let mut reg = registry();
-        reg.by_host.get_mut(HOST).unwrap()[0]
-            .replica_ids
-            .push("r2".to_string());
-        let targets = ReadTargets::from_registry(&reg);
+        let reg = registry_for(&[HOST, HOST_B]);
         let slot = ArcSwap::from_pointee(Snapshot::default());
         let mut state = ReaderState::default();
-        let mut r = raw(vec![Some(sealed_json(&report(1, t0)))], t0);
-        // r2's key holds bytes that are not a UTF-8 string.
+        let targets = ReadTargets::new(&reg, &state);
+        assert_eq!(targets.hosts, vec![HOST.to_string(), HOST_B.to_string()]);
+        let mut r = raw(&targets, vec![Some(sealed_json(&report(1, t0)))], t0);
+        // HOST_B's key holds bytes that are not a UTF-8 string.
         r.frames
             .push(redis::Value::BulkString(vec![0xff, 0xfe, 0x00]));
         publish_cycle(&mut state, &slot, Ok((targets, r)), &reg, t0, &metrics).unwrap();
         let snap = slot.load();
         assert_eq!(snap.built_ms, t0);
         assert_eq!(snap.replicas.len(), 1);
-        assert_eq!(snap.replicas[0].replica_id, REPLICA);
+        assert_eq!(snap.replicas[0].slot, sid(HOST, 0));
         assert_eq!(
             metrics.total(METRIC_FRAMES_REJECTED, Some("reason:envelope")),
             1
@@ -1361,10 +1620,9 @@ mod tests {
     #[test]
     fn future_dated_pins_ignored() {
         let now = 10_000_000u64;
-        let secret = [3u8; 32];
-        let ok = pin_id(&AffinityKey::from_bytes([1u8; 16]), &secret);
-        let skewed = pin_id(&AffinityKey::from_bytes([2u8; 16]), &secret);
-        let late = pin_id(&AffinityKey::from_bytes([3u8; 16]), &secret);
+        let ok = pid(1);
+        let skewed = pid(2);
+        let late = pid(3);
         let mut state = ReaderState::default();
         state.warm_up(
             vec![
@@ -1372,9 +1630,10 @@ mod tests {
                     "2-0",
                     &skewed.to_hex(),
                     "gpu02",
+                    "0",
                     now + PIN_MAX_FUTURE_MS + 1,
                 ),
-                pin_entry("1-0", &ok.to_hex(), "gpu01", now + PIN_MAX_FUTURE_MS),
+                pin_entry("1-0", &ok.to_hex(), "gpu01", "0", now + PIN_MAX_FUTURE_MS),
             ],
             now,
         );
@@ -1382,7 +1641,7 @@ mod tests {
         assert!(state.pins.get(&ok, now).is_some());
         assert_eq!(state.pins.get(&skewed, now), None);
         state.apply_pins(
-            vec![pin_entry("3-0", &late.to_hex(), "gpu03", now + 60_000)],
+            vec![pin_entry("3-0", &late.to_hex(), "gpu03", "0", now + 60_000)],
             now,
         );
         assert_eq!(state.pins.get(&late, now + 60_000), None);
@@ -1397,28 +1656,15 @@ mod tests {
         let slot = ArcSwap::from_pointee(Snapshot::default());
         let mut state = ReaderState::default();
         let f = sealed_json(&report(1, t0));
-        let targets = ReadTargets::from_registry(&reg);
-        let r = raw(vec![Some(f.clone())], t0);
-        publish_cycle(&mut state, &slot, Ok((targets, r)), &reg, t0, &metrics).unwrap();
+        cycle(&mut state, &slot, &reg, vec![Some(f.clone())], t0, &metrics);
         assert_eq!(slot.load().replicas.len(), 1);
 
         // The host re-attests with a different key; the old frame is re-read.
-        let rotated = SigningKey::from_bytes(&[9u8; 32]).verifying_key();
+        let rotated = SigningKey::from_bytes(&[9u8; 32]);
         let mut reg2 = registry();
-        let hk = &mut reg2.by_host.get_mut(HOST).unwrap()[0];
-        hk.key = rotated;
-        hk.key_id = frame::key_id(&rotated);
-        let targets = ReadTargets::from_registry(&reg2);
-        let r = raw(vec![Some(f)], t0 + 500);
-        publish_cycle(
-            &mut state,
-            &slot,
-            Ok((targets, r)),
-            &reg2,
-            t0 + 500,
-            &metrics,
-        )
-        .unwrap();
+        reg2.by_host
+            .insert(HOST.to_string(), vec![host_key(&rotated)]);
+        cycle(&mut state, &slot, &reg2, vec![Some(f)], t0 + 500, &metrics);
         assert!(slot.load().replicas.is_empty());
     }
 
@@ -1429,40 +1675,31 @@ mod tests {
         let reg = registry();
         let slot = ArcSwap::from_pointee(Snapshot::default());
         let mut state = ReaderState::default();
-        let cycle = |state: &mut ReaderState, frames, now| {
-            let targets = ReadTargets::from_registry(&reg);
-            publish_cycle(
-                state,
-                &slot,
-                Ok((targets, raw(frames, now))),
-                &reg,
-                now,
-                &metrics,
-            )
-            .unwrap();
+        let run = |state: &mut ReaderState, frame: Option<String>, now| {
+            cycle(state, &slot, &reg, vec![frame], now, &metrics)
         };
-        cycle(&mut state, vec![Some(sealed_json(&report(2, t0)))], t0);
+        run(&mut state, Some(sealed_json(&report(2, t0))), t0);
         let old = sealed_json(&report(1, t0));
-        cycle(&mut state, vec![Some(old.clone())], t0 + 500);
-        cycle(&mut state, vec![Some(old)], t0 + 1_000);
+        run(&mut state, Some(old.clone()), t0 + 500);
+        run(&mut state, Some(old), t0 + 1_000);
         assert_eq!(
             metrics.total(METRIC_FRAMES_REJECTED, Some("reason:regressed")),
             1
         );
         // The last accepted view survives the repeated regressed read.
         assert_eq!(slot.load().replicas.len(), 1);
-        assert_eq!(slot.load().replicas[0].report.seq, 2);
+        assert_eq!(slot.load().replicas[0].state.proxy_inflight, 2);
 
-        cycle(&mut state, vec![Some("junk".into())], t0 + 1_500);
-        cycle(&mut state, vec![Some("junk".into())], t0 + 2_000);
+        run(&mut state, Some("junk".into()), t0 + 1_500);
+        run(&mut state, Some("junk".into()), t0 + 2_000);
         assert_eq!(
             metrics.total(METRIC_FRAMES_REJECTED, Some("reason:envelope")),
             1
         );
         // Once the key disappears the memory clears: the same junk counts again.
-        cycle(&mut state, vec![None], t0 + 2_500);
+        run(&mut state, None, t0 + 2_500);
         assert!(state.rejected.is_empty());
-        cycle(&mut state, vec![Some("junk".into())], t0 + 3_000);
+        run(&mut state, Some("junk".into()), t0 + 3_000);
         assert_eq!(
             metrics.total(METRIC_FRAMES_REJECTED, Some("reason:envelope")),
             2
@@ -1484,8 +1721,7 @@ mod tests {
         push_write(
             &mut pipe,
             &Write::Routed {
-                host: "gpu01".into(),
-                replica: None,
+                slot: sid("gpu01", 3),
                 tok: 42,
                 sec: 1_700,
             },
@@ -1494,7 +1730,7 @@ mod tests {
             &mut pipe,
             &Write::Pin {
                 id_hex: "ab".repeat(16),
-                host: "gpu02".into(),
+                slot: sid("gpu02", 1),
                 at_ms: 9,
             },
         );
@@ -1503,9 +1739,9 @@ mod tests {
         assert_eq!(
             cmds,
             vec![
-                s(&["HINCRBY", "routed:gpu01:_host:1700", "req", "1"]),
-                s(&["HINCRBY", "routed:gpu01:_host:1700", "tok", "42"]),
-                s(&["EXPIRE", "routed:gpu01:_host:1700", "5"]),
+                s(&["HINCRBY", "routed:gpu01:3:1700", "req", "1"]),
+                s(&["HINCRBY", "routed:gpu01:3:1700", "tok", "42"]),
+                s(&["EXPIRE", "routed:gpu01:3:1700", "5"]),
                 s(&[
                     "XADD",
                     "pins",
@@ -1517,12 +1753,18 @@ mod tests {
                     &"ab".repeat(16),
                     "h",
                     "gpu02",
+                    "r",
+                    "1",
                     "t",
                     "9"
                 ]),
             ]
         );
-        assert_eq!(replica_key("gpu01", "r1"), "replica:gpu01:r1");
+        assert_eq!(replica_key("gpu01"), "replica:gpu01");
+        // The kill switch sits under the router's readable `routed:*` prefix
+        // and can never collide with a slot's counter key.
+        assert!(KILL_SWITCH_KEY.starts_with("routed:"));
+        assert_eq!(KILL_SWITCH_KEY.split(':').count(), 2);
     }
 
     #[test]
@@ -1564,7 +1806,7 @@ mod tests {
         assert_eq!(io.snapshot.load().built_ms, 0);
         io.record(Write::Pin {
             id_hex: "00".repeat(16),
-            host: HOST.into(),
+            slot: sid(HOST, 0),
             at_ms: 1,
         });
         assert_eq!(metrics.total(METRIC_WRITES_DROPPED, None), 0);
@@ -1589,23 +1831,11 @@ mod tests {
 
         // A host id unique to this run keeps the keys test-owned.
         let host = format!("test-{}", uuid::Uuid::new_v4());
-        let pk = signing_key().verifying_key();
-        let mut reg = KeyRegistry::default();
-        reg.by_host.insert(
-            host.clone(),
-            vec![HostKey {
-                key_id: frame::key_id(&pk),
-                key: pk,
-                replica_ids: vec![REPLICA.to_string()],
-                model: COVERED_MODELS[0].to_string(),
-            }],
-        );
+        let reg = registry_for(&[host.as_str()]);
         let now = now_ms();
-        let mut rep = report(1, now);
-        rep.host_id = host.clone();
         let _: () = redis::cmd("SET")
-            .arg(replica_key(&host, REPLICA))
-            .arg(sealed_json(&rep))
+            .arg(replica_key(&host))
+            .arg(sealed_json(&host_report(&host, 1, now, &[0, 1])))
             .arg("EX")
             .arg(5)
             .query_async(&mut conn)
@@ -1613,15 +1843,16 @@ mod tests {
             .unwrap();
 
         let pin = pin_id(
+            Tier::Base,
             &AffinityKey::from_bytes(*uuid::Uuid::new_v4().as_bytes()),
             &[1u8; 32],
         );
+        let routed_slot = sid(&host, 1);
         let mut pipe = redis::pipe();
         push_write(
             &mut pipe,
             &Write::Routed {
-                host: host.clone(),
-                replica: None,
+                slot: routed_slot.clone(),
                 tok: 77,
                 sec: now / 1000,
             },
@@ -1630,7 +1861,7 @@ mod tests {
             &mut pipe,
             &Write::Pin {
                 id_hex: pin.to_hex(),
-                host: host.clone(),
+                slot: routed_slot.clone(),
                 at_ms: now,
             },
         );
@@ -1638,18 +1869,25 @@ mod tests {
 
         let mut state = ReaderState::default();
         state.warm_up(warm_up(&mut conn).await.unwrap(), now);
-        let targets = ReadTargets::from_registry(&reg);
-        let (targets, raw) = fetch(&mut conn, targets, &state, now).await.unwrap();
-        let applied = state.apply(&targets, raw, &reg, now);
+        // Cycle 1 learns the host's slots from its frame; cycle 2 reads
+        // their routed counters.
+        let mut applied = None;
+        for _ in 0..2 {
+            let targets = ReadTargets::new(&reg, &state);
+            let (targets, raw) = fetch(&mut conn, targets, &state, now).await.unwrap();
+            applied = Some(state.apply(&targets, raw, &reg, now));
+        }
+        let applied = applied.unwrap();
 
         assert_eq!(applied.rejects, Vec::<Reject>::new());
-        assert_eq!(applied.snapshot.replicas.len(), 1);
-        assert_eq!(applied.snapshot.replicas[0].host_id, host);
-        let rc = applied.snapshot.routed[&(host.clone(), HOST_REPLICA.to_string())];
+        assert_eq!(applied.snapshot.replicas.len(), 2);
+        // A disposable Valkey never holds the kill switch.
+        assert!(!applied.snapshot.disabled);
+        let rc = applied.snapshot.routed[&routed_slot];
         assert_eq!((rc.req, rc.tok), (1, 77));
         assert_eq!(
             applied.snapshot.pins.get(&pin, now),
-            Some((host.as_str(), now))
+            Some((&routed_slot, now))
         );
     }
 }

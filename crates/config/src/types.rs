@@ -1237,16 +1237,19 @@ impl S3Config {
     }
 }
 
-/// Smart placement. Its only runtime input is the placement Valkey password
-/// (`PLACEMENT_REDIS_PASSWORD`, or a file via `PLACEMENT_REDIS_PASSWORD_FILE`
-/// like every other secret); the endpoint, CA and every tunable are code
-/// constants. This is not a mode flag: without the secret there is simply no
-/// placement state, so every request takes the legacy routing path.
+/// Smart placement. Its runtime inputs are the placement Valkey endpoint
+/// ([`PlacementEndpoint`]: host, port, TLS and CA, none of them secret) and
+/// the `router` password (`PLACEMENT_REDIS_PASSWORD`, or a file via
+/// `PLACEMENT_REDIS_PASSWORD_FILE` like every other secret); every tunable is
+/// a code constant. This is not a mode flag: without both there is simply no
+/// placement state, so every request takes the legacy routing path. A bad
+/// endpoint never fails startup: it disables placement (fail open).
 #[derive(Clone, Default)]
 pub struct PlacementConfig {
     /// Password of the Valkey `router` ACL user, and the input key material
     /// for the affinity and pin HMAC secrets. Never logged.
     pub redis_password: Option<String>,
+    pub redis_endpoint: PlacementEndpoint,
 }
 
 impl std::fmt::Debug for PlacementConfig {
@@ -1256,6 +1259,7 @@ impl std::fmt::Debug for PlacementConfig {
                 "redis_password",
                 &self.redis_password.as_ref().map(|_| "<redacted>"),
             )
+            .field("redis_endpoint", &self.redis_endpoint)
             .finish()
     }
 }
@@ -1267,6 +1271,97 @@ impl PlacementConfig {
                 "PLACEMENT_REDIS_PASSWORD_FILE",
                 "PLACEMENT_REDIS_PASSWORD",
             )?,
+            redis_endpoint: PlacementEndpoint::from_env(),
+        })
+    }
+}
+
+/// The placement Valkey endpoint, read from `PLACEMENT_REDIS_HOST`,
+/// `PLACEMENT_REDIS_PORT` (default 6379), `PLACEMENT_REDIS_TLS_ENABLED`
+/// (default true) and, with TLS, the private CA's PEM from
+/// `PLACEMENT_REDIS_TLS_CA_CERT` or a file via
+/// `PLACEMENT_REDIS_TLS_CA_CERT_FILE`.
+#[derive(Clone, Debug, Default)]
+pub enum PlacementEndpoint {
+    /// `PLACEMENT_REDIS_HOST` is unset: placement is off.
+    #[default]
+    Missing,
+    /// Set but unusable; placement is off. The reason names the variable,
+    /// never its value.
+    Invalid(String),
+    Valid(PlacementRedisEndpoint),
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub struct PlacementRedisEndpoint {
+    /// Host or IP literal. With TLS it must match the server certificate's
+    /// SAN (for the placement Valkey, its Elastic IP).
+    pub host: String,
+    pub port: u16,
+    pub tls: bool,
+    /// The CA that signs the server certificate: present iff `tls`.
+    pub ca_pem: Option<String>,
+}
+
+impl std::fmt::Debug for PlacementRedisEndpoint {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PlacementRedisEndpoint")
+            .field("host", &self.host)
+            .field("port", &self.port)
+            .field("tls", &self.tls)
+            .field("ca_pem", &self.ca_pem.as_ref().map(|_| "<set>"))
+            .finish()
+    }
+}
+
+impl PlacementEndpoint {
+    const DEFAULT_PORT: u16 = 6379;
+
+    pub fn from_env() -> Self {
+        let Some(host) = non_empty_env("PLACEMENT_REDIS_HOST") else {
+            return Self::Missing;
+        };
+        match Self::parse(host) {
+            Ok(endpoint) => Self::Valid(endpoint),
+            Err(reason) => Self::Invalid(reason),
+        }
+    }
+
+    fn parse(host: String) -> Result<PlacementRedisEndpoint, String> {
+        let port = match non_empty_env("PLACEMENT_REDIS_PORT") {
+            None => Self::DEFAULT_PORT,
+            Some(port) => port
+                .parse::<u16>()
+                .ok()
+                .filter(|port| *port > 0)
+                .ok_or("PLACEMENT_REDIS_PORT must be a port number")?,
+        };
+        let tls = match non_empty_env("PLACEMENT_REDIS_TLS_ENABLED") {
+            None => true,
+            Some(tls) => tls
+                .parse::<bool>()
+                .map_err(|_| "PLACEMENT_REDIS_TLS_ENABLED must be true or false")?,
+        };
+        let ca_pem = if tls {
+            let pem = read_optional_secret_env(
+                "PLACEMENT_REDIS_TLS_CA_CERT_FILE",
+                "PLACEMENT_REDIS_TLS_CA_CERT",
+            )?
+            .ok_or(
+                "PLACEMENT_REDIS_TLS_CA_CERT or PLACEMENT_REDIS_TLS_CA_CERT_FILE is required with TLS",
+            )?;
+            if !pem.contains("-----BEGIN CERTIFICATE-----") {
+                return Err("PLACEMENT_REDIS_TLS_CA_CERT holds no PEM certificate".to_string());
+            }
+            Some(pem)
+        } else {
+            None
+        };
+        Ok(PlacementRedisEndpoint {
+            host,
+            port,
+            tls,
+            ca_pem,
         })
     }
 }
@@ -1795,6 +1890,7 @@ mod tests {
     fn placement_config_debug_redacts() {
         let config = PlacementConfig {
             redis_password: Some("valkey-router-secret".to_string()),
+            ..PlacementConfig::default()
         };
         let debug = format!("{config:?}");
         assert!(debug.contains("<redacted>"));
@@ -1818,6 +1914,118 @@ mod tests {
         let config = PlacementConfig::from_env().unwrap();
         std::env::remove_var("PLACEMENT_REDIS_PASSWORD");
         assert_eq!(config.redis_password.as_deref(), Some("pw"));
+    }
+
+    const PLACEMENT_ENDPOINT_KEYS: [&str; 5] = [
+        "PLACEMENT_REDIS_HOST",
+        "PLACEMENT_REDIS_PORT",
+        "PLACEMENT_REDIS_TLS_ENABLED",
+        "PLACEMENT_REDIS_TLS_CA_CERT",
+        "PLACEMENT_REDIS_TLS_CA_CERT_FILE",
+    ];
+
+    fn clear_placement_endpoint_env() {
+        for key in PLACEMENT_ENDPOINT_KEYS {
+            std::env::remove_var(key);
+        }
+    }
+
+    const TEST_CA_PEM: &str = "-----BEGIN CERTIFICATE-----\nMIIB\n-----END CERTIFICATE-----\n";
+
+    fn invalid_endpoint() -> String {
+        match PlacementConfig::from_env().unwrap().redis_endpoint {
+            PlacementEndpoint::Invalid(reason) => reason,
+            other => panic!("expected an invalid endpoint, got {other:?}"),
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn placement_endpoint_missing_is_disabled() {
+        clear_placement_endpoint_env();
+        // No host: placement stays off, and startup does not fail.
+        std::env::set_var("PLACEMENT_REDIS_TLS_CA_CERT", TEST_CA_PEM);
+        let config = PlacementConfig::from_env().unwrap();
+        clear_placement_endpoint_env();
+        assert!(matches!(config.redis_endpoint, PlacementEndpoint::Missing));
+        assert!(matches!(
+            PlacementConfig::default().redis_endpoint,
+            PlacementEndpoint::Missing
+        ));
+    }
+
+    #[test]
+    #[serial]
+    fn placement_endpoint_reads_host_port_tls_and_ca() {
+        clear_placement_endpoint_env();
+        std::env::set_var("PLACEMENT_REDIS_HOST", " 203.0.113.7 ");
+        std::env::set_var("PLACEMENT_REDIS_TLS_CA_CERT", TEST_CA_PEM);
+        let config = PlacementConfig::from_env().unwrap();
+        let PlacementEndpoint::Valid(endpoint) = config.redis_endpoint else {
+            panic!("expected a valid endpoint");
+        };
+        // TLS by default, on the default port.
+        assert_eq!(endpoint.host, "203.0.113.7");
+        assert_eq!(endpoint.port, 6379);
+        assert!(endpoint.tls);
+        assert_eq!(endpoint.ca_pem.as_deref(), Some(TEST_CA_PEM.trim()));
+
+        // The CA from a file, on another port.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ca.pem");
+        std::fs::write(&path, TEST_CA_PEM).unwrap();
+        std::env::remove_var("PLACEMENT_REDIS_TLS_CA_CERT");
+        std::env::set_var("PLACEMENT_REDIS_TLS_CA_CERT_FILE", &path);
+        std::env::set_var("PLACEMENT_REDIS_PORT", "6380");
+        let PlacementEndpoint::Valid(endpoint) =
+            PlacementConfig::from_env().unwrap().redis_endpoint
+        else {
+            panic!("expected a valid endpoint");
+        };
+        assert_eq!(endpoint.port, 6380);
+        assert_eq!(endpoint.ca_pem.as_deref(), Some(TEST_CA_PEM.trim()));
+
+        // Plain TCP needs no CA.
+        clear_placement_endpoint_env();
+        std::env::set_var("PLACEMENT_REDIS_HOST", "127.0.0.1");
+        std::env::set_var("PLACEMENT_REDIS_TLS_ENABLED", "false");
+        let PlacementEndpoint::Valid(endpoint) =
+            PlacementConfig::from_env().unwrap().redis_endpoint
+        else {
+            panic!("expected a valid endpoint");
+        };
+        clear_placement_endpoint_env();
+        assert!(!endpoint.tls);
+        assert_eq!(endpoint.ca_pem, None);
+    }
+
+    #[test]
+    #[serial]
+    fn placement_endpoint_bad_ca_is_disabled_with_an_error() {
+        clear_placement_endpoint_env();
+        std::env::set_var("PLACEMENT_REDIS_HOST", "203.0.113.7");
+
+        // TLS without a CA.
+        assert!(invalid_endpoint().contains("PLACEMENT_REDIS_TLS_CA_CERT"));
+
+        // A CA that holds no certificate.
+        std::env::set_var("PLACEMENT_REDIS_TLS_CA_CERT", "not a certificate");
+        assert!(invalid_endpoint().contains("PLACEMENT_REDIS_TLS_CA_CERT"));
+
+        // A CA file that cannot be read.
+        std::env::remove_var("PLACEMENT_REDIS_TLS_CA_CERT");
+        std::env::set_var("PLACEMENT_REDIS_TLS_CA_CERT_FILE", "/nonexistent/ca.pem");
+        assert!(invalid_endpoint().contains("PLACEMENT_REDIS_TLS_CA_CERT_FILE"));
+
+        // Neither the port nor the TLS switch may be garbage.
+        std::env::set_var("PLACEMENT_REDIS_TLS_CA_CERT", TEST_CA_PEM);
+        std::env::remove_var("PLACEMENT_REDIS_TLS_CA_CERT_FILE");
+        std::env::set_var("PLACEMENT_REDIS_PORT", "not-a-port");
+        assert!(invalid_endpoint().contains("PLACEMENT_REDIS_PORT"));
+        std::env::remove_var("PLACEMENT_REDIS_PORT");
+        std::env::set_var("PLACEMENT_REDIS_TLS_ENABLED", "maybe");
+        assert!(invalid_endpoint().contains("PLACEMENT_REDIS_TLS_ENABLED"));
+        clear_placement_endpoint_env();
     }
 
     #[test]

@@ -36,24 +36,34 @@ use tokio::sync::mpsc;
 
 use crate::BackendHosts;
 
-/// Placement Valkey endpoint (TLS, ACL user `router`). The password comes
-/// from `PLACEMENT_REDIS_PASSWORD` at runtime and is never embedded here.
-///
-/// PLACEHOLDER until infra-aws#15 is applied. To fill it in:
-/// 1. Replace `VALKEY_EIP` with the Elastic IP literal that the apply outputs
-///    for the placement Valkey, e.g. `"rediss://router@203.0.113.7:6379"`.
-///    Use the IP, not a DNS name: the server certificate's SAN is
-///    `IP:<EIP>`, so TLS hostname verification only passes against the IP.
-/// 2. Replace the contents of `placement_valkey_ca.pem` (next to this file)
-///    with the private CA certificate PEM from the same apply's output (the
-///    CA that signed that server certificate, not the server certificate).
-///
-/// While either is a placeholder, [`PlacementIo::start`] logs the error
-/// kind at warn and stays inert, so every request takes the legacy path.
-pub const VALKEY_ENDPOINT: &str = "rediss://router@VALKEY_EIP:6379";
-/// Private CA that signs the placement Valkey's certificate. Placeholder
-/// until infra-aws#15 is applied; see [`VALKEY_ENDPOINT`] to fill it in.
-pub const VALKEY_CA_PEM: &str = include_str!("placement_valkey_ca.pem");
+/// The placement Valkey endpoint, from cloud-api's config
+/// (`PLACEMENT_REDIS_HOST`, `_PORT`, `_TLS_ENABLED`, `_TLS_CA_CERT`). The
+/// client authenticates as ACL user `router` with the password from
+/// `PLACEMENT_REDIS_PASSWORD`, which never appears here.
+#[derive(Clone)]
+pub struct ValkeyEndpoint {
+    /// Host or IP literal. With TLS it must match the server certificate's
+    /// SAN: the placement Valkey's certificate names its Elastic IP, so use
+    /// the IP, not a DNS name.
+    pub host: String,
+    pub port: u16,
+    pub tls: bool,
+    /// The private CA that signed the server certificate (PEM). Required
+    /// with TLS: the platform trust roots are never used instead.
+    pub ca_pem: Option<String>,
+}
+
+impl ValkeyEndpoint {
+    /// `rediss://router@host:port` (`redis://` without TLS).
+    fn url(&self) -> String {
+        let scheme = if self.tls { "rediss" } else { "redis" };
+        if self.host.contains(':') {
+            format!("{scheme}://router@[{}]:{}", self.host, self.port)
+        } else {
+            format!("{scheme}://router@{}:{}", self.host, self.port)
+        }
+    }
+}
 
 /// How often the reader builds a new snapshot.
 pub const READ_INTERVAL: Duration = Duration::from_millis(500);
@@ -144,11 +154,12 @@ impl PlacementHandles {
     /// stops once the Fleet (and so these handles) is dropped.
     pub fn start<M: PlacementMetrics + ?Sized + 'static>(
         password: String,
+        endpoint: &ValkeyEndpoint,
         placer: Arc<placement::decision::Placer>,
         metrics: Arc<M>,
     ) -> Self {
         let hosts = Arc::new(ArcSwap::from_pointee(BackendHosts::default()));
-        let io = PlacementIo::start(password, hosts.clone(), metrics);
+        let io = PlacementIo::start(password, endpoint, hosts.clone(), metrics);
         Self { placer, io, hosts }
     }
 
@@ -309,8 +320,8 @@ fn push_write(pipe: &mut redis::Pipeline, w: &Write) {
 }
 
 /// Set once the "client not configured" warning has been logged: every chat
-/// endpoint starts a handle set, and the cause (endpoint or CA) is
-/// process-wide, so one line says it all.
+/// endpoint starts a handle set, and the cause (the configured endpoint or
+/// CA) is process-wide, so one line says it all.
 static UNCONFIGURED_WARNED: AtomicBool = AtomicBool::new(false);
 
 /// `true` for exactly the first caller on `warned`.
@@ -331,10 +342,10 @@ pub struct PlacementIo {
 }
 
 impl PlacementIo {
-    /// Spawns the reader and writer against [`VALKEY_ENDPOINT`] with
-    /// `password`. Never panics and never blocks: if the endpoint or CA is
-    /// invalid it logs the error kind and returns an inert handle whose
-    /// snapshot stays empty. Must be called inside a Tokio runtime.
+    /// Spawns the reader and writer against `endpoint` with `password`.
+    /// Never panics and never blocks: if the endpoint or CA is invalid it
+    /// logs the error kind and returns an inert handle whose snapshot stays
+    /// empty. Must be called inside a Tokio runtime.
     ///
     /// The reader and writer tasks are detached: the writer ends once every
     /// handle (and so the channel sender) is dropped, and the reader once
@@ -342,13 +353,14 @@ impl PlacementIo {
     /// (see [`PlacementHandles::start`]), never per request.
     pub fn start<M: PlacementMetrics + ?Sized + 'static>(
         password: String,
+        endpoint: &ValkeyEndpoint,
         hosts: Arc<ArcSwap<BackendHosts>>,
         metrics: Arc<M>,
     ) -> Arc<Self> {
         let metrics: Arc<dyn PlacementMetrics> = Arc::new(ErasedMetrics(metrics));
         let (io, rx) = Self::new(metrics.clone());
         install_crypto_provider();
-        match client(VALKEY_ENDPOINT, Some(VALKEY_CA_PEM), Some(password)) {
+        match endpoint_client(endpoint, password) {
             Ok(client) => {
                 tokio::spawn(run(client, hosts, io.snapshot.clone(), rx, metrics));
             }
@@ -416,6 +428,18 @@ pub fn install_crypto_provider() {
     let _ = rustls::crypto::ring::default_provider().install_default();
 }
 
+/// Builds the client for `endpoint`. With TLS it trusts only the endpoint's
+/// CA, which is then required (`ca_missing` otherwise). Errors carry only a
+/// kind, never the host or password.
+fn endpoint_client(endpoint: &ValkeyEndpoint, password: String) -> Result<redis::Client, String> {
+    let ca_pem = match (endpoint.tls, endpoint.ca_pem.as_deref()) {
+        (true, None) => return Err("ca_missing".to_string()),
+        (true, ca_pem) => ca_pem,
+        (false, _) => None,
+    };
+    client(&endpoint.url(), ca_pem, Some(password))
+}
+
 /// Builds a client for `url`, trusting only `ca_pem` (which must hold at
 /// least one certificate) when given. `password`, when non-empty, overrides
 /// the URL's. Errors carry only a kind, never the URL or password.
@@ -424,17 +448,6 @@ fn client(
     ca_pem: Option<&str>,
     password: Option<String>,
 ) -> Result<redis::Client, String> {
-    // `VALKEY_ENDPOINT` still carries its placeholder host until infra-aws#15
-    // is applied. Unlike a real unreachable host, `"VALKEY_EIP"` parses as a
-    // perfectly valid hostname, so without this check `client()` would
-    // succeed and `connect()` would retry forever on a 1-30s backoff instead
-    // of staying inert — the CA placeholder is the only thing that short-
-    // circuits today, and the two placeholders can be filled in at different
-    // times. Same inert contract as `ca_pem_empty` below: one warn, no
-    // connect loop, every placement Legacy.
-    if url.contains("VALKEY_EIP") {
-        return Err("endpoint_placeholder".to_string());
-    }
     use redis::IntoConnectionInfo;
     let mut info = url
         .into_connection_info()
@@ -2503,42 +2516,73 @@ mod tests {
         assert_eq!(KILL_SWITCH_KEY.split(':').count(), 2);
     }
 
+    /// A self-signed CA certificate, PEM.
+    fn test_ca_pem() -> String {
+        let key = rcgen::KeyPair::generate().unwrap();
+        let mut params = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
+        params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        params.self_signed(&key).unwrap().pem()
+    }
+
+    fn endpoint(tls: bool, ca_pem: Option<String>) -> ValkeyEndpoint {
+        ValkeyEndpoint {
+            host: "203.0.113.7".to_string(),
+            port: 6379,
+            tls,
+            ca_pem,
+        }
+    }
+
     #[test]
-    fn placeholder_ca_is_a_config_error_not_a_panic() {
+    fn endpoint_url_names_the_router_user_and_scheme() {
+        assert_eq!(
+            endpoint(true, None).url(),
+            "rediss://router@203.0.113.7:6379"
+        );
+        assert_eq!(
+            endpoint(false, None).url(),
+            "redis://router@203.0.113.7:6379"
+        );
+        let v6 = ValkeyEndpoint {
+            host: "2001:db8::7".to_string(),
+            ..endpoint(true, None)
+        };
+        assert_eq!(v6.url(), "rediss://router@[2001:db8::7]:6379");
+    }
+
+    #[test]
+    fn configured_endpoint_builds_a_client() {
         install_crypto_provider();
-        assert!(client(VALKEY_ENDPOINT, Some(VALKEY_CA_PEM), Some("pw".into())).is_err());
+        assert!(endpoint_client(&endpoint(true, Some(test_ca_pem())), "pw".into()).is_ok());
+        assert!(endpoint_client(&endpoint(false, None), "pw".into()).is_ok());
+    }
+
+    /// A bad CA is a config error (placement stays off), never a panic and
+    /// never a fallback to the platform's trust roots.
+    #[test]
+    fn bad_ca_is_a_config_error_not_a_panic() {
+        install_crypto_provider();
+        let err = |e: &ValkeyEndpoint| endpoint_client(e, "pw".into()).unwrap_err();
+        assert_eq!(err(&endpoint(true, None)), "ca_missing");
+        assert_eq!(
+            err(&endpoint(true, Some("not a certificate".into()))),
+            "ca_pem_empty"
+        );
+        let garbled = "-----BEGIN CERTIFICATE-----\n!!!\n-----END CERTIFICATE-----\n";
+        assert!(endpoint_client(&endpoint(true, Some(garbled.into())), "pw".into()).is_err());
         assert!(client("not a url", None, None).is_err());
     }
 
-    #[test]
-    fn placeholder_endpoint_is_rejected_with_its_own_error_kind() {
-        // Given: the endpoint still carries its placeholder host
-        // (`VALKEY_EIP`), which — unlike a real unreachable host — parses
-        // as a perfectly valid hostname. Without an explicit check,
-        // `client()` would succeed here and `connect()` would loop forever
-        // on its backoff instead of staying inert, and the two placeholders
-        // (endpoint, CA) can be filled in at different times, so this must
-        // be caught independent of the CA outcome.
-        install_crypto_provider();
-
-        // Then: the endpoint check fires before URL parsing or the CA check
-        // and reports its own, distinguishable error kind — never silently
-        // falling through to a real connection attempt.
-        assert_eq!(
-            client(VALKEY_ENDPOINT, None, Some("pw".into())).unwrap_err(),
-            "endpoint_placeholder"
-        );
-        assert_eq!(
-            client(VALKEY_ENDPOINT, Some(VALKEY_CA_PEM), Some("pw".into())).unwrap_err(),
-            "endpoint_placeholder"
-        );
-    }
-
     #[tokio::test]
-    async fn start_with_placeholder_config_is_inert() {
+    async fn start_with_bad_ca_is_inert() {
         let metrics = Arc::new(FakeMetrics::default());
         let hosts = Arc::new(ArcSwap::from_pointee(BackendHosts::default()));
-        let io = PlacementIo::start("secret".into(), hosts, metrics.clone());
+        let io = PlacementIo::start(
+            "secret".into(),
+            &endpoint(true, Some("not a certificate".into())),
+            hosts,
+            metrics.clone(),
+        );
         assert_eq!(io.snapshot.load().built_ms, 0);
         io.record(Write::Pin {
             id_hex: "00".repeat(16),

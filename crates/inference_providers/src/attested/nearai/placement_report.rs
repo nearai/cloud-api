@@ -130,7 +130,7 @@ pub(super) fn report_decision(
         .collect::<Vec<_>>()
         .join(",");
     // One field set for both levels. Placement with no usable state
-    // (Valkey unreachable, placeholder endpoint, hosts that publish no
+    // (Valkey unreachable, endpoint misconfigured, hosts that publish no
     // frames, stale snapshot, kill switch) logs at debug: every such
     // request would otherwise repeat the same line. The decision metric above still counts each one.
     macro_rules! decision_line {

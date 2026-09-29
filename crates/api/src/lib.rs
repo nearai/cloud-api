@@ -935,10 +935,12 @@ async fn ensure_chutes_catalog_row(
     }
 }
 
-/// Enables smart placement on `pool` when `PLACEMENT_REDIS_PASSWORD` is set.
-/// Without the secret there is no placement state and every request routes
-/// as before (this is not a mode flag). The pool derives both HMAC secrets
-/// from the password and is the single source of the affinity secret
+/// Enables smart placement on `pool` when `PLACEMENT_REDIS_PASSWORD` and a
+/// valid placement Valkey endpoint are configured. Without either there is
+/// no placement state and every request routes as before (this is not a
+/// mode flag); a missing or invalid endpoint is logged once, at startup,
+/// and never fails it. The pool derives both HMAC secrets from the password
+/// and is the single source of the affinity secret
 /// (`pool.affinity_secret()`); none of them is ever logged.
 pub fn install_placement(
     pool: &services::inference_provider_pool::InferenceProviderPool,
@@ -948,10 +950,36 @@ pub fn install_placement(
         tracing::info!("Placement secret not configured; smart placement off, legacy routing");
         return;
     };
-    pool.set_placement(password.to_string());
-    // Configured is not active: with a placeholder Valkey endpoint/CA the
-    // snapshot stays empty and every request still routes legacy.
-    tracing::info!("Smart placement secret configured");
+    let endpoint = match &placement.redis_endpoint {
+        config::PlacementEndpoint::Valid(endpoint) => endpoint,
+        config::PlacementEndpoint::Missing => {
+            tracing::warn!(
+                "Placement Valkey endpoint not configured (PLACEMENT_REDIS_HOST); smart placement off, legacy routing"
+            );
+            return;
+        }
+        config::PlacementEndpoint::Invalid(reason) => {
+            // `reason` names the variable, never its value.
+            tracing::error!(
+                reason = %reason,
+                "Placement Valkey endpoint invalid; smart placement off, legacy routing"
+            );
+            return;
+        }
+    };
+    pool.set_placement(
+        password.to_string(),
+        inference_providers::placement_io::ValkeyEndpoint {
+            host: endpoint.host.clone(),
+            port: endpoint.port,
+            tls: endpoint.tls,
+            ca_pem: endpoint.ca_pem.clone(),
+        },
+    );
+    // Configured is not active: until the proxies publish frames (or while
+    // Valkey is unreachable) the snapshot stays empty and every request
+    // still routes legacy.
+    tracing::info!("Smart placement configured");
 }
 
 /// Initialize inference provider pool
@@ -2945,6 +2973,16 @@ mod tests {
         assert!(!pool.has_placement(), "no placement without the password");
     }
 
+    fn configured_endpoint() -> config::PlacementEndpoint {
+        config::PlacementEndpoint::Valid(config::PlacementRedisEndpoint {
+            host: "203.0.113.7".to_string(),
+            port: 6379,
+            tls: true,
+            // Not a parsable certificate: the handle sets stay inert.
+            ca_pem: Some("-----BEGIN CERTIFICATE-----".to_string()),
+        })
+    }
+
     #[test]
     fn placement_password_installs_placement_and_affinity() {
         let pool = services::inference_provider_pool::InferenceProviderPool::new(
@@ -2953,11 +2991,34 @@ mod tests {
         );
         let placement = config::PlacementConfig {
             redis_password: Some("router-password".to_string()),
+            redis_endpoint: configured_endpoint(),
         };
         install_placement(&pool, &placement);
         assert!(pool.has_placement());
         let (expected, _) = services::completions::affinity::secrets_from("router-password");
         assert_eq!(pool.affinity_secret(), Some(expected));
+    }
+
+    /// Without a usable endpoint placement stays off (fail open), password
+    /// or not: no handles and no affinity secret.
+    #[test]
+    fn placement_without_a_usable_endpoint_stays_off() {
+        for endpoint in [
+            config::PlacementEndpoint::Missing,
+            config::PlacementEndpoint::Invalid("PLACEMENT_REDIS_PORT".to_string()),
+        ] {
+            let pool = services::inference_provider_pool::InferenceProviderPool::new(
+                None,
+                config::ExternalProvidersConfig::default(),
+            );
+            let placement = config::PlacementConfig {
+                redis_password: Some("router-password".to_string()),
+                redis_endpoint: endpoint,
+            };
+            install_placement(&pool, &placement);
+            assert!(!pool.has_placement());
+            assert!(pool.affinity_secret().is_none());
+        }
     }
 
     /// Example of how to set up the application for E2E testing

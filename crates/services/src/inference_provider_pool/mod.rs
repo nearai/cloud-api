@@ -929,6 +929,8 @@ impl ProviderMappings {
 /// password, so it intentionally has no `Debug`.
 struct PoolPlacement {
     password: String,
+    /// Where the placement Valkey is (config, not secret).
+    endpoint: inference_providers::placement_io::ValkeyEndpoint,
     /// Keys each tier's placer's follow pins (see `Placer::new`).
     pin_secret: [u8; 32],
     /// Keys request affinity in the completion service. Derived here, once,
@@ -1381,14 +1383,19 @@ impl InferenceProviderPool {
         }
     }
 
-    /// Enable smart placement: `password` authenticates
-    /// to the placement Valkey, and the pin and affinity secrets are derived
+    /// Enable smart placement: `password` authenticates to the placement
+    /// Valkey at `endpoint`, and the pin and affinity secrets are derived
     /// from it (`secrets_from`). Call once at startup, before models load,
-    /// and only when the secret is configured. A second call is a no-op.
-    pub fn set_placement(&self, password: String) {
+    /// and only when both are configured. A second call is a no-op.
+    pub fn set_placement(
+        &self,
+        password: String,
+        endpoint: inference_providers::placement_io::ValkeyEndpoint,
+    ) {
         let (affinity_secret, pin_secret) = crate::completions::affinity::secrets_from(&password);
         let _ = self.placement.set(PoolPlacement {
             password,
+            endpoint,
             pin_secret,
             affinity_secret,
         });
@@ -1421,6 +1428,7 @@ impl InferenceProviderPool {
             .unwrap_or_else(|| Arc::new(crate::metrics::MockMetricsService));
         Some(inference_providers::placement_io::PlacementHandles::start(
             install.password.clone(),
+            &install.endpoint,
             Arc::new(placement::decision::Placer::new(install.pin_secret, tier)),
             metrics,
         ))
@@ -9012,11 +9020,22 @@ mod tests {
     /// (here: the long block becomes valid, so the URL is now the long
     /// tier) recreates its provider with a placer for the new tier, instead
     /// of keeping the tier fixed at creation.
+    /// A placement Valkey endpoint that never connects: TLS without a CA is
+    /// a config error, so handle sets started with it stay inert.
+    fn inert_endpoint() -> inference_providers::placement_io::ValkeyEndpoint {
+        inference_providers::placement_io::ValkeyEndpoint {
+            host: "203.0.113.7".to_string(),
+            port: 6379,
+            tls: true,
+            ca_pem: None,
+        }
+    }
+
     #[tokio::test]
     async fn reused_provider_gets_new_tier_after_catalog_change() {
         use placement::policy::Tier;
         let pool = InferenceProviderPool::new(None, ExternalProvidersConfig::default());
-        pool.set_placement("router-password".to_string());
+        pool.set_placement("router-password".to_string(), inert_endpoint());
         let covered = "z-ai/glm-5.3-flash".to_string();
         let base_url = "https://glm-base.invalid".to_string();
         let long_url = "https://glm-long.invalid".to_string();
@@ -9054,7 +9073,7 @@ mod tests {
     async fn long_fleet_placer_has_long_tier() {
         use placement::policy::Tier;
         let pool = InferenceProviderPool::new(None, ExternalProvidersConfig::default());
-        pool.set_placement("router-password".to_string());
+        pool.set_placement("router-password".to_string(), inert_endpoint());
         let base = pool.placement_handles(Tier::Base).expect("handles");
         let long = pool.placement_handles(Tier::Long).expect("handles");
         assert_eq!(base.placer.tier(), Tier::Base);
@@ -9070,13 +9089,12 @@ mod tests {
 
         assert!(pool.affinity_secret().is_none());
 
-        pool.set_placement("router-password".to_string());
+        pool.set_placement("router-password".to_string(), inert_endpoint());
         assert!(pool.has_placement());
         let (affinity, _) = crate::completions::affinity::secrets_from("router-password");
         assert_eq!(pool.affinity_secret(), Some(affinity));
         // Each call starts a separate handle set (one per Fleet), with its
-        // own placer. The placeholder endpoint/CA keep it inert: no network
-        // is touched.
+        // own placer. The inert endpoint (no CA) keeps it off the network.
         let first = pool.placement_handles(Tier::Base).expect("handles");
         let second = pool.placement_handles(Tier::Base).expect("handles");
         assert!(!Arc::ptr_eq(&first.hosts, &second.hosts));

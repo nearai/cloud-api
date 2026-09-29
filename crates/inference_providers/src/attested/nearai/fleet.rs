@@ -985,10 +985,14 @@ impl Fleet {
             ack,
         });
         if let Some((pin_id, pin_slot)) = pin_write {
+            // The pin carries its host's current boot, so every node ignores
+            // it once that host reboots (its cache is then cold).
+            let boot = snapshot.host_boots.get(&pin_slot.host).cloned();
             handles.io.record(Write::Pin {
                 id_hex: pin_id.to_hex(),
                 slot: pin_slot,
                 at_ms: now_ms,
+                boot,
             });
         }
         report_decision(handles, &record, request);

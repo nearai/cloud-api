@@ -77,6 +77,10 @@ pub struct RoutedCounts {
 /// caller runs a `Refused` decision on its legacy path instead; every other
 /// decision is unchanged.
 ///
+/// `host_boots` is each host's `boot_id` from its latest accepted frame. A
+/// pin written on another boot of its host is ignored
+/// ([`Snapshot::pin_boot_current`]): the host rebooted, so its cache is cold.
+///
 /// `routed_read_ms` is this node's clock when the reader *issued* the Valkey
 /// read that produced `routed` (not when it completed). A local write
 /// acknowledged before it is visible in `routed`; see
@@ -91,6 +95,21 @@ pub struct Snapshot {
     pub pins: Arc<PinTable>,
     pub disabled: bool,
     pub refuse_on: bool,
+    pub host_boots: HashMap<String, String>,
+}
+
+impl Snapshot {
+    /// Whether a pin to a slot on `host`, written while the host was on
+    /// `boot`, still points at a warm cache: false only when both the pin's
+    /// boot and the host's current boot are known and differ. A pin of
+    /// unknown boot (written by an older node) is accepted, as is one whose
+    /// host is not in this snapshot (it cannot be placed on anyway).
+    pub fn pin_boot_current(&self, host: &str, boot: Option<&str>) -> bool {
+        match (boot, self.host_boots.get(host)) {
+            (Some(pinned), Some(current)) => pinned == current,
+            _ => true,
+        }
+    }
 }
 
 /// Why a frame was not accepted into the snapshot.
@@ -372,6 +391,11 @@ impl Ingest {
     /// (`PinTable::drop_host`): a rebooted engine's prefix cache is cold.
     pub fn take_rebooted_hosts(&mut self) -> Vec<String> {
         std::mem::take(&mut self.rebooted).into_iter().collect()
+    }
+
+    /// The `boot_id` of `host`'s latest accepted frame, if any.
+    pub fn boot_id(&self, host: &str) -> Option<&str> {
+        self.hosts.get(host).map(|h| h.boot.as_str())
     }
 }
 

@@ -251,11 +251,13 @@ pub enum Write {
         sec: u64,
         ack: RoutedAck,
     },
-    /// A follow pin: `id_hex` (32 hex chars) now points at `slot`.
+    /// A follow pin: `id_hex` (32 hex chars) now points at `slot`, whose
+    /// host is on `boot` (`None`: unknown, so no `b` field is written).
     Pin {
         id_hex: String,
         slot: SlotId,
         at_ms: u64,
+        boot: Option<String>,
     },
 }
 
@@ -282,9 +284,10 @@ fn push_write(pipe: &mut redis::Pipeline, w: &Write) {
             id_hex,
             slot,
             at_ms,
+            boot,
         } => {
-            pipe.cmd("XADD")
-                .arg(PINS_STREAM)
+            let cmd = pipe.cmd("XADD");
+            cmd.arg(PINS_STREAM)
                 .arg("MAXLEN")
                 .arg("~")
                 .arg(PINS_MAXLEN)
@@ -296,8 +299,11 @@ fn push_write(pipe: &mut redis::Pipeline, w: &Write) {
                 .arg("r")
                 .arg(slot.replica)
                 .arg("t")
-                .arg(*at_ms)
-                .ignore();
+                .arg(*at_ms);
+            if let Some(boot) = boot {
+                cmd.arg("b").arg(boot);
+            }
+            cmd.ignore();
         }
     }
 }
@@ -834,11 +840,11 @@ impl ReaderState {
         let mut bad = 0;
         for entry in entries {
             match parse_pin(&entry.fields) {
-                Some((id, slot, at_ms)) => {
+                Some((id, slot, at_ms, boot)) => {
                     let live = now_ms < at_ms.saturating_add(PIN_TTL_MS);
                     let skewed = at_ms > now_ms.saturating_add(PIN_MAX_FUTURE_MS);
                     if live && !skewed {
-                        Arc::make_mut(&mut self.pins).insert(id, slot, at_ms);
+                        Arc::make_mut(&mut self.pins).insert_on_boot(id, slot, at_ms, boot);
                     }
                 }
                 None => bad += 1,
@@ -985,6 +991,25 @@ impl ReaderState {
             })
             .collect();
 
+        // A rebooted host's caches are cold: drop its pins at once, before
+        // this cycle's new pins (a pin written since the reboot carries the
+        // new boot and is kept; an older one is ignored by its boot).
+        let rebooted = self.ingest.take_rebooted_hosts();
+        if !rebooted.is_empty() {
+            let pins = Arc::make_mut(&mut self.pins);
+            for host in &rebooted {
+                pins.drop_host(host);
+            }
+        }
+        let host_boots = self
+            .hosts
+            .keys()
+            .filter_map(|host| {
+                self.ingest
+                    .boot_id(host)
+                    .map(|boot| (host.clone(), boot.to_string()))
+            })
+            .collect();
         let bad_pins = self.apply_pins(raw.pins, now_ms);
         if !removed.is_empty() {
             Arc::make_mut(&mut self.pins).retain_slots(|slot| !removed.contains(slot));
@@ -1003,6 +1028,7 @@ impl ReaderState {
                 pins: self.pins.clone(),
                 disabled: raw.kill_switch,
                 refuse_on: raw.refuse_on,
+                host_boots,
             },
             rejects,
             bad_envelopes,
@@ -1011,14 +1037,20 @@ impl ReaderState {
     }
 }
 
+/// A parsed pins stream entry: id, slot, written-at ms and host boot.
+type ParsedPin = ([u8; 16], SlotId, u64, Option<String>);
+
 /// Parses a pins stream entry: `k` (32 hex chars), `h` (host), `r` (replica
-/// index), `t` (ms). An entry without a valid `r` is malformed.
-fn parse_pin(fields: &HashMap<String, String>) -> Option<([u8; 16], SlotId, u64)> {
+/// index), `t` (ms) and the optional `b` (the host's `boot_id` when the pin
+/// was written; absent or empty from an older node, i.e. unknown). An entry
+/// without a valid `r` is malformed.
+fn parse_pin(fields: &HashMap<String, String>) -> Option<ParsedPin> {
     let id: [u8; 16] = hex::decode(fields.get("k")?).ok()?.try_into().ok()?;
     let host = fields.get("h").filter(|h| !h.is_empty())?.clone();
     let replica = fields.get("r")?.parse().ok()?;
     let at_ms = fields.get("t")?.parse().ok()?;
-    Some((id, SlotId { host, replica }, at_ms))
+    let boot = fields.get("b").filter(|b| !b.is_empty()).cloned();
+    Some((id, SlotId { host, replica }, at_ms, boot))
 }
 
 fn count_malformed_pins(metrics: &dyn PlacementMetrics, bad: u32) {
@@ -1509,6 +1541,7 @@ mod tests {
             id_hex: "00".repeat(16),
             slot: sid(HOST, 0),
             at_ms: 1,
+            boot: None,
         };
         tx.try_send(pin()).unwrap();
         tx.try_send(routed(&b)).unwrap();
@@ -2053,6 +2086,111 @@ mod tests {
         assert_eq!(state.last_pin_id.as_deref(), Some("3-0"));
     }
 
+    /// A pin written by an older node has no `b` field: its host boot is
+    /// unknown, so it is accepted (rolling-deploy compatibility), while a
+    /// pin carrying a boot is checked against the host's current one.
+    #[test]
+    fn pin_without_boot_field_is_accepted() {
+        let t0 = 10_000_500u64;
+        let metrics = FakeMetrics::default();
+        let reg = registry();
+        let slot = ArcSwap::from_pointee(Snapshot::default());
+        let mut state = ReaderState::default();
+        let (legacy, current, old) = (pid(1), pid(2), pid(3));
+        let with_boot = |id: &str, k: &str, boot: &str| {
+            let mut e = pin_entry(id, k, HOST, "0", t0);
+            e.fields.insert("b".to_string(), boot.to_string());
+            e
+        };
+        let bad = state.warm_up(
+            vec![
+                with_boot("3-0", &old.to_hex(), "boot-z"),
+                with_boot("2-0", &current.to_hex(), "boot-a"),
+                pin_entry("1-0", &legacy.to_hex(), HOST, "0", t0),
+            ],
+            t0,
+        );
+        assert_eq!(bad, 0);
+        cycle(
+            &mut state,
+            &slot,
+            &reg,
+            vec![Some(sealed_json(&report(1, t0)))],
+            t0,
+            &metrics,
+        );
+        let snap = slot.load();
+        assert_eq!(
+            snap.host_boots.get(HOST).map(String::as_str),
+            Some("boot-a")
+        );
+        let stands = |id: &placement::affinity::PinId| {
+            let (s, _, boot) = snap.pins.get_with_boot(id, t0).expect("live pin");
+            snap.pin_boot_current(&s.host, boot)
+        };
+        assert!(stands(&legacy), "a pin without a boot is accepted");
+        assert!(stands(&current));
+        assert!(!stands(&old), "a pin from another boot is not");
+    }
+
+    /// A host whose frame shows a new boot has its pins dropped from this
+    /// node's table at once; other hosts' pins stay.
+    #[test]
+    fn rebooted_host_pins_are_dropped_locally() {
+        let t0 = 10_000_500u64;
+        let metrics = FakeMetrics::default();
+        let reg = registry_for(&[HOST, HOST_B]);
+        let slot = ArcSwap::from_pointee(Snapshot::default());
+        let mut state = ReaderState::default();
+        let (on_host, elsewhere) = (pid(1), pid(2));
+        state.warm_up(
+            vec![
+                pin_entry("2-0", &elsewhere.to_hex(), HOST_B, "0", t0),
+                pin_entry("1-0", &on_host.to_hex(), HOST, "0", t0),
+            ],
+            t0,
+        );
+        let frames = |boot: &str, seq: u64, t: u64| {
+            [HOST, HOST_B]
+                .iter()
+                .map(|h| {
+                    let mut r = host_report(h, seq, t, &[0]);
+                    if *h == HOST {
+                        r.boot_id = boot.into();
+                    }
+                    Some(sealed_json(&r))
+                })
+                .collect::<Vec<_>>()
+        };
+        cycle(
+            &mut state,
+            &slot,
+            &reg,
+            frames("boot-a", 1, t0),
+            t0,
+            &metrics,
+        );
+        assert!(slot.load().pins.get(&on_host, t0).is_some());
+
+        // HOST reboots: its first frame of the new boot drops its pins.
+        let t1 = t0 + 500;
+        cycle(
+            &mut state,
+            &slot,
+            &reg,
+            frames("boot-b", 1, t1),
+            t1,
+            &metrics,
+        );
+        let snap = slot.load();
+        assert_eq!(
+            snap.host_boots.get(HOST).map(String::as_str),
+            Some("boot-b")
+        );
+        assert!(snap.pins.get(&on_host, t1).is_none());
+        assert!(snap.pins.get(&elsewhere, t1).is_some());
+    }
+
     #[test]
     fn pin_entry_without_replica_is_malformed() {
         let now = 10_000_000u64;
@@ -2127,6 +2265,7 @@ mod tests {
             id_hex: "00".repeat(16),
             slot: sid(HOST, 0),
             at_ms: 1,
+            boot: None,
         });
         assert_eq!(metrics.total(METRIC_WRITES_DROPPED, Some("kind:routed")), 1);
         assert_eq!(metrics.total(METRIC_WRITES_DROPPED, Some("kind:pin")), 1);
@@ -2300,6 +2439,17 @@ mod tests {
                 id_hex: "ab".repeat(16),
                 slot: sid("gpu02", 1),
                 at_ms: 9,
+                boot: Some("boot-a".to_string()),
+            },
+        );
+        // A pin whose host boot is unknown carries no `b` field.
+        push_write(
+            &mut pipe,
+            &Write::Pin {
+                id_hex: "cd".repeat(16),
+                slot: sid("gpu02", 0),
+                at_ms: 9,
+                boot: None,
             },
         );
         let cmds: Vec<Vec<String>> = pipe.cmd_iter().map(args).collect();
@@ -2323,6 +2473,24 @@ mod tests {
                     "gpu02",
                     "r",
                     "1",
+                    "t",
+                    "9",
+                    "b",
+                    "boot-a"
+                ]),
+                s(&[
+                    "XADD",
+                    "pins",
+                    "MAXLEN",
+                    "~",
+                    "200000",
+                    "*",
+                    "k",
+                    &"cd".repeat(16),
+                    "h",
+                    "gpu02",
+                    "r",
+                    "0",
                     "t",
                     "9"
                 ]),
@@ -2376,6 +2544,7 @@ mod tests {
             id_hex: "00".repeat(16),
             slot: sid(HOST, 0),
             at_ms: 1,
+            boot: None,
         });
         assert_eq!(metrics.total(METRIC_WRITES_DROPPED, None), 0);
     }
@@ -2432,6 +2601,7 @@ mod tests {
                 id_hex: pin.to_hex(),
                 slot: routed_slot.clone(),
                 at_ms: now,
+                boot: None,
             },
         );
         pipe.query_async::<()>(&mut conn).await.unwrap();

@@ -6920,7 +6920,9 @@ mod tests {
             let now = now_ms();
             let mut pins = PinTable::default();
             pins.insert(id, slot("h-gone", 0), now);
-            let mut h = harness(&[("h-a", 2)], snapshot("h-a", fresh_ms(), pins));
+            let mut snap = snapshot("h-a", fresh_ms(), pins);
+            snap.host_boots = HashMap::from([("h-a".to_string(), "boot-a".to_string())]);
+            let mut h = harness(&[("h-a", 2)], snap);
             let messages = vec![user_msg("keyed request")];
             let mut req = request("z-ai/glm-5.3-flash");
             req.affinity = Some(key);
@@ -6941,10 +6943,13 @@ mod tests {
                     id_hex,
                     slot: s,
                     at_ms,
+                    boot,
                 } => {
                     assert_eq!(id_hex, pid_hex);
                     assert_eq!(s, slot("h-a", 0));
                     assert!(at_ms >= now);
+                    // The pin carries its host's current boot.
+                    assert_eq!(boot.as_deref(), Some("boot-a"));
                 }
                 Write::Routed { .. } => panic!("expected a pin write"),
             }

@@ -7,8 +7,8 @@ FROM builder-base AS builder
 RUN --mount=type=bind,source=pinned-packages-builder.txt,target=/tmp/pinned-packages-builder.txt,ro \
     set -e; \
     # Create a sources.list file pointing to a specific snapshot
-    echo 'deb [check-valid-until=no] https://snapshot.debian.org/archive/debian/20250411T024939Z bookworm main' > /etc/apt/sources.list && \
-    echo 'deb [check-valid-until=no] https://snapshot.debian.org/archive/debian-security/20250411T024939Z bookworm-security main' >> /etc/apt/sources.list && \
+    echo 'deb [check-valid-until=no] https://snapshot.debian.org/archive/debian/20260928T000000Z bookworm main' > /etc/apt/sources.list && \
+    echo 'deb [check-valid-until=no] https://snapshot.debian.org/archive/debian-security/20260928T000000Z bookworm-security main' >> /etc/apt/sources.list && \
     echo 'Acquire::Check-Valid-Until "false";' > /etc/apt/apt.conf.d/10no-check-valid-until && \
     # Create preferences file to pin all packages
     rm -rf /etc/apt/sources.list.d/debian.sources && \
@@ -48,18 +48,13 @@ RUN cargo build --release --locked --bin api
 # Runtime stage
 FROM debian:bookworm-slim@sha256:78d2f66e0fec9e5a39fb2c72ea5e052b548df75602b5215ed01a17171529f706 AS runtime
 
-# Bootstrap by installing ca-certificates which will be overridden by the pinned packages.
-# Otherwise the source list cannot be fetched from the debian snapshot.
-RUN apt-get update && \
-    apt-get install -y --no-install-recommends ca-certificates \
-    && rm -rf /var/lib/apt/lists/* /var/log/* /var/cache/ldconfig/aux-cache
-
 # Install pinned apt dependencies
 RUN --mount=type=bind,source=pinned-packages-runtime.txt,target=/tmp/pinned-packages-runtime.txt,ro \
+    --mount=type=bind,from=builder-base,source=/etc/ssl/certs/ca-certificates.crt,target=/run/bootstrap-ca.crt,ro \
     set -e; \
     # Create a sources.list file pointing to a specific snapshot
-    echo 'deb [check-valid-until=no] https://snapshot.debian.org/archive/debian/20250411T024939Z bookworm main' > /etc/apt/sources.list && \
-    echo 'deb [check-valid-until=no] https://snapshot.debian.org/archive/debian-security/20250411T024939Z bookworm-security main' >> /etc/apt/sources.list && \
+    echo 'deb [check-valid-until=no] https://snapshot.debian.org/archive/debian/20260928T000000Z bookworm main' > /etc/apt/sources.list && \
+    echo 'deb [check-valid-until=no] https://snapshot.debian.org/archive/debian-security/20260928T000000Z bookworm-security main' >> /etc/apt/sources.list && \
     echo 'Acquire::Check-Valid-Until "false";' > /etc/apt/apt.conf.d/10no-check-valid-until && \
     # Create preferences file to pin all packages
     rm -rf /etc/apt/sources.list.d/debian.sources && \
@@ -71,8 +66,8 @@ RUN --mount=type=bind,source=pinned-packages-runtime.txt,target=/tmp/pinned-pack
             printf "Package: %s\nPin: version %s\nPin-Priority: 1001\n\n" "$pkg" "$ver" >> /etc/apt/preferences.d/pinned-packages; \
         fi; \
     done && \
-    apt-get update && \
-    apt-get install -y --no-install-recommends \
+    apt-get -o Acquire::https::CAInfo=/run/bootstrap-ca.crt update && \
+    apt-get -o Acquire::https::CAInfo=/run/bootstrap-ca.crt install -y --no-install-recommends \
         ca-certificates \
         libssl3 \
         curl \

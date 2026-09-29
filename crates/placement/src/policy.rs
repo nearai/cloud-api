@@ -91,33 +91,38 @@ impl PriorityBand {
 }
 
 /// The heavy lane as of one decision, built from raw load only (a replica's
-/// prefill backlog plus its pending tokens), so a request whose size was
-/// underestimated still makes its replica a member.
+/// effective prefill backlog plus its pending tokens), so a request whose
+/// size was underestimated still makes its replica a member.
+///
+/// Membership and the cap count every *live* replica (past `Rule::Lifecycle`
+/// and `Rule::Freshness`), including one stage 1 then drops for `Capacity` or
+/// `Context`: a loaded replica that is KV-full is still prefilling its heavy
+/// work, and dropping it from the count would free a lane slot it holds.
 #[derive(Clone, Debug, Default)]
 pub struct LaneView {
-    /// Slots whose load is at least `LANE_LOAD_TOKENS`.
+    /// Live slots whose load is at least `LANE_LOAD_TOKENS`.
     pub members: HashSet<SlotId>,
     pub size: usize,
-    /// `ceil(stage-1 survivors * HEAVY_SHARE)`.
+    /// `ceil(live replicas * HEAVY_SHARE)`.
     pub cap: usize,
-    /// Whether some stage-1 survivor is not a member.
+    /// Whether some stage-1 survivor is not a member: the only replicas a
+    /// short request can be sent to.
     pub any_clean: bool,
 }
 
-/// Build the lane from the stage-1 survivors (Lifecycle..Context) and each
-/// one's load (`score::effective_backlog` plus pending tokens).
-pub fn lane_view(pre_lane: &[(&ReplicaView, u64)]) -> LaneView {
-    let members: HashSet<SlotId> = pre_lane
+/// Build the lane from every live replica and its load (`live`), and judge
+/// `any_clean` over the stage-1 survivors (`survivors`, a subset of `live`).
+pub fn lane_view(live: &[(&ReplicaView, u64)], survivors: &[&SlotId]) -> LaneView {
+    let members: HashSet<SlotId> = live
         .iter()
         .filter(|(_, load)| *load >= LANE_LOAD_TOKENS)
         .map(|(v, _)| v.slot.clone())
         .collect();
-    let size = members.len();
     LaneView {
-        cap: (pre_lane.len() as f64 * HEAVY_SHARE).ceil() as usize,
-        any_clean: size < pre_lane.len(),
+        cap: (live.len() as f64 * HEAVY_SHARE).ceil() as usize,
+        any_clean: survivors.iter().any(|s| !members.contains(*s)),
+        size: members.len(),
         members,
-        size,
     }
 }
 
@@ -228,7 +233,8 @@ mod tests {
     fn lane_of(loads: &[u64]) -> LaneView {
         let views: Vec<ReplicaView> = (0..loads.len() as u32).map(|i| view("gpu01", i)).collect();
         let pairs: Vec<(&ReplicaView, u64)> = views.iter().zip(loads.iter().copied()).collect();
-        lane_view(&pairs)
+        let slots: Vec<&SlotId> = views.iter().map(|v| &v.slot).collect();
+        lane_view(&pairs, &slots)
     }
 
     #[test]
@@ -248,6 +254,18 @@ mod tests {
         let all_members = lane_of(&[LANE_LOAD_TOKENS; 3]);
         assert!(!all_members.any_clean);
         assert_eq!(all_members.size, 3);
+
+        // A live member outside the survivors still counts; a clean live
+        // replica outside them does not make the lane clean.
+        let views = [view("gpu01", 0), view("gpu01", 1), view("gpu01", 2)];
+        let live = [
+            (&views[0], LANE_LOAD_TOKENS),
+            (&views[1], 0),
+            (&views[2], LANE_LOAD_TOKENS),
+        ];
+        let lane = lane_view(&live, &[&views[2].slot]);
+        assert_eq!((lane.size, lane.cap), (2, 1));
+        assert!(!lane.any_clean);
     }
 
     #[test]
@@ -255,9 +273,9 @@ mod tests {
         // The load passed in is what the caller computed (backlog + pending);
         // a view's own backlog alone doesn't make it a member here.
         let v = with_backlog(0, 70_000);
-        let lane = lane_view(&[(&v, 0)]);
+        let lane = lane_view(&[(&v, 0)], &[&v.slot]);
         assert_eq!(lane.size, 0);
-        let lane = lane_view(&[(&v, 70_000)]);
+        let lane = lane_view(&[(&v, 70_000)], &[&v.slot]);
         assert_eq!(lane.size, 1);
     }
 

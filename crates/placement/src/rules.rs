@@ -3,7 +3,7 @@
 //! Stage 1 is per replica: [`first_exclusion`] runs each [`Rule`] in
 //! [`RULES`] order against a [`ReplicaView`] and returns the first one that
 //! excludes it, or `None` if the replica survives. Stage 2 is `Rule::Lane`,
-//! which needs a view of every stage-1 survivor at once, so `Placer::place`
+//! which needs a view of every live replica at once, so `Placer::place`
 //! evaluates it after stage 1 (see `policy::lane_admits`). Exclusions from
 //! both stages are tallied per rule in [`ALL_RULES`] order.
 

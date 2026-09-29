@@ -4,7 +4,8 @@
 //!
 //! A decision picks one replica slot (`host#index`), scoring every eligible
 //! slot on its own state and its own pending load. The rules run in two
-//! stages: the per-replica rules, then the heavy lane over their survivors.
+//! stages: the per-replica rules, then the heavy lane over their survivors,
+//! judged against a lane view of every live replica.
 
 use std::collections::HashMap;
 use std::time::Instant;
@@ -14,7 +15,7 @@ use rand::Rng;
 use crate::affinity::{pin_id, select, AffinityKey, PinId, Selection};
 use crate::consts::{FRESH_MAX_MS, PIN_TTL_MS};
 use crate::policy::{classify, lane_admits, lane_view, Class, LaneView, PriorityBand, Tier};
-use crate::rules::{first_exclusion, Rule, ALL_RULES};
+use crate::rules::{first_exclusion, Exclusion, Rule, ALL_RULES};
 use crate::score::{
     effective_backlog, fleet_median_tps, known_idle, pending_for, replica_score, Pending,
 };
@@ -317,16 +318,25 @@ impl Placer {
         }
 
         // Stage 1: per-replica rules, tallying exclusions for the record.
+        // Every live replica (past Lifecycle and Freshness) also feeds the
+        // lane view with its load, survivor or not.
         let mut tally = Tally::default();
+        let mut live: Vec<(&ReplicaView, u64)> = Vec::with_capacity(snap.replicas.len());
         let mut candidates: Vec<Candidate<'_>> = Vec::with_capacity(snap.replicas.len());
         for view in &snap.replicas {
-            match first_exclusion(view, input, input.now_ms) {
+            let exclusion = first_exclusion(view, input, input.now_ms);
+            if let Some(Exclusion(rule @ (Rule::Lifecycle | Rule::Freshness))) = exclusion {
+                tally.add(rule);
+                continue;
+            }
+            let pending = pending_for(
+                snap.routed.get(&view.slot),
+                mine.get(&view.slot).copied().unwrap_or_default(),
+            );
+            let load = effective_backlog(&view.state.load).saturating_add(pending.tok);
+            live.push((view, load));
+            match exclusion {
                 None => {
-                    let pending = pending_for(
-                        snap.routed.get(&view.slot),
-                        mine.get(&view.slot).copied().unwrap_or_default(),
-                    );
-                    let load = effective_backlog(&view.state.load).saturating_add(pending.tok);
                     let idle = known_idle(&view.state.load) && pending == Pending::default();
                     candidates.push(Candidate {
                         view,
@@ -335,7 +345,7 @@ impl Placer {
                         idle,
                     });
                 }
-                Some(exclusion) => tally.add(exclusion.0),
+                Some(Exclusion(rule)) => tally.add(rule),
             }
         }
 
@@ -350,12 +360,12 @@ impl Placer {
             );
         }
 
-        // Stage 2: the heavy lane, over every stage-1 survivor at once.
+        // Stage 2: the heavy lane, admitting stage-1 survivors against a view
+        // of every live replica.
         let class = Class::of(input.heavy);
         let lane = {
-            let pre_lane: Vec<(&ReplicaView, u64)> =
-                candidates.iter().map(|c| (c.view, c.load)).collect();
-            lane_view(&pre_lane)
+            let survivors: Vec<&SlotId> = candidates.iter().map(|c| &c.view.slot).collect();
+            lane_view(&live, &survivors)
         };
         candidates.retain(|c| {
             let is_member = lane.members.contains(&c.view.slot);
@@ -1356,6 +1366,48 @@ mod tests {
         assert_eq!(chosen, slot("long01", 1));
         assert_eq!(record.strategy, Some("heavy_long"));
         assert_eq!(record.excluded[4], (Rule::Lane, 1));
+    }
+
+    #[test]
+    fn member_excluded_for_kv_still_counts_toward_lane() {
+        // 4 live replicas (lane cap 1). gpu01#0 carries a 100K backlog but is
+        // KV-full, so stage 1 drops it; it still holds the one lane slot, and
+        // a heavy request can't open a second member on an idle replica.
+        let mut full = with_backlog("gpu01", 0, 100_000);
+        full.state.load.kv_usage = Some(0.96);
+        let snap = snap_with(vec![
+            full,
+            ready_view("gpu01", 1),
+            ready_view("gpu02", 0),
+            ready_view("gpu02", 1),
+        ]);
+        let mut rng = StdRng::seed_from_u64(1);
+        let record =
+            refused_record(placer().place(&heavy(100_000), &snap, &HashMap::new(), &mut rng));
+        assert_eq!((record.lane_size, record.lane_cap), (1, 1));
+        assert_eq!(record.excluded[2], (Rule::Capacity, 1));
+        assert_eq!(record.excluded[4], (Rule::Lane, 3));
+
+        // Short requests still see the idle survivors as clean.
+        let (_, record, _) =
+            placed(placer().place(&base_input(), &snap, &HashMap::new(), &mut rng));
+        assert_eq!(record.strategy, Some("short_clean"));
+        assert_eq!(record.eligible, 3);
+
+        // A stale member is not live: it neither holds a lane slot nor counts
+        // toward the cap.
+        let mut stale = with_backlog("gpu01", 0, 100_000);
+        stale.state.engine_sampled_at_ms = Some(NOW - FRESH_MAX_MS - 1);
+        let snap = snap_with(vec![
+            stale,
+            ready_view("gpu01", 1),
+            ready_view("gpu02", 0),
+            ready_view("gpu02", 1),
+        ]);
+        let (_, record, _) =
+            placed(placer().place(&heavy(100_000), &snap, &HashMap::new(), &mut rng));
+        assert_eq!((record.lane_size, record.lane_cap), (0, 1));
+        assert_eq!(record.strategy, Some("heavy_lane_admit"));
     }
 
     #[test]

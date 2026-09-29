@@ -713,6 +713,14 @@ impl Fleet {
     /// Each handle set belongs to exactly one Fleet (its hosts `ArcSwap` must
     /// have one writer). Installing handles already installed elsewhere is a
     /// wiring bug: it is refused (this Fleet stays on the legacy path).
+    /// The installed placer's tier, if placement is installed.
+    pub(super) fn placement_tier(&self) -> Option<placement::policy::Tier> {
+        self.placement
+            .load()
+            .as_ref()
+            .map(|handles| handles.placer.tier())
+    }
+
     pub(super) fn set_placement(&self, handles: PlacementHandles) {
         if !handles.io.claim_install() {
             tracing::warn!(

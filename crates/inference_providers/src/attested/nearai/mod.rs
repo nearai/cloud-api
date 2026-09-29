@@ -2862,6 +2862,9 @@ impl InferenceProvider for Provider {
     fn set_placement(&self, handles: crate::placement_io::PlacementHandles) {
         self.fleet.set_placement(handles)
     }
+    fn placement_tier(&self) -> Option<placement::policy::Tier> {
+        self.fleet.placement_tier()
+    }
     async fn count_tokens(&self, model: &str, text: String) -> Option<u64> {
         self.fleet.count_tokens(model, text).await
     }

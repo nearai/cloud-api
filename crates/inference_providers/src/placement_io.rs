@@ -580,6 +580,10 @@ pub(crate) struct ReaderState {
     ingest: Ingest,
     /// Last accepted frame per host.
     hosts: HashMap<String, Accepted>,
+    /// The slots of the last accepted frame of each host whose frame key
+    /// has since expired (not in the snapshot), so the host's next accepted
+    /// frame still drops the pins of slots it no longer carries.
+    expired_slots: HashMap<String, Vec<SlotId>>,
     /// Last rejected raw value per host and why (`None`: not a valid
     /// envelope), so identical repeats are neither re-verified nor re-counted.
     rejected: HashMap<String, (Vec<u8>, Option<Reject>)>,
@@ -695,7 +699,17 @@ impl ReaderState {
             let last_reject = self.rejected.remove(host);
             let json = match decode_frame(value) {
                 Ok(Some(json)) => json,
-                Ok(None) => continue, // key expired: the host's views drop out
+                Ok(None) => {
+                    // Key expired: the host's views drop out, but its slots
+                    // are remembered for the removed-slot pin check.
+                    if let Some(acc) = prev {
+                        self.expired_slots.insert(
+                            host.clone(),
+                            acc.views.into_iter().map(|v| v.slot).collect(),
+                        );
+                    }
+                    continue;
+                }
                 Err(()) => {
                     // Not a string: an unusable envelope, dropped (not
                     // remembered, it is rare and cheap to recount).
@@ -735,14 +749,16 @@ impl ReaderState {
             };
             match self.ingest.accept(host, &env, reg, now_ms) {
                 Ok(views) => {
-                    if let Some(acc) = prev.as_ref() {
-                        removed.extend(
-                            acc.views
-                                .iter()
-                                .filter(|old| !views.iter().any(|v| v.slot == old.slot))
-                                .map(|old| old.slot.clone()),
-                        );
-                    }
+                    let old_slots: Vec<SlotId> = match prev.as_ref() {
+                        Some(acc) => acc.views.iter().map(|v| v.slot.clone()).collect(),
+                        None => self.expired_slots.remove(host).unwrap_or_default(),
+                    };
+                    self.expired_slots.remove(host);
+                    removed.extend(
+                        old_slots
+                            .into_iter()
+                            .filter(|old| !views.iter().any(|v| &v.slot == old)),
+                    );
                     let key_id = env.key_id;
                     hosts.insert(
                         host.clone(),
@@ -766,6 +782,9 @@ impl ReaderState {
         }
         self.hosts = hosts;
         self.rejected = rejected;
+        // A host no longer in the key registry is never read again.
+        self.expired_slots
+            .retain(|host, _| targets.hosts.contains(host));
 
         let mut replicas: Vec<ReplicaView> = self
             .hosts
@@ -903,21 +922,17 @@ async fn warm_up(conn: &mut ConnectionManager) -> redis::RedisResult<Vec<PinEntr
     Ok(pin_entries(reply.ids))
 }
 
-/// One pipeline: `MGET` every host's frame key plus [`KILL_SWITCH_KEY`],
-/// `HGETALL` each slot's routed hashes for `now_s-1` and `now_s`, and
-/// `XREAD` new pins.
-async fn fetch(
-    conn: &mut ConnectionManager,
-    targets: ReadTargets,
-    state: &ReaderState,
-    now_ms: u64,
-) -> redis::RedisResult<(ReadTargets, RawRead)> {
-    let now_s = now_ms / 1000;
-    let last_id = state.last_pin_id.as_deref().unwrap_or("0-0");
+/// One pipeline: `EXISTS` [`KILL_SWITCH_KEY`] (presence of any value type
+/// trips it), `MGET` every host's frame key (skipped with no hosts),
+/// `HGETALL` each slot's routed hashes for `now_s-1` and `now_s`, and `XREAD`
+/// new pins.
+fn read_pipeline(targets: &ReadTargets, last_id: &str, now_s: u64) -> redis::Pipeline {
     let mut pipe = redis::pipe();
-    let mut keys: Vec<String> = targets.hosts.iter().map(|h| replica_key(h)).collect();
-    keys.push(KILL_SWITCH_KEY.to_string());
-    pipe.cmd("MGET").arg(keys);
+    pipe.cmd("EXISTS").arg(KILL_SWITCH_KEY);
+    if !targets.hosts.is_empty() {
+        let keys: Vec<String> = targets.hosts.iter().map(|h| replica_key(h)).collect();
+        pipe.cmd("MGET").arg(keys);
+    }
     for slot in &targets.slots {
         pipe.cmd("HGETALL")
             .arg(routed_key(slot, now_s.saturating_sub(1)));
@@ -929,7 +944,26 @@ async fn fetch(
         .arg("STREAMS")
         .arg(PINS_STREAM)
         .arg(last_id);
-    let values: Vec<redis::Value> = pipe.query_async(conn).await?;
+    pipe
+}
+
+/// The kill switch from an `EXISTS` reply: on when the key exists,
+/// whatever its value type.
+fn kill_switch_from_exists(reply: redis::Value) -> redis::RedisResult<bool> {
+    Ok(redis::from_owned_redis_value::<i64>(reply)? > 0)
+}
+
+async fn fetch(
+    conn: &mut ConnectionManager,
+    targets: ReadTargets,
+    state: &ReaderState,
+    now_ms: u64,
+) -> redis::RedisResult<(ReadTargets, RawRead)> {
+    let now_s = now_ms / 1000;
+    let last_id = state.last_pin_id.as_deref().unwrap_or("0-0");
+    let values: Vec<redis::Value> = read_pipeline(&targets, last_id, now_s)
+        .query_async(conn)
+        .await?;
     let mut it = values.into_iter();
     let mut next = || {
         it.next().ok_or_else(|| {
@@ -937,14 +971,18 @@ async fn fetch(
         })
     };
 
-    let mut frames: Vec<redis::Value> = redis::from_owned_redis_value(next()?)?;
-    if frames.len() != targets.hosts.len() + 1 {
+    let kill_switch = kill_switch_from_exists(next()?)?;
+    let frames: Vec<redis::Value> = if targets.hosts.is_empty() {
+        Vec::new()
+    } else {
+        redis::from_owned_redis_value(next()?)?
+    };
+    if frames.len() != targets.hosts.len() {
         return Err(redis::RedisError::from((
             redis::ErrorKind::TypeError,
             "MGET reply length mismatch",
         )));
     }
-    let kill_switch = !matches!(frames.pop(), Some(redis::Value::Nil) | None);
     let mut routed = Vec::with_capacity(targets.slots.len());
     for _ in &targets.slots {
         routed.push(routed_sum([next()?, next()?]));
@@ -1422,6 +1460,60 @@ mod tests {
     }
 
     #[test]
+    fn expired_host_pins_are_dropped() {
+        // A host's frame key expires, then the host returns with fewer
+        // replicas: pins to the slots it no longer carries are dropped,
+        // measured against its last frame before the expiry.
+        let t0 = 10_000_500u64;
+        let metrics = FakeMetrics::default();
+        let reg = registry();
+        let slot = ArcSwap::from_pointee(Snapshot::default());
+        let mut state = ReaderState::default();
+        let pin_kept = pid(1);
+        let pin_gone = pid(2);
+        state.warm_up(
+            vec![
+                pin_entry("2-0", &pin_gone.to_hex(), HOST, "2", t0),
+                pin_entry("1-0", &pin_kept.to_hex(), HOST, "0", t0),
+            ],
+            t0,
+        );
+        cycle(
+            &mut state,
+            &slot,
+            &reg,
+            vec![Some(sealed_json(&host_report(HOST, 1, t0, &[0, 1, 2])))],
+            t0,
+            &metrics,
+        );
+        assert_eq!(slot.load().replicas.len(), 3);
+
+        // Expired for two cycles: no views, pins untouched.
+        for t in [t0 + 500, t0 + 1_000] {
+            cycle(&mut state, &slot, &reg, vec![None], t, &metrics);
+            assert!(slot.load().replicas.is_empty());
+            assert!(slot.load().pins.get(&pin_gone, t).is_some());
+        }
+
+        // Back with replica 0 only.
+        cycle(
+            &mut state,
+            &slot,
+            &reg,
+            vec![Some(sealed_json(&host_report(HOST, 2, t0 + 1_500, &[0])))],
+            t0 + 1_500,
+            &metrics,
+        );
+        let snap = slot.load();
+        assert_eq!(snap.replicas.len(), 1);
+        assert!(snap.pins.get(&pin_kept, t0 + 1_500).is_some());
+        assert!(
+            snap.pins.get(&pin_gone, t0 + 1_500).is_none(),
+            "a pin to a slot gone across the expiry is dropped"
+        );
+    }
+
+    #[test]
     fn routed_counts_are_per_slot() {
         let t0 = 10_000_500u64;
         let metrics = FakeMetrics::default();
@@ -1438,6 +1530,41 @@ mod tests {
         assert!(!applied.snapshot.routed.contains_key(&sid(HOST, 0)));
         let rc = applied.snapshot.routed[&sid(HOST, 1)];
         assert_eq!((rc.req, rc.tok, rc.since_ms), (3, 900, 9_999_000));
+    }
+
+    #[test]
+    fn kill_switch_trips_for_non_string_value() {
+        // `EXISTS` counts a key of any type (a hash from `HINCRBY`, a list,
+        // a stream), where `MGET` would read nil for a non-string value.
+        assert!(kill_switch_from_exists(redis::Value::Int(1)).unwrap());
+        assert!(!kill_switch_from_exists(redis::Value::Int(0)).unwrap());
+        assert!(kill_switch_from_exists(redis::Value::Nil).is_err());
+
+        let targets = ReadTargets {
+            hosts: vec!["gpu01".to_string()],
+            slots: Vec::new(),
+        };
+        let packed =
+            String::from_utf8_lossy(&read_pipeline(&targets, "0-0", 7).get_packed_pipeline())
+                .into_owned();
+        let exists = packed.find("EXISTS").expect("EXISTS in the pipeline");
+        let mget = packed.find("MGET").expect("MGET in the pipeline");
+        assert!(exists < mget, "EXISTS is the first reply");
+        assert_eq!(
+            packed.matches(KILL_SWITCH_KEY).count(),
+            1,
+            "kill key only in EXISTS"
+        );
+
+        // No hosts: no MGET (it would be an error with zero keys).
+        let empty = ReadTargets {
+            hosts: Vec::new(),
+            slots: Vec::new(),
+        };
+        let packed =
+            String::from_utf8_lossy(&read_pipeline(&empty, "0-0", 7).get_packed_pipeline())
+                .into_owned();
+        assert!(!packed.contains("MGET"));
     }
 
     #[test]

@@ -76,6 +76,9 @@ enum ProviderAttemptResult {
     Success,
     Failed,
     ShortCircuited,
+    /// Smart placement refused before any upstream call (load shedding,
+    /// not a provider failure).
+    Refused,
 }
 
 struct ProviderAttemptMetric<'a> {
@@ -119,6 +122,7 @@ const fn attempt_result_metric_tag(result: ProviderAttemptResult) -> &'static st
         ProviderAttemptResult::Success => "attempt_result:success",
         ProviderAttemptResult::Failed => "attempt_result:failed",
         ProviderAttemptResult::ShortCircuited => "attempt_result:short_circuited",
+        ProviderAttemptResult::Refused => "attempt_result:refused",
     }
 }
 
@@ -3771,7 +3775,11 @@ impl InferenceProviderPool {
                                 provider_source,
                                 is_fallback,
                                 operation_name,
-                                attempt_result: ProviderAttemptResult::Failed,
+                                attempt_result: if refused {
+                                    ProviderAttemptResult::Refused
+                                } else {
+                                    ProviderAttemptResult::Failed
+                                },
                                 retry_decision,
                                 retry_round: retry_count,
                                 attempt_index: attempt + 1,
@@ -4210,11 +4218,15 @@ impl InferenceProviderPool {
         if !placement::consts::COVERED_MODELS.contains(&model_id) {
             return;
         }
+        // NEAR tiers only: the same provider set `placement_targets` draws
+        // the tier boundary from, so an attested fallback's (smaller) window
+        // never shifts the heavy class away from the Fleets' tiers.
         let caps: Vec<Option<u32>> = self
             .declared_capacities(model_id)
             .await
             .unwrap_or_default()
             .into_iter()
+            .filter(|(provider, _)| provider.tier() == inference_providers::ProviderTier::Near)
             .map(|(_, cap)| cap)
             .collect();
         params.placement = context_routing::placement_context(&caps, params, exact_count);
@@ -5319,12 +5331,24 @@ impl InferenceProviderPool {
         let pool_load_state = self.provider_load_state.clone();
 
         // Check which models can reuse their existing provider (URL unchanged)
+        let placement_targets = Self::placement_targets(&models);
         let existing_cache = self.inference_url_providers.read().await;
         let mut reused: Vec<(String, String, Arc<InferenceProviderTrait>)> = Vec::new();
         let mut needs_creation: Vec<(String, String, Option<u32>)> = Vec::new();
 
         for (model_name, url, context_length) in &models {
-            if let Some(existing) = existing_cache.get(url) {
+            // A catalog change can move a URL across the tier boundary; a
+            // placer's tier is fixed, so such a provider is recreated with
+            // fresh handles for its new tier (the old one, and its reader,
+            // go when it is dropped).
+            let wanted_tier = placement_targets.get(&(model_name.clone(), url.clone()));
+            let existing = existing_cache.get(url).filter(|existing| {
+                match (existing.placement_tier(), wanted_tier) {
+                    (Some(installed), Some(wanted)) => installed == *wanted,
+                    _ => true,
+                }
+            });
+            if let Some(existing) = existing {
                 // Keep the declared capacity fresh on reuse too — an admin
                 // PATCH that only changes context numbers (same URLs) must
                 // take effect without provider recreation.
@@ -5356,7 +5380,6 @@ impl InferenceProviderPool {
         let verifier = self.attestation_verifier.clone();
         let tls_roots = self.tls_roots.clone();
         let metrics_service = self.metrics_service.get().cloned();
-        let placement_targets = Self::placement_targets(&models);
         let metrics_sink = self.metrics_service.clone();
         let endpoint_futures: Vec<_> = needs_creation
             .iter()
@@ -8717,6 +8740,48 @@ mod tests {
         assert!(!context_routing::exceeds_declared_capacity(262_144, two));
     }
 
+    /// A catalog change that moves a reused URL across the tier boundary
+    /// (here: the long block becomes valid, so the URL is now the long
+    /// tier) recreates its provider with a placer for the new tier, instead
+    /// of keeping the tier fixed at creation.
+    #[tokio::test]
+    async fn reused_provider_gets_new_tier_after_catalog_change() {
+        use placement::policy::Tier;
+        let pool = InferenceProviderPool::new(None, ExternalProvidersConfig::default());
+        pool.set_placement("router-password".to_string());
+        let covered = placement::consts::COVERED_MODELS[0].to_string();
+        let base_url = "https://glm-base.invalid".to_string();
+        let long_url = "https://glm-long.invalid".to_string();
+
+        // The long URL's provider was created while it was a base-tier entry.
+        let stale: Arc<InferenceProviderTrait> = Arc::new(nearai::Provider::new(
+            nearai::Config::new(long_url.clone(), None, Some(1)),
+        ));
+        stale.set_placement(pool.placement_handles(Tier::Base).expect("handles"));
+        assert_eq!(stale.placement_tier(), Some(Tier::Base));
+        pool.inference_url_providers
+            .write()
+            .await
+            .insert(long_url.clone(), stale.clone());
+
+        pool.load_inference_url_models(
+            vec![
+                (covered.clone(), base_url, Some(100_000)),
+                (covered, long_url.clone(), Some(1_048_576)),
+            ],
+            true,
+        )
+        .await;
+
+        let cache = pool.inference_url_providers.read().await;
+        let current = cache.get(&long_url).expect("long URL provider");
+        assert!(
+            !Arc::ptr_eq(current, &stale),
+            "the stale-tier provider is replaced"
+        );
+        assert_eq!(current.placement_tier(), Some(Tier::Long));
+    }
+
     #[tokio::test]
     async fn long_fleet_placer_has_long_tier() {
         use placement::policy::Tier;
@@ -11480,6 +11545,41 @@ mod tests {
         );
     }
 
+    /// An attested fallback with a smaller declared window than the NEAR
+    /// base must not lower the heavy boundary: heavy is decided on the NEAR
+    /// tiers' capacities, the same set that decides each Fleet's tier.
+    #[tokio::test]
+    async fn fallback_capacity_does_not_skew_heavy() {
+        use inference_providers::mock::MockProvider;
+        use inference_providers::ProviderTier;
+
+        let model = placement::consts::COVERED_MODELS[0];
+        let (pool, _providers) = capacity_pool(model, &[100_000, 1_048_576]).await;
+        let fallback = Arc::new(MockProvider::new_accept_all().with_tier(ProviderTier::Attested3p));
+        pool.provider_mappings
+            .write()
+            .await
+            .model_to_providers
+            .get_mut(model)
+            .unwrap()
+            .push(fallback.clone() as Arc<InferenceProviderTrait>);
+        pool.provider_load_state
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .entry(Arc::as_ptr(&fallback) as *const () as usize)
+            .or_default()
+            .max_context_tokens = Some(50_000);
+
+        // ~72k tokens: over the fallback's 50k, within the NEAR base's 100k.
+        let mut params = sized_params(model, 240_000);
+        let mut hints = ChatRoutingHints::default();
+        pool.apply_context_routing(model, &mut params, &mut hints, false)
+            .await;
+        let context = params.placement.context_tokens.expect("sized");
+        assert!(context > 50_000 && context <= 100_000, "{context}");
+        assert!(!params.placement.heavy);
+    }
+
     /// Refine and placement share one formula: the tier sort's requirement
     /// is the placement context's `context_tokens`.
     #[tokio::test]
@@ -11711,6 +11811,62 @@ mod tests {
         assert!(line.contains(" WARN "), "{line}");
         assert!(line.contains("error_kind=\"capacity_refused\""), "{line}");
         assert!(!out.contains(" ERROR "), "{out}");
+    }
+
+    /// #1117 with base as the pinned tier: a short negative-priority request
+    /// refused on base must not cross to the long tier.
+    #[tokio::test]
+    async fn negative_priority_refusal_on_pinned_base_tier_never_crosses() {
+        let (pool, base, long, _) = refusal_pool().await;
+        base.set_error_override(Some(CompletionError::CapacityRefused))
+            .await;
+
+        let result = pool
+            .chat_completion_with_attribution_and_hints(
+                sized_params("z-ai/glm-5.2", 4_000),
+                "h".to_string(),
+                priority(-2),
+            )
+            .await;
+        assert!(matches!(result, Err(CompletionError::CapacityRefused)));
+        assert_eq!(calls(&base).await, 1);
+        assert_eq!(
+            calls(&long).await,
+            0,
+            "negative priority never reaches long"
+        );
+    }
+
+    /// Refusals are load shedding: the provider-attempt metric tags them
+    /// `attempt_result:refused`, never `failed`.
+    #[tokio::test]
+    async fn refusal_is_not_recorded_as_failed_attempt() {
+        use crate::metrics::capturing::CapturingMetricsService;
+        use crate::metrics::consts::METRIC_PROVIDER_ATTEMPTS;
+
+        let (pool, _base, long, params) = refusal_pool().await;
+        let metrics = Arc::new(CapturingMetricsService::new());
+        pool.set_metrics_service(metrics.clone());
+        long.set_error_override(Some(CompletionError::CapacityRefused))
+            .await;
+
+        pool.chat_completion_with_attribution_and_hints(params, "h".to_string(), priority(0))
+            .await
+            .expect("base serves");
+        let results: Vec<String> = metrics
+            .get_metrics()
+            .into_iter()
+            .filter(|metric| metric.name == METRIC_PROVIDER_ATTEMPTS)
+            .flat_map(|metric| metric.tags)
+            .filter(|tag| tag.starts_with("attempt_result:"))
+            .collect();
+        assert_eq!(
+            results,
+            vec![
+                "attempt_result:refused".to_string(),
+                "attempt_result:success".to_string()
+            ]
+        );
     }
 
     /// A 503 from one candidate, then a refusal: the 503 stays the last

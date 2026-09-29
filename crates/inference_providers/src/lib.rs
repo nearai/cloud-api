@@ -527,6 +527,12 @@ pub trait InferenceProvider {
     /// it every request takes the existing routing path.
     fn set_placement(&self, _handles: placement_io::PlacementHandles) {}
 
+    /// The tier of the installed smart-placement placer, `None` when
+    /// placement is not installed on this provider.
+    fn placement_tier(&self) -> Option<placement::policy::Tier> {
+        None
+    }
+
     /// Exact input-token count via the backend's tokenizer (`POST /v1/tokenize`,
     /// proxied to the engine's native tokenize endpoint). The pool calls this
     /// only when a cheap byte-based estimate lands near a context-capacity

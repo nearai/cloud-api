@@ -3765,7 +3765,7 @@ fn parse_metrics_credit_type(
 /// and breakdowns by workspace, API key, and model.
 ///
 /// Percentiles across hours are approximate (sample-weighted means of hourly percentiles).
-/// TTFT threshold counts are exact; divide them by `ttft_measured_requests`, not `requests`.
+/// TTFT threshold counts are exact; divide them by `ttft_measured_requests`, not `requests` / `total_requests`.
 #[utoipa::path(
     get,
     path = "/v1/admin/organizations/{org_id}/metrics",

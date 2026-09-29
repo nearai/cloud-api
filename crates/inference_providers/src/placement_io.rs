@@ -110,6 +110,9 @@ pub const METRIC_PLACE_DURATION_US: &str = "cloud_api.placement.place_duration_u
 pub const METRIC_TTFT_MS: &str = "cloud_api.placement.ttft_ms";
 /// Request sent to end of stream, same tags as [`METRIC_TTFT_MS`].
 pub const METRIC_DURATION_MS: &str = "cloud_api.placement.duration_ms";
+/// Mean inter-token latency of one streamed request, from its first to its
+/// last content chunk; recorded only when at least 2 chunks arrived.
+pub const METRIC_ITL_MS: &str = "cloud_api.placement.itl_ms";
 /// Replicas excluded per decision, by eligibility rule (`rule:{..}`).
 pub const METRIC_EXCLUDED: &str = "cloud_api.placement.excluded";
 /// One per decision, tagged `affinity:{client|prefix|none}` and `outcome:{..}`.

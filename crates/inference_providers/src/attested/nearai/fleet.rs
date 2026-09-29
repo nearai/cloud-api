@@ -15,7 +15,9 @@
 use super::placement_report::{latency_tags, report_decision, PlacementRequest};
 use super::prefix_router::PrefixRouter;
 use super::Config;
-use crate::placement_io::{PlacementHandles, RoutedAck, Write, METRIC_DURATION_MS, METRIC_TTFT_MS};
+use crate::placement_io::{
+    PlacementHandles, RoutedAck, Write, METRIC_DURATION_MS, METRIC_ITL_MS, METRIC_TTFT_MS,
+};
 use crate::rotation;
 use crate::spki_verifier::FingerprintState;
 use crate::BackendHosts;
@@ -150,10 +152,17 @@ pub(super) struct RouteLease {
 }
 
 /// Stream-latency reporting for one request: the placement metrics sink and
-/// the request's static `strategy`/`selection` tags.
+/// the request's static `strategy`/`selection`/`size` tags.
 struct LeaseLatency {
     handles: Arc<PlacementHandles>,
-    tags: [&'static str; 2],
+    tags: [&'static str; 3],
+}
+
+/// Mean inter-token latency of a stream: `(duration - ttft)` spread over the
+/// gaps between its `chunks` content chunks. `None` below 2 chunks, where
+/// there is no gap to measure.
+pub(super) fn mean_itl_ms(duration_ms: f64, ttft_ms: f64, chunks: u64) -> Option<f64> {
+    (chunks >= 2).then(|| (duration_ms - ttft_ms).max(0.0) / (chunks - 1) as f64)
 }
 
 impl RouteLease {
@@ -176,6 +185,17 @@ impl RouteLease {
                 .io
                 .metrics()
                 .record_histogram(METRIC_DURATION_MS, ms, &latency.tags);
+        }
+    }
+
+    /// Records the stream's mean inter-token latency ([`mean_itl_ms`]).
+    pub(super) fn record_itl_ms(&self, ms: f64) {
+        if let Some(latency) = &self.latency {
+            latency
+                .handles
+                .io
+                .metrics()
+                .record_histogram(METRIC_ITL_MS, ms, &latency.tags);
         }
     }
 
@@ -788,7 +808,7 @@ impl Fleet {
                         if let Some(handles) = self.placement.load().as_ref() {
                             lease.latency = Some(LeaseLatency {
                                 handles: handles.clone(),
-                                tags: latency_tags(None),
+                                tags: latency_tags(None, request.size),
                             });
                         }
                     }
@@ -918,7 +938,7 @@ impl Fleet {
         lease.replica = Some(slot.replica);
         lease.latency = Some(LeaseLatency {
             handles: handles.clone(),
-            tags: latency_tags(Some(&record)),
+            tags: latency_tags(Some(&record), request.size),
         });
         handles.io.record(Write::Routed {
             slot,

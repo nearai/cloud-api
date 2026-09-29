@@ -1353,6 +1353,10 @@ struct TtftProbe<S> {
     start: Option<std::time::Instant>,
     /// Send instant, kept for the end-of-stream duration.
     sent: std::time::Instant,
+    /// Send to first content chunk, kept for the inter-token latency.
+    ttft: Option<std::time::Duration>,
+    /// Content chunks seen so far.
+    chunks: u64,
     /// Keeps this backend counted as live until the stream completes or the
     /// caller drops it. `None` is used only by focused unit tests.
     _route_lease: Option<fleet::RouteLease>,
@@ -1372,6 +1376,8 @@ impl<S> TtftProbe<S> {
             index,
             start: Some(start),
             sent: start,
+            ttft: None,
+            chunks: 0,
             _route_lease: route_lease,
         }
     }
@@ -1392,8 +1398,11 @@ where
             // Only a content-bearing chunk counts as the first token; leading
             // control events (keepalives, blank separators) don't.
             if event.chunk.is_some() {
+                self.chunks = self.chunks.saturating_add(1);
                 if let Some(start) = self.start.take() {
-                    let ttft_ms = start.elapsed().as_millis() as f64;
+                    let ttft = start.elapsed();
+                    self.ttft = Some(ttft);
+                    let ttft_ms = ttft.as_millis() as f64;
                     if let Some(lease) = self._route_lease.as_ref() {
                         lease.record_ttft_ms(ttft_ms);
                     }
@@ -1406,7 +1415,15 @@ where
             }
         } else if matches!(polled, std::task::Poll::Ready(None)) {
             if let Some(lease) = self._route_lease.as_ref() {
-                lease.record_duration_ms(self.sent.elapsed().as_millis() as f64);
+                let duration = self.sent.elapsed();
+                lease.record_duration_ms(duration.as_millis() as f64);
+                let ms = |d: std::time::Duration| d.as_secs_f64() * 1_000.0;
+                if let Some(itl) = self
+                    .ttft
+                    .and_then(|ttft| fleet::mean_itl_ms(ms(duration), ms(ttft), self.chunks))
+                {
+                    lease.record_itl_ms(itl);
+                }
             }
             self._route_lease.take();
         }
@@ -5929,7 +5946,7 @@ mod tests {
     /// uses a single eligible host (or a keyed request) so `place()` is
     /// deterministic regardless of the rng.
     mod placement_hook {
-        use super::{role_msg, rotation_provider, user_msg, Provider};
+        use super::{control_event, data_event, role_msg, rotation_provider, user_msg, Provider};
         use crate::attested::nearai::placement_report::PlacementRequest;
         use crate::placement_io::{
             PlacementHandles, PlacementIo, PlacementMetrics, RoutedAck, Write, METRIC_AFFINITY,
@@ -6162,6 +6179,7 @@ mod tests {
                 affinity: None,
                 affinity_source: AffinitySource::None,
                 priority: 0,
+                size: "size:unknown",
             }
         }
 
@@ -6593,6 +6611,63 @@ mod tests {
             // it leaves the routed window.
             reread(&h, now_ms() + 1_000, None);
             assert_eq!(mine_on_a0(&h), Some((1, 10)));
+        }
+
+        #[tokio::test]
+        async fn itl_recorded_only_with_two_chunks() {
+            use crate::attested::nearai::fleet::mean_itl_ms;
+            use crate::attested::nearai::TtftProbe;
+            use crate::placement_io::{METRIC_DURATION_MS, METRIC_ITL_MS, METRIC_TTFT_MS};
+            use tokio_stream::StreamExt;
+
+            // (duration - ttft) / (chunks - 1), and nothing below 2 chunks.
+            assert_eq!(mean_itl_ms(100.0, 40.0, 4), Some(20.0));
+            assert_eq!(mean_itl_ms(100.0, 40.0, 2), Some(60.0));
+            assert_eq!(mean_itl_ms(100.0, 40.0, 1), None);
+            assert_eq!(mean_itl_ms(100.0, 40.0, 0), None);
+
+            for chunks in 0..4usize {
+                let h = harness(
+                    &[("h-a", 2)],
+                    snapshot("h-a", fresh_ms(), PinTable::default()),
+                );
+                let mut req = request(COVERED_MODELS[0]);
+                req.size = "size:le8k";
+                let lease = h
+                    .provider
+                    .fleet
+                    .acquire_index_placed(&messages_avoiding(2), None, &req)
+                    .expect("not refused")
+                    .expect("rotation active");
+                let mut items = vec![Ok(control_event(": keepalive\n"))];
+                items.extend((0..chunks).map(|_| Ok(data_event())));
+                let inner: crate::StreamingResult = Box::pin(futures_util::stream::iter(items));
+                let start = std::time::Instant::now() - std::time::Duration::from_millis(5);
+                let probe = TtftProbe::new(
+                    inner,
+                    h.provider.fleet.backend_stats.clone(),
+                    lease.index(),
+                    start,
+                    Some(lease),
+                );
+                tokio::pin!(probe);
+                while probe.next().await.is_some() {}
+
+                let duration = h.metrics.histogram_tags(METRIC_DURATION_MS);
+                assert_eq!(duration.len(), 1, "{chunks} chunks");
+                assert_eq!(duration[0][2], "size:le8k");
+                assert_eq!(
+                    h.metrics.histogram_tags(METRIC_TTFT_MS).len(),
+                    usize::from(chunks > 0),
+                    "{chunks} chunks"
+                );
+                let itl = h.metrics.histogram_tags(METRIC_ITL_MS);
+                if chunks >= 2 {
+                    assert_eq!(itl, duration, "{chunks} chunks: same tags");
+                } else {
+                    assert!(itl.is_empty(), "{chunks} chunks: no ITL");
+                }
+            }
         }
 
         #[test]
@@ -7085,7 +7160,8 @@ mod tests {
                         h.metrics.histogram_tags(name),
                         vec![vec![
                             "strategy:legacy".to_string(),
-                            "selection:legacy".to_string()
+                            "selection:legacy".to_string(),
+                            "size:unknown".to_string()
                         ]],
                         "{name}"
                     );
@@ -7101,6 +7177,62 @@ mod tests {
                 stream_once(h.provider, "some-org/not-covered").await;
                 assert!(h.metrics.histogram_tags(METRIC_TTFT_MS).is_empty());
                 assert!(h.metrics.histogram_tags(METRIC_DURATION_MS).is_empty());
+            }
+
+            /// Provider-side latency carries the pool's prompt-size bucket,
+            /// on placed and legacy leases alike.
+            #[tokio::test]
+            async fn latency_metrics_tag_size_bucket() {
+                use crate::placement_io::{METRIC_DURATION_MS, METRIC_TTFT_MS};
+                let sized = |tokens: Option<u64>| {
+                    let mut params = params(COVERED_MODELS[0]);
+                    params.placement.prompt_tokens = tokens;
+                    params
+                };
+                let stream_once = |provider: Provider, params: ChatCompletionParams| async move {
+                    let stream = provider
+                        .chat_completion_stream(params, "synthetic-hash-sse".into())
+                        .await
+                        .expect("sse completion");
+                    let _: Vec<_> = stream.try_collect().await.expect("sse stream");
+                };
+
+                for (built_ms, tokens, strategy, size) in [
+                    (
+                        fresh_ms(),
+                        Some(20_000),
+                        "strategy:short_clean",
+                        "size:le32k",
+                    ),
+                    (fresh_ms(), None, "strategy:short_clean", "size:unknown"),
+                    (
+                        now_ms() - 60_000,
+                        Some(150_000),
+                        "strategy:legacy",
+                        "size:gt100k",
+                    ),
+                    (
+                        now_ms() - 60_000,
+                        Some(5_000),
+                        "strategy:legacy",
+                        "size:le8k",
+                    ),
+                ] {
+                    let upstream = mock_upstream(None).await;
+                    let h = harness_on(
+                        upstream_provider(&upstream),
+                        &[("h-a", 2)],
+                        4,
+                        placed_snapshot(built_ms),
+                    );
+                    stream_once(h.provider, sized(tokens)).await;
+                    for name in [METRIC_TTFT_MS, METRIC_DURATION_MS] {
+                        let samples = h.metrics.histogram_tags(name);
+                        assert_eq!(samples.len(), 1, "{name} {tokens:?}");
+                        assert_eq!(samples[0][0], strategy, "{name} {tokens:?}");
+                        assert_eq!(samples[0][2], size, "{name} {tokens:?}");
+                    }
+                }
             }
 
             #[tokio::test]

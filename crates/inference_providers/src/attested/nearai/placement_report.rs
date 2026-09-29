@@ -34,6 +34,8 @@ pub(super) struct PlacementRequest {
     pub(super) affinity_source: AffinitySource,
     /// `params.request_priority` (operator-set, never client JSON).
     pub(super) priority: i32,
+    /// The `size:` latency tag: the pool's prompt estimate, bucketed.
+    pub(super) size: &'static str,
 }
 
 impl PlacementRequest {
@@ -62,6 +64,7 @@ impl PlacementRequest {
                 AffinitySource::None
             },
             priority: params.request_priority,
+            size: size_tag(placement.prompt_tokens),
         }
     }
 }
@@ -162,10 +165,13 @@ pub(super) fn report_decision(
     }
 }
 
-/// `strategy:`/`selection:` tags for the provider's latency histograms:
-/// the placed decision's labels, or `legacy` for a request placement did
-/// not place.
-pub(super) fn latency_tags(record: Option<&DecisionRecord>) -> [&'static str; 2] {
+/// `strategy:`/`selection:`/`size:` tags for the provider's latency
+/// histograms: the placed decision's labels, or `legacy` for a request
+/// placement did not place, and the request's size bucket ([`size_tag`]).
+pub(super) fn latency_tags(
+    record: Option<&DecisionRecord>,
+    size: &'static str,
+) -> [&'static str; 3] {
     match record {
         Some(record) => [
             strategy_tag(record.strategy),
@@ -173,8 +179,22 @@ pub(super) fn latency_tags(record: Option<&DecisionRecord>) -> [&'static str; 2]
                 Some(selection) => selection_tag(selection),
                 None => "selection:none",
             },
+            size,
         ],
-        None => ["strategy:legacy", "selection:legacy"],
+        None => ["strategy:legacy", "selection:legacy", size],
+    }
+}
+
+/// `size:` bucket of the pool's prompt-token estimate (decimal thousands;
+/// the last boundary is the long tier's 100K), `unknown` when the pool gave
+/// none.
+pub(super) fn size_tag(prompt_tokens: Option<u64>) -> &'static str {
+    match prompt_tokens {
+        None => "size:unknown",
+        Some(0..=8_000) => "size:le8k",
+        Some(8_001..=32_000) => "size:le32k",
+        Some(32_001..=100_000) => "size:le100k",
+        Some(_) => "size:gt100k",
     }
 }
 
@@ -411,6 +431,7 @@ mod observability_tests {
             },
             affinity,
             priority: 0,
+            size: "size:le8k",
         }
     }
 
@@ -530,10 +551,30 @@ mod observability_tests {
             assert_eq!(band_tag(band), format!("priority_band:{band}"));
         }
         assert_eq!(
-            latency_tags(Some(&placed("heavy_long", "home"))),
-            ["strategy:heavy_long", "selection:home"]
+            latency_tags(Some(&placed("heavy_long", "home")), "size:gt100k"),
+            ["strategy:heavy_long", "selection:home", "size:gt100k"]
         );
-        assert_eq!(latency_tags(None), ["strategy:legacy", "selection:legacy"]);
+        assert_eq!(
+            latency_tags(None, "size:unknown"),
+            ["strategy:legacy", "selection:legacy", "size:unknown"]
+        );
+    }
+
+    #[test]
+    fn size_buckets_are_static_tags() {
+        for (tokens, tag) in [
+            (None, "size:unknown"),
+            (Some(0), "size:le8k"),
+            (Some(8_000), "size:le8k"),
+            (Some(8_001), "size:le32k"),
+            (Some(32_000), "size:le32k"),
+            (Some(32_001), "size:le100k"),
+            (Some(100_000), "size:le100k"),
+            (Some(100_001), "size:gt100k"),
+            (Some(u64::MAX), "size:gt100k"),
+        ] {
+            assert_eq!(size_tag(tokens), tag, "{tokens:?}");
+        }
     }
 
     #[test]

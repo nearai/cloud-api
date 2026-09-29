@@ -1774,6 +1774,10 @@ impl InferenceProvider for Fleet {
         self.store_backend_count(count);
     }
 
+    async fn poll_backend_count(&self, client: &reqwest::Client) -> crate::CountPoll {
+        self.poll_count(client).await
+    }
+
     async fn get_attestation_report(
         &self,
         model: String,
@@ -2901,6 +2905,9 @@ impl InferenceProvider for Provider {
     }
     fn set_backend_hosts(&self, hosts: crate::BackendHosts) {
         self.fleet.set_backend_hosts(hosts)
+    }
+    async fn poll_backend_count(&self, client: &reqwest::Client) -> crate::CountPoll {
+        self.fleet.poll_backend_count(client).await
     }
     fn set_placement(&self, handles: crate::placement_io::PlacementHandles) {
         self.fleet.set_placement(handles)
@@ -7692,6 +7699,115 @@ mod tests {
                         (false, None),
                     ]
                 );
+            }
+
+            /// The fast healthy-count poll: the count endpoint of
+            /// `glm.mock.test` is `mock.test/backends/count`, resolved to a
+            /// mock that also stands in as the provider's upstream.
+            mod count_poll {
+                use super::*;
+                use crate::CountPoll;
+
+                fn count_client(server: &MockServer) -> reqwest::Client {
+                    reqwest::Client::builder()
+                        .resolve("mock.test", *server.address())
+                        .build()
+                        .unwrap()
+                }
+
+                /// Answers `/backends/count` with `healthy`, or 503 for `None`.
+                async fn count_server(healthy: Option<usize>) -> MockServer {
+                    let server = MockServer::start().await;
+                    let response = match healthy {
+                        Some(n) => ResponseTemplate::new(200)
+                            .set_body_json(serde_json::json!({ "healthy": n, "total": n })),
+                        None => ResponseTemplate::new(503),
+                    };
+                    Mock::given(method("GET"))
+                        .and(path("/backends/count"))
+                        .respond_with(response)
+                        .mount(&server)
+                        .await;
+                    server
+                }
+
+                /// A placing 4-backend Fleet (h-a on backend 2) over `server`.
+                fn placing(server: &MockServer) -> Harness {
+                    harness_on(
+                        upstream_provider(server),
+                        &[("h-a", 2)],
+                        4,
+                        snapshot("h-a", fresh_ms(), PinTable::default()),
+                    )
+                }
+
+                fn acquire(h: &Harness) -> crate::attested::nearai::fleet::RouteLease {
+                    h.provider
+                        .fleet
+                        .acquire_index_placed(
+                            &messages_avoiding(2),
+                            None,
+                            &request("z-ai/glm-5.3-flash"),
+                        )
+                        .expect("not refused")
+                        .expect("rotation active")
+                }
+
+                /// A count change is stored at once, so the host map built
+                /// for the old count no longer places: no stale index is used
+                /// while rediscovery runs.
+                #[tokio::test]
+                async fn count_change_makes_fleet_legacy_immediately() {
+                    let server = count_server(Some(5)).await;
+                    let h = placing(&server);
+                    assert_eq!(acquire(&h).index(), 2, "places before the change");
+
+                    let poll = h.provider.poll_backend_count(&count_client(&server)).await;
+                    assert_eq!(poll, CountPoll::Changed { old: 4, new: 5 });
+                    assert_eq!(h.provider.fleet.backend_count(), 5);
+                    assert_eq!(acquire(&h).replica(), None, "legacy lease");
+                    assert_eq!(h.metrics.decisions_tagged("outcome:place"), 1);
+                    assert_eq!(h.metrics.decisions_tagged("outcome:legacy"), 1);
+                }
+
+                #[tokio::test]
+                async fn count_read_failure_changes_nothing() {
+                    let server = count_server(None).await;
+                    let h = placing(&server);
+                    let poll = h.provider.poll_backend_count(&count_client(&server)).await;
+                    assert_eq!(poll, CountPoll::Failed);
+                    assert_eq!(h.provider.fleet.backend_count(), 4);
+                    assert_eq!(acquire(&h).index(), 2, "still places");
+
+                    // The same count again is no change either.
+                    let server = count_server(Some(4)).await;
+                    let h = placing(&server);
+                    let poll = h.provider.poll_backend_count(&count_client(&server)).await;
+                    assert_eq!(poll, CountPoll::Unchanged);
+                    assert_eq!(acquire(&h).index(), 2);
+                }
+
+                /// Only Fleets whose hosts have published are polled: no
+                /// request at all for one without placement or without an
+                /// attested replica-report key.
+                #[tokio::test]
+                async fn count_poll_skipped_for_unpublished_fleets() {
+                    let server = count_server(Some(5)).await;
+                    let client = count_client(&server);
+
+                    let h = placing(&server);
+                    unpublish(&h);
+                    assert_eq!(
+                        h.provider.poll_backend_count(&client).await,
+                        CountPoll::Skipped
+                    );
+                    assert_eq!(h.provider.fleet.backend_count(), 4);
+
+                    let bare = upstream_provider(&server);
+                    assert_eq!(bare.poll_backend_count(&client).await, CountPoll::Skipped);
+
+                    assert!(server.received_requests().await.unwrap().is_empty());
+                }
             }
         }
 

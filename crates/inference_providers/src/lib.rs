@@ -293,6 +293,21 @@ pub struct BackendHosts {
     pub count: usize,
 }
 
+/// Outcome of [`InferenceProvider::poll_backend_count`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CountPoll {
+    /// Not polled: no placement, no host that has published, or no rotation.
+    Skipped,
+    /// The count read failed; nothing changed.
+    Failed,
+    Unchanged,
+    /// The healthy count moved from `old` to `new`, and `new` is stored.
+    Changed {
+        old: usize,
+        new: usize,
+    },
+}
+
 #[async_trait]
 pub trait InferenceProvider {
     /// Lists all available models from this provider
@@ -521,6 +536,17 @@ pub trait InferenceProvider {
     /// cycle may omit hosts, which is accepted (the placer treats an unmapped
     /// host as legacy and fails open).
     fn set_backend_hosts(&self, _hosts: BackendHosts) {}
+
+    /// Re-read the healthy backend count (`GET /backends/count`) with
+    /// `client`, for a provider whose placement hosts have published, and
+    /// store it at once when it changed. Model-proxy maps rotation index
+    /// `-i<N>` over its live healthy set, so a changed count means the host
+    /// map from the last discovery may point indices at the wrong hosts;
+    /// storing the count makes that map stale, and placement legacy, until
+    /// the next discovery. Default: [`CountPoll::Skipped`].
+    async fn poll_backend_count(&self, _client: &reqwest::Client) -> CountPoll {
+        CountPoll::Skipped
+    }
 
     /// Install smart placement for this provider's model. Default is a no-op — only
     /// providers that participate in smart placement override it; without

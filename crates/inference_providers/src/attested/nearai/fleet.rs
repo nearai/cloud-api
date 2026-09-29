@@ -33,7 +33,7 @@ use std::cmp::Reverse;
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, RwLock};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::Semaphore;
 
 /// What placement did with a request, as the provider acts on it.
@@ -150,6 +150,9 @@ pub(super) struct RouteLease {
     latency: Option<LeaseLatency>,
     prefix_loads: Arc<Mutex<PrefixLoads>>,
 }
+
+/// Timeout for one fast healthy-count read (`Fleet::poll_count`).
+const COUNT_POLL_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// Stream-latency reporting for one request: the placement metrics sink,
 /// the request's static `strategy`/`selection`/`size` tags and its model tag.
@@ -1003,6 +1006,34 @@ impl Fleet {
             .index_by_host
             .keys()
             .any(|host| !seen.contains(host.as_str()))
+    }
+
+    /// See `InferenceProvider::poll_backend_count`. Only a Fleet with
+    /// placement installed and a host that has published is polled: the
+    /// count matters to placement's host map alone (discovery keeps the
+    /// legacy rotation's count fresh). The count is capped like discovery's.
+    pub(super) async fn poll_count(&self, client: &Client) -> crate::CountPoll {
+        let publishing = self
+            .placement
+            .load()
+            .as_ref()
+            .is_some_and(|handles| handles.any_host_publishes());
+        let Some(parts) = self.rotation_parts.as_ref().filter(|_| publishing) else {
+            return crate::CountPoll::Skipped;
+        };
+        match rotation::fetch_backend_count(client, parts, COUNT_POLL_TIMEOUT).await {
+            rotation::CountFetch::Ok(healthy) => {
+                let new = healthy.min(rotation::MAX_FANOUT);
+                let old = self.backend_count();
+                if new == old {
+                    crate::CountPoll::Unchanged
+                } else {
+                    self.store_backend_count(new);
+                    crate::CountPoll::Changed { old, new }
+                }
+            }
+            rotation::CountFetch::Err(_) => crate::CountPoll::Failed,
+        }
     }
 
     /// The verified host map discovery pushed last.

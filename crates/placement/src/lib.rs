@@ -6,7 +6,7 @@ pub mod rules;
 pub mod score;
 pub mod snapshot;
 
-pub use snapshot::KeyRegistry;
+pub use snapshot::{KeyRegistry, SlotId};
 
 #[cfg(test)]
 pub(crate) mod testkit;

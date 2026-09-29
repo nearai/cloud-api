@@ -1,20 +1,26 @@
 //! The `Placer` facade: ties `rules.rs`, `score.rs`, and `affinity.rs`
 //! together into a single placement decision, plus the `DecisionRecord` the
 //! caller logs (IDs and numbers only — see the crate's privacy rules).
+//!
+//! A decision picks one replica slot (`host#index`), scoring every eligible
+//! slot on its own state and its own pending load.
 
 use std::collections::HashMap;
 
 use rand::Rng;
 
 use crate::affinity::{pin_id, select, AffinityKey, PinId, Selection};
-use crate::consts::{COVERED_MODELS, FRESH_MAX_MS, HOST_REPLICA, PIN_TTL_MS};
-use crate::rules::{first_exclusion, Rule, RULES};
-use crate::score::{fleet_median_tps, host_score, pending_for, split_pending, Pending};
-use crate::snapshot::{ReplicaView, Snapshot};
+use crate::consts::{COVERED_MODELS, FRESH_MAX_MS, PIN_TTL_MS};
+use crate::rules::{first_exclusion, Rule, ALL_RULES};
+use crate::score::{fleet_median_tps, pending_for, replica_score, Pending};
+use crate::snapshot::{ReplicaView, SlotId, Snapshot};
 
 /// Per-request inputs the eligibility rules (`rules.rs`) check a
 /// [`crate::snapshot::ReplicaView`] against, plus the rest of what
-/// `Placer::place` needs to score and pick a host.
+/// `Placer::place` needs to score and pick a slot.
+///
+/// The token counts and `heavy` come from the pool's `PlacementContext`;
+/// placement never estimates a request's size itself.
 ///
 /// `affinity` holds an [`AffinityKey`], which has no `Debug`/`Display`, so
 /// `PlaceInput` implements `Debug` manually and redacts it (see the manual
@@ -22,14 +28,19 @@ use crate::snapshot::{ReplicaView, Snapshot};
 #[derive(Clone)]
 pub struct PlaceInput {
     pub model: String,
-    pub prompt_tokens_est: u64,
+    /// Input tokens only (0 if unknown): prefill cost and lane load.
+    pub prompt_tokens: u64,
+    /// Input plus output reserve, checked against each replica's engine
+    /// `max_context_tokens` by `Rule::Context`. `None` if unknown.
+    pub context_tokens: Option<u64>,
+    /// The pool's class decision: the requirement exceeds the base tier.
+    pub heavy: bool,
+    /// `params.request_priority`.
+    pub priority: i32,
     /// The caller-derived affinity key (e.g. from a conversation id), if
     /// this request carries one. Never logged — see `affinity.rs`.
     pub affinity: Option<AffinityKey>,
     pub affinity_source: AffinitySource,
-    /// Host ids known (from Fleet's existing tier knowledge) to serve long
-    /// context, passed in by the caller.
-    pub long_context_hosts: Vec<String>,
     pub now_ms: u64,
 }
 
@@ -37,10 +48,12 @@ impl std::fmt::Debug for PlaceInput {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("PlaceInput")
             .field("model", &self.model)
-            .field("prompt_tokens_est", &self.prompt_tokens_est)
+            .field("prompt_tokens", &self.prompt_tokens)
+            .field("context_tokens", &self.context_tokens)
+            .field("heavy", &self.heavy)
+            .field("priority", &self.priority)
             .field("affinity", &self.affinity.is_some())
             .field("affinity_source", &self.affinity_source)
-            .field("long_context_hosts", &self.long_context_hosts)
             .field("now_ms", &self.now_ms)
             .finish()
     }
@@ -56,7 +69,8 @@ pub enum AffinitySource {
 }
 
 impl AffinitySource {
-    fn as_str(self) -> &'static str {
+    /// A stable, content-free name for logs and metric tags.
+    pub const fn as_str(self) -> &'static str {
         match self {
             AffinitySource::Client => "client",
             AffinitySource::Prefix => "prefix",
@@ -68,6 +82,8 @@ impl AffinitySource {
 /// Why a request fell back to the legacy `Fleet::acquire_index` path.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum LegacyReason {
+    /// The snapshot is disabled by the data-plane kill switch.
+    Disabled,
     NotCovered,
     NoState,
     Stale,
@@ -85,8 +101,9 @@ pub enum LegacyReason {
 
 impl LegacyReason {
     /// A stable, content-free name for logs and metric tags.
-    pub fn as_str(self) -> &'static str {
+    pub const fn as_str(self) -> &'static str {
         match self {
+            LegacyReason::Disabled => "disabled",
             LegacyReason::NotCovered => "not_covered",
             LegacyReason::NoState => "no_state",
             LegacyReason::Stale => "stale",
@@ -102,9 +119,9 @@ impl LegacyReason {
 /// this type intentionally does not derive `Debug`.
 pub enum Decision {
     Place {
-        host: String,
+        slot: SlotId,
         record: DecisionRecord,
-        pin_write: Option<(PinId, String)>,
+        pin_write: Option<(PinId, SlotId)>,
     },
     Legacy {
         reason: LegacyReason,
@@ -121,13 +138,17 @@ pub struct DecisionRecord {
     pub rank: Option<u8>,
     pub affinity: &'static str,
     pub selection: Option<&'static str>,
-    pub host: Option<String>,
+    /// The chosen slot's `hrw_label` (`host#replica`).
+    pub slot: Option<String>,
+    /// The chosen slot's replica index.
+    pub replica: Option<u32>,
+    /// The key's HRW home slot label, for keyed selections.
     pub home: Option<String>,
+    /// The live follow pin's slot label, if one was found.
     pub pinned: Option<String>,
-    /// Number of eligible **hosts** the decision scored over (not the
-    /// number of eligible replicas — a host with 2 eligible replicas still
-    /// counts once here).
+    /// Number of eligible replica slots the decision scored over.
     pub eligible: u16,
+    /// Exclusions per rule, in `ALL_RULES` order.
     pub excluded: [(Rule, u16); 5],
     pub chosen_score: Option<f64>,
     pub home_score: Option<f64>,
@@ -145,11 +166,12 @@ impl DecisionRecord {
             rank: None,
             affinity: input.affinity_source.as_str(),
             selection: None,
-            host: None,
+            slot: None,
+            replica: None,
             home: None,
             pinned: None,
             eligible: 0,
-            excluded: RULES.map(|r| (r, 0)),
+            excluded: ALL_RULES.map(|r| (r, 0)),
             chosen_score: None,
             home_score: None,
             best_score: None,
@@ -158,18 +180,6 @@ impl DecisionRecord {
             chosen_backlog_tokens: None,
         }
     }
-}
-
-/// Sums the eligible replicas' prefill backlog on `views`, or `None` if none
-/// of them report one.
-fn sum_backlog(views: &[&ReplicaView]) -> Option<u64> {
-    let mut total: Option<u64> = None;
-    for v in views {
-        if let Some(b) = v.report.load.prefill_backlog_tokens {
-            total = Some(total.unwrap_or(0) + b);
-        }
-    }
-    total
 }
 
 /// Builds a `Decision::Legacy` for `reason`, optionally overriding the
@@ -188,35 +198,31 @@ fn legacy(
     Decision::Legacy { reason, record }
 }
 
-/// Per-host score (lower is better), plus the host-level `Pending` used to
-/// compute it, for every host with at least one eligible replica.
-fn score_hosts(
-    eligible_by_host: &HashMap<String, Vec<&ReplicaView>>,
-    snap: &Snapshot,
-    mine: &HashMap<String, Pending>,
-    median: f64,
-) -> (Vec<(String, f64)>, HashMap<String, Pending>) {
-    let mut host_scores: Vec<(String, f64)> = Vec::with_capacity(eligible_by_host.len());
-    let mut host_pending: HashMap<String, Pending> = HashMap::new();
-    for (host, views) in eligible_by_host {
-        let n_eligible = views.len();
-        let mine_pending = mine.get(host).copied().unwrap_or_default();
-        let routed = snap.routed.get(&(host.clone(), HOST_REPLICA.to_string()));
-        let pending = pending_for(routed, mine_pending);
-        let split = split_pending(pending, n_eligible);
-        let pairs: Vec<(&ReplicaView, Pending)> = views.iter().map(|v| (*v, split)).collect();
-        let score = host_score(&pairs, median);
-        host_scores.push((host.clone(), score));
-        host_pending.insert(host.clone(), pending);
+/// Exclusion tally, one counter per rule in `ALL_RULES` order.
+#[derive(Default)]
+struct Tally([u16; 5]);
+
+impl Tally {
+    fn add(&mut self, rule: Rule) {
+        if let Some(i) = ALL_RULES.iter().position(|r| *r == rule) {
+            self.0[i] = self.0[i].saturating_add(1);
+        }
     }
-    // `eligible_by_host` is a `HashMap`, so its iteration order (and thus
-    // `host_scores`' order) is otherwise unspecified and can differ between
-    // processes for the same input. `affinity::select`'s keyless BestOfTwo
-    // path samples indices from `rng` against this order, so two `Placer`s
-    // (or the same one on a re-run) must see the same order to draw the
-    // same conclusion from the same rng seed — sort it deterministically.
-    host_scores.sort_by(|a, b| a.0.cmp(&b.0));
-    (host_scores, host_pending)
+
+    fn record(&self) -> [(Rule, u16); 5] {
+        let mut i = 0;
+        ALL_RULES.map(|r| {
+            let n = self.0[i];
+            i += 1;
+            (r, n)
+        })
+    }
+}
+
+/// An eligible slot and the pending load it is scored with.
+struct Candidate<'a> {
+    view: &'a ReplicaView,
+    pending: Pending,
 }
 
 /// The pure placement decision-maker. Holds only the deployment's pin
@@ -234,9 +240,13 @@ impl Placer {
         &self,
         input: &PlaceInput,
         snap: &Snapshot,
-        mine: &HashMap<String, Pending>,
+        mine: &HashMap<SlotId, Pending>,
         rng: &mut impl Rng,
     ) -> Decision {
+        if snap.disabled {
+            return legacy(input, snap, LegacyReason::Disabled, None);
+        }
+
         if !COVERED_MODELS.contains(&input.model.as_str()) {
             return legacy(input, snap, LegacyReason::NotCovered, None);
         }
@@ -249,54 +259,72 @@ impl Placer {
             return legacy(input, snap, LegacyReason::Stale, None);
         }
 
-        // Group eligible replicas by host, tallying exclusions in RULES
-        // order for the record along the way.
-        let mut eligible_by_host: HashMap<String, Vec<&ReplicaView>> = HashMap::new();
-        let mut excluded_counts: HashMap<Rule, u16> = HashMap::new();
+        // Stage 1: per-replica rules, tallying exclusions for the record.
+        let mut tally = Tally::default();
+        let mut candidates: Vec<Candidate<'_>> = Vec::with_capacity(snap.replicas.len());
         for view in &snap.replicas {
             match first_exclusion(view, input, input.now_ms) {
-                None => eligible_by_host
-                    .entry(view.host_id.clone())
-                    .or_default()
-                    .push(view),
-                Some(exclusion) => {
-                    *excluded_counts.entry(exclusion.0).or_insert(0) += 1;
-                }
+                None => candidates.push(Candidate {
+                    view,
+                    pending: pending_for(
+                        snap.routed.get(&view.slot),
+                        mine.get(&view.slot).copied().unwrap_or_default(),
+                    ),
+                }),
+                Some(exclusion) => tally.add(exclusion.0),
             }
         }
-        let excluded: [(Rule, u16); 5] = RULES.map(|r| (r, *excluded_counts.get(&r).unwrap_or(&0)));
 
-        if eligible_by_host.is_empty() {
-            return legacy(input, snap, LegacyReason::NoneEligible, Some(excluded));
+        if candidates.is_empty() {
+            return legacy(
+                input,
+                snap,
+                LegacyReason::NoneEligible,
+                Some(tally.record()),
+            );
         }
 
-        let all_eligible: Vec<&ReplicaView> =
-            eligible_by_host.values().flatten().copied().collect();
-        let median = fleet_median_tps(&all_eligible);
-
-        let (host_scores, host_pending) = score_hosts(&eligible_by_host, snap, mine, median);
-
-        let best_score = host_scores
+        // The snapshot's replica order is the reader's; `select`'s keyless
+        // BestOfTwo samples indices against `scores`' order, so two `Placer`s
+        // (or the same one on a re-run) must see the same order to draw the
+        // same conclusion from the same rng seed — sort by slot.
+        candidates.sort_by(|a, b| a.view.slot.cmp(&b.view.slot));
+        let views: Vec<&ReplicaView> = candidates.iter().map(|c| c.view).collect();
+        let median = fleet_median_tps(&views);
+        let scores: Vec<(SlotId, f64)> = candidates
             .iter()
-            .map(|(_, s)| *s)
-            .fold(f64::INFINITY, f64::min);
+            .map(|c| {
+                (
+                    c.view.slot.clone(),
+                    replica_score(c.view, c.pending, median),
+                )
+            })
+            .collect();
+        let best_score = scores.iter().map(|(_, s)| *s).fold(f64::INFINITY, f64::min);
 
         // Pin lookup: only when this request carries an affinity key.
         let pin_id_opt = input.affinity.as_ref().map(|k| pin_id(k, &self.pin_secret));
-        let pin_lookup: Option<(String, u64)> = pin_id_opt.as_ref().and_then(|pid| {
+        let pin_lookup: Option<(SlotId, u64)> = pin_id_opt.as_ref().and_then(|pid| {
             snap.pins
                 .get(pid, input.now_ms)
-                .map(|(host, at_ms)| (host.to_string(), at_ms))
+                .map(|(slot, at_ms)| (slot.clone(), at_ms))
         });
 
         let selected = match select(
             input.affinity.as_ref(),
-            pin_lookup.as_ref().map(|(h, _)| h.as_str()),
-            &host_scores,
+            pin_lookup.as_ref().map(|(s, _)| s),
+            &scores,
             rng,
         ) {
             Some(s) => s,
-            None => return legacy(input, snap, LegacyReason::NoneEligible, Some(excluded)),
+            None => {
+                return legacy(
+                    input,
+                    snap,
+                    LegacyReason::NoneEligible,
+                    Some(tally.record()),
+                )
+            }
         };
 
         let rank: Option<u8> = match selected.selection {
@@ -304,14 +332,8 @@ impl Placer {
             Selection::Spill { rank } => Some(rank),
             Selection::Pinned | Selection::BestOfTwo => None,
         };
-        let selection_str: &'static str = match selected.selection {
-            Selection::Pinned => "pinned",
-            Selection::Home => "home",
-            Selection::Spill { .. } => "spill",
-            Selection::BestOfTwo => "best_of_two",
-        };
 
-        let mut pin_write: Option<(PinId, String)> = None;
+        let mut pin_write: Option<(PinId, SlotId)> = None;
         if let Some(pid) = pin_id_opt {
             let should_write = match selected.selection {
                 Selection::Pinned => pin_lookup
@@ -321,47 +343,35 @@ impl Placer {
                 _ => selected.write_pin,
             };
             if should_write {
-                pin_write = Some((pid, selected.host.clone()));
+                pin_write = Some((pid, selected.slot.clone()));
             }
         }
 
-        let chosen_score = host_scores
-            .iter()
-            .find(|(h, _)| h == &selected.host)
-            .map(|(_, s)| *s);
-        let home_score = selected
-            .home
-            .as_ref()
-            .and_then(|home| host_scores.iter().find(|(h, _)| h == home).map(|(_, s)| *s));
-        let chosen_pending = host_pending
-            .get(&selected.host)
-            .copied()
-            .unwrap_or_default();
-        let chosen_backlog_tokens = eligible_by_host
-            .get(&selected.host)
-            .and_then(|views| sum_backlog(views));
+        let score_of = |slot: &SlotId| scores.iter().find(|(s, _)| s == slot).map(|(_, v)| *v);
+        let chosen = candidates.iter().find(|c| c.view.slot == selected.slot);
 
         let record = DecisionRecord {
             outcome: "place",
             reason: None,
             rank,
             affinity: input.affinity_source.as_str(),
-            selection: Some(selection_str),
-            host: Some(selected.host.clone()),
-            home: selected.home.clone(),
-            pinned: pin_lookup.map(|(h, _)| h),
-            eligible: u16::try_from(eligible_by_host.len()).unwrap_or(u16::MAX),
-            excluded,
-            chosen_score,
-            home_score,
+            selection: Some(selected.selection.as_str()),
+            slot: Some(selected.slot.hrw_label()),
+            replica: Some(selected.slot.replica),
+            home: selected.home.as_ref().map(SlotId::hrw_label),
+            pinned: pin_lookup.map(|(s, _)| s.hrw_label()),
+            eligible: u16::try_from(candidates.len()).unwrap_or(u16::MAX),
+            excluded: tally.record(),
+            chosen_score: score_of(&selected.slot),
+            home_score: selected.home.as_ref().and_then(score_of),
             best_score: Some(best_score),
             snapshot_age_ms: input.now_ms.saturating_sub(snap.built_ms),
-            pending_req: chosen_pending.req,
-            chosen_backlog_tokens,
+            pending_req: chosen.map(|c| c.pending.req).unwrap_or(0),
+            chosen_backlog_tokens: chosen.and_then(|c| c.view.state.load.prefill_backlog_tokens),
         };
 
         Decision::Place {
-            host: selected.host,
+            slot: selected.slot,
             record,
             pin_write,
         }
@@ -371,60 +381,12 @@ impl Placer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::affinity::AffinityKey;
-    use crate::consts::{COVERED_MODELS, FRESH_MAX_MS, HOST_REPLICA, PIN_TTL_MS};
+    use crate::affinity::{hrw_rank, AffinityKey};
+    use crate::consts::{COVERED_MODELS, FRESH_MAX_MS, PIN_TTL_MS};
     use crate::snapshot::RoutedCounts;
-    use crate::testkit::NOW;
-    use ed25519_dalek::SigningKey;
+    use crate::testkit::{input as base_input, slot, view as ready_view, NOW};
     use rand::rngs::StdRng;
     use rand::SeedableRng;
-
-    const MODEL: &str = "z-ai/glm-5.3-flash";
-
-    fn signing_key() -> SigningKey {
-        SigningKey::from_bytes(&[7u8; 32])
-    }
-
-    fn base_input() -> PlaceInput {
-        PlaceInput {
-            model: MODEL.into(),
-            prompt_tokens_est: 100,
-            affinity: None,
-            affinity_source: AffinitySource::None,
-            long_context_hosts: Vec::new(),
-            now_ms: NOW,
-        }
-    }
-
-    fn ready_view(host: &str, replica: &str) -> ReplicaView {
-        use crate::frame::{Lifecycle, Limits, Load, ReplicaReport};
-        let pk = signing_key().verifying_key();
-        ReplicaView {
-            host_id: host.into(),
-            replica_id: replica.into(),
-            report: ReplicaReport {
-                schema: 1,
-                host_id: host.into(),
-                replica_id: replica.into(),
-                boot_id: "boot-a".into(),
-                seq: 1,
-                engine_sampled_at_ms: Some(NOW),
-                reported_at_ms: NOW,
-                lifecycle_state: Lifecycle::Ready,
-                model: MODEL.into(),
-                engine: "sglang".into(),
-                engine_version: None,
-                limits: Limits { max_running: None },
-                load: Load {
-                    running: Some(0),
-                    queued: Some(0),
-                    ..Load::default()
-                },
-                proxy_inflight: 0,
-                report_key_id: crate::frame::key_id(&pk),
-            },
-        }
-    }
 
     fn snap_with(views: Vec<ReplicaView>) -> Snapshot {
         Snapshot {
@@ -432,6 +394,7 @@ mod tests {
             replicas: views,
             routed: HashMap::new(),
             pins: Default::default(),
+            disabled: false,
         }
     }
 
@@ -439,113 +402,40 @@ mod tests {
         Placer::new([1u8; 32])
     }
 
-    #[test]
-    fn caller_legacy_reasons_have_stable_names() {
-        assert_eq!(LegacyReason::HostUnmapped.as_str(), "host_unmapped");
-        assert_eq!(LegacyReason::KeyGroup.as_str(), "key_group");
-        assert_eq!(LegacyReason::Incomplete.as_str(), "incomplete");
-    }
-
-    #[test]
-    fn not_covered_is_legacy() {
+    fn keyed(key: AffinityKey) -> PlaceInput {
         let mut input = base_input();
-        input.model = "some-other-model".into();
-        let snap = snap_with(vec![ready_view("gpu01", "r1")]);
-        let mut rng = StdRng::seed_from_u64(1);
-        let decision = placer().place(&input, &snap, &HashMap::new(), &mut rng);
-        match decision {
-            Decision::Legacy { reason, record } => {
-                assert_eq!(reason, LegacyReason::NotCovered);
-                assert_eq!(record.reason, Some("not_covered"));
-                assert_eq!(record.outcome, "legacy");
-            }
-            Decision::Place { .. } => panic!("expected Legacy"),
-        }
-    }
-
-    #[test]
-    fn no_state_is_legacy() {
-        let input = base_input();
-        let snap = snap_with(vec![]);
-        let mut rng = StdRng::seed_from_u64(1);
-        let decision = placer().place(&input, &snap, &HashMap::new(), &mut rng);
-        match decision {
-            Decision::Legacy { reason, .. } => assert_eq!(reason, LegacyReason::NoState),
-            Decision::Place { .. } => panic!("expected Legacy"),
-        }
-    }
-
-    #[test]
-    fn stale_snapshot_is_legacy() {
-        let input = base_input();
-        let mut snap = snap_with(vec![ready_view("gpu01", "r1")]);
-        snap.built_ms = NOW - FRESH_MAX_MS - 1;
-        let mut rng = StdRng::seed_from_u64(1);
-        let decision = placer().place(&input, &snap, &HashMap::new(), &mut rng);
-        match decision {
-            Decision::Legacy { reason, record } => {
-                assert_eq!(reason, LegacyReason::Stale);
-                assert_eq!(record.reason, Some("stale"));
-            }
-            Decision::Place { .. } => panic!("expected Legacy"),
-        }
-    }
-
-    #[test]
-    fn none_eligible_is_legacy() {
-        let input = base_input();
-        let mut v = ready_view("gpu01", "r1");
-        v.report.lifecycle_state = crate::frame::Lifecycle::Warming;
-        let snap = snap_with(vec![v]);
-        let mut rng = StdRng::seed_from_u64(1);
-        let decision = placer().place(&input, &snap, &HashMap::new(), &mut rng);
-        match decision {
-            Decision::Legacy { reason, record } => {
-                assert_eq!(reason, LegacyReason::NoneEligible);
-                assert_eq!(record.reason, Some("none_eligible"));
-                let (rule, count) = record.excluded[1];
-                assert_eq!(rule, Rule::Lifecycle);
-                assert_eq!(count, 1);
-            }
-            Decision::Place { .. } => panic!("expected Legacy"),
-        }
-    }
-
-    #[test]
-    fn two_placers_agree() {
-        let key_bytes = [3u8; 16];
-        let mut input = base_input();
-        input.affinity = Some(AffinityKey::from_bytes(key_bytes));
+        input.affinity = Some(key);
         input.affinity_source = AffinitySource::Client;
-
-        let snap = snap_with(vec![ready_view("gpu01", "r1"), ready_view("gpu02", "r1")]);
-
-        let a = Placer::new([9u8; 32]);
-        let b = Placer::new([9u8; 32]);
-
-        let mut rng_a = StdRng::seed_from_u64(1);
-        let mut rng_b = StdRng::seed_from_u64(2);
-
-        let host_a = match a.place(&input, &snap, &HashMap::new(), &mut rng_a) {
-            Decision::Place { host, .. } => host,
-            Decision::Legacy { .. } => panic!("expected Place"),
-        };
-        let host_b = match b.place(&input, &snap, &HashMap::new(), &mut rng_b) {
-            Decision::Place { host, .. } => host,
-            Decision::Legacy { .. } => panic!("expected Place"),
-        };
-        assert_eq!(host_a, host_b);
+        input
     }
 
-    /// Searches for an `AffinityKey` whose HRW rank over `hosts` puts `home`
+    fn placed(d: Decision) -> (SlotId, DecisionRecord, Option<(PinId, SlotId)>) {
+        match d {
+            Decision::Place {
+                slot,
+                record,
+                pin_write,
+            } => (slot, record, pin_write),
+            Decision::Legacy { reason, .. } => panic!("expected Place, got Legacy({reason:?})"),
+        }
+    }
+
+    fn legacy_reason(d: Decision) -> (LegacyReason, DecisionRecord) {
+        match d {
+            Decision::Legacy { reason, record } => (reason, record),
+            Decision::Place { .. } => panic!("expected Legacy"),
+        }
+    }
+
+    /// Searches for an `AffinityKey` whose HRW rank over `slots` puts `home`
     /// first, so a test can force a specific `Selection::Home`/`Spill`
-    /// outcome instead of depending on whichever host an arbitrary key
+    /// outcome instead of depending on whichever slot an arbitrary key
     /// happens to rank first.
-    fn find_key_with_home(hosts: &[&str], home: &str) -> AffinityKey {
-        use crate::affinity::hrw_rank;
+    fn find_key_with_home(slots: &[SlotId], home: &SlotId) -> AffinityKey {
+        let refs: Vec<&SlotId> = slots.iter().collect();
         for seed in 0u128.. {
             let key = AffinityKey::from_bytes(seed.to_be_bytes());
-            if hrw_rank(&key, hosts).first().map(String::as_str) == Some(home) {
+            if hrw_rank(&key, &refs).first() == Some(home) {
                 return key;
             }
         }
@@ -553,142 +443,327 @@ mod tests {
     }
 
     #[test]
-    fn two_placers_agree_after_pin() {
-        let key = find_key_with_home(&["gpu01", "gpu02"], "gpu01");
+    fn caller_legacy_reasons_have_stable_names() {
+        assert_eq!(LegacyReason::HostUnmapped.as_str(), "host_unmapped");
+        assert_eq!(LegacyReason::KeyGroup.as_str(), "key_group");
+        assert_eq!(LegacyReason::Incomplete.as_str(), "incomplete");
+        assert_eq!(LegacyReason::Disabled.as_str(), "disabled");
+    }
 
-        // gpu01 (home) is overloaded; gpu02 is the spill target.
-        let mut hot = ready_view("gpu01", "r1");
-        hot.report.load.running = Some(1000);
-        let cold = ready_view("gpu02", "r1");
-        let snap = snap_with(vec![hot, cold]);
+    #[test]
+    fn disabled_snapshot_is_legacy_disabled() {
+        // Disabled wins over every other check, including a usable snapshot.
+        let mut snap = snap_with(vec![ready_view("gpu01", 0)]);
+        snap.disabled = true;
+        let mut rng = StdRng::seed_from_u64(1);
+        let (reason, record) =
+            legacy_reason(placer().place(&base_input(), &snap, &HashMap::new(), &mut rng));
+        assert_eq!(reason, LegacyReason::Disabled);
+        assert_eq!(record.reason, Some("disabled"));
+        assert_eq!(record.outcome, "legacy");
 
-        let secret = [5u8; 32];
-        let a = Placer::new(secret);
+        let mut uncovered = base_input();
+        uncovered.model = "some-other-model".into();
+        let (reason, _) =
+            legacy_reason(placer().place(&uncovered, &snap, &HashMap::new(), &mut rng));
+        assert_eq!(reason, LegacyReason::Disabled);
+    }
 
+    #[test]
+    fn not_covered_is_legacy() {
         let mut input = base_input();
-        input.affinity = Some(key.clone());
-        input.affinity_source = AffinitySource::Client;
+        input.model = "some-other-model".into();
+        let snap = snap_with(vec![ready_view("gpu01", 0)]);
+        let mut rng = StdRng::seed_from_u64(1);
+        let (reason, record) =
+            legacy_reason(placer().place(&input, &snap, &HashMap::new(), &mut rng));
+        assert_eq!(reason, LegacyReason::NotCovered);
+        assert_eq!(record.reason, Some("not_covered"));
+        assert_eq!(record.outcome, "legacy");
+    }
+
+    #[test]
+    fn no_state_is_legacy() {
+        let snap = snap_with(vec![]);
+        let mut rng = StdRng::seed_from_u64(1);
+        let (reason, _) =
+            legacy_reason(placer().place(&base_input(), &snap, &HashMap::new(), &mut rng));
+        assert_eq!(reason, LegacyReason::NoState);
+    }
+
+    #[test]
+    fn stale_snapshot_is_legacy() {
+        let mut snap = snap_with(vec![ready_view("gpu01", 0)]);
+        snap.built_ms = NOW - FRESH_MAX_MS - 1;
+        let mut rng = StdRng::seed_from_u64(1);
+        let (reason, record) =
+            legacy_reason(placer().place(&base_input(), &snap, &HashMap::new(), &mut rng));
+        assert_eq!(reason, LegacyReason::Stale);
+        assert_eq!(record.reason, Some("stale"));
+    }
+
+    #[test]
+    fn none_eligible_is_legacy() {
+        let mut v = ready_view("gpu01", 0);
+        v.state.lifecycle_state = crate::frame::Lifecycle::Warming;
+        let snap = snap_with(vec![v]);
+        let mut rng = StdRng::seed_from_u64(1);
+        let (reason, record) =
+            legacy_reason(placer().place(&base_input(), &snap, &HashMap::new(), &mut rng));
+        assert_eq!(reason, LegacyReason::NoneEligible);
+        assert_eq!(record.reason, Some("none_eligible"));
+        assert_eq!(record.excluded[0], (Rule::Lifecycle, 1));
+    }
+
+    #[test]
+    fn context_limit_excludes_only_the_small_replica() {
+        let mut small = ready_view("gpu01", 0);
+        small.state.limits.max_context_tokens = Some(100_000);
+        let mut big = ready_view("gpu01", 1);
+        big.state.limits.max_context_tokens = Some(1_000_000);
+        let snap = snap_with(vec![small, big]);
+        let mut input = base_input();
+        input.context_tokens = Some(150_000);
+        for seed in 0..8 {
+            let mut rng = StdRng::seed_from_u64(seed);
+            let (slot_, record, _) =
+                placed(placer().place(&input, &snap, &HashMap::new(), &mut rng));
+            assert_eq!(slot_, slot("gpu01", 1));
+            assert_eq!(record.excluded[3], (Rule::Context, 1));
+        }
+    }
+
+    #[test]
+    fn two_replicas_on_one_host_are_scored_independently() {
+        // Same host, one busy replica and one idle: the idle one wins every
+        // time, and pending load on one slot never leaks onto its sibling.
+        let mut busy = ready_view("gpu01", 0);
+        busy.state.load.running = Some(30);
+        busy.state.load.prefill_backlog_tokens = Some(40_000);
+        let idle = ready_view("gpu01", 1);
+        let snap = snap_with(vec![busy, idle]);
+        for seed in 0..16 {
+            let mut rng = StdRng::seed_from_u64(seed);
+            let (slot_, record, _) =
+                placed(placer().place(&base_input(), &snap, &HashMap::new(), &mut rng));
+            assert_eq!(slot_, slot("gpu01", 1), "seed {seed}");
+            assert_eq!(record.replica, Some(1));
+            assert_eq!(record.slot.as_deref(), Some("gpu01#1"));
+            assert_eq!(record.eligible, 2);
+        }
+
+        // Now load replica 1 through other nodes' routed counts only: it becomes
+        // the worse slot, and replica 0 is picked.
+        let mut snap = snap_with(vec![ready_view("gpu01", 0), ready_view("gpu01", 1)]);
+        snap.routed.insert(
+            slot("gpu01", 1),
+            RoutedCounts {
+                req: 4,
+                tok: 60_000,
+                since_ms: NOW - 1_000,
+            },
+        );
+        let mut rng = StdRng::seed_from_u64(3);
+        let (slot_, record, _) =
+            placed(placer().place(&base_input(), &snap, &HashMap::new(), &mut rng));
+        assert_eq!(slot_, slot("gpu01", 0));
+        assert_eq!(record.pending_req, 0);
+    }
+
+    #[test]
+    fn hrw_home_moves_only_for_removed_replica() {
+        let all: Vec<SlotId> = vec![
+            slot("gpu01", 0),
+            slot("gpu01", 1),
+            slot("gpu02", 0),
+            slot("gpu02", 1),
+        ];
+        let removed = slot("gpu01", 1);
+        let full = snap_with(all.iter().map(|s| ready_view(&s.host, s.replica)).collect());
+        let reduced = snap_with(
+            all.iter()
+                .filter(|s| **s != removed)
+                .map(|s| ready_view(&s.host, s.replica))
+                .collect(),
+        );
+        let mut moved = 0;
+        for k in 0u8..100 {
+            let input = keyed(AffinityKey::from_bytes([k; 16]));
+            let mut rng = StdRng::seed_from_u64(1);
+            let (before, rec, _) = placed(placer().place(&input, &full, &HashMap::new(), &mut rng));
+            assert_eq!(rec.selection, Some("home"));
+            let (after, _, _) = placed(placer().place(&input, &reduced, &HashMap::new(), &mut rng));
+            if before == removed {
+                moved += 1;
+                assert_ne!(after, removed);
+            } else {
+                assert_eq!(after, before, "key {k}: only the removed slot's keys move");
+            }
+        }
+        assert!(
+            moved > 0,
+            "some keys should have had the removed slot as home"
+        );
+    }
+
+    #[test]
+    fn pin_to_vanished_slot_falls_through_to_hrw() {
+        let secret = [4u8; 32];
+        let slots = vec![slot("gpu01", 0), slot("gpu02", 0)];
+        let key = find_key_with_home(&slots, &slot("gpu02", 0));
+        let pid = pin_id(&key, &secret);
+        let mut snap = snap_with(vec![ready_view("gpu01", 0), ready_view("gpu02", 0)]);
+        // The pin names gpu01#3, a replica index gone from gpu01's frame.
+        std::sync::Arc::make_mut(&mut snap.pins).insert(
+            *pid.as_bytes(),
+            slot("gpu01", 3),
+            NOW - 1_000,
+        );
+        let mut rng = StdRng::seed_from_u64(1);
+        let (chosen, record, pin_write) =
+            placed(Placer::new(secret).place(&keyed(key), &snap, &HashMap::new(), &mut rng));
+        assert_eq!(chosen, slot("gpu02", 0));
+        assert_eq!(record.selection, Some("home"));
+        assert_eq!(record.pinned.as_deref(), Some("gpu01#3"));
+        let (_, rewritten) = pin_write.expect("a dead pin is rewritten at home");
+        assert_eq!(rewritten, slot("gpu02", 0));
+    }
+
+    #[test]
+    fn two_placers_agree() {
+        let input = keyed(AffinityKey::from_bytes([3u8; 16]));
+        let snap = snap_with(vec![ready_view("gpu01", 0), ready_view("gpu02", 0)]);
+
+        let a = Placer::new([9u8; 32]);
+        let b = Placer::new([9u8; 32]);
+        let mut rng_a = StdRng::seed_from_u64(1);
+        let mut rng_b = StdRng::seed_from_u64(2);
+        let (slot_a, _, _) = placed(a.place(&input, &snap, &HashMap::new(), &mut rng_a));
+        let (slot_b, _, _) = placed(b.place(&input, &snap, &HashMap::new(), &mut rng_b));
+        assert_eq!(slot_a, slot_b);
+    }
+
+    #[test]
+    fn two_placers_agree_after_pin() {
+        let slots = vec![slot("gpu01", 0), slot("gpu02", 0)];
+        let key = find_key_with_home(&slots, &slot("gpu01", 0));
+
+        // gpu01#0 (home) is overloaded; gpu02#0 is the spill target.
+        let hot_snap = || {
+            let mut hot = ready_view("gpu01", 0);
+            hot.state.load.running = Some(1000);
+            snap_with(vec![hot, ready_view("gpu02", 0)])
+        };
+        let secret = [5u8; 32];
+        let input = keyed(key);
 
         let mut rng = StdRng::seed_from_u64(1);
-        let (host_a, pin_write, record_a) = match a.place(&input, &snap, &HashMap::new(), &mut rng)
-        {
-            Decision::Place {
-                host,
-                pin_write,
-                record,
-            } => (host, pin_write, record),
-            Decision::Legacy { .. } => panic!("expected Place"),
-        };
+        let (slot_a, record_a, pin_write) =
+            placed(Placer::new(secret).place(&input, &hot_snap(), &HashMap::new(), &mut rng));
         assert_eq!(record_a.selection, Some("spill"));
-        assert_eq!(record_a.home.as_deref(), Some("gpu01"));
+        assert_eq!(record_a.home.as_deref(), Some("gpu01#0"));
 
         // Node A writes the pin into a fresh snapshot as node B would read it.
-        let (pin_id_val, pinned_host) = pin_write.expect("spill away from home must write a pin");
-        assert_eq!(pinned_host, host_a);
-        let mut snap_b = snap_with(vec![
-            {
-                let mut hot = ready_view("gpu01", "r1");
-                hot.report.load.running = Some(1000);
-                hot
-            },
-            ready_view("gpu02", "r1"),
-        ]);
-        std::sync::Arc::make_mut(&mut snap_b.pins).insert(*pin_id_val.as_bytes(), pinned_host, NOW);
+        let (pin_id_val, pinned_slot) = pin_write.expect("spill away from home must write a pin");
+        assert_eq!(pinned_slot, slot_a);
+        let mut snap_b = hot_snap();
+        std::sync::Arc::make_mut(&mut snap_b.pins).insert(*pin_id_val.as_bytes(), pinned_slot, NOW);
 
-        let b = Placer::new(secret);
-        let mut input_b = input.clone();
-        input_b.affinity = Some(key);
         let mut rng_b = StdRng::seed_from_u64(2);
-        match b.place(&input_b, &snap_b, &HashMap::new(), &mut rng_b) {
-            Decision::Place { host, record, .. } => {
-                assert_eq!(host, host_a);
-                assert_eq!(record.selection, Some("pinned"));
-            }
-            Decision::Legacy { .. } => panic!("expected Place"),
-        }
+        let (slot_b, record_b, _) =
+            placed(Placer::new(secret).place(&input, &snap_b, &HashMap::new(), &mut rng_b));
+        assert_eq!(slot_b, slot_a);
+        assert_eq!(record_b.selection, Some("pinned"));
     }
 
     #[test]
     fn best_of_two_is_deterministic_across_replica_insertion_order() {
         // No affinity key, so `select` takes the keyless BestOfTwo path,
-        // which samples indices against `host_scores`' order. Two snapshots
-        // built from the same replicas in reverse insertion order must
-        // still agree for the same rng seed, because `score_hosts` sorts
-        // its output instead of relying on `HashMap` iteration order.
+        // which samples indices against the score order. Two snapshots built
+        // from the same replicas in reverse insertion order must still agree
+        // for the same rng seed, because `place` sorts candidates by slot.
         let views_a = vec![
-            ready_view("gpu01", "r1"),
-            ready_view("gpu02", "r1"),
-            ready_view("gpu03", "r1"),
-            ready_view("gpu04", "r1"),
+            ready_view("gpu01", 0),
+            ready_view("gpu01", 1),
+            ready_view("gpu02", 0),
+            ready_view("gpu03", 0),
         ];
         let mut views_b = views_a.clone();
         views_b.reverse();
-
         let snap_a = snap_with(views_a);
         let snap_b = snap_with(views_b);
-        let input = base_input();
 
         let mut rng_a = StdRng::seed_from_u64(99);
         let mut rng_b = StdRng::seed_from_u64(99);
-
-        let host_a = match placer().place(&input, &snap_a, &HashMap::new(), &mut rng_a) {
-            Decision::Place { host, .. } => host,
-            Decision::Legacy { .. } => panic!("expected Place"),
-        };
-        let host_b = match placer().place(&input, &snap_b, &HashMap::new(), &mut rng_b) {
-            Decision::Place { host, .. } => host,
-            Decision::Legacy { .. } => panic!("expected Place"),
-        };
-        assert_eq!(host_a, host_b);
+        let (a, _, _) = placed(placer().place(&base_input(), &snap_a, &HashMap::new(), &mut rng_a));
+        let (b, _, _) = placed(placer().place(&base_input(), &snap_b, &HashMap::new(), &mut rng_b));
+        assert_eq!(a, b);
     }
 
     #[test]
     fn pinned_refreshes_after_half_ttl() {
         let key_bytes = [6u8; 16];
         let secret = [2u8; 32];
-        let snap_views = vec![ready_view("gpu01", "r1"), ready_view("gpu02", "r1")];
-
-        let mut input = base_input();
-        input.affinity = Some(AffinityKey::from_bytes(key_bytes));
-        input.affinity_source = AffinitySource::Client;
-
+        let views = vec![ready_view("gpu01", 0), ready_view("gpu02", 0)];
+        let input = keyed(AffinityKey::from_bytes(key_bytes));
         let pid = pin_id(&AffinityKey::from_bytes(key_bytes), &secret);
+        let p = Placer::new(secret);
 
         // Pin inserted just over half the TTL ago: must refresh.
-        let mut snap_old = snap_with(snap_views.clone());
+        let mut snap_old = snap_with(views.clone());
         std::sync::Arc::make_mut(&mut snap_old.pins).insert(
             *pid.as_bytes(),
-            "gpu01".to_string(),
+            slot("gpu01", 0),
             NOW - (PIN_TTL_MS / 2 + 1),
         );
-        let p = Placer::new(secret);
         let mut rng = StdRng::seed_from_u64(1);
-        match p.place(&input, &snap_old, &HashMap::new(), &mut rng) {
-            Decision::Place {
-                record, pin_write, ..
-            } => {
-                assert_eq!(record.selection, Some("pinned"));
-                assert!(pin_write.is_some(), "half-TTL-old pin should refresh");
-            }
-            Decision::Legacy { .. } => panic!("expected Place"),
-        }
+        let (_, record, pin_write) = placed(p.place(&input, &snap_old, &HashMap::new(), &mut rng));
+        assert_eq!(record.selection, Some("pinned"));
+        assert!(pin_write.is_some(), "half-TTL-old pin should refresh");
 
         // Pin inserted recently: no refresh needed.
-        let mut snap_fresh = snap_with(snap_views);
+        let mut snap_fresh = snap_with(views);
         std::sync::Arc::make_mut(&mut snap_fresh.pins).insert(
             *pid.as_bytes(),
-            "gpu01".to_string(),
+            slot("gpu01", 0),
             NOW - 1_000,
         );
         let mut rng2 = StdRng::seed_from_u64(1);
-        match p.place(&input, &snap_fresh, &HashMap::new(), &mut rng2) {
-            Decision::Place {
-                record, pin_write, ..
-            } => {
-                assert_eq!(record.selection, Some("pinned"));
-                assert!(pin_write.is_none(), "recent pin should not refresh");
+        let (_, record, pin_write) =
+            placed(p.place(&input, &snap_fresh, &HashMap::new(), &mut rng2));
+        assert_eq!(record.selection, Some("pinned"));
+        assert!(pin_write.is_none(), "recent pin should not refresh");
+    }
+
+    /// Fails if `s` contains `key_bytes` or `pid` in any of the encodings a
+    /// careless `Debug`/`Display` would produce.
+    fn assert_no_key_material(s: &str, key_bytes: [u8; 16], pid: &PinId) {
+        assert!(
+            !s.contains(&pid.to_hex()),
+            "output leaked the pin id's hex encoding: {s}"
+        );
+        assert!(
+            !s.contains(&hex::encode(key_bytes)),
+            "output leaked the affinity key's hex encoding: {s}"
+        );
+        assert!(
+            !s.contains(&format!("{key_bytes:?}")),
+            "output leaked the affinity key's raw (decimal) bytes: {s}"
+        );
+        assert!(
+            !s.contains(&format!("{:?}", pid.as_bytes())),
+            "output leaked the pin id's raw (decimal) bytes: {s}"
+        );
+        // Belt-and-suspenders: a leaked pin id or raw key byte dump would
+        // also show up as a run of 32+ hex characters.
+        let mut run = 0usize;
+        for c in s.chars() {
+            if c.is_ascii_hexdigit() {
+                run += 1;
+                assert!(run < 32, "found a 32+ hex-char run in output: {s}");
+            } else {
+                run = 0;
             }
-            Decision::Legacy { .. } => panic!("expected Place"),
         }
     }
 
@@ -697,63 +772,32 @@ mod tests {
         let key_bytes = [0xABu8; 16];
         let secret = [0xCDu8; 32];
         let pid = pin_id(&AffinityKey::from_bytes(key_bytes), &secret);
-
-        let mut input = base_input();
-        input.affinity = Some(AffinityKey::from_bytes(key_bytes));
-        input.affinity_source = AffinitySource::Client;
+        let input = keyed(AffinityKey::from_bytes(key_bytes));
 
         // Give the request a live pin so the `Pinned` path (and its
         // `pin_lookup`) actually runs, instead of trivially passing on a
         // Legacy or keyless decision that never touches key material.
-        let mut snap = snap_with(vec![ready_view("gpu01", "r1"), ready_view("gpu02", "r1")]);
+        let mut snap = snap_with(vec![ready_view("gpu01", 0), ready_view("gpu02", 0)]);
         std::sync::Arc::make_mut(&mut snap.pins).insert(
             *pid.as_bytes(),
-            "gpu01".to_string(),
+            slot("gpu01", 0),
             NOW - 1_000,
         );
 
         let mut rng = StdRng::seed_from_u64(1);
-        let decision = Placer::new(secret).place(&input, &snap, &HashMap::new(), &mut rng);
-        let record = match decision {
-            Decision::Place { record, .. } => {
-                assert_eq!(record.selection, Some("pinned"));
-                record
-            }
-            Decision::Legacy { .. } => panic!("expected Place"),
-        };
-        let debug_str = format!("{record:?}");
+        let (_, record, _) =
+            placed(Placer::new(secret).place(&input, &snap, &HashMap::new(), &mut rng));
+        assert_eq!(record.selection, Some("pinned"));
+        assert_no_key_material(&format!("{record:?}"), key_bytes, &pid);
 
-        assert!(
-            !debug_str.contains(&pid.to_hex()),
-            "record debug output leaked the pin id's hex encoding"
-        );
-        assert!(
-            !debug_str.contains(&hex::encode(key_bytes)),
-            "record debug output leaked the affinity key's hex encoding"
-        );
-        assert!(
-            !debug_str.contains(&format!("{key_bytes:?}")),
-            "record debug output leaked the affinity key's raw (decimal) bytes"
-        );
-        assert!(
-            !debug_str.contains(&format!("{:?}", pid.as_bytes())),
-            "record debug output leaked the pin id's raw (decimal) bytes"
-        );
+        // The request input's own Debug redacts the key.
+        assert_no_key_material(&format!("{input:?}"), key_bytes, &pid);
 
-        // Belt-and-suspenders: a leaked pin id or raw key byte dump would
-        // also show up as a run of 32+ hex characters.
-        let mut run = 0usize;
-        for c in debug_str.chars() {
-            if c.is_ascii_hexdigit() {
-                run += 1;
-                assert!(
-                    run < 32,
-                    "found a 32+ hex-char run in record debug output: {debug_str}"
-                );
-            } else {
-                run = 0;
-            }
-        }
+        // A Legacy decision's record carries none either.
+        snap.disabled = true;
+        let (_, record) =
+            legacy_reason(Placer::new(secret).place(&input, &snap, &HashMap::new(), &mut rng));
+        assert_no_key_material(&format!("{record:?}"), key_bytes, &pid);
     }
 
     use proptest::prelude::*;
@@ -775,18 +819,18 @@ mod tests {
 
     fn view_from_spec(
         host: &str,
-        replica: &str,
+        replica: u32,
         spec: (crate::frame::Lifecycle, bool, u32),
     ) -> ReplicaView {
         let (lifecycle, fresh, running) = spec;
         let mut v = ready_view(host, replica);
-        v.report.lifecycle_state = lifecycle;
-        v.report.engine_sampled_at_ms = if fresh {
+        v.state.lifecycle_state = lifecycle;
+        v.state.engine_sampled_at_ms = if fresh {
             Some(NOW)
         } else {
             Some(NOW - FRESH_MAX_MS - 1)
         };
-        v.report.load.running = Some(running);
+        v.state.load.running = Some(running);
         v
     }
 
@@ -794,10 +838,9 @@ mod tests {
         /// Small random snapshots with an independently random lifecycle,
         /// freshness, and load per replica (not just per run), plus an
         /// optional affinity key, follow pin, and `mine` entry. Whenever the
-        /// placer actually places, the chosen host must have at least one
-        /// eligible replica.
+        /// placer actually places, the chosen slot must be eligible.
         #[test]
-        fn placed_host_is_always_eligible(
+        fn placed_slot_is_always_eligible(
             specs in proptest::collection::vec(replica_spec_strategy(), 1..=12),
             has_affinity in proptest::bool::ANY,
             has_pin in proptest::bool::ANY,
@@ -805,9 +848,7 @@ mod tests {
         ) {
             let mut views = Vec::new();
             for (i, spec) in specs.into_iter().enumerate() {
-                let host = format!("gpu{}", i / 2);
-                let replica = format!("r{}", i % 2);
-                views.push(view_from_spec(&host, &replica, spec));
+                views.push(view_from_spec(&format!("gpu{}", i / 2), (i % 2) as u32, spec));
             }
 
             let mut input = base_input();
@@ -821,26 +862,26 @@ mod tests {
             let mut snap = snap_with(views);
             if has_pin && has_affinity {
                 let pid = pin_id(&AffinityKey::from_bytes(key_bytes), &[1u8; 32]);
-                std::sync::Arc::make_mut(&mut snap.pins).insert(*pid.as_bytes(), "gpu0".to_string(), NOW - 1_000);
+                std::sync::Arc::make_mut(&mut snap.pins).insert(*pid.as_bytes(), slot("gpu0", 0), NOW - 1_000);
             }
 
             let mut mine = HashMap::new();
             if has_mine {
-                mine.insert("gpu0".to_string(), Pending { req: 2, tok: 500 });
+                mine.insert(slot("gpu0", 0), Pending { req: 2, tok: 500 });
             }
 
             let mut rng = StdRng::seed_from_u64(42);
             let decision = placer().place(&input, &snap, &mine, &mut rng);
-            if let Decision::Place { host, .. } = decision {
-                let has_eligible_replica = snap
+            if let Decision::Place { slot, .. } = decision {
+                let eligible = snap
                     .replicas
                     .iter()
-                    .any(|v| v.host_id == host && first_exclusion(v, &input, input.now_ms).is_none());
-                prop_assert!(has_eligible_replica);
+                    .any(|v| v.slot == slot && first_exclusion(v, &input, input.now_ms).is_none());
+                prop_assert!(eligible);
             }
         }
 
-        /// Guards against `placed_host_is_always_eligible` passing vacuously
+        /// Guards against `placed_slot_is_always_eligible` passing vacuously
         /// (e.g. if a bug made the placer stop ever choosing `Place`): a
         /// snapshot that always includes one guaranteed-eligible replica
         /// among the random ones must always yield `Decision::Place`.
@@ -850,11 +891,9 @@ mod tests {
         ) {
             let mut views = Vec::new();
             for (i, spec) in specs.into_iter().enumerate() {
-                let host = format!("gpuX{}", i / 2);
-                let replica = format!("r{}", i % 2);
-                views.push(view_from_spec(&host, &replica, spec));
+                views.push(view_from_spec(&format!("gpuX{}", i / 2), (i % 2) as u32, spec));
             }
-            views.push(ready_view("gpu-forced-eligible", "r0"));
+            views.push(ready_view("gpu-forced-eligible", 0));
 
             let mut input = base_input();
             input.model = COVERED_MODELS[0].to_string();
@@ -868,43 +907,33 @@ mod tests {
     }
 
     #[test]
-    fn host_replica_const_used_for_host_level_routing() {
-        assert_eq!(HOST_REPLICA, "_host");
-        let mut input = base_input();
-        let mut hot = ready_view("gpu01", "r1");
-        hot.report.load.running = Some(0);
-        let snap_with_routed = {
-            let mut s = snap_with(vec![hot]);
-            s.routed.insert(
-                ("gpu01".to_string(), HOST_REPLICA.to_string()),
-                RoutedCounts {
-                    req: 5,
-                    tok: 100,
-                    // As the reader builds it: the window starts a second
-                    // before now, i.e. before the frame's reported_at_ms.
-                    since_ms: NOW - 1_000,
-                },
-            );
-            s
-        };
-        input.model = MODEL.into();
+    fn routed_counts_are_per_slot() {
+        let mut snap = snap_with(vec![ready_view("gpu01", 0)]);
+        snap.routed.insert(
+            slot("gpu01", 0),
+            RoutedCounts {
+                req: 5,
+                tok: 100,
+                // As the reader builds it: the window starts a second
+                // before now, i.e. before the frame's reported_at_ms.
+                since_ms: NOW - 1_000,
+            },
+        );
+        let mut mine = HashMap::new();
+        mine.insert(slot("gpu01", 0), Pending { req: 2, tok: 10 });
         let mut rng = StdRng::seed_from_u64(1);
-        match placer().place(&input, &snap_with_routed, &HashMap::new(), &mut rng) {
-            Decision::Place { record, .. } => {
-                assert_eq!(record.pending_req, 5);
-            }
-            Decision::Legacy { .. } => panic!("expected Place"),
-        }
+        let (_, record, _) = placed(placer().place(&base_input(), &snap, &mine, &mut rng));
+        assert_eq!(record.pending_req, 7);
     }
 
     #[test]
     fn other_nodes_routed_load_shifts_decision() {
-        // Two identical idle hosts. Another node routed load to gpu-a in the
-        // current window (this node's own ledger is empty), so gpu-a must
-        // score worse and the placer must pick gpu-b — for every rng seed.
-        let mut snap = snap_with(vec![ready_view("gpu-a", "r1"), ready_view("gpu-b", "r1")]);
+        // Two identical idle slots. Another node routed load to gpu-a#0 in
+        // the current window (this node's own ledger is empty), so it must
+        // score worse and the placer must pick gpu-b#0 — for every rng seed.
+        let mut snap = snap_with(vec![ready_view("gpu-a", 0), ready_view("gpu-b", 0)]);
         snap.routed.insert(
-            ("gpu-a".to_string(), HOST_REPLICA.to_string()),
+            slot("gpu-a", 0),
             RoutedCounts {
                 req: 8,
                 tok: 40_000,
@@ -913,10 +942,9 @@ mod tests {
         );
         for seed in 0..32 {
             let mut rng = StdRng::seed_from_u64(seed);
-            match placer().place(&base_input(), &snap, &HashMap::new(), &mut rng) {
-                Decision::Place { host, .. } => assert_eq!(host, "gpu-b", "seed {seed}"),
-                Decision::Legacy { .. } => panic!("expected Place"),
-            }
+            let (chosen, _, _) =
+                placed(placer().place(&base_input(), &snap, &HashMap::new(), &mut rng));
+            assert_eq!(chosen, slot("gpu-b", 0), "seed {seed}");
         }
     }
 }

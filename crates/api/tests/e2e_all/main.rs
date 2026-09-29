@@ -38,6 +38,7 @@ mod auto_redact;
 mod auto_redact_adversarial;
 mod backend_output_limits;
 mod billing_and_models;
+mod body_hash_limit;
 mod chat_encryption;
 mod check_api_key;
 mod chutes_catalog;

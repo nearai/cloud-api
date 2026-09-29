@@ -1,4 +1,5 @@
 use crate::ita::ItaAttestationConfig;
+use rustls_pki_types::{pem::PemObject, CertificateDer};
 use std::{collections::HashMap, env};
 
 #[derive(Debug, Clone)]
@@ -1343,15 +1344,29 @@ impl PlacementEndpoint {
                 .map_err(|_| "PLACEMENT_REDIS_TLS_ENABLED must be true or false")?,
         };
         let ca_pem = if tls {
-            let pem = read_optional_secret_env(
-                "PLACEMENT_REDIS_TLS_CA_CERT_FILE",
-                "PLACEMENT_REDIS_TLS_CA_CERT",
-            )?
-            .ok_or(
-                "PLACEMENT_REDIS_TLS_CA_CERT or PLACEMENT_REDIS_TLS_CA_CERT_FILE is required with TLS",
-            )?;
-            if !pem.contains("-----BEGIN CERTIFICATE-----") {
-                return Err("PLACEMENT_REDIS_TLS_CA_CERT holds no PEM certificate".to_string());
+            const CA_FILE: &str = "PLACEMENT_REDIS_TLS_CA_CERT_FILE";
+            const CA_INLINE: &str = "PLACEMENT_REDIS_TLS_CA_CERT";
+            // The variable actually read, so an error names the right one.
+            let var = if non_empty_env(CA_FILE).is_some() {
+                CA_FILE
+            } else {
+                CA_INLINE
+            };
+            let pem = read_optional_secret_env(CA_FILE, CA_INLINE)?
+                .ok_or(
+                    "PLACEMENT_REDIS_TLS_CA_CERT or PLACEMENT_REDIS_TLS_CA_CERT_FILE is required with TLS",
+                )?;
+            // A one-line value with literal `\n` escapes (a `.env` or docker
+            // env) is unescaped, as inference-proxy does.
+            let pem = pem.trim().replace("\\n", "\n");
+            // Parse it now so a corrupt block is invalid at startup, not a
+            // silently inert client later. Errors name the variable, never
+            // the contents.
+            let certs = CertificateDer::pem_slice_iter(pem.as_bytes())
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|_| format!("{var} holds an invalid PEM certificate"))?;
+            if certs.is_empty() {
+                return Err(format!("{var} holds no PEM certificate"));
             }
             Some(pem)
         } else {
@@ -2026,6 +2041,66 @@ mod tests {
         std::env::set_var("PLACEMENT_REDIS_TLS_ENABLED", "maybe");
         assert!(invalid_endpoint().contains("PLACEMENT_REDIS_TLS_ENABLED"));
         clear_placement_endpoint_env();
+    }
+
+    /// A one-line CA with literal `\n` escapes, as it arrives through a
+    /// `.env` or docker env, is unescaped like inference-proxy does; the
+    /// same from a file.
+    #[test]
+    #[serial]
+    fn escaped_newline_ca_is_accepted() {
+        clear_placement_endpoint_env();
+        std::env::set_var("PLACEMENT_REDIS_HOST", "203.0.113.7");
+        let escaped = TEST_CA_PEM.trim().replace('\n', "\\n");
+        assert!(!escaped.contains('\n'));
+        std::env::set_var("PLACEMENT_REDIS_TLS_CA_CERT", format!("  {escaped}  "));
+        let PlacementEndpoint::Valid(endpoint) =
+            PlacementConfig::from_env().unwrap().redis_endpoint
+        else {
+            panic!("expected a valid endpoint");
+        };
+        assert_eq!(endpoint.ca_pem.as_deref(), Some(TEST_CA_PEM.trim()));
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ca.pem");
+        std::fs::write(&path, format!("{escaped}\n")).unwrap();
+        std::env::remove_var("PLACEMENT_REDIS_TLS_CA_CERT");
+        std::env::set_var("PLACEMENT_REDIS_TLS_CA_CERT_FILE", &path);
+        let PlacementEndpoint::Valid(endpoint) =
+            PlacementConfig::from_env().unwrap().redis_endpoint
+        else {
+            panic!("expected a valid endpoint");
+        };
+        clear_placement_endpoint_env();
+        assert_eq!(endpoint.ca_pem.as_deref(), Some(TEST_CA_PEM.trim()));
+    }
+
+    /// A block that looks like a certificate but does not parse is invalid
+    /// at startup, named under the variable that was read, and its contents
+    /// are never in the reason.
+    #[test]
+    #[serial]
+    fn corrupt_pem_is_invalid() {
+        clear_placement_endpoint_env();
+        std::env::set_var("PLACEMENT_REDIS_HOST", "203.0.113.7");
+        let corrupt =
+            "-----BEGIN CERTIFICATE-----\n!!corrupt-secret-body!!\n-----END CERTIFICATE-----";
+        std::env::set_var("PLACEMENT_REDIS_TLS_CA_CERT", corrupt);
+        let reason = invalid_endpoint();
+        assert!(reason.contains("PLACEMENT_REDIS_TLS_CA_CERT"));
+        assert!(!reason.contains("_FILE"));
+        assert!(!reason.contains("corrupt-secret-body"));
+
+        // From a file the reason names the file variable.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ca.pem");
+        std::fs::write(&path, corrupt).unwrap();
+        std::env::remove_var("PLACEMENT_REDIS_TLS_CA_CERT");
+        std::env::set_var("PLACEMENT_REDIS_TLS_CA_CERT_FILE", &path);
+        let reason = invalid_endpoint();
+        clear_placement_endpoint_env();
+        assert!(reason.contains("PLACEMENT_REDIS_TLS_CA_CERT_FILE"));
+        assert!(!reason.contains("corrupt-secret-body"));
     }
 
     #[test]

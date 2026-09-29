@@ -666,6 +666,7 @@ mod tests {
             disabled: false,
             refuse_on: false,
             host_boots: HashMap::new(),
+            host_reported_ms: HashMap::new(),
         }
     }
 

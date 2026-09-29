@@ -6895,23 +6895,59 @@ mod tests {
             assert_eq!(h.metrics.decisions_tagged("reason:stale"), 2);
         }
 
-        /// A host whose every replica is past freshness while another host is
-        /// fresh (typically a skewed clock) would silently starve: the host
-        /// map counts as incomplete and the Fleet routes legacy.
+        /// A snapshot with fresh `h-a` and the given `h-b` replicas, `h-b`'s
+        /// frame reported at `h_b_reported_ms`.
+        fn with_h_b(h_b_replicas: Vec<ReplicaView>, h_b_reported_ms: u64) -> Snapshot {
+            let mut snap = snapshot("h-a", fresh_ms(), PinTable::default());
+            snap.replicas.extend(h_b_replicas);
+            snap.host_reported_ms = HashMap::from([
+                ("h-a".to_string(), now_ms()),
+                ("h-b".to_string(), h_b_reported_ms),
+            ]);
+            snap
+        }
+
+        /// A host that is only booting (replicas warming, or ready with no
+        /// engine sample yet) while its frame is fresh is excluded replica by
+        /// replica, not the whole Fleet.
         #[test]
-        fn all_stale_host_makes_fleet_legacy() {
-            let stale = now_ms() - 60_000;
-            let with_h_b = |samples: [u64; 2]| {
-                let mut snap = snapshot("h-a", fresh_ms(), PinTable::default());
-                for (replica, at) in samples.into_iter().enumerate() {
-                    snap.replicas.push(ready_replica("h-b", replica as u32, at));
-                }
-                snap
-            };
+        fn booting_host_does_not_make_fleet_legacy() {
             let messages = messages_avoiding(2);
             let req = request("z-ai/glm-5.3-flash");
+            let mut warming = ready_replica("h-b", 0, now_ms());
+            warming.state.lifecycle_state = Lifecycle::Warming;
+            let mut unsampled = ready_replica("h-b", 1, now_ms());
+            unsampled.state.engine_sampled_at_ms = None;
 
-            let mut h = harness(&[("h-a", 2), ("h-b", 3)], with_h_b([stale, stale]));
+            let h = harness(
+                &[("h-a", 2), ("h-b", 3)],
+                with_h_b(vec![warming, unsampled], now_ms()),
+            );
+            placed_indices(&h.provider, &messages, None, &req);
+            assert_eq!(h.metrics.decisions_tagged("reason:host_stale"), 0);
+            assert_eq!(h.metrics.decisions_tagged("outcome:place"), 12);
+        }
+
+        /// A host whose frame is old (a silent host) or far from this node's
+        /// clock (a skewed one) would silently starve: the Fleet routes
+        /// legacy. A host clock ahead beyond the allowed skew is rejected
+        /// before it reaches the snapshot, which the incomplete host map
+        /// already covers.
+        #[test]
+        fn skewed_host_frame_makes_fleet_legacy() {
+            let messages = messages_avoiding(2);
+            let req = request("z-ai/glm-5.3-flash");
+            let replicas = || {
+                vec![
+                    ready_replica("h-b", 0, now_ms()),
+                    ready_replica("h-b", 1, now_ms()),
+                ]
+            };
+
+            let mut h = harness(
+                &[("h-a", 2), ("h-b", 3)],
+                with_h_b(replicas(), now_ms() - 60_000),
+            );
             assert_eq!(
                 placed_indices(&h.provider, &messages, None, &req),
                 legacy_indices(&messages, None, None)
@@ -6919,8 +6955,14 @@ mod tests {
             assert_eq!(h.metrics.decisions_tagged("reason:host_stale"), 12);
             assert!(h.writes.try_recv().is_err(), "legacy writes nothing");
 
-            // One fresh replica on h-b: the host is visible, placement runs.
-            let h = harness(&[("h-a", 2), ("h-b", 3)], with_h_b([stale, fresh_ms()]));
+            // Ahead of this node beyond the allowed skew.
+            let ahead = now_ms() + placement::consts::MAX_FUTURE_SKEW_MS + 60_000;
+            let h = harness(&[("h-a", 2), ("h-b", 3)], with_h_b(replicas(), ahead));
+            placed_indices(&h.provider, &messages, None, &req);
+            assert_eq!(h.metrics.decisions_tagged("reason:host_stale"), 12);
+
+            // A fresh frame: the host is visible, placement runs.
+            let h = harness(&[("h-a", 2), ("h-b", 3)], with_h_b(replicas(), now_ms()));
             placed_indices(&h.provider, &messages, None, &req);
             assert_eq!(h.metrics.decisions_tagged("reason:host_stale"), 0);
             assert_eq!(h.metrics.decisions_tagged("outcome:place"), 12);
@@ -7658,6 +7700,28 @@ mod tests {
                 let requests = upstream.received_requests().await.unwrap();
                 assert_eq!(requests.len(), 2, "every legacy request is served");
                 assert_eq!(hints(&requests), vec![None; 2]);
+            }
+
+            /// A refusal made on a picture with a stale-framed host is
+            /// demoted as `host_stale`, before the refuse-off gate: with
+            /// refusals on it is not a 429, and with them off it is still
+            /// tagged `host_stale`, not `refuse_off`.
+            #[tokio::test]
+            async fn refused_with_stale_host_is_host_stale_fallback() {
+                let upstream = mock_upstream(None).await;
+                for refuse_on in [true, false] {
+                    let mut snap = saturated_snapshot(fresh_ms());
+                    snap.refuse_on = refuse_on;
+                    snap.host_reported_ms = HashMap::from([("h-a".to_string(), now_ms() - 60_000)]);
+                    let h = harness_on(upstream_provider(&upstream), &[("h-a", 2)], 4, snap);
+                    send_both(&h.provider, heavy_params()).await;
+
+                    assert_eq!(h.metrics.decisions_tagged("reason:host_stale"), 2);
+                    assert_eq!(h.metrics.decisions_tagged("reason:refuse_off"), 0);
+                    assert_eq!(h.metrics.decisions_tagged("outcome:refused"), 0);
+                }
+                let requests = upstream.received_requests().await.unwrap();
+                assert_eq!(requests.len(), 4, "every legacy request is served");
             }
 
             /// The kill switch takes precedence over refuse-on: with both

@@ -103,8 +103,9 @@ pub const METRIC_READ_ERRORS: &str = "cloud_api.placement.valkey_read_errors";
 pub const METRIC_FRAMES_REJECTED: &str = "cloud_api.placement.frames_rejected";
 pub const METRIC_PINS_MALFORMED: &str = "cloud_api.placement.pins_malformed";
 pub const METRIC_SNAPSHOT_AGE_MS: &str = "cloud_api.placement.snapshot_age_ms";
-/// Per newly accepted frame: this node's clock minus the frame's
-/// `reported_at_ms`, signed (a host clock ahead is negative), tagged
+/// Per newly received signed frame, accepted or rejected as a future one:
+/// this node's clock minus the frame's `reported_at_ms`, signed (a host
+/// clock ahead is negative), tagged
 /// `host:{host}`. Shows clock skew between cloud-api and a GPU host. The
 /// only host-tagged metric: hosts are few (about 10) and not customer data.
 pub const METRIC_FRAME_AGE_MS: &str = "cloud_api.placement.frame_age_ms";
@@ -833,7 +834,8 @@ fn routed_sum(hashes: impl IntoIterator<Item = redis::Value>) -> (u64, u64) {
 /// Outcome of applying one cycle's reads.
 pub(crate) struct Applied {
     snapshot: Snapshot,
-    /// `(host, now - reported_at_ms)` per newly accepted frame.
+    /// `(host, now - reported_at_ms)` per newly received signed frame that was
+    /// accepted or rejected as Future.
     frame_ages: Vec<(String, f64)>,
     rejects: Vec<Reject>,
     bad_envelopes: u32,
@@ -979,6 +981,13 @@ impl ReaderState {
                 }
                 Err(r) => {
                     rejects.push(r);
+                    // A skewed host's frame is still signed: record how far
+                    // ahead it is (a negative age) so the worst skew shows.
+                    if r == Reject::Future {
+                        if let Some(reported) = self.ingest.future_reported_at_ms(host) {
+                            frame_ages.push((host.clone(), now_ms as f64 - reported as f64));
+                        }
+                    }
                     if r == Reject::Regressed {
                         if let Some(acc) = prev {
                             hosts.insert(host.clone(), acc);
@@ -1041,6 +1050,15 @@ impl ReaderState {
                     .map(|boot| (host.clone(), boot.to_string()))
             })
             .collect();
+        let host_reported_ms = self
+            .hosts
+            .keys()
+            .filter_map(|host| {
+                self.ingest
+                    .reported_at_ms(host)
+                    .map(|reported| (host.clone(), reported))
+            })
+            .collect();
         let bad_pins = self.apply_pins(raw.pins, now_ms);
         if !removed.is_empty() {
             Arc::make_mut(&mut self.pins).retain_slots(|slot| !removed.contains(slot));
@@ -1060,6 +1078,7 @@ impl ReaderState {
                 disabled: raw.kill_switch,
                 refuse_on: raw.refuse_on,
                 host_boots,
+                host_reported_ms,
             },
             frame_ages,
             rejects,
@@ -2269,6 +2288,58 @@ mod tests {
                 (1_234.0, vec![format!("host:{HOST}")]),
             ]
         );
+    }
+
+    /// A frame rejected as Future (a host clock far ahead) is still a
+    /// signed frame: its age is recorded (negative) so the worst positive
+    /// skew shows, once per frame and not again when the same frame is read
+    /// again.
+    #[test]
+    fn frame_age_recorded_for_future_rejected_frames() {
+        let t0 = 10_000_500u64;
+        let metrics = FakeMetrics::default();
+        let reg = registry_for(&[HOST]);
+        let slot = ArcSwap::from_pointee(Snapshot::default());
+        let mut state = ReaderState::default();
+        let skewed = report(1, t0 + 60_000);
+        let frames = vec![Some(sealed_json(&skewed))];
+        cycle(&mut state, &slot, &reg, frames.clone(), t0, &metrics);
+        cycle(&mut state, &slot, &reg, frames, t0 + 500, &metrics);
+
+        let ages: Vec<(f64, Vec<String>)> = metrics
+            .histograms
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(n, _, _)| n == METRIC_FRAME_AGE_MS)
+            .map(|(_, v, tags)| (*v, tags.clone()))
+            .collect();
+        assert_eq!(ages, vec![(-60_000.0, vec![format!("host:{HOST}")])]);
+        assert_eq!(
+            metrics.total(METRIC_FRAMES_REJECTED, Some("reason:future")),
+            1
+        );
+    }
+
+    /// The snapshot carries each accepted host's `reported_at_ms`.
+    #[test]
+    fn snapshot_carries_host_reported_ms() {
+        let t0 = 10_000_500u64;
+        let metrics = FakeMetrics::default();
+        let reg = registry_for(&[HOST]);
+        let slot = ArcSwap::from_pointee(Snapshot::default());
+        let mut state = ReaderState::default();
+        let mut r = report(1, t0);
+        r.reported_at_ms = t0 - 700;
+        cycle(
+            &mut state,
+            &slot,
+            &reg,
+            vec![Some(sealed_json(&r))],
+            t0,
+            &metrics,
+        );
+        assert_eq!(slot.load().host_reported_ms.get(HOST), Some(&(t0 - 700)));
     }
 
     #[test]

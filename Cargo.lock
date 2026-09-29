@@ -2051,6 +2051,7 @@ name = "config"
 version = "0.0.0"
 dependencies = [
  "dotenvy",
+ "rustls-pki-types",
  "serde",
  "serial_test",
  "tempfile",

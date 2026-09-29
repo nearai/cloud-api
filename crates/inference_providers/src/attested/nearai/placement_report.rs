@@ -208,7 +208,9 @@ pub(super) fn size_tag(prompt_tokens: Option<u64>) -> &'static str {
 
 /// Legacy decisions made because placement has no usable snapshot, is
 /// switched off by the data-plane kill switch, or had its refusal turned
-/// into legacy because refusals are off (the default), are logged at debug;
+/// into legacy because refusals are off (the default), or that hold a
+/// stale-framed host (`host_stale`, which lasts as long as an outage), are
+/// logged at debug;
 /// they would otherwise repeat on every such request while the shared state
 /// is down, unconfigured, a switch is on or refusals are off. The decision
 /// metric still counts each.
@@ -216,7 +218,7 @@ fn logs_at_debug(record: &DecisionRecord) -> bool {
     record.outcome == "legacy"
         && matches!(
             record.reason,
-            Some("no_state" | "stale" | "disabled" | "refuse_off")
+            Some("no_state" | "stale" | "disabled" | "refuse_off" | "host_stale")
         )
 }
 
@@ -370,6 +372,13 @@ mod tests {
         assert_eq!(record.reason, Some("disabled"));
         assert!(logs_at_debug(&record));
         assert_eq!(super::detail_tag(&record), "reason:disabled");
+    }
+
+    #[test]
+    fn host_stale_decisions_log_at_debug() {
+        let mut record = no_state_record();
+        record.reason = Some("host_stale");
+        assert!(logs_at_debug(&record));
     }
 
     #[test]

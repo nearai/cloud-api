@@ -967,6 +967,11 @@ pub fn install_placement(
             return;
         }
     };
+    if !endpoint.tls {
+        tracing::warn!(
+            "PLACEMENT_REDIS_TLS_ENABLED=false: the placement Valkey password travels in plaintext"
+        );
+    }
     pool.set_placement(
         password.to_string(),
         inference_providers::placement_io::ValkeyEndpoint {
@@ -2997,6 +3002,26 @@ mod tests {
         assert!(pool.has_placement());
         let (expected, _) = services::completions::affinity::secrets_from("router-password");
         assert_eq!(pool.affinity_secret(), Some(expected));
+    }
+
+    /// TLS off is allowed (with a startup warning): placement still installs.
+    #[test]
+    fn plaintext_endpoint_still_installs_placement() {
+        let pool = services::inference_provider_pool::InferenceProviderPool::new(
+            None,
+            config::ExternalProvidersConfig::default(),
+        );
+        let placement = config::PlacementConfig {
+            redis_password: Some("router-password".to_string()),
+            redis_endpoint: config::PlacementEndpoint::Valid(config::PlacementRedisEndpoint {
+                host: "127.0.0.1".to_string(),
+                port: 6379,
+                tls: false,
+                ca_pem: None,
+            }),
+        };
+        install_placement(&pool, &placement);
+        assert!(pool.has_placement());
     }
 
     /// Without a usable endpoint placement stays off (fail open), password

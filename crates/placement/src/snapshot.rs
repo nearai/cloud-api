@@ -81,6 +81,8 @@ pub struct RoutedCounts {
 /// pin written on another boot of its host is ignored
 /// ([`Snapshot::pin_boot_current`]): the host rebooted, so its cache is cold.
 ///
+/// `host_reported_ms` is each host's latest accepted frame's `reported_at_ms`.
+///
 /// `routed_read_ms` is this node's clock when the reader *issued* the Valkey
 /// read that produced `routed` (not when it completed). A local write
 /// acknowledged before it is visible in `routed`; see
@@ -96,6 +98,10 @@ pub struct Snapshot {
     pub disabled: bool,
     pub refuse_on: bool,
     pub host_boots: HashMap<String, String>,
+    /// Each host's latest accepted frame's `reported_at_ms` (the host's
+    /// clock). A frame far from this node's clock marks a silent or skewed
+    /// host, as opposed to a booting one.
+    pub host_reported_ms: HashMap<String, u64>,
 }
 
 impl Snapshot {
@@ -195,6 +201,9 @@ fn map_frame_error(e: FrameError) -> Reject {
 pub struct Ingest {
     hosts: HashMap<String, HostState>,
     rebooted: BTreeSet<String>,
+    /// `reported_at_ms` of a host's latest frame rejected as
+    /// [`Reject::Future`], until a later frame is accepted.
+    future: HashMap<String, u64>,
 }
 
 /// How many superseded boot ids are remembered per host.
@@ -282,6 +291,8 @@ impl Ingest {
             .iter()
             .any(|r| r.engine_sampled_at_ms.is_some_and(|t| t > horizon))
         {
+            self.future
+                .insert(redis_host.to_string(), report.reported_at_ms);
             return Err(Reject::Future);
         }
 
@@ -373,6 +384,7 @@ impl Ingest {
             })
             .collect();
 
+        self.future.remove(redis_host);
         self.hosts.insert(
             redis_host.to_string(),
             HostState {
@@ -400,6 +412,13 @@ impl Ingest {
     /// clock), if any.
     pub fn reported_at_ms(&self, host: &str) -> Option<u64> {
         self.hosts.get(host).map(|h| h.reported_at_ms)
+    }
+
+    /// The `reported_at_ms` of `host`'s latest frame if it was rejected as
+    /// [`Reject::Future`] (a skewed host clock) and no frame has been
+    /// accepted since.
+    pub fn future_reported_at_ms(&self, host: &str) -> Option<u64> {
+        self.future.get(host).copied()
     }
 
     /// The `boot_id` of `host`'s latest accepted frame, if any.
@@ -816,6 +835,25 @@ mod tests {
         corrected.replicas = vec![replica(0, Some(T_NOW - 100))];
         accept(&mut ingest, &corrected)
             .expect("a correct frame after a rejected future frame is accepted");
+    }
+
+    /// A frame rejected as Future still tells the caller when the host says
+    /// it was reported, so large positive skew is visible; an accepted frame
+    /// clears it.
+    #[test]
+    fn future_reject_remembers_the_frames_reported_at() {
+        let mut ingest = Ingest::new();
+        let mut skewed = report();
+        skewed.reported_at_ms = T_NOW + 60_000;
+        skewed.replicas = vec![replica(0, Some(T_NOW + MAX_FUTURE_SKEW_MS + 60_000))];
+        assert_eq!(accept(&mut ingest, &skewed).unwrap_err(), Reject::Future);
+        assert_eq!(ingest.future_reported_at_ms(HOST), Some(T_NOW + 60_000));
+        assert_eq!(ingest.reported_at_ms(HOST), None);
+
+        let mut ok = report();
+        ok.seq = 2;
+        accept(&mut ingest, &ok).unwrap();
+        assert_eq!(ingest.future_reported_at_ms(HOST), None);
     }
 
     #[test]

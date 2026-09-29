@@ -23,8 +23,8 @@ use crate::spki_verifier::FingerprintState;
 use crate::BackendHosts;
 use crate::BackendVerifier;
 use arc_swap::{ArcSwap, ArcSwapOption};
+use placement::consts::{FRESH_MAX_MS, MAX_FUTURE_SKEW_MS};
 use placement::decision::{Decision, DecisionRecord, LegacyReason, PlaceInput};
-use placement::rules::Rule;
 use placement::score::{unseen_by_read, OwnRouted, Pending};
 use placement::snapshot::Snapshot;
 use placement::SlotId;
@@ -894,7 +894,7 @@ impl Fleet {
         // before taking the ledger lock below.
         let snapshot = handles.io.snapshot.load();
         let incomplete = self.host_map_incomplete(&snapshot);
-        let host_stale = !incomplete && self.host_map_has_stale_host(&snapshot, &input);
+        let host_stale = !incomplete && self.host_map_has_stale_host(&snapshot, now_ms);
 
         // One critical section from reading this node's own pending load to
         // reserving the chosen host in it, so concurrent requests on this
@@ -1030,25 +1030,26 @@ impl Fleet {
             .any(|host| !seen.contains(host.as_str()))
     }
 
-    /// True when a mapped host has replicas in `snapshot` but every one of
-    /// them fails `Rule::Freshness` while another mapped host has a fresh
-    /// one. Such a host (typically a skewed clock, see
-    /// `METRIC_FRAME_AGE_MS`) is invisible to the placer, which would
-    /// silently starve it while the rest of the fleet places, so the host
-    /// map counts as incomplete. When no host is fresh the placer itself
-    /// goes Legacy (`stale`).
-    fn host_map_has_stale_host(&self, snapshot: &Snapshot, input: &PlaceInput) -> bool {
+    /// True when a mapped host's latest frame is too old (a silent host) or
+    /// too far from this node's clock (a skewed one, see
+    /// `METRIC_FRAME_AGE_MS`) to be trusted: `now - reported_at_ms` beyond
+    /// `FRESH_MAX_MS`, or ahead by more than `MAX_FUTURE_SKEW_MS`. Such a
+    /// host would silently starve while the rest of the fleet places, so the
+    /// Fleet routes legacy. A host that is merely booting publishes fresh
+    /// frames whose replicas are not ready or not yet sampled; the normal
+    /// per-replica rules exclude those and they do not count. A frame
+    /// rejected as Future never reaches the snapshot: its host is missing
+    /// and `host_map_incomplete` covers it.
+    fn host_map_has_stale_host(&self, snapshot: &Snapshot, now_ms: u64) -> bool {
         let hosts = self.backend_hosts.load();
-        // Per mapped host: whether any of its replicas is fresh.
-        let mut fresh_by_host: HashMap<&str, bool> = HashMap::new();
-        for view in &snapshot.replicas {
-            if !hosts.index_by_host.contains_key(&view.slot.host) {
-                continue;
-            }
-            let fresh = Rule::Freshness.check(view, input, input.now_ms).is_ok();
-            *fresh_by_host.entry(view.slot.host.as_str()).or_default() |= fresh;
-        }
-        fresh_by_host.values().any(|fresh| *fresh) && fresh_by_host.values().any(|fresh| !*fresh)
+        snapshot
+            .host_reported_ms
+            .iter()
+            .filter(|(host, _)| hosts.index_by_host.contains_key(host.as_str()))
+            .any(|(_, reported)| {
+                now_ms.saturating_sub(*reported) > FRESH_MAX_MS
+                    || *reported > now_ms.saturating_add(MAX_FUTURE_SKEW_MS)
+            })
     }
 
     /// See `InferenceProvider::poll_backend_count`. Only a Fleet with
@@ -1288,7 +1289,7 @@ fn ledger_add(ledger: &mut PlacementLedger, slot: SlotId, tok: u64, now_s: u64) 
 }
 
 /// The `reason` of a decision sent to the legacy path because a mapped host
-/// is entirely stale while others are fresh (`host_map_has_stale_host`).
+/// has a stale or skewed frame (`host_map_has_stale_host`).
 const HOST_STALE_REASON: &str = "host_stale";
 
 /// The `reason` of a refusal sent to the legacy path because the refuse-on

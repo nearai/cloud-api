@@ -320,7 +320,7 @@ async fn recompute_counts_ttft_strictly_under_each_threshold() {
     let f = setup_platform_provider_usage_fixture().await;
     let repo = UsageHourlyRepositoryImpl::new(f.database.pool().clone());
     let h = random_past_hour();
-    // Review Focus 1: exact thresholds are not "under"; Review Focus 2: NULL is not measured.
+    // Exact thresholds are not "under"; a NULL ttft is not measured.
     let ttfts = [
         Some(4_999),
         Some(5_000),
@@ -362,7 +362,7 @@ async fn recompute_counts_ttft_strictly_under_each_threshold() {
     assert_eq!(got, vec![8, 7, 1, 3, 5]);
 }
 
-/// Review Focus 4: during a rolling deploy, pods on the previous build insert with the V0081
+/// During a rolling deploy, pods on the previous build insert with the V0081
 /// column list. That must fail loudly (NOT NULL) instead of storing zero threshold counts.
 #[tokio::test]
 async fn usage_hourly_rejects_rows_without_ttft_threshold_counts() {

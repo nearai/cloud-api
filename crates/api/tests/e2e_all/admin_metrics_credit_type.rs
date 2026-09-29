@@ -621,7 +621,7 @@ async fn org_metrics_count_ttft_under_thresholds() {
         .collect();
     assert_eq!(summed, summary_counts(&whole.summary).to_vec());
 
-    // Review Focus 3: a partial edge hour is read raw and still exact.
+    // A partial edge hour is read raw and still exact.
     let edge = get(h + minutes(30), h + hour * 2).await;
     assert_eq!(summary_counts(&edge.summary), [5, 4, 0, 2, 3]);
     assert_eq!(model_counts(&edge.by_model[0]), [5, 4, 0, 2, 3]);

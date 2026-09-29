@@ -142,7 +142,7 @@ async fn test_admin_get_organization_metrics_empty() {
         "Should have 0 unique API keys"
     );
 
-    // Review Focus 5: empty org reports zero TTFT counts, not null.
+    // An empty org reports zero TTFT counts, not null.
     assert_eq!(
         [
             metrics.summary.ttft_measured_requests,

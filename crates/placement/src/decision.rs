@@ -64,10 +64,11 @@ impl std::fmt::Debug for PlaceInput {
 
 /// Where `PlaceInput::affinity` came from, for the (content-free)
 /// `DecisionRecord::affinity` field.
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum AffinitySource {
     Client,
     Prefix,
+    #[default]
     None,
 }
 

@@ -1,26 +1,33 @@
-//! Placement decision reporting: the routing-only request view read out of
-//! `params.extra`, and turning a [`DecisionRecord`] into metrics + one log
-//! line. None of this touches `Fleet` state — it is pure translation from a
-//! placer decision (or the extra map) to observability output, extracted out
-//! of `fleet.rs` to keep that file to routing/reservation state.
+//! Placement decision reporting: the routing-only request view read from
+//! `ChatCompletionParams`, and turning a [`DecisionRecord`] into metrics +
+//! one log line. None of this touches `Fleet` state — it is pure translation
+//! from a placer decision (or the request params) to observability output,
+//! extracted out of `fleet.rs` to keep that file to routing/reservation state.
 
-use super::{placement_headers, tracing_headers};
+use super::tracing_headers;
 use crate::placement_io::{
     PlacementHandles, METRIC_AFFINITY, METRIC_CHOSEN_BACKLOG, METRIC_DECISIONS, METRIC_EXCLUDED,
 };
+use crate::ChatCompletionParams;
 use placement::affinity::AffinityKey;
 use placement::decision::{AffinitySource, DecisionRecord};
 use placement::rules::Rule;
-use std::collections::HashMap;
 
-/// Routing-only placement inputs read from `params.extra` before the
-/// tracing and encryption helpers strip it. Holds an [`AffinityKey`], so it
-/// has no `Debug`; the key is never logged.
+/// Routing-only placement inputs: the pool's typed `params.placement`, the
+/// operator priority and the tracing ids (read from `params.extra` before
+/// the tracing helper strips them). Holds an [`AffinityKey`], so it has no
+/// `Debug`; the key is never logged.
 pub(super) struct PlacementRequest {
     pub(super) model: String,
     /// Tracing ids for the decision log line (empty when absent).
     pub(super) request_id: String,
     pub(super) org_id: String,
+    /// The pool's estimate (input only; 0 when the pool gave none).
+    pub(super) prompt_tokens: u64,
+    /// The pool's context requirement (input plus output reserve).
+    pub(super) context_tokens: Option<u64>,
+    /// The pool's class: the requirement exceeds the base tier.
+    pub(super) heavy: bool,
     pub(super) affinity: Option<AffinityKey>,
     pub(super) affinity_source: AffinitySource,
     /// `params.request_priority` (operator-set, never client JSON).
@@ -28,65 +35,33 @@ pub(super) struct PlacementRequest {
 }
 
 impl PlacementRequest {
-    /// Reads the affinity key (hex; invalid means none), its source and the
-    /// tracing ids from `extra` without removing anything.
-    pub(super) fn from_extra(
-        model: &str,
-        priority: i32,
-        extra: &HashMap<String, serde_json::Value>,
-    ) -> Self {
-        let text = |key: &str| extra.get(key).and_then(|value| value.as_str());
-        let affinity = text(placement_headers::AFFINITY).and_then(AffinityKey::from_hex);
-        let affinity_source = match (&affinity, text(placement_headers::AFFINITY_SOURCE)) {
-            (Some(_), Some("client")) => AffinitySource::Client,
-            (Some(_), Some("prefix")) => AffinitySource::Prefix,
-            _ => AffinitySource::None,
-        };
+    /// Reads `params.placement`, `params.request_priority` and the tracing
+    /// ids without removing anything. Placement never re-estimates: the pool
+    /// (`inference_provider_pool::context_routing`) owns the size estimate.
+    pub(super) fn from_params(params: &ChatCompletionParams) -> Self {
+        let text = |key: &str| params.extra.get(key).and_then(|value| value.as_str());
+        let placement = &params.placement;
         Self {
-            model: model.to_string(),
+            model: params.model.clone(),
             request_id: text(tracing_headers::REQUEST_ID)
                 .unwrap_or_default()
                 .to_string(),
             org_id: text(tracing_headers::ORG_ID)
                 .unwrap_or_default()
                 .to_string(),
-            affinity,
-            affinity_source,
-            priority,
+            prompt_tokens: placement.prompt_tokens.unwrap_or(0),
+            context_tokens: placement.context_tokens,
+            heavy: placement.heavy,
+            affinity: placement.affinity.clone(),
+            // A source without a key would mislabel the decision record.
+            affinity_source: if placement.affinity.is_some() {
+                placement.affinity_source
+            } else {
+                AffinitySource::None
+            },
+            priority: params.request_priority,
         }
     }
-}
-
-/// Estimated prompt tokens: total message text bytes / 4. Text is a string
-/// content, the `text` fields of content parts, each tool call's
-/// `function.arguments`, and any echoed `reasoning_content` — all of it is
-/// serialized upstream, so leaving tool calls or reasoning out of the
-/// estimate would systematically undercount agent/tool-heavy traffic (image
-/// or other non-text content parts cannot be estimated from bytes and stay
-/// excluded).
-pub(super) fn prompt_tokens_est(messages: &[crate::ChatMessage]) -> u64 {
-    let bytes = messages
-        .iter()
-        .map(|message| {
-            let mut bytes = match message.content.as_ref() {
-                Some(serde_json::Value::String(text)) => text.len(),
-                Some(serde_json::Value::Array(parts)) => parts
-                    .iter()
-                    .filter_map(|part| part.get("text").and_then(|text| text.as_str()))
-                    .map(str::len)
-                    .fold(0usize, usize::saturating_add),
-                _ => 0,
-            };
-            if let Some(calls) = &message.tool_calls {
-                for call in calls {
-                    bytes = bytes
-                        .saturating_add(call.function.arguments.as_deref().map_or(0, str::len));
-                }
-            }
-            bytes.saturating_add(message.reasoning_content.as_deref().map_or(0, str::len))
-        })
-        .fold(0usize, usize::saturating_add);
-    u64::try_from(bytes / 4).unwrap_or(u64::MAX)
 }
 
 /// Decision metrics and one info line per decision. IDs and numbers only:
@@ -220,9 +195,7 @@ fn rule_tag(rule: Rule) -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use super::{logs_at_debug, prompt_tokens_est};
-    use crate::models::{FunctionCall, ToolCall};
-    use crate::{ChatMessage, MessageRole};
+    use super::logs_at_debug;
     use placement::decision::{AffinitySource, Decision, DecisionRecord, PlaceInput, Placer};
     use placement::policy::Tier;
     use placement::snapshot::Snapshot;
@@ -280,39 +253,5 @@ mod tests {
         record.outcome = "place";
         record.reason = None;
         assert!(!logs_at_debug(&record));
-    }
-
-    #[test]
-    fn prompt_tokens_est_counts_tool_call_arguments_and_reasoning_content() {
-        let text_only = vec![ChatMessage {
-            role: MessageRole::User,
-            content: Some(serde_json::Value::String("a".repeat(40))),
-            name: None,
-            tool_call_id: None,
-            tool_calls: None,
-            reasoning_content: None,
-        }];
-        let with_tool_and_reasoning = vec![ChatMessage {
-            role: MessageRole::Assistant,
-            content: Some(serde_json::Value::String("a".repeat(40))),
-            name: None,
-            tool_call_id: None,
-            tool_calls: Some(vec![ToolCall {
-                id: Some("call-1".to_string()),
-                type_: Some("function".to_string()),
-                function: FunctionCall {
-                    name: Some("lookup".to_string()),
-                    arguments: Some("b".repeat(40)),
-                },
-                index: None,
-                thought_signature: None,
-            }]),
-            reasoning_content: Some("c".repeat(40)),
-        }];
-
-        // Then: the estimate grows to include the tool call arguments and
-        // the reasoning content bytes, not just the text content.
-        assert_eq!(prompt_tokens_est(&text_only), 10);
-        assert_eq!(prompt_tokens_est(&with_tool_and_reasoning), 30);
     }
 }

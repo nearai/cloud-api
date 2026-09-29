@@ -12,7 +12,7 @@
 //! per-index TTFT EMA so we can steer prefix-affinity routing away from a
 //! pathologically slow backend.
 
-use super::placement_report::{prompt_tokens_est, report_decision, PlacementRequest};
+use super::placement_report::{report_decision, PlacementRequest};
 use super::prefix_router::PrefixRouter;
 use super::Config;
 use crate::placement_io::{PlacementHandles, Write};
@@ -731,12 +731,11 @@ impl Fleet {
         let now_s = now_ms / 1_000;
         let input = PlaceInput {
             model: request.model.clone(),
-            prompt_tokens: prompt_tokens_est(messages),
-            // No context requirement or class yet: `Rule::Context` passes
-            // and every request is short until the pool's typed placement
-            // context arrives (L5).
-            context_tokens: None,
-            heavy: false,
+            // The pool's typed placement context: placement never
+            // re-estimates the request size.
+            prompt_tokens: request.prompt_tokens,
+            context_tokens: request.context_tokens,
+            heavy: request.heavy,
             priority: request.priority,
             affinity: request.affinity.clone(),
             affinity_source: request.affinity_source,

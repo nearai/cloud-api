@@ -26,24 +26,6 @@ type HmacSha256 = Hmac<Sha256>;
 /// hashing.
 const MAX_VALUE_BYTES: usize = 256;
 
-/// `params.extra` key carrying the derived affinity key, lowercase hex of
-/// the 16 key bytes. Stripped before the upstream provider request, the
-/// same way `x_model_pub_key` is.
-///
-/// Defined once in `inference_providers` (`attested::nearai::
-/// placement_headers::AFFINITY`, which `placement_report.rs` also reads)
-/// and re-exported here rather than redeclared, so the derive side
-/// (`services`) and the strip/read side (`inference_providers`) cannot
-/// silently drift apart under a rename.
-pub const AFFINITY_EXTRA_KEY: &str =
-    inference_providers::attested::nearai::placement_headers::AFFINITY;
-/// `params.extra` key carrying the affinity key's source (`"client"` or
-/// `"prefix"`). Stripped before the upstream provider request alongside
-/// [`AFFINITY_EXTRA_KEY`]. See that constant's doc for why this is
-/// re-exported rather than redeclared.
-pub const AFFINITY_SOURCE_EXTRA_KEY: &str =
-    inference_providers::attested::nearai::placement_headers::AFFINITY_SOURCE;
-
 /// Derive a per-request [`AffinityKey`] plus the [`AffinitySource`] it came
 /// from, or `None` when no usable signal exists.
 ///
@@ -293,8 +275,10 @@ mod tests {
 
     const SECRET: [u8; 32] = [9u8; 32];
 
+    /// A stable fingerprint for comparing keys (`AffinityKey` deliberately
+    /// has no `PartialEq`/`Debug`): the key's base-tier pin id.
     fn key_hex(key: &AffinityKey) -> String {
-        key.to_hex()
+        placement::affinity::pin_id(placement::policy::Tier::Base, key, &[0u8; 32]).to_hex()
     }
 
     fn msg(role: MessageRole, content: &str) -> ChatMessage {

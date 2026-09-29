@@ -4025,51 +4025,29 @@ impl InferenceProviderPool {
     /// safety factor. Skipped for encrypted payloads (`skip_exact_count`):
     /// tokenizing ciphertext is meaningless, and the byte heuristic still
     /// approximates plaintext size.
+    ///
+    /// Returns the exact count it took, if any, so the placement context
+    /// ([`Self::apply_context_routing`]) reuses it instead of re-tokenizing.
     async fn refine_context_requirement(
         &self,
         model_id: &str,
         params: &ChatCompletionParams,
         hints: &mut ChatRoutingHints,
         skip_exact_count: bool,
-    ) {
-        let providers = {
-            let mappings = self.provider_mappings.read().await;
-            match mappings.model_to_providers.get(model_id) {
-                Some(p) => p.clone(),
-                None => return,
-            }
-        };
-
-        let caps: Vec<(Arc<InferenceProviderTrait>, Option<u32>)> = {
-            let states = self
-                .provider_load_state
-                .read()
-                .unwrap_or_else(|e| e.into_inner());
-            providers
-                .into_iter()
-                .map(|p| {
-                    let ptr = Arc::as_ptr(&p) as *const () as usize;
-                    let cap = states.get(&ptr).and_then(|s| s.max_context_tokens);
-                    (p, cap)
-                })
-                .collect()
-        };
+    ) -> Option<u64> {
+        let caps = self.declared_capacities(model_id).await?;
 
         let distinct: std::collections::BTreeSet<u32> =
             caps.iter().filter_map(|(_, c)| *c).collect();
         if distinct.len() < 2 {
             // Single-capacity (or undeclared) model: no tier decision to make;
             // leave the hint untouched so existing routing is unchanged.
-            return;
+            return None;
         }
 
         let estimate = context_routing::estimate_input(params);
         let pre_factor = estimate.countable_tokens + estimate.uncounted_tokens;
-        let output_reserve = params
-            .max_completion_tokens
-            .or(params.max_tokens)
-            .unwrap_or(0)
-            .max(0) as u64;
+        let output_reserve = context_routing::output_reserve(params);
 
         // Exact count only when the heuristic is close enough to a capacity
         // boundary that its error could flip the tier decision. The band is
@@ -4111,19 +4089,14 @@ impl InferenceProviderPool {
 
         // The exact count replaces only the COUNTABLE text; media and
         // template overhead are invisible to the tokenizer and re-added.
-        let required = match exact_count {
-            Some(n) => (n as f64 * context_routing::exact_factor()).ceil() as u64,
-            None => {
-                (estimate.countable_tokens as f64 * context_routing::safety_factor()).ceil() as u64
-            }
-        } + estimate.uncounted_tokens
-            + output_reserve;
+        let (_, required) = context_routing::requirement(&estimate, exact_count, output_reserve);
         let required = required.min(u32::MAX as u64) as u32;
         hints.estimated_tokens = Some(required);
 
         // Numbers only — never content (see CLAUDE.md logging rules).
-        let smallest_cap = distinct.iter().next().copied().unwrap_or(u32::MAX);
-        if required > smallest_cap {
+        let is_heavy = context_routing::base_capacity(caps.iter().map(|(_, cap)| *cap))
+            .is_some_and(|base| required > base);
+        if is_heavy {
             tracing::info!(
                 model_id = %model_id,
                 input_estimate = pre_factor,
@@ -4142,6 +4115,63 @@ impl InferenceProviderPool {
                 "Refined context requirement for tier routing"
             );
         }
+        exact_count
+    }
+
+    /// Each of `model_id`'s providers with its declared context capacity
+    /// (`None` when undeclared), or `None` for an unknown model.
+    async fn declared_capacities(
+        &self,
+        model_id: &str,
+    ) -> Option<Vec<(Arc<InferenceProviderTrait>, Option<u32>)>> {
+        let providers = self
+            .provider_mappings
+            .read()
+            .await
+            .model_to_providers
+            .get(model_id)?
+            .clone();
+        let states = self
+            .provider_load_state
+            .read()
+            .unwrap_or_else(|e| e.into_inner());
+        Some(
+            providers
+                .into_iter()
+                .map(|p| {
+                    let ptr = Arc::as_ptr(&p) as *const () as usize;
+                    let cap = states.get(&ptr).and_then(|s| s.max_context_tokens);
+                    (p, cap)
+                })
+                .collect(),
+        )
+    }
+
+    /// Refine `hints` for the tier sort and, for a model smart placement
+    /// covers, set `params.placement`'s size and class from the same formula
+    /// (reusing refine's exact count). Uncovered models keep the default
+    /// context and pay nothing for placement. Both chat paths call this.
+    async fn apply_context_routing(
+        &self,
+        model_id: &str,
+        params: &mut ChatCompletionParams,
+        hints: &mut ChatRoutingHints,
+        skip_exact_count: bool,
+    ) {
+        let exact_count = self
+            .refine_context_requirement(model_id, params, hints, skip_exact_count)
+            .await;
+        if !placement::consts::COVERED_MODELS.contains(&model_id) {
+            return;
+        }
+        let caps: Vec<Option<u32>> = self
+            .declared_capacities(model_id)
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .map(|(_, cap)| cap)
+            .collect();
+        params.placement = context_routing::placement_context(&caps, params, exact_count);
     }
 
     pub async fn chat_completion_stream(
@@ -4178,10 +4208,11 @@ impl InferenceProviderPool {
             .contains_key(encryption_headers::CLIENT_PUB_KEY);
 
         // Turn the rough input estimate into a context requirement (exact
-        // tokenize near tier boundaries). No-op for single-capacity models.
-        self.refine_context_requirement(
+        // tokenize near tier boundaries; no-op for single-capacity models),
+        // and give placement its typed context for covered models.
+        self.apply_context_routing(
             &model_id,
-            &params,
+            &mut params,
             &mut hints,
             model_pub_key.is_some() || needs_client_e2ee,
         )
@@ -4381,10 +4412,11 @@ impl InferenceProviderPool {
             .contains_key(encryption_headers::CLIENT_PUB_KEY);
 
         // Turn the rough input estimate into a context requirement (exact
-        // tokenize near tier boundaries). No-op for single-capacity models.
-        self.refine_context_requirement(
+        // tokenize near tier boundaries; no-op for single-capacity models),
+        // and give placement its typed context for covered models.
+        self.apply_context_routing(
             &model_id,
-            &params,
+            &mut params,
             &mut hints,
             model_pub_key.is_some() || needs_client_e2ee,
         )
@@ -7818,6 +7850,7 @@ mod tests {
             .await;
 
         let params = inference_providers::ChatCompletionParams {
+            placement: Default::default(),
             request_priority: 0,
             model: model_id,
             messages: vec![inference_providers::ChatMessage {
@@ -7894,6 +7927,7 @@ mod tests {
         pool.register_provider(model_id.clone(), mock_provider.clone())
             .await;
         let params = inference_providers::ChatCompletionParams {
+            placement: Default::default(),
             request_priority: 0,
             model: model_id,
             messages: vec![inference_providers::ChatMessage {
@@ -10014,6 +10048,7 @@ mod tests {
 
     fn fallback_params(model: &str) -> inference_providers::ChatCompletionParams {
         inference_providers::ChatCompletionParams {
+            placement: Default::default(),
             request_priority: 0,
             model: model.to_string(),
             messages: vec![inference_providers::ChatMessage {
@@ -11112,6 +11147,207 @@ mod tests {
             hints.estimated_tokens,
             Some((100_000f64 * context_routing::safety_factor()).ceil() as u32 + 4 + 8_000),
             "multi-capacity model: requirement = ceil(countable × factor) + overhead + max_tokens"
+        );
+    }
+
+    /// A pool serving `model` from NEAR mock providers with the given
+    /// declared capacities, in that registration order.
+    async fn capacity_pool(
+        model: &str,
+        caps: &[u32],
+    ) -> (
+        InferenceProviderPool,
+        Vec<Arc<inference_providers::mock::MockProvider>>,
+    ) {
+        use inference_providers::mock::MockProvider;
+        use inference_providers::ProviderTier;
+
+        let pool = InferenceProviderPool::new(None, ExternalProvidersConfig::default());
+        let providers: Vec<Arc<MockProvider>> = caps
+            .iter()
+            .map(|_| Arc::new(MockProvider::new_accept_all().with_tier(ProviderTier::Near)))
+            .collect();
+        {
+            let mut m = pool.provider_mappings.write().await;
+            m.model_to_providers.insert(
+                model.to_string(),
+                providers
+                    .iter()
+                    .map(|p| p.clone() as Arc<InferenceProviderTrait>)
+                    .collect(),
+            );
+        }
+        {
+            let mut states = pool
+                .provider_load_state
+                .write()
+                .unwrap_or_else(|e| e.into_inner());
+            for (provider, cap) in providers.iter().zip(caps) {
+                states
+                    .entry(Arc::as_ptr(provider) as *const () as usize)
+                    .or_default()
+                    .max_context_tokens = Some(*cap);
+            }
+        }
+        (pool, providers)
+    }
+
+    /// `fallback_params` with `bytes` of text (countable = bytes / 4).
+    fn sized_params(model: &str, bytes: usize) -> inference_providers::ChatCompletionParams {
+        let mut params = fallback_params(model);
+        params.messages[0].content = Some(serde_json::Value::String("a".repeat(bytes)));
+        params
+    }
+
+    /// The expected `(prompt_tokens, context_tokens)` of `sized_params` on
+    /// the heuristic path (one message: 4 tokens of template overhead).
+    fn heuristic_requirement(bytes: usize, reserve: u64) -> (u64, u64) {
+        let prompt = ((bytes / 4) as f64 * context_routing::safety_factor()).ceil() as u64 + 4;
+        (prompt, prompt + reserve)
+    }
+
+    async fn served_placement(
+        provider: &inference_providers::mock::MockProvider,
+    ) -> inference_providers::PlacementContext {
+        provider
+            .last_chat_params()
+            .await
+            .expect("provider was called")
+            .placement
+    }
+
+    #[tokio::test]
+    async fn pool_sets_placement_context_for_two_tier_model() {
+        let model = placement::consts::COVERED_MODELS[0];
+        let (pool, providers) = capacity_pool(model, &[100_000, 1_048_576]).await;
+        let (base, long) = (&providers[0], &providers[1]);
+
+        // Short: fits the base tier, so it is not heavy.
+        let mut short = sized_params(model, 4_000);
+        short.max_tokens = Some(2_000);
+        let _stream = pool
+            .chat_completion_stream(short, "h1".to_string(), ChatRoutingHints::default())
+            .await
+            .expect("served");
+        let ctx = served_placement(base).await;
+        let (prompt, context) = heuristic_requirement(4_000, 2_000);
+        assert_eq!(ctx.prompt_tokens, Some(prompt));
+        assert_eq!(ctx.context_tokens, Some(context));
+        assert!(!ctx.heavy);
+
+        // Heavy iff context_tokens > base_capacity: 400k bytes → ~120k
+        // tokens of input, over the 100k base window.
+        let mut heavy = sized_params(model, 400_000);
+        heavy.max_tokens = Some(8_000);
+        let _stream = pool
+            .chat_completion_stream(heavy, "h2".to_string(), ChatRoutingHints::default())
+            .await
+            .expect("served");
+        let ctx = served_placement(long).await;
+        let (prompt, context) = heuristic_requirement(400_000, 8_000);
+        assert_eq!(ctx.prompt_tokens, Some(prompt));
+        assert_eq!(ctx.context_tokens, Some(context));
+        assert!(context > 100_000);
+        assert!(ctx.heavy);
+    }
+
+    #[tokio::test]
+    async fn single_tier_model_is_never_heavy() {
+        let model = placement::consts::COVERED_MODELS[0];
+        let (pool, providers) = capacity_pool(model, &[100_000]).await;
+
+        // Oversized for the only tier: still sized, never heavy.
+        let _stream = pool
+            .chat_completion_stream(
+                sized_params(model, 600_000),
+                "h".to_string(),
+                ChatRoutingHints::default(),
+            )
+            .await
+            .expect("served");
+        let ctx = served_placement(&providers[0]).await;
+        assert_eq!(
+            ctx.context_tokens,
+            Some(heuristic_requirement(600_000, 0).1)
+        );
+        assert!(!ctx.heavy);
+    }
+
+    #[tokio::test]
+    async fn uncovered_model_gets_default_context() {
+        let model = "z-ai/glm-5.2";
+        assert!(!placement::consts::COVERED_MODELS.contains(&model));
+        let (pool, providers) = capacity_pool(model, &[262_144, 1_048_576]).await;
+
+        let _stream = pool
+            .chat_completion_stream(
+                sized_params(model, 1_200_000),
+                "h".to_string(),
+                ChatRoutingHints::default(),
+            )
+            .await
+            .expect("served");
+        let ctx = served_placement(&providers[1]).await;
+        assert_eq!(ctx.prompt_tokens, None);
+        assert_eq!(ctx.context_tokens, None);
+        assert!(!ctx.heavy);
+    }
+
+    #[tokio::test]
+    async fn non_streaming_path_sets_placement_context() {
+        let model = placement::consts::COVERED_MODELS[0];
+        let (pool, providers) = capacity_pool(model, &[100_000, 1_048_576]).await;
+
+        let mut params = sized_params(model, 400_000);
+        // The service's affinity survives the pool's context.
+        params.placement.affinity = Some(placement::affinity::AffinityKey::from_bytes([1; 16]));
+        params.placement.affinity_source = placement::decision::AffinitySource::Client;
+        pool.chat_completion(params, "h".to_string())
+            .await
+            .expect("served");
+        let ctx = served_placement(&providers[1]).await;
+        assert_eq!(
+            ctx.context_tokens,
+            Some(heuristic_requirement(400_000, 0).1)
+        );
+        assert!(ctx.heavy);
+        assert!(ctx.affinity.is_some());
+        assert_eq!(
+            ctx.affinity_source,
+            placement::decision::AffinitySource::Client
+        );
+    }
+
+    /// Refine and placement share one formula: the tier sort's requirement
+    /// is the placement context's `context_tokens`.
+    #[tokio::test]
+    async fn refine_and_placement_share_one_requirement() {
+        let model = placement::consts::COVERED_MODELS[0];
+        let (pool, _providers) = capacity_pool(model, &[100_000, 1_048_576]).await;
+        let mut params = sized_params(model, 400_000);
+        params.max_completion_tokens = Some(3_000);
+        let mut hints = ChatRoutingHints::default();
+        pool.apply_context_routing(model, &mut params, &mut hints, false)
+            .await;
+        assert_eq!(
+            hints.estimated_tokens.map(u64::from),
+            params.placement.context_tokens
+        );
+    }
+
+    #[test]
+    fn base_capacity_is_the_smallest_of_two_or_more_declared() {
+        use context_routing::base_capacity;
+        assert_eq!(base_capacity([]), None);
+        assert_eq!(base_capacity([Some(100_000)]), None);
+        assert_eq!(base_capacity([Some(100_000), Some(100_000), None]), None);
+        assert_eq!(
+            base_capacity([None, Some(1_048_576), Some(100_000)]),
+            Some(100_000)
+        );
+        assert_eq!(
+            base_capacity([Some(262_144), Some(100_000), Some(1_048_576)]),
+            Some(100_000)
         );
     }
 

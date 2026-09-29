@@ -135,20 +135,14 @@ pub(crate) mod encryption_headers {
     pub const ENCRYPT_ALL_FIELDS: &str = "x_encrypt_all_fields";
 }
 
-/// `params.extra` keys the completion service uses to carry the derived
-/// placement affinity key (see `services::completions::affinity::derive`)
-/// down to a later placement-routing consumer. Routing-only, like
-/// `encryption_headers::MODEL_PUB_KEY`: never forwarded to an upstream
-/// provider and never logged. `pub` (not `pub(crate)`) so both other
-/// providers in this crate (Chutes, external) and `services::completions::
-/// affinity` can reference these constants directly instead of each
-/// re-declaring the same string literals, which would let the two sides
-/// silently drift apart.
+/// Legacy placement keys in `params.extra`. Placement inputs now travel on
+/// the typed, never-serialized `ChatCompletionParams::placement`, so nothing
+/// writes or reads these; they stay on a deny-list so a client-supplied value
+/// is still stripped before any upstream (this provider, Chutes, external).
 pub mod placement_headers {
-    /// Lowercase hex of the derived affinity key.
-    pub const AFFINITY: &str = "x_placement_affinity";
-    /// The affinity key's source (`"client"` or `"prefix"`).
-    pub const AFFINITY_SOURCE: &str = "x_placement_affinity_source";
+    /// The old affinity-key and affinity-source extra keys.
+    pub const LEGACY_DENIED_EXTRA_KEYS: [&str; 2] =
+        ["x_placement_affinity", "x_placement_affinity_source"];
 }
 
 /// Configuration for vLLM provider.
@@ -876,12 +870,11 @@ impl Fleet {
             .remove(encryption_headers::MODEL_PUB_KEY)
             .and_then(|value| value.as_str().map(str::to_string));
 
-        // Placement affinity keys are routing-only (consumed by the pool /
-        // Placer before a provider ever sees them): drop them here too so
-        // they never leak into the serialized request body sent upstream,
-        // and are never forwarded as HTTP headers either.
-        extra.remove(placement_headers::AFFINITY);
-        extra.remove(placement_headers::AFFINITY_SOURCE);
+        // Legacy placement keys are denied: a client-supplied value never
+        // reaches the serialized request body or an HTTP header.
+        for key in placement_headers::LEGACY_DENIED_EXTRA_KEYS {
+            extra.remove(key);
+        }
 
         // Extract and forward x_encryption_version as HTTP header, then remove from extra
         if let Some(version) = extra
@@ -1953,11 +1946,7 @@ impl InferenceProvider for Fleet {
             .extra
             .remove(upstream_headers::REPLICA_HINT);
         // Read placement inputs before the helpers below strip them.
-        let placement_request = PlacementRequest::from_extra(
-            &streaming_params.model,
-            streaming_params.request_priority,
-            &streaming_params.extra,
-        );
+        let placement_request = PlacementRequest::from_params(&streaming_params);
         // Prepare tracing headers (request_id, org_id, workspace_id)
         self.prepare_tracing_headers(&mut headers, &mut streaming_params.extra);
         // Prepare encryption headers
@@ -2129,11 +2118,7 @@ impl InferenceProvider for Fleet {
             .extra
             .remove(upstream_headers::REPLICA_HINT);
         // Read placement inputs before the helpers below strip them.
-        let placement_request = PlacementRequest::from_extra(
-            &non_streaming_params.model,
-            non_streaming_params.request_priority,
-            &non_streaming_params.extra,
-        );
+        let placement_request = PlacementRequest::from_params(&non_streaming_params);
         // Prepare tracing headers (request_id, org_id, workspace_id)
         self.prepare_tracing_headers(&mut headers, &mut non_streaming_params.extra);
         // Prepare encryption headers
@@ -3566,23 +3551,21 @@ mod tests {
         );
     }
 
-    /// Regression test: placement affinity keys (`x_placement_affinity`,
-    /// `x_placement_affinity_source`) are routing-only, like
-    /// `x_model_pub_key`, and must never reach the serialized upstream
-    /// request body.
+    /// Regression test: the legacy placement affinity keys
+    /// (`x_placement_affinity`, `x_placement_affinity_source`) are denied,
+    /// like `x_model_pub_key`: a client-supplied value never reaches the
+    /// serialized upstream request body.
     #[test]
     fn test_placement_affinity_keys_never_reach_upstream_body() {
         let provider = create_test_provider();
 
         let mut extra = std::collections::HashMap::new();
-        extra.insert(
-            placement_headers::AFFINITY.to_string(),
-            serde_json::Value::String("00112233445566778899aabbccddeeff".to_string()),
-        );
-        extra.insert(
-            placement_headers::AFFINITY_SOURCE.to_string(),
-            serde_json::Value::String("client".to_string()),
-        );
+        for key in placement_headers::LEGACY_DENIED_EXTRA_KEYS {
+            extra.insert(
+                key.to_string(),
+                serde_json::Value::String("00112233445566778899aabbccddeeff".to_string()),
+            );
+        }
         extra.insert(
             "some_valid_param".to_string(),
             serde_json::Value::String("value".to_string()),
@@ -3593,8 +3576,9 @@ mod tests {
             .fleet
             .prepare_encryption_headers(&mut headers, &mut extra);
 
-        assert!(!extra.contains_key(placement_headers::AFFINITY));
-        assert!(!extra.contains_key(placement_headers::AFFINITY_SOURCE));
+        for key in placement_headers::LEGACY_DENIED_EXTRA_KEYS {
+            assert!(!extra.contains_key(key), "{key} must be stripped");
+        }
 
         // Non-affinity extra fields must be preserved.
         assert_eq!(
@@ -3639,14 +3623,20 @@ mod tests {
             "messages": [{"role": "user", "content": "hi"}],
         }))
         .unwrap();
-        params.extra.insert(
-            placement_headers::AFFINITY.to_string(),
-            serde_json::Value::String("00112233445566778899aabbccddeeff".to_string()),
-        );
-        params.extra.insert(
-            placement_headers::AFFINITY_SOURCE.to_string(),
-            serde_json::Value::String("client".to_string()),
-        );
+        for key in placement_headers::LEGACY_DENIED_EXTRA_KEYS {
+            params.extra.insert(
+                key.to_string(),
+                serde_json::Value::String("00112233445566778899aabbccddeeff".to_string()),
+            );
+        }
+        // The typed channel carries a real key; it is never serialized.
+        params.placement = crate::PlacementContext {
+            prompt_tokens: Some(7),
+            context_tokens: Some(9),
+            heavy: true,
+            affinity: Some(placement::affinity::AffinityKey::from_bytes([0x5a; 16])),
+            affinity_source: placement::decision::AffinitySource::Client,
+        };
 
         let result = provider
             .chat_completion(params, "test-hash".to_string())
@@ -3663,6 +3653,11 @@ mod tests {
         assert!(
             !body.contains("x_placement_affinity"),
             "placement affinity keys must never reach the upstream request body: {body}"
+        );
+        let json: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
+        assert!(
+            json.get("placement").is_none() && !body.contains(&"5a".repeat(16)),
+            "the typed placement context must never be serialized upstream"
         );
     }
 
@@ -4178,6 +4173,7 @@ mod tests {
         );
 
         let params = ChatCompletionParams {
+            placement: Default::default(),
             request_priority: 0,
             model: "test-model".to_string(),
             messages: vec![ChatMessage {
@@ -6128,6 +6124,9 @@ mod tests {
                 model: model.to_string(),
                 request_id: "req-1".to_string(),
                 org_id: "org-1".to_string(),
+                prompt_tokens: 0,
+                context_tokens: None,
+                heavy: false,
                 affinity: None,
                 affinity_source: AffinitySource::None,
                 priority: 0,
@@ -6398,9 +6397,11 @@ mod tests {
                 &[("h-a", 2)],
                 snapshot("h-a", fresh_ms(), PinTable::default()),
             );
-            // 40 text bytes -> 10 estimated prompt tokens.
+            // The routed tokens are the pool's prompt estimate, never a
+            // placement-side re-estimate of the messages.
             let messages = vec![user_msg(&"x".repeat(40))];
-            let req = request(COVERED_MODELS[0]);
+            let mut req = request(COVERED_MODELS[0]);
+            req.prompt_tokens = 10;
             let before_s = now_ms() / 1000;
             let lease = h
                 .provider
@@ -6961,29 +6962,71 @@ mod tests {
         }
 
         #[test]
-        fn placement_request_reads_affinity_from_extra() {
+        fn placement_request_reads_the_typed_context() {
             let key = AffinityKey::from_bytes([3u8; 16]);
-            let extra: HashMap<String, serde_json::Value> = HashMap::from([
-                ("x_placement_affinity".to_string(), key.to_hex().into()),
-                ("x_placement_affinity_source".to_string(), "prefix".into()),
+            let mut params = placement_params(vec![user_msg("hi")]);
+            params.model = "m".to_string();
+            params.request_priority = -5;
+            params.extra = HashMap::from([
                 ("x_request_id".to_string(), "req-9".into()),
                 ("x_org_id".to_string(), "org-9".into()),
             ]);
-            let req = PlacementRequest::from_extra("m", -5, &extra);
+            params.placement = crate::PlacementContext {
+                prompt_tokens: Some(120_000),
+                context_tokens: Some(130_000),
+                heavy: true,
+                affinity: Some(key.clone()),
+                affinity_source: AffinitySource::Prefix,
+            };
+            let req = PlacementRequest::from_params(&params);
             assert_eq!(req.model, "m");
             assert_eq!(req.priority, -5);
             assert_eq!(req.request_id, "req-9");
             assert_eq!(req.org_id, "org-9");
-            assert_eq!(req.affinity.map(|k| k.to_hex()), Some(key.to_hex()));
+            assert_eq!(req.prompt_tokens, 120_000);
+            assert_eq!(req.context_tokens, Some(130_000));
+            assert!(req.heavy);
+            let fingerprint = |k: &AffinityKey| pin_id(Tier::Base, k, &PIN_SECRET).to_hex();
+            assert_eq!(
+                req.affinity.as_ref().map(fingerprint),
+                Some(fingerprint(&key))
+            );
             assert_eq!(req.affinity_source, AffinitySource::Prefix);
 
-            let bad: HashMap<String, serde_json::Value> = HashMap::from([
-                ("x_placement_affinity".to_string(), "not-hex".into()),
-                ("x_placement_affinity_source".to_string(), "client".into()),
-            ]);
-            let req = PlacementRequest::from_extra("m", 0, &bad);
+            // No pool context: an unknown size, short, and no affinity. A
+            // source without a key is dropped.
+            params.placement = crate::PlacementContext {
+                affinity_source: AffinitySource::Client,
+                ..Default::default()
+            };
+            let req = PlacementRequest::from_params(&params);
+            assert_eq!(
+                (req.prompt_tokens, req.context_tokens, req.heavy),
+                (0, None, false)
+            );
             assert!(req.affinity.is_none());
             assert_eq!(req.affinity_source, AffinitySource::None);
+        }
+
+        /// Legacy affinity keys in a client's extra are never read: only the
+        /// typed context carries routing inputs.
+        #[test]
+        fn legacy_affinity_extra_is_ignored_by_placement() {
+            let mut params = placement_params(vec![user_msg("hi")]);
+            params.extra = HashMap::from([
+                ("x_placement_affinity".to_string(), "03".repeat(16).into()),
+                ("x_placement_affinity_source".to_string(), "client".into()),
+            ]);
+            let req = PlacementRequest::from_params(&params);
+            assert!(req.affinity.is_none());
+            assert_eq!(req.affinity_source, AffinitySource::None);
+        }
+
+        fn placement_params(messages: Vec<crate::ChatMessage>) -> crate::ChatCompletionParams {
+            let mut params: crate::ChatCompletionParams =
+                serde_json::from_value(serde_json::json!({"model": "m", "messages": []})).unwrap();
+            params.messages = messages;
+            params
         }
 
         #[test]

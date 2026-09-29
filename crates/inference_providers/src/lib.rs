@@ -98,9 +98,10 @@ pub use models::{
     EmbeddingError, FinishReason, FunctionChoice, FunctionDefinition, ImageData, ImageEditError,
     ImageEditParams, ImageEditResponse, ImageEditResponseWithBytes, ImageGenerationError,
     ImageGenerationParams, ImageGenerationResponse, ImageGenerationResponseWithBytes, MessageRole,
-    ModelInfo, PrivacyClassifyError, RerankError, RerankParams, RerankResponse, RerankResult,
-    RerankUsage, ScoreError, ScoreParams, ScoreResponse, ScoreResult, ScoreUsage, StreamChunk,
-    StreamOptions, TokenUsage, ToolChoice, ToolDefinition, TranscriptionSegment, TranscriptionWord,
+    ModelInfo, PlacementContext, PrivacyClassifyError, RerankError, RerankParams, RerankResponse,
+    RerankResult, RerankUsage, ScoreError, ScoreParams, ScoreResponse, ScoreResult, ScoreUsage,
+    StreamChunk, StreamOptions, TokenUsage, ToolChoice, ToolDefinition, TranscriptionSegment,
+    TranscriptionWord,
 };
 pub use sse_parser::{
     new_external_sse_parser, new_sse_parser, BufferedSSEParser, SSEEvent, SSEEventParser, SSEParser,

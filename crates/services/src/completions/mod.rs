@@ -774,12 +774,10 @@ pub struct CompletionServiceImpl {
     /// Repository for fetching organization concurrent limits
     organization_limit_repository: Arc<dyn ports::OrganizationConcurrentLimitRepository>,
     /// HMAC secret for deriving per-request placement affinity keys (see
-    /// `affinity::derive`). `None` until wired up (HKDF from the Valkey
-    /// password), in which case affinity derivation is skipped — but
-    /// client-supplied `x_placement_affinity`/`x_placement_affinity_source`
-    /// keys are still stripped from `params.extra` unconditionally, so a
-    /// request carrying forged keys is not byte-identical to pre-placement
-    /// behavior. Never logged.
+    /// `affinity::derive`). `None` when placement is off, in which case
+    /// affinity derivation is skipped — but the legacy client-supplied
+    /// `x_placement_affinity`/`x_placement_affinity_source` extra keys are
+    /// still stripped unconditionally (a deny-list). Never logged.
     affinity_secret: Option<[u8; 32]>,
 }
 
@@ -1109,26 +1107,24 @@ impl CompletionServiceImpl {
     }
 
     /// Derive the per-request placement affinity key (if any) and record it
-    /// in `chat_params.extra` for a later placement-routing task to read.
-    /// No-op while `affinity_secret` is `None` (unset until Task 12 wires
-    /// it up), so `extra` — and therefore behavior — is unchanged until
-    /// then. Never logs the key, its hex encoding, or its inputs.
+    /// on the typed, never-serialized `chat_params.placement`. No-op while
+    /// `affinity_secret` is `None` (placement off). Never logs the key or its
+    /// inputs.
     fn apply_placement_affinity(
         chat_params: &mut inference_providers::ChatCompletionParams,
         organization_id: Uuid,
         session_hint: Option<&str>,
         affinity_secret: Option<[u8; 32]>,
     ) {
-        // The request body is flattened into `extra` (see `ChatCompletionParams`),
-        // so a client can set `x_placement_affinity`/`x_placement_affinity_source`
-        // directly and forge routing. Strip any client-supplied value
-        // unconditionally, before checking the secret, the covered-model gate,
-        // or deriving anything, so a forged key can never survive even when
-        // derivation is skipped below — for every model, not just covered ones.
-        chat_params.extra.remove(affinity::AFFINITY_EXTRA_KEY);
-        chat_params
-            .extra
-            .remove(affinity::AFFINITY_SOURCE_EXTRA_KEY);
+        // The request body is flattened into `extra`, so a client can still
+        // send the legacy `x_placement_affinity*` keys. Nothing reads them any
+        // more; strip them unconditionally (every model, secret or not) so
+        // they never reach an upstream.
+        for key in
+            inference_providers::attested::nearai::placement_headers::LEGACY_DENIED_EXTRA_KEYS
+        {
+            chat_params.extra.remove(key);
+        }
 
         let Some(secret) = affinity_secret else {
             return;
@@ -1151,21 +1147,8 @@ impl CompletionServiceImpl {
         ) else {
             return;
         };
-        chat_params.extra.insert(
-            affinity::AFFINITY_EXTRA_KEY.to_string(),
-            serde_json::Value::String(key.to_hex()),
-        );
-        chat_params.extra.insert(
-            affinity::AFFINITY_SOURCE_EXTRA_KEY.to_string(),
-            serde_json::Value::String(
-                match source {
-                    placement::decision::AffinitySource::Client => "client",
-                    placement::decision::AffinitySource::Prefix => "prefix",
-                    placement::decision::AffinitySource::None => "none",
-                }
-                .to_string(),
-            ),
-        );
+        chat_params.placement.affinity = Some(key);
+        chat_params.placement.affinity_source = source;
     }
 
     /// Whether `extra` carries any client-facing E2EE marker: the model
@@ -1780,6 +1763,7 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
         Self::inject_tracing_headers(&mut extra, request_id, organization_id, workspace_id);
 
         let mut chat_params = inference_providers::ChatCompletionParams {
+            placement: Default::default(),
             request_priority: request.request_priority,
             model: request.model.clone(),
             messages: chat_messages,
@@ -1814,6 +1798,9 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
             extra,
         };
         chat_params.strip_client_priority();
+        // Routing-only context is set in process below (affinity) and by the
+        // pool (size, class); never trust a value from anywhere else.
+        chat_params.placement = Default::default();
 
         // Resolve model name (could be an alias) and get model details in a single DB call
         // This also validates that the model exists and is active
@@ -1977,6 +1964,7 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
         Self::inject_tracing_headers(&mut extra, request_id, organization_id, workspace_id);
 
         let mut chat_params = inference_providers::ChatCompletionParams {
+            placement: Default::default(),
             request_priority: request.request_priority,
             model: request.model.clone(),
             messages: chat_messages,
@@ -2011,6 +1999,9 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
             extra,
         };
         chat_params.strip_client_priority();
+        // Routing-only context is set in process below (affinity) and by the
+        // pool (size, class); never trust a value from anywhere else.
+        chat_params.placement = Default::default();
 
         // Resolve model name (could be an alias) and get model details in a single DB call
         // This also validates that the model exists and is active
@@ -3933,6 +3924,7 @@ mod tests {
 
     fn chat_params_for_compat_tests(model: &str) -> inference_providers::ChatCompletionParams {
         inference_providers::ChatCompletionParams {
+            placement: Default::default(),
             request_priority: 0,
             model: model.to_string(),
             messages: vec![inference_providers::ChatMessage {
@@ -4433,40 +4425,45 @@ mod tests {
 
     const APPLY_AFFINITY_SECRET: [u8; 32] = [9u8; 32];
 
-    #[test]
-    fn apply_placement_affinity_forged_client_keys_are_removed_when_secret_is_none() {
-        let mut params = minimal_chat_params();
-        params.extra.insert(
-            affinity::AFFINITY_EXTRA_KEY.to_string(),
-            serde_json::json!("00112233445566778899aabbccddeeff"),
-        );
-        params.extra.insert(
-            affinity::AFFINITY_SOURCE_EXTRA_KEY.to_string(),
-            serde_json::json!("client"),
-        );
+    const LEGACY_KEYS: [&str; 2] =
+        inference_providers::attested::nearai::placement_headers::LEGACY_DENIED_EXTRA_KEYS;
 
-        CompletionServiceImpl::apply_placement_affinity(&mut params, Uuid::new_v4(), None, None);
+    fn insert_legacy_keys(params: &mut inference_providers::ChatCompletionParams) {
+        for key in LEGACY_KEYS {
+            params.extra.insert(
+                key.to_string(),
+                serde_json::json!("ffffffffffffffffffffffffffffffff"),
+            );
+        }
+    }
 
-        assert!(
-            !params.extra.contains_key(affinity::AFFINITY_EXTRA_KEY),
-            "a client-forged affinity key must be stripped even when derivation is skipped"
-        );
-        assert!(!params
-            .extra
-            .contains_key(affinity::AFFINITY_SOURCE_EXTRA_KEY));
+    fn assert_no_legacy_keys(params: &inference_providers::ChatCompletionParams) {
+        for key in LEGACY_KEYS {
+            assert!(!params.extra.contains_key(key), "{key} must be stripped");
+        }
     }
 
     #[test]
-    fn apply_placement_affinity_forged_client_keys_are_replaced_when_secret_is_some() {
+    fn client_legacy_affinity_extra_is_stripped() {
+        for secret in [None, Some(APPLY_AFFINITY_SECRET)] {
+            let mut params = minimal_chat_params();
+            insert_legacy_keys(&mut params);
+
+            CompletionServiceImpl::apply_placement_affinity(
+                &mut params,
+                Uuid::new_v4(),
+                None,
+                secret,
+            );
+
+            assert_no_legacy_keys(&params);
+        }
+    }
+
+    #[test]
+    fn affinity_travels_typed_not_in_extra() {
         let mut params = minimal_chat_params();
-        params.extra.insert(
-            affinity::AFFINITY_EXTRA_KEY.to_string(),
-            serde_json::json!("ffffffffffffffffffffffffffffffff"),
-        );
-        params.extra.insert(
-            affinity::AFFINITY_SOURCE_EXTRA_KEY.to_string(),
-            serde_json::json!("client"),
-        );
+        insert_legacy_keys(&mut params);
 
         CompletionServiceImpl::apply_placement_affinity(
             &mut params,
@@ -4475,19 +4472,23 @@ mod tests {
             Some(APPLY_AFFINITY_SECRET),
         );
 
-        let derived = params
-            .extra
-            .get(affinity::AFFINITY_EXTRA_KEY)
-            .and_then(|v| v.as_str())
-            .expect("a real value must be derived from the message prefix");
-        assert_ne!(
-            derived, "ffffffffffffffffffffffffffffffff",
-            "the forged value must not survive — it must be overwritten by a derived one"
+        assert!(
+            params.placement.affinity.is_some(),
+            "a key must be derived from the message prefix"
         );
+        assert_eq!(
+            params.placement.affinity_source,
+            placement::decision::AffinitySource::Prefix
+        );
+        assert_no_legacy_keys(&params);
+        let body = serde_json::to_value(&params).unwrap();
+        let body_text = body.to_string();
+        assert!(body.get("placement").is_none());
+        assert!(!body_text.contains("x_placement_affinity"));
     }
 
     #[test]
-    fn apply_placement_affinity_none_secret_leaves_extra_otherwise_unchanged() {
+    fn apply_placement_affinity_none_secret_leaves_params_otherwise_unchanged() {
         let mut params = minimal_chat_params();
         params
             .extra
@@ -4499,27 +4500,10 @@ mod tests {
             params.extra.get("some_other_field"),
             Some(&serde_json::json!("kept"))
         );
-        assert!(!params.extra.contains_key(affinity::AFFINITY_EXTRA_KEY));
-        assert!(!params
-            .extra
-            .contains_key(affinity::AFFINITY_SOURCE_EXTRA_KEY));
-    }
-
-    #[test]
-    fn apply_placement_affinity_some_secret_inserts_both_keys() {
-        let mut params = minimal_chat_params();
-
-        CompletionServiceImpl::apply_placement_affinity(
-            &mut params,
-            Uuid::new_v4(),
-            None,
-            Some(APPLY_AFFINITY_SECRET),
-        );
-
-        assert!(params.extra.contains_key(affinity::AFFINITY_EXTRA_KEY));
+        assert!(params.placement.affinity.is_none());
         assert_eq!(
-            params.extra.get(affinity::AFFINITY_SOURCE_EXTRA_KEY),
-            Some(&serde_json::json!("prefix"))
+            params.placement.affinity_source,
+            placement::decision::AffinitySource::None
         );
     }
 
@@ -4537,14 +4521,7 @@ mod tests {
                 ],
             }))
             .unwrap();
-        params.extra.insert(
-            affinity::AFFINITY_EXTRA_KEY.to_string(),
-            serde_json::json!("ffffffffffffffffffffffffffffffff"),
-        );
-        params.extra.insert(
-            affinity::AFFINITY_SOURCE_EXTRA_KEY.to_string(),
-            serde_json::json!("client"),
-        );
+        insert_legacy_keys(&mut params);
 
         CompletionServiceImpl::apply_placement_affinity(
             &mut params,
@@ -4554,12 +4531,10 @@ mod tests {
         );
 
         assert!(
-            !params.extra.contains_key(affinity::AFFINITY_EXTRA_KEY),
-            "an uncovered model must get no derived key, and the forged one must be gone"
+            params.placement.affinity.is_none(),
+            "an uncovered model must get no derived key"
         );
-        assert!(!params
-            .extra
-            .contains_key(affinity::AFFINITY_SOURCE_EXTRA_KEY));
+        assert_no_legacy_keys(&params);
     }
 
     #[test]
@@ -4578,7 +4553,7 @@ mod tests {
         );
 
         assert!(
-            !params.extra.contains_key(affinity::AFFINITY_EXTRA_KEY),
+            params.placement.affinity.is_none(),
             "no session/cache hint and E2EE active must yield no affinity at all"
         );
     }
@@ -4602,7 +4577,7 @@ mod tests {
         );
 
         assert!(
-            !params.extra.contains_key(affinity::AFFINITY_EXTRA_KEY),
+            params.placement.affinity.is_none(),
             "client_pub_key alone must be treated as E2EE, suppressing the prefix source"
         );
     }

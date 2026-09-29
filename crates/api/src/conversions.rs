@@ -100,6 +100,7 @@ impl From<ChatCompletionRequest> for ChatCompletionParams {
         }
 
         Self {
+            placement: Default::default(),
             // This conversion has no authenticated org context. Production
             // completion routes supply organization priority through the service.
             request_priority: 0,

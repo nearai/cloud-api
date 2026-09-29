@@ -830,6 +830,7 @@ mod tests {
             );
         }
         ChatCompletionParams {
+            placement: Default::default(),
             request_priority: 0,
             model: "gpt-5.5".to_string(),
             messages: vec![],

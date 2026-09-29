@@ -48,10 +48,16 @@
 //! not genuinely oversized — so it deserves the same self-heal as any other
 //! priority, never a hard client error for a request the other tier would
 //! have served.
+//!
+//! This module is the only owner of the prompt-size estimate and the tier
+//! boundary ([`base_capacity`]). Placement reads
+//! `ChatCompletionParams.placement` (built by [`placement_context`]); it never
+//! re-estimates. The service's `estimate_input_tokens` seeds
+//! `hints.estimated_tokens` for single-capacity sorting only.
 
 use std::sync::OnceLock;
 
-use inference_providers::ChatCompletionParams;
+use inference_providers::{ChatCompletionParams, PlacementContext};
 
 /// providerConfig key holding the long-context tier declaration. Snake_case
 /// like the other `provider_config` contents (`base_url`, `model_name`).
@@ -159,6 +165,69 @@ pub(crate) fn estimate_input(params: &ChatCompletionParams) -> InputEstimate {
     InputEstimate {
         countable_tokens: (bytes / 4) as u64,
         uncounted_tokens: media_parts * media_part_tokens() + params.messages.len() as u64 * 4,
+    }
+}
+
+/// The base tier's capacity: the smallest DECLARED context capacity among a
+/// model's providers, or `None` when fewer than two distinct capacities are
+/// declared (a single-tier model has no tier boundary). The one tier
+/// boundary: a request is heavy when its context requirement exceeds it, and
+/// a provider is the long tier when its declared capacity exceeds it.
+pub(crate) fn base_capacity(caps: impl IntoIterator<Item = Option<u32>>) -> Option<u32> {
+    let distinct: std::collections::BTreeSet<u32> = caps.into_iter().flatten().collect();
+    if distinct.len() < 2 {
+        return None;
+    }
+    distinct.first().copied()
+}
+
+/// The output reserve counted into the context requirement: the request's
+/// `max_completion_tokens` (or `max_tokens`), 0 when unset.
+pub(crate) fn output_reserve(params: &ChatCompletionParams) -> u64 {
+    params
+        .max_completion_tokens
+        .or(params.max_tokens)
+        .unwrap_or(0)
+        .max(0) as u64
+}
+
+/// The one size formula, shared by the pool's tier sort and placement:
+/// `prompt_tokens = ceil(countable × factor) + uncounted` (the exact factor
+/// with an exact `/v1/tokenize` count of the countable text, the wider
+/// safety factor on the byte heuristic), and `context_tokens = prompt_tokens
+/// + output_reserve`. Returns `(prompt_tokens, context_tokens)`.
+pub(crate) fn requirement(
+    estimate: &InputEstimate,
+    exact_count: Option<u64>,
+    output_reserve: u64,
+) -> (u64, u64) {
+    let prompt_tokens = match exact_count {
+        Some(n) => (n as f64 * exact_factor()).ceil() as u64,
+        None => (estimate.countable_tokens as f64 * safety_factor()).ceil() as u64,
+    }
+    .saturating_add(estimate.uncounted_tokens);
+    (prompt_tokens, prompt_tokens.saturating_add(output_reserve))
+}
+
+/// The typed placement context for a covered model's request: its size
+/// ([`requirement`], reusing the exact count the tier refinement took, if
+/// any) and its class (`heavy` iff the context requirement exceeds
+/// [`base_capacity`]; never for a single-tier model). `caps` are the model's
+/// providers' declared capacities. Keeps the affinity already on `params`.
+pub(crate) fn placement_context(
+    caps: &[Option<u32>],
+    params: &ChatCompletionParams,
+    exact_count: Option<u64>,
+) -> PlacementContext {
+    let (prompt_tokens, context_tokens) =
+        requirement(&estimate_input(params), exact_count, output_reserve(params));
+    let heavy =
+        base_capacity(caps.iter().copied()).is_some_and(|base| context_tokens > u64::from(base));
+    PlacementContext {
+        prompt_tokens: Some(prompt_tokens),
+        context_tokens: Some(context_tokens),
+        heavy,
+        ..params.placement.clone()
     }
 }
 

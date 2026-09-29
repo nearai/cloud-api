@@ -70,10 +70,11 @@ fn strip_internal_keys(extra: &mut std::collections::HashMap<String, serde_json:
     // pinned request should never select an external provider, but strip it here
     // so that guarantee is not load-bearing for request correctness.
     extra.remove(encryption_headers::MODEL_PUB_KEY);
-    // Placement affinity keys are routing-only (see placement_headers); an
+    // Legacy placement keys are denied (see placement_headers); an
     // external, third-party provider must never see them.
-    extra.remove(placement_headers::AFFINITY);
-    extra.remove(placement_headers::AFFINITY_SOURCE);
+    for key in placement_headers::LEGACY_DENIED_EXTRA_KEYS {
+        extra.remove(key);
+    }
 }
 
 fn merge_json_defaults(target: &mut serde_json::Value, defaults: &serde_json::Value) {
@@ -695,8 +696,8 @@ mod tests {
             th::ORG_ID,
             th::WORKSPACE_ID,
             eh::MODEL_PUB_KEY,
-            ph::AFFINITY,
-            ph::AFFINITY_SOURCE,
+            ph::LEGACY_DENIED_EXTRA_KEYS[0],
+            ph::LEGACY_DENIED_EXTRA_KEYS[1],
             eh::SIGNING_ALGO,
             eh::CLIENT_PUB_KEY,
             eh::ENCRYPTION_VERSION,
@@ -716,8 +717,8 @@ mod tests {
             th::ORG_ID,
             th::WORKSPACE_ID,
             eh::MODEL_PUB_KEY,
-            ph::AFFINITY,
-            ph::AFFINITY_SOURCE,
+            ph::LEGACY_DENIED_EXTRA_KEYS[0],
+            ph::LEGACY_DENIED_EXTRA_KEYS[1],
         ] {
             assert!(
                 !extra.contains_key(key),

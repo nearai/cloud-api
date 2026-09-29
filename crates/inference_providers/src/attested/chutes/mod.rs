@@ -611,8 +611,8 @@ const INTERNAL_KEYS: &[&str] = {
         eh::MODEL_PUB_KEY,
         eh::ENCRYPTION_VERSION,
         eh::ENCRYPT_ALL_FIELDS,
-        ph::AFFINITY,
-        ph::AFFINITY_SOURCE,
+        ph::LEGACY_DENIED_EXTRA_KEYS[0],
+        ph::LEGACY_DENIED_EXTRA_KEYS[1],
     ]
 };
 

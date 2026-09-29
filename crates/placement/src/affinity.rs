@@ -223,10 +223,10 @@ fn within_bound(score: f64, best: f64) -> bool {
 /// host's frame) is ignored and the keyed HRW walk decides.
 ///
 /// `pin_ignores_bound` makes a pin to any slot in `scores` win whatever its
-/// score. The placer sets it for heavy requests, whose admission is already
-/// capped by the lane's backlog caps: a warm long conversation returns to its
-/// replica whenever that replica is admitted (caps take precedence over
-/// affinity, the score bound does not).
+/// score. The placer sets it for a prompt-heavy request whose pin passed its
+/// load test instead (`decision::heavy_pin_holds`: stay unless waiting on
+/// the pin costs more than a cold prefill elsewhere); a pin that fails that
+/// test is left out of `scores` altogether.
 pub fn select(
     key: Option<&AffinityKey>,
     pin: Option<&SlotId>,
@@ -252,8 +252,8 @@ pub fn select(
     });
     let home = rank.as_ref().map(|r| r[0].clone());
 
-    // Rule 1: an in-bound (or, for heavy requests, any eligible) pin wins
-    // outright.
+    // Rule 1: an in-bound pin (or one the caller vouched for with
+    // `pin_ignores_bound`) wins outright.
     if let Some(pin_slot) = pin {
         if let Some(score) = score_of(pin_slot) {
             if pin_ignores_bound || within_bound(score, best) {

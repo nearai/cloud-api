@@ -280,6 +280,25 @@ struct Candidate<'a> {
     idle: bool,
 }
 
+/// Heavy-pin continuity for a prompt-heavy request pinned to `pin`: `None`
+/// when `pin` is not an admitted candidate, else whether it holds.
+///
+/// The pin holds unless `pinned_load > best_other_load + prompt`, with
+/// `load` the lane's (effective backlog plus pending tokens) and
+/// `best_other_load` the lightest other admitted candidate. In words: stay
+/// on the warm replica unless waiting behind its backlog costs more than a
+/// cold prefill of the whole prompt on the lightest alternative. With no
+/// other candidate, it holds.
+fn heavy_pin_holds(candidates: &[Candidate<'_>], pin: &SlotId, prompt: u64) -> Option<bool> {
+    let pinned = candidates.iter().find(|c| c.view.slot == *pin)?;
+    let best_other = candidates
+        .iter()
+        .filter(|c| c.view.slot != *pin)
+        .map(|c| c.load)
+        .min();
+    Some(best_other.is_none_or(|other| pinned.load <= other.saturating_add(prompt)))
+}
+
 /// The pure placement decision-maker for one Fleet. Holds only the
 /// deployment's pin secret and the Fleet's tier — no I/O, no mutable state.
 pub struct Placer {
@@ -455,13 +474,28 @@ impl Placer {
                 .map(|(slot, at_ms)| (slot.clone(), at_ms))
         });
 
+        // Heavy-pin continuity is judged on load, not score (see
+        // `heavy_pin_holds`). A pin that holds wins whatever its score; one
+        // that is released leaves the walk entirely, so the HRW walk cannot
+        // land back on the slot the load test just moved it off.
+        let pin_slot = pin_lookup.as_ref().map(|(s, _)| s);
+        let heavy_pin = pin_slot
+            .filter(|_| input.prefill_heavy)
+            .and_then(|p| heavy_pin_holds(&candidates, p, input.prompt_tokens));
+        let released: Vec<(SlotId, f64)>;
+        let walk: &[(SlotId, f64)] = match (heavy_pin, pin_slot) {
+            (Some(false), Some(p)) => {
+                released = scores.iter().filter(|(s, _)| s != p).cloned().collect();
+                &released
+            }
+            _ => &scores,
+        };
+
         let selected = match select(
             input.affinity.as_ref(),
-            pin_lookup.as_ref().map(|(s, _)| s),
-            // Heavy: a pin that survived both rule stages holds regardless of
-            // score; the lane's backlog caps already bound its load.
-            input.prefill_heavy,
-            &scores,
+            pin_slot,
+            heavy_pin == Some(true),
+            walk,
             rng,
         ) {
             Some(s) => s,
@@ -481,7 +515,7 @@ impl Placer {
             Selection::Pinned | Selection::BestOfTwo => None,
         };
 
-        // A keyed heavy placement always (re)writes its pin: lane membership
+        // A keyed prompt-heavy placement always (re)writes its pin: lane membership
         // follows the prefill backlog, so once it drains, the survivor set
         // and the HRW walk over it can change, and only a pin keeps the next
         // turn on its warm replica. Short requests pin only on a move or a
@@ -1394,6 +1428,9 @@ mod tests {
 
     #[test]
     fn pinned_heavy_conversation_returns_to_pinned_member() {
+        // The pin's 100K backlog is no more than a cold 100K prefill on an
+        // idle replica (the load bound is inclusive), so the pin holds even
+        // though its score is far outside the affinity bound.
         let secret = [8u8; 32];
         let (snap, key, pinned) = pinned_member_with_room(secret, 100_000);
         let mut input = keyed(key);
@@ -1633,6 +1670,108 @@ mod tests {
         assert_eq!(record.excluded[4], (Rule::Lane, 2));
     }
 
+    /// Two long-tier replicas, `long01#0` pinned for the returned key with
+    /// `pinned_backlog`, `long01#1` with `other_backlog`. The key's HRW home is
+    /// the pinned slot, so only the pin rule can move it away.
+    fn long_pinned_pair(
+        secret: [u8; 32],
+        pinned_backlog: u64,
+        other_backlog: u64,
+    ) -> (Snapshot, AffinityKey) {
+        let pinned = slot("long01", 0);
+        let views = vec![
+            with_backlog("long01", 0, pinned_backlog),
+            with_backlog("long01", 1, other_backlog),
+        ];
+        let all: Vec<SlotId> = views.iter().map(|v| v.slot.clone()).collect();
+        let key = find_key_with_home(&all, &pinned);
+        let mut snap = snap_with(views);
+        let pid = pin_id(Tier::Long, &key, &secret);
+        std::sync::Arc::make_mut(&mut snap.pins).insert(*pid.as_bytes(), pinned, NOW - 1_000);
+        (snap, key)
+    }
+
+    fn keyed_heavy(key: AffinityKey, prompt_tokens: u64) -> PlaceInput {
+        let mut input = keyed(key);
+        input.heavy = true;
+        input.prefill_heavy = true;
+        input.prompt_tokens = prompt_tokens;
+        input
+    }
+
+    #[test]
+    fn heavy_pin_moves_when_backlog_exceeds_cold_prefill() {
+        // The review's case: a 142K turn pinned behind a 450K backlog while
+        // the other replica is idle. The lane admits the pin (592K <= 600K),
+        // but waiting on 450K costs more than a cold 142K prefill elsewhere.
+        let secret = [8u8; 32];
+        let (snap, key) = long_pinned_pair(secret, 450_000, 0);
+        let long = Placer::new(secret, Tier::Long);
+        let mut rng = StdRng::seed_from_u64(1);
+        let (chosen, record, pin_write) =
+            placed(long.place(&keyed_heavy(key, 142_000), &snap, &HashMap::new(), &mut rng));
+        assert_eq!(chosen, slot("long01", 1));
+        assert_eq!(record.pinned.as_deref(), Some("long01#0"));
+        assert_eq!(
+            record.excluded[4],
+            (Rule::Lane, 0),
+            "the lane admitted the pin"
+        );
+        assert_ne!(record.selection, Some("pinned"));
+        let (_, rewritten) = pin_write.expect("the moved pin is rewritten");
+        assert_eq!(rewritten, slot("long01", 1));
+
+        // Pending tokens count as load too: a 450K routed-but-unreported
+        // burst on the pin moves it the same way.
+        let (mut snap, key) = long_pinned_pair(secret, 0, 0);
+        snap.replicas[0].state.load.running = Some(1);
+        let mut mine = HashMap::new();
+        mine.insert(
+            slot("long01", 0),
+            Pending {
+                req: 1,
+                tok: 450_000,
+            },
+        );
+        let (chosen, _, _) = placed(long.place(&keyed_heavy(key, 142_000), &snap, &mine, &mut rng));
+        assert_eq!(chosen, slot("long01", 1));
+    }
+
+    #[test]
+    fn heavy_pin_holds_when_backlog_below_cold_prefill() {
+        // A warm pin with a small backlog stays, although its score is far
+        // outside the affinity bound of the idle replica: 100K of waiting is
+        // cheaper than a cold 142K prefill.
+        let secret = [8u8; 32];
+        let long = Placer::new(secret, Tier::Long);
+        let mut rng = StdRng::seed_from_u64(1);
+        let (snap, key) = long_pinned_pair(secret, 100_000, 0);
+        let (chosen, record, _) = placed(long.place(
+            &keyed_heavy(key.clone(), 142_000),
+            &snap,
+            &HashMap::new(),
+            &mut rng,
+        ));
+        assert_eq!(chosen, slot("long01", 0));
+        assert_eq!(record.selection, Some("pinned"));
+        assert!(record.chosen_score.unwrap() > record.best_score.unwrap() + 1.0);
+
+        // The bound is inclusive: pinned load equal to the other's load plus
+        // the prompt still holds; one token more moves.
+        let (snap, key) = long_pinned_pair(secret, 242_000, 100_000);
+        let (chosen, _, _) = placed(long.place(
+            &keyed_heavy(key.clone(), 142_000),
+            &snap,
+            &HashMap::new(),
+            &mut rng,
+        ));
+        assert_eq!(chosen, slot("long01", 0));
+        let (snap, key) = long_pinned_pair(secret, 242_001, 100_000);
+        let (chosen, _, _) =
+            placed(long.place(&keyed_heavy(key, 142_000), &snap, &HashMap::new(), &mut rng));
+        assert_eq!(chosen, slot("long01", 1));
+    }
+
     #[test]
     fn heavy_pin_over_backlog_cap_moves() {
         // The pinned member's load plus the prompt exceeds HEAVY_BACKLOG_CAP,
@@ -1660,7 +1799,8 @@ mod tests {
     fn pinned_heavy_conversation_on_drained_replica_readmits_it() {
         // The pinned slot drained out of the lane; another slot is a member,
         // and the 8-slot lane (cap 2) has room, so the pinned slot is
-        // re-admitted as a new member and the pin holds.
+        // re-admitted as a new member. Its load (0) is under every other
+        // load plus the prompt, so the load-aware pin holds.
         let pinned = slot("gpu03", 0);
         let key = AffinityKey::from_bytes([21u8; 16]);
         let secret = [8u8; 32];

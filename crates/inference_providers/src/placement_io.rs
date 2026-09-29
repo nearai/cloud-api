@@ -1413,6 +1413,7 @@ mod tests {
             prompt_tokens: 100,
             context_tokens: None,
             heavy: false,
+            prefill_heavy: false,
             priority: 0,
             affinity: None,
             affinity_source: AffinitySource::None,

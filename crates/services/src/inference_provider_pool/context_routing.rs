@@ -230,9 +230,11 @@ pub(crate) fn requirement(
 
 /// The typed placement context for a chat request: its size
 /// ([`requirement`], reusing the exact count the tier refinement took, if
-/// any) and its class (`heavy` iff the context requirement exceeds
-/// [`base_capacity`]; never for a single-tier model). `caps` are the model's
-/// providers' declared capacities. Keeps the affinity already on `params`.
+/// any) and its classes: `heavy` iff the context requirement exceeds
+/// [`base_capacity`] (the tier class) and `prefill_heavy` iff the prompt
+/// alone does (the lane class); neither for a single-tier model. `caps` are
+/// the model's providers' declared capacities. Keeps the affinity already on
+/// `params`.
 pub(crate) fn placement_context(
     caps: &[Option<u32>],
     params: &ChatCompletionParams,
@@ -244,6 +246,7 @@ pub(crate) fn placement_context(
         prompt_tokens: Some(prompt_tokens),
         context_tokens: Some(context_tokens),
         heavy: is_heavy(context_tokens, caps.iter().copied()),
+        prefill_heavy: is_heavy(prompt_tokens, caps.iter().copied()),
         ..params.placement.clone()
     }
 }

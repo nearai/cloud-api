@@ -33,6 +33,8 @@ pub(super) struct PlacementRequest {
     pub(super) context_tokens: Option<u64>,
     /// The pool's class: the requirement exceeds the base tier.
     pub(super) heavy: bool,
+    /// The lane class: the prompt alone exceeds the base tier.
+    pub(super) prefill_heavy: bool,
     pub(super) affinity: Option<AffinityKey>,
     pub(super) affinity_source: AffinitySource,
     /// `params.request_priority` (operator-set, never client JSON).
@@ -60,6 +62,7 @@ impl PlacementRequest {
             prompt_tokens: placement.prompt_tokens.unwrap_or(0),
             context_tokens: placement.context_tokens,
             heavy: placement.heavy,
+            prefill_heavy: placement.prefill_heavy,
             affinity: placement.affinity.clone(),
             // A source without a key would mislabel the decision record.
             affinity_source: if placement.affinity.is_some() {
@@ -327,6 +330,7 @@ mod tests {
             prompt_tokens: 10,
             context_tokens: None,
             heavy: false,
+            prefill_heavy: false,
             priority: 0,
             affinity: None,
             affinity_source: AffinitySource::None,
@@ -434,6 +438,7 @@ mod observability_tests {
             prompt_tokens: 10,
             context_tokens: Some(20),
             heavy: false,
+            prefill_heavy: false,
             affinity_source: if affinity.is_some() {
                 AffinitySource::Client
             } else {
@@ -451,6 +456,7 @@ mod observability_tests {
             prompt_tokens: 10,
             context_tokens: None,
             heavy: false,
+            prefill_heavy: false,
             priority: 0,
             affinity: None,
             affinity_source: AffinitySource::None,

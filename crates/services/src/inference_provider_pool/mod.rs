@@ -11888,6 +11888,43 @@ mod tests {
             Some(heuristic_requirement(600_000, 0).1)
         );
         assert!(!ctx.heavy);
+        assert!(!ctx.prefill_heavy);
+    }
+
+    /// The lane class follows the prompt alone: a request heavy only because
+    /// of its `max_tokens` reserve keeps the pool's tier class but is not
+    /// prefill-heavy; a prompt over the base capacity is both.
+    #[tokio::test]
+    async fn max_tokens_only_heavy_is_not_prefill_heavy() {
+        let model = "z-ai/glm-5.3-flash";
+        let (pool, providers) = capacity_pool(model, &[100_000, 1_048_576]).await;
+
+        // ~60K of prompt plus a 64K reserve: over the 100K base window.
+        let mut reserve_heavy = sized_params(model, 200_000);
+        reserve_heavy.max_tokens = Some(64_000);
+        let _stream = pool
+            .chat_completion_stream(reserve_heavy, "h1".to_string(), ChatRoutingHints::default())
+            .await
+            .expect("served");
+        let ctx = served_placement(&providers[1]).await;
+        let (prompt, context) = heuristic_requirement(200_000, 64_000);
+        assert!(prompt <= 100_000 && context > 100_000);
+        assert!(ctx.heavy);
+        assert!(!ctx.prefill_heavy);
+
+        // A prompt over the base window is prefill-heavy.
+        let _stream = pool
+            .chat_completion_stream(
+                sized_params(model, 400_000),
+                "h2".to_string(),
+                ChatRoutingHints::default(),
+            )
+            .await
+            .expect("served");
+        let ctx = served_placement(&providers[1]).await;
+        assert!(heuristic_requirement(400_000, 0).0 > 100_000);
+        assert!(ctx.heavy);
+        assert!(ctx.prefill_heavy);
     }
 
     /// Every model gets its placement context: there is no allow-list.

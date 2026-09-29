@@ -234,8 +234,13 @@ pub struct PlacementContext {
     pub prompt_tokens: Option<u64>,
     /// Input plus the output reserve: the context-window requirement.
     pub context_tokens: Option<u64>,
-    /// The requirement exceeds the model's base-tier capacity.
+    /// The requirement exceeds the model's base-tier capacity: the tier
+    /// class, which the pool routes on.
     pub heavy: bool,
+    /// The prompt alone exceeds the model's base-tier capacity: the lane
+    /// class placement admits and refuses on. A request heavy only because
+    /// of its output reserve is not prefill-heavy.
+    pub prefill_heavy: bool,
     /// Derived from customer identity or content: never logged (the
     /// placement crate's key type has no `Debug`).
     pub affinity: Option<placement::affinity::AffinityKey>,
@@ -249,6 +254,7 @@ impl std::fmt::Debug for PlacementContext {
             .field("prompt_tokens", &self.prompt_tokens)
             .field("context_tokens", &self.context_tokens)
             .field("heavy", &self.heavy)
+            .field("prefill_heavy", &self.prefill_heavy)
             .field("affinity", &self.affinity.is_some())
             .field("affinity_source", &self.affinity_source)
             .finish()
@@ -1395,12 +1401,19 @@ mod tests {
             prompt_tokens: Some(1),
             context_tokens: Some(2),
             heavy: true,
+            prefill_heavy: true,
             affinity: Some(placement::affinity::AffinityKey::from_bytes([7; 16])),
             affinity_source: placement::decision::AffinitySource::Client,
         };
         let body = serde_json::to_value(&params).unwrap();
         assert!(body.get("placement").is_none());
-        for key in ["prompt_tokens", "context_tokens", "heavy", "affinity"] {
+        for key in [
+            "prompt_tokens",
+            "context_tokens",
+            "heavy",
+            "prefill_heavy",
+            "affinity",
+        ] {
             assert!(body.get(key).is_none(), "{key} leaked");
         }
         // The redacting Debug never prints the key.

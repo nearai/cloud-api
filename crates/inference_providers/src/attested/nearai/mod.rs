@@ -3710,6 +3710,7 @@ mod tests {
             prompt_tokens: Some(7),
             context_tokens: Some(9),
             heavy: true,
+            prefill_heavy: true,
             affinity: Some(placement::affinity::AffinityKey::from_bytes([0x5a; 16])),
             affinity_source: placement::decision::AffinitySource::Client,
         };
@@ -6251,6 +6252,7 @@ mod tests {
                 prompt_tokens: 0,
                 context_tokens: None,
                 heavy: false,
+                prefill_heavy: false,
                 affinity: None,
                 affinity_source: AffinitySource::None,
                 priority: 0,
@@ -7057,6 +7059,7 @@ mod tests {
                     prompt_tokens: 100,
                     context_tokens: None,
                     heavy: false,
+                    prefill_heavy: false,
                     priority: 0,
                     affinity: None,
                     affinity_source: AffinitySource::None,
@@ -7554,6 +7557,7 @@ mod tests {
                     prompt_tokens: Some(100_000),
                     context_tokens: Some(120_000),
                     heavy: true,
+                    prefill_heavy: true,
                     ..Default::default()
                 };
                 params
@@ -7951,6 +7955,7 @@ mod tests {
                 prompt_tokens: Some(120_000),
                 context_tokens: Some(130_000),
                 heavy: true,
+                prefill_heavy: true,
                 affinity: Some(key.clone()),
                 affinity_source: AffinitySource::Prefix,
             };
@@ -7962,6 +7967,7 @@ mod tests {
             assert_eq!(req.prompt_tokens, 120_000);
             assert_eq!(req.context_tokens, Some(130_000));
             assert!(req.heavy);
+            assert!(req.prefill_heavy);
             let fingerprint = |k: &AffinityKey| pin_id(Tier::Base, k, &PIN_SECRET).to_hex();
             assert_eq!(
                 req.affinity.as_ref().map(fingerprint),
@@ -7977,8 +7983,13 @@ mod tests {
             };
             let req = PlacementRequest::from_params(&params);
             assert_eq!(
-                (req.prompt_tokens, req.context_tokens, req.heavy),
-                (0, None, false)
+                (
+                    req.prompt_tokens,
+                    req.context_tokens,
+                    req.heavy,
+                    req.prefill_heavy
+                ),
+                (0, None, false, false)
             );
             assert!(req.affinity.is_none());
             assert_eq!(req.affinity_source, AffinitySource::None);

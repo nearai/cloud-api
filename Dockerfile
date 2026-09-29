@@ -42,7 +42,7 @@ COPY crates/ ./crates/
 COPY .cargo/ ./.cargo/
 
 # Build the application in release mode
-RUN cargo build --release --locked --bin api
+RUN cargo build --release --locked --bin api --bin pdf-extract-worker
 
 
 # Runtime stage
@@ -83,6 +83,8 @@ WORKDIR /app
 
 # Copy the built binary
 COPY --from=builder /app/target/release/api /app/api
+# Sandboxed PDF text extraction for chat file parts; spawned by api, never run directly.
+COPY --from=builder /app/target/release/pdf-extract-worker /app/pdf-extract-worker
 
 # Copy the migration SQL files
 RUN mkdir -p /app/crates/database/src/migrations/sql

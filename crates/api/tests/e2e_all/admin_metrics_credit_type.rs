@@ -649,6 +649,8 @@ async fn org_credit_type_reports_stay_raw_live_and_exact() {
     for (minute, dollars, ttft) in [
         (10_i64, 3_i64, Some(5_000)),
         (20, 1, None),
+        (22, 1, Some(10_000)),
+        (24, 1, Some(60_000)),
         (50, 4, Some(70_000)),
     ] {
         let at = h + chrono::Duration::minutes(minute);
@@ -681,7 +683,7 @@ async fn org_credit_type_reports_stay_raw_live_and_exact() {
             .await
             .unwrap();
     }
-    // Nothing is recomputed. [h, h + 30m) holds only the first two rows.
+    // Nothing is recomputed. [h, h + 30m) holds four rows: 5000 ms, NULL, 10000 ms and 60000 ms.
     let end = h + chrono::Duration::minutes(30);
     let range = format!("start={}&end={}", url_time(h), url_time(end));
 
@@ -695,9 +697,9 @@ async fn org_credit_type_reports_stay_raw_live_and_exact() {
         (h, end),
         "exact range echoed"
     );
-    assert_eq!(filtered.summary.total_requests, 2);
-    assert_eq!(filtered.summary.total_cost_usd, 4.0);
-    // Raw credit_type body: exactly 5000 ms is not under 5s.
+    assert_eq!(filtered.summary.total_requests, 4);
+    assert_eq!(filtered.summary.total_cost_usd, 6.0);
+    // Raw credit_type body: a TTFT exactly at a threshold (5000, 10000, 60000 ms) is not "under" it.
     let s = &filtered.summary;
     assert_eq!(
         [
@@ -706,10 +708,10 @@ async fn org_credit_type_reports_stay_raw_live_and_exact() {
             s.ttft_under_10s_requests,
             s.ttft_under_60s_requests
         ],
-        [1, 0, 1, 1]
+        [3, 0, 1, 2]
     );
     let m = &filtered.by_model[0];
-    assert_eq!(m.requests, 2);
+    assert_eq!(m.requests, 4);
     assert_eq!(
         [
             m.ttft_measured_requests,
@@ -717,7 +719,7 @@ async fn org_credit_type_reports_stay_raw_live_and_exact() {
             m.ttft_under_10s_requests,
             m.ttft_under_60s_requests
         ],
-        [1, 0, 1, 1]
+        [3, 0, 1, 2]
     );
 
     let series: TimeSeriesMetrics = session_json(
@@ -726,7 +728,7 @@ async fn org_credit_type_reports_stay_raw_live_and_exact() {
     )
     .await;
     assert_eq!((series.period_start, series.period_end), (h, end));
-    assert_eq!(series.data.iter().map(|p| p.requests).sum::<i64>(), 2);
+    assert_eq!(series.data.iter().map(|p| p.requests).sum::<i64>(), 4);
 
     let unfiltered: OrganizationMetrics = session_json(
         &fixture.server,
@@ -735,8 +737,8 @@ async fn org_credit_type_reports_stay_raw_live_and_exact() {
     .await;
     // A sub-hour range reads raw rows, so it is exact without a recompute.
     assert_eq!((unfiltered.period_start, unfiltered.period_end), (h, end));
-    assert_eq!(unfiltered.summary.total_requests, 2);
-    assert_eq!(unfiltered.summary.total_cost_usd, 4.0);
+    assert_eq!(unfiltered.summary.total_requests, 4);
+    assert_eq!(unfiltered.summary.total_cost_usd, 6.0);
     let s = &unfiltered.summary;
     assert_eq!(
         [
@@ -745,7 +747,7 @@ async fn org_credit_type_reports_stay_raw_live_and_exact() {
             s.ttft_under_10s_requests,
             s.ttft_under_60s_requests
         ],
-        [1, 0, 1, 1]
+        [3, 0, 1, 2]
     );
 }
 

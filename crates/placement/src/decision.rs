@@ -3,7 +3,8 @@
 //! caller logs (IDs and numbers only — see the crate's privacy rules).
 //!
 //! A decision picks one replica slot (`host#index`), scoring every eligible
-//! slot on its own state and its own pending load.
+//! slot on its own state and its own pending load. The rules run in two
+//! stages: the per-replica rules, then the heavy lane over their survivors.
 
 use std::collections::HashMap;
 
@@ -11,6 +12,7 @@ use rand::Rng;
 
 use crate::affinity::{pin_id, select, AffinityKey, PinId, Selection};
 use crate::consts::{COVERED_MODELS, FRESH_MAX_MS, PIN_TTL_MS};
+use crate::policy::{classify, lane_admits, lane_view, Class, LaneView, Tier};
 use crate::rules::{first_exclusion, Rule, ALL_RULES};
 use crate::score::{fleet_median_tps, pending_for, replica_score, Pending};
 use crate::snapshot::{ReplicaView, SlotId, Snapshot};
@@ -117,11 +119,18 @@ impl LegacyReason {
 
 /// The outcome of a placement decision. Holds a `PinId` (no `Debug`), so
 /// this type intentionally does not derive `Debug`.
+///
+/// `Legacy` means no usable state, so the caller falls back. `Refused`
+/// means there is state and every replica that survived stage 1 was
+/// excluded by the heavy lane (only possible for a heavy request).
 pub enum Decision {
     Place {
         slot: SlotId,
         record: DecisionRecord,
         pin_write: Option<(PinId, SlotId)>,
+    },
+    Refused {
+        record: DecisionRecord,
     },
     Legacy {
         reason: LegacyReason,
@@ -135,6 +144,8 @@ pub enum Decision {
 pub struct DecisionRecord {
     pub outcome: &'static str,
     pub reason: Option<&'static str>,
+    /// `RoutePolicy::as_str`, for placed and refused decisions.
+    pub strategy: Option<&'static str>,
     pub rank: Option<u8>,
     pub affinity: &'static str,
     pub selection: Option<&'static str>,
@@ -163,6 +174,7 @@ impl DecisionRecord {
         DecisionRecord {
             outcome: "legacy",
             reason: Some(reason.as_str()),
+            strategy: None,
             rank: None,
             affinity: input.affinity_source.as_str(),
             selection: None,
@@ -219,21 +231,24 @@ impl Tally {
     }
 }
 
-/// An eligible slot and the pending load it is scored with.
+/// A stage-1 survivor, the pending load it is scored with, and its lane
+/// load (`prefill_backlog_tokens.unwrap_or(0) + pending.tok`).
 struct Candidate<'a> {
     view: &'a ReplicaView,
     pending: Pending,
+    load: u64,
 }
 
-/// The pure placement decision-maker. Holds only the deployment's pin
-/// secret — no I/O, no mutable state.
+/// The pure placement decision-maker for one Fleet. Holds only the
+/// deployment's pin secret and the Fleet's tier — no I/O, no mutable state.
 pub struct Placer {
     pin_secret: [u8; 32],
+    tier: Tier,
 }
 
 impl Placer {
-    pub fn new(pin_secret: [u8; 32]) -> Self {
-        Self { pin_secret }
+    pub fn new(pin_secret: [u8; 32], tier: Tier) -> Self {
+        Self { pin_secret, tier }
     }
 
     pub fn place(
@@ -264,17 +279,29 @@ impl Placer {
         let mut candidates: Vec<Candidate<'_>> = Vec::with_capacity(snap.replicas.len());
         for view in &snap.replicas {
             match first_exclusion(view, input, input.now_ms) {
-                None => candidates.push(Candidate {
-                    view,
-                    pending: pending_for(
+                None => {
+                    let pending = pending_for(
                         snap.routed.get(&view.slot),
                         mine.get(&view.slot).copied().unwrap_or_default(),
-                    ),
-                }),
+                    );
+                    let load = view
+                        .state
+                        .load
+                        .prefill_backlog_tokens
+                        .unwrap_or(0)
+                        .saturating_add(pending.tok);
+                    candidates.push(Candidate {
+                        view,
+                        pending,
+                        load,
+                    });
+                }
                 Some(exclusion) => tally.add(exclusion.0),
             }
         }
 
+        // No stage-1 survivor (stale, not ready, over context, ...) is a
+        // state problem, never a capacity one: fall back, don't refuse.
         if candidates.is_empty() {
             return legacy(
                 input,
@@ -282,6 +309,44 @@ impl Placer {
                 LegacyReason::NoneEligible,
                 Some(tally.record()),
             );
+        }
+
+        // Stage 2: the heavy lane, over every stage-1 survivor at once.
+        let class = Class::of(input.heavy);
+        let lane = {
+            let pre_lane: Vec<(&ReplicaView, u64)> =
+                candidates.iter().map(|c| (c.view, c.load)).collect();
+            lane_view(&pre_lane)
+        };
+        candidates.retain(|c| {
+            let is_member = lane.members.contains(&c.view.slot);
+            let admitted = lane_admits(
+                self.tier,
+                class,
+                c.load,
+                input.prompt_tokens,
+                is_member,
+                &lane,
+            );
+            if !admitted {
+                tally.add(Rule::Lane);
+            }
+            admitted
+        });
+
+        if candidates.is_empty() {
+            // Only capacity excluded the survivors. `lane_admits` always
+            // admits a short request when anything survived stage 1, so this
+            // is heavy in practice; a short request would still fall back.
+            return match class {
+                Class::Heavy => self.refused(input, snap, &lane, class, tally.record()),
+                Class::Short => legacy(
+                    input,
+                    snap,
+                    LegacyReason::NoneEligible,
+                    Some(tally.record()),
+                ),
+            };
         }
 
         // The snapshot's replica order is the reader's; `select`'s keyless
@@ -353,6 +418,7 @@ impl Placer {
         let record = DecisionRecord {
             outcome: "place",
             reason: None,
+            strategy: Some(classify(self.tier, class, &lane, Some(&selected.slot)).as_str()),
             rank,
             affinity: input.affinity_source.as_str(),
             selection: Some(selected.selection.as_str()),
@@ -376,6 +442,22 @@ impl Placer {
             pin_write,
         }
     }
+
+    fn refused(
+        &self,
+        input: &PlaceInput,
+        snap: &Snapshot,
+        lane: &LaneView,
+        class: Class,
+        excluded: [(Rule, u16); 5],
+    ) -> Decision {
+        let mut record = DecisionRecord::legacy(input, snap, LegacyReason::NoneEligible);
+        record.outcome = "refused";
+        record.reason = None;
+        record.strategy = Some(classify(self.tier, class, lane, None).as_str());
+        record.excluded = excluded;
+        Decision::Refused { record }
+    }
 }
 
 #[cfg(test)]
@@ -383,6 +465,7 @@ mod tests {
     use super::*;
     use crate::affinity::{hrw_rank, AffinityKey};
     use crate::consts::{COVERED_MODELS, FRESH_MAX_MS, PIN_TTL_MS};
+    use crate::policy::Tier;
     use crate::snapshot::RoutedCounts;
     use crate::testkit::{input as base_input, slot, view as ready_view, NOW};
     use rand::rngs::StdRng;
@@ -399,7 +482,7 @@ mod tests {
     }
 
     fn placer() -> Placer {
-        Placer::new([1u8; 32])
+        Placer::new([1u8; 32], Tier::Base)
     }
 
     fn keyed(key: AffinityKey) -> PlaceInput {
@@ -417,13 +500,15 @@ mod tests {
                 pin_write,
             } => (slot, record, pin_write),
             Decision::Legacy { reason, .. } => panic!("expected Place, got Legacy({reason:?})"),
+            Decision::Refused { .. } => panic!("expected Place, got Refused"),
         }
     }
 
     fn legacy_reason(d: Decision) -> (LegacyReason, DecisionRecord) {
         match d {
             Decision::Legacy { reason, record } => (reason, record),
-            Decision::Place { .. } => panic!("expected Legacy"),
+            Decision::Place { .. } => panic!("expected Legacy, got Place"),
+            Decision::Refused { .. } => panic!("expected Legacy, got Refused"),
         }
     }
 
@@ -620,8 +705,12 @@ mod tests {
             NOW - 1_000,
         );
         let mut rng = StdRng::seed_from_u64(1);
-        let (chosen, record, pin_write) =
-            placed(Placer::new(secret).place(&keyed(key), &snap, &HashMap::new(), &mut rng));
+        let (chosen, record, pin_write) = placed(Placer::new(secret, Tier::Base).place(
+            &keyed(key),
+            &snap,
+            &HashMap::new(),
+            &mut rng,
+        ));
         assert_eq!(chosen, slot("gpu02", 0));
         assert_eq!(record.selection, Some("home"));
         assert_eq!(record.pinned.as_deref(), Some("gpu01#3"));
@@ -634,8 +723,8 @@ mod tests {
         let input = keyed(AffinityKey::from_bytes([3u8; 16]));
         let snap = snap_with(vec![ready_view("gpu01", 0), ready_view("gpu02", 0)]);
 
-        let a = Placer::new([9u8; 32]);
-        let b = Placer::new([9u8; 32]);
+        let a = Placer::new([9u8; 32], Tier::Base);
+        let b = Placer::new([9u8; 32], Tier::Base);
         let mut rng_a = StdRng::seed_from_u64(1);
         let mut rng_b = StdRng::seed_from_u64(2);
         let (slot_a, _, _) = placed(a.place(&input, &snap, &HashMap::new(), &mut rng_a));
@@ -658,8 +747,12 @@ mod tests {
         let input = keyed(key);
 
         let mut rng = StdRng::seed_from_u64(1);
-        let (slot_a, record_a, pin_write) =
-            placed(Placer::new(secret).place(&input, &hot_snap(), &HashMap::new(), &mut rng));
+        let (slot_a, record_a, pin_write) = placed(Placer::new(secret, Tier::Base).place(
+            &input,
+            &hot_snap(),
+            &HashMap::new(),
+            &mut rng,
+        ));
         assert_eq!(record_a.selection, Some("spill"));
         assert_eq!(record_a.home.as_deref(), Some("gpu01#0"));
 
@@ -670,8 +763,12 @@ mod tests {
         std::sync::Arc::make_mut(&mut snap_b.pins).insert(*pin_id_val.as_bytes(), pinned_slot, NOW);
 
         let mut rng_b = StdRng::seed_from_u64(2);
-        let (slot_b, record_b, _) =
-            placed(Placer::new(secret).place(&input, &snap_b, &HashMap::new(), &mut rng_b));
+        let (slot_b, record_b, _) = placed(Placer::new(secret, Tier::Base).place(
+            &input,
+            &snap_b,
+            &HashMap::new(),
+            &mut rng_b,
+        ));
         assert_eq!(slot_b, slot_a);
         assert_eq!(record_b.selection, Some("pinned"));
     }
@@ -707,7 +804,7 @@ mod tests {
         let views = vec![ready_view("gpu01", 0), ready_view("gpu02", 0)];
         let input = keyed(AffinityKey::from_bytes(key_bytes));
         let pid = pin_id(&AffinityKey::from_bytes(key_bytes), &secret);
-        let p = Placer::new(secret);
+        let p = Placer::new(secret, Tier::Base);
 
         // Pin inserted just over half the TTL ago: must refresh.
         let mut snap_old = snap_with(views.clone());
@@ -786,7 +883,7 @@ mod tests {
 
         let mut rng = StdRng::seed_from_u64(1);
         let (_, record, _) =
-            placed(Placer::new(secret).place(&input, &snap, &HashMap::new(), &mut rng));
+            placed(Placer::new(secret, Tier::Base).place(&input, &snap, &HashMap::new(), &mut rng));
         assert_eq!(record.selection, Some("pinned"));
         assert_no_key_material(&format!("{record:?}"), key_bytes, &pid);
 
@@ -795,9 +892,282 @@ mod tests {
 
         // A Legacy decision's record carries none either.
         snap.disabled = true;
-        let (_, record) =
-            legacy_reason(Placer::new(secret).place(&input, &snap, &HashMap::new(), &mut rng));
+        let (_, record) = legacy_reason(Placer::new(secret, Tier::Base).place(
+            &input,
+            &snap,
+            &HashMap::new(),
+            &mut rng,
+        ));
         assert_no_key_material(&format!("{record:?}"), key_bytes, &pid);
+    }
+
+    // --- Heavy lane (Rule::Lane) and the route policy label ---
+
+    fn heavy(prompt_tokens: u64) -> PlaceInput {
+        let mut input = base_input();
+        input.heavy = true;
+        input.prompt_tokens = prompt_tokens;
+        input
+    }
+
+    fn with_backlog(host: &str, replica: u32, backlog: u64) -> ReplicaView {
+        let mut v = ready_view(host, replica);
+        v.state.load.prefill_backlog_tokens = Some(backlog);
+        v
+    }
+
+    /// 8 slots: gpu01..gpu04, replicas 0 and 1.
+    fn eight_slots() -> Vec<ReplicaView> {
+        (1..=4)
+            .flat_map(|h| (0..2).map(move |r| ready_view(&format!("gpu0{h}"), r)))
+            .collect()
+    }
+
+    fn refused_record(d: Decision) -> DecisionRecord {
+        match d {
+            Decision::Refused { record } => record,
+            Decision::Place { record, .. } => panic!("expected Refused, placed {:?}", record.slot),
+            Decision::Legacy { reason, .. } => panic!("expected Refused, got Legacy({reason:?})"),
+        }
+    }
+
+    #[test]
+    fn eight_heavy_on_eight_base_replicas() {
+        let snap = snap_with(eight_slots());
+        let prompt = 120_000;
+        let mut mine: HashMap<SlotId, Pending> = HashMap::new();
+        let mut strategies = Vec::new();
+        for seed in 0..8 {
+            let mut rng = StdRng::seed_from_u64(seed);
+            match placer().place(&heavy(prompt), &snap, &mine, &mut rng) {
+                Decision::Place { slot, record, .. } => {
+                    let p = mine.entry(slot).or_default();
+                    p.req += 1;
+                    p.tok += prompt;
+                    strategies.push(record.strategy.unwrap());
+                }
+                Decision::Refused { record } => {
+                    assert_eq!(record.excluded[4], (Rule::Lane, 8));
+                    strategies.push(record.strategy.unwrap());
+                }
+                Decision::Legacy { reason, .. } => panic!("unexpected Legacy({reason:?})"),
+            }
+        }
+        // Two new members, each joined once more until the next prompt would
+        // take it over HEAVY_BACKLOG_CAP (3 x 120K > 300K), then refusals.
+        assert_eq!(
+            strategies,
+            [
+                "heavy_lane_admit",
+                "heavy_lane_admit",
+                "heavy_lane_join",
+                "heavy_lane_join",
+                "refuse",
+                "refuse",
+                "refuse",
+                "refuse"
+            ]
+        );
+        let members: Vec<&SlotId> = mine
+            .iter()
+            .filter(|(_, p)| p.tok >= crate::consts::LANE_LOAD_TOKENS)
+            .map(|(s, _)| s)
+            .collect();
+        assert_eq!(members.len(), 2, "ceil(8 * 0.25) lane members");
+
+        // Short requests land only on the 6 clean replicas.
+        let mut short = base_input();
+        short.prompt_tokens = 500;
+        for seed in 0..64 {
+            let mut rng = StdRng::seed_from_u64(seed);
+            let (chosen, record, _) = placed(placer().place(&short, &snap, &mine, &mut rng));
+            assert!(
+                !members.contains(&&chosen),
+                "seed {seed}: short landed on {chosen:?}"
+            );
+            assert_eq!(record.strategy, Some("short_clean"));
+            assert_eq!(record.eligible, 6);
+            assert_eq!(record.excluded[4], (Rule::Lane, 2));
+        }
+    }
+
+    #[test]
+    fn misestimated_backlog_makes_member() {
+        // A 70K backlog put there by short-class requests (an underestimate,
+        // or many of them) makes gpu01#0 a lane member all the same.
+        let snap = snap_with(vec![
+            with_backlog("gpu01", 0, 70_000),
+            ready_view("gpu01", 1),
+            ready_view("gpu02", 0),
+            ready_view("gpu02", 1),
+        ]);
+        for seed in 0..32 {
+            let mut rng = StdRng::seed_from_u64(seed);
+            let (chosen, record, _) =
+                placed(placer().place(&base_input(), &snap, &HashMap::new(), &mut rng));
+            assert_ne!(chosen, slot("gpu01", 0), "seed {seed}");
+            assert_eq!(record.strategy, Some("short_clean"));
+        }
+        // It also fills the 4-replica lane (cap 1), so a heavy request joins it.
+        let mut rng = StdRng::seed_from_u64(1);
+        let (chosen, record, _) =
+            placed(placer().place(&heavy(100_000), &snap, &HashMap::new(), &mut rng));
+        assert_eq!(chosen, slot("gpu01", 0));
+        assert_eq!(record.strategy, Some("heavy_lane_join"));
+    }
+
+    #[test]
+    fn no_clean_replica_gives_short_overflow() {
+        let snap = snap_with(vec![
+            with_backlog("gpu01", 0, 70_000),
+            with_backlog("gpu01", 1, 400_000),
+        ]);
+        let mut rng = StdRng::seed_from_u64(1);
+        let (chosen, record, _) =
+            placed(placer().place(&base_input(), &snap, &HashMap::new(), &mut rng));
+        assert_eq!(
+            chosen,
+            slot("gpu01", 0),
+            "the lighter member still wins on score"
+        );
+        assert_eq!(record.strategy, Some("short_overflow"));
+        assert_eq!(record.excluded[4], (Rule::Lane, 0));
+    }
+
+    #[test]
+    fn long_tier_refuses_heavy_when_all_over_cap() {
+        let long = Placer::new([1u8; 32], Tier::Long);
+        let snap = snap_with(vec![
+            with_backlog("long01", 0, 550_000),
+            with_backlog("long01", 1, 550_000),
+        ]);
+        let mut rng = StdRng::seed_from_u64(1);
+        let record = refused_record(long.place(&heavy(100_000), &snap, &HashMap::new(), &mut rng));
+        assert_eq!(record.outcome, "refused");
+        assert_eq!(record.strategy, Some("refuse"));
+        assert_eq!(record.excluded[4], (Rule::Lane, 2));
+
+        // One replica with room: placed there, and the long tier ignores
+        // the base lane cap (both are "members").
+        let snap = snap_with(vec![
+            with_backlog("long01", 0, 550_000),
+            with_backlog("long01", 1, 400_000),
+        ]);
+        let (chosen, record, _) =
+            placed(long.place(&heavy(100_000), &snap, &HashMap::new(), &mut rng));
+        assert_eq!(chosen, slot("long01", 1));
+        assert_eq!(record.strategy, Some("heavy_long"));
+    }
+
+    #[test]
+    fn heavy_with_all_replicas_stale_is_legacy_not_refused() {
+        let views = eight_slots()
+            .into_iter()
+            .map(|mut v| {
+                v.state.engine_sampled_at_ms = Some(NOW - FRESH_MAX_MS - 1);
+                v
+            })
+            .collect();
+        let snap = snap_with(views);
+        let mut rng = StdRng::seed_from_u64(1);
+        let (reason, record) =
+            legacy_reason(placer().place(&heavy(200_000), &snap, &HashMap::new(), &mut rng));
+        assert_eq!(reason, LegacyReason::NoneEligible);
+        assert_eq!(record.excluded[1], (Rule::Freshness, 8));
+        assert_eq!(record.excluded[4], (Rule::Lane, 0));
+    }
+
+    #[test]
+    fn heavy_with_no_views_is_legacy_not_refused() {
+        let mut rng = StdRng::seed_from_u64(1);
+        for tier in [Tier::Base, Tier::Long] {
+            let p = Placer::new([1u8; 32], tier);
+            let (reason, _) = legacy_reason(p.place(
+                &heavy(200_000),
+                &snap_with(vec![]),
+                &HashMap::new(),
+                &mut rng,
+            ));
+            assert_eq!(reason, LegacyReason::NoState);
+        }
+    }
+
+    #[test]
+    fn short_request_on_long_tier_is_never_refused() {
+        let long = Placer::new([1u8; 32], Tier::Long);
+        let snap = snap_with(vec![
+            with_backlog("long01", 0, 10_000_000),
+            with_backlog("long01", 1, 10_000_000),
+        ]);
+        let mut rng = StdRng::seed_from_u64(1);
+        let (_, record, _) = placed(long.place(&base_input(), &snap, &HashMap::new(), &mut rng));
+        assert_eq!(record.strategy, Some("short_overflow"));
+    }
+
+    #[test]
+    fn pinned_heavy_conversation_returns_to_pinned_member() {
+        // 4 slots, lane cap 1, filled by the pinned slot itself: the
+        // conversation's own earlier turns. The key's HRW home is elsewhere.
+        let pinned = slot("gpu02", 1);
+        let all = vec![
+            slot("gpu01", 0),
+            slot("gpu01", 1),
+            slot("gpu02", 0),
+            pinned.clone(),
+        ];
+        let key = find_key_with_home(&all, &slot("gpu01", 0));
+        let secret = [8u8; 32];
+        let mut snap = snap_with(vec![
+            ready_view("gpu01", 0),
+            ready_view("gpu01", 1),
+            ready_view("gpu02", 0),
+            with_backlog("gpu02", 1, 100_000),
+        ]);
+        let pid = pin_id(&key, &secret);
+        std::sync::Arc::make_mut(&mut snap.pins).insert(
+            *pid.as_bytes(),
+            pinned.clone(),
+            NOW - 1_000,
+        );
+
+        let mut input = keyed(key);
+        input.heavy = true;
+        input.prompt_tokens = 100_000;
+        let mut rng = StdRng::seed_from_u64(1);
+        let (chosen, record, _) =
+            placed(Placer::new(secret, Tier::Base).place(&input, &snap, &HashMap::new(), &mut rng));
+        assert_eq!(chosen, pinned);
+        assert_eq!(record.selection, Some("pinned"));
+        assert_eq!(record.strategy, Some("heavy_lane_join"));
+    }
+
+    #[test]
+    fn pinned_heavy_conversation_on_drained_replica_readmits_it() {
+        // The pinned slot drained out of the lane; another slot is a member,
+        // and the 8-slot lane (cap 2) has room, so the pinned slot is
+        // re-admitted as a new member and the pin holds.
+        let pinned = slot("gpu03", 0);
+        let key = AffinityKey::from_bytes([21u8; 16]);
+        let secret = [8u8; 32];
+        let mut views = eight_slots();
+        views[0].state.load.prefill_backlog_tokens = Some(100_000); // gpu01#0
+        let mut snap = snap_with(views);
+        let pid = pin_id(&key, &secret);
+        std::sync::Arc::make_mut(&mut snap.pins).insert(
+            *pid.as_bytes(),
+            pinned.clone(),
+            NOW - 1_000,
+        );
+
+        let mut input = keyed(key);
+        input.heavy = true;
+        input.prompt_tokens = 100_000;
+        let mut rng = StdRng::seed_from_u64(1);
+        let (chosen, record, _) =
+            placed(Placer::new(secret, Tier::Base).place(&input, &snap, &HashMap::new(), &mut rng));
+        assert_eq!(chosen, pinned);
+        assert_eq!(record.selection, Some("pinned"));
+        assert_eq!(record.strategy, Some("heavy_lane_admit"));
     }
 
     use proptest::prelude::*;

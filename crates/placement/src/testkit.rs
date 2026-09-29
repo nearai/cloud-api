@@ -22,13 +22,19 @@ pub(crate) const TEST_MODEL: &str = "z-ai/glm-5.3-flash";
 /// inference-proxy uses to produce real frames.
 pub(crate) fn seal(report: &HostReport, key: &SigningKey) -> Envelope {
     let frame = serde_json::to_string(report).expect("report serializes");
+    seal_json(frame, &report.report_key_id, key)
+}
+
+/// Seal raw frame JSON (e.g. with fields `HostReport` doesn't know) under
+/// `key_id`, signed by `key`.
+pub(crate) fn seal_json(frame: String, key_id: &str, key: &SigningKey) -> Envelope {
     let mut message = SIGNING_DOMAIN.to_vec();
     message.extend_from_slice(frame.as_bytes());
     let sig = key.sign(&message);
     Envelope {
         frame,
         sig: base64::engine::general_purpose::STANDARD.encode(sig.to_bytes()),
-        key_id: report.report_key_id.clone(),
+        key_id: key_id.to_string(),
     }
 }
 

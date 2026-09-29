@@ -161,7 +161,7 @@ pub fn open(env: &Envelope, pk: &VerifyingKey) -> Result<HostReport, FrameError>
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::testkit::{host_report, seal};
+    use crate::testkit::{host_report, seal, seal_json};
     use ed25519_dalek::SigningKey;
 
     fn sk() -> SigningKey {
@@ -233,6 +233,20 @@ mod tests {
             serde_json::from_str::<Lifecycle>("\"rebooting\"").unwrap(),
             Lifecycle::Unknown
         );
+    }
+
+    #[test]
+    fn frame_with_unknown_fields_still_opens() {
+        // A newer proxy may add fields at any level; this reader ignores
+        // them (no `deny_unknown_fields`) rather than dropping the host.
+        let r = host_report(&pk());
+        let mut v = serde_json::to_value(&r).unwrap();
+        v["future_field"] = serde_json::json!({ "nested": [1, 2, 3] });
+        v["replicas"][0]["future_replica_field"] = serde_json::json!("x");
+        v["replicas"][0]["load"]["future_load_field"] = serde_json::json!(0.5);
+        let env = seal_json(v.to_string(), &r.report_key_id, &sk());
+        let opened = open(&env, &pk()).expect("unknown fields are ignored");
+        assert_eq!(opened, r);
     }
 
     #[test]

@@ -1,11 +1,13 @@
-//! Ordered eligibility rules (Chain of Responsibility).
+//! Ordered eligibility rules (Chain of Responsibility), in two stages.
 //!
-//! [`first_exclusion`] runs each [`Rule`] in [`RULES`] order against a
-//! [`ReplicaView`] and returns the first one that excludes it, or `None` if
-//! the replica is eligible. Callers use this to filter a snapshot down to
-//! the replicas a placement decision may pick from.
+//! Stage 1 is per replica: [`first_exclusion`] runs each [`Rule`] in
+//! [`RULES`] order against a [`ReplicaView`] and returns the first one that
+//! excludes it, or `None` if the replica survives. Stage 2 is `Rule::Lane`,
+//! which needs a view of every stage-1 survivor at once, so `Placer::place`
+//! evaluates it after stage 1 (see `policy::lane_admits`). Exclusions from
+//! both stages are tallied per rule in [`ALL_RULES`] order.
 
-use crate::consts::{FRESH_MAX_MS, KV_MAX, LONG_CONTEXT_TOKENS, MAX_FUTURE_SKEW_MS};
+use crate::consts::{FRESH_MAX_MS, KV_MAX, MAX_FUTURE_SKEW_MS};
 use crate::decision::PlaceInput;
 use crate::frame::Lifecycle;
 use crate::snapshot::ReplicaView;
@@ -13,11 +15,13 @@ use crate::snapshot::ReplicaView;
 /// A single eligibility check, in the order they are applied.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Rule {
-    Model,
     Lifecycle,
     Freshness,
     Capacity,
     Context,
+    /// Stage 2: the heavy lane. Evaluated by `Placer::place` over the
+    /// stage-1 survivors, never by [`Rule::check`].
+    Lane,
 }
 
 /// A replica was excluded by `Rule`. Carries no request content — safe to
@@ -25,46 +29,49 @@ pub enum Rule {
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Exclusion(pub Rule);
 
-/// All rules, in the order `first_exclusion` applies them.
-pub const RULES: [Rule; 5] = [
-    Rule::Model,
+/// The per-replica (stage 1) rules, in the order `first_exclusion` applies
+/// them.
+pub const RULES: [Rule; 4] = [
     Rule::Lifecycle,
     Rule::Freshness,
     Rule::Capacity,
     Rule::Context,
 ];
 
+/// Every rule, stage 1 then stage 2: the order of `DecisionRecord::excluded`.
+pub const ALL_RULES: [Rule; 5] = [
+    Rule::Lifecycle,
+    Rule::Freshness,
+    Rule::Capacity,
+    Rule::Context,
+    Rule::Lane,
+];
+
 impl Rule {
     /// A stable, content-free name for logging/metrics.
-    pub fn as_str(self) -> &'static str {
+    pub const fn as_str(self) -> &'static str {
         match self {
-            Rule::Model => "model",
             Rule::Lifecycle => "lifecycle",
             Rule::Freshness => "freshness",
             Rule::Capacity => "capacity",
             Rule::Context => "context",
+            Rule::Lane => "lane",
         }
     }
 
-    /// Checks `r` against this rule. `now_ms` is the caller's clock, used by
-    /// `Freshness` to judge how old `engine_sampled_at_ms` is.
+    /// Checks `r` against this stage-1 rule. `now_ms` is the caller's clock,
+    /// used by `Freshness` to judge how old `engine_sampled_at_ms` is.
+    /// `Rule::Lane` always passes here: it is not a per-replica rule.
     pub fn check(self, r: &ReplicaView, input: &PlaceInput, now_ms: u64) -> Result<(), Exclusion> {
         match self {
-            Rule::Model => {
-                if r.report.model == input.model {
-                    Ok(())
-                } else {
-                    Err(Exclusion(self))
-                }
-            }
             Rule::Lifecycle => {
-                if r.report.lifecycle_state == Lifecycle::Ready {
+                if r.state.lifecycle_state == Lifecycle::Ready {
                     Ok(())
                 } else {
                     Err(Exclusion(self))
                 }
             }
-            Rule::Freshness => match r.report.engine_sampled_at_ms {
+            Rule::Freshness => match r.state.engine_sampled_at_ms {
                 // Fresh: no older than FRESH_MAX_MS and no further in the future
                 // than MAX_FUTURE_SKEW_MS (a skewed clock must not look current).
                 Some(t)
@@ -83,17 +90,17 @@ impl Rule {
                 // `queued` gives no evidence it's idle, so treating both as
                 // 0 would make it look falsely attractive. Exclude it
                 // instead of guessing.
-                if r.report.load.running.is_none() && r.report.load.queued.is_none() {
+                if r.state.load.running.is_none() && r.state.load.queued.is_none() {
                     return Err(Exclusion(self));
                 }
-                if let Some(kv) = r.report.load.kv_usage {
+                if let Some(kv) = r.state.load.kv_usage {
                     if kv >= KV_MAX {
                         return Err(Exclusion(self));
                     }
                 }
-                if let Some(m) = r.report.limits.max_running {
-                    let running = r.report.load.running.unwrap_or(0);
-                    let queued = r.report.load.queued.unwrap_or(0);
+                if let Some(m) = r.state.limits.max_running {
+                    let running = r.state.load.running.unwrap_or(0);
+                    let queued = r.state.load.queued.unwrap_or(0);
                     let in_flight = running.saturating_add(queued);
                     let cap = m.saturating_mul(2);
                     if in_flight >= cap {
@@ -103,19 +110,21 @@ impl Rule {
                 Ok(())
             }
             Rule::Context => {
-                if input.prompt_tokens_est > LONG_CONTEXT_TOKENS
-                    && !input.long_context_hosts.iter().any(|h| h == &r.host_id)
-                {
-                    return Err(Exclusion(self));
+                // Fail open on either unknown: without an engine limit or a
+                // requirement there is nothing to compare, and the pool's
+                // context-length-400 self-heal still covers a wrong pick.
+                match (input.context_tokens, r.state.limits.max_context_tokens) {
+                    (Some(need), Some(max)) if need > max => Err(Exclusion(self)),
+                    _ => Ok(()),
                 }
-                Ok(())
             }
+            Rule::Lane => Ok(()),
         }
     }
 }
 
-/// Returns the first rule (in `RULES` order) that excludes `r`, or `None` if
-/// `r` is eligible under every rule.
+/// Returns the first stage-1 rule (in `RULES` order) that excludes `r`, or
+/// `None` if `r` survives stage 1.
 pub fn first_exclusion(r: &ReplicaView, input: &PlaceInput, now_ms: u64) -> Option<Exclusion> {
     RULES
         .into_iter()
@@ -134,18 +143,10 @@ mod tests {
     }
 
     #[test]
-    fn model_mismatch() {
-        let v = view_ready();
-        let mut inp = input();
-        inp.model = "some-other-model".into();
-        assert_eq!(first_exclusion(&v, &inp, NOW), Some(Exclusion(Rule::Model)));
-    }
-
-    #[test]
     fn first_failing_rule_is_reported() {
         let mut v = view_ready();
-        v.report.lifecycle_state = Lifecycle::Warming;
-        v.report.engine_sampled_at_ms = None;
+        v.state.lifecycle_state = Lifecycle::Warming;
+        v.state.engine_sampled_at_ms = None;
         assert_eq!(
             first_exclusion(&v, &input(), NOW),
             Some(Exclusion(Rule::Lifecycle))
@@ -155,20 +156,19 @@ mod tests {
     #[test]
     fn far_future_sample_is_not_fresh() {
         let mut v = view_ready();
-        v.report.engine_sampled_at_ms = Some(NOW + MAX_FUTURE_SKEW_MS + 1);
+        v.state.engine_sampled_at_ms = Some(NOW + MAX_FUTURE_SKEW_MS + 1);
         assert_eq!(
             first_exclusion(&v, &input(), NOW),
             Some(Exclusion(Rule::Freshness))
         );
-        v.report.engine_sampled_at_ms = Some(NOW + MAX_FUTURE_SKEW_MS);
+        v.state.engine_sampled_at_ms = Some(NOW + MAX_FUTURE_SKEW_MS);
         assert_eq!(first_exclusion(&v, &input(), NOW), None);
     }
 
     #[test]
     fn wedged_engine_is_stale() {
         let mut v = view_ready();
-        v.report.engine_sampled_at_ms = Some(NOW - 10_000);
-        v.report.reported_at_ms = NOW;
+        v.state.engine_sampled_at_ms = Some(NOW - 10_000);
         assert_eq!(
             first_exclusion(&v, &input(), NOW),
             Some(Exclusion(Rule::Freshness))
@@ -178,7 +178,7 @@ mod tests {
     #[test]
     fn null_sample_time_is_stale() {
         let mut v = view_ready();
-        v.report.engine_sampled_at_ms = None;
+        v.state.engine_sampled_at_ms = None;
         assert_eq!(
             first_exclusion(&v, &input(), NOW),
             Some(Exclusion(Rule::Freshness))
@@ -188,8 +188,8 @@ mod tests {
     #[test]
     fn capacity_excludes_countless_replica() {
         let mut v = view_ready();
-        v.report.load.running = None;
-        v.report.load.queued = None;
+        v.state.load.running = None;
+        v.state.load.queued = None;
         assert_eq!(
             first_exclusion(&v, &input(), NOW),
             Some(Exclusion(Rule::Capacity))
@@ -199,7 +199,7 @@ mod tests {
     #[test]
     fn kv_full() {
         let mut v = view_ready();
-        v.report.load.kv_usage = Some(0.96);
+        v.state.load.kv_usage = Some(0.96);
         assert_eq!(
             first_exclusion(&v, &input(), NOW),
             Some(Exclusion(Rule::Capacity))
@@ -209,9 +209,9 @@ mod tests {
     #[test]
     fn over_capacity() {
         let mut v = view_ready();
-        v.report.limits.max_running = Some(4);
-        v.report.load.running = Some(6);
-        v.report.load.queued = Some(2);
+        v.state.limits.max_running = Some(4);
+        v.state.load.running = Some(6);
+        v.state.load.queued = Some(2);
         assert_eq!(
             first_exclusion(&v, &input(), NOW),
             Some(Exclusion(Rule::Capacity))
@@ -219,16 +219,61 @@ mod tests {
     }
 
     #[test]
-    fn long_prompt_needs_long_host() {
-        let v = view_ready();
+    fn context_excludes_when_requirement_exceeds_engine_limit() {
+        let mut v = view_ready();
+        v.state.limits.max_context_tokens = Some(131_072);
         let mut inp = input();
-        inp.prompt_tokens_est = 200_000;
+        inp.context_tokens = Some(131_073);
         assert_eq!(
             first_exclusion(&v, &inp, NOW),
             Some(Exclusion(Rule::Context))
         );
+    }
 
-        inp.long_context_hosts = vec![v.host_id.clone()];
+    #[test]
+    fn unknown_context_limit_passes() {
+        let mut v = view_ready();
+        v.state.limits.max_context_tokens = None;
+        let mut inp = input();
+        inp.context_tokens = Some(1_000_000);
         assert_eq!(first_exclusion(&v, &inp, NOW), None);
+    }
+
+    #[test]
+    fn unknown_requirement_passes() {
+        let mut v = view_ready();
+        v.state.limits.max_context_tokens = Some(8_192);
+        let mut inp = input();
+        inp.context_tokens = None;
+        assert_eq!(first_exclusion(&v, &inp, NOW), None);
+    }
+
+    #[test]
+    fn exact_limit_passes() {
+        let mut v = view_ready();
+        v.state.limits.max_context_tokens = Some(131_072);
+        let mut inp = input();
+        inp.context_tokens = Some(131_072);
+        assert_eq!(first_exclusion(&v, &inp, NOW), None);
+    }
+
+    #[test]
+    fn lane_is_not_a_stage_one_rule() {
+        assert!(!RULES.contains(&Rule::Lane));
+        assert_eq!(ALL_RULES[..4], RULES);
+        assert_eq!(
+            Rule::Lane.check(&view_ready(), &input(), NOW),
+            Ok(()),
+            "the lane is evaluated over all survivors, not per replica"
+        );
+    }
+
+    #[test]
+    fn every_rule_has_a_static_tag() {
+        let tags: Vec<&str> = ALL_RULES.iter().map(|r| r.as_str()).collect();
+        assert_eq!(
+            tags,
+            ["lifecycle", "freshness", "capacity", "context", "lane"]
+        );
     }
 }

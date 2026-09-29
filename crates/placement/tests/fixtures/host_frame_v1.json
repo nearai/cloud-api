@@ -1,0 +1,5 @@
+{
+  "frame": "{\"schema\":1,\"host_id\":\"host-a\",\"boot_id\":\"boot-1\",\"seq\":7,\"reported_at_ms\":1700000000500,\"engine\":\"sglang\",\"report_key_id\":\"fe812c12f3ab4ce6\",\"replicas\":[{\"index\":0,\"engine_sampled_at_ms\":1700000000000,\"lifecycle_state\":\"ready\",\"engine_version\":\"0.5.0\",\"limits\":{\"max_running\":64,\"max_context_tokens\":131072},\"load\":{\"running\":3,\"queued\":1,\"prefill_backlog_tokens\":4096,\"kv_usage\":0.25,\"kv_used_tokens\":1000,\"kv_capacity_tokens\":4000,\"gen_tps\":120.5,\"cached_token_ratio\":0.5},\"proxy_inflight\":2},{\"index\":1,\"engine_sampled_at_ms\":1700000000000,\"lifecycle_state\":\"ready\",\"engine_version\":\"0.5.0\",\"limits\":{\"max_running\":64,\"max_context_tokens\":131072},\"load\":{\"running\":3,\"queued\":1,\"prefill_backlog_tokens\":4096,\"kv_usage\":0.25,\"kv_used_tokens\":1000,\"kv_capacity_tokens\":4000,\"gen_tps\":120.5,\"cached_token_ratio\":0.5},\"proxy_inflight\":2}]}",
+  "sig": "pk5t2cVrw11iTlxfbm6ChX6qgCRrhVpMWKwPXmF8FeDuN7uHt2RZ4JCujVJznVC2DY84yIqeifeB05Xxx060Cg==",
+  "key_id": "fe812c12f3ab4ce6"
+}

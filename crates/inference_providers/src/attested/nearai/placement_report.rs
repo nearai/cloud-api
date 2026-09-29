@@ -290,6 +290,7 @@ fn detail_tag(record: &DecisionRecord) -> &'static str {
             "incomplete" => "reason:incomplete",
             "lane_full" => "reason:lane_full",
             "long_full" => "reason:long_full",
+            "capacity_full" => "reason:capacity_full",
             "refuse_off" => "reason:refuse_off",
             "host_stale" => "reason:host_stale",
             _ => "reason:unknown",
@@ -528,11 +529,13 @@ mod observability_tests {
             LegacyReason::Incomplete,
         ]
         .map(LegacyReason::as_str);
-        for reason in
-            legacy_reasons
-                .into_iter()
-                .chain(["lane_full", "long_full", "refuse_off", "host_stale"])
-        {
+        for reason in legacy_reasons.into_iter().chain([
+            "lane_full",
+            "long_full",
+            "capacity_full",
+            "refuse_off",
+            "host_stale",
+        ]) {
             let tag = detail_tag(&legacy(reason));
             assert_eq!(tag, format!("reason:{reason}"), "{reason}");
         }

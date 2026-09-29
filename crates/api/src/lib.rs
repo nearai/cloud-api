@@ -63,7 +63,7 @@ use services::{
 use std::sync::Arc;
 use tower_http::{
     compression::CompressionLayer,
-    cors::{AllowOrigin, Any, CorsLayer},
+    cors::{AllowHeaders, AllowOrigin, Any, CorsLayer},
 };
 use utoipa::OpenApi;
 
@@ -1167,19 +1167,13 @@ pub async fn init_inference_providers_with_mocks(
     (pool, mock_provider)
 }
 
-fn build_cors_layer(cors_config: config::CorsConfig) -> CorsLayer {
+// Browser API clients supply their own tokens; OAuth callback origins remain
+// restricted separately by is_origin_allowed.
+fn build_cors_layer() -> CorsLayer {
     CorsLayer::new()
-        .allow_origin(AllowOrigin::predicate(
-            move |origin: &HeaderValue, _request_parts: &axum::http::request::Parts| {
-                let origin_str = match origin.to_str() {
-                    Ok(s) => s,
-                    Err(_) => return false,
-                };
-                is_origin_allowed(origin_str, &cors_config)
-            },
-        ))
+        .allow_origin(AllowOrigin::mirror_request())
         .allow_methods(Any)
-        .allow_headers(Any)
+        .allow_headers(AllowHeaders::mirror_request())
         .expose_headers(Any)
 }
 
@@ -1459,7 +1453,7 @@ pub fn build_app_with_config_and_options(
         metrics_service: domain_services.metrics_service.clone(),
     };
 
-    let cors = build_cors_layer(config.cors.clone());
+    let cors = build_cors_layer();
 
     // OHTTP routes: `POST /ohttp` and `GET /.well-known/ohttp-gateway` are at the
     // root (not under /v1) so clients can reach them without version-prefixing.
@@ -3253,34 +3247,109 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cors_layer_preserves_origin_allowlist() {
-        use axum::http::header::{ACCESS_CONTROL_ALLOW_ORIGIN, ORIGIN};
+    async fn cors_preflight_allows_browser_authorization() {
+        use axum::http::header::{
+            ACCESS_CONTROL_ALLOW_CREDENTIALS, ACCESS_CONTROL_ALLOW_HEADERS,
+            ACCESS_CONTROL_ALLOW_METHODS, ACCESS_CONTROL_ALLOW_ORIGIN,
+            ACCESS_CONTROL_REQUEST_HEADERS, ACCESS_CONTROL_REQUEST_METHOD, ORIGIN, VARY,
+        };
 
-        for (origin, allowed) in [
-            ("https://example.com", true),
-            ("https://www.typingmind.com", false),
+        for origin in [
+            "https://example.com",
+            "https://www.typingmind.com",
+            "https://client.example",
         ] {
             let app = Router::new()
-                .route("/ok", get(|| async { "ok" }))
-                .layer(build_cors_layer(test_cors_config()));
+                .route(
+                    "/chat/completions",
+                    post(|| async { StatusCode::UNAUTHORIZED }),
+                )
+                .layer(build_cors_layer());
             let response = app
                 .oneshot(
                     HttpRequest::builder()
-                        .uri("/ok")
+                        .method("OPTIONS")
+                        .uri("/chat/completions")
                         .header(ORIGIN, origin)
+                        .header(ACCESS_CONTROL_REQUEST_METHOD, "POST")
+                        .header(
+                            ACCESS_CONTROL_REQUEST_HEADERS,
+                            "authorization,content-type,x-request-id",
+                        )
                         .body(Body::empty())
                         .unwrap(),
                 )
                 .await
                 .unwrap();
             assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(response.headers()[ACCESS_CONTROL_ALLOW_ORIGIN], origin);
+            assert_eq!(response.headers()[ACCESS_CONTROL_ALLOW_METHODS], "*");
             assert_eq!(
-                response.headers().get(ACCESS_CONTROL_ALLOW_ORIGIN),
-                allowed
-                    .then(|| HeaderValue::from_str(origin).unwrap())
-                    .as_ref(),
+                response.headers()[ACCESS_CONTROL_ALLOW_HEADERS],
+                "authorization,content-type,x-request-id",
             );
+            let vary = response.headers()[VARY].to_str().unwrap();
+            for name in ["origin", "access-control-request-headers"] {
+                assert!(vary
+                    .split(',')
+                    .any(|part| part.trim().eq_ignore_ascii_case(name)));
+            }
+            assert!(!response
+                .headers()
+                .contains_key(ACCESS_CONTROL_ALLOW_CREDENTIALS));
         }
+    }
+
+    #[tokio::test]
+    async fn cors_actual_responses_reflect_browser_origin() {
+        use axum::http::header::{
+            ACCESS_CONTROL_ALLOW_CREDENTIALS, ACCESS_CONTROL_ALLOW_ORIGIN,
+            ACCESS_CONTROL_EXPOSE_HEADERS, ORIGIN,
+        };
+
+        for origin in ["https://www.typingmind.com", "https://client.example"] {
+            for status in [StatusCode::OK, StatusCode::UNAUTHORIZED] {
+                let app = Router::new()
+                    .route("/response", get(move || async move { status }))
+                    .layer(build_cors_layer());
+                let response = app
+                    .oneshot(
+                        HttpRequest::builder()
+                            .uri("/response")
+                            .header(ORIGIN, origin)
+                            .body(Body::empty())
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(response.status(), status);
+                assert_eq!(response.headers()[ACCESS_CONTROL_ALLOW_ORIGIN], origin);
+                assert_eq!(response.headers()[ACCESS_CONTROL_EXPOSE_HEADERS], "*");
+                assert!(!response
+                    .headers()
+                    .contains_key(ACCESS_CONTROL_ALLOW_CREDENTIALS));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn cors_request_without_origin_remains_usable() {
+        use axum::http::header::ACCESS_CONTROL_ALLOW_ORIGIN;
+
+        let app = Router::new()
+            .route("/ok", get(|| async { "ok" }))
+            .layer(build_cors_layer());
+        let response = app
+            .oneshot(
+                HttpRequest::builder()
+                    .uri("/ok")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(!response.headers().contains_key(ACCESS_CONTROL_ALLOW_ORIGIN));
     }
 
     // --- cache_control_layer tests -------------------------------------------

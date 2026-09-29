@@ -120,6 +120,13 @@ impl PinTable {
         self.entries.retain(|_, (slot, _)| keep(slot));
     }
 
+    /// Drop every pin to a slot on `host`: after the host reboots (see
+    /// `snapshot::Ingest::take_rebooted_hosts`) its replicas' prefix caches
+    /// are cold, so a pin there no longer buys a warm prefill.
+    pub fn drop_host(&mut self, host: &str) {
+        self.retain_slots(|slot| slot.host != host);
+    }
+
     /// Drop every entry [`Self::get`] would already treat as expired at
     /// `now_ms`, so a long-lived table stays bounded.
     pub fn prune(&mut self, now_ms: u64) {
@@ -353,6 +360,21 @@ mod tests {
             }
         }
         unreachable!("no key found within u128 search space")
+    }
+
+    #[test]
+    fn drop_host_removes_only_that_hosts_pins() {
+        let mut t = PinTable::default();
+        let slot = |host: &str, replica| SlotId {
+            host: host.into(),
+            replica,
+        };
+        t.insert([1u8; 16], slot("gpu01", 0), 0);
+        t.insert([2u8; 16], slot("gpu01", 1), 0);
+        t.insert([3u8; 16], slot("gpu02", 0), 0);
+        t.drop_host("gpu01");
+        assert_eq!(t.len(), 1);
+        assert!(t.entries.contains_key(&[3u8; 16]));
     }
 
     #[test]

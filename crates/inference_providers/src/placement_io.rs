@@ -301,6 +301,16 @@ fn push_write(pipe: &mut redis::Pipeline, w: &Write) {
     }
 }
 
+/// Set once the "client not configured" warning has been logged: every chat
+/// endpoint starts a handle set, and the cause (endpoint or CA) is
+/// process-wide, so one line says it all.
+static UNCONFIGURED_WARNED: AtomicBool = AtomicBool::new(false);
+
+/// `true` for exactly the first caller on `warned`.
+fn claim_unconfigured_warning(warned: &AtomicBool) -> bool {
+    !warned.swap(true, Ordering::AcqRel)
+}
+
 /// Handle to the placement Valkey reader and write queue.
 pub struct PlacementIo {
     /// The latest snapshot; `Snapshot::default()` (so every placement is
@@ -335,10 +345,14 @@ impl PlacementIo {
             Ok(client) => {
                 tokio::spawn(run(client, hosts, io.snapshot.clone(), rx, metrics));
             }
-            Err(kind) => tracing::warn!(
-                error_kind = kind,
-                "Placement Valkey client not configured; placement stays on the legacy path"
-            ),
+            Err(kind) => {
+                if claim_unconfigured_warning(&UNCONFIGURED_WARNED) {
+                    tracing::warn!(
+                        error_kind = kind,
+                        "Placement Valkey client not configured; placement stays on the legacy path"
+                    );
+                }
+            }
         }
         Arc::new(io)
     }
@@ -1428,6 +1442,17 @@ mod tests {
         let targets = ReadTargets::new(reg, state);
         let r = raw(&targets, frames, now);
         publish_cycle(state, slot, Ok((targets, r)), reg, now, metrics).unwrap();
+    }
+
+    /// Every chat endpoint starts a handle set, so the "not configured"
+    /// warning is claimed once per process, not once per endpoint.
+    #[test]
+    fn unconfigured_client_warns_once_per_process() {
+        let warned = AtomicBool::new(false);
+        assert!(claim_unconfigured_warning(&warned));
+        for _ in 0..5 {
+            assert!(!claim_unconfigured_warning(&warned));
+        }
     }
 
     #[test]

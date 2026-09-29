@@ -122,6 +122,16 @@ jobs:
           repository: nearai/cvm-ansible-playbooks
           event-type: deploy-cloud-api-stg
 
+      # Dev tracks the tip of main with no freeze window. Main builds push :latest,
+      # non-main builds push :dev, so dispatch only when :latest was pushed.
+      - name: Trigger dev deployment
+        if: github.ref == 'refs/heads/main'
+        uses: peter-evans/repository-dispatch@28959ce8df70de7be546dd1250a005dd32156697 # v4.0.1
+        with:
+          token: ${{ secrets.REPOSITORY_DISPATCH_TOKEN }}
+          repository: nearai/cvm-ansible-playbooks
+          event-type: deploy-cloud-api-dev
+
       - name: Generate build summary
         run: |
           {

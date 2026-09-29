@@ -257,6 +257,7 @@ fn detail_tag(record: &DecisionRecord) -> &'static str {
             "incomplete" => "reason:incomplete",
             "lane_full" => "reason:lane_full",
             "long_full" => "reason:long_full",
+            "norefuse" => "reason:norefuse",
             _ => "reason:unknown",
         },
         (None, Some(selection)) => selection_tag(selection),
@@ -489,7 +490,10 @@ mod observability_tests {
             LegacyReason::Incomplete,
         ]
         .map(LegacyReason::as_str);
-        for reason in legacy_reasons.into_iter().chain(["lane_full", "long_full"]) {
+        for reason in legacy_reasons
+            .into_iter()
+            .chain(["lane_full", "long_full", "norefuse"])
+        {
             let tag = detail_tag(&legacy(reason));
             assert_eq!(tag, format!("reason:{reason}"), "{reason}");
         }
@@ -676,6 +680,7 @@ mod observability_tests {
         }
         for record in [
             legacy("incomplete"),
+            legacy("norefuse"),
             placed("short_clean", "home"),
             refused(Tier::Long, "long_full"),
         ] {

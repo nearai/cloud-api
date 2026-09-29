@@ -1,6 +1,6 @@
 //! Valkey IO for smart placement: a background reader that turns signed
 //! host frames, per-replica routed counters, follow pins and the data-plane
-//! kill switch into a [`placement::snapshot::Snapshot`], and a bounded,
+//! kill and no-refuse switches into a [`placement::snapshot::Snapshot`], and a bounded,
 //! fire-and-forget write queue for routed counters and pins.
 //!
 //! Nothing here runs on the request path: the reader swaps a fresh snapshot
@@ -90,6 +90,8 @@ pub const METRIC_PINS_MALFORMED: &str = "cloud_api.placement.pins_malformed";
 pub const METRIC_SNAPSHOT_AGE_MS: &str = "cloud_api.placement.snapshot_age_ms";
 /// One per reader cycle that found [`KILL_SWITCH_KEY`] present.
 pub const METRIC_KILL_SWITCH_CYCLES: &str = "cloud_api.placement.kill_switch_cycles";
+/// Reader cycles published while the no-refuse switch is on.
+pub const METRIC_NOREFUSE_CYCLES: &str = "cloud_api.placement.norefuse_cycles";
 /// One per placement decision on a covered model, tagged `outcome`, `tier`,
 /// `class`, `strategy`, `priority_band` plus `selection:{..}` (place) or
 /// `reason:{..}` (legacy or refused). Never host or request ids.
@@ -181,6 +183,12 @@ pub fn routed_key(slot: &SlotId, sec: u64) -> String {
 /// but the router may only `HINCRBY`/`EXPIRE` there and the proxies' writer
 /// is scoped to `replica:*`, so only admin can set it.
 pub const KILL_SWITCH_KEY: &str = "routed:_placement_off";
+
+/// The data-plane no-refuse switch: while this key exists (any value), every
+/// snapshot is published `norefuse`, so a capacity refusal runs the legacy
+/// path instead of failing the request; all other placement stays live.
+/// Read and guarded exactly like [`KILL_SWITCH_KEY`]: only admin sets it.
+pub const NOREFUSE_KEY: &str = "routed:_placement_norefuse";
 
 /// When Valkey acknowledged one routed-count write, shared by the writer
 /// (which sets it) and the placing node's ledger entry (which reads it).
@@ -618,6 +626,8 @@ pub(crate) struct RawRead {
     frames: Vec<redis::Value>,
     /// [`KILL_SWITCH_KEY`] exists.
     kill_switch: bool,
+    /// [`NOREFUSE_KEY`] exists.
+    norefuse: bool,
     /// `(req, tok)` summed over the last two seconds per `targets.slots` entry.
     routed: Vec<(u64, u64)>,
     /// New pins stream entries, oldest first.
@@ -736,7 +746,7 @@ impl ReaderState {
     /// Builds this cycle's snapshot from `raw`: the replicas of every host
     /// whose key is present (a newly accepted frame replaces all of that
     /// host's views; a duplicate or regressed frame keeps the last accepted
-    /// ones), per-slot routed counts, the pins, and the kill switch.
+    /// ones), per-slot routed counts, the pins, and the two switches.
     fn apply(
         &mut self,
         targets: &ReadTargets,
@@ -887,6 +897,7 @@ impl ReaderState {
                 routed_read_ms: raw.read_ms,
                 pins: self.pins.clone(),
                 disabled: raw.kill_switch,
+                norefuse: raw.norefuse,
             },
             rejects,
             bad_envelopes,
@@ -945,6 +956,9 @@ fn publish_cycle(
     if applied.snapshot.disabled {
         metrics.record_count(METRIC_KILL_SWITCH_CYCLES, 1, &[]);
     }
+    if applied.snapshot.norefuse {
+        metrics.record_count(METRIC_NOREFUSE_CYCLES, 1, &[]);
+    }
     slot.store(Arc::new(applied.snapshot));
     Ok(())
 }
@@ -979,13 +993,15 @@ async fn warm_up(conn: &mut ConnectionManager) -> redis::RedisResult<Vec<PinEntr
     Ok(pin_entries(reply.ids))
 }
 
-/// One pipeline: `EXISTS` [`KILL_SWITCH_KEY`] (presence of any value type
-/// trips it), `MGET` every host's frame key (skipped with no hosts),
+/// One pipeline: `EXISTS` [`KILL_SWITCH_KEY`] and `EXISTS` [`NOREFUSE_KEY`]
+/// (presence of any value type trips each), `MGET` every host's frame key
+/// (skipped with no hosts),
 /// `HGETALL` each slot's routed hashes for `now_s-1` and `now_s`, and `XREAD`
 /// new pins.
 fn read_pipeline(targets: &ReadTargets, last_id: &str, now_s: u64) -> redis::Pipeline {
     let mut pipe = redis::pipe();
     pipe.cmd("EXISTS").arg(KILL_SWITCH_KEY);
+    pipe.cmd("EXISTS").arg(NOREFUSE_KEY);
     if !targets.hosts.is_empty() {
         let keys: Vec<String> = targets.hosts.iter().map(|h| replica_key(h)).collect();
         pipe.cmd("MGET").arg(keys);
@@ -1004,9 +1020,9 @@ fn read_pipeline(targets: &ReadTargets, last_id: &str, now_s: u64) -> redis::Pip
     pipe
 }
 
-/// The kill switch from an `EXISTS` reply: on when the key exists,
+/// A data-plane switch from an `EXISTS` reply: on when the key exists,
 /// whatever its value type.
-fn kill_switch_from_exists(reply: redis::Value) -> redis::RedisResult<bool> {
+fn switch_from_exists(reply: redis::Value) -> redis::RedisResult<bool> {
     Ok(redis::from_owned_redis_value::<i64>(reply)? > 0)
 }
 
@@ -1030,7 +1046,8 @@ async fn fetch(
         })
     };
 
-    let kill_switch = kill_switch_from_exists(next()?)?;
+    let kill_switch = switch_from_exists(next()?)?;
+    let norefuse = switch_from_exists(next()?)?;
     let frames: Vec<redis::Value> = if targets.hosts.is_empty() {
         Vec::new()
     } else {
@@ -1061,6 +1078,7 @@ async fn fetch(
         RawRead {
             frames,
             kill_switch,
+            norefuse,
             routed,
             pins,
             now_s,
@@ -1099,6 +1117,7 @@ pub(crate) fn snapshot_from_valkey_values(
                 })
                 .collect(),
             kill_switch: false,
+            norefuse: false,
             routed: targets
                 .slots
                 .iter()
@@ -1258,6 +1277,7 @@ mod tests {
                 })
                 .collect(),
             kill_switch: false,
+            norefuse: false,
             routed: vec![(0, 0); targets.slots.len()],
             pins: Vec::new(),
             now_s: now_ms / 1000,
@@ -1634,9 +1654,9 @@ mod tests {
     fn kill_switch_trips_for_non_string_value() {
         // `EXISTS` counts a key of any type (a hash from `HINCRBY`, a list,
         // a stream), where `MGET` would read nil for a non-string value.
-        assert!(kill_switch_from_exists(redis::Value::Int(1)).unwrap());
-        assert!(!kill_switch_from_exists(redis::Value::Int(0)).unwrap());
-        assert!(kill_switch_from_exists(redis::Value::Nil).is_err());
+        assert!(switch_from_exists(redis::Value::Int(1)).unwrap());
+        assert!(!switch_from_exists(redis::Value::Int(0)).unwrap());
+        assert!(switch_from_exists(redis::Value::Nil).is_err());
 
         let targets = ReadTargets {
             hosts: vec!["gpu01".to_string()],
@@ -1699,6 +1719,59 @@ mod tests {
             Decision::Place { .. }
         ));
         assert_eq!(metrics.total(METRIC_KILL_SWITCH_CYCLES, None), 3);
+    }
+
+    #[test]
+    fn norefuse_key_is_read_like_the_kill_switch_and_counted() {
+        // Read in the same pipeline, the same way: its own `EXISTS`, right
+        // after the kill switch's and before the frames.
+        let targets = ReadTargets {
+            hosts: vec!["gpu01".to_string()],
+            slots: Vec::new(),
+        };
+        let cmds: Vec<Vec<String>> = read_pipeline(&targets, "0-0", 7)
+            .cmd_iter()
+            .map(args)
+            .collect();
+        assert_eq!(
+            cmds[0],
+            vec!["EXISTS".to_string(), KILL_SWITCH_KEY.to_string()]
+        );
+        assert_eq!(
+            cmds[1],
+            vec!["EXISTS".to_string(), NOREFUSE_KEY.to_string()]
+        );
+        assert_eq!(cmds[2][0], "MGET");
+        // Under the router's readable `routed:*` prefix, never a counter key.
+        assert!(NOREFUSE_KEY.starts_with("routed:"));
+        assert_eq!(NOREFUSE_KEY.split(':').count(), 2);
+
+        let t0 = 10_000_000u64;
+        let metrics = FakeMetrics::default();
+        let reg = registry();
+        let slot = ArcSwap::from_pointee(Snapshot::default());
+        let mut state = ReaderState::default();
+        let f = sealed_json(&report(1, t0));
+        for i in 0..2u64 {
+            let now = t0 + i * 500;
+            let targets = ReadTargets::new(&reg, &state);
+            let mut r = raw(&targets, vec![Some(f.clone())], now);
+            r.norefuse = true;
+            publish_cycle(&mut state, &slot, Ok((targets, r)), &reg, now, &metrics).unwrap();
+        }
+        // One count per cycle while the key is present. Placement stays
+        // live: the snapshot is not disabled.
+        assert_eq!(metrics.total(METRIC_NOREFUSE_CYCLES, None), 2);
+        assert_eq!(metrics.total(METRIC_KILL_SWITCH_CYCLES, None), 0);
+        let snap = slot.load();
+        assert!(snap.norefuse);
+        assert!(!snap.disabled);
+        assert!(matches!(place(&snap, t0 + 600), Decision::Place { .. }));
+
+        // The key is deleted: the next cycle clears it, uncounted.
+        cycle(&mut state, &slot, &reg, vec![Some(f)], t0 + 1_000, &metrics);
+        assert!(!slot.load().norefuse);
+        assert_eq!(metrics.total(METRIC_NOREFUSE_CYCLES, None), 2);
     }
 
     #[test]
@@ -2123,8 +2196,9 @@ mod tests {
 
         assert_eq!(applied.rejects, Vec::<Reject>::new());
         assert_eq!(applied.snapshot.replicas.len(), 2);
-        // A disposable Valkey never holds the kill switch.
+        // A disposable Valkey never holds either switch.
         assert!(!applied.snapshot.disabled);
+        assert!(!applied.snapshot.norefuse);
         let rc = applied.snapshot.routed[&routed_slot];
         assert_eq!((rc.req, rc.tok), (1, 77));
         assert_eq!(

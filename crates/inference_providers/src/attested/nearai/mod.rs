@@ -6507,7 +6507,7 @@ mod tests {
                     .collect(),
                 routed_read_ms,
                 pins: old.pins.clone(),
-                disabled: false,
+                ..Snapshot::default()
             }));
         }
 
@@ -7217,6 +7217,48 @@ mod tests {
                 assert!(matches!(sse, Err(crate::CompletionError::CapacityRefused)));
                 assert_eq!(h.metrics.decisions_tagged("outcome:refused"), 2);
                 assert!(upstream.received_requests().await.unwrap().is_empty());
+            }
+
+            /// The no-refuse switch: a refusal runs the legacy path (served,
+            /// tagged `reason:norefuse`, never counted as refused).
+            #[tokio::test]
+            async fn norefuse_key_turns_refusal_into_fallback() {
+                let upstream = mock_upstream(None).await;
+                let mut snap = saturated_snapshot(fresh_ms());
+                snap.norefuse = true;
+                let h = harness_on(upstream_provider(&upstream), &[("h-a", 2)], 4, snap);
+                send_both(&h.provider, heavy_params()).await;
+
+                assert_eq!(h.metrics.decisions_tagged("reason:norefuse"), 2);
+                assert_eq!(h.metrics.decisions_tagged("outcome:legacy"), 2);
+                assert_eq!(h.metrics.decisions_tagged("outcome:refused"), 0);
+                let refused = h
+                    .metrics
+                    .counts
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .filter(|(n, _, _)| n == crate::placement_io::METRIC_REFUSED)
+                    .count();
+                assert_eq!(refused, 0);
+                let requests = upstream.received_requests().await.unwrap();
+                assert_eq!(requests.len(), 2, "every legacy request is served");
+                assert_eq!(hints(&requests), vec![None; 2]);
+            }
+
+            /// Only refusals change: every other decision still places.
+            #[tokio::test]
+            async fn norefuse_leaves_placement_live() {
+                let upstream = mock_upstream(None).await;
+                let mut snap = placed_snapshot(fresh_ms());
+                snap.norefuse = true;
+                let h = harness_on(upstream_provider(&upstream), &[("h-a", 2)], 4, snap);
+                send_both(&h.provider, params(COVERED_MODELS[0])).await;
+
+                assert_eq!(h.metrics.decisions_tagged("outcome:place"), 2);
+                assert_eq!(h.metrics.decisions_tagged("reason:norefuse"), 0);
+                let requests = upstream.received_requests().await.unwrap();
+                assert_eq!(hints(&requests), vec![Some("3".to_string()); 2]);
             }
 
             /// A refusal passes the same fail-open gates as a placement: an

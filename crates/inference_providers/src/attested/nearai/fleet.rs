@@ -864,6 +864,12 @@ impl Fleet {
                     demote(&mut record, LegacyReason::Incomplete);
                     Err(Unplaced::Fallback(record))
                 }
+                // The data-plane no-refuse switch: a refusal runs the legacy
+                // path instead. Every other decision stays live.
+                Decision::Refused { mut record } if snapshot.norefuse => {
+                    demote_as(&mut record, NOREFUSE_REASON);
+                    Err(Unplaced::Fallback(record))
+                }
                 Decision::Refused { record } => Err(Unplaced::Refused(record)),
                 Decision::Place { mut record, .. } if incomplete => {
                     demote(&mut record, LegacyReason::Incomplete);
@@ -1121,10 +1127,18 @@ fn ledger_add(ledger: &mut PlacementLedger, slot: SlotId, tok: u64, now_s: u64) 
     ack
 }
 
+/// The `reason` of a refusal the no-refuse switch sent to the legacy path.
+const NOREFUSE_REASON: &str = "norefuse";
+
 /// Turns a `Place` record into the `Legacy` one the caller fell back with.
 fn demote(record: &mut DecisionRecord, reason: LegacyReason) {
+    demote_as(record, reason.as_str());
+}
+
+/// [`demote`] with a reason the placer itself never gives.
+fn demote_as(record: &mut DecisionRecord, reason: &'static str) {
     record.outcome = "legacy";
-    record.reason = Some(reason.as_str());
+    record.reason = Some(reason);
     record.strategy = None;
     record.selection = None;
     record.rank = None;

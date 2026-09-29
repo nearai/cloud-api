@@ -118,7 +118,13 @@ pub const METRIC_REFUSE_ON_CYCLES: &str = "cloud_api.placement.refuse_on_cycles"
 /// ids. A Fleet no host of which has ever published records none.
 pub const METRIC_DECISIONS: &str = "cloud_api.placement.decisions";
 /// One per refused decision (a capacity refusal, answered as a 429), tagged
-/// `tier`, `class` and `priority_band`.
+/// `tier`, `class` and `priority_band`. Only while [`REFUSE_ON_KEY`] is set.
+///
+/// Alerting: alert on the refused FRACTION of heavy decisions,
+/// `refused / decisions{class:heavy}`, over a window, not on an absolute
+/// rate. Heavy traffic arrives in bursts (several heavy requests a minute is
+/// normal), so a fixed `refused > N/min` threshold fires on ordinary bursts
+/// and stays silent when heavy traffic is low.
 pub const METRIC_REFUSED: &str = "cloud_api.placement.refused";
 /// Heavy-lane members and cap as seen by each decision, tagged `tier`.
 /// Histograms (no gauge primitive); dashboards read the max over the window.

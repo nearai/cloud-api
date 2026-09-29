@@ -258,6 +258,13 @@ const PIN_SECRET_INFO: &[u8] = b"nearai-placement-pin-v1";
 /// a routine config change. Because the password is the sole input key
 /// material, it must be high-entropy — its entropy is inherited directly by
 /// the derived HMAC secrets.
+///
+/// Cost of a rotation: the affinity and pin keys are derived from
+/// `PLACEMENT_REDIS_PASSWORD`, so rotating it re-homes every conversation
+/// once. Each one's next turn lands on a new HRW home with a cold prefix
+/// cache (one cold prefill per conversation), and old pins are never read
+/// again. A separate HMAC secret, rotated independently of the Valkey
+/// password, is future work.
 pub fn secrets_from(password: &str) -> ([u8; 32], [u8; 32]) {
     let hk = hkdf::Hkdf::<Sha256>::new(None, password.as_bytes());
     let mut affinity = [0u8; 32];

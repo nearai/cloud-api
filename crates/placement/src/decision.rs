@@ -274,6 +274,11 @@ impl Placer {
         Self { pin_secret, tier }
     }
 
+    /// The capacity tier this placer serves.
+    pub fn tier(&self) -> Tier {
+        self.tier
+    }
+
     /// Decide where `input` goes on this Fleet, given the latest snapshot and
     /// this node's own outstanding ledger (`mine`, per slot). `Legacy` when
     /// the snapshot is disabled, uncovered, empty, stale or has no stage-1

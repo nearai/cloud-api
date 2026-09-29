@@ -835,7 +835,8 @@ impl ProviderMappings {
 /// password, so it intentionally has no `Debug`.
 struct PoolPlacement {
     password: String,
-    placer: Arc<placement::decision::Placer>,
+    /// Keys each tier's placer's follow pins (see `Placer::new`).
+    pin_secret: [u8; 32],
     /// Keys request affinity in the completion service. Derived here, once,
     /// with the pin secret, so the two can never disagree.
     affinity_secret: [u8; 32],
@@ -1294,12 +1295,7 @@ impl InferenceProviderPool {
         let (affinity_secret, pin_secret) = crate::completions::affinity::secrets_from(&password);
         let _ = self.placement.set(PoolPlacement {
             password,
-            // Every Fleet places as the base tier until the pool installs
-            // each context tier's own placer (L7).
-            placer: Arc::new(placement::decision::Placer::new(
-                pin_secret,
-                placement::policy::Tier::Base,
-            )),
+            pin_secret,
             affinity_secret,
         });
     }
@@ -1315,10 +1311,14 @@ impl InferenceProviderPool {
         self.placement.get().map(|p| p.affinity_secret)
     }
 
-    /// A new handle set (own `PlacementIo` and host map) for one provider,
-    /// or `None` when placement is not configured. Starts background tasks,
-    /// so call it only for a provider that will install the handles.
-    fn placement_handles(&self) -> Option<inference_providers::placement_io::PlacementHandles> {
+    /// A new handle set (own `PlacementIo`, host map and `tier` placer) for
+    /// one provider, or `None` when placement is not configured. Starts
+    /// background tasks, so call it only for a provider that will install
+    /// the handles.
+    fn placement_handles(
+        &self,
+        tier: placement::policy::Tier,
+    ) -> Option<inference_providers::placement_io::PlacementHandles> {
         let install = self.placement.get()?;
         let metrics: Arc<dyn crate::metrics::MetricsServiceTrait> = self
             .metrics_service
@@ -1327,23 +1327,37 @@ impl InferenceProviderPool {
             .unwrap_or_else(|| Arc::new(crate::metrics::MockMetricsService));
         Some(inference_providers::placement_io::PlacementHandles::start(
             install.password.clone(),
-            install.placer.clone(),
+            Arc::new(placement::decision::Placer::new(install.pin_secret, tier)),
             metrics,
         ))
     }
 
-    /// The `(model, inference_url)` entries that get smart placement: the
-    /// base tier of each covered model. `expand_inference_endpoints` emits a
-    /// row's base entry first and any long-context entry after it under the
-    /// same model id, and every caller keeps that order, so the first entry
-    /// per model id is the base tier.
-    fn placement_targets(models: &[(String, String, Option<u32>)]) -> HashSet<(String, String)> {
-        let mut seen: HashSet<&str> = HashSet::new();
+    /// The `(model, inference_url)` entries that get smart placement, with
+    /// each entry's tier: every entry of a covered model. An entry is `Long`
+    /// when its declared capacity is above the model's
+    /// `context_routing::base_capacity`, the same boundary that makes a
+    /// request heavy, and `Base` otherwise. The tier comes from capacities,
+    /// not entry order, so heavy and `Long` cannot disagree (with 3+
+    /// capacities every tier above base is `Long`).
+    fn placement_targets(
+        models: &[(String, String, Option<u32>)],
+    ) -> HashMap<(String, String), placement::policy::Tier> {
+        let covered = |model: &str| placement::consts::COVERED_MODELS.contains(&model);
+        let mut caps: HashMap<&str, Vec<Option<u32>>> = HashMap::new();
+        for (model, _, cap) in models.iter().filter(|(model, _, _)| covered(model)) {
+            caps.entry(model.as_str()).or_default().push(*cap);
+        }
         models
             .iter()
-            .filter(|(model, _, _)| seen.insert(model.as_str()))
-            .filter(|(model, _, _)| placement::consts::COVERED_MODELS.contains(&model.as_str()))
-            .map(|(model, url, _)| (model.clone(), url.clone()))
+            .filter(|(model, _, _)| covered(model))
+            .map(|(model, url, cap)| {
+                let base = context_routing::base_capacity(caps[model.as_str()].iter().copied());
+                let tier = match (base, cap) {
+                    (Some(base), Some(cap)) if *cap > base => placement::policy::Tier::Long,
+                    _ => placement::policy::Tier::Base,
+                };
+                ((model.clone(), url.clone()), tier)
+            })
             .collect()
     }
 
@@ -3317,9 +3331,7 @@ impl InferenceProviderPool {
                 .collect()
         };
         let context_tier_long = hints.estimated_tokens.is_some_and(|req| {
-            ctx_caps
-                .values()
-                .any(|cap| cap.is_some_and(|cap| req > cap))
+            context_routing::is_heavy(u64::from(req), ctx_caps.values().copied())
         });
 
         // Negative-priority organizations never fall back to the OTHER NEAR
@@ -4117,9 +4129,7 @@ impl InferenceProviderPool {
         hints.estimated_tokens = Some(required);
 
         // Numbers only — never content (see CLAUDE.md logging rules).
-        let is_heavy = context_routing::base_capacity(caps.iter().map(|(_, cap)| *cap))
-            .is_some_and(|base| required > base);
-        if is_heavy {
+        if context_routing::is_heavy(u64::from(required), caps.iter().map(|(_, cap)| *cap)) {
             tracing::info!(
                 model_id = %model_id,
                 input_estimate = pre_factor,
@@ -5338,12 +5348,12 @@ impl InferenceProviderPool {
         let endpoint_futures: Vec<_> = needs_creation
             .iter()
             .map(|(model_name, url, context_length)| {
-                // Only a covered model's base-tier provider gets placement,
-                // each with its own handle set (one writer per host map).
+                // Every tier of a covered model gets placement, each provider
+                // with its own handle set (one writer per host map) and a
+                // placer for its tier.
                 let placement = placement_targets
-                    .contains(&(model_name.clone(), url.clone()))
-                    .then(|| self.placement_handles())
-                    .flatten();
+                    .get(&(model_name.clone(), url.clone()))
+                    .and_then(|tier| self.placement_handles(*tier));
                 let model_name = model_name.clone();
                 let url = url.clone();
                 let context_length = *context_length;
@@ -5399,8 +5409,13 @@ impl InferenceProviderPool {
                     serving_provider.set_backend_keys(outcome.key_index_map());
                     serving_provider.set_backend_hosts(outcome.backend_hosts());
                     if let Some(handles) = placement {
+                        let tier = handles.placer.tier();
                         serving_provider.set_placement(handles);
-                        info!(model = %model_name, "Smart placement installed on base-tier provider");
+                        info!(
+                            model = %model_name,
+                            tier = tier.as_str(),
+                            "Smart placement installed on provider"
+                        );
                     }
 
                     // Store the configured context length so latency routing can
@@ -8563,12 +8578,8 @@ mod tests {
         assert_eq!(merged.len(), 1);
     }
 
-    /// Placement installs only on a covered model's base tier: the first
-    /// entry `expand_inference_endpoints` emits for its catalog row, never
-    /// the long-context entry registered under the same model id.
-    #[test]
-    fn placement_targets_are_covered_base_tier_entries() {
-        let covered = placement::consts::COVERED_MODELS[0].to_string();
+    fn covered_two_tier_models() -> Vec<(String, String, Option<u32>)> {
+        let covered = placement::consts::COVERED_MODELS[0];
         let long_context = serde_json::json!({"long_context": {
             "inference_url": "https://long.example",
             "max_context_tokens": 1_048_576,
@@ -8577,25 +8588,121 @@ mod tests {
         let mut models =
             expand_inference_endpoints("other/model", "https://other.example", None, None);
         models.extend(expand_inference_endpoints(
-            &covered,
+            covered,
             "https://base.example",
             Some(1_048_576),
             Some(&long_context),
         ));
+        models
+    }
+
+    /// Placement installs on every entry of a covered model, each with its
+    /// tier: `Long` when its declared capacity is above the model's base
+    /// capacity. Uncovered models get nothing.
+    #[test]
+    fn placement_targets_include_long_tier() {
+        use placement::policy::Tier;
+        let covered = placement::consts::COVERED_MODELS[0].to_string();
+        let models = covered_two_tier_models();
         assert_eq!(models.len(), 3, "covered row expands into base + long");
 
         let targets = InferenceProviderPool::placement_targets(&models);
         assert_eq!(
             targets,
-            HashSet::from([(covered, "https://base.example".to_string())])
+            HashMap::from([
+                (
+                    (covered.clone(), "https://base.example".to_string()),
+                    Tier::Base
+                ),
+                ((covered, "https://long.example".to_string()), Tier::Long),
+            ])
         );
+    }
+
+    #[test]
+    fn single_tier_model_has_base_only() {
+        use placement::policy::Tier;
+        let covered = placement::consts::COVERED_MODELS[0];
+        let models =
+            expand_inference_endpoints(covered, "https://base.example", Some(100_000), None);
+        let targets = InferenceProviderPool::placement_targets(&models);
+        assert_eq!(
+            targets,
+            HashMap::from([(
+                (covered.to_string(), "https://base.example".to_string()),
+                Tier::Base
+            )])
+        );
+    }
+
+    /// With three declared capacities every tier above base is `Long`, and a
+    /// request is heavy exactly when it does not fit base, so "heavy" and
+    /// "Long" come from the one boundary and cannot disagree.
+    #[test]
+    fn three_capacities_tier_and_heavy_agree() {
+        use placement::policy::Tier;
+        let covered = placement::consts::COVERED_MODELS[0].to_string();
+        let caps = [100_000u32, 262_144, 1_048_576];
+        let models: Vec<(String, String, Option<u32>)> = caps
+            .iter()
+            .map(|cap| {
+                (
+                    covered.clone(),
+                    format!("https://t{cap}.example"),
+                    Some(*cap),
+                )
+            })
+            .collect();
+        let targets = InferenceProviderPool::placement_targets(&models);
+        let tier = |cap: u32| targets[&(covered.clone(), format!("https://t{cap}.example"))];
+        assert_eq!(
+            [tier(100_000), tier(262_144), tier(1_048_576)],
+            [Tier::Base, Tier::Long, Tier::Long]
+        );
+
+        let declared: Vec<Option<u32>> = caps.iter().copied().map(Some).collect();
+        for (context_tokens, heavy) in [
+            (90_000, false),
+            (100_000, false),
+            (150_000, true),
+            (500_000, true),
+        ] {
+            assert_eq!(
+                context_routing::is_heavy(context_tokens, declared.iter().copied()),
+                heavy,
+                "context {context_tokens}"
+            );
+        }
+    }
+
+    /// The pool's `context_tier:long` tag uses the same boundary: a
+    /// requirement over the base capacity, and never for a single-tier model.
+    #[test]
+    fn context_tier_long_uses_base_capacity() {
+        let two = [Some(262_144), None, Some(1_048_576)];
+        assert!(!context_routing::is_heavy(262_144, two));
+        assert!(context_routing::is_heavy(262_145, two));
+        assert!(!context_routing::is_heavy(2_000_000, [Some(262_144)]));
+        assert!(!context_routing::is_heavy(2_000_000, [None, None]));
+    }
+
+    #[tokio::test]
+    async fn long_fleet_placer_has_long_tier() {
+        use placement::policy::Tier;
+        let pool = InferenceProviderPool::new(None, ExternalProvidersConfig::default());
+        pool.set_placement("router-password".to_string());
+        let base = pool.placement_handles(Tier::Base).expect("handles");
+        let long = pool.placement_handles(Tier::Long).expect("handles");
+        assert_eq!(base.placer.tier(), Tier::Base);
+        assert_eq!(long.placer.tier(), Tier::Long);
     }
 
     #[tokio::test]
     async fn placement_handles_need_the_secret() {
+        use placement::policy::Tier;
         let pool = InferenceProviderPool::new(None, ExternalProvidersConfig::default());
         assert!(!pool.has_placement());
-        assert!(pool.placement_handles().is_none());
+        assert!(pool.placement_handles(Tier::Base).is_none());
 
         assert!(pool.affinity_secret().is_none());
 
@@ -8603,12 +8710,13 @@ mod tests {
         assert!(pool.has_placement());
         let (affinity, _) = crate::completions::affinity::secrets_from("router-password");
         assert_eq!(pool.affinity_secret(), Some(affinity));
-        // Each call starts a separate handle set (one per base-tier Fleet).
-        // The placeholder endpoint/CA keep it inert: no network is touched.
-        let first = pool.placement_handles().expect("handles");
-        let second = pool.placement_handles().expect("handles");
+        // Each call starts a separate handle set (one per Fleet), with its
+        // own placer. The placeholder endpoint/CA keep it inert: no network
+        // is touched.
+        let first = pool.placement_handles(Tier::Base).expect("handles");
+        let second = pool.placement_handles(Tier::Base).expect("handles");
         assert!(!Arc::ptr_eq(&first.hosts, &second.hosts));
-        assert!(Arc::ptr_eq(&first.placer, &second.placer));
+        assert!(!Arc::ptr_eq(&first.placer, &second.placer));
     }
 
     /// The refresh failure-counter prune (review round 3, Pierre's blocking) must

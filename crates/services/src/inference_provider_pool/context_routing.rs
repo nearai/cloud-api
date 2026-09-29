@@ -181,6 +181,13 @@ pub(crate) fn base_capacity(caps: impl IntoIterator<Item = Option<u32>>) -> Opti
     distinct.first().copied()
 }
 
+/// Whether a context requirement exceeds the base tier ([`base_capacity`]):
+/// the request's class for placement, the pool's `context_tier:long` tag,
+/// and the tier-refinement log. Never true for a single-tier model.
+pub(crate) fn is_heavy(context_tokens: u64, caps: impl IntoIterator<Item = Option<u32>>) -> bool {
+    base_capacity(caps).is_some_and(|base| context_tokens > u64::from(base))
+}
+
 /// The output reserve counted into the context requirement: the request's
 /// `max_completion_tokens` (or `max_tokens`), 0 when unset.
 pub(crate) fn output_reserve(params: &ChatCompletionParams) -> u64 {
@@ -221,12 +228,10 @@ pub(crate) fn placement_context(
 ) -> PlacementContext {
     let (prompt_tokens, context_tokens) =
         requirement(&estimate_input(params), exact_count, output_reserve(params));
-    let heavy =
-        base_capacity(caps.iter().copied()).is_some_and(|base| context_tokens > u64::from(base));
     PlacementContext {
         prompt_tokens: Some(prompt_tokens),
         context_tokens: Some(context_tokens),
-        heavy,
+        heavy: is_heavy(context_tokens, caps.iter().copied()),
         ..params.placement.clone()
     }
 }

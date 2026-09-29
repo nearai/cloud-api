@@ -9,9 +9,9 @@
 use crate::consts::{DEFAULT_MAX_RUNNING, PREFILL_NORM_TOKENS, SPEED_FLOOR};
 use crate::snapshot::{ReplicaView, RoutedCounts};
 
-/// Requests/tokens not yet reflected in a replica's own reported load: this
-/// placer's own outstanding ledger for the replica ("mine"), plus other
-/// placers' routed counts observed since the replica's frame was sealed.
+/// Requests/tokens not yet reflected in a replica's own reported load: the
+/// fleet-wide routed counts read from Valkey, plus this placer's own ledger
+/// entries that read cannot include yet (see [`pending_for`]).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Pending {
     pub req: u32,
@@ -79,30 +79,62 @@ pub fn fleet_median_tps(views: &[&ReplicaView]) -> f64 {
     }
 }
 
+/// One entry of this placer's own routed ledger for a slot: the load it
+/// placed there, and when Valkey acknowledged the routed-count write for it
+/// (`None` while the write is still queued or in flight, or if it was
+/// dropped).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct OwnRouted {
+    pub pending: Pending,
+    pub acked_ms: Option<u64>,
+}
+
+/// The part of this placer's own ledger for a slot that a snapshot's routed
+/// read cannot include yet, summed (saturating): every entry not
+/// acknowledged by Valkey strictly before `routed_read_ms` (the snapshot's
+/// [`crate::snapshot::Snapshot::routed_read_ms`]).
+///
+/// An entry acknowledged before the read was issued is already in `routed`,
+/// so counting it again would double it. An entry acknowledged at or after
+/// that instant, or not acknowledged at all, may be missing from `routed` and
+/// is counted. `routed_read_ms == 0` (no read yet) counts every entry.
+pub fn unseen_by_read<'a>(
+    ledger: impl IntoIterator<Item = &'a OwnRouted>,
+    routed_read_ms: u64,
+) -> Pending {
+    ledger
+        .into_iter()
+        .filter(|e| e.acked_ms.is_none_or(|t| t >= routed_read_ms))
+        .fold(Pending::default(), |acc, e| Pending {
+            req: acc.req.saturating_add(e.pending.req),
+            tok: acc.tok.saturating_add(e.pending.tok),
+        })
+}
+
 /// The `Pending` load for one slot's `routed` counter (cloud-api publishes
 /// one `RoutedCounts` per slot, since it picks the replica).
 ///
 /// `routed` is the fleet-wide routed count for the slot over the reader's
-/// sliding window (the `{now-1s, now}` routed hashes) and already includes
-/// this placer's own routed requests that reached Valkey; `mine` is this
-/// placer's own count over the same window, including writes Valkey has not
-/// seen yet. The result is `routed + mine` component-wise (saturating).
+/// sliding window (the `{now-1s, now}` routed hashes), read from Valkey, so it
+/// already includes this placer's own writes that Valkey acknowledged before
+/// the read. `mine_unseen` must be only the rest of this placer's ledger for
+/// the slot: the entries that read cannot include, as computed by
+/// [`unseen_by_read`] against the same snapshot's `routed_read_ms`. The
+/// result is `routed + mine_unseen` component-wise (saturating).
 ///
-/// The two sources overlap by an unknown amount (this node's writes already
-/// visible in `routed`), so any subtraction or `max` can drop real load: 10
-/// requests from other nodes plus 1 local write not yet visible must count as
-/// at least 11. Summing double-counts only this node's own visible share,
-/// which over-estimates load on hosts this node just used. Over-counting is
-/// preferred to missing load. There is deliberately no freshness gate against
-/// the frame's `reported_at_ms`: frames arrive every 500 ms, so such a gate
-/// would discard other nodes' load almost always.
-pub fn pending_for(routed: Option<&RoutedCounts>, mine: Pending) -> Pending {
+/// Passing the whole ledger instead double-counts this node's own placements
+/// once they are flushed and read back (about one reader cycle), which
+/// inflates pending on exactly the replicas this node just used. There is
+/// deliberately no freshness gate against the frame's `reported_at_ms`:
+/// frames arrive every 500 ms, so such a gate would discard other nodes' load
+/// almost always.
+pub fn pending_for(routed: Option<&RoutedCounts>, mine_unseen: Pending) -> Pending {
     match routed {
         Some(rc) => Pending {
-            req: rc.req.saturating_add(mine.req),
-            tok: rc.tok.saturating_add(mine.tok),
+            req: rc.req.saturating_add(mine_unseen.req),
+            tok: rc.tok.saturating_add(mine_unseen.tok),
         },
-        None => mine,
+        None => mine_unseen,
     }
 }
 
@@ -163,8 +195,8 @@ mod tests {
     #[test]
     fn pending_never_drops_disjoint_load() {
         // 10 requests from other nodes plus 1 local write Valkey hasn't seen
-        // yet must count as at least 11: the two sources can be disjoint, so
-        // they are summed (over-counting this node's visible share is fine).
+        // yet must count as at least 11: `mine` is the unseen share only, so
+        // it is disjoint from `routed` and the two are summed.
         let mine = Pending { req: 1, tok: 500 };
         let routed = RoutedCounts {
             req: 10,
@@ -187,6 +219,79 @@ mod tests {
         };
         let pending = pending_for(Some(&routed), Pending::default());
         assert_eq!(pending, Pending { req: 4, tok: 1_000 });
+    }
+
+    #[test]
+    fn own_placements_are_not_double_counted_after_read() {
+        // Two of this node's placements were acknowledged by Valkey before the
+        // snapshot's routed read was issued, so `routed` (2 requests) already
+        // holds them. They must not be added again.
+        let read_ms = 10_000;
+        let ledger = [
+            OwnRouted {
+                pending: Pending { req: 1, tok: 200 },
+                acked_ms: Some(9_000),
+            },
+            OwnRouted {
+                pending: Pending { req: 1, tok: 300 },
+                acked_ms: Some(read_ms - 1),
+            },
+        ];
+        let routed = RoutedCounts {
+            req: 2,
+            tok: 500,
+            since_ms: read_ms - 1_000,
+        };
+        let mine = unseen_by_read(&ledger, read_ms);
+        assert_eq!(mine, Pending::default());
+        assert_eq!(
+            pending_for(Some(&routed), mine),
+            Pending { req: 2, tok: 500 }
+        );
+    }
+
+    #[test]
+    fn own_placements_after_read_are_added() {
+        // One placement acknowledged before the read (already in `routed`),
+        // one acknowledged at/after the read was issued (the read may have
+        // missed it), and one whose write has not been acknowledged yet. The
+        // last two are added on top of `routed`.
+        let read_ms = 10_000;
+        let ledger = [
+            OwnRouted {
+                pending: Pending { req: 1, tok: 100 },
+                acked_ms: Some(read_ms - 1),
+            },
+            OwnRouted {
+                pending: Pending { req: 1, tok: 20 },
+                acked_ms: Some(read_ms),
+            },
+            OwnRouted {
+                pending: Pending { req: 1, tok: 3 },
+                acked_ms: None,
+            },
+        ];
+        let routed = RoutedCounts {
+            req: 1,
+            tok: 100,
+            since_ms: read_ms - 1_000,
+        };
+        let mine = unseen_by_read(&ledger, read_ms);
+        assert_eq!(mine, Pending { req: 2, tok: 23 });
+        assert_eq!(
+            pending_for(Some(&routed), mine),
+            Pending { req: 3, tok: 123 }
+        );
+    }
+
+    #[test]
+    fn unknown_read_time_counts_every_own_placement() {
+        // `routed_read_ms == 0` (never read): nothing can be assumed visible.
+        let ledger = [OwnRouted {
+            pending: Pending { req: 1, tok: 5 },
+            acked_ms: Some(1),
+        }];
+        assert_eq!(unseen_by_read(&ledger, 0), Pending { req: 1, tok: 5 });
     }
 
     #[test]

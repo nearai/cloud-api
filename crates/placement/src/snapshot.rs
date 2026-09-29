@@ -71,11 +71,18 @@ pub struct RoutedCounts {
 ///
 /// `disabled` is set by the reader while the data-plane kill switch is
 /// present; every decision against such a snapshot is `Legacy(Disabled)`.
+///
+/// `routed_read_ms` is this node's clock when the reader *issued* the Valkey
+/// read that produced `routed` (not when it completed). A local write
+/// acknowledged before it is visible in `routed`; see
+/// [`crate::score::unseen_by_read`]. `0` means unknown, which counts every
+/// local ledger entry on top of `routed`.
 #[derive(Default)]
 pub struct Snapshot {
     pub built_ms: u64,
     pub replicas: Vec<ReplicaView>,
     pub routed: HashMap<SlotId, RoutedCounts>,
+    pub routed_read_ms: u64,
     pub pins: Arc<PinTable>,
     pub disabled: bool,
 }

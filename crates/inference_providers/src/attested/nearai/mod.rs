@@ -108,6 +108,15 @@ pub(crate) mod tracing_headers {
     pub const WORKSPACE_ID: &str = "x_workspace_id";
 }
 
+/// HTTP headers cloud-api itself sets on an upstream request, never taken
+/// from client input.
+pub mod upstream_headers {
+    /// The replica index placement chose on the target backend, in decimal.
+    /// Set only from the `RouteLease`, and only on the request sent to that
+    /// lease's backend; a key of the same name in `params.extra` is dropped.
+    pub const REPLICA_HINT: &str = "x-nearai-replica";
+}
+
 /// Encryption header keys used in params.extra for passing encryption information.
 /// `pub(crate)` so other providers (e.g. the Chutes path) can strip/reject these
 /// internal client-E2EE markers instead of hardcoding the strings.
@@ -908,6 +917,21 @@ impl Fleet {
             HeaderValue::from(params.request_priority),
         );
         params.strip_client_priority();
+    }
+
+    /// `headers` plus the lease's replica hint, when placement chose one.
+    /// Only the request to the lease's own backend carries it: a fallback
+    /// index or the canonical URL lands on a backend whose replicas the
+    /// decision never saw.
+    fn with_replica_hint(
+        headers: &reqwest::header::HeaderMap,
+        lease: &fleet::RouteLease,
+    ) -> reqwest::header::HeaderMap {
+        let mut headers = headers.clone();
+        if let Some(replica) = lease.replica() {
+            headers.insert(upstream_headers::REPLICA_HINT, HeaderValue::from(replica));
+        }
+        headers
     }
 
     /// Prepare tracing headers by extracting correlation IDs from `extra` and forwarding
@@ -1923,6 +1947,11 @@ impl InferenceProvider for Fleet {
         headers.insert("X-Request-Hash", request_hash_value);
 
         Self::prepare_priority_header(&mut headers, &mut streaming_params);
+        // The replica hint is placement's choice alone: a client-supplied key
+        // of that name never reaches the upstream body.
+        streaming_params
+            .extra
+            .remove(upstream_headers::REPLICA_HINT);
         // Read placement inputs before the helpers below strip them.
         let placement_request = PlacementRequest::from_extra(
             &streaming_params.model,
@@ -1969,17 +1998,22 @@ impl InferenceProvider for Fleet {
         // backend (`<canonical>-i<index>.<base>`) via L4 passthrough → prefix
         // cache hits. Index clients are lazily filled: on first use, inline
         // verification connects to the index's backend, verifies attestation,
-        // and pins the client.
-        let url = self
-            .rotation_url(index as u64, "/v1/chat/completions")
-            .unwrap_or_else(|| format!("{}/v1/chat/completions", self.config.base_url));
+        // and pins the client. Only this request carries the replica hint
+        // (never the canonical URL or a fallback index).
+        let rotation_url = self.rotation_url(index as u64, "/v1/chat/completions");
+        let primary_headers = match rotation_url {
+            Some(_) => Self::with_replica_hint(&headers, &route_lease),
+            None => headers.clone(),
+        };
+        let url =
+            rotation_url.unwrap_or_else(|| format!("{}/v1/chat/completions", self.config.base_url));
         let index_client = self.get_or_verify_index_client(index).await?;
         // Capture the send instant for the per-backend TTFT measurement.
         let started = std::time::Instant::now();
         let primary_send = match self
             .send_streaming_request(
                 &url,
-                headers.clone(),
+                primary_headers.clone(),
                 &streaming_params,
                 Some(&index_client),
             )
@@ -1991,7 +2025,7 @@ impl InferenceProvider for Fleet {
                 // clear the index client and re-verify with a fresh attestation.
                 self.clear_index(index);
                 let fresh = self.get_or_verify_index_client(index).await?;
-                self.send_streaming_request(&url, headers.clone(), &streaming_params, Some(&fresh))
+                self.send_streaming_request(&url, primary_headers, &streaming_params, Some(&fresh))
                     .await
             }
             Err(e) => Err(e),
@@ -2089,6 +2123,11 @@ impl InferenceProvider for Fleet {
         headers.insert("X-Request-Hash", request_hash_value);
 
         Self::prepare_priority_header(&mut headers, &mut non_streaming_params);
+        // The replica hint is placement's choice alone: a client-supplied key
+        // of that name never reaches the upstream body.
+        non_streaming_params
+            .extra
+            .remove(upstream_headers::REPLICA_HINT);
         // Read placement inputs before the helpers below strip them.
         let placement_request = PlacementRequest::from_extra(
             &non_streaming_params.model,
@@ -2168,10 +2207,16 @@ impl InferenceProvider for Fleet {
         let route_key = route_lease.route_key();
 
         // Route to the index's verified client, posting at the index's rotation
-        // SNI so completion + signature land on the same backend.
-        let url = self
-            .rotation_url(index as u64, "/v1/chat/completions")
-            .unwrap_or_else(|| format!("{}/v1/chat/completions", self.config.base_url));
+        // SNI so completion + signature land on the same backend. Only this
+        // request carries the replica hint (never the canonical URL or a
+        // fallback index).
+        let rotation_url = self.rotation_url(index as u64, "/v1/chat/completions");
+        let primary_headers = match rotation_url {
+            Some(_) => Self::with_replica_hint(&headers, &route_lease),
+            None => headers.clone(),
+        };
+        let url =
+            rotation_url.unwrap_or_else(|| format!("{}/v1/chat/completions", self.config.base_url));
         let index_client = self.get_or_verify_index_client(index).await?;
 
         let send = |client: &Client, hdrs: reqwest::header::HeaderMap| {
@@ -2183,7 +2228,7 @@ impl InferenceProvider for Fleet {
                 .send()
         };
 
-        let response = match send(&index_client, headers.clone()).await {
+        let response = match send(&index_client, primary_headers.clone()).await {
             Ok(r) => r,
             // Connection dropped or fingerprint mismatch on reconnect — clear
             // the index client and re-verify with a fresh attestation. Two
@@ -2204,7 +2249,7 @@ impl InferenceProvider for Fleet {
             {
                 self.clear_index(index);
                 let fresh = self.get_or_verify_index_client(index).await?;
-                send(&fresh, headers.clone()).await.map_err(map_send_err)?
+                send(&fresh, primary_headers).await.map_err(map_send_err)?
             }
             Err(e) => return Err(map_send_err(e)),
         };
@@ -6008,6 +6053,16 @@ mod tests {
         fn harness_with_count(
             host_map: &[(&str, usize)],
             hosts_count: usize,
+            snap: Snapshot,
+        ) -> Harness {
+            harness_on(rotation_provider(4), host_map, hosts_count, snap)
+        }
+
+        /// [`harness_with_count`] on a given 4-backend `provider`.
+        fn harness_on(
+            provider: Provider,
+            host_map: &[(&str, usize)],
+            hosts_count: usize,
             mut snap: Snapshot,
         ) -> Harness {
             let mut full: Vec<(String, usize)> =
@@ -6024,7 +6079,7 @@ mod tests {
                     snap.replicas.push(view);
                 }
             }
-            harness_exact(&full, hosts_count, snap)
+            install(provider, &full, hosts_count, snap)
         }
 
         /// A 4-backend rotation provider with exactly `host_map` pushed and
@@ -6034,7 +6089,17 @@ mod tests {
             hosts_count: usize,
             snap: Snapshot,
         ) -> Harness {
-            let provider = rotation_provider(4);
+            install(rotation_provider(4), host_map, hosts_count, snap)
+        }
+
+        /// Installs placement on `provider` with exactly `host_map` pushed
+        /// and `snap` as the current snapshot.
+        fn install(
+            provider: Provider,
+            host_map: &[(String, usize)],
+            hosts_count: usize,
+            snap: Snapshot,
+        ) -> Harness {
             let metrics = Arc::new(FakeMetrics::default());
             let (io, writes) = PlacementIo::for_test(metrics.clone());
             io.snapshot.store(Arc::new(snap));
@@ -6646,6 +6711,252 @@ mod tests {
                     assert_eq!(fleet_index(to_a.clone()), 1);
                     assert_eq!(fleet_index(to_b.clone()), 0);
                 }
+            }
+        }
+
+        /// The replica hint, end to end through a mock upstream reached over
+        /// the rotation URLs (`glm-i<N>.mock.test`, resolved to the mock).
+        mod replica_hint {
+            use super::*;
+            use crate::attested::nearai::upstream_headers::REPLICA_HINT;
+            use crate::attested::nearai::Config;
+            use crate::{ChatCompletionParams, InferenceProvider};
+            use futures_util::TryStreamExt;
+            use wiremock::matchers::{method, path};
+            use wiremock::{Mock, MockServer, ResponseTemplate};
+
+            /// Hands out clients that resolve every rotation host to the
+            /// mock upstream.
+            struct ResolvingVerifier(std::net::SocketAddr);
+
+            #[async_trait::async_trait]
+            impl crate::BackendVerifier for ResolvingVerifier {
+                async fn create_verified_client(
+                    &self,
+                    _base_url: &str,
+                ) -> Result<reqwest::Client, crate::BackendVerifyError> {
+                    let mut builder = reqwest::Client::builder();
+                    for index in 0..4 {
+                        builder = builder.resolve(&format!("glm-i{index}.mock.test"), self.0);
+                    }
+                    Ok(builder.build().unwrap())
+                }
+            }
+
+            /// A 4-backend rotation provider whose index clients all reach
+            /// `upstream`.
+            fn upstream_provider(upstream: &MockServer) -> Provider {
+                let addr = *upstream.address();
+                let provider = Provider::new_with_verifier(
+                    Config {
+                        base_url: format!("http://glm.mock.test:{}", addr.port()),
+                        api_key: None,
+                        completion_timeout_seconds: 5,
+                        control_timeout_seconds: 5,
+                    },
+                    Arc::new(std::sync::RwLock::new(
+                        crate::spki_verifier::FingerprintState::Bootstrap,
+                    )),
+                    Arc::new(ResolvingVerifier(addr)),
+                );
+                provider.set_backend_count(4);
+                provider
+            }
+
+            /// Answers JSON or SSE by the request's `stream` flag; a request
+            /// to a host starting with `fail_host` gets a 503.
+            fn respond(fail_host: Option<&'static str>) -> impl wiremock::Respond {
+                move |request: &wiremock::Request| {
+                    let host = request.headers["host"].to_str().unwrap_or_default();
+                    if fail_host.is_some_and(|h| host.starts_with(h)) {
+                        return ResponseTemplate::new(503);
+                    }
+                    let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+                    if body["stream"] == true {
+                        let chunk = serde_json::json!({"id": "synthetic",
+                            "object": "chat.completion.chunk", "created": 0,
+                            "model": "synthetic-model", "choices": [{"index": 0,
+                            "delta": {"content": "ok"}, "finish_reason": "stop"}]});
+                        ResponseTemplate::new(200).set_body_raw(
+                            format!("data: {chunk}\n\ndata: [DONE]\n\n"),
+                            "text/event-stream",
+                        )
+                    } else {
+                        ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                            "id": "synthetic", "object": "chat.completion", "created": 0,
+                            "model": "synthetic-model", "choices": [{"index": 0,
+                            "message": {"role": "assistant", "content": "ok"},
+                            "finish_reason": "stop"}],
+                            "usage": {"prompt_tokens": 1, "completion_tokens": 1,
+                                "total_tokens": 2}
+                        }))
+                    }
+                }
+            }
+
+            async fn mock_upstream(fail_host: Option<&'static str>) -> MockServer {
+                let upstream = MockServer::start().await;
+                Mock::given(method("POST"))
+                    .and(path("/v1/chat/completions"))
+                    .respond_with(respond(fail_host))
+                    .mount(&upstream)
+                    .await;
+                upstream
+            }
+
+            fn params(model: &str) -> ChatCompletionParams {
+                serde_json::from_value(serde_json::json!({
+                    "model": model,
+                    "messages": [{"role": "user", "content": "synthetic replica hint"}],
+                }))
+                .unwrap()
+            }
+
+            /// Sends `params` once non-streaming and once streaming.
+            async fn send_both(provider: &Provider, params: ChatCompletionParams) {
+                provider
+                    .chat_completion(params.clone(), "synthetic-hash-json".into())
+                    .await
+                    .expect("json completion");
+                let stream = provider
+                    .chat_completion_stream(params, "synthetic-hash-sse".into())
+                    .await
+                    .expect("sse completion");
+                let _: Vec<_> = stream.try_collect().await.expect("sse stream");
+            }
+
+            fn hints(requests: &[wiremock::Request]) -> Vec<Option<String>> {
+                requests
+                    .iter()
+                    .map(|r| {
+                        r.headers
+                            .get(REPLICA_HINT)
+                            .map(|v| v.to_str().unwrap().to_string())
+                    })
+                    .collect()
+            }
+
+            /// h-a (backend 2) publishes replicas 0 (draining) and 3 (ready).
+            fn placed_snapshot(built_ms: u64) -> Snapshot {
+                let mut draining = ready_replica("h-a", 0, built_ms);
+                draining.state.lifecycle_state = Lifecycle::Draining;
+                Snapshot {
+                    built_ms,
+                    replicas: vec![draining, ready_replica("h-a", 3, built_ms)],
+                    ..Snapshot::default()
+                }
+            }
+
+            #[tokio::test]
+            async fn placed_request_sends_replica_hint_header() {
+                let upstream = mock_upstream(None).await;
+                let h = harness_on(
+                    upstream_provider(&upstream),
+                    &[("h-a", 2)],
+                    4,
+                    placed_snapshot(fresh_ms()),
+                );
+                send_both(&h.provider, params(COVERED_MODELS[0])).await;
+
+                let requests = upstream.received_requests().await.unwrap();
+                assert_eq!(hints(&requests), vec![Some("3".to_string()); 2]);
+                for request in &requests {
+                    let host = request.headers["host"].to_str().unwrap();
+                    assert!(host.starts_with("glm-i2."), "sent to backend 2: {host}");
+                }
+                assert_eq!(h.metrics.decisions_tagged("outcome:place"), 2);
+            }
+
+            #[tokio::test]
+            async fn legacy_request_sends_no_replica_hint() {
+                // Rotation with a legacy lease: a stale snapshot, and a model
+                // placement does not cover.
+                let upstream = mock_upstream(None).await;
+                let stale = now_ms() - 60_000;
+                let h = harness_on(
+                    upstream_provider(&upstream),
+                    &[("h-a", 2)],
+                    4,
+                    placed_snapshot(stale),
+                );
+                send_both(&h.provider, params(COVERED_MODELS[0])).await;
+                send_both(&h.provider, params("some-org/not-covered")).await;
+                assert_eq!(h.metrics.decisions_tagged("reason:stale"), 2);
+
+                // No rotation at all: the canonical URL.
+                let canonical = mock_upstream(None).await;
+                let provider = Provider::new(Config::new(canonical.uri(), None, Some(5)));
+                send_both(&provider, params(COVERED_MODELS[0])).await;
+
+                let mut requests = upstream.received_requests().await.unwrap();
+                requests.extend(canonical.received_requests().await.unwrap());
+                assert_eq!(hints(&requests), vec![None; 6]);
+            }
+
+            #[tokio::test]
+            async fn client_extra_cannot_inject_replica_hint() {
+                let upstream = mock_upstream(None).await;
+                let stale = now_ms() - 60_000;
+                let h = harness_on(
+                    upstream_provider(&upstream),
+                    &[("h-a", 2)],
+                    4,
+                    placed_snapshot(stale),
+                );
+                let canonical = mock_upstream(None).await;
+                let canonical_provider = Provider::new(Config::new(canonical.uri(), None, Some(5)));
+                let mut injected = params(COVERED_MODELS[0]);
+                injected
+                    .extra
+                    .insert(REPLICA_HINT.to_string(), serde_json::json!("3"));
+                send_both(&h.provider, injected.clone()).await;
+                send_both(&canonical_provider, injected).await;
+
+                let mut requests = upstream.received_requests().await.unwrap();
+                requests.extend(canonical.received_requests().await.unwrap());
+                assert_eq!(requests.len(), 4);
+                assert_eq!(hints(&requests), vec![None; 4]);
+                for request in &requests {
+                    let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+                    assert!(
+                        body.get(REPLICA_HINT).is_none(),
+                        "client replica hint reached the upstream body"
+                    );
+                }
+            }
+
+            #[tokio::test]
+            async fn fallback_index_sends_no_replica_hint() {
+                // The placed backend answers 503: the retry on another index
+                // lands on replicas the decision never saw, so it carries no
+                // hint.
+                let upstream = mock_upstream(Some("glm-i2.")).await;
+                let h = harness_on(
+                    upstream_provider(&upstream),
+                    &[("h-a", 2)],
+                    4,
+                    placed_snapshot(fresh_ms()),
+                );
+                send_both(&h.provider, params(COVERED_MODELS[0])).await;
+
+                let requests = upstream.received_requests().await.unwrap();
+                let by_host: Vec<(bool, Option<String>)> = requests
+                    .iter()
+                    .zip(hints(&requests))
+                    .map(|(r, hint)| {
+                        let host = r.headers["host"].to_str().unwrap();
+                        (host.starts_with("glm-i2."), hint)
+                    })
+                    .collect();
+                assert_eq!(
+                    by_host,
+                    vec![
+                        (true, Some("3".to_string())),
+                        (false, None),
+                        (true, Some("3".to_string())),
+                        (false, None),
+                    ]
+                );
             }
         }
 

@@ -6895,6 +6895,37 @@ mod tests {
             assert_eq!(h.metrics.decisions_tagged("reason:stale"), 2);
         }
 
+        /// A host whose every replica is past freshness while another host is
+        /// fresh (typically a skewed clock) would silently starve: the host
+        /// map counts as incomplete and the Fleet routes legacy.
+        #[test]
+        fn all_stale_host_makes_fleet_legacy() {
+            let stale = now_ms() - 60_000;
+            let with_h_b = |samples: [u64; 2]| {
+                let mut snap = snapshot("h-a", fresh_ms(), PinTable::default());
+                for (replica, at) in samples.into_iter().enumerate() {
+                    snap.replicas.push(ready_replica("h-b", replica as u32, at));
+                }
+                snap
+            };
+            let messages = messages_avoiding(2);
+            let req = request("z-ai/glm-5.3-flash");
+
+            let mut h = harness(&[("h-a", 2), ("h-b", 3)], with_h_b([stale, stale]));
+            assert_eq!(
+                placed_indices(&h.provider, &messages, None, &req),
+                legacy_indices(&messages, None, None)
+            );
+            assert_eq!(h.metrics.decisions_tagged("reason:host_stale"), 12);
+            assert!(h.writes.try_recv().is_err(), "legacy writes nothing");
+
+            // One fresh replica on h-b: the host is visible, placement runs.
+            let h = harness(&[("h-a", 2), ("h-b", 3)], with_h_b([stale, fresh_ms()]));
+            placed_indices(&h.provider, &messages, None, &req);
+            assert_eq!(h.metrics.decisions_tagged("reason:host_stale"), 0);
+            assert_eq!(h.metrics.decisions_tagged("outcome:place"), 12);
+        }
+
         #[test]
         fn kill_switch_snapshot_falls_back_without_a_replica() {
             let mut snap = snapshot("h-a", fresh_ms(), PinTable::default());

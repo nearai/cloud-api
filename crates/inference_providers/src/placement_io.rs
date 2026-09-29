@@ -103,6 +103,11 @@ pub const METRIC_READ_ERRORS: &str = "cloud_api.placement.valkey_read_errors";
 pub const METRIC_FRAMES_REJECTED: &str = "cloud_api.placement.frames_rejected";
 pub const METRIC_PINS_MALFORMED: &str = "cloud_api.placement.pins_malformed";
 pub const METRIC_SNAPSHOT_AGE_MS: &str = "cloud_api.placement.snapshot_age_ms";
+/// Per newly accepted frame: this node's clock minus the frame's
+/// `reported_at_ms`, signed (a host clock ahead is negative), tagged
+/// `host:{host}`. Shows clock skew between cloud-api and a GPU host. The
+/// only host-tagged metric: hosts are few (about 10) and not customer data.
+pub const METRIC_FRAME_AGE_MS: &str = "cloud_api.placement.frame_age_ms";
 /// One per reader cycle that found [`KILL_SWITCH_KEY`] present.
 pub const METRIC_KILL_SWITCH_CYCLES: &str = "cloud_api.placement.kill_switch_cycles";
 /// Reader cycles published while the refuse-on switch is on.
@@ -173,7 +178,8 @@ impl PlacementHandles {
 /// The metrics this module emits. Same method shapes as
 /// `services::metrics::MetricsServiceTrait` (which this crate cannot depend
 /// on); `services` implements it for `dyn MetricsServiceTrait`. Tags are
-/// `key:value` strings and must stay low-cardinality (no host ids).
+/// `key:value` strings and must stay low-cardinality (no host ids, except
+/// [`METRIC_FRAME_AGE_MS`]'s).
 pub trait PlacementMetrics: Send + Sync {
     fn record_count(&self, name: &str, value: i64, tags: &[&str]);
     fn record_histogram(&self, name: &str, value: f64, tags: &[&str]);
@@ -821,6 +827,8 @@ fn routed_sum(hashes: impl IntoIterator<Item = redis::Value>) -> (u64, u64) {
 /// Outcome of applying one cycle's reads.
 pub(crate) struct Applied {
     snapshot: Snapshot,
+    /// `(host, now - reported_at_ms)` per newly accepted frame.
+    frame_ages: Vec<(String, f64)>,
     rejects: Vec<Reject>,
     bad_envelopes: u32,
     bad_pins: u32,
@@ -879,6 +887,7 @@ impl ReaderState {
         now_ms: u64,
     ) -> Applied {
         let mut rejects = Vec::new();
+        let mut frame_ages = Vec::new();
         let mut bad_envelopes = 0;
         let mut hosts = HashMap::with_capacity(targets.hosts.len());
         let mut rejected = HashMap::new();
@@ -939,6 +948,9 @@ impl ReaderState {
             };
             match self.ingest.accept(host, &env, reg, now_ms) {
                 Ok(views) => {
+                    if let Some(reported) = self.ingest.reported_at_ms(host) {
+                        frame_ages.push((host.clone(), now_ms as f64 - reported as f64));
+                    }
                     let old_slots: Vec<SlotId> = match prev.as_ref() {
                         Some(acc) => acc.views.iter().map(|v| v.slot.clone()).collect(),
                         None => self.expired_slots.remove(host).unwrap_or_default(),
@@ -1043,6 +1055,7 @@ impl ReaderState {
                 refuse_on: raw.refuse_on,
                 host_boots,
             },
+            frame_ages,
             rejects,
             bad_envelopes,
             bad_pins,
@@ -1103,6 +1116,10 @@ fn publish_cycle(
         metrics.record_count(METRIC_FRAMES_REJECTED, n, &[&tag]);
     }
     count_malformed_pins(metrics, applied.bad_pins);
+    for (host, age_ms) in &applied.frame_ages {
+        let tag = format!("host:{host}");
+        metrics.record_histogram(METRIC_FRAME_AGE_MS, *age_ms, &[&tag]);
+    }
     if applied.snapshot.disabled {
         metrics.record_count(METRIC_KILL_SWITCH_CYCLES, 1, &[]);
     }
@@ -1303,6 +1320,7 @@ mod tests {
     #[derive(Default)]
     struct FakeMetrics {
         counts: Mutex<Vec<(String, i64, Vec<String>)>>,
+        histograms: Mutex<Vec<(String, f64, Vec<String>)>>,
     }
 
     impl FakeMetrics {
@@ -1325,7 +1343,13 @@ mod tests {
                 tags.iter().map(|t| t.to_string()).collect(),
             ));
         }
-        fn record_histogram(&self, _name: &str, _value: f64, _tags: &[&str]) {}
+        fn record_histogram(&self, name: &str, value: f64, tags: &[&str]) {
+            self.histograms.lock().unwrap().push((
+                name.to_string(),
+                value,
+                tags.iter().map(|t| t.to_string()).collect(),
+            ));
+        }
     }
 
     fn signing_key() -> SigningKey {
@@ -2202,6 +2226,43 @@ mod tests {
         );
         assert!(snap.pins.get(&on_host, t1).is_none());
         assert!(snap.pins.get(&elsewhere, t1).is_some());
+    }
+
+    /// Each newly accepted frame records its age at ingest (this node's
+    /// clock minus the host's `reported_at_ms`, signed, so a host clock
+    /// ahead shows as negative), tagged by host. A frame read again is not
+    /// a new ingest.
+    #[test]
+    fn frame_age_metric_recorded() {
+        let t0 = 10_000_500u64;
+        let metrics = FakeMetrics::default();
+        let reg = registry_for(&[HOST, HOST_B]);
+        let slot = ArcSwap::from_pointee(Snapshot::default());
+        let mut state = ReaderState::default();
+        let mut behind = host_report(HOST, 1, t0 - 1_200, &[0]);
+        behind.reported_at_ms = t0 - 1_234;
+        let mut ahead = host_report(HOST_B, 1, t0, &[0]);
+        ahead.reported_at_ms = t0 + 300;
+        let frames = vec![Some(sealed_json(&behind)), Some(sealed_json(&ahead))];
+        cycle(&mut state, &slot, &reg, frames.clone(), t0, &metrics);
+        cycle(&mut state, &slot, &reg, frames, t0 + 500, &metrics);
+
+        let mut ages: Vec<(f64, Vec<String>)> = metrics
+            .histograms
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(n, _, _)| n == METRIC_FRAME_AGE_MS)
+            .map(|(_, v, tags)| (*v, tags.clone()))
+            .collect();
+        ages.sort_by(|a, b| a.0.total_cmp(&b.0));
+        assert_eq!(
+            ages,
+            vec![
+                (-300.0, vec![format!("host:{HOST_B}")]),
+                (1_234.0, vec![format!("host:{HOST}")]),
+            ]
+        );
     }
 
     #[test]

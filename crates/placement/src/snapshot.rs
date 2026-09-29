@@ -204,6 +204,8 @@ const RETIRED_BOOTS: usize = 8;
 struct HostState {
     boot: String,
     seq: u64,
+    /// The latest accepted frame's `reported_at_ms` (the host's clock).
+    reported_at_ms: u64,
     retired: Vec<String>,
     /// The frame's replicas as last accepted, by index. Only indexes in the
     /// latest accepted frame are kept, so a removed replica is forgotten.
@@ -376,6 +378,7 @@ impl Ingest {
             HostState {
                 boot: report.boot_id,
                 seq: report.seq,
+                reported_at_ms: report.reported_at_ms,
                 retired,
                 slots,
             },
@@ -391,6 +394,12 @@ impl Ingest {
     /// (`PinTable::drop_host`): a rebooted engine's prefix cache is cold.
     pub fn take_rebooted_hosts(&mut self) -> Vec<String> {
         std::mem::take(&mut self.rebooted).into_iter().collect()
+    }
+
+    /// The `reported_at_ms` of `host`'s latest accepted frame (the host's
+    /// clock), if any.
+    pub fn reported_at_ms(&self, host: &str) -> Option<u64> {
+        self.hosts.get(host).map(|h| h.reported_at_ms)
     }
 
     /// The `boot_id` of `host`'s latest accepted frame, if any.

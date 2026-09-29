@@ -24,6 +24,7 @@ use crate::BackendHosts;
 use crate::BackendVerifier;
 use arc_swap::{ArcSwap, ArcSwapOption};
 use placement::decision::{Decision, DecisionRecord, LegacyReason, PlaceInput};
+use placement::rules::Rule;
 use placement::score::{unseen_by_read, OwnRouted, Pending};
 use placement::snapshot::Snapshot;
 use placement::SlotId;
@@ -893,6 +894,7 @@ impl Fleet {
         // before taking the ledger lock below.
         let snapshot = handles.io.snapshot.load();
         let incomplete = self.host_map_incomplete(&snapshot);
+        let host_stale = !incomplete && self.host_map_has_stale_host(&snapshot, &input);
 
         // One critical section from reading this node's own pending load to
         // reserving the chosen host in it, so concurrent requests on this
@@ -920,6 +922,10 @@ impl Fleet {
                     demote(&mut record, LegacyReason::Incomplete);
                     Err(Unplaced::Fallback(record))
                 }
+                Decision::Refused { mut record } if host_stale => {
+                    demote_as(&mut record, HOST_STALE_REASON);
+                    Err(Unplaced::Fallback(record))
+                }
                 // Refusals are opt-in: unless the data-plane refuse-on switch
                 // is set, a refusal runs the legacy path instead. Every other
                 // decision stays live.
@@ -930,6 +936,10 @@ impl Fleet {
                 Decision::Refused { record } => Err(Unplaced::Refused(record)),
                 Decision::Place { mut record, .. } if incomplete => {
                     demote(&mut record, LegacyReason::Incomplete);
+                    Err(Unplaced::Fallback(record))
+                }
+                Decision::Place { mut record, .. } if host_stale => {
+                    demote_as(&mut record, HOST_STALE_REASON);
                     Err(Unplaced::Fallback(record))
                 }
                 Decision::Place {
@@ -1018,6 +1028,27 @@ impl Fleet {
             .index_by_host
             .keys()
             .any(|host| !seen.contains(host.as_str()))
+    }
+
+    /// True when a mapped host has replicas in `snapshot` but every one of
+    /// them fails `Rule::Freshness` while another mapped host has a fresh
+    /// one. Such a host (typically a skewed clock, see
+    /// `METRIC_FRAME_AGE_MS`) is invisible to the placer, which would
+    /// silently starve it while the rest of the fleet places, so the host
+    /// map counts as incomplete. When no host is fresh the placer itself
+    /// goes Legacy (`stale`).
+    fn host_map_has_stale_host(&self, snapshot: &Snapshot, input: &PlaceInput) -> bool {
+        let hosts = self.backend_hosts.load();
+        // Per mapped host: whether any of its replicas is fresh.
+        let mut fresh_by_host: HashMap<&str, bool> = HashMap::new();
+        for view in &snapshot.replicas {
+            if !hosts.index_by_host.contains_key(&view.slot.host) {
+                continue;
+            }
+            let fresh = Rule::Freshness.check(view, input, input.now_ms).is_ok();
+            *fresh_by_host.entry(view.slot.host.as_str()).or_default() |= fresh;
+        }
+        fresh_by_host.values().any(|fresh| *fresh) && fresh_by_host.values().any(|fresh| !*fresh)
     }
 
     /// See `InferenceProvider::poll_backend_count`. Only a Fleet with
@@ -1255,6 +1286,10 @@ fn ledger_add(ledger: &mut PlacementLedger, slot: SlotId, tok: u64, now_s: u64) 
         });
     ack
 }
+
+/// The `reason` of a decision sent to the legacy path because a mapped host
+/// is entirely stale while others are fresh (`host_map_has_stale_host`).
+const HOST_STALE_REASON: &str = "host_stale";
 
 /// The `reason` of a refusal sent to the legacy path because the refuse-on
 /// switch is off (the default).

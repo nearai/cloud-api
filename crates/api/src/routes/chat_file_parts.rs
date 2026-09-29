@@ -5,6 +5,11 @@
 //! `services::files::extract` — as OpenAI does server-side.
 //!
 //! Never log file bytes, extracted text, or filenames.
+//!
+//! Attestation: the request hash sent upstream (`X-Request-Hash`) and signed by
+//! the model TEE is the SHA-256 of the client's original bytes, while the model
+//! sees the extracted text. This is intentional and mirrors auto-redact; the
+//! hash binds the response to what the client sent, not to the rewritten body.
 
 use crate::models::{ErrorResponse, FilePartSource, MessageContentPart};
 use axum::{http::StatusCode, response::IntoResponse, Json as ResponseJson};
@@ -20,6 +25,9 @@ use std::collections::HashMap;
 use uuid::Uuid;
 
 const DEFAULT_FILENAME: &str = "document";
+/// Client filenames are prompt text; cap them so a huge `filename` cannot
+/// dwarf the extracted content.
+const MAX_FILENAME_CHARS: usize = 255;
 
 enum FilePartError {
     TooManyParts(usize),
@@ -116,7 +124,8 @@ async fn resolve_all(
         ));
     }
     let deadline = tokio::time::Instant::now() + limits.timeout;
-    let mut extracted: HashMap<String, String> = HashMap::new();
+    // Source key → (extracted text, stored filename).
+    let mut extracted: HashMap<String, (String, Option<String>)> = HashMap::new();
     let mut total_chars = 0usize;
 
     for (i, message) in messages.iter_mut().enumerate() {
@@ -153,7 +162,7 @@ async fn resolve_all(
                 }
             };
             let (text, stored_name) = match extracted.get(&key) {
-                Some(text) => (text.clone(), None),
+                Some(hit) => hit.clone(),
                 None => {
                     let (bytes, stored_name) = load_bytes(source, workspace_id, files, &limits)
                         .await
@@ -162,7 +171,7 @@ async fn resolve_all(
                         .extract_text(bytes, deadline)
                         .await
                         .map_err(|e| (FilePartError::Extract(e), param.clone()))?;
-                    extracted.insert(key, text.clone());
+                    extracted.insert(key, (text.clone(), stored_name.clone()));
                     (text, stored_name)
                 }
             };
@@ -173,9 +182,13 @@ async fn resolve_all(
                     param,
                 ));
             }
-            let name = filename
+            let name: String = filename
                 .or(stored_name)
-                .unwrap_or_else(|| DEFAULT_FILENAME.to_string());
+                .as_deref()
+                .unwrap_or(DEFAULT_FILENAME)
+                .chars()
+                .take(MAX_FILENAME_CHARS)
+                .collect();
             let replacement =
                 serde_json::json!({ "type": "text", "text": format_file_text(&name, &text) });
             if let Some(slot) = original_request
@@ -243,6 +256,13 @@ fn error_response(error: FilePartError, param: &str) -> axum::response::Response
             StatusCode::INTERNAL_SERVER_ERROR,
             "server_error",
             "File processing is unavailable".to_string(),
+        ),
+        // The deadline is a server-side budget (worker contention included),
+        // so report it as one rather than blaming the request.
+        FilePartError::Extract(FileExtractError::Timeout) => (
+            StatusCode::GATEWAY_TIMEOUT,
+            "server_error",
+            format!("{param}: file processing exceeded the time limit"),
         ),
         FilePartError::Storage => {
             tracing::error!("chat file part: failed to read stored file");
@@ -474,6 +494,30 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn repeated_stored_file_keeps_its_stored_name() {
+        let echo = Echo::new();
+        let part = json!({"type": "file", "file_id": format!("file-{STORED}")});
+        let mut messages = vec![msg(json!([part.clone()])), msg(json!([part]))];
+        run(&mut messages, None, &echo).await.unwrap();
+        assert_eq!(echo.calls.load(Ordering::SeqCst), 1);
+        for message in &messages {
+            assert_eq!(
+                message.content[0]["text"],
+                "File: stored.pdf\nContent:\nstored-bytes"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn oversized_client_filename_is_truncated() {
+        let long = "a".repeat(10_000);
+        let mut messages = vec![msg(json!([inline("x", Some(&long))]))];
+        run(&mut messages, None, &Echo::new()).await.unwrap();
+        let expected = format!("File: {}\nContent:\nx", "a".repeat(MAX_FILENAME_CHARS));
+        assert_eq!(messages[0].content[0]["text"], expected);
+    }
+
+    #[tokio::test]
     async fn too_many_file_parts_is_400_before_any_work() {
         let echo = Echo::new();
         let parts: Vec<_> = (0..5).map(|i| inline(&format!("f{i}"), None)).collect();
@@ -538,6 +582,7 @@ mod tests {
         for (err, status, error_type) in [
             (FileExtractError::Busy, 429, "service_overloaded"),
             (FileExtractError::Unavailable, 500, "server_error"),
+            (FileExtractError::Timeout, 504, "server_error"),
             (
                 FileExtractError::UnsupportedType,
                 400,

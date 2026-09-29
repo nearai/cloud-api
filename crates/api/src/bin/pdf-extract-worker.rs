@@ -14,7 +14,9 @@
 //! Never writes file bytes or extracted text anywhere but stdout, and never
 //! logs.
 
-use services::files::extract::{ExtractLimits, WorkerFailure, WorkerReply};
+use services::files::extract::{
+    ExtractLimits, WorkerFailure, WorkerReply, WORKER_EXIT_LOCKDOWN_FAILED,
+};
 use std::io::{Read, Write};
 use std::time::Instant;
 
@@ -28,7 +30,7 @@ const WORKER_MAX_OPEN_FILES: u64 = 16;
 
 fn main() {
     if lock_down().is_err() && cfg!(target_os = "linux") {
-        std::process::exit(2);
+        std::process::exit(WORKER_EXIT_LOCKDOWN_FAILED);
     }
     let reply = match run(std::io::stdin().lock(), ExtractLimits::default()) {
         Ok(text) => WorkerReply::Ok(text),

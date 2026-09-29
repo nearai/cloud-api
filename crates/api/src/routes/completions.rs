@@ -1513,35 +1513,36 @@ async fn chat_completions_inner(
         .resolve_alias_cached(&request.model)
         .await;
     let resolved_model_name = alias_canonical.as_deref().unwrap_or(&request.model);
-    let (model_attestation_supported, model_input_modalities) =
-        match app_state.models_service.get_models_with_pricing().await {
-            // Exact catalog name first, then the alias target: a name that is
-            // both a model and another model's alias must read its own
-            // capabilities.
-            Ok(models) => models
-                .iter()
-                .find(|model| model.model_name == request.model)
-                .or_else(|| {
-                    models
-                        .iter()
-                        .find(|model| model.model_name == resolved_model_name)
-                })
-                .map(|model| {
-                    (
-                        Some(model.attestation_supported),
-                        model.input_modalities.clone(),
-                    )
-                })
-                .unwrap_or((None, None)),
-            Err(error) => {
-                tracing::warn!(
-                    model = %request.model,
-                    error = %error,
-                    "Failed to read cached model metadata for attestation signing decisions"
-                );
-                (None, None)
-            }
-        };
+    let catalog = app_state.models_service.get_models_with_pricing().await;
+    let catalog_unavailable = catalog.is_err();
+    let (model_attestation_supported, model_input_modalities) = match catalog {
+        // Exact catalog name first, then the alias target: a name that is
+        // both a model and another model's alias must read its own
+        // capabilities.
+        Ok(models) => models
+            .iter()
+            .find(|model| model.model_name == request.model)
+            .or_else(|| {
+                models
+                    .iter()
+                    .find(|model| model.model_name == resolved_model_name)
+            })
+            .map(|model| {
+                (
+                    Some(model.attestation_supported),
+                    model.input_modalities.clone(),
+                )
+            })
+            .unwrap_or((None, None)),
+        Err(error) => {
+            tracing::warn!(
+                model = %request.model,
+                error = %error,
+                "Failed to read cached model metadata for attestation signing decisions"
+            );
+            (None, None)
+        }
+    };
 
     // Refuse gated parts (video) the catalog does not declare for this model
     // before any dispatch. Engines answer an unsupported modality
@@ -1595,7 +1596,10 @@ async fn chat_completions_inner(
             )
                 .into_response();
         }
-        if model_attestation_supported.is_some() {
+        // Skip only when the catalog answered and does not know the model; if
+        // the catalog read failed, still resolve rather than forward raw file
+        // parts every engine would reject.
+        if model_attestation_supported.is_some() || catalog_unavailable {
             let mut original_request = service_request.original_request.take();
             let resolved = crate::routes::chat_file_parts::resolve_file_parts(
                 &mut service_request.messages,

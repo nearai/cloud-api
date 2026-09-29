@@ -286,15 +286,19 @@ async fn unknown_model_is_rejected_without_file_work() {
     let org = setup_org_with_credits(&server, 10_000_000_000i64).await;
     let api_key = get_api_key_for_org(&server, org.id).await;
 
+    let model = format!("no-such-model-{}", uuid::Uuid::new_v4());
     let response = post_chat(
         &server,
         &api_key,
-        &format!("no-such-model-{}", uuid::Uuid::new_v4()),
+        &model,
         json!([{"type": "file", "file": {"file_data": "%%%"}}]),
     )
     .await;
-    assert_ne!(response.status_code(), 200);
-    let text = response.text();
-    // A file-processing error here would mean the part was parsed first.
-    assert!(!text.contains("file_data must be"), "{text}");
+    assert_eq!(response.status_code(), 400);
+    let body: serde_json::Value = response.json();
+    let message = body["error"]["message"].as_str().unwrap_or_default();
+    // The model error, not a file-processing error (which would name the
+    // part via `param` and mean the file was parsed first).
+    assert!(message.contains(&model), "{body}");
+    assert_ne!(body["error"]["param"], "messages[0].content[0]", "{body}");
 }

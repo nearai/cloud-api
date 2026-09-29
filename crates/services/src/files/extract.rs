@@ -32,6 +32,11 @@ const PDF_HEADER_WINDOW: usize = 1024;
 /// Name of the worker binary shipped next to `api` in the image.
 pub const PDF_WORKER_BINARY: &str = "pdf-extract-worker";
 
+/// Worker exit status when it cannot lower its own resource limits (Linux).
+/// It exits before reading any input; the gateway reports it as an outage,
+/// not as a bad PDF.
+pub const WORKER_EXIT_LOCKDOWN_FAILED: i32 = 2;
+
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum FileExtractError {
     #[error("file_data must be a base64 data URL or base64 string")]
@@ -190,7 +195,9 @@ impl FileTextExtractor for WorkerPdfExtractor {
         // env_clear: the gateway's environment holds database, OAuth and
         // provider secrets; the worker needs none of them.
         // kill_on_drop: a cancelled request (client disconnect) kills the
-        // worker; tokio reaps it in the background.
+        // worker; tokio reaps it in the background. On that path the permit
+        // drops with the future, so a dying worker can briefly exceed
+        // `max_workers` until the reaper collects it.
         let mut child = Command::new(&self.program)
             .args(&self.args)
             .env_clear()
@@ -253,6 +260,10 @@ async fn exchange(
         .wait()
         .await
         .map_err(|_| FileExtractError::Unavailable)?;
+    if status.code() == Some(WORKER_EXIT_LOCKDOWN_FAILED) {
+        tracing::error!("chat file part: PDF worker could not apply its resource limits");
+        return Err(FileExtractError::Unavailable);
+    }
     if !status.success() {
         tracing::warn!(
             exit_code = ?status.code(),
@@ -450,6 +461,13 @@ mod tests {
         ] {
             assert_eq!(run(script).await, Err(FileExtractError::Parse), "{script}");
         }
+    }
+
+    #[tokio::test]
+    async fn worker_lockdown_failure_is_unavailable_not_a_parse_error() {
+        // An infra problem (rlimits refused) must not be blamed on the PDF.
+        let script = format!("cat >/dev/null; exit {WORKER_EXIT_LOCKDOWN_FAILED}");
+        assert_eq!(run(&script).await, Err(FileExtractError::Unavailable));
     }
 
     #[tokio::test]

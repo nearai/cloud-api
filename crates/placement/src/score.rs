@@ -7,8 +7,29 @@
 //! Placement picks a replica slot, not just a host, so every slot is scored
 //! on its own state and its own pending load.
 
-use crate::consts::{DEFAULT_MAX_RUNNING, PREFILL_NORM_TOKENS, SPEED_FLOOR};
+use crate::consts::{
+    DEFAULT_MAX_RUNNING, PREFILL_NORM_TOKENS, QUEUED_TOKENS_ESTIMATE, SPEED_FLOOR,
+};
+use crate::frame::Load;
 use crate::snapshot::{ReplicaView, RoutedCounts};
+
+/// A replica's prefill backlog in tokens: `prefill_backlog_tokens` when the
+/// engine reports it, else `queued * QUEUED_TOKENS_ESTIMATE` (saturating). The
+/// one value both the score and the heavy lane read, so a replica that omits
+/// its backlog can never look lighter to one than to the other.
+pub fn effective_backlog(load: &Load) -> u64 {
+    load.prefill_backlog_tokens.unwrap_or_else(|| {
+        u64::from(load.queued.unwrap_or(0)).saturating_mul(QUEUED_TOKENS_ESTIMATE)
+    })
+}
+
+/// Whether a replica's load is *known* to be zero: `running`, `queued` and
+/// `prefill_backlog_tokens` all reported, and all 0. A missing field is not
+/// evidence of idleness, so it never qualifies (see `policy::lane_admits`'s
+/// idle waiver).
+pub fn known_idle(load: &Load) -> bool {
+    load.running == Some(0) && load.queued == Some(0) && load.prefill_backlog_tokens == Some(0)
+}
 
 /// Requests/tokens not yet reflected in a replica's own reported load: the
 /// fleet-wide routed counts read from Valkey, plus this placer's own ledger
@@ -23,7 +44,7 @@ pub struct Pending {
 /// per-stream generation speed (see [`fleet_median_tps`]). Lower is better.
 ///
 /// - `fullness = (running + queued + pending.req) / max_running.unwrap_or(DEFAULT_MAX_RUNNING)`
-/// - `prefill = (prefill_backlog_tokens.unwrap_or(queued * 2000) + pending.tok) / PREFILL_NORM_TOKENS`
+/// - `prefill = (effective_backlog(load) + pending.tok) / PREFILL_NORM_TOKENS`
 /// - `speed = clamp(per_stream_tps / fleet_median_tps, SPEED_FLOOR, 1 / SPEED_FLOOR)`,
 ///   or `1.0` when the replica's per-stream speed is unknown (see
 ///   [`per_stream_tps`])
@@ -51,10 +72,7 @@ pub fn replica_score(r: &ReplicaView, pending: Pending, fleet_median_tps: f64) -
         .unwrap_or(DEFAULT_MAX_RUNNING);
     let fullness = (running + queued + pending.req as f64) / max_running;
 
-    let backlog = load
-        .prefill_backlog_tokens
-        .map(|t| t as f64)
-        .unwrap_or(queued * 2_000.0);
+    let backlog = effective_backlog(load) as f64;
     let prefill = (backlog + pending.tok as f64) / PREFILL_NORM_TOKENS;
 
     // Clamped on both sides: a self-reported huge `gen_tps` must not drive
@@ -170,7 +188,7 @@ mod tests {
 
     #[test]
     fn idle_replica_scores_near_zero() {
-        let v = view_ready(); // running: Some(0), queued: Some(0), no backlog
+        let v = view_ready(); // running, queued and backlog all Some(0)
         let score = replica_score(&v, Pending::default(), 1.0);
         assert!(score.abs() < 1e-9, "expected ~0, got {score}");
     }

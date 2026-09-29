@@ -2,10 +2,11 @@
 //! heavy lane, and the route policy label.
 //!
 //! Both the class and the tier come from the pool, which owns the size
-//! estimate and the tier boundary: a request is heavy when its context
-//! requirement exceeds the smallest declared capacity, and a Fleet is `Long`
-//! when its declared capacity is above that. Placement never re-derives
-//! either from token counts.
+//! estimate and the tier boundary: a request is heavy for the lane when its
+//! prompt alone exceeds the smallest declared capacity
+//! (`PlaceInput::prefill_heavy`), and a Fleet is `Long` when its declared
+//! capacity is above that. Placement never re-derives either from token
+//! counts.
 //!
 //! The heavy lane is the only filter the class adds. [`lane_admits`] is the
 //! whole admission predicate (applied as `Rule::Lane`), and [`classify`] only
@@ -15,7 +16,9 @@
 
 use std::collections::HashSet;
 
-use crate::consts::{HEAVY_BACKLOG_CAP, HEAVY_SHARE, LANE_LOAD_TOKENS, LONG_BACKLOG_CAP};
+use crate::consts::{
+    HEAVY_BACKLOG_CAP, HEAVY_BASE_MAX_PROMPT, HEAVY_SHARE, LANE_LOAD_TOKENS, LONG_BACKLOG_CAP,
+};
 use crate::snapshot::{ReplicaView, SlotId};
 
 /// The capacity tier of the Fleet a `Placer` serves. Fixed at construction.
@@ -35,7 +38,8 @@ impl Tier {
     }
 }
 
-/// A request's size class, from the pool's `PlacementContext.heavy`.
+/// A request's lane class, from `PlaceInput::prefill_heavy` (prompt size
+/// alone over the base tier's capacity).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Class {
     Short,
@@ -91,62 +95,75 @@ impl PriorityBand {
 }
 
 /// The heavy lane as of one decision, built from raw load only (a replica's
-/// prefill backlog plus its pending tokens), so a request whose size was
-/// underestimated still makes its replica a member.
+/// effective prefill backlog plus its pending tokens), so a request whose
+/// size was underestimated still makes its replica a member.
+///
+/// Membership and the cap count every *live* replica (past `Rule::Lifecycle`
+/// and `Rule::Freshness`), including one stage 1 then drops for `Capacity` or
+/// `Context`: a loaded replica that is KV-full is still prefilling its heavy
+/// work, and dropping it from the count would free a lane slot it holds.
 #[derive(Clone, Debug, Default)]
 pub struct LaneView {
-    /// Slots whose load is at least `LANE_LOAD_TOKENS`.
+    /// Live slots whose load is at least `LANE_LOAD_TOKENS`.
     pub members: HashSet<SlotId>,
     pub size: usize,
-    /// `ceil(stage-1 survivors * HEAVY_SHARE)`.
+    /// `ceil(live replicas * HEAVY_SHARE)`.
     pub cap: usize,
-    /// Whether some stage-1 survivor is not a member.
+    /// Whether some stage-1 survivor is not a member: the only replicas a
+    /// short request can be sent to.
     pub any_clean: bool,
 }
 
-/// Build the lane from the stage-1 survivors (Lifecycle..Context) and each
-/// one's load (`prefill_backlog_tokens.unwrap_or(0) + pending tokens`).
-pub fn lane_view(pre_lane: &[(&ReplicaView, u64)]) -> LaneView {
-    let members: HashSet<SlotId> = pre_lane
+/// Build the lane from every live replica and its load (`live`), and judge
+/// `any_clean` over the stage-1 survivors (`survivors`, a subset of `live`).
+pub fn lane_view(live: &[(&ReplicaView, u64)], survivors: &[&SlotId]) -> LaneView {
+    let members: HashSet<SlotId> = live
         .iter()
         .filter(|(_, load)| *load >= LANE_LOAD_TOKENS)
         .map(|(v, _)| v.slot.clone())
         .collect();
-    let size = members.len();
     LaneView {
-        cap: (pre_lane.len() as f64 * HEAVY_SHARE).ceil() as usize,
-        any_clean: size < pre_lane.len(),
+        cap: (live.len() as f64 * HEAVY_SHARE).ceil() as usize,
+        any_clean: survivors.iter().any(|s| !members.contains(*s)),
+        size: members.len(),
         members,
-        size,
     }
 }
 
 /// The single admission predicate, applied to each stage-1 survivor as
-/// `Rule::Lane`.
+/// `Rule::Lane`. `load` is the replica's lane load
+/// (`score::effective_backlog` plus pending tokens), and `idle` says that
+/// load is *known* to be zero: `score::known_idle` and nothing pending.
 ///
 /// - Heavy on the long tier: the replica's load plus the prompt must fit
-///   under `LONG_BACKLOG_CAP`, unless the replica is idle (`load == 0`).
-/// - Heavy on the base tier: the same under `HEAVY_BACKLOG_CAP` (again
-///   waived for an idle replica), and the replica must already be a member
-///   or the lane must have room for one more.
+///   under `LONG_BACKLOG_CAP`, unless the replica is idle.
+/// - Heavy on the base tier: the prompt must be at most
+///   `HEAVY_BASE_MAX_PROMPT`, the load plus the prompt must fit under
+///   `HEAVY_BACKLOG_CAP`, and the replica must already be a member or the
+///   lane must have room for one more. No idle waiver: the prompt limit is
+///   below the cap, so an idle replica always fits.
 ///
-/// The idle waiver keeps a single prompt larger than the cap servable: the
-/// cap bounds queueing behind other work, and an idle replica has none. The
-/// engine's own context limit is `Rule::Context`'s job, not the lane's.
+/// The long tier's idle waiver keeps a single prompt larger than the cap
+/// servable: the cap bounds queueing behind other work, and an idle replica
+/// has none. It needs known load, so a replica that omits a load field never
+/// gets it. The engine's own context limit is `Rule::Context`'s job, not the
+/// lane's.
 /// - Short: a member is avoided while any clean replica survives; with none
 ///   clean, every survivor passes, so short requests are never refused.
 pub fn lane_admits(
     tier: Tier,
     class: Class,
     load: u64,
+    idle: bool,
     prompt: u64,
     is_member: bool,
     lane: &LaneView,
 ) -> bool {
     match (tier, class) {
-        (Tier::Long, Class::Heavy) => load == 0 || load.saturating_add(prompt) <= LONG_BACKLOG_CAP,
+        (Tier::Long, Class::Heavy) => idle || load.saturating_add(prompt) <= LONG_BACKLOG_CAP,
         (Tier::Base, Class::Heavy) => {
-            (load == 0 || load.saturating_add(prompt) <= HEAVY_BACKLOG_CAP)
+            prompt <= HEAVY_BASE_MAX_PROMPT
+                && load.saturating_add(prompt) <= HEAVY_BACKLOG_CAP
                 && (is_member || lane.size < lane.cap)
         }
         (_, Class::Short) => !is_member || !lane.any_clean,
@@ -224,7 +241,8 @@ mod tests {
     fn lane_of(loads: &[u64]) -> LaneView {
         let views: Vec<ReplicaView> = (0..loads.len() as u32).map(|i| view("gpu01", i)).collect();
         let pairs: Vec<(&ReplicaView, u64)> = views.iter().zip(loads.iter().copied()).collect();
-        lane_view(&pairs)
+        let slots: Vec<&SlotId> = views.iter().map(|v| &v.slot).collect();
+        lane_view(&pairs, &slots)
     }
 
     #[test]
@@ -244,6 +262,18 @@ mod tests {
         let all_members = lane_of(&[LANE_LOAD_TOKENS; 3]);
         assert!(!all_members.any_clean);
         assert_eq!(all_members.size, 3);
+
+        // A live member outside the survivors still counts; a clean live
+        // replica outside them does not make the lane clean.
+        let views = [view("gpu01", 0), view("gpu01", 1), view("gpu01", 2)];
+        let live = [
+            (&views[0], LANE_LOAD_TOKENS),
+            (&views[1], 0),
+            (&views[2], LANE_LOAD_TOKENS),
+        ];
+        let lane = lane_view(&live, &[&views[2].slot]);
+        assert_eq!((lane.size, lane.cap), (2, 1));
+        assert!(!lane.any_clean);
     }
 
     #[test]
@@ -251,9 +281,9 @@ mod tests {
         // The load passed in is what the caller computed (backlog + pending);
         // a view's own backlog alone doesn't make it a member here.
         let v = with_backlog(0, 70_000);
-        let lane = lane_view(&[(&v, 0)]);
+        let lane = lane_view(&[(&v, 0)], &[&v.slot]);
         assert_eq!(lane.size, 0);
-        let lane = lane_view(&[(&v, 70_000)]);
+        let lane = lane_view(&[(&v, 70_000)], &[&v.slot]);
         assert_eq!(lane.size, 1);
     }
 
@@ -268,6 +298,7 @@ mod tests {
             Tier::Base,
             Class::Heavy,
             70_000,
+            false,
             prompt,
             true,
             &lane
@@ -276,6 +307,7 @@ mod tests {
             Tier::Base,
             Class::Heavy,
             0,
+            true,
             prompt,
             false,
             &lane
@@ -287,6 +319,7 @@ mod tests {
             Tier::Base,
             Class::Heavy,
             0,
+            true,
             prompt,
             false,
             &lane
@@ -296,7 +329,7 @@ mod tests {
     #[test]
     fn heavy_admission_is_capped_by_tier() {
         let lane = lane_of(&[0, 0, 0, 0]);
-        let at = |tier, load| lane_admits(tier, Class::Heavy, load, 100_000, false, &lane);
+        let at = |tier, load| lane_admits(tier, Class::Heavy, load, false, 100_000, false, &lane);
         assert!(at(Tier::Base, HEAVY_BACKLOG_CAP - 100_000));
         assert!(!at(Tier::Base, HEAVY_BACKLOG_CAP - 99_999));
         assert!(at(Tier::Long, LONG_BACKLOG_CAP - 100_000));
@@ -307,6 +340,7 @@ mod tests {
             Tier::Long,
             Class::Heavy,
             0,
+            true,
             100_000,
             false,
             &full
@@ -316,6 +350,7 @@ mod tests {
             Tier::Long,
             Class::Heavy,
             u64::MAX,
+            false,
             1,
             true,
             &full
@@ -330,6 +365,7 @@ mod tests {
             Tier::Long,
             Class::Heavy,
             0,
+            true,
             prompt,
             false,
             &lane
@@ -337,24 +373,42 @@ mod tests {
     }
 
     #[test]
-    fn idle_base_replica_admits_oversized_heavy_when_lane_has_room() {
-        let prompt = HEAVY_BACKLOG_CAP + 1;
+    fn zero_load_without_known_idle_gets_no_waiver() {
+        // A zero lane load read from missing fields is not idleness.
+        let lane = lane_of(&[0, 0]);
+        let prompt = LONG_BACKLOG_CAP + 1;
+        for tier in [Tier::Base, Tier::Long] {
+            assert!(!lane_admits(
+                tier,
+                Class::Heavy,
+                0,
+                false,
+                prompt,
+                true,
+                &lane
+            ));
+        }
+    }
+
+    #[test]
+    fn base_never_admits_prompt_over_heavy_base_max() {
+        // An idle replica in a lane with room admits up to the limit, and
+        // nothing over it, member or not.
         let room = lane_of(&[0, 0, 0, 0]);
-        assert!(lane_admits(
-            Tier::Base,
-            Class::Heavy,
-            0,
-            prompt,
-            false,
-            &room
-        ));
+        let at = |prompt, is_member| {
+            lane_admits(Tier::Base, Class::Heavy, 0, true, prompt, is_member, &room)
+        };
+        assert!(at(HEAVY_BASE_MAX_PROMPT, false));
+        assert!(!at(HEAVY_BASE_MAX_PROMPT + 1, false));
+        assert!(!at(HEAVY_BASE_MAX_PROMPT + 1, true));
         // A full lane still keeps an idle non-member out.
         let full = lane_of(&[LANE_LOAD_TOKENS, 0, 0, 0]);
         assert!(!lane_admits(
             Tier::Base,
             Class::Heavy,
             0,
-            prompt,
+            true,
+            HEAVY_BASE_MAX_PROMPT,
             false,
             &full
         ));
@@ -367,25 +421,30 @@ mod tests {
             Tier::Long,
             Class::Heavy,
             1,
+            false,
             LONG_BACKLOG_CAP,
             false,
             &lane
         ));
+        // Base: a prompt within HEAVY_BASE_MAX_PROMPT, rejected on the cap.
+        let prompt = HEAVY_BASE_MAX_PROMPT;
         assert!(!lane_admits(
             Tier::Base,
             Class::Heavy,
-            1,
-            HEAVY_BACKLOG_CAP,
+            HEAVY_BACKLOG_CAP - prompt + 1,
+            false,
+            prompt,
             false,
             &lane
         ));
         let member = lane_of(&[LANE_LOAD_TOKENS, 0, 0, 0]);
-        let prompt = HEAVY_BACKLOG_CAP - LANE_LOAD_TOKENS + 1;
+        let load = HEAVY_BACKLOG_CAP - 100_000 + 1;
         assert!(!lane_admits(
             Tier::Base,
             Class::Heavy,
-            LANE_LOAD_TOKENS,
-            prompt,
+            load,
+            false,
+            100_000,
             true,
             &member
         ));
@@ -399,17 +458,19 @@ mod tests {
                 tier,
                 Class::Short,
                 LANE_LOAD_TOKENS,
+                false,
                 10,
                 true,
                 &lane
             ));
-            assert!(lane_admits(tier, Class::Short, 0, 10, false, &lane));
+            assert!(lane_admits(tier, Class::Short, 0, true, 10, false, &lane));
         }
         let no_clean = lane_of(&[LANE_LOAD_TOKENS, LANE_LOAD_TOKENS]);
         assert!(lane_admits(
             Tier::Base,
             Class::Short,
             u64::MAX,
+            false,
             10,
             true,
             &no_clean

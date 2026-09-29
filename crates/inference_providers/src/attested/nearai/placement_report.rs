@@ -23,12 +23,18 @@ pub(super) struct PlacementRequest {
     pub(super) org_id: String,
     pub(super) affinity: Option<AffinityKey>,
     pub(super) affinity_source: AffinitySource,
+    /// `params.request_priority` (operator-set, never client JSON).
+    pub(super) priority: i32,
 }
 
 impl PlacementRequest {
     /// Reads the affinity key (hex; invalid means none), its source and the
     /// tracing ids from `extra` without removing anything.
-    pub(super) fn from_extra(model: &str, extra: &HashMap<String, serde_json::Value>) -> Self {
+    pub(super) fn from_extra(
+        model: &str,
+        priority: i32,
+        extra: &HashMap<String, serde_json::Value>,
+    ) -> Self {
         let text = |key: &str| extra.get(key).and_then(|value| value.as_str());
         let affinity = text(placement_headers::AFFINITY).and_then(AffinityKey::from_hex);
         let affinity_source = match (&affinity, text(placement_headers::AFFINITY_SOURCE)) {
@@ -46,6 +52,7 @@ impl PlacementRequest {
                 .to_string(),
             affinity,
             affinity_source,
+            priority,
         }
     }
 }
@@ -134,7 +141,8 @@ pub(super) fn report_decision(
         selection = record.selection.unwrap_or(""),
         rank = ?record.rank,
         affinity = record.affinity,
-        host = record.host.as_deref().unwrap_or(""),
+        slot = record.slot.as_deref().unwrap_or(""),
+        replica = ?record.replica,
         home = record.home.as_deref().unwrap_or(""),
         pinned = record.pinned.as_deref().unwrap_or(""),
         eligible = record.eligible,
@@ -149,17 +157,19 @@ pub(super) fn report_decision(
     );
 }
 
-/// Legacy decisions made because placement has no usable snapshot are logged at
-/// debug; they would otherwise repeat on every covered request while the
-/// shared state is down or unconfigured.
+/// Legacy decisions made because placement has no usable snapshot, or is
+/// switched off by the data-plane kill switch, are logged at debug; they
+/// would otherwise repeat on every covered request while the shared state is
+/// down, unconfigured or disabled.
 fn logs_at_debug(record: &DecisionRecord) -> bool {
-    record.outcome == "legacy" && matches!(record.reason, Some("no_state" | "stale"))
+    record.outcome == "legacy" && matches!(record.reason, Some("no_state" | "stale" | "disabled"))
 }
 
 fn outcome_tag(outcome: &str) -> &'static str {
     match outcome {
         "place" => "outcome:place",
         "legacy" => "outcome:legacy",
+        "refused" => "outcome:refused",
         _ => "outcome:unknown",
     }
 }
@@ -168,6 +178,7 @@ fn outcome_tag(outcome: &str) -> &'static str {
 fn detail_tag(record: &DecisionRecord) -> &'static str {
     match (record.reason, record.selection) {
         (Some(reason), _) => match reason {
+            "disabled" => "reason:disabled",
             "not_covered" => "reason:not_covered",
             "no_state" => "reason:no_state",
             "stale" => "reason:stale",
@@ -199,11 +210,11 @@ fn affinity_tag(affinity: &str) -> &'static str {
 
 fn rule_tag(rule: Rule) -> &'static str {
     match rule {
-        Rule::Model => "rule:model",
         Rule::Lifecycle => "rule:lifecycle",
         Rule::Freshness => "rule:freshness",
         Rule::Capacity => "rule:capacity",
         Rule::Context => "rule:context",
+        Rule::Lane => "rule:lane",
     }
 }
 
@@ -213,24 +224,32 @@ mod tests {
     use crate::models::{FunctionCall, ToolCall};
     use crate::{ChatMessage, MessageRole};
     use placement::decision::{AffinitySource, Decision, DecisionRecord, PlaceInput, Placer};
+    use placement::policy::Tier;
     use placement::snapshot::Snapshot;
     use std::collections::HashMap;
 
-    fn no_state_record() -> DecisionRecord {
+    fn legacy_record(snap: &Snapshot) -> DecisionRecord {
         let input = PlaceInput {
             model: placement::consts::COVERED_MODELS[0].to_string(),
-            prompt_tokens_est: 10,
+            prompt_tokens: 10,
+            context_tokens: None,
+            heavy: false,
+            priority: 0,
             affinity: None,
             affinity_source: AffinitySource::None,
-            long_context_hosts: Vec::new(),
             now_ms: 10_000,
         };
         let mut rng = rand::rng();
-        match Placer::new([1u8; 32]).place(&input, &Snapshot::default(), &HashMap::new(), &mut rng)
-        {
+        match Placer::new([1u8; 32], Tier::Base).place(&input, snap, &HashMap::new(), &mut rng) {
             Decision::Legacy { record, .. } => record,
-            Decision::Place { .. } => panic!("an empty snapshot never places"),
+            Decision::Place { .. } | Decision::Refused { .. } => {
+                panic!("an empty snapshot is always legacy")
+            }
         }
+    }
+
+    fn no_state_record() -> DecisionRecord {
+        legacy_record(&Snapshot::default())
     }
 
     #[test]
@@ -240,6 +259,17 @@ mod tests {
         assert!(logs_at_debug(&record));
         record.reason = Some("stale");
         assert!(logs_at_debug(&record));
+    }
+
+    #[test]
+    fn kill_switch_decisions_log_at_debug_with_their_own_tag() {
+        let record = legacy_record(&Snapshot {
+            disabled: true,
+            ..Snapshot::default()
+        });
+        assert_eq!(record.reason, Some("disabled"));
+        assert!(logs_at_debug(&record));
+        assert_eq!(super::detail_tag(&record), "reason:disabled");
     }
 
     #[test]

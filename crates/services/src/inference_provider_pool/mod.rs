@@ -682,8 +682,6 @@ impl DiscoveryOutcome {
             host_keys.push(placement::snapshot::HostKey {
                 key_id: replica_key.key_id.clone(),
                 key: verifying_key,
-                replica_ids: replica_key.replica_ids.clone(),
-                model: replica_key.model.clone(),
             });
         }
 
@@ -1296,7 +1294,12 @@ impl InferenceProviderPool {
         let (affinity_secret, pin_secret) = crate::completions::affinity::secrets_from(&password);
         let _ = self.placement.set(PoolPlacement {
             password,
-            placer: Arc::new(placement::decision::Placer::new(pin_secret)),
+            // Every Fleet places as the base tier until the pool installs
+            // each context tier's own placer (L7).
+            placer: Arc::new(placement::decision::Placer::new(
+                pin_secret,
+                placement::policy::Tier::Base,
+            )),
             affinity_secret,
         });
     }
@@ -6647,8 +6650,6 @@ mod tests {
             public_key_hex: hex::encode(verifying_key.to_bytes()),
             boot_id: "boot-1".to_string(),
             host_id: host_id.to_string(),
-            model: "z-ai/glm-5.3-flash".to_string(),
-            replica_ids: vec!["r1".to_string(), "r2".to_string()],
         }
     }
 
@@ -6959,25 +6960,28 @@ mod tests {
                 0,
                 "ecdsa",
                 "key-a",
-                fake_replica_report_key(&key, "glm53-gpu03"),
+                fake_replica_report_key(&key, "host-a"),
             )],
         );
         let golden: placement::frame::Envelope = serde_json::from_str(include_str!(
-            "../../../placement/tests/fixtures/envelope_ok.json"
+            "../../../placement/tests/fixtures/host_frame_v1.json"
         ))
         .unwrap();
 
         // When: the pool's host map feeds ingest.
         let hosts = outcome.backend_hosts();
-        let view = placement::snapshot::Ingest::new()
+        let views = placement::snapshot::Ingest::new()
             // Any clock after the fixture's engine time: this test is about
             // key discovery, not freshness.
-            .accept("glm53-gpu03", "r1", &golden, &hosts.keys, u64::MAX)
+            .accept("host-a", &golden, &hosts.keys, u64::MAX)
             .expect("proxy-sealed frame verifies against the discovered key");
 
-        // Then.
-        assert_eq!(hosts.index_by_host.get("glm53-gpu03"), Some(&0));
-        assert_eq!(view.report.seq, 7);
+        // Then: one view per replica the host frame carries.
+        assert_eq!(hosts.index_by_host.get("host-a"), Some(&0));
+        assert_eq!(
+            views.iter().map(|v| v.slot.replica).collect::<Vec<_>>(),
+            vec![0, 1]
+        );
     }
 
     #[test]
@@ -7040,6 +7044,52 @@ mod tests {
         assert_eq!(hosts.index_by_host.get("host-b"), Some(&2));
         assert!(hosts.keys.by_host.contains_key("host-b"));
         assert_eq!(hosts.index_by_host.len(), 1);
+    }
+
+    #[test]
+    fn two_hosts_claiming_one_index_keep_only_the_first() {
+        // Given: two different attested hosts reported at the same backend
+        // index (the index-to-backend binding moved mid-cycle).
+        let key_a = ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]);
+        let key_b = ed25519_dalek::SigningKey::from_bytes(&[8u8; 32]);
+        let outcome = discovery_outcome_with_probes(
+            2,
+            vec![
+                backend_probe_with_key(
+                    0,
+                    "ecdsa",
+                    "key-a",
+                    fake_replica_report_key(&key_a, "host-a"),
+                ),
+                backend_probe_with_key(
+                    0,
+                    "ed25519",
+                    "key-b",
+                    fake_replica_report_key(&key_b, "host-b"),
+                ),
+            ],
+        );
+
+        // When.
+        let hosts = outcome.backend_hosts();
+
+        // Then: the index maps to one host only, and the other host has no
+        // attested key, so its frames never ingest and placement can never
+        // pick it (the reader skips it; the Fleet sees an incomplete map
+        // until discovery settles, and falls back).
+        assert_eq!(hosts.index_by_host.get("host-a"), Some(&0));
+        assert_eq!(hosts.index_by_host.get("host-b"), None);
+        assert!(!hosts.keys.by_host.contains_key("host-b"));
+        let keys = hosts
+            .keys
+            .by_host
+            .get("host-a")
+            .expect("host-a key present");
+        assert_eq!(keys.len(), 1);
+        assert_eq!(
+            keys[0].key_id,
+            placement::frame::key_id(&key_a.verifying_key())
+        );
     }
 
     #[test]

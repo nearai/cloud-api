@@ -25,6 +25,7 @@ use placement::consts::COVERED_MODELS;
 use placement::decision::{Decision, DecisionRecord, LegacyReason, PlaceInput};
 use placement::score::Pending;
 use placement::snapshot::Snapshot;
+use placement::SlotId;
 use reqwest::Client;
 use sha2::{Digest, Sha256};
 use std::cmp::Reverse;
@@ -78,11 +79,11 @@ pub(super) fn update_ema(stat: &mut BackendStat, ttft_ms: f64) {
     stat.samples = stat.samples.saturating_add(1);
 }
 
+/// Placed (req, tok) per replica slot, keyed by unix second.
+type PlacementLedger = HashMap<u64, HashMap<SlotId, Pending>>;
+
 /// Poison-tolerant lock: a panicked holder shouldn't wedge routing — we only
 /// ever mutate small maps under it, so recovering the inner value is safe.
-/// Placed (req, tok) per host, keyed by unix second.
-type PlacementLedger = HashMap<u64, HashMap<String, Pending>>;
-
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
 }
@@ -114,12 +115,20 @@ impl KeyGroup {
 pub(super) struct RouteLease {
     route_key: u64,
     index: usize,
+    /// The replica index placement chose on the backend at `index`; `None`
+    /// for a legacy lease, which leaves the replica to the proxy.
+    replica: Option<u32>,
     prefix_loads: Arc<Mutex<PrefixLoads>>,
 }
 
 impl RouteLease {
     pub(super) fn index(&self) -> usize {
         self.index
+    }
+
+    /// The placed replica index, sent upstream as the replica hint.
+    pub(super) fn replica(&self) -> Option<u32> {
+        self.replica
     }
 
     pub(super) fn route_key(&self) -> u64 {
@@ -375,6 +384,7 @@ impl Fleet {
         RouteLease {
             route_key,
             index,
+            replica: None,
             prefix_loads: self.prefix_loads.clone(),
         }
     }
@@ -391,6 +401,7 @@ impl Fleet {
         RouteLease {
             route_key,
             index,
+            replica: None,
             prefix_loads: self.prefix_loads.clone(),
         }
     }
@@ -720,13 +731,15 @@ impl Fleet {
         let now_s = now_ms / 1_000;
         let input = PlaceInput {
             model: request.model.clone(),
-            prompt_tokens_est: prompt_tokens_est(messages),
+            prompt_tokens: prompt_tokens_est(messages),
+            // No context requirement or class yet: `Rule::Context` passes
+            // and every request is short until the pool's typed placement
+            // context arrives (L5).
+            context_tokens: None,
+            heavy: false,
+            priority: request.priority,
             affinity: request.affinity.clone(),
             affinity_source: request.affinity_source,
-            // Context tiers are separate providers (pool-level), so this
-            // Fleet has no host-level long-context knowledge: long prompts
-            // are NoneEligible and fail open to the legacy path.
-            long_context_hosts: Vec::new(),
             now_ms,
         };
         let key_group = self.resolve_key_group(pinned_pub_key, count);
@@ -755,15 +768,18 @@ impl Fleet {
                 .place(&input, &snapshot, &mine, &mut rand::rng());
             match decision {
                 Decision::Legacy { record, .. } => Err(record),
+                // Until the pool can act on a refusal (L6), it falls back
+                // like Legacy.
+                Decision::Refused { record } => Err(record),
                 Decision::Place { mut record, .. } if incomplete => {
                     demote(&mut record, LegacyReason::Incomplete);
                     Err(record)
                 }
                 Decision::Place {
-                    host,
+                    slot,
                     mut record,
                     pin_write,
-                } => match self.index_for_host(&host, count) {
+                } => match self.index_for_host(&slot.host, count) {
                     None => {
                         demote(&mut record, LegacyReason::HostUnmapped);
                         Err(record)
@@ -777,13 +793,13 @@ impl Fleet {
                         Err(record)
                     }
                     Some(index) => {
-                        ledger_add(&mut ledger, host.clone(), input.prompt_tokens_est, now_s);
-                        Ok((host, index, record, pin_write))
+                        ledger_add(&mut ledger, slot.clone(), input.prompt_tokens, now_s);
+                        Ok((slot, index, record, pin_write))
                     }
                 },
             }
         };
-        let (host, index, record, pin_write) = match placed {
+        let (slot, index, record, pin_write) = match placed {
             Ok(placed) => placed,
             Err(record) => {
                 report_decision(handles, &record, request);
@@ -794,17 +810,17 @@ impl Fleet {
             self.warn_unknown_key(pinned_pub_key);
         }
 
-        let lease = self.reserve_index(self.route_key(messages), index);
+        let mut lease = self.reserve_index(self.route_key(messages), index);
+        lease.replica = Some(slot.replica);
         handles.io.record(Write::Routed {
-            host,
-            replica: None,
-            tok: input.prompt_tokens_est,
+            slot,
+            tok: input.prompt_tokens,
             sec: now_s,
         });
-        if let Some((pin_id, pin_host)) = pin_write {
+        if let Some((pin_id, pin_slot)) = pin_write {
             handles.io.record(Write::Pin {
                 id_hex: pin_id.to_hex(),
-                host: pin_host,
+                slot: pin_slot,
                 at_ms: now_ms,
             });
         }
@@ -825,7 +841,7 @@ impl Fleet {
         let seen: HashSet<&str> = snapshot
             .replicas
             .iter()
-            .map(|v| v.host_id.as_str())
+            .map(|v| v.slot.host.as_str())
             .collect();
         hosts
             .index_by_host
@@ -848,9 +864,9 @@ impl Fleet {
             .filter(|index| *index < count)
     }
 
-    /// This node's own placed load per host over `{now_s - 1, now_s}`.
+    /// This node's own placed load per replica slot over `{now_s - 1, now_s}`.
     #[cfg(test)]
-    pub(super) fn placement_mine(&self, now_s: u64) -> HashMap<String, Pending> {
+    pub(super) fn placement_mine(&self, now_s: u64) -> HashMap<SlotId, Pending> {
         mine_in(&lock(&self.placement_ledger), now_s)
     }
 
@@ -944,13 +960,13 @@ fn epoch_ms() -> u64 {
         })
 }
 
-/// This node's own placed load per host over `{now_s - 1, now_s}`.
-fn mine_in(ledger: &PlacementLedger, now_s: u64) -> HashMap<String, Pending> {
-    let mut mine: HashMap<String, Pending> = HashMap::new();
+/// This node's own placed load per replica slot over `{now_s - 1, now_s}`.
+fn mine_in(ledger: &PlacementLedger, now_s: u64) -> HashMap<SlotId, Pending> {
+    let mut mine: HashMap<SlotId, Pending> = HashMap::new();
     let window = now_s.saturating_sub(1)..=now_s;
-    for (_, hosts) in ledger.iter().filter(|(sec, _)| window.contains(*sec)) {
-        for (host, pending) in hosts {
-            let entry = mine.entry(host.clone()).or_default();
+    for (_, slots) in ledger.iter().filter(|(sec, _)| window.contains(*sec)) {
+        for (slot, pending) in slots {
+            let entry = mine.entry(slot.clone()).or_default();
             entry.req = entry.req.saturating_add(pending.req);
             entry.tok = entry.tok.saturating_add(pending.tok);
         }
@@ -958,11 +974,12 @@ fn mine_in(ledger: &PlacementLedger, now_s: u64) -> HashMap<String, Pending> {
     mine
 }
 
-/// Reserves one placed request of `tok` tokens on `host` in second `now_s`,
-/// dropping seconds that left the window.
-fn ledger_add(ledger: &mut PlacementLedger, host: String, tok: u64, now_s: u64) {
+/// Reserves one placed request of `tok` tokens on `slot` in second `now_s`,
+/// dropping seconds that left the window (and with them the entries of any
+/// slot that has since left its host's frame).
+fn ledger_add(ledger: &mut PlacementLedger, slot: SlotId, tok: u64, now_s: u64) {
     ledger.retain(|sec, _| sec.saturating_add(1) >= now_s);
-    let pending = ledger.entry(now_s).or_default().entry(host).or_default();
+    let pending = ledger.entry(now_s).or_default().entry(slot).or_default();
     pending.req = pending.req.saturating_add(1);
     pending.tok = pending.tok.saturating_add(tok);
 }
@@ -971,14 +988,16 @@ fn ledger_add(ledger: &mut PlacementLedger, host: String, tok: u64, now_s: u64) 
 fn demote(record: &mut DecisionRecord, reason: LegacyReason) {
     record.outcome = "legacy";
     record.reason = Some(reason.as_str());
+    record.strategy = None;
     record.selection = None;
     record.rank = None;
-    // The candidate was rejected: nothing below may describe a host this
-    // request did not use, or `METRIC_CHOSEN_BACKLOG` ("chosen host, per
+    // The candidate was rejected: nothing below may describe a slot this
+    // request did not use, or `METRIC_CHOSEN_BACKLOG` ("chosen slot, per
     // placed request") samples a record that was never placed. `eligible`
     // and `excluded` are left as-is: they still describe the scoring that
-    // was actually done. Matches the shape of `DecisionRecord::legacy`.
-    record.host = None;
+    // was actually done. Matches the shape of a placer-built Legacy record.
+    record.slot = None;
+    record.replica = None;
     record.home = None;
     record.pinned = None;
     record.chosen_score = None;
@@ -1017,42 +1036,90 @@ fn key_affinity_enabled() -> bool {
 #[cfg(test)]
 mod demote_tests {
     use super::*;
-    use placement::rules::RULES;
+    use placement::decision::{AffinitySource, Placer};
+    use placement::frame::{Lifecycle, Load, ReplicaState};
+    use placement::policy::Tier;
+    use placement::snapshot::ReplicaView;
+
+    const NOW: u64 = 10_000_000;
+
+    fn slot(host: &str, replica: u32) -> SlotId {
+        SlotId {
+            host: host.to_string(),
+            replica,
+        }
+    }
+
+    /// A fully populated `Place` record, as the placer builds it for a
+    /// single ready replica with a prefill backlog.
+    fn placed_record() -> DecisionRecord {
+        let snapshot = Snapshot {
+            built_ms: NOW,
+            replicas: vec![ReplicaView {
+                slot: slot("host-a", 1),
+                state: ReplicaState {
+                    index: 1,
+                    engine_sampled_at_ms: Some(NOW),
+                    lifecycle_state: Lifecycle::Ready,
+                    engine_version: None,
+                    limits: Default::default(),
+                    load: Load {
+                        running: Some(0),
+                        queued: Some(0),
+                        prefill_backlog_tokens: Some(1_234),
+                        ..Load::default()
+                    },
+                    proxy_inflight: 0,
+                },
+            }],
+            ..Snapshot::default()
+        };
+        let input = PlaceInput {
+            model: COVERED_MODELS[0].to_string(),
+            prompt_tokens: 10,
+            context_tokens: None,
+            heavy: false,
+            priority: 0,
+            affinity: None,
+            affinity_source: AffinitySource::None,
+            now_ms: NOW,
+        };
+        match Placer::new([1u8; 32], Tier::Base).place(
+            &input,
+            &snapshot,
+            &HashMap::new(),
+            &mut rand::rng(),
+        ) {
+            Decision::Place { record, .. } => record,
+            Decision::Legacy { .. } | Decision::Refused { .. } => {
+                panic!("one ready replica places")
+            }
+        }
+    }
 
     #[test]
     fn demote_clears_the_rejected_candidate_shape() {
         // Given: a fully populated `Place` decision, as if the placer had
-        // chosen a host, right before the caller demotes it to legacy.
-        let mut record = DecisionRecord {
-            outcome: "place",
-            reason: None,
-            rank: Some(0),
-            affinity: "prefix",
-            selection: Some("primary"),
-            host: Some("host-a".to_string()),
-            home: Some("host-a".to_string()),
-            pinned: Some("pubkey-a".to_string()),
-            eligible: 3,
-            excluded: RULES.map(|r| (r, 0)),
-            chosen_score: Some(1.0),
-            home_score: Some(1.0),
-            best_score: Some(1.0),
-            snapshot_age_ms: 42,
-            pending_req: 5,
-            chosen_backlog_tokens: Some(1234),
-        };
+        // chosen a slot, right before the caller demotes it to legacy.
+        let mut record = placed_record();
+        assert_eq!(record.slot.as_deref(), Some("host-a#1"));
+        assert_eq!(record.replica, Some(1));
+        assert!(record.strategy.is_some());
+        assert_eq!(record.chosen_backlog_tokens, Some(1_234));
 
         // When: the caller falls back to the legacy path.
         demote(&mut record, LegacyReason::HostUnmapped);
 
         // Then: the record matches the shape of a placer-built `Legacy`
-        // record — no host, no backlog, nothing describing a candidate this
+        // record — no slot, no backlog, nothing describing a candidate this
         // request never used.
         assert_eq!(record.outcome, "legacy");
         assert_eq!(record.reason, Some(LegacyReason::HostUnmapped.as_str()));
+        assert_eq!(record.strategy, None);
         assert_eq!(record.selection, None);
         assert_eq!(record.rank, None);
-        assert_eq!(record.host, None);
+        assert_eq!(record.slot, None);
+        assert_eq!(record.replica, None);
         assert_eq!(record.home, None);
         assert_eq!(record.pinned, None);
         assert_eq!(record.chosen_score, None);
@@ -1062,6 +1129,32 @@ mod demote_tests {
         assert_eq!(record.chosen_backlog_tokens, None);
         // `eligible` and `excluded` are left untouched: they still describe
         // the scoring that was actually done.
-        assert_eq!(record.eligible, 3);
+        assert_eq!(record.eligible, 1);
+    }
+
+    #[test]
+    fn ledger_is_per_replica() {
+        // Given: placements on two replicas of one host, and on one of them
+        // again in the next second.
+        let mut ledger = PlacementLedger::new();
+        ledger_add(&mut ledger, slot("host-a", 0), 100, 50);
+        ledger_add(&mut ledger, slot("host-a", 1), 7, 50);
+        ledger_add(&mut ledger, slot("host-a", 0), 20, 51);
+
+        // Then: each replica keeps its own pending load over the window.
+        let mine = mine_in(&ledger, 51);
+        assert_eq!(mine.len(), 2);
+        let pending = |r| mine.get(&slot("host-a", r)).map(|p| (p.req, p.tok));
+        assert_eq!(pending(0), Some((2, 120)));
+        assert_eq!(pending(1), Some((1, 7)));
+
+        // A later second drops what left the window, per replica.
+        ledger_add(&mut ledger, slot("host-a", 1), 5, 53);
+        let mine = mine_in(&ledger, 53);
+        assert_eq!(mine.len(), 1);
+        assert_eq!(
+            mine.get(&slot("host-a", 1)).map(|p| (p.req, p.tok)),
+            Some((1, 5))
+        );
     }
 }

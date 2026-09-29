@@ -1015,8 +1015,6 @@ fn discovery_uses_signing_keys_only_from_matching_probes() {
         public_key_hex: hex::encode(verifying_key.to_bytes()),
         boot_id: "boot-1".to_string(),
         host_id: "host-1".to_string(),
-        model: "model".to_string(),
-        replica_ids: vec!["r1".to_string()],
     };
 
     let probe = backend_probe(

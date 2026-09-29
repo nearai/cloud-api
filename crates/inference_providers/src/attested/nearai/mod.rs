@@ -1924,8 +1924,11 @@ impl InferenceProvider for Fleet {
 
         Self::prepare_priority_header(&mut headers, &mut streaming_params);
         // Read placement inputs before the helpers below strip them.
-        let placement_request =
-            PlacementRequest::from_extra(&streaming_params.model, &streaming_params.extra);
+        let placement_request = PlacementRequest::from_extra(
+            &streaming_params.model,
+            streaming_params.request_priority,
+            &streaming_params.extra,
+        );
         // Prepare tracing headers (request_id, org_id, workspace_id)
         self.prepare_tracing_headers(&mut headers, &mut streaming_params.extra);
         // Prepare encryption headers
@@ -2087,8 +2090,11 @@ impl InferenceProvider for Fleet {
 
         Self::prepare_priority_header(&mut headers, &mut non_streaming_params);
         // Read placement inputs before the helpers below strip them.
-        let placement_request =
-            PlacementRequest::from_extra(&non_streaming_params.model, &non_streaming_params.extra);
+        let placement_request = PlacementRequest::from_extra(
+            &non_streaming_params.model,
+            non_streaming_params.request_priority,
+            &non_streaming_params.extra,
+        );
         // Prepare tracing headers (request_id, org_id, workspace_id)
         self.prepare_tracing_headers(&mut headers, &mut non_streaming_params.extra);
         // Prepare encryption headers
@@ -5881,8 +5887,10 @@ mod tests {
         use placement::affinity::{pin_id, AffinityKey, PinTable};
         use placement::consts::COVERED_MODELS;
         use placement::decision::{AffinitySource, Placer};
-        use placement::frame::{Lifecycle, Limits, Load, ReplicaReport};
+        use placement::frame::{Lifecycle, Load, ReplicaState};
+        use placement::policy::Tier;
         use placement::snapshot::{ReplicaView, Snapshot};
+        use placement::SlotId;
         use std::collections::HashMap;
         use std::sync::{Arc, Mutex};
         use tokio::sync::mpsc;
@@ -5932,32 +5940,40 @@ mod tests {
             now_ms() + placement::consts::MAX_FUTURE_SKEW_MS
         }
 
-        fn ready_view(host: &str, now: u64) -> ReplicaView {
-            ReplicaView {
-                host_id: host.into(),
-                replica_id: "r1".into(),
-                report: ReplicaReport {
-                    schema: 1,
-                    host_id: host.into(),
-                    replica_id: "r1".into(),
-                    boot_id: "boot-a".into(),
-                    seq: 1,
-                    engine_sampled_at_ms: Some(now),
-                    reported_at_ms: now,
-                    lifecycle_state: Lifecycle::Ready,
-                    model: COVERED_MODELS[0].into(),
-                    engine: "sglang".into(),
-                    engine_version: None,
-                    limits: Limits { max_running: None },
-                    load: Load {
-                        running: Some(0),
-                        queued: Some(0),
-                        ..Load::default()
-                    },
-                    proxy_inflight: 0,
-                    report_key_id: "test-key".into(),
-                },
+        fn slot(host: &str, replica: u32) -> SlotId {
+            SlotId {
+                host: host.into(),
+                replica,
             }
+        }
+
+        fn ready_state(index: u32, now: u64) -> ReplicaState {
+            ReplicaState {
+                index,
+                engine_sampled_at_ms: Some(now),
+                lifecycle_state: Lifecycle::Ready,
+                engine_version: None,
+                limits: Default::default(),
+                load: Load {
+                    running: Some(0),
+                    queued: Some(0),
+                    ..Load::default()
+                },
+                proxy_inflight: 0,
+            }
+        }
+
+        /// A ready view of `host#replica`.
+        fn ready_replica(host: &str, replica: u32, now: u64) -> ReplicaView {
+            ReplicaView {
+                slot: slot(host, replica),
+                state: ready_state(replica, now),
+            }
+        }
+
+        /// A ready view of `host#0`.
+        fn ready_view(host: &str, now: u64) -> ReplicaView {
+            ready_replica(host, 0, now)
         }
 
         /// A snapshot built at `built_ms` with one ready replica on `host`.
@@ -5965,8 +5981,8 @@ mod tests {
             Snapshot {
                 built_ms,
                 replicas: vec![ready_view(host, built_ms)],
-                routed: HashMap::new(),
                 pins: Arc::new(pins),
+                ..Snapshot::default()
             }
         }
 
@@ -6002,9 +6018,9 @@ mod tests {
                 }
             }
             for (host, _) in &full {
-                if !snap.replicas.iter().any(|v| &v.host_id == host) {
+                if !snap.replicas.iter().any(|v| &v.slot.host == host) {
                     let mut view = ready_view(host, snap.built_ms);
-                    view.report.lifecycle_state = Lifecycle::Draining;
+                    view.state.lifecycle_state = Lifecycle::Draining;
                     snap.replicas.push(view);
                 }
             }
@@ -6024,7 +6040,7 @@ mod tests {
             io.snapshot.store(Arc::new(snap));
             let hosts = Arc::new(ArcSwap::from_pointee(BackendHosts::default()));
             provider.fleet.set_placement(PlacementHandles {
-                placer: Arc::new(Placer::new(PIN_SECRET)),
+                placer: Arc::new(Placer::new(PIN_SECRET, Tier::Base)),
                 io,
                 hosts: hosts.clone(),
             });
@@ -6049,6 +6065,7 @@ mod tests {
                 org_id: "org-1".to_string(),
                 affinity: None,
                 affinity_source: AffinitySource::None,
+                priority: 0,
             }
         }
 
@@ -6193,8 +6210,7 @@ mod tests {
                     ready_view("h-b", built),
                     ready_view("h-c", built),
                 ],
-                routed: HashMap::new(),
-                pins: Arc::new(PinTable::default()),
+                ..Snapshot::default()
             };
             let mut h = harness_exact(&map, 4, snap);
             let messages = messages_avoiding(2);
@@ -6232,7 +6248,7 @@ mod tests {
             let metrics = Arc::new(FakeMetrics::default());
             let (io, _writes) = PlacementIo::for_test(metrics);
             let handles = PlacementHandles {
-                placer: Arc::new(Placer::new(PIN_SECRET)),
+                placer: Arc::new(Placer::new(PIN_SECRET, Tier::Base)),
                 io,
                 hosts: Arc::new(ArcSwap::from_pointee(BackendHosts::default())),
             };
@@ -6328,14 +6344,8 @@ mod tests {
                 .expect("rotation active");
             assert_eq!(lease.index(), 2);
             match h.writes.try_recv().expect("routed write queued") {
-                Write::Routed {
-                    host,
-                    replica,
-                    tok,
-                    sec,
-                } => {
-                    assert_eq!(host, "h-a");
-                    assert_eq!(replica, None);
+                Write::Routed { slot: s, tok, sec } => {
+                    assert_eq!(s, slot("h-a", 0));
                     assert_eq!(tok, 10);
                     assert!(sec >= before_s && sec <= now_ms() / 1000);
                 }
@@ -6344,19 +6354,91 @@ mod tests {
             assert!(h.writes.try_recv().is_err());
             // This node's own routed count feeds the next decision.
             let mine = h.provider.fleet.placement_mine(now_ms() / 1000);
-            assert_eq!(mine.get("h-a").map(|p| (p.req, p.tok)), Some((1, 10)));
+            assert_eq!(
+                mine.get(&slot("h-a", 0)).map(|p| (p.req, p.tok)),
+                Some((1, 10))
+            );
+        }
+
+        #[test]
+        fn placed_lease_carries_replica_index() {
+            // h-a (backend 2) publishes replicas 0 and 3; only 3 is ready.
+            let built = fresh_ms();
+            let mut draining = ready_replica("h-a", 0, built);
+            draining.state.lifecycle_state = Lifecycle::Draining;
+            let snap = Snapshot {
+                built_ms: built,
+                replicas: vec![draining, ready_replica("h-a", 3, built)],
+                ..Snapshot::default()
+            };
+            let mut h = harness(&[("h-a", 2)], snap);
+            let req = request(COVERED_MODELS[0]);
+            let lease = h
+                .provider
+                .fleet
+                .acquire_index_placed(&messages_avoiding(2), None, &req)
+                .expect("rotation active");
+            assert_eq!(lease.index(), 2);
+            assert_eq!(lease.replica(), Some(3));
+            // The routed counter and this node's ledger are per replica.
+            match h.writes.try_recv().expect("routed write queued") {
+                Write::Routed { slot: s, .. } => assert_eq!(s, slot("h-a", 3)),
+                Write::Pin { .. } => panic!("keyless request writes no pin"),
+            }
+            let mine = h.provider.fleet.placement_mine(now_ms() / 1000);
+            assert_eq!(mine.keys().collect::<Vec<_>>(), vec![&slot("h-a", 3)]);
+        }
+
+        #[test]
+        fn legacy_lease_has_no_replica() {
+            let stale = now_ms() - 60_000;
+            let h = harness(&[("h-a", 2)], snapshot("h-a", stale, PinTable::default()));
+            let messages = messages_avoiding(2);
+            let covered = request(COVERED_MODELS[0]);
+            let uncovered = request("some-org/not-covered");
+            for req in [&covered, &uncovered] {
+                let lease = h
+                    .provider
+                    .fleet
+                    .acquire_index_placed(&messages, None, req)
+                    .expect("rotation active");
+                assert_eq!(lease.replica(), None);
+            }
+            // A plain legacy acquire never carries one either.
+            let lease = h
+                .provider
+                .fleet
+                .acquire_index(&messages, None)
+                .expect("rotation active");
+            assert_eq!(lease.replica(), None);
+            assert_eq!(h.metrics.decisions_tagged("reason:stale"), 1);
+        }
+
+        #[test]
+        fn kill_switch_snapshot_falls_back_without_a_replica() {
+            let mut snap = snapshot("h-a", fresh_ms(), PinTable::default());
+            snap.disabled = true;
+            let mut h = harness(&[("h-a", 2)], snap);
+            let messages = messages_avoiding(2);
+            let req = request(COVERED_MODELS[0]);
+            assert_eq!(
+                placed_indices(&h.provider, &messages, None, &req),
+                legacy_indices(&messages, None, None)
+            );
+            assert_eq!(h.metrics.decisions_tagged("reason:disabled"), 12);
+            assert!(h.writes.try_recv().is_err(), "legacy writes nothing");
         }
 
         #[test]
         fn pin_write_is_recorded() {
             let key = AffinityKey::from_bytes([5u8; 16]);
-            let pid_hex = pin_id(&key, &PIN_SECRET).to_hex();
+            let pid_hex = pin_id(Tier::Base, &key, &PIN_SECRET).to_hex();
             let id: [u8; 16] = hex::decode(&pid_hex).unwrap().try_into().unwrap();
             // An existing pin to a host that is no longer eligible: the placer
             // re-homes the session and rewrites the pin.
             let now = now_ms();
             let mut pins = PinTable::default();
-            pins.insert(id, "h-gone".to_string(), now);
+            pins.insert(id, slot("h-gone", 0), now);
             let mut h = harness(&[("h-a", 2)], snapshot("h-a", fresh_ms(), pins));
             let messages = vec![user_msg("keyed request")];
             let mut req = request(COVERED_MODELS[0]);
@@ -6375,31 +6457,31 @@ mod tests {
             match h.writes.try_recv().expect("pin write queued") {
                 Write::Pin {
                     id_hex,
-                    host,
+                    slot: s,
                     at_ms,
                 } => {
                     assert_eq!(id_hex, pid_hex);
-                    assert_eq!(host, "h-a");
+                    assert_eq!(s, slot("h-a", 0));
                     assert!(at_ms >= now);
                 }
                 Write::Routed { .. } => panic!("expected a pin write"),
             }
         }
 
-        /// Cross-task contract: proxy key -> registry -> proxy-sealed frame
-        /// -> reader `apply` -> `Snapshot` -> `Placer` / `Fleet`.
+        /// Cross-task contract: proxy key -> registry -> proxy-sealed host
+        /// frame -> reader `apply` -> `Snapshot` -> `Placer` / `Fleet`.
         mod contract {
             use super::*;
             use base64::Engine as _;
             use ed25519_dalek::{Signer, SigningKey};
             use placement::decision::Decision;
-            use placement::frame::{key_id, SIGNING_DOMAIN};
+            use placement::frame::{key_id, HostReport, SIGNING_DOMAIN};
             use placement::snapshot::{HostKey, KeyRegistry};
             use rand::rngs::StdRng;
             use rand::SeedableRng;
 
-            /// The golden fixture's host, replica and signing key.
-            const GOLDEN_HOST: &str = "glm53-gpu03";
+            /// The golden fixture's host and signing key.
+            const GOLDEN_HOST: &str = "host-a";
             const GOLDEN_SEED: [u8; 32] = [7u8; 32];
 
             /// The fields of an attested `ReplicaReportKey` event, as the
@@ -6408,8 +6490,6 @@ mod tests {
                 key_id: String,
                 public_key_hex: String,
                 host_id: String,
-                model: String,
-                replica_ids: Vec<String>,
             }
 
             fn proxy_key(signing: &SigningKey, host: &str) -> ProxyKey {
@@ -6418,15 +6498,13 @@ mod tests {
                     key_id: key_id(&vk),
                     public_key_hex: hex::encode(vk.to_bytes()),
                     host_id: host.to_string(),
-                    model: COVERED_MODELS[0].to_string(),
-                    replica_ids: vec!["r1".to_string()],
                 }
             }
 
             /// Builds the registry the way the pool's `backend_hosts()`
             /// does (it lives in `services`, which this crate cannot depend
             /// on): hex-decode the attested public key, verify it is a valid
-            /// ed25519 point, keep key id, replica ids and model.
+            /// ed25519 point, keep the key id.
             fn registry(keys: &[ProxyKey]) -> KeyRegistry {
                 let mut by_host: HashMap<String, Vec<HostKey>> = HashMap::new();
                 for k in keys {
@@ -6435,15 +6513,13 @@ mod tests {
                     by_host.entry(k.host_id.clone()).or_default().push(HostKey {
                         key_id: k.key_id.clone(),
                         key: ed25519_dalek::VerifyingKey::from_bytes(&bytes).unwrap(),
-                        replica_ids: k.replica_ids.clone(),
-                        model: k.model.clone(),
                     });
                 }
                 KeyRegistry { by_host }
             }
 
             /// Envelope JSON sealed exactly as inference-proxy seals it.
-            fn proxy_seal(report: &ReplicaReport, signing: &SigningKey) -> String {
+            fn proxy_seal(report: &HostReport, signing: &SigningKey) -> String {
                 let frame = serde_json::to_string(report).unwrap();
                 let mut msg = SIGNING_DOMAIN.to_vec();
                 msg.extend_from_slice(frame.as_bytes());
@@ -6456,66 +6532,82 @@ mod tests {
                 .to_string()
             }
 
+            /// A one-replica host frame for `host`, sealed by `signing`.
             fn frame_for(host: &str, signing: &SigningKey, at_ms: u64, ready: bool) -> String {
-                let mut view = ready_view(host, at_ms);
-                view.report.report_key_id = key_id(&signing.verifying_key());
+                let mut state = ready_state(0, at_ms);
                 if !ready {
-                    view.report.lifecycle_state = Lifecycle::Draining;
+                    state.lifecycle_state = Lifecycle::Draining;
                 }
-                proxy_seal(&view.report, signing)
+                let report = HostReport {
+                    schema: 1,
+                    host_id: host.into(),
+                    boot_id: "boot-a".into(),
+                    seq: 1,
+                    reported_at_ms: at_ms,
+                    engine: "sglang".into(),
+                    report_key_id: key_id(&signing.verifying_key()),
+                    replicas: vec![state],
+                };
+                proxy_seal(&report, signing)
             }
 
             #[test]
             fn golden_frame_through_reader_places_its_host() {
                 let signing = SigningKey::from_bytes(&GOLDEN_SEED);
                 let reg = registry(&[proxy_key(&signing, GOLDEN_HOST)]);
-                let golden = include_str!("../../../../placement/tests/fixtures/envelope_ok.json");
-                let frames = HashMap::from([(
-                    (GOLDEN_HOST.to_string(), "r1".to_string()),
-                    golden.to_string(),
-                )]);
-                // The fixture's own clock: reported at 1790000000123.
-                let now = 1_790_000_000_500;
+                let golden =
+                    include_str!("../../../../placement/tests/fixtures/host_frame_v1.json");
+                let frames = HashMap::from([(GOLDEN_HOST.to_string(), golden.to_string())]);
+                // The fixture's own clock: reported at 1700000000500.
+                let now = 1_700_000_000_500;
                 let snap = crate::placement_io::snapshot_from_valkey_values(
                     &reg,
                     &frames,
                     &HashMap::new(),
                     now,
                 );
-                assert_eq!(snap.replicas.len(), 1, "golden frame accepted");
+                let slots: Vec<SlotId> = snap.replicas.iter().map(|v| v.slot.clone()).collect();
+                assert_eq!(
+                    slots,
+                    vec![slot(GOLDEN_HOST, 0), slot(GOLDEN_HOST, 1)],
+                    "golden frame accepted, one view per replica"
+                );
                 let input = placement::decision::PlaceInput {
                     model: COVERED_MODELS[0].into(),
-                    prompt_tokens_est: 100,
+                    prompt_tokens: 100,
+                    context_tokens: None,
+                    heavy: false,
+                    priority: 0,
                     affinity: None,
                     affinity_source: AffinitySource::None,
-                    long_context_hosts: Vec::new(),
                     now_ms: now,
                 };
                 let mut rng = StdRng::seed_from_u64(1);
-                match Placer::new(PIN_SECRET).place(&input, &snap, &HashMap::new(), &mut rng) {
-                    Decision::Place { host, .. } => assert_eq!(host, GOLDEN_HOST),
+                match Placer::new(PIN_SECRET, Tier::Base).place(
+                    &input,
+                    &snap,
+                    &HashMap::new(),
+                    &mut rng,
+                ) {
+                    Decision::Place { slot, .. } => assert_eq!(slot.host, GOLDEN_HOST),
                     Decision::Legacy { reason, .. } => panic!("legacy: {}", reason.as_str()),
+                    Decision::Refused { .. } => panic!("a short request is never refused"),
                 }
             }
 
             /// Four backends: h-a (0) and h-b (1) ready, h-c and h-d
             /// draining, all publishing fresh proxy-sealed frames; `routed`
-            /// is what the other nodes' routed hashes hold per host.
-            fn fleet_index(routed: HashMap<String, (u64, u64)>) -> usize {
+            /// is what the other nodes' routed hashes hold per slot.
+            fn fleet_index(routed: HashMap<SlotId, (u64, u64)>) -> usize {
                 let signing = SigningKey::from_bytes(&GOLDEN_SEED);
                 let hosts = [("h-a", true), ("h-b", true), ("h-c", false), ("h-d", false)];
                 let keys: Vec<ProxyKey> =
                     hosts.iter().map(|(h, _)| proxy_key(&signing, h)).collect();
                 let reg = registry(&keys);
                 let at = fresh_ms();
-                let frames: HashMap<(String, String), String> = hosts
+                let frames: HashMap<String, String> = hosts
                     .iter()
-                    .map(|(h, ready)| {
-                        (
-                            (h.to_string(), "r1".to_string()),
-                            frame_for(h, &signing, at, *ready),
-                        )
-                    })
+                    .map(|(h, ready)| (h.to_string(), frame_for(h, &signing, at, *ready)))
                     .collect();
                 let snap =
                     crate::placement_io::snapshot_from_valkey_values(&reg, &frames, &routed, at);
@@ -6533,6 +6625,7 @@ mod tests {
                     .acquire_index_placed(&messages_avoiding(0), None, &req)
                     .expect("rotation active");
                 assert_eq!(h.metrics.decisions_tagged("outcome:place"), 1);
+                assert_eq!(lease.replica(), Some(0));
                 lease.index()
             }
 
@@ -6547,8 +6640,8 @@ mod tests {
                 // Other nodes routed heavy load to h-a in the current window:
                 // the fleet must place on h-b, and vice versa.
                 let heavy = (20, 200_000);
-                let to_a = HashMap::from([("h-a".to_string(), heavy)]);
-                let to_b = HashMap::from([("h-b".to_string(), heavy)]);
+                let to_a = HashMap::from([(slot("h-a", 0), heavy)]);
+                let to_b = HashMap::from([(slot("h-b", 0), heavy)]);
                 for _ in 0..8 {
                     assert_eq!(fleet_index(to_a.clone()), 1);
                     assert_eq!(fleet_index(to_b.clone()), 0);
@@ -6565,8 +6658,9 @@ mod tests {
                 ("x_request_id".to_string(), "req-9".into()),
                 ("x_org_id".to_string(), "org-9".into()),
             ]);
-            let req = PlacementRequest::from_extra("m", &extra);
+            let req = PlacementRequest::from_extra("m", -5, &extra);
             assert_eq!(req.model, "m");
+            assert_eq!(req.priority, -5);
             assert_eq!(req.request_id, "req-9");
             assert_eq!(req.org_id, "org-9");
             assert_eq!(req.affinity.map(|k| k.to_hex()), Some(key.to_hex()));
@@ -6576,7 +6670,7 @@ mod tests {
                 ("x_placement_affinity".to_string(), "not-hex".into()),
                 ("x_placement_affinity_source".to_string(), "client".into()),
             ]);
-            let req = PlacementRequest::from_extra("m", &bad);
+            let req = PlacementRequest::from_extra("m", 0, &bad);
             assert!(req.affinity.is_none());
             assert_eq!(req.affinity_source, AffinitySource::None);
         }
@@ -6593,8 +6687,7 @@ mod tests {
             let snap = Snapshot {
                 built_ms: built,
                 replicas: vec![ready_view("h-a", built), ready_view("h-b", built)],
-                routed: HashMap::new(),
-                pins: Arc::new(PinTable::default()),
+                ..Snapshot::default()
             };
             let h = harness(&[("h-a", 0), ("h-b", 1)], snap);
             let fleet = h.provider.fleet.clone();

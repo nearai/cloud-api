@@ -2,6 +2,7 @@ pub mod affinity;
 pub mod consts;
 pub mod decision;
 pub mod frame;
+pub mod policy;
 pub mod rules;
 pub mod score;
 pub mod snapshot;

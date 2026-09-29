@@ -24,9 +24,6 @@ pub const FRESH_MAX_MS: u64 = 3_000;
 /// on a GPU host cannot freeze that replica's view while it looks current.
 pub const MAX_FUTURE_SKEW_MS: u64 = 2_000;
 
-/// Prompts estimated above this many tokens need a long-context host.
-pub const LONG_CONTEXT_TOKENS: u64 = 100_000;
-
 /// KV cache usage at or above this fraction excludes a replica from routing.
 pub const KV_MAX: f64 = 0.95;
 
@@ -66,3 +63,23 @@ pub const AFFINITY_ABS_SLACK: f64 = 0.1;
 /// How long a follow pin stays valid after it's written, in milliseconds.
 /// 10 minutes, matching OpenRouter's sticky-session TTL.
 pub const PIN_TTL_MS: u64 = 600_000;
+
+// Heavy lane (see `policy`). There is deliberately no class-line constant:
+// whether a request is heavy is the pool's decision, from its declared tier
+// capacities, and arrives as `PlaceInput::heavy`.
+
+/// The largest share of a Fleet's eligible replicas that may be heavy-lane
+/// members: `lane_cap = ceil(eligible * HEAVY_SHARE)`.
+pub const HEAVY_SHARE: f64 = 0.25;
+
+/// A replica whose load (prefill backlog + pending tokens) is at least this
+/// is a heavy-lane member, whatever the class of the requests that put the
+/// load there.
+pub const LANE_LOAD_TOKENS: u64 = 64_000;
+
+/// A heavy request is admitted to a base-tier replica only while that
+/// replica's load plus the request's prompt stays at or under this.
+pub const HEAVY_BACKLOG_CAP: u64 = 300_000;
+
+/// The same admission cap for long-tier replicas, which prefill faster.
+pub const LONG_BACKLOG_CAP: u64 = 600_000;

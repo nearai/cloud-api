@@ -15,7 +15,7 @@ use ed25519_dalek::VerifyingKey;
 
 use crate::affinity::PinTable;
 use crate::consts::{MAX_FUTURE_SKEW_MS, SUPPORTED_SCHEMA};
-use crate::frame::{self, Envelope, FrameError, HostReport, ReplicaState};
+use crate::frame::{self, Envelope, FrameError, HostReport, Lifecycle, ReplicaState};
 
 /// One attested signing key for a host. The key event binds a key to a host
 /// only; every replica in that host's frames is covered by it.
@@ -71,11 +71,18 @@ pub struct RoutedCounts {
 ///
 /// `disabled` is set by the reader while the data-plane kill switch is
 /// present; every decision against such a snapshot is `Legacy(Disabled)`.
+///
+/// `routed_read_ms` is this node's clock when the reader *issued* the Valkey
+/// read that produced `routed` (not when it completed). A local write
+/// acknowledged before it is visible in `routed`; see
+/// [`crate::score::unseen_by_read`]. `0` means unknown, which counts every
+/// local ledger entry on top of `routed`.
 #[derive(Default)]
 pub struct Snapshot {
     pub built_ms: u64,
     pub replicas: Vec<ReplicaView>,
     pub routed: HashMap<SlotId, RoutedCounts>,
+    pub routed_read_ms: u64,
     pub pins: Arc<PinTable>,
     pub disabled: bool,
 }
@@ -196,7 +203,9 @@ impl Ingest {
     ///
     /// A replica whose engine time moved backwards keeps its previously
     /// accepted state while the frame's other replicas update; only a frame
-    /// in which every replica regressed is rejected. The returned views are
+    /// in which every replica regressed is rejected. A `Ready` replica whose
+    /// load is null (a timed-out engine read) keeps its last good load and
+    /// that load's engine time, if it had one. The returned views are
     /// exactly the frame's indexes, sorted by slot.
     ///
     /// `now_ms` is this node's clock; a frame with any replica's engine time
@@ -285,13 +294,25 @@ impl Ingest {
                 (Some(new), None) => Some(new),
                 (None, old) => old,
             };
-            slots.insert(
-                r.index,
-                SlotMemory {
-                    state: r.clone(),
-                    engine_ms,
-                },
-            );
+            let mut state = r.clone();
+            // A `Ready` replica with neither `running` nor `queued` is a
+            // timed-out engine read (typically mid chunked prefill), not an
+            // idle one. `Rule::Capacity` would drop it, so a busy replica
+            // would vanish from affinity and the lane count. Carry the last
+            // good load forward with the engine time it was sampled at:
+            // `Rule::Freshness` then expires it if reads keep failing. Limits
+            // and lifecycle still come from the new frame.
+            if let Some(old) = old {
+                let unread = |l: &frame::Load| l.running.is_none() && l.queued.is_none();
+                if r.lifecycle_state == Lifecycle::Ready
+                    && unread(&r.load)
+                    && !unread(&old.state.load)
+                {
+                    state.load = old.state.load.clone();
+                    state.engine_sampled_at_ms = old.state.engine_sampled_at_ms;
+                }
+            }
+            slots.insert(r.index, SlotMemory { state, engine_ms });
         }
         if !report.replicas.is_empty() && regressed == report.replicas.len() {
             return Err(Reject::Regressed);
@@ -335,6 +356,8 @@ impl Ingest {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::consts::FRESH_MAX_MS;
+    use crate::rules::{first_exclusion, Rule};
     use crate::testkit::{replica_state, seal};
     use ed25519_dalek::SigningKey;
 
@@ -722,6 +745,110 @@ mod tests {
         let mut ahead = report();
         ahead.replicas = vec![replica(0, Some(T_NOW + MAX_FUTURE_SKEW_MS))];
         accept(&mut ingest, &ahead).expect("skew within MAX_FUTURE_SKEW_MS is accepted");
+    }
+
+    /// A replica whose engine read timed out: still `Ready`, every load
+    /// field null, and the previous engine time carried over (as the proxy
+    /// publishes it).
+    fn null_load(index: u32, engine_ms: Option<u64>) -> ReplicaState {
+        let mut r = replica(index, engine_ms);
+        r.load = frame::Load::default();
+        r
+    }
+
+    /// gpu03 seq 10971's r1: 9 running, 3 queued, 3,104 backlog tokens.
+    fn busy(index: u32, engine_ms: u64) -> ReplicaState {
+        let mut r = replica(index, Some(engine_ms));
+        r.load.running = Some(9);
+        r.load.queued = Some(3);
+        r.load.prefill_backlog_tokens = Some(3_104);
+        r
+    }
+
+    fn exclusion_at(view: &ReplicaView, now_ms: u64) -> Option<Rule> {
+        first_exclusion(view, &crate::testkit::input(), now_ms).map(|e| e.0)
+    }
+
+    #[test]
+    fn null_load_frame_keeps_last_good_load_until_stale() {
+        let mut ingest = Ingest::new();
+        let mut first = report();
+        first.replicas = vec![busy(0, 2_000)];
+        accept(&mut ingest, &first).unwrap();
+
+        // The next frame's read timed out. Limits (and lifecycle) still come
+        // from the new frame; load and its engine time from the last good one.
+        let mut second = report();
+        second.seq = 2;
+        second.replicas = vec![null_load(0, Some(2_000))];
+        second.replicas[0].limits.max_running = Some(32);
+        let views = accept(&mut ingest, &second).unwrap();
+        let v = &views[0];
+        assert_eq!(v.state.load, busy(0, 2_000).load);
+        assert_eq!(v.state.engine_sampled_at_ms, Some(2_000));
+        assert_eq!(v.state.limits.max_running, Some(32));
+        assert_eq!(v.state.lifecycle_state, Lifecycle::Ready);
+
+        // Still routable while the carried sample is fresh (not dropped by
+        // the Capacity rule's null-load check), then expired by Freshness.
+        assert_eq!(exclusion_at(v, 2_000 + FRESH_MAX_MS), None);
+        assert_eq!(
+            exclusion_at(v, 2_000 + FRESH_MAX_MS + 1),
+            Some(Rule::Freshness)
+        );
+    }
+
+    #[test]
+    fn null_load_after_fresh_window_is_excluded_by_freshness() {
+        // Reads keep failing, and a frame even claims a newer engine time:
+        // the carried load keeps the time it was sampled at, so Freshness
+        // expires it rather than it looking current forever.
+        let mut ingest = Ingest::new();
+        let mut first = report();
+        first.replicas = vec![busy(0, 2_000)];
+        accept(&mut ingest, &first).unwrap();
+
+        let mut last = Vec::new();
+        for (seq, engine_ms) in [(2, Some(2_000)), (3, Some(2_500)), (4, None)] {
+            let mut next = report();
+            next.seq = seq;
+            next.replicas = vec![null_load(0, engine_ms)];
+            last = accept(&mut ingest, &next).unwrap();
+        }
+        let v = &last[0];
+        assert_eq!(v.state.load.running, Some(9));
+        assert_eq!(v.state.engine_sampled_at_ms, Some(2_000));
+        assert_eq!(
+            exclusion_at(v, 2_000 + FRESH_MAX_MS + 1),
+            Some(Rule::Freshness)
+        );
+
+        // A good read replaces the carried load as usual.
+        let mut good = report();
+        good.seq = 5;
+        good.replicas = vec![replica(0, Some(6_000))];
+        let views = accept(&mut ingest, &good).unwrap();
+        assert_eq!(views[0].state.load.running, Some(0));
+        assert_eq!(views[0].state.engine_sampled_at_ms, Some(6_000));
+    }
+
+    #[test]
+    fn null_load_without_prior_view_stays_excluded() {
+        // No last good load to carry: the null frame is kept as-is and the
+        // Capacity rule still fails closed on it.
+        let mut ingest = Ingest::new();
+        let mut first = report();
+        first.replicas = vec![null_load(0, Some(2_000))];
+        let views = accept(&mut ingest, &first).unwrap();
+        assert_eq!(views[0].state.load, frame::Load::default());
+        assert_eq!(exclusion_at(&views[0], 2_000), Some(Rule::Capacity));
+
+        // A second null frame has only a null view before it: still excluded.
+        let mut second = report();
+        second.seq = 2;
+        second.replicas = vec![null_load(0, Some(2_000))];
+        let views = accept(&mut ingest, &second).unwrap();
+        assert_eq!(exclusion_at(&views[0], 2_000), Some(Rule::Capacity));
     }
 
     #[test]

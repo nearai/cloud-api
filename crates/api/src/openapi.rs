@@ -365,6 +365,12 @@ use utoipa::{Modify, OpenApi};
             // File models
             FileUploadResponse, ExpiresAfter, FileListResponse, FileDeleteResponse,
             // Platform Stats analytics models
+            // Organization metrics (admin)
+            services::admin::OrganizationMetrics,
+            services::admin::MetricsSummary,
+            services::admin::WorkspaceMetrics,
+            services::admin::ApiKeyMetrics,
+            services::admin::ModelMetrics,
             services::admin::PlatformMetrics,
             services::admin::PlatformProviderUsage,
             services::admin::ProviderUsageTotals,

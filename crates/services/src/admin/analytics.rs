@@ -13,7 +13,7 @@ use utoipa::ToSchema;
 use uuid::Uuid;
 
 /// Summary metrics for an organization over a time period
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct MetricsSummary {
     pub total_requests: i64,
     pub total_input_tokens: i64,
@@ -35,7 +35,7 @@ pub struct MetricsSummary {
 }
 
 /// Metrics breakdown by workspace
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct WorkspaceMetrics {
     pub workspace_id: Uuid,
     pub workspace_name: String,
@@ -48,7 +48,7 @@ pub struct WorkspaceMetrics {
 }
 
 /// Metrics breakdown by API key
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct ApiKeyMetrics {
     pub api_key_id: Uuid,
     pub api_key_name: String,
@@ -58,7 +58,7 @@ pub struct ApiKeyMetrics {
 }
 
 /// Metrics breakdown by model
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct ModelMetrics {
     pub model_name: String,
     pub requests: i64,
@@ -91,7 +91,7 @@ pub struct ModelMetrics {
 }
 
 /// Complete organization metrics response
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct OrganizationMetrics {
     pub organization_id: Uuid,
     pub organization_name: String,

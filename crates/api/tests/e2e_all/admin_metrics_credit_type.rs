@@ -780,3 +780,28 @@ async fn org_hourly_reports_are_cancelled_at_the_statement_budget() {
         .get(0);
     assert_eq!(timeout, original_timeout);
 }
+
+#[test]
+fn admin_org_metrics_ttft_thresholds_are_documented() {
+    use utoipa::OpenApi;
+    let spec = serde_json::to_value(api::openapi::ApiDoc::openapi()).unwrap();
+    let body = &spec["paths"]["/v1/admin/organizations/{org_id}/metrics"]["get"]["responses"]
+        ["200"]["content"]["application/json"]["schema"]["$ref"];
+    assert_eq!(body, "#/components/schemas/OrganizationMetrics");
+    for schema in ["MetricsSummary", "ModelMetrics"] {
+        let props = &spec["components"]["schemas"][schema]["properties"];
+        for field in [
+            "ttft_measured_requests",
+            "ttft_under_5s_requests",
+            "ttft_under_10s_requests",
+            "ttft_under_60s_requests",
+        ] {
+            assert!(props[field].is_object(), "{schema}.{field} is undocumented");
+        }
+    }
+    let measured = spec["components"]["schemas"]["ModelMetrics"]["properties"]
+        ["ttft_measured_requests"]["description"]
+        .as_str()
+        .unwrap();
+    assert!(measured.contains("Denominator"), "{measured}");
+}

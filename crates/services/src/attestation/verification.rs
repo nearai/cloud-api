@@ -483,6 +483,9 @@ impl AttestationVerifier {
                     if event.event_type != DSTACK_RUNTIME_EVENT_TYPE {
                         tracing::debug!("replica report key event: not a runtime event");
                     } else if let Some(key) = parse_replica_report_key(&event.event_payload) {
+                        // Last valid event wins. Safe because only the inference-proxy
+                        // container mounts dstack.sock, so no other workload on the CVM
+                        // can emit a competing runtime event; revisit if that changes.
                         replica_report_key = Some(key);
                     }
                 }

@@ -629,7 +629,9 @@ mod tests {
     use super::*;
     use crate::affinity::{hrw_rank, AffinityKey};
     use crate::consts::{FRESH_MAX_MS, PIN_TTL_MS};
-    use crate::consts::{HEAVY_BACKLOG_CAP, LANE_LOAD_TOKENS, LONG_BACKLOG_CAP};
+    use crate::consts::{
+        HEAVY_BACKLOG_CAP, HEAVY_BASE_MAX_PROMPT, LANE_LOAD_TOKENS, LONG_BACKLOG_CAP,
+    };
     use crate::policy::{Class, PriorityBand, Tier};
     use crate::snapshot::RoutedCounts;
     use crate::testkit::{input as base_input, slot, view as ready_view, NOW};
@@ -1770,6 +1772,43 @@ mod tests {
         let (chosen, _, _) =
             placed(long.place(&keyed_heavy(key, 142_000), &snap, &HashMap::new(), &mut rng));
         assert_eq!(chosen, slot("long01", 1));
+    }
+
+    #[test]
+    fn oversized_heavy_never_admitted_on_base() {
+        // Base engines accept 1M context, but a prompt over
+        // HEAVY_BASE_MAX_PROMPT is long-tier work: on an idle base Fleet with
+        // lane room it is still refused (the caller turns that into legacy
+        // while refusals are opt-in).
+        let snap = snap_with(eight_slots());
+        let mut rng = StdRng::seed_from_u64(1);
+        let record = refused_record(placer().place(
+            &heavy(HEAVY_BASE_MAX_PROMPT + 1),
+            &snap,
+            &HashMap::new(),
+            &mut rng,
+        ));
+        assert_eq!(record.reason, Some("lane_full"));
+        assert_eq!(record.excluded[4], (Rule::Lane, 8));
+        assert_eq!((record.lane_size, record.lane_cap), (0, 2));
+
+        let (_, record, _) = placed(placer().place(
+            &heavy(HEAVY_BASE_MAX_PROMPT),
+            &snap,
+            &HashMap::new(),
+            &mut rng,
+        ));
+        assert_eq!(record.strategy, Some("heavy_lane_admit"));
+
+        // The long tier has no such limit.
+        let long = Placer::new([1u8; 32], Tier::Long);
+        let (_, record, _) = placed(long.place(
+            &heavy(HEAVY_BASE_MAX_PROMPT + 1),
+            &snap,
+            &HashMap::new(),
+            &mut rng,
+        ));
+        assert_eq!(record.strategy, Some("heavy_long"));
     }
 
     #[test]

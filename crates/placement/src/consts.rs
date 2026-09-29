@@ -84,5 +84,14 @@ pub const LANE_LOAD_TOKENS: u64 = 64_000;
 /// replica's load plus the request's prompt stays at or under this.
 pub const HEAVY_BACKLOG_CAP: u64 = 300_000;
 
+/// The largest prompt a base-tier replica admits as heavy work, whatever its
+/// load. Base engines accept up to 1M context, so without this a long-tier
+/// refusal that overflows to base would put a 500K+ prefill on a base
+/// replica and undo the long tier's isolation. Anything larger is refused on
+/// base (the caller falls back to legacy while refusals are opt-in). Below
+/// `HEAVY_BACKLOG_CAP`, so the base lane has no idle waiver: an idle replica
+/// always fits one prompt this size.
+pub const HEAVY_BASE_MAX_PROMPT: u64 = 200_000;
+
 /// The same admission cap for long-tier replicas, which prefill faster.
 pub const LONG_BACKLOG_CAP: u64 = 600_000;

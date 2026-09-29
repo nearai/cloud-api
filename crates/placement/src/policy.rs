@@ -16,7 +16,9 @@
 
 use std::collections::HashSet;
 
-use crate::consts::{HEAVY_BACKLOG_CAP, HEAVY_SHARE, LANE_LOAD_TOKENS, LONG_BACKLOG_CAP};
+use crate::consts::{
+    HEAVY_BACKLOG_CAP, HEAVY_BASE_MAX_PROMPT, HEAVY_SHARE, LANE_LOAD_TOKENS, LONG_BACKLOG_CAP,
+};
 use crate::snapshot::{ReplicaView, SlotId};
 
 /// The capacity tier of the Fleet a `Placer` serves. Fixed at construction.
@@ -135,14 +137,17 @@ pub fn lane_view(live: &[(&ReplicaView, u64)], survivors: &[&SlotId]) -> LaneVie
 ///
 /// - Heavy on the long tier: the replica's load plus the prompt must fit
 ///   under `LONG_BACKLOG_CAP`, unless the replica is idle.
-/// - Heavy on the base tier: the same under `HEAVY_BACKLOG_CAP` (again
-///   waived for an idle replica), and the replica must already be a member
-///   or the lane must have room for one more.
+/// - Heavy on the base tier: the prompt must be at most
+///   `HEAVY_BASE_MAX_PROMPT`, the load plus the prompt must fit under
+///   `HEAVY_BACKLOG_CAP`, and the replica must already be a member or the
+///   lane must have room for one more. No idle waiver: the prompt limit is
+///   below the cap, so an idle replica always fits.
 ///
-/// The idle waiver keeps a single prompt larger than the cap servable: the
-/// cap bounds queueing behind other work, and an idle replica has none. It
-/// needs known load, so a replica that omits a load field never gets it. The
-/// engine's own context limit is `Rule::Context`'s job, not the lane's.
+/// The long tier's idle waiver keeps a single prompt larger than the cap
+/// servable: the cap bounds queueing behind other work, and an idle replica
+/// has none. It needs known load, so a replica that omits a load field never
+/// gets it. The engine's own context limit is `Rule::Context`'s job, not the
+/// lane's.
 /// - Short: a member is avoided while any clean replica survives; with none
 ///   clean, every survivor passes, so short requests are never refused.
 pub fn lane_admits(
@@ -157,7 +162,8 @@ pub fn lane_admits(
     match (tier, class) {
         (Tier::Long, Class::Heavy) => idle || load.saturating_add(prompt) <= LONG_BACKLOG_CAP,
         (Tier::Base, Class::Heavy) => {
-            (idle || load.saturating_add(prompt) <= HEAVY_BACKLOG_CAP)
+            prompt <= HEAVY_BASE_MAX_PROMPT
+                && load.saturating_add(prompt) <= HEAVY_BACKLOG_CAP
                 && (is_member || lane.size < lane.cap)
         }
         (_, Class::Short) => !is_member || !lane.any_clean,
@@ -385,18 +391,16 @@ mod tests {
     }
 
     #[test]
-    fn idle_base_replica_admits_oversized_heavy_when_lane_has_room() {
-        let prompt = HEAVY_BACKLOG_CAP + 1;
+    fn base_never_admits_prompt_over_heavy_base_max() {
+        // An idle replica in a lane with room admits up to the limit, and
+        // nothing over it, member or not.
         let room = lane_of(&[0, 0, 0, 0]);
-        assert!(lane_admits(
-            Tier::Base,
-            Class::Heavy,
-            0,
-            true,
-            prompt,
-            false,
-            &room
-        ));
+        let at = |prompt, is_member| {
+            lane_admits(Tier::Base, Class::Heavy, 0, true, prompt, is_member, &room)
+        };
+        assert!(at(HEAVY_BASE_MAX_PROMPT, false));
+        assert!(!at(HEAVY_BASE_MAX_PROMPT + 1, false));
+        assert!(!at(HEAVY_BASE_MAX_PROMPT + 1, true));
         // A full lane still keeps an idle non-member out.
         let full = lane_of(&[LANE_LOAD_TOKENS, 0, 0, 0]);
         assert!(!lane_admits(
@@ -404,7 +408,7 @@ mod tests {
             Class::Heavy,
             0,
             true,
-            prompt,
+            HEAVY_BASE_MAX_PROMPT,
             false,
             &full
         ));
@@ -422,23 +426,25 @@ mod tests {
             false,
             &lane
         ));
+        // Base: a prompt within HEAVY_BASE_MAX_PROMPT, rejected on the cap.
+        let prompt = HEAVY_BASE_MAX_PROMPT;
         assert!(!lane_admits(
             Tier::Base,
             Class::Heavy,
-            1,
+            HEAVY_BACKLOG_CAP - prompt + 1,
             false,
-            HEAVY_BACKLOG_CAP,
+            prompt,
             false,
             &lane
         ));
         let member = lane_of(&[LANE_LOAD_TOKENS, 0, 0, 0]);
-        let prompt = HEAVY_BACKLOG_CAP - LANE_LOAD_TOKENS + 1;
+        let load = HEAVY_BACKLOG_CAP - 100_000 + 1;
         assert!(!lane_admits(
             Tier::Base,
             Class::Heavy,
-            LANE_LOAD_TOKENS,
+            load,
             false,
-            prompt,
+            100_000,
             true,
             &member
         ));

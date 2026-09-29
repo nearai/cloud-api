@@ -422,6 +422,9 @@ impl Placer {
         let selected = match select(
             input.affinity.as_ref(),
             pin_lookup.as_ref().map(|(s, _)| s),
+            // Heavy: a pin that survived both rule stages holds regardless of
+            // score; the lane's backlog caps already bound its load.
+            input.heavy,
             &scores,
             rng,
         ) {
@@ -541,7 +544,7 @@ mod tests {
     use super::*;
     use crate::affinity::{hrw_rank, AffinityKey};
     use crate::consts::{COVERED_MODELS, FRESH_MAX_MS, PIN_TTL_MS};
-    use crate::consts::{HEAVY_BACKLOG_CAP, LONG_BACKLOG_CAP};
+    use crate::consts::{HEAVY_BACKLOG_CAP, LANE_LOAD_TOKENS, LONG_BACKLOG_CAP};
     use crate::policy::{Class, PriorityBand, Tier};
     use crate::snapshot::RoutedCounts;
     use crate::testkit::{input as base_input, slot, view as ready_view, NOW};
@@ -1184,41 +1187,114 @@ mod tests {
         assert_eq!(record.strategy, Some("short_overflow"));
     }
 
-    #[test]
-    fn pinned_heavy_conversation_returns_to_pinned_member() {
-        // 4 slots, lane cap 1, filled by the pinned slot itself: the
-        // conversation's own earlier turns. The key's HRW home is elsewhere.
+    /// 8 slots (lane cap 2) where `gpu02#1` is the only lane member, with a
+    /// 100K backlog, and the key's HRW home is `gpu01#0`. The lane has room,
+    /// so every idle slot is admitted too, and the pinned member's score
+    /// (~6.25) is far outside the affinity bound of the idle best (0).
+    fn pinned_member_with_room(secret: [u8; 32], backlog: u64) -> (Snapshot, AffinityKey, SlotId) {
         let pinned = slot("gpu02", 1);
-        let all = vec![
-            slot("gpu01", 0),
-            slot("gpu01", 1),
-            slot("gpu02", 0),
-            pinned.clone(),
-        ];
+        let mut views = eight_slots();
+        views[3].state.load.prefill_backlog_tokens = Some(backlog); // gpu02#1
+        let all: Vec<SlotId> = views.iter().map(|v| v.slot.clone()).collect();
         let key = find_key_with_home(&all, &slot("gpu01", 0));
-        let secret = [8u8; 32];
-        let mut snap = snap_with(vec![
-            ready_view("gpu01", 0),
-            ready_view("gpu01", 1),
-            ready_view("gpu02", 0),
-            with_backlog("gpu02", 1, 100_000),
-        ]);
+        let mut snap = snap_with(views);
         let pid = pin_id(Tier::Base, &key, &secret);
         std::sync::Arc::make_mut(&mut snap.pins).insert(
             *pid.as_bytes(),
             pinned.clone(),
             NOW - 1_000,
         );
+        (snap, key, pinned)
+    }
 
+    #[test]
+    fn pinned_heavy_conversation_returns_to_pinned_member() {
+        let secret = [8u8; 32];
+        let (snap, key, pinned) = pinned_member_with_room(secret, 100_000);
         let mut input = keyed(key);
         input.heavy = true;
         input.prompt_tokens = 100_000;
         let mut rng = StdRng::seed_from_u64(1);
-        let (chosen, record, _) =
+        let (chosen, record, pin_write) =
             placed(Placer::new(secret, Tier::Base).place(&input, &snap, &HashMap::new(), &mut rng));
         assert_eq!(chosen, pinned);
         assert_eq!(record.selection, Some("pinned"));
         assert_eq!(record.strategy, Some("heavy_lane_join"));
+        assert_eq!((record.lane_size, record.lane_cap), (1, 2));
+        assert_eq!(
+            record.eligible, 8,
+            "the lane had room: idle slots were admitted"
+        );
+        let (chosen_score, best) = (record.chosen_score.unwrap(), record.best_score.unwrap());
+        assert!(
+            chosen_score > best + 1.0,
+            "the pin must be outside the score bound here: {chosen_score} vs {best}"
+        );
+        assert!(pin_write.is_none());
+    }
+
+    #[test]
+    fn pinned_short_conversation_still_spills_outside_bound() {
+        // Same state, short request: the bound applies, so the pinned slot
+        // (out of bound, and a lane member) is left for the HRW home.
+        let secret = [8u8; 32];
+        let (snap, key, pinned) = pinned_member_with_room(secret, 100_000);
+        let mut rng = StdRng::seed_from_u64(1);
+        let (chosen, record, pin_write) = placed(Placer::new(secret, Tier::Base).place(
+            &keyed(key.clone()),
+            &snap,
+            &HashMap::new(),
+            &mut rng,
+        ));
+        assert_ne!(chosen, pinned);
+        assert_eq!(chosen, slot("gpu01", 0));
+        assert_eq!(record.selection, Some("home"));
+        assert!(pin_write.is_some(), "the moved pin is rewritten");
+
+        // Even with the lane member admitted (no clean replica), the short
+        // pin is still bounded: a clean-but-loaded fleet shows it directly.
+        let mut views = eight_slots();
+        for v in &mut views {
+            v.state.load.prefill_backlog_tokens = Some(LANE_LOAD_TOKENS);
+        }
+        views[3].state.load.prefill_backlog_tokens = Some(200_000);
+        let mut snap = snap_with(views);
+        let pid = pin_id(Tier::Base, &key, &secret);
+        std::sync::Arc::make_mut(&mut snap.pins).insert(
+            *pid.as_bytes(),
+            pinned.clone(),
+            NOW - 1_000,
+        );
+        let (chosen, record, _) = placed(Placer::new(secret, Tier::Base).place(
+            &keyed(key),
+            &snap,
+            &HashMap::new(),
+            &mut rng,
+        ));
+        assert_ne!(chosen, pinned);
+        assert_eq!(record.strategy, Some("short_overflow"));
+    }
+
+    #[test]
+    fn heavy_pin_over_backlog_cap_moves() {
+        // The pinned member's load plus the prompt exceeds HEAVY_BACKLOG_CAP,
+        // so stage 2 excludes it and the pin can't hold: it spills to a new
+        // lane member (the lane has room) and the pin is rewritten.
+        let secret = [8u8; 32];
+        let (snap, key, pinned) = pinned_member_with_room(secret, HEAVY_BACKLOG_CAP - 50_000);
+        let mut input = keyed(key);
+        input.heavy = true;
+        input.prompt_tokens = 100_000;
+        let mut rng = StdRng::seed_from_u64(1);
+        let (chosen, record, pin_write) =
+            placed(Placer::new(secret, Tier::Base).place(&input, &snap, &HashMap::new(), &mut rng));
+        assert_ne!(chosen, pinned);
+        assert_eq!(record.excluded[4], (Rule::Lane, 1));
+        assert_eq!(record.strategy, Some("heavy_lane_admit"));
+        assert_eq!(record.selection, Some("home"));
+        assert_eq!(record.pinned.as_deref(), Some("gpu02#1"));
+        let (_, rewritten) = pin_write.expect("the moved pin is rewritten");
+        assert_eq!(rewritten, chosen);
     }
 
     #[test]

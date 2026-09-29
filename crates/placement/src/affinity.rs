@@ -221,9 +221,16 @@ fn within_bound(score: f64, best: f64) -> bool {
 ///
 /// A pin to a slot that is not in `scores` (ineligible, or gone from its
 /// host's frame) is ignored and the keyed HRW walk decides.
+///
+/// `pin_ignores_bound` makes a pin to any slot in `scores` win whatever its
+/// score. The placer sets it for heavy requests, whose admission is already
+/// capped by the lane's backlog caps: a warm long conversation returns to its
+/// replica whenever that replica is admitted (caps take precedence over
+/// affinity, the score bound does not).
 pub fn select(
     key: Option<&AffinityKey>,
     pin: Option<&SlotId>,
+    pin_ignores_bound: bool,
     scores: &[(SlotId, f64)],
     rng: &mut impl Rng,
 ) -> Option<Selected> {
@@ -245,10 +252,11 @@ pub fn select(
     });
     let home = rank.as_ref().map(|r| r[0].clone());
 
-    // Rule 1: an in-bound pin wins outright.
+    // Rule 1: an in-bound (or, for heavy requests, any eligible) pin wins
+    // outright.
     if let Some(pin_slot) = pin {
         if let Some(score) = score_of(pin_slot) {
-            if within_bound(score, best) {
+            if pin_ignores_bound || within_bound(score, best) {
                 return Some(Selected {
                     slot: pin_slot.clone(),
                     selection: Selection::Pinned,
@@ -351,7 +359,7 @@ mod tests {
     fn empty_scores_is_none() {
         let mut rng = StdRng::seed_from_u64(1);
         let scores: Vec<(SlotId, f64)> = vec![];
-        assert!(select(None, None, &scores, &mut rng).is_none());
+        assert!(select(None, None, false, &scores, &mut rng).is_none());
     }
 
     #[test]
@@ -359,7 +367,7 @@ mod tests {
         let key = find_key_with_rank(&[s("gpu02"), s("gpu08")], &[s("gpu02")]);
         let scores = vec![(s("gpu02"), 0.30), (s("gpu08"), 0.28)];
         let mut rng = StdRng::seed_from_u64(1);
-        let sel = select(Some(&key), None, &scores, &mut rng).unwrap();
+        let sel = select(Some(&key), None, false, &scores, &mut rng).unwrap();
         assert_eq!(sel.slot, s("gpu02"));
         assert_eq!(sel.selection, Selection::Home);
         assert!(!sel.write_pin);
@@ -374,7 +382,7 @@ mod tests {
         let key = find_key_with_rank(&[s("gpu-a"), s("gpu-b")], &[s("gpu-b")]);
         let scores = vec![(s("gpu-a"), 0.0), (s("gpu-b"), 0.05)];
         let mut rng = StdRng::seed_from_u64(1);
-        let sel = select(Some(&key), None, &scores, &mut rng).unwrap();
+        let sel = select(Some(&key), None, false, &scores, &mut rng).unwrap();
         assert_eq!(sel.slot, s("gpu-b"));
         assert_eq!(sel.selection, Selection::Home);
     }
@@ -387,14 +395,14 @@ mod tests {
         // Turn 1: home (gpu02) is overloaded at 2.0; gpu08 at 0.4 is the
         // next slot in rank and within bound (best 0.4, bound 0.5).
         let scores = vec![(s("gpu02"), 2.0), (s("gpu08"), 0.4)];
-        let sel = select(Some(&key), None, &scores, &mut rng).unwrap();
+        let sel = select(Some(&key), None, false, &scores, &mut rng).unwrap();
         assert_eq!(sel.slot, s("gpu08"));
         assert_eq!(sel.selection, Selection::Spill { rank: 2 });
         assert!(sel.write_pin, "spill away from home must write a pin");
         assert_eq!(sel.home, Some(s("gpu02")));
 
         // Turn 2: caller now passes the written pin; gpu02 is still hot.
-        let sel = select(Some(&key), Some(&s("gpu08")), &scores, &mut rng).unwrap();
+        let sel = select(Some(&key), Some(&s("gpu08")), false, &scores, &mut rng).unwrap();
         assert_eq!(sel.slot, s("gpu08"));
         assert_eq!(sel.selection, Selection::Pinned);
         assert!(!sel.write_pin);
@@ -403,7 +411,7 @@ mod tests {
         // bound = max(0.35*1.25=0.4375, 0.35+0.1=0.45) = 0.45; 0.42 <= 0.45
         // so the pin holds (no flap).
         let scores = vec![(s("gpu02"), 0.35), (s("gpu08"), 0.42)];
-        let sel = select(Some(&key), Some(&s("gpu08")), &scores, &mut rng).unwrap();
+        let sel = select(Some(&key), Some(&s("gpu08")), false, &scores, &mut rng).unwrap();
         assert_eq!(sel.slot, s("gpu08"));
         assert_eq!(sel.selection, Selection::Pinned);
         assert!(!sel.write_pin);
@@ -411,10 +419,27 @@ mod tests {
         // Turn 4: gpu08 spikes to 0.9, past the bound (0.45) — pin is
         // ignored and the walk returns to home (gpu02), moving the pin.
         let scores = vec![(s("gpu02"), 0.35), (s("gpu08"), 0.9)];
-        let sel = select(Some(&key), Some(&s("gpu08")), &scores, &mut rng).unwrap();
+        let sel = select(Some(&key), Some(&s("gpu08")), false, &scores, &mut rng).unwrap();
         assert_eq!(sel.slot, s("gpu02"));
         assert_eq!(sel.selection, Selection::Home);
         assert!(sel.write_pin, "pin moving back to home must write a pin");
+    }
+
+    #[test]
+    fn pin_ignoring_bound_holds_outside_bound() {
+        let key = find_key_with_rank(&[s("gpu02"), s("gpu08")], &[s("gpu02")]);
+        let scores = vec![(s("gpu02"), 0.1), (s("gpu08"), 6.0)];
+        let mut rng = StdRng::seed_from_u64(1);
+        let sel = select(Some(&key), Some(&s("gpu08")), true, &scores, &mut rng).unwrap();
+        assert_eq!(sel.slot, s("gpu08"));
+        assert_eq!(sel.selection, Selection::Pinned);
+        assert!(!sel.write_pin);
+        // Without the flag, the same pin is out of bound and ignored.
+        let sel = select(Some(&key), Some(&s("gpu08")), false, &scores, &mut rng).unwrap();
+        assert_eq!(sel.selection, Selection::Home);
+        // With the flag, a pin to a slot not in `scores` still falls through.
+        let sel = select(Some(&key), Some(&s("gpu05")), true, &scores, &mut rng).unwrap();
+        assert_eq!(sel.selection, Selection::Home);
     }
 
     #[test]
@@ -424,7 +449,7 @@ mod tests {
         let key = find_key_with_rank(&[s("gpu02"), s("gpu08")], &[s("gpu02")]);
         let scores = vec![(s("gpu02"), 0.2), (s("gpu08"), 0.9)];
         let mut rng = StdRng::seed_from_u64(1);
-        let sel = select(Some(&key), Some(&s("gpu05")), &scores, &mut rng).unwrap();
+        let sel = select(Some(&key), Some(&s("gpu05")), false, &scores, &mut rng).unwrap();
         assert_eq!(sel.slot, s("gpu02"));
         assert_eq!(sel.selection, Selection::Home);
         assert!(
@@ -439,7 +464,14 @@ mod tests {
         let key = find_key_with_rank(&[slot("gpu02", 0)], &[slot("gpu02", 0)]);
         let scores = vec![(slot("gpu02", 0), 0.1)];
         let mut rng = StdRng::seed_from_u64(1);
-        let sel = select(Some(&key), Some(&slot("gpu02", 1)), &scores, &mut rng).unwrap();
+        let sel = select(
+            Some(&key),
+            Some(&slot("gpu02", 1)),
+            false,
+            &scores,
+            &mut rng,
+        )
+        .unwrap();
         assert_eq!(sel.slot, slot("gpu02", 0));
         assert_eq!(sel.selection, Selection::Home);
         assert!(sel.write_pin);
@@ -451,7 +483,7 @@ mod tests {
         // — falls all the way through to keyless BestOfTwo.
         let scores = vec![(s("hostA"), 0.1), (s("hostB"), 0.2)];
         let mut rng = StdRng::seed_from_u64(7);
-        let sel = select(None, Some(&s("ghost")), &scores, &mut rng).unwrap();
+        let sel = select(None, Some(&s("ghost")), false, &scores, &mut rng).unwrap();
         assert_eq!(sel.selection, Selection::BestOfTwo);
         assert_eq!(sel.slot, s("hostA"));
         assert_eq!(sel.home, None);
@@ -465,7 +497,7 @@ mod tests {
         let scores = vec![(s("hostA"), 1.0), (s("hostB"), 2.0)];
         for seed in 0..10u64 {
             let mut rng = StdRng::seed_from_u64(seed);
-            let sel = select(None, None, &scores, &mut rng).unwrap();
+            let sel = select(None, None, false, &scores, &mut rng).unwrap();
             assert_eq!(sel.slot, s("hostA"));
             assert_eq!(sel.selection, Selection::BestOfTwo);
             assert_eq!(sel.home, None);
@@ -491,7 +523,7 @@ mod tests {
         let mut saw_non_global_min = false;
         for seed in 0..50u64 {
             let mut rng = StdRng::seed_from_u64(seed);
-            let sel = select(None, None, &scores, &mut rng).unwrap();
+            let sel = select(None, None, false, &scores, &mut rng).unwrap();
             assert_eq!(sel.selection, Selection::BestOfTwo);
             assert!(
                 by_slot.contains_key(&sel.slot),
@@ -521,7 +553,7 @@ mod tests {
     fn keyless_single_slot_is_taken() {
         let scores = vec![(s("hostA"), 1.0)];
         let mut rng = StdRng::seed_from_u64(1);
-        let sel = select(None, None, &scores, &mut rng).unwrap();
+        let sel = select(None, None, false, &scores, &mut rng).unwrap();
         assert_eq!(sel.slot, s("hostA"));
         assert_eq!(sel.selection, Selection::BestOfTwo);
     }

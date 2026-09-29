@@ -734,9 +734,18 @@ pub struct MockProvider {
     /// order. Lets lifecycle tests assert the signature-fetch routing pin was
     /// released. `std::sync::Mutex` because the trait method is synchronous.
     unpinned_chat_ids: Arc<std::sync::Mutex<Vec<String>>>,
+    /// What [`InferenceProvider::poll_backend_count`] reports; defaults to
+    /// `Skipped`. Set via [`MockProvider::with_count_poll`].
+    count_poll: crate::CountPoll,
 }
 
 impl MockProvider {
+    /// Set what this mock's backend-count poll reports.
+    pub fn with_count_poll(mut self, poll: crate::CountPoll) -> Self {
+        self.count_poll = poll;
+        self
+    }
+
     pub fn with_systemone_handler(
         mut self,
         handler: impl Fn(
@@ -793,6 +802,7 @@ impl MockProvider {
             supports_streaming: true,
             supports_client_e2ee: true,
             supports_chat_signatures: true,
+            count_poll: crate::CountPoll::Skipped,
             per_request_public_key: None,
             unpinned_chat_ids: Arc::new(std::sync::Mutex::new(Vec::new())),
             responses_handler: None,
@@ -823,6 +833,7 @@ impl MockProvider {
             supports_streaming: true,
             supports_client_e2ee: true,
             supports_chat_signatures: true,
+            count_poll: crate::CountPoll::Skipped,
             per_request_public_key: None,
             unpinned_chat_ids: Arc::new(std::sync::Mutex::new(Vec::new())),
             responses_handler: None,
@@ -851,6 +862,7 @@ impl MockProvider {
             supports_streaming: true,
             supports_client_e2ee: true,
             supports_chat_signatures: true,
+            count_poll: crate::CountPoll::Skipped,
             per_request_public_key: None,
             unpinned_chat_ids: Arc::new(std::sync::Mutex::new(Vec::new())),
             responses_handler: None,
@@ -1157,6 +1169,10 @@ impl crate::InferenceProvider for MockProvider {
 
     fn supports_chat_signatures(&self) -> bool {
         self.supports_chat_signatures
+    }
+
+    async fn poll_backend_count(&self, _client: &reqwest::Client) -> crate::CountPoll {
+        self.count_poll
     }
 
     fn supports_per_request_pubkey_routing(&self, public_key: &str) -> bool {

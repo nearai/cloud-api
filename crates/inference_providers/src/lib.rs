@@ -301,11 +301,27 @@ pub enum CountPoll {
     /// The count read failed; nothing changed.
     Failed,
     Unchanged,
+    /// The count is unchanged but the host map was built for another count:
+    /// the rediscovery a change asked for has not landed yet.
+    HostMapStale,
     /// The healthy count moved from `old` to `new`, and `new` is stored.
     Changed {
         old: usize,
         new: usize,
     },
+}
+
+/// One discovery cycle's results for a provider (see
+/// [`InferenceProvider::apply_discovery`]).
+pub struct DiscoveryPush {
+    /// [`InferenceProvider::count_generation`] read before the cycle began.
+    pub generation: u64,
+    pub count: usize,
+    pub keys: std::collections::HashMap<String, Vec<usize>>,
+    pub hosts: BackendHosts,
+    /// The cycle covered every healthy backend. A cycle that did not, and
+    /// saw no replica-report key, keeps the provider's last key registry.
+    pub complete: bool,
 }
 
 #[async_trait]
@@ -546,6 +562,26 @@ pub trait InferenceProvider {
     /// the next discovery. Default: [`CountPoll::Skipped`].
     async fn poll_backend_count(&self, _client: &reqwest::Client) -> CountPoll {
         CountPoll::Skipped
+    }
+
+    /// The version of this provider's backend count: every applied
+    /// discovery push and every count change [`Self::poll_backend_count`]
+    /// stores advances it. Read it before a discovery cycle starts and pass
+    /// it back in [`DiscoveryPush::generation`].
+    fn count_generation(&self) -> u64 {
+        0
+    }
+
+    /// Apply a discovery cycle's count, key map and host map, unless the
+    /// count moved on since the cycle began (a newer poll or push): then the
+    /// whole push is discarded and `false` returned, so a slow cycle never
+    /// replaces a newer count with the one it read. Default: apply
+    /// unconditionally.
+    fn apply_discovery(&self, push: DiscoveryPush) -> bool {
+        self.set_backend_count(push.count);
+        self.set_backend_keys(push.keys);
+        self.set_backend_hosts(push.hosts);
+        true
     }
 
     /// Install smart placement for this provider's model. Default is a no-op — only

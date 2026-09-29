@@ -260,6 +260,11 @@ pub(super) struct Fleet {
     /// Most recent healthy backend count reported by discovery; bounds the
     /// rotation-SNI fan-out. Read with `Relaxed` (best-effort).
     pub(super) last_backend_count: AtomicUsize,
+    /// Version of `last_backend_count` against discovery pushes: advanced by
+    /// every applied push and every count change the fast poll stores, and
+    /// held while either writes, so a push read before a newer count is
+    /// discarded (`apply_discovery_push`).
+    count_generation: Mutex<u64>,
     /// Pre-parsed rotation parts from the provider's base_url. `None` for URLs
     /// that don't fit the rotation scheme (one-label host, IP literal, …) — then
     /// rotation is a no-op and the canonical-SNI path is used.
@@ -343,6 +348,7 @@ impl Fleet {
             pending_rotation: Mutex::new(HashMap::new()),
             signature_rotation: Mutex::new(HashMap::new()),
             last_backend_count: AtomicUsize::new(0),
+            count_generation: Mutex::new(0),
             rotation_parts,
             prefix_router,
             index_clients,
@@ -1024,16 +1030,45 @@ impl Fleet {
         match rotation::fetch_backend_count(client, parts, COUNT_POLL_TIMEOUT).await {
             rotation::CountFetch::Ok(healthy) => {
                 let new = healthy.min(rotation::MAX_FANOUT);
+                let mut generation = lock(&self.count_generation);
                 let old = self.backend_count();
-                if new == old {
-                    crate::CountPoll::Unchanged
-                } else {
+                if new != old {
                     self.store_backend_count(new);
+                    *generation += 1;
                     crate::CountPoll::Changed { old, new }
+                } else if self.backend_hosts.load().count != new {
+                    crate::CountPoll::HostMapStale
+                } else {
+                    crate::CountPoll::Unchanged
                 }
             }
             rotation::CountFetch::Err(_) => crate::CountPoll::Failed,
         }
+    }
+
+    /// See `InferenceProvider::count_generation`.
+    pub(super) fn current_count_generation(&self) -> u64 {
+        *lock(&self.count_generation)
+    }
+
+    /// See `InferenceProvider::apply_discovery`. A cycle that was not
+    /// complete and saw no replica-report key keeps the last non-empty key
+    /// registry, so a publishing model does not go silent over a discovery
+    /// hiccup; a complete cycle that saw none clears it.
+    pub(super) fn apply_discovery_push(&self, push: crate::DiscoveryPush) -> bool {
+        let mut generation = lock(&self.count_generation);
+        if push.generation != *generation {
+            return false;
+        }
+        *generation += 1;
+        self.store_backend_count(push.count);
+        self.set_backend_keys(push.keys);
+        let mut hosts = push.hosts;
+        if hosts.keys.by_host.is_empty() && !push.complete {
+            hosts.keys = self.backend_hosts.load().keys.clone();
+        }
+        self.set_backend_hosts(hosts);
+        true
     }
 
     /// The verified host map discovery pushed last.

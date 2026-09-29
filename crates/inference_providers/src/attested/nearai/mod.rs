@@ -1778,6 +1778,14 @@ impl InferenceProvider for Fleet {
         self.poll_count(client).await
     }
 
+    fn count_generation(&self) -> u64 {
+        self.current_count_generation()
+    }
+
+    fn apply_discovery(&self, push: crate::DiscoveryPush) -> bool {
+        self.apply_discovery_push(push)
+    }
+
     async fn get_attestation_report(
         &self,
         model: String,
@@ -2908,6 +2916,12 @@ impl InferenceProvider for Provider {
     }
     async fn poll_backend_count(&self, client: &reqwest::Client) -> crate::CountPoll {
         self.fleet.poll_backend_count(client).await
+    }
+    fn count_generation(&self) -> u64 {
+        self.fleet.count_generation()
+    }
+    fn apply_discovery(&self, push: crate::DiscoveryPush) -> bool {
+        self.fleet.apply_discovery(push)
     }
     fn set_placement(&self, handles: crate::placement_io::PlacementHandles) {
         self.fleet.set_placement(handles)
@@ -7808,6 +7822,118 @@ mod tests {
 
                     assert!(server.received_requests().await.unwrap().is_empty());
                 }
+
+                /// `h`'s current host map, re-pushed by a discovery cycle
+                /// with `count`, `keys` attested hosts and `complete`.
+                fn push(
+                    h: &Harness,
+                    generation: u64,
+                    count: usize,
+                    keyed: bool,
+                    complete: bool,
+                ) -> crate::DiscoveryPush {
+                    let hosts = h.provider.fleet.backend_hosts();
+                    crate::DiscoveryPush {
+                        generation,
+                        count,
+                        keys: HashMap::new(),
+                        hosts: BackendHosts {
+                            index_by_host: hosts.index_by_host.clone(),
+                            keys: if keyed {
+                                hosts.keys.clone()
+                            } else {
+                                Default::default()
+                            },
+                            count,
+                        },
+                        complete,
+                    }
+                }
+
+                /// A discovery cycle that began before a poll saw the new
+                /// count pushes the old count and host map late: it is
+                /// discarded, and the polled count stands. The poll keeps
+                /// reporting the stale host map until a current push lands.
+                #[tokio::test]
+                async fn older_discovery_push_cannot_overwrite_newer_polled_count() {
+                    let server = count_server(Some(5)).await;
+                    let client = count_client(&server);
+                    let h = placing(&server);
+                    let started = h.provider.count_generation();
+
+                    assert_eq!(
+                        h.provider.poll_backend_count(&client).await,
+                        CountPoll::Changed { old: 4, new: 5 }
+                    );
+                    assert!(!h.provider.apply_discovery(push(&h, started, 4, true, true)));
+                    assert_eq!(h.provider.fleet.backend_count(), 5);
+                    assert_eq!(h.provider.fleet.backend_hosts().count, 4);
+                    assert_eq!(acquire(&h).replica(), None, "still legacy");
+
+                    // The count holds but the host map is from the old one.
+                    assert_eq!(
+                        h.provider.poll_backend_count(&client).await,
+                        CountPoll::HostMapStale
+                    );
+
+                    // A cycle started after the poll lands, and places again.
+                    let current = h.provider.count_generation();
+                    assert!(h.provider.apply_discovery(push(&h, current, 5, true, true)));
+                    assert_eq!(h.provider.fleet.backend_hosts().count, 5);
+                    assert_eq!(
+                        h.provider.poll_backend_count(&client).await,
+                        CountPoll::Unchanged
+                    );
+                    // A push older than that one is discarded too.
+                    assert!(!h.provider.apply_discovery(push(&h, current, 5, true, true)));
+                }
+
+                /// A failed discovery cycle that saw no replica-report key
+                /// keeps the last attested registry, so a publishing model
+                /// keeps reporting its outage. A complete cycle that saw
+                /// none clears it.
+                #[tokio::test]
+                async fn failed_discovery_keeps_last_registry() {
+                    let server = count_server(Some(4)).await;
+                    let h = placing(&server);
+                    let generation = h.provider.count_generation();
+                    assert!(h
+                        .provider
+                        .apply_discovery(push(&h, generation, 4, false, false)));
+                    assert!(!h.provider.fleet.backend_hosts().keys.by_host.is_empty());
+                    assert_eq!(acquire(&h).index(), 2, "still places");
+
+                    let generation = h.provider.count_generation();
+                    assert!(h
+                        .provider
+                        .apply_discovery(push(&h, generation, 4, false, true)));
+                    assert!(h.provider.fleet.backend_hosts().keys.by_host.is_empty());
+                    let before = h.metrics.counts.lock().unwrap().len();
+                    assert_eq!(acquire(&h).replica(), None);
+                    assert_eq!(h.metrics.counts.lock().unwrap().len(), before, "silent");
+                }
+            }
+
+            /// A placed host id that is not a valid header value sends
+            /// neither hint: the replica hint never goes out without its
+            /// host.
+            #[tokio::test]
+            async fn invalid_host_header_value_suppresses_both_headers() {
+                let upstream = mock_upstream(None).await;
+                let bad = "bad\nhost";
+                let h = harness_on(
+                    upstream_provider(&upstream),
+                    &[(bad, 2)],
+                    4,
+                    snapshot(bad, fresh_ms(), PinTable::default()),
+                );
+                send_both(&h.provider, params("z-ai/glm-5.3-flash")).await;
+
+                let requests = upstream.received_requests().await.unwrap();
+                assert_eq!(requests.len(), 2);
+                assert_eq!(h.metrics.decisions_tagged("outcome:place"), 2);
+                assert_eq!(hints(&requests), vec![None; 2]);
+                assert_eq!(host_hints(&requests), vec![None; 2]);
             }
         }
 

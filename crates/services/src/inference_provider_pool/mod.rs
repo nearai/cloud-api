@@ -347,8 +347,89 @@ pub type ProviderLatencyReporter = Arc<dyn Fn(i32) + Send + Sync>;
 /// change can remap indices long before the next full discovery.
 const COUNT_POLL_INTERVAL: Duration = Duration::from_secs(10);
 
-/// The most often a count change re-runs discovery for one model.
+/// The most often a count change re-runs discovery for one model, counted
+/// from its last successful reload.
 const COUNT_REDISCOVERY_DEBOUNCE: Duration = Duration::from_secs(30);
+
+/// Count-driven rediscovery bookkeeping, owned by the count poll: models
+/// whose count changed (or whose host map was built for another count) stay
+/// pending until a reload succeeds, one reload per model is in flight at a
+/// time, and a model reloads at most once per [`COUNT_REDISCOVERY_DEBOUNCE`]
+/// after a success. A failed reload is retried on the next tick.
+#[derive(Default)]
+struct CountRediscovery {
+    pending: HashSet<String>,
+    in_flight: HashSet<String>,
+    last_ok: HashMap<String, std::time::Instant>,
+}
+
+impl CountRediscovery {
+    fn mark_pending(&mut self, models: impl IntoIterator<Item = String>) {
+        self.pending.extend(models);
+    }
+
+    /// The pending models to reload now, each marked in flight.
+    fn take_due(&mut self, now: std::time::Instant) -> Vec<String> {
+        let due: Vec<String> = self
+            .pending
+            .iter()
+            .filter(|model| !self.in_flight.contains(*model))
+            .filter(|model| {
+                self.last_ok.get(*model).is_none_or(|at| {
+                    now.saturating_duration_since(*at) >= COUNT_REDISCOVERY_DEBOUNCE
+                })
+            })
+            .cloned()
+            .collect();
+        self.in_flight.extend(due.iter().cloned());
+        due
+    }
+
+    /// Records the end of `model`'s reload: a success clears it from
+    /// pending and starts its debounce; a failure leaves it pending.
+    fn finish(&mut self, model: &str, ok: bool, now: std::time::Instant) {
+        self.in_flight.remove(model);
+        if ok {
+            self.pending.remove(model);
+            self.last_ok.insert(model.to_string(), now);
+        }
+    }
+}
+
+/// Aborts a background task when dropped: the count poll lives exactly as
+/// long as the refresh task that spawned it.
+struct AbortOnDrop(tokio::task::JoinHandle<()>);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+/// Finishes a count-driven reload in [`CountRediscovery`] when dropped, as a
+/// failure unless marked done, so a panicking reload never leaves its model
+/// in flight forever.
+struct RediscoveryRun {
+    state: Arc<std::sync::Mutex<CountRediscovery>>,
+    model: String,
+    ok: bool,
+}
+
+impl RediscoveryRun {
+    fn record(&mut self, ok: bool) {
+        self.ok = ok;
+    }
+}
+
+impl Drop for RediscoveryRun {
+    fn drop(&mut self) {
+        self.state.lock().unwrap_or_else(|e| e.into_inner()).finish(
+            &self.model,
+            self.ok,
+            std::time::Instant::now(),
+        );
+    }
+}
 
 /// Trait for fetching external model configurations from a data source (e.g., database).
 /// This decouples the InferenceProviderPool from the database crate (hexagonal architecture).
@@ -2079,7 +2160,8 @@ impl InferenceProviderPool {
     /// `InferenceProvider::poll_backend_count`; only Fleets whose placement
     /// hosts have published are read). A changed count is stored by the
     /// provider at once, which makes its placement legacy until
-    /// rediscovery. Returns the models whose count changed.
+    /// rediscovery. Returns the models whose count changed or whose host
+    /// map was built for another count: both need a rediscovery.
     async fn poll_backend_counts(&self, client: &reqwest::Client) -> Vec<String> {
         let providers: Vec<Arc<InferenceProviderTrait>> = self
             .inference_url_providers
@@ -2094,15 +2176,12 @@ impl InferenceProviderPool {
                 .map(|provider| provider.poll_backend_count(client)),
         )
         .await;
-        let changed: Vec<(usize, usize, usize)> = providers
+        use inference_providers::CountPoll;
+        let changed: Vec<(usize, CountPoll)> = providers
             .iter()
             .zip(polls)
-            .filter_map(|(provider, poll)| match poll {
-                inference_providers::CountPoll::Changed { old, new } => {
-                    Some((Arc::as_ptr(provider) as *const () as usize, old, new))
-                }
-                _ => None,
-            })
+            .filter(|(_, poll)| matches!(poll, CountPoll::Changed { .. } | CountPoll::HostMapStale))
+            .map(|(provider, poll)| (Arc::as_ptr(provider) as *const () as usize, poll))
             .collect();
         if changed.is_empty() {
             return Vec::new();
@@ -2110,53 +2189,90 @@ impl InferenceProviderPool {
         let mappings = self.provider_mappings.read().await;
         let mut models = Vec::new();
         for (model, list) in &mappings.model_to_providers {
-            let ptrs = list.iter().map(|p| Arc::as_ptr(p) as *const () as usize);
-            for ptr in ptrs {
-                if let Some((_, old, new)) = changed.iter().find(|(p, _, _)| *p == ptr) {
-                    info!(model = %model, old = *old, new = *new, "count_changed");
+            let poll = list.iter().find_map(|p| {
+                let ptr = Arc::as_ptr(p) as *const () as usize;
+                changed
+                    .iter()
+                    .find(|(c, _)| *c == ptr)
+                    .map(|(_, poll)| *poll)
+            });
+            match poll {
+                Some(CountPoll::Changed { old, new }) => {
+                    info!(model = %model, old, new, "count_changed");
                     models.push(model.clone());
-                    break;
                 }
+                Some(_) => models.push(model.clone()),
+                None => {}
             }
         }
         models
     }
 
-    /// Re-run discovery for the models in `changed` whose last count-driven
-    /// rediscovery (`last`, per model) is at least
-    /// [`COUNT_REDISCOVERY_DEBOUNCE`] old: their catalog entries are
-    /// reloaded as a partial batch, the same path an admin PATCH takes, so
-    /// every probe runs exactly as in the periodic refresh.
-    async fn rediscover_changed(
-        &self,
-        source: &dyn ExternalModelsSource,
-        last: &mut HashMap<String, std::time::Instant>,
-        changed: Vec<String>,
-        now: std::time::Instant,
-    ) {
-        let mut due: HashSet<String> = HashSet::new();
-        for model in changed {
-            let recent = last
-                .get(&model)
-                .is_some_and(|at| now.saturating_duration_since(*at) < COUNT_REDISCOVERY_DEBOUNCE);
-            if !recent {
-                last.insert(model.clone(), now);
-                due.insert(model);
-            }
-        }
-        if due.is_empty() {
-            return;
-        }
+    /// Re-run discovery for `model` after a count change: its catalog
+    /// entries are reloaded as a partial batch, the same path an admin PATCH
+    /// takes, so every probe runs exactly as in the periodic refresh. `false`
+    /// when the catalog could not be read (the model stays pending). A model
+    /// no longer in the catalog has nothing to reload: `true`.
+    async fn rediscover_model(&self, source: &dyn ExternalModelsSource, model: &str) -> bool {
         match source.fetch_inference_url_models().await {
             Ok(models) => {
                 let entries: Vec<_> = models
                     .into_iter()
-                    .filter(|(model, _, _)| due.contains(model))
+                    .filter(|(name, _, _)| name == model)
                     .collect();
-                self.load_inference_url_models(entries, true).await;
+                if !entries.is_empty() {
+                    self.load_inference_url_models(entries, true).await;
+                }
+                true
             }
             Err(e) => {
-                warn!(error = %e, "Failed to read inference_url models for count-change rediscovery");
+                warn!(
+                    model = %model,
+                    error = %e,
+                    "Failed to read inference_url models for count-change rediscovery"
+                );
+                false
+            }
+        }
+    }
+
+    /// The fast count poll: every [`COUNT_POLL_INTERVAL`], read the healthy
+    /// count of every Fleet whose placement hosts have published, and spawn
+    /// a rediscovery for each model that needs one (see
+    /// [`CountRediscovery`]). Runs beside the periodic refresh, so a long
+    /// refresh never stalls it, and reloads run off this task.
+    async fn count_poll_loop(
+        pool: Arc<Self>,
+        source: Arc<dyn ExternalModelsSource>,
+        client: reqwest::Client,
+    ) {
+        let state = Arc::new(std::sync::Mutex::new(CountRediscovery::default()));
+        let mut ticker = tokio::time::interval(COUNT_POLL_INTERVAL);
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        ticker.tick().await;
+        loop {
+            ticker.tick().await;
+            if !pool.has_placement() {
+                continue;
+            }
+            let changed = pool.poll_backend_counts(&client).await;
+            let due = {
+                let mut state = state.lock().unwrap_or_else(|e| e.into_inner());
+                state.mark_pending(changed);
+                state.take_due(std::time::Instant::now())
+            };
+            for model in due {
+                let pool = pool.clone();
+                let source = source.clone();
+                let mut run = RediscoveryRun {
+                    state: state.clone(),
+                    model,
+                    ok: false,
+                };
+                tokio::spawn(async move {
+                    let ok = pool.rediscover_model(source.as_ref(), &run.model).await;
+                    run.record(ok);
+                });
             }
         }
     }
@@ -5722,6 +5838,7 @@ impl InferenceProviderPool {
                     String,
                     String,
                     Arc<InferenceProviderTrait>,
+                    u64,
                     DiscoveryOutcome,
                 ),
             >;
@@ -5793,6 +5910,9 @@ impl InferenceProviderPool {
                         let model_name = model_name.clone();
                         let url = url.clone();
                         let provider = provider.clone();
+                        // Read before the cycle starts: a count the fast
+                        // poll stores meanwhile makes this cycle's push stale.
+                        let generation = provider.count_generation();
                         let metrics_service = metrics_service.clone();
                         let verifier = verifier.clone();
                         let tls_roots = tls_roots.clone();
@@ -5811,7 +5931,7 @@ impl InferenceProviderPool {
                                     metrics_service.as_deref(),
                                 )
                                 .await;
-                                (model_name, url, provider, outcome)
+                                (model_name, url, provider, generation, outcome)
                             }
                             .boxed(),
                         );
@@ -5866,7 +5986,7 @@ impl InferenceProviderPool {
             };
             let (discovery_results, legacy_results) = tokio::join!(drive_discovery, drive_legacy);
 
-            for (model_name, url, provider, outcome) in discovery_results {
+            for (model_name, url, provider, generation, outcome) in discovery_results {
                 record_backend_key_divergence(
                     self.metrics_service.get().map(Arc::as_ref),
                     &model_name,
@@ -5907,9 +6027,24 @@ impl InferenceProviderPool {
                 // useful update because it disables rotation fallback for
                 // this provider until the next cycle proves at least one
                 // backend healthy again.
-                provider.set_backend_count(outcome.backend_count);
-                provider.set_backend_keys(outcome.key_index_map());
-                provider.set_backend_hosts(outcome.backend_hosts());
+                //
+                // Applied as one versioned push: a count the fast poll stored
+                // after this cycle began is newer, so the push is discarded
+                // (the poll keeps the model pending for rediscovery).
+                let applied = provider.apply_discovery(inference_providers::DiscoveryPush {
+                    generation,
+                    count: outcome.backend_count,
+                    keys: outcome.key_index_map(),
+                    hosts: outcome.backend_hosts(),
+                    complete: outcome.replaced_state,
+                });
+                if !applied {
+                    info!(
+                        model = %model_name,
+                        backend_count = outcome.backend_count,
+                        "Discovery push older than a polled backend count; discarded"
+                    );
+                }
 
                 let ptr = Arc::as_ptr(&provider) as *const () as usize;
                 let provider_has_any_pubkey_mapping = mapped_ptrs.contains(&ptr);
@@ -6404,40 +6539,20 @@ impl InferenceProviderPool {
                 // Skip the first immediate tick (providers already loaded at startup)
                 interval.tick().await;
                 // The fast count poll, for Fleets whose placement hosts have
-                // published: a changed count is stored at once and triggers a
-                // debounced rediscovery of that model.
-                let count_client = match Self::count_client(&pool.tls_roots) {
-                    Ok(client) => Some(client),
+                // published, runs as its own task for as long as this one.
+                let _count_poll = match Self::count_client(&pool.tls_roots) {
+                    Ok(client) => Some(AbortOnDrop(tokio::spawn(Self::count_poll_loop(
+                        pool.clone(),
+                        source.clone(),
+                        client,
+                    )))),
                     Err(e) => {
                         warn!(error = %e, "Backend count poll client failed to build; count poll disabled");
                         None
                     }
                 };
-                let mut count_poll = tokio::time::interval(COUNT_POLL_INTERVAL);
-                count_poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-                count_poll.tick().await;
-                let mut rediscovered: HashMap<String, std::time::Instant> = HashMap::new();
                 loop {
-                    tokio::select! {
-                        _ = interval.tick() => {}
-                        _ = count_poll.tick() => {
-                            let Some(client) = count_client.as_ref() else {
-                                continue;
-                            };
-                            if !pool.has_placement() {
-                                continue;
-                            }
-                            let changed = pool.poll_backend_counts(client).await;
-                            pool.rediscover_changed(
-                                source.as_ref(),
-                                &mut rediscovered,
-                                changed,
-                                std::time::Instant::now(),
-                            )
-                            .await;
-                            continue;
-                        }
-                    }
+                    interval.tick().await;
                     debug!("Running periodic provider refresh");
 
                     let mut valid_model_names = std::collections::HashSet::new();
@@ -8972,6 +9087,14 @@ mod tests {
     struct CountingSource {
         models: Vec<(String, String, Option<u32>)>,
         fetches: std::sync::atomic::AtomicUsize,
+        /// When set, every catalog read fails.
+        fail: std::sync::atomic::AtomicBool,
+    }
+
+    impl CountingSource {
+        fn fetches(&self) -> usize {
+            self.fetches.load(std::sync::atomic::Ordering::SeqCst)
+        }
     }
 
     #[async_trait::async_trait]
@@ -8985,12 +9108,15 @@ mod tests {
         ) -> Result<Vec<(String, String, Option<u32>)>, String> {
             self.fetches
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if self.fail.load(std::sync::atomic::Ordering::SeqCst) {
+                return Err("catalog unavailable".to_string());
+            }
             Ok(self.models.clone())
         }
     }
 
     /// A count change re-runs discovery for just its model, from the
-    /// catalog, at most once per `COUNT_REDISCOVERY_DEBOUNCE` per model.
+    /// catalog, and records the successful reload.
     #[tokio::test]
     async fn count_change_triggers_debounced_rediscovery() {
         let pool = InferenceProviderPool::new(None, ExternalProvidersConfig::default());
@@ -9002,40 +9128,81 @@ mod tests {
                 ("m-b".to_string(), b_url.clone(), None),
             ],
             fetches: Default::default(),
+            fail: Default::default(),
         };
-        let fetches = || source.fetches.load(std::sync::atomic::Ordering::SeqCst);
-        let mut last = HashMap::new();
+        assert!(pool.rediscover_model(&source, "m-a").await);
+        assert_eq!(source.fetches(), 1);
+        let states = pool.inference_url_fingerprint_states.read().await;
+        assert!(states.contains_key(&a_url), "m-a rediscovered");
+        assert!(!states.contains_key(&b_url), "only the changed model");
+        drop(states);
+
+        // A catalog read failure is not a reload.
+        source.fail.store(true, std::sync::atomic::Ordering::SeqCst);
+        assert!(!pool.rediscover_model(&source, "m-a").await);
+    }
+
+    /// A changed count is kept pending until a reload succeeds: a failed
+    /// reload is retried on the next tick, a successful one debounces the
+    /// model for `COUNT_REDISCOVERY_DEBOUNCE`, a change inside that window is
+    /// retried once it elapses, and one model is never in flight twice.
+    #[test]
+    fn debounced_or_failed_rediscovery_is_retried() {
+        let mut state = CountRediscovery::default();
         let t0 = std::time::Instant::now();
+        let secs = std::time::Duration::from_secs;
+        assert!(state.take_due(t0).is_empty());
 
-        // Nothing changed: no catalog read.
-        pool.rediscover_changed(&source, &mut last, Vec::new(), t0)
-            .await;
-        assert_eq!(fetches(), 0);
+        state.mark_pending(["m-a".to_string()]);
+        assert_eq!(state.take_due(t0), vec!["m-a".to_string()]);
+        // In flight: not handed out again.
+        state.mark_pending(["m-a".to_string()]);
+        assert!(state.take_due(t0 + secs(1)).is_empty());
+        // Failed: retried on the next tick.
+        state.finish("m-a", false, t0 + secs(2));
+        assert_eq!(state.take_due(t0 + secs(2)), vec!["m-a".to_string()]);
+        state.finish("m-a", true, t0 + secs(3));
+        assert!(state.take_due(t0 + secs(3)).is_empty(), "done");
 
-        pool.rediscover_changed(&source, &mut last, vec!["m-a".to_string()], t0)
-            .await;
-        assert_eq!(fetches(), 1);
-        {
-            let states = pool.inference_url_fingerprint_states.read().await;
-            assert!(states.contains_key(&a_url), "m-a rediscovered");
-            assert!(!states.contains_key(&b_url), "only the changed model");
+        // A new change inside the debounce window waits for it, then runs.
+        state.mark_pending(["m-a".to_string()]);
+        assert!(state.take_due(t0 + secs(10)).is_empty());
+        let due = t0 + secs(3) + COUNT_REDISCOVERY_DEBOUNCE;
+        assert_eq!(state.take_due(due), vec!["m-a".to_string()]);
+    }
+
+    /// A provider whose poll reports a changed count, or a host map built
+    /// for another count, is mapped back to its model(s).
+    #[tokio::test]
+    async fn poll_backend_counts_maps_changed_providers_to_models() {
+        use inference_providers::mock::MockProvider;
+        use inference_providers::CountPoll;
+        let pool = InferenceProviderPool::new(None, ExternalProvidersConfig::default());
+        let providers = [
+            ("m-changed", CountPoll::Changed { old: 4, new: 5 }),
+            ("m-stale", CountPoll::HostMapStale),
+            ("m-same", CountPoll::Unchanged),
+            ("m-failed", CountPoll::Failed),
+        ];
+        for (model, poll) in providers {
+            let provider =
+                Arc::new(MockProvider::new().with_count_poll(poll)) as Arc<InferenceProviderTrait>;
+            pool.inference_url_providers
+                .write()
+                .await
+                .insert(format!("https://{model}.invalid"), provider.clone());
+            pool.provider_mappings
+                .write()
+                .await
+                .model_to_providers
+                .insert(model.to_string(), vec![provider]);
         }
-
-        // Within the debounce window: skipped.
-        let soon = t0 + COUNT_REDISCOVERY_DEBOUNCE / 2;
-        pool.rediscover_changed(&source, &mut last, vec!["m-a".to_string()], soon)
-            .await;
-        assert_eq!(fetches(), 1);
-
-        // Another model is debounced on its own.
-        pool.rediscover_changed(&source, &mut last, vec!["m-b".to_string()], soon)
-            .await;
-        assert_eq!(fetches(), 2);
-
-        let later = t0 + COUNT_REDISCOVERY_DEBOUNCE;
-        pool.rediscover_changed(&source, &mut last, vec!["m-a".to_string()], later)
-            .await;
-        assert_eq!(fetches(), 3);
+        let mut changed = pool.poll_backend_counts(&reqwest::Client::new()).await;
+        changed.sort();
+        assert_eq!(
+            changed,
+            vec!["m-changed".to_string(), "m-stale".to_string()]
+        );
     }
 
     /// The refresh failure-counter prune (review round 3, Pierre's blocking) must

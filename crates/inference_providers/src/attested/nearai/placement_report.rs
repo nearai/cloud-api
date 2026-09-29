@@ -198,12 +198,17 @@ pub(super) fn size_tag(prompt_tokens: Option<u64>) -> &'static str {
     }
 }
 
-/// Legacy decisions made because placement has no usable snapshot, or is
-/// switched off by the data-plane kill switch, are logged at debug; they
-/// would otherwise repeat on every covered request while the shared state is
-/// down, unconfigured or disabled.
+/// Legacy decisions made because placement has no usable snapshot, is
+/// switched off by the data-plane kill switch, or had its refusal turned
+/// into legacy by the no-refuse switch, are logged at debug; they would
+/// otherwise repeat on every such request while the shared state is down,
+/// unconfigured or a switch is on. The decision metric still counts each.
 fn logs_at_debug(record: &DecisionRecord) -> bool {
-    record.outcome == "legacy" && matches!(record.reason, Some("no_state" | "stale" | "disabled"))
+    record.outcome == "legacy"
+        && matches!(
+            record.reason,
+            Some("no_state" | "stale" | "disabled" | "norefuse")
+        )
 }
 
 fn outcome_tag(outcome: &str) -> &'static str {
@@ -714,14 +719,13 @@ mod observability_tests {
     #[test]
     fn decision_log_levels() {
         let h = handles(Arc::new(FakeMetrics::default()));
-        for reason in ["no_state", "stale", "disabled"] {
+        for reason in ["no_state", "stale", "disabled", "norefuse"] {
             let out = captured(|| report_decision(&h, &legacy(reason), &request(None)));
             assert!(out.contains("DEBUG"), "{reason}: {out}");
             assert!(!out.contains("INFO"), "{reason}: {out}");
         }
         for record in [
             legacy("incomplete"),
-            legacy("norefuse"),
             placed("short_clean", "home"),
             refused(Tier::Long, "long_full"),
         ] {

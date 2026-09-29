@@ -1353,10 +1353,11 @@ struct TtftProbe<S> {
     start: Option<std::time::Instant>,
     /// Send instant, kept for the end-of-stream duration.
     sent: std::time::Instant,
-    /// Send to first content chunk, kept for the inter-token latency.
-    ttft: Option<std::time::Duration>,
-    /// Content chunks seen so far.
-    chunks: u64,
+    /// First and last token chunk (at least one choice), and how many,
+    /// for the inter-token latency.
+    first_token: Option<std::time::Instant>,
+    last_token: Option<std::time::Instant>,
+    token_chunks: u64,
     /// Keeps this backend counted as live until the stream completes or the
     /// caller drops it. `None` is used only by focused unit tests.
     _route_lease: Option<fleet::RouteLease>,
@@ -1376,8 +1377,9 @@ impl<S> TtftProbe<S> {
             index,
             start: Some(start),
             sent: start,
-            ttft: None,
-            chunks: 0,
+            first_token: None,
+            last_token: None,
+            token_chunks: 0,
             _route_lease: route_lease,
         }
     }
@@ -1397,12 +1399,15 @@ where
         if let std::task::Poll::Ready(Some(Ok(ref event))) = polled {
             // Only a content-bearing chunk counts as the first token; leading
             // control events (keepalives, blank separators) don't.
+            if event.chunk.as_ref().is_some_and(is_token_chunk) {
+                let now = std::time::Instant::now();
+                self.first_token.get_or_insert(now);
+                self.last_token = Some(now);
+                self.token_chunks = self.token_chunks.saturating_add(1);
+            }
             if event.chunk.is_some() {
-                self.chunks = self.chunks.saturating_add(1);
                 if let Some(start) = self.start.take() {
-                    let ttft = start.elapsed();
-                    self.ttft = Some(ttft);
-                    let ttft_ms = ttft.as_millis() as f64;
+                    let ttft_ms = start.elapsed().as_millis() as f64;
                     if let Some(lease) = self._route_lease.as_ref() {
                         lease.record_ttft_ms(ttft_ms);
                     }
@@ -1415,19 +1420,26 @@ where
             }
         } else if matches!(polled, std::task::Poll::Ready(None)) {
             if let Some(lease) = self._route_lease.as_ref() {
-                let duration = self.sent.elapsed();
-                lease.record_duration_ms(duration.as_millis() as f64);
-                let ms = |d: std::time::Duration| d.as_secs_f64() * 1_000.0;
-                if let Some(itl) = self
-                    .ttft
-                    .and_then(|ttft| fleet::mean_itl_ms(ms(duration), ms(ttft), self.chunks))
-                {
-                    lease.record_itl_ms(itl);
+                lease.record_duration_ms(self.sent.elapsed().as_millis() as f64);
+                if let (Some(first), Some(last)) = (self.first_token, self.last_token) {
+                    let span_ms = last.duration_since(first).as_secs_f64() * 1_000.0;
+                    if let Some(itl) = fleet::mean_itl_ms(span_ms, self.token_chunks) {
+                        lease.record_itl_ms(itl);
+                    }
                 }
             }
             self._route_lease.take();
         }
         polled
+    }
+}
+
+/// A chunk that carries at least one choice, i.e. generated tokens. A
+/// usage-only chunk (`choices: []`) is not one.
+fn is_token_chunk(chunk: &StreamChunk) -> bool {
+    match chunk {
+        StreamChunk::Chat(c) => !c.choices.is_empty(),
+        StreamChunk::Text(c) => !c.choices.is_empty(),
     }
 }
 
@@ -6620,11 +6632,25 @@ mod tests {
             use crate::placement_io::{METRIC_DURATION_MS, METRIC_ITL_MS, METRIC_TTFT_MS};
             use tokio_stream::StreamExt;
 
-            // (duration - ttft) / (chunks - 1), and nothing below 2 chunks.
-            assert_eq!(mean_itl_ms(100.0, 40.0, 4), Some(20.0));
-            assert_eq!(mean_itl_ms(100.0, 40.0, 2), Some(60.0));
-            assert_eq!(mean_itl_ms(100.0, 40.0, 1), None);
-            assert_eq!(mean_itl_ms(100.0, 40.0, 0), None);
+            // (last - first token chunk) / (chunks - 1), nothing below 2.
+            assert_eq!(mean_itl_ms(60.0, 4), Some(20.0));
+            assert_eq!(mean_itl_ms(60.0, 2), Some(60.0));
+            assert_eq!(mean_itl_ms(60.0, 1), None);
+            assert_eq!(mean_itl_ms(60.0, 0), None);
+
+            // A token chunk carries a choice; the trailing usage-only chunk
+            // (`choices: []`) never counts, nor does its arrival time.
+            let token = || {
+                let mut event = data_event();
+                if let Some(crate::StreamChunk::Chat(chunk)) = event.chunk.as_mut() {
+                    chunk.choices = serde_json::from_value(serde_json::json!([
+                        {"index": 0, "delta": {"content": "x"}}
+                    ]))
+                    .unwrap();
+                }
+                event
+            };
+            let usage_only = data_event;
 
             for chunks in 0..4usize {
                 let h = harness(
@@ -6640,7 +6666,8 @@ mod tests {
                     .expect("not refused")
                     .expect("rotation active");
                 let mut items = vec![Ok(control_event(": keepalive\n"))];
-                items.extend((0..chunks).map(|_| Ok(data_event())));
+                items.extend((0..chunks).map(|_| Ok(token())));
+                items.push(Ok(usage_only()));
                 let inner: crate::StreamingResult = Box::pin(futures_util::stream::iter(items));
                 let start = std::time::Instant::now() - std::time::Duration::from_millis(5);
                 let probe = TtftProbe::new(
@@ -6656,11 +6683,7 @@ mod tests {
                 let duration = h.metrics.histogram_tags(METRIC_DURATION_MS);
                 assert_eq!(duration.len(), 1, "{chunks} chunks");
                 assert_eq!(duration[0][2], "size:le8k");
-                assert_eq!(
-                    h.metrics.histogram_tags(METRIC_TTFT_MS).len(),
-                    usize::from(chunks > 0),
-                    "{chunks} chunks"
-                );
+                assert_eq!(h.metrics.histogram_tags(METRIC_TTFT_MS).len(), 1);
                 let itl = h.metrics.histogram_tags(METRIC_ITL_MS);
                 if chunks >= 2 {
                     assert_eq!(itl, duration, "{chunks} chunks: same tags");
@@ -7375,6 +7398,24 @@ mod tests {
                 assert_eq!(refused, 0);
                 let requests = upstream.received_requests().await.unwrap();
                 assert_eq!(requests.len(), 2, "every legacy request is served");
+                assert_eq!(hints(&requests), vec![None; 2]);
+            }
+
+            /// The kill switch takes precedence over no-refuse: with both
+            /// keys set, every covered request is Legacy(disabled).
+            #[tokio::test]
+            async fn kill_switch_wins_over_norefuse() {
+                let upstream = mock_upstream(None).await;
+                let mut snap = saturated_snapshot(fresh_ms());
+                snap.disabled = true;
+                snap.norefuse = true;
+                let h = harness_on(upstream_provider(&upstream), &[("h-a", 2)], 4, snap);
+                send_both(&h.provider, heavy_params()).await;
+
+                assert_eq!(h.metrics.decisions_tagged("reason:disabled"), 2);
+                assert_eq!(h.metrics.decisions_tagged("reason:norefuse"), 0);
+                assert_eq!(h.metrics.decisions_tagged("outcome:refused"), 0);
+                let requests = upstream.received_requests().await.unwrap();
                 assert_eq!(hints(&requests), vec![None; 2]);
             }
 

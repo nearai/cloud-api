@@ -158,11 +158,11 @@ struct LeaseLatency {
     tags: [&'static str; 3],
 }
 
-/// Mean inter-token latency of a stream: `(duration - ttft)` spread over the
-/// gaps between its `chunks` content chunks. `None` below 2 chunks, where
-/// there is no gap to measure.
-pub(super) fn mean_itl_ms(duration_ms: f64, ttft_ms: f64, chunks: u64) -> Option<f64> {
-    (chunks >= 2).then(|| (duration_ms - ttft_ms).max(0.0) / (chunks - 1) as f64)
+/// Mean inter-token latency of a stream: `span_ms`, from its first to its
+/// last token chunk, spread over the gaps between its `chunks` token chunks.
+/// `None` below 2 chunks, where there is no gap to measure.
+pub(super) fn mean_itl_ms(span_ms: f64, chunks: u64) -> Option<f64> {
+    (chunks >= 2).then(|| span_ms.max(0.0) / (chunks - 1) as f64)
 }
 
 impl RouteLease {
@@ -869,7 +869,7 @@ impl Fleet {
         // happen after the lock is released.
         let placed = {
             let mut ledger = lock(&self.placement_ledger);
-            let mine = mine_in(&ledger, now_s, snapshot.routed_read_ms);
+            let mine = mine_in(&ledger, now_s, &snapshot);
             let decision = handles
                 .placer
                 .place(&input, &snapshot, &mine, &mut rand::rng());
@@ -1004,12 +1004,13 @@ impl Fleet {
     /// `try_place` passes to the placer as `mine`.
     #[cfg(test)]
     pub(super) fn placement_mine(&self, now_s: u64) -> HashMap<SlotId, Pending> {
-        let routed_read_ms = self
+        let snapshot: Arc<Snapshot> = self
             .placement
             .load()
             .as_ref()
-            .map_or(0, |handles| handles.io.snapshot.load().routed_read_ms);
-        mine_in(&lock(&self.placement_ledger), now_s, routed_read_ms)
+            .map(|handles| handles.io.snapshot.load_full())
+            .unwrap_or_default();
+        mine_in(&lock(&self.placement_ledger), now_s, &snapshot)
     }
 
     /// Rate-limited warning for a pinned key that discovery does not know.
@@ -1105,8 +1106,11 @@ fn epoch_ms() -> u64 {
 /// This node's own placed load per replica slot over `{now_s - 1, now_s}`
 /// that a snapshot whose routed read was issued at `routed_read_ms` cannot
 /// hold yet: per slot, [`unseen_by_read`] of its ledger entries. A slot
-/// whose every entry is already in `routed` is left out.
-fn mine_in(ledger: &PlacementLedger, now_s: u64, routed_read_ms: u64) -> HashMap<SlotId, Pending> {
+/// whose every entry is already in `routed` is left out. Takes the whole
+/// snapshot so `try_place` and its test accessor read `routed_read_ms` in
+/// exactly one place.
+fn mine_in(ledger: &PlacementLedger, now_s: u64, snapshot: &Snapshot) -> HashMap<SlotId, Pending> {
+    let routed_read_ms = snapshot.routed_read_ms;
     let window = now_s.saturating_sub(1)..=now_s;
     let mut own: HashMap<&SlotId, Vec<OwnRouted>> = HashMap::new();
     for (_, slots) in ledger.iter().filter(|(sec, _)| window.contains(*sec)) {
@@ -1313,7 +1317,7 @@ mod demote_tests {
         ledger_add(&mut ledger, slot("host-a", 0), 20, 51);
 
         // Then: each replica keeps its own pending load over the window.
-        let mine = mine_in(&ledger, 51, 0);
+        let mine = mine_in(&ledger, 51, &Snapshot::default());
         assert_eq!(mine.len(), 2);
         let pending = |r| mine.get(&slot("host-a", r)).map(|p| (p.req, p.tok));
         assert_eq!(pending(0), Some((2, 120)));
@@ -1321,7 +1325,7 @@ mod demote_tests {
 
         // A later second drops what left the window, per replica.
         ledger_add(&mut ledger, slot("host-a", 1), 5, 53);
-        let mine = mine_in(&ledger, 53, 0);
+        let mine = mine_in(&ledger, 53, &Snapshot::default());
         assert_eq!(mine.len(), 1);
         assert_eq!(
             mine.get(&slot("host-a", 1)).map(|p| (p.req, p.tok)),

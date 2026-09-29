@@ -111,7 +111,8 @@ pub const METRIC_TTFT_MS: &str = "cloud_api.placement.ttft_ms";
 /// Request sent to end of stream, same tags as [`METRIC_TTFT_MS`].
 pub const METRIC_DURATION_MS: &str = "cloud_api.placement.duration_ms";
 /// Mean inter-token latency of one streamed request, from its first to its
-/// last content chunk; recorded only when at least 2 chunks arrived.
+/// last token chunk (a chunk with at least one choice; a usage-only chunk
+/// is not one); recorded only when at least 2 token chunks arrived.
 pub const METRIC_ITL_MS: &str = "cloud_api.placement.itl_ms";
 /// Replicas excluded per decision, by eligibility rule (`rule:{..}`).
 pub const METRIC_EXCLUDED: &str = "cloud_api.placement.excluded";
@@ -497,6 +498,37 @@ async fn run(
     reader(conn, hosts, slot, metrics).await;
 }
 
+/// One writer batch: `first` plus whatever is already queued, up to
+/// [`WRITE_BATCH`] writes, in one pipeline. `acks` is refilled with the
+/// acknowledgement handle of every routed write in the batch, in order.
+/// Returns the pipeline and its write count.
+fn build_batch(
+    first: Write,
+    rx: &mut mpsc::Receiver<Write>,
+    acks: &mut Vec<RoutedAck>,
+) -> (redis::Pipeline, usize) {
+    let mut pipe = redis::pipe();
+    acks.clear();
+    let mut add = |w: Write, pipe: &mut redis::Pipeline| {
+        push_write(pipe, &w);
+        if let Write::Routed { ack, .. } = w {
+            acks.push(ack);
+        }
+    };
+    add(first, &mut pipe);
+    let mut n = 1;
+    while n < WRITE_BATCH {
+        match rx.try_recv() {
+            Ok(w) => {
+                add(w, &mut pipe);
+                n += 1;
+            }
+            Err(_) => break,
+        }
+    }
+    (pipe, n)
+}
+
 async fn writer(
     mut conn: ConnectionManager,
     mut rx: mpsc::Receiver<Write>,
@@ -505,25 +537,7 @@ async fn writer(
     let mut last_warn: Option<Instant> = None;
     let mut acks: Vec<RoutedAck> = Vec::with_capacity(WRITE_BATCH);
     while let Some(first) = rx.recv().await {
-        let mut pipe = redis::pipe();
-        acks.clear();
-        let mut add = |w: Write, pipe: &mut redis::Pipeline| {
-            push_write(pipe, &w);
-            if let Write::Routed { ack, .. } = w {
-                acks.push(ack);
-            }
-        };
-        add(first, &mut pipe);
-        let mut n = 1;
-        while n < WRITE_BATCH {
-            match rx.try_recv() {
-                Ok(w) => {
-                    add(w, &mut pipe);
-                    n += 1;
-                }
-                Err(_) => break,
-            }
-        }
+        let (pipe, n) = build_batch(first, &mut rx, &mut acks);
         let result = pipe.query_async::<()>(&mut conn).await;
         acknowledge(&acks, &result, now_ms());
         if let Err(e) = result {
@@ -1378,6 +1392,57 @@ mod tests {
         let err = redis::RedisError::from((redis::ErrorKind::IoError, "down"));
         assert!(publish_cycle(&mut state, &slot, Err(err), &reg, t0 + 500, &metrics).is_err());
         assert_eq!(slot.load().routed_read_ms, t0 - 300);
+    }
+
+    #[test]
+    fn batch_acks_routed_writes_only_on_pipeline_success() {
+        let (tx, mut rx) = mpsc::channel(WRITE_BATCH + 8);
+        let a = RoutedAck::default();
+        let b = RoutedAck::default();
+        let routed = |ack: &RoutedAck| Write::Routed {
+            slot: sid(HOST, 0),
+            tok: 1,
+            sec: 1,
+            ack: ack.clone(),
+        };
+        let pin = || Write::Pin {
+            id_hex: "00".repeat(16),
+            slot: sid(HOST, 0),
+            at_ms: 1,
+        };
+        tx.try_send(pin()).unwrap();
+        tx.try_send(routed(&b)).unwrap();
+        // More than one batch holds: the tail waits for the next batch.
+        let tail: Vec<RoutedAck> = (0..WRITE_BATCH).map(|_| RoutedAck::default()).collect();
+        for ack in &tail {
+            tx.try_send(routed(ack)).unwrap();
+        }
+
+        let mut acks = vec![RoutedAck::default()];
+        let (pipe, n) = build_batch(routed(&a), &mut rx, &mut acks);
+        assert_eq!(n, WRITE_BATCH);
+        // 3 commands per routed write, 1 per pin.
+        assert_eq!(pipe.cmd_iter().count(), 3 * (WRITE_BATCH - 1) + 1);
+        // Only the routed writes' acks, refilled (the stale entry is gone).
+        assert_eq!(acks.len(), WRITE_BATCH - 1);
+
+        let failed: redis::RedisResult<()> =
+            Err(redis::RedisError::from((redis::ErrorKind::IoError, "down")));
+        acknowledge(&acks, &failed, 1_234);
+        assert_eq!(a.acked_ms(), None);
+        assert_eq!(b.acked_ms(), None);
+
+        acknowledge(&acks, &Ok(()), 1_234);
+        assert_eq!(a.acked_ms(), Some(1_234));
+        assert_eq!(b.acked_ms(), Some(1_234));
+        // The 3 routed writes past the cap were not in the batch.
+        let (in_batch, left) = tail.split_at(WRITE_BATCH - 3);
+        assert!(in_batch.iter().all(|ack| ack.acked_ms() == Some(1_234)));
+        assert!(left.iter().all(|ack| ack.acked_ms().is_none()));
+
+        let (_, rest) = build_batch(pin(), &mut rx, &mut acks);
+        assert_eq!(rest, 4);
+        assert_eq!(acks.len(), 3);
     }
 
     #[test]

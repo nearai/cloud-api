@@ -21,6 +21,9 @@ use placement::rules::Rule;
 /// `Debug`; the key is never logged.
 pub(super) struct PlacementRequest {
     pub(super) model: String,
+    /// `model:{model}`, the decision and latency metrics' model tag. Model
+    /// names come from the catalog, so the tag stays low-cardinality.
+    pub(super) model_tag: String,
     /// Tracing ids for the decision log line (empty when absent).
     pub(super) request_id: String,
     pub(super) org_id: String,
@@ -47,6 +50,7 @@ impl PlacementRequest {
         let placement = &params.placement;
         Self {
             model: params.model.clone(),
+            model_tag: format!("model:{}", params.model),
             request_id: text(tracing_headers::REQUEST_ID)
                 .unwrap_or_default()
                 .to_string(),
@@ -70,8 +74,8 @@ impl PlacementRequest {
 }
 
 /// Decision metrics and one log line per decision. IDs and numbers only:
-/// never the affinity key, pin id or content. Metric tags are static strings
-/// (no per-decision allocation) and stay low-cardinality.
+/// never the affinity key, pin id or content. Metric tags stay
+/// low-cardinality: static strings plus the request's catalog model tag.
 pub(super) fn report_decision(
     handles: &PlacementHandles,
     record: &DecisionRecord,
@@ -92,10 +96,11 @@ pub(super) fn report_decision(
             strategy_tag(record.strategy),
             band,
             detail_tag(record),
+            &request.model_tag,
         ],
     );
     if record.outcome == "refused" {
-        metrics.record_count(METRIC_REFUSED, 1, &[tier, class, band]);
+        metrics.record_count(METRIC_REFUSED, 1, &[tier, class, band, &request.model_tag]);
     }
     metrics.record_histogram(METRIC_LANE_SIZE, f64::from(record.lane_size), &[tier]);
     metrics.record_histogram(METRIC_LANE_CAP, f64::from(record.lane_cap), &[tier]);
@@ -423,6 +428,7 @@ mod observability_tests {
     fn request(affinity: Option<AffinityKey>) -> PlacementRequest {
         PlacementRequest {
             model: "z-ai/glm-5.3-flash".to_string(),
+            model_tag: "model:z-ai/glm-5.3-flash".to_string(),
             request_id: "req-1".to_string(),
             org_id: "org-1".to_string(),
             prompt_tokens: 10,
@@ -597,7 +603,8 @@ mod observability_tests {
                 vec![vec![
                     tier_tag.clone(),
                     "class:heavy".to_string(),
-                    "priority_band:neg".to_string()
+                    "priority_band:neg".to_string(),
+                    "model:z-ai/glm-5.3-flash".to_string(),
                 ]]
             );
             assert_eq!(
@@ -609,6 +616,7 @@ mod observability_tests {
                     "strategy:refuse".to_string(),
                     "priority_band:neg".to_string(),
                     format!("reason:{reason}"),
+                    "model:z-ai/glm-5.3-flash".to_string(),
                 ]]
             );
             let histograms = metrics.histograms.lock().unwrap();

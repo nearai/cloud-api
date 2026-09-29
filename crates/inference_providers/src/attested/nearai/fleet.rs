@@ -150,11 +150,35 @@ pub(super) struct RouteLease {
     prefix_loads: Arc<Mutex<PrefixLoads>>,
 }
 
-/// Stream-latency reporting for one request: the placement metrics sink and
-/// the request's static `strategy`/`selection`/`size` tags.
+/// Stream-latency reporting for one request: the placement metrics sink,
+/// the request's static `strategy`/`selection`/`size` tags and its model tag.
 struct LeaseLatency {
     handles: Arc<PlacementHandles>,
     tags: [&'static str; 3],
+    model_tag: String,
+}
+
+impl LeaseLatency {
+    fn new(
+        handles: &Arc<PlacementHandles>,
+        tags: [&'static str; 3],
+        request: &PlacementRequest,
+    ) -> Self {
+        Self {
+            handles: handles.clone(),
+            tags,
+            model_tag: request.model_tag.clone(),
+        }
+    }
+
+    fn record(&self, name: &str, ms: f64) {
+        let [strategy, selection, size] = self.tags;
+        self.handles.io.metrics().record_histogram(
+            name,
+            ms,
+            &[strategy, selection, size, &self.model_tag],
+        );
+    }
 }
 
 /// Mean inter-token latency of a stream: `span_ms`, from its first to its
@@ -168,33 +192,21 @@ impl RouteLease {
     /// Records request-sent to first streamed chunk.
     pub(super) fn record_ttft_ms(&self, ms: f64) {
         if let Some(latency) = &self.latency {
-            latency
-                .handles
-                .io
-                .metrics()
-                .record_histogram(METRIC_TTFT_MS, ms, &latency.tags);
+            latency.record(METRIC_TTFT_MS, ms);
         }
     }
 
     /// Records request-sent to end of stream.
     pub(super) fn record_duration_ms(&self, ms: f64) {
         if let Some(latency) = &self.latency {
-            latency
-                .handles
-                .io
-                .metrics()
-                .record_histogram(METRIC_DURATION_MS, ms, &latency.tags);
+            latency.record(METRIC_DURATION_MS, ms);
         }
     }
 
     /// Records the stream's mean inter-token latency ([`mean_itl_ms`]).
     pub(super) fn record_itl_ms(&self, ms: f64) {
         if let Some(latency) = &self.latency {
-            latency
-                .handles
-                .io
-                .metrics()
-                .record_histogram(METRIC_ITL_MS, ms, &latency.tags);
+            latency.record(METRIC_ITL_MS, ms);
         }
     }
 
@@ -782,13 +794,14 @@ impl Fleet {
 
     /// Place a request on a replica slot, or fall through to `acquire_index`
     /// unchanged (`Ok(None)` there means rotation is unavailable: the
-    /// canonical path). Every model is eligible: a Fleet whose hosts publish
-    /// no replica frames has an empty snapshot, so its decisions are `Legacy`
-    /// (`no_state`). Placement is skipped entirely (no decision, log or
-    /// metric) when it is not installed or rotation is unavailable. A
-    /// `Legacy` decision, an incomplete host map or snapshot, an unmapped
-    /// host, or a host outside the pinned E2EE key group all run the
-    /// existing path. Only a refusal
+    /// canonical path). Every model is eligible. Placement is skipped
+    /// entirely (no decision, log or metric) when it is not installed,
+    /// rotation is unavailable, or no host behind this Fleet has ever
+    /// published (no attested replica-report key). Published hosts whose
+    /// state is unavailable are a real outage and still count as `Legacy`
+    /// (`no_state`). A `Legacy` decision, an incomplete host map or
+    /// snapshot, an unmapped host, or a host outside the pinned E2EE key
+    /// group all run the existing path. Only a refusal
     /// that passed the fail-open gates is `Err(CapacityRefused)`, returned
     /// before any upstream request.
     pub(super) fn acquire_index_placed(
@@ -803,17 +816,18 @@ impl Fleet {
             PlacedOutcome::Fallback => {
                 let mut lease = self.acquire_index(messages, pinned_pub_key);
                 // A request placement did not place on a Fleet whose hosts
-                // publish: its latency is still recorded, as `legacy`, so
-                // the two paths compare. A Fleet with no published replica
-                // (an empty snapshot) records nothing, so models placement
-                // never sees stay out of the comparison.
+                // have published: its latency is still recorded, as
+                // `legacy`, so the two paths compare. A Fleet no host of
+                // which has ever published records nothing, so models
+                // placement never sees stay out of the comparison.
                 if let Some(lease) = lease.as_mut() {
                     if let Some(handles) = self.placement.load().as_ref() {
-                        if !handles.io.snapshot.load().replicas.is_empty() {
-                            lease.latency = Some(LeaseLatency {
-                                handles: handles.clone(),
-                                tags: latency_tags(None, request.size),
-                            });
+                        if handles.any_host_publishes() {
+                            lease.latency = Some(LeaseLatency::new(
+                                handles,
+                                latency_tags(None, request.size),
+                                request,
+                            ));
                         }
                     }
                 }
@@ -832,6 +846,11 @@ impl Fleet {
         let Some(handles) = guard.as_ref() else {
             return PlacedOutcome::Fallback;
         };
+        // No host behind this Fleet has ever published: nothing to place,
+        // and nothing to report (see `acquire_index_placed`).
+        if !handles.any_host_publishes() {
+            return PlacedOutcome::Fallback;
+        }
         let count = self.rotation_count();
         if count == 0 {
             return PlacedOutcome::Fallback;
@@ -937,10 +956,11 @@ impl Fleet {
 
         let mut lease = self.reserve_index(self.route_key(messages), index);
         lease.replica = Some(slot.replica);
-        lease.latency = Some(LeaseLatency {
-            handles: handles.clone(),
-            tags: latency_tags(Some(&record), request.size),
-        });
+        lease.latency = Some(LeaseLatency::new(
+            handles,
+            latency_tags(Some(&record), request.size),
+            request,
+        ));
         handles.io.record(Write::Routed {
             slot,
             tok: input.prompt_tokens,
@@ -977,6 +997,12 @@ impl Fleet {
             .index_by_host
             .keys()
             .any(|host| !seen.contains(host.as_str()))
+    }
+
+    /// The verified host map discovery pushed last.
+    #[cfg(test)]
+    pub(super) fn backend_hosts(&self) -> Arc<BackendHosts> {
+        self.backend_hosts.load_full()
     }
 
     /// True when the pushed host map was built for a different backend

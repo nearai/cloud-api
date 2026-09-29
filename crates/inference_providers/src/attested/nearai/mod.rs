@@ -6164,9 +6164,16 @@ mod tests {
                 io: io.clone(),
                 hosts: hosts.clone(),
             });
+            // Every mapped host has published: it holds an attested
+            // replica-report key.
             provider.fleet.set_backend_hosts(BackendHosts {
                 index_by_host: host_map.iter().map(|(h, i)| (h.clone(), *i)).collect(),
-                keys: Default::default(),
+                keys: placement::KeyRegistry {
+                    by_host: host_map
+                        .iter()
+                        .map(|(h, _)| (h.clone(), vec![report_key()]))
+                        .collect(),
+                },
                 count: hosts_count,
             });
             // Discovery's push lands in the map the Valkey reader also reads.
@@ -6179,9 +6186,31 @@ mod tests {
             }
         }
 
+        /// An attested replica-report key, as discovery records for a host
+        /// that publishes frames.
+        fn report_key() -> placement::snapshot::HostKey {
+            let key = ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]).verifying_key();
+            placement::snapshot::HostKey {
+                key_id: placement::frame::key_id(&key),
+                key,
+            }
+        }
+
+        /// Drops every attested replica-report key from `h`'s host map,
+        /// keeping the host bindings: no host behind it has ever published.
+        fn unpublish(h: &Harness) {
+            let hosts = h.provider.fleet.backend_hosts();
+            h.provider.fleet.set_backend_hosts(BackendHosts {
+                index_by_host: hosts.index_by_host.clone(),
+                keys: Default::default(),
+                count: hosts.count,
+            });
+        }
+
         fn request(model: &str) -> PlacementRequest {
             PlacementRequest {
                 model: model.to_string(),
+                model_tag: format!("model:{model}"),
                 request_id: "req-1".to_string(),
                 org_id: "org-1".to_string(),
                 prompt_tokens: 0,
@@ -6274,9 +6303,9 @@ mod tests {
             assert_eq!(h.metrics.decisions_tagged("outcome:place"), 12);
         }
 
-        /// A model whose hosts publish nothing (an empty snapshot: the
-        /// reader never reads for it) keeps its existing routing, through
-        /// the `no_state` gate, with no placement writes.
+        /// A model whose hosts publish nothing (no attested replica-report
+        /// key, so the reader never reads for it) keeps its existing
+        /// routing, with no placement writes.
         #[test]
         fn model_without_publishing_hosts_is_legacy() {
             let mut h = harness_exact(&[], 0, Snapshot::default());
@@ -6287,8 +6316,70 @@ mod tests {
                 legacy_indices(&messages, None, None)
             );
             assert!(h.writes.try_recv().is_err(), "no placement writes");
-            assert_eq!(h.metrics.decisions_tagged("reason:no_state"), 12);
             assert_eq!(h.metrics.decisions_tagged("outcome:place"), 0);
+        }
+
+        /// No host behind this endpoint has ever published: the legacy path
+        /// is taken silently, with no decision, histogram or latency sample,
+        /// even over a snapshot that would place.
+        #[test]
+        fn never_published_model_emits_no_placement_metrics() {
+            let mut h = harness(
+                &[("h-a", 2)],
+                snapshot("h-a", fresh_ms(), PinTable::default()),
+            );
+            unpublish(&h);
+            let messages = messages_avoiding(2);
+            let req = request("acme/any-new-model");
+            assert_eq!(
+                placed_indices(&h.provider, &messages, None, &req),
+                legacy_indices(&messages, None, None)
+            );
+            let lease = h
+                .provider
+                .fleet
+                .acquire_index_placed(&messages, None, &req)
+                .expect("not refused")
+                .expect("rotation active");
+            lease.record_ttft_ms(5.0);
+            lease.record_duration_ms(9.0);
+            assert!(h.writes.try_recv().is_err(), "no placement writes");
+            assert!(h.metrics.counts.lock().unwrap().is_empty());
+            assert!(h.metrics.histograms.lock().unwrap().is_empty());
+        }
+
+        /// Hosts that have published but whose state is unavailable (Valkey
+        /// down: an empty snapshot) are a real outage: every request still
+        /// counts as `legacy/no_state`, tagged with its model, and its
+        /// latency is recorded as `legacy`.
+        #[test]
+        fn published_model_outage_still_counts_no_state() {
+            let h = harness_exact(&[("h-a".to_string(), 2)], 4, Snapshot::default());
+            let messages = messages_avoiding(2);
+            let req = request("acme/any-new-model");
+            assert_eq!(
+                placed_indices(&h.provider, &messages, None, &req),
+                legacy_indices(&messages, None, None)
+            );
+            assert_eq!(h.metrics.decisions_tagged("reason:no_state"), 12);
+            assert_eq!(h.metrics.decisions_tagged("model:acme/any-new-model"), 12);
+            let lease = h
+                .provider
+                .fleet
+                .acquire_index_placed(&messages, None, &req)
+                .expect("not refused")
+                .expect("rotation active");
+            lease.record_ttft_ms(5.0);
+            assert_eq!(
+                h.metrics
+                    .histogram_tags(crate::placement_io::METRIC_TTFT_MS),
+                vec![vec![
+                    "strategy:legacy".to_string(),
+                    "selection:legacy".to_string(),
+                    "size:unknown".to_string(),
+                    "model:acme/any-new-model".to_string(),
+                ]]
+            );
         }
 
         #[test]
@@ -6431,7 +6522,8 @@ mod tests {
                     "class:short".to_string(),
                     "strategy:short_clean".to_string(),
                     "priority_band:normal".to_string(),
-                    "selection:best_of_two".to_string()
+                    "selection:best_of_two".to_string(),
+                    "model:z-ai/glm-5.3-flash".to_string(),
                 ]
             );
             let backlog = counts
@@ -7201,7 +7293,8 @@ mod tests {
                         vec![vec![
                             "strategy:legacy".to_string(),
                             "selection:legacy".to_string(),
-                            "size:unknown".to_string()
+                            "size:unknown".to_string(),
+                            "model:z-ai/glm-5.3-flash".to_string(),
                         ]],
                         "{name}"
                     );

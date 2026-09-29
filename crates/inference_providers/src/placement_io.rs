@@ -99,7 +99,8 @@ pub const METRIC_KILL_SWITCH_CYCLES: &str = "cloud_api.placement.kill_switch_cyc
 pub const METRIC_NOREFUSE_CYCLES: &str = "cloud_api.placement.norefuse_cycles";
 /// One per placement decision, tagged `outcome`, `tier`,
 /// `class`, `strategy`, `priority_band` plus `selection:{..}` (place) or
-/// `reason:{..}` (legacy or refused). Never host or request ids.
+/// `reason:{..}` (legacy or refused), and `model`. Never host or request
+/// ids. A Fleet no host of which has ever published records none.
 pub const METRIC_DECISIONS: &str = "cloud_api.placement.decisions";
 /// One per refused decision (a capacity refusal, answered as a 429), tagged
 /// `tier`, `class` and `priority_band`.
@@ -111,7 +112,7 @@ pub const METRIC_LANE_CAP: &str = "cloud_api.placement.lane_cap";
 /// Time spent in `Placer::place`, in microseconds, tagged `tier`.
 pub const METRIC_PLACE_DURATION_US: &str = "cloud_api.placement.place_duration_us";
 /// Request sent to first streamed chunk, tagged `strategy` and `selection`
-/// (`legacy` for a request placement did not place).
+/// (`legacy` for a request placement did not place), `size` and `model`.
 pub const METRIC_TTFT_MS: &str = "cloud_api.placement.ttft_ms";
 /// Request sent to end of stream, same tags as [`METRIC_TTFT_MS`].
 pub const METRIC_DURATION_MS: &str = "cloud_api.placement.duration_ms";
@@ -149,6 +150,12 @@ impl PlacementHandles {
         let hosts = Arc::new(ArcSwap::from_pointee(BackendHosts::default()));
         let io = PlacementIo::start(password, hosts.clone(), metrics);
         Self { placer, io, hosts }
+    }
+
+    /// True when a host behind this Fleet has an attested replica-report
+    /// key: it has published, so placement has something to read.
+    pub fn any_host_publishes(&self) -> bool {
+        any_host_publishes(&self.hosts.load().keys)
     }
 }
 

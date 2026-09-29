@@ -1577,6 +1577,42 @@ async fn chat_completions_inner(
         )
             .into_response();
     }
+    // Resolve OpenAI `file` parts to text (nearai/cloud-api#1153): no engine we
+    // route to reads them. Runs before auto-redact so extracted text is
+    // scrubbed like other user text, and only once the catalog knows the model
+    // — an unknown model is rejected by the completion service without paying
+    // for PDF parsing. Under E2EE the gateway cannot read the part and the
+    // engine would reject it, so refuse up front.
+    if crate::routes::chat_file_parts::has_file_parts(&service_request.messages) {
+        if e2ee_active {
+            return (
+                StatusCode::BAD_REQUEST,
+                ResponseJson(ErrorResponse::with_param(
+                    "file content parts are not supported with end-to-end encryption".to_string(),
+                    "invalid_request_error".to_string(),
+                    "messages".to_string(),
+                )),
+            )
+                .into_response();
+        }
+        if model_attestation_supported.is_some() {
+            let mut original_request = service_request.original_request.take();
+            let resolved = crate::routes::chat_file_parts::resolve_file_parts(
+                &mut service_request.messages,
+                original_request.as_mut(),
+                api_key.workspace.id.0,
+                app_state.files_service.as_ref(),
+                app_state.file_text_extractor.as_ref(),
+                app_state.metrics_service.as_ref(),
+            )
+            .await;
+            service_request.original_request = original_request;
+            if let Err(response) = resolved {
+                return response;
+            }
+        }
+    }
+
     let usage_mode = chat_stream_usage_mode(&request, model_attestation_supported, e2ee_active);
     let rewrite_public_stream_usage = usage_mode.rewrite_public_stream_usage;
     let strip_intermediate_usage = usage_mode.strip_intermediate_usage;

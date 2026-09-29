@@ -90,6 +90,10 @@ pub const METRIC_HTTP_DURATION: &str = "cloud_api.http.duration";
 // Usage aggregate freshness: seconds from the oldest raw hour not yet in usage_hourly to the tick.
 pub const METRIC_USAGE_HOURLY_LAG_SECONDS: &str = "cloud_api.usage_hourly.lag_seconds";
 
+// Chat `file` part resolution (PDF → text), tagged `outcome:*`
+pub const METRIC_CHAT_FILE_PARTS_LATENCY: &str = "cloud_api.chat_file_parts.latency";
+pub const METRIC_CHAT_FILE_PARTS_COUNT: &str = "cloud_api.chat_file_parts.count";
+
 // Low-cardinality tags only (NO org/workspace/api_key - those go to database analytics)
 pub const TAG_MODEL: &str = "model";
 pub const TAG_ENVIRONMENT: &str = "environment";

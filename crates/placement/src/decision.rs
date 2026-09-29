@@ -274,7 +274,10 @@ impl Placer {
     }
 
     /// Decide where `input` goes on this Fleet, given the latest snapshot and
-    /// this node's own outstanding ledger (`mine`, per slot). `Legacy` when
+    /// the part of this node's own ledger that `snap.routed` cannot include
+    /// yet (`mine`, per slot: [`crate::score::unseen_by_read`] of the slot's
+    /// ledger against `snap.routed_read_ms`; see
+    /// [`crate::score::pending_for`]). `Legacy` when
     /// the snapshot is disabled, uncovered, empty, stale or has no stage-1
     /// survivor; `Refused` only when the heavy lane excluded every survivor;
     /// otherwise `Place`. The record's `place_us` times the whole call.
@@ -562,6 +565,7 @@ mod tests {
             built_ms: NOW,
             replicas: views,
             routed: HashMap::new(),
+            routed_read_ms: 0,
             pins: Default::default(),
             disabled: false,
         }

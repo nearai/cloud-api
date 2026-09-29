@@ -115,6 +115,16 @@ pub mod upstream_headers {
     /// Set only from the `RouteLease`, and only on the request sent to that
     /// lease's backend; a key of the same name in `params.extra` is dropped.
     pub const REPLICA_HINT: &str = "x-nearai-replica";
+    /// The host id placement chose, sent with [`REPLICA_HINT`]. The rotation
+    /// index can drift to another host before the next discovery (the proxy
+    /// maps `-i<N>` over its live healthy set), so the proxy honours the hint
+    /// only when this matches its own host. Same rules as the hint: set only
+    /// from the `RouteLease`, and a key of this name in `params.extra` is
+    /// dropped.
+    pub const REPLICA_HINT_HOST: &str = "x-nearai-replica-host";
+
+    /// Every header above: none may come from client input.
+    pub(crate) const ALL: [&str; 2] = [REPLICA_HINT, REPLICA_HINT_HOST];
 }
 
 /// Encryption header keys used in params.extra for passing encryption information.
@@ -912,17 +922,21 @@ impl Fleet {
         params.strip_client_priority();
     }
 
-    /// `headers` plus the lease's replica hint, when placement chose one.
-    /// Only the request to the lease's own backend carries it: a fallback
-    /// index or the canonical URL lands on a backend whose replicas the
-    /// decision never saw.
+    /// `headers` plus the lease's replica hint and its host, when placement
+    /// chose one. Only the request to the lease's own backend carries them: a
+    /// fallback index or the canonical URL lands on a backend whose replicas
+    /// the decision never saw. A host id that is not a valid header value
+    /// sends neither, so the hint never goes out without its host.
     fn with_replica_hint(
         headers: &reqwest::header::HeaderMap,
         lease: &fleet::RouteLease,
     ) -> reqwest::header::HeaderMap {
         let mut headers = headers.clone();
-        if let Some(replica) = lease.replica() {
-            headers.insert(upstream_headers::REPLICA_HINT, HeaderValue::from(replica));
+        if let (Some(replica), Some(host)) = (lease.replica(), lease.replica_host()) {
+            if let Ok(host) = HeaderValue::from_str(host) {
+                headers.insert(upstream_headers::REPLICA_HINT, HeaderValue::from(replica));
+                headers.insert(upstream_headers::REPLICA_HINT_HOST, host);
+            }
         }
         headers
     }
@@ -1978,11 +1992,11 @@ impl InferenceProvider for Fleet {
         headers.insert("X-Request-Hash", request_hash_value);
 
         Self::prepare_priority_header(&mut headers, &mut streaming_params);
-        // The replica hint is placement's choice alone: a client-supplied key
-        // of that name never reaches the upstream body.
-        streaming_params
-            .extra
-            .remove(upstream_headers::REPLICA_HINT);
+        // The replica hint and its host are placement's choice alone: a
+        // client-supplied key of either name never reaches the upstream body.
+        for key in upstream_headers::ALL {
+            streaming_params.extra.remove(key);
+        }
         // Read placement inputs before the helpers below strip them.
         let placement_request = PlacementRequest::from_params(&streaming_params);
         // Prepare tracing headers (request_id, org_id, workspace_id)
@@ -2150,11 +2164,11 @@ impl InferenceProvider for Fleet {
         headers.insert("X-Request-Hash", request_hash_value);
 
         Self::prepare_priority_header(&mut headers, &mut non_streaming_params);
-        // The replica hint is placement's choice alone: a client-supplied key
-        // of that name never reaches the upstream body.
-        non_streaming_params
-            .extra
-            .remove(upstream_headers::REPLICA_HINT);
+        // The replica hint and its host are placement's choice alone: a
+        // client-supplied key of either name never reaches the upstream body.
+        for key in upstream_headers::ALL {
+            non_streaming_params.extra.remove(key);
+        }
         // Read placement inputs before the helpers below strip them.
         let placement_request = PlacementRequest::from_params(&non_streaming_params);
         // Prepare tracing headers (request_id, org_id, workspace_id)
@@ -7099,7 +7113,7 @@ mod tests {
         /// the rotation URLs (`glm-i<N>.mock.test`, resolved to the mock).
         mod replica_hint {
             use super::*;
-            use crate::attested::nearai::upstream_headers::REPLICA_HINT;
+            use crate::attested::nearai::upstream_headers::{REPLICA_HINT, REPLICA_HINT_HOST};
             use crate::attested::nearai::Config;
             use crate::{ChatCompletionParams, InferenceProvider};
             use futures_util::TryStreamExt;
@@ -7206,15 +7220,19 @@ mod tests {
                 let _: Vec<_> = stream.try_collect().await.expect("sse stream");
             }
 
-            fn hints(requests: &[wiremock::Request]) -> Vec<Option<String>> {
+            fn header_values(requests: &[wiremock::Request], name: &str) -> Vec<Option<String>> {
                 requests
                     .iter()
-                    .map(|r| {
-                        r.headers
-                            .get(REPLICA_HINT)
-                            .map(|v| v.to_str().unwrap().to_string())
-                    })
+                    .map(|r| r.headers.get(name).map(|v| v.to_str().unwrap().to_string()))
                     .collect()
+            }
+
+            fn hints(requests: &[wiremock::Request]) -> Vec<Option<String>> {
+                header_values(requests, REPLICA_HINT)
+            }
+
+            fn host_hints(requests: &[wiremock::Request]) -> Vec<Option<String>> {
+                header_values(requests, REPLICA_HINT_HOST)
             }
 
             /// h-a (backend 2) publishes replicas 0 (draining) and 3 (ready).
@@ -7246,6 +7264,75 @@ mod tests {
                     assert!(host.starts_with("glm-i2."), "sent to backend 2: {host}");
                 }
                 assert_eq!(h.metrics.decisions_tagged("outcome:place"), 2);
+            }
+
+            /// The replica hint travels with the host placement chose, so the
+            /// proxy can refuse it when the rotation index has drifted to a
+            /// different host since discovery.
+            #[tokio::test]
+            async fn placed_request_sends_replica_host_header() {
+                let upstream = mock_upstream(None).await;
+                let h = harness_on(
+                    upstream_provider(&upstream),
+                    &[("h-a", 2)],
+                    4,
+                    placed_snapshot(fresh_ms()),
+                );
+                send_both(&h.provider, params("z-ai/glm-5.3-flash")).await;
+
+                let requests = upstream.received_requests().await.unwrap();
+                assert_eq!(hints(&requests), vec![Some("3".to_string()); 2]);
+                assert_eq!(host_hints(&requests), vec![Some("h-a".to_string()); 2]);
+            }
+
+            /// A client-supplied host hint never reaches an upstream: not as
+            /// a header on a legacy or canonical request, not over the
+            /// placed host, and not in the body.
+            #[tokio::test]
+            async fn client_cannot_inject_replica_host() {
+                let mut injected = params("z-ai/glm-5.3-flash");
+                injected
+                    .extra
+                    .insert(REPLICA_HINT_HOST.to_string(), serde_json::json!("h-evil"));
+
+                let placed_upstream = mock_upstream(None).await;
+                let placed = harness_on(
+                    upstream_provider(&placed_upstream),
+                    &[("h-a", 2)],
+                    4,
+                    placed_snapshot(fresh_ms()),
+                );
+                send_both(&placed.provider, injected.clone()).await;
+                let placed_requests = placed_upstream.received_requests().await.unwrap();
+                assert_eq!(
+                    host_hints(&placed_requests),
+                    vec![Some("h-a".to_string()); 2]
+                );
+
+                let upstream = mock_upstream(None).await;
+                let stale = harness_on(
+                    upstream_provider(&upstream),
+                    &[("h-a", 2)],
+                    4,
+                    placed_snapshot(now_ms() - 60_000),
+                );
+                let canonical = mock_upstream(None).await;
+                let canonical_provider = Provider::new(Config::new(canonical.uri(), None, Some(5)));
+                send_both(&stale.provider, injected.clone()).await;
+                send_both(&canonical_provider, injected).await;
+
+                let mut requests = upstream.received_requests().await.unwrap();
+                requests.extend(canonical.received_requests().await.unwrap());
+                assert_eq!(requests.len(), 4);
+                assert_eq!(host_hints(&requests), vec![None; 4]);
+                requests.extend(placed_requests);
+                for request in &requests {
+                    let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+                    assert!(
+                        body.get(REPLICA_HINT_HOST).is_none(),
+                        "client host hint reached the upstream body"
+                    );
+                }
             }
 
             /// The stream path records TTFT and duration once per streamed
@@ -7387,6 +7474,7 @@ mod tests {
                 let mut requests = upstream.received_requests().await.unwrap();
                 requests.extend(canonical.received_requests().await.unwrap());
                 assert_eq!(hints(&requests), vec![None; 6]);
+                assert_eq!(host_hints(&requests), vec![None; 6]);
             }
 
             #[tokio::test]

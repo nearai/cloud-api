@@ -141,9 +141,10 @@ impl KeyGroup {
 pub(super) struct RouteLease {
     route_key: u64,
     index: usize,
-    /// The replica index placement chose on the backend at `index`; `None`
-    /// for a legacy lease, which leaves the replica to the proxy.
-    replica: Option<u32>,
+    /// The replica slot (host and replica index) placement chose on the
+    /// backend at `index`; `None` for a legacy lease, which leaves the
+    /// replica to the proxy.
+    placed: Option<SlotId>,
     /// Where and how to record this request's stream latency; set only for
     /// requests on a Fleet whose hosts publish, while placement is installed.
     latency: Option<LeaseLatency>,
@@ -216,7 +217,12 @@ impl RouteLease {
 
     /// The placed replica index, sent upstream as the replica hint.
     pub(super) fn replica(&self) -> Option<u32> {
-        self.replica
+        self.placed.as_ref().map(|slot| slot.replica)
+    }
+
+    /// The placed replica's host id, sent upstream with the replica hint.
+    pub(super) fn replica_host(&self) -> Option<&str> {
+        self.placed.as_ref().map(|slot| slot.host.as_str())
     }
 
     pub(super) fn route_key(&self) -> u64 {
@@ -472,7 +478,7 @@ impl Fleet {
         RouteLease {
             route_key,
             index,
-            replica: None,
+            placed: None,
             latency: None,
             prefix_loads: self.prefix_loads.clone(),
         }
@@ -490,7 +496,7 @@ impl Fleet {
         RouteLease {
             route_key,
             index,
-            replica: None,
+            placed: None,
             latency: None,
             prefix_loads: self.prefix_loads.clone(),
         }
@@ -955,7 +961,7 @@ impl Fleet {
         }
 
         let mut lease = self.reserve_index(self.route_key(messages), index);
-        lease.replica = Some(slot.replica);
+        lease.placed = Some(slot.clone());
         lease.latency = Some(LeaseLatency::new(
             handles,
             latency_tags(Some(&record), request.size),

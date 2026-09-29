@@ -7,8 +7,12 @@
 /// `replica_state::report_key::REPORT_KEY_EVENT`.
 pub const KEY_EVENT: &str = "nearai-replica-report-key-v1";
 
-/// The only `ReplicaReport.schema` value this crate understands.
+/// The only `HostReport.schema` value this crate understands.
 pub const SUPPORTED_SCHEMA: u8 = 1;
+
+/// The most replicas one host frame may carry. A larger frame is rejected by
+/// `frame::open`, bounding what a single host can add to a snapshot.
+pub const MAX_REPLICAS_PER_HOST: usize = 64;
 
 /// A replica's `engine_sampled_at_ms` is stale once it's older than this,
 /// relative to now: 3x a 1s publish interval.
@@ -31,10 +35,9 @@ pub const KV_MAX: f64 = 0.95;
 ///
 /// Entries are catalog `model_name`s: the completions service rewrites
 /// `params.model` to the catalog `model_name` before the pool, so this is what
-/// `Fleet` sees. It must also equal the `model` inference-proxy signs into
-/// every replica frame and key event (`rules::Rule::Model` and
-/// `snapshot` compare them byte for byte). For GLM-5.3 Flash both are the
-/// SGLang `--served-model-name` / inference-proxy `MODEL_NAME`,
+/// `Fleet` sees. Host frames carry no model: each Fleet reads only its own
+/// attested hosts, so a snapshot is already scoped to one model's endpoint.
+/// For GLM-5.3 Flash this is the SGLang `--served-model-name`,
 /// `z-ai/glm-5.3-flash`, not the Hugging Face path `zai-org/GLM-5.3-Flash`.
 pub const COVERED_MODELS: &[&str] = &["z-ai/glm-5.3-flash"];
 
@@ -63,8 +66,3 @@ pub const AFFINITY_ABS_SLACK: f64 = 0.1;
 /// How long a follow pin stays valid after it's written, in milliseconds.
 /// 10 minutes, matching OpenRouter's sticky-session TTL.
 pub const PIN_TTL_MS: u64 = 600_000;
-
-/// The synthetic replica id under which host-level `RoutedCounts` are keyed
-/// in `Snapshot::routed`, since cloud-api's own routed counters are
-/// host-level (the host's inference-proxy balances its own replicas).
-pub const HOST_REPLICA: &str = "_host";

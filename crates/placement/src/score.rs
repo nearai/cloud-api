@@ -2,7 +2,8 @@
 //!
 //! Lower scores are better. A replica's score combines how full its running
 //! queue is (`fullness`), how deep its prefill backlog is (`prefill`), and
-//! how fast it's currently generating relative to the fleet (`speed`).
+//! how fast each of its streams is currently generating relative to the
+//! fleet (`speed`).
 //! Placement picks a replica slot, not just a host, so every slot is scored
 //! on its own state and its own pending load.
 
@@ -19,12 +20,20 @@ pub struct Pending {
 }
 
 /// Score one replica against `pending` extra load, given the fleet's median
-/// generation speed (see [`fleet_median_tps`]). Lower is better.
+/// per-stream generation speed (see [`fleet_median_tps`]). Lower is better.
 ///
 /// - `fullness = (running + queued + pending.req) / max_running.unwrap_or(DEFAULT_MAX_RUNNING)`
 /// - `prefill = (prefill_backlog_tokens.unwrap_or(queued * 2000) + pending.tok) / PREFILL_NORM_TOKENS`
-/// - `speed = clamp(gen_tps.unwrap_or(fleet_median_tps) / fleet_median_tps, SPEED_FLOOR, 1 / SPEED_FLOOR)`
+/// - `speed = clamp(per_stream_tps / fleet_median_tps, SPEED_FLOOR, 1 / SPEED_FLOOR)`,
+///   or `1.0` when the replica's per-stream speed is unknown (see
+///   [`per_stream_tps`])
 /// - `score = (fullness + prefill) / speed`
+///
+/// `speed` is per stream because `gen_tps` is total decode throughput, which
+/// grows with the running count: dividing `fullness` by it would cancel the
+/// load it measures (3 streams at 195 tok/s would score like 1 at 62). A
+/// per-stream collapse (decode stalled behind a prefill) still lowers
+/// `speed` and raises the score.
 ///
 /// `running`/`queued` missing (`None`) are treated as 0 here; a replica with
 /// *both* missing has already been excluded upstream by `Rule::Capacity`'s
@@ -48,23 +57,39 @@ pub fn replica_score(r: &ReplicaView, pending: Pending, fleet_median_tps: f64) -
         .unwrap_or(queued * 2_000.0);
     let prefill = (backlog + pending.tok as f64) / PREFILL_NORM_TOKENS;
 
-    let gen_tps = load.gen_tps.unwrap_or(fleet_median_tps);
     // Clamped on both sides: a self-reported huge `gen_tps` must not drive
     // the score to ~0 and win every decision.
-    let speed = (gen_tps / fleet_median_tps).clamp(SPEED_FLOOR, 1.0 / SPEED_FLOOR);
+    let speed = per_stream_tps(r).map_or(1.0, |tps| {
+        (tps / fleet_median_tps).clamp(SPEED_FLOOR, 1.0 / SPEED_FLOOR)
+    });
 
     (fullness + prefill) / speed
 }
 
-/// The fleet's median `gen_tps`, over replicas reporting `Some(tps) > 0.0`.
-/// Ties (an even sample count) use the average of the two middle values,
-/// rather than the lower one, so the median doesn't favor whichever half it
-/// falls in. Returns `1.0` when there are no qualifying samples, making
-/// `replica_score`'s `speed` term a no-op (`gen_tps.unwrap_or(1.0) / 1.0`).
+/// A replica's decode speed per running stream, `gen_tps / max(running, 1)`.
+/// `None` (speed unknown) when `gen_tps` is missing, or is `0.0` with nothing
+/// running: an idle replica has nothing to generate, which says nothing about
+/// its speed. `0.0` with streams running is a real stall and is kept.
+fn per_stream_tps(r: &ReplicaView) -> Option<f64> {
+    let load = &r.state.load;
+    let tps = load.gen_tps?;
+    let running = load.running.unwrap_or(0);
+    if tps <= 0.0 && running == 0 {
+        return None;
+    }
+    Some(tps / f64::from(running.max(1)))
+}
+
+/// The fleet's median per-stream `gen_tps` (see [`per_stream_tps`]), over
+/// replicas whose per-stream speed is known and `> 0.0`. Ties (an even
+/// sample count) use the average of the two middle values, rather than the
+/// lower one, so the median doesn't favor whichever half it falls in.
+/// Returns `1.0` when there are no qualifying samples; every replica's speed
+/// is then unknown or zero, and `replica_score` needs no real median.
 pub fn fleet_median_tps(views: &[&ReplicaView]) -> f64 {
     let mut samples: Vec<f64> = views
         .iter()
-        .filter_map(|v| v.state.load.gen_tps)
+        .filter_map(|v| per_stream_tps(v))
         .filter(|tps| *tps > 0.0)
         .collect();
     if samples.is_empty() {
@@ -192,6 +217,47 @@ mod tests {
         );
     }
 
+    /// A gpu03-style replica: `running` streams generating `gen_tps` in
+    /// total, `max_running` 32, no queue or backlog.
+    fn gpu03(replica: u32, running: u32, gen_tps: Option<f64>) -> ReplicaView {
+        let mut v = crate::testkit::view(crate::testkit::TEST_HOST, replica);
+        v.state.limits.max_running = Some(32);
+        v.state.load.running = Some(running);
+        v.state.load.gen_tps = gen_tps;
+        v
+    }
+
+    #[test]
+    fn speed_is_per_stream_so_busier_replica_scores_worse() {
+        // gpu03 snapshot A: r0 generates 195.6 tok/s across 3 streams (65 per
+        // stream), r1 62.0 across 1 (62 per stream). Same hardware and the
+        // same per-stream speed, so the replica carrying 3x the load must
+        // score worse; total throughput must not cancel the load.
+        let r0 = gpu03(0, 3, Some(195.6));
+        let r1 = gpu03(1, 1, Some(62.0));
+        let median = fleet_median_tps(&[&r0, &r1]);
+        let busy = replica_score(&r0, Pending::default(), median);
+        let light = replica_score(&r1, Pending::default(), median);
+        assert!(busy > light, "busy={busy} light={light}");
+    }
+
+    #[test]
+    fn zero_tps_idle_replica_is_not_penalised() {
+        // An idle replica reporting gen_tps 0.0 (nothing to generate) is
+        // "speed unknown", exactly like a missing sample: factor 1.0, never
+        // the floor (which would multiply its score by 5).
+        let busy = gpu03(0, 10, Some(500.0));
+        let zero = gpu03(1, 0, Some(0.0));
+        let unknown = gpu03(1, 0, None);
+        let median = fleet_median_tps(&[&busy, &zero]);
+        let pending = Pending { req: 1, tok: 8_000 };
+        let expected = 1.0 / 32.0 + 8_000.0 / PREFILL_NORM_TOKENS;
+        let z = replica_score(&zero, pending, median);
+        let u = replica_score(&unknown, pending, median);
+        assert!((z - expected).abs() < 1e-9, "zero-tps score={z}");
+        assert!((u - expected).abs() < 1e-9, "unknown-tps score={u}");
+    }
+
     #[test]
     fn pending_never_drops_disjoint_load() {
         // 10 requests from other nodes plus 1 local write Valkey hasn't seen
@@ -309,8 +375,10 @@ mod tests {
         let mut liar = honest.clone();
         liar.state.load.gen_tps = Some(1.0e12);
 
-        let base = replica_score(&honest, Pending::default(), 100.0);
-        let score = replica_score(&liar, Pending::default(), 100.0);
+        // The median is per stream now: 100 tok/s over 20 streams is 5.0,
+        // so the honest replica sits at speed 1.0.
+        let base = replica_score(&honest, Pending::default(), 5.0);
+        let score = replica_score(&liar, Pending::default(), 5.0);
         let clamped = base * SPEED_FLOOR;
         assert!(score > 0.0);
         assert!(

@@ -377,7 +377,7 @@ mod tests {
     #[test]
     fn idle_fleet_keeps_home() {
         // best (gpu-a) is 0.0; home (gpu-b) is 0.05. Bound = max(0*1.25,
-        // 0+0.1) = 0.1, so the absolute slack keeps affinity even though the
+        // 0+1.0) = 1.0, so the absolute slack keeps affinity even though the
         // fleet is near idle and a relative-only bound would collapse to ~0.
         let key = find_key_with_rank(&[s("gpu-a"), s("gpu-b")], &[s("gpu-b")]);
         let scores = vec![(s("gpu-a"), 0.0), (s("gpu-b"), 0.05)];
@@ -388,12 +388,47 @@ mod tests {
     }
 
     #[test]
+    fn jitter_within_one_unit_keeps_home() {
+        // gpu03 snapshot B: r0 runs 8 streams at 455.2 tok/s, r1 12 at 469.4,
+        // both max_running 32 and no queue. A 4-stream difference is ordinary
+        // jitter; a conversation homed on the busier r1 must stay there.
+        use crate::score::{fleet_median_tps, replica_score, Pending};
+        let mut r0 = crate::testkit::view("gpu03", 0);
+        r0.state.limits.max_running = Some(32);
+        r0.state.load.running = Some(8);
+        r0.state.load.gen_tps = Some(455.2);
+        let mut r1 = crate::testkit::view("gpu03", 1);
+        r1.state.limits.max_running = Some(32);
+        r1.state.load.running = Some(12);
+        r1.state.load.gen_tps = Some(469.4);
+        let median = fleet_median_tps(&[&r0, &r1]);
+        let scores = vec![
+            (
+                r0.slot.clone(),
+                replica_score(&r0, Pending::default(), median),
+            ),
+            (
+                r1.slot.clone(),
+                replica_score(&r1, Pending::default(), median),
+            ),
+        ];
+        assert!(scores[1].1 > scores[0].1, "r1 is the busier replica");
+
+        let key = find_key_with_rank(&[r0.slot.clone(), r1.slot.clone()], &[r1.slot.clone()]);
+        let mut rng = StdRng::seed_from_u64(1);
+        let sel = select(Some(&key), None, false, &scores, &mut rng).unwrap();
+        assert_eq!(sel.slot, r1.slot);
+        assert_eq!(sel.selection, Selection::Home);
+        assert!(!sel.write_pin);
+    }
+
+    #[test]
     fn spill_then_follow_pin() {
         let key = find_key_with_rank(&[s("gpu02"), s("gpu08")], &[s("gpu02"), s("gpu08")]);
         let mut rng = StdRng::seed_from_u64(1);
 
         // Turn 1: home (gpu02) is overloaded at 2.0; gpu08 at 0.4 is the
-        // next slot in rank and within bound (best 0.4, bound 0.5).
+        // next slot in rank and within bound (best 0.4, bound 0.4+1.0 = 1.4).
         let scores = vec![(s("gpu02"), 2.0), (s("gpu08"), 0.4)];
         let sel = select(Some(&key), None, false, &scores, &mut rng).unwrap();
         assert_eq!(sel.slot, s("gpu08"));
@@ -408,7 +443,7 @@ mod tests {
         assert!(!sel.write_pin);
 
         // Turn 3: gpu02 cools to 0.35, gpu08 drifts to 0.42. best = 0.35,
-        // bound = max(0.35*1.25=0.4375, 0.35+0.1=0.45) = 0.45; 0.42 <= 0.45
+        // bound = max(0.35*1.25=0.4375, 0.35+1.0=1.35) = 1.35; 0.42 <= 1.35
         // so the pin holds (no flap).
         let scores = vec![(s("gpu02"), 0.35), (s("gpu08"), 0.42)];
         let sel = select(Some(&key), Some(&s("gpu08")), false, &scores, &mut rng).unwrap();
@@ -416,9 +451,11 @@ mod tests {
         assert_eq!(sel.selection, Selection::Pinned);
         assert!(!sel.write_pin);
 
-        // Turn 4: gpu08 spikes to 0.9, past the bound (0.45) — pin is
+        // Turn 4: gpu08 spikes to 2.0, past the bound (1.35) — pin is
         // ignored and the walk returns to home (gpu02), moving the pin.
-        let scores = vec![(s("gpu02"), 0.35), (s("gpu08"), 0.9)];
+        // (Was 0.9 against a 0.45 bound; AFFINITY_ABS_SLACK is now 1.0, so
+        // the spike must clear a full unit to leave the pin.)
+        let scores = vec![(s("gpu02"), 0.35), (s("gpu08"), 2.0)];
         let sel = select(Some(&key), Some(&s("gpu08")), false, &scores, &mut rng).unwrap();
         assert_eq!(sel.slot, s("gpu02"));
         assert_eq!(sel.selection, Selection::Home);

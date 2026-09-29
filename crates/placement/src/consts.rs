@@ -47,7 +47,8 @@ pub const PREFILL_NORM_TOKENS: f64 = 16_000.0;
 pub const DEFAULT_MAX_RUNNING: f64 = 40.0;
 
 /// The minimum speed multiplier `score.rs` divides by, so a replica with a
-/// very low (or zero) `gen_tps` sample doesn't blow the score up to infinity.
+/// very low (or zero, while streams are running) per-stream `gen_tps` doesn't
+/// blow the score up to infinity.
 pub const SPEED_FLOOR: f64 = 0.2;
 
 /// Bounded-load affinity tolerance: stay on the affinity home/pin while its
@@ -55,10 +56,18 @@ pub const SPEED_FLOOR: f64 = 0.2;
 pub const AFFINITY_EPS: f64 = 0.25;
 
 /// Absolute slack added to the relative `AFFINITY_EPS` bound (see
-/// `affinity::within_bound`), so affinity is not lost to a proportionally
-/// large-looking gap when the whole fleet is near idle and `best` is close
-/// to 0 (a relative-only bound would otherwise collapse to ~0 there).
-pub const AFFINITY_ABS_SLACK: f64 = 0.1;
+/// `affinity::within_bound`), in score units.
+///
+/// One unit is `PREFILL_NORM_TOKENS` (16K) prefill-equivalent tokens, or a
+/// full `max_running` of extra streams. Ordinary jitter between replicas is
+/// well inside that: gpu03 runs 8 vs 12 of 32 streams side by side (~0.25
+/// apart), and a short 3-deep queue (~3K backlog) is ~0.2. A warm prefix
+/// saves its whole length in prefill on a return, so spilling it for less
+/// than ~16K tokens of extra wait is a net loss. At 0.1 (about 1.6K tokens,
+/// or 3 streams) the bound spilled warm conversations on that jitter. It
+/// also keeps affinity when the fleet is near idle and `best` is close to 0,
+/// where the relative bound alone collapses to ~0.
+pub const AFFINITY_ABS_SLACK: f64 = 1.0;
 
 /// How long a follow pin stays valid after it's written, in milliseconds.
 /// 10 minutes, matching OpenRouter's sticky-session TTL.

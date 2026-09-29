@@ -2,10 +2,11 @@
 //! heavy lane, and the route policy label.
 //!
 //! Both the class and the tier come from the pool, which owns the size
-//! estimate and the tier boundary: a request is heavy when its context
-//! requirement exceeds the smallest declared capacity, and a Fleet is `Long`
-//! when its declared capacity is above that. Placement never re-derives
-//! either from token counts.
+//! estimate and the tier boundary: a request is heavy for the lane when its
+//! prompt alone exceeds the smallest declared capacity
+//! (`PlaceInput::prefill_heavy`), and a Fleet is `Long` when its declared
+//! capacity is above that. Placement never re-derives either from token
+//! counts.
 //!
 //! The heavy lane is the only filter the class adds. [`lane_admits`] is the
 //! whole admission predicate (applied as `Rule::Lane`), and [`classify`] only
@@ -35,7 +36,8 @@ impl Tier {
     }
 }
 
-/// A request's size class, from the pool's `PlacementContext.heavy`.
+/// A request's lane class, from `PlaceInput::prefill_heavy` (prompt size
+/// alone over the base tier's capacity).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Class {
     Short,

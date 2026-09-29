@@ -25,8 +25,8 @@ use crate::snapshot::{ReplicaView, SlotId, Snapshot};
 /// [`crate::snapshot::ReplicaView`] against, plus the rest of what
 /// `Placer::place` needs to score and pick a slot.
 ///
-/// The token counts and `heavy` come from the pool's `PlacementContext`;
-/// placement never estimates a request's size itself.
+/// The token counts, `heavy` and `prefill_heavy` come from the pool's
+/// `PlacementContext`; placement never estimates a request's size itself.
 ///
 /// `affinity` holds an [`AffinityKey`], which has no `Debug`/`Display`, so
 /// `PlaceInput` implements `Debug` manually and redacts it (see the manual
@@ -39,8 +39,16 @@ pub struct PlaceInput {
     /// Input plus output reserve, checked against each replica's engine
     /// `max_context_tokens` by `Rule::Context`. `None` if unknown.
     pub context_tokens: Option<u64>,
-    /// The pool's class decision: the requirement exceeds the base tier.
+    /// The pool's tier class: `context_tokens` (prompt plus output reserve)
+    /// exceeds the base tier's capacity. The pool routes tiers on it; the
+    /// placer only records it (`DecisionRecord::heavy`).
     pub heavy: bool,
+    /// The lane class: `prompt_tokens` alone exceeds the base tier's
+    /// capacity. Everything the lane decides follows this, not `heavy`:
+    /// lane admission, refusal, heavy-pin continuity and heavy pin writes. A
+    /// request heavy only through its output reserve (a 60K prompt with 64K
+    /// `max_tokens`) costs a short prefill, so it is Short for the lane.
+    pub prefill_heavy: bool,
     /// `params.request_priority`.
     pub priority: i32,
     /// The caller-derived affinity key (e.g. from a conversation id), if
@@ -57,6 +65,7 @@ impl std::fmt::Debug for PlaceInput {
             .field("prompt_tokens", &self.prompt_tokens)
             .field("context_tokens", &self.context_tokens)
             .field("heavy", &self.heavy)
+            .field("prefill_heavy", &self.prefill_heavy)
             .field("priority", &self.priority)
             .field("affinity", &self.affinity.is_some())
             .field("affinity_source", &self.affinity_source)
@@ -123,7 +132,8 @@ impl LegacyReason {
 /// this type intentionally does not derive `Debug`.
 ///
 /// `Legacy` means no usable state, so the caller falls back. `Refused`
-/// means there is state and no capacity for a heavy request: the heavy lane
+/// means there is state and no capacity for a prompt-heavy request
+/// (`PlaceInput::prefill_heavy`): the heavy lane
 /// excluded every stage-1 survivor, or every live replica reported itself
 /// full (`rules::saturated`). A short request is never refused.
 pub enum Decision {
@@ -170,7 +180,10 @@ pub struct DecisionRecord {
     /// excluded every survivor) or `capacity_full` (every live replica full).
     pub reason: Option<&'static str>,
     pub tier: Tier,
+    /// The lane class, from `PlaceInput::prefill_heavy`.
     pub class: Class,
+    /// The pool's tier class, `PlaceInput::heavy`.
+    pub heavy: bool,
     /// `RoutePolicy::as_str`, for placed and refused decisions.
     pub strategy: Option<&'static str>,
     /// `PriorityBand::as_str`.
@@ -213,7 +226,8 @@ impl DecisionRecord {
             outcome,
             reason: None,
             tier,
-            class: Class::of(input.heavy),
+            class: Class::of(input.prefill_heavy),
+            heavy: input.heavy,
             strategy: None,
             priority_band: PriorityBand::of(input.priority).as_str(),
             lane_size: 0,
@@ -353,7 +367,7 @@ impl Placer {
 
         // Stage 2: the heavy lane, admitting stage-1 survivors against a view
         // of every live replica.
-        let class = Class::of(input.heavy);
+        let class = Class::of(input.prefill_heavy);
         let lane = {
             let survivors: Vec<&SlotId> = candidates.iter().map(|c| &c.view.slot).collect();
             lane_view(&live, &survivors)
@@ -446,7 +460,7 @@ impl Placer {
             pin_lookup.as_ref().map(|(s, _)| s),
             // Heavy: a pin that survived both rule stages holds regardless of
             // score; the lane's backlog caps already bound its load.
-            input.heavy,
+            input.prefill_heavy,
             &scores,
             rng,
         ) {
@@ -474,7 +488,7 @@ impl Placer {
         // half-TTL refresh.
         let mut pin_write: Option<(PinId, SlotId)> = None;
         if let Some(pid) = pin_id_opt {
-            let should_write = input.heavy
+            let should_write = input.prefill_heavy
                 || match selected.selection {
                     Selection::Pinned => pin_lookup
                         .as_ref()
@@ -495,6 +509,7 @@ impl Placer {
             reason: None,
             tier: self.tier,
             class,
+            heavy: input.heavy,
             strategy: Some(classify(self.tier, class, &lane, Some(&selected.slot)).as_str()),
             priority_band: PriorityBand::of(input.priority).as_str(),
             lane_size: u16::try_from(lane.size).unwrap_or(u16::MAX),
@@ -1033,10 +1048,23 @@ mod tests {
 
     // --- Heavy lane (Rule::Lane) and the route policy label ---
 
+    /// A prompt-heavy request: heavy for the tier and for the lane.
     fn heavy(prompt_tokens: u64) -> PlaceInput {
         let mut input = base_input();
         input.heavy = true;
+        input.prefill_heavy = true;
         input.prompt_tokens = prompt_tokens;
+        input
+    }
+
+    /// Heavy for the tier only because of its output reserve: a 60K prompt
+    /// with 64K `max_tokens`.
+    fn max_tokens_heavy() -> PlaceInput {
+        let mut input = base_input();
+        input.heavy = true;
+        input.prefill_heavy = false;
+        input.prompt_tokens = 60_000;
+        input.context_tokens = Some(124_000);
         input
     }
 
@@ -1263,6 +1291,61 @@ mod tests {
     }
 
     #[test]
+    fn max_tokens_only_heavy_is_never_refused() {
+        // Heavy for the tier (the pool's call) but not for prefill: the lane
+        // treats it as short, so it is never refused and avoids members.
+        let input = max_tokens_heavy();
+        let mut rng = StdRng::seed_from_u64(1);
+
+        // Every replica a member at the backlog cap: overflow, not refusal.
+        for tier in [Tier::Base, Tier::Long] {
+            let p = Placer::new([1u8; 32], tier);
+            let (_, record, _) =
+                placed(p.place(&input, &saturated_base(), &HashMap::new(), &mut rng));
+            assert_eq!(record.strategy, Some("short_overflow"));
+            assert_eq!(record.class, Class::Short);
+            assert!(record.heavy, "the record keeps the tier class");
+        }
+
+        // With a clean replica, it avoids the lane member like a short one.
+        let snap = snap_with(vec![
+            with_backlog("gpu01", 0, 200_000),
+            ready_view("gpu01", 1),
+        ]);
+        for seed in 0..16 {
+            let mut rng = StdRng::seed_from_u64(seed);
+            let (chosen, record, _) =
+                placed(placer().place(&input, &snap, &HashMap::new(), &mut rng));
+            assert_eq!(chosen, slot("gpu01", 1), "seed {seed}");
+            assert_eq!(record.strategy, Some("short_clean"));
+        }
+
+        // Every live replica full: legacy, not refused.
+        let mut kv_full = ready_view("gpu01", 0);
+        kv_full.state.load.kv_usage = Some(0.99);
+        let (reason, _) = legacy_reason(placer().place(
+            &input,
+            &snap_with(vec![kv_full]),
+            &HashMap::new(),
+            &mut rng,
+        ));
+        assert_eq!(reason, LegacyReason::NoneEligible);
+    }
+
+    #[test]
+    fn prompt_heavy_request_uses_lane() {
+        let input = heavy(120_000);
+        let mut rng = StdRng::seed_from_u64(1);
+        let (_, record, _) =
+            placed(placer().place(&input, &snap_with(eight_slots()), &HashMap::new(), &mut rng));
+        assert_eq!(record.strategy, Some("heavy_lane_admit"));
+        assert_eq!(record.class, Class::Heavy);
+        let record =
+            refused_record(placer().place(&input, &saturated_base(), &HashMap::new(), &mut rng));
+        assert_eq!(record.reason, Some("lane_full"));
+    }
+
+    #[test]
     fn heavy_with_no_views_is_legacy_not_refused() {
         let mut rng = StdRng::seed_from_u64(1);
         for tier in [Tier::Base, Tier::Long] {
@@ -1315,6 +1398,7 @@ mod tests {
         let (snap, key, pinned) = pinned_member_with_room(secret, 100_000);
         let mut input = keyed(key);
         input.heavy = true;
+        input.prefill_heavy = true;
         input.prompt_tokens = 100_000;
         let mut rng = StdRng::seed_from_u64(1);
         let (chosen, record, pin_write) =
@@ -1387,6 +1471,8 @@ mod tests {
         let snap = snap_with(eight_slots());
         let mut input = keyed(key.clone());
         input.heavy = true;
+        input.prefill_heavy = true;
+        input.prefill_heavy = true;
         input.prompt_tokens = 150_000;
         let mut rng = StdRng::seed_from_u64(1);
         let (chosen, record, pin_write) =
@@ -1556,6 +1642,7 @@ mod tests {
         let (snap, key, pinned) = pinned_member_with_room(secret, HEAVY_BACKLOG_CAP - 50_000);
         let mut input = keyed(key);
         input.heavy = true;
+        input.prefill_heavy = true;
         input.prompt_tokens = 100_000;
         let mut rng = StdRng::seed_from_u64(1);
         let (chosen, record, pin_write) =
@@ -1589,6 +1676,7 @@ mod tests {
 
         let mut input = keyed(key);
         input.heavy = true;
+        input.prefill_heavy = true;
         input.prompt_tokens = 100_000;
         let mut rng = StdRng::seed_from_u64(1);
         let (chosen, record, _) =
@@ -1746,6 +1834,7 @@ mod tests {
         );
         let mut input = keyed(key.clone());
         input.heavy = true;
+        input.prefill_heavy = true;
         let mut rng = StdRng::seed_from_u64(1);
         let (chosen, record, pin_write) =
             placed(Placer::new(secret, Tier::Long).place(&input, &snap, &HashMap::new(), &mut rng));
@@ -1788,6 +1877,7 @@ mod tests {
         );
         let mut input = keyed(AffinityKey::from_bytes(key_bytes));
         input.heavy = true;
+        input.prefill_heavy = true;
         input.prompt_tokens = 100_000;
         let mut rng = StdRng::seed_from_u64(1);
         let record = refused_record(Placer::new(secret, Tier::Base).place(

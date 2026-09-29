@@ -69,10 +69,10 @@ pub const PIN_TTL_MS: u64 = 600_000;
 
 // Heavy lane (see `policy`). There is deliberately no class-line constant:
 // whether a request is heavy is the pool's decision, from its declared tier
-// capacities, and arrives as `PlaceInput::heavy`.
+// capacities, and arrives as `PlaceInput::prefill_heavy`.
 
-/// The largest share of a Fleet's eligible replicas that may be heavy-lane
-/// members: `lane_cap = ceil(eligible * HEAVY_SHARE)`.
+/// The largest share of a Fleet's live replicas that may be heavy-lane
+/// members: `lane_cap = ceil(live * HEAVY_SHARE)`.
 pub const HEAVY_SHARE: f64 = 0.25;
 
 /// A replica whose load (prefill backlog + pending tokens) is at least this

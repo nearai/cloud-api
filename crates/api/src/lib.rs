@@ -79,6 +79,36 @@ const PRIVACY_CLASSIFY_MAX_BODY_SIZE: usize = 256 * 1024; // 256 KB
 // bounding unauthenticated memory use before the inner request is decrypted.
 const OHTTP_MAX_BODY_SIZE: usize = 32 * 1024 * 1024; // 32 MB
 
+/// The `pdf-extract-worker` binary shipped next to this executable (the image
+/// copies both into `/app`). Under `cargo test` the running executable lives in
+/// `target/<profile>/deps/` while package binaries sit one level up, so the
+/// parent directory is checked second. A missing worker surfaces per request
+/// as "file processing is unavailable", never at startup.
+fn pdf_worker_path() -> std::path::PathBuf {
+    let name = services::files::extract::PDF_WORKER_BINARY;
+    let exe = std::env::current_exe().unwrap_or_default();
+    let sibling = exe.with_file_name(name);
+    if sibling.exists() {
+        return sibling;
+    }
+    let path = exe
+        .parent()
+        .and_then(|dir| dir.parent())
+        .map(|dir| dir.join(name))
+        .filter(|path| path.exists())
+        .unwrap_or(sibling);
+    if !path.exists() {
+        // Surface a bad image at deploy time rather than as 500s on the first
+        // PDF request. `cargo run --bin api` does not build the worker; run
+        // `cargo build --bin pdf-extract-worker` for local PDF support.
+        tracing::warn!(
+            path = %path.display(),
+            "pdf-extract-worker binary not found; chat file parts will fail with 500"
+        );
+    }
+    path
+}
+
 /// Service initialization components
 #[derive(Clone)]
 pub struct AuthComponents {
@@ -1280,6 +1310,11 @@ pub fn build_app_with_config_and_options(
             as Arc<dyn services::reporting_tokens::OrganizationReportingTokenService>,
         user_service: domain_services.user_service.clone(),
         files_service: domain_services.files_service.clone(),
+        file_text_extractor: Arc::new(services::files::extract::WorkerPdfExtractor::new(
+            services::files::extract::ExtractLimits::default(),
+            pdf_worker_path(),
+            Vec::new(),
+        )),
         inference_provider_pool: domain_services.inference_provider_pool.clone(),
         metrics_service: domain_services.metrics_service.clone(),
         analytics_service: analytics_service.clone(),

@@ -1513,35 +1513,36 @@ async fn chat_completions_inner(
         .resolve_alias_cached(&request.model)
         .await;
     let resolved_model_name = alias_canonical.as_deref().unwrap_or(&request.model);
-    let (model_attestation_supported, model_input_modalities) =
-        match app_state.models_service.get_models_with_pricing().await {
-            // Exact catalog name first, then the alias target: a name that is
-            // both a model and another model's alias must read its own
-            // capabilities.
-            Ok(models) => models
-                .iter()
-                .find(|model| model.model_name == request.model)
-                .or_else(|| {
-                    models
-                        .iter()
-                        .find(|model| model.model_name == resolved_model_name)
-                })
-                .map(|model| {
-                    (
-                        Some(model.attestation_supported),
-                        model.input_modalities.clone(),
-                    )
-                })
-                .unwrap_or((None, None)),
-            Err(error) => {
-                tracing::warn!(
-                    model = %request.model,
-                    error = %error,
-                    "Failed to read cached model metadata for attestation signing decisions"
-                );
-                (None, None)
-            }
-        };
+    let catalog = app_state.models_service.get_models_with_pricing().await;
+    let catalog_unavailable = catalog.is_err();
+    let (model_attestation_supported, model_input_modalities) = match catalog {
+        // Exact catalog name first, then the alias target: a name that is
+        // both a model and another model's alias must read its own
+        // capabilities.
+        Ok(models) => models
+            .iter()
+            .find(|model| model.model_name == request.model)
+            .or_else(|| {
+                models
+                    .iter()
+                    .find(|model| model.model_name == resolved_model_name)
+            })
+            .map(|model| {
+                (
+                    Some(model.attestation_supported),
+                    model.input_modalities.clone(),
+                )
+            })
+            .unwrap_or((None, None)),
+        Err(error) => {
+            tracing::warn!(
+                model = %request.model,
+                error = %error,
+                "Failed to read cached model metadata for attestation signing decisions"
+            );
+            (None, None)
+        }
+    };
 
     // Refuse gated parts (video) the catalog does not declare for this model
     // before any dispatch. Engines answer an unsupported modality
@@ -1577,6 +1578,45 @@ async fn chat_completions_inner(
         )
             .into_response();
     }
+    // Resolve OpenAI `file` parts to text (nearai/cloud-api#1153): no engine we
+    // route to reads them. Runs before auto-redact so extracted text is
+    // scrubbed like other user text, and only once the catalog knows the model
+    // — an unknown model is rejected by the completion service without paying
+    // for PDF parsing. Under E2EE the gateway cannot read the part and the
+    // engine would reject it, so refuse up front.
+    if crate::routes::chat_file_parts::has_file_parts(&service_request.messages) {
+        if e2ee_active {
+            return (
+                StatusCode::BAD_REQUEST,
+                ResponseJson(ErrorResponse::with_param(
+                    "file content parts are not supported with end-to-end encryption".to_string(),
+                    "invalid_request_error".to_string(),
+                    "messages".to_string(),
+                )),
+            )
+                .into_response();
+        }
+        // Skip only when the catalog answered and does not know the model; if
+        // the catalog read failed, still resolve rather than forward raw file
+        // parts every engine would reject.
+        if model_attestation_supported.is_some() || catalog_unavailable {
+            let mut original_request = service_request.original_request.take();
+            let resolved = crate::routes::chat_file_parts::resolve_file_parts(
+                &mut service_request.messages,
+                original_request.as_mut(),
+                api_key.workspace.id.0,
+                app_state.files_service.as_ref(),
+                app_state.file_text_extractor.as_ref(),
+                app_state.metrics_service.as_ref(),
+            )
+            .await;
+            service_request.original_request = original_request;
+            if let Err(response) = resolved {
+                return response;
+            }
+        }
+    }
+
     let usage_mode = chat_stream_usage_mode(&request, model_attestation_supported, e2ee_active);
     let rewrite_public_stream_usage = usage_mode.rewrite_public_stream_usage;
     let strip_intermediate_usage = usage_mode.strip_intermediate_usage;

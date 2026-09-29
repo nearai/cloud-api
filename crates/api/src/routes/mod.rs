@@ -6,6 +6,7 @@ pub mod attestation;
 pub mod auth;
 pub mod auth_vpc;
 pub mod billing;
+pub mod chat_file_parts;
 pub mod common;
 pub mod completions;
 pub mod conversations;

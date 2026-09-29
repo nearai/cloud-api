@@ -30,6 +30,8 @@ pub struct AppState {
         Arc<dyn services::reporting_tokens::OrganizationReportingTokenService>,
     pub user_service: Arc<dyn services::user::UserServiceTrait + Send + Sync>,
     pub files_service: Arc<dyn FileServiceTrait + Send + Sync>,
+    /// Turns chat `file` content parts into text (see `routes::chat_file_parts`).
+    pub file_text_extractor: Arc<dyn services::files::extract::FileTextExtractor>,
     pub inference_provider_pool: Arc<services::inference_provider_pool::InferenceProviderPool>,
     pub metrics_service: Arc<dyn services::metrics::MetricsServiceTrait>,
     pub analytics_service: Arc<services::admin::AnalyticsService>,

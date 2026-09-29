@@ -136,6 +136,11 @@ jobs:
         BRAVE_SEARCH_PRO_API_KEY: ${{ secrets.BRAVE_SEARCH_PRO_API_KEY }}
         DEV: "true"
 
+    # Real pdf-extract-worker process (Linux resource limits included) driven
+    # by the gateway's WorkerPdfExtractor; needs no database.
+    - name: Run PDF worker tests
+      run: cargo nextest run -p api --test pdf_worker
+
   # vLLM provider integration tests. Uses MockProvider by default
   # (USE_REAL_VLLM is not set), so these run without external dependencies
   # and without PostgreSQL. Kept as a separate job so a flake here doesn't

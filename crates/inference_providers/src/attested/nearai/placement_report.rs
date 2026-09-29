@@ -122,9 +122,9 @@ pub(super) fn report_decision(
         .collect::<Vec<_>>()
         .join(",");
     // One field set for both levels. Placement with no usable state
-    // (Valkey unreachable, placeholder endpoint, stale snapshot, kill
-    // switch) logs at debug: every covered request would otherwise repeat
-    // the same line. The decision metric above still counts each one.
+    // (Valkey unreachable, placeholder endpoint, hosts that publish no
+    // frames, stale snapshot, kill switch) logs at debug: every such
+    // request would otherwise repeat the same line. The decision metric above still counts each one.
     macro_rules! decision_line {
         ($level:ident) => {
             tracing::$level!(
@@ -273,7 +273,6 @@ fn detail_tag(record: &DecisionRecord) -> &'static str {
     match (record.reason, record.selection) {
         (Some(reason), _) => match reason {
             "disabled" => "reason:disabled",
-            "not_covered" => "reason:not_covered",
             "no_state" => "reason:no_state",
             "stale" => "reason:stale",
             "none_eligible" => "reason:none_eligible",
@@ -319,7 +318,7 @@ mod tests {
 
     fn legacy_record(snap: &Snapshot) -> DecisionRecord {
         let input = PlaceInput {
-            model: placement::consts::COVERED_MODELS[0].to_string(),
+            model: "z-ai/glm-5.3-flash".to_string(),
             prompt_tokens: 10,
             context_tokens: None,
             heavy: false,
@@ -423,7 +422,7 @@ mod observability_tests {
 
     fn request(affinity: Option<AffinityKey>) -> PlacementRequest {
         PlacementRequest {
-            model: placement::consts::COVERED_MODELS[0].to_string(),
+            model: "z-ai/glm-5.3-flash".to_string(),
             request_id: "req-1".to_string(),
             org_id: "org-1".to_string(),
             prompt_tokens: 10,
@@ -442,7 +441,7 @@ mod observability_tests {
 
     fn legacy(reason: &'static str) -> DecisionRecord {
         let input = PlaceInput {
-            model: placement::consts::COVERED_MODELS[0].to_string(),
+            model: "z-ai/glm-5.3-flash".to_string(),
             prompt_tokens: 10,
             context_tokens: None,
             heavy: false,
@@ -507,7 +506,6 @@ mod observability_tests {
 
         let legacy_reasons = [
             LegacyReason::Disabled,
-            LegacyReason::NotCovered,
             LegacyReason::NoState,
             LegacyReason::Stale,
             LegacyReason::NoneEligible,

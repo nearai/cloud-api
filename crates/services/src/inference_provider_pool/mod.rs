@@ -1291,7 +1291,7 @@ impl InferenceProviderPool {
         }
     }
 
-    /// Enable smart placement for covered models: `password` authenticates
+    /// Enable smart placement: `password` authenticates
     /// to the placement Valkey, and the pin and affinity secrets are derived
     /// from it (`secrets_from`). Call once at startup, before models load,
     /// and only when the secret is configured. A second call is a no-op.
@@ -1337,23 +1337,23 @@ impl InferenceProviderPool {
     }
 
     /// The `(model, inference_url)` entries that get smart placement, with
-    /// each entry's tier: every entry of a covered model. An entry is `Long`
-    /// when its declared capacity is above the model's
-    /// `context_routing::base_capacity`, the same boundary that makes a
-    /// request heavy, and `Base` otherwise. The tier comes from capacities,
-    /// not entry order, so heavy and `Long` cannot disagree (with 3+
-    /// capacities every tier above base is `Long`).
+    /// each entry's tier: every entry of every model. There is no model
+    /// allow-list: a Fleet whose hosts publish no replica frames keeps an
+    /// empty snapshot, its reader issues no Valkey reads, and its requests
+    /// take the legacy path. An entry is `Long` when its declared capacity
+    /// is above the model's `context_routing::base_capacity`, the same
+    /// boundary that makes a request heavy, and `Base` otherwise. The tier
+    /// comes from capacities, not entry order, so heavy and `Long` cannot
+    /// disagree (with 3+ capacities every tier above base is `Long`).
     fn placement_targets(
         models: &[(String, String, Option<u32>)],
     ) -> HashMap<(String, String), placement::policy::Tier> {
-        let covered = |model: &str| placement::consts::COVERED_MODELS.contains(&model);
         let mut caps: HashMap<&str, Vec<Option<u32>>> = HashMap::new();
-        for (model, _, cap) in models.iter().filter(|(model, _, _)| covered(model)) {
+        for (model, _, cap) in models {
             caps.entry(model.as_str()).or_default().push(*cap);
         }
         models
             .iter()
-            .filter(|(model, _, _)| covered(model))
             .map(|(model, url, cap)| {
                 let base = context_routing::base_capacity(caps[model.as_str()].iter().copied());
                 let tier = match (base, cap) {
@@ -4201,10 +4201,10 @@ impl InferenceProviderPool {
         )
     }
 
-    /// Refine `hints` for the tier sort and, for a model smart placement
-    /// covers, set `params.placement`'s size and class from the same formula
-    /// (reusing refine's exact count). Uncovered models keep the default
-    /// context and pay nothing for placement. Both chat paths call this.
+    /// Refine `hints` for the tier sort and set `params.placement`'s size and
+    /// class from the same formula (reusing refine's exact count), for every
+    /// model: placement uses it wherever the model's hosts publish frames.
+    /// Both chat paths call this.
     async fn apply_context_routing(
         &self,
         model_id: &str,
@@ -4215,9 +4215,6 @@ impl InferenceProviderPool {
         let exact_count = self
             .refine_context_requirement(model_id, params, hints, skip_exact_count)
             .await;
-        if !placement::consts::COVERED_MODELS.contains(&model_id) {
-            return;
-        }
         // NEAR tiers only: the same provider set `placement_targets` draws
         // the tier boundary from, so an attested fallback's (smaller) window
         // never shifts the heavy class away from the Fleets' tiers.
@@ -4267,7 +4264,7 @@ impl InferenceProviderPool {
 
         // Turn the rough input estimate into a context requirement (exact
         // tokenize near tier boundaries; no-op for single-capacity models),
-        // and give placement its typed context for covered models.
+        // and give placement its typed context.
         self.apply_context_routing(
             &model_id,
             &mut params,
@@ -4471,7 +4468,7 @@ impl InferenceProviderPool {
 
         // Turn the rough input estimate into a context requirement (exact
         // tokenize near tier boundaries; no-op for single-capacity models),
-        // and give placement its typed context for covered models.
+        // and give placement its typed context.
         self.apply_context_routing(
             &model_id,
             &mut params,
@@ -5384,9 +5381,10 @@ impl InferenceProviderPool {
         let endpoint_futures: Vec<_> = needs_creation
             .iter()
             .map(|(model_name, url, context_length)| {
-                // Every tier of a covered model gets placement, each provider
+                // Every tier of every model gets placement, each provider
                 // with its own handle set (one writer per host map) and a
-                // placer for its tier.
+                // placer for its tier. A handle set whose hosts never
+                // publish stays idle: no Valkey connection or reads.
                 let placement = placement_targets
                     .get(&(model_name.clone(), url.clone()))
                     .and_then(|tier| self.placement_handles(*tier));
@@ -8614,8 +8612,8 @@ mod tests {
         assert_eq!(merged.len(), 1);
     }
 
-    fn covered_two_tier_models() -> Vec<(String, String, Option<u32>)> {
-        let covered = placement::consts::COVERED_MODELS[0];
+    fn glm_two_tier_models() -> Vec<(String, String, Option<u32>)> {
+        let covered = "z-ai/glm-5.3-flash";
         let long_context = serde_json::json!({"long_context": {
             "inference_url": "https://long.example",
             "max_context_tokens": 1_048_576,
@@ -8632,33 +8630,54 @@ mod tests {
         models
     }
 
-    /// Placement installs on every entry of a covered model, each with its
+    /// Placement installs on every entry of a two-tier model, each with its
     /// tier: `Long` when its declared capacity is above the model's base
-    /// capacity. Uncovered models get nothing.
+    /// capacity.
     #[test]
     fn placement_targets_include_long_tier() {
         use placement::policy::Tier;
-        let covered = placement::consts::COVERED_MODELS[0].to_string();
-        let models = covered_two_tier_models();
-        assert_eq!(models.len(), 3, "covered row expands into base + long");
+        let covered = "z-ai/glm-5.3-flash".to_string();
+        let models = glm_two_tier_models();
+        assert_eq!(models.len(), 3, "the GLM row expands into base + long");
 
         let targets = InferenceProviderPool::placement_targets(&models);
         assert_eq!(
-            targets,
-            HashMap::from([
-                (
-                    (covered.clone(), "https://base.example".to_string()),
-                    Tier::Base
-                ),
-                ((covered, "https://long.example".to_string()), Tier::Long),
-            ])
+            targets.get(&(covered.clone(), "https://base.example".to_string())),
+            Some(&Tier::Base)
+        );
+        assert_eq!(
+            targets.get(&(covered, "https://long.example".to_string())),
+            Some(&Tier::Long)
+        );
+    }
+
+    /// There is no model allow-list: every entry of every model is a
+    /// placement target, so a new model needs no code change.
+    #[test]
+    fn placement_targets_cover_every_model() {
+        use placement::policy::Tier;
+        let models = glm_two_tier_models();
+        let targets = InferenceProviderPool::placement_targets(&models);
+        assert_eq!(targets.len(), models.len());
+        for (model, url, _) in &models {
+            assert!(
+                targets.contains_key(&(model.clone(), url.clone())),
+                "{model} {url}"
+            );
+        }
+        assert_eq!(
+            targets.get(&(
+                "other/model".to_string(),
+                "https://other.example".to_string()
+            )),
+            Some(&Tier::Base)
         );
     }
 
     #[test]
     fn single_tier_model_has_base_only() {
         use placement::policy::Tier;
-        let covered = placement::consts::COVERED_MODELS[0];
+        let covered = "z-ai/glm-5.3-flash";
         let models =
             expand_inference_endpoints(covered, "https://base.example", Some(100_000), None);
         let targets = InferenceProviderPool::placement_targets(&models);
@@ -8677,7 +8696,7 @@ mod tests {
     #[test]
     fn three_capacities_tier_and_heavy_agree() {
         use placement::policy::Tier;
-        let covered = placement::consts::COVERED_MODELS[0].to_string();
+        let covered = "z-ai/glm-5.3-flash".to_string();
         let caps = [100_000u32, 262_144, 1_048_576];
         let models: Vec<(String, String, Option<u32>)> = caps
             .iter()
@@ -8749,7 +8768,7 @@ mod tests {
         use placement::policy::Tier;
         let pool = InferenceProviderPool::new(None, ExternalProvidersConfig::default());
         pool.set_placement("router-password".to_string());
-        let covered = placement::consts::COVERED_MODELS[0].to_string();
+        let covered = "z-ai/glm-5.3-flash".to_string();
         let base_url = "https://glm-base.invalid".to_string();
         let long_url = "https://glm-long.invalid".to_string();
 
@@ -11445,7 +11464,7 @@ mod tests {
 
     #[tokio::test]
     async fn pool_sets_placement_context_for_two_tier_model() {
-        let model = placement::consts::COVERED_MODELS[0];
+        let model = "z-ai/glm-5.3-flash";
         let (pool, providers) = capacity_pool(model, &[100_000, 1_048_576]).await;
         let (base, long) = (&providers[0], &providers[1]);
 
@@ -11480,7 +11499,7 @@ mod tests {
 
     #[tokio::test]
     async fn single_tier_model_is_never_heavy() {
-        let model = placement::consts::COVERED_MODELS[0];
+        let model = "z-ai/glm-5.3-flash";
         let (pool, providers) = capacity_pool(model, &[100_000]).await;
 
         // Oversized for the only tier: still sized, never heavy.
@@ -11500,10 +11519,10 @@ mod tests {
         assert!(!ctx.heavy);
     }
 
+    /// Every model gets its placement context: there is no allow-list.
     #[tokio::test]
-    async fn uncovered_model_gets_default_context() {
-        let model = "z-ai/glm-5.2";
-        assert!(!placement::consts::COVERED_MODELS.contains(&model));
+    async fn any_model_gets_placement_context() {
+        let model = "acme/any-new-model";
         let (pool, providers) = capacity_pool(model, &[262_144, 1_048_576]).await;
 
         let _stream = pool
@@ -11515,14 +11534,15 @@ mod tests {
             .await
             .expect("served");
         let ctx = served_placement(&providers[1]).await;
-        assert_eq!(ctx.prompt_tokens, None);
-        assert_eq!(ctx.context_tokens, None);
-        assert!(!ctx.heavy);
+        let (prompt, context) = heuristic_requirement(1_200_000, 0);
+        assert_eq!(ctx.prompt_tokens, Some(prompt));
+        assert_eq!(ctx.context_tokens, Some(context));
+        assert!(ctx.heavy);
     }
 
     #[tokio::test]
     async fn non_streaming_path_sets_placement_context() {
-        let model = placement::consts::COVERED_MODELS[0];
+        let model = "z-ai/glm-5.3-flash";
         let (pool, providers) = capacity_pool(model, &[100_000, 1_048_576]).await;
 
         let mut params = sized_params(model, 400_000);
@@ -11553,7 +11573,7 @@ mod tests {
         use inference_providers::mock::MockProvider;
         use inference_providers::ProviderTier;
 
-        let model = placement::consts::COVERED_MODELS[0];
+        let model = "z-ai/glm-5.3-flash";
         let (pool, _providers) = capacity_pool(model, &[100_000, 1_048_576]).await;
         let fallback = Arc::new(MockProvider::new_accept_all().with_tier(ProviderTier::Attested3p));
         pool.provider_mappings
@@ -11584,7 +11604,7 @@ mod tests {
     /// is the placement context's `context_tokens`.
     #[tokio::test]
     async fn refine_and_placement_share_one_requirement() {
-        let model = placement::consts::COVERED_MODELS[0];
+        let model = "z-ai/glm-5.3-flash";
         let (pool, _providers) = capacity_pool(model, &[100_000, 1_048_576]).await;
         let mut params = sized_params(model, 400_000);
         params.max_completion_tokens = Some(3_000);

@@ -1129,12 +1129,9 @@ impl CompletionServiceImpl {
         let Some(secret) = affinity_secret else {
             return;
         };
-        // The HMAC derivation below only matters for models smart placement
-        // actually covers; skip the per-request crypto work for every other
-        // model (`chat_params.model` is already the canonical name here).
-        if !placement::consts::COVERED_MODELS.contains(&chat_params.model.as_str()) {
-            return;
-        }
+        // Every model: placement covers any model whose hosts publish
+        // frames, and the derivation is one HMAC. `chat_params.model` is
+        // already the canonical name here.
         let is_e2ee = Self::extra_is_e2ee(&chat_params.extra);
         let Some((key, source)) = affinity::derive(
             &organization_id.to_string(),
@@ -4434,12 +4431,9 @@ mod tests {
         );
     }
 
-    /// A covered model by default: most `apply_placement_affinity` tests
-    /// exercise derivation, which now only runs for
-    /// `placement::consts::COVERED_MODELS`.
     fn minimal_chat_params() -> inference_providers::ChatCompletionParams {
         serde_json::from_value(serde_json::json!({
-            "model": placement::consts::COVERED_MODELS[0],
+            "model": "z-ai/glm-5.3-flash",
             "messages": [
                 {"role": "system", "content": "you are helpful"},
                 {"role": "user", "content": "hello"},
@@ -4533,10 +4527,10 @@ mod tests {
     }
 
     #[test]
-    fn apply_placement_affinity_uncovered_model_gets_no_key_but_strips_forged() {
-        // "m" is not in `placement::consts::COVERED_MODELS`: derivation must
-        // be skipped (no HMAC work for models smart placement doesn't route),
-        // but a client-forged key must still be stripped for every model.
+    fn affinity_derived_for_any_model() {
+        // There is no model allow-list: any model gets its key (placement
+        // uses it wherever that model's hosts publish frames), and a
+        // client-forged key is stripped as always.
         let mut params: inference_providers::ChatCompletionParams =
             serde_json::from_value(serde_json::json!({
                 "model": "m",
@@ -4556,8 +4550,12 @@ mod tests {
         );
 
         assert!(
-            params.placement.affinity.is_none(),
-            "an uncovered model must get no derived key"
+            params.placement.affinity.is_some(),
+            "any model gets a derived key"
+        );
+        assert_eq!(
+            params.placement.affinity_source,
+            placement::decision::AffinitySource::Prefix
         );
         assert_no_legacy_keys(&params);
     }

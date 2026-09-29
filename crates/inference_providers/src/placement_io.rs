@@ -7,6 +7,11 @@
 //! into an [`ArcSwap`] every [`READ_INTERVAL`], and [`PlacementIo::record`]
 //! only `try_send`s onto a bounded channel (a full channel drops and counts).
 //!
+//! Every chat model's Fleet gets a reader, so an idle one must cost nothing:
+//! while its key registry holds no attested replica-report key (no host of
+//! that model publishes frames) the reader neither connects nor issues any
+//! Valkey read, the switches included, and the snapshot stays empty.
+//!
 //! Fail open: an invalid endpoint or CA, a failed connect, or a failed read
 //! never panics. The last snapshot is kept, ages out by `built_ms`, and the
 //! placer falls back to the legacy path within `FRESH_MAX_MS`.
@@ -92,7 +97,7 @@ pub const METRIC_SNAPSHOT_AGE_MS: &str = "cloud_api.placement.snapshot_age_ms";
 pub const METRIC_KILL_SWITCH_CYCLES: &str = "cloud_api.placement.kill_switch_cycles";
 /// Reader cycles published while the no-refuse switch is on.
 pub const METRIC_NOREFUSE_CYCLES: &str = "cloud_api.placement.norefuse_cycles";
-/// One per placement decision on a covered model, tagged `outcome`, `tier`,
+/// One per placement decision, tagged `outcome`, `tier`,
 /// `class`, `strategy`, `priority_band` plus `selection:{..}` (place) or
 /// `reason:{..}` (legacy or refused). Never host or request ids.
 pub const METRIC_DECISIONS: &str = "cloud_api.placement.decisions";
@@ -121,7 +126,7 @@ pub const METRIC_AFFINITY: &str = "cloud_api.placement.affinity";
 /// Prefill backlog (tokens) on the chosen host, per placed request.
 pub const METRIC_CHOSEN_BACKLOG: &str = "cloud_api.placement.chosen_backlog_tokens";
 
-/// Everything a provider's `Fleet` needs to place covered-model requests.
+/// Everything a provider's `Fleet` needs to place its model's requests.
 /// `hosts` is the same `ArcSwap` the [`PlacementIo`] reader resolves frame
 /// signing keys from, so discovery's host map is shared, not copied.
 #[derive(Clone)]
@@ -464,6 +469,12 @@ async fn connect(
         if orphaned(hosts) {
             return None;
         }
+        // Nothing to read until a host of this Fleet publishes: stay
+        // unconnected rather than hold a connection per idle model.
+        if !any_host_publishes(&hosts.load().keys) {
+            tokio::time::sleep(READ_INTERVAL).await;
+            continue;
+        }
         match ConnectionManager::new_with_config(client.clone(), config.clone()).await {
             Ok(conn) => {
                 tracing::info!("Placement Valkey connected");
@@ -572,9 +583,12 @@ async fn reader(
         }
         let hosts_now = hosts.load();
         let reg = &hosts_now.keys;
-        let result = read_cycle(&mut conn, &mut state, reg, metrics.as_ref()).await;
-        let now = now_ms();
-        if let Err(e) = publish_cycle(&mut state, &slot, result, reg, now, metrics.as_ref()) {
+        let Some((result, now)) =
+            reader_cycle(&mut conn, &mut state, &slot, reg, metrics.as_ref()).await
+        else {
+            continue;
+        };
+        if let Err(e) = result {
             if should_warn(last_warn, Instant::now()) {
                 tracing::warn!(
                     error_kind = ?e.kind(),
@@ -586,6 +600,58 @@ async fn reader(
         let age = now.saturating_sub(slot.load().built_ms);
         metrics.record_histogram(METRIC_SNAPSHOT_AGE_MS, age as f64, &[]);
     }
+}
+
+/// True when at least one host of this Fleet has an attested
+/// replica-report key, i.e. publishes frames placement can read.
+fn any_host_publishes(reg: &KeyRegistry) -> bool {
+    reg.by_host.values().any(|keys| !keys.is_empty())
+}
+
+/// One reader cycle's Valkey reads: the connection in production, a fake in
+/// tests.
+trait CycleSource {
+    fn read_cycle(
+        &mut self,
+        state: &mut ReaderState,
+        reg: &KeyRegistry,
+        metrics: &dyn PlacementMetrics,
+    ) -> impl std::future::Future<Output = redis::RedisResult<(ReadTargets, RawRead)>> + Send;
+}
+
+impl CycleSource for ConnectionManager {
+    fn read_cycle(
+        &mut self,
+        state: &mut ReaderState,
+        reg: &KeyRegistry,
+        metrics: &dyn PlacementMetrics,
+    ) -> impl std::future::Future<Output = redis::RedisResult<(ReadTargets, RawRead)>> + Send {
+        read_cycle(self, state, reg, metrics)
+    }
+}
+
+/// One reader cycle: the result of reading and publishing, with the time it
+/// was published at, or `None` when there is nothing to place. With no host
+/// publishing (see [`any_host_publishes`]) it issues no Valkey read at all,
+/// not even the kill and no-refuse switches, and clears a snapshot left
+/// over from hosts that stopped publishing. Otherwise the switches are read
+/// once, in the same pipeline as the frames.
+async fn reader_cycle(
+    src: &mut impl CycleSource,
+    state: &mut ReaderState,
+    slot: &ArcSwap<Snapshot>,
+    reg: &KeyRegistry,
+    metrics: &dyn PlacementMetrics,
+) -> Option<(redis::RedisResult<()>, u64)> {
+    if !any_host_publishes(reg) {
+        if !slot.load().replicas.is_empty() {
+            slot.store(Arc::new(Snapshot::default()));
+        }
+        return None;
+    }
+    let result = src.read_cycle(state, reg, metrics).await;
+    let now = now_ms();
+    Some((publish_cycle(state, slot, result, reg, now, metrics), now))
 }
 
 /// Warms the pin table up on the first successful cycle, then fetches.
@@ -1155,7 +1221,7 @@ mod tests {
     use base64::Engine as _;
     use ed25519_dalek::{Signer, SigningKey};
     use placement::affinity::{pin_id, AffinityKey};
-    use placement::consts::{COVERED_MODELS, FRESH_MAX_MS};
+    use placement::consts::FRESH_MAX_MS;
     use placement::decision::{AffinitySource, Decision, LegacyReason, PlaceInput, Placer};
     use placement::frame::{self, HostReport, Lifecycle, Load, ReplicaState, SIGNING_DOMAIN};
     use placement::policy::Tier;
@@ -1322,7 +1388,7 @@ mod tests {
 
     fn place(snap: &Snapshot, now_ms: u64) -> Decision {
         let input = PlaceInput {
-            model: COVERED_MODELS[0].into(),
+            model: "z-ai/glm-5.3-flash".into(),
             prompt_tokens: 100,
             context_tokens: None,
             heavy: false,
@@ -1787,6 +1853,92 @@ mod tests {
             Decision::Place { .. }
         ));
         assert_eq!(metrics.total(METRIC_KILL_SWITCH_CYCLES, None), 3);
+    }
+
+    /// Counts the reads a reader cycle issues and serves one frame per target
+    /// host, with the two switches as set.
+    struct FakeSource {
+        reads: usize,
+        frame: String,
+        kill_switch: bool,
+        norefuse: bool,
+    }
+
+    impl CycleSource for FakeSource {
+        async fn read_cycle(
+            &mut self,
+            state: &mut ReaderState,
+            reg: &KeyRegistry,
+            _metrics: &dyn PlacementMetrics,
+        ) -> redis::RedisResult<(ReadTargets, RawRead)> {
+            self.reads += 1;
+            let targets = ReadTargets::new(reg, state);
+            let frames = vec![Some(self.frame.clone()); targets.hosts.len()];
+            let mut r = raw(&targets, frames, now_ms());
+            r.kill_switch = self.kill_switch;
+            r.norefuse = self.norefuse;
+            Ok((targets, r))
+        }
+    }
+
+    #[tokio::test]
+    async fn reader_skips_valkey_when_no_host_publishes() {
+        let metrics = FakeMetrics::default();
+        let slot = ArcSwap::from_pointee(Snapshot::default());
+        let mut state = ReaderState::default();
+        let mut src = FakeSource {
+            reads: 0,
+            frame: sealed_json(&report(1, now_ms())),
+            kill_switch: false,
+            norefuse: false,
+        };
+
+        // No attested replica-report key (a host attested without one counts
+        // the same): nothing to place, so no read at all, switches included.
+        let mut keyless = KeyRegistry::default();
+        keyless.by_host.insert(HOST.to_string(), Vec::new());
+        for reg in [KeyRegistry::default(), keyless] {
+            for _ in 0..3 {
+                let cycle = reader_cycle(&mut src, &mut state, &slot, &reg, &metrics).await;
+                assert!(cycle.is_none());
+            }
+        }
+        assert_eq!(src.reads, 0);
+        assert!(slot.load().replicas.is_empty());
+        assert!(metrics.counts.lock().unwrap().is_empty());
+
+        // A publishing host: one read per cycle, and both switches still
+        // reach the snapshot.
+        let reg = registry();
+        src.kill_switch = true;
+        let (result, _) = reader_cycle(&mut src, &mut state, &slot, &reg, &metrics)
+            .await
+            .expect("read");
+        result.unwrap();
+        assert_eq!(src.reads, 1);
+        assert_eq!(slot.load().replicas.len(), 1);
+        assert!(slot.load().disabled);
+        assert_eq!(metrics.total(METRIC_KILL_SWITCH_CYCLES, None), 1);
+
+        src.kill_switch = false;
+        src.norefuse = true;
+        let (result, _) = reader_cycle(&mut src, &mut state, &slot, &reg, &metrics)
+            .await
+            .expect("read");
+        result.unwrap();
+        assert_eq!(src.reads, 2);
+        assert!(!slot.load().disabled);
+        assert!(slot.load().norefuse);
+        assert_eq!(metrics.total(METRIC_NOREFUSE_CYCLES, None), 1);
+
+        // Its key goes away: reads stop and the stale picture is cleared.
+        let none = KeyRegistry::default();
+        assert!(reader_cycle(&mut src, &mut state, &slot, &none, &metrics)
+            .await
+            .is_none());
+        assert_eq!(src.reads, 2);
+        assert!(slot.load().replicas.is_empty());
+        assert!(!slot.load().disabled);
     }
 
     #[test]

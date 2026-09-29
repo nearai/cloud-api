@@ -228,7 +228,7 @@ pub(crate) fn requirement(
     (prompt_tokens, prompt_tokens.saturating_add(output_reserve))
 }
 
-/// The typed placement context for a covered model's request: its size
+/// The typed placement context for a chat request: its size
 /// ([`requirement`], reusing the exact count the tier refinement took, if
 /// any) and its class (`heavy` iff the context requirement exceeds
 /// [`base_capacity`]; never for a single-tier model). `caps` are the model's

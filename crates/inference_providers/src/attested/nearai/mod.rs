@@ -5967,7 +5967,6 @@ mod tests {
         use crate::BackendHosts;
         use arc_swap::ArcSwap;
         use placement::affinity::{pin_id, AffinityKey, PinTable};
-        use placement::consts::COVERED_MODELS;
         use placement::decision::{AffinitySource, Placer};
         use placement::frame::{Lifecycle, Load, ReplicaState};
         use placement::policy::Tier;
@@ -6250,7 +6249,7 @@ mod tests {
                 snapshot("h-a", fresh_ms(), PinTable::default()),
             );
             let messages = messages_avoiding(2);
-            let req = request(COVERED_MODELS[0]);
+            let req = request("z-ai/glm-5.3-flash");
             assert_eq!(
                 placed_indices(&h.provider, &messages, None, &req),
                 vec![2; 12]
@@ -6258,27 +6257,45 @@ mod tests {
             assert_eq!(h.metrics.decisions_tagged("outcome:place"), 12);
         }
 
+        /// There is no model allow-list: any model whose hosts publish
+        /// frames is placed.
         #[test]
-        fn not_covered_model_uses_existing_path_unchanged() {
-            let mut h = harness(
+        fn any_model_whose_hosts_publish_is_placed() {
+            let h = harness(
                 &[("h-a", 2)],
                 snapshot("h-a", fresh_ms(), PinTable::default()),
             );
             let messages = messages_avoiding(2);
-            let req = request("some-org/not-covered");
+            let req = request("acme/any-new-model");
+            assert_eq!(
+                placed_indices(&h.provider, &messages, None, &req),
+                vec![2; 12]
+            );
+            assert_eq!(h.metrics.decisions_tagged("outcome:place"), 12);
+        }
+
+        /// A model whose hosts publish nothing (an empty snapshot: the
+        /// reader never reads for it) keeps its existing routing, through
+        /// the `no_state` gate, with no placement writes.
+        #[test]
+        fn model_without_publishing_hosts_is_legacy() {
+            let mut h = harness_exact(&[], 0, Snapshot::default());
+            let messages = messages_avoiding(2);
+            let req = request("acme/any-new-model");
             assert_eq!(
                 placed_indices(&h.provider, &messages, None, &req),
                 legacy_indices(&messages, None, None)
             );
             assert!(h.writes.try_recv().is_err(), "no placement writes");
-            assert!(h.metrics.counts.lock().unwrap().is_empty());
+            assert_eq!(h.metrics.decisions_tagged("reason:no_state"), 12);
+            assert_eq!(h.metrics.decisions_tagged("outcome:place"), 0);
         }
 
         #[test]
         fn unconfigured_placement_uses_existing_path_unchanged() {
             let provider = rotation_provider(4);
             let messages = messages_avoiding(2);
-            let req = request(COVERED_MODELS[0]);
+            let req = request("z-ai/glm-5.3-flash");
             assert_eq!(
                 placed_indices(&provider, &messages, None, &req),
                 legacy_indices(&messages, None, None)
@@ -6292,7 +6309,7 @@ mod tests {
                 snapshot("h-z", fresh_ms(), PinTable::default()),
             );
             let messages = messages_avoiding(2);
-            let req = request(COVERED_MODELS[0]);
+            let req = request("z-ai/glm-5.3-flash");
             assert_eq!(
                 placed_indices(&h.provider, &messages, None, &req),
                 legacy_indices(&messages, None, None)
@@ -6311,7 +6328,7 @@ mod tests {
                 snapshot("h-a", fresh_ms(), PinTable::default()),
             );
             let messages = messages_avoiding(2);
-            let req = request(COVERED_MODELS[0]);
+            let req = request("z-ai/glm-5.3-flash");
             assert_eq!(
                 placed_indices(&h.provider, &messages, None, &req),
                 legacy_indices(&messages, None, None)
@@ -6341,7 +6358,7 @@ mod tests {
             };
             let mut h = harness_exact(&map, 4, snap);
             let messages = messages_avoiding(2);
-            let req = request(COVERED_MODELS[0]);
+            let req = request("z-ai/glm-5.3-flash");
             assert_eq!(
                 placed_indices(&h.provider, &messages, None, &req),
                 legacy_indices(&messages, None, None)
@@ -6360,7 +6377,7 @@ mod tests {
                 snapshot("h-a", fresh_ms(), PinTable::default()),
             );
             let messages = messages_avoiding(2);
-            let req = request(COVERED_MODELS[0]);
+            let req = request("z-ai/glm-5.3-flash");
             assert_eq!(
                 placed_indices(&h.provider, &messages, None, &req),
                 legacy_indices(&messages, None, None)
@@ -6385,7 +6402,7 @@ mod tests {
             // Release builds ignore the second install and keep legacy routing.
             second.fleet.set_placement(handles);
             let messages = messages_avoiding(2);
-            let req = request(COVERED_MODELS[0]);
+            let req = request("z-ai/glm-5.3-flash");
             assert_eq!(
                 placed_indices(&second, &messages, None, &req),
                 legacy_indices(&messages, None, None)
@@ -6399,7 +6416,7 @@ mod tests {
                 snapshot("h-a", fresh_ms(), PinTable::default()),
             );
             let messages = messages_avoiding(2);
-            let req = request(COVERED_MODELS[0]);
+            let req = request("z-ai/glm-5.3-flash");
             placed_indices(&h.provider, &messages, None, &req);
             let counts = h.metrics.counts.lock().unwrap();
             let decision = counts
@@ -6429,7 +6446,7 @@ mod tests {
             let stale = now_ms() - 60_000;
             let h = harness(&[("h-a", 2)], snapshot("h-a", stale, PinTable::default()));
             let messages = messages_avoiding(2);
-            let req = request(COVERED_MODELS[0]);
+            let req = request("z-ai/glm-5.3-flash");
             assert_eq!(
                 placed_indices(&h.provider, &messages, None, &req),
                 legacy_indices(&messages, None, None)
@@ -6450,7 +6467,7 @@ mod tests {
                 role_msg(crate::MessageRole::Assistant, "synthetic answer"),
                 user_msg("synthetic follow-up"),
             ];
-            let req = request(COVERED_MODELS[0]);
+            let req = request("z-ai/glm-5.3-flash");
             let got = placed_indices(&h.provider, &messages, Some("key-a"), &req);
             assert!(got.iter().all(|i| [0, 1].contains(i)), "{got:?}");
             assert_eq!(got, legacy_indices(&messages, Some("key-a"), Some(keys)));
@@ -6467,7 +6484,7 @@ mod tests {
             // The routed tokens are the pool's prompt estimate, never a
             // placement-side re-estimate of the messages.
             let messages = vec![user_msg(&"x".repeat(40))];
-            let mut req = request(COVERED_MODELS[0]);
+            let mut req = request("z-ai/glm-5.3-flash");
             req.prompt_tokens = 10;
             let before_s = now_ms() / 1000;
             let lease = h
@@ -6499,7 +6516,7 @@ mod tests {
         /// Places one keyless 10-token request on h-a#0 (backend 2) and
         /// returns its queued routed write's acknowledgement handle.
         fn place_one(h: &mut Harness) -> RoutedAck {
-            let mut req = request(COVERED_MODELS[0]);
+            let mut req = request("z-ai/glm-5.3-flash");
             req.prompt_tokens = 10;
             let lease = h
                 .provider
@@ -6601,7 +6618,7 @@ mod tests {
             for _ in 0..WRITE_QUEUE_CAPACITY {
                 h.io.record(filler());
             }
-            let mut req = request(COVERED_MODELS[0]);
+            let mut req = request("z-ai/glm-5.3-flash");
             req.prompt_tokens = 10;
             h.provider
                 .fleet
@@ -6657,7 +6674,7 @@ mod tests {
                     &[("h-a", 2)],
                     snapshot("h-a", fresh_ms(), PinTable::default()),
                 );
-                let mut req = request(COVERED_MODELS[0]);
+                let mut req = request("z-ai/glm-5.3-flash");
                 req.size = "size:le8k";
                 let lease = h
                     .provider
@@ -6705,7 +6722,7 @@ mod tests {
                 ..Snapshot::default()
             };
             let mut h = harness(&[("h-a", 2)], snap);
-            let req = request(COVERED_MODELS[0]);
+            let req = request("z-ai/glm-5.3-flash");
             let lease = h
                 .provider
                 .fleet
@@ -6728,9 +6745,9 @@ mod tests {
             let stale = now_ms() - 60_000;
             let h = harness(&[("h-a", 2)], snapshot("h-a", stale, PinTable::default()));
             let messages = messages_avoiding(2);
-            let covered = request(COVERED_MODELS[0]);
-            let uncovered = request("some-org/not-covered");
-            for req in [&covered, &uncovered] {
+            let glm = request("z-ai/glm-5.3-flash");
+            let other = request("acme/any-new-model");
+            for req in [&glm, &other] {
                 let lease = h
                     .provider
                     .fleet
@@ -6746,7 +6763,7 @@ mod tests {
                 .acquire_index(&messages, None)
                 .expect("rotation active");
             assert_eq!(lease.replica(), None);
-            assert_eq!(h.metrics.decisions_tagged("reason:stale"), 1);
+            assert_eq!(h.metrics.decisions_tagged("reason:stale"), 2);
         }
 
         #[test]
@@ -6755,7 +6772,7 @@ mod tests {
             snap.disabled = true;
             let mut h = harness(&[("h-a", 2)], snap);
             let messages = messages_avoiding(2);
-            let req = request(COVERED_MODELS[0]);
+            let req = request("z-ai/glm-5.3-flash");
             assert_eq!(
                 placed_indices(&h.provider, &messages, None, &req),
                 legacy_indices(&messages, None, None)
@@ -6776,7 +6793,7 @@ mod tests {
             pins.insert(id, slot("h-gone", 0), now);
             let mut h = harness(&[("h-a", 2)], snapshot("h-a", fresh_ms(), pins));
             let messages = vec![user_msg("keyed request")];
-            let mut req = request(COVERED_MODELS[0]);
+            let mut req = request("z-ai/glm-5.3-flash");
             req.affinity = Some(key);
             req.affinity_source = AffinitySource::Client;
             let lease = h
@@ -6909,7 +6926,7 @@ mod tests {
                     "golden frame accepted, one view per replica"
                 );
                 let input = placement::decision::PlaceInput {
-                    model: COVERED_MODELS[0].into(),
+                    model: "z-ai/glm-5.3-flash".into(),
                     prompt_tokens: 100,
                     context_tokens: None,
                     heavy: false,
@@ -6954,7 +6971,7 @@ mod tests {
                     .map(|(i, (h, _))| (h.to_string(), i))
                     .collect();
                 let h = harness_exact(&map, 4, snap);
-                let req = request(COVERED_MODELS[0]);
+                let req = request("z-ai/glm-5.3-flash");
                 let lease = h
                     .provider
                     .fleet
@@ -7128,7 +7145,7 @@ mod tests {
                     4,
                     placed_snapshot(fresh_ms()),
                 );
-                send_both(&h.provider, params(COVERED_MODELS[0])).await;
+                send_both(&h.provider, params("z-ai/glm-5.3-flash")).await;
 
                 let requests = upstream.received_requests().await.unwrap();
                 assert_eq!(hints(&requests), vec![Some("3".to_string()); 2]);
@@ -7141,7 +7158,7 @@ mod tests {
 
             /// The stream path records TTFT and duration once per streamed
             /// request, by strategy and selection (`legacy` when unplaced,
-            /// nothing for an uncovered model).
+            /// nothing on a Fleet whose hosts publish no frames).
             #[tokio::test]
             async fn stream_latency_is_recorded_by_strategy() {
                 use crate::placement_io::{METRIC_DURATION_MS, METRIC_TTFT_MS};
@@ -7160,7 +7177,7 @@ mod tests {
                     4,
                     placed_snapshot(fresh_ms()),
                 );
-                stream_once(h.provider, COVERED_MODELS[0]).await;
+                stream_once(h.provider, "z-ai/glm-5.3-flash").await;
                 for name in [METRIC_TTFT_MS, METRIC_DURATION_MS] {
                     let samples = h.metrics.histogram_tags(name);
                     assert_eq!(samples.len(), 1, "{name}");
@@ -7177,7 +7194,7 @@ mod tests {
                     4,
                     placed_snapshot(stale),
                 );
-                stream_once(h.provider, COVERED_MODELS[0]).await;
+                stream_once(h.provider, "z-ai/glm-5.3-flash").await;
                 for name in [METRIC_TTFT_MS, METRIC_DURATION_MS] {
                     assert_eq!(
                         h.metrics.histogram_tags(name),
@@ -7191,13 +7208,8 @@ mod tests {
                 }
 
                 let upstream = mock_upstream(None).await;
-                let h = harness_on(
-                    upstream_provider(&upstream),
-                    &[("h-a", 2)],
-                    4,
-                    placed_snapshot(fresh_ms()),
-                );
-                stream_once(h.provider, "some-org/not-covered").await;
+                let h = install(upstream_provider(&upstream), &[], 0, Snapshot::default());
+                stream_once(h.provider, "acme/any-new-model").await;
                 assert!(h.metrics.histogram_tags(METRIC_TTFT_MS).is_empty());
                 assert!(h.metrics.histogram_tags(METRIC_DURATION_MS).is_empty());
             }
@@ -7208,7 +7220,7 @@ mod tests {
             async fn latency_metrics_tag_size_bucket() {
                 use crate::placement_io::{METRIC_DURATION_MS, METRIC_TTFT_MS};
                 let sized = |tokens: Option<u64>| {
-                    let mut params = params(COVERED_MODELS[0]);
+                    let mut params = params("z-ai/glm-5.3-flash");
                     params.placement.prompt_tokens = tokens;
                     params
                 };
@@ -7260,8 +7272,8 @@ mod tests {
 
             #[tokio::test]
             async fn legacy_request_sends_no_replica_hint() {
-                // Rotation with a legacy lease: a stale snapshot, and a model
-                // placement does not cover.
+                // Rotation with a legacy lease: a stale snapshot, for any
+                // model.
                 let upstream = mock_upstream(None).await;
                 let stale = now_ms() - 60_000;
                 let h = harness_on(
@@ -7270,14 +7282,14 @@ mod tests {
                     4,
                     placed_snapshot(stale),
                 );
-                send_both(&h.provider, params(COVERED_MODELS[0])).await;
-                send_both(&h.provider, params("some-org/not-covered")).await;
-                assert_eq!(h.metrics.decisions_tagged("reason:stale"), 2);
+                send_both(&h.provider, params("z-ai/glm-5.3-flash")).await;
+                send_both(&h.provider, params("acme/any-new-model")).await;
+                assert_eq!(h.metrics.decisions_tagged("reason:stale"), 4);
 
                 // No rotation at all: the canonical URL.
                 let canonical = mock_upstream(None).await;
                 let provider = Provider::new(Config::new(canonical.uri(), None, Some(5)));
-                send_both(&provider, params(COVERED_MODELS[0])).await;
+                send_both(&provider, params("z-ai/glm-5.3-flash")).await;
 
                 let mut requests = upstream.received_requests().await.unwrap();
                 requests.extend(canonical.received_requests().await.unwrap());
@@ -7296,7 +7308,7 @@ mod tests {
                 );
                 let canonical = mock_upstream(None).await;
                 let canonical_provider = Provider::new(Config::new(canonical.uri(), None, Some(5)));
-                let mut injected = params(COVERED_MODELS[0]);
+                let mut injected = params("z-ai/glm-5.3-flash");
                 injected
                     .extra
                     .insert(REPLICA_HINT.to_string(), serde_json::json!("3"));
@@ -7333,9 +7345,9 @@ mod tests {
                 }
             }
 
-            /// A covered-model request the pool classed heavy.
+            /// A request the pool classed heavy.
             fn heavy_params() -> ChatCompletionParams {
-                let mut params = params(COVERED_MODELS[0]);
+                let mut params = params("z-ai/glm-5.3-flash");
                 params.placement = crate::PlacementContext {
                     prompt_tokens: Some(100_000),
                     context_tokens: Some(120_000),
@@ -7402,7 +7414,7 @@ mod tests {
             }
 
             /// The kill switch takes precedence over no-refuse: with both
-            /// keys set, every covered request is Legacy(disabled).
+            /// keys set, every request is Legacy(disabled).
             #[tokio::test]
             async fn kill_switch_wins_over_norefuse() {
                 let upstream = mock_upstream(None).await;
@@ -7426,7 +7438,7 @@ mod tests {
                 let mut snap = placed_snapshot(fresh_ms());
                 snap.norefuse = true;
                 let h = harness_on(upstream_provider(&upstream), &[("h-a", 2)], 4, snap);
-                send_both(&h.provider, params(COVERED_MODELS[0])).await;
+                send_both(&h.provider, params("z-ai/glm-5.3-flash")).await;
 
                 assert_eq!(h.metrics.decisions_tagged("outcome:place"), 2);
                 assert_eq!(h.metrics.decisions_tagged("reason:norefuse"), 0);
@@ -7479,7 +7491,7 @@ mod tests {
                     4,
                     placed_snapshot(fresh_ms()),
                 );
-                send_both(&h.provider, params(COVERED_MODELS[0])).await;
+                send_both(&h.provider, params("z-ai/glm-5.3-flash")).await;
 
                 let requests = upstream.received_requests().await.unwrap();
                 let by_host: Vec<(bool, Option<String>)> = requests
@@ -7601,7 +7613,7 @@ mod tests {
                         // Keyless requests: same model, no affinity, so every
                         // thread reaches `try_place`'s ledger critical
                         // section the same way.
-                        let req = request(COVERED_MODELS[0]);
+                        let req = request("z-ai/glm-5.3-flash");
                         start.wait();
                         let lease = fleet
                             .acquire_index_placed(&messages, None, &req)

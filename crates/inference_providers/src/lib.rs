@@ -522,7 +522,7 @@ pub trait InferenceProvider {
     /// host as legacy and fails open).
     fn set_backend_hosts(&self, _hosts: BackendHosts) {}
 
-    /// Install smart placement for covered models. Default is a no-op — only
+    /// Install smart placement for this provider's model. Default is a no-op — only
     /// providers that participate in smart placement override it; without
     /// it every request takes the existing routing path.
     fn set_placement(&self, _handles: placement_io::PlacementHandles) {}

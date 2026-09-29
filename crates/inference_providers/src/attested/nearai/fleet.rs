@@ -23,7 +23,6 @@ use crate::spki_verifier::FingerprintState;
 use crate::BackendHosts;
 use crate::BackendVerifier;
 use arc_swap::{ArcSwap, ArcSwapOption};
-use placement::consts::COVERED_MODELS;
 use placement::decision::{Decision, DecisionRecord, LegacyReason, PlaceInput};
 use placement::score::{unseen_by_read, OwnRouted, Pending};
 use placement::snapshot::Snapshot;
@@ -146,7 +145,7 @@ pub(super) struct RouteLease {
     /// for a legacy lease, which leaves the replica to the proxy.
     replica: Option<u32>,
     /// Where and how to record this request's stream latency; set only for
-    /// covered-model requests while placement is installed.
+    /// requests on a Fleet whose hosts publish, while placement is installed.
     latency: Option<LeaseLatency>,
     prefix_loads: Arc<Mutex<PrefixLoads>>,
 }
@@ -781,13 +780,15 @@ impl Fleet {
         }
     }
 
-    /// Place a covered-model request on a replica slot, or fall through to
-    /// `acquire_index` unchanged (`Ok(None)` there means rotation is
-    /// unavailable: the canonical path). Placement is skipped entirely (no
-    /// decision, log or metric) when it is not installed, the model is not
-    /// covered, or rotation is unavailable. A `Legacy` decision, an
-    /// incomplete host map or snapshot, an unmapped host, or a host outside
-    /// the pinned E2EE key group all run the existing path. Only a refusal
+    /// Place a request on a replica slot, or fall through to `acquire_index`
+    /// unchanged (`Ok(None)` there means rotation is unavailable: the
+    /// canonical path). Every model is eligible: a Fleet whose hosts publish
+    /// no replica frames has an empty snapshot, so its decisions are `Legacy`
+    /// (`no_state`). Placement is skipped entirely (no decision, log or
+    /// metric) when it is not installed or rotation is unavailable. A
+    /// `Legacy` decision, an incomplete host map or snapshot, an unmapped
+    /// host, or a host outside the pinned E2EE key group all run the
+    /// existing path. Only a refusal
     /// that passed the fail-open gates is `Err(CapacityRefused)`, returned
     /// before any upstream request.
     pub(super) fn acquire_index_placed(
@@ -801,11 +802,14 @@ impl Fleet {
             PlacedOutcome::Refused => Err(crate::CompletionError::CapacityRefused),
             PlacedOutcome::Fallback => {
                 let mut lease = self.acquire_index(messages, pinned_pub_key);
-                // A covered request placement did not place: its latency is
-                // still recorded, as `legacy`, so the two paths compare.
+                // A request placement did not place on a Fleet whose hosts
+                // publish: its latency is still recorded, as `legacy`, so
+                // the two paths compare. A Fleet with no published replica
+                // (an empty snapshot) records nothing, so models placement
+                // never sees stay out of the comparison.
                 if let Some(lease) = lease.as_mut() {
-                    if COVERED_MODELS.contains(&request.model.as_str()) {
-                        if let Some(handles) = self.placement.load().as_ref() {
+                    if let Some(handles) = self.placement.load().as_ref() {
+                        if !handles.io.snapshot.load().replicas.is_empty() {
                             lease.latency = Some(LeaseLatency {
                                 handles: handles.clone(),
                                 tags: latency_tags(None, request.size),
@@ -824,9 +828,6 @@ impl Fleet {
         pinned_pub_key: Option<&str>,
         request: &PlacementRequest,
     ) -> PlacedOutcome {
-        if !COVERED_MODELS.contains(&request.model.as_str()) {
-            return PlacedOutcome::Fallback;
-        }
         let guard = self.placement.load();
         let Some(handles) = guard.as_ref() else {
             return PlacedOutcome::Fallback;
@@ -1250,7 +1251,7 @@ mod demote_tests {
             ..Snapshot::default()
         };
         let input = PlaceInput {
-            model: COVERED_MODELS[0].to_string(),
+            model: "z-ai/glm-5.3-flash".to_string(),
             prompt_tokens: 10,
             context_tokens: None,
             heavy: false,

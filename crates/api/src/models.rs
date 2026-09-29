@@ -105,8 +105,18 @@ pub enum MessageContentPart {
     // vLLM format: video_url with url field
     #[serde(rename = "video_url")]
     VideoUrl { video_url: MessageVideoUrl },
+    /// OpenAI file part. OpenAI nests the source under `file`
+    /// (`{"type":"file","file":{"file_data"|"file_id", "filename"}}`); the flat
+    /// `file_id` is the pre-#1153 shape, kept so existing clients still parse.
+    /// No engine reads `file` parts, so the gateway resolves both forms to a
+    /// text part before dispatch (`routes::chat_file_parts`).
     #[serde(rename = "file")]
-    File { file_id: String },
+    File {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        file: Option<MessageFile>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        file_id: Option<String>,
+    },
 }
 
 impl MessageContentPart {
@@ -119,6 +129,32 @@ impl MessageContentPart {
             MessageContentPart::InputAudio { .. } | MessageContentPart::AudioUrl { .. } => "audio",
             MessageContentPart::VideoUrl { .. } => "video",
             MessageContentPart::File { .. } => "file",
+        }
+    }
+
+    /// Where a `file` part's bytes come from; `Ok(None)` for every other part.
+    /// Errs unless exactly one source is set. The message never echoes values.
+    pub fn file_source(&self) -> Result<Option<FilePartSource<'_>>, &'static str> {
+        let MessageContentPart::File { file, file_id } = self else {
+            return Ok(None);
+        };
+        let nested = file.as_ref();
+        let filename = nested.and_then(|f| f.filename.as_deref());
+        let sources = [
+            nested
+                .and_then(|f| f.file_data.as_deref())
+                .map(|data| FilePartSource::Inline { data, filename }),
+            nested
+                .and_then(|f| f.file_id.as_deref())
+                .map(|file_id| FilePartSource::Stored { file_id, filename }),
+            file_id
+                .as_deref()
+                .map(|file_id| FilePartSource::Stored { file_id, filename }),
+        ];
+        let mut set = sources.into_iter().flatten();
+        match (set.next(), set.next()) {
+            (Some(source), None) => Ok(Some(source)),
+            _ => Err("file content part must set exactly one of file.file_data or file.file_id"),
         }
     }
 }
@@ -209,6 +245,33 @@ pub enum MessageAudioUrl {
 pub enum MessageVideoUrl {
     String(String),
     Object { url: String },
+}
+
+/// OpenAI `file` part payload. All fields are optional on the wire; exactly one
+/// of `file_data` / `file_id` must be set (`MessageContentPart::file_source`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
+pub struct MessageFile {
+    /// Base64 data URL (`data:application/pdf;base64,...`) or bare base64.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file_data: Option<String>,
+    /// ID of a file uploaded through `/v1/files` in the same workspace.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub filename: Option<String>,
+}
+
+/// Source of a chat `file` part's bytes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FilePartSource<'a> {
+    Inline {
+        data: &'a str,
+        filename: Option<&'a str>,
+    },
+    Stored {
+        file_id: &'a str,
+        filename: Option<&'a str>,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -1577,6 +1640,13 @@ impl ChatCompletionRequest {
                         "message at index {} has invalid content that cannot be processed",
                         idx
                     ));
+                }
+                if let MessageContent::Parts(parts) = content {
+                    for part in parts {
+                        if let Err(msg) = part.file_source() {
+                            return Err(format!("message at index {idx}: {msg}"));
+                        }
+                    }
                 }
             }
         }
@@ -5112,6 +5182,95 @@ mod tests {
         assert!(request.has_audio_content());
     }
 
+    fn file_request(part: serde_json::Value) -> Result<ChatCompletionRequest, serde_json::Error> {
+        serde_json::from_value(serde_json::json!({
+            "model": "m",
+            "messages": [{"role": "user", "content": [{"type": "text", "text": "read"}, part]}]
+        }))
+    }
+
+    fn only_file_part(req: &ChatCompletionRequest) -> &MessageContentPart {
+        match req.messages[0].content.as_ref().unwrap() {
+            MessageContent::Parts(parts) => &parts[1],
+            other => panic!("expected parts, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn openai_nested_file_data_part_deserializes() {
+        let req = file_request(serde_json::json!({
+            "type": "file",
+            "file": {"filename": "a.pdf", "file_data": "data:application/pdf;base64,JVBERi0="}
+        }))
+        .expect("OpenAI nested file_data shape must deserialize");
+        assert!(req.validate().is_ok());
+        assert_eq!(
+            only_file_part(&req).file_source(),
+            Ok(Some(FilePartSource::Inline {
+                data: "data:application/pdf;base64,JVBERi0=",
+                filename: Some("a.pdf"),
+            }))
+        );
+    }
+
+    #[test]
+    fn openai_nested_file_id_part_deserializes() {
+        let req =
+            file_request(serde_json::json!({"type": "file", "file": {"file_id": "file-abc"}}))
+                .expect("OpenAI nested file_id shape must deserialize");
+        assert!(req.validate().is_ok());
+        assert_eq!(
+            only_file_part(&req).file_source(),
+            Ok(Some(FilePartSource::Stored {
+                file_id: "file-abc",
+                filename: None
+            }))
+        );
+    }
+
+    #[test]
+    fn legacy_flat_file_id_part_still_deserializes() {
+        let req = file_request(serde_json::json!({"type": "file", "file_id": "file-abc"}))
+            .expect("legacy flat shape must keep deserializing");
+        assert!(req.validate().is_ok());
+        assert_eq!(
+            only_file_part(&req).file_source(),
+            Ok(Some(FilePartSource::Stored {
+                file_id: "file-abc",
+                filename: None
+            }))
+        );
+    }
+
+    #[test]
+    fn file_part_with_no_source_is_rejected_by_validate() {
+        let req = file_request(serde_json::json!({"type": "file", "file": {"filename": "a.pdf"}}))
+            .expect("shape parses; source rule is enforced by validate");
+        let err = req.validate().unwrap_err();
+        assert!(err.contains("exactly one of"), "{err}");
+    }
+
+    #[test]
+    fn file_part_with_two_sources_is_rejected_by_validate() {
+        let req = file_request(serde_json::json!({
+            "type": "file", "file_id": "file-x",
+            "file": {"file_data": "SGk="}
+        }))
+        .unwrap();
+        let err = req.validate().unwrap_err();
+        assert!(err.contains("exactly one of"), "{err}");
+        assert!(!err.contains("SGk="), "error must not echo file_data");
+    }
+
+    #[test]
+    fn non_file_part_has_no_file_source() {
+        let part = MessageContentPart::Text {
+            text: "x".into(),
+            cache_control: None,
+        };
+        assert_eq!(part.file_source(), Ok(None));
+    }
+
     #[test]
     fn test_chat_completion_request_with_file_content_allowed() {
         let request = ChatCompletionRequest {
@@ -5121,7 +5280,8 @@ mod tests {
                 reasoning_content: None,
                 role: "user".to_string(),
                 content: Some(MessageContent::Parts(vec![MessageContentPart::File {
-                    file_id: "file-abc123".to_string(),
+                    file: None,
+                    file_id: Some("file-abc123".to_string()),
                 }])),
                 name: None,
                 tool_call_id: None,
@@ -5763,7 +5923,8 @@ mod input_modality_tests {
                     },
                 },
                 MessageContentPart::File {
-                    file_id: "file_1".to_string(),
+                    file: None,
+                    file_id: Some("file_1".to_string()),
                 },
             ]))),
         ];

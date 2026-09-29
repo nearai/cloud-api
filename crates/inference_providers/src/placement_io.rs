@@ -16,7 +16,7 @@
 //! error kinds and counts are logged or measured.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -182,11 +182,50 @@ pub fn routed_key(slot: &SlotId, sec: u64) -> String {
 /// is scoped to `replica:*`, so only admin can set it.
 pub const KILL_SWITCH_KEY: &str = "routed:_placement_off";
 
+/// When Valkey acknowledged one routed-count write, shared by the writer
+/// (which sets it) and the placing node's ledger entry (which reads it).
+/// Unset while the write is queued or in flight, and forever if the write is
+/// dropped or fails, so the entry keeps counting locally until it leaves the
+/// routed window (see [`placement::score::unseen_by_read`]).
+#[derive(Clone, Default)]
+pub struct RoutedAck(Arc<AtomicU64>);
+
+impl RoutedAck {
+    /// This node's clock when Valkey acknowledged the write, if it has.
+    pub fn acked_ms(&self) -> Option<u64> {
+        match self.0.load(Ordering::Acquire) {
+            0 => None,
+            ms => Some(ms),
+        }
+    }
+
+    /// Marks the write acknowledged at `at_ms` (0 is reserved for unset).
+    pub(crate) fn set(&self, at_ms: u64) {
+        self.0.store(at_ms.max(1), Ordering::Release);
+    }
+}
+
+/// Marks every routed write of a batch acknowledged at `at_ms`, but only
+/// when Valkey accepted the batch: a failed batch leaves them unset.
+fn acknowledge(acks: &[RoutedAck], result: &redis::RedisResult<()>, at_ms: u64) {
+    if result.is_ok() {
+        for ack in acks {
+            ack.set(at_ms);
+        }
+    }
+}
+
 /// A fire-and-forget write. Holds a pin id, so it intentionally has no
 /// `Debug`.
 pub enum Write {
     /// One routed request of `tok` tokens to `slot` in unix second `sec`.
-    Routed { slot: SlotId, tok: u64, sec: u64 },
+    /// `ack` is set once Valkey acknowledges the write.
+    Routed {
+        slot: SlotId,
+        tok: u64,
+        sec: u64,
+        ack: RoutedAck,
+    },
     /// A follow pin: `id_hex` (32 hex chars) now points at `slot`.
     Pin {
         id_hex: String,
@@ -208,7 +247,7 @@ impl Write {
 /// Appends `w`'s commands to `pipe`.
 fn push_write(pipe: &mut redis::Pipeline, w: &Write) {
     match w {
-        Write::Routed { slot, tok, sec } => {
+        Write::Routed { slot, tok, sec, .. } => {
             let key = routed_key(slot, *sec);
             pipe.cmd("HINCRBY").arg(&key).arg("req").arg(1).ignore();
             pipe.cmd("HINCRBY").arg(&key).arg("tok").arg(*tok).ignore();
@@ -453,20 +492,30 @@ async fn writer(
     metrics: Arc<dyn PlacementMetrics>,
 ) {
     let mut last_warn: Option<Instant> = None;
+    let mut acks: Vec<RoutedAck> = Vec::with_capacity(WRITE_BATCH);
     while let Some(first) = rx.recv().await {
         let mut pipe = redis::pipe();
-        push_write(&mut pipe, &first);
+        acks.clear();
+        let mut add = |w: Write, pipe: &mut redis::Pipeline| {
+            push_write(pipe, &w);
+            if let Write::Routed { ack, .. } = w {
+                acks.push(ack);
+            }
+        };
+        add(first, &mut pipe);
         let mut n = 1;
         while n < WRITE_BATCH {
             match rx.try_recv() {
                 Ok(w) => {
-                    push_write(&mut pipe, &w);
+                    add(w, &mut pipe);
                     n += 1;
                 }
                 Err(_) => break,
             }
         }
-        if let Err(e) = pipe.query_async::<()>(&mut conn).await {
+        let result = pipe.query_async::<()>(&mut conn).await;
+        acknowledge(&acks, &result, now_ms());
+        if let Err(e) = result {
             metrics.record_count(METRIC_WRITE_ERRORS, n as i64, &[]);
             if should_warn(last_warn, Instant::now()) {
                 tracing::warn!(
@@ -525,7 +574,11 @@ async fn read_cycle(
         let entries = warm_up(conn).await?;
         count_malformed_pins(metrics, state.warm_up(entries, now_ms()));
     }
-    fetch(conn, ReadTargets::new(reg, state), state, now_ms()).await
+    let targets = ReadTargets::new(reg, state);
+    // Taken just before the read is issued, never at completion: a routed
+    // write acknowledged while the read is in flight may be missing from it.
+    let read_ms = now_ms();
+    fetch(conn, targets, state, read_ms).await
 }
 
 /// What one reader cycle reads: the frame key of every attested host (from
@@ -571,6 +624,9 @@ pub(crate) struct RawRead {
     pins: Vec<PinEntry>,
     /// Unix second the routed counters were read for.
     now_s: u64,
+    /// This node's clock when the read was issued (the snapshot's
+    /// `routed_read_ms`).
+    read_ms: u64,
 }
 
 /// Reader-owned state that persists across cycles: monotonic ingest, the
@@ -828,6 +884,7 @@ impl ReaderState {
                 built_ms: now_ms,
                 replicas,
                 routed,
+                routed_read_ms: raw.read_ms,
                 pins: self.pins.clone(),
                 disabled: raw.kill_switch,
             },
@@ -953,13 +1010,15 @@ fn kill_switch_from_exists(reply: redis::Value) -> redis::RedisResult<bool> {
     Ok(redis::from_owned_redis_value::<i64>(reply)? > 0)
 }
 
+/// Issues one read pipeline. `read_ms` is this node's clock just before it
+/// is sent, recorded as the snapshot's `routed_read_ms`.
 async fn fetch(
     conn: &mut ConnectionManager,
     targets: ReadTargets,
     state: &ReaderState,
-    now_ms: u64,
+    read_ms: u64,
 ) -> redis::RedisResult<(ReadTargets, RawRead)> {
-    let now_s = now_ms / 1000;
+    let now_s = read_ms / 1000;
     let last_id = state.last_pin_id.as_deref().unwrap_or("0-0");
     let values: Vec<redis::Value> = read_pipeline(&targets, last_id, now_s)
         .query_async(conn)
@@ -1005,6 +1064,7 @@ async fn fetch(
             routed,
             pins,
             now_s,
+            read_ms,
         },
     ))
 }
@@ -1046,6 +1106,7 @@ pub(crate) fn snapshot_from_valkey_values(
                 .collect(),
             pins: Vec::new(),
             now_s: now_ms / 1000,
+            read_ms: now_ms,
         };
         snapshot = state.apply(&targets, raw, reg, now_ms).snapshot;
     }
@@ -1200,6 +1261,7 @@ mod tests {
             routed: vec![(0, 0); targets.slots.len()],
             pins: Vec::new(),
             now_s: now_ms / 1000,
+            read_ms: now_ms,
         }
     }
 
@@ -1271,6 +1333,42 @@ mod tests {
         assert!(!orphaned(&hosts));
         drop(handles);
         assert!(orphaned(&hosts));
+    }
+
+    #[test]
+    fn routed_read_ms_is_the_issue_time_and_survives_a_failed_read() {
+        let t0 = 10_000_000u64;
+        let metrics = FakeMetrics::default();
+        let reg = registry();
+        let slot = ArcSwap::from_pointee(Snapshot::default());
+        let mut state = ReaderState::default();
+
+        // The read was issued 300 ms before this cycle applied it.
+        let targets = ReadTargets::new(&reg, &state);
+        let mut r = raw(&targets, vec![Some(sealed_json(&report(1, t0)))], t0);
+        r.read_ms = t0 - 300;
+        publish_cycle(&mut state, &slot, Ok((targets, r)), &reg, t0, &metrics).unwrap();
+        assert_eq!(slot.load().routed_read_ms, t0 - 300);
+
+        // A failed read keeps the old routed counts, and with them the old
+        // read time.
+        let err = redis::RedisError::from((redis::ErrorKind::IoError, "down"));
+        assert!(publish_cycle(&mut state, &slot, Err(err), &reg, t0 + 500, &metrics).is_err());
+        assert_eq!(slot.load().routed_read_ms, t0 - 300);
+    }
+
+    #[test]
+    fn routed_write_is_acknowledged_only_when_valkey_accepts_it() {
+        let acks = [RoutedAck::default(), RoutedAck::default()];
+        assert_eq!(acks[0].acked_ms(), None);
+
+        let failed: redis::RedisResult<()> =
+            Err(redis::RedisError::from((redis::ErrorKind::IoError, "down")));
+        acknowledge(&acks, &failed, 1_234);
+        assert!(acks.iter().all(|a| a.acked_ms().is_none()));
+
+        acknowledge(&acks, &Ok(()), 1_234);
+        assert!(acks.iter().all(|a| a.acked_ms() == Some(1_234)));
     }
 
     #[test]
@@ -1691,6 +1789,7 @@ mod tests {
             slot: sid(HOST, 0),
             tok: 10,
             sec: 1,
+            ack: RoutedAck::default(),
         };
         for _ in 0..WRITE_QUEUE_CAPACITY {
             io.record(routed());
@@ -1865,6 +1964,7 @@ mod tests {
                 slot: sid("gpu01", 3),
                 tok: 42,
                 sec: 1_700,
+                ack: RoutedAck::default(),
             },
         );
         push_write(
@@ -1996,6 +2096,7 @@ mod tests {
                 slot: routed_slot.clone(),
                 tok: 77,
                 sec: now / 1000,
+                ack: RoutedAck::default(),
             },
         );
         push_write(

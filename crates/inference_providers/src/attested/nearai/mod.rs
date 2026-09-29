@@ -5932,8 +5932,8 @@ mod tests {
         use super::{role_msg, rotation_provider, user_msg, Provider};
         use crate::attested::nearai::placement_report::PlacementRequest;
         use crate::placement_io::{
-            PlacementHandles, PlacementIo, PlacementMetrics, Write, METRIC_AFFINITY,
-            METRIC_DECISIONS,
+            PlacementHandles, PlacementIo, PlacementMetrics, RoutedAck, Write, METRIC_AFFINITY,
+            METRIC_DECISIONS, METRIC_WRITES_DROPPED, WRITE_QUEUE_CAPACITY,
         };
         use crate::BackendHosts;
         use arc_swap::ArcSwap;
@@ -5942,7 +5942,7 @@ mod tests {
         use placement::decision::{AffinitySource, Placer};
         use placement::frame::{Lifecycle, Load, ReplicaState};
         use placement::policy::Tier;
-        use placement::snapshot::{ReplicaView, Snapshot};
+        use placement::snapshot::{ReplicaView, RoutedCounts, Snapshot};
         use placement::SlotId;
         use std::collections::HashMap;
         use std::sync::{Arc, Mutex};
@@ -6061,6 +6061,7 @@ mod tests {
             provider: Provider,
             metrics: Arc<FakeMetrics>,
             writes: mpsc::Receiver<Write>,
+            io: Arc<PlacementIo>,
         }
 
         /// A 4-backend rotation provider with placement installed: `host_map`
@@ -6132,7 +6133,7 @@ mod tests {
             let hosts = Arc::new(ArcSwap::from_pointee(BackendHosts::default()));
             provider.fleet.set_placement(PlacementHandles {
                 placer: Arc::new(Placer::new(PIN_SECRET, Tier::Base)),
-                io,
+                io: io.clone(),
                 hosts: hosts.clone(),
             });
             provider.fleet.set_backend_hosts(BackendHosts {
@@ -6146,6 +6147,7 @@ mod tests {
                 provider,
                 metrics,
                 writes,
+                io,
             }
         }
 
@@ -6446,7 +6448,9 @@ mod tests {
                 .expect("rotation active");
             assert_eq!(lease.index(), 2);
             match h.writes.try_recv().expect("routed write queued") {
-                Write::Routed { slot: s, tok, sec } => {
+                Write::Routed {
+                    slot: s, tok, sec, ..
+                } => {
                     assert_eq!(s, slot("h-a", 0));
                     assert_eq!(tok, 10);
                     assert!(sec >= before_s && sec <= now_ms() / 1000);
@@ -6460,6 +6464,135 @@ mod tests {
                 mine.get(&slot("h-a", 0)).map(|p| (p.req, p.tok)),
                 Some((1, 10))
             );
+        }
+
+        /// Places one keyless 10-token request on h-a#0 (backend 2) and
+        /// returns its queued routed write's acknowledgement handle.
+        fn place_one(h: &mut Harness) -> RoutedAck {
+            let mut req = request(COVERED_MODELS[0]);
+            req.prompt_tokens = 10;
+            let lease = h
+                .provider
+                .fleet
+                .acquire_index_placed(&messages_avoiding(2), None, &req)
+                .expect("not refused")
+                .expect("rotation active");
+            assert_eq!(lease.index(), 2);
+            match h.writes.try_recv().expect("routed write queued") {
+                Write::Routed { ack, .. } => ack,
+                Write::Pin { .. } => panic!("keyless request writes no pin"),
+            }
+        }
+
+        /// Replaces the current snapshot with the same replicas, as a later
+        /// reader cycle whose routed read was issued at `routed_read_ms` and
+        /// saw `routed` for h-a#0.
+        fn reread(h: &Harness, routed_read_ms: u64, routed: Option<(u32, u64)>) {
+            let old = h.io.snapshot.load_full();
+            h.io.snapshot.store(Arc::new(Snapshot {
+                built_ms: old.built_ms,
+                replicas: old.replicas.clone(),
+                routed: routed
+                    .map(|(req, tok)| {
+                        (
+                            slot("h-a", 0),
+                            RoutedCounts {
+                                req,
+                                tok,
+                                since_ms: routed_read_ms.saturating_sub(1_000),
+                            },
+                        )
+                    })
+                    .into_iter()
+                    .collect(),
+                routed_read_ms,
+                pins: old.pins.clone(),
+                disabled: false,
+            }));
+        }
+
+        fn mine_on_a0(h: &Harness) -> Option<(u32, u64)> {
+            h.provider
+                .fleet
+                .placement_mine(now_ms() / 1000)
+                .get(&slot("h-a", 0))
+                .map(|p| (p.req, p.tok))
+        }
+
+        #[test]
+        fn acked_placement_before_read_is_not_counted_twice() {
+            let mut h = harness(
+                &[("h-a", 2)],
+                snapshot("h-a", fresh_ms(), PinTable::default()),
+            );
+            let ack = place_one(&mut h);
+            let acked_ms = now_ms();
+            ack.set(acked_ms);
+
+            // A read issued after the acknowledgement already holds the
+            // placement in `routed`: this node adds nothing on top.
+            reread(&h, acked_ms + 1, Some((1, 10)));
+            assert_eq!(mine_on_a0(&h), None);
+
+            // A read issued at the acknowledgement instant may have missed
+            // it, so it is still counted locally.
+            reread(&h, acked_ms, Some((0, 0)));
+            assert_eq!(mine_on_a0(&h), Some((1, 10)));
+        }
+
+        #[test]
+        fn queued_placement_is_counted() {
+            let mut h = harness(
+                &[("h-a", 2)],
+                snapshot("h-a", fresh_ms(), PinTable::default()),
+            );
+            // The write is still in the queue (never acknowledged), so even
+            // a read issued after the placement cannot hold it.
+            let ack = place_one(&mut h);
+            assert_eq!(ack.acked_ms(), None);
+            reread(&h, now_ms() + 1_000, None);
+            assert_eq!(mine_on_a0(&h), Some((1, 10)));
+        }
+
+        #[test]
+        fn dropped_write_is_still_counted_locally() {
+            let h = harness(
+                &[("h-a", 2)],
+                snapshot("h-a", fresh_ms(), PinTable::default()),
+            );
+            // Fill the write queue so the placement's routed write is
+            // dropped: it never reaches Valkey and is never acknowledged.
+            let filler = || Write::Routed {
+                slot: slot("h-z", 0),
+                tok: 1,
+                sec: 0,
+                ack: RoutedAck::default(),
+            };
+            for _ in 0..WRITE_QUEUE_CAPACITY {
+                h.io.record(filler());
+            }
+            let mut req = request(COVERED_MODELS[0]);
+            req.prompt_tokens = 10;
+            h.provider
+                .fleet
+                .acquire_index_placed(&messages_avoiding(2), None, &req)
+                .expect("not refused")
+                .expect("rotation active");
+            let dropped: i64 = h
+                .metrics
+                .counts
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(n, _, _)| n == METRIC_WRITES_DROPPED)
+                .map(|(_, v, _)| *v)
+                .sum();
+            assert_eq!(dropped, 1);
+
+            // Every later read misses it; this node keeps counting it until
+            // it leaves the routed window.
+            reread(&h, now_ms() + 1_000, None);
+            assert_eq!(mine_on_a0(&h), Some((1, 10)));
         }
 
         #[test]

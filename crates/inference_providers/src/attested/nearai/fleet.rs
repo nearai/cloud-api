@@ -15,7 +15,7 @@
 use super::placement_report::{latency_tags, report_decision, PlacementRequest};
 use super::prefix_router::PrefixRouter;
 use super::Config;
-use crate::placement_io::{PlacementHandles, Write, METRIC_DURATION_MS, METRIC_TTFT_MS};
+use crate::placement_io::{PlacementHandles, RoutedAck, Write, METRIC_DURATION_MS, METRIC_TTFT_MS};
 use crate::rotation;
 use crate::spki_verifier::FingerprintState;
 use crate::BackendHosts;
@@ -23,7 +23,7 @@ use crate::BackendVerifier;
 use arc_swap::{ArcSwap, ArcSwapOption};
 use placement::consts::COVERED_MODELS;
 use placement::decision::{Decision, DecisionRecord, LegacyReason, PlaceInput};
-use placement::score::Pending;
+use placement::score::{unseen_by_read, OwnRouted, Pending};
 use placement::snapshot::Snapshot;
 use placement::SlotId;
 use reqwest::Client;
@@ -97,8 +97,15 @@ pub(super) fn update_ema(stat: &mut BackendStat, ttft_ms: f64) {
     stat.samples = stat.samples.saturating_add(1);
 }
 
-/// Placed (req, tok) per replica slot, keyed by unix second.
-type PlacementLedger = HashMap<u64, HashMap<SlotId, Pending>>;
+/// One request this node placed on a slot: its tokens, and when Valkey
+/// acknowledged its routed-count write (unset while queued, or if dropped).
+struct LedgerEntry {
+    tok: u64,
+    ack: RoutedAck,
+}
+
+/// This node's placed requests per replica slot, keyed by unix second.
+type PlacementLedger = HashMap<u64, HashMap<SlotId, Vec<LedgerEntry>>>;
 
 /// Poison-tolerant lock: a panicked holder shouldn't wedge routing — we only
 /// ever mutate small maps under it, so recovering the inner value is safe.
@@ -253,9 +260,9 @@ pub(super) struct Fleet {
     /// Smart-placement handles; `None` (every request on the legacy path)
     /// until `set_placement`. Lock-free on the hot path.
     placement: ArcSwapOption<PlacementHandles>,
-    /// This node's own placed (req, tok) per host, bucketed by unix second.
-    /// Only the current and previous second are kept, the same window the
-    /// Valkey routed hash covers. Held from reading it into `place()` to
+    /// This node's own placed requests per replica slot, bucketed by unix
+    /// second. Only the current and previous second are kept, the same
+    /// window the Valkey routed hash covers. Held from reading it into `place()` to
     /// reserving the chosen host (see `try_place`), never across an await.
     placement_ledger: Mutex<PlacementLedger>,
     /// Epoch-ms of the last `UnknownKey` warning, so a client stuck on a stale
@@ -842,7 +849,7 @@ impl Fleet {
         // happen after the lock is released.
         let placed = {
             let mut ledger = lock(&self.placement_ledger);
-            let mine = mine_in(&ledger, now_s);
+            let mine = mine_in(&ledger, now_s, snapshot.routed_read_ms);
             let decision = handles
                 .placer
                 .place(&input, &snapshot, &mine, &mut rand::rng());
@@ -880,13 +887,13 @@ impl Fleet {
                         Err(Unplaced::Fallback(record))
                     }
                     Some(index) => {
-                        ledger_add(&mut ledger, slot.clone(), input.prompt_tokens, now_s);
-                        Ok((slot, index, record, pin_write))
+                        let ack = ledger_add(&mut ledger, slot.clone(), input.prompt_tokens, now_s);
+                        Ok((slot, index, record, pin_write, ack))
                     }
                 },
             }
         };
-        let (slot, index, record, pin_write) = match placed {
+        let (slot, index, record, pin_write, ack) = match placed {
             Ok(placed) => placed,
             Err(Unplaced::Fallback(record)) => {
                 report_decision(handles, &record, request);
@@ -911,6 +918,7 @@ impl Fleet {
             slot,
             tok: input.prompt_tokens,
             sec: now_s,
+            ack,
         });
         if let Some((pin_id, pin_slot)) = pin_write {
             handles.io.record(Write::Pin {
@@ -965,10 +973,17 @@ impl Fleet {
             .filter(|index| *index < count)
     }
 
-    /// This node's own placed load per replica slot over `{now_s - 1, now_s}`.
+    /// This node's own placed load per replica slot over `{now_s - 1, now_s}`
+    /// that the installed snapshot's routed read cannot hold yet: what
+    /// `try_place` passes to the placer as `mine`.
     #[cfg(test)]
     pub(super) fn placement_mine(&self, now_s: u64) -> HashMap<SlotId, Pending> {
-        mine_in(&lock(&self.placement_ledger), now_s)
+        let routed_read_ms = self
+            .placement
+            .load()
+            .as_ref()
+            .map_or(0, |handles| handles.io.snapshot.load().routed_read_ms);
+        mine_in(&lock(&self.placement_ledger), now_s, routed_read_ms)
     }
 
     /// Rate-limited warning for a pinned key that discovery does not know.
@@ -1061,28 +1076,49 @@ fn epoch_ms() -> u64 {
         })
 }
 
-/// This node's own placed load per replica slot over `{now_s - 1, now_s}`.
-fn mine_in(ledger: &PlacementLedger, now_s: u64) -> HashMap<SlotId, Pending> {
-    let mut mine: HashMap<SlotId, Pending> = HashMap::new();
+/// This node's own placed load per replica slot over `{now_s - 1, now_s}`
+/// that a snapshot whose routed read was issued at `routed_read_ms` cannot
+/// hold yet: per slot, [`unseen_by_read`] of its ledger entries. A slot
+/// whose every entry is already in `routed` is left out.
+fn mine_in(ledger: &PlacementLedger, now_s: u64, routed_read_ms: u64) -> HashMap<SlotId, Pending> {
     let window = now_s.saturating_sub(1)..=now_s;
+    let mut own: HashMap<&SlotId, Vec<OwnRouted>> = HashMap::new();
     for (_, slots) in ledger.iter().filter(|(sec, _)| window.contains(*sec)) {
-        for (slot, pending) in slots {
-            let entry = mine.entry(slot.clone()).or_default();
-            entry.req = entry.req.saturating_add(pending.req);
-            entry.tok = entry.tok.saturating_add(pending.tok);
+        for (slot, entries) in slots {
+            own.entry(slot)
+                .or_default()
+                .extend(entries.iter().map(|entry| OwnRouted {
+                    pending: Pending {
+                        req: 1,
+                        tok: entry.tok,
+                    },
+                    acked_ms: entry.ack.acked_ms(),
+                }));
         }
     }
-    mine
+    own.into_iter()
+        .map(|(slot, entries)| (slot.clone(), unseen_by_read(&entries, routed_read_ms)))
+        .filter(|(_, pending)| pending.req > 0 || pending.tok > 0)
+        .collect()
 }
 
 /// Reserves one placed request of `tok` tokens on `slot` in second `now_s`,
 /// dropping seconds that left the window (and with them the entries of any
-/// slot that has since left its host's frame).
-fn ledger_add(ledger: &mut PlacementLedger, slot: SlotId, tok: u64, now_s: u64) {
+/// slot that has since left its host's frame). Returns the entry's
+/// acknowledgement handle, for its routed write.
+fn ledger_add(ledger: &mut PlacementLedger, slot: SlotId, tok: u64, now_s: u64) -> RoutedAck {
     ledger.retain(|sec, _| sec.saturating_add(1) >= now_s);
-    let pending = ledger.entry(now_s).or_default().entry(slot).or_default();
-    pending.req = pending.req.saturating_add(1);
-    pending.tok = pending.tok.saturating_add(tok);
+    let ack = RoutedAck::default();
+    ledger
+        .entry(now_s)
+        .or_default()
+        .entry(slot)
+        .or_default()
+        .push(LedgerEntry {
+            tok,
+            ack: ack.clone(),
+        });
+    ack
 }
 
 /// Turns a `Place` record into the `Legacy` one the caller fell back with.
@@ -1243,7 +1279,7 @@ mod demote_tests {
         ledger_add(&mut ledger, slot("host-a", 0), 20, 51);
 
         // Then: each replica keeps its own pending load over the window.
-        let mine = mine_in(&ledger, 51);
+        let mine = mine_in(&ledger, 51, 0);
         assert_eq!(mine.len(), 2);
         let pending = |r| mine.get(&slot("host-a", r)).map(|p| (p.req, p.tok));
         assert_eq!(pending(0), Some((2, 120)));
@@ -1251,7 +1287,7 @@ mod demote_tests {
 
         // A later second drops what left the window, per replica.
         ledger_add(&mut ledger, slot("host-a", 1), 5, 53);
-        let mine = mine_in(&ledger, 53);
+        let mine = mine_in(&ledger, 53, 0);
         assert_eq!(mine.len(), 1);
         assert_eq!(
             mine.get(&slot("host-a", 1)).map(|p| (p.req, p.tok)),

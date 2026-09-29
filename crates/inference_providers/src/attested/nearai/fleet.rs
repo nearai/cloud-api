@@ -35,6 +35,24 @@ use std::sync::{Arc, Mutex, MutexGuard, OnceLock, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::Semaphore;
 
+/// What placement did with a request, as the provider acts on it.
+pub(super) enum PlacedOutcome {
+    /// Placed on a replica slot: send there, with the replica hint.
+    Lease(RouteLease),
+    /// No usable placement (skipped, Legacy, or a demoted decision): the
+    /// existing `acquire_index` path.
+    Fallback,
+    /// Every replica the tier allows is at its cap, on a complete picture:
+    /// the provider fails fast with `CapacityRefused`.
+    Refused,
+}
+
+/// A decision that did not become a lease, with the record to report.
+enum Unplaced {
+    Fallback(DecisionRecord),
+    Refused(DecisionRecord),
+}
+
 /// EMA smoothing for per-backend TTFT: fast warmup then stable.
 const TTFT_EWMA_ALPHA_WARMUP: f64 = 0.5;
 const TTFT_EWMA_ALPHA_STABLE: f64 = 0.1;
@@ -694,22 +712,26 @@ impl Fleet {
         }
     }
 
-    /// Place a covered-model request on the least-stalling host, or fall
-    /// through to `acquire_index` unchanged. Placement is skipped entirely
-    /// (no decision, log or metric) when it is not installed, the model is
-    /// not covered, or rotation is unavailable. A `Legacy` decision, an
+    /// Place a covered-model request on a replica slot, or fall through to
+    /// `acquire_index` unchanged (`Ok(None)` there means rotation is
+    /// unavailable: the canonical path). Placement is skipped entirely (no
+    /// decision, log or metric) when it is not installed, the model is not
+    /// covered, or rotation is unavailable. A `Legacy` decision, an
     /// incomplete host map or snapshot, an unmapped host, or a host outside
-    /// the pinned E2EE key group all run the existing path.
+    /// the pinned E2EE key group all run the existing path. Only a refusal
+    /// that passed the fail-open gates is `Err(CapacityRefused)`, returned
+    /// before any upstream request.
     pub(super) fn acquire_index_placed(
         &self,
         messages: &[crate::ChatMessage],
         pinned_pub_key: Option<&str>,
         request: &PlacementRequest,
-    ) -> Option<RouteLease> {
-        if let Some(lease) = self.try_place(messages, pinned_pub_key, request) {
-            return Some(lease);
+    ) -> Result<Option<RouteLease>, crate::CompletionError> {
+        match self.try_place(messages, pinned_pub_key, request) {
+            PlacedOutcome::Lease(lease) => Ok(Some(lease)),
+            PlacedOutcome::Refused => Err(crate::CompletionError::CapacityRefused),
+            PlacedOutcome::Fallback => Ok(self.acquire_index(messages, pinned_pub_key)),
         }
-        self.acquire_index(messages, pinned_pub_key)
     }
 
     fn try_place(
@@ -717,15 +739,17 @@ impl Fleet {
         messages: &[crate::ChatMessage],
         pinned_pub_key: Option<&str>,
         request: &PlacementRequest,
-    ) -> Option<RouteLease> {
+    ) -> PlacedOutcome {
         if !COVERED_MODELS.contains(&request.model.as_str()) {
-            return None;
+            return PlacedOutcome::Fallback;
         }
         let guard = self.placement.load();
-        let handles = guard.as_ref()?;
+        let Some(handles) = guard.as_ref() else {
+            return PlacedOutcome::Fallback;
+        };
         let count = self.rotation_count();
         if count == 0 {
-            return None;
+            return PlacedOutcome::Fallback;
         }
         let now_ms = epoch_ms();
         let now_s = now_ms / 1_000;
@@ -766,13 +790,20 @@ impl Fleet {
                 .placer
                 .place(&input, &snapshot, &mine, &mut rand::rng());
             match decision {
-                Decision::Legacy { record, .. } => Err(record),
-                // Until the pool can act on a refusal (L6), it falls back
-                // like Legacy.
-                Decision::Refused { record } => Err(record),
+                Decision::Legacy { record, .. } => Err(Unplaced::Fallback(record)),
+                // A refusal is only as good as the picture it was made on:
+                // the same fail-open gates as a placement (host map complete
+                // and built for this backend count) or it is Legacy. The
+                // host and key-group gates need a chosen host, so they don't
+                // apply.
+                Decision::Refused { mut record } if incomplete || self.host_map_stale() => {
+                    demote(&mut record, LegacyReason::Incomplete);
+                    Err(Unplaced::Fallback(record))
+                }
+                Decision::Refused { record } => Err(Unplaced::Refused(record)),
                 Decision::Place { mut record, .. } if incomplete => {
                     demote(&mut record, LegacyReason::Incomplete);
-                    Err(record)
+                    Err(Unplaced::Fallback(record))
                 }
                 Decision::Place {
                     slot,
@@ -781,7 +812,7 @@ impl Fleet {
                 } => match self.index_for_host(&slot.host, count) {
                     None => {
                         demote(&mut record, LegacyReason::HostUnmapped);
-                        Err(record)
+                        Err(Unplaced::Fallback(record))
                     }
                     Some(index)
                         if key_group
@@ -789,7 +820,7 @@ impl Fleet {
                             .is_some_and(|group| !group.contains(&index)) =>
                     {
                         demote(&mut record, LegacyReason::KeyGroup);
-                        Err(record)
+                        Err(Unplaced::Fallback(record))
                     }
                     Some(index) => {
                         ledger_add(&mut ledger, slot.clone(), input.prompt_tokens, now_s);
@@ -800,9 +831,13 @@ impl Fleet {
         };
         let (slot, index, record, pin_write) = match placed {
             Ok(placed) => placed,
-            Err(record) => {
+            Err(Unplaced::Fallback(record)) => {
                 report_decision(handles, &record, request);
-                return None;
+                return PlacedOutcome::Fallback;
+            }
+            Err(Unplaced::Refused(record)) => {
+                report_decision(handles, &record, request);
+                return PlacedOutcome::Refused;
             }
         };
         if matches!(key_group, KeyGroup::UnknownKey) {
@@ -824,7 +859,7 @@ impl Fleet {
             });
         }
         report_decision(handles, &record, request);
-        Some(lease)
+        PlacedOutcome::Lease(lease)
     }
 
     /// True when placing would starve hosts the placer cannot see: the host
@@ -848,14 +883,20 @@ impl Fleet {
             .any(|host| !seen.contains(host.as_str()))
     }
 
+    /// True when the pushed host map was built for a different backend
+    /// count than this Fleet's current one, so its bindings are stale.
+    fn host_map_stale(&self) -> bool {
+        self.backend_hosts.load().count != self.backend_count()
+    }
+
     /// The backend index `host` is bound to, when the pushed host map was
     /// built for this Fleet's current backend count (otherwise the binding
     /// is stale) and the index is within the rotation fan-out.
     fn index_for_host(&self, host: &str, count: usize) -> Option<usize> {
-        let hosts = self.backend_hosts.load();
-        if hosts.count != self.backend_count() {
+        if self.host_map_stale() {
             return None;
         }
+        let hosts = self.backend_hosts.load();
         hosts
             .index_by_host
             .get(host)

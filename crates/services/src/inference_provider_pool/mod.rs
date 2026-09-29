@@ -2737,6 +2737,7 @@ impl InferenceProviderPool {
                 operation,
                 timeout_seconds,
             },
+            CompletionError::CapacityRefused => CompletionError::CapacityRefused,
         }
     }
 
@@ -2757,6 +2758,7 @@ impl InferenceProviderPool {
             CompletionError::ClientMediaError(_) => "client_media_error",
             CompletionError::NoPubKeyProvider(_) => "no_pubkey_provider",
             CompletionError::Timeout { .. } => "timeout",
+            CompletionError::CapacityRefused => "capacity_refused",
         }
     }
 
@@ -2957,6 +2959,9 @@ impl InferenceProviderPool {
             CompletionError::NoPubKeyProvider(_) => "non_retryable_no_pubkey_provider",
             CompletionError::InvalidResponse(_) => "non_retryable_invalid_response",
             CompletionError::Unknown(_) => "non_retryable_unknown",
+            // Not `retryable_`: a refusal moves on to the next candidate in
+            // the same round, never retries the round or counts a failure.
+            CompletionError::CapacityRefused => "capacity_refused",
         }
     }
 
@@ -3431,6 +3436,9 @@ impl InferenceProviderPool {
         // and prevents the regex matchers in classify_retry_decision from
         // being defeated by sanitization.
         let mut last_retry_decision: Option<&'static str> = None;
+        // Whether `last_error` is a placement refusal (`CapacityRefused`), so
+        // a later context-length 400 fall-through does not replace it.
+        let mut last_was_refused = false;
         let mut total_attempts: usize = 0;
         let mut retry_count: usize = 0;
         let started_at = std::time::Instant::now();
@@ -3654,6 +3662,11 @@ impl InferenceProviderPool {
                         // loop, and the terminal "All providers failed" log.
                         let retry_decision = Self::classify_retry_decision(&e);
                         let is_retryable_error = retry_decision.starts_with("retryable_");
+                        // A placement refusal: the provider sent nothing
+                        // upstream. Move on to the next candidate in this
+                        // round; never back off, count a failure, or unlock
+                        // a sibling NEAR tier.
+                        let refused = matches!(e, CompletionError::CapacityRefused);
                         if let Some(pinned) = pinned_near_capacity {
                             let is_pinned_tier_provider = provider.tier()
                                 == inference_providers::ProviderTier::Near
@@ -3664,7 +3677,8 @@ impl InferenceProviderPool {
                                     == Some(pinned);
                             if is_pinned_tier_provider {
                                 allow_larger_near |= context_400_fell_through;
-                                allow_any_near |= !context_400_fell_through && !is_retryable_error;
+                                allow_any_near |=
+                                    !context_400_fell_through && !is_retryable_error && !refused;
                             }
                         }
 
@@ -3795,11 +3809,20 @@ impl InferenceProviderPool {
                         // surfaces a retryable 503 to the client instead of a
                         // misleading "maximum context length" 400 for a request that
                         // is genuinely servable.
-                        let keep_prior_retryable = context_400_fell_through
-                            && last_retry_decision.is_some_and(|d| d.starts_with("retryable_"));
-                        if !keep_prior_retryable {
+                        //
+                        // The same holds for a refusal (an expected
+                        // rejection before any upstream call): it never
+                        // replaces an earlier retryable error, which then
+                        // drives the round retry. And a context-length 400
+                        // never replaces an earlier refusal, so the client
+                        // gets the 429, not a misleading 400.
+                        let keep_prior = (context_400_fell_through || refused)
+                            && (last_retry_decision.is_some_and(|d| d.starts_with("retryable_"))
+                                || (context_400_fell_through && last_was_refused));
+                        if !keep_prior {
                             last_error = Some(Self::sanitize_completion_error(e, model_id));
                             last_retry_decision = Some(retry_decision);
+                            last_was_refused = refused;
                         }
                     }
                 }
@@ -11349,6 +11372,219 @@ mod tests {
             base_capacity([Some(262_144), Some(100_000), Some(1_048_576)]),
             Some(100_000)
         );
+    }
+
+    // --- Placement refusal (CapacityRefused) in the attempt loop ---
+
+    /// A two-tier NEAR model (262k base, 1M long, no attested fallback) and a
+    /// ~360k-token request: the candidate order is [long, base].
+    async fn refusal_pool() -> (
+        InferenceProviderPool,
+        Arc<inference_providers::mock::MockProvider>,
+        Arc<inference_providers::mock::MockProvider>,
+        inference_providers::ChatCompletionParams,
+    ) {
+        let model = "z-ai/glm-5.2";
+        let (pool, providers) = capacity_pool(model, &[262_144, 1_048_576]).await;
+        (
+            pool,
+            providers[0].clone(),
+            providers[1].clone(),
+            sized_params(model, 1_200_000),
+        )
+    }
+
+    fn priority(request_priority: i32) -> ChatRoutingHints {
+        ChatRoutingHints {
+            request_priority,
+            ..Default::default()
+        }
+    }
+
+    async fn calls(provider: &inference_providers::mock::MockProvider) -> usize {
+        provider.chat_request_priorities().await.len()
+    }
+
+    fn failure_count(pool: &InferenceProviderPool, provider: &Arc<impl ?Sized>) -> u32 {
+        pool.provider_failure_counts
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&(Arc::as_ptr(provider) as *const () as usize))
+            .copied()
+            .unwrap_or(0)
+    }
+
+    fn context_400() -> CompletionError {
+        CompletionError::HttpError {
+            status_code: 400,
+            message: "This model's maximum context length is 262144 tokens.".to_string(),
+            is_external: false,
+        }
+    }
+
+    #[tokio::test]
+    async fn refusal_does_not_backoff_or_count_failure() {
+        let (pool, base, long, params) = refusal_pool().await;
+        long.set_error_override(Some(CompletionError::CapacityRefused))
+            .await;
+        base.set_error_override(Some(CompletionError::CapacityRefused))
+            .await;
+
+        let started = std::time::Instant::now();
+        let result = pool
+            .chat_completion_with_attribution_and_hints(params, "h".to_string(), priority(0))
+            .await;
+        assert!(matches!(result, Err(CompletionError::CapacityRefused)));
+        // One round: each candidate once, and no backoff sleep (>= 500 ms).
+        assert_eq!((calls(&long).await, calls(&base).await), (1, 1));
+        assert!(started.elapsed() < Duration::from_millis(400));
+        assert_eq!(failure_count(&pool, &long), 0);
+        assert_eq!(failure_count(&pool, &base), 0);
+    }
+
+    #[tokio::test]
+    async fn pool_tries_base_after_long_refusal_for_normal_priority() {
+        let (pool, base, long, params) = refusal_pool().await;
+        long.set_error_override(Some(CompletionError::CapacityRefused))
+            .await;
+
+        pool.chat_completion_with_attribution_and_hints(params, "h".to_string(), priority(0))
+            .await
+            .expect("base serves after the long tier refuses");
+        assert_eq!((calls(&long).await, calls(&base).await), (1, 1));
+        assert_eq!(failure_count(&pool, &long), 0);
+    }
+
+    /// Disclosed ordering: an attested third-party fallback that fits the
+    /// context sorts ahead of the overflowing base tier, so after a long-tier
+    /// refusal it is tried before base (priority >= 0), and it is still tried
+    /// at negative priority (the #1117 pin only excludes sibling NEAR tiers).
+    #[tokio::test]
+    async fn long_refusal_tries_attested_fallback_before_base_when_configured() {
+        use inference_providers::mock::MockProvider;
+        use inference_providers::ProviderTier;
+
+        for request_priority in [0, -2] {
+            let (pool, base, long, params) = refusal_pool().await;
+            long.set_error_override(Some(CompletionError::CapacityRefused))
+                .await;
+            let fallback =
+                Arc::new(MockProvider::new_accept_all().with_tier(ProviderTier::Attested3p));
+            {
+                let mut m = pool.provider_mappings.write().await;
+                m.model_to_providers
+                    .get_mut("z-ai/glm-5.2")
+                    .unwrap()
+                    .push(fallback.clone() as Arc<InferenceProviderTrait>);
+            }
+            {
+                let mut states = pool
+                    .provider_load_state
+                    .write()
+                    .unwrap_or_else(|e| e.into_inner());
+                states
+                    .entry(Arc::as_ptr(&fallback) as *const () as usize)
+                    .or_default()
+                    .max_context_tokens = Some(1_048_576);
+            }
+
+            pool.chat_completion_with_attribution_and_hints(
+                params,
+                "h".to_string(),
+                priority(request_priority),
+            )
+            .await
+            .expect("the attested fallback serves");
+            assert_eq!(
+                (
+                    calls(&long).await,
+                    calls(&fallback).await,
+                    calls(&base).await
+                ),
+                (1, 1, 0),
+                "priority {request_priority}: long, then the fallback; base never reached"
+            );
+        }
+    }
+
+    /// Pins the #1117 guard: a refusal on the pinned (long) tier must not
+    /// unlock the sibling NEAR tier the way a non-retryable error does.
+    #[tokio::test]
+    async fn negative_priority_long_refusal_returns_429_without_base() {
+        let (pool, base, long, params) = refusal_pool().await;
+        long.set_error_override(Some(CompletionError::CapacityRefused))
+            .await;
+
+        let result = pool
+            .chat_completion_with_attribution_and_hints(params, "h".to_string(), priority(-2))
+            .await;
+        assert!(matches!(result, Err(CompletionError::CapacityRefused)));
+        assert_eq!(calls(&long).await, 1);
+        assert_eq!(
+            calls(&base).await,
+            0,
+            "negative priority never reaches base"
+        );
+    }
+
+    /// A 503 from one candidate, then a refusal: the 503 stays the last
+    /// error and drives the round retry.
+    #[tokio::test]
+    async fn refusal_does_not_clobber_prior_retryable_error() {
+        let (pool, base, long, params) = refusal_pool().await;
+        long.set_error_override(Some(CompletionError::HttpError {
+            status_code: 503,
+            message: "queue full".to_string(),
+            is_external: false,
+        }))
+        .await;
+        base.set_error_override(Some(CompletionError::CapacityRefused))
+            .await;
+
+        let result = pool
+            .chat_completion_with_attribution_and_hints(params, "h".to_string(), priority(0))
+            .await;
+        match result {
+            Err(CompletionError::HttpError { status_code, .. }) => assert_eq!(status_code, 503),
+            Err(other) => panic!("expected the retryable 503, got: {other}"),
+            Ok(_) => panic!("expected the retryable 503, got a success"),
+        }
+        assert!(calls(&long).await > 1, "the 503 retried the round");
+        assert_eq!(calls(&long).await, calls(&base).await);
+        assert_eq!(failure_count(&pool, &base), 0);
+    }
+
+    /// A context-length 400 falling through after a refusal must not replace
+    /// it: the client gets a 429, not a misleading 400.
+    #[tokio::test]
+    async fn context_400_after_refusal_returns_429_not_400() {
+        let (pool, base, long, params) = refusal_pool().await;
+        long.set_error_override(Some(CompletionError::CapacityRefused))
+            .await;
+        base.set_error_override(Some(context_400())).await;
+
+        let result = pool
+            .chat_completion_with_attribution_and_hints(params, "h".to_string(), priority(0))
+            .await;
+        assert!(matches!(result, Err(CompletionError::CapacityRefused)));
+        assert_eq!((calls(&long).await, calls(&base).await), (1, 1));
+    }
+
+    #[test]
+    fn capacity_refused_has_its_own_labels() {
+        let e = CompletionError::CapacityRefused;
+        assert_eq!(
+            InferenceProviderPool::classify_retry_decision(&e),
+            "capacity_refused"
+        );
+        assert_eq!(
+            InferenceProviderPool::classify_error_kind(&e),
+            "capacity_refused"
+        );
+        assert!(matches!(
+            InferenceProviderPool::sanitize_completion_error(e, "m"),
+            CompletionError::CapacityRefused
+        ));
     }
 
     /// `register_pinned_secondary_provider` records the declared context

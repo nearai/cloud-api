@@ -1008,6 +1008,12 @@ pub enum CompletionError {
         operation: String,
         timeout_seconds: u64,
     },
+    /// Smart placement refused the request before any upstream call: every
+    /// replica its tier allows is at its heavy-lane cap. Transient (clears as
+    /// backlog drains); the pool moves to the next candidate without backoff
+    /// or a failure count, and surfaces a 429 if none serves.
+    #[error("Placement refused: capacity")]
+    CapacityRefused,
 }
 
 /// Parameters for image generation requests

@@ -206,6 +206,8 @@ impl StopReason {
             // error variants, matching the siblings above.
             inference_providers::CompletionError::ClientMediaError(_) => StopReason::ProviderError,
             inference_providers::CompletionError::Timeout { .. } => StopReason::Timeout,
+            // Surfaced to the client as a 429, like a rate limit.
+            inference_providers::CompletionError::CapacityRefused => StopReason::RateLimited,
         }
     }
 }

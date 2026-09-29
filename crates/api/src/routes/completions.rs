@@ -327,6 +327,7 @@ fn completion_stream_error_category(e: &inference_providers::CompletionError) ->
         inference_providers::CompletionError::Unknown(_) => "unknown",
         inference_providers::CompletionError::ClientMediaError(_) => "client_media_error",
         inference_providers::CompletionError::Timeout { .. } => "timeout",
+        inference_providers::CompletionError::CapacityRefused => "capacity_refused",
     }
 }
 
@@ -352,6 +353,8 @@ fn completion_stream_error_openai_type(e: &inference_providers::CompletionError)
         | inference_providers::CompletionError::Unknown(_)
         | inference_providers::CompletionError::NoPubKeyProvider(_)
         | inference_providers::CompletionError::Timeout { .. } => "server_error",
+        // Same type as the non-stream path's `ServiceOverloaded` (a 429).
+        inference_providers::CompletionError::CapacityRefused => "service_overloaded",
     }
 }
 
@@ -4690,6 +4693,17 @@ mod tests {
         assert_eq!(
             completion_stream_error_openai_type(&parse_err),
             "server_error"
+        );
+
+        // A placement refusal matches the non-stream `ServiceOverloaded` 429.
+        let refused = inference_providers::CompletionError::CapacityRefused;
+        assert_eq!(
+            completion_stream_error_openai_type(&refused),
+            "service_overloaded"
+        );
+        assert_eq!(
+            completion_stream_error_category(&refused),
+            "capacity_refused"
         );
     }
 

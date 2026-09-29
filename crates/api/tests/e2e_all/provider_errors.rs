@@ -94,6 +94,34 @@ async fn test_provider_error_503_propagated() {
     assert_retry_after_present(&response);
 }
 
+/// A smart-placement refusal (`CapacityRefused`: every replica the request
+/// may use is at its cap) surfaces as a 429 `service_overloaded` with a
+/// `Retry-After`, on both the JSON and the streaming path.
+#[tokio::test]
+async fn test_placement_capacity_refusal_is_429_with_retry_after() {
+    let (server, _pool, mock_provider, _db) = setup_test_server_with_pool().await;
+    setup_qwen_model(&server).await;
+    let org = setup_org_with_credits(&server, 10_000_000_000i64).await;
+    let api_key = get_api_key_for_org(&server, org.id).await;
+
+    mock_provider
+        .set_error_override(Some(inference_providers::CompletionError::CapacityRefused))
+        .await;
+
+    for stream in [false, true] {
+        let response = server
+            .post("/v1/chat/completions")
+            .add_header("Authorization", format!("Bearer {api_key}"))
+            .json(&chat_request("Qwen/Qwen3-30B-A3B-Instruct-2507", stream))
+            .await;
+
+        assert_eq!(response.status_code(), 429, "stream={stream}");
+        let err = response.json::<api::models::ErrorResponse>();
+        assert_eq!(err.error.r#type, "service_overloaded", "stream={stream}");
+        assert_retry_after_present(&response);
+    }
+}
+
 /// Test that a 429 error from the provider is propagated as rate_limit_exceeded
 #[tokio::test]
 async fn test_provider_error_429_propagated() {

@@ -1964,7 +1964,7 @@ impl InferenceProvider for Fleet {
             &streaming_params.messages,
             pinned_pub_key.as_deref(),
             &placement_request,
-        ) {
+        )? {
             None => {
                 let url = format!("{}/v1/chat/completions", self.config.base_url);
                 let response = self
@@ -2151,7 +2151,7 @@ impl InferenceProvider for Fleet {
             &non_streaming_params.messages,
             pinned_pub_key.as_deref(),
             &placement_request,
-        ) {
+        )? {
             None => {
                 let url = format!("{}/v1/chat/completions", self.config.base_url);
                 let response = self
@@ -6174,6 +6174,7 @@ mod tests {
                     provider
                         .fleet
                         .acquire_index_placed(messages, pinned, req)
+                        .expect("not refused")
                         .expect("rotation active")
                 })
                 .collect();
@@ -6407,6 +6408,7 @@ mod tests {
                 .provider
                 .fleet
                 .acquire_index_placed(&messages, None, &req)
+                .expect("not refused")
                 .expect("rotation active");
             assert_eq!(lease.index(), 2);
             match h.writes.try_recv().expect("routed write queued") {
@@ -6443,6 +6445,7 @@ mod tests {
                 .provider
                 .fleet
                 .acquire_index_placed(&messages_avoiding(2), None, &req)
+                .expect("not refused")
                 .expect("rotation active");
             assert_eq!(lease.index(), 2);
             assert_eq!(lease.replica(), Some(3));
@@ -6467,6 +6470,7 @@ mod tests {
                     .provider
                     .fleet
                     .acquire_index_placed(&messages, None, req)
+                    .expect("not refused")
                     .expect("rotation active");
                 assert_eq!(lease.replica(), None);
             }
@@ -6514,6 +6518,7 @@ mod tests {
                 .provider
                 .fleet
                 .acquire_index_placed(&messages, None, &req)
+                .expect("not refused")
                 .expect("rotation active");
             assert_eq!(lease.index(), 2);
             assert!(matches!(
@@ -6689,6 +6694,7 @@ mod tests {
                     .provider
                     .fleet
                     .acquire_index_placed(&messages_avoiding(0), None, &req)
+                    .expect("not refused")
                     .expect("rotation active");
                 assert_eq!(h.metrics.decisions_tagged("outcome:place"), 1);
                 assert_eq!(lease.replica(), Some(0));
@@ -6926,6 +6932,97 @@ mod tests {
                 }
             }
 
+            /// Every replica h-a (backend 2) publishes is a full heavy-lane
+            /// member: a heavy request fits none of them.
+            fn saturated_snapshot(built_ms: u64) -> Snapshot {
+                Snapshot {
+                    built_ms,
+                    replicas: (0..4)
+                        .map(|r| {
+                            let mut view = ready_replica("h-a", r, built_ms);
+                            view.state.load.prefill_backlog_tokens =
+                                Some(placement::consts::HEAVY_BACKLOG_CAP);
+                            view
+                        })
+                        .collect(),
+                    ..Snapshot::default()
+                }
+            }
+
+            /// A covered-model request the pool classed heavy.
+            fn heavy_params() -> ChatCompletionParams {
+                let mut params = params(COVERED_MODELS[0]);
+                params.placement = crate::PlacementContext {
+                    prompt_tokens: Some(100_000),
+                    context_tokens: Some(120_000),
+                    heavy: true,
+                    ..Default::default()
+                };
+                params
+            }
+
+            #[tokio::test]
+            async fn refused_maps_to_capacity_refused_without_dialing_upstream() {
+                let upstream = MockServer::start().await;
+                Mock::given(method("POST"))
+                    .respond_with(respond(None))
+                    .expect(0)
+                    .mount(&upstream)
+                    .await;
+                let h = harness_on(
+                    upstream_provider(&upstream),
+                    &[("h-a", 2)],
+                    4,
+                    saturated_snapshot(fresh_ms()),
+                );
+
+                let json = h
+                    .provider
+                    .chat_completion(heavy_params(), "synthetic-hash-json".into())
+                    .await;
+                assert!(matches!(json, Err(crate::CompletionError::CapacityRefused)));
+                let sse = h
+                    .provider
+                    .chat_completion_stream(heavy_params(), "synthetic-hash-sse".into())
+                    .await;
+                assert!(matches!(sse, Err(crate::CompletionError::CapacityRefused)));
+                assert_eq!(h.metrics.decisions_tagged("outcome:refused"), 2);
+                assert!(upstream.received_requests().await.unwrap().is_empty());
+            }
+
+            /// A refusal passes the same fail-open gates as a placement: an
+            /// incomplete host map, or one built for another backend count,
+            /// demotes it to the legacy path, which serves the request.
+            #[tokio::test]
+            async fn refused_with_incomplete_host_map_is_fallback_not_429() {
+                let upstream = mock_upstream(None).await;
+                // Only h-a is mapped, of 4 backends.
+                let partial = install(
+                    upstream_provider(&upstream),
+                    &[("h-a".to_string(), 2)],
+                    4,
+                    saturated_snapshot(fresh_ms()),
+                );
+                send_both(&partial.provider, heavy_params()).await;
+                assert_eq!(partial.metrics.decisions_tagged("reason:incomplete"), 2);
+                assert_eq!(partial.metrics.decisions_tagged("outcome:refused"), 0);
+
+                // A complete map pushed for 3 backends while the Fleet has 4.
+                let stale_count = harness_on(
+                    upstream_provider(&upstream),
+                    &[("h-a", 2)],
+                    3,
+                    saturated_snapshot(fresh_ms()),
+                );
+                send_both(&stale_count.provider, heavy_params()).await;
+                assert_eq!(stale_count.metrics.decisions_tagged("reason:incomplete"), 2);
+                assert_eq!(stale_count.metrics.decisions_tagged("outcome:refused"), 0);
+
+                let requests = upstream.received_requests().await.unwrap();
+                assert_eq!(requests.len(), 4, "every legacy request is served");
+                assert_eq!(hints(&requests), vec![None; 4]);
+            }
+
             #[tokio::test]
             async fn fallback_index_sends_no_replica_hint() {
                 // The placed backend answers 503: the retry on another index
@@ -7064,6 +7161,7 @@ mod tests {
                         start.wait();
                         let lease = fleet
                             .acquire_index_placed(&messages, None, &req)
+                            .expect("not refused")
                             .expect("placement active");
                         sender.send(lease.index()).expect("send placed index");
                     })

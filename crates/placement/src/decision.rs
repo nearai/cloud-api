@@ -12,7 +12,7 @@ use std::time::Instant;
 use rand::Rng;
 
 use crate::affinity::{pin_id, select, AffinityKey, PinId, Selection};
-use crate::consts::{COVERED_MODELS, FRESH_MAX_MS, PIN_TTL_MS};
+use crate::consts::{FRESH_MAX_MS, PIN_TTL_MS};
 use crate::policy::{classify, lane_admits, lane_view, Class, LaneView, PriorityBand, Tier};
 use crate::rules::{first_exclusion, Rule, ALL_RULES};
 use crate::score::{fleet_median_tps, pending_for, replica_score, Pending};
@@ -87,7 +87,6 @@ impl AffinitySource {
 pub enum LegacyReason {
     /// The snapshot is disabled by the data-plane kill switch.
     Disabled,
-    NotCovered,
     NoState,
     Stale,
     NoneEligible,
@@ -107,7 +106,6 @@ impl LegacyReason {
     pub const fn as_str(self) -> &'static str {
         match self {
             LegacyReason::Disabled => "disabled",
-            LegacyReason::NotCovered => "not_covered",
             LegacyReason::NoState => "no_state",
             LegacyReason::Stale => "stale",
             LegacyReason::NoneEligible => "none_eligible",
@@ -278,7 +276,7 @@ impl Placer {
     /// yet (`mine`, per slot: [`crate::score::unseen_by_read`] of the slot's
     /// ledger against `snap.routed_read_ms`; see
     /// [`crate::score::pending_for`]). `Legacy` when
-    /// the snapshot is disabled, uncovered, empty, stale or has no stage-1
+    /// the snapshot is disabled, empty, stale or has no stage-1
     /// survivor; `Refused` only when the heavy lane excluded every survivor;
     /// otherwise `Place`. The record's `place_us` times the whole call.
     pub fn place(
@@ -304,10 +302,6 @@ impl Placer {
     ) -> Decision {
         if snap.disabled {
             return self.legacy(input, snap, LegacyReason::Disabled, None);
-        }
-
-        if !COVERED_MODELS.contains(&input.model.as_str()) {
-            return self.legacy(input, snap, LegacyReason::NotCovered, None);
         }
 
         if snap.replicas.is_empty() {
@@ -552,7 +546,7 @@ impl Placer {
 mod tests {
     use super::*;
     use crate::affinity::{hrw_rank, AffinityKey};
-    use crate::consts::{COVERED_MODELS, FRESH_MAX_MS, PIN_TTL_MS};
+    use crate::consts::{FRESH_MAX_MS, PIN_TTL_MS};
     use crate::consts::{HEAVY_BACKLOG_CAP, LANE_LOAD_TOKENS, LONG_BACKLOG_CAP};
     use crate::policy::{Class, PriorityBand, Tier};
     use crate::snapshot::RoutedCounts;
@@ -637,24 +631,37 @@ mod tests {
         assert_eq!(record.reason, Some("disabled"));
         assert_eq!(record.outcome, "legacy");
 
-        let mut uncovered = base_input();
-        uncovered.model = "some-other-model".into();
-        let (reason, _) =
-            legacy_reason(placer().place(&uncovered, &snap, &HashMap::new(), &mut rng));
+        let mut other = base_input();
+        other.model = "some-other-model".into();
+        let (reason, _) = legacy_reason(placer().place(&other, &snap, &HashMap::new(), &mut rng));
         assert_eq!(reason, LegacyReason::Disabled);
     }
 
     #[test]
-    fn not_covered_is_legacy() {
+    fn any_model_whose_hosts_publish_is_placed() {
+        // There is no model allow-list: a snapshot holds only the Fleet's own
+        // attested hosts, so any model whose hosts publish frames is placed.
         let mut input = base_input();
-        input.model = "some-other-model".into();
+        input.model = "acme/any-new-model".into();
         let snap = snap_with(vec![ready_view("gpu01", 0)]);
+        let mut rng = StdRng::seed_from_u64(1);
+        let (chosen, record, _) = placed(placer().place(&input, &snap, &HashMap::new(), &mut rng));
+        assert_eq!(chosen, slot("gpu01", 0));
+        assert_eq!(record.outcome, "place");
+    }
+
+    #[test]
+    fn model_without_publishing_hosts_is_legacy() {
+        // A model whose hosts never publish has an empty snapshot and stays
+        // on legacy routing, whatever its name.
+        let mut input = base_input();
+        input.model = "acme/any-new-model".into();
+        let snap = snap_with(vec![]);
         let mut rng = StdRng::seed_from_u64(1);
         let (reason, record) =
             legacy_reason(placer().place(&input, &snap, &HashMap::new(), &mut rng));
-        assert_eq!(reason, LegacyReason::NotCovered);
-        assert_eq!(record.reason, Some("not_covered"));
-        assert_eq!(record.outcome, "legacy");
+        assert_eq!(reason, LegacyReason::NoState);
+        assert_eq!(record.reason, Some("no_state"));
     }
 
     #[test]
@@ -1653,7 +1660,7 @@ mod tests {
             }
 
             let mut input = base_input();
-            input.model = COVERED_MODELS[0].to_string();
+            input.model = "z-ai/glm-5.3-flash".to_string();
             let key_bytes = [42u8; 16];
             if has_affinity {
                 input.affinity = Some(AffinityKey::from_bytes(key_bytes));
@@ -1697,7 +1704,7 @@ mod tests {
             views.push(ready_view("gpu-forced-eligible", 0));
 
             let mut input = base_input();
-            input.model = COVERED_MODELS[0].to_string();
+            input.model = "z-ai/glm-5.3-flash".to_string();
             let snap = snap_with(views);
 
             let mut rng = StdRng::seed_from_u64(7);

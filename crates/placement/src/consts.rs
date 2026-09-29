@@ -27,17 +27,6 @@ pub const MAX_FUTURE_SKEW_MS: u64 = 2_000;
 /// KV cache usage at or above this fraction excludes a replica from routing.
 pub const KV_MAX: f64 = 0.95;
 
-/// Models eligible for smart routing; everything else falls back to
-/// `Fleet::acquire_index`, unchanged.
-///
-/// Entries are catalog `model_name`s: the completions service rewrites
-/// `params.model` to the catalog `model_name` before the pool, so this is what
-/// `Fleet` sees. Host frames carry no model: each Fleet reads only its own
-/// attested hosts, so a snapshot is already scoped to one model's endpoint.
-/// For GLM-5.3 Flash this is the SGLang `--served-model-name`,
-/// `z-ai/glm-5.3-flash`, not the Hugging Face path `zai-org/GLM-5.3-Flash`.
-pub const COVERED_MODELS: &[&str] = &["z-ai/glm-5.3-flash"];
-
 /// Normalizer for a replica's prefill backlog (queued + pending tokens),
 /// converting a token count into a `fullness`-comparable unit for `score.rs`.
 pub const PREFILL_NORM_TOKENS: f64 = 16_000.0;

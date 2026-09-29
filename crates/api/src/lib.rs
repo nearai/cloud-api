@@ -91,11 +91,22 @@ fn pdf_worker_path() -> std::path::PathBuf {
     if sibling.exists() {
         return sibling;
     }
-    exe.parent()
+    let path = exe
+        .parent()
         .and_then(|dir| dir.parent())
         .map(|dir| dir.join(name))
         .filter(|path| path.exists())
-        .unwrap_or(sibling)
+        .unwrap_or(sibling);
+    if !path.exists() {
+        // Surface a bad image at deploy time rather than as 500s on the first
+        // PDF request. `cargo run --bin api` does not build the worker; run
+        // `cargo build --bin pdf-extract-worker` for local PDF support.
+        tracing::warn!(
+            path = %path.display(),
+            "pdf-extract-worker binary not found; chat file parts will fail with 500"
+        );
+    }
+    path
 }
 
 /// Service initialization components

@@ -6,10 +6,19 @@
 //! that links `lopdf`; keeping it in its own process means a parser abort,
 //! stack overflow or runaway allocation kills this worker, not the gateway.
 //!
-//! Before reading input the worker lowers its own resource limits (CPU time,
-//! address space on Linux, no file writes, few descriptors). On Linux a limit
-//! that cannot be applied is fatal: the worker exits non-zero without
-//! parsing, which the gateway reports as a parse failure.
+//! Before reading input the worker locks itself down:
+//! - resource limits: CPU time, address space (Linux), no file writes, few
+//!   descriptors, no core dumps;
+//! - on Linux, a seccomp filter that fails (`EPERM`) every syscall that could
+//!   reach beyond stdin/stdout: opening files, creating or connecting
+//!   sockets, exec, ptrace, mounts/namespaces and io_uring. The worker runs as
+//!   the gateway's user inside the gateway's container (which mounts the
+//!   dstack socket and TLS keys), so a parser compromise must not be able to
+//!   open anything.
+//!
+//! On Linux a lockdown step that cannot be applied is fatal: the worker exits
+//! with `WORKER_EXIT_LOCKDOWN_FAILED` without reading input, which the gateway
+//! reports as an outage (500), not as a bad PDF.
 //!
 //! Never writes file bytes or extracted text anywhere but stdout, and never
 //! logs.
@@ -42,7 +51,65 @@ fn main() {
     }
 }
 
-fn lock_down() -> std::io::Result<()> {
+fn lock_down() -> Result<(), Box<dyn std::error::Error>> {
+    set_rlimits()?;
+    #[cfg(target_os = "linux")]
+    seccompiler::apply_filter(&escape_filter()?)?;
+    Ok(())
+}
+
+/// Syscalls the worker never needs once it is running: everything that could
+/// open a path, reach a socket (including the dstack socket), start another
+/// program, inspect another process, or change namespaces/mounts.
+#[cfg(target_os = "linux")]
+const DENIED_SYSCALLS: &[libc::c_long] = &[
+    libc::SYS_openat,
+    libc::SYS_openat2,
+    libc::SYS_open_by_handle_at,
+    libc::SYS_socket,
+    libc::SYS_socketpair,
+    libc::SYS_connect,
+    libc::SYS_bind,
+    libc::SYS_listen,
+    libc::SYS_accept4,
+    libc::SYS_execve,
+    libc::SYS_execveat,
+    libc::SYS_ptrace,
+    libc::SYS_process_vm_readv,
+    libc::SYS_process_vm_writev,
+    libc::SYS_mount,
+    libc::SYS_umount2,
+    libc::SYS_unshare,
+    libc::SYS_setns,
+    libc::SYS_io_uring_setup,
+    // Legacy variants that only exist on x86_64.
+    #[cfg(target_arch = "x86_64")]
+    libc::SYS_open,
+    #[cfg(target_arch = "x86_64")]
+    libc::SYS_creat,
+    #[cfg(target_arch = "x86_64")]
+    libc::SYS_accept,
+];
+
+/// Deny-list filter: listed syscalls fail with `EPERM`, everything else is
+/// allowed (an allow-list would couple the worker to libc/allocator internals).
+#[cfg(target_os = "linux")]
+fn escape_filter() -> Result<seccompiler::BpfProgram, Box<dyn std::error::Error>> {
+    use seccompiler::{BpfProgram, SeccompAction, SeccompFilter, TargetArch};
+    let rules = DENIED_SYSCALLS
+        .iter()
+        .map(|&syscall| (syscall, Vec::new()))
+        .collect();
+    let filter = SeccompFilter::new(
+        rules,
+        SeccompAction::Allow,
+        SeccompAction::Errno(libc::EPERM as u32),
+        TargetArch::try_from(std::env::consts::ARCH)?,
+    )?;
+    Ok(BpfProgram::try_from(filter)?)
+}
+
+fn set_rlimits() -> std::io::Result<()> {
     use rustix::process::{setrlimit, Resource, Rlimit};
     let cap = |limit: u64| Rlimit {
         current: Some(limit),

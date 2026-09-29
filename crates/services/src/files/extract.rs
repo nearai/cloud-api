@@ -24,7 +24,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::process::{Child, Command};
-use tokio::sync::Semaphore;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 /// How far into the file the `%PDF-` header may appear.
 const PDF_HEADER_WINDOW: usize = 1024;
@@ -194,11 +194,9 @@ impl FileTextExtractor for WorkerPdfExtractor {
 
         // env_clear: the gateway's environment holds database, OAuth and
         // provider secrets; the worker needs none of them.
-        // kill_on_drop: a cancelled request (client disconnect) kills the
-        // worker; tokio reaps it in the background. On that path the permit
-        // drops with the future, so a dying worker can briefly exceed
-        // `max_workers` until the reaper collects it.
-        let mut child = Command::new(&self.program)
+        // kill_on_drop: last-resort kill if no runtime is left to reap it; the
+        // normal cancellation path is `LiveWorker`'s drop below.
+        let child = Command::new(&self.program)
             .args(&self.args)
             .env_clear()
             .stdin(Stdio::piped())
@@ -211,19 +209,52 @@ impl FileTextExtractor for WorkerPdfExtractor {
                 FileExtractError::Unavailable
             })?;
 
+        let mut worker = LiveWorker {
+            child: Some(child),
+            permit: Some(permit),
+        };
         let cap = self.max_output_bytes();
-        let result = match tokio::time::timeout_at(deadline, exchange(&mut child, bytes, cap)).await
-        {
+        let child = worker.child.as_mut().ok_or(FileExtractError::Unavailable)?;
+        match tokio::time::timeout_at(deadline, exchange(child, bytes, cap)).await {
             Ok(result) => result,
             Err(_) => {
                 let _ = child.start_kill();
                 let _ = child.wait().await;
                 Err(FileExtractError::Timeout)
             }
+        }
+        // `worker` drops here, or earlier if this future is cancelled.
+    }
+}
+
+/// A spawned worker and the pool slot it occupies. The slot is released only
+/// once the process has exited and been reaped: if the request future is
+/// dropped mid-parse (client disconnect), the worker is killed and a reaper
+/// task holds the permit until `wait()` returns, so dying workers never let
+/// the pool exceed `max_workers`.
+struct LiveWorker {
+    child: Option<Child>,
+    permit: Option<OwnedSemaphorePermit>,
+}
+
+impl Drop for LiveWorker {
+    fn drop(&mut self) {
+        let (Some(mut child), permit) = (self.child.take(), self.permit.take()) else {
+            return;
         };
-        // Released only once the worker has exited and been reaped.
-        drop(permit);
-        result
+        // Already exited and reaped (every completed path waits): the permit
+        // is released right here.
+        if matches!(child.try_wait(), Ok(Some(_))) {
+            return;
+        }
+        let _ = child.start_kill();
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            runtime.spawn(async move {
+                let _ = child.wait().await;
+                drop(permit);
+            });
+        }
+        // Without a runtime, kill_on_drop and tokio's orphan reaper apply.
     }
 }
 
@@ -498,6 +529,33 @@ mod tests {
         );
         assert!(started.elapsed() < Duration::from_secs(5));
         assert_eq!(hung.permits.available_permits(), 1, "slot must be freed");
+    }
+
+    #[tokio::test]
+    async fn cancelled_request_holds_its_slot_until_the_worker_is_reaped() {
+        let limits = ExtractLimits {
+            max_workers: 1,
+            ..ExtractLimits::default()
+        };
+        let hung = sh("sleep 30", limits);
+        // Dropping the future models a client disconnect mid-parse.
+        let cancelled = tokio::time::timeout(
+            Duration::from_millis(200),
+            hung.extract_text(FAKE_PDF.to_vec(), soon()),
+        )
+        .await;
+        assert!(cancelled.is_err(), "request should have been cancelled");
+        // Current-thread runtime: the reaper has not run yet, so the slot is
+        // still held by the dying worker rather than handed to a new one.
+        assert_eq!(hung.permits.available_permits(), 0);
+        let started = std::time::Instant::now();
+        while hung.permits.available_permits() == 0 {
+            assert!(
+                started.elapsed() < Duration::from_secs(5),
+                "slot never released after the killed worker exited"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
     }
 
     #[tokio::test]

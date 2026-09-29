@@ -85,3 +85,7 @@ async-trait = "0.1"
 [[test]]
 name = "e2e_all"
 path = "tests/e2e_all/main.rs"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"
+seccompiler = "0.5"

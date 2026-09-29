@@ -164,9 +164,19 @@ async fn resolve_all(
             let (text, stored_name) = match extracted.get(&key) {
                 Some(hit) => hit.clone(),
                 None => {
-                    let (bytes, stored_name) = load_bytes(source, workspace_id, files, &limits)
-                        .await
-                        .map_err(|e| (e, param.clone()))?;
+                    // Storage reads share the request deadline with extraction.
+                    let (bytes, stored_name) = tokio::time::timeout_at(
+                        deadline,
+                        load_bytes(source, workspace_id, files, &limits),
+                    )
+                    .await
+                    .map_err(|_| {
+                        (
+                            FilePartError::Extract(FileExtractError::Timeout),
+                            param.clone(),
+                        )
+                    })?
+                    .map_err(|e| (e, param.clone()))?;
                     let text = extractor
                         .extract_text(bytes, deadline)
                         .await
@@ -304,6 +314,8 @@ mod tests {
     const WS: Uuid = Uuid::from_u128(7);
     const STORED: Uuid = Uuid::from_u128(42);
     const HUGE: Uuid = Uuid::from_u128(43);
+    /// A stored file whose metadata read stalls far past any deadline.
+    const STALLED: Uuid = Uuid::from_u128(44);
 
     fn stored_file(id: Uuid, bytes: i64) -> File {
         File {
@@ -327,6 +339,9 @@ mod tests {
             unimplemented!()
         }
         async fn get_file(&self, id: Uuid, ws: Uuid) -> Result<File, FileServiceError> {
+            if id == STALLED {
+                tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+            }
             match (id, ws) {
                 (STORED, WS) => Ok(stored_file(STORED, 12)),
                 (HUGE, WS) => Ok(stored_file(HUGE, 512 * 1024 * 1024)),
@@ -506,6 +521,26 @@ mod tests {
                 "File: stored.pdf\nContent:\nstored-bytes"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn stalled_stored_file_read_hits_the_request_deadline() {
+        let echo = Echo {
+            limits: ExtractLimits {
+                timeout: std::time::Duration::from_millis(100),
+                ..ExtractLimits::default()
+            },
+            ..Echo::new()
+        };
+        let mut messages = vec![msg(
+            json!([{"type": "file", "file": {"file_id": format!("file-{STALLED}")}}]),
+        )];
+        let started = std::time::Instant::now();
+        let (status, body) = error_json(run(&mut messages, None, &echo).await.unwrap_err()).await;
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+        assert_eq!(status, 504, "{body}");
+        assert_eq!(body["error"]["param"], "messages[0].content[0]");
+        assert_eq!(echo.calls.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]

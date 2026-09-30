@@ -10723,6 +10723,43 @@ mod tests {
         pool.refine_context_requirement(&model, &params, &mut hints, false)
             .await;
         assert_eq!(hints.estimated_tokens, Some(input + 8_000));
+
+        // `max_completion_tokens` is capped the same way, and it takes
+        // precedence over `max_tokens` when both are set.
+        let cases: [(Option<i64>, Option<i64>, u32, &str); 4] = [
+            (
+                Some(1_048_576),
+                None,
+                cap,
+                "max_completion_tokens alone, above the cap",
+            ),
+            (
+                Some(8_000),
+                None,
+                8_000,
+                "max_completion_tokens alone, below the cap",
+            ),
+            (
+                Some(1_048_576),
+                Some(8_000),
+                cap,
+                "both set: max_completion_tokens (above cap) wins",
+            ),
+            (
+                Some(8_000),
+                Some(1_048_576),
+                8_000,
+                "both set: max_completion_tokens (below cap) wins",
+            ),
+        ];
+        for (max_completion_tokens, max_tokens, reserve, case) in cases {
+            params.max_completion_tokens = max_completion_tokens;
+            params.max_tokens = max_tokens;
+            let mut hints = ChatRoutingHints::default();
+            pool.refine_context_requirement(&model, &params, &mut hints, false)
+                .await;
+            assert_eq!(hints.estimated_tokens, Some(input + reserve), "{case}");
+        }
     }
 
     /// `register_pinned_secondary_provider` records the declared context

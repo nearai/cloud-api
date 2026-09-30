@@ -653,8 +653,8 @@ impl AttestationVerifier {
 /// `event_payload` is the hex encoding of the proxy's signed JSON
 /// `{key_id, public_key_hex, boot_id, host_id}`. Returns
 /// `None` on any malformed input (bad hex, bad JSON, bad public key length,
-/// invalid curve point, or a `key_id` that doesn't hash back to the public
-/// key) — never fatal to attestation. Only the error *kind* is logged, never
+/// blank host/boot IDs, invalid curve point, or a `key_id` that doesn't hash
+/// back to the public key) — never fatal to attestation. Only the error *kind* is logged, never
 /// the payload.
 fn parse_replica_report_key(event_payload: &str) -> Option<ReplicaReportKey> {
     let json_bytes = match hex::decode(event_payload) {
@@ -672,6 +672,11 @@ fn parse_replica_report_key(event_payload: &str) -> Option<ReplicaReportKey> {
             return None;
         }
     };
+
+    if payload.host_id.trim().is_empty() || payload.boot_id.trim().is_empty() {
+        tracing::debug!("replica report key event: blank host or boot id");
+        return None;
+    }
 
     let pk_bytes = match hex::decode(&payload.public_key_hex) {
         Ok(b) => b,
@@ -1346,10 +1351,17 @@ mod tests {
         let vk = test_signing_key(7).verifying_key();
         let valid = replica_report_key_payload(&vk, "boot-valid");
 
+        let mut blank_host = valid.clone();
+        blank_host.host_id = " ".to_string();
+        let mut blank_boot = valid.clone();
+        blank_boot.boot_id.clear();
+
         let events = vec![
             runtime_event(placement::consts::KEY_EVENT, &hex_payload(&valid)),
             // Later event: valid hex, but not valid JSON for ReplicaReportKey.
             runtime_event(placement::consts::KEY_EVENT, &hex::encode(b"not json")),
+            runtime_event(placement::consts::KEY_EVENT, &hex_payload(&blank_host)),
+            runtime_event(placement::consts::KEY_EVENT, &hex_payload(&blank_boot)),
         ];
         let rtmr3 = replay_rtmr3(&events);
         let report = event_log_report(&events);
@@ -1360,6 +1372,36 @@ mod tests {
             .verify_rtmr3_and_extract(&report, &rtmr3)
             .unwrap();
         assert_eq!(result.replica_report_key, Some(valid));
+    }
+
+    #[test]
+    fn blank_report_key_claims_are_rejected() {
+        let vk = test_signing_key(7).verifying_key();
+        let valid = replica_report_key_payload(&vk, "boot-valid");
+        for blank in ["", " \t\n"] {
+            for (field, payload) in [
+                (
+                    "host_id",
+                    ReplicaReportKey {
+                        host_id: blank.to_string(),
+                        ..valid.clone()
+                    },
+                ),
+                (
+                    "boot_id",
+                    ReplicaReportKey {
+                        boot_id: blank.to_string(),
+                        ..valid.clone()
+                    },
+                ),
+            ] {
+                assert_eq!(
+                    parse_replica_report_key(&hex_payload(&payload)),
+                    None,
+                    "blank {field} must not produce a trusted report key"
+                );
+            }
+        }
     }
 
     #[test]

@@ -11,6 +11,7 @@ use crate::usage::{
 };
 use inference_providers::{ChatMessage, MessageRole, SSEEvent, StreamChunk, StreamingResult};
 use moka::future::Cache;
+use std::collections::HashSet;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 use uuid::Uuid;
@@ -145,6 +146,9 @@ where
     response_id: Option<ResponseId>,
     /// Last finish_reason from provider (e.g., "stop", "length", "tool_calls")
     last_finish_reason: Option<inference_providers::FinishReason>,
+    /// Requested choice count and the indices that have emitted a finish reason.
+    finished_choice_indices: HashSet<i64>,
+    expected_choice_count: i64,
     /// Last error from provider (for determining stop_reason)
     last_error: Option<inference_providers::CompletionError>,
     /// Time of the most recent nonempty parsed upstream SSE event, including controls.
@@ -658,6 +662,14 @@ where
                                 {
                                     self.last_finish_reason = Some(reason.clone());
                                 }
+                                for choice in &chunk.choices {
+                                    if choice.finish_reason.is_some()
+                                        && choice.index >= 0
+                                        && choice.index < self.expected_choice_count
+                                    {
+                                        self.finished_choice_indices.insert(choice.index);
+                                    }
+                                }
                             }
                             Some(StreamChunk::Text(chunk)) => {
                                 self.last_chat_id = Some(chunk.id.clone());
@@ -671,13 +683,24 @@ where
                                 {
                                     self.last_finish_reason = Some(reason.clone());
                                 }
+                                for choice in &chunk.choices {
+                                    if choice.finish_reason.is_some()
+                                        && choice.index >= 0
+                                        && choice.index < self.expected_choice_count
+                                    {
+                                        self.finished_choice_indices.insert(choice.index);
+                                    }
+                                }
                             }
                             None => {}
                         }
                         return Poll::Ready(Some(Ok(event)));
                     }
                     Poll::Ready(None) => {
-                        if self.last_finish_reason.is_none() {
+                        if self.last_finish_reason.is_none()
+                            || self.finished_choice_indices.len()
+                                != self.expected_choice_count as usize
+                        {
                             let error = inference_providers::CompletionError::CompletionError(
                                 "Provider stream ended before a finish reason".into(),
                             );
@@ -1644,6 +1667,7 @@ impl CompletionServiceImpl {
         cache_write_cost_per_token: Option<i64>,
         requested_service_tier: Option<TextServiceTier>,
         latency_reporter: Option<super::inference_provider_pool::ProviderLatencyReporter>,
+        expected_choice_count: i64,
     ) -> StreamingResult {
         // Create low-cardinality metric tags (no org/workspace/key - those go to database)
         let metric_tags = Self::create_metric_tags(&model_name);
@@ -1684,6 +1708,8 @@ impl CompletionServiceImpl {
             saw_upstream_done_marker: false,
             response_id,
             last_finish_reason: None,
+            finished_choice_indices: HashSet::new(),
+            expected_choice_count,
             last_error: None,
             last_upstream_event_time: None,
             state: StreamState::Streaming,
@@ -1908,6 +1934,7 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
                 cache_write_cost_per_token,
                 requested_service_tier,
                 Some(latency_reporter),
+                request.n.unwrap_or(1).max(1),
             )
             .await;
 
@@ -2550,6 +2577,8 @@ mod tests {
             saw_upstream_done_marker: false,
             response_id: None,
             last_finish_reason: None,
+            finished_choice_indices: HashSet::new(),
+            expected_choice_count: 1,
             last_error: None,
             last_upstream_event_time: None,
             state: StreamState::Streaming,
@@ -2569,6 +2598,73 @@ mod tests {
             chunk: None,
             raw_passthrough: true,
         }
+    }
+
+    fn finished_chat_choices(indices: &[i64]) -> SSEEvent {
+        SSEEvent {
+            raw_bytes: Bytes::from_static(b"data: finish\n\n"),
+            chunk: Some(StreamChunk::Chat(ChatCompletionChunk {
+                id: "chat-finish".to_string(),
+                object: "chat.completion.chunk".to_string(),
+                created: 1,
+                model: "test-model".to_string(),
+                choices: indices
+                    .iter()
+                    .map(|index| ChatChoice {
+                        index: *index,
+                        delta: None,
+                        logprobs: None,
+                        finish_reason: Some(FinishReason::Stop),
+                        token_ids: None,
+                    })
+                    .collect(),
+                usage: None,
+                service_tier: None,
+                prompt_token_ids: None,
+                system_fingerprint: None,
+                modality: None,
+                extra: Default::default(),
+            })),
+            raw_passthrough: true,
+        }
+    }
+
+    #[tokio::test]
+    async fn eof_requires_every_requested_choice_to_finish() {
+        let mut stream = terminal_test_stream(vec![Ok(finished_chat_choices(&[0]))]);
+        stream.expected_choice_count = 2;
+
+        let events = stream.by_ref().collect::<Vec<_>>().await;
+
+        assert!(matches!(
+            events.last(),
+            Some(Err(inference_providers::CompletionError::CompletionError(message)))
+                if message == "Provider stream ended before a finish reason"
+        ));
+        assert!(stream.last_error.is_some());
+    }
+
+    #[tokio::test]
+    async fn eof_succeeds_after_every_requested_choice_finishes() {
+        let mut stream = terminal_test_stream(vec![Ok(finished_chat_choices(&[0, 1]))]);
+        stream.expected_choice_count = 2;
+
+        let events = stream.by_ref().collect::<Vec<_>>().await;
+
+        assert!(events.iter().all(Result::is_ok));
+        assert!(stream.last_error.is_none());
+        assert!(stream.stream_completed);
+    }
+
+    #[tokio::test]
+    async fn eof_succeeds_for_default_single_choice() {
+        let mut stream = terminal_test_stream(vec![Ok(finished_chat_choices(&[0]))]);
+
+        let events = stream.by_ref().collect::<Vec<_>>().await;
+
+        assert!(events.iter().all(Result::is_ok));
+        assert!(stream.last_error.is_none());
+        assert!(stream.stream_completed);
     }
 
     #[tokio::test]
@@ -2769,6 +2865,8 @@ mod tests {
             saw_upstream_done_marker: false,
             response_id: None,
             last_finish_reason: None,
+            finished_choice_indices: HashSet::new(),
+            expected_choice_count: 1,
             last_error: None,
             last_upstream_event_time: None,
             state: StreamState::Streaming,
@@ -2944,6 +3042,8 @@ mod tests {
             saw_upstream_done_marker: false,
             response_id: None,
             last_finish_reason: None,
+            finished_choice_indices: HashSet::new(),
+            expected_choice_count: 1,
             last_error: None,
             last_upstream_event_time: None,
             state: StreamState::Streaming,
@@ -3100,6 +3200,8 @@ mod tests {
             saw_upstream_done_marker: false,
             response_id: None,
             last_finish_reason: None,
+            finished_choice_indices: HashSet::new(),
+            expected_choice_count: 1,
             last_error: None,
             last_upstream_event_time: None,
             state: StreamState::Streaming,
@@ -3230,6 +3332,8 @@ mod tests {
             saw_upstream_done_marker: false,
             response_id: None,
             last_finish_reason: None,
+            finished_choice_indices: HashSet::new(),
+            expected_choice_count: 1,
             last_error: None,
             last_upstream_event_time: None,
             state: StreamState::Streaming,
@@ -3442,6 +3546,8 @@ mod tests {
                 saw_upstream_done_marker: false,
                 response_id: None,
                 last_finish_reason: None,
+                finished_choice_indices: HashSet::new(),
+                expected_choice_count: 1,
                 last_error: None,
                 last_upstream_event_time: None,
                 state: StreamState::Streaming,

@@ -731,6 +731,68 @@ async fn test_chat_stream_empty_eof_emits_error_without_done() {
 }
 
 #[tokio::test]
+async fn test_legacy_text_stream_empty_eof_maps_error_before_sse() {
+    ensure_usage_chat_completions_env();
+    let (server, _pool, mock_provider, _db) = setup_test_server_with_pool().await;
+    mock_provider
+        .set_default_response(
+            inference_providers::mock::ResponseTemplate::new("unused").with_disconnect_after(0),
+        )
+        .await;
+    setup_qwen_model(&server).await;
+    let org = setup_org_with_credits(&server, 10_000_000_000i64).await;
+    let api_key = get_api_key_for_org(&server, org.id.clone()).await;
+
+    let response = server
+        .post("/v1/completions")
+        .add_header("Authorization", format!("Bearer {api_key}"))
+        .json(&json!({
+            "model": E2E_QWEN_MODEL_NAME,
+            "prompt": "hello",
+            "stream": true
+        }))
+        .await;
+
+    assert_eq!(response.status_code(), 502);
+    assert_eq!(response.content_type(), "application/json");
+    let body: api::models::ErrorResponse = response.json();
+    assert_eq!(body.error.r#type, "bad_gateway");
+}
+
+#[tokio::test]
+async fn test_legacy_text_stream_midstream_error_has_no_done() {
+    ensure_usage_chat_completions_env();
+    let (server, _pool, mock_provider, _db) = setup_test_server_with_pool().await;
+    mock_provider
+        .set_default_response(
+            inference_providers::mock::ResponseTemplate::new("partial output")
+                .with_disconnect_after(1),
+        )
+        .await;
+    setup_qwen_model(&server).await;
+    let org = setup_org_with_credits(&server, 10_000_000_000i64).await;
+    let api_key = get_api_key_for_org(&server, org.id.clone()).await;
+
+    let response = server
+        .post("/v1/completions")
+        .add_header("Authorization", format!("Bearer {api_key}"))
+        .json(&json!({
+            "model": E2E_QWEN_MODEL_NAME,
+            "prompt": "hello",
+            "stream": true
+        }))
+        .await;
+
+    assert_eq!(response.status_code(), 200);
+    let wire = response.text();
+    assert!(wire.contains("\"error\""), "missing SSE error: {wire}");
+    assert!(
+        !wire.contains("[DONE]"),
+        "failed stream ended successfully: {wire}"
+    );
+}
+
+#[tokio::test]
 async fn test_chat_stream_usage_only_eof_emits_error_without_done() {
     assert_chat_stream_eof_error_without_done(
         inference_providers::mock::ResponseTemplate::new("").with_disconnect_after(1),

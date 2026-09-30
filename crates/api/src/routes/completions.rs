@@ -1754,7 +1754,7 @@ async fn chat_completions_inner(
                             let status_code = map_domain_error_to_status(&domain_error);
                             let last_upstream_event_gap_ms = last_pre_sse_event_time
                                 .map(|last_event| last_event.elapsed().as_millis() as u64);
-                            tracing::error!(
+                            tracing::warn!(
                                 request_id = %request_id,
                                 organization_id = %api_key.organization.id.0,
                                 model = %request.model,
@@ -2289,7 +2289,11 @@ async fn chat_completions_inner(
                                 let error_count_final =
                                     stream_error_count.load(std::sync::atomic::Ordering::Relaxed);
                                 let may_emit_success_terminal = error_count_final == 0;
-                                if auto_redact_enabled {
+                                // The stream error frame is already terminal from
+                                // the client's perspective. Held redaction bytes
+                                // may be ordinary completion content, so never
+                                // append them after a failed stream.
+                                if auto_redact_enabled && may_emit_success_terminal {
                                     let mut states = unredact_states_for_chain.lock().await;
                                     let template = chunk_template_for_chain.lock().await.clone();
                                     for bytes in build_flush_chunks(&mut states, &template) {
@@ -2796,6 +2800,7 @@ async fn completions_inner(
     request: CompletionRequest,
     request_id: Uuid,
 ) -> axum::response::Response {
+    let request_started_at = Instant::now();
     let request_hash = body_hash.hash.clone();
 
     // Reject E2E encryption: validate for parity (an invalid version still 400s
@@ -2951,7 +2956,33 @@ async fn completions_inner(
                             }
                             true
                         }
-                        _ => break None,
+                        Some(Err(error)) => {
+                            let upstream_status_code =
+                                completion_stream_error_upstream_status_code(error);
+                            let domain_error = CompletionServiceImpl::map_provider_error(
+                                &request.model,
+                                error,
+                                "text completion stream",
+                                api_key.organization.id.0,
+                            );
+                            let status_code = map_domain_error_to_status(&domain_error);
+                            tracing::warn!(
+                                request_id = %request_id,
+                                organization_id = %api_key.organization.id.0,
+                                model = %request.model,
+                                error_category = completion_domain_error_category(&domain_error),
+                                status_code = status_code.as_u16(),
+                                upstream_status_code = ?upstream_status_code,
+                                total_duration_ms = request_started_at.elapsed().as_millis() as u64,
+                                "Text completion stream failed before SSE response"
+                            );
+                            return (
+                                status_code,
+                                ResponseJson::<ErrorResponse>(domain_error.into()),
+                            )
+                                .into_response();
+                        }
+                        None => break None,
                     };
                     if is_control {
                         if control_skipped >= MAX_LEADING_CONTROL_EVENTS {
@@ -3126,7 +3157,11 @@ async fn completions_inner(
                                 }
                             }
 
-                            Ok::<Bytes, Infallible>(done)
+                            if stream_errored {
+                                Ok::<Bytes, Infallible>(Bytes::new())
+                            } else {
+                                Ok::<Bytes, Infallible>(done)
+                            }
                         }
                     }));
 
@@ -5247,7 +5282,9 @@ pub async fn image_generations(
             let image_count = match i32::try_from(response_with_bytes.response.data.len()) {
                 Ok(count) => count,
                 Err(_) => {
-                    tracing::error!("Too many images in provider response, cannot fit in i32 for usage tracking");
+                    tracing::error!(
+                        "Too many images in provider response, cannot fit in i32 for usage tracking"
+                    );
                     return (
                         StatusCode::INTERNAL_SERVER_ERROR,
                         ResponseJson(ErrorResponse::new(
@@ -6042,7 +6079,9 @@ pub async fn image_edits(
             let image_count = match i32::try_from(response_with_bytes.response.data.len()) {
                 Ok(count) => count,
                 Err(_) => {
-                    tracing::error!("Too many images in provider response, cannot fit in i32 for usage tracking");
+                    tracing::error!(
+                        "Too many images in provider response, cannot fit in i32 for usage tracking"
+                    );
                     return (
                         StatusCode::INTERNAL_SERVER_ERROR,
                         ResponseJson(ErrorResponse::new(

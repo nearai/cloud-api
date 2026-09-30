@@ -138,7 +138,61 @@ async fn test_response_items_saved_on_disconnect() {
         }))
         .await;
     assert_eq!(response.status_code(), 200);
-    let _stream = response.text();
+    let stream = response.text();
+    assert!(stream.contains("event: response.failed\n"));
+    assert!(!stream.contains("event: response.completed\n"));
+    let response_id = stream
+        .lines()
+        .filter_map(|line| line.strip_prefix("data: "))
+        .filter_map(|data| serde_json::from_str::<serde_json::Value>(data).ok())
+        .find_map(|event| {
+            event
+                .get("response")?
+                .get("id")?
+                .as_str()
+                .map(str::to_owned)
+        })
+        .expect("Should have a response ID from the created event");
+    let response_uuid = uuid::Uuid::parse_str(
+        response_id
+            .strip_prefix("resp_")
+            .expect("Expected a Responses ID"),
+    )
+    .unwrap();
+
+    // Observe finalization for this response before checking that failure never
+    // created a gateway signature. Other test responses and title usage are unrelated.
+    tokio::time::timeout(tokio::time::Duration::from_secs(5), async {
+        loop {
+            let client = database.pool().get().await.unwrap();
+            let row = client
+                .query_one(
+                    "SELECT EXISTS (SELECT 1 FROM responses WHERE id = $1 AND status = 'failed')
+                     AND EXISTS (SELECT 1 FROM organization_usage_log WHERE response_id = $1)",
+                    &[&response_uuid],
+                )
+                .await
+                .unwrap();
+            if row.get::<_, bool>(0) {
+                break;
+            }
+            drop(client);
+            tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("Failed response and partial usage should be persisted");
+    let client = database.pool().get().await.unwrap();
+    let signature_count: i64 = client
+        .query_one(
+            "SELECT COUNT(*) FROM chat_signatures WHERE chat_id = $1",
+            &[&response_id],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(signature_count, 0, "Failed responses must not be signed");
+    drop(client);
 
     // Wait for async DB writes (stream completion + title generation)
     tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;

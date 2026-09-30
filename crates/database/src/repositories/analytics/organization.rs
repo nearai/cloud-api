@@ -57,7 +57,11 @@ fn hourly_metrics_sql() -> MetricsSql {
                 COALESCE(SUM(output_tokens), 0)::bigint as output_tokens,
                 COALESCE(SUM(cache_read_tokens), 0)::bigint as cache_read_tokens,
                 COALESCE(SUM(total_cost), 0)::bigint as cost_nano,
-                COUNT(DISTINCT api_key_id)::bigint as unique_api_keys
+                COUNT(DISTINCT api_key_id)::bigint as unique_api_keys,
+                COALESCE(SUM(ttft_count), 0)::bigint as ttft_measured_requests,
+                COALESCE(SUM(ttft_under_5s_count), 0)::bigint as ttft_under_5s_requests,
+                COALESCE(SUM(ttft_under_10s_count), 0)::bigint as ttft_under_10s_requests,
+                COALESCE(SUM(ttft_under_60s_count), 0)::bigint as ttft_under_60s_requests
             FROM usage_rows
             WHERE organization_id = $1
             "#,
@@ -116,7 +120,11 @@ fn hourly_metrics_sql() -> MetricsSql {
                 {avg_ttft} as avg_ttft_ms,
                 {p95_ttft} as p95_ttft_ms,
                 {avg_itl} as avg_itl_ms,
-                {p95_itl} as p95_itl_ms
+                {p95_itl} as p95_itl_ms,
+                COALESCE(SUM(uh.ttft_count), 0)::bigint as ttft_measured_requests,
+                COALESCE(SUM(uh.ttft_under_5s_count), 0)::bigint as ttft_under_5s_requests,
+                COALESCE(SUM(uh.ttft_under_10s_count), 0)::bigint as ttft_under_10s_requests,
+                COALESCE(SUM(uh.ttft_under_60s_count), 0)::bigint as ttft_under_60s_requests
             FROM usage_rows uh
             WHERE uh.organization_id = $1
             GROUP BY uh.model_name
@@ -144,7 +152,11 @@ fn credit_type_metrics_sql() -> MetricsSql {
                 COALESCE(SUM(output_tokens), 0)::bigint as output_tokens,
                 COALESCE(SUM(cache_read_tokens), 0)::bigint as cache_read_tokens,
                 COALESCE(SUM(filtered_cost), 0)::bigint as cost_nano,
-                COUNT(DISTINCT api_key_id)::bigint as unique_api_keys
+                COUNT(DISTINCT api_key_id)::bigint as unique_api_keys,
+                COUNT(ttft_ms)::bigint as ttft_measured_requests,
+                COUNT(*) FILTER (WHERE ttft_ms < 5000)::bigint as ttft_under_5s_requests,
+                COUNT(*) FILTER (WHERE ttft_ms < 10000)::bigint as ttft_under_10s_requests,
+                COUNT(*) FILTER (WHERE ttft_ms < 60000)::bigint as ttft_under_60s_requests
             FROM metric_usage
             "#
         ),
@@ -193,7 +205,11 @@ fn credit_type_metrics_sql() -> MetricsSql {
                 AVG(ul.ttft_ms)::double precision as avg_ttft_ms,
                 PERCENTILE_CONT(0.95) WITHIN GROUP (ORDER BY ul.ttft_ms)::double precision as p95_ttft_ms,
                 AVG(ul.avg_itl_ms)::double precision as avg_itl_ms,
-                PERCENTILE_CONT(0.95) WITHIN GROUP (ORDER BY ul.avg_itl_ms)::double precision as p95_itl_ms
+                PERCENTILE_CONT(0.95) WITHIN GROUP (ORDER BY ul.avg_itl_ms)::double precision as p95_itl_ms,
+                COUNT(ul.ttft_ms)::bigint as ttft_measured_requests,
+                COUNT(*) FILTER (WHERE ul.ttft_ms < 5000)::bigint as ttft_under_5s_requests,
+                COUNT(*) FILTER (WHERE ul.ttft_ms < 10000)::bigint as ttft_under_10s_requests,
+                COUNT(*) FILTER (WHERE ul.ttft_ms < 60000)::bigint as ttft_under_60s_requests
             FROM metric_usage ul
             GROUP BY ul.model_name
             ORDER BY requests DESC
@@ -258,6 +274,10 @@ pub(super) async fn get_organization_metrics_with_client(
         total_cache_read_tokens: summary_row.get::<_, i64>(3),
         total_cost_usd: nano_to_usd(summary_row.get::<_, i64>(4)),
         unique_api_keys: summary_row.get::<_, i64>(5),
+        ttft_measured_requests: summary_row.get::<_, i64>(6),
+        ttft_under_5s_requests: summary_row.get::<_, i64>(7),
+        ttft_under_10s_requests: summary_row.get::<_, i64>(8),
+        ttft_under_60s_requests: summary_row.get::<_, i64>(9),
     };
 
     arm(tx, deadline).await?;
@@ -311,6 +331,10 @@ pub(super) async fn get_organization_metrics_with_client(
             p95_ttft_ms: row.get::<_, Option<f64>>(7),
             avg_itl_ms: row.get::<_, Option<f64>>(8),
             p95_itl_ms: row.get::<_, Option<f64>>(9),
+            ttft_measured_requests: row.get::<_, i64>(10),
+            ttft_under_5s_requests: row.get::<_, i64>(11),
+            ttft_under_10s_requests: row.get::<_, i64>(12),
+            ttft_under_60s_requests: row.get::<_, i64>(13),
         })
         .collect();
 

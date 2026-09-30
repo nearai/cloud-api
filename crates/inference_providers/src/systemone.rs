@@ -96,7 +96,7 @@ impl SystemOneRequest {
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 pub struct SystemOneResponse {
     /// Optional upstream ID. Required by our self-hosted TEE signing contract.
-    /// TypeSafe's hosted API omits it; the gateway exposes X-Signature-Id instead.
+    /// TypeSafe's hosted API omits it; the gateway exposes X-Generation-Id instead.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub id: Option<String>,
     pub model: String,
@@ -139,26 +139,19 @@ pub struct Usage {
 pub struct SystemOneResponseWithBytes {
     pub response: SystemOneResponse,
     pub raw_bytes: Vec<u8>,
+    /// Upstream generation ID: response body first, then X-Generation-Id.
+    /// Kept separately so a header-only ID does not change the response body.
+    pub decision_id: Option<String>,
 }
 
 impl SystemOneResponseWithBytes {
-    /// Provider IDs become URL path segments and response headers.
-    pub fn provider_signature_id(&self) -> Result<&str, CompletionError> {
-        self.response
-            .id
-            .as_deref()
-            .filter(|id| {
-                !id.is_empty()
-                    && id.len() <= 255
-                    && id
-                        .bytes()
-                        .all(|c| c.is_ascii_alphanumeric() || c == b'-' || c == b'_')
-            })
-            .ok_or_else(|| {
-                CompletionError::InvalidResponse(
-                    "TEE System One response requires a valid signature id".into(),
-                )
-            })
+    /// The self-hosted TEE contract uses the response body's ID for signature lookup.
+    pub fn provider_decision_id(&self) -> Result<&str, CompletionError> {
+        self.response.id.as_deref().ok_or_else(|| {
+            CompletionError::InvalidResponse(
+                "TEE System One response requires a body id for signature lookup".into(),
+            )
+        })
     }
 
     pub fn parse(raw_bytes: Vec<u8>, request: &SystemOneRequest) -> Result<Self, CompletionError> {
@@ -221,11 +214,23 @@ impl SystemOneResponseWithBytes {
                 return Err(invalid());
             }
         }
+        let decision_id = response.id.as_deref().map(parse_decision_id).transpose()?;
         Ok(Self {
             response,
             raw_bytes,
+            decision_id,
         })
     }
+}
+
+/// Treat IDs as opaque strings, subject to response-header and storage limits.
+fn parse_decision_id(id: &str) -> Result<String, CompletionError> {
+    if id.is_empty() || id.len() > 255 || http::HeaderValue::from_str(id).is_err() {
+        return Err(CompletionError::InvalidResponse(
+            "Invalid System One generation id".into(),
+        ));
+    }
+    Ok(id.to_owned())
 }
 
 /// Shared HTTP response handling for the TypeSafe and self-hosted transports.
@@ -242,6 +247,7 @@ pub(crate) async fn read_response(
             is_external,
         });
     }
+    let generation_id = response.headers().get("x-generation-id").cloned();
     let mut raw_bytes = Vec::new();
     while let Some(chunk) = response.chunk().await.map_err(|_| {
         CompletionError::InvalidResponse("Failed to read System One response".into())
@@ -253,7 +259,16 @@ pub(crate) async fn read_response(
         }
         raw_bytes.extend_from_slice(&chunk);
     }
-    SystemOneResponseWithBytes::parse(raw_bytes, request)
+    let mut parsed = SystemOneResponseWithBytes::parse(raw_bytes, request)?;
+    if parsed.decision_id.is_none() {
+        if let Some(generation_id) = generation_id {
+            let id = generation_id.to_str().map_err(|_| {
+                CompletionError::InvalidResponse("Invalid System One generation id".into())
+            })?;
+            parsed.decision_id = Some(parse_decision_id(id)?);
+        }
+    }
+    Ok(parsed)
 }
 
 pub(crate) fn transport_error(error: reqwest::Error, timeout_seconds: u64) -> CompletionError {

@@ -123,10 +123,13 @@ The successful response body is returned **byte for byte** from the provider,
 including unknown response extensions and its reported model name. No ID or
 alias warning is injected into the body:
 
-- `X-Signature-Id`: use with `GET /v1/signature/{id}?signing_algo=ecdsa` or
-  `ed25519`. Hosted TypeSafe has no response ID; the gateway mints a unique ID
-  for each call. External upstream IDs never control gateway receipt IDs.
-- `Inference-Id`: UUID derived from that signature ID, used by `/v1/billing/costs`.
+- `X-Generation-Id`: use with `GET /v1/signature/{id}?signing_algo=ecdsa` or
+  `ed25519`. The gateway uses the upstream JSON `id` first, then the upstream
+  `X-Generation-Id`. If neither is supplied, a gateway-signed response gets a
+  new unique ID. Request-tracing headers such as `x-typesafe-request-id` are
+  not used. IDs are opaque strings, limited to 1–255 bytes and valid HTTP
+  header values. URL-encode the ID as a single path segment for signature lookup.
+- `Inference-Id`: UUID derived from that generation ID, used by `/v1/billing/costs`.
 - `X-Serving-Provider`: actual serving tier, using the shared `near` / `chutes` /
   `non-attested` header values (`chutes` is the existing attested-third-party label).
 - `X-Model-Alias-Resolved`: present when a catalog alias resolves. Set

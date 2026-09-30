@@ -12,6 +12,19 @@ use bytes::Bytes;
 /// its favor. Both names are per-test so another test resetting aliases on a
 /// shared model cannot remove this fixture between setup and the assertion.
 async fn setup_deprecated_alias() -> (axum_test::TestServer, axum::Router, String, String) {
+    let (server, router, _mock, alias, canonical) = setup_deprecated_alias_with_mock().await;
+    (server, router, alias, canonical)
+}
+
+/// [`setup_deprecated_alias`], also returning the mock provider that serves
+/// the canonical model.
+async fn setup_deprecated_alias_with_mock() -> (
+    axum_test::TestServer,
+    axum::Router,
+    std::sync::Arc<inference_providers::mock::MockProvider>,
+    String,
+    String,
+) {
     let (server, router, inference_pool, mock_provider, _) =
         setup_test_server_with_pool_and_router().await;
     let suffix = uuid::Uuid::new_v4();
@@ -50,7 +63,7 @@ async fn setup_deprecated_alias() -> (axum_test::TestServer, axum::Router, Strin
 
     let mock_provider_trait: std::sync::Arc<
         dyn inference_providers::InferenceProvider + Send + Sync,
-    > = mock_provider;
+    > = mock_provider.clone();
     inference_pool
         .register_provider(canonical.clone(), mock_provider_trait)
         .await;
@@ -71,7 +84,7 @@ async fn setup_deprecated_alias() -> (axum_test::TestServer, axum::Router, Strin
         "deprecation should succeed: {}",
         resp.text()
     );
-    (server, router, old, canonical)
+    (server, router, mock_provider, old, canonical)
 }
 
 fn chat_body(model: &str, stream: bool) -> serde_json::Value {
@@ -141,6 +154,153 @@ async fn test_aliased_request_warns_non_streaming() {
             "{}:{}",
             compute_sha256(&request_json),
             compute_sha256(&response_text)
+        )
+    );
+}
+
+/// The mock engine reports reasoning usage the way SGLang does: a top-level
+/// `usage.reasoning_tokens`, one token per reasoning word.
+const ALIAS_REASONING: &str = "Check which model serves this alias.";
+
+fn alias_reasoning_tokens() -> i64 {
+    ALIAS_REASONING.split_whitespace().count() as i64
+}
+
+async fn respond_with_reasoning(mock: &inference_providers::mock::MockProvider) {
+    mock.set_default_response(
+        inference_providers::mock::ResponseTemplate::new("Served by the successor.")
+            .with_reasoning(ALIAS_REASONING),
+    )
+    .await;
+}
+
+/// An alias-served body is rewritten (warning field) and gateway-signed, so it
+/// also carries the reasoning count where OpenAI-compatible clients read it.
+#[tokio::test]
+async fn test_aliased_non_streaming_reports_standard_reasoning_tokens() {
+    let (server, _router, mock, alias, _canonical) = setup_deprecated_alias_with_mock().await;
+    respond_with_reasoning(&mock).await;
+    let org = setup_org_with_credits(&server, 10_000_000_000i64).await;
+    let api_key = get_api_key_for_org(&server, org.id).await;
+
+    let request_json =
+        serde_json::to_string(&chat_body(&alias, false)).expect("request should serialize");
+    let response = server
+        .post("/v1/chat/completions")
+        .add_header("Authorization", format!("Bearer {api_key}"))
+        .content_type("application/json")
+        .bytes(Bytes::from(request_json.clone()))
+        .await;
+    assert_eq!(response.status_code(), 200, "{}", response.text());
+
+    let response_text = response.text();
+    let body: serde_json::Value =
+        serde_json::from_str(&response_text).expect("chat response should be JSON");
+    assert!(
+        body["warning"].is_string(),
+        "alias warning expected: {body}"
+    );
+    let expected = alias_reasoning_tokens();
+    assert_eq!(
+        body["usage"]["completion_tokens_details"]["reasoning_tokens"], expected,
+        "standard reasoning count missing: {body}"
+    );
+    assert_eq!(
+        body["usage"]["reasoning_tokens"], expected,
+        "top-level reasoning count should be kept: {body}"
+    );
+
+    let chat_id = body["id"].as_str().expect("response should have an id");
+    let signature_response = server
+        .get(format!("/v1/signature/{chat_id}?signing_algo=ecdsa").as_str())
+        .add_header("Authorization", format!("Bearer {api_key}"))
+        .await;
+    assert_eq!(
+        signature_response.status_code(),
+        200,
+        "gateway signature should be available: {}",
+        signature_response.text()
+    );
+    let signature = signature_response.json::<serde_json::Value>();
+    assert_eq!(signature["signature_kind"], "gateway");
+    assert_eq!(
+        signature["text"],
+        format!(
+            "{}:{}",
+            compute_sha256(&request_json),
+            compute_sha256(&response_text)
+        )
+    );
+}
+
+/// Alias streams are re-serialized chunk by chunk. With continuous usage
+/// stats every chunk keeps its usage, which then also carries the standard
+/// reasoning field.
+#[tokio::test]
+async fn test_aliased_continuous_usage_stream_reports_standard_reasoning_tokens() {
+    let (server, _router, mock, alias, _canonical) = setup_deprecated_alias_with_mock().await;
+    respond_with_reasoning(&mock).await;
+    let org = setup_org_with_credits(&server, 10_000_000_000i64).await;
+    let api_key = get_api_key_for_org(&server, org.id).await;
+
+    let mut request_body = chat_body(&alias, true);
+    request_body["stream_options"] = serde_json::json!({ "continuous_usage_stats": true });
+    let request_json = serde_json::to_string(&request_body).expect("request should serialize");
+    let response = server
+        .post("/v1/chat/completions")
+        .add_header("Authorization", format!("Bearer {api_key}"))
+        .content_type("application/json")
+        .bytes(Bytes::from(request_json.clone()))
+        .await;
+    assert_eq!(response.status_code(), 200, "{}", response.text());
+    let text = response.text();
+
+    let usages: Vec<serde_json::Value> = text
+        .lines()
+        .filter_map(|line| line.strip_prefix("data: "))
+        .filter(|data| data.trim() != "[DONE]")
+        .map(|data| serde_json::from_str::<serde_json::Value>(data).expect("chunk should parse"))
+        .filter_map(|chunk| {
+            chunk
+                .get("usage")
+                .filter(|usage| usage.is_object())
+                .cloned()
+        })
+        .collect();
+    assert!(!usages.is_empty(), "continuous usage expected: {text}");
+    for usage in &usages {
+        assert_eq!(
+            usage["completion_tokens_details"]["reasoning_tokens"], usage["reasoning_tokens"],
+            "each usage must mirror the engine's reasoning count: {usage}"
+        );
+    }
+    let last = usages.last().expect("at least one usage");
+    assert_eq!(last["reasoning_tokens"], alias_reasoning_tokens());
+
+    let chat_id = text
+        .lines()
+        .filter_map(|line| line.strip_prefix("data: "))
+        .find_map(|data| serde_json::from_str::<serde_json::Value>(data).ok())
+        .and_then(|chunk| chunk["id"].as_str().map(str::to_string))
+        .expect("stream should carry a chat id");
+    let signature_response = server
+        .get(format!("/v1/signature/{chat_id}?signing_algo=ecdsa").as_str())
+        .add_header("Authorization", format!("Bearer {api_key}"))
+        .await;
+    assert_eq!(
+        signature_response.status_code(),
+        200,
+        "gateway signature should be available: {}",
+        signature_response.text()
+    );
+    let signature = signature_response.json::<serde_json::Value>();
+    assert_eq!(signature["signature_kind"], "gateway");
+    assert_eq!(
+        signature["text"],
+        format!(
+            "{}:{}",
+            compute_sha256(&request_json),
+            compute_sha256(&text)
         )
     );
 }

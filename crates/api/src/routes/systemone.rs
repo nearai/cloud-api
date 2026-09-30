@@ -22,7 +22,7 @@ use services::{
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
-pub const HEADER_SIGNATURE_ID: &str = "x-signature-id";
+pub const HEADER_GENERATION_ID: &str = "x-generation-id";
 
 #[utoipa::path(
     post,
@@ -30,7 +30,7 @@ pub const HEADER_SIGNATURE_ID: &str = "x-signature-id";
     tag = "Decisions",
     request_body = SystemOneRequest,
     responses(
-        (status = 200, description = "Typed decisions. X-Signature-Id identifies the receipt at /v1/signature/{id}; Inference-Id identifies billing usage.", body = SystemOneResponse),
+        (status = 200, description = "Typed decisions. X-Generation-Id identifies the receipt at /v1/signature/{id}; Inference-Id identifies billing usage.", body = SystemOneResponse),
         (status = 400, description = "Invalid request or model modality", body = ErrorResponse),
         (status = 401, description = "Authentication required", body = ErrorResponse),
         (status = 429, description = "Rate or concurrency limit", body = ErrorResponse),
@@ -134,8 +134,8 @@ pub async fn systemone(
     // client disconnects while waiting for persistence.
     let finalize = tokio::spawn(async move {
         let _slot = slot;
-        let id = &served.signature_id;
-        let inference_id = hash_inference_id_to_uuid(id);
+        let decision_id = &served.decision_id;
+        let inference_id = hash_inference_id_to_uuid(decision_id);
         let usage = &served.response.response.usage;
         let usage_request = RecordUsageServiceRequest {
             organization_id: api_key.organization.id.0,
@@ -153,7 +153,7 @@ pub async fn systemone(
             ttft_ms: None,
             avg_itl_ms: None,
             inference_id: Some(inference_id),
-            provider_request_id: Some(id.clone()),
+            provider_request_id: Some(decision_id.clone()),
             stop_reason: Some(StopReason::Completed),
             response_id: None,
             image_count: None,
@@ -166,14 +166,14 @@ pub async fn systemone(
                     SignatureKind::ProviderTee => {
                         state
                             .attestation_service
-                            .store_stream_chat_signature_from_provider(id)
+                            .store_stream_chat_signature_from_provider(decision_id)
                             .await
                     }
                     SignatureKind::Gateway => {
                         state
                             .attestation_service
                             .store_chat_signature_and_unpin(
-                                id,
+                                decision_id,
                                 body_hash.hash,
                                 hex::encode(Sha256::digest(&served.response.raw_bytes)),
                             )
@@ -187,10 +187,10 @@ pub async fn systemone(
             // cancels that write or the gateway helper's own cleanup.
             state
                 .attestation_service
-                .release_chat_signature_pin(id)
+                .release_chat_signature_pin(decision_id)
                 .await;
             if !matches!(result, Ok(Ok(()))) {
-                tracing::error!(signature_id = %id, "System One signature finalization failed or timed out");
+                tracing::error!(decision_id = %decision_id, "System One signature finalization failed or timed out");
             }
         };
         tokio::join!(
@@ -212,12 +212,12 @@ pub async fn systemone(
         );
         let mut response = Response::builder()
             .header(header::CONTENT_TYPE, "application/json")
-            .header(HEADER_SIGNATURE_ID, id)
+            .header(HEADER_GENERATION_ID, decision_id)
             .header(completions::HEADER_INFERENCE_ID, inference_id.to_string())
             .header("x-serving-provider", tier)
             .header(
                 header::ACCESS_CONTROL_EXPOSE_HEADERS,
-                "X-Signature-Id, Inference-Id, X-Serving-Provider, X-Model-Alias-Resolved",
+                "X-Generation-Id, Inference-Id, X-Serving-Provider, X-Model-Alias-Resolved",
             );
         if let Some(alias) = alias {
             response = response.header(common::HEADER_MODEL_ALIAS_RESOLVED, alias);

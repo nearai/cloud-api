@@ -96,6 +96,58 @@ pub fn inject_warning_field(body: &[u8], warning: &str) -> Option<Vec<u8>> {
     serde_json::to_vec(&value).ok()
 }
 
+/// [`inject_warning_field`] for a chat completion body. The body is rewritten
+/// anyway, so this also mirrors the reasoning count into the standard usage
+/// field (see [`mirror_reasoning_usage`]).
+pub fn inject_chat_warning_field(body: &[u8], warning: &str) -> Option<Vec<u8>> {
+    let mut value: serde_json::Value = serde_json::from_slice(body).ok()?;
+    value.as_object_mut()?.insert(
+        "warning".to_string(),
+        serde_json::Value::String(warning.to_string()),
+    );
+    mirror_reasoning_usage(&mut value);
+    serde_json::to_vec(&value).ok()
+}
+
+/// Copy a top-level `usage.reasoning_tokens` (SGLang's field) into
+/// `usage.completion_tokens_details.reasoning_tokens`, where OpenAI-compatible
+/// clients read it. JSON counterpart of
+/// `TokenUsage::ensure_standard_reasoning_details`, for bodies the gateway
+/// rewrites without parsing them into typed structs. Only a non-negative
+/// integer is copied, unmodified. An existing standard value, or a
+/// `completion_tokens_details` that is not an object, is left alone, and the
+/// top-level field is kept.
+pub fn mirror_reasoning_usage(body: &mut serde_json::Value) {
+    let Some(usage) = body
+        .get_mut("usage")
+        .and_then(serde_json::Value::as_object_mut)
+    else {
+        return;
+    };
+    let Some(tokens) = usage
+        .get("reasoning_tokens")
+        .filter(|tokens| tokens.as_u64().is_some())
+        .cloned()
+    else {
+        return;
+    };
+    let details = usage
+        .entry("completion_tokens_details")
+        .or_insert(serde_json::Value::Null);
+    if details.is_null() {
+        *details = serde_json::Value::Object(serde_json::Map::new());
+    }
+    let Some(details) = details.as_object_mut() else {
+        return;
+    };
+    let standard = details
+        .entry("reasoning_tokens")
+        .or_insert(serde_json::Value::Null);
+    if standard.is_null() {
+        *standard = tokens;
+    }
+}
+
 /// Validate pagination parameters (limit/offset pattern)
 ///
 /// Ensures:
@@ -927,6 +979,84 @@ mod tests {
         // Non-JSON / non-object payloads (e.g. E2EE blobs) must be left alone.
         assert!(inject_warning_field(b"not json", "w").is_none());
         assert!(inject_warning_field(b"[1,2,3]", "w").is_none());
+    }
+
+    #[test]
+    fn test_inject_chat_warning_field_mirrors_reasoning_usage() {
+        let body = br#"{"id":"x","usage":{"prompt_tokens":2,"completion_tokens":30,"total_tokens":32,"reasoning_tokens":12}}"#;
+        let out = inject_chat_warning_field(body, "heads up").unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(v["warning"], "heads up");
+        assert_eq!(
+            v["usage"]["completion_tokens_details"]["reasoning_tokens"],
+            12
+        );
+        assert_eq!(v["usage"]["reasoning_tokens"], 12);
+
+        assert!(inject_chat_warning_field(b"not json", "w").is_none());
+        assert!(inject_chat_warning_field(b"[1,2,3]", "w").is_none());
+    }
+
+    #[test]
+    fn test_mirror_reasoning_usage() {
+        let mirrored = |usage: serde_json::Value| {
+            let mut body = serde_json::json!({ "id": "x", "usage": usage });
+            mirror_reasoning_usage(&mut body);
+            body["usage"].clone()
+        };
+
+        // Copied unmodified, even past completion_tokens; the legacy field stays.
+        assert_eq!(
+            mirrored(serde_json::json!({ "completion_tokens": 10, "reasoning_tokens": 15 })),
+            serde_json::json!({
+                "completion_tokens": 10,
+                "reasoning_tokens": 15,
+                "completion_tokens_details": { "reasoning_tokens": 15 }
+            })
+        );
+        // Other detail fields are kept, and a null standard value is filled.
+        assert_eq!(
+            mirrored(serde_json::json!({
+                "reasoning_tokens": 4,
+                "completion_tokens_details": { "audio_tokens": 1, "reasoning_tokens": null }
+            }))["completion_tokens_details"],
+            serde_json::json!({ "audio_tokens": 1, "reasoning_tokens": 4 })
+        );
+        assert_eq!(
+            mirrored(serde_json::json!({
+                "reasoning_tokens": 4,
+                "completion_tokens_details": null
+            }))["completion_tokens_details"],
+            serde_json::json!({ "reasoning_tokens": 4 })
+        );
+
+        // Left alone: an existing standard value, a non-object details value,
+        // no count, or a count that is not a non-negative integer.
+        for usage in [
+            serde_json::json!({
+                "reasoning_tokens": 4,
+                "completion_tokens_details": { "reasoning_tokens": 3 }
+            }),
+            serde_json::json!({ "reasoning_tokens": 4, "completion_tokens_details": "n/a" }),
+            serde_json::json!({ "completion_tokens": 10 }),
+            serde_json::json!({ "reasoning_tokens": -1 }),
+            serde_json::json!({ "reasoning_tokens": 1.5 }),
+            serde_json::json!({ "reasoning_tokens": "4" }),
+            serde_json::json!({ "reasoning_tokens": null }),
+        ] {
+            assert_eq!(mirrored(usage.clone()), usage);
+        }
+
+        // Bodies without an object `usage` are untouched.
+        for mut body in [
+            serde_json::json!({ "id": "x" }),
+            serde_json::json!({ "usage": null }),
+            serde_json::json!([1, 2]),
+        ] {
+            let before = body.clone();
+            mirror_reasoning_usage(&mut body);
+            assert_eq!(body, before);
+        }
     }
 
     #[test]

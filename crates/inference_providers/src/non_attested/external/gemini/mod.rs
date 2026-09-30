@@ -100,6 +100,7 @@ fn convert_to_openai_response(
             completion_tokens: gemini_response.usage_metadata.candidates_token_count,
             total_tokens: gemini_response.usage_metadata.total_token_count,
             prompt_tokens_details: None,
+            ..Default::default()
         },
         prompt_logprobs: None,
         prompt_token_ids: None,

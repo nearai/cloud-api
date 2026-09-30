@@ -1420,12 +1420,12 @@ impl InferenceProvider for Fleet {
                     .await
                     .map_err(|e| crate::systemone::transport_error(e, timeout_seconds))?;
                 let response = crate::systemone::read_response(response, &request, false).await?;
-                let id = response.provider_signature_id()?;
+                let decision_id = response.provider_decision_id()?;
                 if let Some(index) = index {
                     self.signature_rotation
                         .lock()
                         .unwrap_or_else(|e| e.into_inner())
-                        .insert(id.to_owned(), index as u64);
+                        .insert(decision_id.to_owned(), index as u64);
                 }
                 Ok(response)
             }
@@ -1474,7 +1474,8 @@ impl InferenceProvider for Fleet {
         signing_algo: Option<String>,
     ) -> Result<ChatSignature, CompletionError> {
         let signing_algo = signing_algo.unwrap_or_else(|| "ecdsa".to_string());
-        let path_and_query = format!("/v1/signature/{chat_id}?signing_algo={signing_algo}");
+        let encoded_chat_id = urlencoding::encode(chat_id);
+        let path_and_query = format!("/v1/signature/{encoded_chat_id}?signing_algo={signing_algo}");
         let canonical_url = format!("{}{}", self.config.base_url, path_and_query);
         let headers = self
             .build_headers()

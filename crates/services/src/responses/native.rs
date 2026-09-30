@@ -254,6 +254,7 @@ impl Usage {
                 completion_tokens: count("output_tokens")?,
                 total_tokens: count("total_tokens")?,
                 prompt_tokens_details: usage.get("input_tokens_details").cloned(),
+                ..Default::default()
             });
         }
         match response["status"].as_str() {

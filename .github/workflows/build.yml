@@ -13,6 +13,14 @@ on:
     tags:
       - 'v*'
 
+# Serialize builds per ref so overlapping main runs cannot publish :latest (and
+# dispatch the dev deployment) out of commit order. cancel-in-progress: false
+# lets a running build finish; GitHub keeps only the newest queued run, so the
+# latest commit on main always publishes last.
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: false
+
 env:
   REGISTRY: docker.io
   IMAGE_REPOSITORY: ${{ vars.DOCKER_REGISTRY_USER }}/cloud-api

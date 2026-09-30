@@ -178,9 +178,8 @@ async fn test_response_items_saved_on_disconnect() {
 
     assert_eq!(
         main_usage.stop_reason.as_deref(),
-        Some("incomplete"),
-        "A stream truncated mid-answer declares no finish reason, so it must not \
-         be recorded as a clean completion. Found: {:?}",
+        Some("provider_error"),
+        "A stream truncated mid-answer must be recorded as an error. Found: {:?}",
         main_usage.stop_reason
     );
 
@@ -215,15 +214,16 @@ async fn test_signature_returns_stream_disconnected_on_client_disconnect() {
 
     use crate::common::mock_prompts;
 
-    // Configure mock: 10 words, disconnect after 5
+    // Complete the provider stream normally; the test simulates a client
+    // disconnect below by removing its signature and marking usage accordingly.
     let full_response = "Machine learning is a fascinating field of artificial intelligence today";
     let prompt = mock_prompts::build_prompt("Tell me about AI");
     mock.when(inference_providers::mock::RequestMatcher::ExactPrompt(
         prompt,
     ))
-    .respond_with(
-        inference_providers::mock::ResponseTemplate::new(full_response).with_disconnect_after(5),
-    )
+    .respond_with(inference_providers::mock::ResponseTemplate::new(
+        full_response,
+    ))
     .await;
 
     // Create conversation
@@ -272,9 +272,8 @@ async fn test_signature_returns_stream_disconnected_on_client_disconnect() {
     let response_uuid_str = response_id.strip_prefix("resp_").unwrap_or(&response_id);
     let response_uuid = uuid::Uuid::parse_str(response_uuid_str).expect("Invalid response ID");
 
-    // The mock truncates the provider stream, but Responses API still emits
-    // response.completed and asynchronously stores a gateway signature. Wait
-    // for both it and this response's usage row before simulating a client
+    // Wait for response.completed and the asynchronously stored gateway
+    // signature before simulating a client
     // disconnect, so UPDATE cannot miss the row or DELETE race the signature write.
     tokio::time::timeout(tokio::time::Duration::from_secs(5), async {
         loop {

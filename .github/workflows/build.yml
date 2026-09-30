@@ -13,10 +13,6 @@ on:
     tags:
       - 'v*'
 
-# Serialize builds per ref so overlapping main runs cannot publish :latest (and
-# dispatch the dev deployment) out of commit order. cancel-in-progress: false
-# lets a running build finish; GitHub keeps only the newest queued run, so the
-# latest commit on main always publishes last.
 # Serialize builds per ref so :latest is pushed and the staging/dev dispatches fire in commit
 # order. queue: max keeps every pending run (FIFO) instead of GitHub's default of replacing
 # queued runs, so no commit is skipped and every one still gets its staging-stamped tag.

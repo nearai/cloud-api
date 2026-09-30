@@ -555,6 +555,78 @@ async fn org_reports_read_usage_hourly_over_whole_hours() {
     assert_eq!(customer_series["data"].as_array().unwrap().len(), 2);
 }
 
+/// TTFT threshold counts: whole hours from usage_hourly, edge hours from raw, and a window
+/// equals the sum of its parts.
+#[tokio::test]
+async fn org_metrics_count_ttft_under_thresholds() {
+    use services::admin::{MetricsSummary, ModelMetrics, OrganizationMetrics};
+    let fixture = setup_platform_provider_usage_fixture().await;
+    let org = fixture.organization_id;
+    let hour = chrono::Duration::hours(1);
+    let (h, _) = crate::admin_provider_attribution_support::isolated_usage_hours(&fixture, 2).await;
+    let minutes = chrono::Duration::minutes;
+    for (at, ttft) in [
+        (h + minutes(10), Some(4_999)),
+        (h + minutes(40), Some(5_000)),
+        (h + minutes(50), None),
+        (h + hour + minutes(10), Some(9_999)),
+        (h + hour + minutes(20), Some(60_000)),
+        (h + hour + minutes(30), Some(59_999)),
+    ] {
+        crate::usage_hourly::insert_raw(&fixture, at, 1, 10, ttft, None, Some("external")).await;
+    }
+    crate::usage_hourly::recompute_usage_hours(h, h + hour * 2).await;
+
+    fn summary_counts(s: &MetricsSummary) -> [i64; 5] {
+        [
+            s.total_requests,
+            s.ttft_measured_requests,
+            s.ttft_under_5s_requests,
+            s.ttft_under_10s_requests,
+            s.ttft_under_60s_requests,
+        ]
+    }
+    fn model_counts(m: &ModelMetrics) -> [i64; 5] {
+        [
+            m.requests,
+            m.ttft_measured_requests,
+            m.ttft_under_5s_requests,
+            m.ttft_under_10s_requests,
+            m.ttft_under_60s_requests,
+        ]
+    }
+    let get = |from: chrono::DateTime<Utc>, to: chrono::DateTime<Utc>| {
+        let path = format!(
+            "/v1/admin/organizations/{org}/metrics?start={}&end={}",
+            url_time(from),
+            url_time(to)
+        );
+        let server = &fixture.server;
+        async move { session_json::<OrganizationMetrics>(server, &path).await }
+    };
+
+    // Whole hours: served from usage_hourly.
+    let whole = get(h, h + hour * 2).await;
+    assert_eq!(summary_counts(&whole.summary), [6, 5, 1, 3, 4]);
+    assert_eq!(whole.by_model.len(), 1);
+    assert_eq!(model_counts(&whole.by_model[0]), [6, 5, 1, 3, 4]);
+
+    // A window equals the sum of its constituent periods.
+    let first = get(h, h + hour).await;
+    let second = get(h + hour, h + hour * 2).await;
+    let summed: Vec<i64> = summary_counts(&first.summary)
+        .iter()
+        .zip(summary_counts(&second.summary))
+        .map(|(a, b)| a + b)
+        .collect();
+    assert_eq!(summed, summary_counts(&whole.summary).to_vec());
+
+    // A partial edge hour is read raw and still exact.
+    let edge = get(h + minutes(30), h + hour * 2).await;
+    assert_eq!(summary_counts(&edge.summary), [5, 4, 0, 2, 3]);
+    assert_eq!(model_counts(&edge.by_model[0]), [5, 4, 0, 2, 3]);
+}
+
 /// `credit_type` reports read raw; unfiltered ones read usage_rows. Both are exact over the
 /// requested range.
 #[tokio::test]
@@ -574,14 +646,20 @@ async fn org_credit_type_reports_stay_raw_live_and_exact() {
         .await
         .unwrap()
         .get(0);
-    for (minute, dollars) in [(10_i64, 3_i64), (50, 4)] {
+    for (minute, dollars, ttft) in [
+        (10_i64, 3_i64, Some(5_000)),
+        (20, 1, None),
+        (22, 1, Some(10_000)),
+        (24, 1, Some(60_000)),
+        (50, 4, Some(70_000)),
+    ] {
         let at = h + chrono::Duration::minutes(minute);
         crate::usage_hourly::insert_raw(
             &fixture,
             at,
             dollars * 1_000_000_000,
             10,
-            None,
+            ttft,
             None,
             Some("external"),
         )
@@ -605,7 +683,7 @@ async fn org_credit_type_reports_stay_raw_live_and_exact() {
             .await
             .unwrap();
     }
-    // Nothing is recomputed. [h, h + 30m) exactly holds only the first row.
+    // Nothing is recomputed. [h, h + 30m) holds four rows: 5000 ms, NULL, 10000 ms and 60000 ms.
     let end = h + chrono::Duration::minutes(30);
     let range = format!("start={}&end={}", url_time(h), url_time(end));
 
@@ -619,8 +697,30 @@ async fn org_credit_type_reports_stay_raw_live_and_exact() {
         (h, end),
         "exact range echoed"
     );
-    assert_eq!(filtered.summary.total_requests, 1);
-    assert_eq!(filtered.summary.total_cost_usd, 3.0);
+    assert_eq!(filtered.summary.total_requests, 4);
+    assert_eq!(filtered.summary.total_cost_usd, 6.0);
+    // Raw credit_type body: a TTFT exactly at a threshold (5000, 10000, 60000 ms) is not "under" it.
+    let s = &filtered.summary;
+    assert_eq!(
+        [
+            s.ttft_measured_requests,
+            s.ttft_under_5s_requests,
+            s.ttft_under_10s_requests,
+            s.ttft_under_60s_requests
+        ],
+        [3, 0, 1, 2]
+    );
+    let m = &filtered.by_model[0];
+    assert_eq!(m.requests, 4);
+    assert_eq!(
+        [
+            m.ttft_measured_requests,
+            m.ttft_under_5s_requests,
+            m.ttft_under_10s_requests,
+            m.ttft_under_60s_requests
+        ],
+        [3, 0, 1, 2]
+    );
 
     let series: TimeSeriesMetrics = session_json(
         &fixture.server,
@@ -628,7 +728,7 @@ async fn org_credit_type_reports_stay_raw_live_and_exact() {
     )
     .await;
     assert_eq!((series.period_start, series.period_end), (h, end));
-    assert_eq!(series.data.iter().map(|p| p.requests).sum::<i64>(), 1);
+    assert_eq!(series.data.iter().map(|p| p.requests).sum::<i64>(), 4);
 
     let unfiltered: OrganizationMetrics = session_json(
         &fixture.server,
@@ -637,8 +737,18 @@ async fn org_credit_type_reports_stay_raw_live_and_exact() {
     .await;
     // A sub-hour range reads raw rows, so it is exact without a recompute.
     assert_eq!((unfiltered.period_start, unfiltered.period_end), (h, end));
-    assert_eq!(unfiltered.summary.total_requests, 1);
-    assert_eq!(unfiltered.summary.total_cost_usd, 3.0);
+    assert_eq!(unfiltered.summary.total_requests, 4);
+    assert_eq!(unfiltered.summary.total_cost_usd, 6.0);
+    let s = &unfiltered.summary;
+    assert_eq!(
+        [
+            s.ttft_measured_requests,
+            s.ttft_under_5s_requests,
+            s.ttft_under_10s_requests,
+            s.ttft_under_60s_requests
+        ],
+        [3, 0, 1, 2]
+    );
 }
 
 #[tokio::test]
@@ -676,4 +786,29 @@ async fn org_hourly_reports_are_cancelled_at_the_statement_budget() {
         .unwrap()
         .get(0);
     assert_eq!(timeout, original_timeout);
+}
+
+#[test]
+fn admin_org_metrics_ttft_thresholds_are_documented() {
+    use utoipa::OpenApi;
+    let spec = serde_json::to_value(api::openapi::ApiDoc::openapi()).unwrap();
+    let body = &spec["paths"]["/v1/admin/organizations/{org_id}/metrics"]["get"]["responses"]
+        ["200"]["content"]["application/json"]["schema"]["$ref"];
+    assert_eq!(body, "#/components/schemas/OrganizationMetrics");
+    for schema in ["MetricsSummary", "ModelMetrics"] {
+        let props = &spec["components"]["schemas"][schema]["properties"];
+        for field in [
+            "ttft_measured_requests",
+            "ttft_under_5s_requests",
+            "ttft_under_10s_requests",
+            "ttft_under_60s_requests",
+        ] {
+            assert!(props[field].is_object(), "{schema}.{field} is undocumented");
+        }
+    }
+    let measured = spec["components"]["schemas"]["ModelMetrics"]["properties"]
+        ["ttft_measured_requests"]["description"]
+        .as_str()
+        .unwrap();
+    assert!(measured.contains("Denominator"), "{measured}");
 }

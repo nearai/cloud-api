@@ -25,7 +25,12 @@ fn verifies_proxy_golden_host_frame() {
 fn golden_frame_rejects_one_flipped_byte() {
     let mut env: Envelope =
         serde_json::from_str(include_str!("fixtures/host_frame_v1.json")).unwrap();
+    let original = env.frame.clone();
     env.frame = env.frame.replacen("\"seq\":7", "\"seq\":8", 1);
+    assert_ne!(
+        env.frame, original,
+        "golden no longer contains \"seq\":7; update the tamper pattern"
+    );
     let pk = SigningKey::from_bytes(&[7u8; 32]).verifying_key();
     assert!(frame::open(&env, &pk).is_err());
 }

@@ -27,7 +27,8 @@ const USAGE_HOURLY_COLUMNS: &str = "hour, organization_id, workspace_id, api_key
     request_count, input_tokens, output_tokens, cache_read_tokens, total_tokens, total_cost, \
     error_count, incomplete_count, stop_reason_count, \
     ttft_count, ttft_sum_ms, ttft_p50_ms, ttft_p95_ms, ttft_p99_ms, \
-    itl_count, itl_sum_ms, itl_p95_ms, last_usage_at";
+    itl_count, itl_sum_ms, itl_p95_ms, last_usage_at, \
+    ttft_under_5s_count, ttft_under_10s_count, ttft_under_60s_count";
 
 /// One usage_hourly row per UTC hour and grain from raw rows; callers add FROM, WHERE and
 /// `GROUP BY 1..10`. The recompute and `usage_rows_cte` share it, so aggregate hours and
@@ -49,7 +50,10 @@ SELECT
     PERCENTILE_CONT(0.99) WITHIN GROUP (ORDER BY ttft_ms),
     COUNT(avg_itl_ms), COALESCE(SUM(avg_itl_ms), 0)::DOUBLE PRECISION,
     PERCENTILE_CONT(0.95) WITHIN GROUP (ORDER BY avg_itl_ms),
-    MAX(created_at)
+    MAX(created_at),
+    COUNT(*) FILTER (WHERE ttft_ms < 5000),
+    COUNT(*) FILTER (WHERE ttft_ms < 10000),
+    COUNT(*) FILTER (WHERE ttft_ms < 60000)
 "#;
 
 fn recompute_insert() -> String {

@@ -13,7 +13,7 @@ use utoipa::ToSchema;
 use uuid::Uuid;
 
 /// Summary metrics for an organization over a time period
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct MetricsSummary {
     pub total_requests: i64,
     pub total_input_tokens: i64,
@@ -23,10 +23,19 @@ pub struct MetricsSummary {
     pub total_cost_usd: f64,
     /// Number of unique API keys used in the period
     pub unique_api_keys: i64,
+    /// Requests with a recorded time to first token; the denominator for the
+    /// `ttft_under_*` shares. See `ModelMetrics::ttft_measured_requests`.
+    pub ttft_measured_requests: i64,
+    /// Requests whose time to first token was strictly under 5000 ms
+    pub ttft_under_5s_requests: i64,
+    /// Requests whose time to first token was strictly under 10000 ms
+    pub ttft_under_10s_requests: i64,
+    /// Requests whose time to first token was strictly under 60000 ms
+    pub ttft_under_60s_requests: i64,
 }
 
 /// Metrics breakdown by workspace
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct WorkspaceMetrics {
     pub workspace_id: Uuid,
     pub workspace_name: String,
@@ -39,7 +48,7 @@ pub struct WorkspaceMetrics {
 }
 
 /// Metrics breakdown by API key
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct ApiKeyMetrics {
     pub api_key_id: Uuid,
     pub api_key_name: String,
@@ -49,7 +58,7 @@ pub struct ApiKeyMetrics {
 }
 
 /// Metrics breakdown by model
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct ModelMetrics {
     pub model_name: String,
     pub requests: i64,
@@ -66,10 +75,23 @@ pub struct ModelMetrics {
     pub p95_itl_ms: Option<f64>,
     /// Cost in USD
     pub cost_usd: f64,
+    /// Requests with a recorded time to first token. Denominator for the `ttft_under_*`
+    /// shares (share = ttft_under_Ns_requests / ttft_measured_requests); usually below
+    /// `requests`: non-streamed requests and native passthrough streams (/v1/messages,
+    /// native Responses) record no TTFT, and streams that end before usage arrives write no
+    /// usage row at all. TTFT runs from request arrival to the first streamed chunk of any
+    /// kind (possibly role-only or usage-only), not necessarily the first generated token.
+    pub ttft_measured_requests: i64,
+    /// Requests whose time to first token was strictly under 5000 ms
+    pub ttft_under_5s_requests: i64,
+    /// Requests whose time to first token was strictly under 10000 ms
+    pub ttft_under_10s_requests: i64,
+    /// Requests whose time to first token was strictly under 60000 ms
+    pub ttft_under_60s_requests: i64,
 }
 
 /// Complete organization metrics response
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct OrganizationMetrics {
     pub organization_id: Uuid,
     pub organization_name: String,

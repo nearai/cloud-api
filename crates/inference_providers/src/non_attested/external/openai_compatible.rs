@@ -681,6 +681,64 @@ mod tests {
         assert!(!body.contains("word,segment"), "body was: {body}");
     }
 
+    /// The non-streaming relay re-serializes provider usage through `TokenUsage`
+    /// (#465). The typed `completion_tokens_details` survives that round trip;
+    /// provider cost fields and non-standard detail keys still do not.
+    #[tokio::test]
+    async fn chat_completion_keeps_standard_reasoning_details_and_drops_cost() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "gen-1",
+                "object": "chat.completion",
+                "created": 1,
+                "model": "upstream-model",
+                "choices": [{
+                    "index": 0,
+                    "message": { "role": "assistant", "content": "ok" },
+                    "finish_reason": "stop"
+                }],
+                "usage": {
+                    "prompt_tokens": 20,
+                    "completion_tokens": 40,
+                    "total_tokens": 60,
+                    "cost": 0.0001,
+                    "is_byok": false,
+                    "cost_details": { "upstream_inference_cost": 0.0001 },
+                    "completion_tokens_details": { "reasoning_tokens": 25, "image_tokens": 0 }
+                }
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let backend = OpenAiCompatibleBackend::new();
+        let config = BackendConfig {
+            base_url: server.uri(),
+            api_key: "sk-test".to_string(),
+            timeout_seconds: 5,
+            extra: HashMap::new(),
+            extra_request_body: HashMap::new(),
+        };
+        let response = backend
+            .chat_completion(&config, "upstream-model", make_chat_params(None, None))
+            .await
+            .unwrap();
+
+        let body: serde_json::Value = serde_json::from_slice(&response.raw_bytes).unwrap();
+        assert_eq!(
+            body["usage"],
+            serde_json::json!({
+                "prompt_tokens": 20,
+                "completion_tokens": 40,
+                "total_tokens": 60,
+                "completion_tokens_details": { "reasoning_tokens": 25 }
+            })
+        );
+        assert_eq!(response.response.usage.reasoning_tokens(), Some(25));
+    }
+
     // ==================== URL Building Tests ====================
 
     #[test]

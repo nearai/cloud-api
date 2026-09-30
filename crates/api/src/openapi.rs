@@ -364,6 +364,12 @@ use utoipa::{Modify, OpenApi};
             crate::routes::billing::RequestCost,
             // File models
             FileUploadResponse, ExpiresAfter, FileListResponse, FileDeleteResponse,
+            // Organization metrics (admin)
+            services::admin::OrganizationMetrics,
+            services::admin::MetricsSummary,
+            services::admin::WorkspaceMetrics,
+            services::admin::ApiKeyMetrics,
+            services::admin::ModelMetrics,
             // Platform Stats analytics models
             services::admin::PlatformMetrics,
             services::admin::PlatformProviderUsage,

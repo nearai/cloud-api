@@ -3765,6 +3765,7 @@ fn parse_metrics_credit_type(
 /// and breakdowns by workspace, API key, and model.
 ///
 /// Percentiles across hours are approximate (sample-weighted means of hourly percentiles).
+/// TTFT threshold counts are exact; divide them by `ttft_measured_requests`, not `requests` / `total_requests`.
 #[utoipa::path(
     get,
     path = "/v1/admin/organizations/{org_id}/metrics",
@@ -3776,7 +3777,7 @@ fn parse_metrics_credit_type(
         ("credit_type" = Option<CreditType>, Query, description = CREDIT_TYPE_QUERY_DESCRIPTION)
     ),
     responses(
-        (status = 200, description = "Organization metrics retrieved successfully"),
+        (status = 200, description = "Organization metrics retrieved successfully", body = services::admin::OrganizationMetrics),
         (status = 400, description = "Invalid request", body = ErrorResponse),
         (status = 401, description = "Unauthorized", body = ErrorResponse),
         (status = 504, description = "Analytics statement budget exceeded", body = ErrorResponse),

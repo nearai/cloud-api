@@ -4784,7 +4784,7 @@ impl InferenceProviderPool {
                     async move {
                         let response = provider.systemone(request, request_hash).await?;
                         if provider.tier().is_attested() && provider.supports_chat_signatures() {
-                            response.provider_signature_id()?;
+                            response.provider_decision_id()?;
                         }
                         Ok(response)
                     }
@@ -4795,14 +4795,18 @@ impl InferenceProviderPool {
         // Catalog flags and the trait's historical signature default are insufficient.
         let provider_signs =
             served.provider.tier().is_attested() && served.provider.supports_chat_signatures();
-        let (signature_id, signature_kind) = if provider_signs {
+        let (decision_id, signature_kind) = if provider_signs {
             (
-                served.value.provider_signature_id()?.to_owned(),
+                served.value.provider_decision_id()?.to_owned(),
                 crate::attestation::SignatureKind::ProviderTee,
             )
         } else {
             (
-                format!("decision-{}", uuid::Uuid::new_v4()),
+                served
+                    .value
+                    .decision_id
+                    .clone()
+                    .unwrap_or_else(|| format!("decision-{}", uuid::Uuid::new_v4())),
                 crate::attestation::SignatureKind::Gateway,
             )
         };
@@ -4812,14 +4816,14 @@ impl InferenceProviderPool {
             // so its implementation is a no-op for this call.
             served
                 .provider
-                .pin_chat_connection(&request_hash, &signature_id);
-            self.store_chat_id_mapping(signature_id.clone(), served.provider)
+                .pin_chat_connection(&request_hash, &decision_id);
+            self.store_chat_id_mapping(decision_id.clone(), served.provider)
                 .await;
         }
         Ok(AttributedSystemOne {
             response: served.value,
             provider_attribution: served.provider_attribution,
-            signature_id,
+            decision_id,
             signature_kind,
         })
     }

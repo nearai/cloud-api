@@ -42,6 +42,7 @@ serde_urlencoded = "0.7.1"
 regex = "1"
 sha2 = "0.11"
 url = "2.5"
+urlencoding = "2.1"
 # Chutes E2EE transport: ML-KEM-768 (FIPS 203) + HKDF-SHA256 + ChaCha20-Poly1305.
 # Exact-pinned (`=`) to match Chutes' own RustCrypto reference client
 # (github.com/chutesai/e2ee-test), which interoperates with their server — a

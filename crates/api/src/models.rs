@@ -1314,16 +1314,25 @@ pub struct CompletionChoice {
 }
 
 /// Usage for chat/completions endpoints.
-/// Serializes as prompt_tokens, completion_tokens, prompt_tokens_details, completion_tokens_details, total_tokens.
+/// Serializes as prompt_tokens, prompt_tokens_details, completion_tokens, completion_tokens_details, total_tokens, reasoning_tokens.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct CompletionUsage {
     pub prompt_tokens: i32,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub prompt_tokens_details: Option<InputTokensDetails>,
     pub completion_tokens: i32,
+    /// Breakdown of `completion_tokens`. `reasoning_tokens` here is the
+    /// standard location of the reasoning count, present when the model
+    /// reported one.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub completion_tokens_details: Option<OutputTokensDetails>,
+    pub completion_tokens_details: Option<CompletionTokensDetails>,
     pub total_tokens: i32,
+    /// Deprecated: use `completion_tokens_details.reasoning_tokens`. Top-level
+    /// reasoning count as reported by some self-hosted engines; kept for
+    /// existing readers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(deprecated)]
+    pub reasoning_tokens: Option<i64>,
 }
 
 /// Usage for Response API and other non-OpenAI endpoints.
@@ -1347,6 +1356,21 @@ pub struct InputTokensDetails {
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct OutputTokensDetails {
     pub reasoning_tokens: i64,
+}
+
+/// Breakdown of chat-completion `completion_tokens`. Every field is optional:
+/// a provider may report any subset of them.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, ToSchema)]
+pub struct CompletionTokensDetails {
+    /// Tokens spent on reasoning.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_tokens: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub audio_tokens: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub accepted_prediction_tokens: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rejected_prediction_tokens: Option<i64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]

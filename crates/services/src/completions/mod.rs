@@ -2777,6 +2777,7 @@ mod tests {
                         "cached_tokens": 3,
                         "cache_write_tokens": 4,
                     })),
+                    ..Default::default()
                 }),
                 service_tier: Some("priority".to_string()),
                 prompt_token_ids: None,
@@ -2955,6 +2956,7 @@ mod tests {
                         "cached_tokens": 7,
                         "cache_creation_tokens": 2,
                     })),
+                    ..Default::default()
                 }),
                 service_tier: None,
                 prompt_token_ids: None,
@@ -3100,6 +3102,7 @@ mod tests {
                     completion_tokens: 20,
                     total_tokens: 30,
                     prompt_tokens_details: None,
+                    ..Default::default()
                 }),
                 service_tier: None,
                 prompt_token_ids: None,
@@ -3233,6 +3236,7 @@ mod tests {
                     completion_tokens: 1,
                     total_tokens: 6,
                     prompt_tokens_details: None,
+                    ..Default::default()
                 }),
                 service_tier: None,
                 prompt_token_ids: None,

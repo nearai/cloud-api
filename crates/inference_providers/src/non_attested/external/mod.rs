@@ -696,13 +696,14 @@ mod tests {
             th::ORG_ID,
             th::WORKSPACE_ID,
             eh::MODEL_PUB_KEY,
-            ph::LEGACY_DENIED_EXTRA_KEYS[0],
-            ph::LEGACY_DENIED_EXTRA_KEYS[1],
             eh::SIGNING_ALGO,
             eh::CLIENT_PUB_KEY,
             eh::ENCRYPTION_VERSION,
             eh::ENCRYPT_ALL_FIELDS,
         ] {
+            extra.insert(key.to_string(), serde_json::json!("value"));
+        }
+        for key in ph::LEGACY_DENIED_EXTRA_KEYS {
             extra.insert(key.to_string(), serde_json::json!("value"));
         }
 
@@ -717,9 +718,13 @@ mod tests {
             th::ORG_ID,
             th::WORKSPACE_ID,
             eh::MODEL_PUB_KEY,
-            ph::LEGACY_DENIED_EXTRA_KEYS[0],
-            ph::LEGACY_DENIED_EXTRA_KEYS[1],
         ] {
+            assert!(
+                !extra.contains_key(key),
+                "internal key {key} must be stripped"
+            );
+        }
+        for key in ph::LEGACY_DENIED_EXTRA_KEYS {
             assert!(
                 !extra.contains_key(key),
                 "internal key {key} must be stripped"

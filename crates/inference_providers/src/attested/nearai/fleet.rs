@@ -1321,6 +1321,7 @@ fn demote_as(record: &mut DecisionRecord, reason: &'static str) {
     record.home_score = None;
     record.best_score = None;
     record.pending_req = 0;
+    record.pending_tok = 0;
     record.chosen_backlog_tokens = None;
 }
 
@@ -1356,6 +1357,7 @@ mod demote_tests {
     use placement::decision::{AffinitySource, Placer};
     use placement::frame::{Lifecycle, Load, ReplicaState};
     use placement::policy::Tier;
+    use placement::score::Pending;
     use placement::snapshot::ReplicaView;
 
     const NOW: u64 = 10_000_000;
@@ -1402,10 +1404,11 @@ mod demote_tests {
             affinity_source: AffinitySource::None,
             now_ms: NOW,
         };
+        let pending = HashMap::from([(slot("host-a", 1), Pending { req: 1, tok: 42 })]);
         match Placer::new([1u8; 32], Tier::Base).place(
             &input,
             &snapshot,
-            &HashMap::new(),
+            &pending,
             &mut rand::rng(),
         ) {
             Decision::Place { record, .. } => record,
@@ -1423,6 +1426,7 @@ mod demote_tests {
         assert_eq!(record.slot.as_deref(), Some("host-a#1"));
         assert_eq!(record.replica, Some(1));
         assert!(record.strategy.is_some());
+        assert_eq!(record.pending_tok, 42);
         assert_eq!(record.chosen_backlog_tokens, Some(1_234));
 
         // When: the caller falls back to the legacy path.
@@ -1435,6 +1439,7 @@ mod demote_tests {
         assert_eq!(record.reason, Some(LegacyReason::HostUnmapped.as_str()));
         assert_eq!(record.strategy, None);
         assert_eq!(record.selection, None);
+        assert_eq!(record.pending_tok, 0);
         assert_eq!(record.rank, None);
         assert_eq!(record.slot, None);
         assert_eq!(record.replica, None);

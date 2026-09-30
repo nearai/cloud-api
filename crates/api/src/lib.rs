@@ -1171,11 +1171,25 @@ pub async fn init_inference_providers_with_mocks(
     (pool, mock_provider)
 }
 
-// Browser API clients supply their own tokens; OAuth callback origins remain
-// restricted separately by is_origin_allowed.
-fn build_cors_layer() -> CorsLayer {
+// Browser API clients supply their own tokens. Keep public API CORS open for
+// third-party clients, while admin browser access remains limited to configured
+// origins. OAuth callback origins use the same configured origin policy.
+fn build_cors_layer(cors_config: config::CorsConfig) -> CorsLayer {
     CorsLayer::new()
-        .allow_origin(AllowOrigin::mirror_request())
+        .allow_origin(AllowOrigin::predicate(
+            move |origin: &HeaderValue, request_parts: &axum::http::request::Parts| {
+                let path = request_parts.uri.path();
+                let is_admin_route = path == "/v1/admin" || path.starts_with("/v1/admin/");
+                if !is_admin_route {
+                    return true;
+                }
+
+                origin
+                    .to_str()
+                    .map(|origin| is_origin_allowed(origin, &cors_config))
+                    .unwrap_or(false)
+            },
+        ))
         .allow_methods(Any)
         .allow_headers(AllowHeaders::mirror_request())
         .expose_headers(Any)
@@ -1457,7 +1471,7 @@ pub fn build_app_with_config_and_options(
         metrics_service: domain_services.metrics_service.clone(),
     };
 
-    let cors = build_cors_layer();
+    let cors = build_cors_layer(config.cors.clone());
 
     // OHTTP routes: `POST /ohttp` and `GET /.well-known/ohttp-gateway` are at the
     // root (not under /v1) so clients can reach them without version-prefixing.
@@ -3279,7 +3293,7 @@ mod tests {
                     "/chat/completions",
                     post(|| async { StatusCode::UNAUTHORIZED }),
                 )
-                .layer(build_cors_layer());
+                .layer(build_cors_layer(config::CorsConfig::default()));
             let response = app
                 .oneshot(
                     HttpRequest::builder()
@@ -3326,7 +3340,7 @@ mod tests {
             for status in [StatusCode::OK, StatusCode::UNAUTHORIZED] {
                 let app = Router::new()
                     .route("/response", get(move || async move { status }))
-                    .layer(build_cors_layer());
+                    .layer(build_cors_layer(config::CorsConfig::default()));
                 let response = app
                     .oneshot(
                         HttpRequest::builder()
@@ -3353,7 +3367,7 @@ mod tests {
 
         let app = Router::new()
             .route("/ok", get(|| async { "ok" }))
-            .layer(build_cors_layer());
+            .layer(build_cors_layer(config::CorsConfig::default()));
         let response = app
             .oneshot(
                 HttpRequest::builder()

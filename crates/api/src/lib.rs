@@ -79,6 +79,10 @@ const PRIVACY_CLASSIFY_MAX_BODY_SIZE: usize = 256 * 1024; // 256 KB
 // bounding unauthenticated memory use before the inner request is decrypted.
 const OHTTP_MAX_BODY_SIZE: usize = 32 * 1024 * 1024; // 32 MB
 
+// POST /v1/responses sets no DefaultBodyLimit, so axum's 2 MB extractor default
+// is its effective limit. body_hash_middleware needs it as an explicit cap.
+const RESPONSES_MAX_BODY_SIZE: usize = 2 * 1024 * 1024; // 2 MB
+
 /// Service initialization components
 #[derive(Clone)]
 pub struct AuthComponents {
@@ -1707,12 +1711,17 @@ pub fn build_completion_routes(
             auth_state_middleware.clone(),
             middleware::auth::auth_middleware_with_workspace_context,
         ))
-        .layer(from_fn(middleware::body_hash_middleware));
+        // body_hash buffers before auth runs, so cap it at the largest route
+        // limit in this group. Smaller per-route limits (privacy) still apply
+        // through their extractors.
+        .layer(from_fn_with_state(
+            middleware::BodyHashLimit(AUDIO_TRANSCRIPTION_MAX_BODY_SIZE),
+            middleware::body_hash_middleware,
+        ));
 
     // File-based inference routes (image edits)
-    // Apply 512 MB limit only to endpoints that accept file uploads
-    // IMPORTANT: body_hash_middleware is placed AFTER auth to prevent buffering
-    // unauthenticated requests. Auth failures prevent memory exhaustion DoS attacks.
+    // Apply 512 MB limit only to endpoints that accept file uploads.
+    // body_hash_middleware buffers before auth, so it is capped at the same limit.
     let file_inference_routes = Router::new()
         .route("/images/edits", post(image_edits))
         .with_state(app_state.clone())
@@ -1728,7 +1737,10 @@ pub fn build_completion_routes(
             auth_state_middleware.clone(),
             middleware::auth::auth_middleware_with_workspace_context,
         ))
-        .layer(from_fn(middleware::body_hash_middleware))
+        .layer(from_fn_with_state(
+            middleware::BodyHashLimit(MAX_FILE_SIZE),
+            middleware::body_hash_middleware,
+        ))
         .layer(DefaultBodyLimit::max(MAX_FILE_SIZE));
 
     let metadata_routes = Router::new()
@@ -1784,7 +1796,10 @@ pub fn build_response_routes(
             auth_state_middleware.clone(),
             middleware::auth::auth_middleware_with_workspace_context,
         ))
-        .layer(from_fn(middleware::body_hash_middleware));
+        .layer(from_fn_with_state(
+            middleware::BodyHashLimit(RESPONSES_MAX_BODY_SIZE),
+            middleware::body_hash_middleware,
+        ));
 
     let other_routes = Router::new()
         .route("/responses/{response_id}", get(responses::get_response))

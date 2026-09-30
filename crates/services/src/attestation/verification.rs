@@ -43,11 +43,11 @@ pub struct VerifiedAttestation {
 /// Trust boundary: the whole payload is bound into RTMR3, so it is exactly
 /// what the attested workload emitted. Attestation itself validates only the
 /// key: a valid, non-weak ed25519 point whose hash equals `key_id`.
-/// `boot_id` and `host_id` are the workload's own
-/// claims and are not checked against any request or discovery context here;
-/// consumers must cross-check them before trusting a report signed by this
-/// key (placement ingest compares them with the Valkey key it read and with
-/// the frame's own claims).
+/// `boot_id` and `host_id` are the workload's own claims and are not checked
+/// against any request or discovery context here. Placement associates the
+/// key with this `host_id` and checks the signed frame's host against the
+/// Valkey key. It tracks the signed frame's `boot_id` for replay protection
+/// and cache invalidation; it does not compare it with this event's `boot_id`.
 ///
 /// `Debug` is safe here: every field is an ID or a public key, never customer
 /// content.

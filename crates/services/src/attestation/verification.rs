@@ -1081,9 +1081,9 @@ mod tests {
     use ed25519_dalek::SigningKey;
     use serde_json::json;
 
-    // --- Replica report key event (Task 7) ---------------------------------
+    // --- Replica report key event ----------------------------------------
 
-    /// Deterministic test keypair, per the brief.
+    /// Deterministic test keypair for replica report events.
     fn test_signing_key(seed: u8) -> SigningKey {
         SigningKey::from_bytes(&[seed; 32])
     }
@@ -1329,7 +1329,7 @@ mod tests {
         let rtmr3 = replay_rtmr3(&events);
         let report = event_log_report(&events);
 
-        // P4: RTMR3 replay must still succeed with an extra, unknown event
+        // RTMR3 replay must still succeed with an extra, unknown event
         // mixed into the log, and known extraction still works.
         let result = verifier()
             .verify_rtmr3_and_extract(&report, &rtmr3)

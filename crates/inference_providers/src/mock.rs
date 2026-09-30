@@ -286,7 +286,12 @@ impl ResponseTemplate {
         self
     }
 
-    fn token_usage(&self, input_tokens: i32, output_tokens: i32) -> TokenUsage {
+    fn token_usage(
+        &self,
+        input_tokens: i32,
+        output_tokens: i32,
+        reasoning_tokens: i32,
+    ) -> TokenUsage {
         let mut usage = TokenUsage::new(input_tokens, output_tokens);
         let mut details = serde_json::Map::new();
         if let Some(tokens) = self.cache_tokens {
@@ -297,6 +302,11 @@ impl ResponseTemplate {
         }
         if !details.is_empty() {
             usage.prompt_tokens_details = Some(details.into());
+        }
+        // A reasoning model served by SGLang reports its reasoning count as a
+        // top-level `usage.reasoning_tokens`, not in `completion_tokens_details`.
+        if self.reasoning_content.is_some() {
+            usage.reasoning_tokens = Some(reasoning_tokens);
         }
         usage
     }
@@ -343,8 +353,14 @@ impl ResponseTemplate {
         requested_service_tier: Option<String>,
     ) -> ChatCompletionResponse {
         let model = self.model_override.clone().unwrap_or(model);
-        // Calculate output tokens as word count of content
-        let output_tokens = self.content.split_whitespace().count() as i32;
+        // Reasoning is part of the completion. Count it like the streamed
+        // chunks do: one token per `' '`-separated segment (see
+        // `generate_chunks`), so both modes report the same reasoning count.
+        let reasoning_tokens = self
+            .reasoning_content
+            .as_deref()
+            .map_or(0, |reasoning| reasoning.split(' ').count() as i32);
+        let output_tokens = self.content.split_whitespace().count() as i32 + reasoning_tokens;
 
         // Convert tool calls if present
         let tool_calls = self.tool_calls.as_ref().map(|calls| {
@@ -402,7 +418,7 @@ impl ResponseTemplate {
                 .clone()
                 .or(requested_service_tier),
             system_fingerprint: None,
-            usage: self.token_usage(input_tokens, output_tokens),
+            usage: self.token_usage(input_tokens, output_tokens, reasoning_tokens),
             prompt_logprobs: None,
             prompt_token_ids: None,
             kv_transfer_params: None,
@@ -424,12 +440,14 @@ impl ResponseTemplate {
         let model = self.model_override.clone().unwrap_or(model);
         let mut chunks = Vec::new();
         let mut output_token_count = 0;
+        let mut reasoning_token_count = 0;
 
         // Stream reasoning content word by word if present
         if let Some(reasoning) = &self.reasoning_content {
             let words: Vec<&str> = reasoning.split(' ').collect();
             for (i, word) in words.iter().enumerate() {
                 output_token_count += 1;
+                reasoning_token_count += 1;
                 let word_with_space = if i == 0 {
                     word.to_string()
                 } else {
@@ -457,7 +475,11 @@ impl ResponseTemplate {
                         finish_reason: None,
                         token_ids: None,
                     }],
-                    usage: Some(self.token_usage(input_tokens, output_token_count)),
+                    usage: Some(self.token_usage(
+                        input_tokens,
+                        output_token_count,
+                        reasoning_token_count,
+                    )),
                     service_tier: self
                         .service_tier_override
                         .clone()
@@ -507,7 +529,11 @@ impl ResponseTemplate {
                         finish_reason,
                         token_ids: None,
                     }],
-                    usage: Some(self.token_usage(input_tokens, output_token_count)),
+                    usage: Some(self.token_usage(
+                        input_tokens,
+                        output_token_count,
+                        reasoning_token_count,
+                    )),
                     service_tier: self
                         .service_tier_override
                         .clone()
@@ -558,7 +584,11 @@ impl ResponseTemplate {
                         finish_reason: None,
                         token_ids: None,
                     }],
-                    usage: Some(self.token_usage(input_tokens, output_token_count)),
+                    usage: Some(self.token_usage(
+                        input_tokens,
+                        output_token_count,
+                        reasoning_token_count,
+                    )),
                     service_tier: self
                         .service_tier_override
                         .clone()
@@ -614,7 +644,11 @@ impl ResponseTemplate {
                             finish_reason,
                             token_ids: None,
                         }],
-                        usage: Some(self.token_usage(input_tokens, output_token_count)),
+                        usage: Some(self.token_usage(
+                            input_tokens,
+                            output_token_count,
+                            reasoning_token_count,
+                        )),
                         service_tier: self
                             .service_tier_override
                             .clone()
@@ -635,7 +669,7 @@ impl ResponseTemplate {
             model,
             system_fingerprint: None,
             choices: vec![],
-            usage: Some(self.token_usage(input_tokens, output_token_count)),
+            usage: Some(self.token_usage(input_tokens, output_token_count, reasoning_token_count)),
             service_tier: self
                 .service_tier_override
                 .clone()

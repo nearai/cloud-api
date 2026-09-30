@@ -297,6 +297,7 @@ mod tests {
             completion_tokens: 20,
             total_tokens: 30,
             prompt_tokens_details: None,
+            ..Default::default()
         };
         let chunk = ctx.finish_chunk(Some(FinishReason::Stop), usage);
 

@@ -263,6 +263,7 @@ async fn recompute_computes_every_aggregate_column_and_excludes_the_upper_bound(
             "SELECT hour, request_count, input_tokens, output_tokens, cache_read_tokens,
                     total_tokens, total_cost, error_count, incomplete_count, stop_reason_count,
                     ttft_count, ttft_sum_ms, ttft_p50_ms, ttft_p95_ms, ttft_p99_ms,
+                    ttft_under_5s_count, ttft_under_10s_count, ttft_under_60s_count,
                     itl_count, itl_sum_ms, itl_p95_ms, last_usage_at
              FROM usage_hourly WHERE organization_id = $1",
             &[&f.organization_id],
@@ -284,12 +285,19 @@ async fn recompute_computes_every_aggregate_column_and_excludes_the_upper_bound(
         "stop_reason_count",
         "ttft_count",
         "ttft_sum_ms",
+        "ttft_under_5s_count",
+        "ttft_under_10s_count",
+        "ttft_under_60s_count",
         "itl_count",
     ]
     .iter()
     .map(|c| r.get(*c))
     .collect();
-    assert_eq!(ints, vec![5, 20, 30, 4, 50, 166, 1, 1, 3, 4, 1000, 3]);
+    // ttft [100, 200, 300, 400] are all under every threshold; the 9999 row is outside [h, h+1h).
+    assert_eq!(
+        ints,
+        vec![5, 20, 30, 4, 50, 166, 1, 1, 3, 4, 1000, 4, 4, 4, 3]
+    );
     // PERCENTILE_CONT interpolates at p*(n-1): ttft [100,200,300,400], itl [10,20,40].
     for (col, want) in [
         ("ttft_p50_ms", 250.0),
@@ -304,6 +312,80 @@ async fn recompute_computes_every_aggregate_column_and_excludes_the_upper_bound(
     assert_eq!(
         r.get::<_, DateTime<Utc>>("last_usage_at"),
         h + Duration::milliseconds(3_599_500)
+    );
+}
+
+#[tokio::test]
+async fn recompute_counts_ttft_strictly_under_each_threshold() {
+    let f = setup_platform_provider_usage_fixture().await;
+    let repo = UsageHourlyRepositoryImpl::new(f.database.pool().clone());
+    let h = random_past_hour();
+    // Exact thresholds are not "under"; a NULL ttft is not measured.
+    let ttfts = [
+        Some(4_999),
+        Some(5_000),
+        Some(9_999),
+        Some(10_000),
+        Some(59_999),
+        Some(60_000),
+        Some(120_000),
+        None,
+    ];
+    for (i, ttft) in ttfts.into_iter().enumerate() {
+        insert_raw(
+            &f,
+            h + Duration::minutes(i as i64),
+            1,
+            1,
+            ttft,
+            None,
+            Some("external"),
+        )
+        .await;
+    }
+    repo.recompute(h, h + Duration::hours(1), AggregateLockBehavior::Wait)
+        .await
+        .unwrap()
+        .unwrap();
+
+    let client = f.database.pool().get().await.unwrap();
+    let r = client
+        .query_one(
+            "SELECT request_count, ttft_count, ttft_under_5s_count, ttft_under_10s_count,
+                    ttft_under_60s_count
+             FROM usage_hourly WHERE organization_id = $1",
+            &[&f.organization_id],
+        )
+        .await
+        .unwrap();
+    let got: Vec<i64> = (0..5).map(|i| r.get(i)).collect();
+    assert_eq!(got, vec![8, 7, 1, 3, 5]);
+}
+
+/// During a rolling deploy, pods on the previous build insert with the V0081
+/// column list. That must fail loudly (NOT NULL) instead of storing zero threshold counts.
+#[tokio::test]
+async fn usage_hourly_rejects_rows_without_ttft_threshold_counts() {
+    let pool = crate::common::db_setup::create_test_pool().await;
+    let client = pool.get().await.unwrap();
+    let err = client
+        .execute(
+            "INSERT INTO usage_hourly (hour, organization_id, workspace_id, api_key_id, model_id,
+                model_name, inference_type, served_provider_type, served_provider_tier,
+                served_via_fallback, request_count, input_tokens, output_tokens,
+                cache_read_tokens, total_tokens, total_cost, error_count, incomplete_count,
+                stop_reason_count, ttft_count, ttft_sum_ms, ttft_p50_ms, ttft_p95_ms,
+                ttft_p99_ms, itl_count, itl_sum_ms, itl_p95_ms, last_usage_at)
+             VALUES ($1, gen_random_uuid(), gen_random_uuid(), gen_random_uuid(),
+                gen_random_uuid(), 'pre-v0082', NULL, NULL, NULL, false, 1, 0, 0, 0, 0, 0,
+                0, 0, 0, 0, 0, NULL, NULL, NULL, 0, 0, NULL, $1)",
+            &[&random_past_hour()],
+        )
+        .await
+        .expect_err("a pre-V0082 column list must be rejected");
+    assert_eq!(
+        err.code(),
+        Some(&tokio_postgres::error::SqlState::NOT_NULL_VIOLATION)
     );
 }
 

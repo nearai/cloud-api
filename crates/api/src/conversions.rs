@@ -1,6 +1,6 @@
 use crate::{middleware::AuthenticatedUser, models::*};
 use inference_providers::{
-    ChatCompletionParams, ChatMessage, FinishReason, MessageRole, StreamOptions, TokenUsage,
+    ChatCompletionParams, ChatMessage, FinishReason, MessageRole, StreamOptions,
 };
 use services::completions::CompletionError;
 
@@ -186,22 +186,6 @@ fn finish_reason_to_string(reason: &FinishReason) -> String {
         FinishReason::Length => "length".to_string(),
         FinishReason::ContentFilter => "content_filter".to_string(),
         FinishReason::ToolCalls => "tool_calls".to_string(),
-    }
-}
-
-impl From<&TokenUsage> for crate::models::CompletionUsage {
-    fn from(usage: &TokenUsage) -> Self {
-        Self {
-            prompt_tokens: usage.prompt_tokens,
-            prompt_tokens_details: Some(InputTokensDetails {
-                cached_tokens: usage.cached_tokens() as i64,
-            }),
-            completion_tokens: usage.completion_tokens,
-            completion_tokens_details: Some(OutputTokensDetails {
-                reasoning_tokens: 0,
-            }),
-            total_tokens: usage.total_tokens,
-        }
     }
 }
 

@@ -1741,6 +1741,10 @@ async fn chat_completions_inner(
                             true
                         }
                         Some(Err(error)) => {
+                            // Keep the provider's actual HTTP status separate from
+                            // the mapped response status (e.g. upstream 503 -> mapped 502).
+                            let upstream_status_code =
+                                completion_stream_error_upstream_status_code(error);
                             let domain_error = CompletionServiceImpl::map_provider_error(
                                 &request.model,
                                 error,
@@ -1756,6 +1760,7 @@ async fn chat_completions_inner(
                                 model = %request.model,
                                 error_category = completion_domain_error_category(&domain_error),
                                 status_code = status_code.as_u16(),
+                                upstream_status_code = ?upstream_status_code,
                                 total_duration_ms = request_started_at.elapsed().as_millis() as u64,
                                 last_upstream_event_gap_ms = ?last_upstream_event_gap_ms,
                                 "Completion stream failed before SSE response"

@@ -82,6 +82,7 @@ pub struct CompletionRequest {
     pub request_id: uuid::Uuid,
     pub model: String,
     pub messages: Vec<CompletionMessage>,
+    /// Effective output limit, normalized from the Chat API's two token-limit fields.
     pub max_tokens: Option<i64>,
     pub temperature: Option<f32>,
     pub top_p: Option<f32>,

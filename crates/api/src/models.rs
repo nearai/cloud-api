@@ -40,6 +40,10 @@ pub struct Delta {
 pub struct ChatCompletionRequest {
     pub model: String,
     pub messages: Vec<Message>,
+    /// Completion token limit, including reasoning tokens. Takes precedence over `max_tokens`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_completion_tokens: Option<i64>,
+    /// Legacy completion token limit. Prefer `max_completion_tokens` for new clients.
     pub max_tokens: Option<i64>,
     #[serde(default)]
     pub temperature: Option<f32>,
@@ -1497,18 +1501,14 @@ use crate::consts::{
 };
 use crate::routes::common::{validate_max_length, validate_non_empty_field};
 
-/// Reject `max_tokens` values the OpenAI API requires to be `>= 1`.
-///
-/// `None` (unset) is valid. Negative or zero values are rejected with a 400
-/// `invalid_request_error` carrying `param: "max_tokens"` instead of falling
-/// through to upstream and surfacing as a masked 502 (nearai/cloud-api #786).
-fn validate_max_tokens(max_tokens: Option<i64>) -> Result<(), ErrorResponse> {
-    if let Some(value) = max_tokens {
+/// Reject non-positive token limits with an error naming the supplied parameter.
+fn validate_token_limit(value: Option<i64>, param: &str) -> Result<(), ErrorResponse> {
+    if let Some(value) = value {
         if value < 1 {
             return Err(ErrorResponse::with_param(
-                "max_tokens must be at least 1".to_string(),
+                format!("{param} must be at least 1"),
                 "invalid_request_error".to_string(),
-                "max_tokens".to_string(),
+                param.to_string(),
             ));
         }
     }
@@ -1534,7 +1534,7 @@ impl ChatCompletionRequest {
     /// envelope (`{error:{message,type,param,code}}`) on failure.
     ///
     /// This wraps the message-only [`Self::validate`] (temperature/top_p/stop/
-    /// logprobs) and adds the param-bearing sampling checks (`max_tokens`, `n`)
+    /// logprobs) and adds the param-bearing sampling checks (token limits, `n`)
     /// that would otherwise fall through to upstream and surface as a masked
     /// 502 instead of a 4xx (nearai/cloud-api #786). All checks reject only
     /// genuinely-invalid values; valid requests are untouched.
@@ -1547,7 +1547,8 @@ impl ChatCompletionRequest {
     pub fn validate_request(&self) -> Result<(), ErrorResponse> {
         self.validate()
             .map_err(|message| ErrorResponse::new(message, "invalid_request_error".to_string()))?;
-        validate_max_tokens(self.max_tokens)?;
+        validate_token_limit(self.max_completion_tokens, "max_completion_tokens")?;
+        validate_token_limit(self.max_tokens, "max_tokens")?;
         validate_n(self.n)?;
         Ok(())
     }
@@ -1663,7 +1664,7 @@ impl CompletionRequest {
     pub fn validate_request(&self) -> Result<(), ErrorResponse> {
         self.validate()
             .map_err(|message| ErrorResponse::new(message, "invalid_request_error".to_string()))?;
-        validate_max_tokens(self.max_tokens)?;
+        validate_token_limit(self.max_tokens, "max_tokens")?;
         validate_n(self.n)?;
         Ok(())
     }
@@ -4864,6 +4865,7 @@ mod tests {
                 tool_call_id: None,
                 tool_calls: None,
             }],
+            max_completion_tokens: None,
             max_tokens: Some(100),
             temperature: None,
             top_p: None,
@@ -5052,6 +5054,7 @@ mod tests {
                 tool_call_id: None,
                 tool_calls: None,
             }],
+            max_completion_tokens: None,
             max_tokens: Some(100),
             temperature: None,
             top_p: None,
@@ -5092,6 +5095,7 @@ mod tests {
                 tool_call_id: None,
                 tool_calls: None,
             }],
+            max_completion_tokens: None,
             max_tokens: Some(100),
             temperature: None,
             top_p: None,
@@ -5127,6 +5131,7 @@ mod tests {
                 tool_call_id: None,
                 tool_calls: None,
             }],
+            max_completion_tokens: None,
             max_tokens: Some(100),
             temperature: None,
             top_p: None,
@@ -5160,6 +5165,7 @@ mod tests {
                 tool_call_id: None,
                 tool_calls: None,
             }],
+            max_completion_tokens: None,
             max_tokens: Some(100),
             temperature: None,
             top_p: None,
@@ -5191,6 +5197,7 @@ mod tests {
                 tool_call_id: None,
                 tool_calls: None,
             }],
+            max_completion_tokens: None,
             max_tokens,
             temperature: None,
             top_p: None,
@@ -5222,6 +5229,39 @@ mod tests {
             assert_eq!(err.r#type, "invalid_request_error");
             assert_eq!(err.param.as_deref(), Some("max_tokens"));
             assert_eq!(err.message, "max_tokens must be at least 1");
+        }
+    }
+
+    #[test]
+    fn chat_validate_request_rejects_non_positive_max_completion_tokens() {
+        for value in [-1, 0] {
+            let request: ChatCompletionRequest = serde_json::from_value(serde_json::json!({
+                "model": "test-model",
+                "messages": [{"role": "user", "content": "hi"}],
+                "max_completion_tokens": value,
+                "max_tokens": 128,
+            }))
+            .unwrap();
+            let error = request.validate_request().unwrap_err().error;
+            assert_eq!(error.r#type, "invalid_request_error");
+            assert_eq!(error.param.as_deref(), Some("max_completion_tokens"));
+            assert_eq!(error.message, "max_completion_tokens must be at least 1");
+        }
+    }
+
+    #[test]
+    fn chat_max_completion_tokens_requires_an_integer() {
+        for value in [
+            serde_json::json!("128"),
+            serde_json::json!(1.5),
+            serde_json::json!(true),
+        ] {
+            let result = serde_json::from_value::<ChatCompletionRequest>(serde_json::json!({
+                "model": "test-model",
+                "messages": [{"role": "user", "content": "hi"}],
+                "max_completion_tokens": value,
+            }));
+            assert!(result.is_err(), "invalid token limit was accepted: {value}");
         }
     }
 

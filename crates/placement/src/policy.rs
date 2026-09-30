@@ -102,6 +102,11 @@ impl PriorityBand {
 /// and `Rule::Freshness`), including one stage 1 then drops for `Capacity` or
 /// `Context`: a loaded replica that is KV-full is still prefilling its heavy
 /// work, and dropping it from the count would free a lane slot it holds.
+///
+/// The cap is a snapshot-based admission limit, not a distributed reservation.
+/// Concurrent routers can admit different members before shared pending load
+/// becomes visible, temporarily exceeding the cap. Callers should monitor the
+/// observed lane size alongside the cap.
 #[derive(Clone, Debug, Default)]
 pub struct LaneView {
     /// Live slots whose load is at least `LANE_LOAD_TOKENS`.

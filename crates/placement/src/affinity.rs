@@ -53,8 +53,12 @@ type HmacSha256 = Hmac<Sha256>;
 /// key)`. The tier is in the MAC input so the base and long placers never
 /// read or overwrite each other's pins, though both share one pins stream.
 pub fn pin_id(tier: Tier, key: &AffinityKey, pin_secret: &[u8; 32]) -> PinId {
-    // A 32-byte key is always valid for HMAC-SHA256; this never fails.
-    let mut mac = HmacSha256::new_from_slice(pin_secret).expect("32-byte HMAC key is always valid");
+    // HMAC zero-pads a short key to the block size, so padding the 32-byte
+    // secret ourselves yields the identical MAC through the infallible
+    // `new` constructor (no panic path).
+    let mut padded = hmac::digest::Key::<HmacSha256>::default();
+    padded[..pin_secret.len()].copy_from_slice(pin_secret);
+    let mut mac = HmacSha256::new(&padded);
     mac.update(tier.as_str().as_bytes());
     mac.update(&[0u8]);
     mac.update(&key.0);
@@ -160,7 +164,10 @@ pub fn hrw_rank(key: &AffinityKey, slots: &[&SlotId]) -> Vec<SlotId> {
             hasher.update(key.0);
             hasher.update(slot.hrw_label().as_bytes());
             let digest = hasher.finalize();
-            let val = u64::from_be_bytes(digest[..8].try_into().expect("8 bytes"));
+            let val = u64::from_be_bytes([
+                digest[0], digest[1], digest[2], digest[3], digest[4], digest[5], digest[6],
+                digest[7],
+            ]);
             (val, *slot)
         })
         .collect();

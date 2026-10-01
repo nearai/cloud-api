@@ -3419,6 +3419,22 @@ mod tests {
     use super::*;
 
     #[test]
+    fn session_hint_is_read_from_x_session_id_header() {
+        let mut headers = header::HeaderMap::new();
+        assert_eq!(session_hint_from_headers(&headers), None);
+
+        headers.insert("X-Session-Id", header::HeaderValue::from_static("abc"));
+        assert_eq!(session_hint_from_headers(&headers).as_deref(), Some("abc"));
+
+        let mut bad = header::HeaderMap::new();
+        bad.insert(
+            SESSION_ID_HEADER,
+            header::HeaderValue::from_bytes(&[0xff, 0xfe]).unwrap(),
+        );
+        assert_eq!(session_hint_from_headers(&bad), None);
+    }
+
+    #[test]
     fn model_public_key_alone_does_not_enable_e2ee() {
         let mut headers = crate::routes::common::EncryptionHeaders {
             signing_algo: None,

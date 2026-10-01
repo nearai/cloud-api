@@ -1042,3 +1042,100 @@ async fn concurrent_inference_and_service_cannot_double_spend_capacity() -> anyh
         .await?;
     Ok(())
 }
+
+#[tokio::test]
+async fn credit_status_reports_consumption_and_funding_columns() -> anyhow::Result<()> {
+    let pool = test_pool().await?;
+    let limits = OrganizationLimitsRepository::new(pool.clone());
+    let repository = OrganizationUsageRepository::new(pool.clone());
+    let org = insert_org_fixture(&pool).await?;
+    let model = insert_model(&pool, "allocation-status-columns").await?;
+    set_limit(&limits, org.org_id, "grant", 50).await?;
+    set_limit(&limits, org.org_id, "payment", 30).await?;
+    pool.get()
+        .await?
+        .execute(
+            "UPDATE organization_balance SET legacy_unattributed_amount = 7 WHERE organization_id = $1",
+            &[&org.org_id],
+        )
+        .await?;
+    repository
+        .record_usage(usage(&org, &model, Uuid::new_v4(), 90))
+        .await?;
+
+    let (status, unfunded, unattributed) = limits.get_current_credit_status(org.org_id).await?;
+    assert_eq!(status.len(), 2);
+    let find = |credit_type: &str| {
+        status
+            .iter()
+            .find(|s| s.limit.credit_type == credit_type)
+            .unwrap()
+    };
+    assert_eq!((find("grant").consumed, find("grant").available), (50, 0));
+    assert_eq!(
+        (find("payment").consumed, find("payment").available),
+        (23, 7)
+    );
+    assert_eq!(unfunded, 17);
+    assert_eq!(unattributed, 7);
+
+    cleanup_usage_fixtures(&pool, &[org.org_id], &[model.id]).await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn credit_status_without_limit_rows_is_empty() -> anyhow::Result<()> {
+    let pool = test_pool().await?;
+    let limits = OrganizationLimitsRepository::new(pool.clone());
+    let org = insert_org_fixture(&pool).await?;
+
+    let (status, _, _) = limits.get_current_credit_status(org.org_id).await?;
+    assert!(status.is_empty());
+
+    cleanup_usage_fixtures(&pool, &[org.org_id], &[]).await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn credit_status_reads_one_snapshot_during_concurrent_usage() -> anyhow::Result<()> {
+    const UNIT_COST: i64 = 3;
+    const WRITES: usize = 40;
+    let pool = test_pool().await?;
+    let limits = OrganizationLimitsRepository::new(pool.clone());
+    let repository = OrganizationUsageRepository::new(pool.clone());
+    let org = insert_org_fixture(&pool).await?;
+    let model = insert_model(&pool, "allocation-status-snapshot").await?;
+    set_limit(&limits, org.org_id, "grant", 50).await?;
+    set_limit(&limits, org.org_id, "payment", 20).await?;
+
+    let done = std::sync::atomic::AtomicBool::new(false);
+    let writer = async {
+        for _ in 0..WRITES {
+            repository
+                .record_usage(usage(&org, &model, Uuid::new_v4(), UNIT_COST))
+                .await?;
+        }
+        done.store(true, std::sync::atomic::Ordering::SeqCst);
+        anyhow::Ok(())
+    };
+    let reader = async {
+        let mut reads = 0;
+        while !done.load(std::sync::atomic::Ordering::SeqCst) {
+            let (status, unfunded, _) = limits.get_current_credit_status(org.org_id).await?;
+            let total = status.iter().map(|s| s.consumed).sum::<i64>() + unfunded;
+            assert_eq!(total % UNIT_COST, 0, "torn read: total={total}");
+            reads += 1;
+        }
+        anyhow::Ok(reads)
+    };
+    let (written, reads) = tokio::join!(writer, reader);
+    written?;
+    assert!(reads? > 0);
+
+    let (status, unfunded, _) = limits.get_current_credit_status(org.org_id).await?;
+    let total = status.iter().map(|s| s.consumed).sum::<i64>() + unfunded;
+    assert_eq!(total, UNIT_COST * WRITES as i64);
+
+    cleanup_usage_fixtures(&pool, &[org.org_id], &[model.id]).await?;
+    Ok(())
+}

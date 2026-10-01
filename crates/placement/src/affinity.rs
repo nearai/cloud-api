@@ -30,25 +30,6 @@ impl AffinityKey {
     pub fn from_bytes(b: [u8; 16]) -> Self {
         Self(b)
     }
-
-    /// Lowercase hex encoding of the 16 key bytes, for the caller to carry
-    /// the key through an opaque channel (e.g. `params.extra`) between the
-    /// request path that derives it and the placement decision that reads
-    /// it. This is an explicit, deliberate conversion — not a `Display`/
-    /// `Debug`/`Serialize` impl — so it never fires from a `{:?}`/log call;
-    /// callers must still never log the returned string.
-    pub fn to_hex(&self) -> String {
-        hex::encode(self.0)
-    }
-
-    /// Inverse of [`Self::to_hex`]: parses a lowercase (or uppercase) hex
-    /// string back into an `AffinityKey`. Returns `None` if `s` is not
-    /// exactly 32 hex characters.
-    pub fn from_hex(s: &str) -> Option<Self> {
-        let bytes = hex::decode(s).ok()?;
-        let arr: [u8; 16] = bytes.try_into().ok()?;
-        Some(Self(arr))
-    }
 }
 
 /// An opaque follow-pin identifier: `HMAC-SHA256(pin_secret, key)`,
@@ -87,15 +68,24 @@ pub fn pin_id(tier: Tier, key: &AffinityKey, pin_secret: &[u8; 32]) -> PinId {
     PinId(out)
 }
 
-/// In-memory follow-pin table: pin id -> (slot, written-at ms). The caller
-/// loads this from Valkey and persists writes back; this crate never talks
-/// to Valkey directly.
+/// In-memory follow-pin table: pin id -> (slot, written-at ms, boot of the
+/// slot's host when written). The caller loads this from Valkey and persists
+/// writes back; this crate never talks to Valkey directly.
 ///
 /// `Clone` so a reader can copy-on-write it behind an `Arc` (see
 /// `Snapshot::pins`).
 #[derive(Clone, Default)]
 pub struct PinTable {
-    entries: HashMap<[u8; 16], (SlotId, u64)>,
+    entries: HashMap<[u8; 16], Pin>,
+}
+
+#[derive(Clone)]
+struct Pin {
+    slot: SlotId,
+    at_ms: u64,
+    /// The `boot_id` of the slot's host when the pin was written; `None`
+    /// when unknown (written by an older node).
+    boot: Option<String>,
 }
 
 impl PinTable {
@@ -104,24 +94,37 @@ impl PinTable {
     /// `at_ms` from the far past or a clock skew never panics or wraps to
     /// "still valid").
     pub fn get(&self, id: &PinId, now_ms: u64) -> Option<(&SlotId, u64)> {
-        let (slot, at_ms) = self.entries.get(&id.0)?;
-        if now_ms < at_ms.saturating_add(PIN_TTL_MS) {
-            Some((slot, *at_ms))
+        self.get_with_boot(id, now_ms)
+            .map(|(slot, at_ms, _)| (slot, at_ms))
+    }
+
+    /// As [`Self::get`], plus the boot of the slot's host the pin was
+    /// written on (`None`: unknown). See `Snapshot::pin_boot_current`.
+    pub fn get_with_boot(&self, id: &PinId, now_ms: u64) -> Option<(&SlotId, u64, Option<&str>)> {
+        let pin = self.entries.get(&id.0)?;
+        if now_ms < pin.at_ms.saturating_add(PIN_TTL_MS) {
+            Some((&pin.slot, pin.at_ms, pin.boot.as_deref()))
         } else {
             None
         }
     }
 
-    /// Write (or overwrite) the pin for `id`.
+    /// Write (or overwrite) the pin for `id`, its host's boot unknown.
     pub fn insert(&mut self, id: [u8; 16], slot: SlotId, at_ms: u64) {
-        self.entries.insert(id, (slot, at_ms));
+        self.insert_on_boot(id, slot, at_ms, None);
+    }
+
+    /// Write (or overwrite) the pin for `id`, written while `slot`'s host
+    /// was on `boot` (`None`: unknown).
+    pub fn insert_on_boot(&mut self, id: [u8; 16], slot: SlotId, at_ms: u64, boot: Option<String>) {
+        self.entries.insert(id, Pin { slot, at_ms, boot });
     }
 
     /// Drop every pin to a slot `keep` rejects (e.g. a replica index that is
     /// gone from its host's latest frame). A pin to a missing slot would fall
     /// through to HRW anyway; this keeps the table from carrying dead slots.
     pub fn retain_slots(&mut self, mut keep: impl FnMut(&SlotId) -> bool) {
-        self.entries.retain(|_, (slot, _)| keep(slot));
+        self.entries.retain(|_, pin| keep(&pin.slot));
     }
 
     /// Drop every pin to a slot on `host`: after the host reboots (see
@@ -135,7 +138,7 @@ impl PinTable {
     /// `now_ms`, so a long-lived table stays bounded.
     pub fn prune(&mut self, now_ms: u64) {
         self.entries
-            .retain(|_, (_, at_ms)| now_ms < at_ms.saturating_add(PIN_TTL_MS));
+            .retain(|_, pin| now_ms < pin.at_ms.saturating_add(PIN_TTL_MS));
     }
 
     /// Number of entries, expired or not.
@@ -650,22 +653,6 @@ mod tests {
             Selection::BestOfTwo.as_str(),
         ];
         assert_eq!(tags, ["pinned", "home", "spill", "best_of_two"]);
-    }
-
-    #[test]
-    fn affinity_key_hex_round_trips() {
-        let key = AffinityKey::from_bytes([0xabu8; 16]);
-        let hex = key.to_hex();
-        assert_eq!(hex.len(), 32);
-        assert_eq!(hex, "ab".repeat(16));
-        let decoded = AffinityKey::from_hex(&hex).expect("valid hex decodes");
-        assert_eq!(decoded.to_hex(), hex);
-    }
-
-    #[test]
-    fn affinity_key_from_hex_rejects_wrong_length_and_garbage() {
-        assert!(AffinityKey::from_hex("abcd").is_none());
-        assert!(AffinityKey::from_hex("not-hex-at-all-not-hex-at-all!!").is_none());
     }
 
     #[test]

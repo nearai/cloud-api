@@ -1,4 +1,4 @@
-use crate::attestation::{AttestationVerifier, BackendAttestationVerifier};
+use crate::attestation::{AttestationVerifier, BackendAttestationVerifier, ReplicaReportKey};
 use crate::common::encryption_headers;
 use config::ExternalProvidersConfig;
 use inference_providers::nearai;
@@ -311,8 +311,8 @@ pub struct ChatRoutingHints {
     /// Estimated context requirement in tokens. Callers set a rough input
     /// estimate (bytes / 4 over the countable request text); for models whose
     /// providers declare multiple context capacities the pool refines it into
-    /// `ceil(input_tokens × factor) + max_tokens reserve`, using an exact
-    /// `/v1/tokenize` count near tier boundaries (see
+    /// `ceil(input_tokens × factor)` plus media/template overhead (input
+    /// only: never `max_tokens`, never a tokenizer; see
     /// `refine_context_requirement`). Providers whose max_context_tokens <
     /// this value are sorted after capable providers.
     pub estimated_tokens: Option<u32>,
@@ -336,6 +336,96 @@ pub struct ChatRoutingHints {
 /// The pool creates this when returning a stream from chat_completion_stream and
 /// passes it to InterceptStream, which calls it once on Drop.
 pub type ProviderLatencyReporter = Arc<dyn Fn(i32) + Send + Sync>;
+
+/// How often the refresh task re-reads the healthy backend count of every
+/// Fleet whose placement hosts have published. Model-proxy maps rotation
+/// index `-i<N>` over its live healthy set, so a join, leave or health
+/// change can remap indices long before the next full discovery.
+const COUNT_POLL_INTERVAL: Duration = Duration::from_secs(10);
+
+/// The most often a count change re-runs discovery for one model, counted
+/// from its last successful reload.
+const COUNT_REDISCOVERY_DEBOUNCE: Duration = Duration::from_secs(30);
+
+/// Count-driven rediscovery bookkeeping, owned by the count poll: models
+/// whose count changed (or whose host map was built for another count) stay
+/// pending until a reload succeeds, one reload per model is in flight at a
+/// time, and a model reloads at most once per [`COUNT_REDISCOVERY_DEBOUNCE`]
+/// after a success. A failed reload is retried on the next tick.
+#[derive(Default)]
+struct CountRediscovery {
+    pending: HashSet<String>,
+    in_flight: HashSet<String>,
+    last_ok: HashMap<String, std::time::Instant>,
+}
+
+impl CountRediscovery {
+    fn mark_pending(&mut self, models: impl IntoIterator<Item = String>) {
+        self.pending.extend(models);
+    }
+
+    /// The pending models to reload now, each marked in flight.
+    fn take_due(&mut self, now: std::time::Instant) -> Vec<String> {
+        let due: Vec<String> = self
+            .pending
+            .iter()
+            .filter(|model| !self.in_flight.contains(*model))
+            .filter(|model| {
+                self.last_ok.get(*model).is_none_or(|at| {
+                    now.saturating_duration_since(*at) >= COUNT_REDISCOVERY_DEBOUNCE
+                })
+            })
+            .cloned()
+            .collect();
+        self.in_flight.extend(due.iter().cloned());
+        due
+    }
+
+    /// Records the end of `model`'s reload: a success clears it from
+    /// pending and starts its debounce; a failure leaves it pending.
+    fn finish(&mut self, model: &str, ok: bool, now: std::time::Instant) {
+        self.in_flight.remove(model);
+        if ok {
+            self.pending.remove(model);
+            self.last_ok.insert(model.to_string(), now);
+        }
+    }
+}
+
+/// Aborts a background task when dropped: the count poll lives exactly as
+/// long as the refresh task that spawned it.
+struct AbortOnDrop(tokio::task::JoinHandle<()>);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+/// Finishes a count-driven reload in [`CountRediscovery`] when dropped, as a
+/// failure unless marked done, so a panicking reload never leaves its model
+/// in flight forever.
+struct RediscoveryRun {
+    state: Arc<std::sync::Mutex<CountRediscovery>>,
+    model: String,
+    ok: bool,
+}
+
+impl RediscoveryRun {
+    fn record(&mut self, ok: bool) {
+        self.ok = ok;
+    }
+}
+
+impl Drop for RediscoveryRun {
+    fn drop(&mut self) {
+        self.state.lock().unwrap_or_else(|e| e.into_inner()).finish(
+            &self.model,
+            self.ok,
+            std::time::Instant::now(),
+        );
+    }
+}
 
 /// Trait for fetching external model configurations from a data source (e.g., database).
 /// This decouples the InferenceProviderPool from the database crate (hexagonal architecture).
@@ -418,6 +508,10 @@ struct BackendProbe {
     algo: String,
     pubkey: String,
     identity: Option<TeeIdentity>,
+    /// The host's attested per-boot replica-report signing key, if the
+    /// verified attestation carried one. Only ever `Some` from a verified
+    /// probe — `backend_probes` holds verified probes exclusively.
+    replica_key: Option<ReplicaReportKey>,
 }
 
 /// KMS root id and app id. Equal identities derive the same model keypair.
@@ -591,6 +685,107 @@ impl DiscoveryOutcome {
         }
         groups
     }
+
+    /// Verified `host_id -> backend index` map plus attested keys, built only
+    /// from probes carrying a verified replica-report key. The two algos per
+    /// index carry the same key, so this dedups per index before folding into
+    /// the host map. A host observed at two different indices is ambiguous
+    /// (e.g. a stale index binding mid-rotation), so it is dropped from both
+    /// the map and the key registry: its frames are then never accepted and
+    /// the model goes legacy until the next discovery resolves it.
+    fn backend_hosts(&self) -> inference_providers::BackendHosts {
+        let mut index_by_host: HashMap<String, usize> = HashMap::new();
+        let mut keys: HashMap<String, Vec<placement::snapshot::HostKey>> = HashMap::new();
+        let mut seen_indices: HashSet<usize> = HashSet::new();
+        let mut duplicates: HashSet<String> = HashSet::new();
+
+        for probe in &self.backend_probes {
+            let Some(replica_key) = probe.replica_key.as_ref() else {
+                continue;
+            };
+
+            // Parse the key before consuming the index: a malformed key on
+            // one algo's probe then falls through to the sibling probe at
+            // the same index instead of masking it. This also keeps us from
+            // creating an empty `keys` entry for a host whose only probe
+            // failed to parse, since the `keys` entry is only inserted below
+            // once a key has successfully parsed.
+            let key_bytes = match hex::decode(&replica_key.public_key_hex) {
+                Ok(bytes) => bytes,
+                Err(_) => {
+                    debug!(
+                        host_id = %replica_key.host_id,
+                        key_id = %replica_key.key_id,
+                        why = "hex_decode",
+                        "replica-report key failed to parse; probe excluded from the placement registry"
+                    );
+                    continue;
+                }
+            };
+            let Ok(key_bytes) = <[u8; 32]>::try_from(key_bytes.as_slice()) else {
+                debug!(
+                    host_id = %replica_key.host_id,
+                    key_id = %replica_key.key_id,
+                    why = "length",
+                    "replica-report key failed to parse; probe excluded from the placement registry"
+                );
+                continue;
+            };
+            let verifying_key = match ed25519_dalek::VerifyingKey::from_bytes(&key_bytes) {
+                Ok(key) => key,
+                Err(_) => {
+                    debug!(
+                        host_id = %replica_key.host_id,
+                        key_id = %replica_key.key_id,
+                        why = "point",
+                        "replica-report key failed to parse; probe excluded from the placement registry"
+                    );
+                    continue;
+                }
+            };
+
+            if !seen_indices.insert(probe.index) {
+                continue;
+            }
+
+            if let Some(first_index) = index_by_host.get(&replica_key.host_id).copied() {
+                if first_index != probe.index {
+                    debug!(
+                        host_id = %replica_key.host_id,
+                        first_index,
+                        second_index = probe.index,
+                        "duplicate_host: host reported at two backend indices, dropping it"
+                    );
+                    duplicates.insert(replica_key.host_id.clone());
+                }
+            } else {
+                index_by_host.insert(replica_key.host_id.clone(), probe.index);
+            }
+
+            let host_keys = keys.entry(replica_key.host_id.clone()).or_default();
+            if host_keys
+                .iter()
+                .any(|existing| existing.key_id == replica_key.key_id)
+            {
+                continue;
+            }
+            host_keys.push(placement::snapshot::HostKey {
+                key_id: replica_key.key_id.clone(),
+                key: verifying_key,
+            });
+        }
+
+        for host in &duplicates {
+            index_by_host.remove(host);
+            keys.remove(host);
+        }
+
+        inference_providers::BackendHosts {
+            index_by_host,
+            keys: placement::snapshot::KeyRegistry { by_host: keys },
+            count: self.backend_count,
+        }
+    }
 }
 
 fn tee_identity(report: &serde_json::Map<String, serde_json::Value>) -> Option<TeeIdentity> {
@@ -614,11 +809,15 @@ fn tee_identity(report: &serde_json::Map<String, serde_json::Value>) -> Option<T
 /// Signing key and TEE identity reported by a verified discovery probe. These
 /// report fields are not checked by the attestation verifier, so they are only
 /// taken from a probe whose connection presented the attested certificate.
+/// `replica_key` is the replica-report key from that same verified report; it
+/// is kept under the same gate so placement only trusts keys attested over the
+/// connection that carried the report.
 fn backend_probe(
     binding: ChannelBinding,
     report: &serde_json::Map<String, serde_json::Value>,
     index: usize,
     algo: &str,
+    replica_key: Option<&ReplicaReportKey>,
 ) -> Option<BackendProbe> {
     if binding != ChannelBinding::Match {
         return None;
@@ -629,6 +828,7 @@ fn backend_probe(
         algo: algo.to_string(),
         pubkey: pubkey.to_string(),
         identity: tee_identity(report),
+        replica_key: replica_key.cloned(),
     })
 }
 
@@ -721,6 +921,19 @@ impl ProviderMappings {
     }
 }
 
+/// What the pool needs to start placement for a provider. Holds the Valkey
+/// password, so it intentionally has no `Debug`.
+struct PoolPlacement {
+    password: String,
+    /// Where the placement Valkey is (config, not secret).
+    endpoint: inference_providers::placement_io::ValkeyEndpoint,
+    /// Keys each tier's placer's follow pins (see `Placer::new`).
+    pin_secret: [u8; 32],
+    /// Keys request affinity in the completion service. Derived here, once,
+    /// with the pin secret, so the two can never disagree.
+    affinity_secret: [u8; 32],
+}
+
 #[derive(Clone)]
 pub struct InferenceProviderPool {
     /// Optional API key for authenticating with inference backends
@@ -785,6 +998,11 @@ pub struct InferenceProviderPool {
     /// Shared with each `PoolBackendVerifier`, so a verifier created before the
     /// sink is attached still reports to it.
     metrics_service: Arc<std::sync::OnceLock<Arc<dyn crate::metrics::MetricsServiceTrait>>>,
+    /// Smart-placement install state, set once at startup when the placement
+    /// secret is configured ([`Self::set_placement`]). Applied to every
+    /// covered base-tier provider this pool creates, at startup and on later
+    /// discovery refreshes alike. Unset: every provider stays legacy.
+    placement: Arc<std::sync::OnceLock<PoolPlacement>>,
     /// Providers explicitly registered as fallbacks, keyed by model id. This
     /// role is configuration metadata rather than an inference from whichever
     /// providers happen to be live, so it survives primary discovery failures
@@ -1156,8 +1374,89 @@ impl InferenceProviderPool {
             pinned_models: Arc::new(std::sync::RwLock::new(std::collections::HashSet::new())),
             pinned_providers: Arc::new(std::sync::RwLock::new(HashMap::new())),
             metrics_service: Arc::new(std::sync::OnceLock::new()),
+            placement: Arc::new(std::sync::OnceLock::new()),
             fallback_providers: Arc::new(std::sync::RwLock::new(HashMap::new())),
         }
+    }
+
+    /// Enable smart placement: `password` authenticates to the placement
+    /// Valkey at `endpoint`, and the pin and affinity secrets are derived
+    /// from it (`secrets_from`). Call once at startup, before models load,
+    /// and only when both are configured. A second call is a no-op.
+    pub fn set_placement(
+        &self,
+        password: String,
+        endpoint: inference_providers::placement_io::ValkeyEndpoint,
+    ) {
+        let (affinity_secret, pin_secret) = crate::completions::affinity::secrets_from(&password);
+        let _ = self.placement.set(PoolPlacement {
+            password,
+            endpoint,
+            pin_secret,
+            affinity_secret,
+        });
+    }
+
+    /// Whether [`Self::set_placement`] was called.
+    pub fn has_placement(&self) -> bool {
+        self.placement.get().is_some()
+    }
+
+    /// The affinity secret derived by [`Self::set_placement`], or `None`
+    /// when placement is off. The single source for the completion service.
+    pub fn affinity_secret(&self) -> Option<[u8; 32]> {
+        self.placement.get().map(|p| p.affinity_secret)
+    }
+
+    /// A new handle set (own `PlacementIo`, host map and `tier` placer) for
+    /// one provider, or `None` when placement is not configured. Starts
+    /// background tasks, so call it only for a provider that will install
+    /// the handles.
+    fn placement_handles(
+        &self,
+        tier: placement::policy::Tier,
+    ) -> Option<inference_providers::placement_io::PlacementHandles> {
+        let install = self.placement.get()?;
+        let metrics: Arc<dyn crate::metrics::MetricsServiceTrait> = self
+            .metrics_service
+            .get()
+            .cloned()
+            .unwrap_or_else(|| Arc::new(crate::metrics::MockMetricsService));
+        Some(inference_providers::placement_io::PlacementHandles::start(
+            install.password.clone(),
+            &install.endpoint,
+            Arc::new(placement::decision::Placer::new(install.pin_secret, tier)),
+            metrics,
+        ))
+    }
+
+    /// The `(model, inference_url)` entries that get smart placement, with
+    /// each entry's tier: every entry of every model. There is no model
+    /// allow-list: a Fleet whose hosts publish no replica frames keeps an
+    /// empty snapshot, its reader issues no Valkey reads, and its requests
+    /// take the legacy path. An entry is `Long` when its declared capacity
+    /// is above the model's `context_routing::base_capacity`, the same
+    /// boundary that makes a request heavy, and `Base` otherwise. The tier
+    /// comes from capacities, not entry order, so heavy and `Long` cannot
+    /// disagree (with 3+ capacities every tier above base is `Long`).
+    fn placement_targets(
+        models: &[(String, String, Option<u32>)],
+    ) -> HashMap<(String, String), placement::policy::Tier> {
+        let mut caps: HashMap<&str, Vec<Option<u32>>> = HashMap::new();
+        for (model, _, cap) in models {
+            caps.entry(model.as_str()).or_default().push(*cap);
+        }
+        models
+            .iter()
+            .map(|(model, url, cap)| {
+                let base = context_routing::base_capacity(caps[model.as_str()].iter().copied());
+                let tier = match (base, cap) {
+                    (Some(base), Some(cap)) if *cap > base => placement::policy::Tier::Long,
+                    _ => placement::policy::Tier::Base,
+                };
+                ((model.clone(), url.clone()), tier)
+            })
+            .collect()
     }
 
     /// Attach a metrics sink for tiered-routing/fallback visibility. Set once
@@ -1850,6 +2149,138 @@ impl InferenceProviderPool {
         }
     }
 
+    /// A client for `GET /backends/count`. The count endpoint terminates TLS
+    /// at the model-proxy base domain with a public certificate, so it is
+    /// unpinned (Bootstrap): there is no per-backend SPKI to bind to.
+    fn count_client(tls_roots: &SharedTlsRoots) -> reqwest::Result<reqwest::Client> {
+        let count_state = Arc::new(std::sync::RwLock::new(FingerprintState::Bootstrap));
+        reqwest::Client::builder()
+            .use_preconfigured_tls(tls_roots.build_config(count_state))
+            .connect_timeout(Duration::from_secs(3))
+            .build()
+    }
+
+    /// One fast count poll over every inference_url provider (see
+    /// `InferenceProvider::poll_backend_count`; only Fleets whose placement
+    /// hosts have published are read). A changed count is stored by the
+    /// provider at once, which makes its placement legacy until
+    /// rediscovery. Returns the models whose count changed or whose host
+    /// map was built for another count: both need a rediscovery.
+    async fn poll_backend_counts(&self, client: &reqwest::Client) -> Vec<String> {
+        let providers: Vec<Arc<InferenceProviderTrait>> = self
+            .inference_url_providers
+            .read()
+            .await
+            .values()
+            .cloned()
+            .collect();
+        let polls = futures::future::join_all(
+            providers
+                .iter()
+                .map(|provider| provider.poll_backend_count(client)),
+        )
+        .await;
+        use inference_providers::CountPoll;
+        let changed: Vec<(usize, CountPoll)> = providers
+            .iter()
+            .zip(polls)
+            .filter(|(_, poll)| matches!(poll, CountPoll::Changed { .. } | CountPoll::HostMapStale))
+            .map(|(provider, poll)| (Arc::as_ptr(provider) as *const () as usize, poll))
+            .collect();
+        if changed.is_empty() {
+            return Vec::new();
+        }
+        let mappings = self.provider_mappings.read().await;
+        let mut models = Vec::new();
+        for (model, list) in &mappings.model_to_providers {
+            let poll = list.iter().find_map(|p| {
+                let ptr = Arc::as_ptr(p) as *const () as usize;
+                changed
+                    .iter()
+                    .find(|(c, _)| *c == ptr)
+                    .map(|(_, poll)| *poll)
+            });
+            match poll {
+                Some(CountPoll::Changed { old, new }) => {
+                    info!(model = %model, old, new, "count_changed");
+                    models.push(model.clone());
+                }
+                Some(_) => models.push(model.clone()),
+                None => {}
+            }
+        }
+        models
+    }
+
+    /// Re-run discovery for `model` after a count change: its catalog
+    /// entries are reloaded as a partial batch, the same path an admin PATCH
+    /// takes, so every probe runs exactly as in the periodic refresh. `false`
+    /// when the catalog could not be read (the model stays pending). A model
+    /// no longer in the catalog has nothing to reload: `true`.
+    async fn rediscover_model(&self, source: &dyn ExternalModelsSource, model: &str) -> bool {
+        match source.fetch_inference_url_models().await {
+            Ok(models) => {
+                let entries: Vec<_> = models
+                    .into_iter()
+                    .filter(|(name, _, _)| name == model)
+                    .collect();
+                if !entries.is_empty() {
+                    self.load_inference_url_models(entries, true).await;
+                }
+                true
+            }
+            Err(e) => {
+                warn!(
+                    model = %model,
+                    error = %e,
+                    "Failed to read inference_url models for count-change rediscovery"
+                );
+                false
+            }
+        }
+    }
+
+    /// The fast count poll: every [`COUNT_POLL_INTERVAL`], read the healthy
+    /// count of every Fleet whose placement hosts have published, and spawn
+    /// a rediscovery for each model that needs one (see
+    /// [`CountRediscovery`]). Runs beside the periodic refresh, so a long
+    /// refresh never stalls it, and reloads run off this task.
+    async fn count_poll_loop(
+        pool: Arc<Self>,
+        source: Arc<dyn ExternalModelsSource>,
+        client: reqwest::Client,
+    ) {
+        let state = Arc::new(std::sync::Mutex::new(CountRediscovery::default()));
+        let mut ticker = tokio::time::interval(COUNT_POLL_INTERVAL);
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        ticker.tick().await;
+        loop {
+            ticker.tick().await;
+            if !pool.has_placement() {
+                continue;
+            }
+            let changed = pool.poll_backend_counts(&client).await;
+            let due = {
+                let mut state = state.lock().unwrap_or_else(|e| e.into_inner());
+                state.mark_pending(changed);
+                state.take_due(std::time::Instant::now())
+            };
+            for model in due {
+                let pool = pool.clone();
+                let source = source.clone();
+                let mut run = RediscoveryRun {
+                    state: state.clone(),
+                    model,
+                    ok: false,
+                };
+                tokio::spawn(async move {
+                    let ok = pool.rediscover_model(source.as_ref(), &run.model).await;
+                    run.record(ok);
+                });
+            }
+        }
+    }
+
     async fn discover_model(
         url: &str,
         model_name: &str,
@@ -1901,12 +2332,7 @@ impl InferenceProviderPool {
         // (Bootstrap) verifier is appropriate — there's no per-backend SPKI
         // to bind to here. We reuse the existing tls_roots so we don't build
         // yet another crypto provider.
-        let count_state = Arc::new(std::sync::RwLock::new(FingerprintState::Bootstrap));
-        let count_client = match reqwest::Client::builder()
-            .use_preconfigured_tls(tls_roots.build_config(count_state))
-            .connect_timeout(Duration::from_secs(3))
-            .build()
-        {
+        let count_client = match Self::count_client(tls_roots) {
             Ok(c) => c,
             Err(e) => {
                 failure_reasons.push(format!("count_client_build: {e}"));
@@ -2168,7 +2594,13 @@ impl InferenceProviderPool {
                     }
                     // Keys are KMS-root-derived: replicas under different roots
                     // serve different keys for the same model and algorithm.
-                    if let Some(probe) = backend_probe(binding, &report, backend_index, &algo) {
+                    if let Some(probe) = backend_probe(
+                        binding,
+                        &report,
+                        backend_index,
+                        &algo,
+                        verified.replica_report_key.as_ref(),
+                    ) {
                         if probe.identity.is_none() {
                             warn!(
                                 model = %model_name,
@@ -3119,9 +3551,7 @@ impl InferenceProviderPool {
                 .collect()
         };
         let context_tier_long = hints.estimated_tokens.is_some_and(|req| {
-            ctx_caps
-                .values()
-                .any(|cap| cap.is_some_and(|cap| req > cap))
+            context_routing::exceeds_declared_capacity(u64::from(req), ctx_caps.values().copied())
         });
 
         // Negative-priority organizations never fall back to the OTHER NEAR
@@ -3807,16 +4237,10 @@ impl InferenceProviderPool {
             .unwrap_or_else(|| AttestationError::ProviderNotFound(model)))
     }
 
-    /// Bound on concurrent `/v1/tokenize` refinement calls. Requests that
-    /// can't get a permit fall back to the byte heuristic immediately — the
-    /// exact count is an accuracy optimization, never worth queueing for,
-    /// and the cap keeps a burst of boundary-sized prompts from doubling
-    /// ingress bandwidth against the backend.
-    const TOKENIZE_CONCURRENCY: usize = 4;
-
-    /// Set `hints.estimated_tokens` to the CONTEXT REQUIREMENT the routing
-    /// sort compares against provider capacities:
-    /// `ceil(countable_input × factor) + media/template overhead + max_tokens reserve`.
+    /// Set `hints.estimated_tokens` to the prompt estimate the routing sort
+    /// compares against provider capacities:
+    /// `ceil(countable_input × factor) + media/template overhead`. Input
+    /// only: `max_tokens` never changes the tier, and no tokenizer is called.
     ///
     /// Runs ONLY for models whose providers declare ≥2 distinct context
     /// capacities (e.g. glm-5.2's 262k fleet + 1M tier) — for every other
@@ -3824,42 +4248,15 @@ impl InferenceProviderPool {
     /// semantics, so their routing is unchanged. The estimate is computed
     /// here, from the full request (text + tools + media + template
     /// overhead), NOT taken from the service-side hint — keeping the richer
-    /// accounting scoped to multi-tier models only. When it lands inside the
-    /// tokenize band around a declared capacity (where the ±25% byte
-    /// heuristic could flip the tier decision), asks a NEAR provider for an
-    /// exact count via its attested `/v1/tokenize` passthrough — best-effort
-    /// and concurrency-capped, falling back to the heuristic with the wider
-    /// safety factor. Skipped for encrypted payloads (`skip_exact_count`):
-    /// tokenizing ciphertext is meaningless, and the byte heuristic still
-    /// approximates plaintext size.
+    /// accounting scoped to multi-tier models only.
     async fn refine_context_requirement(
         &self,
         model_id: &str,
         params: &ChatCompletionParams,
         hints: &mut ChatRoutingHints,
-        skip_exact_count: bool,
     ) {
-        let providers = {
-            let mappings = self.provider_mappings.read().await;
-            match mappings.model_to_providers.get(model_id) {
-                Some(p) => p.clone(),
-                None => return,
-            }
-        };
-
-        let caps: Vec<(Arc<InferenceProviderTrait>, Option<u32>)> = {
-            let states = self
-                .provider_load_state
-                .read()
-                .unwrap_or_else(|e| e.into_inner());
-            providers
-                .into_iter()
-                .map(|p| {
-                    let ptr = Arc::as_ptr(&p) as *const () as usize;
-                    let cap = states.get(&ptr).and_then(|s| s.max_context_tokens);
-                    (p, cap)
-                })
-                .collect()
+        let Some(caps) = self.declared_capacities(model_id).await else {
+            return;
         };
 
         let distinct: std::collections::BTreeSet<u32> =
@@ -3871,84 +4268,77 @@ impl InferenceProviderPool {
         }
 
         let estimate = context_routing::estimate_input(params);
-        let pre_factor = estimate.countable_tokens + estimate.uncounted_tokens;
-        let output_reserve = params
-            .max_completion_tokens
-            .or(params.max_tokens)
-            .unwrap_or(0)
-            .max(0) as u64;
-
-        // Exact count only when the heuristic is close enough to a capacity
-        // boundary that its error could flip the tier decision. The band is
-        // checked against input + output reserve: a large max_tokens shrinks
-        // the input room to `cap - reserve`, so a mid-size prompt can sit at
-        // the boundary even when the input alone looks comfortably below it.
-        let (band_low, band_high) = context_routing::tokenize_band();
-        let boundary_demand = (pre_factor + output_reserve) as f64;
-        let near_boundary = distinct.iter().any(|cap| {
-            let cap = *cap as f64;
-            boundary_demand >= band_low * cap && boundary_demand <= band_high * cap
-        });
-
-        let mut exact_count: Option<u64> = None;
-        if near_boundary && !skip_exact_count {
-            static TOKENIZE_PERMITS: tokio::sync::Semaphore =
-                tokio::sync::Semaphore::const_new(InferenceProviderPool::TOKENIZE_CONCURRENCY);
-            if let Ok(_permit) = TOKENIZE_PERMITS.try_acquire() {
-                // Count on the base fleet (smallest declared capacity — the
-                // plentiful tier) so the long-context host doesn't pay the
-                // tokenize traffic too. Same model ⇒ same tokenizer everywhere.
-                let smallest = distinct.iter().next().copied();
-                let tokenizer_provider = caps
-                    .iter()
-                    .find(|(p, c)| {
-                        *c == smallest && p.tier() == inference_providers::ProviderTier::Near
-                    })
-                    .or_else(|| {
-                        caps.iter()
-                            .find(|(p, _)| p.tier() == inference_providers::ProviderTier::Near)
-                    })
-                    .map(|(p, _)| p.clone());
-                if let Some(provider) = tokenizer_provider {
-                    let text = context_routing::concat_prompt_text(params);
-                    exact_count = provider.count_tokens(model_id, text).await;
-                }
-            }
-        }
-
-        // The exact count replaces only the COUNTABLE text; media and
-        // template overhead are invisible to the tokenizer and re-added.
-        let required = match exact_count {
-            Some(n) => (n as f64 * context_routing::exact_factor()).ceil() as u64,
-            None => {
-                (estimate.countable_tokens as f64 * context_routing::safety_factor()).ceil() as u64
-            }
-        } + estimate.uncounted_tokens
-            + output_reserve;
-        let required = required.min(u32::MAX as u64) as u32;
+        let required = context_routing::requirement(&estimate).min(u32::MAX as u64) as u32;
         hints.estimated_tokens = Some(required);
 
         // Numbers only — never content (see CLAUDE.md logging rules).
-        let smallest_cap = distinct.iter().next().copied().unwrap_or(u32::MAX);
-        if required > smallest_cap {
+        if context_routing::is_heavy(u64::from(required), caps.iter().map(|(_, cap)| *cap)) {
             tracing::info!(
                 model_id = %model_id,
-                input_estimate = pre_factor,
                 required_tokens = required,
-                output_reserve,
-                exact_count_used = exact_count.is_some(),
                 "Request exceeds the base tier's context window; routing to a longer-context provider"
             );
         } else {
             tracing::debug!(
                 model_id = %model_id,
-                input_estimate = pre_factor,
                 required_tokens = required,
-                output_reserve,
-                exact_count_used = exact_count.is_some(),
                 "Refined context requirement for tier routing"
             );
         }
+    }
+
+    /// Each of `model_id`'s providers with its declared context capacity
+    /// (`None` when undeclared), or `None` for an unknown model.
+    async fn declared_capacities(
+        &self,
+        model_id: &str,
+    ) -> Option<Vec<(Arc<InferenceProviderTrait>, Option<u32>)>> {
+        let providers = self
+            .provider_mappings
+            .read()
+            .await
+            .model_to_providers
+            .get(model_id)?
+            .clone();
+        let states = self
+            .provider_load_state
+            .read()
+            .unwrap_or_else(|e| e.into_inner());
+        Some(
+            providers
+                .into_iter()
+                .map(|p| {
+                    let ptr = Arc::as_ptr(&p) as *const () as usize;
+                    let cap = states.get(&ptr).and_then(|s| s.max_context_tokens);
+                    (p, cap)
+                })
+                .collect(),
+        )
+    }
+
+    /// Refine `hints` for the tier sort and set `params.placement`'s size and
+    /// class from the same formula, for every model: placement uses it wherever the model's hosts publish frames.
+    /// Both chat paths call this.
+    async fn apply_context_routing(
+        &self,
+        model_id: &str,
+        params: &mut ChatCompletionParams,
+        hints: &mut ChatRoutingHints,
+    ) {
+        self.refine_context_requirement(model_id, params, hints)
+            .await;
+        // NEAR tiers only: the same provider set `placement_targets` draws
+        // the tier boundary from, so an attested fallback's (smaller) window
+        // never shifts the heavy class away from the Fleets' tiers.
+        let caps: Vec<Option<u32>> = self
+            .declared_capacities(model_id)
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|(provider, _)| provider.tier() == inference_providers::ProviderTier::Near)
+            .map(|(_, cap)| cap)
+            .collect();
+        params.placement = context_routing::placement_context(&caps, params);
     }
 
     pub async fn chat_completion_stream(
@@ -3984,15 +4374,11 @@ impl InferenceProviderPool {
             .extra
             .contains_key(encryption_headers::CLIENT_PUB_KEY);
 
-        // Turn the rough input estimate into a context requirement (exact
-        // tokenize near tier boundaries). No-op for single-capacity models.
-        self.refine_context_requirement(
-            &model_id,
-            &params,
-            &mut hints,
-            model_pub_key.is_some() || needs_client_e2ee,
-        )
-        .await;
+        // Turn the rough input estimate into the prompt-size requirement
+        // (no-op for single-capacity models), and give placement its typed
+        // context.
+        self.apply_context_routing(&model_id, &mut params, &mut hints)
+            .await;
 
         let mut params_for_provider = params.clone();
         reinsert_pubkey_pin(&mut params_for_provider, model_pub_key_str.as_deref());
@@ -4187,15 +4573,11 @@ impl InferenceProviderPool {
             .extra
             .contains_key(encryption_headers::CLIENT_PUB_KEY);
 
-        // Turn the rough input estimate into a context requirement (exact
-        // tokenize near tier boundaries). No-op for single-capacity models.
-        self.refine_context_requirement(
-            &model_id,
-            &params,
-            &mut hints,
-            model_pub_key.is_some() || needs_client_e2ee,
-        )
-        .await;
+        // Turn the rough input estimate into the prompt-size requirement
+        // (no-op for single-capacity models), and give placement its typed
+        // context.
+        self.apply_context_routing(&model_id, &mut params, &mut hints)
+            .await;
 
         tracing::debug!(
             model = %model_id,
@@ -5052,12 +5434,24 @@ impl InferenceProviderPool {
         let pool_load_state = self.provider_load_state.clone();
 
         // Check which models can reuse their existing provider (URL unchanged)
+        let placement_targets = Self::placement_targets(&models);
         let existing_cache = self.inference_url_providers.read().await;
         let mut reused: Vec<(String, String, Arc<InferenceProviderTrait>)> = Vec::new();
         let mut needs_creation: Vec<(String, String, Option<u32>)> = Vec::new();
 
         for (model_name, url, context_length) in &models {
-            if let Some(existing) = existing_cache.get(url) {
+            // A catalog change can move a URL across the tier boundary; a
+            // placer's tier is fixed, so such a provider is recreated with
+            // fresh handles for its new tier (the old one, and its reader,
+            // go when it is dropped).
+            let wanted_tier = placement_targets.get(&(model_name.clone(), url.clone()));
+            let existing = existing_cache.get(url).filter(|existing| {
+                match (existing.placement_tier(), wanted_tier) {
+                    (Some(installed), Some(wanted)) => installed == *wanted,
+                    _ => true,
+                }
+            });
+            if let Some(existing) = existing {
                 // Keep the declared capacity fresh on reuse too — an admin
                 // PATCH that only changes context numbers (same URLs) must
                 // take effect without provider recreation.
@@ -5093,6 +5487,13 @@ impl InferenceProviderPool {
         let endpoint_futures: Vec<_> = needs_creation
             .iter()
             .map(|(model_name, url, context_length)| {
+                // Every tier of every model gets placement, each provider
+                // with its own handle set (one writer per host map) and a
+                // placer for its tier. A handle set whose hosts never
+                // publish stays idle: no Valkey connection or reads.
+                let placement = placement_targets
+                    .get(&(model_name.clone(), url.clone()))
+                    .and_then(|tier| self.placement_handles(*tier));
                 let model_name = model_name.clone();
                 let url = url.clone();
                 let context_length = *context_length;
@@ -5146,6 +5547,16 @@ impl InferenceProviderPool {
                     // before any refresh cycle would skip rotation entirely.
                     serving_provider.set_backend_count(outcome.backend_count);
                     serving_provider.set_backend_keys(outcome.key_index_map());
+                    serving_provider.set_backend_hosts(outcome.backend_hosts());
+                    if let Some(handles) = placement {
+                        let tier = handles.placer.tier();
+                        serving_provider.set_placement(handles);
+                        info!(
+                            model = %model_name,
+                            tier = tier.as_str(),
+                            "Smart placement installed on provider"
+                        );
+                    }
 
                     // Store the configured context length so latency routing can
                     // filter out providers that can't serve oversized requests.
@@ -5316,6 +5727,7 @@ impl InferenceProviderPool {
                     String,
                     String,
                     Arc<InferenceProviderTrait>,
+                    u64,
                     DiscoveryOutcome,
                 ),
             >;
@@ -5387,6 +5799,9 @@ impl InferenceProviderPool {
                         let model_name = model_name.clone();
                         let url = url.clone();
                         let provider = provider.clone();
+                        // Read before the cycle starts: a count the fast
+                        // poll stores meanwhile makes this cycle's push stale.
+                        let generation = provider.count_generation();
                         let metrics_service = metrics_service.clone();
                         let verifier = verifier.clone();
                         let tls_roots = tls_roots.clone();
@@ -5405,7 +5820,7 @@ impl InferenceProviderPool {
                                     metrics_service.as_deref(),
                                 )
                                 .await;
-                                (model_name, url, provider, outcome)
+                                (model_name, url, provider, generation, outcome)
                             }
                             .boxed(),
                         );
@@ -5460,7 +5875,7 @@ impl InferenceProviderPool {
             };
             let (discovery_results, legacy_results) = tokio::join!(drive_discovery, drive_legacy);
 
-            for (model_name, url, provider, outcome) in discovery_results {
+            for (model_name, url, provider, generation, outcome) in discovery_results {
                 record_backend_key_divergence(
                     self.metrics_service.get().map(Arc::as_ref),
                     &model_name,
@@ -5501,8 +5916,24 @@ impl InferenceProviderPool {
                 // useful update because it disables rotation fallback for
                 // this provider until the next cycle proves at least one
                 // backend healthy again.
-                provider.set_backend_count(outcome.backend_count);
-                provider.set_backend_keys(outcome.key_index_map());
+                //
+                // Applied as one versioned push: a count the fast poll stored
+                // after this cycle began is newer, so the push is discarded
+                // (the poll keeps the model pending for rediscovery).
+                let applied = provider.apply_discovery(inference_providers::DiscoveryPush {
+                    generation,
+                    count: outcome.backend_count,
+                    keys: outcome.key_index_map(),
+                    hosts: outcome.backend_hosts(),
+                    complete: outcome.replaced_state,
+                });
+                if !applied {
+                    info!(
+                        model = %model_name,
+                        backend_count = outcome.backend_count,
+                        "Discovery push older than a polled backend count; discarded"
+                    );
+                }
 
                 let ptr = Arc::as_ptr(&provider) as *const () as usize;
                 let provider_has_any_pubkey_mapping = mapped_ptrs.contains(&ptr);
@@ -5996,6 +6427,19 @@ impl InferenceProviderPool {
                     tokio::time::interval(tokio::time::Duration::from_secs(refresh_interval_secs));
                 // Skip the first immediate tick (providers already loaded at startup)
                 interval.tick().await;
+                // The fast count poll, for Fleets whose placement hosts have
+                // published, runs as its own task for as long as this one.
+                let _count_poll = match Self::count_client(&pool.tls_roots) {
+                    Ok(client) => Some(AbortOnDrop(tokio::spawn(Self::count_poll_loop(
+                        pool.clone(),
+                        source.clone(),
+                        client,
+                    )))),
+                    Err(e) => {
+                        warn!(error = %e, "Backend count poll client failed to build; count poll disabled");
+                        None
+                    }
+                };
                 loop {
                     interval.tick().await;
                     debug!("Running periodic provider refresh");
@@ -6419,6 +6863,35 @@ mod tests {
             algo: algo.to_string(),
             pubkey: pubkey.to_string(),
             identity: identity.map(|(root_id, app_id)| (root_id.to_string(), app_id.to_string())),
+            replica_key: None,
+        }
+    }
+
+    fn backend_probe_with_key(
+        index: usize,
+        algo: &str,
+        pubkey: &str,
+        replica_key: ReplicaReportKey,
+    ) -> BackendProbe {
+        BackendProbe {
+            index,
+            algo: algo.to_string(),
+            pubkey: pubkey.to_string(),
+            identity: None,
+            replica_key: Some(replica_key),
+        }
+    }
+
+    fn fake_replica_report_key(
+        signing_key: &ed25519_dalek::SigningKey,
+        host_id: &str,
+    ) -> ReplicaReportKey {
+        let verifying_key = signing_key.verifying_key();
+        ReplicaReportKey {
+            key_id: placement::frame::key_id(&verifying_key),
+            public_key_hex: hex::encode(verifying_key.to_bytes()),
+            boot_id: "boot-1".to_string(),
+            host_id: host_id.to_string(),
         }
     }
 
@@ -6679,6 +7152,186 @@ mod tests {
         assert_eq!(key_index_map.get("abcd"), Some(&vec![0, 2]));
         assert_eq!(key_index_map.get("efgh"), Some(&vec![1, 3]));
         assert_eq!(key_index_map.len(), 2);
+    }
+
+    #[test]
+    fn discovery_outcome_maps_host_to_index() {
+        // Given: two verified hosts, each probed under both algos (same key
+        // both times), plus one index with no verified key.
+        let key_a = ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]);
+        let key_b = ed25519_dalek::SigningKey::from_bytes(&[9u8; 32]);
+        let replica_key_a = fake_replica_report_key(&key_a, "host-a");
+        let replica_key_b = fake_replica_report_key(&key_b, "host-b");
+        let outcome = discovery_outcome_with_probes(
+            3,
+            vec![
+                backend_probe_with_key(0, "ecdsa", "key-a", replica_key_a.clone()),
+                backend_probe_with_key(0, "ed25519", "key-a", replica_key_a.clone()),
+                backend_probe_with_key(1, "ecdsa", "key-b", replica_key_b.clone()),
+                backend_probe_with_key(1, "ed25519", "key-b", replica_key_b.clone()),
+                backend_probe(2, "ecdsa", "key-c", None),
+                backend_probe(2, "ed25519", "key-c", None),
+            ],
+        );
+
+        // When: the verified host map is built for providers.
+        let hosts = outcome.backend_hosts();
+
+        // Then: only the two verified hosts are mapped, index 2 (no key) is
+        // absent, and each host has exactly one attested key despite two probes.
+        assert_eq!(hosts.index_by_host.get("host-a"), Some(&0));
+        assert_eq!(hosts.index_by_host.get("host-b"), Some(&1));
+        assert_eq!(hosts.index_by_host.len(), 2);
+        assert_eq!(hosts.keys.by_host.get("host-a").map(Vec::len), Some(1));
+        assert_eq!(hosts.keys.by_host.get("host-b").map(Vec::len), Some(1));
+        assert_eq!(hosts.count, 3);
+        assert_eq!(
+            hosts.keys.by_host.get("host-a").unwrap()[0].key,
+            key_a.verifying_key()
+        );
+    }
+
+    #[test]
+    fn backend_hosts_registry_verifies_the_proxy_golden_frame() {
+        // Given: the proxy's attested replica-report key (the golden
+        // fixture's key [7u8; 32]) observed at one backend.
+        let key = ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]);
+        let outcome = discovery_outcome_with_probes(
+            1,
+            vec![backend_probe_with_key(
+                0,
+                "ecdsa",
+                "key-a",
+                fake_replica_report_key(&key, "host-a"),
+            )],
+        );
+        let golden: placement::frame::Envelope = serde_json::from_str(include_str!(
+            "../../../placement/tests/fixtures/host_frame_v1.json"
+        ))
+        .unwrap();
+
+        // When: the pool's host map feeds ingest.
+        let hosts = outcome.backend_hosts();
+        let views = placement::snapshot::Ingest::new()
+            // Any clock after the fixture's engine time: this test is about
+            // key discovery, not freshness.
+            .accept("host-a", &golden, &hosts.keys, u64::MAX)
+            .expect("proxy-sealed frame verifies against the discovered key");
+
+        // Then: one view per replica the host frame carries.
+        assert_eq!(hosts.index_by_host.get("host-a"), Some(&0));
+        assert_eq!(
+            views.iter().map(|v| v.slot.replica).collect::<Vec<_>>(),
+            vec![0, 1]
+        );
+    }
+
+    #[test]
+    fn malformed_key_falls_through_to_sibling_probe_at_same_index() {
+        // Given: two probes at the same index (the two algos), the first
+        // carrying a key that fails to parse and the second carrying a
+        // valid key for the same host.
+        let key = ed25519_dalek::SigningKey::from_bytes(&[9u8; 32]);
+        let mut bad_key = fake_replica_report_key(&key, "host-a");
+        bad_key.public_key_hex = "not-hex".to_string();
+        let good_key = fake_replica_report_key(&key, "host-a");
+        let outcome = discovery_outcome_with_probes(
+            1,
+            vec![
+                backend_probe_with_key(0, "ecdsa", "key-a", bad_key),
+                backend_probe_with_key(0, "ed25519", "key-a", good_key),
+            ],
+        );
+
+        // When.
+        let hosts = outcome.backend_hosts();
+
+        // Then: the malformed probe does not mask its sibling — the host
+        // ends up mapped, with the valid key in the registry.
+        assert_eq!(hosts.index_by_host.get("host-a"), Some(&0));
+        let keys = hosts.keys.by_host.get("host-a").expect("host key present");
+        assert_eq!(keys.len(), 1);
+        assert_eq!(keys[0].key, key.verifying_key());
+    }
+
+    #[test]
+    fn duplicate_host_is_dropped() {
+        // Given: the same attested host_id is reported at two different
+        // backend indices in the same discovery cycle (e.g. a stale index
+        // binding mid-rotation), next to an unambiguous host.
+        let key_a = ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]);
+        let key_b = ed25519_dalek::SigningKey::from_bytes(&[8u8; 32]);
+        let replica_key = fake_replica_report_key(&key_a, "host-a");
+        let outcome = discovery_outcome_with_probes(
+            3,
+            vec![
+                backend_probe_with_key(1, "ecdsa", "key-a", replica_key.clone()),
+                backend_probe_with_key(0, "ecdsa", "key-a", replica_key.clone()),
+                backend_probe_with_key(
+                    2,
+                    "ecdsa",
+                    "key-b",
+                    fake_replica_report_key(&key_b, "host-b"),
+                ),
+            ],
+        );
+
+        // When.
+        let hosts = outcome.backend_hosts();
+
+        // Then: the ambiguous host is gone from both the map and the key
+        // registry, regardless of probe order; the other host is kept.
+        assert_eq!(hosts.index_by_host.get("host-a"), None);
+        assert!(!hosts.keys.by_host.contains_key("host-a"));
+        assert_eq!(hosts.index_by_host.get("host-b"), Some(&2));
+        assert!(hosts.keys.by_host.contains_key("host-b"));
+        assert_eq!(hosts.index_by_host.len(), 1);
+    }
+
+    #[test]
+    fn two_hosts_claiming_one_index_keep_only_the_first() {
+        // Given: two different attested hosts reported at the same backend
+        // index (the index-to-backend binding moved mid-cycle).
+        let key_a = ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]);
+        let key_b = ed25519_dalek::SigningKey::from_bytes(&[8u8; 32]);
+        let outcome = discovery_outcome_with_probes(
+            2,
+            vec![
+                backend_probe_with_key(
+                    0,
+                    "ecdsa",
+                    "key-a",
+                    fake_replica_report_key(&key_a, "host-a"),
+                ),
+                backend_probe_with_key(
+                    0,
+                    "ed25519",
+                    "key-b",
+                    fake_replica_report_key(&key_b, "host-b"),
+                ),
+            ],
+        );
+
+        // When.
+        let hosts = outcome.backend_hosts();
+
+        // Then: the index maps to one host only, and the other host has no
+        // attested key, so its frames never ingest and placement can never
+        // pick it (the reader skips it; the Fleet sees an incomplete map
+        // until discovery settles, and falls back).
+        assert_eq!(hosts.index_by_host.get("host-a"), Some(&0));
+        assert_eq!(hosts.index_by_host.get("host-b"), None);
+        assert!(!hosts.keys.by_host.contains_key("host-b"));
+        let keys = hosts
+            .keys
+            .by_host
+            .get("host-a")
+            .expect("host-a key present");
+        assert_eq!(keys.len(), 1);
+        assert_eq!(
+            keys[0].key_id,
+            placement::frame::key_id(&key_a.verifying_key())
+        );
     }
 
     #[test]
@@ -7407,6 +8060,7 @@ mod tests {
             .await;
 
         let params = inference_providers::ChatCompletionParams {
+            placement: Default::default(),
             request_priority: 0,
             model: model_id,
             messages: vec![inference_providers::ChatMessage {
@@ -7483,6 +8137,7 @@ mod tests {
         pool.register_provider(model_id.clone(), mock_provider.clone())
             .await;
         let params = inference_providers::ChatCompletionParams {
+            placement: Default::default(),
             request_priority: 0,
             model: model_id,
             messages: vec![inference_providers::ChatMessage {
@@ -8093,6 +8748,360 @@ mod tests {
         // the partial-batch safety the admin PATCH path depends on.
         assert!(!merged.contains_key("other-pinned"));
         assert_eq!(merged.len(), 1);
+    }
+
+    fn glm_two_tier_models() -> Vec<(String, String, Option<u32>)> {
+        let covered = "z-ai/glm-5.3-flash";
+        let long_context = serde_json::json!({"long_context": {
+            "inference_url": "https://long.example",
+            "max_context_tokens": 1_048_576,
+            "base_max_context_tokens": 100_000,
+        }});
+        let mut models =
+            expand_inference_endpoints("other/model", "https://other.example", None, None);
+        models.extend(expand_inference_endpoints(
+            covered,
+            "https://base.example",
+            Some(1_048_576),
+            Some(&long_context),
+        ));
+        models
+    }
+
+    /// Placement installs on every entry of a two-tier model, each with its
+    /// tier: `Long` when its declared capacity is above the model's base
+    /// capacity.
+    #[test]
+    fn placement_targets_include_long_tier() {
+        use placement::policy::Tier;
+        let covered = "z-ai/glm-5.3-flash".to_string();
+        let models = glm_two_tier_models();
+        assert_eq!(models.len(), 3, "the GLM row expands into base + long");
+
+        let targets = InferenceProviderPool::placement_targets(&models);
+        assert_eq!(
+            targets.get(&(covered.clone(), "https://base.example".to_string())),
+            Some(&Tier::Base)
+        );
+        assert_eq!(
+            targets.get(&(covered, "https://long.example".to_string())),
+            Some(&Tier::Long)
+        );
+    }
+
+    /// There is no model allow-list: every entry of every model is a
+    /// placement target, so a new model needs no code change.
+    #[test]
+    fn placement_targets_cover_every_model() {
+        use placement::policy::Tier;
+        let models = glm_two_tier_models();
+        let targets = InferenceProviderPool::placement_targets(&models);
+        assert_eq!(targets.len(), models.len());
+        for (model, url, _) in &models {
+            assert!(
+                targets.contains_key(&(model.clone(), url.clone())),
+                "{model} {url}"
+            );
+        }
+        assert_eq!(
+            targets.get(&(
+                "other/model".to_string(),
+                "https://other.example".to_string()
+            )),
+            Some(&Tier::Base)
+        );
+    }
+
+    #[test]
+    fn single_tier_model_has_base_only() {
+        use placement::policy::Tier;
+        let covered = "z-ai/glm-5.3-flash";
+        let models =
+            expand_inference_endpoints(covered, "https://base.example", Some(100_000), None);
+        let targets = InferenceProviderPool::placement_targets(&models);
+        assert_eq!(
+            targets,
+            HashMap::from([(
+                (covered.to_string(), "https://base.example".to_string()),
+                Tier::Base
+            )])
+        );
+    }
+
+    /// With three declared capacities every tier above base is `Long`, and a
+    /// request is heavy exactly when it does not fit base, so "heavy" and
+    /// "Long" come from the one boundary and cannot disagree.
+    #[test]
+    fn three_capacities_tier_and_heavy_agree() {
+        use placement::policy::Tier;
+        let covered = "z-ai/glm-5.3-flash".to_string();
+        let caps = [100_000u32, 262_144, 1_048_576];
+        let models: Vec<(String, String, Option<u32>)> = caps
+            .iter()
+            .map(|cap| {
+                (
+                    covered.clone(),
+                    format!("https://t{cap}.example"),
+                    Some(*cap),
+                )
+            })
+            .collect();
+        let targets = InferenceProviderPool::placement_targets(&models);
+        let tier = |cap: u32| targets[&(covered.clone(), format!("https://t{cap}.example"))];
+        assert_eq!(
+            [tier(100_000), tier(262_144), tier(1_048_576)],
+            [Tier::Base, Tier::Long, Tier::Long]
+        );
+
+        let declared: Vec<Option<u32>> = caps.iter().copied().map(Some).collect();
+        for (context_tokens, heavy) in [
+            (90_000, false),
+            (100_000, false),
+            (150_000, true),
+            (500_000, true),
+        ] {
+            assert_eq!(
+                context_routing::is_heavy(context_tokens, declared.iter().copied()),
+                heavy,
+                "context {context_tokens}"
+            );
+        }
+    }
+
+    /// `heavy` (placement's class) never applies to a single-tier model.
+    #[test]
+    fn context_tier_long_uses_base_capacity() {
+        let two = [Some(262_144), None, Some(1_048_576)];
+        assert!(!context_routing::is_heavy(262_144, two));
+        assert!(context_routing::is_heavy(262_145, two));
+        assert!(!context_routing::is_heavy(2_000_000, [Some(262_144)]));
+        assert!(!context_routing::is_heavy(2_000_000, [None, None]));
+    }
+
+    /// The `context_tier:long` metric tag keeps its original predicate (the
+    /// requirement exceeds at least one declared capacity), so an oversized
+    /// request on a single-capacity model is still tagged, though it is not
+    /// heavy for placement.
+    #[test]
+    fn context_tier_tag_covers_single_capacity_oversized_request() {
+        let single = [Some(262_144), Some(262_144)];
+        assert!(context_routing::exceeds_declared_capacity(262_145, single));
+        assert!(!context_routing::is_heavy(262_145, single));
+        assert!(!context_routing::exceeds_declared_capacity(262_144, single));
+        assert!(!context_routing::exceeds_declared_capacity(
+            2_000_000,
+            [None, None]
+        ));
+        let two = [Some(262_144), None, Some(1_048_576)];
+        assert!(context_routing::exceeds_declared_capacity(262_145, two));
+        assert!(!context_routing::exceeds_declared_capacity(262_144, two));
+    }
+
+    /// A catalog change that moves a reused URL across the tier boundary
+    /// (here: the long block becomes valid, so the URL is now the long
+    /// tier) recreates its provider with a placer for the new tier, instead
+    /// of keeping the tier fixed at creation.
+    /// A placement Valkey endpoint that never connects: TLS without a CA is
+    /// a config error, so handle sets started with it stay inert.
+    fn inert_endpoint() -> inference_providers::placement_io::ValkeyEndpoint {
+        inference_providers::placement_io::ValkeyEndpoint {
+            host: "203.0.113.7".to_string(),
+            port: 6379,
+            tls: true,
+            ca_pem: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn reused_provider_gets_new_tier_after_catalog_change() {
+        use placement::policy::Tier;
+        let pool = InferenceProviderPool::new(None, ExternalProvidersConfig::default());
+        pool.set_placement("router-password".to_string(), inert_endpoint());
+        let covered = "z-ai/glm-5.3-flash".to_string();
+        let base_url = "https://glm-base.invalid".to_string();
+        let long_url = "https://glm-long.invalid".to_string();
+
+        // The long URL's provider was created while it was a base-tier entry.
+        let stale: Arc<InferenceProviderTrait> = Arc::new(nearai::Provider::new(
+            nearai::Config::new(long_url.clone(), None, Some(1)),
+        ));
+        stale.set_placement(pool.placement_handles(Tier::Base).expect("handles"));
+        assert_eq!(stale.placement_tier(), Some(Tier::Base));
+        pool.inference_url_providers
+            .write()
+            .await
+            .insert(long_url.clone(), stale.clone());
+
+        pool.load_inference_url_models(
+            vec![
+                (covered.clone(), base_url, Some(100_000)),
+                (covered, long_url.clone(), Some(1_048_576)),
+            ],
+            true,
+        )
+        .await;
+
+        let cache = pool.inference_url_providers.read().await;
+        let current = cache.get(&long_url).expect("long URL provider");
+        assert!(
+            !Arc::ptr_eq(current, &stale),
+            "the stale-tier provider is replaced"
+        );
+        assert_eq!(current.placement_tier(), Some(Tier::Long));
+    }
+
+    #[tokio::test]
+    async fn long_fleet_placer_has_long_tier() {
+        use placement::policy::Tier;
+        let pool = InferenceProviderPool::new(None, ExternalProvidersConfig::default());
+        pool.set_placement("router-password".to_string(), inert_endpoint());
+        let base = pool.placement_handles(Tier::Base).expect("handles");
+        let long = pool.placement_handles(Tier::Long).expect("handles");
+        assert_eq!(base.placer.tier(), Tier::Base);
+        assert_eq!(long.placer.tier(), Tier::Long);
+    }
+
+    #[tokio::test]
+    async fn placement_handles_need_the_secret() {
+        use placement::policy::Tier;
+        let pool = InferenceProviderPool::new(None, ExternalProvidersConfig::default());
+        assert!(!pool.has_placement());
+        assert!(pool.placement_handles(Tier::Base).is_none());
+
+        assert!(pool.affinity_secret().is_none());
+
+        pool.set_placement("router-password".to_string(), inert_endpoint());
+        assert!(pool.has_placement());
+        let (affinity, _) = crate::completions::affinity::secrets_from("router-password");
+        assert_eq!(pool.affinity_secret(), Some(affinity));
+        // Each call starts a separate handle set (one per Fleet), with its
+        // own placer. The inert endpoint (no CA) keeps it off the network.
+        let first = pool.placement_handles(Tier::Base).expect("handles");
+        let second = pool.placement_handles(Tier::Base).expect("handles");
+        assert!(!Arc::ptr_eq(&first.hosts, &second.hosts));
+        assert!(!Arc::ptr_eq(&first.placer, &second.placer));
+    }
+
+    /// Serves a fixed inference_url catalog and counts its reads.
+    struct CountingSource {
+        models: Vec<(String, String, Option<u32>)>,
+        fetches: std::sync::atomic::AtomicUsize,
+        /// When set, every catalog read fails.
+        fail: std::sync::atomic::AtomicBool,
+    }
+
+    impl CountingSource {
+        fn fetches(&self) -> usize {
+            self.fetches.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ExternalModelsSource for CountingSource {
+        async fn fetch_external_models(&self) -> Result<Vec<(String, serde_json::Value)>, String> {
+            Ok(Vec::new())
+        }
+
+        async fn fetch_inference_url_models(
+            &self,
+        ) -> Result<Vec<(String, String, Option<u32>)>, String> {
+            self.fetches
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if self.fail.load(std::sync::atomic::Ordering::SeqCst) {
+                return Err("catalog unavailable".to_string());
+            }
+            Ok(self.models.clone())
+        }
+    }
+
+    /// A count change re-runs discovery for just its model, from the
+    /// catalog, and records the successful reload.
+    #[tokio::test]
+    async fn count_change_triggers_debounced_rediscovery() {
+        let pool = InferenceProviderPool::new(None, ExternalProvidersConfig::default());
+        let a_url = "https://m-a.completions.invalid".to_string();
+        let b_url = "https://m-b.completions.invalid".to_string();
+        let source = CountingSource {
+            models: vec![
+                ("m-a".to_string(), a_url.clone(), None),
+                ("m-b".to_string(), b_url.clone(), None),
+            ],
+            fetches: Default::default(),
+            fail: Default::default(),
+        };
+        assert!(pool.rediscover_model(&source, "m-a").await);
+        assert_eq!(source.fetches(), 1);
+        let states = pool.inference_url_fingerprint_states.read().await;
+        assert!(states.contains_key(&a_url), "m-a rediscovered");
+        assert!(!states.contains_key(&b_url), "only the changed model");
+        drop(states);
+
+        // A catalog read failure is not a reload.
+        source.fail.store(true, std::sync::atomic::Ordering::SeqCst);
+        assert!(!pool.rediscover_model(&source, "m-a").await);
+    }
+
+    /// A changed count is kept pending until a reload succeeds: a failed
+    /// reload is retried on the next tick, a successful one debounces the
+    /// model for `COUNT_REDISCOVERY_DEBOUNCE`, a change inside that window is
+    /// retried once it elapses, and one model is never in flight twice.
+    #[test]
+    fn debounced_or_failed_rediscovery_is_retried() {
+        let mut state = CountRediscovery::default();
+        let t0 = std::time::Instant::now();
+        let secs = std::time::Duration::from_secs;
+        assert!(state.take_due(t0).is_empty());
+
+        state.mark_pending(["m-a".to_string()]);
+        assert_eq!(state.take_due(t0), vec!["m-a".to_string()]);
+        // In flight: not handed out again.
+        state.mark_pending(["m-a".to_string()]);
+        assert!(state.take_due(t0 + secs(1)).is_empty());
+        // Failed: retried on the next tick.
+        state.finish("m-a", false, t0 + secs(2));
+        assert_eq!(state.take_due(t0 + secs(2)), vec!["m-a".to_string()]);
+        state.finish("m-a", true, t0 + secs(3));
+        assert!(state.take_due(t0 + secs(3)).is_empty(), "done");
+
+        // A new change inside the debounce window waits for it, then runs.
+        state.mark_pending(["m-a".to_string()]);
+        assert!(state.take_due(t0 + secs(10)).is_empty());
+        let due = t0 + secs(3) + COUNT_REDISCOVERY_DEBOUNCE;
+        assert_eq!(state.take_due(due), vec!["m-a".to_string()]);
+    }
+
+    /// A provider whose poll reports a changed count, or a host map built
+    /// for another count, is mapped back to its model(s).
+    #[tokio::test]
+    async fn poll_backend_counts_maps_changed_providers_to_models() {
+        use inference_providers::mock::MockProvider;
+        use inference_providers::CountPoll;
+        let pool = InferenceProviderPool::new(None, ExternalProvidersConfig::default());
+        let providers = [
+            ("m-changed", CountPoll::Changed { old: 4, new: 5 }),
+            ("m-stale", CountPoll::HostMapStale),
+            ("m-same", CountPoll::Unchanged),
+            ("m-failed", CountPoll::Failed),
+        ];
+        for (model, poll) in providers {
+            let provider =
+                Arc::new(MockProvider::new().with_count_poll(poll)) as Arc<InferenceProviderTrait>;
+            pool.inference_url_providers
+                .write()
+                .await
+                .insert(format!("https://{model}.invalid"), provider.clone());
+            pool.provider_mappings
+                .write()
+                .await
+                .model_to_providers
+                .insert(model.to_string(), vec![provider]);
+        }
+        let mut changed = pool.poll_backend_counts(&reqwest::Client::new()).await;
+        changed.sort();
+        assert_eq!(
+            changed,
+            vec!["m-changed".to_string(), "m-stale".to_string()]
+        );
     }
 
     /// The refresh failure-counter prune (review round 3, Pierre's blocking) must
@@ -9555,6 +10564,7 @@ mod tests {
 
     fn fallback_params(model: &str) -> inference_providers::ChatCompletionParams {
         inference_providers::ChatCompletionParams {
+            placement: Default::default(),
             request_priority: 0,
             model: model.to_string(),
             messages: vec![inference_providers::ChatMessage {
@@ -10361,8 +11371,7 @@ mod tests {
     /// pin must block only the RETRYABLE-error spill between NEAR tiers
     /// (previous test), never the existing context-length-400 self-heal. A
     /// request whose ESTIMATE fits the pinned (base) tier but whose ACTUAL
-    /// size does not — a byte-heuristic under-estimate, or an E2EE request
-    /// that skips the exact tokenize count — must still fall through to the
+    /// size does not — a byte-heuristic under-estimate — must still fall through to the
     /// larger declared NEAR sibling, exactly as it would at priority >= 0
     /// (`context_400_fall_through_does_not_clobber_retryable_error` above).
     #[tokio::test]
@@ -10585,7 +11594,7 @@ mod tests {
     /// declare ≥2 distinct capacities — for every other model the hint is
     /// left exactly as the caller set it (byte-identical routing). For
     /// multi-tier models the hint becomes
-    /// ceil(countable × safety_factor) + overhead + max_tokens reserve,
+    /// ceil(countable × safety_factor) + overhead (never `max_tokens`),
     /// computed from the request itself (whatever the incoming hint was).
     #[tokio::test]
     async fn refine_context_requirement_gates_on_multi_capacity() {
@@ -10606,7 +11615,7 @@ mod tests {
         }
 
         // 400k bytes of text → countable = 100_000 tokens; 1 message → 4
-        // tokens overhead; max_tokens reserve 8_000.
+        // tokens overhead; max_tokens 8_000 is ignored.
         let mut params = fallback_params(&model);
         params.messages[0].content = Some(serde_json::Value::String("a".repeat(400_000)));
         params.max_tokens = Some(8_000);
@@ -10626,7 +11635,7 @@ mod tests {
             }
         }
         let mut hints = ChatRoutingHints::default();
-        pool.refine_context_requirement(&model, &params, &mut hints, false)
+        pool.refine_context_requirement(&model, &params, &mut hints)
             .await;
         assert_eq!(
             hints.estimated_tokens, None,
@@ -10634,8 +11643,6 @@ mod tests {
         );
 
         // Heterogeneous capacities: requirement computed from the request.
-        // (MockProvider's count_tokens is the trait default None, and 100k is
-        // outside the [0.7, 1.3] tokenize band of both caps → heuristic path.)
         {
             let mut states = pool
                 .provider_load_state
@@ -10647,12 +11654,289 @@ mod tests {
                 .max_context_tokens = Some(1_048_576);
         }
         let mut hints = ChatRoutingHints::default();
-        pool.refine_context_requirement(&model, &params, &mut hints, false)
+        pool.refine_context_requirement(&model, &params, &mut hints)
             .await;
         assert_eq!(
             hints.estimated_tokens,
-            Some((100_000f64 * context_routing::safety_factor()).ceil() as u32 + 4 + 8_000),
-            "multi-capacity model: requirement = ceil(countable × factor) + overhead + max_tokens"
+            Some((100_000f64 * context_routing::safety_factor()).ceil() as u32 + 4),
+            "multi-capacity model: requirement = ceil(countable × factor) + overhead"
+        );
+    }
+
+    /// A pool serving `model` from NEAR mock providers with the given
+    /// declared capacities, in that registration order.
+    async fn capacity_pool(
+        model: &str,
+        caps: &[u32],
+    ) -> (
+        InferenceProviderPool,
+        Vec<Arc<inference_providers::mock::MockProvider>>,
+    ) {
+        use inference_providers::mock::MockProvider;
+        use inference_providers::ProviderTier;
+
+        let pool = InferenceProviderPool::new(None, ExternalProvidersConfig::default());
+        let providers: Vec<Arc<MockProvider>> = caps
+            .iter()
+            .map(|_| Arc::new(MockProvider::new_accept_all().with_tier(ProviderTier::Near)))
+            .collect();
+        {
+            let mut m = pool.provider_mappings.write().await;
+            m.model_to_providers.insert(
+                model.to_string(),
+                providers
+                    .iter()
+                    .map(|p| p.clone() as Arc<InferenceProviderTrait>)
+                    .collect(),
+            );
+        }
+        {
+            let mut states = pool
+                .provider_load_state
+                .write()
+                .unwrap_or_else(|e| e.into_inner());
+            for (provider, cap) in providers.iter().zip(caps) {
+                states
+                    .entry(Arc::as_ptr(provider) as *const () as usize)
+                    .or_default()
+                    .max_context_tokens = Some(*cap);
+            }
+        }
+        (pool, providers)
+    }
+
+    /// `fallback_params` with `bytes` of text (countable = bytes / 4).
+    fn sized_params(model: &str, bytes: usize) -> inference_providers::ChatCompletionParams {
+        let mut params = fallback_params(model);
+        params.messages[0].content = Some(serde_json::Value::String("a".repeat(bytes)));
+        params
+    }
+
+    /// The expected prompt tokens of `sized_params` (one message: 4 tokens
+    /// of template overhead).
+    fn heuristic_requirement(bytes: usize) -> u64 {
+        ((bytes / 4) as f64 * context_routing::safety_factor()).ceil() as u64 + 4
+    }
+
+    async fn served_placement(
+        provider: &inference_providers::mock::MockProvider,
+    ) -> inference_providers::PlacementContext {
+        provider
+            .last_chat_params()
+            .await
+            .expect("provider was called")
+            .placement
+    }
+
+    #[tokio::test]
+    async fn pool_sets_placement_context_for_two_tier_model() {
+        let model = "z-ai/glm-5.3-flash";
+        let (pool, providers) = capacity_pool(model, &[100_000, 1_048_576]).await;
+        let (base, long) = (&providers[0], &providers[1]);
+
+        // Short: fits the base tier, so it is not heavy.
+        let mut short = sized_params(model, 4_000);
+        short.max_tokens = Some(2_000);
+        let _stream = pool
+            .chat_completion_stream(short, "h1".to_string(), ChatRoutingHints::default())
+            .await
+            .expect("served");
+        let ctx = served_placement(base).await;
+        assert_eq!(ctx.prompt_tokens, Some(heuristic_requirement(4_000)));
+        assert!(!ctx.prefill_heavy);
+
+        // Heavy iff the prompt > base_capacity: 400k bytes → ~120k tokens of
+        // input, over the 100k base window.
+        let mut heavy = sized_params(model, 400_000);
+        heavy.max_tokens = Some(8_000);
+        let _stream = pool
+            .chat_completion_stream(heavy, "h2".to_string(), ChatRoutingHints::default())
+            .await
+            .expect("served");
+        let ctx = served_placement(long).await;
+        let prompt = heuristic_requirement(400_000);
+        assert_eq!(ctx.prompt_tokens, Some(prompt));
+        assert!(prompt > 100_000);
+        assert!(ctx.prefill_heavy);
+    }
+
+    #[tokio::test]
+    async fn single_tier_model_is_never_heavy() {
+        let model = "z-ai/glm-5.3-flash";
+        let (pool, providers) = capacity_pool(model, &[100_000]).await;
+
+        // Oversized for the only tier: still sized, never heavy.
+        let _stream = pool
+            .chat_completion_stream(
+                sized_params(model, 600_000),
+                "h".to_string(),
+                ChatRoutingHints::default(),
+            )
+            .await
+            .expect("served");
+        let ctx = served_placement(&providers[0]).await;
+        assert_eq!(ctx.prompt_tokens, Some(heuristic_requirement(600_000)));
+        assert!(!ctx.prefill_heavy);
+    }
+
+    /// Output length never enters routing: a short prompt with a huge
+    /// `max_tokens` stays on the base tier, and is not prefill-heavy.
+    #[tokio::test]
+    async fn max_tokens_does_not_change_tier() {
+        let model = "z-ai/glm-5.3-flash";
+        let (pool, providers) = capacity_pool(model, &[100_000, 1_048_576]).await;
+        let (base, long) = (&providers[0], &providers[1]);
+
+        let mut params = sized_params(model, 4_000);
+        params.max_tokens = Some(900_000);
+        params.max_completion_tokens = Some(900_000);
+        let mut hints = ChatRoutingHints::default();
+        pool.apply_context_routing(model, &mut params, &mut hints)
+            .await;
+        let prompt = heuristic_requirement(4_000);
+        assert_eq!(hints.estimated_tokens.map(u64::from), Some(prompt));
+        assert_eq!(params.placement.prompt_tokens, Some(prompt));
+        assert!(!params.placement.prefill_heavy);
+
+        let _stream = pool
+            .chat_completion_stream(params, "h".to_string(), ChatRoutingHints::default())
+            .await
+            .expect("served");
+        assert!(
+            base.last_chat_params().await.is_some(),
+            "a short prompt sorts base first"
+        );
+        assert!(
+            long.last_chat_params().await.is_none(),
+            "max_tokens must not push a short prompt to the long tier"
+        );
+    }
+
+    /// Routing never asks a backend for a token count (the trait has no such
+    /// method): a prompt right at the base capacity is sized by the byte
+    /// estimate alone, with no band or factor switch around the boundary.
+    #[tokio::test]
+    async fn routing_never_calls_count_tokens() {
+        let model = "z-ai/glm-5.3-flash";
+        let (pool, _providers) = capacity_pool(model, &[100_000, 1_048_576]).await;
+        for bytes in [280_000usize, 330_000, 400_000] {
+            let mut params = sized_params(model, bytes);
+            let mut hints = ChatRoutingHints::default();
+            pool.apply_context_routing(model, &mut params, &mut hints)
+                .await;
+            let prompt = heuristic_requirement(bytes);
+            assert_eq!(hints.estimated_tokens.map(u64::from), Some(prompt));
+            assert_eq!(params.placement.prompt_tokens, Some(prompt));
+            assert_eq!(params.placement.prefill_heavy, prompt > 100_000);
+        }
+    }
+
+    /// Every model gets its placement context: there is no allow-list.
+    #[tokio::test]
+    async fn any_model_gets_placement_context() {
+        let model = "acme/any-new-model";
+        let (pool, providers) = capacity_pool(model, &[262_144, 1_048_576]).await;
+
+        let _stream = pool
+            .chat_completion_stream(
+                sized_params(model, 1_200_000),
+                "h".to_string(),
+                ChatRoutingHints::default(),
+            )
+            .await
+            .expect("served");
+        let ctx = served_placement(&providers[1]).await;
+        assert_eq!(ctx.prompt_tokens, Some(heuristic_requirement(1_200_000)));
+        assert!(ctx.prefill_heavy);
+    }
+
+    #[tokio::test]
+    async fn non_streaming_path_sets_placement_context() {
+        let model = "z-ai/glm-5.3-flash";
+        let (pool, providers) = capacity_pool(model, &[100_000, 1_048_576]).await;
+
+        let mut params = sized_params(model, 400_000);
+        // The service's affinity survives the pool's context.
+        params.placement.affinity = Some(placement::affinity::AffinityKey::from_bytes([1; 16]));
+        params.placement.affinity_source = placement::decision::AffinitySource::Client;
+        pool.chat_completion(params, "h".to_string())
+            .await
+            .expect("served");
+        let ctx = served_placement(&providers[1]).await;
+        assert_eq!(ctx.prompt_tokens, Some(heuristic_requirement(400_000)));
+        assert!(ctx.prefill_heavy);
+        assert!(ctx.affinity.is_some());
+        assert_eq!(
+            ctx.affinity_source,
+            placement::decision::AffinitySource::Client
+        );
+    }
+
+    /// An attested fallback with a smaller declared window than the NEAR
+    /// base must not lower the heavy boundary: heavy is decided on the NEAR
+    /// tiers' capacities, the same set that decides each Fleet's tier.
+    #[tokio::test]
+    async fn fallback_capacity_does_not_skew_heavy() {
+        use inference_providers::mock::MockProvider;
+        use inference_providers::ProviderTier;
+
+        let model = "z-ai/glm-5.3-flash";
+        let (pool, _providers) = capacity_pool(model, &[100_000, 1_048_576]).await;
+        let fallback = Arc::new(MockProvider::new_accept_all().with_tier(ProviderTier::Attested3p));
+        pool.provider_mappings
+            .write()
+            .await
+            .model_to_providers
+            .get_mut(model)
+            .unwrap()
+            .push(fallback.clone() as Arc<InferenceProviderTrait>);
+        pool.provider_load_state
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .entry(Arc::as_ptr(&fallback) as *const () as usize)
+            .or_default()
+            .max_context_tokens = Some(50_000);
+
+        // ~72k tokens: over the fallback's 50k, within the NEAR base's 100k.
+        let mut params = sized_params(model, 240_000);
+        let mut hints = ChatRoutingHints::default();
+        pool.apply_context_routing(model, &mut params, &mut hints)
+            .await;
+        let prompt = params.placement.prompt_tokens.expect("sized");
+        assert!(prompt > 50_000 && prompt <= 100_000, "{prompt}");
+        assert!(!params.placement.prefill_heavy);
+    }
+
+    /// Refine and placement share one formula: the tier sort's requirement
+    /// is the placement context's `prompt_tokens`.
+    #[tokio::test]
+    async fn refine_and_placement_share_one_requirement() {
+        let model = "z-ai/glm-5.3-flash";
+        let (pool, _providers) = capacity_pool(model, &[100_000, 1_048_576]).await;
+        let mut params = sized_params(model, 400_000);
+        params.max_completion_tokens = Some(3_000);
+        let mut hints = ChatRoutingHints::default();
+        pool.apply_context_routing(model, &mut params, &mut hints)
+            .await;
+        assert_eq!(
+            hints.estimated_tokens.map(u64::from),
+            params.placement.prompt_tokens
+        );
+    }
+
+    #[test]
+    fn base_capacity_is_the_smallest_of_two_or_more_declared() {
+        use context_routing::base_capacity;
+        assert_eq!(base_capacity([]), None);
+        assert_eq!(base_capacity([Some(100_000)]), None);
+        assert_eq!(base_capacity([Some(100_000), Some(100_000), None]), None);
+        assert_eq!(
+            base_capacity([None, Some(1_048_576), Some(100_000)]),
+            Some(100_000)
+        );
+        assert_eq!(
+            base_capacity([Some(262_144), Some(100_000), Some(1_048_576)]),
+            Some(100_000)
         );
     }
 

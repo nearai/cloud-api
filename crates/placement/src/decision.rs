@@ -67,10 +67,11 @@ impl std::fmt::Debug for PlaceInput {
 
 /// Where `PlaceInput::affinity` came from, for the (content-free)
 /// `DecisionRecord::affinity` field.
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum AffinitySource {
     Client,
     Prefix,
+    #[default]
     None,
 }
 
@@ -209,6 +210,8 @@ pub struct DecisionRecord {
     pub best_score: Option<f64>,
     pub snapshot_age_ms: u64,
     pub pending_req: u32,
+    /// Pending prompt tokens on the chosen slot (0 when none chosen).
+    pub pending_tok: u64,
     pub chosen_backlog_tokens: Option<u64>,
 }
 
@@ -240,6 +243,7 @@ impl DecisionRecord {
             best_score: None,
             snapshot_age_ms: input.now_ms.saturating_sub(snap.built_ms),
             pending_req: 0,
+            pending_tok: 0,
             chosen_backlog_tokens: None,
         }
     }
@@ -300,6 +304,11 @@ pub struct Placer {
 impl Placer {
     pub fn new(pin_secret: [u8; 32], tier: Tier) -> Self {
         Self { pin_secret, tier }
+    }
+
+    /// The capacity tier this placer serves.
+    pub fn tier(&self) -> Tier {
+        self.tier
     }
 
     /// Decide where `input` goes on this Fleet, given the latest snapshot and
@@ -449,10 +458,17 @@ impl Placer {
             .affinity
             .as_ref()
             .map(|k| pin_id(self.tier, k, &self.pin_secret));
+        // A pin written on an earlier boot of its host points at a cold
+        // cache: it is ignored, and rewritten wherever this request lands.
+        let mut stale_boot_pin = false;
         let pin_lookup: Option<(SlotId, u64)> = pin_id_opt.as_ref().and_then(|pid| {
-            snap.pins
-                .get(pid, input.now_ms)
-                .map(|(slot, at_ms)| (slot.clone(), at_ms))
+            let (slot, at_ms, boot) = snap.pins.get_with_boot(pid, input.now_ms)?;
+            if snap.pin_boot_current(&slot.host, boot) {
+                Some((slot.clone(), at_ms))
+            } else {
+                stale_boot_pin = true;
+                None
+            }
         });
 
         // Heavy-pin continuity is judged on load, not score (see
@@ -504,6 +520,7 @@ impl Placer {
         let mut pin_write: Option<(PinId, SlotId)> = None;
         if let Some(pid) = pin_id_opt {
             let should_write = input.prefill_heavy
+                || stale_boot_pin
                 || match selected.selection {
                     Selection::Pinned => pin_lookup
                         .as_ref()
@@ -544,6 +561,7 @@ impl Placer {
             best_score: Some(best_score),
             snapshot_age_ms: input.now_ms.saturating_sub(snap.built_ms),
             pending_req: chosen.map(|c| c.pending.req).unwrap_or(0),
+            pending_tok: chosen.map(|c| c.pending.tok).unwrap_or(0),
             chosen_backlog_tokens: chosen.and_then(|c| c.view.state.load.prefill_backlog_tokens),
         };
 
@@ -612,6 +630,8 @@ mod tests {
             routed_read_ms: 0,
             pins: Default::default(),
             disabled: false,
+            host_boots: HashMap::new(),
+            host_reported_ms: HashMap::new(),
         }
     }
 
@@ -867,6 +887,51 @@ mod tests {
         assert_eq!(record.selection, Some("home"));
         assert_eq!(record.pinned.as_deref(), Some("gpu01#3"));
         let (_, rewritten) = pin_write.expect("a dead pin is rewritten at home");
+        assert_eq!(rewritten, slot("gpu02", 0));
+    }
+
+    #[test]
+    fn pin_from_previous_boot_is_ignored() {
+        let secret = [4u8; 32];
+        let slots = vec![slot("gpu01", 0), slot("gpu02", 0)];
+        let key = find_key_with_home(&slots, &slot("gpu02", 0));
+        let pid = pin_id(Tier::Base, &key, &secret);
+        let pinned_on = |boot: &str| {
+            let mut snap = snap_with(vec![ready_view("gpu01", 0), ready_view("gpu02", 0)]);
+            snap.host_boots = HashMap::from([
+                ("gpu01".to_string(), "boot-b".to_string()),
+                ("gpu02".to_string(), "boot-x".to_string()),
+            ]);
+            std::sync::Arc::make_mut(&mut snap.pins).insert_on_boot(
+                *pid.as_bytes(),
+                slot("gpu01", 0),
+                NOW - 1_000,
+                Some(boot.to_string()),
+            );
+            snap
+        };
+        let place = |snap: &Snapshot| {
+            let mut rng = StdRng::seed_from_u64(1);
+            placed(Placer::new(secret, Tier::Base).place(
+                &keyed(key.clone()),
+                snap,
+                &HashMap::new(),
+                &mut rng,
+            ))
+        };
+
+        // Written on the host's current boot: honoured.
+        let (chosen, record, _) = place(&pinned_on("boot-b"));
+        assert_eq!(chosen, slot("gpu01", 0));
+        assert_eq!(record.selection, Some("pinned"));
+
+        // Written on a boot the host has moved on from: its cache is cold,
+        // so the pin is ignored, HRW picks home and a fresh pin is written.
+        let (chosen, record, pin_write) = place(&pinned_on("boot-a"));
+        assert_eq!(chosen, slot("gpu02", 0));
+        assert_eq!(record.selection, Some("home"));
+        assert_eq!(record.pinned, None);
+        let (_, rewritten) = pin_write.expect("a fresh pin is written");
         assert_eq!(rewritten, slot("gpu02", 0));
     }
 

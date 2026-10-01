@@ -224,12 +224,45 @@ pub enum ChatServiceTier {
 /// validate writes; request paths carry the value loaded from that column.
 pub type RequestPriority = i32;
 
+/// Routing-only placement inputs: the pool's size estimate and class, and
+/// the completion service's affinity key. Set in process, on
+/// [`ChatCompletionParams::placement`], and never serialized, so a client
+/// cannot set any of it and none of it reaches an upstream body.
+#[derive(Clone, Default)]
+pub struct PlacementContext {
+    /// Input tokens only: prefill cost, lane load and the context-window
+    /// requirement. Output length (`max_tokens`) never enters routing.
+    pub prompt_tokens: Option<u64>,
+    /// The prompt exceeds the model's base-tier capacity: the lane class
+    /// placement admits on, and the tier class the pool routes on.
+    pub prefill_heavy: bool,
+    /// Derived from customer identity or content: never logged (the
+    /// placement crate's key type has no `Debug`).
+    pub affinity: Option<placement::affinity::AffinityKey>,
+    pub affinity_source: placement::decision::AffinitySource,
+}
+
+impl std::fmt::Debug for PlacementContext {
+    // Manual: prints whether an affinity key is present, never the key.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PlacementContext")
+            .field("prompt_tokens", &self.prompt_tokens)
+            .field("prefill_heavy", &self.prefill_heavy)
+            .field("affinity", &self.affinity.is_some())
+            .field("affinity_source", &self.affinity_source)
+            .finish()
+    }
+}
+
 /// Parameters for chat completion requests (matches OpenAI API)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChatCompletionParams {
     /// Operator-controlled scheduler priority. Never accepted from or exposed in JSON.
     #[serde(skip)]
     pub request_priority: RequestPriority,
+    /// Routing-only facts from the pool. Never accepted from or sent in JSON.
+    #[serde(skip)]
+    pub placement: PlacementContext,
     /// Model ID to use for the completion
     pub model: String,
 
@@ -1465,6 +1498,40 @@ pub fn detect_audio_content_type(filename: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn placement_context_is_not_serialized() {
+        let mut params: ChatCompletionParams =
+            serde_json::from_value(serde_json::json!({"model": "m", "messages": []})).unwrap();
+        params.placement = PlacementContext {
+            prompt_tokens: Some(1),
+            prefill_heavy: true,
+            affinity: Some(placement::affinity::AffinityKey::from_bytes([7; 16])),
+            affinity_source: placement::decision::AffinitySource::Client,
+        };
+        let body = serde_json::to_value(&params).unwrap();
+        assert!(body.get("placement").is_none());
+        for key in ["prompt_tokens", "prefill_heavy", "affinity"] {
+            assert!(body.get(key).is_none(), "{key} leaked");
+        }
+        // The redacting Debug never prints the key.
+        let debug = format!("{:?}", params.placement);
+        assert!(debug.contains("affinity: true"), "{debug}");
+        assert!(!debug.contains("[7"), "{debug}");
+    }
+
+    #[test]
+    fn client_json_cannot_set_placement_context() {
+        let params: ChatCompletionParams = serde_json::from_value(serde_json::json!({
+            "model": "m",
+            "messages": [],
+            "placement": {"prefill_heavy": true, "prompt_tokens": 5},
+        }))
+        .unwrap();
+        assert!(!params.placement.prefill_heavy);
+        assert_eq!(params.placement.prompt_tokens, None);
+        assert!(params.placement.affinity.is_none());
+    }
 
     #[test]
     fn model_info_advertised_context_length_uses_backend_metadata() {

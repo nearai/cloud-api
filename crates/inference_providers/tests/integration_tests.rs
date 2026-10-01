@@ -80,6 +80,7 @@ async fn test_chat_completion_streaming() {
     println!("Testing with model: {model_id}");
 
     let params = ChatCompletionParams {
+        placement: Default::default(),
         request_priority: 0,
         model: model_id.clone(),
         messages: vec![
@@ -333,6 +334,7 @@ async fn test_error_handling() {
     let provider = create_test_provider();
 
     let params = ChatCompletionParams {
+        placement: Default::default(),
         request_priority: 0,
         model: "nonexistent-model-12345".to_string(),
         messages: vec![ChatMessage {
@@ -425,6 +427,7 @@ async fn test_chat_completion_streaming_with_tool_calls() {
     }];
 
     let params = ChatCompletionParams {
+        placement: Default::default(),
         request_priority: 0,
         model: model_id.clone(),
         messages: vec![ChatMessage {
@@ -624,6 +627,7 @@ async fn test_reasoning_content() {
         .await;
 
     let params = ChatCompletionParams {
+        placement: Default::default(),
         request_priority: 0,
         model: "Qwen/Qwen3-30B-A3B-Instruct-2507".to_string(),
         messages: vec![ChatMessage {

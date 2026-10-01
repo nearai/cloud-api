@@ -62,6 +62,7 @@ pub mod chunk_builder;
 pub mod mock;
 pub mod models;
 pub mod non_attested;
+pub mod placement_io;
 pub mod responses_raw;
 pub mod rotation;
 pub mod spki_verifier;
@@ -97,9 +98,10 @@ pub use models::{
     EmbeddingError, FinishReason, FunctionChoice, FunctionDefinition, ImageData, ImageEditError,
     ImageEditParams, ImageEditResponse, ImageEditResponseWithBytes, ImageGenerationError,
     ImageGenerationParams, ImageGenerationResponse, ImageGenerationResponseWithBytes, MessageRole,
-    ModelInfo, PrivacyClassifyError, RerankError, RerankParams, RerankResponse, RerankResult,
-    RerankUsage, ScoreError, ScoreParams, ScoreResponse, ScoreResult, ScoreUsage, StreamChunk,
-    StreamOptions, TokenUsage, ToolChoice, ToolDefinition, TranscriptionSegment, TranscriptionWord,
+    ModelInfo, PlacementContext, PrivacyClassifyError, RerankError, RerankParams, RerankResponse,
+    RerankResult, RerankUsage, ScoreError, ScoreParams, ScoreResponse, ScoreResult, ScoreUsage,
+    StreamChunk, StreamOptions, TokenUsage, ToolChoice, ToolDefinition, TranscriptionSegment,
+    TranscriptionWord,
 };
 pub use sse_parser::{
     new_external_sse_parser, new_sse_parser, BufferedSSEParser, SSEEvent, SSEEventParser, SSEParser,
@@ -277,6 +279,49 @@ impl StreamingResultExt for StreamingResult {
     fn peekable(self) -> PeekableStreamingResult {
         StreamExt::peekable(self)
     }
+}
+
+/// Verified `host_id -> backend index` map from the latest discovery cycle,
+/// plus the attested signing keys for those hosts. Built only from probes
+/// that carried a verified [`placement::snapshot::HostKey`]-worthy replica
+/// report key, so an unmapped host is never routed to by the placer — it
+/// falls open onto `Fleet::acquire_index` instead.
+#[derive(Clone, Default)]
+pub struct BackendHosts {
+    pub index_by_host: std::collections::HashMap<String, usize>,
+    pub keys: placement::KeyRegistry,
+    pub count: usize,
+}
+
+/// Outcome of [`InferenceProvider::poll_backend_count`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CountPoll {
+    /// Not polled: no placement, no host that has published, or no rotation.
+    Skipped,
+    /// The count read failed; nothing changed.
+    Failed,
+    Unchanged,
+    /// The count is unchanged but the host map was built for another count:
+    /// the rediscovery a change asked for has not landed yet.
+    HostMapStale,
+    /// The healthy count moved from `old` to `new`, and `new` is stored.
+    Changed {
+        old: usize,
+        new: usize,
+    },
+}
+
+/// One discovery cycle's results for a provider (see
+/// [`InferenceProvider::apply_discovery`]).
+pub struct DiscoveryPush {
+    /// [`InferenceProvider::count_generation`] read before the cycle began.
+    pub generation: u64,
+    pub count: usize,
+    pub keys: std::collections::HashMap<String, Vec<usize>>,
+    pub hosts: BackendHosts,
+    /// The cycle covered every healthy backend. A cycle that did not, and
+    /// saw no replica-report key, keeps the provider's last key registry.
+    pub complete: bool,
 }
 
 #[async_trait]
@@ -500,16 +545,53 @@ pub trait InferenceProvider {
     /// override this default no-op.
     fn set_backend_keys(&self, _map: std::collections::HashMap<String, Vec<usize>>) {}
 
-    /// Exact input-token count via the backend's tokenizer (`POST /v1/tokenize`,
-    /// proxied to the engine's native tokenize endpoint). The pool calls this
-    /// only when a cheap byte-based estimate lands near a context-capacity
-    /// boundary and the model has providers with different context windows, so
-    /// the tier decision is made on real token counts rather than a ±25%
-    /// heuristic. Best-effort: `None` means "unsupported or failed" and the
-    /// caller falls back to the heuristic. Implementations MUST send the text
-    /// only over their attested/verified transport (it is customer content)
-    /// and MUST NOT log it. Default: unsupported.
-    async fn count_tokens(&self, _model: &str, _text: String) -> Option<u64> {
+    /// Update the provider's verified host map from discovery: which backend
+    /// index each attested host holds this cycle, and the attested keys for
+    /// those hosts. Default is a no-op — only providers that participate in
+    /// smart placement override it. Rebuilt every discovery cycle; a partial
+    /// cycle may omit hosts, which is accepted (the placer treats an unmapped
+    /// host as legacy and fails open).
+    fn set_backend_hosts(&self, _hosts: BackendHosts) {}
+
+    /// Re-read the healthy backend count (`GET /backends/count`) with
+    /// `client`, for a provider whose placement hosts have published, and
+    /// store it at once when it changed. Model-proxy maps rotation index
+    /// `-i<N>` over its live healthy set, so a changed count means the host
+    /// map from the last discovery may point indices at the wrong hosts;
+    /// storing the count makes that map stale, and placement legacy, until
+    /// the next discovery. Default: [`CountPoll::Skipped`].
+    async fn poll_backend_count(&self, _client: &reqwest::Client) -> CountPoll {
+        CountPoll::Skipped
+    }
+
+    /// The version of this provider's backend count: every applied
+    /// discovery push and every count change [`Self::poll_backend_count`]
+    /// stores advances it. Read it before a discovery cycle starts and pass
+    /// it back in [`DiscoveryPush::generation`].
+    fn count_generation(&self) -> u64 {
+        0
+    }
+
+    /// Apply a discovery cycle's count, key map and host map, unless the
+    /// count moved on since the cycle began (a newer poll or push): then the
+    /// whole push is discarded and `false` returned, so a slow cycle never
+    /// replaces a newer count with the one it read. Default: apply
+    /// unconditionally.
+    fn apply_discovery(&self, push: DiscoveryPush) -> bool {
+        self.set_backend_count(push.count);
+        self.set_backend_keys(push.keys);
+        self.set_backend_hosts(push.hosts);
+        true
+    }
+
+    /// Install smart placement for this provider's model. Default is a no-op — only
+    /// providers that participate in smart placement override it; without
+    /// it every request takes the existing routing path.
+    fn set_placement(&self, _handles: placement_io::PlacementHandles) {}
+
+    /// The tier of the installed smart-placement placer, `None` when
+    /// placement is not installed on this provider.
+    fn placement_tier(&self) -> Option<placement::policy::Tier> {
         None
     }
 

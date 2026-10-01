@@ -56,6 +56,8 @@ aws-sdk-s3 = { version = "1.134", default-features = false, features = ["sigv4a"
 aes-gcm = "0.10"
 # HMAC for VPC signature verification
 hmac = "0.13"
+# HKDF for deriving the placement affinity/pin secrets
+hkdf = "0.13"
 sha2 = "0.11"
 x509-parser = "0.18"
 dcap-qvl = "0.5"
@@ -69,6 +71,7 @@ default = []
 test-mocks = ["mockall"]
 
 [dev-dependencies]
+tracing-subscriber = { version = "0.3", default-features = false, features = ["std", "fmt"] }
 tokio-test = "0.4"
 async-trait = "0.1"
 futures = "0.3"

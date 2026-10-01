@@ -43,15 +43,22 @@
 //! request that context-400s on its pinned tier but has a strictly larger
 //! declared NEAR sibling still falls through to it, exactly as for
 //! priority >= 0 requests (see `mod.rs`'s `larger_ctx_sibling_exists` /
-//! `ctx_400_falls_through`). Such a 400 means the request was mis-sized (byte
-//! heuristic error, or an E2EE request that skips the exact tokenize count) —
-//! not genuinely oversized — so it deserves the same self-heal as any other
-//! priority, never a hard client error for a request the other tier would
-//! have served.
+//! `ctx_400_falls_through`). Sizing is prompt-only (`max_tokens` is ignored),
+//! so such a 400 means either the prompt estimate was too low (byte heuristic
+//! error) or prompt plus the requested output exceeds the base tier. Neither
+//! is a genuinely oversized request when a larger tier exists, so it
+//! deserves the same self-heal as any other priority, never a hard client
+//! error for a request the other tier would have served.
+//!
+//! This module is the only owner of the prompt-size estimate and the tier
+//! boundary ([`base_capacity`]). Placement reads
+//! `ChatCompletionParams.placement` (built by [`placement_context`]); it never
+//! re-estimates. The service's `estimate_input_tokens` seeds
+//! `hints.estimated_tokens` for single-capacity sorting only.
 
 use std::sync::OnceLock;
 
-use inference_providers::ChatCompletionParams;
+use inference_providers::{ChatCompletionParams, PlacementContext};
 
 /// providerConfig key holding the long-context tier declaration. Snake_case
 /// like the other `provider_config` contents (`base_url`, `model_name`).
@@ -73,30 +80,6 @@ pub(crate) fn safety_factor() -> f64 {
     *V.get_or_init(|| env_f64("CONTEXT_ROUTE_SAFETY_FACTOR", 1.2))
 }
 
-/// Multiplier applied to an exact `/v1/tokenize` count (chat-template
-/// serialization overhead only, so much tighter than the heuristic factor).
-pub(crate) fn exact_factor() -> f64 {
-    static V: OnceLock<f64> = OnceLock::new();
-    *V.get_or_init(|| env_f64("CONTEXT_ROUTE_EXACT_FACTOR", 1.05))
-}
-
-/// Band around a declared capacity (as `low*cap ..= high*cap`) inside which
-/// the heuristic is too coarse to make the tier decision and the pool asks
-/// the backend for an exact token count. Outside the band the heuristic's
-/// error cannot flip the decision, so the extra round-trip is skipped.
-pub(crate) fn tokenize_band() -> (f64, f64) {
-    static V: OnceLock<(f64, f64)> = OnceLock::new();
-    *V.get_or_init(|| {
-        let low = env_f64("CONTEXT_ROUTE_TOKENIZE_BAND_LOW", 0.7);
-        let high = env_f64("CONTEXT_ROUTE_TOKENIZE_BAND_HIGH", 1.3);
-        if low < high {
-            (low, high)
-        } else {
-            (0.7, 1.3)
-        }
-    })
-}
-
 /// Flat token cost assumed per non-text content part (image/audio/data URI)
 /// in the byte-based estimate. Byte-counting base64 media would wildly
 /// overestimate (a single image would look like ~250k tokens).
@@ -116,11 +99,10 @@ pub(crate) fn media_part_tokens() -> u64 {
 /// semantics so single-capacity models route exactly as before.
 pub(crate) struct InputEstimate {
     /// bytes/4 over the countable text (message contents, tool-call args,
-    /// tool definitions) — the part an exact `/v1/tokenize` count replaces.
+    /// tool definitions).
     pub countable_tokens: u64,
     /// Flat `media_part_tokens()` per non-text content part plus ~4
-    /// tokens/message chat-template overhead — added on BOTH the heuristic
-    /// and the exact path (the tokenizer never sees media or the template).
+    /// tokens/message chat-template overhead.
     pub uncounted_tokens: u64,
 }
 
@@ -159,6 +141,63 @@ pub(crate) fn estimate_input(params: &ChatCompletionParams) -> InputEstimate {
     InputEstimate {
         countable_tokens: (bytes / 4) as u64,
         uncounted_tokens: media_parts * media_part_tokens() + params.messages.len() as u64 * 4,
+    }
+}
+
+/// The base tier's capacity: the smallest DECLARED context capacity among a
+/// model's providers, or `None` when fewer than two distinct capacities are
+/// declared (a single-tier model has no tier boundary). The one tier
+/// boundary: a request is heavy when its context requirement exceeds it, and
+/// a provider is the long tier when its declared capacity exceeds it.
+pub(crate) fn base_capacity(caps: impl IntoIterator<Item = Option<u32>>) -> Option<u32> {
+    let distinct: std::collections::BTreeSet<u32> = caps.into_iter().flatten().collect();
+    if distinct.len() < 2 {
+        return None;
+    }
+    distinct.first().copied()
+}
+
+/// Whether a prompt estimate exceeds the base tier ([`base_capacity`]):
+/// the request's class for placement and the tier-refinement log. Never true
+/// for a single-tier model (the metric tag uses [`exceeds_declared_capacity`]).
+pub(crate) fn is_heavy(prompt_tokens: u64, caps: impl IntoIterator<Item = Option<u32>>) -> bool {
+    base_capacity(caps).is_some_and(|base| prompt_tokens > u64::from(base))
+}
+
+/// Whether a prompt estimate exceeds at least one declared capacity. This
+/// is the `context_tier:long` metric tag's predicate: unlike [`is_heavy`] it
+/// also holds for an oversized request on a single-capacity model.
+pub(crate) fn exceeds_declared_capacity(
+    prompt_tokens: u64,
+    caps: impl IntoIterator<Item = Option<u32>>,
+) -> bool {
+    caps.into_iter()
+        .flatten()
+        .any(|cap| prompt_tokens > u64::from(cap))
+}
+
+/// The one size formula, shared by the pool's tier sort and placement:
+/// `prompt_tokens = ceil(countable × safety_factor) + uncounted`. Input only:
+/// the requested output length (`max_tokens`) never enters routing, and no
+/// tokenizer is consulted.
+pub(crate) fn requirement(estimate: &InputEstimate) -> u64 {
+    ((estimate.countable_tokens as f64 * safety_factor()).ceil() as u64)
+        .saturating_add(estimate.uncounted_tokens)
+}
+
+/// The typed placement context for a chat request: its size
+/// ([`requirement`]) and its class: `prefill_heavy` iff the prompt exceeds
+/// [`base_capacity`]; never for a single-tier model. `caps` are the model's
+/// providers' declared capacities. Keeps the affinity already on `params`.
+pub(crate) fn placement_context(
+    caps: &[Option<u32>],
+    params: &ChatCompletionParams,
+) -> PlacementContext {
+    let prompt_tokens = requirement(&estimate_input(params));
+    PlacementContext {
+        prompt_tokens: Some(prompt_tokens),
+        prefill_heavy: is_heavy(prompt_tokens, caps.iter().copied()),
+        ..params.placement.clone()
     }
 }
 
@@ -227,42 +266,6 @@ pub fn expand_inference_endpoints(
     }
 
     out
-}
-
-/// Concatenate the request's countable text — message contents (string or
-/// `text` content parts), tool-call arguments, and tool definitions — for an
-/// exact `/v1/tokenize` count. This is CUSTOMER CONTENT: it must only be
-/// sent over a provider's attested transport and must never be logged.
-pub(crate) fn concat_prompt_text(params: &ChatCompletionParams) -> String {
-    let mut text = String::new();
-    for msg in &params.messages {
-        match &msg.content {
-            Some(serde_json::Value::String(s)) => text.push_str(s),
-            Some(serde_json::Value::Array(parts)) => {
-                for part in parts {
-                    if let Some(t) = part.get("text").and_then(|t| t.as_str()) {
-                        text.push_str(t);
-                    }
-                }
-            }
-            _ => {}
-        }
-        if let Some(tool_calls) = &msg.tool_calls {
-            if let Ok(s) = serde_json::to_string(tool_calls) {
-                text.push_str(&s);
-            }
-        }
-        if let Some(reasoning) = &msg.reasoning_content {
-            text.push_str(reasoning);
-        }
-        text.push('\n');
-    }
-    if let Some(tools) = &params.tools {
-        if let Ok(s) = serde_json::to_string(tools) {
-            text.push_str(&s);
-        }
-    }
-    text
 }
 
 /// Decide the single NEAR capacity a negative-priority request's estimated
@@ -427,32 +430,6 @@ mod tests {
     }
 
     #[test]
-    fn concat_prompt_text_covers_content_forms_tool_calls_and_tools() {
-        let params: ChatCompletionParams = serde_json::from_value(serde_json::json!({
-            "model": "m",
-            "messages": [
-                {"role": "system", "content": "sys"},
-                {"role": "user", "content": [
-                    {"type": "text", "text": "part1"},
-                    {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}}
-                ]},
-            ],
-            "tools": [{"type": "function", "function": {"name": "f", "parameters": {}}}]
-        }))
-        .unwrap();
-        let text = concat_prompt_text(&params);
-        assert!(text.contains("sys"));
-        assert!(text.contains("part1"));
-        assert!(
-            !text.contains("base64"),
-            "media payloads must not be counted as text"
-        );
-        assert!(
-            text.contains("\"f\""),
-            "tool definitions count toward context"
-        );
-    }
-    #[test]
     fn prior_reasoning_counts_toward_input_estimates() {
         let base: ChatCompletionParams = serde_json::from_value(serde_json::json!({
             "model": "m",
@@ -470,8 +447,6 @@ mod tests {
         let after = estimate_input(&with_reasoning);
         assert_eq!(after.countable_tokens, before.countable_tokens + 1_000);
         assert_eq!(after.uncounted_tokens, before.uncounted_tokens);
-        assert!(concat_prompt_text(&with_reasoning).contains(&"x".repeat(4_000)));
-        assert!(!concat_prompt_text(&base).contains("xxxx"));
     }
 
     #[test]

@@ -639,6 +639,19 @@ fn message_content_to_value(content: &Option<MessageContent>) -> serde_json::Val
     }
 }
 
+/// Header carrying a client-supplied session identifier, used only to derive
+/// a placement affinity key (`services::completions::affinity::derive`).
+/// Never logged, never forwarded to a provider.
+const SESSION_ID_HEADER: &str = "x-session-id";
+
+/// Read the `x-session-id` header, if present and valid UTF-8.
+fn session_hint_from_headers(headers: &header::HeaderMap) -> Option<String> {
+    headers
+        .get(SESSION_ID_HEADER)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string)
+}
+
 // Convert HTTP ChatCompletionRequest to service CompletionRequest
 #[allow(clippy::too_many_arguments)]
 fn convert_chat_request_to_service(
@@ -677,6 +690,7 @@ fn convert_chat_request_to_service(
 
     ServiceCompletionRequest {
         request_priority,
+        session_hint: None,
         request_id,
         model: request.model.clone(),
         messages: request
@@ -1334,6 +1348,7 @@ fn convert_text_request_to_service(
 
     ServiceCompletionRequest {
         request_priority,
+        session_hint: None,
         request_id,
         model: request.model.clone(),
         messages: vec![CompletionMessage {
@@ -1481,6 +1496,7 @@ async fn chat_completions_inner(
         body_hash,
         request_id,
     );
+    service_request.session_hint = session_hint_from_headers(&headers);
 
     // Extract and validate encryption headers if present
     let encryption_headers = match crate::routes::common::validate_encryption_headers(&headers) {
@@ -2815,6 +2831,7 @@ async fn completions_inner(
         body_hash,
         request_id,
     );
+    service_request.session_hint = session_hint_from_headers(&headers);
     // This endpoint always converts the provider's chat-completion payload
     // into the legacy completion format, so a provider signature cannot
     // verify the bytes returned to the client.
@@ -3400,6 +3417,22 @@ fn model_with_pricing_to_info(model: services::models::ModelWithPricing) -> Mode
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn session_hint_is_read_from_x_session_id_header() {
+        let mut headers = header::HeaderMap::new();
+        assert_eq!(session_hint_from_headers(&headers), None);
+
+        headers.insert("X-Session-Id", header::HeaderValue::from_static("abc"));
+        assert_eq!(session_hint_from_headers(&headers).as_deref(), Some("abc"));
+
+        let mut bad = header::HeaderMap::new();
+        bad.insert(
+            SESSION_ID_HEADER,
+            header::HeaderValue::from_bytes(&[0xff, 0xfe]).unwrap(),
+        );
+        assert_eq!(session_hint_from_headers(&bad), None);
+    }
 
     #[test]
     fn model_public_key_alone_does_not_enable_e2ee() {

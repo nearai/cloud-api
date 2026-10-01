@@ -321,7 +321,7 @@ pub async fn init_domain_services(
     metrics_service: Arc<dyn services::metrics::MetricsServiceTrait>,
 ) -> DomainServices {
     let inference_provider_pool =
-        init_inference_providers(database.clone(), config, Some(metrics_service.clone())).await;
+        init_inference_providers(database.clone(), config, metrics_service.clone()).await;
     init_domain_services_with_pool(
         database,
         config,
@@ -465,14 +465,19 @@ pub async fn init_domain_services_with_pool(
         as Arc<dyn services::completions::ports::OrganizationConcurrentLimitRepository>;
 
     // Create completion service with usage tracking (needs usage_service)
-    let completion_service = Arc::new(services::CompletionServiceImpl::new(
+    let mut completion_service = services::CompletionServiceImpl::new(
         inference_provider_pool.clone(),
         attestation_service.clone(),
         usage_service.clone(),
         metrics_service.clone(),
         models_repo.clone() as Arc<dyn services::models::ModelsRepository>,
         org_limit_repository,
-    ));
+    );
+    // Affinity keys only matter to a pool that places requests.
+    if let Some(affinity_secret) = inference_provider_pool.affinity_secret() {
+        completion_service = completion_service.with_affinity_secret(affinity_secret);
+    }
+    let completion_service = Arc::new(completion_service);
 
     let brave_search_provider =
         Arc::new(services::responses::tools::brave::BraveWebSearchProvider::new());
@@ -934,16 +939,70 @@ async fn ensure_chutes_catalog_row(
     }
 }
 
+/// Enables smart placement on `pool` when `PLACEMENT_REDIS_PASSWORD` and a
+/// valid placement Valkey endpoint are configured. Without either there is
+/// no placement state and every request routes as before (this is not a
+/// mode flag); a missing or invalid endpoint is logged once, at startup,
+/// and never fails it. The pool derives both HMAC secrets from the password
+/// and is the single source of the affinity secret
+/// (`pool.affinity_secret()`); none of them is ever logged.
+pub fn install_placement(
+    pool: &services::inference_provider_pool::InferenceProviderPool,
+    placement: &config::PlacementConfig,
+) {
+    let Some(password) = placement.redis_password.as_deref() else {
+        tracing::info!("Placement secret not configured; smart placement off, legacy routing");
+        return;
+    };
+    let endpoint = match &placement.redis_endpoint {
+        config::PlacementEndpoint::Valid(endpoint) => endpoint,
+        config::PlacementEndpoint::Missing => {
+            tracing::warn!(
+                "Placement Valkey endpoint not configured (PLACEMENT_REDIS_HOST); smart placement off, legacy routing"
+            );
+            return;
+        }
+        config::PlacementEndpoint::Invalid(reason) => {
+            // `reason` names the variable, never its value.
+            tracing::error!(
+                reason = %reason,
+                "Placement Valkey endpoint invalid; smart placement off, legacy routing"
+            );
+            return;
+        }
+    };
+    if !endpoint.tls {
+        tracing::warn!(
+            "PLACEMENT_REDIS_TLS_ENABLED=false: the placement Valkey password travels in plaintext"
+        );
+    }
+    pool.set_placement(
+        password.to_string(),
+        inference_providers::placement_io::ValkeyEndpoint {
+            host: endpoint.host.clone(),
+            port: endpoint.port,
+            tls: endpoint.tls,
+            ca_pem: endpoint.ca_pem.clone(),
+        },
+    );
+    // Configured is not active: until the proxies publish frames (or while
+    // Valkey is unreachable) the snapshot stays empty and every request
+    // still routes legacy.
+    tracing::info!("Smart placement configured");
+}
+
 /// Initialize inference provider pool
 ///
 /// Loads inference_url models and external providers from the database,
-/// then starts a periodic refresh task to keep them in sync. A metrics sink
-/// passed here is attached before the initial load, so counters emitted by
-/// the initial attestation discovery are recorded.
+/// then starts a periodic refresh task to keep them in sync. The metrics
+/// sink and smart placement are attached before the first load, so
+/// providers created at startup get them exactly like those created by
+/// later discovery refreshes, and counters emitted by the initial
+/// attestation discovery are recorded.
 pub async fn init_inference_providers(
     database: Arc<Database>,
     config: &ApiConfig,
-    metrics_service: Option<Arc<dyn services::metrics::MetricsServiceTrait>>,
+    metrics_service: Arc<dyn services::metrics::MetricsServiceTrait>,
 ) -> Arc<services::inference_provider_pool::InferenceProviderPool> {
     let api_key = config.inference_api_key.clone();
 
@@ -953,9 +1012,8 @@ pub async fn init_inference_providers(
             config.external_providers.clone(),
         ),
     );
-    if let Some(metrics_service) = metrics_service {
-        pool.set_metrics_service(metrics_service);
-    }
+    pool.set_metrics_service(metrics_service);
+    install_placement(&pool, &config.placement);
 
     let models_repo = Arc::new(database::repositories::ModelRepository::new(
         database.pool().clone(),
@@ -2970,6 +3028,88 @@ mod tests {
         assert!(!properties.contains_key("resultJson"));
     }
 
+    #[test]
+    fn missing_password_means_no_placement() {
+        let pool = services::inference_provider_pool::InferenceProviderPool::new(
+            None,
+            config::ExternalProvidersConfig::default(),
+        );
+        install_placement(&pool, &config::PlacementConfig::default());
+        assert!(
+            pool.affinity_secret().is_none(),
+            "no affinity secret without the password"
+        );
+        assert!(!pool.has_placement(), "no placement without the password");
+    }
+
+    fn configured_endpoint() -> config::PlacementEndpoint {
+        config::PlacementEndpoint::Valid(config::PlacementRedisEndpoint {
+            host: "203.0.113.7".to_string(),
+            port: 6379,
+            tls: true,
+            // Not a parsable certificate: the handle sets stay inert.
+            ca_pem: Some("-----BEGIN CERTIFICATE-----".to_string()),
+        })
+    }
+
+    #[test]
+    fn placement_password_installs_placement_and_affinity() {
+        let pool = services::inference_provider_pool::InferenceProviderPool::new(
+            None,
+            config::ExternalProvidersConfig::default(),
+        );
+        let placement = config::PlacementConfig {
+            redis_password: Some("router-password".to_string()),
+            redis_endpoint: configured_endpoint(),
+        };
+        install_placement(&pool, &placement);
+        assert!(pool.has_placement());
+        let (expected, _) = services::completions::affinity::secrets_from("router-password");
+        assert_eq!(pool.affinity_secret(), Some(expected));
+    }
+
+    /// TLS off is allowed (with a startup warning): placement still installs.
+    #[test]
+    fn plaintext_endpoint_still_installs_placement() {
+        let pool = services::inference_provider_pool::InferenceProviderPool::new(
+            None,
+            config::ExternalProvidersConfig::default(),
+        );
+        let placement = config::PlacementConfig {
+            redis_password: Some("router-password".to_string()),
+            redis_endpoint: config::PlacementEndpoint::Valid(config::PlacementRedisEndpoint {
+                host: "127.0.0.1".to_string(),
+                port: 6379,
+                tls: false,
+                ca_pem: None,
+            }),
+        };
+        install_placement(&pool, &placement);
+        assert!(pool.has_placement());
+    }
+
+    /// Without a usable endpoint placement stays off (fail open), password
+    /// or not: no handles and no affinity secret.
+    #[test]
+    fn placement_without_a_usable_endpoint_stays_off() {
+        for endpoint in [
+            config::PlacementEndpoint::Missing,
+            config::PlacementEndpoint::Invalid("PLACEMENT_REDIS_PORT".to_string()),
+        ] {
+            let pool = services::inference_provider_pool::InferenceProviderPool::new(
+                None,
+                config::ExternalProvidersConfig::default(),
+            );
+            let placement = config::PlacementConfig {
+                redis_password: Some("router-password".to_string()),
+                redis_endpoint: endpoint,
+            };
+            install_placement(&pool, &placement);
+            assert!(!pool.has_placement());
+            assert!(pool.affinity_secret().is_none());
+        }
+    }
+
     /// Example of how to set up the application for E2E testing
     #[tokio::test]
     #[ignore] // Remove ignore to run with a real database and Patroni cluster
@@ -3046,6 +3186,7 @@ mod tests {
             usage_reporting: config::UsageReportingConfig::default(),
             credit_allocation: config::CreditAllocationConfig::default(),
             ita: config::ItaAttestationConfig::default(),
+            placement: config::PlacementConfig::default(),
         };
 
         // Initialize services
@@ -3167,6 +3308,7 @@ mod tests {
             usage_reporting: config::UsageReportingConfig::default(),
             credit_allocation: config::CreditAllocationConfig::default(),
             ita: config::ItaAttestationConfig::default(),
+            placement: config::PlacementConfig::default(),
         };
 
         let auth_components = init_auth_services(database.clone(), &config);

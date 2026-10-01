@@ -16,9 +16,7 @@
 
 use std::collections::HashSet;
 
-use crate::consts::{
-    HEAVY_BACKLOG_CAP, HEAVY_BASE_MAX_PROMPT, HEAVY_SHARE, LANE_LOAD_TOKENS, LONG_BACKLOG_CAP,
-};
+use crate::consts::{HEAVY_BACKLOG_CAP, HEAVY_BASE_MAX_PROMPT, HEAVY_SHARE, LONG_BACKLOG_CAP};
 use crate::snapshot::{ReplicaView, SlotId};
 
 /// The capacity tier of the Fleet a `Placer` serves. Fixed at construction.
@@ -109,7 +107,7 @@ impl PriorityBand {
 /// observed lane size alongside the cap.
 #[derive(Clone, Debug, Default)]
 pub struct LaneView {
-    /// Live slots whose load is at least `LANE_LOAD_TOKENS`.
+    /// Live slots whose load is at least `Tuning::lane_load_tokens`.
     pub members: HashSet<SlotId>,
     pub size: usize,
     /// `ceil(live replicas * HEAVY_SHARE)`.
@@ -121,10 +119,15 @@ pub struct LaneView {
 
 /// Build the lane from every live replica and its load (`live`), and judge
 /// `any_clean` over the stage-1 survivors (`survivors`, a subset of `live`).
-pub fn lane_view(live: &[(&ReplicaView, u64)], survivors: &[&SlotId]) -> LaneView {
+/// A replica is a member at `lane_load_tokens` of load or more.
+pub fn lane_view(
+    live: &[(&ReplicaView, u64)],
+    survivors: &[&SlotId],
+    lane_load_tokens: u64,
+) -> LaneView {
     let members: HashSet<SlotId> = live
         .iter()
-        .filter(|(_, load)| *load >= LANE_LOAD_TOKENS)
+        .filter(|(_, load)| *load >= lane_load_tokens)
         .map(|(v, _)| v.slot.clone())
         .collect();
     LaneView {
@@ -218,6 +221,7 @@ pub fn classify(tier: Tier, class: Class, lane: &LaneView, chosen: &SlotId) -> R
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::consts::LANE_LOAD_TOKENS;
     use crate::testkit::{slot, view};
 
     #[test]
@@ -240,7 +244,7 @@ mod tests {
         let views: Vec<ReplicaView> = (0..loads.len() as u32).map(|i| view("gpu01", i)).collect();
         let pairs: Vec<(&ReplicaView, u64)> = views.iter().zip(loads.iter().copied()).collect();
         let slots: Vec<&SlotId> = views.iter().map(|v| &v.slot).collect();
-        lane_view(&pairs, &slots)
+        lane_view(&pairs, &slots, LANE_LOAD_TOKENS)
     }
 
     #[test]
@@ -269,9 +273,18 @@ mod tests {
             (&views[1], 0),
             (&views[2], LANE_LOAD_TOKENS),
         ];
-        let lane = lane_view(&live, &[&views[2].slot]);
+        let lane = lane_view(&live, &[&views[2].slot], LANE_LOAD_TOKENS);
         assert_eq!((lane.size, lane.cap), (2, 1));
         assert!(!lane.any_clean);
+    }
+
+    #[test]
+    fn lane_membership_follows_the_tuned_threshold() {
+        let v = view("gpu01", 0);
+        let live = [(&v, 10_000)];
+        assert_eq!(lane_view(&live, &[&v.slot], 10_000).size, 1);
+        assert_eq!(lane_view(&live, &[&v.slot], 10_001).size, 0);
+        assert_eq!(lane_view(&live, &[&v.slot], LANE_LOAD_TOKENS).size, 0);
     }
 
     #[test]
@@ -279,9 +292,9 @@ mod tests {
         // The load passed in is what the caller computed (backlog + pending);
         // a view's own backlog alone doesn't make it a member here.
         let v = with_backlog(0, 70_000);
-        let lane = lane_view(&[(&v, 0)], &[&v.slot]);
+        let lane = lane_view(&[(&v, 0)], &[&v.slot], LANE_LOAD_TOKENS);
         assert_eq!(lane.size, 0);
-        let lane = lane_view(&[(&v, 70_000)], &[&v.slot]);
+        let lane = lane_view(&[(&v, 70_000)], &[&v.slot], LANE_LOAD_TOKENS);
         assert_eq!(lane.size, 1);
     }
 

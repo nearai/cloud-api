@@ -1,5 +1,6 @@
-//! Crate-wide constants. Per the global constraints, all tunables and fixed
-//! identifiers are code constants; there is exactly one runtime env var
+//! Crate-wide constants. Fixed identifiers and tunables are code constants;
+//! the five live-tunable knobs (see [`crate::tuning::Tuning`]) keep their
+//! constants here as the defaults. There is exactly one runtime env var
 //! (`PLACEMENT_REDIS_PASSWORD`, read outside this crate).
 
 /// dstack event name under which inference-proxy records a replica report
@@ -48,15 +49,13 @@ pub const AFFINITY_EPS: f64 = 0.25;
 /// `affinity::within_bound`), in score units.
 ///
 /// One unit is `PREFILL_NORM_TOKENS` (16K) prefill-equivalent tokens, or a
-/// full `max_running` of extra streams. Ordinary jitter between replicas is
-/// well inside that: gpu03 runs 8 vs 12 of 32 streams side by side (~0.25
-/// apart), and a short 3-deep queue (~3K backlog) is ~0.2. A warm prefix
-/// saves its whole length in prefill on a return, so spilling it for less
-/// than ~16K tokens of extra wait is a net loss. At 0.1 (about 1.6K tokens,
-/// or 3 streams) the bound spilled warm conversations on that jitter. It
-/// also keeps affinity when the fleet is near idle and `best` is close to 0,
-/// where the relative bound alone collapses to ~0.
-pub const AFFINITY_ABS_SLACK: f64 = 1.0;
+/// full `max_running` of extra streams. It also keeps affinity when the fleet
+/// is near idle and `best` is close to 0, where the relative bound alone
+/// collapses to ~0. Staging data from 2026-10-01 at a slack of 1.0: 11 of 30
+/// decisions picked a replica more than 0.25 above the best one, and three of
+/// those cost 3-5 s. 0.25 is about 4K prefill tokens or a quarter of a
+/// replica's streams, still above ordinary jitter between replicas.
+pub const AFFINITY_ABS_SLACK: f64 = 0.25;
 
 /// How long a follow pin stays valid after it's written, in milliseconds.
 /// 10 minutes, matching OpenRouter's sticky-session TTL.

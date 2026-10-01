@@ -17,9 +17,9 @@ use hmac::{Hmac, KeyInit, Mac};
 use rand::{Rng, RngExt};
 use sha2::{Digest, Sha256};
 
-use crate::consts::{AFFINITY_ABS_SLACK, AFFINITY_EPS, PIN_TTL_MS};
 use crate::policy::Tier;
 use crate::snapshot::SlotId;
+use crate::tuning::Tuning;
 
 /// An opaque, unlinkable-by-inspection affinity key (e.g. derived from a
 /// conversation id). Intentionally has no `Debug`/`Display`/`Serialize`.
@@ -74,9 +74,22 @@ pub fn pin_id(tier: Tier, key: &AffinityKey, pin_secret: &[u8; 32]) -> PinId {
 ///
 /// `Clone` so a reader can copy-on-write it behind an `Arc` (see
 /// `Snapshot::pins`).
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct PinTable {
     entries: HashMap<[u8; 16], Pin>,
+    /// How long an entry stays valid after it is written, in ms. The reader
+    /// keeps this at `Tuning::pin_ttl_ms`; a `default()` table uses the
+    /// default tuning's.
+    ttl_ms: u64,
+}
+
+impl Default for PinTable {
+    fn default() -> Self {
+        Self {
+            entries: HashMap::new(),
+            ttl_ms: Tuning::default().pin_ttl_ms,
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -89,8 +102,19 @@ struct Pin {
 }
 
 impl PinTable {
+    /// The validity window of an entry, in ms.
+    pub fn ttl_ms(&self) -> u64 {
+        self.ttl_ms
+    }
+
+    /// Sets the validity window. It applies to every entry, written or not
+    /// yet: `get` and `prune` judge each entry against the current value.
+    pub fn set_ttl_ms(&mut self, ttl_ms: u64) {
+        self.ttl_ms = ttl_ms;
+    }
+
     /// The pinned `(slot, written-at ms)`, if `id` has an entry that hasn't
-    /// expired: valid while `now_ms < at_ms + PIN_TTL_MS` (saturating, so an
+    /// expired: valid while `now_ms < at_ms + ttl_ms` (saturating, so an
     /// `at_ms` from the far past or a clock skew never panics or wraps to
     /// "still valid").
     pub fn get(&self, id: &PinId, now_ms: u64) -> Option<(&SlotId, u64)> {
@@ -102,7 +126,7 @@ impl PinTable {
     /// written on (`None`: unknown). See `Snapshot::pin_boot_current`.
     pub fn get_with_boot(&self, id: &PinId, now_ms: u64) -> Option<(&SlotId, u64, Option<&str>)> {
         let pin = self.entries.get(&id.0)?;
-        if now_ms < pin.at_ms.saturating_add(PIN_TTL_MS) {
+        if now_ms < pin.at_ms.saturating_add(self.ttl_ms) {
             Some((&pin.slot, pin.at_ms, pin.boot.as_deref()))
         } else {
             None
@@ -137,8 +161,9 @@ impl PinTable {
     /// Drop every entry [`Self::get`] would already treat as expired at
     /// `now_ms`, so a long-lived table stays bounded.
     pub fn prune(&mut self, now_ms: u64) {
+        let ttl_ms = self.ttl_ms;
         self.entries
-            .retain(|_, pin| now_ms < pin.at_ms.saturating_add(PIN_TTL_MS));
+            .retain(|_, pin| now_ms < pin.at_ms.saturating_add(ttl_ms));
     }
 
     /// Number of entries, expired or not.
@@ -222,12 +247,16 @@ pub struct Selected {
 /// The bounded-load affinity test: is `score` close enough to the fleet's
 /// `best` score to keep routing there?
 ///
-/// `bound = max(best * (1 + EPS), best + ABS_SLACK)` — the absolute slack
+/// `bound = max(best * (1 + eps), best + abs_slack)` (`Tuning::affinity_eps`
+/// and `Tuning::affinity_abs_slack`) — the absolute slack
 /// keeps affinity intact when the whole fleet is near idle and `best` is
 /// close to 0, where a purely relative bound would collapse to ~0 and
 /// reject any nonzero score.
-fn within_bound(score: f64, best: f64) -> bool {
-    let bound = f64::max(best * (1.0 + AFFINITY_EPS), best + AFFINITY_ABS_SLACK);
+fn within_bound(score: f64, best: f64, tuning: &Tuning) -> bool {
+    let bound = f64::max(
+        best * (1.0 + tuning.affinity_eps),
+        best + tuning.affinity_abs_slack,
+    );
     score <= bound
 }
 
@@ -249,6 +278,7 @@ pub fn select(
     pin: Option<&SlotId>,
     pin_ignores_bound: bool,
     scores: &[(SlotId, f64)],
+    tuning: &Tuning,
     rng: &mut impl Rng,
 ) -> Option<Selected> {
     if scores.is_empty() {
@@ -273,7 +303,7 @@ pub fn select(
     // `pin_ignores_bound`) wins outright.
     if let Some(pin_slot) = pin {
         if let Some(score) = score_of(pin_slot) {
-            if pin_ignores_bound || within_bound(score, best) {
+            if pin_ignores_bound || within_bound(score, best, tuning) {
                 return Some(Selected {
                     slot: pin_slot.clone(),
                     selection: Selection::Pinned,
@@ -288,7 +318,7 @@ pub fn select(
     if let Some(rank) = rank {
         let chosen_idx = rank
             .iter()
-            .position(|h| score_of(h).is_some_and(|s| within_bound(s, best)))
+            .position(|h| score_of(h).is_some_and(|s| within_bound(s, best, tuning)))
             .unwrap_or_else(|| {
                 // Unreachable in practice: the best-scoring slot is always
                 // within its own bound. Kept as a no-panic fallback to the
@@ -391,7 +421,7 @@ mod tests {
     fn empty_scores_is_none() {
         let mut rng = StdRng::seed_from_u64(1);
         let scores: Vec<(SlotId, f64)> = vec![];
-        assert!(select(None, None, false, &scores, &mut rng).is_none());
+        assert!(select(None, None, false, &scores, &Tuning::default(), &mut rng).is_none());
     }
 
     #[test]
@@ -399,7 +429,15 @@ mod tests {
         let key = find_key_with_rank(&[s("gpu02"), s("gpu08")], &[s("gpu02")]);
         let scores = vec![(s("gpu02"), 0.30), (s("gpu08"), 0.28)];
         let mut rng = StdRng::seed_from_u64(1);
-        let sel = select(Some(&key), None, false, &scores, &mut rng).unwrap();
+        let sel = select(
+            Some(&key),
+            None,
+            false,
+            &scores,
+            &Tuning::default(),
+            &mut rng,
+        )
+        .unwrap();
         assert_eq!(sel.slot, s("gpu02"));
         assert_eq!(sel.selection, Selection::Home);
         assert!(!sel.write_pin);
@@ -409,18 +447,26 @@ mod tests {
     #[test]
     fn idle_fleet_keeps_home() {
         // best (gpu-a) is 0.0; home (gpu-b) is 0.05. Bound = max(0*1.25,
-        // 0+1.0) = 1.0, so the absolute slack keeps affinity even though the
+        // 0+0.25) = 0.25, so the absolute slack keeps affinity even though the
         // fleet is near idle and a relative-only bound would collapse to ~0.
         let key = find_key_with_rank(&[s("gpu-a"), s("gpu-b")], &[s("gpu-b")]);
         let scores = vec![(s("gpu-a"), 0.0), (s("gpu-b"), 0.05)];
         let mut rng = StdRng::seed_from_u64(1);
-        let sel = select(Some(&key), None, false, &scores, &mut rng).unwrap();
+        let sel = select(
+            Some(&key),
+            None,
+            false,
+            &scores,
+            &Tuning::default(),
+            &mut rng,
+        )
+        .unwrap();
         assert_eq!(sel.slot, s("gpu-b"));
         assert_eq!(sel.selection, Selection::Home);
     }
 
     #[test]
-    fn jitter_within_one_unit_keeps_home() {
+    fn ordinary_jitter_keeps_home() {
         // gpu03 snapshot B: r0 runs 8 streams at 455.2 tok/s, r1 12 at 469.4,
         // both max_running 32 and no queue. A 4-stream difference is ordinary
         // jitter; a conversation homed on the busier r1 must stay there.
@@ -448,10 +494,54 @@ mod tests {
 
         let key = find_key_with_rank(&[r0.slot.clone(), r1.slot.clone()], &[r1.slot.clone()]);
         let mut rng = StdRng::seed_from_u64(1);
-        let sel = select(Some(&key), None, false, &scores, &mut rng).unwrap();
+        let sel = select(
+            Some(&key),
+            None,
+            false,
+            &scores,
+            &Tuning::default(),
+            &mut rng,
+        )
+        .unwrap();
         assert_eq!(sel.slot, r1.slot);
         assert_eq!(sel.selection, Selection::Home);
         assert!(!sel.write_pin);
+    }
+
+    #[test]
+    fn bound_respects_a_custom_slack_and_eps() {
+        let key = find_key_with_rank(&[s("gpu02"), s("gpu08")], &[s("gpu02")]);
+        // best 1.0 on gpu08; home gpu02 at 1.5.
+        let scores = vec![(s("gpu02"), 1.5), (s("gpu08"), 1.0)];
+        let mut rng = StdRng::seed_from_u64(1);
+        let pick = |t: Tuning, rng: &mut StdRng| {
+            select(Some(&key), None, false, &scores, &t, rng)
+                .unwrap()
+                .slot
+        };
+        // Default: bound = max(1.25, 1.25) = 1.25 < 1.5, so home spills.
+        assert_eq!(pick(Tuning::default(), &mut rng), s("gpu08"));
+        // Wider slack: bound = max(1.25, 2.0) keeps home.
+        let wide_slack = Tuning {
+            affinity_abs_slack: 1.0,
+            ..Tuning::default()
+        };
+        assert_eq!(pick(wide_slack, &mut rng), s("gpu02"));
+        // Wider eps: bound = max(1.6, 1.25) keeps home.
+        let wide_eps = Tuning {
+            affinity_eps: 0.6,
+            ..Tuning::default()
+        };
+        assert_eq!(pick(wide_eps, &mut rng), s("gpu02"));
+        // Zero slack and eps: only the best itself is in bound.
+        let none = Tuning {
+            affinity_abs_slack: 0.0,
+            affinity_eps: 0.0,
+            ..Tuning::default()
+        };
+        let scores = vec![(s("gpu02"), 1.001), (s("gpu08"), 1.0)];
+        let sel = select(Some(&key), None, false, &scores, &none, &mut rng).unwrap();
+        assert_eq!(sel.slot, s("gpu08"));
     }
 
     #[test]
@@ -460,35 +550,65 @@ mod tests {
         let mut rng = StdRng::seed_from_u64(1);
 
         // Turn 1: home (gpu02) is overloaded at 2.0; gpu08 at 0.4 is the
-        // next slot in rank and within bound (best 0.4, bound 0.4+1.0 = 1.4).
+        // next slot in rank and within bound (best 0.4, bound 0.4+0.25 = 0.65).
         let scores = vec![(s("gpu02"), 2.0), (s("gpu08"), 0.4)];
-        let sel = select(Some(&key), None, false, &scores, &mut rng).unwrap();
+        let sel = select(
+            Some(&key),
+            None,
+            false,
+            &scores,
+            &Tuning::default(),
+            &mut rng,
+        )
+        .unwrap();
         assert_eq!(sel.slot, s("gpu08"));
         assert_eq!(sel.selection, Selection::Spill { rank: 2 });
         assert!(sel.write_pin, "spill away from home must write a pin");
         assert_eq!(sel.home, Some(s("gpu02")));
 
         // Turn 2: caller now passes the written pin; gpu02 is still hot.
-        let sel = select(Some(&key), Some(&s("gpu08")), false, &scores, &mut rng).unwrap();
+        let sel = select(
+            Some(&key),
+            Some(&s("gpu08")),
+            false,
+            &scores,
+            &Tuning::default(),
+            &mut rng,
+        )
+        .unwrap();
         assert_eq!(sel.slot, s("gpu08"));
         assert_eq!(sel.selection, Selection::Pinned);
         assert!(!sel.write_pin);
 
         // Turn 3: gpu02 cools to 0.35, gpu08 drifts to 0.42. best = 0.35,
-        // bound = max(0.35*1.25=0.4375, 0.35+1.0=1.35) = 1.35; 0.42 <= 1.35
+        // bound = max(0.35*1.25=0.4375, 0.35+0.25=0.60) = 0.60; 0.42 <= 0.60
         // so the pin holds (no flap).
         let scores = vec![(s("gpu02"), 0.35), (s("gpu08"), 0.42)];
-        let sel = select(Some(&key), Some(&s("gpu08")), false, &scores, &mut rng).unwrap();
+        let sel = select(
+            Some(&key),
+            Some(&s("gpu08")),
+            false,
+            &scores,
+            &Tuning::default(),
+            &mut rng,
+        )
+        .unwrap();
         assert_eq!(sel.slot, s("gpu08"));
         assert_eq!(sel.selection, Selection::Pinned);
         assert!(!sel.write_pin);
 
-        // Turn 4: gpu08 spikes to 2.0, past the bound (1.35) — pin is
+        // Turn 4: gpu08 spikes to 2.0, past the bound (0.60) — pin is
         // ignored and the walk returns to home (gpu02), moving the pin.
-        // (Was 0.9 against a 0.45 bound; AFFINITY_ABS_SLACK is now 1.0, so
-        // the spike must clear a full unit to leave the pin.)
         let scores = vec![(s("gpu02"), 0.35), (s("gpu08"), 2.0)];
-        let sel = select(Some(&key), Some(&s("gpu08")), false, &scores, &mut rng).unwrap();
+        let sel = select(
+            Some(&key),
+            Some(&s("gpu08")),
+            false,
+            &scores,
+            &Tuning::default(),
+            &mut rng,
+        )
+        .unwrap();
         assert_eq!(sel.slot, s("gpu02"));
         assert_eq!(sel.selection, Selection::Home);
         assert!(sel.write_pin, "pin moving back to home must write a pin");
@@ -499,15 +619,39 @@ mod tests {
         let key = find_key_with_rank(&[s("gpu02"), s("gpu08")], &[s("gpu02")]);
         let scores = vec![(s("gpu02"), 0.1), (s("gpu08"), 6.0)];
         let mut rng = StdRng::seed_from_u64(1);
-        let sel = select(Some(&key), Some(&s("gpu08")), true, &scores, &mut rng).unwrap();
+        let sel = select(
+            Some(&key),
+            Some(&s("gpu08")),
+            true,
+            &scores,
+            &Tuning::default(),
+            &mut rng,
+        )
+        .unwrap();
         assert_eq!(sel.slot, s("gpu08"));
         assert_eq!(sel.selection, Selection::Pinned);
         assert!(!sel.write_pin);
         // Without the flag, the same pin is out of bound and ignored.
-        let sel = select(Some(&key), Some(&s("gpu08")), false, &scores, &mut rng).unwrap();
+        let sel = select(
+            Some(&key),
+            Some(&s("gpu08")),
+            false,
+            &scores,
+            &Tuning::default(),
+            &mut rng,
+        )
+        .unwrap();
         assert_eq!(sel.selection, Selection::Home);
         // With the flag, a pin to a slot not in `scores` still falls through.
-        let sel = select(Some(&key), Some(&s("gpu05")), true, &scores, &mut rng).unwrap();
+        let sel = select(
+            Some(&key),
+            Some(&s("gpu05")),
+            true,
+            &scores,
+            &Tuning::default(),
+            &mut rng,
+        )
+        .unwrap();
         assert_eq!(sel.selection, Selection::Home);
     }
 
@@ -518,7 +662,15 @@ mod tests {
         let key = find_key_with_rank(&[s("gpu02"), s("gpu08")], &[s("gpu02")]);
         let scores = vec![(s("gpu02"), 0.2), (s("gpu08"), 0.9)];
         let mut rng = StdRng::seed_from_u64(1);
-        let sel = select(Some(&key), Some(&s("gpu05")), false, &scores, &mut rng).unwrap();
+        let sel = select(
+            Some(&key),
+            Some(&s("gpu05")),
+            false,
+            &scores,
+            &Tuning::default(),
+            &mut rng,
+        )
+        .unwrap();
         assert_eq!(sel.slot, s("gpu02"));
         assert_eq!(sel.selection, Selection::Home);
         assert!(
@@ -538,6 +690,7 @@ mod tests {
             Some(&slot("gpu02", 1)),
             false,
             &scores,
+            &Tuning::default(),
             &mut rng,
         )
         .unwrap();
@@ -552,7 +705,15 @@ mod tests {
         // — falls all the way through to keyless BestOfTwo.
         let scores = vec![(s("hostA"), 0.1), (s("hostB"), 0.2)];
         let mut rng = StdRng::seed_from_u64(7);
-        let sel = select(None, Some(&s("ghost")), false, &scores, &mut rng).unwrap();
+        let sel = select(
+            None,
+            Some(&s("ghost")),
+            false,
+            &scores,
+            &Tuning::default(),
+            &mut rng,
+        )
+        .unwrap();
         assert_eq!(sel.selection, Selection::BestOfTwo);
         assert_eq!(sel.slot, s("hostA"));
         assert_eq!(sel.home, None);
@@ -566,7 +727,7 @@ mod tests {
         let scores = vec![(s("hostA"), 1.0), (s("hostB"), 2.0)];
         for seed in 0..10u64 {
             let mut rng = StdRng::seed_from_u64(seed);
-            let sel = select(None, None, false, &scores, &mut rng).unwrap();
+            let sel = select(None, None, false, &scores, &Tuning::default(), &mut rng).unwrap();
             assert_eq!(sel.slot, s("hostA"));
             assert_eq!(sel.selection, Selection::BestOfTwo);
             assert_eq!(sel.home, None);
@@ -592,7 +753,7 @@ mod tests {
         let mut saw_non_global_min = false;
         for seed in 0..50u64 {
             let mut rng = StdRng::seed_from_u64(seed);
-            let sel = select(None, None, false, &scores, &mut rng).unwrap();
+            let sel = select(None, None, false, &scores, &Tuning::default(), &mut rng).unwrap();
             assert_eq!(sel.selection, Selection::BestOfTwo);
             assert!(
                 by_slot.contains_key(&sel.slot),
@@ -622,7 +783,7 @@ mod tests {
     fn keyless_single_slot_is_taken() {
         let scores = vec![(s("hostA"), 1.0)];
         let mut rng = StdRng::seed_from_u64(1);
-        let sel = select(None, None, false, &scores, &mut rng).unwrap();
+        let sel = select(None, None, false, &scores, &Tuning::default(), &mut rng).unwrap();
         assert_eq!(sel.slot, s("hostA"));
         assert_eq!(sel.selection, Selection::BestOfTwo);
     }
@@ -685,28 +846,40 @@ mod tests {
     #[test]
     fn pin_table_expires_by_ttl() {
         let mut table = PinTable::default();
+        let ttl = Tuning::default().pin_ttl_ms;
         let id = pin_id(Tier::Base, &AffinityKey::from_bytes([3u8; 16]), &[1u8; 32]);
         table.insert(*id.as_bytes(), slot("gpu09", 1), 1_000);
         assert_eq!(table.get(&id, 1_000), Some((&slot("gpu09", 1), 1_000)));
         assert_eq!(
-            table.get(&id, 1_000 + PIN_TTL_MS - 1),
+            table.get(&id, 1_000 + ttl - 1),
             Some((&slot("gpu09", 1), 1_000))
         );
-        assert_eq!(table.get(&id, 1_000 + PIN_TTL_MS), None);
+        assert_eq!(table.get(&id, 1_000 + ttl), None);
+    }
+
+    #[test]
+    fn pin_table_ttl_is_tunable() {
+        let mut table = PinTable::default();
+        assert_eq!(table.ttl_ms(), Tuning::default().pin_ttl_ms);
+        let id = PinId([1u8; 16]);
+        table.insert(*id.as_bytes(), s("a"), 1_000);
+        table.set_ttl_ms(60_000);
+        assert!(table.get(&id, 1_000 + 59_999).is_some());
+        assert!(table.get(&id, 1_000 + 60_000).is_none());
+        table.prune(1_000 + 60_000);
+        assert!(table.is_empty());
     }
 
     #[test]
     fn pin_table_prune_drops_only_expired() {
         let mut table = PinTable::default();
+        let ttl = Tuning::default().pin_ttl_ms;
         table.insert([1u8; 16], s("old"), 1_000);
         table.insert([2u8; 16], s("new"), 5_000);
-        table.prune(1_000 + PIN_TTL_MS);
+        table.prune(1_000 + ttl);
         assert_eq!(table.len(), 1);
         let new_id = PinId([2u8; 16]);
-        assert_eq!(
-            table.get(&new_id, 1_000 + PIN_TTL_MS),
-            Some((&s("new"), 5_000))
-        );
+        assert_eq!(table.get(&new_id, 1_000 + ttl), Some((&s("new"), 5_000)));
     }
 
     #[test]

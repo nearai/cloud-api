@@ -3872,11 +3872,14 @@ impl InferenceProviderPool {
 
         let estimate = context_routing::estimate_input(params);
         let pre_factor = estimate.countable_tokens + estimate.uncounted_tokens;
-        let output_reserve = params
+        // Capped: the reserve is the output the caller allows, not what it
+        // will produce (see `context_routing::output_reserve_cap`).
+        let output_reserve = (params
             .max_completion_tokens
             .or(params.max_tokens)
             .unwrap_or(0)
-            .max(0) as u64;
+            .max(0) as u64)
+            .min(context_routing::output_reserve_cap());
 
         // Exact count only when the heuristic is close enough to a capacity
         // boundary that its error could flip the tier decision. The band is
@@ -10654,6 +10657,109 @@ mod tests {
             Some((100_000f64 * context_routing::safety_factor()).ceil() as u32 + 4 + 8_000),
             "multi-capacity model: requirement = ceil(countable × factor) + overhead + max_tokens"
         );
+    }
+
+    /// A huge `max_tokens` on a short prompt must not push the request onto
+    /// the long-context tier: the reserve counts at most
+    /// `context_routing::output_reserve_cap()` (32_768 by default). Shape of
+    /// the GLM-5.3 Flash lane: base declared at 100k, long at 1M, and clients
+    /// that send the advertised maximum output on one-line requests.
+    #[tokio::test]
+    async fn refine_context_requirement_caps_the_output_reserve() {
+        use inference_providers::mock::MockProvider;
+        use inference_providers::ProviderTier;
+
+        let pool = InferenceProviderPool::new(None, ExternalProvidersConfig::default());
+        let model = "z-ai/glm-5.3-flash".to_string();
+        let base: Arc<InferenceProviderTrait> =
+            Arc::new(MockProvider::new().with_tier(ProviderTier::Near));
+        let long: Arc<InferenceProviderTrait> =
+            Arc::new(MockProvider::new().with_tier(ProviderTier::Near));
+        {
+            let mut m = pool.provider_mappings.write().await;
+            m.model_to_providers
+                .insert(model.clone(), vec![base.clone(), long.clone()]);
+        }
+        {
+            let mut states = pool
+                .provider_load_state
+                .write()
+                .unwrap_or_else(|e| e.into_inner());
+            states
+                .entry(Arc::as_ptr(&base) as *const () as usize)
+                .or_default()
+                .max_context_tokens = Some(100_000);
+            states
+                .entry(Arc::as_ptr(&long) as *const () as usize)
+                .or_default()
+                .max_context_tokens = Some(1_048_576);
+        }
+
+        // 400 bytes → 100 countable tokens; 1 message → 4 tokens overhead.
+        let mut params = fallback_params(&model);
+        params.messages[0].content = Some(serde_json::Value::String("a".repeat(400)));
+        let input = (100f64 * context_routing::safety_factor()).ceil() as u32 + 4;
+        let cap = context_routing::output_reserve_cap() as u32;
+
+        for max_tokens in [1_048_576i64, 943_718, 131_073] {
+            params.max_tokens = Some(max_tokens);
+            let mut hints = ChatRoutingHints::default();
+            pool.refine_context_requirement(&model, &params, &mut hints, false)
+                .await;
+            assert_eq!(
+                hints.estimated_tokens,
+                Some(input + cap),
+                "max_tokens {max_tokens}: reserve must be capped at {cap}"
+            );
+            assert!(
+                hints.estimated_tokens.unwrap() <= 100_000,
+                "a short prompt must stay within the base tier's window"
+            );
+        }
+
+        // Below the cap the reserve is counted in full, as before.
+        params.max_tokens = Some(8_000);
+        let mut hints = ChatRoutingHints::default();
+        pool.refine_context_requirement(&model, &params, &mut hints, false)
+            .await;
+        assert_eq!(hints.estimated_tokens, Some(input + 8_000));
+
+        // `max_completion_tokens` is capped the same way, and it takes
+        // precedence over `max_tokens` when both are set.
+        let cases: [(Option<i64>, Option<i64>, u32, &str); 4] = [
+            (
+                Some(1_048_576),
+                None,
+                cap,
+                "max_completion_tokens alone, above the cap",
+            ),
+            (
+                Some(8_000),
+                None,
+                8_000,
+                "max_completion_tokens alone, below the cap",
+            ),
+            (
+                Some(1_048_576),
+                Some(8_000),
+                cap,
+                "both set: max_completion_tokens (above cap) wins",
+            ),
+            (
+                Some(8_000),
+                Some(1_048_576),
+                8_000,
+                "both set: max_completion_tokens (below cap) wins",
+            ),
+        ];
+        for (max_completion_tokens, max_tokens, reserve, case) in cases {
+            params.max_completion_tokens = max_completion_tokens;
+            params.max_tokens = max_tokens;
+            let mut hints = ChatRoutingHints::default();
+            pool.refine_context_requirement(&model, &params, &mut hints, false)
+                .await;
+            assert_eq!(hints.estimated_tokens, Some(input + reserve), "{case}");
+        }
     }
 
     /// `register_pinned_secondary_provider` records the declared context

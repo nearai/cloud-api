@@ -97,6 +97,28 @@ pub(crate) fn tokenize_band() -> (f64, f64) {
     })
 }
 
+/// Ceiling on the `max_tokens` / `max_completion_tokens` reserve added to a
+/// request's input estimate for the tier decision. The reserve says how much
+/// output the caller *allows*, not how much it will produce: many clients send
+/// the model's advertised maximum (e.g. 1,048,576) on every request, and
+/// counting that in full would put every such request -- including a
+/// one-line answer -- on the long-context tier. Real outputs are small (GLM-5.3
+/// Flash: 99.98% under 20k tokens), and the tier choice is about prefill size,
+/// so the reserve is capped. A request that genuinely overruns a smaller
+/// window still self-heals through the context-length-400 fall-through to a
+/// larger declared sibling. SGLang makes the same trade at admission
+/// (`SGLANG_CLIP_MAX_NEW_TOKENS_ESTIMATION`, 4096).
+pub(crate) fn output_reserve_cap() -> u64 {
+    static V: OnceLock<u64> = OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("CONTEXT_ROUTE_OUTPUT_RESERVE_CAP")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .filter(|v| *v > 0)
+            .unwrap_or(32_768)
+    })
+}
+
 /// Flat token cost assumed per non-text content part (image/audio/data URI)
 /// in the byte-based estimate. Byte-counting base64 media would wildly
 /// overestimate (a single image would look like ~250k tokens).

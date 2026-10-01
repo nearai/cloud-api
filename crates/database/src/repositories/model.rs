@@ -432,12 +432,17 @@ impl ModelRepository {
         let text_pricing_clear: bool = matches!(update_request.text_pricing, Some(None));
 
         let row = retry_db!("upsert_model_pricing", {
-            let client = self
+            let mut client = self
                 .pool
                 .get()
                 .await
                 .context("Failed to get database connection")
                 .map_err(RepositoryError::PoolError)?;
+            // The `models` write and its `model_history` snapshot commit
+            // together: as separate autocommit statements, a concurrent writer
+            // (another PATCH, or a data migration) could interleave between
+            // them and leave the open history snapshot stale.
+            let client = client.transaction().await.map_err(map_db_error)?;
 
             let row = if existing.is_some() {
                 // Model exists - do UPDATE (partial updates work)
@@ -664,6 +669,7 @@ impl ModelRepository {
                 inserted_row
             };
 
+            client.commit().await.map_err(map_db_error)?;
             Ok(row)
         })?;
 
@@ -711,12 +717,17 @@ impl ModelRepository {
         let text_pricing_value: Option<serde_json::Value> = req.text_pricing.clone().flatten();
 
         let row = retry_db!("seed_model_if_absent", {
-            let client = self
+            let mut client = self
                 .pool
                 .get()
                 .await
                 .context("Failed to get database connection")
                 .map_err(RepositoryError::PoolError)?;
+            // The `models` write and its `model_history` snapshot commit
+            // together: as separate autocommit statements, a concurrent writer
+            // (another PATCH, or a data migration) could interleave between
+            // them and leave the open history snapshot stale.
+            let client = client.transaction().await.map_err(map_db_error)?;
 
             // Column list mirrors the INSERT in `upsert_model_pricing` (schema-safe)
             // — the only difference is `ON CONFLICT DO NOTHING` (no UPDATE).
@@ -802,6 +813,7 @@ impl ModelRepository {
                 .map_err(RepositoryError::DatabaseError)?;
             }
 
+            client.commit().await.map_err(map_db_error)?;
             Ok(inserted)
         })?;
 
@@ -1052,12 +1064,17 @@ impl ModelRepository {
         changed_by_user_email: Option<String>,
     ) -> Result<bool> {
         let result = retry_db!("soft_delete_model", {
-            let client = self
+            let mut client = self
                 .pool
                 .get()
                 .await
                 .context("Failed to get database connection")
                 .map_err(RepositoryError::PoolError)?;
+            // The `models` write and its `model_history` snapshot commit
+            // together: as separate autocommit statements, a concurrent writer
+            // (another PATCH, or a data migration) could interleave between
+            // them and leave the open history snapshot stale.
+            let client = client.transaction().await.map_err(map_db_error)?;
 
             let result = client
                 .query_opt(
@@ -1093,6 +1110,7 @@ impl ModelRepository {
                 .await
                 .map_err(RepositoryError::DatabaseError)?;
 
+                client.commit().await.map_err(map_db_error)?;
                 Ok(Some(()))
             } else {
                 Ok(None)
@@ -1106,7 +1124,7 @@ impl ModelRepository {
     /// Closes the previous history record and creates a new one
     async fn record_model_history(
         &self,
-        client: &tokio_postgres::Client,
+        client: &impl deadpool_postgres::GenericClient,
         model_id: uuid::Uuid,
         model_row: &Row,
         change_reason: &Option<String>,

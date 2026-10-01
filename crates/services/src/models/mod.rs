@@ -33,6 +33,29 @@ const MODELS_LIST_CACHE_CAPACITY: u64 = 1;
 /// Cache key used for the single model-list entry.
 const MODELS_LIST_CACHE_KEY: &str = "all";
 
+/// TTL backstop for the per-request model-resolve cache. Same-instance admin
+/// writes clear it via `invalidate_models_cache`; this bounds staleness only
+/// for writes made through other instances.
+const MODEL_RESOLVE_CACHE_TTL_SECS: u64 = 30;
+const MODEL_RESOLVE_CACHE_CAPACITY: u64 = 1_000;
+
+/// Positive-only cache of `ModelsRepository::resolve_and_get_model`, keyed by the
+/// requested model string (alias or canonical name). Cloning shares the cache.
+/// Owned by `ModelsServiceImpl` (which clears it on invalidation) and handed to
+/// the completion service.
+pub type ModelResolveCache = Cache<String, ModelWithPricing>;
+
+pub fn new_model_resolve_cache() -> ModelResolveCache {
+    model_resolve_cache_with_ttl(Duration::from_secs(MODEL_RESOLVE_CACHE_TTL_SECS))
+}
+
+pub fn model_resolve_cache_with_ttl(ttl: Duration) -> ModelResolveCache {
+    Cache::builder()
+        .max_capacity(MODEL_RESOLVE_CACHE_CAPACITY)
+        .time_to_live(ttl)
+        .build()
+}
+
 fn apply_backend_model_metadata(
     models: &mut [ModelWithPricing],
     metadata_by_model: &HashMap<String, BackendModelMetadata>,
@@ -72,6 +95,8 @@ pub struct ModelsServiceImpl {
     /// sentinel since pagination has been dropped — there is only ever one
     /// list to serve.
     models_list_cache: Cache<&'static str, Arc<Vec<ModelWithPricing>>>,
+    /// Shared with the completion service; cleared by `invalidate_models_cache`.
+    model_resolve_cache: ModelResolveCache,
 }
 
 impl ModelsServiceImpl {
@@ -87,7 +112,14 @@ impl ModelsServiceImpl {
             inference_provider_pool,
             models_repository,
             models_list_cache,
+            model_resolve_cache: new_model_resolve_cache(),
         }
+    }
+
+    /// Handle to the resolve cache for the completion service. Invalidation on
+    /// this service clears it, so admin writes take effect immediately here.
+    pub fn model_resolve_cache(&self) -> ModelResolveCache {
+        self.model_resolve_cache.clone()
     }
 
     /// Fetch the active-models list through the in-process cache, returning
@@ -194,6 +226,7 @@ impl ModelsServiceTrait for ModelsServiceImpl {
 
     async fn invalidate_models_cache(&self) {
         self.models_list_cache.invalidate_all();
+        self.model_resolve_cache.invalidate_all();
     }
 }
 

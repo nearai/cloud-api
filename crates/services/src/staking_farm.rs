@@ -15,6 +15,10 @@ pub const CREDIT_TYPE_STAKING_FARM: &str = "staking_farm";
 pub const CREDIT_SOURCE_HOUSE_OF_STAKE: &str = "house-of-stake";
 const REWARD_UNIT_SCALE_24: u128 = 1_000_000_000_000_000_000_000_000;
 const NEAR_RPC_TIMEOUT_SECS: u64 = 10;
+/// How long "this org has no staking source" is remembered. Only the negative
+/// answer is cached; orgs with a source always read the repository.
+const NO_SOURCE_CACHE_TTL_SECS: u64 = 60;
+const NO_SOURCE_CACHE_CAPACITY: u64 = 10_000;
 
 #[derive(Debug, thiserror::Error)]
 #[error("NEAR account is already linked to another organization")]
@@ -220,6 +224,9 @@ pub struct StakingFarmService {
     aml_gate: Option<Arc<dyn StakingFarmAmlGate>>,
     config: StakingFarmConfig,
     active_syncs: Arc<Mutex<HashSet<Uuid>>>,
+    /// Organizations known to have no staking source. Invalidated locally when a
+    /// source is created or linked; the TTL covers links made by other instances.
+    no_source_orgs: moka::future::Cache<Uuid, ()>,
 }
 
 impl StakingFarmService {
@@ -235,7 +242,20 @@ impl StakingFarmService {
             aml_gate,
             config,
             active_syncs: Arc::new(Mutex::new(HashSet::new())),
+            no_source_orgs: moka::future::Cache::builder()
+                .max_capacity(NO_SOURCE_CACHE_CAPACITY)
+                .time_to_live(std::time::Duration::from_secs(NO_SOURCE_CACHE_TTL_SECS))
+                .build(),
         }
+    }
+
+    #[cfg(test)]
+    fn with_no_source_ttl(mut self, ttl: std::time::Duration) -> Self {
+        self.no_source_orgs = moka::future::Cache::builder()
+            .max_capacity(NO_SOURCE_CACHE_CAPACITY)
+            .time_to_live(ttl)
+            .build();
+        self
     }
 
     pub fn config(&self) -> &StakingFarmConfig {
@@ -262,7 +282,8 @@ impl StakingFarmService {
         created_by_user_id: Option<Uuid>,
     ) -> anyhow::Result<OrganizationStakingFarmSource> {
         ensure_configured(&self.config)?;
-        self.repository
+        let source = self
+            .repository
             .upsert_source(UpsertStakingFarmSourceRequest {
                 organization_id,
                 near_account_id,
@@ -273,7 +294,10 @@ impl StakingFarmService {
                 credit_nano_usd_per_reward_unit: self.config.credit_nano_usd_per_reward_unit,
                 created_by_user_id,
             })
-            .await
+            .await;
+        // Invalidate even on error: the write may have landed before failing.
+        self.no_source_orgs.invalidate(&organization_id).await;
+        source
     }
 
     pub async fn sync_for_source(
@@ -392,7 +416,12 @@ impl StakingFarmService {
             return Ok(None);
         }
 
+        if self.no_source_orgs.contains_key(&organization_id) {
+            return Ok(None);
+        }
+
         let Some(source) = self.get_source(organization_id).await? else {
+            self.no_source_orgs.insert(organization_id, ()).await;
             return Ok(None);
         };
 
@@ -535,6 +564,7 @@ mod tests {
         upserts: Mutex<Vec<UpsertStakingFarmSourceRequest>>,
         sync_updates: Mutex<Vec<StakingFarmSourceSyncUpdate>>,
         limit_updates: Mutex<Vec<(Uuid, i64, Option<Uuid>)>>,
+        source_reads: std::sync::atomic::AtomicUsize,
     }
 
     #[async_trait]
@@ -574,6 +604,8 @@ mod tests {
             &self,
             _organization_id: Uuid,
         ) -> anyhow::Result<Option<OrganizationStakingFarmSource>> {
+            self.source_reads
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             Ok(self.source.lock().unwrap().clone())
         }
 
@@ -1097,5 +1129,97 @@ mod tests {
         assert_eq!(result.last_synced_credit_nano_usd, Some(1_000_000_000));
         assert!(repo.limit_updates.lock().unwrap().is_empty());
         assert!(client.calls.lock().unwrap().is_empty());
+    }
+
+    fn source_reads(repo: &MockStakingFarmRepository) -> usize {
+        repo.source_reads.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    fn no_source_service(repo: &Arc<MockStakingFarmRepository>) -> StakingFarmService {
+        let client = Arc::new(MockStakingFarmContractClient::returning(farm_account("0")));
+        StakingFarmService::new(repo.clone(), client, None, enabled_config())
+    }
+
+    #[tokio::test]
+    async fn no_source_answer_is_cached_and_skips_the_read() {
+        let organization_id = Uuid::new_v4();
+        let repo = Arc::new(MockStakingFarmRepository::default());
+        let service = no_source_service(&repo);
+
+        assert!(service
+            .sync_organization_if_stale(organization_id)
+            .await
+            .unwrap()
+            .is_none());
+        assert!(service
+            .sync_organization_if_stale(organization_id)
+            .await
+            .unwrap()
+            .is_none());
+
+        assert_eq!(source_reads(&repo), 1);
+    }
+
+    #[tokio::test]
+    async fn existing_source_is_never_cached() {
+        let organization_id = Uuid::new_v4();
+        let mut source = source_fixture(organization_id);
+        source.last_synced_at = Some(Utc::now());
+        let repo = Arc::new(MockStakingFarmRepository::default());
+        *repo.source.lock().unwrap() = Some(source);
+        let service = no_source_service(&repo);
+
+        for _ in 0..2 {
+            assert!(service
+                .sync_organization_if_stale(organization_id)
+                .await
+                .unwrap()
+                .is_some());
+        }
+
+        assert_eq!(source_reads(&repo), 2);
+    }
+
+    #[tokio::test]
+    async fn linking_a_source_invalidates_the_no_source_marker() {
+        let organization_id = Uuid::new_v4();
+        let repo = Arc::new(MockStakingFarmRepository::default());
+        let service = no_source_service(&repo);
+
+        assert!(service
+            .sync_organization_if_stale(organization_id)
+            .await
+            .unwrap()
+            .is_none());
+        service
+            .ensure_source_for_near_account(organization_id, "alice.near".to_string(), None)
+            .await
+            .unwrap();
+
+        assert!(service
+            .sync_organization_if_stale(organization_id)
+            .await
+            .unwrap()
+            .is_some());
+    }
+
+    #[tokio::test]
+    async fn no_source_marker_expires() {
+        let organization_id = Uuid::new_v4();
+        let repo = Arc::new(MockStakingFarmRepository::default());
+        let service =
+            no_source_service(&repo).with_no_source_ttl(std::time::Duration::from_millis(50));
+
+        service
+            .sync_organization_if_stale(organization_id)
+            .await
+            .unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        service
+            .sync_organization_if_stale(organization_id)
+            .await
+            .unwrap();
+
+        assert_eq!(source_reads(&repo), 2);
     }
 }

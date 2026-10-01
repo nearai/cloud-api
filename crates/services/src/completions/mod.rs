@@ -771,6 +771,9 @@ pub struct CompletionServiceImpl {
     concurrent_limit: u32,
     /// Cache for per-organization concurrent limits (5-minute TTL)
     org_concurrent_limits: Cache<Uuid, u32>,
+    /// Positive-only cache of model resolution (30 s TTL), shared with
+    /// `ModelsServiceImpl` so admin invalidation clears it.
+    model_resolve_cache: crate::models::ModelResolveCache,
     /// Repository for fetching organization concurrent limits
     organization_limit_repository: Arc<dyn ports::OrganizationConcurrentLimitRepository>,
     /// HMAC secret for deriving per-request placement affinity keys (see
@@ -896,9 +899,38 @@ impl CompletionServiceImpl {
             concurrent_counts,
             concurrent_limit: DEFAULT_CONCURRENT_LIMIT,
             org_concurrent_limits,
+            model_resolve_cache: crate::models::new_model_resolve_cache(),
             organization_limit_repository,
             affinity_secret: None,
         }
+    }
+
+    /// Share the model-resolve cache owned by `ModelsServiceImpl` so its
+    /// `invalidate_models_cache` also clears this service's cached models.
+    pub fn with_model_resolve_cache(mut self, cache: crate::models::ModelResolveCache) -> Self {
+        self.model_resolve_cache = cache;
+        self
+    }
+
+    /// `resolve_and_get_model` through the cache. Only found models are cached;
+    /// `None` always re-reads so a newly activated model works immediately.
+    async fn resolve_model_cached(
+        &self,
+        identifier: &str,
+    ) -> Result<Option<crate::models::ModelWithPricing>, anyhow::Error> {
+        if let Some(model) = self.model_resolve_cache.get(identifier).await {
+            return Ok(Some(model));
+        }
+        let resolved = self
+            .models_repository
+            .resolve_and_get_model(identifier)
+            .await?;
+        if let Some(model) = &resolved {
+            self.model_resolve_cache
+                .insert(identifier.to_string(), model.clone())
+                .await;
+        }
+        Ok(resolved)
     }
 
     /// Set the placement-affinity HMAC secret (HKDF from the Valkey
@@ -1801,11 +1833,7 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
 
         // Resolve model name (could be an alias) and get model details in a single DB call
         // This also validates that the model exists and is active
-        let model = match self
-            .models_repository
-            .resolve_and_get_model(&request.model)
-            .await
-        {
+        let model = match self.resolve_model_cached(&request.model).await {
             Ok(Some(m)) => m,
             Ok(None) => {
                 let err = ports::CompletionError::InvalidModel(format!(
@@ -2002,11 +2030,7 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
 
         // Resolve model name (could be an alias) and get model details in a single DB call
         // This also validates that the model exists and is active
-        let model = match self
-            .models_repository
-            .resolve_and_get_model(&request.model)
-            .await
-        {
+        let model = match self.resolve_model_cached(&request.model).await {
             Ok(Some(m)) => m,
             Ok(None) => {
                 let err = ports::CompletionError::InvalidModel(format!(
@@ -4605,3 +4629,6 @@ mod tests {
         assert!(!CompletionServiceImpl::extra_is_e2ee(&empty));
     }
 }
+
+#[cfg(test)]
+mod model_resolve_cache_tests;

@@ -76,9 +76,6 @@ enum ProviderAttemptResult {
     Success,
     Failed,
     ShortCircuited,
-    /// Smart placement refused before any upstream call (load shedding,
-    /// not a provider failure).
-    Refused,
 }
 
 struct ProviderAttemptMetric<'a> {
@@ -122,7 +119,6 @@ const fn attempt_result_metric_tag(result: ProviderAttemptResult) -> &'static st
         ProviderAttemptResult::Success => "attempt_result:success",
         ProviderAttemptResult::Failed => "attempt_result:failed",
         ProviderAttemptResult::ShortCircuited => "attempt_result:short_circuited",
-        ProviderAttemptResult::Refused => "attempt_result:refused",
     }
 }
 
@@ -315,8 +311,8 @@ pub struct ChatRoutingHints {
     /// Estimated context requirement in tokens. Callers set a rough input
     /// estimate (bytes / 4 over the countable request text); for models whose
     /// providers declare multiple context capacities the pool refines it into
-    /// `ceil(input_tokens × factor) + max_tokens reserve`, using an exact
-    /// `/v1/tokenize` count near tier boundaries (see
+    /// `ceil(input_tokens × factor)` plus media/template overhead (input
+    /// only: never `max_tokens`, never a tokenizer; see
     /// `refine_context_requirement`). Providers whose max_context_tokens <
     /// this value are sorted after capable providers.
     pub estimated_tokens: Option<u32>,
@@ -2980,7 +2976,6 @@ impl InferenceProviderPool {
                 operation,
                 timeout_seconds,
             },
-            CompletionError::CapacityRefused => CompletionError::CapacityRefused,
         }
     }
 
@@ -3001,7 +2996,6 @@ impl InferenceProviderPool {
             CompletionError::ClientMediaError(_) => "client_media_error",
             CompletionError::NoPubKeyProvider(_) => "no_pubkey_provider",
             CompletionError::Timeout { .. } => "timeout",
-            CompletionError::CapacityRefused => "capacity_refused",
         }
     }
 
@@ -3202,9 +3196,6 @@ impl InferenceProviderPool {
             CompletionError::NoPubKeyProvider(_) => "non_retryable_no_pubkey_provider",
             CompletionError::InvalidResponse(_) => "non_retryable_invalid_response",
             CompletionError::Unknown(_) => "non_retryable_unknown",
-            // Not `retryable_`: a refusal moves on to the next candidate in
-            // the same round, never retries the round or counts a failure.
-            CompletionError::CapacityRefused => "capacity_refused",
         }
     }
 
@@ -3677,9 +3668,6 @@ impl InferenceProviderPool {
         // and prevents the regex matchers in classify_retry_decision from
         // being defeated by sanitization.
         let mut last_retry_decision: Option<&'static str> = None;
-        // Whether `last_error` is a placement refusal (`CapacityRefused`), so
-        // a later context-length 400 fall-through does not replace it.
-        let mut last_was_refused = false;
         let mut total_attempts: usize = 0;
         let mut retry_count: usize = 0;
         let started_at = std::time::Instant::now();
@@ -3903,11 +3891,6 @@ impl InferenceProviderPool {
                         // loop, and the terminal "All providers failed" log.
                         let retry_decision = Self::classify_retry_decision(&e);
                         let is_retryable_error = retry_decision.starts_with("retryable_");
-                        // A placement refusal: the provider sent nothing
-                        // upstream. Move on to the next candidate in this
-                        // round; never back off, count a failure, or unlock
-                        // a sibling NEAR tier.
-                        let refused = matches!(e, CompletionError::CapacityRefused);
                         if let Some(pinned) = pinned_near_capacity {
                             let is_pinned_tier_provider = provider.tier()
                                 == inference_providers::ProviderTier::Near
@@ -3918,8 +3901,7 @@ impl InferenceProviderPool {
                                     == Some(pinned);
                             if is_pinned_tier_provider {
                                 allow_larger_near |= context_400_fell_through;
-                                allow_any_near |=
-                                    !context_400_fell_through && !is_retryable_error && !refused;
+                                allow_any_near |= !context_400_fell_through && !is_retryable_error;
                             }
                         }
 
@@ -4000,11 +3982,7 @@ impl InferenceProviderPool {
                                 provider_source,
                                 is_fallback,
                                 operation_name,
-                                attempt_result: if refused {
-                                    ProviderAttemptResult::Refused
-                                } else {
-                                    ProviderAttemptResult::Failed
-                                },
+                                attempt_result: ProviderAttemptResult::Failed,
                                 retry_decision,
                                 retry_round: retry_count,
                                 attempt_index: attempt + 1,
@@ -4054,20 +4032,11 @@ impl InferenceProviderPool {
                         // surfaces a retryable 503 to the client instead of a
                         // misleading "maximum context length" 400 for a request that
                         // is genuinely servable.
-                        //
-                        // The same holds for a refusal (an expected
-                        // rejection before any upstream call): it never
-                        // replaces an earlier retryable error, which then
-                        // drives the round retry. And a context-length 400
-                        // never replaces an earlier refusal, so the client
-                        // gets the 429, not a misleading 400.
-                        let keep_prior = (context_400_fell_through || refused)
-                            && (last_retry_decision.is_some_and(|d| d.starts_with("retryable_"))
-                                || (context_400_fell_through && last_was_refused));
-                        if !keep_prior {
+                        let keep_prior_retryable = context_400_fell_through
+                            && last_retry_decision.is_some_and(|d| d.starts_with("retryable_"));
+                        if !keep_prior_retryable {
                             last_error = Some(Self::sanitize_completion_error(e, model_id));
                             last_retry_decision = Some(retry_decision);
-                            last_was_refused = refused;
                         }
                     }
                 }
@@ -4143,48 +4112,35 @@ impl InferenceProviderPool {
         // [URL_REDACTED] which would defeat the matcher's url-anchored regex).
         let retry_decision = last_retry_decision.unwrap_or("none");
         let elapsed_ms = started_at.elapsed().as_millis();
-        // A placement capacity refusal is expected load shedding (a 429 for
-        // the client), not a provider failure: warn, not error, so a burst
-        // of refusals does not page. Same ID-and-number fields either way.
-        let capacity_refused = matches!(last_error, Some(CompletionError::CapacityRefused));
-        macro_rules! all_providers_failed {
-            ($level:ident) => {
-                if let Some(pub_key) = model_pub_key {
-                    tracing::$level!(
-                        model_id = %model_id,
-                        model_pub_key_prefix = %pub_key.chars().take(16).collect::<String>(),
-                        providers_tried = providers.len(),
-                        model_provider_count,
-                        pubkey_filtered = true,
-                        total_attempts,
-                        retry_count,
-                        error_kind,
-                        retry_decision,
-                        elapsed_ms,
-                        operation = operation_name,
-                        "All providers failed for model with public key"
-                    );
-                } else {
-                    tracing::$level!(
-                        model_id = %model_id,
-                        providers_tried = providers.len(),
-                        model_provider_count,
-                        pubkey_filtered = false,
-                        total_attempts,
-                        retry_count,
-                        error_kind,
-                        retry_decision,
-                        elapsed_ms,
-                        operation = operation_name,
-                        "All providers failed for model"
-                    );
-                }
-            };
-        }
-        if capacity_refused {
-            all_providers_failed!(warn);
+        if let Some(pub_key) = model_pub_key {
+            tracing::error!(
+                model_id = %model_id,
+                model_pub_key_prefix = %pub_key.chars().take(16).collect::<String>(),
+                providers_tried = providers.len(),
+                model_provider_count,
+                pubkey_filtered = true,
+                total_attempts,
+                retry_count,
+                error_kind,
+                retry_decision,
+                elapsed_ms,
+                operation = operation_name,
+                "All providers failed for model with public key"
+            );
         } else {
-            all_providers_failed!(error);
+            tracing::error!(
+                model_id = %model_id,
+                providers_tried = providers.len(),
+                model_provider_count,
+                pubkey_filtered = false,
+                total_attempts,
+                retry_count,
+                error_kind,
+                retry_decision,
+                elapsed_ms,
+                operation = operation_name,
+                "All providers failed for model"
+            );
         }
 
         // Return the last error, preserving its HttpError variant for proper status code mapping
@@ -4281,16 +4237,10 @@ impl InferenceProviderPool {
             .unwrap_or_else(|| AttestationError::ProviderNotFound(model)))
     }
 
-    /// Bound on concurrent `/v1/tokenize` refinement calls. Requests that
-    /// can't get a permit fall back to the byte heuristic immediately — the
-    /// exact count is an accuracy optimization, never worth queueing for,
-    /// and the cap keeps a burst of boundary-sized prompts from doubling
-    /// ingress bandwidth against the backend.
-    const TOKENIZE_CONCURRENCY: usize = 4;
-
-    /// Set `hints.estimated_tokens` to the CONTEXT REQUIREMENT the routing
-    /// sort compares against provider capacities:
-    /// `ceil(countable_input × factor) + media/template overhead + max_tokens reserve`.
+    /// Set `hints.estimated_tokens` to the prompt estimate the routing sort
+    /// compares against provider capacities:
+    /// `ceil(countable_input × factor) + media/template overhead`. Input
+    /// only: `max_tokens` never changes the tier, and no tokenizer is called.
     ///
     /// Runs ONLY for models whose providers declare ≥2 distinct context
     /// capacities (e.g. glm-5.2's 262k fleet + 1M tier) — for every other
@@ -4298,103 +4248,43 @@ impl InferenceProviderPool {
     /// semantics, so their routing is unchanged. The estimate is computed
     /// here, from the full request (text + tools + media + template
     /// overhead), NOT taken from the service-side hint — keeping the richer
-    /// accounting scoped to multi-tier models only. When it lands inside the
-    /// tokenize band around a declared capacity (where the ±25% byte
-    /// heuristic could flip the tier decision), asks a NEAR provider for an
-    /// exact count via its attested `/v1/tokenize` passthrough — best-effort
-    /// and concurrency-capped, falling back to the heuristic with the wider
-    /// safety factor. Skipped for encrypted payloads (`skip_exact_count`):
-    /// tokenizing ciphertext is meaningless, and the byte heuristic still
-    /// approximates plaintext size.
-    ///
-    /// Returns the exact count it took, if any, so the placement context
-    /// ([`Self::apply_context_routing`]) reuses it instead of re-tokenizing.
+    /// accounting scoped to multi-tier models only.
     async fn refine_context_requirement(
         &self,
         model_id: &str,
         params: &ChatCompletionParams,
         hints: &mut ChatRoutingHints,
-        skip_exact_count: bool,
-    ) -> Option<u64> {
-        let caps = self.declared_capacities(model_id).await?;
+    ) {
+        let Some(caps) = self.declared_capacities(model_id).await else {
+            return;
+        };
 
         let distinct: std::collections::BTreeSet<u32> =
             caps.iter().filter_map(|(_, c)| *c).collect();
         if distinct.len() < 2 {
             // Single-capacity (or undeclared) model: no tier decision to make;
             // leave the hint untouched so existing routing is unchanged.
-            return None;
+            return;
         }
 
         let estimate = context_routing::estimate_input(params);
-        let pre_factor = estimate.countable_tokens + estimate.uncounted_tokens;
-        let output_reserve = context_routing::output_reserve(params);
-
-        // Exact count only when the heuristic is close enough to a capacity
-        // boundary that its error could flip the tier decision. The band is
-        // checked against input + output reserve: a large max_tokens shrinks
-        // the input room to `cap - reserve`, so a mid-size prompt can sit at
-        // the boundary even when the input alone looks comfortably below it.
-        let (band_low, band_high) = context_routing::tokenize_band();
-        let boundary_demand = (pre_factor + output_reserve) as f64;
-        let near_boundary = distinct.iter().any(|cap| {
-            let cap = *cap as f64;
-            boundary_demand >= band_low * cap && boundary_demand <= band_high * cap
-        });
-
-        let mut exact_count: Option<u64> = None;
-        if near_boundary && !skip_exact_count {
-            static TOKENIZE_PERMITS: tokio::sync::Semaphore =
-                tokio::sync::Semaphore::const_new(InferenceProviderPool::TOKENIZE_CONCURRENCY);
-            if let Ok(_permit) = TOKENIZE_PERMITS.try_acquire() {
-                // Count on the base fleet (smallest declared capacity — the
-                // plentiful tier) so the long-context host doesn't pay the
-                // tokenize traffic too. Same model ⇒ same tokenizer everywhere.
-                let smallest = distinct.iter().next().copied();
-                let tokenizer_provider = caps
-                    .iter()
-                    .find(|(p, c)| {
-                        *c == smallest && p.tier() == inference_providers::ProviderTier::Near
-                    })
-                    .or_else(|| {
-                        caps.iter()
-                            .find(|(p, _)| p.tier() == inference_providers::ProviderTier::Near)
-                    })
-                    .map(|(p, _)| p.clone());
-                if let Some(provider) = tokenizer_provider {
-                    let text = context_routing::concat_prompt_text(params);
-                    exact_count = provider.count_tokens(model_id, text).await;
-                }
-            }
-        }
-
-        // The exact count replaces only the COUNTABLE text; media and
-        // template overhead are invisible to the tokenizer and re-added.
-        let (_, required) = context_routing::requirement(&estimate, exact_count, output_reserve);
-        let required = required.min(u32::MAX as u64) as u32;
+        let required = context_routing::requirement(&estimate).min(u32::MAX as u64) as u32;
         hints.estimated_tokens = Some(required);
 
         // Numbers only — never content (see CLAUDE.md logging rules).
         if context_routing::is_heavy(u64::from(required), caps.iter().map(|(_, cap)| *cap)) {
             tracing::info!(
                 model_id = %model_id,
-                input_estimate = pre_factor,
                 required_tokens = required,
-                output_reserve,
-                exact_count_used = exact_count.is_some(),
                 "Request exceeds the base tier's context window; routing to a longer-context provider"
             );
         } else {
             tracing::debug!(
                 model_id = %model_id,
-                input_estimate = pre_factor,
                 required_tokens = required,
-                output_reserve,
-                exact_count_used = exact_count.is_some(),
                 "Refined context requirement for tier routing"
             );
         }
-        exact_count
     }
 
     /// Each of `model_id`'s providers with its declared context capacity
@@ -4427,18 +4317,15 @@ impl InferenceProviderPool {
     }
 
     /// Refine `hints` for the tier sort and set `params.placement`'s size and
-    /// class from the same formula (reusing refine's exact count), for every
-    /// model: placement uses it wherever the model's hosts publish frames.
+    /// class from the same formula, for every model: placement uses it wherever the model's hosts publish frames.
     /// Both chat paths call this.
     async fn apply_context_routing(
         &self,
         model_id: &str,
         params: &mut ChatCompletionParams,
         hints: &mut ChatRoutingHints,
-        skip_exact_count: bool,
     ) {
-        let exact_count = self
-            .refine_context_requirement(model_id, params, hints, skip_exact_count)
+        self.refine_context_requirement(model_id, params, hints)
             .await;
         // NEAR tiers only: the same provider set `placement_targets` draws
         // the tier boundary from, so an attested fallback's (smaller) window
@@ -4451,7 +4338,7 @@ impl InferenceProviderPool {
             .filter(|(provider, _)| provider.tier() == inference_providers::ProviderTier::Near)
             .map(|(_, cap)| cap)
             .collect();
-        params.placement = context_routing::placement_context(&caps, params, exact_count);
+        params.placement = context_routing::placement_context(&caps, params);
     }
 
     pub async fn chat_completion_stream(
@@ -4487,16 +4374,11 @@ impl InferenceProviderPool {
             .extra
             .contains_key(encryption_headers::CLIENT_PUB_KEY);
 
-        // Turn the rough input estimate into a context requirement (exact
-        // tokenize near tier boundaries; no-op for single-capacity models),
-        // and give placement its typed context.
-        self.apply_context_routing(
-            &model_id,
-            &mut params,
-            &mut hints,
-            model_pub_key.is_some() || needs_client_e2ee,
-        )
-        .await;
+        // Turn the rough input estimate into the prompt-size requirement
+        // (no-op for single-capacity models), and give placement its typed
+        // context.
+        self.apply_context_routing(&model_id, &mut params, &mut hints)
+            .await;
 
         let mut params_for_provider = params.clone();
         reinsert_pubkey_pin(&mut params_for_provider, model_pub_key_str.as_deref());
@@ -4691,16 +4573,11 @@ impl InferenceProviderPool {
             .extra
             .contains_key(encryption_headers::CLIENT_PUB_KEY);
 
-        // Turn the rough input estimate into a context requirement (exact
-        // tokenize near tier boundaries; no-op for single-capacity models),
-        // and give placement its typed context.
-        self.apply_context_routing(
-            &model_id,
-            &mut params,
-            &mut hints,
-            model_pub_key.is_some() || needs_client_e2ee,
-        )
-        .await;
+        // Turn the rough input estimate into the prompt-size requirement
+        // (no-op for single-capacity models), and give placement its typed
+        // context.
+        self.apply_context_routing(&model_id, &mut params, &mut hints)
+            .await;
 
         tracing::debug!(
             model = %model_id,
@@ -11494,8 +11371,7 @@ mod tests {
     /// pin must block only the RETRYABLE-error spill between NEAR tiers
     /// (previous test), never the existing context-length-400 self-heal. A
     /// request whose ESTIMATE fits the pinned (base) tier but whose ACTUAL
-    /// size does not — a byte-heuristic under-estimate, or an E2EE request
-    /// that skips the exact tokenize count — must still fall through to the
+    /// size does not — a byte-heuristic under-estimate — must still fall through to the
     /// larger declared NEAR sibling, exactly as it would at priority >= 0
     /// (`context_400_fall_through_does_not_clobber_retryable_error` above).
     #[tokio::test]
@@ -11718,7 +11594,7 @@ mod tests {
     /// declare ≥2 distinct capacities — for every other model the hint is
     /// left exactly as the caller set it (byte-identical routing). For
     /// multi-tier models the hint becomes
-    /// ceil(countable × safety_factor) + overhead + max_tokens reserve,
+    /// ceil(countable × safety_factor) + overhead (never `max_tokens`),
     /// computed from the request itself (whatever the incoming hint was).
     #[tokio::test]
     async fn refine_context_requirement_gates_on_multi_capacity() {
@@ -11739,7 +11615,7 @@ mod tests {
         }
 
         // 400k bytes of text → countable = 100_000 tokens; 1 message → 4
-        // tokens overhead; max_tokens reserve 8_000.
+        // tokens overhead; max_tokens 8_000 is ignored.
         let mut params = fallback_params(&model);
         params.messages[0].content = Some(serde_json::Value::String("a".repeat(400_000)));
         params.max_tokens = Some(8_000);
@@ -11759,7 +11635,7 @@ mod tests {
             }
         }
         let mut hints = ChatRoutingHints::default();
-        pool.refine_context_requirement(&model, &params, &mut hints, false)
+        pool.refine_context_requirement(&model, &params, &mut hints)
             .await;
         assert_eq!(
             hints.estimated_tokens, None,
@@ -11767,8 +11643,6 @@ mod tests {
         );
 
         // Heterogeneous capacities: requirement computed from the request.
-        // (MockProvider's count_tokens is the trait default None, and 100k is
-        // outside the [0.7, 1.3] tokenize band of both caps → heuristic path.)
         {
             let mut states = pool
                 .provider_load_state
@@ -11780,12 +11654,12 @@ mod tests {
                 .max_context_tokens = Some(1_048_576);
         }
         let mut hints = ChatRoutingHints::default();
-        pool.refine_context_requirement(&model, &params, &mut hints, false)
+        pool.refine_context_requirement(&model, &params, &mut hints)
             .await;
         assert_eq!(
             hints.estimated_tokens,
-            Some((100_000f64 * context_routing::safety_factor()).ceil() as u32 + 4 + 8_000),
-            "multi-capacity model: requirement = ceil(countable × factor) + overhead + max_tokens"
+            Some((100_000f64 * context_routing::safety_factor()).ceil() as u32 + 4),
+            "multi-capacity model: requirement = ceil(countable × factor) + overhead"
         );
     }
 
@@ -11838,11 +11712,10 @@ mod tests {
         params
     }
 
-    /// The expected `(prompt_tokens, context_tokens)` of `sized_params` on
-    /// the heuristic path (one message: 4 tokens of template overhead).
-    fn heuristic_requirement(bytes: usize, reserve: u64) -> (u64, u64) {
-        let prompt = ((bytes / 4) as f64 * context_routing::safety_factor()).ceil() as u64 + 4;
-        (prompt, prompt + reserve)
+    /// The expected prompt tokens of `sized_params` (one message: 4 tokens
+    /// of template overhead).
+    fn heuristic_requirement(bytes: usize) -> u64 {
+        ((bytes / 4) as f64 * context_routing::safety_factor()).ceil() as u64 + 4
     }
 
     async fn served_placement(
@@ -11869,13 +11742,11 @@ mod tests {
             .await
             .expect("served");
         let ctx = served_placement(base).await;
-        let (prompt, context) = heuristic_requirement(4_000, 2_000);
-        assert_eq!(ctx.prompt_tokens, Some(prompt));
-        assert_eq!(ctx.context_tokens, Some(context));
-        assert!(!ctx.heavy);
+        assert_eq!(ctx.prompt_tokens, Some(heuristic_requirement(4_000)));
+        assert!(!ctx.prefill_heavy);
 
-        // Heavy iff context_tokens > base_capacity: 400k bytes → ~120k
-        // tokens of input, over the 100k base window.
+        // Heavy iff the prompt > base_capacity: 400k bytes → ~120k tokens of
+        // input, over the 100k base window.
         let mut heavy = sized_params(model, 400_000);
         heavy.max_tokens = Some(8_000);
         let _stream = pool
@@ -11883,11 +11754,10 @@ mod tests {
             .await
             .expect("served");
         let ctx = served_placement(long).await;
-        let (prompt, context) = heuristic_requirement(400_000, 8_000);
+        let prompt = heuristic_requirement(400_000);
         assert_eq!(ctx.prompt_tokens, Some(prompt));
-        assert_eq!(ctx.context_tokens, Some(context));
-        assert!(context > 100_000);
-        assert!(ctx.heavy);
+        assert!(prompt > 100_000);
+        assert!(ctx.prefill_heavy);
     }
 
     #[tokio::test]
@@ -11905,48 +11775,60 @@ mod tests {
             .await
             .expect("served");
         let ctx = served_placement(&providers[0]).await;
-        assert_eq!(
-            ctx.context_tokens,
-            Some(heuristic_requirement(600_000, 0).1)
-        );
-        assert!(!ctx.heavy);
+        assert_eq!(ctx.prompt_tokens, Some(heuristic_requirement(600_000)));
         assert!(!ctx.prefill_heavy);
     }
 
-    /// The lane class follows the prompt alone: a request heavy only because
-    /// of its `max_tokens` reserve keeps the pool's tier class but is not
-    /// prefill-heavy; a prompt over the base capacity is both.
+    /// Output length never enters routing: a short prompt with a huge
+    /// `max_tokens` stays on the base tier, and is not prefill-heavy.
     #[tokio::test]
-    async fn max_tokens_only_heavy_is_not_prefill_heavy() {
+    async fn max_tokens_does_not_change_tier() {
         let model = "z-ai/glm-5.3-flash";
         let (pool, providers) = capacity_pool(model, &[100_000, 1_048_576]).await;
+        let (base, long) = (&providers[0], &providers[1]);
 
-        // ~60K of prompt plus a 64K reserve: over the 100K base window.
-        let mut reserve_heavy = sized_params(model, 200_000);
-        reserve_heavy.max_tokens = Some(64_000);
+        let mut params = sized_params(model, 4_000);
+        params.max_tokens = Some(900_000);
+        params.max_completion_tokens = Some(900_000);
+        let mut hints = ChatRoutingHints::default();
+        pool.apply_context_routing(model, &mut params, &mut hints)
+            .await;
+        let prompt = heuristic_requirement(4_000);
+        assert_eq!(hints.estimated_tokens.map(u64::from), Some(prompt));
+        assert_eq!(params.placement.prompt_tokens, Some(prompt));
+        assert!(!params.placement.prefill_heavy);
+
         let _stream = pool
-            .chat_completion_stream(reserve_heavy, "h1".to_string(), ChatRoutingHints::default())
+            .chat_completion_stream(params, "h".to_string(), ChatRoutingHints::default())
             .await
             .expect("served");
-        let ctx = served_placement(&providers[1]).await;
-        let (prompt, context) = heuristic_requirement(200_000, 64_000);
-        assert!(prompt <= 100_000 && context > 100_000);
-        assert!(ctx.heavy);
-        assert!(!ctx.prefill_heavy);
+        assert!(
+            base.last_chat_params().await.is_some(),
+            "a short prompt sorts base first"
+        );
+        assert!(
+            long.last_chat_params().await.is_none(),
+            "max_tokens must not push a short prompt to the long tier"
+        );
+    }
 
-        // A prompt over the base window is prefill-heavy.
-        let _stream = pool
-            .chat_completion_stream(
-                sized_params(model, 400_000),
-                "h2".to_string(),
-                ChatRoutingHints::default(),
-            )
-            .await
-            .expect("served");
-        let ctx = served_placement(&providers[1]).await;
-        assert!(heuristic_requirement(400_000, 0).0 > 100_000);
-        assert!(ctx.heavy);
-        assert!(ctx.prefill_heavy);
+    /// Routing never asks a backend for a token count (the trait has no such
+    /// method): a prompt right at the base capacity is sized by the byte
+    /// estimate alone, with no band or factor switch around the boundary.
+    #[tokio::test]
+    async fn routing_never_calls_count_tokens() {
+        let model = "z-ai/glm-5.3-flash";
+        let (pool, _providers) = capacity_pool(model, &[100_000, 1_048_576]).await;
+        for bytes in [280_000usize, 330_000, 400_000] {
+            let mut params = sized_params(model, bytes);
+            let mut hints = ChatRoutingHints::default();
+            pool.apply_context_routing(model, &mut params, &mut hints)
+                .await;
+            let prompt = heuristic_requirement(bytes);
+            assert_eq!(hints.estimated_tokens.map(u64::from), Some(prompt));
+            assert_eq!(params.placement.prompt_tokens, Some(prompt));
+            assert_eq!(params.placement.prefill_heavy, prompt > 100_000);
+        }
     }
 
     /// Every model gets its placement context: there is no allow-list.
@@ -11964,10 +11846,8 @@ mod tests {
             .await
             .expect("served");
         let ctx = served_placement(&providers[1]).await;
-        let (prompt, context) = heuristic_requirement(1_200_000, 0);
-        assert_eq!(ctx.prompt_tokens, Some(prompt));
-        assert_eq!(ctx.context_tokens, Some(context));
-        assert!(ctx.heavy);
+        assert_eq!(ctx.prompt_tokens, Some(heuristic_requirement(1_200_000)));
+        assert!(ctx.prefill_heavy);
     }
 
     #[tokio::test]
@@ -11983,11 +11863,8 @@ mod tests {
             .await
             .expect("served");
         let ctx = served_placement(&providers[1]).await;
-        assert_eq!(
-            ctx.context_tokens,
-            Some(heuristic_requirement(400_000, 0).1)
-        );
-        assert!(ctx.heavy);
+        assert_eq!(ctx.prompt_tokens, Some(heuristic_requirement(400_000)));
+        assert!(ctx.prefill_heavy);
         assert!(ctx.affinity.is_some());
         assert_eq!(
             ctx.affinity_source,
@@ -12023,15 +11900,15 @@ mod tests {
         // ~72k tokens: over the fallback's 50k, within the NEAR base's 100k.
         let mut params = sized_params(model, 240_000);
         let mut hints = ChatRoutingHints::default();
-        pool.apply_context_routing(model, &mut params, &mut hints, false)
+        pool.apply_context_routing(model, &mut params, &mut hints)
             .await;
-        let context = params.placement.context_tokens.expect("sized");
-        assert!(context > 50_000 && context <= 100_000, "{context}");
-        assert!(!params.placement.heavy);
+        let prompt = params.placement.prompt_tokens.expect("sized");
+        assert!(prompt > 50_000 && prompt <= 100_000, "{prompt}");
+        assert!(!params.placement.prefill_heavy);
     }
 
     /// Refine and placement share one formula: the tier sort's requirement
-    /// is the placement context's `context_tokens`.
+    /// is the placement context's `prompt_tokens`.
     #[tokio::test]
     async fn refine_and_placement_share_one_requirement() {
         let model = "z-ai/glm-5.3-flash";
@@ -12039,11 +11916,11 @@ mod tests {
         let mut params = sized_params(model, 400_000);
         params.max_completion_tokens = Some(3_000);
         let mut hints = ChatRoutingHints::default();
-        pool.apply_context_routing(model, &mut params, &mut hints, false)
+        pool.apply_context_routing(model, &mut params, &mut hints)
             .await;
         assert_eq!(
             hints.estimated_tokens.map(u64::from),
-            params.placement.context_tokens
+            params.placement.prompt_tokens
         );
     }
 
@@ -12061,322 +11938,6 @@ mod tests {
             base_capacity([Some(262_144), Some(100_000), Some(1_048_576)]),
             Some(100_000)
         );
-    }
-
-    // --- Placement refusal (CapacityRefused) in the attempt loop ---
-
-    /// A two-tier NEAR model (262k base, 1M long, no attested fallback) and a
-    /// ~360k-token request: the candidate order is [long, base].
-    async fn refusal_pool() -> (
-        InferenceProviderPool,
-        Arc<inference_providers::mock::MockProvider>,
-        Arc<inference_providers::mock::MockProvider>,
-        inference_providers::ChatCompletionParams,
-    ) {
-        let model = "z-ai/glm-5.2";
-        let (pool, providers) = capacity_pool(model, &[262_144, 1_048_576]).await;
-        (
-            pool,
-            providers[0].clone(),
-            providers[1].clone(),
-            sized_params(model, 1_200_000),
-        )
-    }
-
-    fn priority(request_priority: i32) -> ChatRoutingHints {
-        ChatRoutingHints {
-            request_priority,
-            ..Default::default()
-        }
-    }
-
-    async fn calls(provider: &inference_providers::mock::MockProvider) -> usize {
-        provider.chat_request_priorities().await.len()
-    }
-
-    fn failure_count(pool: &InferenceProviderPool, provider: &Arc<impl ?Sized>) -> u32 {
-        pool.provider_failure_counts
-            .read()
-            .unwrap_or_else(|e| e.into_inner())
-            .get(&(Arc::as_ptr(provider) as *const () as usize))
-            .copied()
-            .unwrap_or(0)
-    }
-
-    fn context_400() -> CompletionError {
-        CompletionError::HttpError {
-            status_code: 400,
-            message: "This model's maximum context length is 262144 tokens.".to_string(),
-            is_external: false,
-        }
-    }
-
-    #[tokio::test]
-    async fn refusal_does_not_backoff_or_count_failure() {
-        let (pool, base, long, params) = refusal_pool().await;
-        long.set_error_override(Some(CompletionError::CapacityRefused))
-            .await;
-        base.set_error_override(Some(CompletionError::CapacityRefused))
-            .await;
-
-        let started = std::time::Instant::now();
-        let result = pool
-            .chat_completion_with_attribution_and_hints(params, "h".to_string(), priority(0))
-            .await;
-        assert!(matches!(result, Err(CompletionError::CapacityRefused)));
-        // One round: each candidate once, and no backoff sleep (>= 500 ms).
-        assert_eq!((calls(&long).await, calls(&base).await), (1, 1));
-        assert!(started.elapsed() < Duration::from_millis(400));
-        assert_eq!(failure_count(&pool, &long), 0);
-        assert_eq!(failure_count(&pool, &base), 0);
-    }
-
-    #[tokio::test]
-    async fn pool_tries_base_after_long_refusal_for_normal_priority() {
-        let (pool, base, long, params) = refusal_pool().await;
-        long.set_error_override(Some(CompletionError::CapacityRefused))
-            .await;
-
-        pool.chat_completion_with_attribution_and_hints(params, "h".to_string(), priority(0))
-            .await
-            .expect("base serves after the long tier refuses");
-        assert_eq!((calls(&long).await, calls(&base).await), (1, 1));
-        assert_eq!(failure_count(&pool, &long), 0);
-    }
-
-    /// Disclosed ordering: an attested third-party fallback that fits the
-    /// context sorts ahead of the overflowing base tier, so after a long-tier
-    /// refusal it is tried before base (priority >= 0), and it is still tried
-    /// at negative priority (the #1117 pin only excludes sibling NEAR tiers).
-    #[tokio::test]
-    async fn long_refusal_tries_attested_fallback_before_base_when_configured() {
-        use inference_providers::mock::MockProvider;
-        use inference_providers::ProviderTier;
-
-        for request_priority in [0, -2] {
-            let (pool, base, long, params) = refusal_pool().await;
-            long.set_error_override(Some(CompletionError::CapacityRefused))
-                .await;
-            let fallback =
-                Arc::new(MockProvider::new_accept_all().with_tier(ProviderTier::Attested3p));
-            {
-                let mut m = pool.provider_mappings.write().await;
-                m.model_to_providers
-                    .get_mut("z-ai/glm-5.2")
-                    .unwrap()
-                    .push(fallback.clone() as Arc<InferenceProviderTrait>);
-            }
-            {
-                let mut states = pool
-                    .provider_load_state
-                    .write()
-                    .unwrap_or_else(|e| e.into_inner());
-                states
-                    .entry(Arc::as_ptr(&fallback) as *const () as usize)
-                    .or_default()
-                    .max_context_tokens = Some(1_048_576);
-            }
-
-            pool.chat_completion_with_attribution_and_hints(
-                params,
-                "h".to_string(),
-                priority(request_priority),
-            )
-            .await
-            .expect("the attested fallback serves");
-            assert_eq!(
-                (
-                    calls(&long).await,
-                    calls(&fallback).await,
-                    calls(&base).await
-                ),
-                (1, 1, 0),
-                "priority {request_priority}: long, then the fallback; base never reached"
-            );
-        }
-    }
-
-    /// Pins the #1117 guard: a refusal on the pinned (long) tier must not
-    /// unlock the sibling NEAR tier the way a non-retryable error does.
-    #[tokio::test]
-    async fn negative_priority_long_refusal_returns_429_without_base() {
-        let (pool, base, long, params) = refusal_pool().await;
-        long.set_error_override(Some(CompletionError::CapacityRefused))
-            .await;
-
-        let result = pool
-            .chat_completion_with_attribution_and_hints(params, "h".to_string(), priority(-2))
-            .await;
-        assert!(matches!(result, Err(CompletionError::CapacityRefused)));
-        assert_eq!(calls(&long).await, 1);
-        assert_eq!(
-            calls(&base).await,
-            0,
-            "negative priority never reaches base"
-        );
-    }
-
-    /// Refusals are expected load shedding: when every candidate refused,
-    /// the terminal "All providers failed" line is a warn (not an error),
-    /// with the same ID-and-number fields.
-    #[tokio::test]
-    async fn all_refused_final_log_is_warn() {
-        #[derive(Clone)]
-        struct Capture(Arc<std::sync::Mutex<Vec<u8>>>);
-        impl std::io::Write for Capture {
-            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-                self.0.lock().unwrap().extend_from_slice(buf);
-                Ok(buf.len())
-            }
-            fn flush(&mut self) -> std::io::Result<()> {
-                Ok(())
-            }
-        }
-
-        let (pool, base, long, params) = refusal_pool().await;
-        long.set_error_override(Some(CompletionError::CapacityRefused))
-            .await;
-        base.set_error_override(Some(CompletionError::CapacityRefused))
-            .await;
-
-        let buf = Capture(Arc::new(std::sync::Mutex::new(Vec::new())));
-        let writer = buf.clone();
-        let subscriber = tracing_subscriber::fmt()
-            .with_max_level(tracing::Level::DEBUG)
-            .with_ansi(false)
-            .with_writer(move || writer.clone())
-            .finish();
-        let guard = tracing::subscriber::set_default(subscriber);
-        let result = pool
-            .chat_completion_with_attribution_and_hints(params, "h".to_string(), priority(0))
-            .await;
-        drop(guard);
-        assert!(matches!(result, Err(CompletionError::CapacityRefused)));
-
-        let out = String::from_utf8(buf.0.lock().unwrap().clone()).unwrap();
-        let line = out
-            .lines()
-            .find(|l| l.contains("All providers failed for model"))
-            .unwrap_or_else(|| panic!("no terminal line: {out}"));
-        assert!(line.contains(" WARN "), "{line}");
-        assert!(line.contains("error_kind=\"capacity_refused\""), "{line}");
-        assert!(!out.contains(" ERROR "), "{out}");
-    }
-
-    /// #1117 with base as the pinned tier: a short negative-priority request
-    /// refused on base must not cross to the long tier.
-    #[tokio::test]
-    async fn negative_priority_refusal_on_pinned_base_tier_never_crosses() {
-        let (pool, base, long, _) = refusal_pool().await;
-        base.set_error_override(Some(CompletionError::CapacityRefused))
-            .await;
-
-        let result = pool
-            .chat_completion_with_attribution_and_hints(
-                sized_params("z-ai/glm-5.2", 4_000),
-                "h".to_string(),
-                priority(-2),
-            )
-            .await;
-        assert!(matches!(result, Err(CompletionError::CapacityRefused)));
-        assert_eq!(calls(&base).await, 1);
-        assert_eq!(
-            calls(&long).await,
-            0,
-            "negative priority never reaches long"
-        );
-    }
-
-    /// Refusals are load shedding: the provider-attempt metric tags them
-    /// `attempt_result:refused`, never `failed`.
-    #[tokio::test]
-    async fn refusal_is_not_recorded_as_failed_attempt() {
-        use crate::metrics::capturing::CapturingMetricsService;
-        use crate::metrics::consts::METRIC_PROVIDER_ATTEMPTS;
-
-        let (pool, _base, long, params) = refusal_pool().await;
-        let metrics = Arc::new(CapturingMetricsService::new());
-        pool.set_metrics_service(metrics.clone());
-        long.set_error_override(Some(CompletionError::CapacityRefused))
-            .await;
-
-        pool.chat_completion_with_attribution_and_hints(params, "h".to_string(), priority(0))
-            .await
-            .expect("base serves");
-        let results: Vec<String> = metrics
-            .get_metrics()
-            .into_iter()
-            .filter(|metric| metric.name == METRIC_PROVIDER_ATTEMPTS)
-            .flat_map(|metric| metric.tags)
-            .filter(|tag| tag.starts_with("attempt_result:"))
-            .collect();
-        assert_eq!(
-            results,
-            vec![
-                "attempt_result:refused".to_string(),
-                "attempt_result:success".to_string()
-            ]
-        );
-    }
-
-    /// A 503 from one candidate, then a refusal: the 503 stays the last
-    /// error and drives the round retry.
-    #[tokio::test]
-    async fn refusal_does_not_clobber_prior_retryable_error() {
-        let (pool, base, long, params) = refusal_pool().await;
-        long.set_error_override(Some(CompletionError::HttpError {
-            status_code: 503,
-            message: "queue full".to_string(),
-            is_external: false,
-        }))
-        .await;
-        base.set_error_override(Some(CompletionError::CapacityRefused))
-            .await;
-
-        let result = pool
-            .chat_completion_with_attribution_and_hints(params, "h".to_string(), priority(0))
-            .await;
-        match result {
-            Err(CompletionError::HttpError { status_code, .. }) => assert_eq!(status_code, 503),
-            Err(other) => panic!("expected the retryable 503, got: {other}"),
-            Ok(_) => panic!("expected the retryable 503, got a success"),
-        }
-        assert!(calls(&long).await > 1, "the 503 retried the round");
-        assert_eq!(calls(&long).await, calls(&base).await);
-        assert_eq!(failure_count(&pool, &base), 0);
-    }
-
-    /// A context-length 400 falling through after a refusal must not replace
-    /// it: the client gets a 429, not a misleading 400.
-    #[tokio::test]
-    async fn context_400_after_refusal_returns_429_not_400() {
-        let (pool, base, long, params) = refusal_pool().await;
-        long.set_error_override(Some(CompletionError::CapacityRefused))
-            .await;
-        base.set_error_override(Some(context_400())).await;
-
-        let result = pool
-            .chat_completion_with_attribution_and_hints(params, "h".to_string(), priority(0))
-            .await;
-        assert!(matches!(result, Err(CompletionError::CapacityRefused)));
-        assert_eq!((calls(&long).await, calls(&base).await), (1, 1));
-    }
-
-    #[test]
-    fn capacity_refused_has_its_own_labels() {
-        let e = CompletionError::CapacityRefused;
-        assert_eq!(
-            InferenceProviderPool::classify_retry_decision(&e),
-            "capacity_refused"
-        );
-        assert_eq!(
-            InferenceProviderPool::classify_error_kind(&e),
-            "capacity_refused"
-        );
-        assert!(matches!(
-            InferenceProviderPool::sanitize_completion_error(e, "m"),
-            CompletionError::CapacityRefused
-        ));
     }
 
     /// `register_pinned_secondary_provider` records the declared context

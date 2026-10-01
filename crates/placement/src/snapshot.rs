@@ -72,11 +72,6 @@ pub struct RoutedCounts {
 /// `disabled` is set by the reader while the data-plane kill switch is
 /// present; every decision against such a snapshot is `Legacy(Disabled)`.
 ///
-/// `refuse_on` is set by the reader while the data-plane refuse-on switch is
-/// present. The placer does not read it: while it is unset (the default) the
-/// caller runs a `Refused` decision on its legacy path instead; every other
-/// decision is unchanged.
-///
 /// `host_boots` is each host's `boot_id` from its latest accepted frame. A
 /// pin written on another boot of its host is ignored
 /// ([`Snapshot::pin_boot_current`]): the host rebooted, so its cache is cold.
@@ -96,7 +91,6 @@ pub struct Snapshot {
     pub routed_read_ms: u64,
     pub pins: Arc<PinTable>,
     pub disabled: bool,
-    pub refuse_on: bool,
     pub host_boots: HashMap<String, String>,
     /// Each host's latest accepted frame's `reported_at_ms` (the host's
     /// clock). A frame far from this node's clock marks a silent or skewed

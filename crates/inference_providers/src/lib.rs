@@ -595,19 +595,6 @@ pub trait InferenceProvider {
         None
     }
 
-    /// Exact input-token count via the backend's tokenizer (`POST /v1/tokenize`,
-    /// proxied to the engine's native tokenize endpoint). The pool calls this
-    /// only when a cheap byte-based estimate lands near a context-capacity
-    /// boundary and the model has providers with different context windows, so
-    /// the tier decision is made on real token counts rather than a ±25%
-    /// heuristic. Best-effort: `None` means "unsupported or failed" and the
-    /// caller falls back to the heuristic. Implementations MUST send the text
-    /// only over their attested/verified transport (it is customer content)
-    /// and MUST NOT log it. Default: unsupported.
-    async fn count_tokens(&self, _model: &str, _text: String) -> Option<u64> {
-        None
-    }
-
     async fn get_attestation_report(
         &self,
         model: String,

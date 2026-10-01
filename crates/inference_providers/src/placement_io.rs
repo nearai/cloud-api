@@ -1,6 +1,6 @@
 //! Valkey IO for smart placement: a background reader that turns signed
 //! host frames, per-replica routed counters, follow pins and the data-plane
-//! kill and refuse-on switches into a [`placement::snapshot::Snapshot`], and a bounded,
+//! kill switch into a [`placement::snapshot::Snapshot`], and a bounded,
 //! fire-and-forget write queue for routed counters and pins.
 //!
 //! Nothing here runs on the request path: the reader swaps a fresh snapshot
@@ -111,22 +111,11 @@ pub const METRIC_SNAPSHOT_AGE_MS: &str = "cloud_api.placement.snapshot_age_ms";
 pub const METRIC_FRAME_AGE_MS: &str = "cloud_api.placement.frame_age_ms";
 /// One per reader cycle that found [`KILL_SWITCH_KEY`] present.
 pub const METRIC_KILL_SWITCH_CYCLES: &str = "cloud_api.placement.kill_switch_cycles";
-/// Reader cycles published while the refuse-on switch is on.
-pub const METRIC_REFUSE_ON_CYCLES: &str = "cloud_api.placement.refuse_on_cycles";
 /// One per placement decision, tagged `outcome`, `tier`,
 /// `class`, `strategy`, `priority_band` plus `selection:{..}` (place) or
-/// `reason:{..}` (legacy or refused), and `model`. Never host or request
+/// `reason:{..}` (legacy), and `model`. Never host or request
 /// ids. A Fleet no host of which has ever published records none.
 pub const METRIC_DECISIONS: &str = "cloud_api.placement.decisions";
-/// One per refused decision (a capacity refusal, answered as a 429), tagged
-/// `tier`, `class` and `priority_band`. Only while [`REFUSE_ON_KEY`] is set.
-///
-/// Alerting: alert on the refused FRACTION of heavy decisions,
-/// `refused / decisions{class:heavy}`, over a window, not on an absolute
-/// rate. Heavy traffic arrives in bursts (several heavy requests a minute is
-/// normal), so a fixed `refused > N/min` threshold fires on ordinary bursts
-/// and stays silent when heavy traffic is low.
-pub const METRIC_REFUSED: &str = "cloud_api.placement.refused";
 /// Heavy-lane members and cap as seen by each decision, tagged `tier`.
 /// Histograms (no gauge primitive); dashboards read the max over the window.
 pub const METRIC_LANE_SIZE: &str = "cloud_api.placement.lane_size";
@@ -223,13 +212,6 @@ pub fn routed_key(slot: &SlotId, sec: u64) -> String {
 /// but the router may only `HINCRBY`/`EXPIRE` there and the proxies' writer
 /// is scoped to `replica:*`, so only admin can set it.
 pub const KILL_SWITCH_KEY: &str = "routed:_placement_off";
-
-/// The data-plane refuse-on switch: refusals are opt-in. Only while this key
-/// exists (any value) is every snapshot published `refuse_on`, so a capacity
-/// refusal fails the request (a 429); otherwise it runs the legacy path. All
-/// other placement is unaffected, and [`KILL_SWITCH_KEY`] wins over it. Read
-/// and guarded exactly like [`KILL_SWITCH_KEY`]: only admin sets it.
-pub const REFUSE_ON_KEY: &str = "routed:_placement_refuse_on";
 
 /// When Valkey acknowledged one routed-count write, shared by the writer
 /// (which sets it) and the placing node's ledger entry (which reads it).
@@ -687,8 +669,8 @@ impl CycleSource for ConnectionManager {
 /// One reader cycle: the result of reading and publishing, with the time it
 /// was published at, or `None` when there is nothing to place. With no host
 /// publishing (see [`any_host_publishes`]) it issues no Valkey read at all,
-/// not even the kill and refuse-on switches, and clears a snapshot left
-/// over from hosts that stopped publishing. Otherwise the switches are read
+/// not even the kill switch, and clears a snapshot left
+/// over from hosts that stopped publishing. Otherwise the switch is read
 /// once, in the same pipeline as the frames.
 async fn reader_cycle(
     src: &mut impl CycleSource,
@@ -763,8 +745,6 @@ pub(crate) struct RawRead {
     frames: Vec<redis::Value>,
     /// [`KILL_SWITCH_KEY`] exists.
     kill_switch: bool,
-    /// [`REFUSE_ON_KEY`] exists.
-    refuse_on: bool,
     /// `(req, tok)` summed over the last two seconds per `targets.slots` entry.
     routed: Vec<(u64, u64)>,
     /// New pins stream entries, oldest first.
@@ -1076,7 +1056,6 @@ impl ReaderState {
                 routed_read_ms: raw.read_ms,
                 pins: self.pins.clone(),
                 disabled: raw.kill_switch,
-                refuse_on: raw.refuse_on,
                 host_boots,
                 host_reported_ms,
             },
@@ -1148,9 +1127,6 @@ fn publish_cycle(
     if applied.snapshot.disabled {
         metrics.record_count(METRIC_KILL_SWITCH_CYCLES, 1, &[]);
     }
-    if applied.snapshot.refuse_on {
-        metrics.record_count(METRIC_REFUSE_ON_CYCLES, 1, &[]);
-    }
     slot.store(Arc::new(applied.snapshot));
     Ok(())
 }
@@ -1185,15 +1161,14 @@ async fn warm_up(conn: &mut ConnectionManager) -> redis::RedisResult<Vec<PinEntr
     Ok(pin_entries(reply.ids))
 }
 
-/// One pipeline: `EXISTS` [`KILL_SWITCH_KEY`] and `EXISTS` [`REFUSE_ON_KEY`]
-/// (presence of any value type trips each), `MGET` every host's frame key
+/// One pipeline: `EXISTS` [`KILL_SWITCH_KEY`]
+/// (presence of any value type trips it), `MGET` every host's frame key
 /// (skipped with no hosts),
 /// `HGETALL` each slot's routed hashes for `now_s-1` and `now_s`, and `XREAD`
 /// new pins.
 fn read_pipeline(targets: &ReadTargets, last_id: &str, now_s: u64) -> redis::Pipeline {
     let mut pipe = redis::pipe();
     pipe.cmd("EXISTS").arg(KILL_SWITCH_KEY);
-    pipe.cmd("EXISTS").arg(REFUSE_ON_KEY);
     if !targets.hosts.is_empty() {
         let keys: Vec<String> = targets.hosts.iter().map(|h| replica_key(h)).collect();
         pipe.cmd("MGET").arg(keys);
@@ -1239,7 +1214,6 @@ async fn fetch(
     };
 
     let kill_switch = switch_from_exists(next()?)?;
-    let refuse_on = switch_from_exists(next()?)?;
     let frames: Vec<redis::Value> = if targets.hosts.is_empty() {
         Vec::new()
     } else {
@@ -1270,7 +1244,6 @@ async fn fetch(
         RawRead {
             frames,
             kill_switch,
-            refuse_on,
             routed,
             pins,
             now_s,
@@ -1309,7 +1282,6 @@ pub(crate) fn snapshot_from_valkey_values(
                 })
                 .collect(),
             kill_switch: false,
-            refuse_on: false,
             routed: targets
                 .slots
                 .iter()
@@ -1421,6 +1393,7 @@ mod tests {
             load: Load {
                 running: Some(0),
                 queued: Some(0),
+                prefill_backlog_tokens: Some(0),
                 ..Load::default()
             },
             proxy_inflight: u32::try_from(seq).unwrap(),
@@ -1476,7 +1449,6 @@ mod tests {
                 })
                 .collect(),
             kill_switch: false,
-            refuse_on: false,
             routed: vec![(0, 0); targets.slots.len()],
             pins: Vec::new(),
             now_s: now_ms / 1000,
@@ -1506,8 +1478,6 @@ mod tests {
         let input = PlaceInput {
             model: "z-ai/glm-5.3-flash".into(),
             prompt_tokens: 100,
-            context_tokens: None,
-            heavy: false,
             prefill_heavy: false,
             priority: 0,
             affinity: None,
@@ -1522,7 +1492,6 @@ mod tests {
         match d {
             Decision::Legacy { reason, .. } => reason,
             Decision::Place { .. } => panic!("expected legacy, placed"),
-            Decision::Refused { .. } => panic!("expected legacy, refused"),
         }
     }
 
@@ -1985,12 +1954,11 @@ mod tests {
     }
 
     /// Counts the reads a reader cycle issues and serves one frame per target
-    /// host, with the two switches as set.
+    /// host, with the kill switch as set.
     struct FakeSource {
         reads: usize,
         frame: String,
         kill_switch: bool,
-        refuse_on: bool,
     }
 
     impl CycleSource for FakeSource {
@@ -2005,7 +1973,6 @@ mod tests {
             let frames = vec![Some(self.frame.clone()); targets.hosts.len()];
             let mut r = raw(&targets, frames, now_ms());
             r.kill_switch = self.kill_switch;
-            r.refuse_on = self.refuse_on;
             Ok((targets, r))
         }
     }
@@ -2019,7 +1986,6 @@ mod tests {
             reads: 0,
             frame: sealed_json(&report(1, now_ms())),
             kill_switch: false,
-            refuse_on: false,
         };
 
         // No attested replica-report key (a host attested without one counts
@@ -2036,8 +2002,8 @@ mod tests {
         assert!(slot.load().replicas.is_empty());
         assert!(metrics.counts.lock().unwrap().is_empty());
 
-        // A publishing host: one read per cycle, and both switches still
-        // reach the snapshot.
+        // A publishing host: one read per cycle, and the kill switch still
+        // reaches the snapshot.
         let reg = registry();
         src.kill_switch = true;
         let (result, _) = reader_cycle(&mut src, &mut state, &slot, &reg, &metrics)
@@ -2050,15 +2016,12 @@ mod tests {
         assert_eq!(metrics.total(METRIC_KILL_SWITCH_CYCLES, None), 1);
 
         src.kill_switch = false;
-        src.refuse_on = true;
         let (result, _) = reader_cycle(&mut src, &mut state, &slot, &reg, &metrics)
             .await
             .expect("read");
         result.unwrap();
         assert_eq!(src.reads, 2);
         assert!(!slot.load().disabled);
-        assert!(slot.load().refuse_on);
-        assert_eq!(metrics.total(METRIC_REFUSE_ON_CYCLES, None), 1);
 
         // Its key goes away: reads stop and the stale picture is cleared.
         let none = KeyRegistry::default();
@@ -2071,9 +2034,7 @@ mod tests {
     }
 
     #[test]
-    fn refuse_on_key_is_read_like_the_kill_switch_and_counted() {
-        // Read in the same pipeline, the same way: its own `EXISTS`, right
-        // after the kill switch's and before the frames.
+    fn kill_switch_is_read_first_in_the_pipeline() {
         let targets = ReadTargets {
             hosts: vec!["gpu01".to_string()],
             slots: Vec::new(),
@@ -2086,41 +2047,10 @@ mod tests {
             cmds[0],
             vec!["EXISTS".to_string(), KILL_SWITCH_KEY.to_string()]
         );
-        assert_eq!(
-            cmds[1],
-            vec!["EXISTS".to_string(), REFUSE_ON_KEY.to_string()]
-        );
-        assert_eq!(cmds[2][0], "MGET");
+        assert_eq!(cmds[1][0], "MGET");
         // Under the router's readable `routed:*` prefix, never a counter key.
-        assert!(REFUSE_ON_KEY.starts_with("routed:"));
-        assert_eq!(REFUSE_ON_KEY.split(':').count(), 2);
-
-        let t0 = 10_000_000u64;
-        let metrics = FakeMetrics::default();
-        let reg = registry();
-        let slot = ArcSwap::from_pointee(Snapshot::default());
-        let mut state = ReaderState::default();
-        let f = sealed_json(&report(1, t0));
-        for i in 0..2u64 {
-            let now = t0 + i * 500;
-            let targets = ReadTargets::new(&reg, &state);
-            let mut r = raw(&targets, vec![Some(f.clone())], now);
-            r.refuse_on = true;
-            publish_cycle(&mut state, &slot, Ok((targets, r)), &reg, now, &metrics).unwrap();
-        }
-        // One count per cycle while the key is present. Placement stays
-        // live: the snapshot is not disabled.
-        assert_eq!(metrics.total(METRIC_REFUSE_ON_CYCLES, None), 2);
-        assert_eq!(metrics.total(METRIC_KILL_SWITCH_CYCLES, None), 0);
-        let snap = slot.load();
-        assert!(snap.refuse_on);
-        assert!(!snap.disabled);
-        assert!(matches!(place(&snap, t0 + 600), Decision::Place { .. }));
-
-        // The key is deleted: the next cycle clears it, uncounted.
-        cycle(&mut state, &slot, &reg, vec![Some(f)], t0 + 1_000, &metrics);
-        assert!(!slot.load().refuse_on);
-        assert_eq!(metrics.total(METRIC_REFUSE_ON_CYCLES, None), 2);
+        assert!(KILL_SWITCH_KEY.starts_with("routed:"));
+        assert_eq!(KILL_SWITCH_KEY.split(':').count(), 2);
     }
 
     #[test]
@@ -2802,9 +2732,8 @@ mod tests {
 
         assert_eq!(applied.rejects, Vec::<Reject>::new());
         assert_eq!(applied.snapshot.replicas.len(), 2);
-        // A disposable Valkey never holds either switch.
+        // A disposable Valkey never holds the switch.
         assert!(!applied.snapshot.disabled);
-        assert!(!applied.snapshot.refuse_on);
         let rc = applied.snapshot.routed[&routed_slot];
         assert_eq!((rc.req, rc.tok), (1, 77));
         assert_eq!(

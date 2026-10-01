@@ -230,16 +230,11 @@ pub type RequestPriority = i32;
 /// cannot set any of it and none of it reaches an upstream body.
 #[derive(Clone, Default)]
 pub struct PlacementContext {
-    /// Input tokens only: prefill cost and lane load.
+    /// Input tokens only: prefill cost, lane load and the context-window
+    /// requirement. Output length (`max_tokens`) never enters routing.
     pub prompt_tokens: Option<u64>,
-    /// Input plus the output reserve: the context-window requirement.
-    pub context_tokens: Option<u64>,
-    /// The requirement exceeds the model's base-tier capacity: the tier
-    /// class, which the pool routes on.
-    pub heavy: bool,
-    /// The prompt alone exceeds the model's base-tier capacity: the lane
-    /// class placement admits and refuses on. A request heavy only because
-    /// of its output reserve is not prefill-heavy.
+    /// The prompt exceeds the model's base-tier capacity: the lane class
+    /// placement admits on, and the tier class the pool routes on.
     pub prefill_heavy: bool,
     /// Derived from customer identity or content: never logged (the
     /// placement crate's key type has no `Debug`).
@@ -252,8 +247,6 @@ impl std::fmt::Debug for PlacementContext {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("PlacementContext")
             .field("prompt_tokens", &self.prompt_tokens)
-            .field("context_tokens", &self.context_tokens)
-            .field("heavy", &self.heavy)
             .field("prefill_heavy", &self.prefill_heavy)
             .field("affinity", &self.affinity.is_some())
             .field("affinity_source", &self.affinity_source)
@@ -1133,12 +1126,6 @@ pub enum CompletionError {
         operation: String,
         timeout_seconds: u64,
     },
-    /// Smart placement refused the request before any upstream call: every
-    /// replica its tier allows is at its heavy-lane cap. Transient (clears as
-    /// backlog drains); the pool moves to the next candidate without backoff
-    /// or a failure count, and surfaces a 429 if none serves.
-    #[error("Placement refused: capacity")]
-    CapacityRefused,
 }
 
 /// Parameters for image generation requests
@@ -1518,21 +1505,13 @@ mod tests {
             serde_json::from_value(serde_json::json!({"model": "m", "messages": []})).unwrap();
         params.placement = PlacementContext {
             prompt_tokens: Some(1),
-            context_tokens: Some(2),
-            heavy: true,
             prefill_heavy: true,
             affinity: Some(placement::affinity::AffinityKey::from_bytes([7; 16])),
             affinity_source: placement::decision::AffinitySource::Client,
         };
         let body = serde_json::to_value(&params).unwrap();
         assert!(body.get("placement").is_none());
-        for key in [
-            "prompt_tokens",
-            "context_tokens",
-            "heavy",
-            "prefill_heavy",
-            "affinity",
-        ] {
+        for key in ["prompt_tokens", "prefill_heavy", "affinity"] {
             assert!(body.get(key).is_none(), "{key} leaked");
         }
         // The redacting Debug never prints the key.
@@ -1546,12 +1525,11 @@ mod tests {
         let params: ChatCompletionParams = serde_json::from_value(serde_json::json!({
             "model": "m",
             "messages": [],
-            "placement": {"heavy": true, "prompt_tokens": 5, "context_tokens": 6},
+            "placement": {"prefill_heavy": true, "prompt_tokens": 5},
         }))
         .unwrap();
-        assert!(!params.placement.heavy);
+        assert!(!params.placement.prefill_heavy);
         assert_eq!(params.placement.prompt_tokens, None);
-        assert_eq!(params.placement.context_tokens, None);
         assert!(params.placement.affinity.is_none());
     }
 

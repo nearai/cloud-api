@@ -37,24 +37,6 @@ use std::sync::{Arc, Mutex, MutexGuard, OnceLock, RwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::Semaphore;
 
-/// What placement did with a request, as the provider acts on it.
-pub(super) enum PlacedOutcome {
-    /// Placed on a replica slot: send there, with the replica hint.
-    Lease(RouteLease),
-    /// No usable placement (skipped, Legacy, or a demoted decision): the
-    /// existing `acquire_index` path.
-    Fallback,
-    /// Every replica the tier allows is at its cap, on a complete picture:
-    /// the provider fails fast with `CapacityRefused`.
-    Refused,
-}
-
-/// A decision that did not become a lease, with the record to report.
-enum Unplaced {
-    Fallback(DecisionRecord),
-    Refused(DecisionRecord),
-}
-
 /// EMA smoothing for per-backend TTFT: fast warmup then stable.
 const TTFT_EWMA_ALPHA_WARMUP: f64 = 0.5;
 const TTFT_EWMA_ALPHA_STABLE: f64 = 0.1;
@@ -817,39 +799,34 @@ impl Fleet {
     /// state is unavailable are a real outage and still count as `Legacy`
     /// (`no_state`). A `Legacy` decision, an incomplete host map or
     /// snapshot, an unmapped host, or a host outside the pinned E2EE key
-    /// group all run the existing path. Only a refusal
-    /// that passed the fail-open gates is `Err(CapacityRefused)`, returned
-    /// before any upstream request.
+    /// group all run the existing path.
     pub(super) fn acquire_index_placed(
         &self,
         messages: &[crate::ChatMessage],
         pinned_pub_key: Option<&str>,
         request: &PlacementRequest,
-    ) -> Result<Option<RouteLease>, crate::CompletionError> {
-        match self.try_place(messages, pinned_pub_key, request) {
-            PlacedOutcome::Lease(lease) => Ok(Some(lease)),
-            PlacedOutcome::Refused => Err(crate::CompletionError::CapacityRefused),
-            PlacedOutcome::Fallback => {
-                let mut lease = self.acquire_index(messages, pinned_pub_key);
-                // A request placement did not place on a Fleet whose hosts
-                // have published: its latency is still recorded, as
-                // `legacy`, so the two paths compare. A Fleet no host of
-                // which has ever published records nothing, so models
-                // placement never sees stay out of the comparison.
-                if let Some(lease) = lease.as_mut() {
-                    if let Some(handles) = self.placement.load().as_ref() {
-                        if handles.any_host_publishes() {
-                            lease.latency = Some(LeaseLatency::new(
-                                handles,
-                                latency_tags(None, request.size),
-                                request,
-                            ));
-                        }
-                    }
+    ) -> Option<RouteLease> {
+        if let Some(lease) = self.try_place(messages, pinned_pub_key, request) {
+            return Some(lease);
+        }
+        let mut lease = self.acquire_index(messages, pinned_pub_key);
+        // A request placement did not place on a Fleet whose hosts
+        // have published: its latency is still recorded, as
+        // `legacy`, so the two paths compare. A Fleet no host of
+        // which has ever published records nothing, so models
+        // placement never sees stay out of the comparison.
+        if let Some(lease) = lease.as_mut() {
+            if let Some(handles) = self.placement.load().as_ref() {
+                if handles.any_host_publishes() {
+                    lease.latency = Some(LeaseLatency::new(
+                        handles,
+                        latency_tags(None, request.size),
+                        request,
+                    ));
                 }
-                Ok(lease)
             }
         }
+        lease
     }
 
     fn try_place(
@@ -857,19 +834,17 @@ impl Fleet {
         messages: &[crate::ChatMessage],
         pinned_pub_key: Option<&str>,
         request: &PlacementRequest,
-    ) -> PlacedOutcome {
+    ) -> Option<RouteLease> {
         let guard = self.placement.load();
-        let Some(handles) = guard.as_ref() else {
-            return PlacedOutcome::Fallback;
-        };
+        let handles = guard.as_ref()?;
         // No host behind this Fleet has ever published: nothing to place,
         // and nothing to report (see `acquire_index_placed`).
         if !handles.any_host_publishes() {
-            return PlacedOutcome::Fallback;
+            return None;
         }
         let count = self.rotation_count();
         if count == 0 {
-            return PlacedOutcome::Fallback;
+            return None;
         }
         let now_ms = epoch_ms();
         let now_s = now_ms / 1_000;
@@ -878,8 +853,6 @@ impl Fleet {
             // The pool's typed placement context: placement never
             // re-estimates the request size.
             prompt_tokens: request.prompt_tokens,
-            context_tokens: request.context_tokens,
-            heavy: request.heavy,
             prefill_heavy: request.prefill_heavy,
             priority: request.priority,
             affinity: request.affinity.clone(),
@@ -912,35 +885,14 @@ impl Fleet {
                 .placer
                 .place(&input, &snapshot, &mine, &mut rand::rng());
             match decision {
-                Decision::Legacy { record, .. } => Err(Unplaced::Fallback(record)),
-                // A refusal is only as good as the picture it was made on:
-                // the same fail-open gates as a placement (host map complete
-                // and built for this backend count) or it is Legacy. The
-                // host and key-group gates need a chosen host, so they don't
-                // apply.
-                Decision::Refused { mut record } if incomplete || self.host_map_stale() => {
-                    demote(&mut record, LegacyReason::Incomplete);
-                    Err(Unplaced::Fallback(record))
-                }
-                Decision::Refused { mut record } if host_stale => {
-                    demote_as(&mut record, HOST_STALE_REASON);
-                    Err(Unplaced::Fallback(record))
-                }
-                // Refusals are opt-in: unless the data-plane refuse-on switch
-                // is set, a refusal runs the legacy path instead. Every other
-                // decision stays live.
-                Decision::Refused { mut record } if !snapshot.refuse_on => {
-                    demote_as(&mut record, REFUSE_OFF_REASON);
-                    Err(Unplaced::Fallback(record))
-                }
-                Decision::Refused { record } => Err(Unplaced::Refused(record)),
+                Decision::Legacy { record, .. } => Err(record),
                 Decision::Place { mut record, .. } if incomplete => {
                     demote(&mut record, LegacyReason::Incomplete);
-                    Err(Unplaced::Fallback(record))
+                    Err(record)
                 }
                 Decision::Place { mut record, .. } if host_stale => {
                     demote_as(&mut record, HOST_STALE_REASON);
-                    Err(Unplaced::Fallback(record))
+                    Err(record)
                 }
                 Decision::Place {
                     slot,
@@ -949,7 +901,7 @@ impl Fleet {
                 } => match self.index_for_host(&slot.host, count) {
                     None => {
                         demote(&mut record, LegacyReason::HostUnmapped);
-                        Err(Unplaced::Fallback(record))
+                        Err(record)
                     }
                     Some(index)
                         if key_group
@@ -957,7 +909,7 @@ impl Fleet {
                             .is_some_and(|group| !group.contains(&index)) =>
                     {
                         demote(&mut record, LegacyReason::KeyGroup);
-                        Err(Unplaced::Fallback(record))
+                        Err(record)
                     }
                     Some(index) => {
                         let ack = ledger_add(&mut ledger, slot.clone(), input.prompt_tokens, now_s);
@@ -968,13 +920,9 @@ impl Fleet {
         };
         let (slot, index, record, pin_write, ack) = match placed {
             Ok(placed) => placed,
-            Err(Unplaced::Fallback(record)) => {
+            Err(record) => {
                 report_decision(handles, &record, request);
-                return PlacedOutcome::Fallback;
-            }
-            Err(Unplaced::Refused(record)) => {
-                report_decision(handles, &record, request);
-                return PlacedOutcome::Refused;
+                return None;
             }
         };
         if matches!(key_group, KeyGroup::UnknownKey) {
@@ -1006,7 +954,7 @@ impl Fleet {
             });
         }
         report_decision(handles, &record, request);
-        PlacedOutcome::Lease(lease)
+        Some(lease)
     }
 
     /// True when placing would starve hosts the placer cannot see: the host
@@ -1292,10 +1240,6 @@ fn ledger_add(ledger: &mut PlacementLedger, slot: SlotId, tok: u64, now_s: u64) 
 /// has a stale or skewed frame (`host_map_has_stale_host`).
 const HOST_STALE_REASON: &str = "host_stale";
 
-/// The `reason` of a refusal sent to the legacy path because the refuse-on
-/// switch is off (the default).
-const REFUSE_OFF_REASON: &str = "refuse_off";
-
 /// Turns a `Place` record into the `Legacy` one the caller fell back with.
 fn demote(record: &mut DecisionRecord, reason: LegacyReason) {
     demote_as(record, reason.as_str());
@@ -1396,8 +1340,6 @@ mod demote_tests {
         let input = PlaceInput {
             model: "z-ai/glm-5.3-flash".to_string(),
             prompt_tokens: 10,
-            context_tokens: None,
-            heavy: false,
             prefill_heavy: false,
             priority: 0,
             affinity: None,
@@ -1412,7 +1354,7 @@ mod demote_tests {
             &mut rand::rng(),
         ) {
             Decision::Place { record, .. } => record,
-            Decision::Legacy { .. } | Decision::Refused { .. } => {
+            Decision::Legacy { .. } => {
                 panic!("one ready replica places")
             }
         }

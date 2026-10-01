@@ -630,7 +630,6 @@ mod tests {
             routed_read_ms: 0,
             pins: Default::default(),
             disabled: false,
-            refuse_on: false,
             host_boots: HashMap::new(),
             host_reported_ms: HashMap::new(),
         }

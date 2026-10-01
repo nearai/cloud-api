@@ -1924,59 +1924,6 @@ impl InferenceProvider for Fleet {
         Ok(merge_model_responses(responses))
     }
 
-    /// Exact token count via the backend's `POST /v1/tokenize` passthrough
-    /// (inference-proxy forwards it to the engine's native tokenize endpoint).
-    ///
-    /// Best-effort by design: any transport/HTTP/parse failure returns `None`
-    /// and the caller falls back to its byte-based heuristic — this must never
-    /// fail a request. Goes over `self.client`, whose TLS config enforces the
-    /// pinned attested fingerprints, so the prompt text only ever reaches a
-    /// verified backend. Nothing about the text (or the response body, which
-    /// may echo token ids) is logged.
-    async fn count_tokens(&self, model: &str, text: String) -> Option<u64> {
-        // Tight on purpose: this sits on the request's critical path and is a
-        // best-effort precision upgrade — a slow backend should fail-open to
-        // the caller's heuristic, not add seconds of latency. (Tokenizing
-        // ~1MB of text takes SGLang well under a second when healthy.)
-        const TOKENIZE_TIMEOUT: Duration = Duration::from_secs(2);
-
-        let url = format!("{}/v1/tokenize", self.config.base_url);
-        let headers = self.build_headers().ok()?;
-        let body = serde_json::json!({ "model": model, "prompt": text });
-
-        let response = self
-            .client
-            .post(&url)
-            .headers(headers)
-            .timeout(TOKENIZE_TIMEOUT)
-            .json(&body)
-            .send()
-            .await
-            .map_err(|e| {
-                tracing::debug!(error = %e, "Tokenize request failed; falling back to heuristic");
-            })
-            .ok()?;
-
-        if !response.status().is_success() {
-            tracing::debug!(
-                status = %response.status(),
-                "Tokenize request returned non-2xx; falling back to heuristic"
-            );
-            return None;
-        }
-
-        let parsed: serde_json::Value = response.json().await.ok()?;
-        // Engines differ slightly: vLLM/SGLang return `count` (int); fall back
-        // to the length of a flat `tokens` array. Anything else → None.
-        if let Some(count) = parsed.get("count").and_then(|c| c.as_u64()) {
-            return Some(count);
-        }
-        parsed
-            .get("tokens")
-            .and_then(|t| t.as_array())
-            .map(|arr| arr.len() as u64)
-    }
-
     /// Performs a streaming chat completion request
     async fn chat_completion_stream(
         &self,
@@ -2029,7 +1976,7 @@ impl InferenceProvider for Fleet {
             &streaming_params.messages,
             pinned_pub_key.as_deref(),
             &placement_request,
-        )? {
+        ) {
             None => {
                 let url = format!("{}/v1/chat/completions", self.config.base_url);
                 let response = self
@@ -2216,7 +2163,7 @@ impl InferenceProvider for Fleet {
             &non_streaming_params.messages,
             pinned_pub_key.as_deref(),
             &placement_request,
-        )? {
+        ) {
             None => {
                 let url = format!("{}/v1/chat/completions", self.config.base_url);
                 let response = self
@@ -2929,9 +2876,6 @@ impl InferenceProvider for Provider {
     }
     fn placement_tier(&self) -> Option<placement::policy::Tier> {
         self.fleet.placement_tier()
-    }
-    async fn count_tokens(&self, model: &str, text: String) -> Option<u64> {
-        self.fleet.count_tokens(model, text).await
     }
     async fn get_attestation_report(
         &self,
@@ -3709,8 +3653,6 @@ mod tests {
         // The typed channel carries a real key; it is never serialized.
         params.placement = crate::PlacementContext {
             prompt_tokens: Some(7),
-            context_tokens: Some(9),
-            heavy: true,
             prefill_heavy: true,
             affinity: Some(placement::affinity::AffinityKey::from_bytes([0x5a; 16])),
             affinity_source: placement::decision::AffinitySource::Client,
@@ -6093,6 +6035,7 @@ mod tests {
                 load: Load {
                     running: Some(0),
                     queued: Some(0),
+                    prefill_backlog_tokens: Some(0),
                     ..Load::default()
                 },
                 proxy_inflight: 0,
@@ -6251,8 +6194,6 @@ mod tests {
                 request_id: "req-1".to_string(),
                 org_id: "org-1".to_string(),
                 prompt_tokens: 0,
-                context_tokens: None,
-                heavy: false,
                 prefill_heavy: false,
                 affinity: None,
                 affinity_source: AffinitySource::None,
@@ -6302,7 +6243,6 @@ mod tests {
                     provider
                         .fleet
                         .acquire_index_placed(messages, pinned, req)
-                        .expect("not refused")
                         .expect("rotation active")
                 })
                 .collect();
@@ -6377,7 +6317,6 @@ mod tests {
                 .provider
                 .fleet
                 .acquire_index_placed(&messages, None, &req)
-                .expect("not refused")
                 .expect("rotation active");
             lease.record_ttft_ms(5.0);
             lease.record_duration_ms(9.0);
@@ -6405,7 +6344,6 @@ mod tests {
                 .provider
                 .fleet
                 .acquire_index_placed(&messages, None, &req)
-                .expect("not refused")
                 .expect("rotation active");
             lease.record_ttft_ms(5.0);
             assert_eq!(
@@ -6621,7 +6559,6 @@ mod tests {
                 .provider
                 .fleet
                 .acquire_index_placed(&messages, None, &req)
-                .expect("not refused")
                 .expect("rotation active");
             assert_eq!(lease.index(), 2);
             match h.writes.try_recv().expect("routed write queued") {
@@ -6652,7 +6589,6 @@ mod tests {
                 .provider
                 .fleet
                 .acquire_index_placed(&messages_avoiding(2), None, &req)
-                .expect("not refused")
                 .expect("rotation active");
             assert_eq!(lease.index(), 2);
             match h.writes.try_recv().expect("routed write queued") {
@@ -6753,7 +6689,6 @@ mod tests {
             h.provider
                 .fleet
                 .acquire_index_placed(&messages_avoiding(2), None, &req)
-                .expect("not refused")
                 .expect("rotation active");
             let dropped: i64 = h
                 .metrics
@@ -6810,7 +6745,6 @@ mod tests {
                     .provider
                     .fleet
                     .acquire_index_placed(&messages_avoiding(2), None, &req)
-                    .expect("not refused")
                     .expect("rotation active");
                 let mut items = vec![Ok(control_event(": keepalive\n"))];
                 items.extend((0..chunks).map(|_| Ok(token())));
@@ -6857,7 +6791,6 @@ mod tests {
                 .provider
                 .fleet
                 .acquire_index_placed(&messages_avoiding(2), None, &req)
-                .expect("not refused")
                 .expect("rotation active");
             assert_eq!(lease.index(), 2);
             assert_eq!(lease.replica(), Some(3));
@@ -6882,7 +6815,6 @@ mod tests {
                     .provider
                     .fleet
                     .acquire_index_placed(&messages, None, req)
-                    .expect("not refused")
                     .expect("rotation active");
                 assert_eq!(lease.replica(), None);
             }
@@ -7005,7 +6937,6 @@ mod tests {
                 .provider
                 .fleet
                 .acquire_index_placed(&messages, None, &req)
-                .expect("not refused")
                 .expect("rotation active");
             assert_eq!(lease.index(), 2);
             assert!(matches!(
@@ -7136,8 +7067,6 @@ mod tests {
                 let input = placement::decision::PlaceInput {
                     model: "z-ai/glm-5.3-flash".into(),
                     prompt_tokens: 100,
-                    context_tokens: None,
-                    heavy: false,
                     prefill_heavy: false,
                     priority: 0,
                     affinity: None,
@@ -7153,7 +7082,6 @@ mod tests {
                 ) {
                     Decision::Place { slot, .. } => assert_eq!(slot.host, GOLDEN_HOST),
                     Decision::Legacy { reason, .. } => panic!("legacy: {}", reason.as_str()),
-                    Decision::Refused { .. } => panic!("a short request is never refused"),
                 }
             }
 
@@ -7185,7 +7113,6 @@ mod tests {
                     .provider
                     .fleet
                     .acquire_index_placed(&messages_avoiding(0), None, &req)
-                    .expect("not refused")
                     .expect("rotation active");
                 assert_eq!(h.metrics.decisions_tagged("outcome:place"), 1);
                 assert_eq!(lease.replica(), Some(0));
@@ -7634,49 +7561,16 @@ mod tests {
                 let mut params = params("z-ai/glm-5.3-flash");
                 params.placement = crate::PlacementContext {
                     prompt_tokens: Some(100_000),
-                    context_tokens: Some(120_000),
-                    heavy: true,
                     prefill_heavy: true,
                     ..Default::default()
                 };
                 params
             }
 
-            /// Refusals are opt-in: while the refuse-on key is set, a refusal
-            /// is a 429 (`CapacityRefused`) returned before any upstream
-            /// request.
+            /// Every replica full: the placer answers Legacy(`lane_full`)
+            /// and the request is served on the legacy path, never failed.
             #[tokio::test]
-            async fn refuse_on_key_enables_429() {
-                let upstream = MockServer::start().await;
-                Mock::given(method("POST"))
-                    .respond_with(respond(None))
-                    .expect(0)
-                    .mount(&upstream)
-                    .await;
-                let mut snap = saturated_snapshot(fresh_ms());
-                snap.refuse_on = true;
-                let h = harness_on(upstream_provider(&upstream), &[("h-a", 2)], 4, snap);
-
-                let json = h
-                    .provider
-                    .chat_completion(heavy_params(), "synthetic-hash-json".into())
-                    .await;
-                assert!(matches!(json, Err(crate::CompletionError::CapacityRefused)));
-                let sse = h
-                    .provider
-                    .chat_completion_stream(heavy_params(), "synthetic-hash-sse".into())
-                    .await;
-                assert!(matches!(sse, Err(crate::CompletionError::CapacityRefused)));
-                assert_eq!(h.metrics.decisions_tagged("outcome:refused"), 2);
-                assert_eq!(h.metrics.decisions_tagged("reason:refuse_off"), 0);
-                assert!(upstream.received_requests().await.unwrap().is_empty());
-            }
-
-            /// Without the refuse-on key a refusal runs the legacy path
-            /// (served, tagged `reason:refuse_off`, never counted as
-            /// refused); every other decision stays live.
-            #[tokio::test]
-            async fn refusal_is_fallback_by_default() {
+            async fn lane_full_serves_legacy_with_reason_tag() {
                 let upstream = mock_upstream(None).await;
                 let h = harness_on(
                     upstream_provider(&upstream),
@@ -7686,92 +7580,69 @@ mod tests {
                 );
                 send_both(&h.provider, heavy_params()).await;
 
-                assert_eq!(h.metrics.decisions_tagged("reason:refuse_off"), 2);
+                assert_eq!(h.metrics.decisions_tagged("reason:lane_full"), 2);
                 assert_eq!(h.metrics.decisions_tagged("outcome:legacy"), 2);
-                assert_eq!(h.metrics.decisions_tagged("outcome:refused"), 0);
-                let refused = h
-                    .metrics
-                    .counts
-                    .lock()
-                    .unwrap()
-                    .iter()
-                    .filter(|(n, _, _)| n == crate::placement_io::METRIC_REFUSED)
-                    .count();
-                assert_eq!(refused, 0);
                 let requests = upstream.received_requests().await.unwrap();
                 assert_eq!(requests.len(), 2, "every legacy request is served");
                 assert_eq!(hints(&requests), vec![None; 2]);
             }
 
-            /// A refusal made on a picture with a stale-framed host is
-            /// demoted as `host_stale`, before the refuse-off gate: with
-            /// refusals on it is not a 429, and with them off it is still
-            /// tagged `host_stale`, not `refuse_off`.
+            /// A full lane on a picture with a stale-framed host still runs
+            /// the legacy path and is served.
             #[tokio::test]
-            async fn refused_with_stale_host_is_host_stale_fallback() {
+            async fn lane_full_with_stale_host_is_served_as_legacy() {
                 let upstream = mock_upstream(None).await;
-                for refuse_on in [true, false] {
-                    let mut snap = saturated_snapshot(fresh_ms());
-                    snap.refuse_on = refuse_on;
-                    snap.host_reported_ms = HashMap::from([("h-a".to_string(), now_ms() - 60_000)]);
-                    let h = harness_on(upstream_provider(&upstream), &[("h-a", 2)], 4, snap);
-                    send_both(&h.provider, heavy_params()).await;
+                let mut snap = saturated_snapshot(fresh_ms());
+                snap.host_reported_ms = HashMap::from([("h-a".to_string(), now_ms() - 60_000)]);
+                let h = harness_on(upstream_provider(&upstream), &[("h-a", 2)], 4, snap);
+                send_both(&h.provider, heavy_params()).await;
 
-                    assert_eq!(h.metrics.decisions_tagged("reason:host_stale"), 2);
-                    assert_eq!(h.metrics.decisions_tagged("reason:refuse_off"), 0);
-                    assert_eq!(h.metrics.decisions_tagged("outcome:refused"), 0);
-                }
+                assert_eq!(h.metrics.decisions_tagged("outcome:legacy"), 2);
+                assert_eq!(h.metrics.decisions_tagged("outcome:place"), 0);
                 let requests = upstream.received_requests().await.unwrap();
-                assert_eq!(requests.len(), 4, "every legacy request is served");
+                assert_eq!(requests.len(), 2, "every legacy request is served");
             }
 
-            /// The kill switch takes precedence over refuse-on: with both
-            /// keys set, every request is Legacy(disabled) and served.
+            /// The kill switch wins: every request is Legacy(disabled) and
+            /// served.
             #[tokio::test]
-            async fn kill_switch_wins_over_refuse_on() {
+            async fn kill_switch_serves_legacy() {
                 let upstream = mock_upstream(None).await;
                 let mut snap = saturated_snapshot(fresh_ms());
                 snap.disabled = true;
-                snap.refuse_on = true;
                 let h = harness_on(upstream_provider(&upstream), &[("h-a", 2)], 4, snap);
                 send_both(&h.provider, heavy_params()).await;
 
                 assert_eq!(h.metrics.decisions_tagged("reason:disabled"), 2);
-                assert_eq!(h.metrics.decisions_tagged("outcome:refused"), 0);
                 let requests = upstream.received_requests().await.unwrap();
                 assert_eq!(requests.len(), 2, "every legacy request is served");
                 assert_eq!(hints(&requests), vec![None; 2]);
             }
 
-            /// A refusal passes the same fail-open gates as a placement: an
-            /// incomplete host map, or one built for another backend count,
-            /// demotes it to the legacy path, which serves the request.
+            /// An incomplete host map, or one built for another backend
+            /// count, runs the legacy path, which serves the request.
             #[tokio::test]
-            async fn refused_with_incomplete_host_map_is_fallback_not_429() {
+            async fn full_lane_with_incomplete_host_map_is_served_as_legacy() {
                 let upstream = mock_upstream(None).await;
-                // Refusals on, so only the gate demotes them.
-                let refusing = || {
-                    let mut snap = saturated_snapshot(fresh_ms());
-                    snap.refuse_on = true;
-                    snap
-                };
                 // Only h-a is mapped, of 4 backends.
                 let partial = install(
                     upstream_provider(&upstream),
                     &[("h-a".to_string(), 2)],
                     4,
-                    refusing(),
+                    saturated_snapshot(fresh_ms()),
                 );
                 send_both(&partial.provider, heavy_params()).await;
-                assert_eq!(partial.metrics.decisions_tagged("reason:incomplete"), 2);
-                assert_eq!(partial.metrics.decisions_tagged("outcome:refused"), 0);
+                assert_eq!(partial.metrics.decisions_tagged("outcome:legacy"), 2);
 
                 // A complete map pushed for 3 backends while the Fleet has 4.
-                let stale_count =
-                    harness_on(upstream_provider(&upstream), &[("h-a", 2)], 3, refusing());
+                let stale_count = harness_on(
+                    upstream_provider(&upstream),
+                    &[("h-a", 2)],
+                    3,
+                    saturated_snapshot(fresh_ms()),
+                );
                 send_both(&stale_count.provider, heavy_params()).await;
-                assert_eq!(stale_count.metrics.decisions_tagged("reason:incomplete"), 2);
-                assert_eq!(stale_count.metrics.decisions_tagged("outcome:refused"), 0);
+                assert_eq!(stale_count.metrics.decisions_tagged("outcome:legacy"), 2);
 
                 let requests = upstream.received_requests().await.unwrap();
                 assert_eq!(requests.len(), 4, "every legacy request is served");
@@ -7860,7 +7731,6 @@ mod tests {
                             None,
                             &request("z-ai/glm-5.3-flash"),
                         )
-                        .expect("not refused")
                         .expect("rotation active")
                 }
 
@@ -8046,8 +7916,6 @@ mod tests {
             ]);
             params.placement = crate::PlacementContext {
                 prompt_tokens: Some(120_000),
-                context_tokens: Some(130_000),
-                heavy: true,
                 prefill_heavy: true,
                 affinity: Some(key.clone()),
                 affinity_source: AffinitySource::Prefix,
@@ -8058,8 +7926,6 @@ mod tests {
             assert_eq!(req.request_id, "req-9");
             assert_eq!(req.org_id, "org-9");
             assert_eq!(req.prompt_tokens, 120_000);
-            assert_eq!(req.context_tokens, Some(130_000));
-            assert!(req.heavy);
             assert!(req.prefill_heavy);
             let fingerprint = |k: &AffinityKey| pin_id(Tier::Base, k, &PIN_SECRET).to_hex();
             assert_eq!(
@@ -8075,15 +7941,7 @@ mod tests {
                 ..Default::default()
             };
             let req = PlacementRequest::from_params(&params);
-            assert_eq!(
-                (
-                    req.prompt_tokens,
-                    req.context_tokens,
-                    req.heavy,
-                    req.prefill_heavy
-                ),
-                (0, None, false, false)
-            );
+            assert_eq!((req.prompt_tokens, req.prefill_heavy), (0, false));
             assert!(req.affinity.is_none());
             assert_eq!(req.affinity_source, AffinitySource::None);
         }
@@ -8144,7 +8002,6 @@ mod tests {
                         start.wait();
                         let lease = fleet
                             .acquire_index_placed(&messages, None, &req)
-                            .expect("not refused")
                             .expect("placement active");
                         sender.send(lease.index()).expect("send placed index");
                     })

@@ -7,7 +7,7 @@
 use super::tracing_headers;
 use crate::placement_io::{
     PlacementHandles, METRIC_AFFINITY, METRIC_CHOSEN_BACKLOG, METRIC_DECISIONS, METRIC_EXCLUDED,
-    METRIC_LANE_CAP, METRIC_LANE_SIZE, METRIC_PLACE_DURATION_US, METRIC_REFUSED,
+    METRIC_LANE_CAP, METRIC_LANE_SIZE, METRIC_PLACE_DURATION_US,
 };
 use crate::ChatCompletionParams;
 use placement::affinity::AffinityKey;
@@ -29,11 +29,7 @@ pub(super) struct PlacementRequest {
     pub(super) org_id: String,
     /// The pool's estimate (input only; 0 when the pool gave none).
     pub(super) prompt_tokens: u64,
-    /// The pool's context requirement (input plus output reserve).
-    pub(super) context_tokens: Option<u64>,
-    /// The pool's class: the requirement exceeds the base tier.
-    pub(super) heavy: bool,
-    /// The lane class: the prompt alone exceeds the base tier.
+    /// The pool's class: the prompt exceeds the base tier.
     pub(super) prefill_heavy: bool,
     pub(super) affinity: Option<AffinityKey>,
     pub(super) affinity_source: AffinitySource,
@@ -60,8 +56,6 @@ impl PlacementRequest {
                 .unwrap_or_default()
                 .to_string(),
             prompt_tokens: placement.prompt_tokens.unwrap_or(0),
-            context_tokens: placement.context_tokens,
-            heavy: placement.heavy,
             prefill_heavy: placement.prefill_heavy,
             affinity: placement.affinity.clone(),
             // A source without a key would mislabel the decision record.
@@ -102,9 +96,6 @@ pub(super) fn report_decision(
             &request.model_tag,
         ],
     );
-    if record.outcome == "refused" {
-        metrics.record_count(METRIC_REFUSED, 1, &[tier, class, band, &request.model_tag]);
-    }
     metrics.record_histogram(METRIC_LANE_SIZE, f64::from(record.lane_size), &[tier]);
     metrics.record_histogram(METRIC_LANE_CAP, f64::from(record.lane_cap), &[tier]);
     metrics.record_histogram(
@@ -143,7 +134,6 @@ pub(super) fn report_decision(
                 class = record.class.as_str(),
                 priority_band = record.priority_band,
                 prompt_tokens = record.prompt_tokens,
-                context_tokens = ?record.context_tokens,
                 outcome = record.outcome,
                 strategy = record.strategy.unwrap_or(""),
                 selection = record.selection.unwrap_or(""),
@@ -207,18 +197,18 @@ pub(super) fn size_tag(prompt_tokens: Option<u64>) -> &'static str {
 }
 
 /// Legacy decisions made because placement has no usable snapshot, is
-/// switched off by the data-plane kill switch, or had its refusal turned
-/// into legacy because refusals are off (the default), or that hold a
+/// switched off by the data-plane kill switch, or that hold a
 /// stale-framed host (`host_stale`, which lasts as long as an outage), are
 /// logged at debug;
 /// they would otherwise repeat on every such request while the shared state
-/// is down, unconfigured, a switch is on or refusals are off. The decision
-/// metric still counts each.
+/// is down, unconfigured or the switch is on. The decision metric still
+/// counts each. `capacity_full`, `lane_full` and `long_full` log with the
+/// other legacy reasons, at info.
 fn logs_at_debug(record: &DecisionRecord) -> bool {
     record.outcome == "legacy"
         && matches!(
             record.reason,
-            Some("no_state" | "stale" | "disabled" | "refuse_off" | "host_stale")
+            Some("no_state" | "stale" | "disabled" | "host_stale")
         )
 }
 
@@ -226,7 +216,6 @@ fn outcome_tag(outcome: &str) -> &'static str {
     match outcome {
         "place" => "outcome:place",
         "legacy" => "outcome:legacy",
-        "refused" => "outcome:refused",
         _ => "outcome:unknown",
     }
 }
@@ -273,12 +262,11 @@ fn strategy_tag(strategy: Option<&str>) -> &'static str {
         Some("heavy_long") => "strategy:heavy_long",
         Some("heavy_lane_join") => "strategy:heavy_lane_join",
         Some("heavy_lane_admit") => "strategy:heavy_lane_admit",
-        Some("refuse") => "strategy:refuse",
         Some(_) => "strategy:unknown",
     }
 }
 
-/// `reason:{..}` for a legacy or refused record, `selection:{..}` for a
+/// `reason:{..}` for a legacy record, `selection:{..}` for a
 /// placed one.
 fn detail_tag(record: &DecisionRecord) -> &'static str {
     match (record.reason, record.selection) {
@@ -293,7 +281,6 @@ fn detail_tag(record: &DecisionRecord) -> &'static str {
             "lane_full" => "reason:lane_full",
             "long_full" => "reason:long_full",
             "capacity_full" => "reason:capacity_full",
-            "refuse_off" => "reason:refuse_off",
             "host_stale" => "reason:host_stale",
             _ => "reason:unknown",
         },
@@ -333,8 +320,6 @@ mod tests {
         let input = PlaceInput {
             model: "z-ai/glm-5.3-flash".to_string(),
             prompt_tokens: 10,
-            context_tokens: None,
-            heavy: false,
             prefill_heavy: false,
             priority: 0,
             affinity: None,
@@ -344,7 +329,7 @@ mod tests {
         let mut rng = rand::rng();
         match Placer::new([1u8; 32], Tier::Base).place(&input, snap, &HashMap::new(), &mut rng) {
             Decision::Legacy { record, .. } => record,
-            Decision::Place { .. } | Decision::Refused { .. } => {
+            Decision::Place { .. } => {
                 panic!("an empty snapshot is always legacy")
             }
         }
@@ -397,7 +382,7 @@ mod observability_tests {
     use super::*;
     use crate::placement_io::{
         PlacementIo, PlacementMetrics, METRIC_DECISIONS, METRIC_LANE_CAP, METRIC_LANE_SIZE,
-        METRIC_PLACE_DURATION_US, METRIC_REFUSED,
+        METRIC_PLACE_DURATION_US,
     };
     use arc_swap::ArcSwap;
     use placement::affinity::pin_id;
@@ -448,8 +433,6 @@ mod observability_tests {
             request_id: "req-1".to_string(),
             org_id: "org-1".to_string(),
             prompt_tokens: 10,
-            context_tokens: Some(20),
-            heavy: false,
             prefill_heavy: false,
             affinity_source: if affinity.is_some() {
                 AffinitySource::Client
@@ -466,8 +449,6 @@ mod observability_tests {
         let input = PlaceInput {
             model: "z-ai/glm-5.3-flash".to_string(),
             prompt_tokens: 10,
-            context_tokens: None,
-            heavy: false,
             prefill_heavy: false,
             priority: 0,
             affinity: None,
@@ -488,14 +469,13 @@ mod observability_tests {
         record
     }
 
-    fn refused(tier: Tier, reason: &'static str) -> DecisionRecord {
-        let mut record = legacy("no_state");
-        record.outcome = "refused";
-        record.reason = Some(reason);
+    /// A legacy decision for a request every replica was too busy or capped
+    /// to take, as the placer records it (no strategy).
+    fn capacity_legacy(tier: Tier, reason: LegacyReason) -> DecisionRecord {
+        let mut record = legacy(reason.as_str());
         record.tier = tier;
         record.class = Class::Heavy;
         record.priority_band = "neg";
-        record.strategy = Some("refuse");
         record.lane_size = 4;
         record.lane_cap = 2;
         record.place_us = 37;
@@ -523,7 +503,7 @@ mod observability_tests {
     /// an `unknown` fallback.
     #[test]
     fn every_outcome_reason_selection_strategy_is_static_tag() {
-        for outcome in ["place", "legacy", "refused"] {
+        for outcome in ["place", "legacy"] {
             assert!(!outcome_tag(outcome).ends_with("unknown"), "{outcome}");
         }
         assert!(outcome_tag("bogus").ends_with("unknown"));
@@ -536,15 +516,12 @@ mod observability_tests {
             LegacyReason::HostUnmapped,
             LegacyReason::KeyGroup,
             LegacyReason::Incomplete,
+            LegacyReason::CapacityFull,
+            LegacyReason::LaneFull,
+            LegacyReason::LongFull,
         ]
         .map(LegacyReason::as_str);
-        for reason in legacy_reasons.into_iter().chain([
-            "lane_full",
-            "long_full",
-            "capacity_full",
-            "refuse_off",
-            "host_stale",
-        ]) {
+        for reason in legacy_reasons.into_iter().chain(["host_stale"]) {
             let tag = detail_tag(&legacy(reason));
             assert_eq!(tag, format!("reason:{reason}"), "{reason}");
         }
@@ -562,7 +539,6 @@ mod observability_tests {
             RoutePolicy::HeavyLong,
             RoutePolicy::HeavyLaneJoin,
             RoutePolicy::HeavyLaneAdmit,
-            RoutePolicy::Refuse,
         ] {
             assert_eq!(
                 strategy_tag(Some(strategy.as_str())),
@@ -607,60 +583,56 @@ mod observability_tests {
         }
     }
 
-    #[test]
-    fn refused_metric_tags_exact() {
-        for (tier, reason) in [(Tier::Base, "lane_full"), (Tier::Long, "long_full")] {
-            let metrics = Arc::new(FakeMetrics::default());
-            report_decision(
-                &handles(metrics.clone()),
-                &refused(tier, reason),
-                &request(None),
-            );
+    /// `outcome:legacy` plus the reason, tier and class tags: the "every
+    /// replica busy or capped" metric. No refusal counter exists.
+    fn assert_capacity_legacy_tags(tier: Tier, reason: LegacyReason) {
+        let metrics = Arc::new(FakeMetrics::default());
+        report_decision(
+            &handles(metrics.clone()),
+            &capacity_legacy(tier, reason),
+            &request(None),
+        );
 
-            let tier_tag = format!("tier:{}", tier.as_str());
-            let counts = metrics.counts.lock().unwrap();
-            assert_eq!(
-                tags_of(&counts, METRIC_REFUSED),
-                vec![vec![
-                    tier_tag.clone(),
-                    "class:heavy".to_string(),
-                    "priority_band:neg".to_string(),
-                    "model:z-ai/glm-5.3-flash".to_string(),
-                ]]
-            );
-            assert_eq!(
-                tags_of(&counts, METRIC_DECISIONS),
-                vec![vec![
-                    "outcome:refused".to_string(),
-                    tier_tag.clone(),
-                    "class:heavy".to_string(),
-                    "strategy:refuse".to_string(),
-                    "priority_band:neg".to_string(),
-                    format!("reason:{reason}"),
-                    "model:z-ai/glm-5.3-flash".to_string(),
-                ]]
-            );
-            let histograms = metrics.histograms.lock().unwrap();
-            for (name, value) in [
-                (METRIC_LANE_SIZE, 4.0),
-                (METRIC_LANE_CAP, 2.0),
-                (METRIC_PLACE_DURATION_US, 37.0),
-            ] {
-                let found: Vec<_> = histograms.iter().filter(|(n, _, _)| n == name).collect();
-                assert_eq!(found.len(), 1, "{name}");
-                assert_eq!(found[0].1, value, "{name}");
-                assert_eq!(found[0].2, vec![tier_tag.clone()], "{name}");
-            }
+        let tier_tag = format!("tier:{}", tier.as_str());
+        let counts = metrics.counts.lock().unwrap();
+        assert_eq!(
+            tags_of(&counts, METRIC_DECISIONS),
+            vec![vec![
+                "outcome:legacy".to_string(),
+                tier_tag.clone(),
+                "class:heavy".to_string(),
+                "strategy:none".to_string(),
+                "priority_band:neg".to_string(),
+                format!("reason:{}", reason.as_str()),
+                "model:z-ai/glm-5.3-flash".to_string(),
+            ]]
+        );
+        let histograms = metrics.histograms.lock().unwrap();
+        for (name, value) in [
+            (METRIC_LANE_SIZE, 4.0),
+            (METRIC_LANE_CAP, 2.0),
+            (METRIC_PLACE_DURATION_US, 37.0),
+        ] {
+            let found: Vec<_> = histograms.iter().filter(|(n, _, _)| n == name).collect();
+            assert_eq!(found.len(), 1, "{name}");
+            assert_eq!(found[0].1, value, "{name}");
+            assert_eq!(found[0].2, vec![tier_tag.clone()], "{name}");
         }
     }
 
     #[test]
-    fn non_refused_decisions_do_not_count_refusals() {
-        let metrics = Arc::new(FakeMetrics::default());
-        let h = handles(metrics.clone());
-        report_decision(&h, &legacy("no_state"), &request(None));
-        report_decision(&h, &placed("short_clean", "home"), &request(None));
-        assert!(tags_of(&metrics.counts.lock().unwrap(), METRIC_REFUSED).is_empty());
+    fn capacity_full_legacy_metric_tags_exact() {
+        assert_capacity_legacy_tags(Tier::Base, LegacyReason::CapacityFull);
+    }
+
+    #[test]
+    fn lane_full_legacy_metric_tags_exact() {
+        assert_capacity_legacy_tags(Tier::Base, LegacyReason::LaneFull);
+    }
+
+    #[test]
+    fn long_full_legacy_metric_tags_exact() {
+        assert_capacity_legacy_tags(Tier::Long, LegacyReason::LongFull);
     }
 
     #[derive(Clone)]
@@ -746,7 +718,7 @@ mod observability_tests {
     #[test]
     fn decision_log_levels() {
         let h = handles(Arc::new(FakeMetrics::default()));
-        for reason in ["no_state", "stale", "disabled", "refuse_off"] {
+        for reason in ["no_state", "stale", "disabled", "host_stale"] {
             let out = captured(|| report_decision(&h, &legacy(reason), &request(None)));
             assert!(out.contains("DEBUG"), "{reason}: {out}");
             assert!(!out.contains("INFO"), "{reason}: {out}");
@@ -754,7 +726,9 @@ mod observability_tests {
         for record in [
             legacy("incomplete"),
             placed("short_clean", "home"),
-            refused(Tier::Long, "long_full"),
+            capacity_legacy(Tier::Long, LegacyReason::LongFull),
+            capacity_legacy(Tier::Base, LegacyReason::LaneFull),
+            capacity_legacy(Tier::Base, LegacyReason::CapacityFull),
         ] {
             let out = captured(|| report_decision(&h, &record, &request(None)));
             assert!(out.contains("INFO"), "{out}");

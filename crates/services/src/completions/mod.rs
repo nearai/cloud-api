@@ -1490,20 +1490,6 @@ impl CompletionServiceImpl {
                             .to_string(),
                 }
             }
-            // Every replica placement allows for this request is at its cap:
-            // transient, so a 429 (the Retry-After middleware adds its hint).
-            inference_providers::CompletionError::CapacityRefused => {
-                tracing::warn!(
-                    %organization_id,
-                    model,
-                    "Placement refused at capacity during {}",
-                    operation
-                );
-                ports::CompletionError::ServiceOverloaded(
-                    "The model is at capacity for requests of this size. Please retry shortly."
-                        .to_string(),
-                )
-            }
         }
     }
 
@@ -3598,17 +3584,6 @@ mod tests {
             }
             other => panic!("Expected ProviderError, got {:?}", other),
         }
-    }
-
-    #[test]
-    fn test_map_provider_error_capacity_refused_becomes_service_overloaded() {
-        let error = inference_providers::CompletionError::CapacityRefused;
-        let result =
-            CompletionServiceImpl::map_provider_error("test-model", &error, "test", Uuid::nil());
-        assert!(
-            matches!(result, ports::CompletionError::ServiceOverloaded(_)),
-            "a placement refusal is a 429, got {result:?}"
-        );
     }
 
     #[test]

@@ -1375,6 +1375,60 @@ mod tests {
     }
 
     #[test]
+    fn malformed_key_encodings_are_ignored_not_fatal() {
+        let vk = test_signing_key(7).verifying_key();
+        let valid = replica_report_key_payload(&vk, "boot-valid");
+
+        // A 32-byte value that is not a valid curve point.
+        let off_curve = (0u8..=255)
+            .map(|b| {
+                let mut a = [0u8; 32];
+                a[0] = b;
+                a[31] = 0x7f;
+                a
+            })
+            .find(|a| VerifyingKey::from_bytes(a).is_err())
+            .expect("some 32-byte value must fail point decompression");
+        // The identity point decodes but is a weak (low-order) key.
+        let mut identity = [0u8; 32];
+        identity[0] = 1;
+
+        let with_pk = |pk_hex: String| ReplicaReportKey {
+            public_key_hex: pk_hex,
+            ..valid.clone()
+        };
+        let malformed = vec![
+            with_pk("zz".repeat(32)),                   // invalid public-key hex
+            with_pk(hex::encode(&vk.as_bytes()[..31])), // too short
+            with_pk(hex::encode([vk.as_bytes().as_slice(), &[0u8]].concat())), // too long
+            with_pk(hex::encode(off_curve)),            // invalid curve point
+            with_pk(hex::encode(identity)),             // weak key
+            ReplicaReportKey {
+                key_id: "0000000000000000".to_string(), // key_id mismatch
+                ..valid.clone()
+            },
+        ];
+
+        let mut events = vec![runtime_event(
+            placement::consts::KEY_EVENT,
+            &hex_payload(&valid),
+        )];
+        for m in &malformed {
+            assert_eq!(parse_replica_report_key(&hex_payload(m)), None);
+            events.push(runtime_event(placement::consts::KEY_EVENT, &hex_payload(m)));
+        }
+        // A payload that is not valid hex parses to no key.
+        assert_eq!(parse_replica_report_key("zz"), None);
+
+        let rtmr3 = replay_rtmr3(&events);
+        let report = event_log_report(&events);
+        let result = verifier()
+            .verify_rtmr3_and_extract(&report, &rtmr3)
+            .unwrap();
+        assert_eq!(result.replica_report_key, Some(valid));
+    }
+
+    #[test]
     fn blank_report_key_claims_are_rejected() {
         let vk = test_signing_key(7).verifying_key();
         let valid = replica_report_key_payload(&vk, "boot-valid");

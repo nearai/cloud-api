@@ -194,6 +194,7 @@ pub struct AdminAppState {
     pub inference_provider_pool: Arc<services::inference_provider_pool::InferenceProviderPool>,
     pub github_dispatcher: Arc<dyn GitHubDispatcher>,
     pub infra_service: Arc<services::admin::InfraService>,
+    pub admin_settings_service: Arc<services::admin_settings::AdminSettingsService>,
 }
 
 /// Small helper for 400 responses from analytics query-param validation.
@@ -4206,6 +4207,157 @@ pub async fn get_infra_summary(
     debug!("Get platform infra summary request");
     let summary = app_state.infra_service.get_infra_summary().await;
     Ok(ResponseJson(summary))
+}
+
+/// An admin setting: its effective value (stored fields over the defaults).
+#[derive(Debug, serde::Serialize, utoipa::ToSchema)]
+pub struct AdminSettingResponse {
+    pub key: String,
+    /// The effective value. For `placement`: affinity_abs_slack (0.0 - 4.0),
+    /// affinity_eps (0.0 - 2.0), kv_max (0.5 - 1.0), lane_load_tokens
+    /// (4000 - 1000000) and pin_ttl_ms (60000 - 3600000).
+    #[schema(value_type = Object)]
+    pub value: serde_json::Value,
+    /// When it was last changed; absent until first changed.
+    pub updated_at: Option<DateTime<Utc>>,
+    /// The admin who last changed it.
+    pub updated_by_user_id: Option<Uuid>,
+}
+
+#[derive(Debug, serde::Serialize, utoipa::ToSchema)]
+pub struct ListAdminSettingsResponse {
+    pub settings: Vec<AdminSettingResponse>,
+}
+
+impl From<services::admin_settings::SettingView> for AdminSettingResponse {
+    fn from(v: services::admin_settings::SettingView) -> Self {
+        Self {
+            key: v.key.to_string(),
+            value: v.value,
+            updated_at: v.updated_at,
+            updated_by_user_id: v.updated_by_user_id,
+        }
+    }
+}
+
+fn admin_settings_error(
+    e: services::admin_settings::AdminSettingsError,
+) -> (StatusCode, ResponseJson<ErrorResponse>) {
+    use services::admin_settings::AdminSettingsError as E;
+    match e {
+        E::UnknownKey => not_found("Unknown setting", "not_found"),
+        E::Invalid(message) => bad_request(message, "invalid_request"),
+        E::Storage(_) => {
+            error!("Admin settings storage failed");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                ResponseJson(ErrorResponse::new(
+                    "Internal server error".to_string(),
+                    "internal_server_error".to_string(),
+                )),
+            )
+        }
+    }
+}
+
+/// List admin settings (Admin only)
+///
+/// Every known setting with its effective value: stored fields over the code defaults.
+#[utoipa::path(
+    get,
+    path = "/v1/admin/settings",
+    tag = "Admin",
+    responses(
+        (status = 200, description = "All settings", body = ListAdminSettingsResponse),
+        (status = 401, description = "Unauthorized", body = ErrorResponse),
+        (status = 500, description = "Internal server error", body = ErrorResponse)
+    ),
+    security(
+        ("session_token" = [])
+    )
+)]
+pub async fn list_admin_settings(
+    State(app_state): State<AdminAppState>,
+    Extension(_admin_user): Extension<AdminUser>,
+) -> Result<ResponseJson<ListAdminSettingsResponse>, (StatusCode, ResponseJson<ErrorResponse>)> {
+    let settings = app_state
+        .admin_settings_service
+        .get_all()
+        .await
+        .map_err(admin_settings_error)?;
+    Ok(ResponseJson(ListAdminSettingsResponse {
+        settings: settings.into_iter().map(Into::into).collect(),
+    }))
+}
+
+/// Get one admin setting (Admin only)
+#[utoipa::path(
+    get,
+    path = "/v1/admin/settings/{key}",
+    tag = "Admin",
+    params(
+        ("key" = String, Path, description = "Setting key, e.g. `placement`")
+    ),
+    responses(
+        (status = 200, description = "The setting", body = AdminSettingResponse),
+        (status = 401, description = "Unauthorized", body = ErrorResponse),
+        (status = 404, description = "Unknown setting", body = ErrorResponse),
+        (status = 500, description = "Internal server error", body = ErrorResponse)
+    ),
+    security(
+        ("session_token" = [])
+    )
+)]
+pub async fn get_admin_setting(
+    State(app_state): State<AdminAppState>,
+    Extension(_admin_user): Extension<AdminUser>,
+    Path(key): Path<String>,
+) -> Result<ResponseJson<AdminSettingResponse>, (StatusCode, ResponseJson<ErrorResponse>)> {
+    let setting = app_state
+        .admin_settings_service
+        .get(&key)
+        .await
+        .map_err(admin_settings_error)?;
+    Ok(ResponseJson(setting.into()))
+}
+
+/// Update one admin setting (Admin only)
+///
+/// Partial update: fields in the body are merged into the stored value, `null`
+/// resets a field to its default. The result is validated as a whole; an invalid
+/// value is rejected with 400 and nothing is stored. Takes effect immediately on the
+/// instance that handles it, and on the others within 10 minutes.
+#[utoipa::path(
+    patch,
+    path = "/v1/admin/settings/{key}",
+    tag = "Admin",
+    params(
+        ("key" = String, Path, description = "Setting key, e.g. `placement`")
+    ),
+    request_body(content = Object, description = "Fields to change; null resets a field"),
+    responses(
+        (status = 200, description = "The updated setting", body = AdminSettingResponse),
+        (status = 400, description = "Invalid value", body = ErrorResponse),
+        (status = 401, description = "Unauthorized", body = ErrorResponse),
+        (status = 404, description = "Unknown setting", body = ErrorResponse),
+        (status = 500, description = "Internal server error", body = ErrorResponse)
+    ),
+    security(
+        ("session_token" = [])
+    )
+)]
+pub async fn update_admin_setting(
+    State(app_state): State<AdminAppState>,
+    Extension(admin_user): Extension<AdminUser>,
+    Path(key): Path<String>,
+    ResponseJson(patch): ResponseJson<serde_json::Value>,
+) -> Result<ResponseJson<AdminSettingResponse>, (StatusCode, ResponseJson<ErrorResponse>)> {
+    let setting = app_state
+        .admin_settings_service
+        .update(&key, patch, admin_user.0.id)
+        .await
+        .map_err(admin_settings_error)?;
+    Ok(ResponseJson(setting.into()))
 }
 
 #[derive(Debug, serde::Deserialize)]

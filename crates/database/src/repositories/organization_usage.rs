@@ -16,6 +16,7 @@ use services::common::RepositoryError;
 use services::responses::models::ResponseId;
 use std::collections::HashMap;
 use std::time::Duration;
+use tokio_postgres::types::Type;
 use tokio_postgres::Row;
 use uuid::Uuid;
 
@@ -58,14 +59,15 @@ impl OrganizationUsageRepository {
                 .context("Failed to get database connection")
                 .map_err(RepositoryError::PoolError)?;
 
+            // One-shot typed query: one round trip, see repositories/mod.rs.
             client
-                .query_one(
+                .query_typed_one(
                     r#"
                     SELECT COALESCE(SUM(total_cost), 0)::BIGINT as total_spend
                     FROM organization_usage_log
                     WHERE api_key_id = $1
                     "#,
-                    &[&api_key_id],
+                    &[(&api_key_id, Type::UUID)],
                 )
                 .await
                 .map_err(map_db_error)
@@ -315,15 +317,16 @@ impl OrganizationUsageRepository {
                 .context("Failed to get database connection")
                 .map_err(RepositoryError::PoolError)?;
 
+            // One-shot typed query: one round trip, see repositories/mod.rs.
             client
-                .query_opt(
+                .query_typed_opt(
                     r#"
                     SELECT organization_id, total_spent, last_usage_at,
                            total_requests, total_tokens, updated_at
                     FROM organization_balance
                     WHERE organization_id = $1
                     "#,
-                    &[&organization_id],
+                    &[(&organization_id, Type::UUID)],
                 )
                 .await
                 .map_err(map_db_error)

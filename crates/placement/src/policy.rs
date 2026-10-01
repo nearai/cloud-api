@@ -154,7 +154,7 @@ pub fn lane_view(live: &[(&ReplicaView, u64)], survivors: &[&SlotId]) -> LaneVie
 /// gets it. The engine's own context limit is `Rule::Context`'s job, not the
 /// lane's.
 /// - Short: a member is avoided while any clean replica survives; with none
-///   clean, every survivor passes, so short requests are never refused.
+///   clean, every survivor passes, so the lane never empties a short request.
 pub fn lane_admits(
     tier: Tier,
     class: Class,
@@ -189,8 +189,6 @@ pub enum RoutePolicy {
     HeavyLaneJoin,
     /// Heavy, placed on a base replica that joins the lane.
     HeavyLaneAdmit,
-    /// Heavy, and the lane excluded every replica that survived stage 1.
-    Refuse,
 }
 
 impl RoutePolicy {
@@ -202,23 +200,18 @@ impl RoutePolicy {
             RoutePolicy::HeavyLong => "heavy_long",
             RoutePolicy::HeavyLaneJoin => "heavy_lane_join",
             RoutePolicy::HeavyLaneAdmit => "heavy_lane_admit",
-            RoutePolicy::Refuse => "refuse",
         }
     }
 }
 
-/// Pure label: no scoring, no candidates. `chosen` is `None` when nothing
-/// survived the rules.
-pub fn classify(tier: Tier, class: Class, lane: &LaneView, chosen: Option<&SlotId>) -> RoutePolicy {
-    match (class, tier, chosen) {
-        (Class::Heavy, _, None) => RoutePolicy::Refuse,
-        (Class::Heavy, Tier::Long, Some(_)) => RoutePolicy::HeavyLong,
-        (Class::Heavy, Tier::Base, Some(s)) if lane.members.contains(s) => {
-            RoutePolicy::HeavyLaneJoin
-        }
-        (Class::Heavy, Tier::Base, Some(_)) => RoutePolicy::HeavyLaneAdmit,
-        (Class::Short, _, _) if lane.any_clean => RoutePolicy::ShortClean,
-        (Class::Short, _, _) => RoutePolicy::ShortOverflow,
+/// Pure label for a placed decision: no scoring, no candidates.
+pub fn classify(tier: Tier, class: Class, lane: &LaneView, chosen: &SlotId) -> RoutePolicy {
+    match (class, tier) {
+        (Class::Heavy, Tier::Long) => RoutePolicy::HeavyLong,
+        (Class::Heavy, Tier::Base) if lane.members.contains(chosen) => RoutePolicy::HeavyLaneJoin,
+        (Class::Heavy, Tier::Base) => RoutePolicy::HeavyLaneAdmit,
+        (Class::Short, _) if lane.any_clean => RoutePolicy::ShortClean,
+        (Class::Short, _) => RoutePolicy::ShortOverflow,
     }
 }
 
@@ -490,40 +483,14 @@ mod tests {
         let no_clean = lane_of(&[LANE_LOAD_TOKENS, LANE_LOAD_TOKENS]);
         use RoutePolicy::*;
         let table = [
-            (Tier::Base, Class::Heavy, &lane, None, Refuse),
-            (Tier::Long, Class::Heavy, &lane, None, Refuse),
-            (Tier::Long, Class::Heavy, &lane, Some(&member), HeavyLong),
-            (Tier::Long, Class::Heavy, &lane, Some(&clean), HeavyLong),
-            (
-                Tier::Base,
-                Class::Heavy,
-                &lane,
-                Some(&member),
-                HeavyLaneJoin,
-            ),
-            (
-                Tier::Base,
-                Class::Heavy,
-                &lane,
-                Some(&clean),
-                HeavyLaneAdmit,
-            ),
-            (Tier::Base, Class::Short, &lane, Some(&clean), ShortClean),
-            (Tier::Long, Class::Short, &lane, Some(&clean), ShortClean),
-            (
-                Tier::Base,
-                Class::Short,
-                &no_clean,
-                Some(&member),
-                ShortOverflow,
-            ),
-            (
-                Tier::Long,
-                Class::Short,
-                &no_clean,
-                Some(&member),
-                ShortOverflow,
-            ),
+            (Tier::Long, Class::Heavy, &lane, &member, HeavyLong),
+            (Tier::Long, Class::Heavy, &lane, &clean, HeavyLong),
+            (Tier::Base, Class::Heavy, &lane, &member, HeavyLaneJoin),
+            (Tier::Base, Class::Heavy, &lane, &clean, HeavyLaneAdmit),
+            (Tier::Base, Class::Short, &lane, &clean, ShortClean),
+            (Tier::Long, Class::Short, &lane, &clean, ShortClean),
+            (Tier::Base, Class::Short, &no_clean, &member, ShortOverflow),
+            (Tier::Long, Class::Short, &no_clean, &member, ShortOverflow),
         ];
         for (tier, class, lane, chosen, want) in table {
             assert_eq!(
@@ -539,7 +506,6 @@ mod tests {
             HeavyLong,
             HeavyLaneJoin,
             HeavyLaneAdmit,
-            Refuse,
         ]
         .iter()
         .map(|p| p.as_str())
@@ -551,8 +517,7 @@ mod tests {
                 "short_overflow",
                 "heavy_long",
                 "heavy_lane_join",
-                "heavy_lane_admit",
-                "refuse"
+                "heavy_lane_admit"
             ]
         );
     }

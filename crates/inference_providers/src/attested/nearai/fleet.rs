@@ -885,6 +885,27 @@ impl Fleet {
                 .placer
                 .place(&input, &snapshot, &mine, &mut rand::rng());
             match decision {
+                // A busy/capped verdict is only as good as the picture it was
+                // made on: on a partial or stale picture it is demoted with the
+                // same precedence and tags a `Place` gets below.
+                Decision::Legacy {
+                    reason:
+                        LegacyReason::CapacityFull | LegacyReason::LaneFull | LegacyReason::LongFull,
+                    mut record,
+                } if incomplete || self.host_map_stale() => {
+                    // A host map built for another backend count is as
+                    // partial a picture as an incomplete one.
+                    demote(&mut record, LegacyReason::Incomplete);
+                    Err(record)
+                }
+                Decision::Legacy {
+                    reason:
+                        LegacyReason::CapacityFull | LegacyReason::LaneFull | LegacyReason::LongFull,
+                    mut record,
+                } if host_stale => {
+                    demote_as(&mut record, HOST_STALE_REASON);
+                    Err(record)
+                }
                 Decision::Legacy { record, .. } => Err(record),
                 Decision::Place { mut record, .. } if incomplete => {
                     demote(&mut record, LegacyReason::Incomplete);

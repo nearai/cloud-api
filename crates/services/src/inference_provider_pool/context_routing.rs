@@ -43,11 +43,12 @@
 //! request that context-400s on its pinned tier but has a strictly larger
 //! declared NEAR sibling still falls through to it, exactly as for
 //! priority >= 0 requests (see `mod.rs`'s `larger_ctx_sibling_exists` /
-//! `ctx_400_falls_through`). Such a 400 means the request was mis-sized (byte
-//! heuristic error) —
-//! not genuinely oversized — so it deserves the same self-heal as any other
-//! priority, never a hard client error for a request the other tier would
-//! have served.
+//! `ctx_400_falls_through`). Sizing is prompt-only (`max_tokens` is ignored),
+//! so such a 400 means either the prompt estimate was too low (byte heuristic
+//! error) or prompt plus the requested output exceeds the base tier. Neither
+//! is a genuinely oversized request when a larger tier exists, so it
+//! deserves the same self-heal as any other priority, never a hard client
+//! error for a request the other tier would have served.
 //!
 //! This module is the only owner of the prompt-size estimate and the tier
 //! boundary ([`base_capacity`]). Placement reads
@@ -156,23 +157,23 @@ pub(crate) fn base_capacity(caps: impl IntoIterator<Item = Option<u32>>) -> Opti
     distinct.first().copied()
 }
 
-/// Whether a context requirement exceeds the base tier ([`base_capacity`]):
+/// Whether a prompt estimate exceeds the base tier ([`base_capacity`]):
 /// the request's class for placement and the tier-refinement log. Never true
 /// for a single-tier model (the metric tag uses [`exceeds_declared_capacity`]).
-pub(crate) fn is_heavy(context_tokens: u64, caps: impl IntoIterator<Item = Option<u32>>) -> bool {
-    base_capacity(caps).is_some_and(|base| context_tokens > u64::from(base))
+pub(crate) fn is_heavy(prompt_tokens: u64, caps: impl IntoIterator<Item = Option<u32>>) -> bool {
+    base_capacity(caps).is_some_and(|base| prompt_tokens > u64::from(base))
 }
 
-/// Whether a context requirement exceeds at least one declared capacity. This
+/// Whether a prompt estimate exceeds at least one declared capacity. This
 /// is the `context_tier:long` metric tag's predicate: unlike [`is_heavy`] it
 /// also holds for an oversized request on a single-capacity model.
 pub(crate) fn exceeds_declared_capacity(
-    context_tokens: u64,
+    prompt_tokens: u64,
     caps: impl IntoIterator<Item = Option<u32>>,
 ) -> bool {
     caps.into_iter()
         .flatten()
-        .any(|cap| context_tokens > u64::from(cap))
+        .any(|cap| prompt_tokens > u64::from(cap))
 }
 
 /// The one size formula, shared by the pool's tier sort and placement:

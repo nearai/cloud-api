@@ -7567,8 +7567,9 @@ mod tests {
                 params
             }
 
-            /// Every replica full: the placer answers Legacy(`lane_full`)
-            /// and the request is served on the legacy path, never failed.
+            /// Every replica full on a complete, fresh picture: the placer
+            /// answers Legacy(`lane_full`), the reason stays `lane_full` (not
+            /// demoted), and the request is served on the legacy path.
             #[tokio::test]
             async fn lane_full_serves_legacy_with_reason_tag() {
                 let upstream = mock_upstream(None).await;
@@ -7581,6 +7582,8 @@ mod tests {
                 send_both(&h.provider, heavy_params()).await;
 
                 assert_eq!(h.metrics.decisions_tagged("reason:lane_full"), 2);
+                assert_eq!(h.metrics.decisions_tagged("reason:host_stale"), 0);
+                assert_eq!(h.metrics.decisions_tagged("reason:incomplete"), 0);
                 assert_eq!(h.metrics.decisions_tagged("outcome:legacy"), 2);
                 let requests = upstream.received_requests().await.unwrap();
                 assert_eq!(requests.len(), 2, "every legacy request is served");
@@ -7597,6 +7600,8 @@ mod tests {
                 let h = harness_on(upstream_provider(&upstream), &[("h-a", 2)], 4, snap);
                 send_both(&h.provider, heavy_params()).await;
 
+                assert_eq!(h.metrics.decisions_tagged("reason:host_stale"), 2);
+                assert_eq!(h.metrics.decisions_tagged("reason:lane_full"), 0);
                 assert_eq!(h.metrics.decisions_tagged("outcome:legacy"), 2);
                 assert_eq!(h.metrics.decisions_tagged("outcome:place"), 0);
                 let requests = upstream.received_requests().await.unwrap();
@@ -7632,6 +7637,8 @@ mod tests {
                     saturated_snapshot(fresh_ms()),
                 );
                 send_both(&partial.provider, heavy_params()).await;
+                assert_eq!(partial.metrics.decisions_tagged("reason:incomplete"), 2);
+                assert_eq!(partial.metrics.decisions_tagged("reason:lane_full"), 0);
                 assert_eq!(partial.metrics.decisions_tagged("outcome:legacy"), 2);
 
                 // A complete map pushed for 3 backends while the Fleet has 4.
@@ -7642,6 +7649,7 @@ mod tests {
                     saturated_snapshot(fresh_ms()),
                 );
                 send_both(&stale_count.provider, heavy_params()).await;
+                assert_eq!(stale_count.metrics.decisions_tagged("reason:incomplete"), 2);
                 assert_eq!(stale_count.metrics.decisions_tagged("outcome:legacy"), 2);
 
                 let requests = upstream.received_requests().await.unwrap();

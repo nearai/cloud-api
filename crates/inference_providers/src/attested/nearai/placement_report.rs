@@ -202,13 +202,21 @@ pub(super) fn size_tag(prompt_tokens: Option<u64>) -> &'static str {
 /// logged at debug;
 /// they would otherwise repeat on every such request while the shared state
 /// is down, unconfigured or the switch is on. The decision metric still
-/// counts each. `capacity_full`, `lane_full` and `long_full` log with the
-/// other legacy reasons, at info.
+/// counts each. So are `capacity_full`, `lane_full` and `long_full`: with the
+/// fleet busy they repeat on every request, and the metric is the signal.
 fn logs_at_debug(record: &DecisionRecord) -> bool {
     record.outcome == "legacy"
         && matches!(
             record.reason,
-            Some("no_state" | "stale" | "disabled" | "host_stale")
+            Some(
+                "no_state"
+                    | "stale"
+                    | "disabled"
+                    | "host_stale"
+                    | "capacity_full"
+                    | "lane_full"
+                    | "long_full"
+            )
         )
 }
 
@@ -364,6 +372,15 @@ mod tests {
         let mut record = no_state_record();
         record.reason = Some("host_stale");
         assert!(logs_at_debug(&record));
+    }
+
+    #[test]
+    fn busy_decisions_log_at_debug() {
+        let mut record = no_state_record();
+        for reason in ["capacity_full", "lane_full", "long_full"] {
+            record.reason = Some(reason);
+            assert!(logs_at_debug(&record), "{reason}");
+        }
     }
 
     #[test]
@@ -718,18 +735,21 @@ mod observability_tests {
     #[test]
     fn decision_log_levels() {
         let h = handles(Arc::new(FakeMetrics::default()));
-        for reason in ["no_state", "stale", "disabled", "host_stale"] {
-            let out = captured(|| report_decision(&h, &legacy(reason), &request(None)));
-            assert!(out.contains("DEBUG"), "{reason}: {out}");
-            assert!(!out.contains("INFO"), "{reason}: {out}");
-        }
-        for record in [
-            legacy("incomplete"),
-            placed("short_clean", "home"),
+        let debug_records = [
+            legacy("no_state"),
+            legacy("stale"),
+            legacy("disabled"),
+            legacy("host_stale"),
             capacity_legacy(Tier::Long, LegacyReason::LongFull),
             capacity_legacy(Tier::Base, LegacyReason::LaneFull),
             capacity_legacy(Tier::Base, LegacyReason::CapacityFull),
-        ] {
+        ];
+        for record in &debug_records {
+            let out = captured(|| report_decision(&h, record, &request(None)));
+            assert!(out.contains("DEBUG"), "{:?}: {out}", record.reason);
+            assert!(!out.contains("INFO"), "{:?}: {out}", record.reason);
+        }
+        for record in [legacy("incomplete"), placed("short_clean", "home")] {
             let out = captured(|| report_decision(&h, &record, &request(None)));
             assert!(out.contains("INFO"), "{out}");
         }

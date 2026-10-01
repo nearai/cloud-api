@@ -1003,6 +1003,10 @@ pub struct InferenceProviderPool {
     /// covered base-tier provider this pool creates, at startup and on later
     /// discovery refreshes alike. Unset: every provider stays legacy.
     placement: Arc<std::sync::OnceLock<PoolPlacement>>,
+    /// The live placement tuning every placer of this pool reads. Written by
+    /// `placement_settings::PlacementSettingsService`; the defaults until it
+    /// loads a stored setting, and for good when placement is off.
+    placement_tuning: Arc<arc_swap::ArcSwap<placement::Tuning>>,
     /// Providers explicitly registered as fallbacks, keyed by model id. This
     /// role is configuration metadata rather than an inference from whichever
     /// providers happen to be live, so it survives primary discovery failures
@@ -1375,8 +1379,16 @@ impl InferenceProviderPool {
             pinned_providers: Arc::new(std::sync::RwLock::new(HashMap::new())),
             metrics_service: Arc::new(std::sync::OnceLock::new()),
             placement: Arc::new(std::sync::OnceLock::new()),
+            placement_tuning: Arc::new(arc_swap::ArcSwap::from_pointee(
+                placement::Tuning::default(),
+            )),
             fallback_providers: Arc::new(std::sync::RwLock::new(HashMap::new())),
         }
+    }
+
+    /// The handle to the live placement tuning (see the field).
+    pub fn placement_tuning(&self) -> Arc<arc_swap::ArcSwap<placement::Tuning>> {
+        self.placement_tuning.clone()
     }
 
     /// Enable smart placement: `password` authenticates to the placement
@@ -1425,7 +1437,11 @@ impl InferenceProviderPool {
         Some(inference_providers::placement_io::PlacementHandles::start(
             install.password.clone(),
             &install.endpoint,
-            Arc::new(placement::decision::Placer::new(install.pin_secret, tier)),
+            Arc::new(placement::decision::Placer::with_tuning(
+                install.pin_secret,
+                tier,
+                self.placement_tuning.clone(),
+            )),
             metrics,
         ))
     }

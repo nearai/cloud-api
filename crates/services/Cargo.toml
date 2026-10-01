@@ -20,6 +20,7 @@ tokio = { version = "1", features = ["full"] }
 tracing = "0.1"
 inference_providers = { path = "../inference_providers" }
 placement = { path = "../placement" }
+arc-swap = "1.9.1"
 futures = "0.3"
 futures-util = "0.3"
 thiserror = "2.0"

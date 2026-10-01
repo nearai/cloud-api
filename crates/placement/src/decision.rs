@@ -25,8 +25,9 @@ use crate::snapshot::{ReplicaView, SlotId, Snapshot};
 /// [`crate::snapshot::ReplicaView`] against, plus the rest of what
 /// `Placer::place` needs to score and pick a slot.
 ///
-/// The token counts, `heavy` and `prefill_heavy` come from the pool's
+/// `prompt_tokens` and `prefill_heavy` come from the pool's
 /// `PlacementContext`; placement never estimates a request's size itself.
+/// Sizing is prompt-only: the output allowance influences nothing here.
 ///
 /// `affinity` holds an [`AffinityKey`], which has no `Debug`/`Display`, so
 /// `PlaceInput` implements `Debug` manually and redacts it (see the manual
@@ -34,20 +35,12 @@ use crate::snapshot::{ReplicaView, SlotId, Snapshot};
 #[derive(Clone)]
 pub struct PlaceInput {
     pub model: String,
-    /// Input tokens only (0 if unknown): prefill cost and lane load.
+    /// Input tokens: prefill cost and lane load, and the requirement
+    /// `Rule::Context` checks against each replica's engine
+    /// `max_context_tokens`.
     pub prompt_tokens: u64,
-    /// Input plus output reserve, checked against each replica's engine
-    /// `max_context_tokens` by `Rule::Context`. `None` if unknown.
-    pub context_tokens: Option<u64>,
-    /// The pool's tier class: `context_tokens` (prompt plus output reserve)
-    /// exceeds the base tier's capacity. The pool routes tiers on it; the
-    /// placer only records it (`DecisionRecord::heavy`).
-    pub heavy: bool,
-    /// The lane class: `prompt_tokens` alone exceeds the base tier's
-    /// capacity. Everything the lane decides follows this, not `heavy`:
-    /// lane admission, refusal, heavy-pin continuity and heavy pin writes. A
-    /// request heavy only through its output reserve (a 60K prompt with 64K
-    /// `max_tokens`) costs a short prefill, so it is Short for the lane.
+    /// The lane class: `prompt_tokens` exceeds the base tier's capacity.
+    /// Lane admission, heavy-pin continuity and heavy pin writes follow it.
     pub prefill_heavy: bool,
     /// `params.request_priority`.
     pub priority: i32,
@@ -63,8 +56,6 @@ impl std::fmt::Debug for PlaceInput {
         f.debug_struct("PlaceInput")
             .field("model", &self.model)
             .field("prompt_tokens", &self.prompt_tokens)
-            .field("context_tokens", &self.context_tokens)
-            .field("heavy", &self.heavy)
             .field("prefill_heavy", &self.prefill_heavy)
             .field("priority", &self.priority)
             .field("affinity", &self.affinity.is_some())
@@ -103,6 +94,19 @@ pub enum LegacyReason {
     NoState,
     Stale,
     NoneEligible,
+    /// Placement had state but every eligible replica was busy or capped; the
+    /// request is routed by legacy (load-blind) routing. No stage-1 survivor
+    /// and every live replica saturated (`rules::saturated`), for short and
+    /// heavy requests alike.
+    CapacityFull,
+    /// Placement had state but every eligible replica was busy or capped; the
+    /// request is routed by legacy (load-blind) routing. A heavy request on
+    /// base where the lane filter left no candidate.
+    LaneFull,
+    /// Placement had state but every eligible replica was busy or capped; the
+    /// request is routed by legacy (load-blind) routing. A heavy request on
+    /// long where the backlog cap left no candidate.
+    LongFull,
     /// Reserved for the caller: the chosen host isn't in its host map.
     HostUnmapped,
     /// Reserved for the caller: the chosen host's index is outside the
@@ -122,6 +126,9 @@ impl LegacyReason {
             LegacyReason::NoState => "no_state",
             LegacyReason::Stale => "stale",
             LegacyReason::NoneEligible => "none_eligible",
+            LegacyReason::CapacityFull => "capacity_full",
+            LegacyReason::LaneFull => "lane_full",
+            LegacyReason::LongFull => "long_full",
             LegacyReason::HostUnmapped => "host_unmapped",
             LegacyReason::KeyGroup => "key_group",
             LegacyReason::Incomplete => "incomplete",
@@ -132,19 +139,13 @@ impl LegacyReason {
 /// The outcome of a placement decision. Holds a `PinId` (no `Debug`), so
 /// this type intentionally does not derive `Debug`.
 ///
-/// `Legacy` means no usable state, so the caller falls back. `Refused`
-/// means there is state and no capacity for a prompt-heavy request
-/// (`PlaceInput::prefill_heavy`): the heavy lane
-/// excluded every stage-1 survivor, or every live replica reported itself
-/// full (`rules::saturated`). A short request is never refused.
+/// `Legacy` means the caller falls back to legacy routing: there is no usable
+/// state, or there is state but no capacity (see [`LegacyReason`]).
 pub enum Decision {
     Place {
         slot: SlotId,
         record: DecisionRecord,
         pin_write: Option<(PinId, SlotId)>,
-    },
-    Refused {
-        record: DecisionRecord,
     },
     Legacy {
         reason: LegacyReason,
@@ -156,17 +157,13 @@ impl Decision {
     /// The decision's record, whatever the outcome.
     pub fn record(&self) -> &DecisionRecord {
         match self {
-            Decision::Place { record, .. }
-            | Decision::Refused { record }
-            | Decision::Legacy { record, .. } => record,
+            Decision::Place { record, .. } | Decision::Legacy { record, .. } => record,
         }
     }
 
     fn record_mut(&mut self) -> &mut DecisionRecord {
         match self {
-            Decision::Place { record, .. }
-            | Decision::Refused { record }
-            | Decision::Legacy { record, .. } => record,
+            Decision::Place { record, .. } | Decision::Legacy { record, .. } => record,
         }
     }
 }
@@ -175,17 +172,14 @@ impl Decision {
 /// and numbers only). Must never carry `AffinityKey` or `PinId` bytes/hex.
 #[derive(Clone, Debug)]
 pub struct DecisionRecord {
-    /// `place`, `refused` or `legacy`.
+    /// `place` or `legacy`.
     pub outcome: &'static str,
-    /// The legacy reason, or for a refusal `lane_full`/`long_full` (the lane
-    /// excluded every survivor) or `capacity_full` (every live replica full).
+    /// The `LegacyReason::as_str`, for legacy decisions.
     pub reason: Option<&'static str>,
     pub tier: Tier,
     /// The lane class, from `PlaceInput::prefill_heavy`.
     pub class: Class,
-    /// The pool's tier class, `PlaceInput::heavy`.
-    pub heavy: bool,
-    /// `RoutePolicy::as_str`, for placed and refused decisions.
+    /// `RoutePolicy::as_str`, for placed decisions.
     pub strategy: Option<&'static str>,
     /// `PriorityBand::as_str`.
     pub priority_band: &'static str,
@@ -194,7 +188,6 @@ pub struct DecisionRecord {
     pub lane_size: u16,
     pub lane_cap: u16,
     pub prompt_tokens: u64,
-    pub context_tokens: Option<u64>,
     /// Time spent in `Placer::place`, in microseconds.
     pub place_us: u32,
     pub rank: Option<u8>,
@@ -230,13 +223,11 @@ impl DecisionRecord {
             reason: None,
             tier,
             class: Class::of(input.prefill_heavy),
-            heavy: input.heavy,
             strategy: None,
             priority_band: PriorityBand::of(input.priority).as_str(),
             lane_size: 0,
             lane_cap: 0,
             prompt_tokens: input.prompt_tokens,
-            context_tokens: input.context_tokens,
             place_us: 0,
             rank: None,
             affinity: input.affinity_source.as_str(),
@@ -324,10 +315,10 @@ impl Placer {
     /// the part of this node's own ledger that `snap.routed` cannot include
     /// yet (`mine`, per slot: [`crate::score::unseen_by_read`] of the slot's
     /// ledger against `snap.routed_read_ms`; see
-    /// [`crate::score::pending_for`]). `Legacy` when
-    /// the snapshot is disabled, empty, stale or has no stage-1
-    /// survivor; `Refused` only for a heavy request with no capacity (see
-    /// [`Decision`]); otherwise `Place`. The record's `place_us` times the whole call.
+    /// [`crate::score::pending_for`]). `Legacy` when the snapshot is
+    /// disabled, empty or stale, or when nothing survives the rules (see
+    /// [`LegacyReason`]); otherwise `Place`. The record's `place_us` times
+    /// the whole call.
     pub fn place(
         &self,
         input: &PlaceInput,
@@ -402,22 +393,17 @@ impl Placer {
         };
 
         // No stage-1 survivor is a state problem (stale, not ready, over
-        // context, no load counts), so fall back, except when every live
-        // replica reported itself full: that is the same capacity answer as a
-        // full lane, and a heavy request is refused either way.
+        // context, no load counts), so `NoneEligible`, except when every live
+        // replica reported itself full: that is a capacity answer, for short
+        // and heavy requests alike. Either way the caller falls back.
         if candidates.is_empty() {
             let all_full = !live.is_empty() && live.iter().all(|(v, _)| saturated(v));
-            return match class {
-                Class::Heavy if all_full => {
-                    self.refused(input, snap, &lane, class, "capacity_full", tally.record())
-                }
-                _ => self.legacy(
-                    input,
-                    snap,
-                    LegacyReason::NoneEligible,
-                    Some(tally.record()),
-                ),
+            let reason = if all_full {
+                LegacyReason::CapacityFull
+            } else {
+                LegacyReason::NoneEligible
             };
+            return self.legacy_in_lane(input, snap, &lane, reason, tally.record());
         }
 
         candidates.retain(|c| {
@@ -441,17 +427,12 @@ impl Placer {
             // Only the lane excluded the survivors. `lane_admits` always
             // admits a short request when anything survived stage 1, so this
             // is heavy in practice; a short request would still fall back.
-            return match class {
-                Class::Heavy => {
-                    self.refused(input, snap, &lane, class, self.lane_full(), tally.record())
-                }
-                Class::Short => self.legacy(
-                    input,
-                    snap,
-                    LegacyReason::NoneEligible,
-                    Some(tally.record()),
-                ),
+            let reason = match (class, self.tier) {
+                (Class::Heavy, Tier::Long) => LegacyReason::LongFull,
+                (Class::Heavy, Tier::Base) => LegacyReason::LaneFull,
+                (Class::Short, _) => LegacyReason::NoneEligible,
             };
+            return self.legacy_in_lane(input, snap, &lane, reason, tally.record());
         }
 
         // The snapshot's replica order is the reader's; `select`'s keyless
@@ -560,13 +541,11 @@ impl Placer {
             reason: None,
             tier: self.tier,
             class,
-            heavy: input.heavy,
-            strategy: Some(classify(self.tier, class, &lane, Some(&selected.slot)).as_str()),
+            strategy: Some(classify(self.tier, class, &lane, &selected.slot).as_str()),
             priority_band: PriorityBand::of(input.priority).as_str(),
             lane_size: u16::try_from(lane.size).unwrap_or(u16::MAX),
             lane_cap: u16::try_from(lane.cap).unwrap_or(u16::MAX),
             prompt_tokens: input.prompt_tokens,
-            context_tokens: input.context_tokens,
             place_us: 0,
             rank,
             affinity: input.affinity_source.as_str(),
@@ -611,34 +590,21 @@ impl Placer {
         Decision::Legacy { reason, record }
     }
 
-    /// Builds a `Decision::Refused` with `reason`: see
-    /// [`DecisionRecord::reason`] and [`Self::lane_full`].
-    fn refused(
+    /// A `Decision::Legacy` that also carries the lane's size and cap, for a
+    /// fall-back decided after the lane was built.
+    fn legacy_in_lane(
         &self,
         input: &PlaceInput,
         snap: &Snapshot,
         lane: &LaneView,
-        class: Class,
-        reason: &'static str,
+        reason: LegacyReason,
         excluded: [(Rule, u16); 5],
     ) -> Decision {
-        let mut record = DecisionRecord::empty(input, snap, self.tier, "refused");
-        record.reason = Some(reason);
-        record.strategy = Some(classify(self.tier, class, lane, None).as_str());
+        let mut decision = self.legacy(input, snap, reason, Some(excluded));
+        let record = decision.record_mut();
         record.lane_size = u16::try_from(lane.size).unwrap_or(u16::MAX);
         record.lane_cap = u16::try_from(lane.cap).unwrap_or(u16::MAX);
-        record.excluded = excluded;
-        Decision::Refused { record }
-    }
-
-    /// The refusal reason when the lane excluded every survivor: `long_full`
-    /// on the long tier (every survivor over `LONG_BACKLOG_CAP`), `lane_full`
-    /// on base.
-    const fn lane_full(&self) -> &'static str {
-        match self.tier {
-            Tier::Long => "long_full",
-            Tier::Base => "lane_full",
-        }
+        decision
     }
 }
 
@@ -689,7 +655,6 @@ mod tests {
                 pin_write,
             } => (slot, record, pin_write),
             Decision::Legacy { reason, .. } => panic!("expected Place, got Legacy({reason:?})"),
-            Decision::Refused { .. } => panic!("expected Place, got Refused"),
         }
     }
 
@@ -697,7 +662,6 @@ mod tests {
         match d {
             Decision::Legacy { reason, record } => (reason, record),
             Decision::Place { .. } => panic!("expected Legacy, got Place"),
-            Decision::Refused { .. } => panic!("expected Legacy, got Refused"),
         }
     }
 
@@ -722,6 +686,13 @@ mod tests {
         assert_eq!(LegacyReason::KeyGroup.as_str(), "key_group");
         assert_eq!(LegacyReason::Incomplete.as_str(), "incomplete");
         assert_eq!(LegacyReason::Disabled.as_str(), "disabled");
+    }
+
+    #[test]
+    fn busy_or_capped_legacy_reasons_have_stable_names() {
+        assert_eq!(LegacyReason::CapacityFull.as_str(), "capacity_full");
+        assert_eq!(LegacyReason::LaneFull.as_str(), "lane_full");
+        assert_eq!(LegacyReason::LongFull.as_str(), "long_full");
     }
 
     #[test]
@@ -810,7 +781,7 @@ mod tests {
         big.state.limits.max_context_tokens = Some(1_000_000);
         let snap = snap_with(vec![small, big]);
         let mut input = base_input();
-        input.context_tokens = Some(150_000);
+        input.prompt_tokens = 150_000;
         for seed in 0..8 {
             let mut rng = StdRng::seed_from_u64(seed);
             let (slot_, record, _) =
@@ -1150,23 +1121,11 @@ mod tests {
 
     // --- Heavy lane (Rule::Lane) and the route policy label ---
 
-    /// A prompt-heavy request: heavy for the tier and for the lane.
+    /// A prompt-heavy request.
     fn heavy(prompt_tokens: u64) -> PlaceInput {
         let mut input = base_input();
-        input.heavy = true;
         input.prefill_heavy = true;
         input.prompt_tokens = prompt_tokens;
-        input
-    }
-
-    /// Heavy for the tier only because of its output reserve: a 60K prompt
-    /// with 64K `max_tokens`.
-    fn max_tokens_heavy() -> PlaceInput {
-        let mut input = base_input();
-        input.heavy = true;
-        input.prefill_heavy = false;
-        input.prompt_tokens = 60_000;
-        input.context_tokens = Some(124_000);
         input
     }
 
@@ -1183,12 +1142,14 @@ mod tests {
             .collect()
     }
 
-    fn refused_record(d: Decision) -> DecisionRecord {
-        match d {
-            Decision::Refused { record } => record,
-            Decision::Place { record, .. } => panic!("expected Refused, placed {:?}", record.slot),
-            Decision::Legacy { reason, .. } => panic!("expected Refused, got Legacy({reason:?})"),
-        }
+    /// The record of a `Legacy` decision that must carry `want`.
+    fn legacy_record(d: Decision, want: LegacyReason) -> DecisionRecord {
+        let (reason, record) = legacy_reason(d);
+        assert_eq!(reason, want);
+        assert_eq!(record.outcome, "legacy");
+        assert_eq!(record.reason, Some(want.as_str()));
+        assert_eq!(record.strategy, None);
+        record
     }
 
     #[test]
@@ -1206,17 +1167,16 @@ mod tests {
                     p.tok += prompt;
                     strategies.push(record.strategy.unwrap());
                 }
-                Decision::Refused { record } => {
+                Decision::Legacy { reason, record } => {
+                    assert_eq!(reason, LegacyReason::LaneFull);
                     assert_eq!(record.excluded[4], (Rule::Lane, 8));
-                    assert_eq!(record.reason, Some("lane_full"));
                     assert_eq!((record.lane_size, record.lane_cap), (2, 2));
-                    strategies.push(record.strategy.unwrap());
+                    strategies.push(reason.as_str());
                 }
-                Decision::Legacy { reason, .. } => panic!("unexpected Legacy({reason:?})"),
             }
         }
         // Two new members, each joined once more until the next prompt would
-        // take it over HEAVY_BACKLOG_CAP (3 x 120K > 300K), then refusals.
+        // take it over HEAVY_BACKLOG_CAP (3 x 120K > 300K), then legacy.
         assert_eq!(
             strategies,
             [
@@ -1224,10 +1184,10 @@ mod tests {
                 "heavy_lane_admit",
                 "heavy_lane_join",
                 "heavy_lane_join",
-                "refuse",
-                "refuse",
-                "refuse",
-                "refuse"
+                "lane_full",
+                "lane_full",
+                "lane_full",
+                "lane_full"
             ]
         );
         let members: Vec<&SlotId> = mine
@@ -1297,18 +1257,18 @@ mod tests {
     }
 
     #[test]
-    fn long_tier_refuses_heavy_when_all_over_cap() {
+    fn long_tier_falls_back_for_heavy_when_all_over_cap() {
         let long = Placer::new([1u8; 32], Tier::Long);
         let snap = snap_with(vec![
             with_backlog("long01", 0, 550_000),
             with_backlog("long01", 1, 550_000),
         ]);
         let mut rng = StdRng::seed_from_u64(1);
-        let record = refused_record(long.place(&heavy(100_000), &snap, &HashMap::new(), &mut rng));
-        assert_eq!(record.outcome, "refused");
-        assert_eq!(record.strategy, Some("refuse"));
+        let record = legacy_record(
+            long.place(&heavy(100_000), &snap, &HashMap::new(), &mut rng),
+            LegacyReason::LongFull,
+        );
         assert_eq!(record.excluded[4], (Rule::Lane, 2));
-        assert_eq!(record.reason, Some("long_full"));
 
         // One replica with room: placed there, and the long tier ignores
         // the base lane cap (both are "members").
@@ -1323,12 +1283,12 @@ mod tests {
     }
 
     #[test]
-    fn long_tier_third_oversized_prompt_in_burst_is_refused() {
+    fn long_tier_third_oversized_prompt_in_burst_falls_back() {
         // Two idle long replicas and three 310K prompts in a burst, each
         // placement recorded in this node's ledger before the next. The long
         // tier has no lane cap, only LONG_BACKLOG_CAP (600K): the first lands
         // on an idle replica, the second can't join it (620K > 600K) and takes
-        // the other, and the third fits neither, so it is refused.
+        // the other, and the third fits neither, so it falls back to legacy.
         let long = Placer::new([1u8; 32], Tier::Long);
         let snap = snap_with(vec![ready_view("long01", 0), ready_view("long01", 1)]);
         let prompt = 310_000;
@@ -1347,14 +1307,15 @@ mod tests {
         assert_ne!(chosen[0], chosen[1], "one prompt per replica");
 
         let mut rng = StdRng::seed_from_u64(2);
-        let record = refused_record(long.place(&heavy(prompt), &snap, &mine, &mut rng));
-        assert_eq!(record.reason, Some("long_full"));
-        assert_eq!(record.strategy, Some("refuse"));
+        let record = legacy_record(
+            long.place(&heavy(prompt), &snap, &mine, &mut rng),
+            LegacyReason::LongFull,
+        );
         assert_eq!(record.excluded[4], (Rule::Lane, 2));
     }
 
     #[test]
-    fn heavy_with_all_replicas_stale_is_legacy_not_refused() {
+    fn heavy_with_all_replicas_stale_is_none_eligible() {
         let views = eight_slots()
             .into_iter()
             .map(|mut v| {
@@ -1372,96 +1333,65 @@ mod tests {
     }
 
     #[test]
-    fn heavy_with_all_replicas_kv_full_is_refused_not_legacy() {
-        // Every live replica is out of capacity: one KV-full, one at the
-        // queue bound (2 x max_running in flight). That is the same capacity
-        // answer as a full lane, so a heavy request is refused, not sent to
-        // legacy routing (which would queue it on the same replicas).
+    fn all_replicas_kv_full_is_capacity_full_for_any_class() {
+        // Every live replica is out of capacity (KV at the bound), so there is
+        // no survivor and the answer is `capacity_full` for a short request
+        // as much as a heavy one: legacy routing, with the reason named.
         let mut kv_full = ready_view("gpu01", 0);
         kv_full.state.load.kv_usage = Some(crate::consts::KV_MAX);
-        let mut queue_full = ready_view("gpu01", 1);
-        queue_full.state.limits.max_running = Some(4);
-        queue_full.state.load.running = Some(8);
+        let mut kv_over = ready_view("gpu01", 1);
+        kv_over.state.load.kv_usage = Some(0.99);
         let mut draining = ready_view("gpu02", 0);
         draining.state.lifecycle_state = crate::frame::Lifecycle::Draining;
-        let snap = snap_with(vec![kv_full.clone(), queue_full, draining]);
+        let snap = snap_with(vec![kv_full.clone(), kv_over, draining]);
         for tier in [Tier::Base, Tier::Long] {
             let mut rng = StdRng::seed_from_u64(1);
             let p = Placer::new([1u8; 32], tier);
-            let record = refused_record(p.place(&heavy(100_000), &snap, &HashMap::new(), &mut rng));
-            assert_eq!(record.outcome, "refused");
-            assert_eq!(record.strategy, Some("refuse"));
-            assert_eq!(record.reason, Some("capacity_full"));
-            assert_eq!(record.excluded[0], (Rule::Lifecycle, 1));
-            assert_eq!(record.excluded[2], (Rule::Capacity, 2));
-            assert_eq!(record.excluded[4], (Rule::Lane, 0));
-
-            // A short request never refuses: it falls back.
-            let (reason, _) =
-                legacy_reason(p.place(&base_input(), &snap, &HashMap::new(), &mut rng));
-            assert_eq!(reason, LegacyReason::NoneEligible);
+            for input in [heavy(100_000), base_input()] {
+                let record = legacy_record(
+                    p.place(&input, &snap, &HashMap::new(), &mut rng),
+                    LegacyReason::CapacityFull,
+                );
+                assert_eq!(record.excluded[0], (Rule::Lifecycle, 1));
+                assert_eq!(record.excluded[2], (Rule::Capacity, 2));
+                assert_eq!(record.excluded[4], (Rule::Lane, 0));
+            }
         }
 
+        // Deep queues with low KV are not saturation: the replica survives.
+        let mut queued = ready_view("gpu01", 1);
+        queued.state.limits.max_running = Some(4);
+        queued.state.load.running = Some(8);
+        queued.state.load.queued = Some(8);
+        let snap = snap_with(vec![kv_full.clone(), queued]);
         let mut rng = StdRng::seed_from_u64(1);
-        // A live replica with no load counts at all is a state problem, not a
-        // full one: still legacy.
+        let (chosen, _, _) =
+            placed(placer().place(&base_input(), &snap, &HashMap::new(), &mut rng));
+        assert_eq!(chosen, slot("gpu01", 1));
+
+        let mut rng = StdRng::seed_from_u64(1);
+        // A live replica missing load counts is a state problem, not a full
+        // one: `none_eligible`, for a missing backlog as much as missing
+        // running/queued.
         let mut countless = ready_view("gpu02", 1);
         countless.state.load.running = None;
         countless.state.load.queued = None;
-        let snap = snap_with(vec![kv_full.clone(), countless]);
-        let (reason, _) =
-            legacy_reason(placer().place(&heavy(100_000), &snap, &HashMap::new(), &mut rng));
-        assert_eq!(reason, LegacyReason::NoneEligible);
+        countless.state.load.prefill_backlog_tokens = None;
+        let mut no_backlog = ready_view("gpu02", 1);
+        no_backlog.state.load.prefill_backlog_tokens = None;
+        for missing in [countless, no_backlog] {
+            let snap = snap_with(vec![kv_full.clone(), missing]);
+            let (reason, _) =
+                legacy_reason(placer().place(&heavy(100_000), &snap, &HashMap::new(), &mut rng));
+            assert_eq!(reason, LegacyReason::NoneEligible);
+        }
 
         // So is a live replica the request does not fit (Context).
         let mut small = ready_view("gpu02", 1);
         small.state.limits.max_context_tokens = Some(64_000);
-        let mut input = heavy(100_000);
-        input.context_tokens = Some(120_000);
         let snap = snap_with(vec![kv_full, small]);
-        let (reason, _) = legacy_reason(placer().place(&input, &snap, &HashMap::new(), &mut rng));
-        assert_eq!(reason, LegacyReason::NoneEligible);
-    }
-
-    #[test]
-    fn max_tokens_only_heavy_is_never_refused() {
-        // Heavy for the tier (the pool's call) but not for prefill: the lane
-        // treats it as short, so it is never refused and avoids members.
-        let input = max_tokens_heavy();
-        let mut rng = StdRng::seed_from_u64(1);
-
-        // Every replica a member at the backlog cap: overflow, not refusal.
-        for tier in [Tier::Base, Tier::Long] {
-            let p = Placer::new([1u8; 32], tier);
-            let (_, record, _) =
-                placed(p.place(&input, &saturated_base(), &HashMap::new(), &mut rng));
-            assert_eq!(record.strategy, Some("short_overflow"));
-            assert_eq!(record.class, Class::Short);
-            assert!(record.heavy, "the record keeps the tier class");
-        }
-
-        // With a clean replica, it avoids the lane member like a short one.
-        let snap = snap_with(vec![
-            with_backlog("gpu01", 0, 200_000),
-            ready_view("gpu01", 1),
-        ]);
-        for seed in 0..16 {
-            let mut rng = StdRng::seed_from_u64(seed);
-            let (chosen, record, _) =
-                placed(placer().place(&input, &snap, &HashMap::new(), &mut rng));
-            assert_eq!(chosen, slot("gpu01", 1), "seed {seed}");
-            assert_eq!(record.strategy, Some("short_clean"));
-        }
-
-        // Every live replica full: legacy, not refused.
-        let mut kv_full = ready_view("gpu01", 0);
-        kv_full.state.load.kv_usage = Some(0.99);
-        let (reason, _) = legacy_reason(placer().place(
-            &input,
-            &snap_with(vec![kv_full]),
-            &HashMap::new(),
-            &mut rng,
-        ));
+        let (reason, _) =
+            legacy_reason(placer().place(&heavy(100_000), &snap, &HashMap::new(), &mut rng));
         assert_eq!(reason, LegacyReason::NoneEligible);
     }
 
@@ -1473,13 +1403,14 @@ mod tests {
             placed(placer().place(&input, &snap_with(eight_slots()), &HashMap::new(), &mut rng));
         assert_eq!(record.strategy, Some("heavy_lane_admit"));
         assert_eq!(record.class, Class::Heavy);
-        let record =
-            refused_record(placer().place(&input, &saturated_base(), &HashMap::new(), &mut rng));
-        assert_eq!(record.reason, Some("lane_full"));
+        legacy_record(
+            placer().place(&input, &saturated_base(), &HashMap::new(), &mut rng),
+            LegacyReason::LaneFull,
+        );
     }
 
     #[test]
-    fn heavy_with_no_views_is_legacy_not_refused() {
+    fn heavy_with_no_views_is_no_state() {
         let mut rng = StdRng::seed_from_u64(1);
         for tier in [Tier::Base, Tier::Long] {
             let p = Placer::new([1u8; 32], tier);
@@ -1494,7 +1425,7 @@ mod tests {
     }
 
     #[test]
-    fn short_request_on_long_tier_is_never_refused() {
+    fn short_request_on_long_tier_overflows_not_legacy() {
         let long = Placer::new([1u8; 32], Tier::Long);
         let snap = snap_with(vec![
             with_backlog("long01", 0, 10_000_000),
@@ -1533,7 +1464,6 @@ mod tests {
         let secret = [8u8; 32];
         let (snap, key, pinned) = pinned_member_with_room(secret, 100_000);
         let mut input = keyed(key);
-        input.heavy = true;
         input.prefill_heavy = true;
         input.prompt_tokens = 100_000;
         let mut rng = StdRng::seed_from_u64(1);
@@ -1606,8 +1536,6 @@ mod tests {
         let key = find_key_with_home(&slots, &home);
         let snap = snap_with(eight_slots());
         let mut input = keyed(key.clone());
-        input.heavy = true;
-        input.prefill_heavy = true;
         input.prefill_heavy = true;
         input.prompt_tokens = 150_000;
         let mut rng = StdRng::seed_from_u64(1);
@@ -1654,8 +1582,7 @@ mod tests {
             with_backlog("long01", 0, 100_000),
             ready_view("long01", 1),
         ]);
-        let mut input = heavy(LONG_BACKLOG_CAP + 100_000);
-        input.context_tokens = Some(LONG_BACKLOG_CAP + 120_000);
+        let input = heavy(LONG_BACKLOG_CAP + 100_000);
         let mut rng = StdRng::seed_from_u64(1);
         let (chosen, record, _) = placed(long.place(&input, &snap, &HashMap::new(), &mut rng));
         assert_eq!(chosen, slot("long01", 1));
@@ -1677,8 +1604,10 @@ mod tests {
             ready_view("gpu02", 1),
         ]);
         let mut rng = StdRng::seed_from_u64(1);
-        let record =
-            refused_record(placer().place(&heavy(100_000), &snap, &HashMap::new(), &mut rng));
+        let record = legacy_record(
+            placer().place(&heavy(100_000), &snap, &HashMap::new(), &mut rng),
+            LegacyReason::LaneFull,
+        );
         assert_eq!((record.lane_size, record.lane_cap), (1, 1));
         assert_eq!(record.excluded[2], (Rule::Capacity, 1));
         assert_eq!(record.excluded[4], (Rule::Lane, 3));
@@ -1706,10 +1635,10 @@ mod tests {
     }
 
     #[test]
-    fn missing_backlog_counts_conservatively_in_lane() {
-        // No reported backlog, 40 queued: the score reads that as 80K tokens
-        // (`queued * QUEUED_TOKENS_ESTIMATE`), so the lane must too. It makes
-        // gpu01#0 a member, and short requests avoid it.
+    fn missing_backlog_is_excluded_not_estimated() {
+        // No reported backlog, 40 queued: the replica is dropped by
+        // `Rule::Capacity` (missing evidence), never scored or admitted on an
+        // estimate, and it counts as no lane member (zero load).
         let mut unknown = ready_view("gpu01", 0);
         unknown.state.load.queued = Some(40);
         unknown.state.load.prefill_backlog_tokens = None;
@@ -1724,26 +1653,28 @@ mod tests {
             let (chosen, record, _) =
                 placed(placer().place(&base_input(), &snap, &HashMap::new(), &mut rng));
             assert_ne!(chosen, slot("gpu01", 0), "seed {seed}");
-            assert_eq!(record.lane_size, 1);
-            assert_eq!(record.excluded[4], (Rule::Lane, 1));
+            assert_eq!(record.lane_size, 0);
+            assert_eq!(record.excluded[2], (Rule::Capacity, 1));
         }
 
-        // On the long tier the same estimate counts toward the backlog cap:
-        // 150 queued is ~300K, so a 310K prompt no longer fits under 600K.
+        // Alone on the long tier it leaves nothing to place on.
         let long = Placer::new([1u8; 32], Tier::Long);
         unknown.slot = slot("long01", 0);
-        unknown.state.load.queued = Some(150);
         let snap = snap_with(vec![unknown]);
         let mut rng = StdRng::seed_from_u64(1);
-        let record = refused_record(long.place(&heavy(310_000), &snap, &HashMap::new(), &mut rng));
-        assert_eq!(record.excluded[4], (Rule::Lane, 1));
+        let record = legacy_record(
+            long.place(&heavy(310_000), &snap, &HashMap::new(), &mut rng),
+            LegacyReason::NoneEligible,
+        );
+        assert_eq!(record.excluded[2], (Rule::Capacity, 1));
     }
 
     #[test]
     fn idle_waiver_requires_known_load() {
         // A prompt over LONG_BACKLOG_CAP is admitted only on a replica whose
         // load is known to be zero: running, queued and backlog all reported
-        // as 0. Missing any of them is not evidence of idleness.
+        // as 0. Missing any of them is not evidence of idleness, and
+        // `Rule::Capacity` drops such a replica before the lane sees it.
         let long = Placer::new([1u8; 32], Tier::Long);
         let mut known = ready_view("long01", 0);
         known.state.load.prefill_backlog_tokens = Some(0);
@@ -1760,13 +1691,19 @@ mod tests {
             let (chosen, record, _) =
                 placed(long.place(&heavy(prompt), &snap, &HashMap::new(), &mut rng));
             assert_eq!(chosen, slot("long01", 0), "seed {seed}");
-            assert_eq!(record.excluded[4], (Rule::Lane, 2));
+            assert_eq!(record.excluded[2], (Rule::Capacity, 2));
         }
 
-        let snap = snap_with(vec![no_backlog, no_running]);
+        // A known replica with any load is over the cap with this prompt.
+        let busy = with_backlog("long01", 3, 1);
+        let snap = snap_with(vec![busy, no_backlog, no_running]);
         let mut rng = StdRng::seed_from_u64(1);
-        let record = refused_record(long.place(&heavy(prompt), &snap, &HashMap::new(), &mut rng));
-        assert_eq!(record.excluded[4], (Rule::Lane, 2));
+        let record = legacy_record(
+            long.place(&heavy(prompt), &snap, &HashMap::new(), &mut rng),
+            LegacyReason::LongFull,
+        );
+        assert_eq!(record.excluded[2], (Rule::Capacity, 2));
+        assert_eq!(record.excluded[4], (Rule::Lane, 1));
     }
 
     /// Two long-tier replicas, `long01#0` pinned for the returned key with
@@ -1792,7 +1729,6 @@ mod tests {
 
     fn keyed_heavy(key: AffinityKey, prompt_tokens: u64) -> PlaceInput {
         let mut input = keyed(key);
-        input.heavy = true;
         input.prefill_heavy = true;
         input.prompt_tokens = prompt_tokens;
         input
@@ -1875,17 +1811,18 @@ mod tests {
     fn oversized_heavy_never_admitted_on_base() {
         // Base engines accept 1M context, but a prompt over
         // HEAVY_BASE_MAX_PROMPT is long-tier work: on an idle base Fleet with
-        // lane room it is still refused (the caller turns that into legacy
-        // while refusals are opt-in).
+        // lane room it finds no candidate and falls back to legacy.
         let snap = snap_with(eight_slots());
         let mut rng = StdRng::seed_from_u64(1);
-        let record = refused_record(placer().place(
-            &heavy(HEAVY_BASE_MAX_PROMPT + 1),
-            &snap,
-            &HashMap::new(),
-            &mut rng,
-        ));
-        assert_eq!(record.reason, Some("lane_full"));
+        let record = legacy_record(
+            placer().place(
+                &heavy(HEAVY_BASE_MAX_PROMPT + 1),
+                &snap,
+                &HashMap::new(),
+                &mut rng,
+            ),
+            LegacyReason::LaneFull,
+        );
         assert_eq!(record.excluded[4], (Rule::Lane, 8));
         assert_eq!((record.lane_size, record.lane_cap), (0, 2));
 
@@ -1916,7 +1853,6 @@ mod tests {
         let secret = [8u8; 32];
         let (snap, key, pinned) = pinned_member_with_room(secret, HEAVY_BACKLOG_CAP - 50_000);
         let mut input = keyed(key);
-        input.heavy = true;
         input.prefill_heavy = true;
         input.prompt_tokens = 100_000;
         let mut rng = StdRng::seed_from_u64(1);
@@ -1951,7 +1887,6 @@ mod tests {
         );
 
         let mut input = keyed(key);
-        input.heavy = true;
         input.prefill_heavy = true;
         input.prompt_tokens = 100_000;
         let mut rng = StdRng::seed_from_u64(1);
@@ -1962,10 +1897,10 @@ mod tests {
         assert_eq!(record.strategy, Some("heavy_lane_admit"));
     }
 
-    // --- Refused, tier-keyed pins and record fields ---
+    // --- Capacity fall-backs, tier-keyed pins and record fields ---
 
     /// A heavy request on a saturated 4-slot base Fleet: every replica is a
-    /// member at the backlog cap, so a usable snapshot refuses it.
+    /// member at the backlog cap, so a usable snapshot falls it back to legacy.
     fn saturated_base() -> Snapshot {
         snap_with(
             (0..4)
@@ -1975,29 +1910,28 @@ mod tests {
     }
 
     #[test]
-    fn refused_record_names_tier_class_and_lane() {
+    fn lane_full_record_names_tier_class_and_lane() {
         let mut input = heavy(100_000);
-        input.context_tokens = Some(120_000);
         input.priority = -1;
         let mut rng = StdRng::seed_from_u64(1);
-        let record =
-            refused_record(placer().place(&input, &saturated_base(), &HashMap::new(), &mut rng));
-        assert_eq!(record.outcome, "refused");
-        assert_eq!(record.reason, Some("lane_full"));
-        assert_eq!(record.strategy, Some("refuse"));
+        let record = legacy_record(
+            placer().place(&input, &saturated_base(), &HashMap::new(), &mut rng),
+            LegacyReason::LaneFull,
+        );
         assert_eq!(record.tier, Tier::Base);
         assert_eq!(record.class, Class::Heavy);
         assert_eq!(record.priority_band, "neg");
         assert_eq!((record.lane_size, record.lane_cap), (4, 1));
         assert_eq!(record.prompt_tokens, 100_000);
-        assert_eq!(record.context_tokens, Some(120_000));
         assert_eq!(record.eligible, 0);
         assert_eq!(record.slot, None);
 
         let long = Placer::new([1u8; 32], Tier::Long);
         let snap = snap_with(vec![with_backlog("long01", 0, LONG_BACKLOG_CAP)]);
-        let record = refused_record(long.place(&input, &snap, &HashMap::new(), &mut rng));
-        assert_eq!(record.reason, Some("long_full"));
+        let record = legacy_record(
+            long.place(&input, &snap, &HashMap::new(), &mut rng),
+            LegacyReason::LongFull,
+        );
         assert_eq!(record.tier, Tier::Long);
     }
 
@@ -2005,7 +1939,6 @@ mod tests {
     fn placed_record_carries_request_numbers() {
         let mut input = base_input();
         input.prompt_tokens = 4_000;
-        input.context_tokens = Some(12_000);
         input.priority = 3;
         let snap = snap_with(eight_slots());
         let mut rng = StdRng::seed_from_u64(1);
@@ -2016,11 +1949,10 @@ mod tests {
         assert_eq!(record.priority_band, "high");
         assert_eq!((record.lane_size, record.lane_cap), (0, 2));
         assert_eq!(record.prompt_tokens, 4_000);
-        assert_eq!(record.context_tokens, Some(12_000));
     }
 
     #[test]
-    fn refused_never_without_state() {
+    fn state_less_snapshots_are_never_capacity_fallbacks() {
         let stale = || {
             let mut s = saturated_base();
             s.built_ms = NOW - FRESH_MAX_MS - 1;
@@ -2056,10 +1988,13 @@ mod tests {
     }
 
     #[test]
-    fn refused_never_when_disabled() {
+    fn disabled_wins_over_a_capacity_fallback() {
         let mut snap = saturated_base();
         let mut rng = StdRng::seed_from_u64(1);
-        refused_record(placer().place(&heavy(100_000), &snap, &HashMap::new(), &mut rng));
+        legacy_record(
+            placer().place(&heavy(100_000), &snap, &HashMap::new(), &mut rng),
+            LegacyReason::LaneFull,
+        );
 
         snap.disabled = true;
         let (reason, record) =
@@ -2109,7 +2044,6 @@ mod tests {
             NOW - 1_000,
         );
         let mut input = keyed(key.clone());
-        input.heavy = true;
         input.prefill_heavy = true;
         let mut rng = StdRng::seed_from_u64(1);
         let (chosen, record, pin_write) =
@@ -2141,7 +2075,7 @@ mod tests {
     }
 
     #[test]
-    fn refused_record_never_contains_key_material() {
+    fn lane_full_record_never_contains_key_material() {
         let key_bytes = [0xABu8; 16];
         let secret = [0xCDu8; 32];
         let pid = pin_id(Tier::Base, &AffinityKey::from_bytes(key_bytes), &secret);
@@ -2152,16 +2086,13 @@ mod tests {
             NOW - 1_000,
         );
         let mut input = keyed(AffinityKey::from_bytes(key_bytes));
-        input.heavy = true;
         input.prefill_heavy = true;
         input.prompt_tokens = 100_000;
         let mut rng = StdRng::seed_from_u64(1);
-        let record = refused_record(Placer::new(secret, Tier::Base).place(
-            &input,
-            &snap,
-            &HashMap::new(),
-            &mut rng,
-        ));
+        let record = legacy_record(
+            Placer::new(secret, Tier::Base).place(&input, &snap, &HashMap::new(), &mut rng),
+            LegacyReason::LaneFull,
+        );
         assert_no_key_material(&format!("{record:?}"), key_bytes, &pid);
     }
 

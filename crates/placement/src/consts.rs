@@ -31,11 +31,6 @@ pub const KV_MAX: f64 = 0.95;
 /// converting a token count into a `fullness`-comparable unit for `score.rs`.
 pub const PREFILL_NORM_TOKENS: f64 = 16_000.0;
 
-/// Tokens assumed per queued request when a replica reports `queued` but no
-/// `prefill_backlog_tokens` (see `score::effective_backlog`). Conservative on
-/// purpose: an unreported backlog must never read as an empty one.
-pub const QUEUED_TOKENS_ESTIMATE: u64 = 2_000;
-
 /// Fallback denominator for `fullness` when a replica reports no
 /// `limits.max_running`.
 pub const DEFAULT_MAX_RUNNING: f64 = 40.0;
@@ -85,12 +80,11 @@ pub const LANE_LOAD_TOKENS: u64 = 64_000;
 pub const HEAVY_BACKLOG_CAP: u64 = 300_000;
 
 /// The largest prompt a base-tier replica admits as heavy work, whatever its
-/// load. Base engines accept up to 1M context, so without this a long-tier
-/// refusal that overflows to base would put a 500K+ prefill on a base
-/// replica and undo the long tier's isolation. Anything larger is refused on
-/// base (the caller falls back to legacy while refusals are opt-in). Below
-/// `HEAVY_BACKLOG_CAP`, so the base lane has no idle waiver: an idle replica
-/// always fits one prompt this size.
+/// load. Base engines accept up to 1M context, so without this a prompt that
+/// overflows the long tier would put a 500K+ prefill on a base replica and
+/// undo the long tier's isolation. Anything larger finds no candidate on base
+/// (`LegacyReason::LaneFull`). Below `HEAVY_BACKLOG_CAP`, so the base lane has
+/// no idle waiver: an idle replica always fits one prompt this size.
 pub const HEAVY_BASE_MAX_PROMPT: u64 = 200_000;
 
 /// The same admission cap for long-tier replicas, which prefill faster.

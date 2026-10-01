@@ -7,20 +7,16 @@
 //! Placement picks a replica slot, not just a host, so every slot is scored
 //! on its own state and its own pending load.
 
-use crate::consts::{
-    DEFAULT_MAX_RUNNING, PREFILL_NORM_TOKENS, QUEUED_TOKENS_ESTIMATE, SPEED_FLOOR,
-};
+use crate::consts::{DEFAULT_MAX_RUNNING, PREFILL_NORM_TOKENS, SPEED_FLOOR};
 use crate::frame::Load;
 use crate::snapshot::{ReplicaView, RoutedCounts};
 
-/// A replica's prefill backlog in tokens: `prefill_backlog_tokens` when the
-/// engine reports it, else `queued * QUEUED_TOKENS_ESTIMATE` (saturating). The
-/// one value both the score and the heavy lane read, so a replica that omits
-/// its backlog can never look lighter to one than to the other.
+/// A replica's prefill backlog in tokens: the reported
+/// `prefill_backlog_tokens`. The one value both the score and the heavy lane
+/// read. A replica that omits it never reaches either: `Rule::Capacity`
+/// excludes it, so a missing backlog is never read as an empty one.
 pub fn effective_backlog(load: &Load) -> u64 {
-    load.prefill_backlog_tokens.unwrap_or_else(|| {
-        u64::from(load.queued.unwrap_or(0)).saturating_mul(QUEUED_TOKENS_ESTIMATE)
-    })
+    load.prefill_backlog_tokens.unwrap_or(0)
 }
 
 /// Whether a replica's load is *known* to be zero: `running`, `queued` and
@@ -57,8 +53,9 @@ pub struct Pending {
 /// `speed` and raises the score.
 ///
 /// `running`/`queued` missing (`None`) are treated as 0 here; a replica with
-/// *both* missing has already been excluded upstream by `Rule::Capacity`'s
-/// fail-closed check, so this function never has to guess for that case.
+/// any of `running`, `queued` or `prefill_backlog_tokens` missing has already
+/// been excluded upstream by `Rule::Capacity`'s fail-closed check, so this
+/// function never has to guess for that case.
 pub fn replica_score(r: &ReplicaView, pending: Pending, fleet_median_tps: f64) -> f64 {
     let load = &r.state.load;
     let running = load.running.unwrap_or(0) as f64;
@@ -406,18 +403,32 @@ mod tests {
     }
 
     #[test]
-    fn null_backlog_uses_queued_estimate() {
-        let mut v = view_ready();
-        v.state.load.running = Some(0);
-        v.state.load.queued = Some(3);
-        v.state.load.prefill_backlog_tokens = None;
-        let score = replica_score(&v, Pending::default(), 1.0);
-        let expected_fullness = 3.0 / DEFAULT_MAX_RUNNING;
-        let expected_prefill = (3.0 * 2_000.0) / PREFILL_NORM_TOKENS;
-        let expected = expected_fullness + expected_prefill;
-        assert!(
-            (score - expected).abs() < 1e-9,
-            "score={score} expected={expected}"
-        );
+    fn effective_backlog_is_the_reported_backlog() {
+        let mut load = view_ready().state.load;
+        load.queued = Some(3);
+        load.prefill_backlog_tokens = Some(7_000);
+        assert_eq!(effective_backlog(&load), 7_000);
+    }
+
+    #[test]
+    fn missing_backlog_is_not_estimated_from_queued() {
+        let mut load = view_ready().state.load;
+        load.queued = Some(3);
+        load.prefill_backlog_tokens = None;
+        assert_eq!(effective_backlog(&load), 0);
+    }
+
+    #[test]
+    fn missing_backlog_is_never_known_idle() {
+        let mut load = view_ready().state.load;
+        assert!(known_idle(&load));
+        load.prefill_backlog_tokens = None;
+        assert!(!known_idle(&load));
+        load.prefill_backlog_tokens = Some(0);
+        load.queued = None;
+        assert!(!known_idle(&load));
+        load.queued = Some(0);
+        load.running = None;
+        assert!(!known_idle(&load));
     }
 }

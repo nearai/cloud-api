@@ -700,7 +700,8 @@ fn convert_chat_request_to_service(
                 }),
             })
             .collect(),
-        max_tokens: request.max_tokens,
+        // Service and provider adapters share one effective output limit.
+        max_tokens: request.max_completion_tokens.or(request.max_tokens),
         temperature: request.temperature,
         top_p: request.top_p,
         stop: request.stop.clone().map(|s| s.into_vec()),
@@ -3402,6 +3403,60 @@ mod tests {
     use super::*;
 
     #[test]
+    fn chat_token_limits_are_normalized_before_dispatch() {
+        use serde_json::json;
+
+        for (limits, expected) in [
+            (json!({"max_completion_tokens": 128}), Some(128)),
+            (json!({"max_tokens": 64}), Some(64)),
+            (
+                json!({"max_completion_tokens": 128, "max_tokens": 64}),
+                Some(128),
+            ),
+            (
+                json!({"max_completion_tokens": null, "max_tokens": 64}),
+                Some(64),
+            ),
+            (json!({"max_completion_tokens": null}), None),
+            (json!({}), None),
+        ] {
+            let mut body = json!({
+                "model": "test-model",
+                "messages": [{"role": "user", "content": "hi"}],
+            });
+            body.as_object_mut()
+                .unwrap()
+                .extend(limits.as_object().unwrap().clone());
+            let request: ChatCompletionRequest = serde_json::from_value(body.clone()).unwrap();
+            request.validate_request().unwrap();
+            let service = convert_chat_request_to_service(
+                &request,
+                Uuid::nil(),
+                Uuid::nil().to_string(),
+                Uuid::nil(),
+                Uuid::nil(),
+                false,
+                0,
+                RequestBodyHash {
+                    hash: "original-request-hash".to_string(),
+                    body_bytes: serde_json::to_vec(&body).unwrap().into(),
+                },
+                Uuid::nil(),
+            );
+            assert_eq!(service.max_tokens, expected, "{body}");
+            assert!(!service.extra.contains_key("max_completion_tokens"));
+            // Preserve the original bytes/hash contract for signatures and wire adapters.
+            assert_eq!(service.body_hash, "original-request-hash");
+            assert_eq!(service.original_request, Some(body.clone()));
+
+            let provider: inference_providers::ChatCompletionParams = request.into();
+            assert_eq!(provider.max_tokens, expected, "{body}");
+            assert_eq!(provider.max_completion_tokens, None);
+            assert!(!provider.extra.contains_key("max_completion_tokens"));
+        }
+    }
+
+    #[test]
     fn model_public_key_alone_does_not_enable_e2ee() {
         let mut headers = crate::routes::common::EncryptionHeaders {
             signing_algo: None,
@@ -3723,6 +3778,7 @@ mod tests {
         ChatCompletionRequest {
             model: "test-model".to_string(),
             messages: vec![],
+            max_completion_tokens: None,
             max_tokens: None,
             temperature: None,
             top_p: None,

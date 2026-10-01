@@ -533,6 +533,23 @@ mod tests {
         }
     }
 
+    #[test]
+    fn test_build_request_forwards_token_limit() {
+        let backend = GeminiBackend::new();
+        for (max_tokens, max_completion_tokens, expected) in [
+            (Some(128), None, 128),
+            (None, Some(256), 256),
+            (Some(128), Some(256), 256),
+        ] {
+            let mut params = base_params();
+            params.max_tokens = max_tokens;
+            params.max_completion_tokens = max_completion_tokens;
+            let request = backend.build_request(&params);
+            let body = serde_json::to_value(&request).unwrap();
+            assert_eq!(body["generationConfig"]["maxOutputTokens"], expected);
+        }
+    }
+
     // ── #669: seed forwarded to generationConfig.seed ───────────────────────
 
     #[test]

@@ -86,11 +86,15 @@ impl Rule {
                 _ => Err(Exclusion(self)),
             },
             Rule::Capacity => {
-                // Fail closed: a replica reporting neither `running` nor
-                // `queued` gives no evidence it's idle, so treating both as
-                // 0 would make it look falsely attractive. Exclude it
-                // instead of guessing.
-                if r.state.load.running.is_none() && r.state.load.queued.is_none() {
+                // Fail closed: a replica missing any of `running`, `queued` or
+                // `prefill_backlog_tokens` gives no evidence it's idle, so
+                // treating it as 0 would make it look falsely attractive.
+                // Exclude it instead of guessing.
+                let load = &r.state.load;
+                if load.running.is_none()
+                    || load.queued.is_none()
+                    || load.prefill_backlog_tokens.is_none()
+                {
                     return Err(Exclusion(self));
                 }
                 if saturated(r) {
@@ -99,11 +103,11 @@ impl Rule {
                 Ok(())
             }
             Rule::Context => {
-                // Fail open on either unknown: without an engine limit or a
-                // requirement there is nothing to compare, and the pool's
-                // context-length-400 self-heal still covers a wrong pick.
-                match (input.context_tokens, r.state.limits.max_context_tokens) {
-                    (Some(need), Some(max)) if need > max => Err(Exclusion(self)),
+                // Fail open on an unknown engine limit: with nothing to compare,
+                // the pool's context-length-400 self-heal still covers a wrong
+                // pick.
+                match r.state.limits.max_context_tokens {
+                    Some(max) if input.prompt_tokens > max => Err(Exclusion(self)),
                     _ => Ok(()),
                 }
             }
@@ -113,18 +117,11 @@ impl Rule {
 }
 
 /// Whether `r` reports itself out of capacity: KV usage at or above
-/// `KV_MAX`, or at least `2 * max_running` requests in flight. The part of
-/// `Rule::Capacity` that is evidence of a full replica, as opposed to its
-/// fail-closed exclusion of a replica that reports no counts at all.
+/// `KV_MAX`. The part of `Rule::Capacity` that is evidence of a full replica,
+/// as opposed to its fail-closed exclusion of a replica missing load counts.
+/// Queue depth is not a signal: the engine caps running + queued itself.
 pub fn saturated(r: &ReplicaView) -> bool {
-    if r.state.load.kv_usage.is_some_and(|kv| kv >= KV_MAX) {
-        return true;
-    }
-    r.state.limits.max_running.is_some_and(|m| {
-        let running = r.state.load.running.unwrap_or(0);
-        let queued = r.state.load.queued.unwrap_or(0);
-        running.saturating_add(queued) >= m.saturating_mul(2)
-    })
+    r.state.load.kv_usage.is_some_and(|kv| kv >= KV_MAX)
 }
 
 /// Returns the first stage-1 rule (in `RULES` order) that excludes `r`, or
@@ -194,6 +191,38 @@ mod tests {
         let mut v = view_ready();
         v.state.load.running = None;
         v.state.load.queued = None;
+        v.state.load.prefill_backlog_tokens = None;
+        assert_eq!(
+            first_exclusion(&v, &input(), NOW),
+            Some(Exclusion(Rule::Capacity))
+        );
+    }
+
+    #[test]
+    fn backlog_missing_with_queued_known_is_excluded() {
+        let mut v = view_ready();
+        v.state.load.queued = Some(3);
+        v.state.load.prefill_backlog_tokens = None;
+        assert_eq!(
+            first_exclusion(&v, &input(), NOW),
+            Some(Exclusion(Rule::Capacity))
+        );
+    }
+
+    #[test]
+    fn queued_missing_is_excluded() {
+        let mut v = view_ready();
+        v.state.load.queued = None;
+        assert_eq!(
+            first_exclusion(&v, &input(), NOW),
+            Some(Exclusion(Rule::Capacity))
+        );
+    }
+
+    #[test]
+    fn running_missing_is_excluded() {
+        let mut v = view_ready();
+        v.state.load.running = None;
         assert_eq!(
             first_exclusion(&v, &input(), NOW),
             Some(Exclusion(Rule::Capacity))
@@ -204,6 +233,7 @@ mod tests {
     fn kv_full() {
         let mut v = view_ready();
         v.state.load.kv_usage = Some(0.96);
+        assert!(saturated(&v));
         assert_eq!(
             first_exclusion(&v, &input(), NOW),
             Some(Exclusion(Rule::Capacity))
@@ -212,22 +242,22 @@ mod tests {
 
     #[test]
     fn over_capacity() {
+        // Queue depth alone is not saturation: only KV is.
         let mut v = view_ready();
         v.state.limits.max_running = Some(4);
         v.state.load.running = Some(6);
         v.state.load.queued = Some(2);
-        assert_eq!(
-            first_exclusion(&v, &input(), NOW),
-            Some(Exclusion(Rule::Capacity))
-        );
+        v.state.load.kv_usage = Some(0.5);
+        assert!(!saturated(&v));
+        assert_eq!(first_exclusion(&v, &input(), NOW), None);
     }
 
     #[test]
-    fn context_excludes_when_requirement_exceeds_engine_limit() {
+    fn context_excludes_when_prompt_exceeds_engine_limit() {
         let mut v = view_ready();
         v.state.limits.max_context_tokens = Some(131_072);
         let mut inp = input();
-        inp.context_tokens = Some(131_073);
+        inp.prompt_tokens = 131_073;
         assert_eq!(
             first_exclusion(&v, &inp, NOW),
             Some(Exclusion(Rule::Context))
@@ -239,16 +269,7 @@ mod tests {
         let mut v = view_ready();
         v.state.limits.max_context_tokens = None;
         let mut inp = input();
-        inp.context_tokens = Some(1_000_000);
-        assert_eq!(first_exclusion(&v, &inp, NOW), None);
-    }
-
-    #[test]
-    fn unknown_requirement_passes() {
-        let mut v = view_ready();
-        v.state.limits.max_context_tokens = Some(8_192);
-        let mut inp = input();
-        inp.context_tokens = None;
+        inp.prompt_tokens = 1_000_000;
         assert_eq!(first_exclusion(&v, &inp, NOW), None);
     }
 
@@ -257,7 +278,7 @@ mod tests {
         let mut v = view_ready();
         v.state.limits.max_context_tokens = Some(131_072);
         let mut inp = input();
-        inp.context_tokens = Some(131_072);
+        inp.prompt_tokens = 131_072;
         assert_eq!(first_exclusion(&v, &inp, NOW), None);
     }
 

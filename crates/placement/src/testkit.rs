@@ -94,14 +94,11 @@ pub(crate) fn slot(host: &str, replica: u32) -> SlotId {
     }
 }
 
-/// A short, keyless `PlaceInput` for `TEST_MODEL` with no context
-/// requirement.
+/// A short, keyless `PlaceInput` for `TEST_MODEL`.
 pub(crate) fn input() -> PlaceInput {
     PlaceInput {
         model: TEST_MODEL.into(),
         prompt_tokens: 100,
-        context_tokens: None,
-        heavy: false,
         prefill_heavy: false,
         priority: 0,
         affinity: None,

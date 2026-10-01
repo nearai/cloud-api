@@ -125,6 +125,7 @@ fn verified(tls_cert_fingerprint: Option<&str>) -> VerifiedAttestation {
         os_image_hash: None,
         compose_hash: None,
         gpu_verdict: None,
+        replica_report_key: None,
     }
 }
 

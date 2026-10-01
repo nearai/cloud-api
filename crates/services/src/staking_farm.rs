@@ -421,6 +421,9 @@ impl StakingFarmService {
         }
 
         let Some(source) = self.get_source(organization_id).await? else {
+            // A concurrent ensure_source_for_near_account() may invalidate the
+            // marker between the read above and this insert, briefly resurrecting
+            // a stale "no source" entry; the TTL bounds that window.
             self.no_source_orgs.insert(organization_id, ()).await;
             return Ok(None);
         };

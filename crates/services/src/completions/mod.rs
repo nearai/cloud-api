@@ -899,6 +899,9 @@ impl CompletionServiceImpl {
             concurrent_counts,
             concurrent_limit: DEFAULT_CONCURRENT_LIMIT,
             org_concurrent_limits,
+            // Private until `with_model_resolve_cache` shares the one owned by
+            // `ModelsServiceImpl`; a private cache is NOT cleared by
+            // `invalidate_models_cache`, so production wiring must call it.
             model_resolve_cache: crate::models::new_model_resolve_cache(),
             organization_limit_repository,
             affinity_secret: None,
@@ -912,25 +915,16 @@ impl CompletionServiceImpl {
         self
     }
 
-    /// `resolve_and_get_model` through the cache. Only found models are cached;
-    /// `None` always re-reads so a newly activated model works immediately.
     async fn resolve_model_cached(
         &self,
         identifier: &str,
     ) -> Result<Option<crate::models::ModelWithPricing>, anyhow::Error> {
-        if let Some(model) = self.model_resolve_cache.get(identifier).await {
-            return Ok(Some(model));
-        }
-        let resolved = self
-            .models_repository
-            .resolve_and_get_model(identifier)
-            .await?;
-        if let Some(model) = &resolved {
-            self.model_resolve_cache
-                .insert(identifier.to_string(), model.clone())
-                .await;
-        }
-        Ok(resolved)
+        crate::models::resolve_model_cached(
+            &self.model_resolve_cache,
+            self.models_repository.as_ref(),
+            identifier,
+        )
+        .await
     }
 
     /// Set the placement-affinity HMAC secret (HKDF from the Valkey
@@ -2547,9 +2541,7 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
         &self,
         model_name: &str,
     ) -> Result<Option<crate::models::ModelWithPricing>, anyhow::Error> {
-        self.models_repository
-            .resolve_and_get_model(model_name)
-            .await
+        self.resolve_model_cached(model_name).await
     }
 
     fn get_inference_provider_pool(

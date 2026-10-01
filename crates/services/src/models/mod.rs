@@ -34,8 +34,10 @@ const MODELS_LIST_CACHE_CAPACITY: u64 = 1;
 const MODELS_LIST_CACHE_KEY: &str = "all";
 
 /// TTL backstop for the per-request model-resolve cache. Same-instance admin
-/// writes clear it via `invalidate_models_cache`; this bounds staleness only
-/// for writes made through other instances.
+/// writes clear it via `invalidate_models_cache` (best-effort: a resolve that
+/// was in flight during the write can repopulate a stale entry, also bounded
+/// by this TTL); otherwise this bounds staleness for writes made through
+/// other instances.
 const MODEL_RESOLVE_CACHE_TTL_SECS: u64 = 30;
 const MODEL_RESOLVE_CACHE_CAPACITY: u64 = 1_000;
 
@@ -54,6 +56,24 @@ pub fn model_resolve_cache_with_ttl(ttl: Duration) -> ModelResolveCache {
         .max_capacity(MODEL_RESOLVE_CACHE_CAPACITY)
         .time_to_live(ttl)
         .build()
+}
+
+/// `ModelsRepository::resolve_and_get_model` through the positive-only cache.
+/// Only found models are cached; `None` always re-reads so a newly activated
+/// model works immediately.
+pub async fn resolve_model_cached(
+    cache: &ModelResolveCache,
+    repository: &dyn ModelsRepository,
+    identifier: &str,
+) -> Result<Option<ModelWithPricing>, anyhow::Error> {
+    if let Some(model) = cache.get(identifier).await {
+        return Ok(Some(model));
+    }
+    let resolved = repository.resolve_and_get_model(identifier).await?;
+    if let Some(model) = &resolved {
+        cache.insert(identifier.to_string(), model.clone()).await;
+    }
+    Ok(resolved)
 }
 
 fn apply_backend_model_metadata(
@@ -187,11 +207,14 @@ impl ModelsServiceTrait for ModelsServiceImpl {
         &self,
         identifier: &str,
     ) -> Result<ModelWithPricing, ModelsError> {
-        self.models_repository
-            .resolve_and_get_model(identifier)
-            .await
-            .map_err(|e| ModelsError::InternalError(e.to_string()))?
-            .ok_or_else(|| ModelsError::NotFound(format!("Model '{identifier}' not found")))
+        resolve_model_cached(
+            &self.model_resolve_cache,
+            self.models_repository.as_ref(),
+            identifier,
+        )
+        .await
+        .map_err(|e| ModelsError::InternalError(e.to_string()))?
+        .ok_or_else(|| ModelsError::NotFound(format!("Model '{identifier}' not found")))
     }
 
     async fn resolve_public_model(

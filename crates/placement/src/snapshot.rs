@@ -888,7 +888,13 @@ mod tests {
     }
 
     fn exclusion_at(view: &ReplicaView, now_ms: u64) -> Option<Rule> {
-        first_exclusion(view, &crate::testkit::input(), now_ms).map(|e| e.0)
+        first_exclusion(
+            view,
+            &crate::testkit::input(),
+            now_ms,
+            &crate::tuning::Tuning::default(),
+        )
+        .map(|e| e.0)
     }
 
     #[test]

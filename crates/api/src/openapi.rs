@@ -186,6 +186,9 @@ use utoipa::{Modify, OpenApi};
         crate::routes::admin_usage_hourly::recompute_usage_hourly,
         crate::routes::admin::get_org_revenue,
         crate::routes::admin::get_infra_summary,
+        crate::routes::admin::list_admin_settings,
+        crate::routes::admin::get_admin_setting,
+        crate::routes::admin::update_admin_setting,
         crate::routes::admin::list_invitation_email_deliveries,
         crate::routes::admin::resend_invitation_email,
         crate::routes::admin::list_users,
@@ -310,6 +313,9 @@ use utoipa::{Modify, OpenApi};
             // Admin access token models
             CreateAdminAccessTokenRequest, AdminAccessTokenResponse,
             AdminAccessTokenPermission, AdminAccessTokenListEntry, ListAdminAccessTokensResponse,
+            // Admin settings models
+            crate::routes::admin::AdminSettingResponse,
+            crate::routes::admin::ListAdminSettingsResponse,
             // Usage tracking models
             crate::routes::usage::OrganizationBalanceResponse,
             crate::routes::usage::UsageHistoryResponse,
@@ -601,6 +607,9 @@ mod admin_token_permission_tests {
             .contains(&json!("permission")));
         for model in ["AdminAccessTokenResponse", "AdminAccessTokenListEntry"] {
             assert!(schemas[model]["properties"].get("permission").is_some());
+        }
+        for model in ["AdminSettingResponse", "ListAdminSettingsResponse"] {
+            assert!(schemas.get(model).is_some(), "{model} is registered");
         }
         for (path, method, phrase, tokens_allowed) in [
             ("/v1/admin/models", "get", "read_only token", true),

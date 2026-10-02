@@ -27,7 +27,6 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use arc_swap::ArcSwap;
 use placement::affinity::PinTable;
-use placement::consts::PIN_TTL_MS;
 use placement::frame::Envelope;
 use placement::snapshot::{Ingest, Reject, ReplicaView, RoutedCounts, Snapshot};
 use placement::{KeyRegistry, SlotId};
@@ -160,7 +159,13 @@ impl PlacementHandles {
         metrics: Arc<M>,
     ) -> Self {
         let hosts = Arc::new(ArcSwap::from_pointee(BackendHosts::default()));
-        let io = PlacementIo::start(password, endpoint, hosts.clone(), metrics);
+        let io = PlacementIo::start(
+            password,
+            endpoint,
+            hosts.clone(),
+            placer.tuning_handle().clone(),
+            metrics,
+        );
         Self { placer, io, hosts }
     }
 
@@ -350,6 +355,7 @@ impl PlacementIo {
         password: String,
         endpoint: &ValkeyEndpoint,
         hosts: Arc<ArcSwap<BackendHosts>>,
+        tuning: Arc<ArcSwap<placement::Tuning>>,
         metrics: Arc<M>,
     ) -> Arc<Self> {
         let metrics: Arc<dyn PlacementMetrics> = Arc::new(ErasedMetrics(metrics));
@@ -357,7 +363,7 @@ impl PlacementIo {
         install_crypto_provider();
         match endpoint_client(endpoint, password) {
             Ok(client) => {
-                tokio::spawn(run(client, hosts, io.snapshot.clone(), rx, metrics));
+                tokio::spawn(run(client, hosts, io.snapshot.clone(), tuning, rx, metrics));
             }
             Err(kind) => {
                 if claim_unconfigured_warning(&UNCONFIGURED_WARNED) {
@@ -535,6 +541,7 @@ async fn run(
     client: redis::Client,
     hosts: Arc<ArcSwap<BackendHosts>>,
     slot: Arc<ArcSwap<Snapshot>>,
+    tuning: Arc<ArcSwap<placement::Tuning>>,
     rx: mpsc::Receiver<Write>,
     metrics: Arc<dyn PlacementMetrics>,
 ) {
@@ -542,7 +549,7 @@ async fn run(
         return;
     };
     tokio::spawn(writer(conn.clone(), rx, metrics.clone()));
-    reader(conn, hosts, slot, metrics).await;
+    reader(conn, hosts, slot, tuning, metrics).await;
 }
 
 /// One writer batch: `first` plus whatever is already queued, up to
@@ -605,6 +612,7 @@ async fn reader(
     mut conn: ConnectionManager,
     hosts: Arc<ArcSwap<BackendHosts>>,
     slot: Arc<ArcSwap<Snapshot>>,
+    tuning: Arc<ArcSwap<placement::Tuning>>,
     metrics: Arc<dyn PlacementMetrics>,
 ) {
     let mut state = ReaderState::default();
@@ -617,6 +625,7 @@ async fn reader(
             tracing::info!("Placement handles dropped; Valkey reader stopping");
             return;
         }
+        state.set_pin_ttl_ms(tuning.load().pin_ttl_ms);
         let hosts_now = hosts.load();
         let reg = &hosts_now.keys;
         let Some((result, now)) =
@@ -823,12 +832,24 @@ pub(crate) struct Applied {
 }
 
 impl ReaderState {
+    /// Applies the live pin TTL to the table. Copies the shared table only
+    /// when the TTL actually changed. Raising the TTL does not bring back pins
+    /// already dropped (skipped at warm-up or pruned under the shorter TTL):
+    /// the stream is read forward only, so such pins are simply absent and
+    /// those requests place without a follow pin until new pins arrive. This
+    /// is a deliberate simplification, bounded by one TTL window.
+    fn set_pin_ttl_ms(&mut self, ttl_ms: u64) {
+        if self.pins.ttl_ms() != ttl_ms {
+            Arc::make_mut(&mut self.pins).set_ttl_ms(ttl_ms);
+        }
+    }
+
     fn warmed(&self) -> bool {
         self.last_pin_id.is_some()
     }
 
     /// Loads the warm-up pins (`XREVRANGE`, newest first), ignoring entries
-    /// already older than `PIN_TTL_MS`, and resumes `XREAD` after the newest
+    /// already older than the pin TTL, and resumes `XREAD` after the newest
     /// one (or from the start of an empty stream). Returns the malformed count.
     fn warm_up(&mut self, mut newest_first: Vec<PinEntry>, now_ms: u64) -> u32 {
         let resume = newest_first
@@ -850,7 +871,7 @@ impl ReaderState {
         for entry in entries {
             match parse_pin(&entry.fields) {
                 Some((id, slot, at_ms, boot)) => {
-                    let live = now_ms < at_ms.saturating_add(PIN_TTL_MS);
+                    let live = now_ms < at_ms.saturating_add(self.pins.ttl_ms());
                     let skewed = at_ms > now_ms.saturating_add(PIN_MAX_FUTURE_MS);
                     if live && !skewed {
                         Arc::make_mut(&mut self.pins).insert_on_boot(id, slot, at_ms, boot);
@@ -2063,7 +2084,13 @@ mod tests {
             vec![
                 pin_entry("3-0", &fresh_id.to_hex(), "gpu02", "1", now - 1_000),
                 pin_entry("2-0", "zz-not-hex", "gpu05", "0", now - 1_000),
-                pin_entry("1-0", &old_id.to_hex(), "gpu01", "0", now - PIN_TTL_MS),
+                pin_entry(
+                    "1-0",
+                    &old_id.to_hex(),
+                    "gpu01",
+                    "0",
+                    now - placement::Tuning::default().pin_ttl_ms,
+                ),
             ],
             now,
         );
@@ -2076,6 +2103,29 @@ mod tests {
         assert_eq!(state.pins.get(&old_id, now), None);
         // XREAD resumes after the newest warm-up entry.
         assert_eq!(state.last_pin_id.as_deref(), Some("3-0"));
+    }
+
+    #[test]
+    fn tuned_pin_ttl_applies_to_warmup_and_existing_pins() {
+        let now = 10_000_000u64;
+        let id = pid(1);
+        let mut state = ReaderState::default();
+        state.warm_up(
+            vec![pin_entry("1-0", &id.to_hex(), "gpu01", "0", now - 90_000)],
+            now,
+        );
+        assert!(state.pins.get(&id, now).is_some());
+        // A shorter TTL expires the same entry; a pin that old is not
+        // loaded at warm-up either.
+        state.set_pin_ttl_ms(60_000);
+        assert!(state.pins.get(&id, now).is_none());
+        let mut fresh = ReaderState::default();
+        fresh.set_pin_ttl_ms(60_000);
+        fresh.warm_up(
+            vec![pin_entry("1-0", &id.to_hex(), "gpu01", "0", now - 90_000)],
+            now,
+        );
+        assert!(fresh.pins.is_empty());
     }
 
     /// A pin written by an older node has no `b` field: its host boot is
@@ -2649,6 +2699,7 @@ mod tests {
             "secret".into(),
             &endpoint(true, Some("not a certificate".into())),
             hosts,
+            Arc::new(ArcSwap::from_pointee(placement::Tuning::default())),
             metrics.clone(),
         );
         assert_eq!(io.snapshot.load().built_ms, 0);

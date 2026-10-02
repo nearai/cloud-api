@@ -7,10 +7,11 @@
 //! evaluates it after stage 1 (see `policy::lane_admits`). Exclusions from
 //! both stages are tallied per rule in [`ALL_RULES`] order.
 
-use crate::consts::{FRESH_MAX_MS, KV_MAX, MAX_FUTURE_SKEW_MS};
+use crate::consts::{FRESH_MAX_MS, MAX_FUTURE_SKEW_MS};
 use crate::decision::PlaceInput;
 use crate::frame::Lifecycle;
 use crate::snapshot::ReplicaView;
+use crate::tuning::Tuning;
 
 /// A single eligibility check, in the order they are applied.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -62,7 +63,13 @@ impl Rule {
     /// Checks `r` against this stage-1 rule. `now_ms` is the caller's clock,
     /// used by `Freshness` to judge how old `engine_sampled_at_ms` is.
     /// `Rule::Lane` always passes here: it is not a per-replica rule.
-    pub fn check(self, r: &ReplicaView, input: &PlaceInput, now_ms: u64) -> Result<(), Exclusion> {
+    pub fn check(
+        self,
+        r: &ReplicaView,
+        input: &PlaceInput,
+        now_ms: u64,
+        tuning: &Tuning,
+    ) -> Result<(), Exclusion> {
         match self {
             Rule::Lifecycle => {
                 if r.state.lifecycle_state == Lifecycle::Ready {
@@ -97,7 +104,7 @@ impl Rule {
                 {
                     return Err(Exclusion(self));
                 }
-                if saturated(r) {
+                if saturated(r, tuning.kv_max) {
                     return Err(Exclusion(self));
                 }
                 Ok(())
@@ -117,19 +124,24 @@ impl Rule {
 }
 
 /// Whether `r` reports itself out of capacity: KV usage at or above
-/// `KV_MAX`. The part of `Rule::Capacity` that is evidence of a full replica,
+/// `kv_max` (`Tuning::kv_max`). The part of `Rule::Capacity` that is evidence of a full replica,
 /// as opposed to its fail-closed exclusion of a replica missing load counts.
 /// Queue depth is not a signal: the engine caps running + queued itself.
-pub fn saturated(r: &ReplicaView) -> bool {
-    r.state.load.kv_usage.is_some_and(|kv| kv >= KV_MAX)
+pub fn saturated(r: &ReplicaView, kv_max: f64) -> bool {
+    r.state.load.kv_usage.is_some_and(|kv| kv >= kv_max)
 }
 
 /// Returns the first stage-1 rule (in `RULES` order) that excludes `r`, or
 /// `None` if `r` survives stage 1.
-pub fn first_exclusion(r: &ReplicaView, input: &PlaceInput, now_ms: u64) -> Option<Exclusion> {
+pub fn first_exclusion(
+    r: &ReplicaView,
+    input: &PlaceInput,
+    now_ms: u64,
+    tuning: &Tuning,
+) -> Option<Exclusion> {
     RULES
         .into_iter()
-        .find_map(|rule| rule.check(r, input, now_ms).err())
+        .find_map(|rule| rule.check(r, input, now_ms, tuning).err())
 }
 
 #[cfg(test)]
@@ -140,7 +152,7 @@ mod tests {
     #[test]
     fn ready_fresh_passes() {
         let v = view_ready();
-        assert_eq!(first_exclusion(&v, &input(), NOW), None);
+        assert_eq!(first_exclusion(&v, &input(), NOW, &Tuning::default()), None);
     }
 
     #[test]
@@ -149,7 +161,7 @@ mod tests {
         v.state.lifecycle_state = Lifecycle::Warming;
         v.state.engine_sampled_at_ms = None;
         assert_eq!(
-            first_exclusion(&v, &input(), NOW),
+            first_exclusion(&v, &input(), NOW, &Tuning::default()),
             Some(Exclusion(Rule::Lifecycle))
         );
     }
@@ -159,11 +171,11 @@ mod tests {
         let mut v = view_ready();
         v.state.engine_sampled_at_ms = Some(NOW + MAX_FUTURE_SKEW_MS + 1);
         assert_eq!(
-            first_exclusion(&v, &input(), NOW),
+            first_exclusion(&v, &input(), NOW, &Tuning::default()),
             Some(Exclusion(Rule::Freshness))
         );
         v.state.engine_sampled_at_ms = Some(NOW + MAX_FUTURE_SKEW_MS);
-        assert_eq!(first_exclusion(&v, &input(), NOW), None);
+        assert_eq!(first_exclusion(&v, &input(), NOW, &Tuning::default()), None);
     }
 
     #[test]
@@ -171,7 +183,7 @@ mod tests {
         let mut v = view_ready();
         v.state.engine_sampled_at_ms = Some(NOW - 10_000);
         assert_eq!(
-            first_exclusion(&v, &input(), NOW),
+            first_exclusion(&v, &input(), NOW, &Tuning::default()),
             Some(Exclusion(Rule::Freshness))
         );
     }
@@ -181,7 +193,7 @@ mod tests {
         let mut v = view_ready();
         v.state.engine_sampled_at_ms = None;
         assert_eq!(
-            first_exclusion(&v, &input(), NOW),
+            first_exclusion(&v, &input(), NOW, &Tuning::default()),
             Some(Exclusion(Rule::Freshness))
         );
     }
@@ -193,7 +205,7 @@ mod tests {
         v.state.load.queued = None;
         v.state.load.prefill_backlog_tokens = None;
         assert_eq!(
-            first_exclusion(&v, &input(), NOW),
+            first_exclusion(&v, &input(), NOW, &Tuning::default()),
             Some(Exclusion(Rule::Capacity))
         );
     }
@@ -204,7 +216,7 @@ mod tests {
         v.state.load.queued = Some(3);
         v.state.load.prefill_backlog_tokens = None;
         assert_eq!(
-            first_exclusion(&v, &input(), NOW),
+            first_exclusion(&v, &input(), NOW, &Tuning::default()),
             Some(Exclusion(Rule::Capacity))
         );
     }
@@ -214,7 +226,7 @@ mod tests {
         let mut v = view_ready();
         v.state.load.queued = None;
         assert_eq!(
-            first_exclusion(&v, &input(), NOW),
+            first_exclusion(&v, &input(), NOW, &Tuning::default()),
             Some(Exclusion(Rule::Capacity))
         );
     }
@@ -224,7 +236,7 @@ mod tests {
         let mut v = view_ready();
         v.state.load.running = None;
         assert_eq!(
-            first_exclusion(&v, &input(), NOW),
+            first_exclusion(&v, &input(), NOW, &Tuning::default()),
             Some(Exclusion(Rule::Capacity))
         );
     }
@@ -233,11 +245,31 @@ mod tests {
     fn kv_full() {
         let mut v = view_ready();
         v.state.load.kv_usage = Some(0.96);
-        assert!(saturated(&v));
+        assert!(saturated(&v, Tuning::default().kv_max));
         assert_eq!(
-            first_exclusion(&v, &input(), NOW),
+            first_exclusion(&v, &input(), NOW, &Tuning::default()),
             Some(Exclusion(Rule::Capacity))
         );
+    }
+
+    #[test]
+    fn kv_max_is_tunable() {
+        let mut v = view_ready();
+        v.state.load.kv_usage = Some(0.8);
+        let tight = Tuning {
+            kv_max: 0.7,
+            ..Tuning::default()
+        };
+        assert!(!saturated(&v, 0.95));
+        assert!(saturated(&v, tight.kv_max));
+        assert_eq!(
+            first_exclusion(&v, &input(), NOW, &tight),
+            Some(Exclusion(Rule::Capacity))
+        );
+        assert_eq!(first_exclusion(&v, &input(), NOW, &Tuning::default()), None);
+        // The bound is inclusive.
+        v.state.load.kv_usage = Some(0.7);
+        assert!(saturated(&v, 0.7));
     }
 
     #[test]
@@ -248,8 +280,8 @@ mod tests {
         v.state.load.running = Some(6);
         v.state.load.queued = Some(2);
         v.state.load.kv_usage = Some(0.5);
-        assert!(!saturated(&v));
-        assert_eq!(first_exclusion(&v, &input(), NOW), None);
+        assert!(!saturated(&v, Tuning::default().kv_max));
+        assert_eq!(first_exclusion(&v, &input(), NOW, &Tuning::default()), None);
     }
 
     #[test]
@@ -259,7 +291,7 @@ mod tests {
         let mut inp = input();
         inp.prompt_tokens = 131_073;
         assert_eq!(
-            first_exclusion(&v, &inp, NOW),
+            first_exclusion(&v, &inp, NOW, &Tuning::default()),
             Some(Exclusion(Rule::Context))
         );
     }
@@ -270,7 +302,7 @@ mod tests {
         v.state.limits.max_context_tokens = None;
         let mut inp = input();
         inp.prompt_tokens = 1_000_000;
-        assert_eq!(first_exclusion(&v, &inp, NOW), None);
+        assert_eq!(first_exclusion(&v, &inp, NOW, &Tuning::default()), None);
     }
 
     #[test]
@@ -279,7 +311,7 @@ mod tests {
         v.state.limits.max_context_tokens = Some(131_072);
         let mut inp = input();
         inp.prompt_tokens = 131_072;
-        assert_eq!(first_exclusion(&v, &inp, NOW), None);
+        assert_eq!(first_exclusion(&v, &inp, NOW, &Tuning::default()), None);
     }
 
     #[test]
@@ -287,7 +319,7 @@ mod tests {
         assert!(!RULES.contains(&Rule::Lane));
         assert_eq!(ALL_RULES[..4], RULES);
         assert_eq!(
-            Rule::Lane.check(&view_ready(), &input(), NOW),
+            Rule::Lane.check(&view_ready(), &input(), NOW, &Tuning::default()),
             Ok(()),
             "the lane is evaluated over all survivors, not per replica"
         );

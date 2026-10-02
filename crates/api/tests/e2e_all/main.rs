@@ -26,6 +26,7 @@ mod admin_revenue_totals;
 mod admin_routing_policy;
 mod admin_schema_compatibility;
 mod admin_services;
+mod admin_settings;
 mod admin_token_permissions;
 mod admin_usage_hourly_repair;
 mod api_key_usage_hourly;

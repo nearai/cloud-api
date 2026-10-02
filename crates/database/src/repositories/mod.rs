@@ -9,6 +9,7 @@
 
 pub mod admin_access_token;
 pub mod admin_composite;
+pub mod admin_settings;
 pub mod aml;
 pub mod analytics;
 pub mod api_key;
@@ -51,6 +52,7 @@ pub mod workspace;
 
 pub use admin_access_token::AdminAccessTokenRepository;
 pub use admin_composite::AdminCompositeRepository;
+pub use admin_settings::PostgresAdminSettingsRepository;
 pub use aml::PostgresAmlRepository;
 pub use analytics::PgAnalyticsRepository;
 pub use api_key::ApiKeyRepository;

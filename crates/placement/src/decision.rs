@@ -8,18 +8,21 @@
 //! judged against a lane view of every live replica.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::Instant;
 
+use arc_swap::ArcSwap;
 use rand::Rng;
 
 use crate::affinity::{pin_id, select, AffinityKey, PinId, Selection};
-use crate::consts::{FRESH_MAX_MS, PIN_TTL_MS};
+use crate::consts::FRESH_MAX_MS;
 use crate::policy::{classify, lane_admits, lane_view, Class, LaneView, PriorityBand, Tier};
 use crate::rules::{first_exclusion, saturated, Exclusion, Rule, ALL_RULES};
 use crate::score::{
     effective_backlog, fleet_median_tps, known_idle, pending_for, replica_score, Pending,
 };
 use crate::snapshot::{ReplicaView, SlotId, Snapshot};
+use crate::tuning::Tuning;
 
 /// Per-request inputs the eligibility rules (`rules.rs`) check a
 /// [`crate::snapshot::ReplicaView`] against, plus the rest of what
@@ -294,16 +297,38 @@ fn heavy_pin_holds(candidates: &[Candidate<'_>], pin: &SlotId, prompt: u64) -> O
     Some(best_other.is_none_or(|other| pinned.load <= other.saturating_add(prompt)))
 }
 
-/// The pure placement decision-maker for one Fleet. Holds only the
-/// deployment's pin secret and the Fleet's tier — no I/O, no mutable state.
+/// The pure placement decision-maker for one Fleet. Holds the deployment's
+/// pin secret, the Fleet's tier and a handle to the live [`Tuning`] — no I/O.
+/// The handle is written by the caller (an admin setting reload); a decision
+/// reads it once, so one decision sees one consistent tuning.
 pub struct Placer {
     pin_secret: [u8; 32],
     tier: Tier,
+    tuning: Arc<ArcSwap<Tuning>>,
 }
 
 impl Placer {
+    /// A placer on the default tuning, which nothing changes.
     pub fn new(pin_secret: [u8; 32], tier: Tier) -> Self {
-        Self { pin_secret, tier }
+        Self::with_tuning(
+            pin_secret,
+            tier,
+            Arc::new(ArcSwap::from_pointee(Tuning::default())),
+        )
+    }
+
+    /// A placer reading `tuning`, shared with whoever updates it.
+    pub fn with_tuning(pin_secret: [u8; 32], tier: Tier, tuning: Arc<ArcSwap<Tuning>>) -> Self {
+        Self {
+            pin_secret,
+            tier,
+            tuning,
+        }
+    }
+
+    /// The live tuning handle this placer reads.
+    pub fn tuning_handle(&self) -> &Arc<ArcSwap<Tuning>> {
+        &self.tuning
     }
 
     /// The capacity tier this placer serves.
@@ -327,7 +352,8 @@ impl Placer {
         rng: &mut impl Rng,
     ) -> Decision {
         let started = Instant::now();
-        let mut decision = self.decide(input, snap, mine, rng);
+        let tuning = **self.tuning.load();
+        let mut decision = self.decide(input, snap, mine, &tuning, rng);
         decision.record_mut().place_us =
             u32::try_from(started.elapsed().as_micros()).unwrap_or(u32::MAX);
         decision
@@ -338,6 +364,7 @@ impl Placer {
         input: &PlaceInput,
         snap: &Snapshot,
         mine: &HashMap<SlotId, Pending>,
+        tuning: &Tuning,
         rng: &mut impl Rng,
     ) -> Decision {
         if snap.disabled {
@@ -359,7 +386,7 @@ impl Placer {
         let mut live: Vec<(&ReplicaView, u64)> = Vec::with_capacity(snap.replicas.len());
         let mut candidates: Vec<Candidate<'_>> = Vec::with_capacity(snap.replicas.len());
         for view in &snap.replicas {
-            let exclusion = first_exclusion(view, input, input.now_ms);
+            let exclusion = first_exclusion(view, input, input.now_ms, tuning);
             if let Some(Exclusion(rule @ (Rule::Lifecycle | Rule::Freshness))) = exclusion {
                 tally.add(rule);
                 continue;
@@ -389,7 +416,7 @@ impl Placer {
         let class = Class::of(input.prefill_heavy);
         let lane = {
             let survivors: Vec<&SlotId> = candidates.iter().map(|c| &c.view.slot).collect();
-            lane_view(&live, &survivors)
+            lane_view(&live, &survivors, tuning.lane_load_tokens)
         };
 
         // No stage-1 survivor is a state problem (stale, not ready, over
@@ -397,7 +424,8 @@ impl Placer {
         // replica reported itself full: that is a capacity answer, for short
         // and heavy requests alike. Either way the caller falls back.
         if candidates.is_empty() {
-            let all_full = !live.is_empty() && live.iter().all(|(v, _)| saturated(v));
+            let all_full =
+                !live.is_empty() && live.iter().all(|(v, _)| saturated(v, tuning.kv_max));
             let reason = if all_full {
                 LegacyReason::CapacityFull
             } else {
@@ -493,6 +521,7 @@ impl Placer {
             pin_slot,
             heavy_pin == Some(true),
             walk,
+            tuning,
             rng,
         ) {
             Some(s) => s,
@@ -524,7 +553,9 @@ impl Placer {
                 || match selected.selection {
                     Selection::Pinned => pin_lookup
                         .as_ref()
-                        .map(|(_, at_ms)| input.now_ms.saturating_sub(*at_ms) > PIN_TTL_MS / 2)
+                        .map(|(_, at_ms)| {
+                            input.now_ms.saturating_sub(*at_ms) > snap.pins.ttl_ms() / 2
+                        })
                         .unwrap_or(false),
                     _ => selected.write_pin,
                 };
@@ -1329,6 +1360,27 @@ mod tests {
         assert_eq!(reason, LegacyReason::NoneEligible);
         assert_eq!(record.excluded[1], (Rule::Freshness, 8));
         assert_eq!(record.excluded[4], (Rule::Lane, 0));
+    }
+
+    #[test]
+    fn placer_reads_live_tuning_per_decision() {
+        let mut v = ready_view("gpu01", 0);
+        v.state.load.kv_usage = Some(0.8);
+        let snap = snap_with(vec![v]);
+        let handle = Arc::new(ArcSwap::from_pointee(Tuning::default()));
+        let p = Placer::with_tuning([1u8; 32], Tier::Base, handle.clone());
+        let mut rng = StdRng::seed_from_u64(1);
+
+        placed(p.place(&base_input(), &snap, &HashMap::new(), &mut rng));
+
+        // Tightening kv_max through the shared handle takes effect on the
+        // next decision, with no new Placer.
+        handle.store(Arc::new(Tuning {
+            kv_max: 0.7,
+            ..Tuning::default()
+        }));
+        let (reason, _) = legacy_reason(p.place(&base_input(), &snap, &HashMap::new(), &mut rng));
+        assert_eq!(reason, LegacyReason::CapacityFull);
     }
 
     #[test]
@@ -2171,7 +2223,7 @@ mod tests {
                 let eligible = snap
                     .replicas
                     .iter()
-                    .any(|v| v.slot == slot && first_exclusion(v, &input, input.now_ms).is_none());
+                    .any(|v| v.slot == slot && first_exclusion(v, &input, input.now_ms, &Tuning::default()).is_none());
                 prop_assert!(eligible);
             }
         }

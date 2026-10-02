@@ -116,6 +116,7 @@ pub struct DomainServices {
     pub web_search_provider: Arc<dyn services::responses::tools::WebSearchProviderTrait>,
     pub service_usage_service:
         Arc<dyn services::service_usage::ServiceUsageServiceTrait + Send + Sync>,
+    pub admin_settings_service: Arc<services::admin_settings::AdminSettingsService>,
 }
 
 /// Controls process-level background work started while the application router
@@ -588,6 +589,16 @@ pub async fn init_domain_services_with_pool(
         config.staking_farm.clone(),
     ));
 
+    // Admin settings (placement tuning today): load into the pool's tuning
+    // handle now, then every 10 minutes. Placement off leaves it unused.
+    let admin_settings_service = Arc::new(services::admin_settings::AdminSettingsService::new(
+        Arc::new(
+            database::repositories::PostgresAdminSettingsRepository::new(database.pool().clone()),
+        ),
+        inference_provider_pool.placement_tuning(),
+    ));
+    admin_settings_service.clone().start().await;
+
     DomainServices {
         conversation_service,
         response_service,
@@ -606,6 +617,7 @@ pub async fn init_domain_services_with_pool(
         aml_service,
         web_search_provider,
         service_usage_service,
+        admin_settings_service,
     }
 }
 
@@ -1472,6 +1484,7 @@ pub fn build_app_with_config_and_options(
             completion_service: domain_services.completion_service.clone(),
             organization_service: domain_services.organization_service.clone(),
             usage_service: domain_services.usage_service.clone(),
+            admin_settings_service: domain_services.admin_settings_service.clone(),
         },
     );
 
@@ -2315,6 +2328,7 @@ pub struct AdminRouteServices {
     pub organization_service:
         Arc<dyn services::organization::OrganizationServiceTrait + Send + Sync>,
     pub usage_service: Arc<dyn services::usage::UsageServiceTrait + Send + Sync>,
+    pub admin_settings_service: Arc<services::admin_settings::AdminSettingsService>,
 }
 
 pub fn build_admin_routes(
@@ -2344,19 +2358,20 @@ fn build_admin_routes_with_options(
         batch_upsert_models, cancel_model_pricing_change, confirm_model_deprecation,
         confirm_model_pricing_changes, create_admin_access_token, create_service,
         delete_admin_access_token, delete_aml_allowlist_entry, delete_model, deprecate_model,
-        get_admin_organization_balance, get_billing_summary, get_infra_summary,
+        get_admin_organization_balance, get_admin_setting, get_billing_summary, get_infra_summary,
         get_model_consumption_timeseries, get_model_history, get_model_revenue, get_org_revenue,
         get_organization as get_admin_organization, get_organization_concurrent_limit,
         get_organization_fallback, get_organization_limits_history, get_organization_metrics,
         get_organization_priority, get_organization_timeseries, get_performance_timeseries,
         get_platform_metrics, get_platform_timeseries, get_revenue_density,
-        list_admin_access_tokens, list_aml_allowlist, list_aml_reports,
+        list_admin_access_tokens, list_admin_settings, list_aml_allowlist, list_aml_reports,
         list_invitation_email_deliveries, list_model_pricing_changes,
         list_models as admin_list_models, list_organization_members, list_organizations,
         list_users, preview_model_deprecation, preview_model_pricing_changes,
-        resend_invitation_email, update_aml_report_status, update_organization_concurrent_limit,
-        update_organization_fallback, update_organization_limits, update_organization_member_role,
-        update_organization_priority, update_service, upsert_aml_allowlist_entry, AdminAppState,
+        resend_invitation_email, update_admin_setting, update_aml_report_status,
+        update_organization_concurrent_limit, update_organization_fallback,
+        update_organization_limits, update_organization_member_role, update_organization_priority,
+        update_service, upsert_aml_allowlist_entry, AdminAppState,
     };
     use crate::routes::staking_farm::{
         get_admin_organization_staking_farm, sync_admin_organization_staking_farm,
@@ -2415,6 +2430,7 @@ fn build_admin_routes_with_options(
         inference_provider_pool: services.inference_provider_pool,
         github_dispatcher,
         infra_service,
+        admin_settings_service: services.admin_settings_service,
     };
 
     let database_encryption_state = crate::database_encryption::DatabaseEncryptionState::new(
@@ -2551,6 +2567,11 @@ fn build_admin_routes_with_options(
         .route(
             "/admin/platform/infra-summary",
             axum::routing::get(get_infra_summary),
+        )
+        .route("/admin/settings", axum::routing::get(list_admin_settings))
+        .route(
+            "/admin/settings/{key}",
+            axum::routing::get(get_admin_setting).patch(update_admin_setting),
         )
         .route(
             "/admin/platform/model-consumption-timeseries",

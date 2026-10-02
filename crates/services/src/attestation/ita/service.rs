@@ -217,11 +217,7 @@ impl AttestationService {
             .resolve_and_get_model(requested_model)
             .await
             .map_err(|e| AttestationError::ProviderError(format!("Failed to resolve model: {e}")))?
-            .ok_or_else(|| {
-                AttestationError::ProviderError(format!(
-                    "Model '{requested_model}' not found. It's not a valid model name or alias."
-                ))
-            })?;
+            .ok_or_else(|| AttestationError::UnknownModel(requested_model.clone()))?;
         let canonical_model = resolved_model.model_name;
         let model_alias_resolved =
             (canonical_model != *requested_model).then(|| ItaModelAliasResolved {

@@ -266,17 +266,13 @@ fn within_bound(score: f64, best: f64, tuning: &Tuning) -> bool {
 /// path. See the module doc and `Selection` for the decision rules.
 ///
 /// A pin to a slot that is not in `scores` (ineligible, or gone from its
-/// host's frame) is ignored and the keyed HRW walk decides.
-///
-/// `pin_ignores_bound` makes a pin to any slot in `scores` win whatever its
-/// score. The placer sets it for a request whose pin passed its load test
-/// instead (`decision::pin_holds`: stay unless waiting on the pin costs more
-/// than a cold prefill elsewhere); a pin that fails that
-/// test is left out of `scores` altogether.
+/// host's frame) is ignored and the keyed HRW walk decides. A pin present in
+/// `scores` wins whatever its score: pin continuity is judged on load by the
+/// caller (`decision::pin_holds`), which passes only a pin that held and
+/// leaves a released one out of `scores`.
 pub fn select(
     key: Option<&AffinityKey>,
     pin: Option<&SlotId>,
-    pin_ignores_bound: bool,
     scores: &[(SlotId, f64)],
     tuning: &Tuning,
     rng: &mut impl Rng,
@@ -299,18 +295,15 @@ pub fn select(
     });
     let home = rank.as_ref().map(|r| r[0].clone());
 
-    // Rule 1: an in-bound pin (or one the caller vouched for with
-    // `pin_ignores_bound`) wins outright.
+    // Rule 1: a pin the caller passed, present in `scores`, wins outright.
     if let Some(pin_slot) = pin {
-        if let Some(score) = score_of(pin_slot) {
-            if pin_ignores_bound || within_bound(score, best, tuning) {
-                return Some(Selected {
-                    slot: pin_slot.clone(),
-                    selection: Selection::Pinned,
-                    home: home.clone(),
-                    write_pin: false,
-                });
-            }
+        if score_of(pin_slot).is_some() {
+            return Some(Selected {
+                slot: pin_slot.clone(),
+                selection: Selection::Pinned,
+                home: home.clone(),
+                write_pin: false,
+            });
         }
     }
 
@@ -421,7 +414,7 @@ mod tests {
     fn empty_scores_is_none() {
         let mut rng = StdRng::seed_from_u64(1);
         let scores: Vec<(SlotId, f64)> = vec![];
-        assert!(select(None, None, false, &scores, &Tuning::default(), &mut rng).is_none());
+        assert!(select(None, None, &scores, &Tuning::default(), &mut rng).is_none());
     }
 
     #[test]
@@ -429,15 +422,7 @@ mod tests {
         let key = find_key_with_rank(&[s("gpu02"), s("gpu08")], &[s("gpu02")]);
         let scores = vec![(s("gpu02"), 0.30), (s("gpu08"), 0.28)];
         let mut rng = StdRng::seed_from_u64(1);
-        let sel = select(
-            Some(&key),
-            None,
-            false,
-            &scores,
-            &Tuning::default(),
-            &mut rng,
-        )
-        .unwrap();
+        let sel = select(Some(&key), None, &scores, &Tuning::default(), &mut rng).unwrap();
         assert_eq!(sel.slot, s("gpu02"));
         assert_eq!(sel.selection, Selection::Home);
         assert!(!sel.write_pin);
@@ -452,15 +437,7 @@ mod tests {
         let key = find_key_with_rank(&[s("gpu-a"), s("gpu-b")], &[s("gpu-b")]);
         let scores = vec![(s("gpu-a"), 0.0), (s("gpu-b"), 0.05)];
         let mut rng = StdRng::seed_from_u64(1);
-        let sel = select(
-            Some(&key),
-            None,
-            false,
-            &scores,
-            &Tuning::default(),
-            &mut rng,
-        )
-        .unwrap();
+        let sel = select(Some(&key), None, &scores, &Tuning::default(), &mut rng).unwrap();
         assert_eq!(sel.slot, s("gpu-b"));
         assert_eq!(sel.selection, Selection::Home);
     }
@@ -494,15 +471,7 @@ mod tests {
 
         let key = find_key_with_rank(&[r0.slot.clone(), r1.slot.clone()], &[r1.slot.clone()]);
         let mut rng = StdRng::seed_from_u64(1);
-        let sel = select(
-            Some(&key),
-            None,
-            false,
-            &scores,
-            &Tuning::default(),
-            &mut rng,
-        )
-        .unwrap();
+        let sel = select(Some(&key), None, &scores, &Tuning::default(), &mut rng).unwrap();
         assert_eq!(sel.slot, r1.slot);
         assert_eq!(sel.selection, Selection::Home);
         assert!(!sel.write_pin);
@@ -514,11 +483,8 @@ mod tests {
         // best 1.0 on gpu08; home gpu02 at 1.5.
         let scores = vec![(s("gpu02"), 1.5), (s("gpu08"), 1.0)];
         let mut rng = StdRng::seed_from_u64(1);
-        let pick = |t: Tuning, rng: &mut StdRng| {
-            select(Some(&key), None, false, &scores, &t, rng)
-                .unwrap()
-                .slot
-        };
+        let pick =
+            |t: Tuning, rng: &mut StdRng| select(Some(&key), None, &scores, &t, rng).unwrap().slot;
         // Default: bound = max(1.25, 1.25) = 1.25 < 1.5, so home spills.
         assert_eq!(pick(Tuning::default(), &mut rng), s("gpu08"));
         // Wider slack: bound = max(1.25, 2.0) keeps home.
@@ -540,7 +506,7 @@ mod tests {
             ..Tuning::default()
         };
         let scores = vec![(s("gpu02"), 1.001), (s("gpu08"), 1.0)];
-        let sel = select(Some(&key), None, false, &scores, &none, &mut rng).unwrap();
+        let sel = select(Some(&key), None, &scores, &none, &mut rng).unwrap();
         assert_eq!(sel.slot, s("gpu08"));
     }
 
@@ -552,15 +518,7 @@ mod tests {
         // Turn 1: home (gpu02) is overloaded at 2.0; gpu08 at 0.4 is the
         // next slot in rank and within bound (best 0.4, bound 0.4+0.25 = 0.65).
         let scores = vec![(s("gpu02"), 2.0), (s("gpu08"), 0.4)];
-        let sel = select(
-            Some(&key),
-            None,
-            false,
-            &scores,
-            &Tuning::default(),
-            &mut rng,
-        )
-        .unwrap();
+        let sel = select(Some(&key), None, &scores, &Tuning::default(), &mut rng).unwrap();
         assert_eq!(sel.slot, s("gpu08"));
         assert_eq!(sel.selection, Selection::Spill { rank: 2 });
         assert!(sel.write_pin, "spill away from home must write a pin");
@@ -570,7 +528,6 @@ mod tests {
         let sel = select(
             Some(&key),
             Some(&s("gpu08")),
-            false,
             &scores,
             &Tuning::default(),
             &mut rng,
@@ -580,14 +537,12 @@ mod tests {
         assert_eq!(sel.selection, Selection::Pinned);
         assert!(!sel.write_pin);
 
-        // Turn 3: gpu02 cools to 0.35, gpu08 drifts to 0.42. best = 0.35,
-        // bound = max(0.35*1.25=0.4375, 0.35+0.25=0.60) = 0.60; 0.42 <= 0.60
-        // so the pin holds (no flap).
+        // Turn 3: gpu02 cools to 0.35, gpu08 drifts to 0.42; a held pin wins
+        // whatever its score (no flap).
         let scores = vec![(s("gpu02"), 0.35), (s("gpu08"), 0.42)];
         let sel = select(
             Some(&key),
             Some(&s("gpu08")),
-            false,
             &scores,
             &Tuning::default(),
             &mut rng,
@@ -597,32 +552,24 @@ mod tests {
         assert_eq!(sel.selection, Selection::Pinned);
         assert!(!sel.write_pin);
 
-        // Turn 4: gpu08 spikes to 2.0, past the bound (0.60) — pin is
-        // ignored and the walk returns to home (gpu02), moving the pin.
+        // Turn 4: gpu08 spikes to 2.0 and the placer's load test releases the
+        // pin (it passes none), so the walk returns to home (gpu02).
         let scores = vec![(s("gpu02"), 0.35), (s("gpu08"), 2.0)];
-        let sel = select(
-            Some(&key),
-            Some(&s("gpu08")),
-            false,
-            &scores,
-            &Tuning::default(),
-            &mut rng,
-        )
-        .unwrap();
+        let sel = select(Some(&key), None, &scores, &Tuning::default(), &mut rng).unwrap();
         assert_eq!(sel.slot, s("gpu02"));
         assert_eq!(sel.selection, Selection::Home);
-        assert!(sel.write_pin, "pin moving back to home must write a pin");
+        // The placer, which saw the released pin, writes the new one.
+        assert!(!sel.write_pin);
     }
 
     #[test]
-    fn pin_ignoring_bound_holds_outside_bound() {
+    fn pin_wins_regardless_of_score() {
         let key = find_key_with_rank(&[s("gpu02"), s("gpu08")], &[s("gpu02")]);
         let scores = vec![(s("gpu02"), 0.1), (s("gpu08"), 6.0)];
         let mut rng = StdRng::seed_from_u64(1);
         let sel = select(
             Some(&key),
             Some(&s("gpu08")),
-            true,
             &scores,
             &Tuning::default(),
             &mut rng,
@@ -631,22 +578,10 @@ mod tests {
         assert_eq!(sel.slot, s("gpu08"));
         assert_eq!(sel.selection, Selection::Pinned);
         assert!(!sel.write_pin);
-        // Without the flag, the same pin is out of bound and ignored.
-        let sel = select(
-            Some(&key),
-            Some(&s("gpu08")),
-            false,
-            &scores,
-            &Tuning::default(),
-            &mut rng,
-        )
-        .unwrap();
-        assert_eq!(sel.selection, Selection::Home);
-        // With the flag, a pin to a slot not in `scores` still falls through.
+        // A pin to a slot not in `scores` still falls through.
         let sel = select(
             Some(&key),
             Some(&s("gpu05")),
-            true,
             &scores,
             &Tuning::default(),
             &mut rng,
@@ -665,7 +600,6 @@ mod tests {
         let sel = select(
             Some(&key),
             Some(&s("gpu05")),
-            false,
             &scores,
             &Tuning::default(),
             &mut rng,
@@ -688,7 +622,6 @@ mod tests {
         let sel = select(
             Some(&key),
             Some(&slot("gpu02", 1)),
-            false,
             &scores,
             &Tuning::default(),
             &mut rng,
@@ -708,7 +641,6 @@ mod tests {
         let sel = select(
             None,
             Some(&s("ghost")),
-            false,
             &scores,
             &Tuning::default(),
             &mut rng,
@@ -727,7 +659,7 @@ mod tests {
         let scores = vec![(s("hostA"), 1.0), (s("hostB"), 2.0)];
         for seed in 0..10u64 {
             let mut rng = StdRng::seed_from_u64(seed);
-            let sel = select(None, None, false, &scores, &Tuning::default(), &mut rng).unwrap();
+            let sel = select(None, None, &scores, &Tuning::default(), &mut rng).unwrap();
             assert_eq!(sel.slot, s("hostA"));
             assert_eq!(sel.selection, Selection::BestOfTwo);
             assert_eq!(sel.home, None);
@@ -753,7 +685,7 @@ mod tests {
         let mut saw_non_global_min = false;
         for seed in 0..50u64 {
             let mut rng = StdRng::seed_from_u64(seed);
-            let sel = select(None, None, false, &scores, &Tuning::default(), &mut rng).unwrap();
+            let sel = select(None, None, &scores, &Tuning::default(), &mut rng).unwrap();
             assert_eq!(sel.selection, Selection::BestOfTwo);
             assert!(
                 by_slot.contains_key(&sel.slot),
@@ -783,7 +715,7 @@ mod tests {
     fn keyless_single_slot_is_taken() {
         let scores = vec![(s("hostA"), 1.0)];
         let mut rng = StdRng::seed_from_u64(1);
-        let sel = select(None, None, false, &scores, &Tuning::default(), &mut rng).unwrap();
+        let sel = select(None, None, &scores, &Tuning::default(), &mut rng).unwrap();
         assert_eq!(sel.slot, s("hostA"));
         assert_eq!(sel.selection, Selection::BestOfTwo);
     }

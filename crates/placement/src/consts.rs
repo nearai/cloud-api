@@ -62,6 +62,13 @@ pub const AFFINITY_ABS_SLACK: f64 = 0.25;
 /// cost comparison: stay unless waiting on the warm replica costs more than a
 /// cold prefill of the prompt elsewhere. There is no evidence yet for other
 /// values.
+///
+/// This rule now governs every pinned request. Previously, prompts at or below
+/// the base-tier window used the score+slack bound, which released warm pins
+/// (and their prefix cache) whenever the pinned slot was slightly busier than
+/// the best. The factor tunes the rule but cannot restore that old behavior for
+/// short prompts; rollback for that is the placement kill switch (routes
+/// everything legacy) or reverting the change.
 pub const PIN_HOLD_FACTOR: f64 = 1.0;
 
 /// How long a follow pin stays valid after it's written, in milliseconds.

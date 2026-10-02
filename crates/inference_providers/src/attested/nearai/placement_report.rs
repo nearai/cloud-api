@@ -140,7 +140,7 @@ pub(super) fn report_decision(
                 reason = record.reason.unwrap_or(""),
                 slot = record.slot.as_deref().unwrap_or(""),
                 home = record.home.as_deref().unwrap_or(""),
-                key_source = record.key_source,
+                affinity = record.affinity,
                 pinned = record.pinned.as_deref().unwrap_or(""),
                 pin_outcome = record.pin_outcome,
                 pin_age_ms = ?record.pin_age_ms,
@@ -304,7 +304,7 @@ fn detail_tag(record: &DecisionRecord) -> &'static str {
 
 fn affinity_tag(affinity: &str) -> &'static str {
     match affinity {
-        "client" => "affinity:client",
+        "header" | "body_session_id" | "prompt_cache_key" | "client" => "affinity:client",
         "prefix" => "affinity:prefix",
         "none" => "affinity:none",
         _ => "affinity:unknown",
@@ -693,7 +693,7 @@ mod observability_tests {
         record.slot = Some("host-a#1".to_string());
         record.home = Some("host-a#0".to_string());
         record.pinned = Some("host-a#1".to_string());
-        record.affinity = "client";
+        record.affinity = "header";
 
         let metrics = Arc::new(FakeMetrics::default());
         let h = handles(metrics.clone());
@@ -712,7 +712,7 @@ mod observability_tests {
             "selection=\"pinned\"",
             "slot=\"host-a#1\"",
             "home=\"host-a#0\"",
-            "key_source=\"none\"",
+            "affinity=\"header\"",
             "pinned=\"host-a#1\"",
             "pin_outcome=\"none\"",
             "pin_age_ms=",

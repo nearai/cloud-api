@@ -84,21 +84,8 @@ pub enum AffinitySource {
 }
 
 impl AffinitySource {
-    /// A stable, content-free name for logs and metric tags: the three
-    /// client-supplied sources share `client`.
+    /// A stable, content-free name for logs.
     pub const fn as_str(self) -> &'static str {
-        match self {
-            AffinitySource::Header
-            | AffinitySource::BodySessionId
-            | AffinitySource::PromptCacheKey => "client",
-            AffinitySource::Prefix => "prefix",
-            AffinitySource::None => "none",
-        }
-    }
-
-    /// Where the key came from, finer than [`Self::as_str`], for the decision
-    /// log.
-    pub const fn key_source(self) -> &'static str {
         match self {
             AffinitySource::Header => "header",
             AffinitySource::BodySessionId => "body_session_id",
@@ -215,8 +202,6 @@ pub struct DecisionRecord {
     pub place_us: u32,
     pub rank: Option<u8>,
     pub affinity: &'static str,
-    /// `AffinitySource::key_source`.
-    pub key_source: &'static str,
     /// What became of the request's follow pin: `held`, `released_load`,
     /// `not_admitted`, `stale_boot` or `none`.
     pub pin_outcome: &'static str,
@@ -265,7 +250,6 @@ impl DecisionRecord {
             place_us: 0,
             rank: None,
             affinity: input.affinity_source.as_str(),
-            key_source: input.affinity_source.key_source(),
             pin_outcome: "none",
             pin_age_ms: None,
             pinned_load: None,
@@ -324,6 +308,11 @@ struct PinTest {
 
 /// Pin continuity for a request pinned to `pin`: `None` when `pin` is not an
 /// admitted candidate, else whether it holds.
+///
+/// This rule governs every pinned request. Before it, prompts at or below the
+/// base-tier window used the score+slack bound, which released a warm pin (and
+/// its prefix cache) whenever the pinned slot was slightly busier than the
+/// best; only heavy prompts were judged on load.
 ///
 /// The pin holds iff `pinned_load <= best_other_load + prompt * factor`
 /// (`Tuning::pin_hold_factor`), with `load` the lane's (effective backlog
@@ -579,8 +568,7 @@ impl Placer {
 
         let selected = match select(
             input.affinity.as_ref(),
-            pin_slot,
-            pin_test.as_ref().is_some_and(|t| t.holds),
+            pin_slot.filter(|_| pin_test.as_ref().is_some_and(|t| t.holds)),
             walk,
             tuning,
             rng,
@@ -618,7 +606,8 @@ impl Placer {
                             input.now_ms.saturating_sub(*at_ms) > snap.pins.ttl_ms() / 2
                         })
                         .unwrap_or(false),
-                    _ => selected.write_pin,
+                    // A pin that did not hold is moved to where the request went.
+                    _ => selected.write_pin || pin_slot.is_some(),
                 };
             if should_write {
                 pin_write = Some((pid, selected.slot.clone()));
@@ -641,7 +630,6 @@ impl Placer {
             place_us: 0,
             rank,
             affinity: input.affinity_source.as_str(),
-            key_source: input.affinity_source.key_source(),
             pin_outcome,
             pin_age_ms: pin_lookup
                 .as_ref()
@@ -1977,7 +1965,7 @@ mod tests {
         assert_eq!(record.pin_age_ms, Some(1_000));
         assert_eq!(record.pinned_load, Some(6_000));
         assert_eq!(record.best_other_load, Some(0));
-        assert_eq!(record.key_source, "header");
+        assert_eq!(record.affinity, "header");
     }
 
     #[test]

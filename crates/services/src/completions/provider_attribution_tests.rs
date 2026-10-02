@@ -36,7 +36,7 @@ impl ModelsRepository for StaticModelsRepository {
     }
 }
 
-struct StaticOrganizationLimitRepository;
+pub(super) struct StaticOrganizationLimitRepository;
 
 #[async_trait::async_trait]
 impl ports::OrganizationConcurrentLimitRepository for StaticOrganizationLimitRepository {
@@ -45,7 +45,7 @@ impl ports::OrganizationConcurrentLimitRepository for StaticOrganizationLimitRep
     }
 }
 
-fn test_model(model_name: &str) -> ModelWithPricing {
+pub(super) fn test_model(model_name: &str) -> ModelWithPricing {
     ModelWithPricing {
         id: Uuid::new_v4(),
         model_name: model_name.to_string(),

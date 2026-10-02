@@ -55,6 +55,7 @@ const PLACEMENT_FIELDS: &[&str] = &[
     "lane_load_tokens",
     "pin_hold_factor",
     "pin_ttl_ms",
+    "enabled",
 ];
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
@@ -74,6 +75,14 @@ pub struct PlacementTuning {
     pub pin_hold_factor: f64,
     /// How long a follow pin stays valid, in ms (60000 - 3600000).
     pub pin_ttl_ms: i64,
+    /// Default true. False routes every request through legacy routing
+    /// (`LegacyReason::Disabled`). A PATCH applies immediately on the instance
+    /// that receives it and on other instances at the next reload
+    /// ([`RELOAD_INTERVAL`]). For an instant fleet-wide stop (affects every
+    /// environment sharing the Valkey) use the Valkey key
+    /// `routed:_placement_off`. Set it to false only after every instance runs
+    /// a build that knows this field (`deny_unknown_fields`).
+    pub enabled: bool,
 }
 
 impl Default for PlacementTuning {
@@ -91,6 +100,7 @@ impl From<Tuning> for PlacementTuning {
             lane_load_tokens: t.lane_load_tokens as i64,
             pin_hold_factor: t.pin_hold_factor,
             pin_ttl_ms: t.pin_ttl_ms as i64,
+            enabled: t.enabled,
         }
     }
 }
@@ -134,6 +144,7 @@ impl PlacementTuning {
             lane_load_tokens: self.lane_load_tokens as u64,
             pin_hold_factor: self.pin_hold_factor,
             pin_ttl_ms: self.pin_ttl_ms as u64,
+            enabled: self.enabled,
         }
     }
 }
@@ -522,6 +533,8 @@ mod tests {
         // Wrong types and unknown fields are rejected too.
         invalid(&svc, json!({"kv_max": "high"})).await;
         invalid(&svc, json!({"lane_load_tokens": 5000.5})).await;
+        invalid(&svc, json!({"enabled": "no"})).await;
+        invalid(&svc, json!({"enabled": 0})).await;
         invalid(&svc, json!({"not_a_knob": 1})).await;
         // A null-valued unknown field is rejected too (not silently dropped).
         invalid(&svc, json!({"not_a_knob": null})).await;
@@ -589,6 +602,7 @@ mod tests {
             lane_load_tokens: 4_000,
             pin_hold_factor: 0.5,
             pin_ttl_ms: 60_000,
+            enabled: false,
         };
         let hi = PlacementTuning {
             affinity_abs_slack: 4.0,
@@ -597,6 +611,7 @@ mod tests {
             lane_load_tokens: 1_000_000,
             pin_hold_factor: 2.0,
             pin_ttl_ms: 3_600_000,
+            enabled: true,
         };
         assert!(lo.validate().is_ok());
         assert!(hi.validate().is_ok());
@@ -613,7 +628,7 @@ mod tests {
             json!({
                 "affinity_abs_slack": 0.25, "affinity_eps": 0.25, "kv_max": 0.95,
                 "lane_load_tokens": 64_000, "pin_hold_factor": 1.0,
-                "pin_ttl_ms": 600_000
+                "pin_ttl_ms": 600_000, "enabled": true
             })
         );
         assert_eq!(v.updated_at, None);
@@ -682,6 +697,26 @@ mod tests {
                 ..d
             }
         );
+    }
+
+    #[tokio::test]
+    async fn enabled_round_trips_and_null_resets() {
+        let (svc, _, handle) = service();
+        let admin = Uuid::new_v4();
+        let v = svc
+            .update(KEY_PLACEMENT, json!({"enabled": false}), admin)
+            .await
+            .unwrap();
+        assert_eq!(v.value["enabled"], json!(false));
+        assert!(!handle.load().enabled);
+        assert!(!svc.placement().enabled);
+
+        let v = svc
+            .update(KEY_PLACEMENT, json!({"enabled": null}), admin)
+            .await
+            .unwrap();
+        assert_eq!(v.value["enabled"], json!(true));
+        assert_eq!(**handle.load(), Tuning::default());
     }
 
     #[tokio::test]

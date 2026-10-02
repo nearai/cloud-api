@@ -412,7 +412,7 @@ impl Placer {
         tuning: &Tuning,
         rng: &mut impl Rng,
     ) -> Decision {
-        if snap.disabled {
+        if snap.disabled || !tuning.enabled {
             return self.legacy(input, snap, LegacyReason::Disabled, None);
         }
 
@@ -798,6 +798,28 @@ mod tests {
         other.model = "some-other-model".into();
         let (reason, _) = legacy_reason(placer().place(&other, &snap, &HashMap::new(), &mut rng));
         assert_eq!(reason, LegacyReason::Disabled);
+    }
+
+    #[test]
+    fn tuning_enabled_false_is_legacy_disabled() {
+        // The admin kill switch behaves like a disabled snapshot, even when
+        // the snapshot is fresh and healthy; enabled places normally.
+        let snap = snap_with(vec![ready_view("gpu01", 0)]);
+        let mut rng = StdRng::seed_from_u64(1);
+        let handle = Arc::new(ArcSwap::from_pointee(Tuning {
+            enabled: false,
+            ..Tuning::default()
+        }));
+        let p = Placer::with_tuning([1u8; 32], Tier::Base, handle.clone());
+        let (reason, record) =
+            legacy_reason(p.place(&base_input(), &snap, &HashMap::new(), &mut rng));
+        assert_eq!(reason, LegacyReason::Disabled);
+        assert_eq!(record.reason, Some("disabled"));
+
+        handle.store(Arc::new(Tuning::default()));
+        let (chosen, record, _) = placed(p.place(&base_input(), &snap, &HashMap::new(), &mut rng));
+        assert_eq!(chosen, slot("gpu01", 0));
+        assert_eq!(record.outcome, "place");
     }
 
     #[test]

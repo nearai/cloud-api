@@ -3847,14 +3847,6 @@ pub struct ModelMetadata {
     /// string. Omitted when there is no planned deprecation.
     #[serde(rename = "deprecationDate", skip_serializing_if = "Option::is_none")]
     pub deprecation_date: Option<String>,
-    /// When the planned deprecation was announced (RFC 3339, UTC). This is the
-    /// date carried by the `Deprecation` response header on inference
-    /// responses. Omitted when there is no planned deprecation.
-    #[serde(
-        rename = "deprecationAnnouncedAt",
-        skip_serializing_if = "Option::is_none"
-    )]
-    pub deprecation_announced_at: Option<String>,
     /// Recommended replacement for a model with a planned deprecation
     /// (canonical model id). Omitted when none is set.
     #[serde(rename = "successorModelId", skip_serializing_if = "Option::is_none")]
@@ -3995,8 +3987,8 @@ pub struct UpdateModelApiRequest {
     pub deprecation_date: Nullable<String>,
     /// Recommended replacement for a model with a planned deprecation: the
     /// canonical id of an active model (or of a model created in the same
-    /// request). Announced to API users in the `Link: rel="successor-version"`
-    /// response header and on `GET /v1/models`.
+    /// request). Announced to API users in the `x-model-successor` response
+    /// header and on `GET /v1/models`.
     ///
     /// Tri-state PATCH semantics:
     /// - omitted → leave unchanged
@@ -4377,11 +4369,6 @@ pub struct ModelHistoryEntry {
     pub is_ready: Option<bool>,
     #[serde(rename = "deprecationDate", skip_serializing_if = "Option::is_none")]
     pub deprecation_date: Option<String>,
-    #[serde(
-        rename = "deprecationAnnouncedAt",
-        skip_serializing_if = "Option::is_none"
-    )]
-    pub deprecation_announced_at: Option<String>,
     #[serde(rename = "successorModelId", skip_serializing_if = "Option::is_none")]
     pub successor_model_id: Option<String>,
     /// OpenRouter `openrouter.slug` override the model carried at this point.

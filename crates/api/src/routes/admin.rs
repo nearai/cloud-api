@@ -148,12 +148,6 @@ pub(crate) fn format_deprecation_date(dt: &DateTime<Utc>) -> String {
     dt.format("%Y-%m-%dT%H:00:00Z").to_string()
 }
 
-/// Serialize a stored `deprecation_announced_at` as an RFC 3339 UTC instant
-/// with second precision (e.g. `2026-10-05T12:00:00Z`).
-pub(crate) fn format_deprecation_announced_at(dt: &DateTime<Utc>) -> String {
-    dt.to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
-}
-
 /// Validate an OpenRouter `openrouter.slug` override.
 ///
 /// OpenRouter's `/api/v1/models` ids are lowercase `author/slug` pairs (e.g.
@@ -1145,10 +1139,6 @@ pub async fn batch_upsert_models(
                     .deprecation_date
                     .as_ref()
                     .map(format_deprecation_date),
-                deprecation_announced_at: updated_model
-                    .deprecation_announced_at
-                    .as_ref()
-                    .map(format_deprecation_announced_at),
                 successor_model_id: updated_model.successor_model_name,
                 openrouter_slug: updated_model.openrouter_slug,
             },
@@ -1256,10 +1246,6 @@ pub async fn list_models(
                 datacenters: crate::models::Datacenter::from_codes(model.datacenters),
                 is_ready: model.is_ready,
                 deprecation_date: model.deprecation_date.as_ref().map(format_deprecation_date),
-                deprecation_announced_at: model
-                    .deprecation_announced_at
-                    .as_ref()
-                    .map(format_deprecation_announced_at),
                 successor_model_id: model.successor_model_name,
                 openrouter_slug: model.openrouter_slug,
             },
@@ -1399,10 +1385,6 @@ pub async fn get_model_history(
             datacenters: crate::models::Datacenter::from_codes(h.datacenters),
             is_ready: h.is_ready,
             deprecation_date: h.deprecation_date.as_ref().map(format_deprecation_date),
-            deprecation_announced_at: h
-                .deprecation_announced_at
-                .as_ref()
-                .map(format_deprecation_announced_at),
             successor_model_id: h.successor_model_name,
             openrouter_slug: h.openrouter_slug,
             allow_free: h.allow_free,
@@ -1949,10 +1931,6 @@ pub async fn deprecate_model(
             datacenters: crate::models::Datacenter::from_codes(m.datacenters),
             is_ready: m.is_ready,
             deprecation_date: m.deprecation_date.as_ref().map(format_deprecation_date),
-            deprecation_announced_at: m
-                .deprecation_announced_at
-                .as_ref()
-                .map(format_deprecation_announced_at),
             successor_model_id: m.successor_model_name,
             openrouter_slug: m.openrouter_slug,
         },

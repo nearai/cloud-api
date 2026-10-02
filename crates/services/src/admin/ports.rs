@@ -54,8 +54,8 @@ pub struct UpdateModelAdminRequest {
     /// `Some(Some(dt))` = set to `dt`.
     pub deprecation_date: Option<Option<chrono::DateTime<chrono::Utc>>>,
     /// Recommended replacement model for a planned deprecation (canonical
-    /// model name). Announced in the `Link: rel="successor-version"` response
-    /// header. Cleared together with `deprecation_date`.
+    /// model name). Announced in the `x-model-successor` response header.
+    /// Cleared together with `deprecation_date`.
     ///
     /// Tri-state: `None` = leave unchanged, `Some(None)` = clear to NULL,
     /// `Some(Some(v))` = set to `v`.
@@ -119,8 +119,6 @@ pub struct ModelPricing {
     pub datacenters: Option<Vec<String>>,
     pub is_ready: Option<bool>,
     pub deprecation_date: Option<chrono::DateTime<chrono::Utc>>,
-    /// When the planned deprecation was announced. NULL = none planned.
-    pub deprecation_announced_at: Option<chrono::DateTime<chrono::Utc>>,
     /// Recommended replacement model for the planned deprecation.
     pub successor_model_name: Option<String>,
     /// OpenRouter `openrouter.slug` override. NULL = unset.
@@ -172,8 +170,6 @@ pub struct ModelHistoryEntry {
     pub datacenters: Option<Vec<String>>,
     pub is_ready: Option<bool>,
     pub deprecation_date: Option<chrono::DateTime<chrono::Utc>>,
-    /// When the planned deprecation was announced. NULL = none planned.
-    pub deprecation_announced_at: Option<chrono::DateTime<chrono::Utc>>,
     /// Recommended replacement model for the planned deprecation.
     pub successor_model_name: Option<String>,
     /// OpenRouter `openrouter.slug` override the model carried at this point.
@@ -305,8 +301,6 @@ pub struct AdminModelInfo {
     pub datacenters: Option<Vec<String>>,
     pub is_ready: Option<bool>,
     pub deprecation_date: Option<chrono::DateTime<chrono::Utc>>,
-    /// When the planned deprecation was announced. NULL = none planned.
-    pub deprecation_announced_at: Option<chrono::DateTime<chrono::Utc>>,
     /// Recommended replacement model for the planned deprecation.
     pub successor_model_name: Option<String>,
     /// OpenRouter `openrouter.slug` override. NULL = unset.

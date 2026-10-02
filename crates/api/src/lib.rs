@@ -1711,7 +1711,6 @@ pub fn build_completion_routes(
     // layer: it only sees requests that passed auth, rate and usage checks.
     let model_deprecation_state = middleware::ModelDeprecationState {
         models_service: app_state.models_service.clone(),
-        docs_url: app_state.config.model_deprecation_docs_url.clone(),
     };
 
     // Native Anthropic Messages support is staging-gated and hard-off by
@@ -1871,7 +1870,6 @@ pub fn build_response_routes(
 ) -> Router {
     let model_deprecation_state = middleware::ModelDeprecationState {
         models_service: native_app_state.models_service.clone(),
-        docs_url: native_app_state.config.model_deprecation_docs_url.clone(),
     };
     let route_state = responses::ResponseRouteState {
         native_service: services::responses::native::NativeResponsesService {
@@ -3236,7 +3234,6 @@ mod tests {
             credit_allocation: config::CreditAllocationConfig::default(),
             ita: config::ItaAttestationConfig::default(),
             placement: config::PlacementConfig::default(),
-            model_deprecation_docs_url: None,
         };
 
         // Initialize services
@@ -3359,7 +3356,6 @@ mod tests {
             credit_allocation: config::CreditAllocationConfig::default(),
             ita: config::ItaAttestationConfig::default(),
             placement: config::PlacementConfig::default(),
-            model_deprecation_docs_url: None,
         };
 
         let auth_components = init_auth_services(database.clone(), &config);

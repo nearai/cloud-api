@@ -1,13 +1,13 @@
 // E2E tests for the response headers that announce a planned model
-// deprecation: `Deprecation` (RFC 9745), `Sunset` (RFC 8594) and
-// `Link: rel="successor-version"`, plus the catalog fields behind them.
+// deprecation (`x-model-deprecation-date`, `x-model-successor`) and the
+// catalog field behind the successor.
 
 use crate::common::*;
 use api::models::BatchUpdateModelApiRequest;
 
-/// `2030-01-01` defaults to 13:00 UTC; that day is a Tuesday.
+/// `2030-01-01` defaults to 13:00 UTC.
 const DEPRECATION_DATE: &str = "2030-01-01";
-const SUNSET_HEADER: &str = "Tue, 01 Jan 2030 13:00:00 GMT";
+const DEPRECATION_DATE_HEADER: &str = "2030-01-01T13:00:00Z";
 
 struct Fixture {
     server: axum_test::TestServer,
@@ -16,7 +16,6 @@ struct Fixture {
     /// endpoint takes it as a path segment.
     old: String,
     old_alias: String,
-    /// Contains a `/`, so the `Link` target must percent-encode it.
     successor: String,
 }
 
@@ -123,67 +122,82 @@ fn header(response: &axum_test::TestResponse, name: &str) -> Option<String> {
         .map(|value| value.to_str().unwrap().to_string())
 }
 
-/// The `Deprecation` header as unix seconds.
-fn deprecation_timestamp(response: &axum_test::TestResponse) -> i64 {
-    let value = header(response, "deprecation").expect("response must carry Deprecation");
-    value
-        .strip_prefix('@')
-        .unwrap_or_else(|| panic!("Deprecation must be a structured-field date, got {value}"))
-        .parse()
-        .unwrap_or_else(|_| panic!("Deprecation must be @<unix seconds>, got {value}"))
+fn assert_announced(fixture: &Fixture, response: &axum_test::TestResponse, context: &str) {
+    assert_eq!(
+        header(response, "x-model-deprecation-date").as_deref(),
+        Some(DEPRECATION_DATE_HEADER),
+        "{context}"
+    );
+    assert_eq!(
+        header(response, "x-model-successor"),
+        Some(fixture.successor.clone()),
+        "{context}"
+    );
+    // The endpoint is not being deprecated, so the URL-scoped standard
+    // headers must not appear.
+    for standard in ["deprecation", "sunset", "link"] {
+        assert_eq!(header(response, standard), None, "{context}: {standard}");
+    }
 }
 
-fn assert_no_deprecation_headers(response: &axum_test::TestResponse) {
-    assert_eq!(header(response, "deprecation"), None);
-    assert_eq!(header(response, "sunset"), None);
-    assert_eq!(header(response, "link"), None);
-}
-
-fn successor_link(fixture: &Fixture) -> String {
-    format!(
-        "</v1/model/{}>; rel=\"successor-version\"",
-        fixture.successor.replace('/', "%2F")
-    )
+fn assert_not_announced(response: &axum_test::TestResponse) {
+    assert_eq!(header(response, "x-model-deprecation-date"), None);
+    assert_eq!(header(response, "x-model-successor"), None);
 }
 
 #[tokio::test]
 async fn test_model_without_planned_deprecation_has_no_headers() {
     let fixture = setup().await;
 
-    assert_no_deprecation_headers(&chat(&fixture, &fixture.old, false).await);
-    assert_no_deprecation_headers(&chat(&fixture, &fixture.old, true).await);
+    assert_not_announced(&chat(&fixture, &fixture.old, false).await);
+    assert_not_announced(&chat(&fixture, &fixture.old, true).await);
 }
 
 #[tokio::test]
 async fn test_confirmed_deprecation_is_announced_in_response_headers() {
     let fixture = setup().await;
-    let before = chrono::Utc::now().timestamp();
     confirm_deprecation(&fixture).await;
-    let after = chrono::Utc::now().timestamp();
 
     for stream in [false, true] {
         let response = chat(&fixture, &fixture.old, stream).await;
-
-        let announced = deprecation_timestamp(&response);
-        assert!(
-            (before - 1..=after + 1).contains(&announced),
-            "stream={stream}: Deprecation {announced} should be the confirm time ({before}..={after})"
-        );
-        assert_eq!(
-            header(&response, "sunset").as_deref(),
-            Some(SUNSET_HEADER),
-            "stream={stream}"
-        );
-        assert_eq!(
-            header(&response, "link"),
-            Some(successor_link(&fixture)),
-            "stream={stream}"
-        );
+        assert_announced(&fixture, &response, &format!("stream={stream}"));
     }
 
     // The body is not annotated: only headers carry the announcement.
     let body: serde_json::Value = chat(&fixture, &fixture.old, false).await.json();
     assert!(body.get("warning").is_none(), "{body}");
+}
+
+#[tokio::test]
+async fn test_deprecation_is_announced_on_a_non_chat_route() {
+    let fixture = setup().await;
+    confirm_deprecation(&fixture).await;
+
+    let response = fixture
+        .server
+        .post("/v1/embeddings")
+        .add_header("Authorization", format!("Bearer {}", fixture.api_key))
+        .json(&serde_json::json!({ "model": fixture.old, "input": "Hello world" }))
+        .await;
+
+    assert_eq!(response.status_code(), 200, "{}", response.text());
+    assert_announced(&fixture, &response, "embeddings");
+}
+
+#[tokio::test]
+async fn test_failed_request_is_not_annotated() {
+    let fixture = setup().await;
+    confirm_deprecation(&fixture).await;
+
+    let response = fixture
+        .server
+        .post("/v1/chat/completions")
+        .add_header("Authorization", format!("Bearer {}", fixture.api_key))
+        .json(&serde_json::json!({ "model": fixture.old, "messages": [] }))
+        .await;
+
+    assert_eq!(response.status_code(), 400, "{}", response.text());
+    assert_not_announced(&response);
 }
 
 #[tokio::test]
@@ -197,16 +211,18 @@ async fn test_alias_request_gets_the_canonical_models_headers() {
         header(&response, "x-model-alias-resolved"),
         Some(format!("{} -> {}", fixture.old_alias, fixture.old))
     );
-    deprecation_timestamp(&response);
-    assert_eq!(header(&response, "sunset").as_deref(), Some(SUNSET_HEADER));
-    assert_eq!(header(&response, "link"), Some(successor_link(&fixture)));
+    assert_announced(&fixture, &response, "alias");
 }
 
 #[tokio::test]
 async fn test_clearing_the_deprecation_date_removes_the_headers() {
     let fixture = setup().await;
     confirm_deprecation(&fixture).await;
-    assert!(header(&chat(&fixture, &fixture.old, false).await, "sunset").is_some());
+    assert_announced(
+        &fixture,
+        &chat(&fixture, &fixture.old, false).await,
+        "before clear",
+    );
 
     let cleared = patch_models(
         &fixture.server,
@@ -217,17 +233,14 @@ async fn test_clearing_the_deprecation_date_removes_the_headers() {
     let cleared: serde_json::Value = cleared.json();
     let metadata = &cleared[0]["metadata"];
     assert!(metadata.get("deprecationDate").is_none(), "{metadata}");
-    assert!(
-        metadata.get("deprecationAnnouncedAt").is_none(),
-        "{metadata}"
-    );
+    // The successor goes with the date.
     assert!(metadata.get("successorModelId").is_none(), "{metadata}");
 
-    assert_no_deprecation_headers(&chat(&fixture, &fixture.old, false).await);
+    assert_not_announced(&chat(&fixture, &fixture.old, false).await);
 }
 
 #[tokio::test]
-async fn test_patch_stamps_the_announcement_once_and_exposes_the_successor() {
+async fn test_patch_sets_the_successor_and_the_catalog_exposes_it() {
     let fixture = setup().await;
 
     let set = patch_models(
@@ -241,14 +254,10 @@ async fn test_patch_stamps_the_announcement_once_and_exposes_the_successor() {
     assert_eq!(set.status_code(), 200, "{}", set.text());
     let set: serde_json::Value = set.json();
     let metadata = &set[0]["metadata"];
-    assert_eq!(metadata["deprecationDate"], "2030-01-01T13:00:00Z");
+    assert_eq!(metadata["deprecationDate"], DEPRECATION_DATE_HEADER);
     assert_eq!(metadata["successorModelId"], fixture.successor.as_str());
-    let announced_at = metadata["deprecationAnnouncedAt"]
-        .as_str()
-        .expect("announcement time must be stamped")
-        .to_string();
 
-    // Moving the date keeps the original announcement.
+    // Moving the date keeps the successor; the header follows the new date.
     let moved = patch_models(
         &fixture.server,
         serde_json::json!({ &fixture.old: { "deprecationDate": "2031-06-01" } }),
@@ -258,8 +267,17 @@ async fn test_patch_stamps_the_announcement_once_and_exposes_the_successor() {
     let moved: serde_json::Value = moved.json();
     let metadata = &moved[0]["metadata"];
     assert_eq!(metadata["deprecationDate"], "2031-06-01T13:00:00Z");
-    assert_eq!(metadata["deprecationAnnouncedAt"], announced_at.as_str());
     assert_eq!(metadata["successorModelId"], fixture.successor.as_str());
+
+    let response = chat(&fixture, &fixture.old, false).await;
+    assert_eq!(
+        header(&response, "x-model-deprecation-date").as_deref(),
+        Some("2031-06-01T13:00:00Z")
+    );
+    assert_eq!(
+        header(&response, "x-model-successor"),
+        Some(fixture.successor.clone())
+    );
 
     // The public catalog names the successor next to the date.
     let models = fixture
@@ -278,7 +296,7 @@ async fn test_patch_stamps_the_announcement_once_and_exposes_the_successor() {
     assert_eq!(entry["deprecation_date"], "2031-06-01T13:00:00Z");
     assert_eq!(entry["successor_model_id"], fixture.successor.as_str());
 
-    // The audit trail records both fields.
+    // The audit trail records the successor.
     let history = fixture
         .server
         .get(&format!("/v1/admin/models/{}/history", fixture.old))
@@ -287,9 +305,10 @@ async fn test_patch_stamps_the_announcement_once_and_exposes_the_successor() {
         .await;
     assert_eq!(history.status_code(), 200, "{}", history.text());
     let history: serde_json::Value = history.json();
-    let latest = &history["history"][0];
-    assert_eq!(latest["deprecationAnnouncedAt"], announced_at.as_str());
-    assert_eq!(latest["successorModelId"], fixture.successor.as_str());
+    assert_eq!(
+        history["history"][0]["successorModelId"],
+        fixture.successor.as_str()
+    );
 }
 
 #[tokio::test]
@@ -317,5 +336,5 @@ async fn test_patch_rejects_an_invalid_successor() {
     assert_eq!(itself.status_code(), 400, "{}", itself.text());
 
     // Nothing was written by the rejected requests.
-    assert_no_deprecation_headers(&chat(&fixture, &fixture.old, false).await);
+    assert_not_announced(&chat(&fixture, &fixture.old, false).await);
 }

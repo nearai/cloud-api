@@ -93,7 +93,7 @@ impl ModelRepository {
                         m.input_modalities, m.output_modalities, m.inference_url,
                         m.hugging_face_id, m.quantization, m.max_output_length,
                         m.supported_sampling_parameters, m.supported_features, m.datacenters,
-                        m.is_ready, m.deprecation_date, m.deprecation_announced_at, m.successor_model_name, m.openrouter_slug, m.allow_free,
+                        m.is_ready, m.deprecation_date, m.successor_model_name, m.openrouter_slug, m.allow_free,
                         COALESCE(array_agg(a.alias_name) FILTER (WHERE a.alias_name IS NOT NULL), '{}') AS aliases
                     FROM models m
                     LEFT JOIN model_aliases a ON a.canonical_model_id = m.id AND a.is_active = true
@@ -176,7 +176,7 @@ impl ModelRepository {
                             m.input_modalities, m.output_modalities, m.inference_url,
                             m.hugging_face_id, m.quantization, m.max_output_length,
                             m.supported_sampling_parameters, m.supported_features, m.datacenters,
-                            m.is_ready, m.deprecation_date, m.deprecation_announced_at, m.successor_model_name, m.openrouter_slug, m.allow_free,
+                            m.is_ready, m.deprecation_date, m.successor_model_name, m.openrouter_slug, m.allow_free,
                             COALESCE(array_agg(a.alias_name) FILTER (WHERE a.alias_name IS NOT NULL), '{}') AS aliases
                         FROM models m
                         LEFT JOIN model_aliases a ON a.canonical_model_id = m.id AND a.is_active = true
@@ -200,7 +200,7 @@ impl ModelRepository {
                             m.input_modalities, m.output_modalities, m.inference_url,
                             m.hugging_face_id, m.quantization, m.max_output_length,
                             m.supported_sampling_parameters, m.supported_features, m.datacenters,
-                            m.is_ready, m.deprecation_date, m.deprecation_announced_at, m.successor_model_name, m.openrouter_slug, m.allow_free,
+                            m.is_ready, m.deprecation_date, m.successor_model_name, m.openrouter_slug, m.allow_free,
                             COALESCE(array_agg(a.alias_name) FILTER (WHERE a.alias_name IS NOT NULL), '{}') AS aliases
                         FROM models m
                         LEFT JOIN model_aliases a ON a.canonical_model_id = m.id AND a.is_active = true
@@ -242,7 +242,7 @@ impl ModelRepository {
                         input_cost_per_token, output_cost_per_token, cost_per_image, cache_read_cost_per_token, text_pricing,
                         context_length, verifiable, is_active, owned_by, created_at, updated_at,
                         provider_type, provider_config, attestation_supported,
-                        input_modalities, output_modalities, inference_url, hugging_face_id, quantization, max_output_length, supported_sampling_parameters, supported_features, datacenters, is_ready, deprecation_date, deprecation_announced_at, successor_model_name, openrouter_slug, allow_free
+                        input_modalities, output_modalities, inference_url, hugging_face_id, quantization, max_output_length, supported_sampling_parameters, supported_features, datacenters, is_ready, deprecation_date, successor_model_name, openrouter_slug, allow_free
                     FROM models
                     WHERE model_name = $1
                     "#,
@@ -277,7 +277,7 @@ impl ModelRepository {
                         input_cost_per_token, output_cost_per_token, cost_per_image, cache_read_cost_per_token, text_pricing,
                         context_length, verifiable, is_active, owned_by, created_at, updated_at,
                         provider_type, provider_config, attestation_supported,
-                        input_modalities, output_modalities, inference_url, hugging_face_id, quantization, max_output_length, supported_sampling_parameters, supported_features, datacenters, is_ready, deprecation_date, deprecation_announced_at, successor_model_name, openrouter_slug, allow_free
+                        input_modalities, output_modalities, inference_url, hugging_face_id, quantization, max_output_length, supported_sampling_parameters, supported_features, datacenters, is_ready, deprecation_date, successor_model_name, openrouter_slug, allow_free
                     FROM models
                     WHERE id = $1
                     "#,
@@ -339,7 +339,6 @@ impl ModelRepository {
                         m.datacenters,
                         m.is_ready,
                         m.deprecation_date,
-                        m.deprecation_announced_at,
                         m.successor_model_name,
                         m.openrouter_slug,
                         m.allow_free,
@@ -476,13 +475,6 @@ impl ModelRepository {
                             datacenters = COALESCE($24, datacenters),
                             is_ready = CASE WHEN $27 THEN NULL ELSE COALESCE($25, is_ready) END,
                             deprecation_date = CASE WHEN $28 THEN NULL ELSE COALESCE($26, deprecation_date) END,
-                            -- Stamped once, when a planned deprecation is first set; kept when
-                            -- the date later moves; cleared together with the date.
-                            deprecation_announced_at = CASE
-                                WHEN $28 THEN NULL
-                                WHEN $26::timestamptz IS NOT NULL THEN COALESCE(deprecation_announced_at, NOW())
-                                ELSE deprecation_announced_at
-                            END,
                             successor_model_name = CASE WHEN $28 OR $36 THEN NULL ELSE COALESCE($35, successor_model_name) END,
                             openrouter_slug = CASE WHEN $30 THEN NULL ELSE COALESCE($29, openrouter_slug) END,
                             allow_free = COALESCE($31, allow_free),
@@ -492,7 +484,7 @@ impl ModelRepository {
                                   input_cost_per_token, output_cost_per_token, cost_per_image, cache_read_cost_per_token, text_pricing,
                                   context_length, verifiable, is_active, owned_by, created_at, updated_at,
                                   provider_type, provider_config, attestation_supported,
-                                  input_modalities, output_modalities, inference_url, hugging_face_id, quantization, max_output_length, supported_sampling_parameters, supported_features, datacenters, is_ready, deprecation_date, deprecation_announced_at, successor_model_name, openrouter_slug, allow_free
+                                  input_modalities, output_modalities, inference_url, hugging_face_id, quantization, max_output_length, supported_sampling_parameters, supported_features, datacenters, is_ready, deprecation_date, successor_model_name, openrouter_slug, allow_free
                         "#,
                         &[
                             &model_name,
@@ -565,7 +557,7 @@ impl ModelRepository {
                             provider_type, provider_config, attestation_supported,
                             input_modalities, output_modalities, inference_url, hugging_face_id, quantization, max_output_length, supported_sampling_parameters, supported_features, datacenters,
                             is_ready, deprecation_date, openrouter_slug, allow_free, text_pricing,
-                            deprecation_announced_at, successor_model_name
+                            successor_model_name
                         ) VALUES (
                             $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11,
                             COALESCE($12, $13),
@@ -581,7 +573,7 @@ impl ModelRepository {
                             COALESCE($24, ARRAY[]::TEXT[]),
                             $25, $26, $27, $30,
                             COALESCE($32, false), $33,
-                            CASE WHEN $27::timestamptz IS NOT NULL THEN NOW() END, $35
+                            $35
                         )
                         ON CONFLICT (model_name) DO UPDATE SET
                             input_cost_per_token = EXCLUDED.input_cost_per_token,
@@ -613,11 +605,6 @@ impl ModelRepository {
                             datacenters = COALESCE($25, models.datacenters),
                             is_ready = CASE WHEN $28 THEN NULL ELSE COALESCE($26, models.is_ready) END,
                             deprecation_date = CASE WHEN $29 THEN NULL ELSE COALESCE($27, models.deprecation_date) END,
-                            deprecation_announced_at = CASE
-                                WHEN $29 THEN NULL
-                                WHEN $27::timestamptz IS NOT NULL THEN COALESCE(models.deprecation_announced_at, NOW())
-                                ELSE models.deprecation_announced_at
-                            END,
                             successor_model_name = CASE WHEN $29 OR $36 THEN NULL ELSE COALESCE($35, models.successor_model_name) END,
                             openrouter_slug = CASE WHEN $31 THEN NULL ELSE COALESCE($30, models.openrouter_slug) END,
                             allow_free = COALESCE($32, models.allow_free),
@@ -626,7 +613,7 @@ impl ModelRepository {
                                   input_cost_per_token, output_cost_per_token, cost_per_image, cache_read_cost_per_token, text_pricing,
                                   context_length, verifiable, is_active, owned_by, created_at, updated_at,
                                   provider_type, provider_config, attestation_supported,
-                                  input_modalities, output_modalities, inference_url, hugging_face_id, quantization, max_output_length, supported_sampling_parameters, supported_features, datacenters, is_ready, deprecation_date, deprecation_announced_at, successor_model_name, openrouter_slug, allow_free
+                                  input_modalities, output_modalities, inference_url, hugging_face_id, quantization, max_output_length, supported_sampling_parameters, supported_features, datacenters, is_ready, deprecation_date, successor_model_name, openrouter_slug, allow_free
                         "#,
                         &[
                             &model_name,
@@ -757,7 +744,7 @@ impl ModelRepository {
                         provider_type, provider_config, attestation_supported,
                         input_modalities, output_modalities, inference_url, hugging_face_id, quantization, max_output_length, supported_sampling_parameters, supported_features, datacenters,
                         is_ready, deprecation_date, openrouter_slug, allow_free, text_pricing,
-                        deprecation_announced_at, successor_model_name
+                        successor_model_name
                     ) VALUES (
                         $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11,
                         COALESCE($12, $13),
@@ -770,14 +757,14 @@ impl ModelRepository {
                         COALESCE($24, ARRAY[]::TEXT[]),
                         $25, $26, $27, $28,
                         COALESCE($29, false), $30,
-                        CASE WHEN $27::timestamptz IS NOT NULL THEN NOW() END, $31
+                        $31
                     )
                     ON CONFLICT (model_name) DO NOTHING
                     RETURNING id, model_name, model_display_name, model_description, model_icon,
                               input_cost_per_token, output_cost_per_token, cost_per_image, cache_read_cost_per_token, text_pricing,
                               context_length, verifiable, is_active, owned_by, created_at, updated_at,
                               provider_type, provider_config, attestation_supported,
-                              input_modalities, output_modalities, inference_url, hugging_face_id, quantization, max_output_length, supported_sampling_parameters, supported_features, datacenters, is_ready, deprecation_date, deprecation_announced_at, successor_model_name, openrouter_slug, allow_free
+                              input_modalities, output_modalities, inference_url, hugging_face_id, quantization, max_output_length, supported_sampling_parameters, supported_features, datacenters, is_ready, deprecation_date, successor_model_name, openrouter_slug, allow_free
                     "#,
                     &[
                         &model_name,
@@ -863,18 +850,18 @@ impl ModelRepository {
                         provider_type, provider_config, attestation_supported,
                         input_modalities, output_modalities, inference_url, hugging_face_id, quantization, max_output_length, supported_sampling_parameters, supported_features, datacenters,
                         is_ready, deprecation_date, openrouter_slug, allow_free, text_pricing,
-                        deprecation_announced_at, successor_model_name
+                        successor_model_name
                     ) VALUES (
                         $1, $2, $3, $4, $5, $6, $7, $8,
                         $9, $10, $11, $12, $13, $14, $15, $16, $17, $18,
                         $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29,
-                        $30, $31
+                        $30
                     )
                     RETURNING id, model_name, model_display_name, model_description, model_icon,
                               input_cost_per_token, output_cost_per_token, cost_per_image, cache_read_cost_per_token, text_pricing,
                               context_length, verifiable, is_active, owned_by, created_at, updated_at,
                               provider_type, provider_config, attestation_supported,
-                              input_modalities, output_modalities, inference_url, hugging_face_id, quantization, max_output_length, supported_sampling_parameters, supported_features, datacenters, is_ready, deprecation_date, deprecation_announced_at, successor_model_name, openrouter_slug, allow_free
+                              input_modalities, output_modalities, inference_url, hugging_face_id, quantization, max_output_length, supported_sampling_parameters, supported_features, datacenters, is_ready, deprecation_date, successor_model_name, openrouter_slug, allow_free
                     "#,
                     &[
                         &model.model_name,
@@ -906,7 +893,6 @@ impl ModelRepository {
                         &model.openrouter_slug,
                         &model.allow_free,
                         &model.text_pricing,
-                        &model.deprecation_announced_at,
                         &model.successor_model_name,
                     ],
                 )
@@ -936,7 +922,7 @@ impl ModelRepository {
                         model_icon, verifiable, is_active, owned_by,
                         provider_type, provider_config, attestation_supported,
                         input_modalities, output_modalities, inference_url, hugging_face_id, quantization, max_output_length, supported_sampling_parameters, supported_features, datacenters,
-                        is_ready, deprecation_date, deprecation_announced_at, successor_model_name, openrouter_slug, allow_free,
+                        is_ready, deprecation_date, successor_model_name, openrouter_slug, allow_free,
                         effective_from, effective_until, changed_by_user_id, changed_by_user_email,
                         change_reason, created_at
                     FROM model_history
@@ -979,7 +965,7 @@ impl ModelRepository {
                         model_icon, verifiable, is_active, owned_by,
                         provider_type, provider_config, attestation_supported,
                         input_modalities, output_modalities, inference_url, hugging_face_id, quantization, max_output_length, supported_sampling_parameters, supported_features, datacenters,
-                        is_ready, deprecation_date, deprecation_announced_at, successor_model_name, openrouter_slug, allow_free,
+                        is_ready, deprecation_date, successor_model_name, openrouter_slug, allow_free,
                         effective_from, effective_until, changed_by_user_id, changed_by_user_email,
                         change_reason, created_at
                     FROM model_history
@@ -1054,7 +1040,7 @@ impl ModelRepository {
                         h.input_modalities, h.output_modalities, h.inference_url,
                         h.hugging_face_id, h.quantization, h.max_output_length,
                         h.supported_sampling_parameters, h.supported_features, h.datacenters,
-                        h.is_ready, h.deprecation_date, h.deprecation_announced_at, h.successor_model_name, h.openrouter_slug, h.allow_free,
+                        h.is_ready, h.deprecation_date, h.successor_model_name, h.openrouter_slug, h.allow_free,
                         h.effective_from, h.effective_until, h.changed_by_user_id, h.changed_by_user_email,
                         h.change_reason, h.created_at
                     FROM model_history h
@@ -1102,7 +1088,7 @@ impl ModelRepository {
                               input_cost_per_token, output_cost_per_token, cost_per_image, cache_read_cost_per_token, text_pricing,
                               context_length, verifiable, is_active, owned_by, created_at, updated_at,
                               provider_type, provider_config, attestation_supported,
-                              input_modalities, output_modalities, inference_url, hugging_face_id, quantization, max_output_length, supported_sampling_parameters, supported_features, datacenters, is_ready, deprecation_date, deprecation_announced_at, successor_model_name, openrouter_slug, allow_free
+                              input_modalities, output_modalities, inference_url, hugging_face_id, quantization, max_output_length, supported_sampling_parameters, supported_features, datacenters, is_ready, deprecation_date, successor_model_name, openrouter_slug, allow_free
                     "#,
                     &[&model_name],
                 )
@@ -1200,7 +1186,6 @@ impl ModelRepository {
                     change_reason,
                     created_at,
                     text_pricing,
-                    deprecation_announced_at,
                     successor_model_name
                 ) VALUES (
                     $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19,
@@ -1208,7 +1193,7 @@ impl ModelRepository {
                     COALESCE($23, ARRAY[]::TEXT[]),
                     COALESCE($24, ARRAY[]::TEXT[]),
                     $25, $26, $27, $28, $29,
-                    NOW(), NULL, $30, $31, $32, NOW(), $33, $34, $35
+                    NOW(), NULL, $30, $31, $32, NOW(), $33, $34
                 )
                 "#,
                 &[
@@ -1281,12 +1266,6 @@ impl ModelRepository {
                     change_reason,
                     &model_row
                         .try_get::<_, Option<serde_json::Value>>("text_pricing")
-                        .ok()
-                        .flatten(),
-                    &model_row
-                        .try_get::<_, Option<chrono::DateTime<chrono::Utc>>>(
-                            "deprecation_announced_at",
-                        )
                         .ok()
                         .flatten(),
                     &model_row
@@ -1380,7 +1359,6 @@ impl ModelRepository {
                         m.datacenters,
                         m.is_ready,
                         m.deprecation_date,
-                        m.deprecation_announced_at,
                         m.successor_model_name,
                         m.openrouter_slug,
                         m.allow_free,
@@ -1467,7 +1445,6 @@ impl ModelRepository {
             datacenters: row.try_get("datacenters").ok().flatten(),
             is_ready: row.try_get("is_ready").ok().flatten(),
             deprecation_date: row.try_get("deprecation_date").ok().flatten(),
-            deprecation_announced_at: row.try_get("deprecation_announced_at").ok().flatten(),
             successor_model_name: row.try_get("successor_model_name").ok().flatten(),
             openrouter_slug: row.try_get("openrouter_slug").ok().flatten(),
             allow_free: row.try_get("allow_free").unwrap_or(false),
@@ -1521,7 +1498,6 @@ impl ModelRepository {
             datacenters: row.try_get("datacenters").ok().flatten(),
             is_ready: row.try_get("is_ready").ok().flatten(),
             deprecation_date: row.try_get("deprecation_date").ok().flatten(),
-            deprecation_announced_at: row.try_get("deprecation_announced_at").ok().flatten(),
             successor_model_name: row.try_get("successor_model_name").ok().flatten(),
             openrouter_slug: row.try_get("openrouter_slug").ok().flatten(),
             allow_free: row.try_get("allow_free").unwrap_or(false),
@@ -1603,7 +1579,7 @@ impl ModelRepository {
                         m.input_modalities, m.output_modalities, m.inference_url,
                         m.hugging_face_id, m.quantization, m.max_output_length,
                         m.supported_sampling_parameters, m.supported_features, m.datacenters,
-                        m.is_ready, m.deprecation_date, m.deprecation_announced_at, m.successor_model_name, m.openrouter_slug, m.allow_free,
+                        m.is_ready, m.deprecation_date, m.successor_model_name, m.openrouter_slug, m.allow_free,
                         COALESCE(array_agg(a.alias_name) FILTER (WHERE a.alias_name IS NOT NULL), '{}') AS aliases
                     FROM models m
                     LEFT JOIN model_aliases a ON a.canonical_model_id = m.id AND a.is_active = true
@@ -1690,7 +1666,6 @@ impl services::models::ModelsRepository for ModelRepository {
                     datacenters: m.datacenters,
                     is_ready: m.is_ready,
                     deprecation_date: m.deprecation_date,
-                    deprecation_announced_at: m.deprecation_announced_at,
                     successor_model_name: m.successor_model_name,
                     openrouter_slug: m.openrouter_slug,
                     created_at: m.created_at,
@@ -1735,7 +1710,6 @@ impl services::models::ModelsRepository for ModelRepository {
                     datacenters: m.datacenters,
                     is_ready: m.is_ready,
                     deprecation_date: m.deprecation_date,
-                    deprecation_announced_at: m.deprecation_announced_at,
                     successor_model_name: m.successor_model_name,
                     openrouter_slug: m.openrouter_slug,
                     created_at: m.created_at,
@@ -1780,7 +1754,6 @@ impl services::models::ModelsRepository for ModelRepository {
                     datacenters: m.datacenters,
                     is_ready: m.is_ready,
                     deprecation_date: m.deprecation_date,
-                    deprecation_announced_at: m.deprecation_announced_at,
                     successor_model_name: m.successor_model_name,
                     openrouter_slug: m.openrouter_slug,
                     created_at: m.created_at,

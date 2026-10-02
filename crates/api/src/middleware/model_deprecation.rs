@@ -1,18 +1,17 @@
 //! Announces a planned model deprecation on inference responses.
 //!
 //! When the model named in a request has a planned deprecation, successful
-//! responses carry the standard headers:
+//! responses carry:
 //!
-//! - `Deprecation` (RFC 9745): when the deprecation was announced, as a
-//!   structured-field date (`@<unix seconds>`).
-//! - `Sunset` (RFC 8594): the planned deprecation date, i.e. when the model
-//!   stops being served under that name, as an HTTP date.
-//! - `Link` with `rel="deprecation"` (human documentation, when configured)
-//!   and `rel="successor-version"` (the replacement model's catalog entry).
+//! - `x-model-deprecation-date`: the planned deprecation date, in the same
+//!   form as `deprecation_date` on `GET /v1/models`.
+//! - `x-model-successor`: the recommended replacement model, when one is set.
 //!
-//! Both RFCs scope these headers to the requested URL by default and let a
-//! service document a different scope. Here they describe the model named in
-//! the request, not the endpoint; the linked documentation says so.
+//! These are deliberately not the standard `Deprecation` (RFC 9745) and
+//! `Sunset` (RFC 8594) headers. Those describe the requested URL, so on a
+//! shared endpoint such as `/v1/chat/completions` they would announce that the
+//! endpoint itself is going away. The model is only a field of the request
+//! body; the header names say what is actually being deprecated.
 //!
 //! Only headers are added. The response body is left untouched, so
 //! response-hash verification is unaffected.
@@ -22,7 +21,7 @@ use std::sync::{Arc, OnceLock};
 use axum::{
     extract::{FromRequestParts, Request, State},
     http::{
-        header::{self, HeaderMap, HeaderName, HeaderValue},
+        header::{self, HeaderMap, HeaderValue},
         request::Parts,
     },
     middleware::Next,
@@ -31,15 +30,11 @@ use axum::{
 use chrono::{DateTime, Utc};
 use services::models::{ModelWithPricing, ModelsServiceTrait};
 
-pub const HEADER_DEPRECATION: HeaderName = HeaderName::from_static("deprecation");
-pub const HEADER_SUNSET: HeaderName = HeaderName::from_static("sunset");
+pub const HEADER_MODEL_DEPRECATION_DATE: &str = "x-model-deprecation-date";
+pub const HEADER_MODEL_SUCCESSOR: &str = "x-model-successor";
 
 /// Upper bound on the catalog lookup made while a finished response waits.
 const LOOKUP_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(250);
-
-/// Names appended to an explicit `Access-Control-Expose-Headers` list so
-/// browser clients can read the announcement.
-const EXPOSED_HEADER_NAMES: &str = "Deprecation, Sunset, Link";
 
 /// The model a request named, recorded by the handler once it has parsed the
 /// request so [`model_deprecation_middleware`] can annotate the response.
@@ -76,85 +71,49 @@ impl<S: Send + Sync> FromRequestParts<S> for RequestedModel {
 #[derive(Clone)]
 pub struct ModelDeprecationState {
     pub models_service: Arc<dyn ModelsServiceTrait>,
-    /// Documentation page linked with `rel="deprecation"`. `None` omits the
-    /// link.
-    pub docs_url: Option<String>,
 }
 
 /// What the response headers say about a model's planned deprecation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ModelDeprecationNotice {
-    announced_at: DateTime<Utc>,
-    sunset: DateTime<Utc>,
+    deprecation_date: DateTime<Utc>,
     successor: Option<String>,
 }
 
 impl ModelDeprecationNotice {
     /// `None` when the model has no planned deprecation.
     pub fn from_model(model: &ModelWithPricing) -> Option<Self> {
-        let sunset = model.deprecation_date?;
-        // `Sunset` must not be earlier than `Deprecation` (RFC 9745 section 4).
-        // A planned date earlier than the recorded announcement, or a row with
-        // no recorded announcement, is announced as deprecated at that date.
-        let announced_at = model
-            .deprecation_announced_at
-            .map_or(sunset, |announced| announced.min(sunset));
         Some(Self {
-            announced_at,
-            sunset,
+            deprecation_date: model.deprecation_date?,
             successor: model.successor_model_name.clone(),
         })
     }
 
-    fn deprecation_value(&self) -> String {
-        format!("@{}", self.announced_at.timestamp())
-    }
-
-    fn sunset_value(&self) -> String {
-        self.sunset.format("%a, %d %b %Y %H:%M:%S GMT").to_string()
-    }
-
-    /// One `Link` field value carrying every applicable relation, or `None`
-    /// when there is neither a documentation page nor a successor.
-    fn link_value(&self, docs_url: Option<&str>) -> Option<String> {
-        let mut links = Vec::new();
-        if let Some(url) = docs_url {
-            links.push(format!("<{url}>; rel=\"deprecation\"; type=\"text/html\""));
-        }
-        if let Some(successor) = &self.successor {
-            // Relative reference: resolves against the request URL, so it
-            // points at this deployment's public catalog entry.
-            links.push(format!(
-                "</v1/model/{}>; rel=\"successor-version\"",
-                urlencoding::encode(successor)
-            ));
-        }
-        (!links.is_empty()).then(|| links.join(", "))
-    }
-
-    pub fn apply(&self, headers: &mut HeaderMap, docs_url: Option<&str>) {
-        // Guarded construction: a header-invalid byte in a model name or a
-        // configured URL drops that one header instead of failing the request.
-        if let Ok(value) = HeaderValue::from_str(&self.deprecation_value()) {
-            headers.insert(HEADER_DEPRECATION, value);
-        }
-        if let Ok(value) = HeaderValue::from_str(&self.sunset_value()) {
-            headers.insert(HEADER_SUNSET, value);
+    pub fn apply(&self, headers: &mut HeaderMap) {
+        // Guarded construction: a header-invalid byte in a model name drops
+        // that one header instead of failing the request.
+        let mut exposed = Vec::new();
+        let date = crate::routes::admin::format_deprecation_date(&self.deprecation_date);
+        if let Ok(value) = HeaderValue::from_str(&date) {
+            headers.insert(HEADER_MODEL_DEPRECATION_DATE, value);
+            exposed.push(HEADER_MODEL_DEPRECATION_DATE);
         }
         if let Some(value) = self
-            .link_value(docs_url)
-            .and_then(|link| HeaderValue::from_str(&link).ok())
+            .successor
+            .as_deref()
+            .and_then(|successor| HeaderValue::from_str(successor).ok())
         {
-            headers.append(header::LINK, value);
+            headers.insert(HEADER_MODEL_SUCCESSOR, value);
+            exposed.push(HEADER_MODEL_SUCCESSOR);
         }
         // Handlers that set an explicit CORS expose list name each header;
         // keep the announcement readable from browsers.
-        if let Some(exposed) = headers
+        if let Some(current) = headers
             .get(header::ACCESS_CONTROL_EXPOSE_HEADERS)
             .and_then(|value| value.to_str().ok())
-            .filter(|value| value.trim() != "*")
+            .filter(|value| value.trim() != "*" && !exposed.is_empty())
         {
-            if let Ok(value) = HeaderValue::from_str(&format!("{exposed}, {EXPOSED_HEADER_NAMES}"))
+            if let Ok(value) = HeaderValue::from_str(&format!("{current}, {}", exposed.join(", ")))
             {
                 headers.insert(header::ACCESS_CONTROL_EXPOSE_HEADERS, value);
             }
@@ -190,7 +149,7 @@ pub async fn model_deprecation_middleware(
         return response;
     };
     if let Some(notice) = ModelDeprecationNotice::from_model(&model) {
-        notice.apply(response.headers_mut(), state.docs_url.as_deref());
+        notice.apply(response.headers_mut());
     }
     response
 }
@@ -200,63 +159,49 @@ mod tests {
     use super::*;
     use chrono::TimeZone;
 
-    fn notice(
-        announced_at: DateTime<Utc>,
-        sunset: DateTime<Utc>,
-        successor: Option<&str>,
-    ) -> ModelDeprecationNotice {
+    fn example(successor: Option<&str>) -> ModelDeprecationNotice {
         ModelDeprecationNotice {
-            announced_at,
-            sunset,
+            deprecation_date: Utc.with_ymd_and_hms(2026, 12, 1, 13, 0, 0).unwrap(),
             successor: successor.map(str::to_string),
         }
     }
 
-    fn example() -> ModelDeprecationNotice {
-        notice(
-            Utc.with_ymd_and_hms(2026, 10, 5, 12, 0, 0).unwrap(),
-            Utc.with_ymd_and_hms(2026, 12, 1, 13, 0, 0).unwrap(),
-            Some("zai-org/GLM-5.3"),
-        )
-    }
-
     #[test]
-    fn deprecation_is_a_structured_field_date() {
-        assert_eq!(example().deprecation_value(), "@1791201600");
-    }
-
-    #[test]
-    fn sunset_is_an_http_date() {
-        assert_eq!(example().sunset_value(), "Tue, 01 Dec 2026 13:00:00 GMT");
-    }
-
-    #[test]
-    fn link_carries_documentation_and_percent_encoded_successor() {
-        assert_eq!(
-            example()
-                .link_value(Some("https://docs.example.com/model-deprecations"))
-                .as_deref(),
-            Some(
-                "<https://docs.example.com/model-deprecations>; rel=\"deprecation\"; \
-                 type=\"text/html\", </v1/model/zai-org%2FGLM-5.3>; rel=\"successor-version\""
-            )
-        );
-    }
-
-    #[test]
-    fn link_is_omitted_without_documentation_or_successor() {
-        let mut bare = example();
-        bare.successor = None;
-        assert_eq!(bare.link_value(None), None);
-
+    fn headers_carry_the_catalog_date_and_the_successor() {
         let mut headers = HeaderMap::new();
-        bare.apply(&mut headers, None);
-        assert_eq!(headers.get(HEADER_DEPRECATION).unwrap(), "@1791201600");
+        example(Some("zai-org/GLM-5.3")).apply(&mut headers);
+
+        // Same form as `deprecation_date` on `GET /v1/models`.
         assert_eq!(
-            headers.get(HEADER_SUNSET).unwrap(),
-            "Tue, 01 Dec 2026 13:00:00 GMT"
+            headers.get(HEADER_MODEL_DEPRECATION_DATE).unwrap(),
+            "2026-12-01T13:00:00Z"
         );
+        assert_eq!(
+            headers.get(HEADER_MODEL_SUCCESSOR).unwrap(),
+            "zai-org/GLM-5.3"
+        );
+        // The endpoint itself is not deprecated: no standard headers.
+        assert!(headers.get("deprecation").is_none());
+        assert!(headers.get("sunset").is_none());
         assert!(headers.get(header::LINK).is_none());
+    }
+
+    #[test]
+    fn successor_header_is_omitted_when_none_is_set() {
+        let mut headers = HeaderMap::new();
+        example(None).apply(&mut headers);
+
+        assert!(headers.get(HEADER_MODEL_DEPRECATION_DATE).is_some());
+        assert!(headers.get(HEADER_MODEL_SUCCESSOR).is_none());
+    }
+
+    #[test]
+    fn header_invalid_successor_drops_only_that_header() {
+        let mut headers = HeaderMap::new();
+        example(Some("bad\nname")).apply(&mut headers);
+
+        assert!(headers.get(HEADER_MODEL_DEPRECATION_DATE).is_some());
+        assert!(headers.get(HEADER_MODEL_SUCCESSOR).is_none());
     }
 
     #[test]
@@ -266,10 +211,23 @@ mod tests {
             header::ACCESS_CONTROL_EXPOSE_HEADERS,
             HeaderValue::from_static("Inference-Id"),
         );
-        example().apply(&mut headers, None);
+        example(Some("zai-org/GLM-5.3")).apply(&mut headers);
         assert_eq!(
             headers.get(header::ACCESS_CONTROL_EXPOSE_HEADERS).unwrap(),
-            "Inference-Id, Deprecation, Sunset, Link"
+            "Inference-Id, x-model-deprecation-date, x-model-successor"
+        );
+
+        let mut without_successor = HeaderMap::new();
+        without_successor.insert(
+            header::ACCESS_CONTROL_EXPOSE_HEADERS,
+            HeaderValue::from_static("Inference-Id"),
+        );
+        example(None).apply(&mut without_successor);
+        assert_eq!(
+            without_successor
+                .get(header::ACCESS_CONTROL_EXPOSE_HEADERS)
+                .unwrap(),
+            "Inference-Id, x-model-deprecation-date"
         );
 
         let mut wildcard = HeaderMap::new();
@@ -277,38 +235,18 @@ mod tests {
             header::ACCESS_CONTROL_EXPOSE_HEADERS,
             HeaderValue::from_static("*"),
         );
-        example().apply(&mut wildcard, None);
+        example(None).apply(&mut wildcard);
         assert_eq!(
             wildcard.get(header::ACCESS_CONTROL_EXPOSE_HEADERS).unwrap(),
             "*"
         );
 
         let mut none = HeaderMap::new();
-        example().apply(&mut none, None);
+        example(None).apply(&mut none);
         assert!(none.get(header::ACCESS_CONTROL_EXPOSE_HEADERS).is_none());
     }
 
-    #[test]
-    fn apply_keeps_an_existing_link_header() {
-        let mut headers = HeaderMap::new();
-        headers.insert(
-            header::LINK,
-            HeaderValue::from_static("<https://example.com/next>; rel=\"next\""),
-        );
-        example().apply(&mut headers, None);
-        let links: Vec<_> = headers.get_all(header::LINK).iter().collect();
-        assert_eq!(links.len(), 2);
-        assert_eq!(links[0], "<https://example.com/next>; rel=\"next\"");
-        assert_eq!(
-            links[1],
-            "</v1/model/zai-org%2FGLM-5.3>; rel=\"successor-version\""
-        );
-    }
-
-    fn model(
-        deprecation_date: Option<DateTime<Utc>>,
-        announced_at: Option<DateTime<Utc>>,
-    ) -> ModelWithPricing {
+    fn model(deprecation_date: Option<DateTime<Utc>>) -> ModelWithPricing {
         ModelWithPricing {
             id: uuid::Uuid::nil(),
             model_name: "nearai/old-model".to_string(),
@@ -338,7 +276,6 @@ mod tests {
             datacenters: None,
             is_ready: None,
             deprecation_date,
-            deprecation_announced_at: announced_at,
             successor_model_name: Some("nearai/new-model".to_string()),
             openrouter_slug: None,
             created_at: Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap(),
@@ -347,35 +284,19 @@ mod tests {
 
     #[test]
     fn no_planned_deprecation_means_no_notice() {
-        let announced = Utc.with_ymd_and_hms(2026, 10, 5, 12, 0, 0).unwrap();
-        assert_eq!(
-            ModelDeprecationNotice::from_model(&model(None, Some(announced))),
-            None
-        );
+        // A successor alone announces nothing.
+        assert_eq!(ModelDeprecationNotice::from_model(&model(None)), None);
     }
 
     #[test]
-    fn notice_uses_the_recorded_announcement() {
-        let announced = Utc.with_ymd_and_hms(2026, 10, 5, 12, 0, 0).unwrap();
-        let sunset = Utc.with_ymd_and_hms(2026, 12, 1, 13, 0, 0).unwrap();
+    fn notice_is_built_from_the_catalog_row() {
+        let date = Utc.with_ymd_and_hms(2026, 12, 1, 13, 0, 0).unwrap();
         assert_eq!(
-            ModelDeprecationNotice::from_model(&model(Some(sunset), Some(announced))),
-            Some(notice(announced, sunset, Some("nearai/new-model")))
-        );
-    }
-
-    #[test]
-    fn deprecation_is_clamped_so_sunset_is_never_earlier() {
-        let announced = Utc.with_ymd_and_hms(2026, 10, 5, 12, 0, 0).unwrap();
-        let backdated = Utc.with_ymd_and_hms(2026, 9, 1, 13, 0, 0).unwrap();
-        assert_eq!(
-            ModelDeprecationNotice::from_model(&model(Some(backdated), Some(announced))),
-            Some(notice(backdated, backdated, Some("nearai/new-model")))
-        );
-        // No recorded announcement: deprecated as of the planned date.
-        assert_eq!(
-            ModelDeprecationNotice::from_model(&model(Some(backdated), None)),
-            Some(notice(backdated, backdated, Some("nearai/new-model")))
+            ModelDeprecationNotice::from_model(&model(Some(date))),
+            Some(ModelDeprecationNotice {
+                deprecation_date: date,
+                successor: Some("nearai/new-model".to_string()),
+            })
         );
     }
 }

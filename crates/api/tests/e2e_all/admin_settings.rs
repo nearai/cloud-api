@@ -51,6 +51,7 @@ fn assert_defaults(setting: &Value) {
     assert_eq!(v["lane_load_tokens"], json!(64_000));
     assert_eq!(v["pin_hold_factor"], json!(1.0));
     assert_eq!(v["pin_ttl_ms"], json!(600_000));
+    assert_eq!(v["enabled"], json!(true));
 }
 
 async fn reset(server: &axum_test::TestServer) {
@@ -58,7 +59,8 @@ async fn reset(server: &axum_test::TestServer) {
         server,
         json!({
             "affinity_abs_slack": null, "affinity_eps": null, "kv_max": null,
-            "lane_load_tokens": null, "pin_hold_factor": null, "pin_ttl_ms": null
+            "lane_load_tokens": null, "pin_hold_factor": null, "pin_ttl_ms": null,
+            "enabled": null
         }),
     )
     .await;
@@ -104,6 +106,8 @@ async fn patch_then_get_merges_validates_and_resets() {
         json!({"pin_hold_factor": 0.49}),
         json!({"pin_ttl_ms": 59_999}),
         json!({"pin_ttl_ms": 3_600_001}),
+        json!({"enabled": "no"}),
+        json!({"enabled": 0}),
         json!({"not_a_knob": 1}),
         json!({"affinity_eps": 0.5, "pin_ttl_ms": 1}),
         json!([1]),

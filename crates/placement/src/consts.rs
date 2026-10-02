@@ -71,6 +71,16 @@ pub const AFFINITY_ABS_SLACK: f64 = 0.25;
 /// everything legacy) or reverting the change.
 pub const PIN_HOLD_FACTOR: f64 = 1.0;
 
+/// Whether smart placement is on. False routes every request through legacy
+/// routing (`LegacyReason::Disabled`). A PATCH of the `placement` admin setting
+/// applies immediately on the instance that receives it and on other instances
+/// at the next reload (`admin_settings::RELOAD_INTERVAL`, 10 minutes). For an
+/// instant fleet-wide stop, which affects every environment sharing the Valkey,
+/// set the Valkey key `routed:_placement_off`. Set it to false only after every
+/// instance runs a build that knows the field (`PlacementTuning` uses
+/// `deny_unknown_fields`).
+pub const PLACEMENT_ENABLED: bool = true;
+
 /// How long a follow pin stays valid after it's written, in milliseconds.
 /// 10 minutes, matching OpenRouter's sticky-session TTL.
 pub const PIN_TTL_MS: u64 = 600_000;

@@ -4216,7 +4216,8 @@ pub struct AdminSettingResponse {
     /// The effective value. For `placement`: affinity_abs_slack (0.0 - 4.0),
     /// affinity_eps (0.0 - 2.0), kv_max (0.5 - 1.0), lane_load_tokens
     /// (4000 - 1000000), pin_hold_factor (0.5 - 2.0) and pin_ttl_ms
-    /// (60000 - 3600000).
+    /// (60000 - 3600000), and enabled (boolean, default true; false routes
+    /// every request through legacy routing).
     #[schema(value_type = Object)]
     pub value: serde_json::Value,
     /// When it was last changed; absent until first changed.

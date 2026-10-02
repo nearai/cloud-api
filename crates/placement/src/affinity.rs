@@ -269,9 +269,9 @@ fn within_bound(score: f64, best: f64, tuning: &Tuning) -> bool {
 /// host's frame) is ignored and the keyed HRW walk decides.
 ///
 /// `pin_ignores_bound` makes a pin to any slot in `scores` win whatever its
-/// score. The placer sets it for a prompt-heavy request whose pin passed its
-/// load test instead (`decision::heavy_pin_holds`: stay unless waiting on
-/// the pin costs more than a cold prefill elsewhere); a pin that fails that
+/// score. The placer sets it for a request whose pin passed its load test
+/// instead (`decision::pin_holds`: stay unless waiting on the pin costs more
+/// than a cold prefill elsewhere); a pin that fails that
 /// test is left out of `scores` altogether.
 pub fn select(
     key: Option<&AffinityKey>,

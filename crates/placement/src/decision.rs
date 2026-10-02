@@ -72,17 +72,37 @@ impl std::fmt::Debug for PlaceInput {
 /// `DecisionRecord::affinity` field.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum AffinitySource {
-    Client,
+    /// The `x-session-id` request header.
+    Header,
+    /// The body's `session_id`.
+    BodySessionId,
+    /// The body's `prompt_cache_key`.
+    PromptCacheKey,
     Prefix,
     #[default]
     None,
 }
 
 impl AffinitySource {
-    /// A stable, content-free name for logs and metric tags.
+    /// A stable, content-free name for logs and metric tags: the three
+    /// client-supplied sources share `client`.
     pub const fn as_str(self) -> &'static str {
         match self {
-            AffinitySource::Client => "client",
+            AffinitySource::Header
+            | AffinitySource::BodySessionId
+            | AffinitySource::PromptCacheKey => "client",
+            AffinitySource::Prefix => "prefix",
+            AffinitySource::None => "none",
+        }
+    }
+
+    /// Where the key came from, finer than [`Self::as_str`], for the decision
+    /// log.
+    pub const fn key_source(self) -> &'static str {
+        match self {
+            AffinitySource::Header => "header",
+            AffinitySource::BodySessionId => "body_session_id",
+            AffinitySource::PromptCacheKey => "prompt_cache_key",
             AffinitySource::Prefix => "prefix",
             AffinitySource::None => "none",
         }
@@ -195,6 +215,17 @@ pub struct DecisionRecord {
     pub place_us: u32,
     pub rank: Option<u8>,
     pub affinity: &'static str,
+    /// `AffinitySource::key_source`.
+    pub key_source: &'static str,
+    /// What became of the request's follow pin: `held`, `released_load`,
+    /// `not_admitted`, `stale_boot` or `none`.
+    pub pin_outcome: &'static str,
+    /// Age of the live pin, in ms.
+    pub pin_age_ms: Option<u64>,
+    /// The loads `pin_holds` compared: the pinned slot's and the lightest
+    /// other admitted candidate's (absent when there is none).
+    pub pinned_load: Option<u64>,
+    pub best_other_load: Option<u64>,
     pub selection: Option<&'static str>,
     /// The chosen slot's `hrw_label` (`host#replica`).
     pub slot: Option<String>,
@@ -234,6 +265,11 @@ impl DecisionRecord {
             place_us: 0,
             rank: None,
             affinity: input.affinity_source.as_str(),
+            key_source: input.affinity_source.key_source(),
+            pin_outcome: "none",
+            pin_age_ms: None,
+            pinned_load: None,
+            best_other_load: None,
             selection: None,
             slot: None,
             replica: None,
@@ -278,23 +314,42 @@ struct Candidate<'a> {
     idle: bool,
 }
 
-/// Heavy-pin continuity for a prompt-heavy request pinned to `pin`: `None`
-/// when `pin` is not an admitted candidate, else whether it holds.
+/// The load test on a request's follow pin.
+struct PinTest {
+    holds: bool,
+    pinned_load: u64,
+    /// The lightest other admitted candidate's load, if there is one.
+    best_other_load: Option<u64>,
+}
+
+/// Pin continuity for a request pinned to `pin`: `None` when `pin` is not an
+/// admitted candidate, else whether it holds.
 ///
-/// The pin holds unless `pinned_load > best_other_load + prompt`, with
-/// `load` the lane's (effective backlog plus pending tokens) and
-/// `best_other_load` the lightest other admitted candidate. In words: stay
-/// on the warm replica unless waiting behind its backlog costs more than a
-/// cold prefill of the whole prompt on the lightest alternative. With no
-/// other candidate, it holds.
-fn heavy_pin_holds(candidates: &[Candidate<'_>], pin: &SlotId, prompt: u64) -> Option<bool> {
+/// The pin holds iff `pinned_load <= best_other_load + prompt * factor`
+/// (`Tuning::pin_hold_factor`), with `load` the lane's (effective backlog
+/// plus pending tokens) and `best_other_load` the lightest other admitted
+/// candidate. In words: stay on the warm replica unless waiting behind its
+/// backlog costs more than a cold prefill of the prompt on the lightest
+/// alternative. With no other candidate, it holds.
+fn pin_holds(
+    candidates: &[Candidate<'_>],
+    pin: &SlotId,
+    prompt: u64,
+    factor: f64,
+) -> Option<PinTest> {
     let pinned = candidates.iter().find(|c| c.view.slot == *pin)?;
-    let best_other = candidates
+    let best_other_load = candidates
         .iter()
         .filter(|c| c.view.slot != *pin)
         .map(|c| c.load)
         .min();
-    Some(best_other.is_none_or(|other| pinned.load <= other.saturating_add(prompt)))
+    let holds = best_other_load
+        .is_none_or(|other| pinned.load as f64 <= other as f64 + prompt as f64 * factor);
+    Some(PinTest {
+        holds,
+        pinned_load: pinned.load,
+        best_other_load,
+    })
 }
 
 /// The pure placement decision-maker for one Fleet. Holds the deployment's
@@ -499,17 +554,23 @@ impl Placer {
             }
         });
 
-        // Heavy-pin continuity is judged on load, not score (see
-        // `heavy_pin_holds`). A pin that holds wins whatever its score; one
-        // that is released leaves the walk entirely, so the HRW walk cannot
-        // land back on the slot the load test just moved it off.
+        // Pin continuity is judged on load, not score (see `pin_holds`). A
+        // pin that holds wins whatever its score; one that is released leaves
+        // the walk entirely, so the HRW walk cannot land back on the slot the
+        // load test just moved it off.
         let pin_slot = pin_lookup.as_ref().map(|(s, _)| s);
-        let heavy_pin = pin_slot
-            .filter(|_| input.prefill_heavy)
-            .and_then(|p| heavy_pin_holds(&candidates, p, input.prompt_tokens));
+        let pin_test = pin_slot
+            .and_then(|p| pin_holds(&candidates, p, input.prompt_tokens, tuning.pin_hold_factor));
+        let pin_outcome = match (&pin_test, pin_slot) {
+            (Some(t), _) if t.holds => "held",
+            (Some(_), _) => "released_load",
+            (None, Some(_)) => "not_admitted",
+            (None, None) if stale_boot_pin => "stale_boot",
+            (None, None) => "none",
+        };
         let released: Vec<(SlotId, f64)>;
-        let walk: &[(SlotId, f64)] = match (heavy_pin, pin_slot) {
-            (Some(false), Some(p)) => {
+        let walk: &[(SlotId, f64)] = match (&pin_test, pin_slot) {
+            (Some(t), Some(p)) if !t.holds => {
                 released = scores.iter().filter(|(s, _)| s != p).cloned().collect();
                 &released
             }
@@ -519,7 +580,7 @@ impl Placer {
         let selected = match select(
             input.affinity.as_ref(),
             pin_slot,
-            heavy_pin == Some(true),
+            pin_test.as_ref().is_some_and(|t| t.holds),
             walk,
             tuning,
             rng,
@@ -580,6 +641,13 @@ impl Placer {
             place_us: 0,
             rank,
             affinity: input.affinity_source.as_str(),
+            key_source: input.affinity_source.key_source(),
+            pin_outcome,
+            pin_age_ms: pin_lookup
+                .as_ref()
+                .map(|(_, at_ms)| input.now_ms.saturating_sub(*at_ms)),
+            pinned_load: pin_test.as_ref().map(|t| t.pinned_load),
+            best_other_load: pin_test.as_ref().and_then(|t| t.best_other_load),
             selection: Some(selected.selection.as_str()),
             slot: Some(selected.slot.hrw_label()),
             replica: Some(selected.slot.replica),
@@ -673,7 +741,7 @@ mod tests {
     fn keyed(key: AffinityKey) -> PlaceInput {
         let mut input = base_input();
         input.affinity = Some(key);
-        input.affinity_source = AffinitySource::Client;
+        input.affinity_source = AffinitySource::Header;
         input
     }
 
@@ -1858,6 +1926,158 @@ mod tests {
         assert_eq!(chosen, slot("long01", 1));
     }
 
+    /// Two base replicas, `gpu01#0` pinned for the returned key with
+    /// `pinned_backlog`, `gpu02#0` with `other_backlog`. The key's HRW home is
+    /// the other slot, so only the pin rule can keep the request on the pin.
+    fn base_pinned_pair(
+        secret: [u8; 32],
+        pinned_backlog: u64,
+        other_backlog: u64,
+    ) -> (Snapshot, AffinityKey) {
+        let views = vec![
+            with_backlog("gpu01", 0, pinned_backlog),
+            with_backlog("gpu02", 0, other_backlog),
+        ];
+        let all: Vec<SlotId> = views.iter().map(|v| v.slot.clone()).collect();
+        let key = find_key_with_home(&all, &slot("gpu02", 0));
+        let mut snap = snap_with(views);
+        let pid = pin_id(Tier::Base, &key, &secret);
+        std::sync::Arc::make_mut(&mut snap.pins).insert(
+            *pid.as_bytes(),
+            slot("gpu01", 0),
+            NOW - 1_000,
+        );
+        (snap, key)
+    }
+
+    fn keyed_prompt(key: AffinityKey, prompt_tokens: u64) -> PlaceInput {
+        let mut input = keyed(key);
+        input.prompt_tokens = prompt_tokens;
+        input
+    }
+
+    #[test]
+    fn short_pin_holds_when_backlog_below_cold_prefill() {
+        // The regression case: a 10K prompt pinned to a slot 6K busier than
+        // the idle one. Its score is outside the affinity slack, but waiting
+        // on 6K is cheaper than a cold 10K prefill, so the pin holds.
+        let secret = [8u8; 32];
+        let (snap, key) = base_pinned_pair(secret, 6_000, 0);
+        let mut rng = StdRng::seed_from_u64(1);
+        let (chosen, record, _) = placed(Placer::new(secret, Tier::Base).place(
+            &keyed_prompt(key, 10_000),
+            &snap,
+            &HashMap::new(),
+            &mut rng,
+        ));
+        assert_eq!(chosen, slot("gpu01", 0));
+        assert_eq!(record.selection, Some("pinned"));
+        assert!(record.chosen_score.unwrap() > record.best_score.unwrap() + 0.25);
+        assert_eq!(record.pin_outcome, "held");
+        assert_eq!(record.pin_age_ms, Some(1_000));
+        assert_eq!(record.pinned_load, Some(6_000));
+        assert_eq!(record.best_other_load, Some(0));
+        assert_eq!(record.key_source, "header");
+    }
+
+    #[test]
+    fn short_pin_released_when_backlog_exceeds_cold_prefill() {
+        let secret = [8u8; 32];
+        let (snap, key) = base_pinned_pair(secret, 30_000, 2_000);
+        let mut rng = StdRng::seed_from_u64(1);
+        let (chosen, record, pin_write) = placed(Placer::new(secret, Tier::Base).place(
+            &keyed_prompt(key, 500),
+            &snap,
+            &HashMap::new(),
+            &mut rng,
+        ));
+        assert_eq!(chosen, slot("gpu02", 0));
+        assert_eq!(record.pin_outcome, "released_load");
+        assert_eq!(record.pinned_load, Some(30_000));
+        assert_eq!(record.best_other_load, Some(2_000));
+        let (_, rewritten) = pin_write.expect("the moved pin is rewritten");
+        assert_eq!(rewritten, slot("gpu02", 0));
+    }
+
+    #[test]
+    fn pin_hold_factor_scales_the_cold_prefill_cost() {
+        // A 40K prompt, pinned load 45K above the other: released at 1.0
+        // (45K > 40K), held at 1.25 (45K <= 50K).
+        let secret = [8u8; 32];
+        let (snap, key) = base_pinned_pair(secret, 45_000, 0);
+        let handle = Arc::new(ArcSwap::from_pointee(Tuning::default()));
+        let p = Placer::with_tuning(secret, Tier::Base, handle.clone());
+        let mut rng = StdRng::seed_from_u64(1);
+        let input = keyed_prompt(key, 40_000);
+        let (chosen, record, _) = placed(p.place(&input, &snap, &HashMap::new(), &mut rng));
+        assert_eq!(chosen, slot("gpu02", 0));
+        assert_eq!(record.pin_outcome, "released_load");
+
+        handle.store(Arc::new(Tuning {
+            pin_hold_factor: 1.25,
+            ..Tuning::default()
+        }));
+        let (chosen, record, _) = placed(p.place(&input, &snap, &HashMap::new(), &mut rng));
+        assert_eq!(chosen, slot("gpu01", 0));
+        assert_eq!(record.pin_outcome, "held");
+    }
+
+    #[test]
+    fn pin_outcome_covers_none_stale_boot_and_non_admitted_pins() {
+        let secret = [4u8; 32];
+        let slots = vec![slot("gpu01", 0), slot("gpu02", 0)];
+        let key = find_key_with_home(&slots, &slot("gpu02", 0));
+        let pid = pin_id(Tier::Base, &key, &secret);
+        let mut rng = StdRng::seed_from_u64(1);
+
+        // No pin at all.
+        let snap = snap_with(vec![ready_view("gpu01", 0), ready_view("gpu02", 0)]);
+        let (_, record, _) = placed(Placer::new(secret, Tier::Base).place(
+            &keyed(key.clone()),
+            &snap,
+            &HashMap::new(),
+            &mut rng,
+        ));
+        assert_eq!(record.pin_outcome, "none");
+        assert_eq!(record.pin_age_ms, None);
+
+        // A pin from a previous boot is ignored.
+        let mut snap = snap_with(vec![ready_view("gpu01", 0), ready_view("gpu02", 0)]);
+        snap.host_boots = HashMap::from([("gpu01".to_string(), "boot-b".to_string())]);
+        std::sync::Arc::make_mut(&mut snap.pins).insert_on_boot(
+            *pid.as_bytes(),
+            slot("gpu01", 0),
+            NOW - 1_000,
+            Some("boot-a".to_string()),
+        );
+        let (chosen, record, _) = placed(Placer::new(secret, Tier::Base).place(
+            &keyed(key.clone()),
+            &snap,
+            &HashMap::new(),
+            &mut rng,
+        ));
+        assert_eq!(chosen, slot("gpu02", 0));
+        assert_eq!(record.pin_outcome, "stale_boot");
+        assert_eq!(record.pinned, None);
+
+        // A pin to a slot that is not an admitted candidate falls to HRW.
+        let mut snap = snap_with(vec![ready_view("gpu01", 0), ready_view("gpu02", 0)]);
+        std::sync::Arc::make_mut(&mut snap.pins).insert(
+            *pid.as_bytes(),
+            slot("gpu01", 3),
+            NOW - 1_000,
+        );
+        let (chosen, record, _) = placed(Placer::new(secret, Tier::Base).place(
+            &keyed(key),
+            &snap,
+            &HashMap::new(),
+            &mut rng,
+        ));
+        assert_eq!(chosen, slot("gpu02", 0));
+        assert_eq!(record.pin_outcome, "not_admitted");
+        assert_eq!(record.pinned_load, None);
+    }
+
     #[test]
     fn oversized_heavy_never_admitted_on_base() {
         // Base engines accept 1M context, but a prompt over
@@ -2203,7 +2423,7 @@ mod tests {
             let key_bytes = [42u8; 16];
             if has_affinity {
                 input.affinity = Some(AffinityKey::from_bytes(key_bytes));
-                input.affinity_source = AffinitySource::Client;
+                input.affinity_source = AffinitySource::Header;
             }
 
             let mut snap = snap_with(views);

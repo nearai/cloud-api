@@ -57,6 +57,13 @@ pub const AFFINITY_EPS: f64 = 0.25;
 /// replica's streams, still above ordinary jitter between replicas.
 pub const AFFINITY_ABS_SLACK: f64 = 0.25;
 
+/// Scales the cold-prefill cost in the pin-hold test: a pin holds iff
+/// `pinned_load <= best_other_load + prompt * PIN_HOLD_FACTOR`. 1.0 is a pure
+/// cost comparison: stay unless waiting on the warm replica costs more than a
+/// cold prefill of the prompt elsewhere. There is no evidence yet for other
+/// values.
+pub const PIN_HOLD_FACTOR: f64 = 1.0;
+
 /// How long a follow pin stays valid after it's written, in milliseconds.
 /// 10 minutes, matching OpenRouter's sticky-session TTL.
 pub const PIN_TTL_MS: u64 = 600_000;

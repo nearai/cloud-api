@@ -140,7 +140,12 @@ pub(super) fn report_decision(
                 reason = record.reason.unwrap_or(""),
                 slot = record.slot.as_deref().unwrap_or(""),
                 home = record.home.as_deref().unwrap_or(""),
+                key_source = record.key_source,
                 pinned = record.pinned.as_deref().unwrap_or(""),
+                pin_outcome = record.pin_outcome,
+                pin_age_ms = ?record.pin_age_ms,
+                pinned_load = ?record.pinned_load,
+                best_other_load = ?record.best_other_load,
                 eligible = record.eligible,
                 excluded = %excluded,
                 lane_size = record.lane_size,
@@ -452,7 +457,7 @@ mod observability_tests {
             prompt_tokens: 10,
             prefill_heavy: false,
             affinity_source: if affinity.is_some() {
-                AffinitySource::Client
+                AffinitySource::Header
             } else {
                 AffinitySource::None
             },
@@ -707,7 +712,12 @@ mod observability_tests {
             "selection=\"pinned\"",
             "slot=\"host-a#1\"",
             "home=\"host-a#0\"",
+            "key_source=\"none\"",
             "pinned=\"host-a#1\"",
+            "pin_outcome=\"none\"",
+            "pin_age_ms=",
+            "pinned_load=",
+            "best_other_load=",
             "lane_size=",
             "lane_cap=",
             "pending_tok=",

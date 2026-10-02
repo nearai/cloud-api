@@ -11874,7 +11874,7 @@ mod tests {
         let mut params = sized_params(model, 400_000);
         // The service's affinity survives the pool's context.
         params.placement.affinity = Some(placement::affinity::AffinityKey::from_bytes([1; 16]));
-        params.placement.affinity_source = placement::decision::AffinitySource::Client;
+        params.placement.affinity_source = placement::decision::AffinitySource::Header;
         pool.chat_completion(params, "h".to_string())
             .await
             .expect("served");
@@ -11884,7 +11884,7 @@ mod tests {
         assert!(ctx.affinity.is_some());
         assert_eq!(
             ctx.affinity_source,
-            placement::decision::AffinitySource::Client
+            placement::decision::AffinitySource::Header
         );
     }
 

@@ -57,7 +57,7 @@ pub fn derive(
     if let Some(hint) = non_empty(session_hint) {
         return Some((
             hashed_key(secret, org_id, model, "client", truncate(hint.as_bytes())),
-            AffinitySource::Client,
+            AffinitySource::Header,
         ));
     }
 
@@ -70,7 +70,7 @@ pub fn derive(
                 "client",
                 truncate(session_id.as_bytes()),
             ),
-            AffinitySource::Client,
+            AffinitySource::BodySessionId,
         ));
     }
 
@@ -83,7 +83,7 @@ pub fn derive(
                 "client",
                 truncate(prompt_cache_key.as_bytes()),
             ),
-            AffinitySource::Client,
+            AffinitySource::PromptCacheKey,
         ));
     }
 
@@ -342,7 +342,7 @@ mod tests {
             &SECRET,
         )
         .expect("header hint present");
-        assert_eq!(source, AffinitySource::Client);
+        assert_eq!(source, AffinitySource::Header);
 
         let (from_header_only, _) = derive(
             "org-1",
@@ -382,7 +382,7 @@ mod tests {
             &SECRET,
         )
         .expect("prompt_cache_key present");
-        assert_eq!(source, AffinitySource::Client);
+        assert_eq!(source, AffinitySource::PromptCacheKey);
 
         // Same logical value passed as the header hint instead must produce
         // the same key (same org/model/source/value), proving prompt_cache_key

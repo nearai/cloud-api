@@ -6,8 +6,13 @@ authors.workspace = true
 license.workspace = true
 description.workspace = true
 
+[features]
+openapi = ["dep:utoipa"]
+
 [dependencies]
+utoipa = { version = "5", optional = true }
 anthropic_compat = { path = "../anthropic_compat" }
+placement = { path = "../placement" }
 async-trait = "0.1"
 base64 = "0.22"
 bytes = "1.11"
@@ -21,7 +26,11 @@ tokio-stream = "0.1"
 tokio = { version = "1.50", features = ["full"] }
 thiserror = "2.0"
 reqwest = { version = "0.12", features = ["json", "stream", "multipart", "rustls-tls-native-roots"] }
-rustls = { version = "0.23.45", features = ["aws-lc-rs"] }
+rustls = { version = "0.23.45", features = ["aws-lc-rs", "ring"] }
+# Placement Valkey IO. 0.32.x only: redis 1.x pulls in xxhash-rust (BSL-1.0).
+redis = { version = "0.32", default-features = false, features = ["tokio-comp", "tokio-rustls-comp", "connection-manager", "streams"] }
+arc-swap = "1.9.1"
+rand = "0.10"
 rustls-native-certs = "0.8"
 x509-parser = "0.18"
 hex = "0.4"
@@ -33,6 +42,7 @@ serde_urlencoded = "0.7.1"
 regex = "1"
 sha2 = "0.11"
 url = "2.5"
+urlencoding = "2.1"
 # Chutes E2EE transport: ML-KEM-768 (FIPS 203) + HKDF-SHA256 + ChaCha20-Poly1305.
 # Exact-pinned (`=`) to match Chutes' own RustCrypto reference client
 # (github.com/chutesai/e2ee-test), which interoperates with their server — a
@@ -46,8 +56,12 @@ async-stream = "0.3"
 
 # Dev dependencies for testing and examples
 [dev-dependencies]
+tracing-subscriber = { version = "0.3", default-features = false, features = ["std", "fmt"] }
 futures-util = "0.3"
 tokio-test = "0.4"
 dotenvy = "0.15.7"
 serial_test = "3.4"
 wiremock = "0.6"
+ed25519-dalek = "2.1"
+rcgen = "0.14"
+tokio-rustls = "0.26"

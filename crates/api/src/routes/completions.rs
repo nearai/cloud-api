@@ -4,8 +4,9 @@ use crate::{
     routes::{
         api::AppState,
         common::{
-            alias_warning_message, inject_warning_field, map_domain_error_to_status,
-            no_aliasing_requested, HEADER_MODEL_ALIAS_RESOLVED, HEADER_NO_ALIASING,
+            alias_warning_message, inject_chat_warning_field, inject_warning_field,
+            map_domain_error_to_status, no_aliasing_requested, HEADER_MODEL_ALIAS_RESOLVED,
+            HEADER_NO_ALIASING,
         },
         extractors::OpenAiJson,
         files::MAX_FILE_SIZE,
@@ -111,7 +112,7 @@ const HEADER_SERVING_PROVIDER: &str = "x-serving-provider";
 
 /// Map a [`inference_providers::ProviderTier`] to the string value emitted in
 /// the `x-serving-provider` response header.
-fn provider_tier_to_str(tier: inference_providers::ProviderTier) -> &'static str {
+pub(super) fn provider_tier_to_str(tier: inference_providers::ProviderTier) -> &'static str {
     match tier {
         inference_providers::ProviderTier::Near => "near",
         inference_providers::ProviderTier::Attested3p => "chutes",
@@ -210,6 +211,7 @@ fn build_image_usage_request(
         stop_reason: Some(services::usage::StopReason::Completed),
         response_id: None,
         image_count: Some(record.image_count),
+        discount: None,
         provider_attribution: record.provider_attribution,
     }
 }
@@ -217,7 +219,7 @@ fn build_image_usage_request(
 /// Record usage synchronously with timeout, falling back to async retry.
 /// Used for non-streaming operations (image gen/edit) where usage should be
 /// persisted before the HTTP response is returned.
-async fn record_usage_with_sync_fallback(
+pub(super) async fn record_usage_with_sync_fallback(
     usage_service: Arc<dyn services::usage::UsageServiceTrait + Send + Sync>,
     request: services::usage::RecordUsageServiceRequest,
     operation_label: &str,
@@ -587,12 +589,16 @@ fn rewritten_control_event_bytes(event: &inference_providers::SSEEvent) -> Optio
 }
 
 fn build_final_usage_chunk_bytes(
-    usage: inference_providers::TokenUsage,
+    mut usage: inference_providers::TokenUsage,
     template: &ChunkTemplate,
 ) -> Result<Option<Bytes>, serde_json::Error> {
     let Some((id, model, created, system_fingerprint)) = template else {
         return Ok(None);
     };
+    // OpenAI-compatible clients read the reasoning count only from
+    // `completion_tokens_details`; SGLang reports it top-level. This chunk is
+    // synthesized on the usage-rewrite path, which the gateway signs.
+    usage.ensure_standard_reasoning_details();
 
     let final_usage_chunk =
         inference_providers::StreamChunk::Chat(inference_providers::models::ChatCompletionChunk {
@@ -633,6 +639,19 @@ fn message_content_to_value(content: &Option<MessageContent>) -> serde_json::Val
     }
 }
 
+/// Header carrying a client-supplied session identifier, used only to derive
+/// a placement affinity key (`services::completions::affinity::derive`).
+/// Never logged, never forwarded to a provider.
+const SESSION_ID_HEADER: &str = "x-session-id";
+
+/// Read the `x-session-id` header, if present and valid UTF-8.
+fn session_hint_from_headers(headers: &header::HeaderMap) -> Option<String> {
+    headers
+        .get(SESSION_ID_HEADER)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string)
+}
+
 // Convert HTTP ChatCompletionRequest to service CompletionRequest
 #[allow(clippy::too_many_arguments)]
 fn convert_chat_request_to_service(
@@ -671,6 +690,7 @@ fn convert_chat_request_to_service(
 
     ServiceCompletionRequest {
         request_priority,
+        session_hint: None,
         request_id,
         model: request.model.clone(),
         messages: request
@@ -882,6 +902,7 @@ async fn bill_auto_redact_classify(
         stop_reason: Some(services::usage::StopReason::Completed),
         response_id: None,
         image_count: None,
+        discount: None,
         provider_attribution: services::usage::ProviderAttribution::default(),
     };
 
@@ -1327,6 +1348,7 @@ fn convert_text_request_to_service(
 
     ServiceCompletionRequest {
         request_priority,
+        session_hint: None,
         request_id,
         model: request.model.clone(),
         messages: vec![CompletionMessage {
@@ -1474,6 +1496,7 @@ async fn chat_completions_inner(
         body_hash,
         request_id,
     );
+    service_request.session_hint = session_hint_from_headers(&headers);
 
     // Extract and validate encryption headers if present
     let encryption_headers = match crate::routes::common::validate_encryption_headers(&headers) {
@@ -2055,6 +2078,22 @@ async fn chat_completions_inner(
                                         }
                                     }
 
+                                    // This chunk is re-serialized, so usage it still
+                                    // carries (e.g. continuous usage stats on an alias
+                                    // or auto-redact stream) also reports the reasoning
+                                    // count where OpenAI-compatible clients read it.
+                                    let chunk_usage = match &mut chunk {
+                                        inference_providers::StreamChunk::Chat(chat) => {
+                                            chat.usage.as_mut()
+                                        }
+                                        inference_providers::StreamChunk::Text(text) => {
+                                            text.usage.as_mut()
+                                        }
+                                    };
+                                    if let Some(usage) = chunk_usage {
+                                        usage.ensure_standard_reasoning_details();
+                                    }
+
                                     if auto_redact_enabled {
                                         // Swap minted placeholders in this
                                         // chunk's text deltas back to originals.
@@ -2447,6 +2486,13 @@ async fn chat_completions_inner(
                         &mut response_with_bytes.response,
                         &redaction_map,
                     );
+                    // This body is re-serialized, so no provider signature covers
+                    // it; expose the reasoning count where OpenAI-compatible
+                    // clients read it.
+                    response_with_bytes
+                        .response
+                        .usage
+                        .ensure_standard_reasoning_details();
                     match serde_json::to_vec(&response_with_bytes.response) {
                         Ok(b) => b,
                         Err(e) => {
@@ -2477,11 +2523,13 @@ async fn chat_completions_inner(
                 // auto-redact — it deliberately gives up raw-bytes hash
                 // verification for these responses; clients that need the
                 // raw-bytes guarantee should send the canonical model name
-                // (or x-no-aliasing). E2EE bodies are opaque and are left
-                // untouched (inject_warning_field returns None for them, and
-                // we don't attempt it) — the header below is the signal.
+                // (or x-no-aliasing). Since the body is rewritten, the
+                // reasoning count is also mirrored into the standard usage
+                // field. E2EE bodies are opaque and are left untouched
+                // (inject_chat_warning_field returns None for them, and we
+                // don't attempt it) — the header below is the signal.
                 let body_bytes = match &alias_canonical {
-                    Some(canonical) if !e2ee_active => inject_warning_field(
+                    Some(canonical) if !e2ee_active => inject_chat_warning_field(
                         &body_bytes,
                         &alias_warning_message(&request.model, canonical),
                     )
@@ -2783,6 +2831,7 @@ async fn completions_inner(
         body_hash,
         request_id,
     );
+    service_request.session_hint = session_hint_from_headers(&headers);
     // This endpoint always converts the provider's chat-completion payload
     // into the legacy completion format, so a provider signature cannot
     // verify the bytes returned to the client.
@@ -3174,6 +3223,7 @@ fn chat_response_to_text_response(
             completion_tokens: response.usage.completion_tokens,
             completion_tokens_details: None,
             total_tokens: response.usage.total_tokens,
+            reasoning_tokens: None,
         },
     }
 }
@@ -3367,6 +3417,22 @@ fn model_with_pricing_to_info(model: services::models::ModelWithPricing) -> Mode
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn session_hint_is_read_from_x_session_id_header() {
+        let mut headers = header::HeaderMap::new();
+        assert_eq!(session_hint_from_headers(&headers), None);
+
+        headers.insert("X-Session-Id", header::HeaderValue::from_static("abc"));
+        assert_eq!(session_hint_from_headers(&headers).as_deref(), Some("abc"));
+
+        let mut bad = header::HeaderMap::new();
+        bad.insert(
+            SESSION_ID_HEADER,
+            header::HeaderValue::from_bytes(&[0xff, 0xfe]).unwrap(),
+        );
+        assert_eq!(session_hint_from_headers(&bad), None);
+    }
 
     #[test]
     fn model_public_key_alone_does_not_enable_e2ee() {
@@ -4213,6 +4279,64 @@ mod tests {
         assert!(value["choices"].as_array().is_some_and(Vec::is_empty));
         assert_eq!(value["usage"]["prompt_tokens"], 10);
         assert_eq!(value["usage"]["completion_tokens"], 5);
+        // No reasoning count reported upstream, so none is invented.
+        assert!(value["usage"].get("completion_tokens_details").is_none());
+        assert!(value["usage"].get("reasoning_tokens").is_none());
+    }
+
+    #[test]
+    fn final_usage_chunk_reports_sglang_reasoning_count_in_standard_details() {
+        let template = Some((
+            "chatcmpl-test".to_string(),
+            "test-model".to_string(),
+            1234567890,
+            None,
+        ));
+        // Last cumulative usage from an SGLang stream (top-level count).
+        let mut chunk: inference_providers::models::ChatCompletionChunk =
+            serde_json::from_value(serde_json::json!({
+                "id": "chatcmpl-test",
+                "object": "chat.completion.chunk",
+                "created": 1234567890,
+                "model": "test-model",
+                "choices": [chat_stream_finish_choice()],
+                "usage": {
+                    "prompt_tokens": 20,
+                    "total_tokens": 120,
+                    "completion_tokens": 100,
+                    "prompt_tokens_details": { "cached_tokens": 4 },
+                    "reasoning_tokens": 14
+                }
+            }))
+            .expect("SGLang chunk should parse");
+        let mut final_usage = None;
+        assert!(prepare_chat_stream_chunk_for_client_with_state(
+            &mut chunk,
+            true,
+            &mut final_usage
+        ));
+
+        let bytes = build_final_usage_chunk_bytes(
+            final_usage.expect("usage should be kept for the final chunk"),
+            &template,
+        )
+        .expect("final usage chunk should serialize")
+        .expect("template should produce final usage chunk");
+        let body = String::from_utf8(bytes.to_vec()).expect("SSE bytes should be UTF-8");
+        let value: serde_json::Value =
+            serde_json::from_str(body.trim_start_matches("data: ").trim_end())
+                .expect("final usage payload should be JSON");
+        assert_eq!(
+            value["usage"],
+            serde_json::json!({
+                "prompt_tokens": 20,
+                "completion_tokens": 100,
+                "total_tokens": 120,
+                "prompt_tokens_details": { "cached_tokens": 4 },
+                "completion_tokens_details": { "reasoning_tokens": 14 },
+                "reasoning_tokens": 14
+            })
+        );
     }
 
     #[test]
@@ -5430,6 +5554,7 @@ pub async fn audio_transcriptions(
                 stop_reason: Some(services::usage::StopReason::Completed),
                 response_id: None,
                 image_count: None,
+                discount: None,
                 provider_attribution: services::usage::ProviderAttribution::default(),
             };
 
@@ -6283,6 +6408,7 @@ pub async fn rerank(
                 stop_reason: Some(services::usage::StopReason::Completed),
                 response_id: None,
                 image_count: None,
+                discount: None,
                 provider_attribution: services::usage::ProviderAttribution::default(),
             };
 
@@ -6631,6 +6757,7 @@ pub async fn embeddings(
                 stop_reason: Some(services::usage::StopReason::Completed),
                 response_id: None,
                 image_count: None,
+                discount: None,
                 provider_attribution: services::usage::ProviderAttribution::default(),
             };
 
@@ -6966,6 +7093,7 @@ pub async fn privacy_classify(
                 stop_reason: Some(services::usage::StopReason::Completed),
                 response_id: None,
                 image_count: None,
+                discount: None,
                 provider_attribution: services::usage::ProviderAttribution::default(),
             };
 
@@ -7494,6 +7622,7 @@ pub async fn privacy_redact(
         stop_reason: Some(services::usage::StopReason::Completed),
         response_id: None,
         image_count: None,
+        discount: None,
         provider_attribution: services::usage::ProviderAttribution::default(),
     };
 
@@ -7707,6 +7836,7 @@ pub async fn score(
                 stop_reason: Some(services::usage::StopReason::Completed),
                 response_id: None,
                 image_count: None,
+                discount: None,
                 provider_attribution: services::usage::ProviderAttribution::default(),
             };
 
@@ -7745,6 +7875,7 @@ pub async fn score(
                         stop_reason: Some(services::usage::StopReason::Completed),
                         response_id: None,
                         image_count: None,
+                        discount: None,
                         provider_attribution: services::usage::ProviderAttribution::default(),
                     };
                     tokio::spawn(async move {
@@ -7786,6 +7917,7 @@ pub async fn score(
                         stop_reason: Some(services::usage::StopReason::Completed),
                         response_id: None,
                         image_count: None,
+                        discount: None,
                         provider_attribution: services::usage::ProviderAttribution::default(),
                     };
                     tokio::spawn(async move {

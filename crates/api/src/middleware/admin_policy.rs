@@ -49,6 +49,8 @@ pub(crate) fn admin_operation(method: &Method, matched_path: &str) -> AdminOpera
                 | "/admin/platform/model-revenue"
                 | "/admin/platform/org-revenue"
                 | "/admin/platform/infra-summary"
+                | "/admin/settings"
+                | "/admin/settings/{key}"
                 | "/admin/platform/model-consumption-timeseries"
                 | "/admin/platform/performance-timeseries"
                 | "/admin/platform/revenue-density"
@@ -79,4 +81,23 @@ pub(crate) fn admin_operation(method: &Method, matched_path: &str) -> AdminOpera
     }
 
     AdminOperation::Write
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn settings_get_is_read_and_patch_is_write() {
+        for path in [
+            "/v1/admin/settings",
+            "/admin/settings",
+            "/v1/admin/settings/{key}",
+            "/admin/settings/{key}",
+        ] {
+            assert_eq!(admin_operation(&Method::GET, path), AdminOperation::Read);
+            assert_eq!(admin_operation(&Method::PATCH, path), AdminOperation::Write);
+            assert_eq!(admin_operation(&Method::PUT, path), AdminOperation::Write);
+        }
+    }
 }

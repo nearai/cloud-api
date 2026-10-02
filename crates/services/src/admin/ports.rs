@@ -608,6 +608,8 @@ pub enum AdminError {
     PricingChangeNotFound(String),
     #[error("Unauthorized: {0}")]
     Unauthorized(String),
+    #[error("Analytics query exceeded its statement budget")]
+    Timeout,
     #[error("Internal error: {0}")]
     InternalError(String),
 }

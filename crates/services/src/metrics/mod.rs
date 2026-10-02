@@ -16,6 +16,17 @@ pub trait MetricsServiceTrait: Send + Sync {
     fn record_histogram(&self, name: &str, value: f64, tags: &[&str]);
 }
 
+/// Lets `PlacementIo::start` take the service's `Arc<dyn MetricsServiceTrait>`
+/// directly (`inference_providers` cannot depend on this crate).
+impl inference_providers::placement_io::PlacementMetrics for dyn MetricsServiceTrait {
+    fn record_count(&self, name: &str, value: i64, tags: &[&str]) {
+        MetricsServiceTrait::record_count(self, name, value, tags)
+    }
+    fn record_histogram(&self, name: &str, value: f64, tags: &[&str]) {
+        MetricsServiceTrait::record_histogram(self, name, value, tags)
+    }
+}
+
 pub struct OtlpMetricsService {
     meter: Meter,
     // Cache instruments to avoid recreating them
@@ -170,6 +181,10 @@ impl MetricsServiceTrait for OtlpMetricsService {
                 consts::METRIC_CACHE_HIT_RATE => (
                     "Per-request prefix-cache hit rate (cache-read / prompt tokens)",
                     "percent",
+                ),
+                consts::METRIC_USAGE_HOURLY_LAG_SECONDS => (
+                    "Seconds from the oldest raw hour not yet in usage_hourly to the scheduler tick",
+                    "s",
                 ),
                 _ => ("Value distribution", ""),
             };

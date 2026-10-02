@@ -19,6 +19,8 @@ anyhow = "1.0"
 tokio = { version = "1", features = ["full"] }
 tracing = "0.1"
 inference_providers = { path = "../inference_providers" }
+placement = { path = "../placement" }
+arc-swap = "1.9.1"
 futures = "0.3"
 futures-util = "0.3"
 thiserror = "2.0"
@@ -55,6 +57,8 @@ aws-sdk-s3 = { version = "1.134", default-features = false, features = ["sigv4a"
 aes-gcm = "0.10"
 # HMAC for VPC signature verification
 hmac = "0.13"
+# HKDF for deriving the placement affinity/pin secrets
+hkdf = "0.13"
 sha2 = "0.11"
 x509-parser = "0.18"
 dcap-qvl = "0.5"
@@ -68,8 +72,16 @@ default = []
 test-mocks = ["mockall"]
 
 [dev-dependencies]
+tracing-subscriber = { version = "0.3", default-features = false, features = ["std", "fmt"] }
 tokio-test = "0.4"
 async-trait = "0.1"
 futures = "0.3"
 mockall = "0.14"
 wiremock = "0.6"
+# Local TLS backends for the attestation channel-binding tests.
+rcgen = "0.14"
+rustls = { version = "0.23.45", features = ["aws-lc-rs"] }
+tokio-rustls = "0.26"
+hyper = { version = "1", features = ["server", "http1", "http2"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+http-body-util = "0.1"

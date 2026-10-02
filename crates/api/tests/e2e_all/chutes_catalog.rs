@@ -11,6 +11,7 @@ use std::sync::Arc;
 
 fn chat_params(model: &str) -> inference_providers::ChatCompletionParams {
     inference_providers::ChatCompletionParams {
+        placement: Default::default(),
         request_priority: 0,
         model: model.to_string(),
         messages: vec![inference_providers::ChatMessage {

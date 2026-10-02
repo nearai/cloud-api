@@ -842,6 +842,7 @@ impl SSEEventParser for GeminiEventParser {
                     completion_tokens: state.completion_tokens,
                     total_tokens: state.prompt_tokens + state.completion_tokens,
                     prompt_tokens_details: None,
+                    ..Default::default()
                 }),
             )
         } else if is_first {
@@ -858,6 +859,7 @@ impl SSEEventParser for GeminiEventParser {
                 completion_tokens: state.completion_tokens,
                 total_tokens: state.prompt_tokens + state.completion_tokens,
                 prompt_tokens_details: None,
+                ..Default::default()
             });
             chunk
         } else if let Some(t) = text {
@@ -869,6 +871,7 @@ impl SSEEventParser for GeminiEventParser {
                 completion_tokens: state.completion_tokens,
                 total_tokens: state.prompt_tokens + state.completion_tokens,
                 prompt_tokens_details: None,
+                ..Default::default()
             });
             chunk
         } else {
@@ -880,6 +883,7 @@ impl SSEEventParser for GeminiEventParser {
                     completion_tokens: state.completion_tokens,
                     total_tokens: state.prompt_tokens + state.completion_tokens,
                     prompt_tokens_details: None,
+                    ..Default::default()
                 },
             )
         };

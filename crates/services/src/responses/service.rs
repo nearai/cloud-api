@@ -29,6 +29,7 @@ enum AgentLoopResult {
 /// Context for processing a response stream
 struct ProcessStreamContext {
     request: models::CreateResponseRequest,
+    model: Option<crate::models::ModelWithPricing>,
     user_id: crate::UserId,
     api_key_id: String,
     request_id: uuid::Uuid,
@@ -175,6 +176,20 @@ impl ports::ResponseServiceTrait for ResponseServiceImpl {
             ));
         }
 
+        // Reuse the lookup needed for image dispatch, but perform it before
+        // starting the stream or tools so endpoint errors remain HTTP 400s.
+        let model = self
+            .completion_service
+            .get_model(&request.model)
+            .await
+            .ok()
+            .flatten();
+        if let Some(model) = &model {
+            model
+                .validate_endpoint(crate::models::InferenceEndpoint::Responses)
+                .map_err(|message| errors::ResponseError::InvalidParams(message.into()))?;
+        }
+
         // Create a channel for streaming events
         let (mut tx, rx) = mpsc::unbounded::<models::ResponseStreamEvent>();
 
@@ -214,6 +229,7 @@ impl ports::ResponseServiceTrait for ResponseServiceImpl {
 
             let context = ProcessStreamContext {
                 request,
+                model,
                 user_id,
                 api_key_id,
                 request_id,
@@ -1112,16 +1128,13 @@ impl ResponseServiceImpl {
         }
 
         // Check if this is an image model and handle it specially
-        if let Ok(Some(model)) = context
-            .completion_service
-            .get_model(&context.request.model)
-            .await
-        {
-            if Self::has_image_generation_capability(&model.output_modalities) {
+        if let Some(model) = &context.model {
+            if model.has_output_modality("image") {
                 tracing::info!(
                     "Image generation model detected, handling image operation: {}",
                     model.model_name
                 );
+                context.request.model = model.model_name.clone();
 
                 // Handle image generation/editing and return early
                 let image_result = Self::process_image_operation(
@@ -1461,8 +1474,15 @@ impl ResponseServiceImpl {
             }
 
             // Create completion request (names not included - tracked via database analytics)
+            // `session_hint` is intentionally always None: /responses does not read or
+            // forward `x-session-id` (unlike /chat/completions, see routes/completions.rs).
+            // Covered-model traffic entering through /responses therefore only ever gets
+            // `client` affinity by falling through to prefix-based derivation (or none
+            // under E2EE). This is an intentional scope cut, not an oversight: the
+            // Response API is deprecated and will not receive client affinity wiring.
             let completion_request = CompletionRequest {
                 request_priority: process_context.request_priority,
+                session_hint: None,
                 request_id: process_context.request_id,
                 model: process_context.request.model.clone(),
                 messages: messages.clone(),
@@ -3135,8 +3155,12 @@ impl ResponseServiceImpl {
         // Generate title using completion service (names not included - tracked via database)
         let title_model = std::env::var("TITLE_GENERATION_MODEL")
             .unwrap_or_else(|_| "Qwen/Qwen3-30B-A3B-Instruct-2507".to_string());
+        // `session_hint: None` here too: this is the internal title-generation
+        // request, issued by the deprecated /responses API, which does not forward
+        // `x-session-id`. See the comment on the other CompletionRequest above.
         let completion_request = crate::completions::ports::CompletionRequest {
             request_id,
+            session_hint: None,
             model: title_model,
             messages: vec![crate::completions::ports::CompletionMessage {
                 reasoning_content: None,
@@ -3262,14 +3286,6 @@ impl ResponseServiceImpl {
         let _ = tx.send(event).await;
 
         Ok(())
-    }
-
-    /// Check if a model has image generation capability based on output_modalities
-    fn has_image_generation_capability(output_modalities: &Option<Vec<String>>) -> bool {
-        output_modalities
-            .as_ref()
-            .map(|modalities| modalities.contains(&"image".to_string()))
-            .unwrap_or(false)
     }
 
     /// Process image generation or editing operations

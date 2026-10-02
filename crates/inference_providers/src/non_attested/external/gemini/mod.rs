@@ -100,6 +100,7 @@ fn convert_to_openai_response(
             completion_tokens: gemini_response.usage_metadata.candidates_token_count,
             total_tokens: gemini_response.usage_metadata.total_token_count,
             prompt_tokens_details: None,
+            ..Default::default()
         },
         prompt_logprobs: None,
         prompt_token_ids: None,
@@ -495,6 +496,7 @@ mod tests {
 
     fn base_params() -> ChatCompletionParams {
         ChatCompletionParams {
+            placement: Default::default(),
             request_priority: 0,
             model: "gemini-2.5-flash".to_string(),
             messages: vec![crate::ChatMessage {

@@ -130,6 +130,7 @@ struct ApprovedGroup {
 
 const APPROVED: &[ApprovedGroup] = &[
     ApprovedGroup { table: "admin_access_token", columns: &["token_hash", "name", "creation_reason", "revocation_reason", "user_agent", "permission"], reason: "Operational admin-token metadata; the credential itself is stored as a one-way hash" },
+    ApprovedGroup { table: "admin_settings", columns: &["key", "value"], reason: "Operator-set runtime tuning knobs (numeric placement parameters); no customer data" },
     ApprovedGroup { table: "aml_allowlisted_accounts", columns: &["account_id", "address_type", "reason"], reason: "Queryable compliance allowlist and audit rationale" },
     ApprovedGroup { table: "aml_reports", columns: &["flow", "provider", "account_id", "address_type", "risk_level", "report_id", "reason", "result_json"], reason: "Queryable compliance evidence with access restricted to AML/admin workflows" },
     ApprovedGroup { table: "api_keys", columns: &["key_hash", "name", "key_prefix"], reason: "API credentials are one-way hashed; name and prefix are query/display metadata" },
@@ -163,6 +164,7 @@ const APPROVED: &[ApprovedGroup] = &[
     ApprovedGroup { table: "scheduled_model_pricing_changes", columns: &["model_name", "model_display_name", "status", "last_error", "cancelled_by_user_email", "created_by_user_email", "change_reason", "old_text_pricing", "new_text_pricing"], reason: "Restricted administrator pricing workflow and audit data" },
     ApprovedGroup { table: "services", columns: &["service_name", "display_name", "description", "unit"], reason: "Public service catalog" },
     ApprovedGroup { table: "usage_credit_allocations", columns: &["credit_type", "source", "policy_version", "allocation_phase"], reason: "Immutable restricted billing attribution records" },
+    ApprovedGroup { table: "usage_hourly", columns: &["model_name", "inference_type", "served_provider_type", "served_provider_tier"], reason: "Derived hourly metering aggregate; same restricted dimensions as organization_usage_log" },
     ApprovedGroup { table: "users", columns: &["email", "username", "display_name", "avatar_url", "auth_provider", "provider_user_id"], reason: "Account identity fields required for login, uniqueness, and user-facing profiles" },
     ApprovedGroup { table: "workspaces", columns: &["name", "description", "settings"], reason: "Workspace profile and administrator-managed settings" },
 ];

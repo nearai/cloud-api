@@ -49,6 +49,7 @@ use serde_json::{json, Value};
 
 use self::client::{ChutesClient, ChutesClientError, InvokeMode, InvokeRequest};
 use self::verifier_port::ChutesInstanceVerifier;
+use crate::attested::nearai::placement_headers as ph;
 use crate::{
     AttestationError, AudioTranscriptionError, AudioTranscriptionParams,
     AudioTranscriptionResponse, ChatCompletionParams, ChatCompletionResponse,
@@ -1370,6 +1371,9 @@ fn request_body(model: &str, params: &ChatCompletionParams, stream: bool) -> Res
         // Chutes inside the (encrypted) request body.
         for k in INTERNAL_KEYS {
             obj.remove(*k);
+        }
+        for k in ph::LEGACY_DENIED_EXTRA_KEYS {
+            obj.remove(k);
         }
     } else {
         return Err("chat params did not serialize to a JSON object".to_string());
@@ -2880,20 +2884,14 @@ mod tests {
 
     #[test]
     fn request_body_strips_internal_and_e2ee_keys() {
-        use crate::attested::nearai::{encryption_headers as eh, tracing_headers as th};
         let mut params: ChatCompletionParams =
             serde_json::from_value(json!({"model": "m", "messages": []})).unwrap();
-        // Internal identifiers + client-E2EE markers must never reach Chutes.
-        for k in [
-            th::REQUEST_ID,
-            th::ORG_ID,
-            th::WORKSPACE_ID,
-            eh::SIGNING_ALGO,
-            eh::CLIENT_PUB_KEY,
-            eh::MODEL_PUB_KEY,
-            eh::ENCRYPTION_VERSION,
-            eh::ENCRYPT_ALL_FIELDS,
-        ] {
+        // Internal identifiers, client-E2EE markers, and placement affinity
+        // keys must never reach Chutes.
+        for k in INTERNAL_KEYS {
+            params.extra.insert((*k).to_string(), json!("leak"));
+        }
+        for k in ph::LEGACY_DENIED_EXTRA_KEYS {
             params.extra.insert(k.to_string(), json!("leak"));
         }
         let body = request_body("m", &params, false).unwrap();
@@ -2902,6 +2900,12 @@ mod tests {
             assert!(
                 !obj.contains_key(*k),
                 "internal key {k} must not reach Chutes in the request body"
+            );
+        }
+        for k in ph::LEGACY_DENIED_EXTRA_KEYS {
+            assert!(
+                !obj.contains_key(k),
+                "legacy placement key {k} must not reach Chutes in the request body"
             );
         }
     }

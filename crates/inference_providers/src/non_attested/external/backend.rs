@@ -49,6 +49,17 @@ impl Default for BackendConfig {
 /// ChatCompletionParams format and the provider's native format.
 #[async_trait]
 pub trait ExternalBackend: Send + Sync {
+    async fn systemone(
+        &self,
+        _config: &BackendConfig,
+        _model: &str,
+        _request: crate::SystemOneRequest,
+    ) -> Result<crate::SystemOneResponseWithBytes, CompletionError> {
+        Err(CompletionError::CompletionError(
+            "System One is unavailable for this backend".into(),
+        ))
+    }
+
     /// Returns the backend type identifier (e.g., "openai_compatible", "anthropic", "gemini")
     fn backend_type(&self) -> &'static str;
 

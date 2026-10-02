@@ -14,6 +14,7 @@ use chrono::Utc;
 use services::auth::ports::UserId;
 use services::common::RepositoryError;
 use services::organization::ports::*;
+use tokio_postgres::types::Type;
 use tracing::debug;
 use uuid::Uuid;
 
@@ -1548,10 +1549,11 @@ impl services::completions::ports::OrganizationConcurrentLimitRepository
                 .context("Failed to get database connection")
                 .map_err(RepositoryError::PoolError)?;
 
+            // One-shot typed query: one round trip, see repositories/mod.rs.
             client
-                .query_opt(
+                .query_typed_opt(
                     "SELECT rate_limit FROM organizations WHERE id = $1 AND is_active = true",
-                    &[&org_id],
+                    &[(&org_id, Type::UUID)],
                 )
                 .await
                 .map_err(map_db_error)

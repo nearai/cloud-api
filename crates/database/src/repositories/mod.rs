@@ -1,5 +1,15 @@
+// Why a few hot-path queries use `query_typed*` / `execute_typed` with explicit
+// parameter types: Parse+Bind+Execute go out in one network write, so a query
+// costs one round trip instead of prepare + execute, with no per-connection
+// statement state. Only per-request queries on the inference hot path use it
+// (API key and workspace auth, balance and spend, staking source, model
+// resolve, concurrent limit, chat signatures). Elsewhere keep plain `query*`
+// and do not spread this style without a measured round-trip cost. Each
+// parameter type must match the column type in the migrations.
+
 pub mod admin_access_token;
 pub mod admin_composite;
+pub mod admin_settings;
 pub mod aml;
 pub mod analytics;
 pub mod api_key;
@@ -34,6 +44,7 @@ pub mod retry;
 pub mod service;
 pub mod service_usage_repository_impl;
 pub mod session;
+pub mod usage_hourly;
 pub mod usage_repository_impl;
 pub mod user;
 pub mod utils;
@@ -41,6 +52,7 @@ pub mod workspace;
 
 pub use admin_access_token::AdminAccessTokenRepository;
 pub use admin_composite::AdminCompositeRepository;
+pub use admin_settings::PostgresAdminSettingsRepository;
 pub use aml::PostgresAmlRepository;
 pub use analytics::PgAnalyticsRepository;
 pub use api_key::ApiKeyRepository;
@@ -65,12 +77,13 @@ pub use organization_service_usage::{
     OrganizationServiceUsageRepository, RecordServiceUsageRequest,
 };
 pub use organization_staking_farm_sources::OrganizationStakingFarmSourcesRepository;
-pub use organization_usage::{OrganizationUsageRepository, UsageStats};
+pub use organization_usage::OrganizationUsageRepository;
 pub use reporting_usage_summary::PostgresReportingUsageSummaryRepository;
 pub use response::PgResponseRepository;
 pub use response_item::PgResponseItemsRepository;
 pub use service::ServiceRepository;
 pub use service_usage_repository_impl::ServiceUsageRepositoryImpl;
 pub use session::SessionRepository;
+pub use usage_hourly::UsageHourlyRepositoryImpl;
 pub use user::UserRepository;
 pub use workspace::WorkspaceRepository;

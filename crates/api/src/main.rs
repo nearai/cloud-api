@@ -15,6 +15,23 @@ mod telemetry;
 
 #[tokio::main]
 async fn main() {
+    // Install the process-wide rustls crypto provider unconditionally, as
+    // early as possible. Both `aws-lc-rs` and `ring` are enabled on rustls
+    // (needed for TLS support across the dependency graph), which removes
+    // rustls's implicit default provider for the whole binary: any rustls
+    // config built through that implicit default (today, `redis`'s
+    // `rediss://` TLS setup) would otherwise panic unless something already
+    // installed a provider first. `inference_providers::placement_io` also
+    // calls this lazily inside `PlacementIo::start` (kept below, since it's
+    // the one path that's guaranteed to run before that crate's own
+    // `rediss://` client is built) — installing it here too makes the
+    // default provider exist regardless of whether placement is configured.
+    // `install_crypto_provider` is idempotent: a second call is a no-op.
+    // The `database` crate separately installs `ring` as well; both calls
+    // race for "install_default" and only the first one wins, which is fine
+    // since they install the same provider.
+    inference_providers::placement_io::install_crypto_provider();
+
     // Load configuration and initialize logging
     let config = load_configuration();
     init_tracing(&config.logging);
@@ -26,16 +43,6 @@ async fn main() {
         database::ensure_usage_reporting_indexes(database.pool())
             .await
             .expect("Usage reporting index prerequisites are not satisfied");
-    }
-    let spend_counters = database::spend_counter_readiness(database.pool())
-        .await
-        .expect("Failed to check spend counter readiness");
-    if !spend_counters.is_ready() {
-        tracing::warn!(
-            missing_balances = spend_counters.missing_balances,
-            incomplete = spend_counters.incomplete,
-            "Spend counters are incomplete; readers use raw usage for these organizations until backfill-spend-counters completes"
-        );
     }
     let auth_components = init_auth_services(database.clone(), &config);
 
@@ -97,6 +104,19 @@ async fn main() {
         .start(config.server.pricing_change_apply_interval_secs)
         .await;
 
+    // Maintain the usage_hourly aggregate. Safe on every instance: recompute takes a
+    // transaction-scoped try-lock, so one replica writes per tick.
+    let usage_hourly_scheduler = Arc::new(services::usage::UsageHourlyScheduler::new(
+        Arc::new(database::repositories::UsageHourlyRepositoryImpl::new(
+            database.pool().clone(),
+        )),
+        domain_services.metrics_service.clone(),
+    ));
+    usage_hourly_scheduler
+        .clone()
+        .start(config.server.usage_hourly_interval_secs)
+        .await;
+
     // Start server with graceful shutdown handling
     start_server(
         app,
@@ -104,6 +124,7 @@ async fn main() {
         database,
         domain_services.inference_provider_pool,
         pricing_scheduler,
+        usage_hourly_scheduler,
     )
     .await;
 }
@@ -126,6 +147,7 @@ async fn start_server(
     database: Arc<Database>,
     inference_provider_pool: Arc<InferenceProviderPool>,
     pricing_scheduler: Arc<ModelPricingScheduler>,
+    usage_hourly_scheduler: Arc<services::usage::UsageHourlyScheduler>,
 ) {
     let bind_address = format!("{}:{}", config.server.host, config.server.port);
     let listener = tokio::net::TcpListener::bind(&bind_address)
@@ -147,13 +169,23 @@ async fn start_server(
     match server.await {
         Ok(_) => {
             tracing::info!("Server shutdown successfully, initiating coordinated cleanup");
-            perform_coordinated_shutdown(database, inference_provider_pool, pricing_scheduler)
-                .await;
+            perform_coordinated_shutdown(
+                database,
+                inference_provider_pool,
+                pricing_scheduler,
+                usage_hourly_scheduler,
+            )
+            .await;
         }
         Err(e) => {
             tracing::error!("Server error: {}", e);
-            perform_coordinated_shutdown(database, inference_provider_pool, pricing_scheduler)
-                .await;
+            perform_coordinated_shutdown(
+                database,
+                inference_provider_pool,
+                pricing_scheduler,
+                usage_hourly_scheduler,
+            )
+            .await;
             std::process::exit(1);
         }
     }
@@ -164,6 +196,7 @@ async fn perform_coordinated_shutdown(
     database: Arc<Database>,
     inference_provider_pool: Arc<InferenceProviderPool>,
     pricing_scheduler: Arc<ModelPricingScheduler>,
+    usage_hourly_scheduler: Arc<services::usage::UsageHourlyScheduler>,
 ) {
     let mut coordinator = ShutdownCoordinator::new(Duration::from_secs(30));
     coordinator.start();
@@ -183,6 +216,8 @@ async fn perform_coordinated_shutdown(
                 inference_provider_pool.shutdown().await;
                 tracing::info!("Step 1.2: Cancelling pricing change scheduler task");
                 pricing_scheduler.shutdown().await;
+                tracing::info!("Step 1.3: Cancelling usage_hourly scheduler task");
+                usage_hourly_scheduler.shutdown().await;
                 tracing::debug!("All background tasks cancelled");
             },
         )

@@ -1114,6 +1114,7 @@ async fn record_native_usage(
     // upstream response carried no id.
     let inference_id = usage.inference_id().unwrap_or_else(Uuid::new_v4);
     let request = RecordUsageServiceRequest {
+        discount: None,
         organization_id: context.organization_id,
         workspace_id: context.workspace_id,
         api_key_id: context.api_key_id,
@@ -1784,6 +1785,7 @@ redact-thinking-2026-02-12";
             _workspace_id: Uuid,
             _api_key_id: Uuid,
             _request: services::usage::RecordUsageApiRequest,
+            _discount: Option<services::usage::UsageDiscount>,
         ) -> Result<services::usage::UsageLogEntry, services::usage::UsageError> {
             unimplemented!()
         }

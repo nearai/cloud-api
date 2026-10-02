@@ -364,6 +364,41 @@ mod tests {
     }
 
     #[test]
+    fn body_session_id_used_when_no_header() {
+        let extra: HashMap<String, serde_json::Value> =
+            [("session_id".to_string(), serde_json::json!("sess-1"))]
+                .into_iter()
+                .collect();
+
+        let (from_session, source) = derive(
+            "org-1",
+            "model-a",
+            None,
+            &extra,
+            &base_messages(),
+            false,
+            &SECRET,
+        )
+        .expect("session_id present");
+        assert_eq!(source, AffinitySource::BodySessionId);
+        assert_eq!(source.as_str(), "body_session_id");
+
+        // The same value as a header hint hashes to the same key (the
+        // "client" source tag is shared), proving session_id was read.
+        let (from_header, _) = derive(
+            "org-1",
+            "model-a",
+            Some("sess-1"),
+            &HashMap::new(),
+            &base_messages(),
+            false,
+            &SECRET,
+        )
+        .expect("header present");
+        assert_eq!(key_hex(&from_session), key_hex(&from_header));
+    }
+
+    #[test]
     fn prompt_cache_key_used() {
         let extra: HashMap<String, serde_json::Value> = [(
             "prompt_cache_key".to_string(),

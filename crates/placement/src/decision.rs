@@ -43,7 +43,8 @@ pub struct PlaceInput {
     /// `max_context_tokens`.
     pub prompt_tokens: u64,
     /// The lane class: `prompt_tokens` exceeds the base tier's capacity.
-    /// Lane admission, heavy-pin continuity and heavy pin writes follow it.
+    /// Lane admission and heavy pin writes follow it. Pin continuity does
+    /// not: every pinned request is judged by the same load test (`pin_holds`).
     pub prefill_heavy: bool,
     /// `params.request_priority`.
     pub priority: i32,

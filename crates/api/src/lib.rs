@@ -1707,6 +1707,12 @@ pub fn build_completion_routes(
 ) -> Router {
     use crate::routes::files::MAX_FILE_SIZE;
 
+    // Announces a planned model deprecation in response headers. Innermost
+    // layer: it only sees requests that passed auth, rate and usage checks.
+    let model_deprecation_state = middleware::ModelDeprecationState {
+        models_service: app_state.models_service.clone(),
+    };
+
     // Native Anthropic Messages support is staging-gated and hard-off by
     // default. Keep it on its own router so enabling it cannot alter the
     // existing OpenAI-compatible routes or middleware behavior.
@@ -1719,6 +1725,10 @@ pub fn build_completion_routes(
             .route("/messages", post(routes::anthropic::messages))
             .layer(DefaultBodyLimit::max(AUDIO_TRANSCRIPTION_MAX_BODY_SIZE))
             .with_state(app_state.clone())
+            .layer(from_fn_with_state(
+                model_deprecation_state.clone(),
+                middleware::model_deprecation_middleware,
+            ))
             .layer(from_fn_with_state(
                 usage_state.clone(),
                 middleware::usage::anthropic_usage_check_middleware,
@@ -1782,6 +1792,10 @@ pub fn build_completion_routes(
         .layer(DefaultBodyLimit::max(AUDIO_TRANSCRIPTION_MAX_BODY_SIZE))
         .with_state(app_state.clone())
         .layer(from_fn_with_state(
+            model_deprecation_state.clone(),
+            middleware::model_deprecation_middleware,
+        ))
+        .layer(from_fn_with_state(
             usage_state.clone(),
             middleware::usage_check_middleware,
         ))
@@ -1807,6 +1821,10 @@ pub fn build_completion_routes(
     let file_inference_routes = Router::new()
         .route("/images/edits", post(image_edits))
         .with_state(app_state.clone())
+        .layer(from_fn_with_state(
+            model_deprecation_state.clone(),
+            middleware::model_deprecation_middleware,
+        ))
         .layer(from_fn_with_state(
             usage_state,
             middleware::usage_check_middleware,
@@ -1850,6 +1868,9 @@ pub fn build_response_routes(
     usage_state: middleware::UsageState,
     rate_limit_state: middleware::RateLimitState,
 ) -> Router {
+    let model_deprecation_state = middleware::ModelDeprecationState {
+        models_service: native_app_state.models_service.clone(),
+    };
     let route_state = responses::ResponseRouteState {
         native_service: services::responses::native::NativeResponsesService {
             models: native_app_state.config.native_responses_models.clone(),
@@ -1866,6 +1887,10 @@ pub fn build_response_routes(
     let inference_routes = Router::new()
         .route("/responses", post(responses::create_response))
         .with_state(route_state.clone())
+        .layer(from_fn_with_state(
+            model_deprecation_state,
+            middleware::model_deprecation_middleware,
+        ))
         .layer(from_fn_with_state(
             usage_state,
             middleware::usage_check_middleware,

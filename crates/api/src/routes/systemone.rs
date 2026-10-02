@@ -1,7 +1,7 @@
 //! TypeSafe-compatible typed decisions, with the same billing and trust policy
 //! for external and self-hosted providers.
 use crate::{
-    middleware::{auth::AuthenticatedApiKey, RequestBodyHash},
+    middleware::{auth::AuthenticatedApiKey, RequestBodyHash, RequestedModel},
     models::ErrorResponse,
     routes::{api::AppState, common, completions, extractors::OpenAiJson},
 };
@@ -43,8 +43,10 @@ pub async fn systemone(
     Extension(api_key): Extension<AuthenticatedApiKey>,
     Extension(body_hash): Extension<RequestBodyHash>,
     headers: HeaderMap,
+    requested_model: RequestedModel,
     OpenAiJson(mut request): OpenAiJson<SystemOneRequest>,
 ) -> Response {
+    requested_model.set(&request.model);
     if let Err(message) = request.validate() {
         return error(StatusCode::BAD_REQUEST, message);
     }

@@ -68,6 +68,7 @@ mod mcp;
 mod mcp_server;
 mod message_metadata;
 mod model_alias_transparency;
+mod model_deprecation_headers;
 mod model_history_test;
 mod multiturn_tools;
 mod near_auth;

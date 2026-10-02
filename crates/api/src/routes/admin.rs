@@ -844,6 +844,12 @@ pub async fn batch_upsert_models(
                             .deprecation_date
                             .as_ref()
                             .map(|inner| inner.as_deref().and_then(parse_deprecation_date)),
+                        // Tri-state. The service layer checks that a set value
+                        // names an active model.
+                        successor_model_name: request
+                            .successor_model_id
+                            .as_ref()
+                            .map(|inner| inner.as_ref().map(|s| s.trim().to_string())),
                         // Tri-state passes straight through: outer None = leave
                         // unchanged, Some(None) = clear, Some(Some(v)) = set. The
                         // value was already shape-validated above.
@@ -871,6 +877,10 @@ pub async fn batch_upsert_models(
                 services::admin::AdminError::InvalidPricing(msg) => (
                     StatusCode::BAD_REQUEST,
                     ResponseJson(ErrorResponse::new(msg, "invalid_pricing".to_string())),
+                ),
+                services::admin::AdminError::InvalidDeprecation(msg) => (
+                    StatusCode::BAD_REQUEST,
+                    ResponseJson(ErrorResponse::new(msg, "invalid_request".to_string())),
                 ),
                 services::admin::AdminError::Unauthorized(msg) => (
                     StatusCode::UNAUTHORIZED,
@@ -1129,6 +1139,7 @@ pub async fn batch_upsert_models(
                     .deprecation_date
                     .as_ref()
                     .map(format_deprecation_date),
+                successor_model_id: updated_model.successor_model_name,
                 openrouter_slug: updated_model.openrouter_slug,
             },
         })
@@ -1235,6 +1246,7 @@ pub async fn list_models(
                 datacenters: crate::models::Datacenter::from_codes(model.datacenters),
                 is_ready: model.is_ready,
                 deprecation_date: model.deprecation_date.as_ref().map(format_deprecation_date),
+                successor_model_id: model.successor_model_name,
                 openrouter_slug: model.openrouter_slug,
             },
             is_active: model.is_active,
@@ -1373,6 +1385,7 @@ pub async fn get_model_history(
             datacenters: crate::models::Datacenter::from_codes(h.datacenters),
             is_ready: h.is_ready,
             deprecation_date: h.deprecation_date.as_ref().map(format_deprecation_date),
+            successor_model_id: h.successor_model_name,
             openrouter_slug: h.openrouter_slug,
             allow_free: h.allow_free,
         })
@@ -1918,6 +1931,7 @@ pub async fn deprecate_model(
             datacenters: crate::models::Datacenter::from_codes(m.datacenters),
             is_ready: m.is_ready,
             deprecation_date: m.deprecation_date.as_ref().map(format_deprecation_date),
+            successor_model_id: m.successor_model_name,
             openrouter_slug: m.openrouter_slug,
         },
     };

@@ -1,4 +1,6 @@
 target/
+# Incremental cache written by the former `-C incremental=false` rustflag
+false/
 config/config.yaml
 config/docker.yaml
 config/examples/production.yaml

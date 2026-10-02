@@ -16,6 +16,8 @@ use std::time::Duration;
 struct CountingModelsRepository {
     model: Mutex<Option<ModelWithPricing>>,
     resolves: AtomicUsize,
+    delay: Duration,
+    fail: std::sync::atomic::AtomicBool,
 }
 
 impl CountingModelsRepository {
@@ -23,6 +25,17 @@ impl CountingModelsRepository {
         Arc::new(Self {
             model: Mutex::new(model),
             resolves: AtomicUsize::new(0),
+            delay: Duration::ZERO,
+            fail: std::sync::atomic::AtomicBool::new(false),
+        })
+    }
+
+    fn slow(model: Option<ModelWithPricing>, delay: Duration) -> Arc<Self> {
+        Arc::new(Self {
+            model: Mutex::new(model),
+            resolves: AtomicUsize::new(0),
+            delay,
+            fail: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
@@ -46,6 +59,12 @@ impl ModelsRepository for CountingModelsRepository {
         _: &str,
     ) -> Result<Option<ModelWithPricing>, anyhow::Error> {
         self.resolves.fetch_add(1, Ordering::SeqCst);
+        if !self.delay.is_zero() {
+            tokio::time::sleep(self.delay).await;
+        }
+        if self.fail.load(Ordering::SeqCst) {
+            anyhow::bail!("db down");
+        }
         Ok(self.model.lock().unwrap().clone())
     }
 
@@ -131,4 +150,64 @@ async fn entries_expire_after_ttl() {
     tokio::time::sleep(Duration::from_millis(150)).await;
     service.resolve_model_cached("m").await.unwrap();
     assert_eq!(repo.resolves(), 2);
+}
+
+#[tokio::test]
+async fn concurrent_misses_for_one_key_read_the_repository_once() {
+    let repo = CountingModelsRepository::slow(Some(test_model("m")), Duration::from_millis(100));
+    let service = Arc::new(service(repo.clone()));
+
+    let tasks: Vec<_> = (0..16)
+        .map(|_| {
+            let service = service.clone();
+            tokio::spawn(async move { service.resolve_model_cached("m").await })
+        })
+        .collect();
+    for task in tasks {
+        assert!(task.await.unwrap().unwrap().is_some());
+    }
+    assert_eq!(repo.resolves(), 1);
+}
+
+#[tokio::test]
+async fn concurrent_none_misses_are_coalesced_but_not_cached() {
+    let repo = CountingModelsRepository::slow(None, Duration::from_millis(100));
+    let service = Arc::new(service(repo.clone()));
+
+    let tasks: Vec<_> = (0..8)
+        .map(|_| {
+            let service = service.clone();
+            tokio::spawn(async move { service.resolve_model_cached("m").await })
+        })
+        .collect();
+    for task in tasks {
+        assert!(task.await.unwrap().unwrap().is_none());
+    }
+    assert_eq!(repo.resolves(), 1);
+
+    // Not cached: the next request re-reads and sees a newly activated model.
+    *repo.model.lock().unwrap() = Some(test_model("m"));
+    assert!(service.resolve_model_cached("m").await.unwrap().is_some());
+    assert_eq!(repo.resolves(), 2);
+}
+
+#[tokio::test]
+async fn repository_errors_propagate_to_coalesced_callers_and_are_not_cached() {
+    let repo = CountingModelsRepository::slow(Some(test_model("m")), Duration::from_millis(100));
+    repo.fail.store(true, Ordering::SeqCst);
+    let service = Arc::new(service(repo.clone()));
+
+    let tasks: Vec<_> = (0..4)
+        .map(|_| {
+            let service = service.clone();
+            tokio::spawn(async move { service.resolve_model_cached("m").await })
+        })
+        .collect();
+    for task in tasks {
+        assert!(task.await.unwrap().is_err());
+    }
+    assert_eq!(repo.resolves(), 1);
+
+    repo.fail.store(false, Ordering::SeqCst);
+    assert!(service.resolve_model_cached("m").await.unwrap().is_some());
 }

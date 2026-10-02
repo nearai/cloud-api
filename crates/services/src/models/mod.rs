@@ -36,7 +36,7 @@ const MODELS_LIST_CACHE_KEY: &str = "all";
 /// TTL backstop for the per-request model-resolve cache. Same-instance admin
 /// writes clear it via `invalidate_models_cache` (best-effort: a resolve that
 /// was in flight during the write can repopulate a stale entry, also bounded
-/// by this TTL); otherwise this bounds staleness for writes made through
+/// by this TTL, see `resolve_model_cached`); otherwise this bounds staleness for writes made through
 /// other instances.
 const MODEL_RESOLVE_CACHE_TTL_SECS: u64 = 30;
 const MODEL_RESOLVE_CACHE_CAPACITY: u64 = 1_000;
@@ -58,22 +58,44 @@ pub fn model_resolve_cache_with_ttl(ttl: Duration) -> ModelResolveCache {
         .build()
 }
 
+/// Outcome of a failed single-flight load: not-found is not cached, errors
+/// are shared with the callers coalesced onto the same load.
+enum ResolveMiss {
+    NotFound,
+    Failed(anyhow::Error),
+}
+
 /// `ModelsRepository::resolve_and_get_model` through the positive-only cache.
-/// Only found models are cached; `None` always re-reads so a newly activated
-/// model works immediately.
+/// Concurrent misses for the same identifier are coalesced into one repository
+/// read (moka single-flight). Only found models are cached; `None` is surfaced
+/// as an `Err` to moka so it is never stored and always re-reads, so a newly
+/// activated model works immediately.
+///
+/// Invalidation: `invalidate_all` only discards entries inserted before it, so a
+/// load already in flight when an admin write invalidates can still insert its
+/// pre-write value afterwards. That staleness is bounded by the TTL; moka has no
+/// built-in way to make an in-flight load respect invalidation.
 pub async fn resolve_model_cached(
     cache: &ModelResolveCache,
     repository: &dyn ModelsRepository,
     identifier: &str,
 ) -> Result<Option<ModelWithPricing>, anyhow::Error> {
-    if let Some(model) = cache.get(identifier).await {
-        return Ok(Some(model));
+    let loaded = cache
+        .try_get_with_by_ref(identifier, async {
+            match repository.resolve_and_get_model(identifier).await {
+                Ok(Some(model)) => Ok(model),
+                Ok(None) => Err(ResolveMiss::NotFound),
+                Err(e) => Err(ResolveMiss::Failed(e)),
+            }
+        })
+        .await;
+    match loaded {
+        Ok(model) => Ok(Some(model)),
+        Err(miss) => match &*miss {
+            ResolveMiss::NotFound => Ok(None),
+            ResolveMiss::Failed(e) => Err(anyhow::anyhow!("{e:#}")),
+        },
     }
-    let resolved = repository.resolve_and_get_model(identifier).await?;
-    if let Some(model) = &resolved {
-        cache.insert(identifier.to_string(), model.clone()).await;
-    }
-    Ok(resolved)
 }
 
 fn apply_backend_model_metadata(

@@ -473,7 +473,8 @@ pub async fn init_domain_services_with_pool(
         metrics_service.clone(),
         models_repo.clone() as Arc<dyn services::models::ModelsRepository>,
         org_limit_repository,
-    );
+    )
+    .with_model_resolve_cache(models_service.model_resolve_cache());
     // Affinity keys only matter to a pool that places requests.
     if let Some(affinity_secret) = inference_provider_pool.affinity_secret() {
         completion_service = completion_service.with_affinity_secret(affinity_secret);

@@ -11,6 +11,7 @@ use services::staking_farm::{
     StakingSyncStatus, UpsertStakingFarmSourceRequest, CREDIT_SOURCE_HOUSE_OF_STAKE,
     CREDIT_TYPE_STAKING_FARM,
 };
+use tokio_postgres::types::Type;
 use tokio_postgres::Row;
 use uuid::Uuid;
 
@@ -178,8 +179,9 @@ impl StakingFarmRepository for OrganizationStakingFarmSourcesRepository {
                 .context("Failed to get database connection")
                 .map_err(RepositoryError::PoolError)?;
 
+            // One-shot typed query: one round trip, see repositories/mod.rs.
             client
-                .query_opt(
+                .query_typed_opt(
                     r#"
                     SELECT id, organization_id, near_account_id, network_id, contract_id,
                            farm_product_id, farm_price_id, credit_nano_usd_per_reward_unit,
@@ -194,7 +196,7 @@ impl StakingFarmRepository for OrganizationStakingFarmSourcesRepository {
                     ORDER BY created_at ASC
                     LIMIT 1
                     "#,
-                    &[&organization_id],
+                    &[(&organization_id, Type::UUID)],
                 )
                 .await
                 .map_err(map_db_error)

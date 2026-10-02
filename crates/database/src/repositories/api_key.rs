@@ -8,6 +8,7 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use services::common::{extract_api_key_prefix, generate_api_key, hash_api_key, RepositoryError};
 use services::workspace::ports::{ApiKeyOrderBy, ApiKeyOrderDirection, CreateApiKeyRequest};
+use tokio_postgres::types::Type;
 use tracing::debug;
 use uuid::Uuid;
 
@@ -149,8 +150,9 @@ impl ApiKeyRepository {
                 .context("Failed to get database connection")
                 .map_err(RepositoryError::PoolError)?;
 
+            // One-shot typed query: one round trip, see repositories/mod.rs.
             client
-                .query_opt(
+                .query_typed_opt(
                     r#"
             SELECT ak.*
             FROM api_keys ak
@@ -163,7 +165,7 @@ impl ApiKeyRepository {
               AND w.is_active = true
               AND o.is_active = true
             "#,
-                    &[&key_hash],
+                    &[(&key_hash, Type::VARCHAR)],
                 )
                 .await
                 .map_err(map_db_error)
@@ -192,10 +194,11 @@ impl ApiKeyRepository {
                 .context("Failed to get database connection")
                 .map_err(RepositoryError::PoolError)?;
 
+            // One-shot typed query: one round trip, see repositories/mod.rs.
             client
-                .execute(
+                .execute_typed(
                     "UPDATE api_keys SET last_used_at = NOW() WHERE id = $1",
-                    &[&id],
+                    &[(&id, Type::UUID)],
                 )
                 .await
                 .map_err(map_db_error)

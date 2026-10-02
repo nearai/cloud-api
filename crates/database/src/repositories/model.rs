@@ -7,6 +7,7 @@ use anyhow::{Context, Result};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use services::common::RepositoryError;
+use tokio_postgres::types::Type;
 use tokio_postgres::Row;
 
 // Default reason for soft delete operations
@@ -1300,8 +1301,9 @@ impl ModelRepository {
                 .context("Failed to get database connection")
                 .map_err(RepositoryError::PoolError)?;
 
+            // One-shot typed query: one round trip, see repositories/mod.rs.
             client
-                .query_opt(
+                .query_typed_opt(
                     r#"
                     SELECT
                         m.id,
@@ -1359,7 +1361,7 @@ impl ModelRepository {
                     GROUP BY m.id
                     LIMIT 1;
                     "#,
-                    &[&identifier],
+                    &[(&identifier, Type::VARCHAR)],
                 )
                 .await
                 .map_err(map_db_error)

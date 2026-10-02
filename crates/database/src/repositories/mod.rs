@@ -1,3 +1,12 @@
+// Why a few hot-path queries use `query_typed*` / `execute_typed` with explicit
+// parameter types: Parse+Bind+Execute go out in one network write, so a query
+// costs one round trip instead of prepare + execute, with no per-connection
+// statement state. Only per-request queries on the inference hot path use it
+// (API key and workspace auth, balance and spend, staking source, model
+// resolve, concurrent limit, chat signatures). Elsewhere keep plain `query*`
+// and do not spread this style without a measured round-trip cost. Each
+// parameter type must match the column type in the migrations.
+
 pub mod admin_access_token;
 pub mod admin_composite;
 pub mod admin_settings;

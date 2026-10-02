@@ -138,7 +138,61 @@ async fn test_response_items_saved_on_disconnect() {
         }))
         .await;
     assert_eq!(response.status_code(), 200);
-    let _stream = response.text();
+    let stream = response.text();
+    assert!(stream.contains("event: response.failed\n"));
+    assert!(!stream.contains("event: response.completed\n"));
+    let response_id = stream
+        .lines()
+        .filter_map(|line| line.strip_prefix("data: "))
+        .filter_map(|data| serde_json::from_str::<serde_json::Value>(data).ok())
+        .find_map(|event| {
+            event
+                .get("response")?
+                .get("id")?
+                .as_str()
+                .map(str::to_owned)
+        })
+        .expect("Should have a response ID from the created event");
+    let response_uuid = uuid::Uuid::parse_str(
+        response_id
+            .strip_prefix("resp_")
+            .expect("Expected a Responses ID"),
+    )
+    .unwrap();
+
+    // Observe finalization for this response before checking that failure never
+    // created a gateway signature. Other test responses and title usage are unrelated.
+    tokio::time::timeout(tokio::time::Duration::from_secs(5), async {
+        loop {
+            let client = database.pool().get().await.unwrap();
+            let row = client
+                .query_one(
+                    "SELECT EXISTS (SELECT 1 FROM responses WHERE id = $1 AND status = 'failed')
+                     AND EXISTS (SELECT 1 FROM organization_usage_log WHERE response_id = $1)",
+                    &[&response_uuid],
+                )
+                .await
+                .unwrap();
+            if row.get::<_, bool>(0) {
+                break;
+            }
+            drop(client);
+            tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("Failed response and partial usage should be persisted");
+    let client = database.pool().get().await.unwrap();
+    let signature_count: i64 = client
+        .query_one(
+            "SELECT COUNT(*) FROM chat_signatures WHERE chat_id = $1",
+            &[&response_id],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(signature_count, 0, "Failed responses must not be signed");
+    drop(client);
 
     // Wait for async DB writes (stream completion + title generation)
     tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
@@ -178,9 +232,8 @@ async fn test_response_items_saved_on_disconnect() {
 
     assert_eq!(
         main_usage.stop_reason.as_deref(),
-        Some("incomplete"),
-        "A stream truncated mid-answer declares no finish reason, so it must not \
-         be recorded as a clean completion. Found: {:?}",
+        Some("provider_error"),
+        "A stream truncated mid-answer must be recorded as an error. Found: {:?}",
         main_usage.stop_reason
     );
 
@@ -215,15 +268,16 @@ async fn test_signature_returns_stream_disconnected_on_client_disconnect() {
 
     use crate::common::mock_prompts;
 
-    // Configure mock: 10 words, disconnect after 5
+    // Complete the provider stream normally; the test simulates a client
+    // disconnect below by removing its signature and marking usage accordingly.
     let full_response = "Machine learning is a fascinating field of artificial intelligence today";
     let prompt = mock_prompts::build_prompt("Tell me about AI");
     mock.when(inference_providers::mock::RequestMatcher::ExactPrompt(
         prompt,
     ))
-    .respond_with(
-        inference_providers::mock::ResponseTemplate::new(full_response).with_disconnect_after(5),
-    )
+    .respond_with(inference_providers::mock::ResponseTemplate::new(
+        full_response,
+    ))
     .await;
 
     // Create conversation
@@ -272,9 +326,8 @@ async fn test_signature_returns_stream_disconnected_on_client_disconnect() {
     let response_uuid_str = response_id.strip_prefix("resp_").unwrap_or(&response_id);
     let response_uuid = uuid::Uuid::parse_str(response_uuid_str).expect("Invalid response ID");
 
-    // The mock truncates the provider stream, but Responses API still emits
-    // response.completed and asynchronously stores a gateway signature. Wait
-    // for both it and this response's usage row before simulating a client
+    // Wait for response.completed and the asynchronously stored gateway
+    // signature before simulating a client
     // disconnect, so UPDATE cannot miss the row or DELETE race the signature write.
     tokio::time::timeout(tokio::time::Duration::from_secs(5), async {
         loop {

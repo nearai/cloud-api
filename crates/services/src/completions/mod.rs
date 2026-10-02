@@ -12,6 +12,7 @@ use crate::usage::{
 };
 use inference_providers::{ChatMessage, MessageRole, SSEEvent, StreamChunk, StreamingResult};
 use moka::future::Cache;
+use std::collections::HashSet;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 use uuid::Uuid;
@@ -50,6 +51,18 @@ fn is_sse_event_separator(event: &SSEEvent) -> bool {
             .raw_bytes
             .iter()
             .all(|byte| matches!(*byte, b'\r' | b'\n'))
+}
+
+fn stream_error_category(error: &inference_providers::CompletionError) -> &'static str {
+    match error {
+        inference_providers::CompletionError::CompletionError(_) => "completion_error",
+        inference_providers::CompletionError::HttpError { .. } => "http_error",
+        inference_providers::CompletionError::InvalidResponse(_) => "invalid_response",
+        inference_providers::CompletionError::NoPubKeyProvider(_) => "stale_pubkey",
+        inference_providers::CompletionError::Unknown(_) => "unknown",
+        inference_providers::CompletionError::ClientMediaError(_) => "client_media_error",
+        inference_providers::CompletionError::Timeout { .. } => "timeout",
+    }
 }
 
 /// Hash inference ID to UUID deterministically using MD5 (v5)
@@ -134,8 +147,13 @@ where
     response_id: Option<ResponseId>,
     /// Last finish_reason from provider (e.g., "stop", "length", "tool_calls")
     last_finish_reason: Option<inference_providers::FinishReason>,
+    /// Requested choice count and the indices that have emitted a finish reason.
+    finished_choice_indices: HashSet<i64>,
+    expected_choice_count: i64,
     /// Last error from provider (for determining stop_reason)
     last_error: Option<inference_providers::CompletionError>,
+    /// Time of the most recent nonempty parsed upstream SSE event, including controls.
+    last_upstream_event_time: Option<Instant>,
     state: StreamState,
     /// Whether the model supports TEE attestation (false for external providers)
     attestation_supported: bool,
@@ -157,6 +175,12 @@ impl<S> InterceptStream<S>
 where
     S: Stream<Item = Result<SSEEvent, inference_providers::CompletionError>> + Unpin,
 {
+    fn observe_upstream_event(&mut self, event: &SSEEvent) {
+        if !event.raw_bytes.is_empty() {
+            self.last_upstream_event_time = Some(Instant::now());
+        }
+    }
+
     /// Finalize attestation handling before the route sends `[DONE]` to the client.
     /// This stores a provider signature when supported, otherwise releases the
     /// provider-routing pin. The API route handles Gateway signatures separately.
@@ -250,6 +274,34 @@ where
 
     /// Record usage and metrics. Called from Drop to ensure it always runs.
     fn record_usage_and_metrics(&self) {
+        let error_category = self
+            .last_error
+            .as_ref()
+            .map(stream_error_category)
+            .or_else(|| (!self.stream_completed).then_some("client_cancelled"));
+        if let Some(error_category) = error_category {
+            let upstream_status_code = self.last_error.as_ref().and_then(|error| match error {
+                inference_providers::CompletionError::HttpError { status_code, .. } => {
+                    Some(*status_code)
+                }
+                _ => None,
+            });
+            let last_upstream_event_gap_ms = self
+                .last_upstream_event_time
+                .map(|last_event| last_event.elapsed().as_millis() as u64);
+            tracing::warn!(
+                request_id = %self.request_id,
+                organization_id = %self.organization_id,
+                model_id = %self.model_id,
+                model = %self.model_name,
+                error_category,
+                upstream_status_code = ?upstream_status_code,
+                total_duration_ms = self.service_start_time.elapsed().as_millis() as u64,
+                last_upstream_event_gap_ms = ?last_upstream_event_gap_ms,
+                "Completion stream failed or was interrupted"
+            );
+        }
+
         let request_id = self.request_id;
         let organization_id = self.organization_id;
         let workspace_id = self.workspace_id;
@@ -538,6 +590,7 @@ where
             if matches!(&self.state, StreamState::Streaming) {
                 match Pin::new(&mut self.inner).poll_next(cx) {
                     Poll::Ready(Some(Ok(event))) => {
+                        self.observe_upstream_event(&event);
                         if event.is_done_marker() {
                             if event.raw_bytes.len() > MAX_PROVIDER_DONE_EVENT_BYTES {
                                 let error = inference_providers::CompletionError::CompletionError(
@@ -594,32 +647,74 @@ where
                             self.last_token_time = Some(now);
                         }
 
-                        if let Some(StreamChunk::Chat(ref chat_chunk)) = event.chunk {
-                            // Track chat_id for attestation (updated on each chunk).
-                            self.last_chat_id = Some(chat_chunk.id.clone());
-
-                            // Track usage stats (updated on each chunk that has usage).
-                            if let Some(usage) = &chat_chunk.usage {
-                                self.last_usage_stats = Some(usage.clone());
-                            }
-
-                            if let Some(service_tier) = &chat_chunk.service_tier {
-                                self.provider_service_tier = Some(service_tier.clone());
-                            }
-
-                            // Track finish_reason from the final chunk (only set once at end).
-                            if let Some(choice) = chat_chunk.choices.first() {
-                                if let Some(ref reason) = choice.finish_reason {
+                        match event.chunk.as_ref() {
+                            Some(StreamChunk::Chat(chunk)) => {
+                                self.last_chat_id = Some(chunk.id.clone());
+                                if let Some(usage) = &chunk.usage {
+                                    self.last_usage_stats = Some(usage.clone());
+                                }
+                                if let Some(service_tier) = &chunk.service_tier {
+                                    self.provider_service_tier = Some(service_tier.clone());
+                                }
+                                if let Some(reason) = chunk
+                                    .choices
+                                    .iter()
+                                    .find_map(|choice| choice.finish_reason.as_ref())
+                                {
                                     self.last_finish_reason = Some(reason.clone());
                                 }
+                                for choice in &chunk.choices {
+                                    if choice.finish_reason.is_some()
+                                        && choice.index >= 0
+                                        && choice.index < self.expected_choice_count
+                                    {
+                                        self.finished_choice_indices.insert(choice.index);
+                                    }
+                                }
                             }
+                            Some(StreamChunk::Text(chunk)) => {
+                                self.last_chat_id = Some(chunk.id.clone());
+                                if let Some(usage) = &chunk.usage {
+                                    self.last_usage_stats = Some(usage.clone());
+                                }
+                                if let Some(reason) = chunk
+                                    .choices
+                                    .iter()
+                                    .find_map(|choice| choice.finish_reason.as_ref())
+                                {
+                                    self.last_finish_reason = Some(reason.clone());
+                                }
+                                for choice in &chunk.choices {
+                                    if choice.finish_reason.is_some()
+                                        && choice.index >= 0
+                                        && choice.index < self.expected_choice_count
+                                    {
+                                        self.finished_choice_indices.insert(choice.index);
+                                    }
+                                }
+                            }
+                            None => {}
                         }
                         return Poll::Ready(Some(Ok(event)));
                     }
-                    Poll::Ready(None) => self.begin_finalizing(),
+                    Poll::Ready(None) => {
+                        if self.last_finish_reason.is_none()
+                            || self.finished_choice_indices.len()
+                                != self.expected_choice_count as usize
+                        {
+                            let error = inference_providers::CompletionError::CompletionError(
+                                "Provider stream ended before a finish reason".into(),
+                            );
+                            self.last_error = Some(error.clone());
+                            self.begin_finalizing();
+                            return Poll::Ready(Some(Err(error)));
+                        }
+                        self.begin_finalizing();
+                    }
                     Poll::Ready(Some(Err(err))) => {
                         // Capture error for stop_reason in usage recording (handled in Drop).
                         self.last_error = Some(err.clone());
+                        self.begin_finalizing();
                         return Poll::Ready(Some(Err(err)));
                     }
                     Poll::Pending => return Poll::Pending,
@@ -631,6 +726,7 @@ where
                 let marker_len = *marker_len;
                 match Pin::new(&mut self.inner).poll_next(cx) {
                     Poll::Ready(Some(Ok(event))) if is_sse_event_separator(&event) => {
+                        self.observe_upstream_event(&event);
                         let terminal_len = marker_len.checked_add(event.raw_bytes.len());
                         if terminal_len.is_none_or(|len| len > MAX_PROVIDER_DONE_EVENT_BYTES) {
                             let error = inference_providers::CompletionError::CompletionError(
@@ -1255,7 +1351,7 @@ impl CompletionServiceImpl {
         ]
     }
 
-    pub(crate) fn map_provider_error(
+    pub fn map_provider_error(
         model: &str,
         error: &inference_providers::CompletionError,
         operation: &str,
@@ -1307,7 +1403,6 @@ impl CompletionServiceImpl {
                         %organization_id,
                         model,
                         status_code,
-                        provider_message = %message,
                         "Auth error during {}",
                         operation
                     );
@@ -1323,7 +1418,6 @@ impl CompletionServiceImpl {
                         %organization_id,
                         model,
                         status_code,
-                        provider_message = %message,
                         "External provider not found during {}",
                         operation
                     );
@@ -1344,7 +1438,6 @@ impl CompletionServiceImpl {
                         %organization_id,
                         model,
                         status_code,
-                        provider_message = %message,
                         "Provider timeout during {}",
                         operation
                     );
@@ -1386,7 +1479,6 @@ impl CompletionServiceImpl {
                         %organization_id,
                         model,
                         status_code,
-                        provider_message = %message,
                         "Provider error during {}",
                         operation
                     );
@@ -1402,7 +1494,6 @@ impl CompletionServiceImpl {
                         %organization_id,
                         model,
                         status_code,
-                        provider_message = %message,
                         "External provider error during {}",
                         operation
                     );
@@ -1439,10 +1530,9 @@ impl CompletionServiceImpl {
                         .to_string(),
                 )
             }
-            inference_providers::CompletionError::NoPubKeyProvider(msg) => {
+            inference_providers::CompletionError::NoPubKeyProvider(_) => {
                 tracing::warn!(
                     model,
-                    provider_message = %msg,
                     "E2EE pubkey routing failed during {} (stale attestation?)",
                     operation
                 );
@@ -1458,7 +1548,6 @@ impl CompletionServiceImpl {
                     tracing::error!(
                         %organization_id,
                         model,
-                        provider_message = %msg,
                         "Provider error during {}",
                         operation
                     );
@@ -1469,11 +1558,10 @@ impl CompletionServiceImpl {
                     }
                 }
             }
-            inference_providers::CompletionError::InvalidResponse(msg) => {
+            inference_providers::CompletionError::InvalidResponse(_) => {
                 tracing::error!(
                     %organization_id,
                     model,
-                    provider_message = %msg,
                     "Invalid response during {}",
                     operation
                 );
@@ -1483,11 +1571,10 @@ impl CompletionServiceImpl {
                         .to_string(),
                 }
             }
-            inference_providers::CompletionError::Unknown(msg) => {
+            inference_providers::CompletionError::Unknown(_) => {
                 tracing::error!(
                     %organization_id,
                     model,
-                    provider_message = %msg,
                     "Unknown error during {}",
                     operation
                 );
@@ -1687,6 +1774,7 @@ impl CompletionServiceImpl {
         cache_write_cost_per_token: Option<i64>,
         requested_service_tier: Option<TextServiceTier>,
         latency_reporter: Option<super::inference_provider_pool::ProviderLatencyReporter>,
+        expected_choice_count: i64,
     ) -> StreamingResult {
         // Create low-cardinality metric tags (no org/workspace/key - those go to database)
         let metric_tags = Self::create_metric_tags(&model_name);
@@ -1727,7 +1815,10 @@ impl CompletionServiceImpl {
             saw_upstream_done_marker: false,
             response_id,
             last_finish_reason: None,
+            finished_choice_indices: HashSet::new(),
+            expected_choice_count,
             last_error: None,
+            last_upstream_event_time: None,
             state: StreamState::Streaming,
             attestation_supported,
             store_provider_chat_signature,
@@ -1957,6 +2048,7 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
                 cache_write_cost_per_token,
                 requested_service_tier,
                 Some(latency_reporter),
+                request.n.unwrap_or(1).max(1),
             )
             .await;
 
@@ -2604,7 +2696,10 @@ mod tests {
             saw_upstream_done_marker: false,
             response_id: None,
             last_finish_reason: None,
+            finished_choice_indices: HashSet::new(),
+            expected_choice_count: 1,
             last_error: None,
+            last_upstream_event_time: None,
             state: StreamState::Streaming,
             attestation_supported: false,
             store_provider_chat_signature: true,
@@ -2622,6 +2717,73 @@ mod tests {
             chunk: None,
             raw_passthrough: true,
         }
+    }
+
+    fn finished_chat_choices(indices: &[i64]) -> SSEEvent {
+        SSEEvent {
+            raw_bytes: Bytes::from_static(b"data: finish\n\n"),
+            chunk: Some(StreamChunk::Chat(ChatCompletionChunk {
+                id: "chat-finish".to_string(),
+                object: "chat.completion.chunk".to_string(),
+                created: 1,
+                model: "test-model".to_string(),
+                choices: indices
+                    .iter()
+                    .map(|index| ChatChoice {
+                        index: *index,
+                        delta: None,
+                        logprobs: None,
+                        finish_reason: Some(FinishReason::Stop),
+                        token_ids: None,
+                    })
+                    .collect(),
+                usage: None,
+                service_tier: None,
+                prompt_token_ids: None,
+                system_fingerprint: None,
+                modality: None,
+                extra: Default::default(),
+            })),
+            raw_passthrough: true,
+        }
+    }
+
+    #[tokio::test]
+    async fn eof_requires_every_requested_choice_to_finish() {
+        let mut stream = terminal_test_stream(vec![Ok(finished_chat_choices(&[0]))]);
+        stream.expected_choice_count = 2;
+
+        let events = stream.by_ref().collect::<Vec<_>>().await;
+
+        assert!(matches!(
+            events.last(),
+            Some(Err(inference_providers::CompletionError::CompletionError(message)))
+                if message == "Provider stream ended before a finish reason"
+        ));
+        assert!(stream.last_error.is_some());
+    }
+
+    #[tokio::test]
+    async fn eof_succeeds_after_every_requested_choice_finishes() {
+        let mut stream = terminal_test_stream(vec![Ok(finished_chat_choices(&[0, 1]))]);
+        stream.expected_choice_count = 2;
+
+        let events = stream.by_ref().collect::<Vec<_>>().await;
+
+        assert!(events.iter().all(Result::is_ok));
+        assert!(stream.last_error.is_none());
+        assert!(stream.stream_completed);
+    }
+
+    #[tokio::test]
+    async fn eof_succeeds_for_default_single_choice() {
+        let mut stream = terminal_test_stream(vec![Ok(finished_chat_choices(&[0]))]);
+
+        let events = stream.by_ref().collect::<Vec<_>>().await;
+
+        assert!(events.iter().all(Result::is_ok));
+        assert!(stream.last_error.is_none());
+        assert!(stream.stream_completed);
     }
 
     #[tokio::test]
@@ -2822,7 +2984,10 @@ mod tests {
             saw_upstream_done_marker: false,
             response_id: None,
             last_finish_reason: None,
+            finished_choice_indices: HashSet::new(),
+            expected_choice_count: 1,
             last_error: None,
+            last_upstream_event_time: None,
             state: StreamState::Streaming,
             attestation_supported: true,
             store_provider_chat_signature: true,
@@ -2996,7 +3161,10 @@ mod tests {
             saw_upstream_done_marker: false,
             response_id: None,
             last_finish_reason: None,
+            finished_choice_indices: HashSet::new(),
+            expected_choice_count: 1,
             last_error: None,
+            last_upstream_event_time: None,
             state: StreamState::Streaming,
             attestation_supported: true,
             store_provider_chat_signature: true,
@@ -3151,7 +3319,10 @@ mod tests {
             saw_upstream_done_marker: false,
             response_id: None,
             last_finish_reason: None,
+            finished_choice_indices: HashSet::new(),
+            expected_choice_count: 1,
             last_error: None,
+            last_upstream_event_time: None,
             state: StreamState::Streaming,
             attestation_supported: true,
             store_provider_chat_signature: true,
@@ -3280,7 +3451,10 @@ mod tests {
             saw_upstream_done_marker: false,
             response_id: None,
             last_finish_reason: None,
+            finished_choice_indices: HashSet::new(),
+            expected_choice_count: 1,
             last_error: None,
+            last_upstream_event_time: None,
             state: StreamState::Streaming,
             attestation_supported: true,
             store_provider_chat_signature: true,
@@ -3491,7 +3665,10 @@ mod tests {
                 saw_upstream_done_marker: false,
                 response_id: None,
                 last_finish_reason: None,
+                finished_choice_indices: HashSet::new(),
+                expected_choice_count: 1,
                 last_error: None,
+                last_upstream_event_time: None,
                 state: StreamState::Streaming,
                 attestation_supported: true,
                 store_provider_chat_signature: true,

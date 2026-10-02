@@ -24,12 +24,12 @@ use services::common::encryption_headers as service_encryption_headers;
 use services::completions::{
     hash_inference_id_to_uuid,
     ports::{CompletionMessage, CompletionRequest as ServiceCompletionRequest},
-    MAX_PROVIDER_DONE_EVENT_BYTES,
+    CompletionServiceImpl, MAX_PROVIDER_DONE_EVENT_BYTES,
 };
 use sha2::{Digest, Sha256};
 use std::convert::Infallible;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tracing::{debug, Instrument};
 use utoipa;
 use uuid::Uuid;
@@ -328,6 +328,33 @@ fn completion_stream_error_category(e: &inference_providers::CompletionError) ->
         inference_providers::CompletionError::Unknown(_) => "unknown",
         inference_providers::CompletionError::ClientMediaError(_) => "client_media_error",
         inference_providers::CompletionError::Timeout { .. } => "timeout",
+    }
+}
+
+fn completion_stream_error_upstream_status_code(
+    e: &inference_providers::CompletionError,
+) -> Option<u16> {
+    match e {
+        inference_providers::CompletionError::HttpError { status_code, .. } => Some(*status_code),
+        inference_providers::CompletionError::CompletionError(_)
+        | inference_providers::CompletionError::InvalidResponse(_)
+        | inference_providers::CompletionError::Unknown(_)
+        | inference_providers::CompletionError::ClientMediaError(_)
+        | inference_providers::CompletionError::NoPubKeyProvider(_)
+        | inference_providers::CompletionError::Timeout { .. } => None,
+    }
+}
+
+fn completion_domain_error_category(
+    e: &services::completions::ports::CompletionError,
+) -> &'static str {
+    match e {
+        services::completions::ports::CompletionError::InvalidModel(_) => "invalid_model",
+        services::completions::ports::CompletionError::RateLimitExceeded(_) => "rate_limited",
+        services::completions::ports::CompletionError::InvalidParams(_) => "invalid_params",
+        services::completions::ports::CompletionError::ProviderError { .. } => "provider_error",
+        services::completions::ports::CompletionError::ServiceOverloaded(_) => "overloaded",
+        services::completions::ports::CompletionError::InternalError(_) => "internal_error",
     }
 }
 
@@ -1481,6 +1508,7 @@ async fn chat_completions_inner(
     request: ChatCompletionRequest,
     request_id: Uuid,
 ) -> axum::response::Response {
+    let request_started_at = Instant::now();
     let request_hash = body_hash.hash.clone();
 
     // Convert HTTP request to service parameters
@@ -1707,12 +1735,16 @@ async fn chat_completions_inner(
                 let mut leading_control: Vec<
                     Result<inference_providers::SSEEvent, inference_providers::CompletionError>,
                 > = Vec::new();
+                let mut last_pre_sse_event_time: Option<Instant> = None;
                 // Raw chat_id string captured alongside the hashed UUID so we can
                 // look up the serving-provider tier from the pool's chat_id mapping.
                 let mut stream_chat_id: Option<String> = None;
                 let inference_id = loop {
                     let is_control = match peekable_stream.as_mut().peek().await {
                         Some(Ok(event)) => {
+                            if !event.raw_bytes.is_empty() {
+                                last_pre_sse_event_time = Some(Instant::now());
+                            }
                             if let Some(chunk) = &event.chunk {
                                 // Capture the raw chat_id for the tier lookup below.
                                 stream_chat_id = Some(match chunk {
@@ -1724,7 +1756,38 @@ async fn chat_completions_inner(
                             }
                             true
                         }
-                        _ => break None,
+                        Some(Err(error)) => {
+                            // Keep the provider's actual HTTP status separate from
+                            // the mapped response status (e.g. upstream 503 -> mapped 502).
+                            let upstream_status_code =
+                                completion_stream_error_upstream_status_code(error);
+                            let domain_error = CompletionServiceImpl::map_provider_error(
+                                &request.model,
+                                error,
+                                "chat completion stream",
+                                api_key.organization.id.0,
+                            );
+                            let status_code = map_domain_error_to_status(&domain_error);
+                            let last_upstream_event_gap_ms = last_pre_sse_event_time
+                                .map(|last_event| last_event.elapsed().as_millis() as u64);
+                            tracing::warn!(
+                                request_id = %request_id,
+                                organization_id = %api_key.organization.id.0,
+                                model = %request.model,
+                                error_category = completion_domain_error_category(&domain_error),
+                                status_code = status_code.as_u16(),
+                                upstream_status_code = ?upstream_status_code,
+                                total_duration_ms = request_started_at.elapsed().as_millis() as u64,
+                                last_upstream_event_gap_ms = ?last_upstream_event_gap_ms,
+                                "Completion stream failed before SSE response"
+                            );
+                            return (
+                                status_code,
+                                ResponseJson::<ErrorResponse>(domain_error.into()),
+                            )
+                                .into_response();
+                        }
+                        None => break None,
                     };
                     if is_control {
                         if leading_control.len() >= MAX_LEADING_CONTROL_EVENTS {
@@ -1787,6 +1850,9 @@ async fn chat_completions_inner(
                 let error_count_clone = stream_error_count.clone();
                 let request_model = request.model.clone();
                 let organization_id = api_key.organization.id.0;
+                let stream_request_id = request_id;
+                let last_upstream_event_at =
+                    Arc::new(std::sync::Mutex::new(last_pre_sse_event_time));
 
                 // Set when the upstream's own `data: [DONE]` terminator was
                 // observed, so the end-of-stream tail doesn't append a
@@ -1834,6 +1900,9 @@ async fn chat_completions_inner(
                 let byte_stream = event_stream
                     .filter_map(move |result| {
                         let error_count_inner = error_count_clone.clone();
+                        let last_upstream_event_at = last_upstream_event_at.clone();
+                        let request_started_at = request_started_at;
+                        let stream_request_id = stream_request_id;
                         let model_for_err = request_model.clone();
                         let states = unredact_states.clone();
                         let template = chunk_template.clone();
@@ -1855,6 +1924,16 @@ async fn chat_completions_inner(
                         async move {
                             match result {
                                 Ok(event) => {
+                                    // event_stream contains provider SSE events only; control
+                                    // comments count as upstream activity too, while empty
+                                    // transport items and generated downstream frames do not.
+                                    if !event.raw_bytes.is_empty() {
+                                        if let Ok(mut last_event_at) =
+                                            last_upstream_event_at.lock()
+                                        {
+                                            *last_event_at = Some(Instant::now());
+                                        }
+                                    }
                                     if holding_provider_terminal_suffix
                                         .load(std::sync::atomic::Ordering::Relaxed)
                                     {
@@ -2185,10 +2264,21 @@ async fn chat_completions_inner(
                                     let count = error_count_inner
                                         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                                     if count == 0 {
+                                        let last_upstream_event_gap_ms = last_upstream_event_at
+                                            .lock()
+                                            .ok()
+                                            .and_then(|last_event_at| *last_event_at)
+                                            .map(|last_event_at| {
+                                                last_event_at.elapsed().as_millis() as u64
+                                            });
                                         tracing::error!(
-                                            %organization_id,
+                                            request_id = %stream_request_id,
+                                            organization_id = %organization_id,
                                             model = %model_for_err,
-                                            error_type = %completion_stream_error_category(&e),
+                                            error_category = %completion_stream_error_category(&e),
+                                            upstream_status_code = ?completion_stream_error_upstream_status_code(&e),
+                                            total_duration_ms = request_started_at.elapsed().as_millis() as u64,
+                                            last_upstream_event_gap_ms = ?last_upstream_event_gap_ms,
                                             "Completion stream error"
                                         );
                                     }
@@ -2214,7 +2304,12 @@ async fn chat_completions_inner(
                                 let mut combined: Vec<u8> = Vec::new();
                                 let error_count_final =
                                     stream_error_count.load(std::sync::atomic::Ordering::Relaxed);
-                                if auto_redact_enabled {
+                                let may_emit_success_terminal = error_count_final == 0;
+                                // The stream error frame is already terminal from
+                                // the client's perspective. Held redaction bytes
+                                // may be ordinary completion content, so never
+                                // append them after a failed stream.
+                                if auto_redact_enabled && may_emit_success_terminal {
                                     let mut states = unredact_states_for_chain.lock().await;
                                     let template = chunk_template_for_chain.lock().await.clone();
                                     for bytes in build_flush_chunks(&mut states, &template) {
@@ -2277,9 +2372,9 @@ async fn chat_completions_inner(
 
                                 let synthesized_done = !upstream_done_for_chain
                                     .load(std::sync::atomic::Ordering::Relaxed);
-                                if synthesized_done {
+                                if synthesized_done && may_emit_success_terminal {
                                     combined.extend_from_slice(b"data: [DONE]\n\n");
-                                } else if error_count_final == 0
+                                } else if !synthesized_done && may_emit_success_terminal
                                     && defer_upstream_terminal
                                     && holding_provider_terminal_suffix_for_chain
                                         .load(std::sync::atomic::Ordering::Relaxed)
@@ -2458,6 +2553,16 @@ async fn chat_completions_inner(
             }
             Err(domain_error) => {
                 let status_code = map_domain_error_to_status(&domain_error);
+                tracing::error!(
+                    request_id = %request_id,
+                    organization_id = %api_key.organization.id.0,
+                    model = %request.model,
+                    error_category = completion_domain_error_category(&domain_error),
+                    status_code = status_code.as_u16(),
+                    total_duration_ms = request_started_at.elapsed().as_millis() as u64,
+                    last_upstream_event_gap_ms = Option::<u64>::None,
+                    "Completion stream failed before SSE response"
+                );
                 (
                     status_code,
                     ResponseJson::<ErrorResponse>(domain_error.into()),
@@ -2711,6 +2816,7 @@ async fn completions_inner(
     request: CompletionRequest,
     request_id: Uuid,
 ) -> axum::response::Response {
+    let request_started_at = Instant::now();
     let request_hash = body_hash.hash.clone();
 
     // Reject E2E encryption: validate for parity (an invalid version still 400s
@@ -2867,7 +2973,33 @@ async fn completions_inner(
                             }
                             true
                         }
-                        _ => break None,
+                        Some(Err(error)) => {
+                            let upstream_status_code =
+                                completion_stream_error_upstream_status_code(error);
+                            let domain_error = CompletionServiceImpl::map_provider_error(
+                                &request.model,
+                                error,
+                                "text completion stream",
+                                api_key.organization.id.0,
+                            );
+                            let status_code = map_domain_error_to_status(&domain_error);
+                            tracing::warn!(
+                                request_id = %request_id,
+                                organization_id = %api_key.organization.id.0,
+                                model = %request.model,
+                                error_category = completion_domain_error_category(&domain_error),
+                                status_code = status_code.as_u16(),
+                                upstream_status_code = ?upstream_status_code,
+                                total_duration_ms = request_started_at.elapsed().as_millis() as u64,
+                                "Text completion stream failed before SSE response"
+                            );
+                            return (
+                                status_code,
+                                ResponseJson::<ErrorResponse>(domain_error.into()),
+                            )
+                                .into_response();
+                        }
+                        None => break None,
                     };
                     if is_control {
                         if control_skipped >= MAX_LEADING_CONTROL_EVENTS {
@@ -3042,7 +3174,11 @@ async fn completions_inner(
                                 }
                             }
 
-                            Ok::<Bytes, Infallible>(done)
+                            if stream_errored {
+                                Ok::<Bytes, Infallible>(Bytes::new())
+                            } else {
+                                Ok::<Bytes, Infallible>(done)
+                            }
                         }
                     }));
 
@@ -5179,7 +5315,9 @@ pub async fn image_generations(
             let image_count = match i32::try_from(response_with_bytes.response.data.len()) {
                 Ok(count) => count,
                 Err(_) => {
-                    tracing::error!("Too many images in provider response, cannot fit in i32 for usage tracking");
+                    tracing::error!(
+                        "Too many images in provider response, cannot fit in i32 for usage tracking"
+                    );
                     return (
                         StatusCode::INTERNAL_SERVER_ERROR,
                         ResponseJson(ErrorResponse::new(
@@ -5974,7 +6112,9 @@ pub async fn image_edits(
             let image_count = match i32::try_from(response_with_bytes.response.data.len()) {
                 Ok(count) => count,
                 Err(_) => {
-                    tracing::error!("Too many images in provider response, cannot fit in i32 for usage tracking");
+                    tracing::error!(
+                        "Too many images in provider response, cannot fit in i32 for usage tracking"
+                    );
                     return (
                         StatusCode::INTERNAL_SERVER_ERROR,
                         ResponseJson(ErrorResponse::new(

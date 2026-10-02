@@ -49,6 +49,12 @@ pub struct ApiConfig {
     pub credit_allocation: CreditAllocationConfig,
     pub ita: ItaAttestationConfig,
     pub placement: PlacementConfig,
+    /// Documentation page describing model deprecations
+    /// (`MODEL_DEPRECATION_DOCS_URL`). Sent as `Link: rel="deprecation"` on
+    /// inference responses for a model with a planned deprecation. Unset
+    /// omits the link; the `Deprecation` and `Sunset` headers are sent either
+    /// way.
+    pub model_deprecation_docs_url: Option<String>,
 }
 
 impl ApiConfig {
@@ -100,8 +106,31 @@ impl ApiConfig {
             usage_reporting: UsageReportingConfig::from_env()?,
             credit_allocation: CreditAllocationConfig::from_env()?,
             placement: PlacementConfig::from_env()?,
+            model_deprecation_docs_url: parse_model_deprecation_docs_url(non_empty_env(
+                MODEL_DEPRECATION_DOCS_URL_ENV,
+            ))?,
         })
     }
+}
+
+pub const MODEL_DEPRECATION_DOCS_URL_ENV: &str = "MODEL_DEPRECATION_DOCS_URL";
+
+/// The value is placed inside `<...>` in a `Link` response header, so it must
+/// be an absolute http(s) URL made of visible ASCII with no `<`, `>` or `"`.
+fn parse_model_deprecation_docs_url(value: Option<String>) -> Result<Option<String>, String> {
+    let Some(url) = value else {
+        return Ok(None);
+    };
+    let has_scheme = url.starts_with("https://") || url.starts_with("http://");
+    let header_safe = url
+        .bytes()
+        .all(|b| b.is_ascii_graphic() && !matches!(b, b'<' | b'>' | b'"'));
+    if !has_scheme || !header_safe {
+        return Err(format!(
+            "{MODEL_DEPRECATION_DOCS_URL_ENV} must be an absolute http(s) URL without spaces, '<', '>' or '\"'"
+        ));
+    }
+    Ok(Some(url))
 }
 
 /// Credit funding priority used when a usage charge is posted.
@@ -3131,6 +3160,41 @@ mod internal_usage_max_discount_tests {
         ] {
             assert!(
                 parse_internal_usage_max_discount(Some(bad)).is_err(),
+                "{bad}"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod model_deprecation_docs_url_tests {
+    use super::parse_model_deprecation_docs_url;
+
+    #[test]
+    fn unset_omits_the_link() {
+        assert_eq!(parse_model_deprecation_docs_url(None).unwrap(), None);
+    }
+
+    #[test]
+    fn accepts_an_absolute_http_url() {
+        let url = "https://docs.example.com/model-deprecations".to_string();
+        assert_eq!(
+            parse_model_deprecation_docs_url(Some(url.clone())).unwrap(),
+            Some(url)
+        );
+    }
+
+    #[test]
+    fn rejects_values_that_cannot_sit_in_a_link_header() {
+        for bad in [
+            "docs.example.com/model-deprecations",
+            "/model-deprecations",
+            "https://docs.example.com/a b",
+            "https://docs.example.com/>; rel=\"x\"",
+            "https://docs.example.com/\u{e9}",
+        ] {
+            assert!(
+                parse_model_deprecation_docs_url(Some(bad.to_string())).is_err(),
                 "{bad}"
             );
         }

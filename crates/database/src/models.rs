@@ -517,6 +517,12 @@ pub struct Model {
     pub is_ready: Option<bool>,
     /// Planned deprecation date (ISO 8601). NULL = no planned deprecation.
     pub deprecation_date: Option<DateTime<Utc>>,
+    /// When the planned deprecation was announced: stamped when
+    /// `deprecation_date` goes from NULL to set, cleared together with it.
+    pub deprecation_announced_at: Option<DateTime<Utc>>,
+    /// Canonical name of the recommended replacement model. Cleared together
+    /// with `deprecation_date`.
+    pub successor_model_name: Option<String>,
     /// OpenRouter `openrouter.slug` override (lowercase `author/slug`). Set when
     /// our canonical `model_name` does not match OpenRouter's slug. NULL = unset;
     /// the public API then omits the nested `openrouter` object.
@@ -579,6 +585,10 @@ pub struct UpdateModelPricingRequest {
     /// Tri-state: `None` = leave unchanged, `Some(None)` = clear to NULL,
     /// `Some(Some(dt))` = set to `dt`.
     pub deprecation_date: Option<Option<DateTime<Utc>>>,
+    /// Recommended replacement model for a planned deprecation.
+    /// Tri-state: `None` = leave unchanged, `Some(None)` = clear to NULL,
+    /// `Some(Some(v))` = set to `v`. Also cleared when `deprecation_date` is.
+    pub successor_model_name: Option<Option<String>>,
     /// OpenRouter `openrouter.slug` override.
     /// Tri-state: `None` = leave unchanged, `Some(None)` = clear to NULL,
     /// `Some(Some(v))` = set to `v`.
@@ -637,6 +647,8 @@ pub struct ModelHistory {
     pub datacenters: Option<Vec<String>>,
     pub is_ready: Option<bool>,
     pub deprecation_date: Option<DateTime<Utc>>,
+    pub deprecation_announced_at: Option<DateTime<Utc>>,
+    pub successor_model_name: Option<String>,
     /// OpenRouter `openrouter.slug` override the model carried at this point.
     pub openrouter_slug: Option<String>,
 

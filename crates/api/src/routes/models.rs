@@ -163,6 +163,11 @@ pub async fn list_models(
                     .deprecation_date
                     .as_ref()
                     .map(crate::routes::admin::format_deprecation_date),
+                deprecation_announced_at: model
+                    .deprecation_announced_at
+                    .as_ref()
+                    .map(crate::routes::admin::format_deprecation_announced_at),
+                successor_model_id: model.successor_model_name,
                 openrouter_slug: model.openrouter_slug,
             },
         })
@@ -282,6 +287,11 @@ pub async fn get_model_by_name(
                 .deprecation_date
                 .as_ref()
                 .map(crate::routes::admin::format_deprecation_date),
+            deprecation_announced_at: model
+                .deprecation_announced_at
+                .as_ref()
+                .map(crate::routes::admin::format_deprecation_announced_at),
+            successor_model_id: model.successor_model_name,
             openrouter_slug: model.openrouter_slug,
         },
     };
@@ -336,6 +346,8 @@ mod tests {
             datacenters: None,
             is_ready: Some(true),
             deprecation_date: None,
+            deprecation_announced_at: None,
+            successor_model_name: None,
             openrouter_slug: None,
             created_at: chrono::Utc::now(),
         }

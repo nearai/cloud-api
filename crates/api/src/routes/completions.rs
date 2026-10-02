@@ -1,5 +1,5 @@
 use crate::{
-    middleware::{auth::AuthenticatedApiKey, RequestBodyHash, RequestCorrelation},
+    middleware::{auth::AuthenticatedApiKey, RequestBodyHash, RequestCorrelation, RequestedModel},
     models::*,
     routes::{
         api::AppState,
@@ -1430,8 +1430,10 @@ pub async fn chat_completions(
     Extension(body_hash): Extension<RequestBodyHash>,
     Extension(correlation): Extension<RequestCorrelation>,
     headers: header::HeaderMap,
+    requested_model: RequestedModel,
     OpenAiJson(request): OpenAiJson<ChatCompletionRequest>,
 ) -> axum::response::Response {
+    requested_model.set(&request.model);
     debug!(
         "Chat completions request from api key: {:?}",
         api_key.api_key.id
@@ -2653,8 +2655,10 @@ pub async fn completions(
     Extension(body_hash): Extension<RequestBodyHash>,
     Extension(correlation): Extension<RequestCorrelation>,
     headers: header::HeaderMap,
+    requested_model: RequestedModel,
     OpenAiJson(request): OpenAiJson<CompletionRequest>,
 ) -> axum::response::Response {
+    requested_model.set(&request.model);
     debug!(
         "Text completions request from api key: {:?}",
         api_key.api_key.id
@@ -3397,6 +3401,7 @@ fn model_with_pricing_to_info(model: services::models::ModelWithPricing) -> Mode
             .deprecation_date
             .as_ref()
             .map(crate::routes::admin::format_deprecation_date),
+        successor_model_id: model.successor_model_name,
         description,
         top_provider: Some(TopProvider {
             context_length: Some(model.context_length),
@@ -3553,6 +3558,8 @@ mod tests {
             datacenters: None,
             is_ready: None,
             deprecation_date: None,
+            deprecation_announced_at: None,
+            successor_model_name: None,
             openrouter_slug: None,
             created_at: chrono::Utc::now(),
         }
@@ -5046,8 +5053,10 @@ pub async fn image_generations(
     Extension(body_hash): Extension<RequestBodyHash>,
     Extension(correlation): Extension<RequestCorrelation>,
     headers: header::HeaderMap,
+    requested_model: RequestedModel,
     OpenAiJson(request): OpenAiJson<crate::models::ImageGenerationRequest>,
 ) -> axum::response::Response {
+    requested_model.set(&request.model);
     debug!(
         "Image generation request from api key: {:?}",
         api_key.api_key.id
@@ -5305,6 +5314,7 @@ pub async fn audio_transcriptions(
     Extension(body_hash): Extension<RequestBodyHash>,
     Extension(correlation): Extension<RequestCorrelation>,
     headers: header::HeaderMap,
+    requested_model: RequestedModel,
     mut multipart: Multipart,
 ) -> axum::response::Response {
     debug!(
@@ -5401,6 +5411,7 @@ pub async fn audio_transcriptions(
         temperature,
         timestamp_granularities,
     };
+    requested_model.set(&request.model);
 
     debug!(
         "Audio transcription: model={}, filename={}, file_size_kb={}, org={}, workspace={}",
@@ -5708,6 +5719,7 @@ pub async fn image_edits(
     State(app_state): State<AppState>,
     Extension(api_key): Extension<AuthenticatedApiKey>,
     Extension(body_hash): Extension<RequestBodyHash>,
+    requested_model: RequestedModel,
     mut multipart: axum::extract::Multipart,
 ) -> axum::response::Response {
     debug!("Image edit request from api key: {:?}", api_key.api_key.id);
@@ -5859,6 +5871,7 @@ pub async fn image_edits(
         size,
         response_format,
     };
+    requested_model.set(&request.model);
 
     debug!(
         "Image edit request: model={}, org={}, workspace={}",
@@ -6216,8 +6229,10 @@ pub async fn rerank(
     Extension(_body_hash): Extension<RequestBodyHash>,
     Extension(correlation): Extension<RequestCorrelation>,
     headers: header::HeaderMap,
+    requested_model: RequestedModel,
     OpenAiJson(request): OpenAiJson<crate::models::RerankRequest>,
 ) -> axum::response::Response {
+    requested_model.set(&request.model);
     debug!(
         "Rerank request: model={}, org={}, workspace={}",
         request.model, api_key.organization.id, api_key.workspace.id.0
@@ -6574,6 +6589,7 @@ pub async fn embeddings(
     Extension(_body_hash): Extension<RequestBodyHash>,
     Extension(correlation): Extension<RequestCorrelation>,
     headers: header::HeaderMap,
+    requested_model: RequestedModel,
     body: Bytes,
 ) -> axum::response::Response {
     // Minimal deserialization: extract only the model name for routing
@@ -6595,6 +6611,7 @@ pub async fn embeddings(
                 .into_response();
         }
     };
+    requested_model.set(&model_name);
 
     debug!(
         "Embeddings request: model={}, org={}, workspace={}",
@@ -6897,6 +6914,7 @@ pub async fn privacy_classify(
     Extension(_body_hash): Extension<RequestBodyHash>,
     Extension(correlation): Extension<RequestCorrelation>,
     headers: header::HeaderMap,
+    requested_model: RequestedModel,
     body: Bytes,
 ) -> axum::response::Response {
     // Minimal deserialization: extract only the model name for routing
@@ -6918,6 +6936,7 @@ pub async fn privacy_classify(
                 .into_response();
         }
     };
+    requested_model.set(&model_name);
 
     debug!(
         "Privacy classify request: model={}, org={}, workspace={}",
@@ -7235,6 +7254,7 @@ pub async fn privacy_redact(
     Extension(_body_hash): Extension<RequestBodyHash>,
     Extension(correlation): Extension<RequestCorrelation>,
     headers: header::HeaderMap,
+    requested_model: RequestedModel,
     body: Bytes,
 ) -> axum::response::Response {
     #[derive(serde::Deserialize)]
@@ -7326,6 +7346,7 @@ pub async fn privacy_redact(
     }
 
     let model_name = parsed.model;
+    requested_model.set(&model_name);
 
     debug!(
         "Privacy redact request: model={}, org={}, workspace={}, n_inputs={}",
@@ -7708,8 +7729,10 @@ pub async fn score(
     Extension(body_hash): Extension<RequestBodyHash>,
     Extension(correlation): Extension<RequestCorrelation>,
     headers: header::HeaderMap,
+    requested_model: RequestedModel,
     OpenAiJson(request): OpenAiJson<crate::models::ScoreRequest>,
 ) -> axum::response::Response {
+    requested_model.set(&request.model);
     debug!(
         "Score request: model={}, org={}, workspace={}",
         request.model, api_key.organization.id, api_key.workspace.id.0

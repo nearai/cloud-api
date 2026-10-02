@@ -290,6 +290,8 @@ fn canonical_model() -> ModelWithPricing {
         datacenters: None,
         is_ready: None,
         deprecation_date: None,
+        deprecation_announced_at: None,
+        successor_model_name: None,
         openrouter_slug: None,
         created_at: chrono::Utc::now(),
     }

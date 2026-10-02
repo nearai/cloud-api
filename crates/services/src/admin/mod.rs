@@ -348,6 +348,33 @@ impl AdminService for AdminServiceImpl {
             Self::validate_model_request(model_name, request, Arc::clone(&self.repository)).await?;
         }
 
+        // A successor must name an active model, or one written by this same
+        // request, and cannot be the model itself: it is announced to API
+        // users as the migration target.
+        for (model_name, request) in &models {
+            let Some(Some(successor)) = &request.successor_model_name else {
+                continue;
+            };
+            if successor.is_empty() || successor == model_name {
+                return Err(AdminError::InvalidDeprecation(format!(
+                    "model '{model_name}': successorModelId must name a different model"
+                )));
+            }
+            if models.contains_key(successor) {
+                continue;
+            }
+            let active = self
+                .repository
+                .get_active_model_for_deprecation(successor)
+                .await
+                .map_err(|e| AdminError::InternalError(e.to_string()))?;
+            if active.is_none() {
+                return Err(AdminError::InvalidDeprecation(format!(
+                    "model '{model_name}': successorModelId '{successor}' is not an active model"
+                )));
+            }
+        }
+
         // Upsert all models. Each row is committed independently, so we
         // invalidate the public `/v1/model/list` cache after EACH successful
         // write rather than only at the end of the loop. If a later row fails
@@ -638,6 +665,7 @@ impl AdminService for AdminServiceImpl {
             datacenters: None,
             is_ready: None,
             deprecation_date: Some(Some(deprecation_date)),
+            successor_model_name: Some(Some(successor.model_name.clone())),
             openrouter_slug: None,
             change_reason: change_reason.or_else(|| {
                 Some(format!(

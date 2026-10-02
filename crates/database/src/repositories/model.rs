@@ -573,7 +573,7 @@ impl ModelRepository {
                             COALESCE($24, ARRAY[]::TEXT[]),
                             $25, $26, $27, $30,
                             COALESCE($32, false), $33,
-                            $35
+                            CASE WHEN $29 THEN NULL ELSE $35 END
                         )
                         ON CONFLICT (model_name) DO UPDATE SET
                             input_cost_per_token = EXCLUDED.input_cost_per_token,

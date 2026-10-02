@@ -338,3 +338,112 @@ async fn test_patch_rejects_an_invalid_successor() {
     // Nothing was written by the rejected requests.
     assert_not_announced(&chat(&fixture, &fixture.old, false).await);
 }
+
+#[tokio::test]
+async fn test_patch_rejects_a_successor_without_a_planned_date() {
+    let fixture = setup().await;
+
+    // The model has no planned date and the request does not set one.
+    let no_date = patch_models(
+        &fixture.server,
+        serde_json::json!({ &fixture.old: { "successorModelId": fixture.successor } }),
+    )
+    .await;
+    assert_eq!(no_date.status_code(), 400, "{}", no_date.text());
+
+    // The request clears the date it would need.
+    confirm_deprecation(&fixture).await;
+    let cleared = patch_models(
+        &fixture.server,
+        serde_json::json!({ &fixture.old: {
+            "deprecationDate": null,
+            "successorModelId": fixture.successor,
+        } }),
+    )
+    .await;
+    assert_eq!(cleared.status_code(), 400, "{}", cleared.text());
+
+    // The rejected request left the confirmed deprecation in place.
+    assert_announced(
+        &fixture,
+        &chat(&fixture, &fixture.old, false).await,
+        "after rejected clear",
+    );
+}
+
+#[tokio::test]
+async fn test_clearing_only_the_successor_keeps_the_date() {
+    let fixture = setup().await;
+    confirm_deprecation(&fixture).await;
+
+    let cleared = patch_models(
+        &fixture.server,
+        serde_json::json!({ &fixture.old: { "successorModelId": null } }),
+    )
+    .await;
+    assert_eq!(cleared.status_code(), 200, "{}", cleared.text());
+
+    let response = chat(&fixture, &fixture.old, false).await;
+    assert_eq!(
+        header(&response, "x-model-deprecation-date").as_deref(),
+        Some(DEPRECATION_DATE_HEADER)
+    );
+    assert_eq!(header(&response, "x-model-successor"), None);
+}
+
+#[tokio::test]
+async fn test_same_request_successor_must_end_up_active() {
+    let fixture = setup().await;
+
+    // The same request deactivates the successor.
+    let deactivated = patch_models(
+        &fixture.server,
+        serde_json::json!({
+            &fixture.old: {
+                "deprecationDate": DEPRECATION_DATE,
+                "successorModelId": fixture.successor,
+            },
+            &fixture.successor: { "isActive": false },
+        }),
+    )
+    .await;
+    assert_eq!(deactivated.status_code(), 400, "{}", deactivated.text());
+
+    // The successor is already inactive and the request leaves that alone.
+    let deactivate = patch_models(
+        &fixture.server,
+        serde_json::json!({ &fixture.successor: { "isActive": false } }),
+    )
+    .await;
+    assert_eq!(deactivate.status_code(), 200, "{}", deactivate.text());
+    let inactive = patch_models(
+        &fixture.server,
+        serde_json::json!({
+            &fixture.old: {
+                "deprecationDate": DEPRECATION_DATE,
+                "successorModelId": fixture.successor,
+            },
+            &fixture.successor: { "modelDescription": "Still inactive" },
+        }),
+    )
+    .await;
+    assert_eq!(inactive.status_code(), 400, "{}", inactive.text());
+    assert_not_announced(&chat(&fixture, &fixture.old, false).await);
+
+    // A successor created by the same request is active by default.
+    let created = format!("test-dep-headers/Created-{}", uuid::Uuid::new_v4());
+    let accepted = patch_models(
+        &fixture.server,
+        serde_json::json!({
+            &fixture.old: {
+                "deprecationDate": DEPRECATION_DATE,
+                "successorModelId": created,
+            },
+            &created: model_upsert(&[]),
+        }),
+    )
+    .await;
+    assert_eq!(accepted.status_code(), 200, "{}", accepted.text());
+    let response = chat(&fixture, &fixture.old, false).await;
+    assert_eq!(header(&response, "x-model-successor"), Some(created));
+}

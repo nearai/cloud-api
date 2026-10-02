@@ -233,6 +233,7 @@ impl AdminRepository for AdminCompositeRepository {
             allow_free: m.allow_free,
             provider_type: m.provider_type,
             provider_config: m.provider_config,
+            deprecation_date: m.deprecation_date,
         }))
     }
 

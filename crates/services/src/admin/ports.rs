@@ -135,6 +135,7 @@ pub struct ModelValidationState {
     pub allow_free: bool,
     pub provider_type: String,
     pub provider_config: Option<serde_json::Value>,
+    pub deprecation_date: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 /// Model history entry - includes pricing, context length, and other model attributes

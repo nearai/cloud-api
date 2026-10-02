@@ -14,14 +14,15 @@
 //! body; the header names say what is actually being deprecated.
 //!
 //! Only headers are added. The response body is left untouched, so
-//! response-hash verification is unaffected.
+//! response-hash verification is unaffected. Browser clients can read the
+//! headers: the app-wide CORS layer exposes every response header.
 
 use std::sync::{Arc, OnceLock};
 
 use axum::{
     extract::{FromRequestParts, Request, State},
     http::{
-        header::{self, HeaderMap, HeaderValue},
+        header::{HeaderMap, HeaderValue},
         request::Parts,
     },
     middleware::Next,
@@ -92,11 +93,9 @@ impl ModelDeprecationNotice {
     pub fn apply(&self, headers: &mut HeaderMap) {
         // Guarded construction: a header-invalid byte in a model name drops
         // that one header instead of failing the request.
-        let mut exposed = Vec::new();
         let date = crate::routes::admin::format_deprecation_date(&self.deprecation_date);
         if let Ok(value) = HeaderValue::from_str(&date) {
             headers.insert(HEADER_MODEL_DEPRECATION_DATE, value);
-            exposed.push(HEADER_MODEL_DEPRECATION_DATE);
         }
         if let Some(value) = self
             .successor
@@ -104,19 +103,6 @@ impl ModelDeprecationNotice {
             .and_then(|successor| HeaderValue::from_str(successor).ok())
         {
             headers.insert(HEADER_MODEL_SUCCESSOR, value);
-            exposed.push(HEADER_MODEL_SUCCESSOR);
-        }
-        // Handlers that set an explicit CORS expose list name each header;
-        // keep the announcement readable from browsers.
-        if let Some(current) = headers
-            .get(header::ACCESS_CONTROL_EXPOSE_HEADERS)
-            .and_then(|value| value.to_str().ok())
-            .filter(|value| value.trim() != "*" && !exposed.is_empty())
-        {
-            if let Ok(value) = HeaderValue::from_str(&format!("{current}, {}", exposed.join(", ")))
-            {
-                headers.insert(header::ACCESS_CONTROL_EXPOSE_HEADERS, value);
-            }
         }
     }
 }
@@ -183,7 +169,7 @@ mod tests {
         // The endpoint itself is not deprecated: no standard headers.
         assert!(headers.get("deprecation").is_none());
         assert!(headers.get("sunset").is_none());
-        assert!(headers.get(header::LINK).is_none());
+        assert!(headers.get("link").is_none());
     }
 
     #[test]
@@ -202,48 +188,6 @@ mod tests {
 
         assert!(headers.get(HEADER_MODEL_DEPRECATION_DATE).is_some());
         assert!(headers.get(HEADER_MODEL_SUCCESSOR).is_none());
-    }
-
-    #[test]
-    fn apply_extends_an_explicit_cors_expose_list() {
-        let mut headers = HeaderMap::new();
-        headers.insert(
-            header::ACCESS_CONTROL_EXPOSE_HEADERS,
-            HeaderValue::from_static("Inference-Id"),
-        );
-        example(Some("zai-org/GLM-5.3")).apply(&mut headers);
-        assert_eq!(
-            headers.get(header::ACCESS_CONTROL_EXPOSE_HEADERS).unwrap(),
-            "Inference-Id, x-model-deprecation-date, x-model-successor"
-        );
-
-        let mut without_successor = HeaderMap::new();
-        without_successor.insert(
-            header::ACCESS_CONTROL_EXPOSE_HEADERS,
-            HeaderValue::from_static("Inference-Id"),
-        );
-        example(None).apply(&mut without_successor);
-        assert_eq!(
-            without_successor
-                .get(header::ACCESS_CONTROL_EXPOSE_HEADERS)
-                .unwrap(),
-            "Inference-Id, x-model-deprecation-date"
-        );
-
-        let mut wildcard = HeaderMap::new();
-        wildcard.insert(
-            header::ACCESS_CONTROL_EXPOSE_HEADERS,
-            HeaderValue::from_static("*"),
-        );
-        example(None).apply(&mut wildcard);
-        assert_eq!(
-            wildcard.get(header::ACCESS_CONTROL_EXPOSE_HEADERS).unwrap(),
-            "*"
-        );
-
-        let mut none = HeaderMap::new();
-        example(None).apply(&mut none);
-        assert!(none.get(header::ACCESS_CONTROL_EXPOSE_HEADERS).is_none());
     }
 
     fn model(deprecation_date: Option<DateTime<Utc>>) -> ModelWithPricing {

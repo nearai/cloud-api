@@ -8,6 +8,10 @@
 //! snapshot of the effective values, reloaded on a timer and refreshed
 //! immediately after an update handled by this instance. Consumers read the
 //! typed snapshot, never the JSON.
+//!
+//! The table is stored in plaintext (approved in `database_encryption.rs`):
+//! settings here must be operational tuning values only. Never add a setting
+//! that holds secrets, credentials, or customer data.
 
 pub mod ports;
 

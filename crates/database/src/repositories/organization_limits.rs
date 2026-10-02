@@ -174,9 +174,11 @@ impl OrganizationLimitsRepository {
         organization_id: Uuid,
     ) -> Result<(Vec<CurrentCreditStatus>, i64, i64)> {
         // One statement, one snapshot: a single statement reads a consistent
-        // view, and writers serialize under the org `FOR UPDATE` lock, so no
-        // transaction is needed. With no active limit rows the result is empty
-        // (callers treat that as "no limits").
+        // view on its own, so no transaction is needed. (The org `FOR UPDATE`
+        // lock only keeps consumption and balance moving together in one
+        // commit; the snapshot guarantee does not depend on it.) With no
+        // active limit rows the result is empty (callers treat that as "no
+        // limits").
         let rows = retry_db!("get_current_credit_status", {
             let client = self
                 .pool

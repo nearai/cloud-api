@@ -1089,8 +1089,18 @@ async fn credit_status_without_limit_rows_is_empty() -> anyhow::Result<()> {
     let limits = OrganizationLimitsRepository::new(pool.clone());
     let org = insert_org_fixture(&pool).await?;
 
-    let (status, _, _) = limits.get_current_credit_status(org.org_id).await?;
+    pool.get()
+        .await?
+        .execute(
+            "UPDATE organization_balance SET legacy_unattributed_amount = 7 WHERE organization_id = $1",
+            &[&org.org_id],
+        )
+        .await?;
+
+    let (status, unfunded, unattributed) = limits.get_current_credit_status(org.org_id).await?;
     assert!(status.is_empty());
+    assert_eq!(unfunded, 0);
+    assert_eq!(unattributed, 0);
 
     cleanup_usage_fixtures(&pool, &[org.org_id], &[]).await?;
     Ok(())
@@ -1110,13 +1120,19 @@ async fn credit_status_reads_one_snapshot_during_concurrent_usage() -> anyhow::R
 
     let done = std::sync::atomic::AtomicBool::new(false);
     let writer = async {
+        let mut result = anyhow::Ok(());
         for _ in 0..WRITES {
-            repository
+            if let Err(e) = repository
                 .record_usage(usage(&org, &model, Uuid::new_v4(), UNIT_COST))
-                .await?;
+                .await
+            {
+                result = Err(e);
+                break;
+            }
         }
+        // Always release the reader, so a writer failure surfaces instead of hanging.
         done.store(true, std::sync::atomic::Ordering::SeqCst);
-        anyhow::Ok(())
+        result
     };
     let reader = async {
         let mut reads = 0;

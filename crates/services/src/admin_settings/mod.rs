@@ -47,6 +47,15 @@ pub enum AdminSettingsError {
 
 /// The live-tunable placement knobs, in API units. Integer knobs are signed
 /// so a negative value reaches the range check instead of a parse error.
+/// `PlacementTuning`'s field names (a test keeps this in step with the struct).
+const PLACEMENT_FIELDS: &[&str] = &[
+    "affinity_abs_slack",
+    "affinity_eps",
+    "kv_max",
+    "lane_load_tokens",
+    "pin_ttl_ms",
+];
+
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct PlacementTuning {
@@ -167,6 +176,14 @@ impl ParsedSetting {
     }
 }
 
+/// The field names a stored value can hold under `key`.
+fn known_fields(key: &str) -> &'static [&'static str] {
+    match key {
+        KEY_PLACEMENT => PLACEMENT_FIELDS,
+        _ => &[],
+    }
+}
+
 fn known_key(key: &str) -> Result<&'static str, AdminSettingsError> {
     KNOWN_KEYS
         .iter()
@@ -184,6 +201,14 @@ fn merge(key: &str, stored: Option<&Value>, patch: &Value) -> Result<Value, Admi
             "the body must be a JSON object".to_string(),
         ));
     };
+    // Checked before `null` resets are applied, so a field name outside the
+    // schema never gets past here, and never reaches a log line.
+    let known = known_fields(key);
+    if patch.keys().any(|f| !known.contains(&f.as_str())) {
+        return Err(AdminSettingsError::Invalid(
+            "the body has a field that is not a knob of this setting".to_string(),
+        ));
+    }
     let mut merged: Map<String, Value> = match stored {
         Some(Value::Object(m)) => m.clone(),
         _ => Map::new(),
@@ -234,6 +259,9 @@ pub struct AdminSettingsService {
     current: ArcSwap<AdminSettings>,
     /// The handle the placers read (`InferenceProviderPool::placement_tuning`).
     placement: Arc<ArcSwap<Tuning>>,
+    /// Held across every read-then-apply of the snapshot (`update` and
+    /// `reload`), so an older read can never be applied after a newer one.
+    refresh: tokio::sync::Mutex<()>,
 }
 
 impl AdminSettingsService {
@@ -245,6 +273,7 @@ impl AdminSettingsService {
             repository,
             current: ArcSwap::from_pointee(AdminSettings::default()),
             placement,
+            refresh: tokio::sync::Mutex::new(()),
         }
     }
 
@@ -291,6 +320,7 @@ impl AdminSettingsService {
         by_user: Uuid,
     ) -> Result<SettingView, AdminSettingsError> {
         let key = known_key(key)?;
+        let _refresh = self.refresh.lock().await;
         let stored = self
             .repository
             .get(key)
@@ -302,12 +332,16 @@ impl AdminSettingsService {
             .upsert(key, merged, by_user)
             .await
             .map_err(AdminSettingsError::Storage)?;
-        let rows = self
-            .repository
-            .get_all()
-            .await
-            .map_err(AdminSettingsError::Storage)?;
-        self.apply(snapshot(&rows));
+        // Applied from the value just saved, not a re-read: the write has
+        // committed, so nothing after it may fail the request.
+        match parse(key, Some(&saved.value)) {
+            Ok(ParsedSetting::Placement(p)) => {
+                let mut s = **self.current.load();
+                s.placement = p;
+                self.apply(s);
+            }
+            Err(_) => {}
+        }
         let names: Vec<&String> = patch
             .as_object()
             .map(|o| o.keys().collect())
@@ -324,6 +358,7 @@ impl AdminSettingsService {
     /// Reads every stored setting into the live snapshot. A read failure
     /// keeps the last good values.
     pub async fn reload(&self) {
+        let _refresh = self.refresh.lock().await;
         match self.repository.get_all().await {
             Ok(rows) => self.apply(snapshot(&rows)),
             Err(e) => tracing::warn!(
@@ -361,6 +396,7 @@ mod tests {
     struct FakeRepo {
         rows: Mutex<BTreeMap<String, StoredSetting>>,
         fail_reads: Mutex<bool>,
+        fail_get_all: Mutex<bool>,
         upserts: Mutex<u32>,
     }
 
@@ -381,7 +417,7 @@ mod tests {
     #[async_trait]
     impl AdminSettingsRepository for FakeRepo {
         async fn get_all(&self) -> anyhow::Result<Vec<StoredSetting>> {
-            if *self.fail_reads.lock().unwrap() {
+            if *self.fail_reads.lock().unwrap() || *self.fail_get_all.lock().unwrap() {
                 return Err(anyhow!("db down"));
             }
             Ok(self.rows.lock().unwrap().values().cloned().collect())
@@ -476,9 +512,35 @@ mod tests {
         invalid(&svc, json!({"kv_max": "high"})).await;
         invalid(&svc, json!({"lane_load_tokens": 5000.5})).await;
         invalid(&svc, json!({"not_a_knob": 1})).await;
+        // A null-valued unknown field is rejected too (not silently dropped).
+        invalid(&svc, json!({"not_a_knob": null})).await;
         invalid(&svc, json!([1])).await;
         assert_eq!(*repo.upserts.lock().unwrap(), 0, "nothing stored");
         assert_eq!(**handle.load(), Tuning::default());
+    }
+
+    #[test]
+    fn placement_fields_match_the_struct() {
+        let v = serde_json::to_value(PlacementTuning::default()).unwrap();
+        let mut keys: Vec<&str> = v.as_object().unwrap().keys().map(|k| k.as_str()).collect();
+        keys.sort();
+        let mut want = PLACEMENT_FIELDS.to_vec();
+        want.sort();
+        assert_eq!(keys, want);
+    }
+
+    #[tokio::test]
+    async fn update_succeeds_and_applies_when_reads_after_the_write_fail() {
+        let (svc, repo, handle) = service();
+        // Reads fail after the first (the pre-write get): emulate by failing
+        // get_all only; update must not depend on it.
+        *repo.fail_get_all.lock().unwrap() = true;
+        let v = svc
+            .update(KEY_PLACEMENT, json!({"kv_max": 0.9}), Uuid::new_v4())
+            .await
+            .unwrap();
+        assert_eq!(v.value["kv_max"], json!(0.9));
+        assert_eq!(handle.load().kv_max, 0.9);
     }
 
     #[test]

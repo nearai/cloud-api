@@ -833,7 +833,11 @@ pub(crate) struct Applied {
 
 impl ReaderState {
     /// Applies the live pin TTL to the table. Copies the shared table only
-    /// when the TTL actually changed.
+    /// when the TTL actually changed. Raising the TTL does not bring back pins
+    /// already dropped (skipped at warm-up or pruned under the shorter TTL):
+    /// the stream is read forward only, so such pins are simply absent and
+    /// those requests place without a follow pin until new pins arrive. This
+    /// is a deliberate simplification, bounded by one TTL window.
     fn set_pin_ttl_ms(&mut self, ttl_ms: u64) {
         if self.pins.ttl_ms() != ttl_ms {
             Arc::make_mut(&mut self.pins).set_ttl_ms(ttl_ms);

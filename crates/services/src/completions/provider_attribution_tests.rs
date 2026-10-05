@@ -36,7 +36,7 @@ impl ModelsRepository for StaticModelsRepository {
     }
 }
 
-struct StaticOrganizationLimitRepository;
+pub(super) struct StaticOrganizationLimitRepository;
 
 #[async_trait::async_trait]
 impl ports::OrganizationConcurrentLimitRepository for StaticOrganizationLimitRepository {
@@ -45,7 +45,7 @@ impl ports::OrganizationConcurrentLimitRepository for StaticOrganizationLimitRep
     }
 }
 
-fn test_model(model_name: &str) -> ModelWithPricing {
+pub(super) fn test_model(model_name: &str) -> ModelWithPricing {
     ModelWithPricing {
         id: Uuid::new_v4(),
         model_name: model_name.to_string(),
@@ -75,6 +75,7 @@ fn test_model(model_name: &str) -> ModelWithPricing {
         datacenters: None,
         is_ready: None,
         deprecation_date: None,
+        successor_model_name: None,
         openrouter_slug: None,
         created_at: chrono::Utc::now(),
     }
@@ -83,6 +84,7 @@ fn test_model(model_name: &str) -> ModelWithPricing {
 fn completion_request(model: &str) -> ports::CompletionRequest {
     ports::CompletionRequest {
         request_priority: 0,
+        session_hint: None,
         request_id: Uuid::new_v4(),
         model: model.to_string(),
         messages: vec![ports::CompletionMessage {

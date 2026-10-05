@@ -286,7 +286,12 @@ impl ResponseTemplate {
         self
     }
 
-    fn token_usage(&self, input_tokens: i32, output_tokens: i32) -> TokenUsage {
+    fn token_usage(
+        &self,
+        input_tokens: i32,
+        output_tokens: i32,
+        reasoning_tokens: i32,
+    ) -> TokenUsage {
         let mut usage = TokenUsage::new(input_tokens, output_tokens);
         let mut details = serde_json::Map::new();
         if let Some(tokens) = self.cache_tokens {
@@ -297,6 +302,11 @@ impl ResponseTemplate {
         }
         if !details.is_empty() {
             usage.prompt_tokens_details = Some(details.into());
+        }
+        // A reasoning model served by SGLang reports its reasoning count as a
+        // top-level `usage.reasoning_tokens`, not in `completion_tokens_details`.
+        if self.reasoning_content.is_some() {
+            usage.reasoning_tokens = Some(reasoning_tokens);
         }
         usage
     }
@@ -343,8 +353,14 @@ impl ResponseTemplate {
         requested_service_tier: Option<String>,
     ) -> ChatCompletionResponse {
         let model = self.model_override.clone().unwrap_or(model);
-        // Calculate output tokens as word count of content
-        let output_tokens = self.content.split_whitespace().count() as i32;
+        // Reasoning is part of the completion. Count it like the streamed
+        // chunks do: one token per `' '`-separated segment (see
+        // `generate_chunks`), so both modes report the same reasoning count.
+        let reasoning_tokens = self
+            .reasoning_content
+            .as_deref()
+            .map_or(0, |reasoning| reasoning.split(' ').count() as i32);
+        let output_tokens = self.content.split_whitespace().count() as i32 + reasoning_tokens;
 
         // Convert tool calls if present
         let tool_calls = self.tool_calls.as_ref().map(|calls| {
@@ -402,7 +418,7 @@ impl ResponseTemplate {
                 .clone()
                 .or(requested_service_tier),
             system_fingerprint: None,
-            usage: self.token_usage(input_tokens, output_tokens),
+            usage: self.token_usage(input_tokens, output_tokens, reasoning_tokens),
             prompt_logprobs: None,
             prompt_token_ids: None,
             kv_transfer_params: None,
@@ -424,12 +440,14 @@ impl ResponseTemplate {
         let model = self.model_override.clone().unwrap_or(model);
         let mut chunks = Vec::new();
         let mut output_token_count = 0;
+        let mut reasoning_token_count = 0;
 
         // Stream reasoning content word by word if present
         if let Some(reasoning) = &self.reasoning_content {
             let words: Vec<&str> = reasoning.split(' ').collect();
             for (i, word) in words.iter().enumerate() {
                 output_token_count += 1;
+                reasoning_token_count += 1;
                 let word_with_space = if i == 0 {
                     word.to_string()
                 } else {
@@ -457,7 +475,11 @@ impl ResponseTemplate {
                         finish_reason: None,
                         token_ids: None,
                     }],
-                    usage: Some(self.token_usage(input_tokens, output_token_count)),
+                    usage: Some(self.token_usage(
+                        input_tokens,
+                        output_token_count,
+                        reasoning_token_count,
+                    )),
                     service_tier: self
                         .service_tier_override
                         .clone()
@@ -507,7 +529,11 @@ impl ResponseTemplate {
                         finish_reason,
                         token_ids: None,
                     }],
-                    usage: Some(self.token_usage(input_tokens, output_token_count)),
+                    usage: Some(self.token_usage(
+                        input_tokens,
+                        output_token_count,
+                        reasoning_token_count,
+                    )),
                     service_tier: self
                         .service_tier_override
                         .clone()
@@ -558,7 +584,11 @@ impl ResponseTemplate {
                         finish_reason: None,
                         token_ids: None,
                     }],
-                    usage: Some(self.token_usage(input_tokens, output_token_count)),
+                    usage: Some(self.token_usage(
+                        input_tokens,
+                        output_token_count,
+                        reasoning_token_count,
+                    )),
                     service_tier: self
                         .service_tier_override
                         .clone()
@@ -614,7 +644,11 @@ impl ResponseTemplate {
                             finish_reason,
                             token_ids: None,
                         }],
-                        usage: Some(self.token_usage(input_tokens, output_token_count)),
+                        usage: Some(self.token_usage(
+                            input_tokens,
+                            output_token_count,
+                            reasoning_token_count,
+                        )),
                         service_tier: self
                             .service_tier_override
                             .clone()
@@ -635,7 +669,7 @@ impl ResponseTemplate {
             model,
             system_fingerprint: None,
             choices: vec![],
-            usage: Some(self.token_usage(input_tokens, output_token_count)),
+            usage: Some(self.token_usage(input_tokens, output_token_count, reasoning_token_count)),
             service_tier: self
                 .service_tier_override
                 .clone()
@@ -688,10 +722,16 @@ impl MockExpectationBuilder {
 
 type ResponsesHandler =
     Arc<dyn Fn(serde_json::Value) -> crate::responses_raw::ResponsesRawResponse + Send + Sync>;
+type SystemOneHandler = Arc<
+    dyn Fn(crate::SystemOneRequest) -> Result<crate::SystemOneResponseWithBytes, CompletionError>
+        + Send
+        + Sync,
+>;
 
 /// Mock provider that implements InferenceProvider for testing
 pub struct MockProvider {
     responses_handler: Option<ResponsesHandler>,
+    systemone_handler: Option<SystemOneHandler>,
     /// List of available mock models
     models: Vec<ModelInfo>,
     /// Map of chat_id to (request_hash, response_hash) for signature generation
@@ -728,9 +768,31 @@ pub struct MockProvider {
     /// order. Lets lifecycle tests assert the signature-fetch routing pin was
     /// released. `std::sync::Mutex` because the trait method is synchronous.
     unpinned_chat_ids: Arc<std::sync::Mutex<Vec<String>>>,
+    /// What [`InferenceProvider::poll_backend_count`] reports; defaults to
+    /// `Skipped`. Set via [`MockProvider::with_count_poll`].
+    count_poll: crate::CountPoll,
 }
 
 impl MockProvider {
+    /// Set what this mock's backend-count poll reports.
+    pub fn with_count_poll(mut self, poll: crate::CountPoll) -> Self {
+        self.count_poll = poll;
+        self
+    }
+
+    pub fn with_systemone_handler(
+        mut self,
+        handler: impl Fn(
+                crate::SystemOneRequest,
+            ) -> Result<crate::SystemOneResponseWithBytes, CompletionError>
+            + Send
+            + Sync
+            + 'static,
+    ) -> Self {
+        self.systemone_handler = Some(Arc::new(handler));
+        self
+    }
+
     /// Install a native Responses fixture without affecting chat fixtures.
     pub fn with_responses_handler(
         mut self,
@@ -774,9 +836,11 @@ impl MockProvider {
             supports_streaming: true,
             supports_client_e2ee: true,
             supports_chat_signatures: true,
+            count_poll: crate::CountPoll::Skipped,
             per_request_public_key: None,
             unpinned_chat_ids: Arc::new(std::sync::Mutex::new(Vec::new())),
             responses_handler: None,
+            systemone_handler: None,
         }
     }
 
@@ -803,9 +867,11 @@ impl MockProvider {
             supports_streaming: true,
             supports_client_e2ee: true,
             supports_chat_signatures: true,
+            count_poll: crate::CountPoll::Skipped,
             per_request_public_key: None,
             unpinned_chat_ids: Arc::new(std::sync::Mutex::new(Vec::new())),
             responses_handler: None,
+            systemone_handler: None,
         }
     }
 
@@ -830,9 +896,11 @@ impl MockProvider {
             supports_streaming: true,
             supports_client_e2ee: true,
             supports_chat_signatures: true,
+            count_poll: crate::CountPoll::Skipped,
             per_request_public_key: None,
             unpinned_chat_ids: Arc::new(std::sync::Mutex::new(Vec::new())),
             responses_handler: None,
+            systemone_handler: None,
         }
     }
 
@@ -1078,6 +1146,31 @@ impl Default for MockProvider {
 
 #[async_trait]
 impl crate::InferenceProvider for MockProvider {
+    fn supports_systemone(&self) -> bool {
+        self.systemone_handler.is_some()
+    }
+
+    async fn systemone(
+        &self,
+        request: crate::SystemOneRequest,
+        request_hash: String,
+    ) -> Result<crate::SystemOneResponseWithBytes, CompletionError> {
+        let handler = self
+            .systemone_handler
+            .as_ref()
+            .ok_or_else(|| CompletionError::CompletionError("No System One fixture".into()))?;
+        let response = handler(request)?;
+        if let Some(id) = &response.response.id {
+            self.register_signature_hashes(
+                id.clone(),
+                request_hash,
+                hex::encode(Sha256::digest(&response.raw_bytes)),
+            )
+            .await;
+        }
+        Ok(response)
+    }
+
     fn supports_responses_raw(&self) -> bool {
         self.responses_handler.is_some()
     }
@@ -1110,6 +1203,10 @@ impl crate::InferenceProvider for MockProvider {
 
     fn supports_chat_signatures(&self) -> bool {
         self.supports_chat_signatures
+    }
+
+    async fn poll_backend_count(&self, _client: &reqwest::Client) -> crate::CountPoll {
+        self.count_poll
     }
 
     fn supports_per_request_pubkey_routing(&self, public_key: &str) -> bool {

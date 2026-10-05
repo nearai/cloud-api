@@ -195,6 +195,12 @@ in `env.example` are **no-ops** today; only `INFERENCE_API_KEY` (a.k.a.
 `MODEL_DISCOVERY_API_KEY`) is read, as the bearer token forwarded to
 the inference URL.
 
+Attested backends must serve `GET /v1/attestation/report` without
+authentication. cloud-api fetches the report before it has checked the
+connection's TLS certificate against the attested fingerprint, so it does
+not send the bearer token on that request (inference-proxy serves this
+route unauthenticated).
+
 ### Option A — exercise prod against the real cloud-api
 
 The fastest way to test the streaming path is to skip local cloud-api

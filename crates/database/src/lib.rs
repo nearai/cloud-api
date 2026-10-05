@@ -8,7 +8,6 @@ pub mod patroni_discovery;
 pub mod pool;
 pub mod repositories;
 pub mod shutdown_coordinator;
-pub mod spend_counters_backfill;
 mod usage_reporting_indexes;
 
 pub use constants::*;
@@ -22,10 +21,6 @@ pub use repositories::{
     SessionRepository, UserRepository,
 };
 pub use shutdown_coordinator::{ShutdownCoordinator, ShutdownStage, ShutdownStageResult};
-pub use spend_counters_backfill::{
-    ensure_spend_counters_ready, spend_counter_readiness, PreparedSpendBackfill,
-    SpendBackfillOutcome, SpendCounterReadiness, SpendDrift,
-};
 pub use usage_reporting_indexes::ensure_usage_reporting_indexes;
 
 use anyhow::Result;

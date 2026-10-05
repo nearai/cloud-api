@@ -1,5 +1,6 @@
 use crate::models::ApiKey;
 use crate::pool::DbPool;
+use crate::repositories::usage_hourly::with_usage_rows;
 use crate::repositories::utils::map_db_error;
 use crate::retry_db;
 use anyhow::{Context, Result};
@@ -7,6 +8,7 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use services::common::{extract_api_key_prefix, generate_api_key, hash_api_key, RepositoryError};
 use services::workspace::ports::{ApiKeyOrderBy, ApiKeyOrderDirection, CreateApiKeyRequest};
+use tokio_postgres::types::Type;
 use tracing::debug;
 use uuid::Uuid;
 
@@ -148,8 +150,9 @@ impl ApiKeyRepository {
                 .context("Failed to get database connection")
                 .map_err(RepositoryError::PoolError)?;
 
+            // One-shot typed query: one round trip, see repositories/mod.rs.
             client
-                .query_opt(
+                .query_typed_opt(
                     r#"
             SELECT ak.*
             FROM api_keys ak
@@ -162,7 +165,7 @@ impl ApiKeyRepository {
               AND w.is_active = true
               AND o.is_active = true
             "#,
-                    &[&key_hash],
+                    &[(&key_hash, Type::VARCHAR)],
                 )
                 .await
                 .map_err(map_db_error)
@@ -191,10 +194,11 @@ impl ApiKeyRepository {
                 .context("Failed to get database connection")
                 .map_err(RepositoryError::PoolError)?;
 
+            // One-shot typed query: one round trip, see repositories/mod.rs.
             client
-                .execute(
+                .execute_typed(
                     "UPDATE api_keys SET last_used_at = NOW() WHERE id = $1",
-                    &[&id],
+                    &[(&id, Type::UUID)],
                 )
                 .await
                 .map_err(map_db_error)
@@ -253,8 +257,8 @@ impl ApiKeyRepository {
         Ok(row.get::<_, i64>("count"))
     }
 
-    /// List API keys for a workspace with usage data.
-    /// This is the primary method to list API keys, using the spend counter JOIN.
+    /// List API keys for a workspace with usage data
+    /// This is the primary method to list API keys, using an efficient JOIN query
     pub async fn list_by_workspace_paginated(
         &self,
         workspace_id: Uuid,
@@ -287,13 +291,13 @@ impl ApiKeyRepository {
                 .context("Failed to get database connection")
                 .map_err(RepositoryError::PoolError)?;
 
-            // ponytail: raw fallback for organizations whose spend counters are not yet reconciled
-            // (spend_counters_ready_at IS NULL, or no balance row). Delete once
-            // backfill-spend-counters has completed in every environment and
-            // spend_counter_readiness reports ready at startup.
-            let list = |usage: &str, usage_source: &str| {
-                format!(
-                    r#"
+            client
+                .query(
+                    &with_usage_rows(
+                        "'-infinity'::timestamptz",
+                        "'infinity'::timestamptz",
+                        &format!(
+                            r#"
                 SELECT
                     ak.id,
                     ak.key_hash,
@@ -307,43 +311,14 @@ impl ApiKeyRepository {
                     ak.is_active,
                     ak.deleted_at,
                     ak.spend_limit,
-                    ({usage})::BIGINT as usage,
-                    readiness.spend_counters_ready_at IS NOT NULL AS counters_ready
+                    (
+                        COALESCE(inference_usage.total_cost, 0)
+                        + COALESCE(service_usage.total_cost, 0)
+                    )::BIGINT as usage
                 FROM api_keys ak
-                LEFT JOIN workspaces workspace ON workspace.id = ak.workspace_id
-                LEFT JOIN organization_balance readiness
-                  ON readiness.organization_id = workspace.organization_id
-                {usage_source}
-                WHERE ak.workspace_id = $1 AND ak.deleted_at IS NULL
-                ORDER BY {order_by_column} {order_dir}{tie_breaker}
-                LIMIT $2 OFFSET $3
-                "#
-                )
-            };
-
-            let rows = client
-                .query(
-                    &list(
-                        "COALESCE(spend.inference_spent, 0) + COALESCE(spend.service_spent, 0)",
-                        "LEFT JOIN api_key_spend spend ON ak.id = spend.api_key_id",
-                    ),
-                    &[&workspace_id, &limit, &offset],
-                )
-                .await
-                .map_err(map_db_error)?;
-            if rows
-                .first()
-                .is_none_or(|row| row.get::<_, bool>("counters_ready"))
-            {
-                return Ok(rows);
-            }
-            client
-                .query(
-                    &list(
-                        "COALESCE(inference_usage.total_cost, 0) + COALESCE(service_usage.total_cost, 0)",
-                        r#"LEFT JOIN (
+                LEFT JOIN (
                     SELECT api_key_id, COALESCE(SUM(total_cost), 0)::BIGINT AS total_cost
-                    FROM organization_usage_log
+                    FROM usage_rows
                     WHERE workspace_id = $1
                     GROUP BY api_key_id
                 ) inference_usage ON ak.id = inference_usage.api_key_id
@@ -352,7 +327,12 @@ impl ApiKeyRepository {
                     FROM organization_service_usage_log
                     WHERE workspace_id = $1
                     GROUP BY api_key_id
-                ) service_usage ON ak.id = service_usage.api_key_id"#,
+                ) service_usage ON ak.id = service_usage.api_key_id
+                WHERE ak.workspace_id = $1 AND ak.deleted_at IS NULL
+                ORDER BY {order_by_column} {order_dir}{tie_breaker}
+                LIMIT $2 OFFSET $3
+                "#
+                        ),
                     ),
                     &[&workspace_id, &limit, &offset],
                 )
@@ -431,44 +411,6 @@ impl ApiKeyRepository {
         })?;
 
         Ok(rows_affected as i64)
-    }
-
-    /// Get workspace info for an API key - used for auth resolution
-    pub async fn get_workspace_for_api_key(
-        &self,
-        api_key: &ApiKey,
-    ) -> Result<Option<crate::models::Workspace>> {
-        let row = retry_db!("get_workspace_info_for_api_key", {
-            let client = self
-                .pool
-                .get()
-                .await
-                .context("Failed to get database connection")
-                .map_err(RepositoryError::PoolError)?;
-
-            client
-                .query_opt(
-                    "SELECT * FROM workspaces WHERE id = $1 AND is_active = true",
-                    &[&api_key.workspace_id],
-                )
-                .await
-                .map_err(map_db_error)
-        })?;
-
-        match row {
-            Some(row) => Ok(Some(crate::models::Workspace {
-                id: row.get("id"),
-                name: row.get("name"),
-                description: row.get("description"),
-                organization_id: row.get("organization_id"),
-                created_by_user_id: row.get("created_by_user_id"),
-                created_at: row.get("created_at"),
-                updated_at: row.get("updated_at"),
-                is_active: row.get("is_active"),
-                settings: row.get("settings"),
-            })),
-            None => Ok(None),
-        }
     }
 
     /// Update spend limit for an API key

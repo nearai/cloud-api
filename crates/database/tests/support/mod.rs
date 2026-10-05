@@ -223,22 +223,18 @@ pub async fn cleanup_usage_fixtures(
     Ok(())
 }
 
-fn env_value(primary: &str, fallback: &str, default: &str) -> String {
-    std::env::var(primary)
-        .or_else(|_| std::env::var(fallback))
-        .unwrap_or_else(|_| default.to_string())
-}
-
-pub fn pool_config() -> Config {
+fn pool_config() -> Config {
     let mut config = Config::new();
-    config.host = Some(env_value("PGHOST", "DATABASE_HOST", "localhost"));
+    config.host = Some(std::env::var("PGHOST").unwrap_or_else(|_| "localhost".to_string()));
     config.port = Some(
-        env_value("PGPORT", "DATABASE_PORT", "5432")
-            .parse()
-            .expect("database port must be numeric"),
+        std::env::var("PGPORT")
+            .ok()
+            .and_then(|value| value.parse::<u16>().ok())
+            .unwrap_or(5432),
     );
-    config.dbname = Some(env_value("PGDATABASE", "DATABASE_NAME", "platform_api"));
-    config.user = Some(env_value("PGUSER", "DATABASE_USERNAME", "postgres"));
-    config.password = Some(env_value("PGPASSWORD", "DATABASE_PASSWORD", "postgres"));
+    config.dbname =
+        Some(std::env::var("PGDATABASE").unwrap_or_else(|_| "platform_api".to_string()));
+    config.user = Some(std::env::var("PGUSER").unwrap_or_else(|_| "postgres".to_string()));
+    config.password = Some(std::env::var("PGPASSWORD").unwrap_or_else(|_| "postgres".to_string()));
     config
 }

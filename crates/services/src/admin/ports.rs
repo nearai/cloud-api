@@ -53,6 +53,13 @@ pub struct UpdateModelAdminRequest {
     /// Tri-state: `None` = leave unchanged, `Some(None)` = clear to NULL,
     /// `Some(Some(dt))` = set to `dt`.
     pub deprecation_date: Option<Option<chrono::DateTime<chrono::Utc>>>,
+    /// Recommended replacement model for a planned deprecation (canonical
+    /// model name). Announced in the `x-model-successor` response header.
+    /// Cleared together with `deprecation_date`.
+    ///
+    /// Tri-state: `None` = leave unchanged, `Some(None)` = clear to NULL,
+    /// `Some(Some(v))` = set to `v`.
+    pub successor_model_name: Option<Option<String>>,
     /// OpenRouter `openrouter.slug` override (validated at the route layer).
     ///
     /// Tri-state: `None` = leave unchanged, `Some(None)` = clear to NULL,
@@ -112,6 +119,8 @@ pub struct ModelPricing {
     pub datacenters: Option<Vec<String>>,
     pub is_ready: Option<bool>,
     pub deprecation_date: Option<chrono::DateTime<chrono::Utc>>,
+    /// Recommended replacement model for the planned deprecation.
+    pub successor_model_name: Option<String>,
     /// OpenRouter `openrouter.slug` override. NULL = unset.
     pub openrouter_slug: Option<String>,
 }
@@ -126,6 +135,7 @@ pub struct ModelValidationState {
     pub allow_free: bool,
     pub provider_type: String,
     pub provider_config: Option<serde_json::Value>,
+    pub deprecation_date: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 /// Model history entry - includes pricing, context length, and other model attributes
@@ -161,6 +171,8 @@ pub struct ModelHistoryEntry {
     pub datacenters: Option<Vec<String>>,
     pub is_ready: Option<bool>,
     pub deprecation_date: Option<chrono::DateTime<chrono::Utc>>,
+    /// Recommended replacement model for the planned deprecation.
+    pub successor_model_name: Option<String>,
     /// OpenRouter `openrouter.slug` override the model carried at this point.
     pub openrouter_slug: Option<String>,
     /// If true, this model was allowed to serve without pricing at this point in time.
@@ -290,6 +302,8 @@ pub struct AdminModelInfo {
     pub datacenters: Option<Vec<String>>,
     pub is_ready: Option<bool>,
     pub deprecation_date: Option<chrono::DateTime<chrono::Utc>>,
+    /// Recommended replacement model for the planned deprecation.
+    pub successor_model_name: Option<String>,
     /// OpenRouter `openrouter.slug` override. NULL = unset.
     pub openrouter_slug: Option<String>,
 }
@@ -608,6 +622,8 @@ pub enum AdminError {
     PricingChangeNotFound(String),
     #[error("Unauthorized: {0}")]
     Unauthorized(String),
+    #[error("Analytics query exceeded its statement budget")]
+    Timeout,
     #[error("Internal error: {0}")]
     InternalError(String),
 }

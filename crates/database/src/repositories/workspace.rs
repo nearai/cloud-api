@@ -9,6 +9,7 @@ use async_trait::async_trait;
 use chrono::Utc;
 use services::common::RepositoryError;
 use services::workspace::{WorkspaceOrderBy, WorkspaceOrderDirection};
+use tokio_postgres::types::Type;
 use tracing::debug;
 use uuid::Uuid;
 
@@ -379,8 +380,9 @@ impl WorkspaceRepository {
                 .context("Failed to get database connection")
                 .map_err(RepositoryError::PoolError)?;
 
+            // One-shot typed query: one round trip, see repositories/mod.rs.
             client
-                .query_opt(
+                .query_typed_opt(
                     r#"
                 SELECT
                     w.*,
@@ -393,7 +395,7 @@ impl WorkspaceRepository {
                 JOIN organizations o ON w.organization_id = o.id
                 WHERE w.id = $1 AND w.is_active = true AND o.is_active = true
                 "#,
-                    &[&workspace_id],
+                    &[(&workspace_id, Type::UUID)],
                 )
                 .await
                 .map_err(map_db_error)

@@ -3,10 +3,44 @@
 //! rows, and every history and by-model query stops at the statement timeout.
 
 use crate::common::*;
+use chrono::{Duration, Utc};
 use serde_json::Value;
 use uuid::Uuid;
 
 const INTERNAL_USAGE_TOKEN: &str = "usage-history-bounds-secret";
+
+#[tokio::test]
+async fn usage_by_model_combines_hourly_counts_with_recent_requests() {
+    use crate::admin_provider_attribution_support::setup_platform_provider_usage_fixture;
+    use crate::usage_hourly::{insert_raw, recompute_usage_hours};
+
+    let fixture = setup_platform_provider_usage_fixture().await;
+    let hour = services::usage::trunc_hour(Utc::now() - Duration::days(1));
+    // Two requests collapse into one aggregate row; count requests, not rows.
+    for _ in 0..2 {
+        insert_raw(&fixture, hour, 100, 10, None, None, Some("external")).await;
+    }
+    recompute_usage_hours(hour, hour + Duration::hours(1)).await;
+    insert_raw(&fixture, Utc::now(), 7, 3, None, None, Some("external")).await;
+
+    let response = fixture
+        .server
+        .get(&format!(
+            "/v1/organizations/{}/usage/by-model?period=month",
+            fixture.organization_id
+        ))
+        .add_header("Authorization", format!("Bearer {}", get_session_id()))
+        .await;
+    assert_eq!(response.status_code(), 200, "{}", response.text());
+    let body = response.json::<Value>();
+    let rows = body["data"].as_array().expect("by-model entries");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0]["model"], fixture.model_name);
+    assert_eq!(rows[0]["request_count"], 3);
+    assert_eq!(rows[0]["input_tokens"], 23);
+    assert_eq!(rows[0]["total_tokens"], 23);
+    assert_eq!(rows[0]["total_cost"], 207);
+}
 
 #[tokio::test]
 async fn usage_history_total_is_the_recorded_request_count() {

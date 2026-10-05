@@ -1,4 +1,5 @@
 use crate::ita::ItaAttestationConfig;
+use rustls_pki_types::{pem::PemObject, CertificateDer};
 use std::{collections::HashMap, env};
 
 #[derive(Debug, Clone)]
@@ -15,6 +16,12 @@ pub struct ApiConfig {
     /// `/v1/internal/usage` endpoint is disabled and returns 503, so reporters
     /// cannot submit usage until an operator sets the secret.
     pub internal_usage_token: Option<String>,
+    /// Ceiling for the `discount_to_user` fraction accepted on
+    /// `POST /v1/internal/usage` (`INTERNAL_USAGE_MAX_DISCOUNT`, default
+    /// [`DEFAULT_INTERNAL_USAGE_MAX_DISCOUNT`]). Rows are never recorded
+    /// below `(1 - ceiling)` of the list price, however a reporter is
+    /// configured; `0` refuses every non-zero discount.
+    pub internal_usage_max_discount: f64,
     pub logging: LoggingConfig,
     pub dstack_client: DstackClientConfig,
     pub auth: AuthConfig,
@@ -41,6 +48,7 @@ pub struct ApiConfig {
     /// every attributed usage charge, so changing it never rewrites history.
     pub credit_allocation: CreditAllocationConfig,
     pub ita: ItaAttestationConfig,
+    pub placement: PlacementConfig,
 }
 
 impl ApiConfig {
@@ -62,6 +70,9 @@ impl ApiConfig {
             internal_usage_token: env::var("CLOUD_API_USAGE_TOKEN")
                 .ok()
                 .filter(|s| !s.is_empty()),
+            internal_usage_max_discount: parse_internal_usage_max_discount(
+                non_empty_env(INTERNAL_USAGE_MAX_DISCOUNT_ENV).as_deref(),
+            )?,
             logging: LoggingConfig::from_env()?,
             dstack_client: DstackClientConfig::from_env()?,
             staking_farm: StakingFarmConfig::from_env(&auth.near),
@@ -88,6 +99,7 @@ impl ApiConfig {
             ita: ItaAttestationConfig::from_env()?,
             usage_reporting: UsageReportingConfig::from_env()?,
             credit_allocation: CreditAllocationConfig::from_env()?,
+            placement: PlacementConfig::from_env()?,
         })
     }
 }
@@ -589,6 +601,35 @@ impl InfraConfig {
     }
 }
 
+/// Env var holding the ceiling for reporter-supplied usage discounts.
+pub const INTERNAL_USAGE_MAX_DISCOUNT_ENV: &str = "INTERNAL_USAGE_MAX_DISCOUNT";
+
+/// Default ceiling for reporter-supplied usage discounts (50% off).
+pub const DEFAULT_INTERNAL_USAGE_MAX_DISCOUNT: f64 = 0.5;
+
+/// Parse `INTERNAL_USAGE_MAX_DISCOUNT`: unset means the default; a set value
+/// must be a finite number in `[0, 1)`.
+fn parse_internal_usage_max_discount(raw: Option<&str>) -> Result<f64, String> {
+    let Some(raw) = raw else {
+        return Ok(DEFAULT_INTERNAL_USAGE_MAX_DISCOUNT);
+    };
+    let invalid =
+        || format!("{INTERNAL_USAGE_MAX_DISCOUNT_ENV} must be a number in the range [0, 1)");
+    let value = raw.trim().parse::<f64>().map_err(|_| invalid())?;
+    if !value.is_finite() || !(0.0..1.0).contains(&value) {
+        return Err(invalid());
+    }
+    // Discounts are compared in basis points, so a ceiling finer than one
+    // basis point would silently allow the next value up.
+    let scaled = value * 10_000.0;
+    if (scaled - scaled.round()).abs() > 1e-6 {
+        return Err(format!(
+            "{INTERNAL_USAGE_MAX_DISCOUNT_ENV} must be a multiple of 0.0001"
+        ));
+    }
+    Ok(value)
+}
+
 fn parse_nonnegative_finite_env(key: &str) -> Result<f64, String> {
     let Some(raw) = env::var(key).ok() else {
         return Ok(0.0);
@@ -854,6 +895,10 @@ pub struct ServerConfig {
     /// Interval in seconds between scheduled-pricing-change apply passes.
     /// Set to 0 to disable the background scheduler. Default: 60.
     pub pricing_change_apply_interval_secs: u64,
+    /// Interval in seconds between usage_hourly aggregate ticks. After deploy, ticks catch up
+    /// every 60 s until current. Then 3600 (the default) runs at HH:05 UTC; any other value
+    /// runs on the plain interval with no clock alignment. Set to 0 to disable.
+    pub usage_hourly_interval_secs: u64,
     /// Enable the OHTTP gateway (RFC 9458).  Set OHTTP_ENABLED=true to enable.
     pub ohttp_enabled: bool,
 }
@@ -871,6 +916,10 @@ impl ServerConfig {
                 .unwrap_or_else(|_| "60".to_string())
                 .parse()
                 .map_err(|_| "PRICING_CHANGE_APPLY_INTERVAL_SECS must be a non-negative integer")?,
+            usage_hourly_interval_secs: env::var("USAGE_HOURLY_INTERVAL_SECS")
+                .unwrap_or_else(|_| "3600".to_string())
+                .parse()
+                .map_err(|_| "USAGE_HOURLY_INTERVAL_SECS must be a non-negative integer")?,
             ohttp_enabled: env::var("OHTTP_ENABLED")
                 .map(|v| v == "true" || v == "1")
                 .unwrap_or(false),
@@ -1185,6 +1234,149 @@ impl S3Config {
             bucket: env::var("AWS_S3_BUCKET").map_err(|_| "AWS_S3_BUCKET not set".to_string())?,
             region: env::var("AWS_S3_REGION").map_err(|_| "AWS_S3_REGION not set".to_string())?,
             encryption_key,
+        })
+    }
+}
+
+/// Smart placement. Its runtime inputs are the placement Valkey endpoint
+/// ([`PlacementEndpoint`]: host, port, TLS and CA, none of them secret) and
+/// the `router` password (`PLACEMENT_REDIS_PASSWORD`, or a file via
+/// `PLACEMENT_REDIS_PASSWORD_FILE` like every other secret); every tunable is
+/// a code constant. This is not a mode flag: without both there is simply no
+/// placement state, so every request takes the legacy routing path. A bad
+/// endpoint never fails startup: it disables placement (fail open).
+#[derive(Clone, Default)]
+pub struct PlacementConfig {
+    /// Password of the Valkey `router` ACL user, and the input key material
+    /// for the affinity and pin HMAC secrets. Never logged.
+    pub redis_password: Option<String>,
+    pub redis_endpoint: PlacementEndpoint,
+}
+
+impl std::fmt::Debug for PlacementConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PlacementConfig")
+            .field(
+                "redis_password",
+                &self.redis_password.as_ref().map(|_| "<redacted>"),
+            )
+            .field("redis_endpoint", &self.redis_endpoint)
+            .finish()
+    }
+}
+
+impl PlacementConfig {
+    pub fn from_env() -> Result<Self, String> {
+        Ok(Self {
+            redis_password: read_optional_secret_env(
+                "PLACEMENT_REDIS_PASSWORD_FILE",
+                "PLACEMENT_REDIS_PASSWORD",
+            )?,
+            redis_endpoint: PlacementEndpoint::from_env(),
+        })
+    }
+}
+
+/// The placement Valkey endpoint, read from `PLACEMENT_REDIS_HOST`,
+/// `PLACEMENT_REDIS_PORT` (default 6379), `PLACEMENT_REDIS_TLS_ENABLED`
+/// (default true) and, with TLS, the private CA's PEM from
+/// `PLACEMENT_REDIS_TLS_CA_CERT` or a file via
+/// `PLACEMENT_REDIS_TLS_CA_CERT_FILE`.
+#[derive(Clone, Debug, Default)]
+pub enum PlacementEndpoint {
+    /// `PLACEMENT_REDIS_HOST` is unset: placement is off.
+    #[default]
+    Missing,
+    /// Set but unusable; placement is off. The reason names the variable,
+    /// never its value.
+    Invalid(String),
+    Valid(PlacementRedisEndpoint),
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub struct PlacementRedisEndpoint {
+    /// Host or IP literal. With TLS it must match the server certificate's
+    /// SAN (for the placement Valkey, its Elastic IP).
+    pub host: String,
+    pub port: u16,
+    pub tls: bool,
+    /// The CA that signs the server certificate: present iff `tls`.
+    pub ca_pem: Option<String>,
+}
+
+impl std::fmt::Debug for PlacementRedisEndpoint {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PlacementRedisEndpoint")
+            .field("host", &self.host)
+            .field("port", &self.port)
+            .field("tls", &self.tls)
+            .field("ca_pem", &self.ca_pem.as_ref().map(|_| "<set>"))
+            .finish()
+    }
+}
+
+impl PlacementEndpoint {
+    const DEFAULT_PORT: u16 = 6379;
+
+    pub fn from_env() -> Self {
+        let Some(host) = non_empty_env("PLACEMENT_REDIS_HOST") else {
+            return Self::Missing;
+        };
+        match Self::parse(host) {
+            Ok(endpoint) => Self::Valid(endpoint),
+            Err(reason) => Self::Invalid(reason),
+        }
+    }
+
+    fn parse(host: String) -> Result<PlacementRedisEndpoint, String> {
+        let port = match non_empty_env("PLACEMENT_REDIS_PORT") {
+            None => Self::DEFAULT_PORT,
+            Some(port) => port
+                .parse::<u16>()
+                .ok()
+                .filter(|port| *port > 0)
+                .ok_or("PLACEMENT_REDIS_PORT must be a port number")?,
+        };
+        let tls = match non_empty_env("PLACEMENT_REDIS_TLS_ENABLED") {
+            None => true,
+            Some(tls) => tls
+                .parse::<bool>()
+                .map_err(|_| "PLACEMENT_REDIS_TLS_ENABLED must be true or false")?,
+        };
+        let ca_pem = if tls {
+            const CA_FILE: &str = "PLACEMENT_REDIS_TLS_CA_CERT_FILE";
+            const CA_INLINE: &str = "PLACEMENT_REDIS_TLS_CA_CERT";
+            // The variable actually read, so an error names the right one.
+            let var = if non_empty_env(CA_FILE).is_some() {
+                CA_FILE
+            } else {
+                CA_INLINE
+            };
+            let pem = read_optional_secret_env(CA_FILE, CA_INLINE)?
+                .ok_or(
+                    "PLACEMENT_REDIS_TLS_CA_CERT or PLACEMENT_REDIS_TLS_CA_CERT_FILE is required with TLS",
+                )?;
+            // A one-line value with literal `\n` escapes (a `.env` or docker
+            // env) is unescaped, as inference-proxy does.
+            let pem = pem.trim().replace("\\n", "\n");
+            // Parse it now so a corrupt block is invalid at startup, not a
+            // silently inert client later. Errors name the variable, never
+            // the contents.
+            let certs = CertificateDer::pem_slice_iter(pem.as_bytes())
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|_| format!("{var} holds an invalid PEM certificate"))?;
+            if certs.is_empty() {
+                return Err(format!("{var} holds no PEM certificate"));
+            }
+            Some(pem)
+        } else {
+            None
+        };
+        Ok(PlacementRedisEndpoint {
+            host,
+            port,
+            tls,
+            ca_pem,
         })
     }
 }
@@ -1707,6 +1899,208 @@ mod tests {
         let debug = format!("{config:?}");
         assert!(debug.contains("<redacted>"));
         assert!(!debug.contains("grafana-secret-token"));
+    }
+
+    #[test]
+    fn placement_config_debug_redacts() {
+        let config = PlacementConfig {
+            redis_password: Some("valkey-router-secret".to_string()),
+            ..PlacementConfig::default()
+        };
+        let debug = format!("{config:?}");
+        assert!(debug.contains("<redacted>"));
+        assert!(!debug.contains("valkey-router-secret"));
+
+        let unset = format!("{:?}", PlacementConfig::default());
+        assert!(unset.contains("None"));
+    }
+
+    #[test]
+    #[serial]
+    fn placement_config_reads_the_password_secret() {
+        std::env::remove_var("PLACEMENT_REDIS_PASSWORD_FILE");
+        std::env::remove_var("PLACEMENT_REDIS_PASSWORD");
+        assert!(PlacementConfig::from_env()
+            .unwrap()
+            .redis_password
+            .is_none());
+
+        std::env::set_var("PLACEMENT_REDIS_PASSWORD", "  pw  ");
+        let config = PlacementConfig::from_env().unwrap();
+        std::env::remove_var("PLACEMENT_REDIS_PASSWORD");
+        assert_eq!(config.redis_password.as_deref(), Some("pw"));
+    }
+
+    const PLACEMENT_ENDPOINT_KEYS: [&str; 5] = [
+        "PLACEMENT_REDIS_HOST",
+        "PLACEMENT_REDIS_PORT",
+        "PLACEMENT_REDIS_TLS_ENABLED",
+        "PLACEMENT_REDIS_TLS_CA_CERT",
+        "PLACEMENT_REDIS_TLS_CA_CERT_FILE",
+    ];
+
+    fn clear_placement_endpoint_env() {
+        for key in PLACEMENT_ENDPOINT_KEYS {
+            std::env::remove_var(key);
+        }
+    }
+
+    const TEST_CA_PEM: &str = "-----BEGIN CERTIFICATE-----\nMIIB\n-----END CERTIFICATE-----\n";
+
+    fn invalid_endpoint() -> String {
+        match PlacementConfig::from_env().unwrap().redis_endpoint {
+            PlacementEndpoint::Invalid(reason) => reason,
+            other => panic!("expected an invalid endpoint, got {other:?}"),
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn placement_endpoint_missing_is_disabled() {
+        clear_placement_endpoint_env();
+        // No host: placement stays off, and startup does not fail.
+        std::env::set_var("PLACEMENT_REDIS_TLS_CA_CERT", TEST_CA_PEM);
+        let config = PlacementConfig::from_env().unwrap();
+        clear_placement_endpoint_env();
+        assert!(matches!(config.redis_endpoint, PlacementEndpoint::Missing));
+        assert!(matches!(
+            PlacementConfig::default().redis_endpoint,
+            PlacementEndpoint::Missing
+        ));
+    }
+
+    #[test]
+    #[serial]
+    fn placement_endpoint_reads_host_port_tls_and_ca() {
+        clear_placement_endpoint_env();
+        std::env::set_var("PLACEMENT_REDIS_HOST", " 203.0.113.7 ");
+        std::env::set_var("PLACEMENT_REDIS_TLS_CA_CERT", TEST_CA_PEM);
+        let config = PlacementConfig::from_env().unwrap();
+        let PlacementEndpoint::Valid(endpoint) = config.redis_endpoint else {
+            panic!("expected a valid endpoint");
+        };
+        // TLS by default, on the default port.
+        assert_eq!(endpoint.host, "203.0.113.7");
+        assert_eq!(endpoint.port, 6379);
+        assert!(endpoint.tls);
+        assert_eq!(endpoint.ca_pem.as_deref(), Some(TEST_CA_PEM.trim()));
+
+        // The CA from a file, on another port.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ca.pem");
+        std::fs::write(&path, TEST_CA_PEM).unwrap();
+        std::env::remove_var("PLACEMENT_REDIS_TLS_CA_CERT");
+        std::env::set_var("PLACEMENT_REDIS_TLS_CA_CERT_FILE", &path);
+        std::env::set_var("PLACEMENT_REDIS_PORT", "6380");
+        let PlacementEndpoint::Valid(endpoint) =
+            PlacementConfig::from_env().unwrap().redis_endpoint
+        else {
+            panic!("expected a valid endpoint");
+        };
+        assert_eq!(endpoint.port, 6380);
+        assert_eq!(endpoint.ca_pem.as_deref(), Some(TEST_CA_PEM.trim()));
+
+        // Plain TCP needs no CA.
+        clear_placement_endpoint_env();
+        std::env::set_var("PLACEMENT_REDIS_HOST", "127.0.0.1");
+        std::env::set_var("PLACEMENT_REDIS_TLS_ENABLED", "false");
+        let PlacementEndpoint::Valid(endpoint) =
+            PlacementConfig::from_env().unwrap().redis_endpoint
+        else {
+            panic!("expected a valid endpoint");
+        };
+        clear_placement_endpoint_env();
+        assert!(!endpoint.tls);
+        assert_eq!(endpoint.ca_pem, None);
+    }
+
+    #[test]
+    #[serial]
+    fn placement_endpoint_bad_ca_is_disabled_with_an_error() {
+        clear_placement_endpoint_env();
+        std::env::set_var("PLACEMENT_REDIS_HOST", "203.0.113.7");
+
+        // TLS without a CA.
+        assert!(invalid_endpoint().contains("PLACEMENT_REDIS_TLS_CA_CERT"));
+
+        // A CA that holds no certificate.
+        std::env::set_var("PLACEMENT_REDIS_TLS_CA_CERT", "not a certificate");
+        assert!(invalid_endpoint().contains("PLACEMENT_REDIS_TLS_CA_CERT"));
+
+        // A CA file that cannot be read.
+        std::env::remove_var("PLACEMENT_REDIS_TLS_CA_CERT");
+        std::env::set_var("PLACEMENT_REDIS_TLS_CA_CERT_FILE", "/nonexistent/ca.pem");
+        assert!(invalid_endpoint().contains("PLACEMENT_REDIS_TLS_CA_CERT_FILE"));
+
+        // Neither the port nor the TLS switch may be garbage.
+        std::env::set_var("PLACEMENT_REDIS_TLS_CA_CERT", TEST_CA_PEM);
+        std::env::remove_var("PLACEMENT_REDIS_TLS_CA_CERT_FILE");
+        std::env::set_var("PLACEMENT_REDIS_PORT", "not-a-port");
+        assert!(invalid_endpoint().contains("PLACEMENT_REDIS_PORT"));
+        std::env::remove_var("PLACEMENT_REDIS_PORT");
+        std::env::set_var("PLACEMENT_REDIS_TLS_ENABLED", "maybe");
+        assert!(invalid_endpoint().contains("PLACEMENT_REDIS_TLS_ENABLED"));
+        clear_placement_endpoint_env();
+    }
+
+    /// A one-line CA with literal `\n` escapes, as it arrives through a
+    /// `.env` or docker env, is unescaped like inference-proxy does; the
+    /// same from a file.
+    #[test]
+    #[serial]
+    fn escaped_newline_ca_is_accepted() {
+        clear_placement_endpoint_env();
+        std::env::set_var("PLACEMENT_REDIS_HOST", "203.0.113.7");
+        let escaped = TEST_CA_PEM.trim().replace('\n', "\\n");
+        assert!(!escaped.contains('\n'));
+        std::env::set_var("PLACEMENT_REDIS_TLS_CA_CERT", format!("  {escaped}  "));
+        let PlacementEndpoint::Valid(endpoint) =
+            PlacementConfig::from_env().unwrap().redis_endpoint
+        else {
+            panic!("expected a valid endpoint");
+        };
+        assert_eq!(endpoint.ca_pem.as_deref(), Some(TEST_CA_PEM.trim()));
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ca.pem");
+        std::fs::write(&path, format!("{escaped}\n")).unwrap();
+        std::env::remove_var("PLACEMENT_REDIS_TLS_CA_CERT");
+        std::env::set_var("PLACEMENT_REDIS_TLS_CA_CERT_FILE", &path);
+        let PlacementEndpoint::Valid(endpoint) =
+            PlacementConfig::from_env().unwrap().redis_endpoint
+        else {
+            panic!("expected a valid endpoint");
+        };
+        clear_placement_endpoint_env();
+        assert_eq!(endpoint.ca_pem.as_deref(), Some(TEST_CA_PEM.trim()));
+    }
+
+    /// A block that looks like a certificate but does not parse is invalid
+    /// at startup, named under the variable that was read, and its contents
+    /// are never in the reason.
+    #[test]
+    #[serial]
+    fn corrupt_pem_is_invalid() {
+        clear_placement_endpoint_env();
+        std::env::set_var("PLACEMENT_REDIS_HOST", "203.0.113.7");
+        let corrupt =
+            "-----BEGIN CERTIFICATE-----\n!!corrupt-secret-body!!\n-----END CERTIFICATE-----";
+        std::env::set_var("PLACEMENT_REDIS_TLS_CA_CERT", corrupt);
+        let reason = invalid_endpoint();
+        assert!(reason.contains("PLACEMENT_REDIS_TLS_CA_CERT"));
+        assert!(!reason.contains("_FILE"));
+        assert!(!reason.contains("corrupt-secret-body"));
+
+        // From a file the reason names the file variable.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ca.pem");
+        std::fs::write(&path, corrupt).unwrap();
+        std::env::remove_var("PLACEMENT_REDIS_TLS_CA_CERT");
+        std::env::set_var("PLACEMENT_REDIS_TLS_CA_CERT_FILE", &path);
+        let reason = invalid_endpoint();
+        clear_placement_endpoint_env();
+        assert!(reason.contains("PLACEMENT_REDIS_TLS_CA_CERT_FILE"));
+        assert!(!reason.contains("corrupt-secret-body"));
     }
 
     #[test]
@@ -2388,6 +2782,8 @@ pub struct ExternalProvidersConfig {
     pub anthropic_denied_betas: Vec<String>,
     /// Google Gemini API key
     pub gemini_api_key: Option<String>,
+    /// TypeSafe System One API key.
+    pub typesafe_api_key: Option<String>,
     /// Default timeout for external provider requests (seconds)
     pub timeout_seconds: i64,
     /// Interval in seconds for refreshing external providers from the database.
@@ -2416,6 +2812,20 @@ impl ExternalProvidersConfig {
     /// Load from environment variables
     /// Keys can be provided directly via env vars or through file paths
     pub fn from_env() -> Self {
+        let typesafe_api_key = if let Ok(path) = env::var("TYPESAFE_API_KEY_FILE") {
+            match std::fs::read_to_string(&path) {
+                Ok(value) => Some(value.trim().to_string()),
+                Err(error) => {
+                    eprintln!("WARN: failed to read TYPESAFE_API_KEY_FILE ({path}): {error}");
+                    None
+                }
+            }
+        } else {
+            env::var("TYPESAFE_API_KEY")
+                .ok()
+                .map(|value| value.trim().to_string())
+        }
+        .filter(|value| !value.is_empty());
         // OpenAI API key
         let openai_api_key = if let Ok(path) = env::var("OPENAI_API_KEY_FILE") {
             std::fs::read_to_string(path)
@@ -2569,6 +2979,7 @@ impl ExternalProvidersConfig {
             enable_anthropic_messages,
             anthropic_denied_betas,
             gemini_api_key,
+            typesafe_api_key,
             timeout_seconds,
             refresh_interval_secs,
             enable_chutes,
@@ -2585,6 +2996,7 @@ impl ExternalProvidersConfig {
             "openai_compatible" => self.openai_api_key.as_deref(),
             "anthropic" => self.anthropic_api_key.as_deref(),
             "gemini" => self.gemini_api_key.as_deref(),
+            "typesafe" => self.typesafe_api_key.as_deref(),
             _ => None,
         }
     }
@@ -2628,6 +3040,8 @@ pub struct CorsConfig {
 
 impl Default for CorsConfig {
     fn default() -> Self {
+        // CORS_ALLOWED_ORIGINS restricts admin HTTP and OAuth callback origins.
+        // Other API routes allow any origin without credentialed browser access.
         let raw_origins = env::var("CORS_ALLOWED_ORIGINS")
             .unwrap_or_else(|_| "http://localhost:3000,https://near.ai,*.near.ai".to_string());
 
@@ -2682,5 +3096,43 @@ mod native_responses_config_tests {
             parse_native_responses_models(" openai/gpt-6-astra,custom/model,openai/gpt-6-astra,,"),
             vec!["custom/model", "openai/gpt-6-astra"]
         );
+    }
+}
+
+#[cfg(test)]
+mod internal_usage_max_discount_tests {
+    use super::{parse_internal_usage_max_discount, DEFAULT_INTERNAL_USAGE_MAX_DISCOUNT};
+
+    #[test]
+    fn unset_uses_the_default() {
+        assert_eq!(
+            parse_internal_usage_max_discount(None).unwrap(),
+            DEFAULT_INTERNAL_USAGE_MAX_DISCOUNT
+        );
+    }
+
+    #[test]
+    fn accepts_values_in_the_unit_interval() {
+        assert_eq!(parse_internal_usage_max_discount(Some("0")).unwrap(), 0.0);
+        assert_eq!(
+            parse_internal_usage_max_discount(Some(" 0.25 ")).unwrap(),
+            0.25
+        );
+        assert_eq!(
+            parse_internal_usage_max_discount(Some("0.9999")).unwrap(),
+            0.9999
+        );
+    }
+
+    #[test]
+    fn rejects_everything_else() {
+        for bad in [
+            "1", "1.5", "-0.1", "nan", "inf", "twenty", "0.12345", "0.10005",
+        ] {
+            assert!(
+                parse_internal_usage_max_discount(Some(bad)).is_err(),
+                "{bad}"
+            );
+        }
     }
 }

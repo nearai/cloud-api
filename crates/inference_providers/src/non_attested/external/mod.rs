@@ -28,6 +28,7 @@ pub mod backend;
 pub mod content;
 pub mod gemini;
 pub mod openai_compatible;
+pub mod typesafe;
 
 #[cfg(test)]
 mod routing_policy_tests;
@@ -50,6 +51,7 @@ pub use anthropic::AnthropicBackend;
 pub use backend::BackendConfig as ExternalBackendConfig;
 pub use gemini::GeminiBackend;
 pub use openai_compatible::OpenAiCompatibleBackend;
+pub use typesafe::TypeSafeBackend;
 
 /// Strip cloud-api internal keys from `extra` before forwarding params to
 /// external providers.
@@ -60,7 +62,7 @@ pub use openai_compatible::OpenAiCompatibleBackend;
 /// serialised as top-level JSON body fields — unknown fields that strict
 /// providers (Anthropic, Gemini) may reject with a 400/422.
 fn strip_internal_keys(extra: &mut std::collections::HashMap<String, serde_json::Value>) {
-    use crate::attested::nearai::{encryption_headers, tracing_headers};
+    use crate::attested::nearai::{encryption_headers, placement_headers, tracing_headers};
     extra.remove(tracing_headers::REQUEST_ID);
     extra.remove(tracing_headers::ORG_ID);
     extra.remove(tracing_headers::WORKSPACE_ID);
@@ -68,6 +70,11 @@ fn strip_internal_keys(extra: &mut std::collections::HashMap<String, serde_json:
     // pinned request should never select an external provider, but strip it here
     // so that guarantee is not load-bearing for request correctness.
     extra.remove(encryption_headers::MODEL_PUB_KEY);
+    // Legacy placement keys are denied (see placement_headers); an
+    // external, third-party provider must never see them.
+    for key in placement_headers::LEGACY_DENIED_EXTRA_KEYS {
+        extra.remove(key);
+    }
 }
 
 fn merge_json_defaults(target: &mut serde_json::Value, defaults: &serde_json::Value) {
@@ -125,7 +132,7 @@ pub fn validate_external_provider_config(config: &serde_json::Value) -> Result<(
             "api_key",
         ],
         "anthropic" => &["backend", "base_url", "version", "model_name", "api_key"],
-        "gemini" => &["backend", "base_url", "model_name", "api_key"],
+        "gemini" | "typesafe" => &["backend", "base_url", "model_name", "api_key"],
         _ => return Err("unsupported external provider backend"),
     };
     if config
@@ -188,6 +195,14 @@ pub fn validate_external_provider_config(config: &serde_json::Value) -> Result<(
 #[derive(Debug, Clone, Deserialize)]
 #[serde(tag = "backend")]
 pub enum ProviderConfig {
+    /// TypeSafe System One (also supported by OpenRouter's /v1/systemone API).
+    #[serde(rename = "typesafe")]
+    TypeSafe {
+        /// Versioned API root, e.g. https://api.typesafe.ai/v1.
+        base_url: String,
+        #[serde(default)]
+        model_name: Option<String>,
+    },
     /// OpenAI-compatible providers (OpenAI, Azure, Together, Groq, Fireworks, OpenRouter, etc.)
     #[serde(rename = "openai_compatible")]
     OpenAiCompatible {
@@ -290,6 +305,20 @@ impl ExternalProvider {
             Option<String>,
             std::collections::HashMap<String, serde_json::Value>,
         ) = match provider_config {
+            ProviderConfig::TypeSafe {
+                base_url,
+                model_name: config_model_name,
+            } => (
+                Arc::new(TypeSafeBackend::default()),
+                BackendConfig {
+                    base_url,
+                    api_key,
+                    timeout_seconds,
+                    ..Default::default()
+                },
+                config_model_name,
+                std::collections::HashMap::new(),
+            ),
             ProviderConfig::OpenAiCompatible {
                 base_url,
                 organization_id,
@@ -407,6 +436,20 @@ impl ExternalProvider {
 
 #[async_trait]
 impl InferenceProvider for ExternalProvider {
+    fn supports_systemone(&self) -> bool {
+        self.backend.backend_type() == "typesafe"
+    }
+
+    async fn systemone(
+        &self,
+        request: crate::SystemOneRequest,
+        _request_hash: String,
+    ) -> Result<crate::SystemOneResponseWithBytes, CompletionError> {
+        self.backend
+            .systemone(&self.config, &self.model_name, request)
+            .await
+    }
+
     fn provider_source(&self) -> crate::ProviderSource {
         crate::ProviderSource::External
     }
@@ -640,10 +683,13 @@ mod tests {
 
     #[test]
     fn strip_internal_keys_removes_routing_pin_and_tracing_keys() {
-        use crate::attested::nearai::{encryption_headers as eh, tracing_headers as th};
+        use crate::attested::nearai::{
+            encryption_headers as eh, placement_headers as ph, tracing_headers as th,
+        };
 
         // Given: request extras contain tracing metadata, the routing-only pin,
-        // and the client-E2EE fields external providers already receive.
+        // placement affinity keys, and the client-E2EE fields external
+        // providers already receive.
         let mut extra = HashMap::new();
         for key in [
             th::REQUEST_ID,
@@ -657,18 +703,28 @@ mod tests {
         ] {
             extra.insert(key.to_string(), serde_json::json!("value"));
         }
+        for key in ph::LEGACY_DENIED_EXTRA_KEYS {
+            extra.insert(key.to_string(), serde_json::json!("value"));
+        }
 
         // When: external-provider internal keys are stripped.
         strip_internal_keys(&mut extra);
 
-        // Then: tracing metadata and the routing pin are removed, while the
-        // pre-existing client-E2EE fields remain unchanged.
+        // Then: tracing metadata, the routing pin, and the placement affinity
+        // keys are removed, while the pre-existing client-E2EE fields remain
+        // unchanged.
         for key in [
             th::REQUEST_ID,
             th::ORG_ID,
             th::WORKSPACE_ID,
             eh::MODEL_PUB_KEY,
         ] {
+            assert!(
+                !extra.contains_key(key),
+                "internal key {key} must be stripped"
+            );
+        }
+        for key in ph::LEGACY_DENIED_EXTRA_KEYS {
             assert!(
                 !extra.contains_key(key),
                 "internal key {key} must be stripped"

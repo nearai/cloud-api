@@ -152,8 +152,29 @@ async fn test_request_id_contract_for_cors_and_streaming_surfaces() {
         .get("/v1/health")
         .add_header("Origin", "http://localhost:3000")
         .await;
+    let browser_origin = "https://www.typingmind.com";
+    let browser_preflight = server
+        .method(Method::OPTIONS, "/v1/chat/completions")
+        .add_header("Origin", browser_origin)
+        .add_header("Access-Control-Request-Method", "POST")
+        .add_header(
+            "Access-Control-Request-Headers",
+            "authorization,content-type,x-request-id",
+        )
+        .await;
+    let browser_models = server
+        .get("/v1/models")
+        .add_header("Origin", browser_origin)
+        .await;
+    let browser_auth_error = server
+        .post("/v1/chat/completions")
+        .add_header("Origin", browser_origin)
+        .add_header("Authorization", "Bearer invalidkey")
+        .json(&serde_json::json!({"model": "test", "messages": []}))
+        .await;
     let streaming = server
         .post("/v1/chat/completions")
+        .add_header("Origin", browser_origin)
         .add_header("Authorization", format!("Bearer {api_key}"))
         .add_header(REQUEST_ID_HEADER, inbound_request_id.to_string())
         .add_header(ORG_ID_HEADER, spoofed_org_id.clone())
@@ -184,6 +205,28 @@ async fn test_request_id_contract_for_cors_and_streaming_surfaces() {
         cors_actual.status_code(),
         header_value(&cors_actual, "access-control-expose-headers")
     );
+    assert_eq!(browser_preflight.status_code(), 200);
+    assert_eq!(
+        header_value(&browser_preflight, "access-control-allow-headers"),
+        "authorization,content-type,x-request-id",
+        "Authorization must be explicitly allowed, not covered by a wildcard",
+    );
+    assert_eq!(browser_models.status_code(), 200);
+    assert_eq!(browser_auth_error.status_code(), 401);
+    for response in [
+        &browser_preflight,
+        &browser_models,
+        &browser_auth_error,
+        &streaming,
+    ] {
+        assert_eq!(
+            header_value(response, "access-control-allow-origin"),
+            browser_origin
+        );
+        assert!(!response
+            .headers()
+            .contains_key("access-control-allow-credentials"));
+    }
     let selected_id = assert_uuid_response_id("streaming success", &streaming);
     assert_eq!(streaming.status_code(), 200);
     assert_eq!(selected_id, inbound_request_id);

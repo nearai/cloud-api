@@ -348,6 +348,69 @@ impl AdminService for AdminServiceImpl {
             Self::validate_model_request(model_name, request, Arc::clone(&self.repository)).await?;
         }
 
+        // A successor is announced to API users as the migration target for a
+        // model with a planned deprecation. So the model must have (or get) a
+        // planned date, and the successor must be a different model that is
+        // active once this request has been applied.
+        let mut active_successors = std::collections::HashSet::new();
+        for (model_name, request) in &models {
+            let Some(Some(successor)) = &request.successor_model_name else {
+                continue;
+            };
+            if successor.is_empty() || successor == model_name {
+                return Err(AdminError::InvalidDeprecation(format!(
+                    "model '{model_name}': successorModelId must name a different model"
+                )));
+            }
+
+            let has_planned_date = match request.deprecation_date {
+                Some(date) => date.is_some(),
+                None => self
+                    .repository
+                    .get_model_validation_state(model_name)
+                    .await
+                    .map_err(|e| AdminError::InternalError(e.to_string()))?
+                    .is_some_and(|existing| existing.deprecation_date.is_some()),
+            };
+            if !has_planned_date {
+                return Err(AdminError::InvalidDeprecation(format!(
+                    "model '{model_name}': successorModelId requires a planned deprecationDate"
+                )));
+            }
+
+            if active_successors.contains(successor) {
+                continue;
+            }
+            let in_batch = models.get(successor);
+            let active = match in_batch.and_then(|entry| entry.is_active) {
+                // This request decides the successor's active state.
+                Some(active) => active,
+                None => {
+                    let active_now = self
+                        .repository
+                        .get_active_model_for_deprecation(successor)
+                        .await
+                        .map_err(|e| AdminError::InternalError(e.to_string()))?
+                        .is_some();
+                    // A model this request creates is active by default.
+                    active_now
+                        || (in_batch.is_some()
+                            && self
+                                .repository
+                                .get_model_validation_state(successor)
+                                .await
+                                .map_err(|e| AdminError::InternalError(e.to_string()))?
+                                .is_none())
+                }
+            };
+            if !active {
+                return Err(AdminError::InvalidDeprecation(format!(
+                    "model '{model_name}': successorModelId '{successor}' is not an active model"
+                )));
+            }
+            active_successors.insert(successor);
+        }
+
         // Upsert all models. Each row is committed independently, so we
         // invalidate the public `/v1/model/list` cache after EACH successful
         // write rather than only at the end of the loop. If a later row fails
@@ -638,6 +701,7 @@ impl AdminService for AdminServiceImpl {
             datacenters: None,
             is_ready: None,
             deprecation_date: Some(Some(deprecation_date)),
+            successor_model_name: Some(Some(successor.model_name.clone())),
             openrouter_slug: None,
             change_reason: change_reason.or_else(|| {
                 Some(format!(
@@ -1312,6 +1376,7 @@ impl AdminServiceImpl {
             allow_free: false,
             provider_type: "vllm".to_string(),
             provider_config: None,
+            deprecation_date: None,
         });
 
         let effective_provider_type = request

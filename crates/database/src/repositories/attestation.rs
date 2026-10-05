@@ -2,6 +2,7 @@ use async_trait::async_trait;
 use services::attestation::{
     ports::AttestationRepository, AttestationError, ChatSignature, SignatureKind,
 };
+use tokio_postgres::types::Type;
 
 use crate::DbPool;
 
@@ -82,10 +83,18 @@ impl AttestationRepository for PgAttestationRepository {
             .await
             .map_err(|e| AttestationError::RepositoryError(e.to_string()))?;
         let signature_kind = signature.signature_kind.map(|kind| kind.as_str());
+        // One-shot typed query: one round trip, see repositories/mod.rs.
         client
-            .execute(
+            .execute_typed(
                 "INSERT INTO chat_signatures (chat_id, text, signature, signing_address, signing_algo, signature_kind) VALUES ($1, $2, $3, $4, $5, $6) ON CONFLICT (chat_id, signing_algo) DO UPDATE SET text = EXCLUDED.text, signature = EXCLUDED.signature, signing_address = EXCLUDED.signing_address, signature_kind = EXCLUDED.signature_kind, updated_at = NOW()",
-                &[&chat_id, &signature.text, &signature.signature, &signature.signing_address, &signature.signing_algo, &signature_kind],
+                &[
+                    (&chat_id, Type::VARCHAR),
+                    (&signature.text, Type::TEXT),
+                    (&signature.signature, Type::TEXT),
+                    (&signature.signing_address, Type::VARCHAR),
+                    (&signature.signing_algo, Type::VARCHAR),
+                    (&signature_kind, Type::VARCHAR),
+                ],
             )
             .await
             .map_err(|e| AttestationError::RepositoryError(e.to_string()))?;
@@ -119,7 +128,7 @@ impl AttestationRepository for PgAttestationRepository {
         let mut sql = String::from(
             "INSERT INTO chat_signatures (chat_id, text, signature, signing_address, signing_algo, signature_kind) VALUES ",
         );
-        let mut params: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> = Vec::new();
+        let mut params: Vec<(&(dyn tokio_postgres::types::ToSql + Sync), Type)> = Vec::new();
         for (index, (signature, signature_kind)) in
             signatures.iter().zip(signature_kinds.iter()).enumerate()
         {
@@ -136,19 +145,20 @@ impl AttestationRepository for PgAttestationRepository {
                 base + 5,
                 base + 6
             ));
-            params.push(&chat_id);
-            params.push(&signature.text);
-            params.push(&signature.signature);
-            params.push(&signature.signing_address);
-            params.push(&signature.signing_algo);
-            params.push(signature_kind);
+            params.push((&chat_id, Type::VARCHAR));
+            params.push((&signature.text, Type::TEXT));
+            params.push((&signature.signature, Type::TEXT));
+            params.push((&signature.signing_address, Type::VARCHAR));
+            params.push((&signature.signing_algo, Type::VARCHAR));
+            params.push((signature_kind, Type::VARCHAR));
         }
         sql.push_str(
             " ON CONFLICT (chat_id, signing_algo) DO UPDATE SET text = EXCLUDED.text, signature = EXCLUDED.signature, signing_address = EXCLUDED.signing_address, signature_kind = EXCLUDED.signature_kind, updated_at = NOW()",
         );
 
+        // One-shot typed query: one round trip, see repositories/mod.rs.
         client
-            .execute(sql.as_str(), &params)
+            .execute_typed(sql.as_str(), &params)
             .await
             .map_err(|e| AttestationError::RepositoryError(e.to_string()))?;
 

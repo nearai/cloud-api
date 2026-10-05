@@ -191,17 +191,33 @@ pub(super) fn model_provider_breakdown<'a>(
 pub(super) async fn isolated_provider_usage_window(
     fixture: &PlatformProviderUsageFixture,
 ) -> ProviderUsageWindow {
-    // Allocate compact, non-overlapping slots from PostgreSQL's cluster-wide
-    // transaction counter. A random start at microsecond precision is not enough:
-    // two distinct starts can still make the queried time ranges overlap.
+    isolated_usage_hours(fixture, 1).await
+}
+
+/// `hours` (at most `SLOT_HOURS`) whole far-past UTC hours that no other test reads or
+/// recomputes, starting on a slot boundary.
+pub(super) async fn isolated_usage_hours(
+    fixture: &PlatformProviderUsageFixture,
+    hours: i64,
+) -> ProviderUsageWindow {
+    // Invariant: only this allocator hands out 1900s hours, one slot per caller, and every
+    // other usage_hourly recompute stays outside the 1900s (random_past_hour and day parity:
+    // 2001-2021; live and fixed-date tests: 2026; serial tests: +4000 days).
+    //
+    // Allocate whole, non-overlapping far-past slots from PostgreSQL's cluster-wide
+    // transaction counter. Reports read usage_hourly at hour grain (spec §6.1), so a test's
+    // cohort must own its entire hours, including "not yet aggregated" assertions.
     //
     // The occupancy check also handles a restored database, transaction-ID wrap,
     // and rows retained from older versions of this test helper.
     const MAX_ATTEMPTS: usize = 64;
-    const SLOT_COUNT: i64 = 1_000_000_000;
-    const SLOT_SECONDS: i64 = 10;
-    const WINDOW_SECONDS: i64 = 8;
-    let base = chrono::DateTime::parse_from_rfc3339("2400-01-01T00:00:00Z")
+    const SLOT_HOURS: i64 = 2;
+    const SLOT_COUNT: i64 = 438_000; // 2-hour slots from 1900-01-01, all before 2000
+    assert!(
+        (1..=SLOT_HOURS).contains(&hours),
+        "at most {SLOT_HOURS} hours"
+    );
+    let base = chrono::DateTime::parse_from_rfc3339("1900-01-01T00:00:00Z")
         .expect("provider usage window base is valid")
         .with_timezone(&chrono::Utc);
     let client = fixture.database.pool().get().await.expect("db connection");
@@ -213,8 +229,8 @@ pub(super) async fn isolated_provider_usage_window(
             .expect("allocate provider usage window")
             .get(0);
         let slot = allocation_id.rem_euclid(SLOT_COUNT);
-        let start = base + chrono::Duration::seconds(slot * SLOT_SECONDS);
-        let end = start + chrono::Duration::seconds(WINDOW_SECONDS);
+        let start = base + chrono::Duration::hours(slot * SLOT_HOURS);
+        let slot_end = start + chrono::Duration::hours(SLOT_HOURS);
         let occupied: bool = client
             .query_one(
                 r#"
@@ -224,14 +240,14 @@ pub(super) async fn isolated_provider_usage_window(
                     WHERE created_at >= $1 AND created_at < $2
                 )
                 "#,
-                &[&start, &end],
+                &[&start, &slot_end],
             )
             .await
             .expect("check provider usage window occupancy")
             .get(0);
 
         if !occupied {
-            return (start, end);
+            return (start, start + chrono::Duration::hours(hours));
         }
     }
 

@@ -198,6 +198,15 @@ jobs:
       with:
         cache-key: e2e
 
+    - name: Run typed-query and credit-allocation regressions
+      run: cargo test --locked -p database --test hot_path_typed_queries --test billing_typed_queries --test credit_allocation
+      env:
+        PGHOST: localhost
+        PGPORT: 5432
+        PGDATABASE: platform_api
+        PGUSER: postgres
+        PGPASSWORD: postgres
+
     - name: Run e2e tests
       run: cargo nextest run --test e2e_all
       env:

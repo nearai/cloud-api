@@ -6,27 +6,28 @@ use crate::conversions::{
 use crate::middleware::AdminUser;
 use crate::models::{
     AdminAccessTokenPermission, AdminAccessTokenResponse, AdminAmlAllowlistEntryResponse,
-    AdminAmlReportResponse, AdminInvitationEmailResendResultResponse, AdminModelListResponse,
-    AdminModelWithPricing, AdminOrganizationMemberResponse, AdminOrganizationResponse,
-    AdminServiceResponse, AdminUserOrganizationDetails, AdminUserResponse,
-    BatchUpdateModelApiRequest, CreateAdminAccessTokenRequest, CreateServiceRequest, CreditType,
-    DecimalPrice, DecimalPriceRequest, DeleteAdminAccessTokenRequest, DeleteModelRequest,
-    DeprecateModelRequest, DeprecateModelResponse, ErrorResponse,
-    GetOrganizationConcurrentLimitResponse, ListAdminAccessTokensResponse,
-    ListAdminAmlAllowlistResponse, ListAdminAmlReportsResponse,
-    ListAdminInvitationEmailDeliveriesResponse, ListAdminOrganizationMembersResponse,
-    ListOrganizationsAdminResponse, ListPricingChangesResponse, ListUsersResponse, MemberRole,
-    ModelArchitecture, ModelDeprecationConfirmResponse, ModelDeprecationPreviewResponse,
-    ModelDeprecationRequest, ModelHistoryEntry, ModelHistoryResponse, ModelMetadata,
-    ModelWithPricing, OrgLimitsHistoryEntry, OrgLimitsHistoryResponse,
-    OrganizationFallbackResponse, OrganizationMemberResponse, OrganizationPriorityResponse,
-    OrganizationUsage, PricingChangeBatchRequest, PricingChangeConfirmResponse,
-    PricingChangeModelPreviewDto, PricingChangePreviewResponse, PricingFieldUpdates, PricingFields,
-    ScheduledPricingChangeDto, SpendLimit, UpdateAmlReportStatusRequest,
-    UpdateOrganizationConcurrentLimitRequest, UpdateOrganizationConcurrentLimitResponse,
-    UpdateOrganizationFallbackRequest, UpdateOrganizationLimitsRequest,
-    UpdateOrganizationLimitsResponse, UpdateOrganizationMemberRequest,
-    UpdateOrganizationPriorityRequest, UpdateServiceRequest, UpsertAmlAllowlistEntryRequest,
+    AdminAmlReportResponse, AdminApiKeyResponse, AdminInvitationEmailResendResultResponse,
+    AdminModelListResponse, AdminModelWithPricing, AdminOrganizationMemberResponse,
+    AdminOrganizationResponse, AdminServiceResponse, AdminUserOrganizationDetails,
+    AdminUserResponse, BatchUpdateModelApiRequest, CreateAdminAccessTokenRequest,
+    CreateServiceRequest, CreditType, DecimalPrice, DecimalPriceRequest,
+    DeleteAdminAccessTokenRequest, DeleteModelRequest, DeprecateModelRequest,
+    DeprecateModelResponse, ErrorResponse, GetOrganizationConcurrentLimitResponse,
+    ListAdminAccessTokensResponse, ListAdminAmlAllowlistResponse, ListAdminAmlReportsResponse,
+    ListAdminApiKeysResponse, ListAdminInvitationEmailDeliveriesResponse,
+    ListAdminOrganizationMembersResponse, ListOrganizationsAdminResponse,
+    ListPricingChangesResponse, ListUsersResponse, MemberRole, ModelArchitecture,
+    ModelDeprecationConfirmResponse, ModelDeprecationPreviewResponse, ModelDeprecationRequest,
+    ModelHistoryEntry, ModelHistoryResponse, ModelMetadata, ModelWithPricing,
+    OrgLimitsHistoryEntry, OrgLimitsHistoryResponse, OrganizationFallbackResponse,
+    OrganizationMemberResponse, OrganizationPriorityResponse, OrganizationUsage,
+    PricingChangeBatchRequest, PricingChangeConfirmResponse, PricingChangeModelPreviewDto,
+    PricingChangePreviewResponse, PricingFieldUpdates, PricingFields, ScheduledPricingChangeDto,
+    SpendLimit, UpdateAmlReportStatusRequest, UpdateOrganizationConcurrentLimitRequest,
+    UpdateOrganizationConcurrentLimitResponse, UpdateOrganizationFallbackRequest,
+    UpdateOrganizationLimitsRequest, UpdateOrganizationLimitsResponse,
+    UpdateOrganizationMemberRequest, UpdateOrganizationPriorityRequest, UpdateServiceRequest,
+    UpsertAmlAllowlistEntryRequest,
 };
 use crate::routes::common::{analytics_error_response, format_amount};
 use crate::routes::usage::{compute_organization_balance_response, OrganizationBalanceResponse};
@@ -844,6 +845,12 @@ pub async fn batch_upsert_models(
                             .deprecation_date
                             .as_ref()
                             .map(|inner| inner.as_deref().and_then(parse_deprecation_date)),
+                        // Tri-state. The service layer checks that a set value
+                        // names an active model.
+                        successor_model_name: request
+                            .successor_model_id
+                            .as_ref()
+                            .map(|inner| inner.as_ref().map(|s| s.trim().to_string())),
                         // Tri-state passes straight through: outer None = leave
                         // unchanged, Some(None) = clear, Some(Some(v)) = set. The
                         // value was already shape-validated above.
@@ -871,6 +878,10 @@ pub async fn batch_upsert_models(
                 services::admin::AdminError::InvalidPricing(msg) => (
                     StatusCode::BAD_REQUEST,
                     ResponseJson(ErrorResponse::new(msg, "invalid_pricing".to_string())),
+                ),
+                services::admin::AdminError::InvalidDeprecation(msg) => (
+                    StatusCode::BAD_REQUEST,
+                    ResponseJson(ErrorResponse::new(msg, "invalid_request".to_string())),
                 ),
                 services::admin::AdminError::Unauthorized(msg) => (
                     StatusCode::UNAUTHORIZED,
@@ -1129,6 +1140,7 @@ pub async fn batch_upsert_models(
                     .deprecation_date
                     .as_ref()
                     .map(format_deprecation_date),
+                successor_model_id: updated_model.successor_model_name,
                 openrouter_slug: updated_model.openrouter_slug,
             },
         })
@@ -1235,6 +1247,7 @@ pub async fn list_models(
                 datacenters: crate::models::Datacenter::from_codes(model.datacenters),
                 is_ready: model.is_ready,
                 deprecation_date: model.deprecation_date.as_ref().map(format_deprecation_date),
+                successor_model_id: model.successor_model_name,
                 openrouter_slug: model.openrouter_slug,
             },
             is_active: model.is_active,
@@ -1373,6 +1386,7 @@ pub async fn get_model_history(
             datacenters: crate::models::Datacenter::from_codes(h.datacenters),
             is_ready: h.is_ready,
             deprecation_date: h.deprecation_date.as_ref().map(format_deprecation_date),
+            successor_model_id: h.successor_model_name,
             openrouter_slug: h.openrouter_slug,
             allow_free: h.allow_free,
         })
@@ -1918,6 +1932,7 @@ pub async fn deprecate_model(
             datacenters: crate::models::Datacenter::from_codes(m.datacenters),
             is_ready: m.is_ready,
             deprecation_date: m.deprecation_date.as_ref().map(format_deprecation_date),
+            successor_model_id: m.successor_model_name,
             openrouter_slug: m.openrouter_slug,
         },
     };
@@ -2401,7 +2416,8 @@ fn admin_error_to_response(
     match e {
         services::admin::AdminError::InvalidDeprecation(msg)
         | services::admin::AdminError::InvalidPricing(msg)
-        | services::admin::AdminError::InvalidLimits(msg) => (
+        | services::admin::AdminError::InvalidLimits(msg)
+        | services::admin::AdminError::InvalidParams(msg) => (
             StatusCode::BAD_REQUEST,
             ResponseJson(ErrorResponse::new(msg, "invalid_request".to_string())),
         ),
@@ -2678,6 +2694,101 @@ pub async fn list_organizations(
     };
 
     Ok(ResponseJson(response))
+}
+
+/// List API keys across all organizations (Admin only)
+///
+/// Returns key metadata for activation reporting, newest first, including revoked and
+/// inactive keys. Never returns key material (raw key, hash, or prefix) or key names.
+#[utoipa::path(
+    get,
+    path = "/v1/admin/api-keys",
+    tag = "Admin",
+    params(
+        ("limit" = Option<i64>, Query, description = "Maximum number of API keys to return (default: 100)"),
+        ("offset" = Option<i64>, Query, description = "Number of API keys to skip (default: 0)"),
+        ("organization_id" = Option<Uuid>, Query, description = "Filter by organization ID"),
+        ("created_after" = Option<DateTime<Utc>>, Query, description = "Only keys created at or after this timestamp"),
+        ("created_before" = Option<DateTime<Utc>>, Query, description = "Only keys created at or before this timestamp")
+    ),
+    responses(
+        (status = 200, description = "API keys retrieved successfully", body = ListAdminApiKeysResponse),
+        (status = 400, description = "Invalid request", body = ErrorResponse),
+        (status = 401, description = "Unauthorized", body = ErrorResponse),
+        (status = 500, description = "Internal server error", body = ErrorResponse)
+    ),
+    security(
+        ("session_token" = [])
+    )
+)]
+pub async fn list_api_keys(
+    State(app_state): State<AdminAppState>,
+    Extension(_admin_user): Extension<AdminUser>,
+    axum::extract::Query(params): axum::extract::Query<ListAdminApiKeysQueryParams>,
+) -> Result<ResponseJson<ListAdminApiKeysResponse>, (StatusCode, ResponseJson<ErrorResponse>)> {
+    crate::routes::common::validate_limit_offset(params.limit, params.offset)?;
+
+    debug!(
+        "List API keys request with limit={}, offset={}",
+        params.limit, params.offset
+    );
+
+    let filters = services::admin::AdminApiKeyFilters {
+        organization_id: params.organization_id,
+        created_after: params.created_after,
+        created_before: params.created_before,
+    };
+
+    let (api_keys, total) = app_state
+        .admin_service
+        .list_api_keys(filters, params.limit, params.offset)
+        .await
+        .map_err(|e| match e {
+            services::admin::AdminError::InvalidParams(msg) => (
+                StatusCode::BAD_REQUEST,
+                ResponseJson(ErrorResponse::new(msg, "invalid_request".to_string())),
+            ),
+            services::admin::AdminError::Unauthorized(msg) => (
+                StatusCode::UNAUTHORIZED,
+                ResponseJson(ErrorResponse::new(msg, "unauthorized".to_string())),
+            ),
+            _ => {
+                error!("Failed to list API keys: {:?}", e);
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    ResponseJson(ErrorResponse::new(
+                        "Failed to retrieve API keys".to_string(),
+                        "internal_server_error".to_string(),
+                    )),
+                )
+            }
+        })?;
+
+    let response = ListAdminApiKeysResponse {
+        api_keys: api_keys
+            .into_iter()
+            .map(admin_api_key_info_to_response)
+            .collect(),
+        total,
+        limit: params.limit,
+        offset: params.offset,
+    };
+
+    Ok(ResponseJson(response))
+}
+
+fn admin_api_key_info_to_response(key: services::admin::AdminApiKeyInfo) -> AdminApiKeyResponse {
+    AdminApiKeyResponse {
+        id: key.id.to_string(),
+        organization_id: key.organization_id.to_string(),
+        organization_name: key.organization_name,
+        workspace_id: key.workspace_id.to_string(),
+        created_by_user_id: key.created_by_user_id.to_string(),
+        created_at: key.created_at,
+        is_active: key.is_active,
+        deleted_at: key.deleted_at,
+        is_managed_playground: key.is_managed_playground,
+    }
 }
 
 /// Get an organization's scheduler priority (platform admins only).
@@ -3679,6 +3790,17 @@ pub struct ListOrganizationsQueryParams {
     pub limit: i64,
     #[serde(default)]
     pub offset: i64,
+}
+
+#[derive(Debug, serde::Deserialize)]
+pub struct ListAdminApiKeysQueryParams {
+    #[serde(default = "crate::routes::common::default_limit")]
+    pub limit: i64,
+    #[serde(default)]
+    pub offset: i64,
+    pub organization_id: Option<Uuid>,
+    pub created_after: Option<DateTime<Utc>>,
+    pub created_before: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug, serde::Deserialize)]

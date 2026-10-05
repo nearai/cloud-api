@@ -52,6 +52,11 @@ pub const METRIC_PROVIDER_REQUESTS: &str = "cloud_api.provider.requests";
 
 pub const METRIC_PROVIDER_ATTEMPTS: &str = "cloud_api.provider.attempts";
 pub const METRIC_BACKEND_KEY_DIVERGENCE: &str = "cloud_api.backend.key_divergence";
+// Attested backends: whether the certificate presented on the connection that
+// carried an attestation report matches the TLS fingerprint the report attests.
+// Tagged `model`, `path` (inline_verify|discovery) and `result`
+// (match|mismatch|unattested|missing).
+pub const METRIC_BACKEND_CHANNEL_BINDING: &str = "cloud_api.backend.channel_binding";
 
 // Error metrics
 pub const METRIC_REQUEST_ERRORS: &str = "cloud_api.request.errors";
@@ -78,9 +83,26 @@ pub const METRIC_BILLING_PRICING_FALLBACK: &str = "cloud_api.billing.pricing_fal
 pub const METRIC_PROVIDER_TOKEN_ANOMALIES: &str = "cloud_api.provider.token_anomalies";
 pub const METRIC_PROVIDER_ZERO_TOKENS: &str = "cloud_api.provider.zero_tokens";
 
+// Smart placement metrics. Emitted from `inference_providers` (which cannot
+// depend on this crate), so the names are defined once there and re-exported.
+pub use inference_providers::placement_io::{
+    METRIC_AFFINITY as METRIC_PLACEMENT_AFFINITY,
+    METRIC_CHOSEN_BACKLOG as METRIC_PLACEMENT_CHOSEN_BACKLOG,
+    METRIC_DECISIONS as METRIC_PLACEMENT_DECISIONS, METRIC_EXCLUDED as METRIC_PLACEMENT_EXCLUDED,
+    METRIC_FRAMES_REJECTED as METRIC_PLACEMENT_FRAMES_REJECTED,
+    METRIC_PINS_MALFORMED as METRIC_PLACEMENT_PINS_MALFORMED,
+    METRIC_READ_ERRORS as METRIC_PLACEMENT_READ_ERRORS,
+    METRIC_SNAPSHOT_AGE_MS as METRIC_PLACEMENT_SNAPSHOT_AGE_MS,
+    METRIC_WRITES_DROPPED as METRIC_PLACEMENT_WRITES_DROPPED,
+    METRIC_WRITE_ERRORS as METRIC_PLACEMENT_WRITE_ERRORS,
+};
+
 // HTTP metrics
 pub const METRIC_HTTP_REQUESTS: &str = "cloud_api.http.requests";
 pub const METRIC_HTTP_DURATION: &str = "cloud_api.http.duration";
+
+// Usage aggregate freshness: seconds from the oldest raw hour not yet in usage_hourly to the tick.
+pub const METRIC_USAGE_HOURLY_LAG_SECONDS: &str = "cloud_api.usage_hourly.lag_seconds";
 
 // Low-cardinality tags only (NO org/workspace/api_key - those go to database analytics)
 pub const TAG_MODEL: &str = "model";

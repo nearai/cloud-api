@@ -348,6 +348,7 @@ mod tests {
             _workspace_id: Uuid,
             _api_key_id: Uuid,
             _request: RecordUsageApiRequest,
+            _discount: Option<services::usage::UsageDiscount>,
         ) -> Result<UsageLogEntry, UsageError> {
             unimplemented!()
         }
@@ -394,6 +395,7 @@ mod tests {
         async fn get_usage_history_by_api_key(
             &self,
             _api_key_id: Uuid,
+            _credit_type: Option<&str>,
             _limit: Option<i64>,
             _offset: Option<i64>,
         ) -> Result<(Vec<UsageLogEntry>, i64), UsageError> {
@@ -405,6 +407,7 @@ mod tests {
             _workspace_id: Uuid,
             _api_key_id: Uuid,
             _user_id: Uuid,
+            _credit_type: Option<&str>,
             _limit: Option<i64>,
             _offset: Option<i64>,
         ) -> Result<(Vec<UsageLogEntry>, i64), UsageError> {

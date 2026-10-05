@@ -348,6 +348,69 @@ impl AdminService for AdminServiceImpl {
             Self::validate_model_request(model_name, request, Arc::clone(&self.repository)).await?;
         }
 
+        // A successor is announced to API users as the migration target for a
+        // model with a planned deprecation. So the model must have (or get) a
+        // planned date, and the successor must be a different model that is
+        // active once this request has been applied.
+        let mut active_successors = std::collections::HashSet::new();
+        for (model_name, request) in &models {
+            let Some(Some(successor)) = &request.successor_model_name else {
+                continue;
+            };
+            if successor.is_empty() || successor == model_name {
+                return Err(AdminError::InvalidDeprecation(format!(
+                    "model '{model_name}': successorModelId must name a different model"
+                )));
+            }
+
+            let has_planned_date = match request.deprecation_date {
+                Some(date) => date.is_some(),
+                None => self
+                    .repository
+                    .get_model_validation_state(model_name)
+                    .await
+                    .map_err(|e| AdminError::InternalError(e.to_string()))?
+                    .is_some_and(|existing| existing.deprecation_date.is_some()),
+            };
+            if !has_planned_date {
+                return Err(AdminError::InvalidDeprecation(format!(
+                    "model '{model_name}': successorModelId requires a planned deprecationDate"
+                )));
+            }
+
+            if active_successors.contains(successor) {
+                continue;
+            }
+            let in_batch = models.get(successor);
+            let active = match in_batch.and_then(|entry| entry.is_active) {
+                // This request decides the successor's active state.
+                Some(active) => active,
+                None => {
+                    let active_now = self
+                        .repository
+                        .get_active_model_for_deprecation(successor)
+                        .await
+                        .map_err(|e| AdminError::InternalError(e.to_string()))?
+                        .is_some();
+                    // A model this request creates is active by default.
+                    active_now
+                        || (in_batch.is_some()
+                            && self
+                                .repository
+                                .get_model_validation_state(successor)
+                                .await
+                                .map_err(|e| AdminError::InternalError(e.to_string()))?
+                                .is_none())
+                }
+            };
+            if !active {
+                return Err(AdminError::InvalidDeprecation(format!(
+                    "model '{model_name}': successorModelId '{successor}' is not an active model"
+                )));
+            }
+            active_successors.insert(successor);
+        }
+
         // Upsert all models. Each row is committed independently, so we
         // invalidate the public `/v1/model/list` cache after EACH successful
         // write rather than only at the end of the loop. If a later row fails
@@ -638,6 +701,7 @@ impl AdminService for AdminServiceImpl {
             datacenters: None,
             is_ready: None,
             deprecation_date: Some(Some(deprecation_date)),
+            successor_model_name: Some(Some(successor.model_name.clone())),
             openrouter_slug: None,
             change_reason: change_reason.or_else(|| {
                 Some(format!(
@@ -1297,35 +1361,62 @@ impl AdminServiceImpl {
         // and cache_read.  A model with non-zero cost on any field is treated
         // as priced and is not blocked.
         let existing = repository
-            .get_model_costs(model_name)
+            .get_model_validation_state(model_name)
             .await
             .map_err(|e| AdminError::InternalError(e.to_string()))?;
 
         let is_new_model = existing.is_none();
 
         // Evaluate whether this request will result in an active model.
-        let (
-            existing_input,
-            existing_output,
-            existing_image,
-            existing_cache_read,
-            existing_allow_free,
-        ) = existing.unwrap_or((0, 0, 0, None, false));
+        let existing = existing.unwrap_or(ModelValidationState {
+            input_cost_per_token: 0,
+            output_cost_per_token: 0,
+            cost_per_image: 0,
+            cache_read_cost_per_token: None,
+            allow_free: false,
+            provider_type: "vllm".to_string(),
+            provider_config: None,
+            deprecation_date: None,
+        });
+
+        let effective_provider_type = request
+            .provider_type
+            .as_deref()
+            .unwrap_or(&existing.provider_type);
+        if effective_provider_type == "external" {
+            let config = request
+                .provider_config
+                .as_ref()
+                .or(existing.provider_config.as_ref())
+                .ok_or_else(|| {
+                    AdminError::InvalidPricing(format!(
+                        "model '{model_name}': external models require providerConfig"
+                    ))
+                })?;
+            inference_providers::non_attested::external::validate_external_provider_config(config)
+                .map_err(|error| {
+                    AdminError::InvalidPricing(format!("model '{model_name}': {error}"))
+                })?;
+        }
 
         let effective_is_active = request.is_active.unwrap_or(is_new_model);
 
         if effective_is_active {
-            let effective_input = request.input_cost_per_token.unwrap_or(existing_input);
-            let effective_output = request.output_cost_per_token.unwrap_or(existing_output);
-            let effective_image = request.cost_per_image.unwrap_or(existing_image);
+            let effective_input = request
+                .input_cost_per_token
+                .unwrap_or(existing.input_cost_per_token);
+            let effective_output = request
+                .output_cost_per_token
+                .unwrap_or(existing.output_cost_per_token);
+            let effective_image = request.cost_per_image.unwrap_or(existing.cost_per_image);
             // Tri-state: absent = keep existing, explicit null = disabled (None),
             // value = that value. Disabled (None) and an explicit free price
             // (Some(0)) both contribute no revenue, so neither counts as
             // "priced" for the activation gate.
             let effective_cache_read = request
                 .cache_read_cost_per_token
-                .unwrap_or(existing_cache_read);
-            let effective_allow_free = request.allow_free.unwrap_or(existing_allow_free);
+                .unwrap_or(existing.cache_read_cost_per_token);
+            let effective_allow_free = request.allow_free.unwrap_or(existing.allow_free);
 
             if effective_input == 0
                 && effective_output == 0

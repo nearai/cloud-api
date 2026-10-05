@@ -1,22 +1,41 @@
 use crate::models::{OrganizationLimitsHistory, UpdateOrganizationLimitsDbRequest};
 use crate::pool::DbPool;
-use crate::repositories::statement_cache::CachedStatements;
+use crate::repositories::credit_allocation::{settle_unfunded_usage, CreditAllocationPolicy};
 use crate::repositories::utils::map_db_error;
 use crate::retry_db;
 use anyhow::{Context, Result};
 use chrono::Utc;
 use services::common::RepositoryError;
+use tokio_postgres::types::Type;
 use tokio_postgres::Row;
 use uuid::Uuid;
 
 #[derive(Debug, Clone)]
 pub struct OrganizationLimitsRepository {
     pool: DbPool,
+    allocation_policy: CreditAllocationPolicy,
+}
+
+#[derive(Debug, Clone)]
+pub struct CurrentCreditStatus {
+    pub limit: OrganizationLimitsHistory,
+    pub consumed: i64,
+    pub available: i64,
 }
 
 impl OrganizationLimitsRepository {
     pub fn new(pool: DbPool) -> Self {
-        Self { pool }
+        Self {
+            pool,
+            allocation_policy: CreditAllocationPolicy::default(),
+        }
+    }
+
+    pub fn with_accounting_config(pool: DbPool, config: &config::CreditAllocationConfig) -> Self {
+        Self {
+            pool,
+            allocation_policy: CreditAllocationPolicy::from(config),
+        }
     }
 
     /// Update organization limits - closes previous active limit of the same type and creates new one
@@ -38,7 +57,7 @@ impl OrganizationLimitsRepository {
             // Check if organization exists
             let org_exists = transaction
                 .query_opt(
-                    "SELECT 1 FROM organizations WHERE id = $1 AND is_active = true",
+                    "SELECT 1 FROM organizations WHERE id = $1 AND is_active = true FOR UPDATE",
                     &[&organization_id],
                 )
                 .await
@@ -101,6 +120,8 @@ impl OrganizationLimitsRepository {
                 .await
                 .map_err(map_db_error)?;
 
+            settle_unfunded_usage(&transaction, organization_id, &self.allocation_policy).await?;
+
             transaction.commit().await.map_err(map_db_error)?;
 
             Ok::<tokio_postgres::Row, RepositoryError>(row)
@@ -123,7 +144,7 @@ impl OrganizationLimitsRepository {
                 .map_err(RepositoryError::PoolError)?;
 
             client
-                .cached_query(
+                .query(
                     r#"
                     SELECT id, organization_id, spend_limit, credit_type, source, currency,
                            effective_from, effective_until,
@@ -143,6 +164,71 @@ impl OrganizationLimitsRepository {
             .map(|row| self.row_to_limits_history(row))
             .collect();
         Ok(limits)
+    }
+
+    /// Return active type ceilings with lifetime attributed consumption, plus
+    /// unresolved overage. Consumption intentionally survives limit-row
+    /// replacement so raising a cumulative ceiling adds only new capacity.
+    pub async fn get_current_credit_status(
+        &self,
+        organization_id: Uuid,
+    ) -> Result<(Vec<CurrentCreditStatus>, i64, i64)> {
+        // One statement, one snapshot: a single statement reads a consistent
+        // view on its own, so no transaction is needed. (The org `FOR UPDATE`
+        // lock only keeps consumption and balance moving together in one
+        // commit; the snapshot guarantee does not depend on it.) With no
+        // active limit rows the result is empty (callers treat that as "no
+        // limits").
+        let rows = retry_db!("get_current_credit_status", {
+            let client = self
+                .pool
+                .get()
+                .await
+                .context("Failed to get database connection")
+                .map_err(RepositoryError::PoolError)?;
+            client
+                .query_typed(
+                    r#"
+                SELECT olh.id, olh.organization_id, olh.spend_limit, olh.credit_type,
+                       olh.source, olh.currency, olh.effective_from, olh.effective_until,
+                       olh.changed_by, olh.change_reason, olh.changed_by_user_id,
+                       olh.changed_by_user_email, olh.created_at,
+                       COALESCE(consumed.amount, 0)::BIGINT AS consumed,
+                       COALESCE(balance.unresolved_unfunded_amount, 0)::BIGINT AS unfunded,
+                       COALESCE(balance.legacy_unattributed_amount, 0)::BIGINT AS unattributed
+                FROM organization_limits_history olh
+                LEFT JOIN organization_credit_consumption consumed
+                  ON consumed.organization_id = olh.organization_id
+                 AND consumed.credit_type = olh.credit_type
+                LEFT JOIN organization_balance balance
+                  ON balance.organization_id = olh.organization_id
+                WHERE olh.organization_id = $1 AND olh.effective_until IS NULL
+                ORDER BY olh.credit_type, olh.effective_from DESC
+                "#,
+                    &[(&organization_id, Type::UUID)],
+                )
+                .await
+                .map_err(map_db_error)
+        })?;
+        let (unfunded, unattributed) = rows.first().map_or((0, 0), |row| {
+            (
+                row.get::<_, i64>("unfunded"),
+                row.get::<_, i64>("unattributed"),
+            )
+        });
+        let statuses = rows
+            .iter()
+            .map(|row| {
+                let limit = self.row_to_limits_history(row);
+                let consumed = row.get::<_, i64>("consumed");
+                CurrentCreditStatus {
+                    available: limit.spend_limit.saturating_sub(consumed).max(0),
+                    limit,
+                    consumed,
+                }
+            })
+            .collect();
+        Ok((statuses, unfunded, unattributed))
     }
 
     /// Count limits history for an organization

@@ -32,7 +32,12 @@ pub mod e2ee_stream;
 pub mod evidence;
 pub mod measurements;
 pub mod report_data;
+#[cfg(test)]
+mod report_tests;
 pub mod verifier_port;
+
+#[cfg(test)]
+mod routing_tests;
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -44,6 +49,7 @@ use serde_json::{json, Value};
 
 use self::client::{ChutesClient, ChutesClientError, InvokeMode, InvokeRequest};
 use self::verifier_port::ChutesInstanceVerifier;
+use crate::attested::nearai::placement_headers as ph;
 use crate::{
     AttestationError, AudioTranscriptionError, AudioTranscriptionParams,
     AudioTranscriptionResponse, ChatCompletionParams, ChatCompletionResponse,
@@ -204,6 +210,14 @@ struct CachedInstances {
     expires_at: std::time::Instant,
 }
 
+/// Base64 keys are case-sensitive. Match the same trimmed discovery value that
+/// is bound by attestation and used for encapsulation, including on retries.
+fn is_candidate(instance: &client::E2eInstance, model_pub_key: Option<&str>) -> bool {
+    !instance.e2e_pubkey.trim().is_empty()
+        && !instance.nonces.is_empty()
+        && model_pub_key.is_none_or(|key| instance.e2e_pubkey.trim() == key)
+}
+
 impl CachedInstances {
     /// An empty, already-expired entry: its first use triggers a refresh (the
     /// `or_insert_with` seed for a chute we haven't discovered yet).
@@ -295,7 +309,7 @@ impl Provider {
 
     /// Return a fresh-enough `/e2e/instances` snapshot for `chute_id`, refreshing
     /// via a real discovery call only when the cached entry is expired or carries
-    /// no usable (E2E-capable + nonce-bearing) instance.
+    /// no usable (E2E-capable + nonce-bearing) instance matching the requested key.
     ///
     /// SINGLE-FLIGHT PER CHUTE: the per-chute `tokio::sync::Mutex` is held across
     /// the refresh, so concurrent requests for the SAME chute wait and then observe
@@ -307,13 +321,14 @@ impl Provider {
     async fn discover_cached(
         &self,
         chute_id: &str,
+        model_pub_key: Option<&str>,
     ) -> Result<Vec<client::E2eInstance>, CompletionError> {
         let cell = self.chute_cache(chute_id);
         let mut guard = cell.lock().await;
         let usable = guard
             .instances
             .iter()
-            .any(|i| !i.e2e_pubkey.is_empty() && !i.nonces.is_empty());
+            .any(|i| is_candidate(i, model_pub_key));
         if guard.expires_at <= std::time::Instant::now() || !usable {
             let fresh = self
                 .client
@@ -342,16 +357,21 @@ impl Provider {
     /// Atomically consume one single-use nonce token for `instance_id` from the
     /// cached snapshot (the point that PREVENTS reuse: a popped token is gone from
     /// the cache, so no concurrent request can hand out the same one). Returns
-    /// `None` if the instance is no longer present or its pool is already drained —
+    /// `None` if the instance/key is no longer present or its pool is already drained —
     /// the caller then moves to the next candidate (and a fully drained chute
     /// refreshes on the next [`Self::discover_cached`]).
-    async fn take_nonce(&self, chute_id: &str, instance_id: &str) -> Option<String> {
+    async fn take_nonce(
+        &self,
+        chute_id: &str,
+        instance_id: &str,
+        e2e_pubkey: &str,
+    ) -> Option<String> {
         let cell = self.chute_cache(chute_id);
         let mut guard = cell.lock().await;
         let inst = guard
             .instances
             .iter_mut()
-            .find(|i| i.instance_id == instance_id)?;
+            .find(|i| i.instance_id == instance_id && i.e2e_pubkey.trim() == e2e_pubkey)?;
         inst.nonces.pop()
     }
 
@@ -426,6 +446,7 @@ impl Provider {
     async fn verify_and_prepare(
         &self,
         request_json: &Value,
+        model_pub_key: Option<&str>,
     ) -> Result<PreparedInvoke, CompletionError> {
         // Cached: the model→chute_id mapping is static, so resolve once. A
         // `/v1/models` rate-limit 429 here is preserved as retryable too.
@@ -438,14 +459,20 @@ impl Provider {
         // ~50 requests per discovery call (single-flight per chute), cutting the
         // call rate that self-inflicts the 429s. `instances` is an OWNED snapshot;
         // nonces are consumed later via `take_nonce` (the single-use atomic point).
-        let instances = self.discover_cached(&chute_id).await?;
+        let instances = self.discover_cached(&chute_id, model_pub_key).await?;
 
         // Candidate instances: live + E2E-capable + with at least one nonce token.
         let candidates: Vec<&client::E2eInstance> = instances
             .iter()
-            .filter(|i| !i.e2e_pubkey.is_empty() && !i.nonces.is_empty())
+            .filter(|i| is_candidate(i, model_pub_key))
             .collect();
         if candidates.is_empty() {
+            if model_pub_key.is_some() {
+                return Err(CompletionError::NoPubKeyProvider(
+                    "No available Chutes instance matches the requested model and public key"
+                        .to_string(),
+                ));
+            }
             return Err(availability::retryable_provider_unavailable(
                 "discover instances",
                 "no E2E-capable instance with an available nonce token",
@@ -527,10 +554,16 @@ impl Provider {
             // snapshot and here just moves us to the next candidate; if every
             // candidate's pool is drained the request fails (retryable), and the
             // next request's `discover_cached` refreshes the now-empty chute.
-            let nonce = match self.take_nonce(&chute_id, &inst.instance_id).await {
+            let nonce = match self
+                .take_nonce(&chute_id, &inst.instance_id, e2e_pubkey)
+                .await
+            {
                 Some(n) => n,
                 None => {
-                    last_err = format!("instance {} nonce pool drained", inst.instance_id);
+                    last_err = format!(
+                        "instance {} nonce pool drained or key changed",
+                        inst.instance_id
+                    );
                     last_err_retryable = true;
                     continue;
                 }
@@ -1339,6 +1372,9 @@ fn request_body(model: &str, params: &ChatCompletionParams, stream: bool) -> Res
         for k in INTERNAL_KEYS {
             obj.remove(*k);
         }
+        for k in ph::LEGACY_DENIED_EXTRA_KEYS {
+            obj.remove(k);
+        }
     } else {
         return Err("chat params did not serialize to a JSON object".to_string());
     }
@@ -1397,7 +1433,11 @@ impl InferenceProvider for Provider {
         crate::strip_cache_control(&mut params.messages);
         let body = request_body(&self.model_name, &params, false)
             .map_err(CompletionError::CompletionError)?;
-        let prep = self.verify_and_prepare(&body).await?;
+        let model_pub_key = params
+            .extra
+            .get(crate::attested::nearai::encryption_headers::MODEL_PUB_KEY)
+            .and_then(Value::as_str);
+        let prep = self.verify_and_prepare(&body, model_pub_key).await?;
 
         let resp_blob = self
             .client
@@ -1497,7 +1537,11 @@ impl InferenceProvider for Provider {
         });
         let body = request_body(&self.model_name, &params, true)
             .map_err(CompletionError::CompletionError)?;
-        let prep = self.verify_and_prepare(&body).await?;
+        let model_pub_key = params
+            .extra
+            .get(crate::attested::nearai::encryption_headers::MODEL_PUB_KEY)
+            .and_then(Value::as_str);
+        let prep = self.verify_and_prepare(&body, model_pub_key).await?;
 
         let resp = self
             .client
@@ -1674,7 +1718,8 @@ impl InferenceProvider for Provider {
             };
 
             // A self-describing, independently re-verifiable report: the verdict
-            // plus the raw quote + cert so a client can recompute the bindings.
+            // plus the raw quote, cert, and all GPU evidence from this same
+            // verified instance and evidence request.
             let mut m = serde_json::Map::new();
             m.insert("provider".to_string(), json!("chutes"));
             m.insert("verified".to_string(), json!(true));
@@ -1687,6 +1732,7 @@ impl InferenceProvider for Provider {
             );
             m.insert("tcb_status".to_string(), json!(info.tcb_status));
             m.insert("gpu_verdict".to_string(), json!(info.gpu_verdict));
+            m.insert("gpu_evidence".to_string(), json!(evidence.gpu_evidence));
             m.insert("e2e_pubkey".to_string(), json!(info.e2e_pubkey));
             m.insert("nonce".to_string(), json!(boot_nonce));
             m.insert("quote_b64".to_string(), json!(evidence.quote));
@@ -1737,6 +1783,10 @@ impl InferenceProvider for Provider {
     /// through to that hard rejection.
     fn supports_client_e2ee(&self) -> bool {
         false
+    }
+
+    fn supports_per_request_pubkey_routing(&self, public_key: &str) -> bool {
+        e2ee::is_encoded_public_key(public_key)
     }
 
     async fn get_signature(
@@ -2022,16 +2072,16 @@ mod tests {
         // The cell really is the consumption point: seed it and consume via take_nonce.
         *a1.lock().await = cached(&[("i1", &["only-token"])]);
         assert_eq!(
-            p.take_nonce("chute-A", "i1").await.as_deref(),
+            p.take_nonce("chute-A", "i1", "cGs=").await.as_deref(),
             Some("only-token"),
             "take_nonce consumes from the shared cell"
         );
         assert!(
-            p.take_nonce("chute-A", "i1").await.is_none(),
+            p.take_nonce("chute-A", "i1", "cGs=").await.is_none(),
             "second take on a 1-token pool drains it → None (no reuse)"
         );
         assert!(
-            p.take_nonce("chute-A", "absent").await.is_none(),
+            p.take_nonce("chute-A", "absent", "cGs=").await.is_none(),
             "missing instance → None"
         );
     }
@@ -2834,20 +2884,14 @@ mod tests {
 
     #[test]
     fn request_body_strips_internal_and_e2ee_keys() {
-        use crate::attested::nearai::{encryption_headers as eh, tracing_headers as th};
         let mut params: ChatCompletionParams =
             serde_json::from_value(json!({"model": "m", "messages": []})).unwrap();
-        // Internal identifiers + client-E2EE markers must never reach Chutes.
-        for k in [
-            th::REQUEST_ID,
-            th::ORG_ID,
-            th::WORKSPACE_ID,
-            eh::SIGNING_ALGO,
-            eh::CLIENT_PUB_KEY,
-            eh::MODEL_PUB_KEY,
-            eh::ENCRYPTION_VERSION,
-            eh::ENCRYPT_ALL_FIELDS,
-        ] {
+        // Internal identifiers, client-E2EE markers, and placement affinity
+        // keys must never reach Chutes.
+        for k in INTERNAL_KEYS {
+            params.extra.insert((*k).to_string(), json!("leak"));
+        }
+        for k in ph::LEGACY_DENIED_EXTRA_KEYS {
             params.extra.insert(k.to_string(), json!("leak"));
         }
         let body = request_body("m", &params, false).unwrap();
@@ -2856,6 +2900,12 @@ mod tests {
             assert!(
                 !obj.contains_key(*k),
                 "internal key {k} must not reach Chutes in the request body"
+            );
+        }
+        for k in ph::LEGACY_DENIED_EXTRA_KEYS {
+            assert!(
+                !obj.contains_key(k),
+                "legacy placement key {k} must not reach Chutes in the request body"
             );
         }
     }

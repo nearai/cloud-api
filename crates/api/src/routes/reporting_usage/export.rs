@@ -35,6 +35,7 @@ pub use super::export_sources::ReportingUsageExportState;
         ("model" = Option<String>, Query, description = "Filter inference rows by model name."),
         ("inference_type" = Option<String>, Query, description = "Filter inference rows by inference type."),
         ("service_name" = Option<String>, Query, description = "Filter service rows by platform service name."),
+        ("credit_type" = Option<String>, Query, description = "Filter costs by their saved grant, postpay, staking_farm, or payment allocation."),
         ("limit" = Option<u16>, Query, description = "Maximum rows to return. Defaults to 100 and must not exceed 1000."),
         ("cursor" = Option<String>, Query, description = "Opaque cursor returned by the previous export page.")
     ),

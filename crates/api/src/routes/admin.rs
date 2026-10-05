@@ -5,28 +5,30 @@ use crate::conversions::{
 };
 use crate::middleware::AdminUser;
 use crate::models::{
-    AdminAccessTokenResponse, AdminAmlAllowlistEntryResponse, AdminAmlReportResponse,
-    AdminInvitationEmailResendResultResponse, AdminModelListResponse, AdminModelWithPricing,
-    AdminOrganizationMemberResponse, AdminOrganizationResponse, AdminServiceResponse,
-    AdminUserOrganizationDetails, AdminUserResponse, BatchUpdateModelApiRequest,
-    CreateAdminAccessTokenRequest, CreateServiceRequest, CreditType, DecimalPrice,
-    DecimalPriceRequest, DeleteAdminAccessTokenRequest, DeleteModelRequest, DeprecateModelRequest,
-    DeprecateModelResponse, ErrorResponse, GetOrganizationConcurrentLimitResponse,
+    AdminAccessTokenPermission, AdminAccessTokenResponse, AdminAmlAllowlistEntryResponse,
+    AdminAmlReportResponse, AdminInvitationEmailResendResultResponse, AdminModelListResponse,
+    AdminModelWithPricing, AdminOrganizationMemberResponse, AdminOrganizationResponse,
+    AdminServiceResponse, AdminUserOrganizationDetails, AdminUserResponse,
+    BatchUpdateModelApiRequest, CreateAdminAccessTokenRequest, CreateServiceRequest, CreditType,
+    DecimalPrice, DecimalPriceRequest, DeleteAdminAccessTokenRequest, DeleteModelRequest,
+    DeprecateModelRequest, DeprecateModelResponse, ErrorResponse,
+    GetOrganizationConcurrentLimitResponse, ListAdminAccessTokensResponse,
     ListAdminAmlAllowlistResponse, ListAdminAmlReportsResponse,
     ListAdminInvitationEmailDeliveriesResponse, ListAdminOrganizationMembersResponse,
     ListOrganizationsAdminResponse, ListPricingChangesResponse, ListUsersResponse, MemberRole,
     ModelArchitecture, ModelDeprecationConfirmResponse, ModelDeprecationPreviewResponse,
     ModelDeprecationRequest, ModelHistoryEntry, ModelHistoryResponse, ModelMetadata,
     ModelWithPricing, OrgLimitsHistoryEntry, OrgLimitsHistoryResponse,
-    OrganizationFallbackResponse, OrganizationMemberResponse, OrganizationUsage,
-    PricingChangeBatchRequest, PricingChangeConfirmResponse, PricingChangeModelPreviewDto,
-    PricingChangePreviewResponse, PricingFieldUpdates, PricingFields, ScheduledPricingChangeDto,
-    SpendLimit, UpdateAmlReportStatusRequest, UpdateOrganizationConcurrentLimitRequest,
-    UpdateOrganizationConcurrentLimitResponse, UpdateOrganizationFallbackRequest,
-    UpdateOrganizationLimitsRequest, UpdateOrganizationLimitsResponse,
-    UpdateOrganizationMemberRequest, UpdateServiceRequest, UpsertAmlAllowlistEntryRequest,
+    OrganizationFallbackResponse, OrganizationMemberResponse, OrganizationPriorityResponse,
+    OrganizationUsage, PricingChangeBatchRequest, PricingChangeConfirmResponse,
+    PricingChangeModelPreviewDto, PricingChangePreviewResponse, PricingFieldUpdates, PricingFields,
+    ScheduledPricingChangeDto, SpendLimit, UpdateAmlReportStatusRequest,
+    UpdateOrganizationConcurrentLimitRequest, UpdateOrganizationConcurrentLimitResponse,
+    UpdateOrganizationFallbackRequest, UpdateOrganizationLimitsRequest,
+    UpdateOrganizationLimitsResponse, UpdateOrganizationMemberRequest,
+    UpdateOrganizationPriorityRequest, UpdateServiceRequest, UpsertAmlAllowlistEntryRequest,
 };
-use crate::routes::common::format_amount;
+use crate::routes::common::{analytics_error_response, format_amount};
 use crate::routes::usage::{compute_organization_balance_response, OrganizationBalanceResponse};
 use axum::{
     extract::{Json, Path, Query, State},
@@ -35,7 +37,7 @@ use axum::{
     response::Json as ResponseJson,
     Extension,
 };
-use chrono::{DateTime, Duration, Timelike, Utc};
+use chrono::{DateTime, Timelike, Utc};
 use config::ApiConfig;
 use services::admin::{AdminService, AnalyticsService, UpdateModelAdminRequest};
 use services::aml::{AmlAllowlistEntry, AmlError, AmlReport};
@@ -192,6 +194,7 @@ pub struct AdminAppState {
     pub inference_provider_pool: Arc<services::inference_provider_pool::InferenceProviderPool>,
     pub github_dispatcher: Arc<dyn GitHubDispatcher>,
     pub infra_service: Arc<services::admin::InfraService>,
+    pub admin_settings_service: Arc<services::admin_settings::AdminSettingsService>,
 }
 
 /// Small helper for 400 responses from analytics query-param validation.
@@ -547,6 +550,29 @@ pub async fn batch_upsert_models(
 
     // Validate all pricing fields are non-negative to prevent incorrect billing
     for (model_name, request) in &batch_request {
+        if let Some(config) = &request.provider_config {
+            // Backend-less configs belong to non-external features such as
+            // long-context routing. The service layer repeats this validation
+            // against the merged stored provider type, which covers partial
+            // updates that omit `providerType`.
+            if request.provider_type.as_deref() == Some("external")
+                || config.get("backend").is_some()
+                || config.get("enforced_request_body").is_some()
+            {
+                inference_providers::non_attested::external::validate_external_provider_config(
+                    config,
+                )
+                .map_err(|error| {
+                    (
+                        StatusCode::BAD_REQUEST,
+                        ResponseJson(ErrorResponse::new(
+                            format!("model '{model_name}': {error}"),
+                            "invalid_request".to_string(),
+                        )),
+                    )
+                })?;
+            }
+        }
         let validate_price = |price: &Option<DecimalPriceRequest>, field: &str| {
             if let Some(p) = price {
                 p.validate().map_err(|e| {
@@ -818,6 +844,12 @@ pub async fn batch_upsert_models(
                             .deprecation_date
                             .as_ref()
                             .map(|inner| inner.as_deref().and_then(parse_deprecation_date)),
+                        // Tri-state. The service layer checks that a set value
+                        // names an active model.
+                        successor_model_name: request
+                            .successor_model_id
+                            .as_ref()
+                            .map(|inner| inner.as_ref().map(|s| s.trim().to_string())),
                         // Tri-state passes straight through: outer None = leave
                         // unchanged, Some(None) = clear, Some(Some(v)) = set. The
                         // value was already shape-validated above.
@@ -846,6 +878,10 @@ pub async fn batch_upsert_models(
                     StatusCode::BAD_REQUEST,
                     ResponseJson(ErrorResponse::new(msg, "invalid_pricing".to_string())),
                 ),
+                services::admin::AdminError::InvalidDeprecation(msg) => (
+                    StatusCode::BAD_REQUEST,
+                    ResponseJson(ErrorResponse::new(msg, "invalid_request".to_string())),
+                ),
                 services::admin::AdminError::Unauthorized(msg) => (
                     StatusCode::UNAUTHORIZED,
                     ResponseJson(ErrorResponse::new(msg, "unauthorized".to_string())),
@@ -872,6 +908,20 @@ pub async fn batch_upsert_models(
                 &model.provider_type,
                 model.inference_url.is_some(),
             );
+    }
+
+    if batch_request.values().any(|request| {
+        request.provider_type.is_some()
+            || request.provider_config.is_some()
+            || request.inference_url.is_some()
+            || request.is_active.is_some()
+    }) {
+        // The database write is complete. Prevent an older periodic snapshot
+        // from replacing or removing the provider state reconciled below.
+        app_state
+            .inference_provider_pool
+            .invalidate_periodic_provider_refreshes()
+            .await;
     }
 
     // Update providers at runtime so changes take effect without server restart.
@@ -968,11 +1018,12 @@ pub async fn batch_upsert_models(
     let external_models: Vec<(String, serde_json::Value)> = batch_request
         .iter()
         .filter_map(|(model_name, request)| {
-            let is_external = request.provider_type.as_deref() == Some("external");
-            let is_active = request.is_active != Some(false);
-
-            if is_external && is_active {
-                request
+            let merged = updated_models.get(model_name)?;
+            let touches_registration = request.provider_type.is_some()
+                || request.provider_config.is_some()
+                || request.is_active.is_some();
+            if merged.provider_type == "external" && merged.is_active && touches_registration {
+                merged
                     .provider_config
                     .clone()
                     .map(|config| (model_name.clone(), config))
@@ -1088,6 +1139,7 @@ pub async fn batch_upsert_models(
                     .deprecation_date
                     .as_ref()
                     .map(format_deprecation_date),
+                successor_model_id: updated_model.successor_model_name,
                 openrouter_slug: updated_model.openrouter_slug,
             },
         })
@@ -1194,6 +1246,7 @@ pub async fn list_models(
                 datacenters: crate::models::Datacenter::from_codes(model.datacenters),
                 is_ready: model.is_ready,
                 deprecation_date: model.deprecation_date.as_ref().map(format_deprecation_date),
+                successor_model_id: model.successor_model_name,
                 openrouter_slug: model.openrouter_slug,
             },
             is_active: model.is_active,
@@ -1332,6 +1385,7 @@ pub async fn get_model_history(
             datacenters: crate::models::Datacenter::from_codes(h.datacenters),
             is_ready: h.is_ready,
             deprecation_date: h.deprecation_date.as_ref().map(format_deprecation_date),
+            successor_model_id: h.successor_model_name,
             openrouter_slug: h.openrouter_slug,
             allow_free: h.allow_free,
         })
@@ -1877,6 +1931,7 @@ pub async fn deprecate_model(
             datacenters: crate::models::Datacenter::from_codes(m.datacenters),
             is_ready: m.is_ready,
             deprecation_date: m.deprecation_date.as_ref().map(format_deprecation_date),
+            successor_model_id: m.successor_model_name,
             openrouter_slug: m.openrouter_slug,
         },
     };
@@ -2379,6 +2434,9 @@ fn admin_error_to_response(
             StatusCode::UNAUTHORIZED,
             ResponseJson(ErrorResponse::new(msg, "unauthorized".to_string())),
         ),
+        err @ services::admin::AdminError::Timeout => {
+            analytics_error_response(err, "Admin operation failed", true)
+        }
         services::admin::AdminError::InternalError(msg) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             ResponseJson(ErrorResponse::new(
@@ -2634,6 +2692,74 @@ pub async fn list_organizations(
     };
 
     Ok(ResponseJson(response))
+}
+
+/// Get an organization's scheduler priority (platform admins only).
+#[utoipa::path(
+    get,
+    path = "/v1/admin/organizations/{org_id}/priority",
+    tag = "Admin",
+    params(("org_id" = Uuid, Path, description = "Organization ID")),
+    responses(
+        (status = 200, description = "Scheduler priority retrieved", body = OrganizationPriorityResponse),
+        (status = 401, description = "Unauthorized", body = ErrorResponse),
+        (status = 403, description = "Forbidden", body = ErrorResponse),
+        (status = 404, description = "Organization not found", body = ErrorResponse)
+    ),
+    security(("session_token" = []))
+)]
+pub async fn get_organization_priority(
+    State(app_state): State<AdminAppState>,
+    Extension(_admin_user): Extension<AdminUser>,
+    Path(org_id): Path<Uuid>,
+) -> Result<ResponseJson<OrganizationPriorityResponse>, (StatusCode, ResponseJson<ErrorResponse>)> {
+    let priority = app_state
+        .organization_service
+        .get_request_priority_for_admin(services::organization::OrganizationId(org_id))
+        .await
+        .map_err(crate::routes::common::map_organization_error)?;
+    Ok(ResponseJson(OrganizationPriorityResponse {
+        organization_id: org_id,
+        priority,
+    }))
+}
+
+/// Set an organization's scheduler priority (platform admins with write access only).
+#[utoipa::path(
+    patch,
+    path = "/v1/admin/organizations/{org_id}/priority",
+    tag = "Admin",
+    params(("org_id" = Uuid, Path, description = "Organization ID")),
+    request_body = UpdateOrganizationPriorityRequest,
+    responses(
+        (status = 200, description = "Scheduler priority updated", body = OrganizationPriorityResponse),
+        (status = 400, description = "Priority outside -1000..1000", body = ErrorResponse),
+        (status = 401, description = "Unauthorized", body = ErrorResponse),
+        (status = 403, description = "Forbidden", body = ErrorResponse),
+        (status = 404, description = "Organization not found", body = ErrorResponse)
+    ),
+    security(("session_token" = []))
+)]
+pub async fn update_organization_priority(
+    State(app_state): State<AdminAppState>,
+    Extension(admin_user): Extension<AdminUser>,
+    Path(org_id): Path<Uuid>,
+    Json(request): Json<UpdateOrganizationPriorityRequest>,
+) -> Result<ResponseJson<OrganizationPriorityResponse>, (StatusCode, ResponseJson<ErrorResponse>)> {
+    let priority = app_state
+        .organization_service
+        .update_request_priority_for_admin(
+            services::organization::OrganizationId(org_id),
+            request.priority,
+        )
+        .await
+        .map_err(crate::routes::common::map_organization_error)?;
+    tracing::info!(organization_id = %org_id, actor_id = %admin_user.0.id,
+        actor_type = "platform_admin", priority, "Organization request priority changed");
+    Ok(ResponseJson(OrganizationPriorityResponse {
+        organization_id: org_id,
+        priority,
+    }))
 }
 
 /// Get an organization's effective fallback policy (Admin only).
@@ -3286,6 +3412,8 @@ pub async fn update_service(
         (status = 200, description = "Admin access token created successfully", body = AdminAccessTokenResponse),
         (status = 400, description = "Invalid request", body = ErrorResponse),
         (status = 401, description = "Unauthorized", body = ErrorResponse),
+        (status = 503, description = "Read-only token issuance is disabled during rollout", body = ErrorResponse),
+        (status = 422, description = "Request deserialization failed (including invalid permission values)"),
         (status = 500, description = "Internal server error", body = ErrorResponse)
     ),
     security(
@@ -3323,6 +3451,18 @@ pub async fn create_admin_access_token(
         ));
     }
 
+    if request_body.permission == AdminAccessTokenPermission::ReadOnly
+        && !app_state.config.auth.admin_read_only_tokens_enabled
+    {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            ResponseJson(ErrorResponse::new(
+                "Read-only admin token issuance is not enabled".to_string(),
+                "read_only_token_issuance_disabled".to_string(),
+            )),
+        ));
+    }
+
     // Create admin access token directly in database
     let expires_at = Utc::now() + chrono::Duration::hours(request_body.expires_in_hours);
 
@@ -3334,6 +3474,7 @@ pub async fn create_admin_access_token(
             request_body.reason,
             expires_at,
             user_agent,
+            request_body.permission.into(),
         )
         .await
     {
@@ -3352,6 +3493,7 @@ pub async fn create_admin_access_token(
                 expires_at: admin_token.expires_at,
                 name: admin_token.name,
                 reason: admin_token.creation_reason,
+                permission: admin_token.permission.into(),
             };
 
             Ok(ResponseJson(response))
@@ -3382,7 +3524,7 @@ pub async fn create_admin_access_token(
         ("offset" = Option<i64>, Query, description = "Number of records to skip (default: 0)")
     ),
     responses(
-        (status = 200, description = "Admin access tokens retrieved successfully"),
+        (status = 200, description = "Admin access tokens retrieved successfully", body = ListAdminAccessTokensResponse),
         (status = 401, description = "Unauthorized", body = ErrorResponse),
         (status = 500, description = "Internal server error", body = ErrorResponse)
     ),
@@ -3394,7 +3536,8 @@ pub async fn list_admin_access_tokens(
     State(app_state): State<AdminAppState>,
     Extension(admin_user): Extension<AdminUser>, // Require admin auth
     axum::extract::Query(params): axum::extract::Query<ListUsersQueryParams>,
-) -> Result<ResponseJson<serde_json::Value>, (StatusCode, ResponseJson<ErrorResponse>)> {
+) -> Result<ResponseJson<ListAdminAccessTokensResponse>, (StatusCode, ResponseJson<ErrorResponse>)>
+{
     crate::routes::common::validate_limit_offset(params.limit, params.offset)?;
 
     debug!(
@@ -3416,12 +3559,12 @@ pub async fn list_admin_access_tokens(
                 .await
                 .unwrap_or(0);
 
-            let response = serde_json::json!({
-                "data": tokens,
-                "limit": params.limit,
-                "offset": params.offset,
-                "total": total
-            });
+            let response = ListAdminAccessTokensResponse {
+                data: tokens.into_iter().map(Into::into).collect(),
+                limit: params.limit,
+                offset: params.offset,
+                total,
+            };
 
             Ok(ResponseJson(response))
         }
@@ -3600,24 +3743,59 @@ pub struct MetricsQueryParams {
     pub end: Option<String>,
 }
 
+const CREDIT_TYPE_QUERY_DESCRIPTION: &str = "Filter consumed inference usage by grant, staking_farm, payment, or postpay. Costs include only saved matching allocations, including settlements. Each matching request and its full tokens count once; counts are not additive across credit types. Unattributed historical usage is excluded. Period totals may increase until outstanding unfunded usage is settled. Omit for all usage.";
+
+#[derive(Debug, serde::Deserialize)]
+pub struct OrganizationMetricsQueryParams {
+    #[serde(flatten)]
+    pub metrics: MetricsQueryParams,
+    /// Optional saved credit allocation type: grant, staking_farm, payment, or postpay.
+    pub credit_type: Option<String>,
+}
+
+fn parse_metrics_credit_type(
+    value: Option<&str>,
+) -> Result<Option<String>, (StatusCode, ResponseJson<ErrorResponse>)> {
+    value
+        .map(|value| {
+            value
+                .parse::<CreditType>()
+                .map(|kind| kind.as_str().to_string())
+                .map_err(|_| {
+                    (
+                        StatusCode::BAD_REQUEST,
+                        ResponseJson(ErrorResponse::new(
+                            format!("invalid credit_type: {value}"),
+                            "invalid_request".to_string(),
+                        )),
+                    )
+                })
+        })
+        .transpose()
+}
+
 /// Get organization metrics (Admin only)
 ///
 /// Returns usage metrics for an organization including summary totals,
 /// and breakdowns by workspace, API key, and model.
+///
+/// Percentiles across hours are approximate (sample-weighted means of hourly percentiles).
+/// TTFT threshold counts are exact; divide them by `ttft_measured_requests`, not `requests` / `total_requests`.
 #[utoipa::path(
     get,
     path = "/v1/admin/organizations/{org_id}/metrics",
     tag = "Admin",
     params(
         ("org_id" = String, Path, description = "Organization ID to get metrics for"),
-        ("start" = Option<String>, Query, description = "Start of time range (ISO 8601). Defaults to 30 days ago."),
-        ("end" = Option<String>, Query, description = "End of time range (ISO 8601). Defaults to now.")
+        ("start" = Option<String>, Query, description = "Start of time range (ISO 8601). Defaults to 30 days ago. Window may not exceed 366 days."),
+        ("end" = Option<String>, Query, description = "End of time range (ISO 8601). Defaults to now. Window may not exceed 366 days."),
+        ("credit_type" = Option<CreditType>, Query, description = CREDIT_TYPE_QUERY_DESCRIPTION)
     ),
     responses(
-        (status = 200, description = "Organization metrics retrieved successfully"),
+        (status = 200, description = "Organization metrics retrieved successfully", body = services::admin::OrganizationMetrics),
         (status = 400, description = "Invalid request", body = ErrorResponse),
         (status = 401, description = "Unauthorized", body = ErrorResponse),
-        (status = 404, description = "Organization not found", body = ErrorResponse),
+        (status = 504, description = "Analytics statement budget exceeded", body = ErrorResponse),
         (status = 500, description = "Internal server error", body = ErrorResponse)
     ),
     security(
@@ -3627,15 +3805,18 @@ pub struct MetricsQueryParams {
 pub async fn get_organization_metrics(
     State(app_state): State<AdminAppState>,
     Path(org_id): Path<String>,
-    Query(params): Query<MetricsQueryParams>,
+    Query(params): Query<OrganizationMetricsQueryParams>,
     Extension(_admin_user): Extension<AdminUser>,
 ) -> Result<
     ResponseJson<services::admin::OrganizationMetrics>,
     (StatusCode, ResponseJson<ErrorResponse>),
 > {
+    let credit_type = parse_metrics_credit_type(params.credit_type.as_deref())?;
+
     debug!(
+        credit_type = ?credit_type,
         "Get organization metrics request for org_id: {}, start: {:?}, end: {:?}",
-        org_id, params.start, params.end
+        org_id, params.metrics.start, params.metrics.end
     );
 
     // Parse organization ID
@@ -3649,43 +3830,19 @@ pub async fn get_organization_metrics(
         )
     })?;
 
-    // Parse time range with defaults
-    let end = params
-        .end
-        .and_then(|s| chrono::DateTime::parse_from_rfc3339(&s).ok())
-        .map(|dt| dt.with_timezone(&Utc))
-        .unwrap_or_else(Utc::now);
+    let (start, end) = crate::routes::common::parse_metrics_range(
+        params.metrics.start.as_deref(),
+        params.metrics.end.as_deref(),
+        None,
+        0,
+        366,
+    )?;
 
-    let start = params
-        .start
-        .and_then(|s| chrono::DateTime::parse_from_rfc3339(&s).ok())
-        .map(|dt| dt.with_timezone(&Utc))
-        .unwrap_or_else(|| end - Duration::days(30));
-
-    // Get metrics from analytics service
     let metrics = app_state
         .analytics_service
-        .get_organization_metrics(organization_id, start, end)
+        .get_organization_metrics(organization_id, start, end, credit_type.as_deref())
         .await
-        .map_err(|e| {
-            error!("Failed to get organization metrics, error: {:?}", e);
-            match e {
-                services::admin::AdminError::OrganizationNotFound(msg) => (
-                    StatusCode::NOT_FOUND,
-                    ResponseJson(ErrorResponse::new(
-                        msg,
-                        "organization_not_found".to_string(),
-                    )),
-                ),
-                _ => (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    ResponseJson(ErrorResponse::new(
-                        format!("Failed to retrieve metrics: {e}"),
-                        "internal_server_error".to_string(),
-                    )),
-                ),
-            }
-        })?;
+        .map_err(|e| analytics_error_response(e, "Failed to retrieve metrics", true))?;
 
     Ok(ResponseJson(metrics))
 }
@@ -3697,6 +3854,8 @@ pub async fn get_organization_metrics(
 /// - Total requests and revenue
 /// - Top models by usage
 /// - Top organizations by spend
+///
+/// Percentiles across hours are approximate (sample-weighted means of hourly percentiles).
 #[utoipa::path(
     get,
     path = "/v1/admin/platform/metrics",
@@ -3708,6 +3867,7 @@ pub async fn get_organization_metrics(
     responses(
         (status = 200, description = "Platform metrics retrieved successfully", body = services::admin::PlatformMetrics),
         (status = 401, description = "Unauthorized", body = ErrorResponse),
+        (status = 504, description = "Analytics statement budget exceeded", body = ErrorResponse),
         (status = 500, description = "Internal server error", body = ErrorResponse)
     ),
     security(
@@ -3730,6 +3890,7 @@ pub async fn get_platform_metrics(
         params.end.as_deref(),
         None,
         0,
+        366,
     )?;
 
     // Get platform metrics from analytics service
@@ -3737,16 +3898,7 @@ pub async fn get_platform_metrics(
         .analytics_service
         .get_platform_metrics(start, end)
         .await
-        .map_err(|e| {
-            error!("Failed to get platform metrics, error: {:?}", e);
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                ResponseJson(ErrorResponse::new(
-                    format!("Failed to retrieve platform metrics: {e}"),
-                    "internal_server_error".to_string(),
-                )),
-            )
-        })?;
+        .map_err(|e| analytics_error_response(e, "Failed to retrieve platform metrics", true))?;
 
     Ok(ResponseJson(metrics))
 }
@@ -3768,6 +3920,7 @@ pub async fn get_platform_metrics(
         (status = 200, description = "Platform time series retrieved successfully", body = services::admin::PlatformTimeSeriesMetrics),
         (status = 400, description = "Invalid request", body = ErrorResponse),
         (status = 401, description = "Unauthorized", body = ErrorResponse),
+        (status = 504, description = "Analytics statement budget exceeded", body = ErrorResponse),
         (status = 500, description = "Internal server error", body = ErrorResponse)
     ),
     security(
@@ -3807,22 +3960,14 @@ pub async fn get_platform_timeseries(
         params.end.as_deref(),
         Some(granularity),
         31,
+        366,
     )?;
 
     let metrics = app_state
         .analytics_service
         .get_platform_timeseries(start, end, granularity)
         .await
-        .map_err(|e| {
-            error!("Failed to get platform timeseries, error: {:?}", e);
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                ResponseJson(ErrorResponse::new(
-                    format!("Failed to retrieve platform timeseries: {e}"),
-                    "internal_server_error".to_string(),
-                )),
-            )
-        })?;
+        .map_err(|e| analytics_error_response(e, "Failed to retrieve platform timeseries", true))?;
 
     Ok(ResponseJson(metrics))
 }
@@ -3832,6 +3977,9 @@ pub async fn get_platform_timeseries(
 /// Credit LIMITS (caps) and consumption — NOT payments/cash. Returns active paid/grant
 /// credit limits, total consumed, paying/granted org counts, and a breakdown by funding
 /// source. Real money-in lives in the billing service, not cloud-api.
+///
+/// `inference_consumed_usd` can differ from `total_consumed_usd` (the live balance) by
+/// historical duplicate-row cleanup.
 #[utoipa::path(
     get,
     path = "/v1/admin/platform/billing-summary",
@@ -3839,6 +3987,7 @@ pub async fn get_platform_timeseries(
     responses(
         (status = 200, description = "Billing summary retrieved successfully", body = services::admin::BillingSummary),
         (status = 401, description = "Unauthorized", body = ErrorResponse),
+        (status = 504, description = "Analytics statement budget exceeded", body = ErrorResponse),
         (status = 500, description = "Internal server error", body = ErrorResponse)
     ),
     security(
@@ -3856,16 +4005,7 @@ pub async fn get_billing_summary(
         .analytics_service
         .get_billing_summary()
         .await
-        .map_err(|e| {
-            error!("Failed to get billing summary, error: {:?}", e);
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                ResponseJson(ErrorResponse::new(
-                    format!("Failed to retrieve billing summary: {e}"),
-                    "internal_server_error".to_string(),
-                )),
-            )
-        })?;
+        .map_err(|e| analytics_error_response(e, "Failed to retrieve billing summary", true))?;
 
     Ok(ResponseJson(summary))
 }
@@ -3894,6 +4034,8 @@ pub struct ModelRevenueQueryParams {
 ///
 /// Models for the selected period ranked by consumed cost, with requests, tokens,
 /// unique orgs, verifiable flag, provider type, and latency. Paginated and filterable.
+///
+/// Percentiles across hours are approximate (sample-weighted means of hourly percentiles).
 #[utoipa::path(
     get,
     path = "/v1/admin/platform/model-revenue",
@@ -3911,6 +4053,7 @@ pub struct ModelRevenueQueryParams {
         (status = 200, description = "Model revenue retrieved successfully", body = services::admin::ModelRevenueReport),
         (status = 400, description = "Invalid request", body = ErrorResponse),
         (status = 401, description = "Unauthorized", body = ErrorResponse),
+        (status = 504, description = "Analytics statement budget exceeded", body = ErrorResponse),
         (status = 500, description = "Internal server error", body = ErrorResponse)
     ),
     security(
@@ -3935,6 +4078,7 @@ pub async fn get_model_revenue(
         params.end.as_deref(),
         None,
         0,
+        366,
     )?;
     let sort = services::admin::RevenueSort::from_query(params.sort.as_deref())
         .map_err(|m| bad_request(m, "invalid_parameter"))?;
@@ -3960,16 +4104,7 @@ pub async fn get_model_revenue(
             offset: params.offset,
         })
         .await
-        .map_err(|e| {
-            error!("Failed to get model revenue, error: {:?}", e);
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                ResponseJson(ErrorResponse::new(
-                    format!("Failed to retrieve model revenue: {e}"),
-                    "internal_server_error".to_string(),
-                )),
-            )
-        })?;
+        .map_err(|e| analytics_error_response(e, "Failed to retrieve model revenue", true))?;
 
     Ok(ResponseJson(report))
 }
@@ -4013,6 +4148,7 @@ pub struct OrgRevenueQueryParams {
         (status = 200, description = "Org revenue retrieved successfully", body = services::admin::OrgRevenueReport),
         (status = 400, description = "Invalid request", body = ErrorResponse),
         (status = 401, description = "Unauthorized", body = ErrorResponse),
+        (status = 504, description = "Analytics statement budget exceeded", body = ErrorResponse),
         (status = 500, description = "Internal server error", body = ErrorResponse)
     ),
     security(
@@ -4037,6 +4173,7 @@ pub async fn get_org_revenue(
         params.end.as_deref(),
         None,
         0,
+        366,
     )?;
     let sort = services::admin::RevenueSort::from_query(params.sort.as_deref())
         .map_err(|m| bad_request(m, "invalid_parameter"))?;
@@ -4053,16 +4190,7 @@ pub async fn get_org_revenue(
             offset: params.offset,
         })
         .await
-        .map_err(|e| {
-            error!("Failed to get org revenue, error: {:?}", e);
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                ResponseJson(ErrorResponse::new(
-                    format!("Failed to retrieve org revenue: {e}"),
-                    "internal_server_error".to_string(),
-                )),
-            )
-        })?;
+        .map_err(|e| analytics_error_response(e, "Failed to retrieve org revenue", true))?;
 
     Ok(ResponseJson(report))
 }
@@ -4095,6 +4223,157 @@ pub async fn get_infra_summary(
     Ok(ResponseJson(summary))
 }
 
+/// An admin setting: its effective value (stored fields over the defaults).
+#[derive(Debug, serde::Serialize, utoipa::ToSchema)]
+pub struct AdminSettingResponse {
+    pub key: String,
+    /// The effective value. For `placement`: affinity_abs_slack (0.0 - 4.0),
+    /// affinity_eps (0.0 - 2.0), kv_max (0.5 - 1.0), lane_load_tokens
+    /// (4000 - 1000000) and pin_ttl_ms (60000 - 3600000).
+    #[schema(value_type = Object)]
+    pub value: serde_json::Value,
+    /// When it was last changed; absent until first changed.
+    pub updated_at: Option<DateTime<Utc>>,
+    /// The admin who last changed it.
+    pub updated_by_user_id: Option<Uuid>,
+}
+
+#[derive(Debug, serde::Serialize, utoipa::ToSchema)]
+pub struct ListAdminSettingsResponse {
+    pub settings: Vec<AdminSettingResponse>,
+}
+
+impl From<services::admin_settings::SettingView> for AdminSettingResponse {
+    fn from(v: services::admin_settings::SettingView) -> Self {
+        Self {
+            key: v.key.to_string(),
+            value: v.value,
+            updated_at: v.updated_at,
+            updated_by_user_id: v.updated_by_user_id,
+        }
+    }
+}
+
+fn admin_settings_error(
+    e: services::admin_settings::AdminSettingsError,
+) -> (StatusCode, ResponseJson<ErrorResponse>) {
+    use services::admin_settings::AdminSettingsError as E;
+    match e {
+        E::UnknownKey => not_found("Unknown setting", "not_found"),
+        E::Invalid(message) => bad_request(message, "invalid_request"),
+        E::Storage(_) => {
+            error!("Admin settings storage failed");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                ResponseJson(ErrorResponse::new(
+                    "Internal server error".to_string(),
+                    "internal_server_error".to_string(),
+                )),
+            )
+        }
+    }
+}
+
+/// List admin settings (Admin only)
+///
+/// Every known setting with its effective value: stored fields over the code defaults.
+#[utoipa::path(
+    get,
+    path = "/v1/admin/settings",
+    tag = "Admin",
+    responses(
+        (status = 200, description = "All settings", body = ListAdminSettingsResponse),
+        (status = 401, description = "Unauthorized", body = ErrorResponse),
+        (status = 500, description = "Internal server error", body = ErrorResponse)
+    ),
+    security(
+        ("session_token" = [])
+    )
+)]
+pub async fn list_admin_settings(
+    State(app_state): State<AdminAppState>,
+    Extension(_admin_user): Extension<AdminUser>,
+) -> Result<ResponseJson<ListAdminSettingsResponse>, (StatusCode, ResponseJson<ErrorResponse>)> {
+    let settings = app_state
+        .admin_settings_service
+        .get_all()
+        .await
+        .map_err(admin_settings_error)?;
+    Ok(ResponseJson(ListAdminSettingsResponse {
+        settings: settings.into_iter().map(Into::into).collect(),
+    }))
+}
+
+/// Get one admin setting (Admin only)
+#[utoipa::path(
+    get,
+    path = "/v1/admin/settings/{key}",
+    tag = "Admin",
+    params(
+        ("key" = String, Path, description = "Setting key, e.g. `placement`")
+    ),
+    responses(
+        (status = 200, description = "The setting", body = AdminSettingResponse),
+        (status = 401, description = "Unauthorized", body = ErrorResponse),
+        (status = 404, description = "Unknown setting", body = ErrorResponse),
+        (status = 500, description = "Internal server error", body = ErrorResponse)
+    ),
+    security(
+        ("session_token" = [])
+    )
+)]
+pub async fn get_admin_setting(
+    State(app_state): State<AdminAppState>,
+    Extension(_admin_user): Extension<AdminUser>,
+    Path(key): Path<String>,
+) -> Result<ResponseJson<AdminSettingResponse>, (StatusCode, ResponseJson<ErrorResponse>)> {
+    let setting = app_state
+        .admin_settings_service
+        .get(&key)
+        .await
+        .map_err(admin_settings_error)?;
+    Ok(ResponseJson(setting.into()))
+}
+
+/// Update one admin setting (Admin only)
+///
+/// Partial update: fields in the body are merged into the stored value, `null`
+/// resets a field to its default. The result is validated as a whole; an invalid
+/// value is rejected with 400 and nothing is stored. Takes effect immediately on the
+/// instance that handles it, and on the others within 10 minutes.
+#[utoipa::path(
+    patch,
+    path = "/v1/admin/settings/{key}",
+    tag = "Admin",
+    params(
+        ("key" = String, Path, description = "Setting key, e.g. `placement`")
+    ),
+    request_body(content = Object, description = "Fields to change; null resets a field"),
+    responses(
+        (status = 200, description = "The updated setting", body = AdminSettingResponse),
+        (status = 400, description = "Invalid value", body = ErrorResponse),
+        (status = 401, description = "Unauthorized", body = ErrorResponse),
+        (status = 404, description = "Unknown setting", body = ErrorResponse),
+        (status = 500, description = "Internal server error", body = ErrorResponse)
+    ),
+    security(
+        ("session_token" = [])
+    )
+)]
+pub async fn update_admin_setting(
+    State(app_state): State<AdminAppState>,
+    Extension(admin_user): Extension<AdminUser>,
+    Path(key): Path<String>,
+    ResponseJson(patch): ResponseJson<serde_json::Value>,
+) -> Result<ResponseJson<AdminSettingResponse>, (StatusCode, ResponseJson<ErrorResponse>)> {
+    let setting = app_state
+        .admin_settings_service
+        .update(&key, patch, admin_user.0.id)
+        .await
+        .map_err(admin_settings_error)?;
+    Ok(ResponseJson(setting.into()))
+}
+
 #[derive(Debug, serde::Deserialize)]
 pub struct TimeSeriesQueryParams {
     /// Start of time range (ISO 8601 format). Defaults to 30 days ago.
@@ -4104,6 +4383,14 @@ pub struct TimeSeriesQueryParams {
     /// Granularity: "hour", "day" (default), or "week"
     #[serde(default = "default_granularity")]
     pub granularity: String,
+}
+
+#[derive(Debug, serde::Deserialize)]
+pub struct OrganizationTimeSeriesQueryParams {
+    #[serde(flatten)]
+    pub metrics: TimeSeriesQueryParams,
+    /// Optional saved credit allocation type: grant, staking_farm, payment, or postpay.
+    pub credit_type: Option<String>,
 }
 
 fn default_granularity() -> String {
@@ -4160,6 +4447,7 @@ pub struct PerformanceTimeseriesParams {
         (status = 200, description = "Model consumption timeseries retrieved successfully", body = services::admin::ModelConsumptionTimeseries),
         (status = 400, description = "Invalid request", body = ErrorResponse),
         (status = 401, description = "Unauthorized", body = ErrorResponse),
+        (status = 504, description = "Analytics statement budget exceeded", body = ErrorResponse),
         (status = 500, description = "Internal server error", body = ErrorResponse)
     ),
     security(("session_token" = []))
@@ -4180,6 +4468,7 @@ pub async fn get_model_consumption_timeseries(
         params.end.as_deref(),
         Some(granularity),
         31,
+        366,
     )?;
 
     let result = app_state
@@ -4192,14 +4481,7 @@ pub async fn get_model_consumption_timeseries(
         })
         .await
         .map_err(|e| {
-            error!("Failed to get model consumption timeseries: {:?}", e);
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                ResponseJson(ErrorResponse::new(
-                    format!("Failed to retrieve model consumption timeseries: {e}"),
-                    "internal_server_error".to_string(),
-                )),
-            )
+            analytics_error_response(e, "Failed to retrieve model consumption timeseries", true)
         })?;
 
     Ok(ResponseJson(result))
@@ -4217,6 +4499,8 @@ pub async fn get_model_consumption_timeseries(
 /// **Error rate** = `stop_reason IN ('provider_error','timeout','incomplete')` / requests
 /// with a recorded `stop_reason`. Pre-V0037 rows (stop_reason IS NULL) are excluded from
 /// both numerator and denominator.
+///
+/// Percentiles across hours are approximate (sample-weighted means of hourly percentiles).
 #[utoipa::path(
     get,
     path = "/v1/admin/platform/performance-timeseries",
@@ -4231,6 +4515,7 @@ pub async fn get_model_consumption_timeseries(
         (status = 200, description = "Performance timeseries retrieved successfully", body = services::admin::PerformanceTimeseries),
         (status = 400, description = "Invalid request", body = ErrorResponse),
         (status = 401, description = "Unauthorized", body = ErrorResponse),
+        (status = 504, description = "Analytics statement budget exceeded", body = ErrorResponse),
         (status = 500, description = "Internal server error", body = ErrorResponse)
     ),
     security(("session_token" = []))
@@ -4249,6 +4534,7 @@ pub async fn get_performance_timeseries(
         params.end.as_deref(),
         Some(granularity),
         31,
+        366,
     )?;
 
     let result = app_state
@@ -4261,14 +4547,7 @@ pub async fn get_performance_timeseries(
         })
         .await
         .map_err(|e| {
-            error!("Failed to get performance timeseries: {:?}", e);
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                ResponseJson(ErrorResponse::new(
-                    format!("Failed to retrieve performance timeseries: {e}"),
-                    "internal_server_error".to_string(),
-                )),
-            )
+            analytics_error_response(e, "Failed to retrieve performance timeseries", true)
         })?;
 
     Ok(ResponseJson(result))
@@ -4289,6 +4568,27 @@ pub struct RevenueDensityParams {
 /// then returns P50/P95/P99/peak over active buckets — platform-wide and per model.
 /// Use the annualized figures to estimate potential revenue if a given demand
 /// rate were sustained continuously.
+///
+/// Reads raw usage at minute grain over the exact requested range, under a 120 s statement
+/// budget.
+#[utoipa::path(
+    get,
+    path = "/v1/admin/platform/revenue-density",
+    tag = "Admin",
+    params(
+        ("start" = Option<String>, Query, description = "Start of time range (ISO 8601). Defaults to 30 days ago. Window may not exceed 90 days."),
+        ("end" = Option<String>, Query, description = "End of time range (ISO 8601). Defaults to now. Window may not exceed 90 days."),
+        ("provider_type" = Option<String>, Query, description = "Filter by provider type (vllm, external, or chutes)")
+    ),
+    responses(
+        (status = 200, description = "Revenue density retrieved successfully", body = services::admin::RevenueDensityReport),
+        (status = 400, description = "Invalid request", body = ErrorResponse),
+        (status = 401, description = "Unauthorized", body = ErrorResponse),
+        (status = 504, description = "Analytics statement budget exceeded", body = ErrorResponse),
+        (status = 500, description = "Internal server error", body = ErrorResponse)
+    ),
+    security(("session_token" = []))
+)]
 pub async fn get_revenue_density(
     State(app_state): State<AdminAppState>,
     Query(params): Query<RevenueDensityParams>,
@@ -4302,6 +4602,7 @@ pub async fn get_revenue_density(
         params.start.as_deref(),
         params.end.as_deref(),
         None,
+        0,
         90,
     )?;
 
@@ -4313,16 +4614,7 @@ pub async fn get_revenue_density(
             provider_type: params.provider_type,
         })
         .await
-        .map_err(|e| {
-            error!("Failed to get revenue density: {:?}", e);
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                ResponseJson(ErrorResponse::new(
-                    format!("Failed to retrieve revenue density: {e}"),
-                    "internal_server_error".to_string(),
-                )),
-            )
-        })?;
+        .map_err(|e| analytics_error_response(e, "Failed to retrieve revenue density", true))?;
 
     Ok(ResponseJson(result))
 }
@@ -4339,13 +4631,14 @@ pub async fn get_revenue_density(
         ("org_id" = String, Path, description = "Organization ID to get metrics for"),
         ("start" = Option<String>, Query, description = "Start of time range (ISO 8601). Defaults to 30 days ago."),
         ("end" = Option<String>, Query, description = "End of time range (ISO 8601). Defaults to now."),
-        ("granularity" = Option<String>, Query, description = "Time granularity: hour, day (default), or week")
+        ("granularity" = Option<String>, Query, description = "Time granularity: hour, day (default), or week"),
+        ("credit_type" = Option<CreditType>, Query, description = CREDIT_TYPE_QUERY_DESCRIPTION)
     ),
     responses(
         (status = 200, description = "Time series metrics retrieved successfully"),
         (status = 400, description = "Invalid request", body = ErrorResponse),
         (status = 401, description = "Unauthorized", body = ErrorResponse),
-        (status = 404, description = "Organization not found", body = ErrorResponse),
+        (status = 504, description = "Analytics statement budget exceeded", body = ErrorResponse),
         (status = 500, description = "Internal server error", body = ErrorResponse)
     ),
     security(
@@ -4355,15 +4648,18 @@ pub async fn get_revenue_density(
 pub async fn get_organization_timeseries(
     State(app_state): State<AdminAppState>,
     Path(org_id): Path<String>,
-    Query(params): Query<TimeSeriesQueryParams>,
+    Query(params): Query<OrganizationTimeSeriesQueryParams>,
     Extension(_admin_user): Extension<AdminUser>,
 ) -> Result<
     ResponseJson<services::admin::TimeSeriesMetrics>,
     (StatusCode, ResponseJson<ErrorResponse>),
 > {
+    let credit_type = parse_metrics_credit_type(params.credit_type.as_deref())?;
+
     debug!(
+        credit_type = ?credit_type,
         "Get organization timeseries request for org_id: {}, start: {:?}, end: {:?}, granularity: {}",
-        org_id, params.start, params.end, params.granularity
+        org_id, params.metrics.start, params.metrics.end, params.metrics.granularity
     );
 
     // Parse organization ID
@@ -4378,8 +4674,8 @@ pub async fn get_organization_timeseries(
     })?;
 
     // Validate granularity
-    let granularity = match params.granularity.as_str() {
-        "hour" | "day" | "week" => params.granularity.as_str(),
+    let granularity = match params.metrics.granularity.as_str() {
+        "hour" | "day" | "week" => params.metrics.granularity.as_str(),
         _ => {
             return Err((
                 StatusCode::BAD_REQUEST,
@@ -4393,36 +4689,25 @@ pub async fn get_organization_timeseries(
 
     // Parse time range — hard error on bad input, 366-day cap for non-hour granularities
     let (start, end) = crate::routes::common::parse_metrics_range(
-        params.start.as_deref(),
-        params.end.as_deref(),
+        params.metrics.start.as_deref(),
+        params.metrics.end.as_deref(),
         Some(granularity),
         31,
+        366,
     )?;
 
     // Get timeseries from analytics service
     let metrics = app_state
         .analytics_service
-        .get_organization_timeseries(organization_id, start, end, granularity)
+        .get_organization_timeseries(
+            organization_id,
+            start,
+            end,
+            granularity,
+            credit_type.as_deref(),
+        )
         .await
-        .map_err(|e| {
-            error!("Failed to get organization timeseries, error: {:?}", e);
-            match e {
-                services::admin::AdminError::OrganizationNotFound(msg) => (
-                    StatusCode::NOT_FOUND,
-                    ResponseJson(ErrorResponse::new(
-                        msg,
-                        "organization_not_found".to_string(),
-                    )),
-                ),
-                _ => (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    ResponseJson(ErrorResponse::new(
-                        format!("Failed to retrieve timeseries metrics: {e}"),
-                        "internal_server_error".to_string(),
-                    )),
-                ),
-            }
-        })?;
+        .map_err(|e| analytics_error_response(e, "Failed to retrieve timeseries metrics", true))?;
 
     Ok(ResponseJson(metrics))
 }

@@ -134,6 +134,19 @@ impl From<services::attestation::models::AttestationReport> for AttestationRespo
 /// Get hardware attestation report for TEE verification. Requires an API key
 /// (nearai/infra#193); report retrieval is non-billable — no usage or billing
 /// records are created.
+///
+/// With `model=...&provider=chutes`, the Chutes entry in `model_attestations` includes
+/// `quote_b64`, `certificate_b64`, `e2e_pubkey`, `nonce`, and `gpu_evidence` for
+/// the selected verified instance. `gpu_evidence` preserves every GPU's `arch`,
+/// `certificate` (base64 device certificate chain), and `evidence` (base64 SPDM
+/// evidence) from the same evidence request as the CPU quote and certificate.
+/// `gpu_verdict` remains available as verification metadata.
+///
+/// The GPU challenge is `SHA256(UTF8(nonce + e2e_pubkey))`, using the returned
+/// nonce's hex text and public key's base64 text without decoding either input.
+/// Pass the hex-encoded digest as the NVIDIA verification nonce; it is also bound
+/// into the CPU quote's `report_data[0:32]`. The raw client nonce is not the GPU
+/// challenge.
 #[utoipa::path(
     get,
     path = "/v1/attestation/report",

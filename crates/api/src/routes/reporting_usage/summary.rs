@@ -45,7 +45,8 @@ impl ReportingUsageSummaryState {
         ("api_key_id" = Option<Uuid>, Query, description = "Filter by API key ID."),
         ("model" = Option<String>, Query, description = "Filter inference usage by model name."),
         ("inference_type" = Option<String>, Query, description = "Filter inference usage by inference type."),
-        ("service_name" = Option<String>, Query, description = "Filter service usage by platform service name.")
+        ("service_name" = Option<String>, Query, description = "Filter service usage by platform service name."),
+        ("credit_type" = Option<String>, Query, description = "Filter costs by their saved grant, postpay, staking_farm, or payment allocation.")
     ),
     responses(
         (status = 200, description = "Usage summary", body = ReportingUsageSummaryResponse),
@@ -106,6 +107,7 @@ fn summary_filters(
         model: query.model.clone(),
         inference_type: query.inference_type.map(|value| value.as_str().to_string()),
         service_name: query.service_name.clone(),
+        credit_type: query.credit_type.clone(),
         source: match query.source {
             ReportingUsageSource::All => ReportingUsageSummarySource::All,
             ReportingUsageSource::Inference => ReportingUsageSummarySource::Inference,

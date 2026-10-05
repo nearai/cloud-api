@@ -1,11 +1,12 @@
 use crate::{
-    middleware::{auth::AuthenticatedApiKey, RequestBodyHash, RequestCorrelation},
+    middleware::{auth::AuthenticatedApiKey, RequestBodyHash, RequestCorrelation, RequestedModel},
     models::*,
     routes::{
         api::AppState,
         common::{
-            alias_warning_message, inject_warning_field, map_domain_error_to_status,
-            no_aliasing_requested, HEADER_MODEL_ALIAS_RESOLVED, HEADER_NO_ALIASING,
+            alias_warning_message, inject_chat_warning_field, inject_warning_field,
+            map_domain_error_to_status, no_aliasing_requested, HEADER_MODEL_ALIAS_RESOLVED,
+            HEADER_NO_ALIASING,
         },
         extractors::OpenAiJson,
         files::MAX_FILE_SIZE,
@@ -111,7 +112,7 @@ const HEADER_SERVING_PROVIDER: &str = "x-serving-provider";
 
 /// Map a [`inference_providers::ProviderTier`] to the string value emitted in
 /// the `x-serving-provider` response header.
-fn provider_tier_to_str(tier: inference_providers::ProviderTier) -> &'static str {
+pub(super) fn provider_tier_to_str(tier: inference_providers::ProviderTier) -> &'static str {
     match tier {
         inference_providers::ProviderTier::Near => "near",
         inference_providers::ProviderTier::Attested3p => "chutes",
@@ -119,13 +120,13 @@ fn provider_tier_to_str(tier: inference_providers::ProviderTier) -> &'static str
     }
 }
 
-/// True when any E2EE encryption header was supplied. E2EE bodies are opaque
-/// to the gateway, so alias warnings can't be injected into them — the
-/// `x-model-alias-resolved` response header is the only signal in that mode.
+/// True when a client encryption header was supplied. `X-Model-Pub-Key` alone
+/// only pins routing and does not make the request or response encrypted.
+/// E2EE bodies are opaque to the gateway, so alias warnings use the response
+/// header rather than being injected into the body.
 fn e2ee_requested(encryption_headers: &crate::routes::common::EncryptionHeaders) -> bool {
     encryption_headers.signing_algo.is_some()
         || encryption_headers.client_pub_key.is_some()
-        || encryption_headers.model_pub_key.is_some()
         || encryption_headers.encryption_version.is_some()
         || encryption_headers.encrypt_all_fields.is_some()
 }
@@ -210,6 +211,7 @@ fn build_image_usage_request(
         stop_reason: Some(services::usage::StopReason::Completed),
         response_id: None,
         image_count: Some(record.image_count),
+        discount: None,
         provider_attribution: record.provider_attribution,
     }
 }
@@ -217,7 +219,7 @@ fn build_image_usage_request(
 /// Record usage synchronously with timeout, falling back to async retry.
 /// Used for non-streaming operations (image gen/edit) where usage should be
 /// persisted before the HTTP response is returned.
-async fn record_usage_with_sync_fallback(
+pub(super) async fn record_usage_with_sync_fallback(
     usage_service: Arc<dyn services::usage::UsageServiceTrait + Send + Sync>,
     request: services::usage::RecordUsageServiceRequest,
     operation_label: &str,
@@ -587,12 +589,16 @@ fn rewritten_control_event_bytes(event: &inference_providers::SSEEvent) -> Optio
 }
 
 fn build_final_usage_chunk_bytes(
-    usage: inference_providers::TokenUsage,
+    mut usage: inference_providers::TokenUsage,
     template: &ChunkTemplate,
 ) -> Result<Option<Bytes>, serde_json::Error> {
     let Some((id, model, created, system_fingerprint)) = template else {
         return Ok(None);
     };
+    // OpenAI-compatible clients read the reasoning count only from
+    // `completion_tokens_details`; SGLang reports it top-level. This chunk is
+    // synthesized on the usage-rewrite path, which the gateway signs.
+    usage.ensure_standard_reasoning_details();
 
     let final_usage_chunk =
         inference_providers::StreamChunk::Chat(inference_providers::models::ChatCompletionChunk {
@@ -633,6 +639,19 @@ fn message_content_to_value(content: &Option<MessageContent>) -> serde_json::Val
     }
 }
 
+/// Header carrying a client-supplied session identifier, used only to derive
+/// a placement affinity key (`services::completions::affinity::derive`).
+/// Never logged, never forwarded to a provider.
+const SESSION_ID_HEADER: &str = "x-session-id";
+
+/// Read the `x-session-id` header, if present and valid UTF-8.
+fn session_hint_from_headers(headers: &header::HeaderMap) -> Option<String> {
+    headers
+        .get(SESSION_ID_HEADER)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string)
+}
+
 // Convert HTTP ChatCompletionRequest to service CompletionRequest
 #[allow(clippy::too_many_arguments)]
 fn convert_chat_request_to_service(
@@ -642,6 +661,7 @@ fn convert_chat_request_to_service(
     organization_id: Uuid,
     workspace_id: Uuid,
     fallback_enabled: bool,
+    request_priority: i32,
     body_hash: RequestBodyHash,
     request_id: Uuid,
 ) -> ServiceCompletionRequest {
@@ -669,6 +689,8 @@ fn convert_chat_request_to_service(
     }
 
     ServiceCompletionRequest {
+        request_priority,
+        session_hint: None,
         request_id,
         model: request.model.clone(),
         messages: request
@@ -880,6 +902,7 @@ async fn bill_auto_redact_classify(
         stop_reason: Some(services::usage::StopReason::Completed),
         response_id: None,
         image_count: None,
+        discount: None,
         provider_attribution: services::usage::ProviderAttribution::default(),
     };
 
@@ -1300,6 +1323,7 @@ fn convert_text_request_to_service(
     organization_id: Uuid,
     workspace_id: Uuid,
     fallback_enabled: bool,
+    request_priority: i32,
     body_hash: RequestBodyHash,
     request_id: Uuid,
 ) -> ServiceCompletionRequest {
@@ -1323,6 +1347,8 @@ fn convert_text_request_to_service(
     }
 
     ServiceCompletionRequest {
+        request_priority,
+        session_hint: None,
         request_id,
         model: request.model.clone(),
         messages: vec![CompletionMessage {
@@ -1404,8 +1430,10 @@ pub async fn chat_completions(
     Extension(body_hash): Extension<RequestBodyHash>,
     Extension(correlation): Extension<RequestCorrelation>,
     headers: header::HeaderMap,
+    requested_model: RequestedModel,
     OpenAiJson(request): OpenAiJson<ChatCompletionRequest>,
 ) -> axum::response::Response {
+    requested_model.set(&request.model);
     debug!(
         "Chat completions request from api key: {:?}",
         api_key.api_key.id
@@ -1466,9 +1494,11 @@ async fn chat_completions_inner(
         api_key.organization.id.0,
         api_key.workspace.id.0,
         api_key.organization.fallback_enabled(),
+        api_key.organization.request_priority,
         body_hash,
         request_id,
     );
+    service_request.session_hint = session_hint_from_headers(&headers);
 
     // Extract and validate encryption headers if present
     let encryption_headers = match crate::routes::common::validate_encryption_headers(&headers) {
@@ -1615,29 +1645,33 @@ async fn chat_completions_inner(
         service_request.original_request = None;
     }
 
+    // Non-attested (Incognito) models have no model TEE signature to collect.
+    // Sign their public request/response bytes at the Gateway even when neither
+    // body was rewritten. Missing catalog metadata is not a non-attested model.
+    let non_attested_requires_gateway_signature = model_attestation_supported == Some(false);
     // Auto-redact and alias handling can change the bytes returned to the
     // client. A provider signature covers the upstream request and response,
     // so it cannot verify those public bytes.
     let alias_requires_gateway_signature =
         alias_canonical.is_some() && model_attestation_supported.unwrap_or(false);
-    let gateway_signature_enabled = usage_mode.gateway_signature_enabled
+    let gateway_signature_enabled = non_attested_requires_gateway_signature
+        || usage_mode.gateway_signature_enabled
         || auto_redact_requires_gateway_signature(auto_redact_enabled, model_attestation_supported)
         || alias_requires_gateway_signature;
     let public_response_rewritten = auto_redact_enabled || alias_canonical.is_some();
-    // A raw stream can require a Gateway signature only after it reaches EOF:
-    // if its provider omitted `[DONE]`, the route appends one for the client.
+    // A raw stream may also require a Gateway signature at EOF: if its provider
+    // omitted `[DONE]`, the route appends one for the client.
     // Hash attested streams as they are emitted so that tail path can decide
     // whether the final client-visible bytes need a Gateway signature.
     let may_need_synthesized_done_gateway_signature =
         synthesized_done_requires_gateway_signature(model_attestation_supported, e2ee_active);
     let hash_client_visible_stream =
         gateway_signature_enabled || may_need_synthesized_done_gateway_signature;
-    // Never publish a provider signature over bytes that auto-redact or alias
-    // routing changes. If metadata is unavailable, we cannot safely create a
-    // Gateway signature either, but omitting a signature is still better than
-    // returning one that cannot verify.
+    // Never publish a provider signature over bytes that this route rewrites.
+    // The actual provider can additionally require Gateway signing once the
+    // stream starts, even if no public bytes need rewriting.
     service_request.skip_provider_chat_signature =
-        usage_mode.gateway_signature_enabled || public_response_rewritten;
+        gateway_signature_enabled || public_response_rewritten;
     // Defer an upstream terminator whenever this route would otherwise relay it
     // unchanged. The completion service owns the authoritative model lookup, so
     // it decides whether finalization stores a provider signature or is a no-op.
@@ -1703,6 +1737,29 @@ async fn chat_completions_inner(
                         }
                     }
                 };
+
+                // The model may have fallen back to Chutes, which attests its
+                // deployment but does not sign individual responses. Decide
+                // from the actual serving provider before emitting any bytes,
+                // including the leading control events buffered above.
+                let serving_provider = match stream_chat_id.as_deref() {
+                    Some(chat_id) => {
+                        app_state
+                            .inference_provider_pool
+                            .get_provider_by_chat_id(chat_id)
+                            .await
+                    }
+                    None => None,
+                };
+                let provider_requires_gateway_signature = match &serving_provider {
+                    Some(provider) => !provider.supports_chat_signatures(),
+                    // Missing provider information does not imply missing signature support.
+                    None => false,
+                };
+                let gateway_signature_enabled =
+                    gateway_signature_enabled || provider_requires_gateway_signature;
+                let hash_client_visible_stream =
+                    hash_client_visible_stream || provider_requires_gateway_signature;
 
                 // Warning to inject into the first streamed chunk. Skipped
                 // for E2EE (the chunks are opaque; the response header is
@@ -1910,7 +1967,7 @@ async fn chat_completions_inner(
                                                 };
                                                 let mut chat_id =
                                                     public_signature_chat_id.lock().await;
-                                                if chat_id.is_none() {
+                                                if chat_id.is_none() && !candidate.is_empty() {
                                                     *chat_id = Some(candidate);
                                                 }
                                             }
@@ -1983,7 +2040,7 @@ async fn chat_completions_inner(
                                             }
                                         };
                                         let mut chat_id = public_signature_chat_id.lock().await;
-                                        if chat_id.is_none() {
+                                        if chat_id.is_none() && !candidate.is_empty() {
                                             *chat_id = Some(candidate);
                                         }
                                     }
@@ -2021,6 +2078,22 @@ async fn chat_completions_inner(
                                         ) {
                                             return None;
                                         }
+                                    }
+
+                                    // This chunk is re-serialized, so usage it still
+                                    // carries (e.g. continuous usage stats on an alias
+                                    // or auto-redact stream) also reports the reasoning
+                                    // count where OpenAI-compatible clients read it.
+                                    let chunk_usage = match &mut chunk {
+                                        inference_providers::StreamChunk::Chat(chat) => {
+                                            chat.usage.as_mut()
+                                        }
+                                        inference_providers::StreamChunk::Text(text) => {
+                                            text.usage.as_mut()
+                                        }
+                                    };
+                                    if let Some(usage) = chunk_usage {
+                                        usage.ensure_standard_reasoning_details();
                                     }
 
                                     if auto_redact_enabled {
@@ -2333,18 +2406,7 @@ async fn chat_completions_inner(
                         .filter_map(std::future::ready),
                     );
 
-                // Look up which trust tier served this stream. The pool stores a
-                // chat_id → provider mapping when the first chunk arrives; we read
-                // it now (synchronously, before streaming starts) so the header is
-                // present on the initial HTTP/1.1 response line.
-                let serving_tier = if let Some(ref chat_id) = stream_chat_id {
-                    app_state
-                        .inference_provider_pool
-                        .get_provider_tier_for_chat_id(chat_id)
-                        .await
-                } else {
-                    None
-                };
+                let serving_tier = serving_provider.as_ref().map(|provider| provider.tier());
 
                 // Return raw streaming response with SSE headers
                 let mut response_builder = Response::builder()
@@ -2426,6 +2488,13 @@ async fn chat_completions_inner(
                         &mut response_with_bytes.response,
                         &redaction_map,
                     );
+                    // This body is re-serialized, so no provider signature covers
+                    // it; expose the reasoning count where OpenAI-compatible
+                    // clients read it.
+                    response_with_bytes
+                        .response
+                        .usage
+                        .ensure_standard_reasoning_details();
                     match serde_json::to_vec(&response_with_bytes.response) {
                         Ok(b) => b,
                         Err(e) => {
@@ -2456,11 +2525,13 @@ async fn chat_completions_inner(
                 // auto-redact — it deliberately gives up raw-bytes hash
                 // verification for these responses; clients that need the
                 // raw-bytes guarantee should send the canonical model name
-                // (or x-no-aliasing). E2EE bodies are opaque and are left
-                // untouched (inject_warning_field returns None for them, and
-                // we don't attempt it) — the header below is the signal.
+                // (or x-no-aliasing). Since the body is rewritten, the
+                // reasoning count is also mirrored into the standard usage
+                // field. E2EE bodies are opaque and are left untouched
+                // (inject_chat_warning_field returns None for them, and we
+                // don't attempt it) — the header below is the signal.
                 let body_bytes = match &alias_canonical {
-                    Some(canonical) if !e2ee_active => inject_warning_field(
+                    Some(canonical) if !e2ee_active => inject_chat_warning_field(
                         &body_bytes,
                         &alias_warning_message(&request.model, canonical),
                     )
@@ -2468,30 +2539,38 @@ async fn chat_completions_inner(
                     _ => body_bytes,
                 };
 
-                if public_response_rewritten {
-                    if gateway_signature_enabled {
-                        let response_hash = hex::encode(Sha256::digest(&body_bytes));
-                        if let Err(error) = app_state
-                            .attestation_service
-                            .store_chat_signature_and_unpin(
-                                &response_with_bytes.response.id,
-                                request_hash.clone(),
-                                response_hash,
-                            )
-                            .await
-                        {
-                            tracing::error!(
-                                chat_id = %response_with_bytes.response.id,
-                                error = %error,
-                                "Failed to store public chat completion signature"
-                            );
-                        }
-                    } else {
-                        app_state
-                            .attestation_service
-                            .release_chat_signature_pin(&response_with_bytes.response.id)
-                            .await;
+                // Attestation support does not imply per-response signatures:
+                // Chutes needs a Gateway receipt even for unchanged JSON. The
+                // pool records the actual serving provider before returning,
+                // so this also covers NEAR-to-Chutes fallback.
+                if gateway_signature_enabled
+                    || app_state
+                        .inference_provider_pool
+                        .get_provider_by_chat_id(&response_with_bytes.response.id)
+                        .await
+                        .is_some_and(|provider| !provider.supports_chat_signatures())
+                {
+                    let response_hash = hex::encode(Sha256::digest(&body_bytes));
+                    if let Err(error) = app_state
+                        .attestation_service
+                        .store_chat_signature_and_unpin(
+                            &response_with_bytes.response.id,
+                            request_hash.clone(),
+                            response_hash,
+                        )
+                        .await
+                    {
+                        tracing::error!(
+                            chat_id = %response_with_bytes.response.id,
+                            error = %error,
+                            "Failed to store public chat completion signature"
+                        );
                     }
+                } else if public_response_rewritten {
+                    app_state
+                        .attestation_service
+                        .release_chat_signature_pin(&response_with_bytes.response.id)
+                        .await;
                 }
 
                 let mut response_builder = Response::builder()
@@ -2576,8 +2655,10 @@ pub async fn completions(
     Extension(body_hash): Extension<RequestBodyHash>,
     Extension(correlation): Extension<RequestCorrelation>,
     headers: header::HeaderMap,
+    requested_model: RequestedModel,
     OpenAiJson(request): OpenAiJson<CompletionRequest>,
 ) -> axum::response::Response {
+    requested_model.set(&request.model);
     debug!(
         "Text completions request from api key: {:?}",
         api_key.api_key.id
@@ -2750,9 +2831,11 @@ async fn completions_inner(
         api_key.organization.id.0,
         api_key.workspace.id.0,
         api_key.organization.fallback_enabled(),
+        api_key.organization.request_priority,
         body_hash,
         request_id,
     );
+    service_request.session_hint = session_hint_from_headers(&headers);
     // This endpoint always converts the provider's chat-completion payload
     // into the legacy completion format, so a provider signature cannot
     // verify the bytes returned to the client.
@@ -3144,6 +3227,7 @@ fn chat_response_to_text_response(
             completion_tokens: response.usage.completion_tokens,
             completion_tokens_details: None,
             total_tokens: response.usage.total_tokens,
+            reasoning_tokens: None,
         },
     }
 }
@@ -3317,6 +3401,7 @@ fn model_with_pricing_to_info(model: services::models::ModelWithPricing) -> Mode
             .deprecation_date
             .as_ref()
             .map(crate::routes::admin::format_deprecation_date),
+        successor_model_id: model.successor_model_name,
         description,
         top_provider: Some(TopProvider {
             context_length: Some(model.context_length),
@@ -3337,6 +3422,59 @@ fn model_with_pricing_to_info(model: services::models::ModelWithPricing) -> Mode
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn session_hint_is_read_from_x_session_id_header() {
+        let mut headers = header::HeaderMap::new();
+        assert_eq!(session_hint_from_headers(&headers), None);
+
+        headers.insert("X-Session-Id", header::HeaderValue::from_static("abc"));
+        assert_eq!(session_hint_from_headers(&headers).as_deref(), Some("abc"));
+
+        let mut bad = header::HeaderMap::new();
+        bad.insert(
+            SESSION_ID_HEADER,
+            header::HeaderValue::from_bytes(&[0xff, 0xfe]).unwrap(),
+        );
+        assert_eq!(session_hint_from_headers(&bad), None);
+    }
+
+    #[test]
+    fn model_public_key_alone_does_not_enable_e2ee() {
+        let mut headers = crate::routes::common::EncryptionHeaders {
+            signing_algo: None,
+            client_pub_key: None,
+            model_pub_key: None,
+            encryption_version: None,
+            encrypt_all_fields: None,
+        };
+        assert!(!e2ee_requested(&headers));
+        headers.model_pub_key = Some("model routing key".to_string());
+        assert!(!e2ee_requested(&headers));
+
+        headers.client_pub_key = Some("client response key".to_string());
+        assert!(e2ee_requested(&headers));
+    }
+
+    #[test]
+    fn encryption_parameters_still_enable_e2ee() {
+        for field in ["signing_algo", "encryption_version", "encrypt_all_fields"] {
+            let mut headers = crate::routes::common::EncryptionHeaders {
+                signing_algo: None,
+                client_pub_key: None,
+                model_pub_key: Some("model routing key".to_string()),
+                encryption_version: None,
+                encrypt_all_fields: None,
+            };
+            match field {
+                "signing_algo" => headers.signing_algo = Some("ed25519".to_string()),
+                "encryption_version" => headers.encryption_version = Some("2".to_string()),
+                "encrypt_all_fields" => headers.encrypt_all_fields = Some("true".to_string()),
+                _ => unreachable!(),
+            }
+            assert!(e2ee_requested(&headers), "{field}");
+        }
+    }
 
     #[test]
     fn nano_dollars_zero_renders_as_bare_zero() {
@@ -3420,6 +3558,7 @@ mod tests {
             datacenters: None,
             is_ready: None,
             deprecation_date: None,
+            successor_model_name: None,
             openrouter_slug: None,
             created_at: chrono::Utc::now(),
         }
@@ -3774,11 +3913,12 @@ mod tests {
     }
 
     #[test]
-    fn include_usage_rewrites_non_attested_without_gateway_signature() {
+    fn include_usage_rewrites_non_attested_streams() {
         let request = chat_request_with_include_usage(Some(true));
         let mode = chat_stream_usage_mode(&request, Some(false), false);
 
         assert!(mode.rewrite_public_stream_usage);
+        // Incognito signing is selected independently of usage shaping by the route.
         assert!(!mode.gateway_signature_enabled);
         assert!(!mode.strip_intermediate_usage);
     }
@@ -4145,6 +4285,64 @@ mod tests {
         assert!(value["choices"].as_array().is_some_and(Vec::is_empty));
         assert_eq!(value["usage"]["prompt_tokens"], 10);
         assert_eq!(value["usage"]["completion_tokens"], 5);
+        // No reasoning count reported upstream, so none is invented.
+        assert!(value["usage"].get("completion_tokens_details").is_none());
+        assert!(value["usage"].get("reasoning_tokens").is_none());
+    }
+
+    #[test]
+    fn final_usage_chunk_reports_sglang_reasoning_count_in_standard_details() {
+        let template = Some((
+            "chatcmpl-test".to_string(),
+            "test-model".to_string(),
+            1234567890,
+            None,
+        ));
+        // Last cumulative usage from an SGLang stream (top-level count).
+        let mut chunk: inference_providers::models::ChatCompletionChunk =
+            serde_json::from_value(serde_json::json!({
+                "id": "chatcmpl-test",
+                "object": "chat.completion.chunk",
+                "created": 1234567890,
+                "model": "test-model",
+                "choices": [chat_stream_finish_choice()],
+                "usage": {
+                    "prompt_tokens": 20,
+                    "total_tokens": 120,
+                    "completion_tokens": 100,
+                    "prompt_tokens_details": { "cached_tokens": 4 },
+                    "reasoning_tokens": 14
+                }
+            }))
+            .expect("SGLang chunk should parse");
+        let mut final_usage = None;
+        assert!(prepare_chat_stream_chunk_for_client_with_state(
+            &mut chunk,
+            true,
+            &mut final_usage
+        ));
+
+        let bytes = build_final_usage_chunk_bytes(
+            final_usage.expect("usage should be kept for the final chunk"),
+            &template,
+        )
+        .expect("final usage chunk should serialize")
+        .expect("template should produce final usage chunk");
+        let body = String::from_utf8(bytes.to_vec()).expect("SSE bytes should be UTF-8");
+        let value: serde_json::Value =
+            serde_json::from_str(body.trim_start_matches("data: ").trim_end())
+                .expect("final usage payload should be JSON");
+        assert_eq!(
+            value["usage"],
+            serde_json::json!({
+                "prompt_tokens": 20,
+                "completion_tokens": 100,
+                "total_tokens": 120,
+                "prompt_tokens_details": { "cached_tokens": 4 },
+                "completion_tokens_details": { "reasoning_tokens": 14 },
+                "reasoning_tokens": 14
+            })
+        );
     }
 
     #[test]
@@ -4778,6 +4976,7 @@ mod tests {
             Uuid::nil(),
             Uuid::nil(),
             true,
+            0,
             body_hash,
             Uuid::nil(),
         );
@@ -4853,8 +5052,10 @@ pub async fn image_generations(
     Extension(body_hash): Extension<RequestBodyHash>,
     Extension(correlation): Extension<RequestCorrelation>,
     headers: header::HeaderMap,
+    requested_model: RequestedModel,
     OpenAiJson(request): OpenAiJson<crate::models::ImageGenerationRequest>,
 ) -> axum::response::Response {
+    requested_model.set(&request.model);
     debug!(
         "Image generation request from api key: {:?}",
         api_key.api_key.id
@@ -5112,6 +5313,7 @@ pub async fn audio_transcriptions(
     Extension(body_hash): Extension<RequestBodyHash>,
     Extension(correlation): Extension<RequestCorrelation>,
     headers: header::HeaderMap,
+    requested_model: RequestedModel,
     mut multipart: Multipart,
 ) -> axum::response::Response {
     debug!(
@@ -5208,6 +5410,7 @@ pub async fn audio_transcriptions(
         temperature,
         timestamp_granularities,
     };
+    requested_model.set(&request.model);
 
     debug!(
         "Audio transcription: model={}, filename={}, file_size_kb={}, org={}, workspace={}",
@@ -5361,6 +5564,7 @@ pub async fn audio_transcriptions(
                 stop_reason: Some(services::usage::StopReason::Completed),
                 response_id: None,
                 image_count: None,
+                discount: None,
                 provider_attribution: services::usage::ProviderAttribution::default(),
             };
 
@@ -5514,6 +5718,7 @@ pub async fn image_edits(
     State(app_state): State<AppState>,
     Extension(api_key): Extension<AuthenticatedApiKey>,
     Extension(body_hash): Extension<RequestBodyHash>,
+    requested_model: RequestedModel,
     mut multipart: axum::extract::Multipart,
 ) -> axum::response::Response {
     debug!("Image edit request from api key: {:?}", api_key.api_key.id);
@@ -5665,6 +5870,7 @@ pub async fn image_edits(
         size,
         response_format,
     };
+    requested_model.set(&request.model);
 
     debug!(
         "Image edit request: model={}, org={}, workspace={}",
@@ -6022,8 +6228,10 @@ pub async fn rerank(
     Extension(_body_hash): Extension<RequestBodyHash>,
     Extension(correlation): Extension<RequestCorrelation>,
     headers: header::HeaderMap,
+    requested_model: RequestedModel,
     OpenAiJson(request): OpenAiJson<crate::models::RerankRequest>,
 ) -> axum::response::Response {
+    requested_model.set(&request.model);
     debug!(
         "Rerank request: model={}, org={}, workspace={}",
         request.model, api_key.organization.id, api_key.workspace.id.0
@@ -6214,6 +6422,7 @@ pub async fn rerank(
                 stop_reason: Some(services::usage::StopReason::Completed),
                 response_id: None,
                 image_count: None,
+                discount: None,
                 provider_attribution: services::usage::ProviderAttribution::default(),
             };
 
@@ -6379,6 +6588,7 @@ pub async fn embeddings(
     Extension(_body_hash): Extension<RequestBodyHash>,
     Extension(correlation): Extension<RequestCorrelation>,
     headers: header::HeaderMap,
+    requested_model: RequestedModel,
     body: Bytes,
 ) -> axum::response::Response {
     // Minimal deserialization: extract only the model name for routing
@@ -6400,6 +6610,7 @@ pub async fn embeddings(
                 .into_response();
         }
     };
+    requested_model.set(&model_name);
 
     debug!(
         "Embeddings request: model={}, org={}, workspace={}",
@@ -6562,6 +6773,7 @@ pub async fn embeddings(
                 stop_reason: Some(services::usage::StopReason::Completed),
                 response_id: None,
                 image_count: None,
+                discount: None,
                 provider_attribution: services::usage::ProviderAttribution::default(),
             };
 
@@ -6701,6 +6913,7 @@ pub async fn privacy_classify(
     Extension(_body_hash): Extension<RequestBodyHash>,
     Extension(correlation): Extension<RequestCorrelation>,
     headers: header::HeaderMap,
+    requested_model: RequestedModel,
     body: Bytes,
 ) -> axum::response::Response {
     // Minimal deserialization: extract only the model name for routing
@@ -6722,6 +6935,7 @@ pub async fn privacy_classify(
                 .into_response();
         }
     };
+    requested_model.set(&model_name);
 
     debug!(
         "Privacy classify request: model={}, org={}, workspace={}",
@@ -6897,6 +7111,7 @@ pub async fn privacy_classify(
                 stop_reason: Some(services::usage::StopReason::Completed),
                 response_id: None,
                 image_count: None,
+                discount: None,
                 provider_attribution: services::usage::ProviderAttribution::default(),
             };
 
@@ -7038,6 +7253,7 @@ pub async fn privacy_redact(
     Extension(_body_hash): Extension<RequestBodyHash>,
     Extension(correlation): Extension<RequestCorrelation>,
     headers: header::HeaderMap,
+    requested_model: RequestedModel,
     body: Bytes,
 ) -> axum::response::Response {
     #[derive(serde::Deserialize)]
@@ -7129,6 +7345,7 @@ pub async fn privacy_redact(
     }
 
     let model_name = parsed.model;
+    requested_model.set(&model_name);
 
     debug!(
         "Privacy redact request: model={}, org={}, workspace={}, n_inputs={}",
@@ -7425,6 +7642,7 @@ pub async fn privacy_redact(
         stop_reason: Some(services::usage::StopReason::Completed),
         response_id: None,
         image_count: None,
+        discount: None,
         provider_attribution: services::usage::ProviderAttribution::default(),
     };
 
@@ -7510,8 +7728,10 @@ pub async fn score(
     Extension(body_hash): Extension<RequestBodyHash>,
     Extension(correlation): Extension<RequestCorrelation>,
     headers: header::HeaderMap,
+    requested_model: RequestedModel,
     OpenAiJson(request): OpenAiJson<crate::models::ScoreRequest>,
 ) -> axum::response::Response {
+    requested_model.set(&request.model);
     debug!(
         "Score request: model={}, org={}, workspace={}",
         request.model, api_key.organization.id, api_key.workspace.id.0
@@ -7638,6 +7858,7 @@ pub async fn score(
                 stop_reason: Some(services::usage::StopReason::Completed),
                 response_id: None,
                 image_count: None,
+                discount: None,
                 provider_attribution: services::usage::ProviderAttribution::default(),
             };
 
@@ -7676,6 +7897,7 @@ pub async fn score(
                         stop_reason: Some(services::usage::StopReason::Completed),
                         response_id: None,
                         image_count: None,
+                        discount: None,
                         provider_attribution: services::usage::ProviderAttribution::default(),
                     };
                     tokio::spawn(async move {
@@ -7717,6 +7939,7 @@ pub async fn score(
                         stop_reason: Some(services::usage::StopReason::Completed),
                         response_id: None,
                         image_count: None,
+                        discount: None,
                         provider_attribution: services::usage::ProviderAttribution::default(),
                     };
                     tokio::spawn(async move {

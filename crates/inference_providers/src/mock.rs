@@ -226,6 +226,8 @@ pub struct ResponseTemplate {
     disconnect_after_chunks: Option<usize>,
     /// Simulate an upstream stream error after N chunks.
     stream_error_after_chunks: Option<(usize, CompletionError)>,
+    /// Number of raw SSE comments emitted before the first chat-id-bearing chunk.
+    leading_control_events: usize,
     /// Tool calls to include in the response
     tool_calls: Option<Vec<ToolCall>>,
     /// If set, usage will include prompt_tokens_details.cached_tokens (for cache-hit tests)
@@ -249,6 +251,7 @@ impl ResponseTemplate {
             reasoning_content: None,
             disconnect_after_chunks: None,
             stream_error_after_chunks: None,
+            leading_control_events: 0,
             tool_calls: None,
             cache_tokens: None,
             cache_write_tokens: None,
@@ -283,7 +286,12 @@ impl ResponseTemplate {
         self
     }
 
-    fn token_usage(&self, input_tokens: i32, output_tokens: i32) -> TokenUsage {
+    fn token_usage(
+        &self,
+        input_tokens: i32,
+        output_tokens: i32,
+        reasoning_tokens: i32,
+    ) -> TokenUsage {
         let mut usage = TokenUsage::new(input_tokens, output_tokens);
         let mut details = serde_json::Map::new();
         if let Some(tokens) = self.cache_tokens {
@@ -294,6 +302,11 @@ impl ResponseTemplate {
         }
         if !details.is_empty() {
             usage.prompt_tokens_details = Some(details.into());
+        }
+        // A reasoning model served by SGLang reports its reasoning count as a
+        // top-level `usage.reasoning_tokens`, not in `completion_tokens_details`.
+        if self.reasoning_content.is_some() {
+            usage.reasoning_tokens = Some(reasoning_tokens);
         }
         usage
     }
@@ -317,6 +330,13 @@ impl ResponseTemplate {
         self
     }
 
+    /// Prefix a stream with deterministic raw comments to exercise bounded
+    /// chat-id peeking without discarding any client-visible bytes.
+    pub fn with_leading_control_events(mut self, count: usize) -> Self {
+        self.leading_control_events = count;
+        self
+    }
+
     /// Add tool calls to this response
     pub fn with_tool_calls(mut self, tool_calls: Vec<ToolCall>) -> Self {
         self.tool_calls = Some(tool_calls);
@@ -333,8 +353,14 @@ impl ResponseTemplate {
         requested_service_tier: Option<String>,
     ) -> ChatCompletionResponse {
         let model = self.model_override.clone().unwrap_or(model);
-        // Calculate output tokens as word count of content
-        let output_tokens = self.content.split_whitespace().count() as i32;
+        // Reasoning is part of the completion. Count it like the streamed
+        // chunks do: one token per `' '`-separated segment (see
+        // `generate_chunks`), so both modes report the same reasoning count.
+        let reasoning_tokens = self
+            .reasoning_content
+            .as_deref()
+            .map_or(0, |reasoning| reasoning.split(' ').count() as i32);
+        let output_tokens = self.content.split_whitespace().count() as i32 + reasoning_tokens;
 
         // Convert tool calls if present
         let tool_calls = self.tool_calls.as_ref().map(|calls| {
@@ -392,7 +418,7 @@ impl ResponseTemplate {
                 .clone()
                 .or(requested_service_tier),
             system_fingerprint: None,
-            usage: self.token_usage(input_tokens, output_tokens),
+            usage: self.token_usage(input_tokens, output_tokens, reasoning_tokens),
             prompt_logprobs: None,
             prompt_token_ids: None,
             kv_transfer_params: None,
@@ -414,12 +440,14 @@ impl ResponseTemplate {
         let model = self.model_override.clone().unwrap_or(model);
         let mut chunks = Vec::new();
         let mut output_token_count = 0;
+        let mut reasoning_token_count = 0;
 
         // Stream reasoning content word by word if present
         if let Some(reasoning) = &self.reasoning_content {
             let words: Vec<&str> = reasoning.split(' ').collect();
             for (i, word) in words.iter().enumerate() {
                 output_token_count += 1;
+                reasoning_token_count += 1;
                 let word_with_space = if i == 0 {
                     word.to_string()
                 } else {
@@ -447,7 +475,11 @@ impl ResponseTemplate {
                         finish_reason: None,
                         token_ids: None,
                     }],
-                    usage: Some(self.token_usage(input_tokens, output_token_count)),
+                    usage: Some(self.token_usage(
+                        input_tokens,
+                        output_token_count,
+                        reasoning_token_count,
+                    )),
                     service_tier: self
                         .service_tier_override
                         .clone()
@@ -497,7 +529,11 @@ impl ResponseTemplate {
                         finish_reason,
                         token_ids: None,
                     }],
-                    usage: Some(self.token_usage(input_tokens, output_token_count)),
+                    usage: Some(self.token_usage(
+                        input_tokens,
+                        output_token_count,
+                        reasoning_token_count,
+                    )),
                     service_tier: self
                         .service_tier_override
                         .clone()
@@ -548,7 +584,11 @@ impl ResponseTemplate {
                         finish_reason: None,
                         token_ids: None,
                     }],
-                    usage: Some(self.token_usage(input_tokens, output_token_count)),
+                    usage: Some(self.token_usage(
+                        input_tokens,
+                        output_token_count,
+                        reasoning_token_count,
+                    )),
                     service_tier: self
                         .service_tier_override
                         .clone()
@@ -604,7 +644,11 @@ impl ResponseTemplate {
                             finish_reason,
                             token_ids: None,
                         }],
-                        usage: Some(self.token_usage(input_tokens, output_token_count)),
+                        usage: Some(self.token_usage(
+                            input_tokens,
+                            output_token_count,
+                            reasoning_token_count,
+                        )),
                         service_tier: self
                             .service_tier_override
                             .clone()
@@ -625,7 +669,7 @@ impl ResponseTemplate {
             model,
             system_fingerprint: None,
             choices: vec![],
-            usage: Some(self.token_usage(input_tokens, output_token_count)),
+            usage: Some(self.token_usage(input_tokens, output_token_count, reasoning_token_count)),
             service_tier: self
                 .service_tier_override
                 .clone()
@@ -676,8 +720,18 @@ impl MockExpectationBuilder {
     }
 }
 
+type ResponsesHandler =
+    Arc<dyn Fn(serde_json::Value) -> crate::responses_raw::ResponsesRawResponse + Send + Sync>;
+type SystemOneHandler = Arc<
+    dyn Fn(crate::SystemOneRequest) -> Result<crate::SystemOneResponseWithBytes, CompletionError>
+        + Send
+        + Sync,
+>;
+
 /// Mock provider that implements InferenceProvider for testing
 pub struct MockProvider {
+    responses_handler: Option<ResponsesHandler>,
+    systemone_handler: Option<SystemOneHandler>,
     /// List of available mock models
     models: Vec<ModelInfo>,
     /// Map of chat_id to (request_hash, response_hash) for signature generation
@@ -686,6 +740,8 @@ pub struct MockProvider {
     config: Arc<Mutex<MockConfig>>,
     /// Last chat completion params received (for test assertions)
     last_chat_params: Arc<Mutex<Option<ChatCompletionParams>>>,
+    /// Numeric policy metadata only, for multi-request propagation assertions.
+    chat_request_priorities: Arc<Mutex<Vec<i32>>>,
     /// When true, get_attestation_report returns an error (simulates blocked/broken backend)
     fail_attestation: Arc<std::sync::atomic::AtomicBool>,
     /// Trust tier reported by [`InferenceProvider::tier`]; defaults to
@@ -705,13 +761,50 @@ pub struct MockProvider {
     /// to `true`. Set via [`MockProvider::with_chat_signature_support`] to model a
     /// provider whose response integrity does not use per-response signatures.
     supports_chat_signatures: bool,
+    /// Exact request-time routing key accepted by this fixture, independently
+    /// of the signing-key attestation map (as used by Chutes).
+    per_request_public_key: Option<String>,
     /// Chat ids passed to [`InferenceProvider::unpin_chat_connection`], in call
     /// order. Lets lifecycle tests assert the signature-fetch routing pin was
     /// released. `std::sync::Mutex` because the trait method is synchronous.
     unpinned_chat_ids: Arc<std::sync::Mutex<Vec<String>>>,
+    /// What [`InferenceProvider::poll_backend_count`] reports; defaults to
+    /// `Skipped`. Set via [`MockProvider::with_count_poll`].
+    count_poll: crate::CountPoll,
 }
 
 impl MockProvider {
+    /// Set what this mock's backend-count poll reports.
+    pub fn with_count_poll(mut self, poll: crate::CountPoll) -> Self {
+        self.count_poll = poll;
+        self
+    }
+
+    pub fn with_systemone_handler(
+        mut self,
+        handler: impl Fn(
+                crate::SystemOneRequest,
+            ) -> Result<crate::SystemOneResponseWithBytes, CompletionError>
+            + Send
+            + Sync
+            + 'static,
+    ) -> Self {
+        self.systemone_handler = Some(Arc::new(handler));
+        self
+    }
+
+    /// Install a native Responses fixture without affecting chat fixtures.
+    pub fn with_responses_handler(
+        mut self,
+        handler: impl Fn(serde_json::Value) -> crate::responses_raw::ResponsesRawResponse
+            + Send
+            + Sync
+            + 'static,
+    ) -> Self {
+        self.responses_handler = Some(Arc::new(handler));
+        self
+    }
+
     /// Create a new mock provider with default models
     pub fn new() -> Self {
         let models = vec![ModelInfo {
@@ -736,13 +829,18 @@ impl MockProvider {
                 audio_transcription_error_override: None,
             })),
             last_chat_params: Arc::new(Mutex::new(None)),
+            chat_request_priorities: Arc::new(Mutex::new(Vec::new())),
             fail_attestation: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             tier: crate::ProviderTier::NonAttested,
             provider_source: crate::ProviderSource::External,
             supports_streaming: true,
             supports_client_e2ee: true,
             supports_chat_signatures: true,
+            count_poll: crate::CountPoll::Skipped,
+            per_request_public_key: None,
             unpinned_chat_ids: Arc::new(std::sync::Mutex::new(Vec::new())),
+            responses_handler: None,
+            systemone_handler: None,
         }
     }
 
@@ -762,13 +860,18 @@ impl MockProvider {
                 audio_transcription_error_override: None,
             })),
             last_chat_params: Arc::new(Mutex::new(None)),
+            chat_request_priorities: Arc::new(Mutex::new(Vec::new())),
             fail_attestation: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             tier: crate::ProviderTier::NonAttested,
             provider_source: crate::ProviderSource::External,
             supports_streaming: true,
             supports_client_e2ee: true,
             supports_chat_signatures: true,
+            count_poll: crate::CountPoll::Skipped,
+            per_request_public_key: None,
             unpinned_chat_ids: Arc::new(std::sync::Mutex::new(Vec::new())),
+            responses_handler: None,
+            systemone_handler: None,
         }
     }
 
@@ -786,13 +889,18 @@ impl MockProvider {
                 audio_transcription_error_override: None,
             })),
             last_chat_params: Arc::new(Mutex::new(None)),
+            chat_request_priorities: Arc::new(Mutex::new(Vec::new())),
             fail_attestation: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             tier: crate::ProviderTier::NonAttested,
             provider_source: crate::ProviderSource::External,
             supports_streaming: true,
             supports_client_e2ee: true,
             supports_chat_signatures: true,
+            count_poll: crate::CountPoll::Skipped,
+            per_request_public_key: None,
             unpinned_chat_ids: Arc::new(std::sync::Mutex::new(Vec::new())),
+            responses_handler: None,
+            systemone_handler: None,
         }
     }
 
@@ -831,13 +939,25 @@ impl MockProvider {
         self
     }
 
+    /// Accept one exact request-time public-key pin without advertising it as
+    /// an Ed25519/ECDSA signing key in the mock attestation report.
+    pub fn with_per_request_pubkey_routing(mut self, public_key: String) -> Self {
+        self.per_request_public_key = Some(public_key);
+        self
+    }
+
     /// Make get_attestation_report return an error (simulates blocked/broken backend).
     pub fn set_fail_attestation(&self, fail: bool) {
         self.fail_attestation
             .store(fail, std::sync::atomic::Ordering::Relaxed);
     }
 
-    /// Get the last chat completion params received by the mock provider
+    /// Get the scheduler priorities recorded across mock completion calls.
+    pub async fn chat_request_priorities(&self) -> Vec<i32> {
+        self.chat_request_priorities.lock().await.clone()
+    }
+
+    /// Get the last chat completion params received by the mock provider.
     pub async fn last_chat_params(&self) -> Option<ChatCompletionParams> {
         self.last_chat_params.lock().await.clone()
     }
@@ -1026,6 +1146,45 @@ impl Default for MockProvider {
 
 #[async_trait]
 impl crate::InferenceProvider for MockProvider {
+    fn supports_systemone(&self) -> bool {
+        self.systemone_handler.is_some()
+    }
+
+    async fn systemone(
+        &self,
+        request: crate::SystemOneRequest,
+        request_hash: String,
+    ) -> Result<crate::SystemOneResponseWithBytes, CompletionError> {
+        let handler = self
+            .systemone_handler
+            .as_ref()
+            .ok_or_else(|| CompletionError::CompletionError("No System One fixture".into()))?;
+        let response = handler(request)?;
+        if let Some(id) = &response.response.id {
+            self.register_signature_hashes(
+                id.clone(),
+                request_hash,
+                hex::encode(Sha256::digest(&response.raw_bytes)),
+            )
+            .await;
+        }
+        Ok(response)
+    }
+
+    fn supports_responses_raw(&self) -> bool {
+        self.responses_handler.is_some()
+    }
+
+    async fn responses_raw(
+        &self,
+        body: serde_json::Value,
+    ) -> Result<crate::responses_raw::ResponsesRawResponse, CompletionError> {
+        self.responses_handler
+            .as_ref()
+            .map(|handler| handler(body))
+            .ok_or_else(|| CompletionError::CompletionError("No native Responses fixture".into()))
+    }
+
     fn tier(&self) -> crate::ProviderTier {
         self.tier
     }
@@ -1046,6 +1205,14 @@ impl crate::InferenceProvider for MockProvider {
         self.supports_chat_signatures
     }
 
+    async fn poll_backend_count(&self, _client: &reqwest::Client) -> crate::CountPoll {
+        self.count_poll
+    }
+
+    fn supports_per_request_pubkey_routing(&self, public_key: &str) -> bool {
+        self.per_request_public_key.as_deref() == Some(public_key)
+    }
+
     fn unpin_chat_connection(&self, chat_id: &str) {
         if let Ok(mut ids) = self.unpinned_chat_ids.lock() {
             ids.push(chat_id.to_string());
@@ -1064,6 +1231,10 @@ impl crate::InferenceProvider for MockProvider {
         params: ChatCompletionParams,
         request_hash: String,
     ) -> Result<StreamingResult, CompletionError> {
+        self.chat_request_priorities
+            .lock()
+            .await
+            .push(params.request_priority);
         *self.last_chat_params.lock().await = Some(params.clone());
 
         // Check for invalid model
@@ -1141,9 +1312,15 @@ impl crate::InferenceProvider for MockProvider {
         // verbatim — re-serializing the parsed chunk yields different bytes.
         // This makes the e2e signature tests a regression guard for byte-exact
         // streaming passthrough (issue #701).
+        let leading_controls: Vec<Bytes> = (0..response_template.leading_control_events)
+            .map(|index| Bytes::from(format!(": mock control {index}\r\n\r\n")))
+            .collect();
         let chat_id_opt = chunks.first().map(|c| c.id.clone());
         if let Some(chat_id) = chat_id_opt {
             let mut accumulated: Vec<u8> = Vec::new();
+            for control in &leading_controls {
+                accumulated.extend_from_slice(control);
+            }
             for chunk in &chunks {
                 accumulated.extend_from_slice(&Self::mock_chunk_wire_bytes(chunk)?);
             }
@@ -1163,16 +1340,23 @@ impl crate::InferenceProvider for MockProvider {
         // The trailing [DONE] terminator is emitted as a chunk-less control
         // event, matching the lossless passthrough parser behavior.
         let stream = stream::iter(
-            chunks
+            leading_controls
                 .into_iter()
-                .map(move |chunk| {
+                .map(|raw_bytes| {
+                    Ok(SSEEvent {
+                        raw_bytes,
+                        chunk: None,
+                        raw_passthrough: true,
+                    })
+                })
+                .chain(chunks.into_iter().map(move |chunk| {
                     let raw_bytes = Bytes::from(Self::mock_chunk_wire_bytes(&chunk)?);
                     Ok(SSEEvent {
                         raw_bytes,
                         chunk: Some(StreamChunk::Chat(chunk)),
                         raw_passthrough: true,
                     })
-                })
+                }))
                 .chain(send_done.then(|| {
                     Ok(SSEEvent {
                         raw_bytes: Bytes::from_static(b"data: [DONE]\n\n"),
@@ -1191,6 +1375,10 @@ impl crate::InferenceProvider for MockProvider {
         params: ChatCompletionParams,
         request_hash: String,
     ) -> Result<ChatCompletionResponseWithBytes, CompletionError> {
+        self.chat_request_priorities
+            .lock()
+            .await
+            .push(params.request_priority);
         *self.last_chat_params.lock().await = Some(params.clone());
 
         // Check for invalid model

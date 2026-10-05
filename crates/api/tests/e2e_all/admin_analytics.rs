@@ -142,6 +142,17 @@ async fn test_admin_get_organization_metrics_empty() {
         "Should have 0 unique API keys"
     );
 
+    // An empty org reports zero TTFT counts, not null.
+    assert_eq!(
+        [
+            metrics.summary.ttft_measured_requests,
+            metrics.summary.ttft_under_5s_requests,
+            metrics.summary.ttft_under_10s_requests,
+            metrics.summary.ttft_under_60s_requests,
+        ],
+        [0, 0, 0, 0]
+    );
+
     // Verify breakdowns - workspaces may have the default workspace with 0 usage
     // API keys and models should be empty since no requests were made
     assert!(metrics.by_api_key.is_empty(), "Should have no API key data");
@@ -262,10 +273,9 @@ async fn test_admin_get_organization_metrics_with_usage() {
 async fn test_admin_get_organization_metrics_with_time_range() {
     let server = setup_test_server().await;
 
-    // Create organization
     let org = create_org(&server).await;
 
-    // Get metrics with custom time range (last 7 days)
+    // URL-encode `+` because query-form decoding otherwise turns it into a space.
     let now = chrono::Utc::now();
     let week_ago = now - chrono::Duration::days(7);
 
@@ -274,8 +284,8 @@ async fn test_admin_get_organization_metrics_with_time_range() {
             format!(
                 "/v1/admin/organizations/{}/metrics?start={}&end={}",
                 org.id,
-                week_ago.to_rfc3339(),
-                now.to_rfc3339()
+                week_ago.to_rfc3339().replace('+', "%2B"),
+                now.to_rfc3339().replace('+', "%2B")
             )
             .as_str(),
         )
@@ -289,13 +299,13 @@ async fn test_admin_get_organization_metrics_with_time_range() {
     let metrics: OrganizationMetrics =
         serde_json::from_str(&response.text()).expect("Failed to parse response");
 
-    // Verify period is present and valid
     assert!(
         metrics.period_start < metrics.period_end,
         "Period start should be before period end"
     );
+    assert_eq!(metrics.period_start, week_ago);
+    assert_eq!(metrics.period_end, now);
 
-    // Verify structure is valid
     assert_eq!(
         metrics.organization_id.to_string(),
         org.id,

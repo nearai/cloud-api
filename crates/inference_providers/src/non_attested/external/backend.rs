@@ -49,6 +49,17 @@ impl Default for BackendConfig {
 /// ChatCompletionParams format and the provider's native format.
 #[async_trait]
 pub trait ExternalBackend: Send + Sync {
+    async fn systemone(
+        &self,
+        _config: &BackendConfig,
+        _model: &str,
+        _request: crate::SystemOneRequest,
+    ) -> Result<crate::SystemOneResponseWithBytes, CompletionError> {
+        Err(CompletionError::CompletionError(
+            "System One is unavailable for this backend".into(),
+        ))
+    }
+
     /// Returns the backend type identifier (e.g., "openai_compatible", "anthropic", "gemini")
     fn backend_type(&self) -> &'static str;
 
@@ -203,6 +214,18 @@ pub trait ExternalBackend: Send + Sync {
             "Privacy classification is not supported by the {} backend.",
             self.backend_type()
         )))
+    }
+
+    /// Performs a native stateless Responses request as a raw HTTP passthrough.
+    async fn responses_raw(
+        &self,
+        _config: &BackendConfig,
+        _model: &str,
+        _body: serde_json::Value,
+    ) -> Result<crate::responses_raw::ResponsesRawResponse, CompletionError> {
+        Err(CompletionError::CompletionError(
+            "Native Responses is unavailable for this backend".into(),
+        ))
     }
 
     /// Performs a native Anthropic Messages request as a raw HTTP passthrough.

@@ -527,6 +527,7 @@ pub async fn cancel_organization_invitation(
         )),
         Err(OrganizationError::UserNotFound)
         | Err(OrganizationError::AlreadyExists)
+        | Err(OrganizationError::DefaultOrganization)
         | Err(OrganizationError::StakingWalletBound)
         | Err(OrganizationError::AlreadyMember)
         | Err(OrganizationError::InternalError(_)) => {

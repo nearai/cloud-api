@@ -119,6 +119,7 @@ async fn list_inference_rows(
             api_key_id: query.api_key_id,
             model: query.model.clone(),
             inference_type: query.inference_type.map(|value| value.as_str().to_string()),
+            credit_type: query.credit_type.clone(),
             limit: fetch_limit,
             cursor: cursor.map(|value| InferenceUsageReportCursor {
                 created_at: value.created_at,
@@ -152,6 +153,7 @@ async fn list_service_rows(
             service_name: query.service_name.clone(),
             workspace_id: query.workspace_id,
             api_key_id: query.api_key_id,
+            credit_type: query.credit_type.clone(),
             start_time: query.start_time,
             end_time: query.end_time,
             cursor: cursor.map(|value| ServiceUsageReportCursor {
@@ -166,7 +168,10 @@ async fn list_service_rows(
             services::service_usage::ServiceUsageError::ReportingTimeout => timeout_error(),
             _ => internal_error("Failed to list service usage export"),
         })?;
-    Ok(rows.into_iter().map(ExportRow::Service).collect())
+    Ok(rows
+        .into_iter()
+        .map(|row| ExportRow::Service(Box::new(row)))
+        .collect())
 }
 
 fn source_cursor(

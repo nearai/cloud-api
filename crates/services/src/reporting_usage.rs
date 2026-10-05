@@ -20,6 +20,7 @@ pub struct ReportingUsageSummaryFilters {
     pub model: Option<String>,
     pub inference_type: Option<String>,
     pub service_name: Option<String>,
+    pub credit_type: Option<String>,
     pub source: ReportingUsageSummarySource,
     pub deadline: Option<Instant>,
 }
@@ -210,6 +211,7 @@ mod tests {
             model: None,
             inference_type: None,
             service_name: None,
+            credit_type: None,
             source: ReportingUsageSummarySource::All,
             deadline: None,
         };

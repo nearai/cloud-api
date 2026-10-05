@@ -1,5 +1,4 @@
 use crate::pool::DbPool;
-use crate::repositories::statement_cache::CachedStatements;
 use crate::repositories::utils::map_db_error;
 use crate::retry_db;
 use anyhow::{Context, Result};
@@ -12,17 +11,32 @@ use services::staking_farm::{
     StakingSyncStatus, UpsertStakingFarmSourceRequest, CREDIT_SOURCE_HOUSE_OF_STAKE,
     CREDIT_TYPE_STAKING_FARM,
 };
+use tokio_postgres::types::Type;
 use tokio_postgres::Row;
 use uuid::Uuid;
 
 #[derive(Debug, Clone)]
 pub struct OrganizationStakingFarmSourcesRepository {
     pool: DbPool,
+    allocation_policy: crate::repositories::credit_allocation::CreditAllocationPolicy,
 }
 
 impl OrganizationStakingFarmSourcesRepository {
     pub fn new(pool: DbPool) -> Self {
-        Self { pool }
+        Self {
+            pool,
+            allocation_policy:
+                crate::repositories::credit_allocation::CreditAllocationPolicy::default(),
+        }
+    }
+
+    pub fn with_accounting_config(pool: DbPool, config: &config::CreditAllocationConfig) -> Self {
+        Self {
+            pool,
+            allocation_policy: crate::repositories::credit_allocation::CreditAllocationPolicy::from(
+                config,
+            ),
+        }
     }
 
     fn row_to_source(row: &Row) -> OrganizationStakingFarmSource {
@@ -165,8 +179,9 @@ impl StakingFarmRepository for OrganizationStakingFarmSourcesRepository {
                 .context("Failed to get database connection")
                 .map_err(RepositoryError::PoolError)?;
 
+            // One-shot typed query: one round trip, see repositories/mod.rs.
             client
-                .cached_query_opt(
+                .query_typed_opt(
                     r#"
                     SELECT id, organization_id, near_account_id, network_id, contract_id,
                            farm_product_id, farm_price_id, credit_nano_usd_per_reward_unit,
@@ -181,7 +196,7 @@ impl StakingFarmRepository for OrganizationStakingFarmSourcesRepository {
                     ORDER BY created_at ASC
                     LIMIT 1
                     "#,
-                    &[&organization_id],
+                    &[(&organization_id, Type::UUID)],
                 )
                 .await
                 .map_err(map_db_error)
@@ -260,15 +275,11 @@ impl StakingFarmRepository for OrganizationStakingFarmSourcesRepository {
 
             let transaction = client.transaction().await.map_err(map_db_error)?;
             let now = Utc::now();
-            let advisory_key = format!("{organization_id}:{CREDIT_TYPE_STAKING_FARM}");
-
-            transaction
-                .query_one(
-                    "SELECT pg_advisory_xact_lock(hashtext($1))",
-                    &[&advisory_key],
-                )
-                .await
-                .map_err(map_db_error)?;
+            crate::repositories::credit_allocation::lock_organization_accounting(
+                &transaction,
+                organization_id,
+            )
+            .await?;
 
             transaction
                 .execute(
@@ -312,6 +323,13 @@ impl StakingFarmRepository for OrganizationStakingFarmSourcesRepository {
                 )
                 .await
                 .map_err(map_db_error)?;
+
+            crate::repositories::credit_allocation::settle_unfunded_usage(
+                &transaction,
+                organization_id,
+                &self.allocation_policy,
+            )
+            .await?;
 
             transaction.commit().await.map_err(map_db_error)?;
             Ok::<(), RepositoryError>(())

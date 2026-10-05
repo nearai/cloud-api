@@ -69,6 +69,10 @@ pub struct ServiceUsageLogEntry {
     pub total_cost: i64,
     pub inference_id: Option<Uuid>,
     pub created_at: chrono::DateTime<chrono::Utc>,
+    pub credit_allocations: Option<Vec<crate::usage::CreditAllocation>>,
+    pub funded_amount: Option<i64>,
+    pub unfunded_amount: Option<i64>,
+    pub allocation_policy_version: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -83,6 +87,7 @@ pub struct ServiceUsageReportFilters {
     pub service_name: Option<String>,
     pub workspace_id: Option<Uuid>,
     pub api_key_id: Option<Uuid>,
+    pub credit_type: Option<String>,
     pub start_time: Option<DateTime<Utc>>,
     pub end_time: Option<DateTime<Utc>>,
     pub cursor: Option<ServiceUsageReportCursor>,
@@ -97,6 +102,7 @@ impl Default for ServiceUsageReportFilters {
             service_name: None,
             workspace_id: None,
             api_key_id: None,
+            credit_type: None,
             start_time: None,
             end_time: None,
             cursor: None,
@@ -118,6 +124,10 @@ pub struct ServiceUsageReportEntry {
     pub total_cost: i64,
     pub inference_id: Option<Uuid>,
     pub created_at: DateTime<Utc>,
+    pub credit_allocations: Option<Vec<crate::usage::CreditAllocation>>,
+    pub funded_amount: Option<i64>,
+    pub unfunded_amount: Option<i64>,
+    pub allocation_policy_version: Option<String>,
 }
 
 /// Port for the service usage service. Implemented by ServiceUsageService.
@@ -141,6 +151,7 @@ pub trait ServiceUsageServiceTrait: Send + Sync {
         &self,
         organization_id: Uuid,
         service_name: Option<&str>,
+        credit_type: Option<&str>,
         limit: i64,
         offset: i64,
     ) -> Result<(Vec<ServiceUsageLogEntry>, i64), super::ServiceUsageError>;
@@ -169,6 +180,7 @@ pub trait ServiceUsageRepositoryTrait: Send + Sync {
         &self,
         organization_id: Uuid,
         service_name: Option<&str>,
+        credit_type: Option<&str>,
         limit: i64,
         offset: i64,
     ) -> anyhow::Result<(Vec<ServiceUsageLogEntry>, i64)>;

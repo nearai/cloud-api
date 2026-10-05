@@ -74,6 +74,14 @@ pub enum CompletionError {
 // Request/Response models
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CompletionRequest {
+    /// Operator-controlled scheduler priority. Never accepted from or exposed in JSON.
+    #[serde(skip)]
+    pub request_priority: inference_providers::models::RequestPriority,
+    /// The `x-session-id` request header, if present. Used only to derive a
+    /// placement affinity key (see `completions::affinity::derive`); never
+    /// accepted from or exposed in the JSON body, and never logged.
+    #[serde(skip)]
+    pub session_hint: Option<String>,
     /// UUIDv4 correlation ID generated (or echoed) by the API layer.
     /// Propagated downstream as `X-Request-Id` so every hop can join on it.
     pub request_id: uuid::Uuid,
@@ -247,7 +255,7 @@ pub trait CompletionServiceTrait: Send + Sync {
         params: inference_providers::ScoreParams,
     ) -> Result<inference_providers::ScoreResponse, CompletionError>;
 
-    /// Get model information by name (for checking output_modalities, etc.)
+    /// Resolve an active model by canonical name or alias (for capability checks, etc.).
     async fn get_model(
         &self,
         model_name: &str,

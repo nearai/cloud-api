@@ -935,6 +935,13 @@ mod tests {
         async fn get_by_id(&self, _: Uuid) -> Result<Option<Organization>, RepositoryError> {
             unimplemented!()
         }
+        async fn set_request_priority(
+            &self,
+            _: Uuid,
+            _: i32,
+        ) -> Result<Option<i32>, RepositoryError> {
+            unimplemented!()
+        }
         async fn get_by_name(&self, _: &str) -> Result<Option<Organization>, RepositoryError> {
             unimplemented!()
         }
@@ -1348,6 +1355,20 @@ mod tests {
         ) -> Result<crate::organization::OrganizationSettings, OrganizationError> {
             unimplemented!()
         }
+        async fn get_request_priority_for_admin(
+            &self,
+            _: OrganizationId,
+        ) -> Result<i32, OrganizationError> {
+            unimplemented!()
+        }
+        async fn update_request_priority_for_admin(
+            &self,
+            _: OrganizationId,
+            _: i32,
+        ) -> Result<i32, OrganizationError> {
+            unimplemented!()
+        }
+
         async fn get_fallback_enabled_for_admin(
             &self,
             _: OrganizationId,

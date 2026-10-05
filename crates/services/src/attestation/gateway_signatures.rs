@@ -13,6 +13,11 @@ impl AttestationService {
         request_hash: String,
         response_hash: String,
     ) -> Result<(), AttestationError> {
+        if signature_id.is_empty() {
+            return Err(AttestationError::InvalidParameter(
+                "Signature ID must not be empty".to_string(),
+            ));
+        }
         let start_time = std::time::Instant::now();
         let environment = get_environment();
         let env_tag = format!("{TAG_ENVIRONMENT}:{environment}");

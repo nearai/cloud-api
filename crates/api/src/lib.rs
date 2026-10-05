@@ -63,7 +63,7 @@ use services::{
 use std::sync::Arc;
 use tower_http::{
     compression::CompressionLayer,
-    cors::{AllowOrigin, Any, CorsLayer},
+    cors::{AllowHeaders, AllowOrigin, Any, CorsLayer},
 };
 use utoipa::OpenApi;
 
@@ -78,6 +78,10 @@ const PRIVACY_CLASSIFY_MAX_BODY_SIZE: usize = 256 * 1024; // 256 KB
 // cover audio-transcription payloads (≤25 MB) plus HPKE overhead, while
 // bounding unauthenticated memory use before the inner request is decrypted.
 const OHTTP_MAX_BODY_SIZE: usize = 32 * 1024 * 1024; // 32 MB
+
+// POST /v1/responses sets no DefaultBodyLimit, so axum's 2 MB extractor default
+// is its effective limit. body_hash_middleware needs it as an explicit cap.
+const RESPONSES_MAX_BODY_SIZE: usize = 2 * 1024 * 1024; // 2 MB
 
 /// Service initialization components
 #[derive(Clone)]
@@ -112,6 +116,7 @@ pub struct DomainServices {
     pub web_search_provider: Arc<dyn services::responses::tools::WebSearchProviderTrait>,
     pub service_usage_service:
         Arc<dyn services::service_usage::ServiceUsageServiceTrait + Send + Sync>,
+    pub admin_settings_service: Arc<services::admin_settings::AdminSettingsService>,
 }
 
 /// Controls process-level background work started while the application router
@@ -316,7 +321,8 @@ pub async fn init_domain_services(
     organization_service: Arc<dyn services::organization::OrganizationServiceTrait + Send + Sync>,
     metrics_service: Arc<dyn services::metrics::MetricsServiceTrait>,
 ) -> DomainServices {
-    let inference_provider_pool = init_inference_providers(database.clone(), config).await;
+    let inference_provider_pool =
+        init_inference_providers(database.clone(), config, metrics_service.clone()).await;
     init_domain_services_with_pool(
         database,
         config,
@@ -412,13 +418,17 @@ pub async fn init_domain_services_with_pool(
 
     // Prepare repositories for usage service (will be created after workspace service)
     let usage_repository = Arc::new(
-        database::repositories::OrganizationUsageRepository::with_reporting_statement_timeout(
+        database::repositories::OrganizationUsageRepository::with_accounting_config(
             database.pool().clone(),
             reporting_statement_timeout,
+            &config.credit_allocation,
         ),
     );
     let limits_repository_for_usage = Arc::new(
-        database::repositories::OrganizationLimitsRepository::new(database.pool().clone()),
+        database::repositories::OrganizationLimitsRepository::with_accounting_config(
+            database.pool().clone(),
+            &config.credit_allocation,
+        ),
     );
 
     // Create MCP client manager
@@ -456,14 +466,20 @@ pub async fn init_domain_services_with_pool(
         as Arc<dyn services::completions::ports::OrganizationConcurrentLimitRepository>;
 
     // Create completion service with usage tracking (needs usage_service)
-    let completion_service = Arc::new(services::CompletionServiceImpl::new(
+    let mut completion_service = services::CompletionServiceImpl::new(
         inference_provider_pool.clone(),
         attestation_service.clone(),
         usage_service.clone(),
         metrics_service.clone(),
         models_repo.clone() as Arc<dyn services::models::ModelsRepository>,
         org_limit_repository,
-    ));
+    )
+    .with_model_resolve_cache(models_service.model_resolve_cache());
+    // Affinity keys only matter to a pool that places requests.
+    if let Some(affinity_secret) = inference_provider_pool.affinity_secret() {
+        completion_service = completion_service.with_affinity_secret(affinity_secret);
+    }
+    let completion_service = Arc::new(completion_service);
 
     let brave_search_provider =
         Arc::new(services::responses::tools::brave::BraveWebSearchProvider::new());
@@ -525,9 +541,10 @@ pub async fn init_domain_services_with_pool(
         database.pool().clone(),
     ));
     let org_service_usage_repo = Arc::new(
-        database::repositories::OrganizationServiceUsageRepository::with_reporting_statement_timeout(
+        database::repositories::OrganizationServiceUsageRepository::with_accounting_config(
             database.pool().clone(),
             reporting_statement_timeout,
+            &config.credit_allocation,
         ),
     );
     let service_usage_repo = Arc::new(database::repositories::ServiceUsageRepositoryImpl::new(
@@ -552,8 +569,9 @@ pub async fn init_domain_services_with_pool(
         config.aml.clone(),
     ));
     let staking_farm_repository = Arc::new(
-        database::repositories::OrganizationStakingFarmSourcesRepository::new(
+        database::repositories::OrganizationStakingFarmSourcesRepository::with_accounting_config(
             database.pool().clone(),
+            &config.credit_allocation,
         ),
     ) as Arc<dyn services::staking_farm::StakingFarmRepository>;
     let staking_farm_contract_client = Arc::new(
@@ -570,6 +588,16 @@ pub async fn init_domain_services_with_pool(
         Some(aml_service.clone()),
         config.staking_farm.clone(),
     ));
+
+    // Admin settings (placement tuning today): load into the pool's tuning
+    // handle now, then every 10 minutes. Placement off leaves it unused.
+    let admin_settings_service = Arc::new(services::admin_settings::AdminSettingsService::new(
+        Arc::new(
+            database::repositories::PostgresAdminSettingsRepository::new(database.pool().clone()),
+        ),
+        inference_provider_pool.placement_tuning(),
+    ));
+    admin_settings_service.clone().start().await;
 
     DomainServices {
         conversation_service,
@@ -589,6 +617,7 @@ pub async fn init_domain_services_with_pool(
         aml_service,
         web_search_provider,
         service_usage_service,
+        admin_settings_service,
     }
 }
 
@@ -923,13 +952,70 @@ async fn ensure_chutes_catalog_row(
     }
 }
 
+/// Enables smart placement on `pool` when `PLACEMENT_REDIS_PASSWORD` and a
+/// valid placement Valkey endpoint are configured. Without either there is
+/// no placement state and every request routes as before (this is not a
+/// mode flag); a missing or invalid endpoint is logged once, at startup,
+/// and never fails it. The pool derives both HMAC secrets from the password
+/// and is the single source of the affinity secret
+/// (`pool.affinity_secret()`); none of them is ever logged.
+pub fn install_placement(
+    pool: &services::inference_provider_pool::InferenceProviderPool,
+    placement: &config::PlacementConfig,
+) {
+    let Some(password) = placement.redis_password.as_deref() else {
+        tracing::info!("Placement secret not configured; smart placement off, legacy routing");
+        return;
+    };
+    let endpoint = match &placement.redis_endpoint {
+        config::PlacementEndpoint::Valid(endpoint) => endpoint,
+        config::PlacementEndpoint::Missing => {
+            tracing::warn!(
+                "Placement Valkey endpoint not configured (PLACEMENT_REDIS_HOST); smart placement off, legacy routing"
+            );
+            return;
+        }
+        config::PlacementEndpoint::Invalid(reason) => {
+            // `reason` names the variable, never its value.
+            tracing::error!(
+                reason = %reason,
+                "Placement Valkey endpoint invalid; smart placement off, legacy routing"
+            );
+            return;
+        }
+    };
+    if !endpoint.tls {
+        tracing::warn!(
+            "PLACEMENT_REDIS_TLS_ENABLED=false: the placement Valkey password travels in plaintext"
+        );
+    }
+    pool.set_placement(
+        password.to_string(),
+        inference_providers::placement_io::ValkeyEndpoint {
+            host: endpoint.host.clone(),
+            port: endpoint.port,
+            tls: endpoint.tls,
+            ca_pem: endpoint.ca_pem.clone(),
+        },
+    );
+    // Configured is not active: until the proxies publish frames (or while
+    // Valkey is unreachable) the snapshot stays empty and every request
+    // still routes legacy.
+    tracing::info!("Smart placement configured");
+}
+
 /// Initialize inference provider pool
 ///
 /// Loads inference_url models and external providers from the database,
-/// then starts a periodic refresh task to keep them in sync.
+/// then starts a periodic refresh task to keep them in sync. The metrics
+/// sink and smart placement are attached before the first load, so
+/// providers created at startup get them exactly like those created by
+/// later discovery refreshes, and counters emitted by the initial
+/// attestation discovery are recorded.
 pub async fn init_inference_providers(
     database: Arc<Database>,
     config: &ApiConfig,
+    metrics_service: Arc<dyn services::metrics::MetricsServiceTrait>,
 ) -> Arc<services::inference_provider_pool::InferenceProviderPool> {
     let api_key = config.inference_api_key.clone();
 
@@ -939,6 +1025,8 @@ pub async fn init_inference_providers(
             config.external_providers.clone(),
         ),
     );
+    pool.set_metrics_service(metrics_service);
+    install_placement(&pool, &config.placement);
 
     let models_repo = Arc::new(database::repositories::ModelRepository::new(
         database.pool().clone(),
@@ -1099,7 +1187,7 @@ pub async fn init_inference_providers(
 /// This function uses the existing MockProvider from inference_providers::mock
 /// and registers it for common test models without changing any implementations
 pub async fn init_inference_providers_with_mocks(
-    _config: &ApiConfig,
+    config: &ApiConfig,
 ) -> (
     Arc<services::inference_provider_pool::InferenceProviderPool>,
     Arc<inference_providers::mock::MockProvider>,
@@ -1110,7 +1198,7 @@ pub async fn init_inference_providers_with_mocks(
     let pool = Arc::new(
         services::inference_provider_pool::InferenceProviderPool::new(
             None,
-            config::ExternalProvidersConfig::default(),
+            config.external_providers.clone(),
         ),
     );
 
@@ -1152,6 +1240,30 @@ pub async fn init_inference_providers_with_mocks(
     tracing::info!("Initialized inference provider pool with MockProvider for testing");
 
     (pool, mock_provider)
+}
+
+// Browser API clients supply their own tokens. Keep public API CORS open for
+// third-party clients, while admin browser access remains limited to configured
+// origins. OAuth callback origins use the same configured origin policy.
+fn build_cors_layer(cors_config: config::CorsConfig) -> CorsLayer {
+    CorsLayer::new()
+        .allow_origin(AllowOrigin::predicate(
+            move |origin: &HeaderValue, request_parts: &axum::http::request::Parts| {
+                let path = request_parts.uri.path();
+                let is_admin_route = path == "/v1/admin" || path.starts_with("/v1/admin/");
+                if !is_admin_route {
+                    return true;
+                }
+
+                origin
+                    .to_str()
+                    .map(|origin| is_origin_allowed(origin, &cors_config))
+                    .unwrap_or(false)
+            },
+        ))
+        .allow_methods(Any)
+        .allow_headers(AllowHeaders::mirror_request())
+        .expose_headers(Any)
 }
 
 pub fn is_origin_allowed(origin_str: &str, cors_config: &config::CorsConfig) -> bool {
@@ -1313,12 +1425,12 @@ pub fn build_app_with_config_and_options(
         app_state.clone(),
         &auth_components.auth_state_middleware,
         usage_state.clone(),
-        rate_limit_state.clone(),
     );
 
     let internal_routes = build_internal_routes(app_state.clone());
 
     let response_routes = build_response_routes(
+        app_state.clone(),
         domain_services.response_service,
         domain_services.attestation_service.clone(),
         &auth_components.auth_state_middleware,
@@ -1372,6 +1484,7 @@ pub fn build_app_with_config_and_options(
             completion_service: domain_services.completion_service.clone(),
             organization_service: domain_services.organization_service.clone(),
             usage_service: domain_services.usage_service.clone(),
+            admin_settings_service: domain_services.admin_settings_service.clone(),
         },
     );
 
@@ -1430,21 +1543,7 @@ pub fn build_app_with_config_and_options(
         metrics_service: domain_services.metrics_service.clone(),
     };
 
-    // Create CORS layer
-    let cors_config = config.cors.clone();
-    let cors = CorsLayer::new()
-        .allow_origin(AllowOrigin::predicate(
-            move |origin: &HeaderValue, _request_parts: &axum::http::request::Parts| {
-                let origin_str = match origin.to_str() {
-                    Ok(s) => s,
-                    Err(_) => return false,
-                };
-                is_origin_allowed(origin_str, &cors_config)
-            },
-        ))
-        .allow_methods(Any)
-        .allow_headers(Any)
-        .expose_headers(Any);
+    let cors = build_cors_layer(config.cors.clone());
 
     // OHTTP routes: `POST /ohttp` and `GET /.well-known/ohttp-gateway` are at the
     // root (not under /v1) so clients can reach them without version-prefixing.
@@ -1608,6 +1707,12 @@ pub fn build_completion_routes(
 ) -> Router {
     use crate::routes::files::MAX_FILE_SIZE;
 
+    // Announces a planned model deprecation in response headers. Innermost
+    // layer: it only sees requests that passed auth, rate and usage checks.
+    let model_deprecation_state = middleware::ModelDeprecationState {
+        models_service: app_state.models_service.clone(),
+    };
+
     // Native Anthropic Messages support is staging-gated and hard-off by
     // default. Keep it on its own router so enabling it cannot alter the
     // existing OpenAI-compatible routes or middleware behavior.
@@ -1620,6 +1725,10 @@ pub fn build_completion_routes(
             .route("/messages", post(routes::anthropic::messages))
             .layer(DefaultBodyLimit::max(AUDIO_TRANSCRIPTION_MAX_BODY_SIZE))
             .with_state(app_state.clone())
+            .layer(from_fn_with_state(
+                model_deprecation_state.clone(),
+                middleware::model_deprecation_middleware,
+            ))
             .layer(from_fn_with_state(
                 usage_state.clone(),
                 middleware::usage::anthropic_usage_check_middleware,
@@ -1667,6 +1776,7 @@ pub fn build_completion_routes(
         .route("/rerank", post(rerank))
         .route("/embeddings", post(embeddings))
         .route("/score", post(score))
+        .route("/systemone", post(routes::systemone::systemone))
         // Override the router-level audio limit (25 MB) for privacy/classify: this is a
         // text-only endpoint, so a 256 KB cap is more appropriate.
         .route(
@@ -1682,6 +1792,10 @@ pub fn build_completion_routes(
         .layer(DefaultBodyLimit::max(AUDIO_TRANSCRIPTION_MAX_BODY_SIZE))
         .with_state(app_state.clone())
         .layer(from_fn_with_state(
+            model_deprecation_state.clone(),
+            middleware::model_deprecation_middleware,
+        ))
+        .layer(from_fn_with_state(
             usage_state.clone(),
             middleware::usage_check_middleware,
         ))
@@ -1693,15 +1807,24 @@ pub fn build_completion_routes(
             auth_state_middleware.clone(),
             middleware::auth::auth_middleware_with_workspace_context,
         ))
-        .layer(from_fn(middleware::body_hash_middleware));
+        // body_hash buffers before auth runs, so cap it at the largest route
+        // limit in this group. Smaller per-route limits (privacy) still apply
+        // through their extractors.
+        .layer(from_fn_with_state(
+            middleware::BodyHashLimit(AUDIO_TRANSCRIPTION_MAX_BODY_SIZE),
+            middleware::body_hash_middleware,
+        ));
 
     // File-based inference routes (image edits)
-    // Apply 512 MB limit only to endpoints that accept file uploads
-    // IMPORTANT: body_hash_middleware is placed AFTER auth to prevent buffering
-    // unauthenticated requests. Auth failures prevent memory exhaustion DoS attacks.
+    // Apply 512 MB limit only to endpoints that accept file uploads.
+    // body_hash_middleware buffers before auth, so it is capped at the same limit.
     let file_inference_routes = Router::new()
         .route("/images/edits", post(image_edits))
         .with_state(app_state.clone())
+        .layer(from_fn_with_state(
+            model_deprecation_state.clone(),
+            middleware::model_deprecation_middleware,
+        ))
         .layer(from_fn_with_state(
             usage_state,
             middleware::usage_check_middleware,
@@ -1714,7 +1837,10 @@ pub fn build_completion_routes(
             auth_state_middleware.clone(),
             middleware::auth::auth_middleware_with_workspace_context,
         ))
-        .layer(from_fn(middleware::body_hash_middleware))
+        .layer(from_fn_with_state(
+            middleware::BodyHashLimit(MAX_FILE_SIZE),
+            middleware::body_hash_middleware,
+        ))
         .layer(DefaultBodyLimit::max(MAX_FILE_SIZE));
 
     let metadata_routes = Router::new()
@@ -1735,13 +1861,25 @@ pub fn build_completion_routes(
 
 /// Build response routes with auth
 pub fn build_response_routes(
+    native_app_state: AppState,
     response_service: Arc<services::ResponseService>,
     attestation_service: Arc<dyn services::attestation::ports::AttestationServiceTrait>,
     auth_state_middleware: &AuthState,
     usage_state: middleware::UsageState,
     rate_limit_state: middleware::RateLimitState,
 ) -> Router {
+    let model_deprecation_state = middleware::ModelDeprecationState {
+        models_service: native_app_state.models_service.clone(),
+    };
     let route_state = responses::ResponseRouteState {
+        native_service: services::responses::native::NativeResponsesService {
+            models: native_app_state.config.native_responses_models.clone(),
+            models_service: native_app_state.models_service,
+            completion_service: native_app_state.completion_service,
+            inference_provider_pool: native_app_state.inference_provider_pool,
+            usage_service: native_app_state.usage_service,
+            attestation_service: native_app_state.attestation_service,
+        },
         response_service: response_service.clone(),
         attestation_service: attestation_service.clone(),
     };
@@ -1749,6 +1887,10 @@ pub fn build_response_routes(
     let inference_routes = Router::new()
         .route("/responses", post(responses::create_response))
         .with_state(route_state.clone())
+        .layer(from_fn_with_state(
+            model_deprecation_state,
+            middleware::model_deprecation_middleware,
+        ))
         .layer(from_fn_with_state(
             usage_state,
             middleware::usage_check_middleware,
@@ -1761,7 +1903,10 @@ pub fn build_response_routes(
             auth_state_middleware.clone(),
             middleware::auth::auth_middleware_with_workspace_context,
         ))
-        .layer(from_fn(middleware::body_hash_middleware));
+        .layer(from_fn_with_state(
+            middleware::BodyHashLimit(RESPONSES_MAX_BODY_SIZE),
+            middleware::body_hash_middleware,
+        ));
 
     let other_routes = Router::new()
         .route("/responses/{response_id}", get(responses::get_response))
@@ -1993,6 +2138,7 @@ pub fn build_feature_request_routes(
             auth_middleware,
         ));
 
+    // Classify read operations in middleware::admin_policy when adding admin routes.
     let admin_routes = Router::new()
         .route("/admin/feature-requests", get(list_admin_feature_requests))
         .with_state(state)
@@ -2069,12 +2215,21 @@ pub fn build_reporting_usage_routes(
 }
 
 /// Build gateway routes for external model gateways to validate API keys.
-/// Reuses the same auth, rate limiting, and usage check middleware as completions.
+///
+/// `/v1/check_api_key` runs the same API-key auth and credit (usage) check
+/// middleware as completions, but deliberately not the per-key request
+/// limiter (`api_key_rate_limit_middleware`). A gateway validates the caller's
+/// key once per request, before its own admission decision, so key checks
+/// arrive at the caller's full request rate; counting them against the
+/// per-key limit turns caller bursts into 429s unrelated to backend load
+/// (nearai/infra#242). Key checks do not spend the key's inference allowance
+/// either. Without a per-key cap here, a valid key holder can call this
+/// route at any rate, the same as the other authenticated non-inference
+/// routes; how those routes are bounded is tracked in nearai/cloud-api#1142.
 pub fn build_gateway_routes(
     app_state: AppState,
     auth_state_middleware: &AuthState,
     usage_state: middleware::UsageState,
-    rate_limit_state: middleware::RateLimitState,
 ) -> Router {
     Router::new()
         .route(
@@ -2085,10 +2240,6 @@ pub fn build_gateway_routes(
         .layer(from_fn_with_state(
             usage_state,
             middleware::usage_check_middleware,
-        ))
-        .layer(from_fn_with_state(
-            rate_limit_state,
-            middleware::api_key_rate_limit_middleware,
         ))
         .layer(from_fn_with_state(
             auth_state_middleware.clone(),
@@ -2202,6 +2353,7 @@ pub struct AdminRouteServices {
     pub organization_service:
         Arc<dyn services::organization::OrganizationServiceTrait + Send + Sync>,
     pub usage_service: Arc<dyn services::usage::UsageServiceTrait + Send + Sync>,
+    pub admin_settings_service: Arc<services::admin_settings::AdminSettingsService>,
 }
 
 pub fn build_admin_routes(
@@ -2231,17 +2383,19 @@ fn build_admin_routes_with_options(
         batch_upsert_models, cancel_model_pricing_change, confirm_model_deprecation,
         confirm_model_pricing_changes, create_admin_access_token, create_service,
         delete_admin_access_token, delete_aml_allowlist_entry, delete_model, deprecate_model,
-        get_admin_organization_balance, get_billing_summary, get_infra_summary,
+        get_admin_organization_balance, get_admin_setting, get_billing_summary, get_infra_summary,
         get_model_consumption_timeseries, get_model_history, get_model_revenue, get_org_revenue,
         get_organization as get_admin_organization, get_organization_concurrent_limit,
         get_organization_fallback, get_organization_limits_history, get_organization_metrics,
-        get_organization_timeseries, get_performance_timeseries, get_platform_metrics,
-        get_platform_timeseries, get_revenue_density, list_admin_access_tokens, list_aml_allowlist,
-        list_aml_reports, list_invitation_email_deliveries, list_model_pricing_changes,
+        get_organization_priority, get_organization_timeseries, get_performance_timeseries,
+        get_platform_metrics, get_platform_timeseries, get_revenue_density,
+        list_admin_access_tokens, list_admin_settings, list_aml_allowlist, list_aml_reports,
+        list_invitation_email_deliveries, list_model_pricing_changes,
         list_models as admin_list_models, list_organization_members, list_organizations,
         list_users, preview_model_deprecation, preview_model_pricing_changes,
-        resend_invitation_email, update_aml_report_status, update_organization_concurrent_limit,
-        update_organization_fallback, update_organization_limits, update_organization_member_role,
+        resend_invitation_email, update_admin_setting, update_aml_report_status,
+        update_organization_concurrent_limit, update_organization_fallback,
+        update_organization_limits, update_organization_member_role, update_organization_priority,
         update_service, upsert_aml_allowlist_entry, AdminAppState,
     };
     use crate::routes::staking_farm::{
@@ -2251,12 +2405,14 @@ fn build_admin_routes_with_options(
     use services::admin::AdminServiceImpl;
 
     // Create composite admin repository (handles models, organization limits, and users)
-    let admin_repository = Arc::new(AdminCompositeRepository::new(database.pool().clone()));
+    let admin_repository = Arc::new(AdminCompositeRepository::with_accounting_config(
+        database.pool().clone(),
+        &config.credit_allocation,
+    ));
 
     // Create admin access token repository
     let admin_access_token_repository =
         Arc::new(AdminAccessTokenRepository::new(database.pool().clone()));
-
     // Create admin service with composite repository.
     //
     // The admin service holds a reference to the `models_service` so it can
@@ -2299,6 +2455,7 @@ fn build_admin_routes_with_options(
         inference_provider_pool: services.inference_provider_pool,
         github_dispatcher,
         infra_service,
+        admin_settings_service: services.admin_settings_service,
     };
 
     let database_encryption_state = crate::database_encryption::DatabaseEncryptionState::new(
@@ -2314,6 +2471,7 @@ fn build_admin_routes_with_options(
     })
     .ok();
 
+    // Classify read operations in middleware::admin_policy when adding admin routes.
     let admin_routes = Router::new()
         .route(
             "/admin/models",
@@ -2396,6 +2554,10 @@ fn build_admin_routes_with_options(
                 .get(get_organization_concurrent_limit),
         )
         .route(
+            "/admin/organizations/{org_id}/priority",
+            axum::routing::get(get_organization_priority).patch(update_organization_priority),
+        )
+        .route(
             "/admin/organizations/{org_id}/fallback",
             axum::routing::get(get_organization_fallback).patch(update_organization_fallback),
         )
@@ -2430,6 +2592,11 @@ fn build_admin_routes_with_options(
         .route(
             "/admin/platform/infra-summary",
             axum::routing::get(get_infra_summary),
+        )
+        .route("/admin/settings", axum::routing::get(list_admin_settings))
+        .route(
+            "/admin/settings/{key}",
+            axum::routing::get(get_admin_setting).patch(update_admin_setting),
         )
         .route(
             "/admin/platform/model-consumption-timeseries",
@@ -2480,7 +2647,23 @@ fn build_admin_routes_with_options(
             "/admin/access-tokens/{token_id}",
             axum::routing::delete(delete_admin_access_token),
         )
-        .with_state(admin_app_state);
+        .with_state(admin_app_state)
+        .merge(
+            Router::new()
+                .route(
+                    "/admin/usage-hourly/recompute",
+                    axum::routing::post(crate::routes::admin_usage_hourly::recompute_usage_hourly),
+                )
+                .layer(axum::Extension(
+                    crate::routes::admin_usage_hourly::UsageHourlyRepairState {
+                        repository: Arc::new(
+                            database::repositories::UsageHourlyRepositoryImpl::new(
+                                database.pool().clone(),
+                            ),
+                        ),
+                    },
+                )),
+        );
 
     let admin_routes = if let Some(database_encryption_state) = database_encryption_state {
         if build_options.start_database_encryption_recovery {
@@ -2702,6 +2885,45 @@ mod tests {
         assert!(spec.servers.is_none() || spec.servers.as_ref().unwrap().is_empty());
     }
 
+    #[test]
+    fn test_openapi_chat_completion_details_are_optional() {
+        // Chat-completion usage details are independently optional (a provider
+        // may report only `audio_tokens`), while the Responses API usage keeps
+        // OpenAI's required `output_tokens_details.reasoning_tokens`.
+        let spec = serde_json::to_value(ApiDoc::openapi()).unwrap();
+        let schemas = &spec["components"]["schemas"];
+        let details = &schemas["CompletionUsage"]["properties"]["completion_tokens_details"];
+        assert!(
+            details
+                .to_string()
+                .contains("#/components/schemas/CompletionTokensDetails"),
+            "completion_tokens_details should use CompletionTokensDetails: {details}"
+        );
+        let completion_details = &schemas["CompletionTokensDetails"];
+        for field in [
+            "reasoning_tokens",
+            "audio_tokens",
+            "accepted_prediction_tokens",
+            "rejected_prediction_tokens",
+        ] {
+            assert!(
+                completion_details["properties"].get(field).is_some(),
+                "CompletionTokensDetails should document {field}"
+            );
+        }
+        assert!(
+            completion_details
+                .get("required")
+                .and_then(serde_json::Value::as_array)
+                .is_none_or(Vec::is_empty),
+            "no CompletionTokensDetails field is required: {completion_details}"
+        );
+        assert_eq!(
+            schemas["OutputTokensDetails"]["required"],
+            serde_json::json!(["reasoning_tokens"])
+        );
+    }
+
     fn assert_reporting_path_security(
         spec: &serde_json::Value,
         path: &str,
@@ -2818,7 +3040,7 @@ mod tests {
     }
 
     #[test]
-    fn test_openapi_admin_aml_paths_require_session_security() {
+    fn test_openapi_admin_aml_paths_require_admin_security() {
         let spec = serde_json::to_value(ApiDoc::openapi()).unwrap();
         let paths = spec["paths"].as_object().unwrap();
 
@@ -2836,8 +3058,8 @@ mod tests {
             );
             assert_eq!(
                 operation["security"],
-                serde_json::json!([{ "session_token": [] }]),
-                "{method} {path} must require session_token security"
+                serde_json::json!([{ "session_token": [] }, { "admin_token": [] }]),
+                "{method} {path} must require session_token or admin_token security"
             );
         }
     }
@@ -2853,6 +3075,88 @@ mod tests {
         assert!(!properties.contains_key("resultJson"));
     }
 
+    #[test]
+    fn missing_password_means_no_placement() {
+        let pool = services::inference_provider_pool::InferenceProviderPool::new(
+            None,
+            config::ExternalProvidersConfig::default(),
+        );
+        install_placement(&pool, &config::PlacementConfig::default());
+        assert!(
+            pool.affinity_secret().is_none(),
+            "no affinity secret without the password"
+        );
+        assert!(!pool.has_placement(), "no placement without the password");
+    }
+
+    fn configured_endpoint() -> config::PlacementEndpoint {
+        config::PlacementEndpoint::Valid(config::PlacementRedisEndpoint {
+            host: "203.0.113.7".to_string(),
+            port: 6379,
+            tls: true,
+            // Not a parsable certificate: the handle sets stay inert.
+            ca_pem: Some("-----BEGIN CERTIFICATE-----".to_string()),
+        })
+    }
+
+    #[test]
+    fn placement_password_installs_placement_and_affinity() {
+        let pool = services::inference_provider_pool::InferenceProviderPool::new(
+            None,
+            config::ExternalProvidersConfig::default(),
+        );
+        let placement = config::PlacementConfig {
+            redis_password: Some("router-password".to_string()),
+            redis_endpoint: configured_endpoint(),
+        };
+        install_placement(&pool, &placement);
+        assert!(pool.has_placement());
+        let (expected, _) = services::completions::affinity::secrets_from("router-password");
+        assert_eq!(pool.affinity_secret(), Some(expected));
+    }
+
+    /// TLS off is allowed (with a startup warning): placement still installs.
+    #[test]
+    fn plaintext_endpoint_still_installs_placement() {
+        let pool = services::inference_provider_pool::InferenceProviderPool::new(
+            None,
+            config::ExternalProvidersConfig::default(),
+        );
+        let placement = config::PlacementConfig {
+            redis_password: Some("router-password".to_string()),
+            redis_endpoint: config::PlacementEndpoint::Valid(config::PlacementRedisEndpoint {
+                host: "127.0.0.1".to_string(),
+                port: 6379,
+                tls: false,
+                ca_pem: None,
+            }),
+        };
+        install_placement(&pool, &placement);
+        assert!(pool.has_placement());
+    }
+
+    /// Without a usable endpoint placement stays off (fail open), password
+    /// or not: no handles and no affinity secret.
+    #[test]
+    fn placement_without_a_usable_endpoint_stays_off() {
+        for endpoint in [
+            config::PlacementEndpoint::Missing,
+            config::PlacementEndpoint::Invalid("PLACEMENT_REDIS_PORT".to_string()),
+        ] {
+            let pool = services::inference_provider_pool::InferenceProviderPool::new(
+                None,
+                config::ExternalProvidersConfig::default(),
+            );
+            let placement = config::PlacementConfig {
+                redis_password: Some("router-password".to_string()),
+                redis_endpoint: endpoint,
+            };
+            install_placement(&pool, &placement);
+            assert!(!pool.has_placement());
+            assert!(pool.affinity_secret().is_none());
+        }
+    }
+
     /// Example of how to set up the application for E2E testing
     #[tokio::test]
     #[ignore] // Remove ignore to run with a real database and Patroni cluster
@@ -2863,10 +3167,13 @@ mod tests {
                 host: "127.0.0.1".to_string(),
                 port: 0, // Use port 0 for testing to get a random available port
                 pricing_change_apply_interval_secs: 0,
+                usage_hourly_interval_secs: 0,
                 ohttp_enabled: false,
             },
             inference_api_key: Some("test-key".to_string()),
             internal_usage_token: None,
+            internal_usage_max_discount: config::DEFAULT_INTERNAL_USAGE_MAX_DISCOUNT,
+            native_responses_models: Vec::new(),
             logging: config::LoggingConfig {
                 level: "info".to_string(),
                 format: "compact".to_string(),
@@ -2882,6 +3189,7 @@ mod tests {
                 google: None,
                 near: config::NearConfig::default(),
                 admin_domains: vec![],
+                admin_read_only_tokens_enabled: false,
                 require_session_bound_access_tokens: false,
             },
             database: config::DatabaseConfig {
@@ -2923,7 +3231,9 @@ mod tests {
             staking_farm: config::StakingFarmConfig::default(),
             aml: config::AmlConfig::default(),
             usage_reporting: config::UsageReportingConfig::default(),
+            credit_allocation: config::CreditAllocationConfig::default(),
             ita: config::ItaAttestationConfig::default(),
+            placement: config::PlacementConfig::default(),
         };
 
         // Initialize services
@@ -2979,10 +3289,13 @@ mod tests {
                 host: "127.0.0.1".to_string(),
                 port: 0,
                 pricing_change_apply_interval_secs: 0,
+                usage_hourly_interval_secs: 0,
                 ohttp_enabled: false,
             },
             inference_api_key: Some("test-key".to_string()),
             internal_usage_token: None,
+            internal_usage_max_discount: config::DEFAULT_INTERNAL_USAGE_MAX_DISCOUNT,
+            native_responses_models: Vec::new(),
             logging: config::LoggingConfig {
                 level: "info".to_string(),
                 format: "compact".to_string(),
@@ -2998,6 +3311,7 @@ mod tests {
                 google: None,
                 near: config::NearConfig::default(),
                 admin_domains: vec![],
+                admin_read_only_tokens_enabled: false,
                 require_session_bound_access_tokens: false,
             },
             database: config::DatabaseConfig {
@@ -3039,7 +3353,9 @@ mod tests {
             staking_farm: config::StakingFarmConfig::default(),
             aml: config::AmlConfig::default(),
             usage_reporting: config::UsageReportingConfig::default(),
+            credit_allocation: config::CreditAllocationConfig::default(),
             ita: config::ItaAttestationConfig::default(),
+            placement: config::PlacementConfig::default(),
         };
 
         let auth_components = init_auth_services(database.clone(), &config);
@@ -3146,6 +3462,112 @@ mod tests {
         let config = test_cors_config();
         assert!(is_origin_allowed("https://preview-example.com", &config));
         assert!(is_origin_allowed("https://staging-example.com", &config));
+    }
+
+    #[tokio::test]
+    async fn cors_preflight_allows_browser_authorization() {
+        use axum::http::header::{
+            ACCESS_CONTROL_ALLOW_CREDENTIALS, ACCESS_CONTROL_ALLOW_HEADERS,
+            ACCESS_CONTROL_ALLOW_METHODS, ACCESS_CONTROL_ALLOW_ORIGIN,
+            ACCESS_CONTROL_REQUEST_HEADERS, ACCESS_CONTROL_REQUEST_METHOD, ORIGIN, VARY,
+        };
+
+        for origin in [
+            "https://example.com",
+            "https://www.typingmind.com",
+            "https://client.example",
+        ] {
+            let app = Router::new()
+                .route(
+                    "/chat/completions",
+                    post(|| async { StatusCode::UNAUTHORIZED }),
+                )
+                .layer(build_cors_layer(config::CorsConfig::default()));
+            let response = app
+                .oneshot(
+                    HttpRequest::builder()
+                        .method("OPTIONS")
+                        .uri("/chat/completions")
+                        .header(ORIGIN, origin)
+                        .header(ACCESS_CONTROL_REQUEST_METHOD, "POST")
+                        .header(
+                            ACCESS_CONTROL_REQUEST_HEADERS,
+                            "authorization,content-type,x-request-id",
+                        )
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(response.headers()[ACCESS_CONTROL_ALLOW_ORIGIN], origin);
+            assert_eq!(response.headers()[ACCESS_CONTROL_ALLOW_METHODS], "*");
+            assert_eq!(
+                response.headers()[ACCESS_CONTROL_ALLOW_HEADERS],
+                "authorization,content-type,x-request-id",
+            );
+            let vary = response.headers()[VARY].to_str().unwrap();
+            for name in ["origin", "access-control-request-headers"] {
+                assert!(vary
+                    .split(',')
+                    .any(|part| part.trim().eq_ignore_ascii_case(name)));
+            }
+            assert!(!response
+                .headers()
+                .contains_key(ACCESS_CONTROL_ALLOW_CREDENTIALS));
+        }
+    }
+
+    #[tokio::test]
+    async fn cors_actual_responses_reflect_browser_origin() {
+        use axum::http::header::{
+            ACCESS_CONTROL_ALLOW_CREDENTIALS, ACCESS_CONTROL_ALLOW_ORIGIN,
+            ACCESS_CONTROL_EXPOSE_HEADERS, ORIGIN,
+        };
+
+        for origin in ["https://www.typingmind.com", "https://client.example"] {
+            for status in [StatusCode::OK, StatusCode::UNAUTHORIZED] {
+                let app = Router::new()
+                    .route("/response", get(move || async move { status }))
+                    .layer(build_cors_layer(config::CorsConfig::default()));
+                let response = app
+                    .oneshot(
+                        HttpRequest::builder()
+                            .uri("/response")
+                            .header(ORIGIN, origin)
+                            .body(Body::empty())
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(response.status(), status);
+                assert_eq!(response.headers()[ACCESS_CONTROL_ALLOW_ORIGIN], origin);
+                assert_eq!(response.headers()[ACCESS_CONTROL_EXPOSE_HEADERS], "*");
+                assert!(!response
+                    .headers()
+                    .contains_key(ACCESS_CONTROL_ALLOW_CREDENTIALS));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn cors_request_without_origin_remains_usable() {
+        use axum::http::header::ACCESS_CONTROL_ALLOW_ORIGIN;
+
+        let app = Router::new()
+            .route("/ok", get(|| async { "ok" }))
+            .layer(build_cors_layer(config::CorsConfig::default()));
+        let response = app
+            .oneshot(
+                HttpRequest::builder()
+                    .uri("/ok")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(!response.headers().contains_key(ACCESS_CONTROL_ALLOW_ORIGIN));
     }
 
     // --- cache_control_layer tests -------------------------------------------

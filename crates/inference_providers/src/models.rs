@@ -117,7 +117,7 @@ pub struct ToolCall {
     pub index: Option<i64>,
     /// Thought signature for Gemini 3 models (required for tool calls to work correctly)
     /// Only included if the model returned one - older models don't use this
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(flatten, with = "crate::thought_signature")]
     pub thought_signature: Option<String>,
 }
 
@@ -133,8 +133,8 @@ pub struct ToolCallDelta {
     pub index: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub function: Option<FunctionCallDelta>,
-    /// Thought signature for Gemini 3 models (internal use only, not exposed to clients)
-    #[serde(skip_serializing_if = "Option::is_none")]
+    /// Thought signature for Gemini tool-call replay, emitted in both wire formats
+    #[serde(flatten, with = "crate::thought_signature")]
     pub thought_signature: Option<String>,
 }
 
@@ -219,9 +219,50 @@ pub enum ChatServiceTier {
     Priority,
 }
 
+/// Operator scheduler priority, in the inclusive range -1000..=1000; default 0.
+/// Higher values run first. The organization admin service and database CHECK
+/// validate writes; request paths carry the value loaded from that column.
+pub type RequestPriority = i32;
+
+/// Routing-only placement inputs: the pool's size estimate and class, and
+/// the completion service's affinity key. Set in process, on
+/// [`ChatCompletionParams::placement`], and never serialized, so a client
+/// cannot set any of it and none of it reaches an upstream body.
+#[derive(Clone, Default)]
+pub struct PlacementContext {
+    /// Input tokens only: prefill cost, lane load and the context-window
+    /// requirement. Output length (`max_tokens`) never enters routing.
+    pub prompt_tokens: Option<u64>,
+    /// The prompt exceeds the model's base-tier capacity: the lane class
+    /// placement admits on, and the tier class the pool routes on.
+    pub prefill_heavy: bool,
+    /// Derived from customer identity or content: never logged (the
+    /// placement crate's key type has no `Debug`).
+    pub affinity: Option<placement::affinity::AffinityKey>,
+    pub affinity_source: placement::decision::AffinitySource,
+}
+
+impl std::fmt::Debug for PlacementContext {
+    // Manual: prints whether an affinity key is present, never the key.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PlacementContext")
+            .field("prompt_tokens", &self.prompt_tokens)
+            .field("prefill_heavy", &self.prefill_heavy)
+            .field("affinity", &self.affinity.is_some())
+            .field("affinity_source", &self.affinity_source)
+            .finish()
+    }
+}
+
 /// Parameters for chat completion requests (matches OpenAI API)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChatCompletionParams {
+    /// Operator-controlled scheduler priority. Never accepted from or exposed in JSON.
+    #[serde(skip)]
+    pub request_priority: RequestPriority,
+    /// Routing-only facts from the pool. Never accepted from or sent in JSON.
+    #[serde(skip)]
+    pub placement: PlacementContext,
     /// Model ID to use for the completion
     pub model: String,
 
@@ -324,6 +365,23 @@ pub struct ChatCompletionParams {
     pub extra: std::collections::HashMap<String, serde_json::Value>,
 }
 
+impl ChatCompletionParams {
+    /// Customer JSON cannot select scheduler policy, including in adapters
+    /// that use the original request sidecar. Preserve unrelated provider fields.
+    pub fn strip_client_priority(&mut self) {
+        self.extra.remove("priority");
+        self.extra.remove("request_priority");
+        if let Some(original) = self
+            .original_request
+            .as_mut()
+            .and_then(|value| value.as_object_mut())
+        {
+            original.remove("priority");
+            original.remove("request_priority");
+        }
+    }
+}
+
 /// Parameters for text completion requests (legacy OpenAI API)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CompletionParams {
@@ -408,13 +466,95 @@ pub enum FinishReason {
     ToolCalls,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// Deserialize an optional usage detail without letting a malformed value fail
+/// the enclosing chunk or response: anything that is not a valid `T` becomes
+/// `None`. Upstream usage parse errors would otherwise surface as stream errors
+/// (see `sse_parser.rs`) or failed non-streaming responses.
+fn deserialize_lenient<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: serde::de::DeserializeOwned,
+{
+    let value = serde_json::Value::deserialize(deserializer)?;
+    if value.is_null() {
+        return Ok(None);
+    }
+    // No usage field is an array, and serde would map one onto a struct's
+    // fields by position.
+    let parsed = if value.is_array() {
+        None
+    } else {
+        serde_json::from_value(value).ok()
+    };
+    if parsed.is_none() {
+        // Distinguishes "reported a count we could not parse" from "reported
+        // none". The value itself is not logged.
+        tracing::debug!(
+            detail_type = std::any::type_name::<T>(),
+            "Discarding malformed usage detail"
+        );
+    }
+    Ok(parsed)
+}
+
+/// OpenAI's `usage.completion_tokens_details`, a breakdown of
+/// `completion_tokens`. Typed so that a re-serialized response carries only
+/// these standard keys, never a provider's extras (the allowlist intent of
+/// `TokenUsage`, #465).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct CompletionTokensDetails {
+    /// Tokens spent on reasoning. This is the field OpenAI-compatible clients
+    /// read for the reasoning count.
+    #[serde(
+        default,
+        deserialize_with = "deserialize_lenient",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub reasoning_tokens: Option<i32>,
+    #[serde(
+        default,
+        deserialize_with = "deserialize_lenient",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub audio_tokens: Option<i32>,
+    #[serde(
+        default,
+        deserialize_with = "deserialize_lenient",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub accepted_prediction_tokens: Option<i32>,
+    #[serde(
+        default,
+        deserialize_with = "deserialize_lenient",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub rejected_prediction_tokens: Option<i32>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct TokenUsage {
     pub prompt_tokens: i32,
     pub completion_tokens: i32,
     pub total_tokens: i32,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub prompt_tokens_details: Option<serde_json::Value>,
+    /// OpenAI-standard breakdown of `completion_tokens` (OpenAI, OpenRouter
+    /// and vLLM report the reasoning count here).
+    #[serde(
+        default,
+        deserialize_with = "deserialize_lenient",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub completion_tokens_details: Option<CompletionTokensDetails>,
+    /// SGLang's top-level reasoning count, as the provider sent it. Deprecated
+    /// alias of `completion_tokens_details.reasoning_tokens`, kept for existing
+    /// readers. For the effective, clamped count use `reasoning_tokens()`.
+    #[serde(
+        default,
+        deserialize_with = "deserialize_lenient",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub reasoning_tokens: Option<i32>,
 }
 
 impl TokenUsage {
@@ -423,7 +563,7 @@ impl TokenUsage {
             prompt_tokens,
             completion_tokens,
             total_tokens: prompt_tokens + completion_tokens,
-            prompt_tokens_details: None,
+            ..Default::default()
         }
     }
 
@@ -439,6 +579,7 @@ impl TokenUsage {
             completion_tokens,
             total_tokens: prompt_tokens + completion_tokens,
             prompt_tokens_details: details,
+            ..Default::default()
         }
     }
 
@@ -492,6 +633,42 @@ impl TokenUsage {
             .unwrap_or(0)
             .max(0);
         tokens.min(self.prompt_tokens.saturating_sub(self.cached_tokens()))
+    }
+
+    /// Reasoning tokens the provider reported: the standard
+    /// `completion_tokens_details.reasoning_tokens`, else SGLang's top-level
+    /// `reasoning_tokens`. `None` when the provider reported neither.
+    /// For internal use, the count is clamped to `[0, completion_tokens]`,
+    /// since reasoning is a subset of the completion. The wire keeps the
+    /// provider's own values (see `ensure_standard_reasoning_details`).
+    pub fn reasoning_tokens(&self) -> Option<i32> {
+        self.completion_tokens_details
+            .as_ref()
+            .and_then(|details| details.reasoning_tokens)
+            .or(self.reasoning_tokens)
+            .map(|tokens| tokens.min(self.completion_tokens).max(0))
+    }
+
+    /// Fill `completion_tokens_details.reasoning_tokens`, where OpenAI-compatible
+    /// clients read the count, when the provider reported one only in SGLang's
+    /// top-level field. The provider's value is copied unmodified, so both
+    /// fields carry the same number; a negative value is not copied. An
+    /// existing standard value is left as is, the legacy field is kept, and
+    /// nothing is added when the provider reported no count.
+    pub fn ensure_standard_reasoning_details(&mut self) {
+        if self
+            .completion_tokens_details
+            .as_ref()
+            .is_some_and(|details| details.reasoning_tokens.is_some())
+        {
+            return;
+        }
+        let Some(tokens) = self.reasoning_tokens.filter(|tokens| *tokens >= 0) else {
+            return;
+        };
+        self.completion_tokens_details
+            .get_or_insert_with(CompletionTokensDetails::default)
+            .reasoning_tokens = Some(tokens);
     }
 }
 
@@ -1323,6 +1500,40 @@ mod tests {
     use super::*;
 
     #[test]
+    fn placement_context_is_not_serialized() {
+        let mut params: ChatCompletionParams =
+            serde_json::from_value(serde_json::json!({"model": "m", "messages": []})).unwrap();
+        params.placement = PlacementContext {
+            prompt_tokens: Some(1),
+            prefill_heavy: true,
+            affinity: Some(placement::affinity::AffinityKey::from_bytes([7; 16])),
+            affinity_source: placement::decision::AffinitySource::Client,
+        };
+        let body = serde_json::to_value(&params).unwrap();
+        assert!(body.get("placement").is_none());
+        for key in ["prompt_tokens", "prefill_heavy", "affinity"] {
+            assert!(body.get(key).is_none(), "{key} leaked");
+        }
+        // The redacting Debug never prints the key.
+        let debug = format!("{:?}", params.placement);
+        assert!(debug.contains("affinity: true"), "{debug}");
+        assert!(!debug.contains("[7"), "{debug}");
+    }
+
+    #[test]
+    fn client_json_cannot_set_placement_context() {
+        let params: ChatCompletionParams = serde_json::from_value(serde_json::json!({
+            "model": "m",
+            "messages": [],
+            "placement": {"prefill_heavy": true, "prompt_tokens": 5},
+        }))
+        .unwrap();
+        assert!(!params.placement.prefill_heavy);
+        assert_eq!(params.placement.prompt_tokens, None);
+        assert!(params.placement.affinity.is_none());
+    }
+
+    #[test]
     fn model_info_advertised_context_length_uses_backend_metadata() {
         let model = ModelInfo {
             id: "test/model".to_string(),
@@ -1839,6 +2050,268 @@ mod tests {
         assert_eq!(usage.cached_tokens(), 80);
         assert_eq!(usage.cache_write_tokens(), 20);
         assert_eq!(usage.cache_creation_tokens(), 20);
+    }
+
+    #[test]
+    fn token_usage_reads_sglang_top_level_reasoning_count() {
+        // SGLang's shape: the count sits at the top level of `usage`.
+        let usage: TokenUsage = serde_json::from_value(serde_json::json!({
+            "prompt_tokens": 20,
+            "total_tokens": 120,
+            "completion_tokens": 100,
+            "prompt_tokens_details": null,
+            "reasoning_tokens": 14
+        }))
+        .unwrap();
+
+        assert_eq!(usage.reasoning_tokens, Some(14));
+        assert_eq!(usage.completion_tokens_details, None);
+        assert_eq!(usage.reasoning_tokens(), Some(14));
+    }
+
+    #[test]
+    fn token_usage_reads_openai_completion_tokens_details() {
+        // OpenAI / OpenRouter / vLLM shape; unknown detail keys are not kept.
+        let usage: TokenUsage = serde_json::from_value(serde_json::json!({
+            "prompt_tokens": 20,
+            "completion_tokens": 100,
+            "total_tokens": 120,
+            "completion_tokens_details": {
+                "reasoning_tokens": 64,
+                "audio_tokens": 0,
+                "accepted_prediction_tokens": 1,
+                "rejected_prediction_tokens": 2,
+                "image_tokens": 5
+            }
+        }))
+        .unwrap();
+
+        assert_eq!(
+            usage.completion_tokens_details,
+            Some(CompletionTokensDetails {
+                reasoning_tokens: Some(64),
+                audio_tokens: Some(0),
+                accepted_prediction_tokens: Some(1),
+                rejected_prediction_tokens: Some(2),
+            })
+        );
+        assert_eq!(usage.reasoning_tokens, None);
+        assert_eq!(usage.reasoning_tokens(), Some(64));
+        assert_eq!(
+            serde_json::to_value(&usage).unwrap()["completion_tokens_details"],
+            serde_json::json!({
+                "reasoning_tokens": 64,
+                "audio_tokens": 0,
+                "accepted_prediction_tokens": 1,
+                "rejected_prediction_tokens": 2
+            })
+        );
+    }
+
+    #[test]
+    fn token_usage_prefers_standard_reasoning_count_over_legacy() {
+        let usage: TokenUsage = serde_json::from_value(serde_json::json!({
+            "prompt_tokens": 1,
+            "completion_tokens": 50,
+            "total_tokens": 51,
+            "completion_tokens_details": { "reasoning_tokens": 7 },
+            "reasoning_tokens": 5
+        }))
+        .unwrap();
+
+        assert_eq!(usage.reasoning_tokens(), Some(7));
+    }
+
+    #[test]
+    fn token_usage_without_reasoning_count_reports_none_and_serializes_unchanged() {
+        let mut usage: TokenUsage = serde_json::from_value(serde_json::json!({
+            "prompt_tokens": 3,
+            "completion_tokens": 4,
+            "total_tokens": 7
+        }))
+        .unwrap();
+
+        assert_eq!(usage.reasoning_tokens(), None);
+        usage.ensure_standard_reasoning_details();
+        assert_eq!(
+            serde_json::to_value(&usage).unwrap(),
+            serde_json::json!({ "prompt_tokens": 3, "completion_tokens": 4, "total_tokens": 7 })
+        );
+        assert_eq!(
+            serde_json::to_value(TokenUsage::new(1, 2)).unwrap(),
+            serde_json::json!({ "prompt_tokens": 1, "completion_tokens": 2, "total_tokens": 3 })
+        );
+    }
+
+    #[test]
+    fn token_usage_tolerates_malformed_reasoning_details() {
+        // A malformed provider detail must not fail parsing: the SSE parser
+        // turns a chunk parse error into a stream error.
+        for (details, legacy) in [
+            (serde_json::json!("oops"), serde_json::json!("14")),
+            (serde_json::json!([1, 2]), serde_json::json!(1.5)),
+            (serde_json::json!(null), serde_json::json!({ "n": 1 })),
+            (serde_json::json!(42), serde_json::json!(99_999_999_999_i64)),
+        ] {
+            let chunk: ChatCompletionChunk = serde_json::from_value(serde_json::json!({
+                "id": "chatcmpl-x",
+                "object": "chat.completion.chunk",
+                "created": 1,
+                "model": "m",
+                "choices": [],
+                "usage": {
+                    "prompt_tokens": 1,
+                    "completion_tokens": 2,
+                    "total_tokens": 3,
+                    "completion_tokens_details": details,
+                    "reasoning_tokens": legacy
+                }
+            }))
+            .expect("malformed usage details must not fail chunk parsing");
+            let usage = chunk.usage.expect("usage should parse");
+            assert_eq!(usage.completion_tokens, 2);
+            assert_eq!(usage.completion_tokens_details, None);
+            assert_eq!(usage.reasoning_tokens, None);
+            assert_eq!(usage.reasoning_tokens(), None);
+        }
+
+        // One malformed detail field does not discard its valid siblings.
+        let usage: TokenUsage = serde_json::from_value(serde_json::json!({
+            "prompt_tokens": 1,
+            "completion_tokens": 20,
+            "total_tokens": 21,
+            "completion_tokens_details": { "reasoning_tokens": 9, "audio_tokens": "x" }
+        }))
+        .unwrap();
+        assert_eq!(
+            usage.completion_tokens_details,
+            Some(CompletionTokensDetails {
+                reasoning_tokens: Some(9),
+                ..Default::default()
+            })
+        );
+    }
+
+    #[test]
+    fn token_usage_reasoning_count_is_clamped_to_completion_tokens() {
+        let usage = |details: serde_json::Value, legacy: serde_json::Value| -> TokenUsage {
+            serde_json::from_value(serde_json::json!({
+                "prompt_tokens": 1,
+                "completion_tokens": 100,
+                "total_tokens": 101,
+                "completion_tokens_details": details,
+                "reasoning_tokens": legacy
+            }))
+            .unwrap()
+        };
+
+        let null = serde_json::Value::Null;
+        assert_eq!(
+            usage(null.clone(), serde_json::json!(150)).reasoning_tokens(),
+            Some(100)
+        );
+        assert_eq!(
+            usage(null.clone(), serde_json::json!(-3)).reasoning_tokens(),
+            Some(0)
+        );
+        assert_eq!(
+            usage(serde_json::json!({ "reasoning_tokens": 101 }), null).reasoning_tokens(),
+            Some(100)
+        );
+    }
+
+    #[test]
+    fn ensure_standard_reasoning_details_mirrors_legacy_count_without_inventing() {
+        // SGLang shape: the count is copied into the standard location and the
+        // legacy field stays for existing readers.
+        let mut usage: TokenUsage = serde_json::from_value(serde_json::json!({
+            "prompt_tokens": 20,
+            "completion_tokens": 100,
+            "total_tokens": 120,
+            "reasoning_tokens": 14
+        }))
+        .unwrap();
+        usage.ensure_standard_reasoning_details();
+        usage.ensure_standard_reasoning_details();
+        assert_eq!(
+            serde_json::to_value(&usage).unwrap(),
+            serde_json::json!({
+                "prompt_tokens": 20,
+                "completion_tokens": 100,
+                "total_tokens": 120,
+                "completion_tokens_details": { "reasoning_tokens": 14 },
+                "reasoning_tokens": 14
+            })
+        );
+
+        // An existing standard value wins; other detail fields are kept.
+        let mut usage: TokenUsage = serde_json::from_value(serde_json::json!({
+            "prompt_tokens": 1,
+            "completion_tokens": 50,
+            "total_tokens": 51,
+            "completion_tokens_details": { "reasoning_tokens": 7, "audio_tokens": 2 },
+            "reasoning_tokens": 5
+        }))
+        .unwrap();
+        usage.ensure_standard_reasoning_details();
+        assert_eq!(
+            usage.completion_tokens_details,
+            Some(CompletionTokensDetails {
+                reasoning_tokens: Some(7),
+                audio_tokens: Some(2),
+                ..Default::default()
+            })
+        );
+        assert_eq!(usage.reasoning_tokens, Some(5));
+
+        // Details without a reasoning count get it from the legacy field.
+        let mut usage: TokenUsage = serde_json::from_value(serde_json::json!({
+            "prompt_tokens": 1,
+            "completion_tokens": 50,
+            "total_tokens": 51,
+            "completion_tokens_details": { "audio_tokens": 2 },
+            "reasoning_tokens": 5
+        }))
+        .unwrap();
+        usage.ensure_standard_reasoning_details();
+        assert_eq!(
+            usage.completion_tokens_details,
+            Some(CompletionTokensDetails {
+                reasoning_tokens: Some(5),
+                audio_tokens: Some(2),
+                ..Default::default()
+            })
+        );
+    }
+
+    #[test]
+    fn ensure_standard_reasoning_details_copies_the_raw_value() {
+        // The wire carries the provider's number in both fields, even when it
+        // is inconsistent; only the internal accessor clamps.
+        let mut usage: TokenUsage = serde_json::from_value(serde_json::json!({
+            "prompt_tokens": 1,
+            "completion_tokens": 100,
+            "total_tokens": 101,
+            "reasoning_tokens": 150
+        }))
+        .unwrap();
+        usage.ensure_standard_reasoning_details();
+        let wire = serde_json::to_value(&usage).unwrap();
+        assert_eq!(wire["completion_tokens_details"]["reasoning_tokens"], 150);
+        assert_eq!(wire["reasoning_tokens"], 150);
+        assert_eq!(usage.reasoning_tokens(), Some(100));
+
+        // A negative count is not copied into the standard field.
+        let mut usage: TokenUsage = serde_json::from_value(serde_json::json!({
+            "prompt_tokens": 1,
+            "completion_tokens": 100,
+            "total_tokens": 101,
+            "reasoning_tokens": -3
+        }))
+        .unwrap();
+        usage.ensure_standard_reasoning_details();
+        assert_eq!(usage.completion_tokens_details, None);
+        assert_eq!(usage.reasoning_tokens, Some(-3));
     }
 
     #[test]

@@ -1,4 +1,3 @@
-use crate::repositories::statement_cache::CachedStatements;
 use crate::{
     models::{CreateWorkspaceRequest, UpdateWorkspaceRequest, Workspace},
     pool::DbPool,
@@ -10,6 +9,7 @@ use async_trait::async_trait;
 use chrono::Utc;
 use services::common::RepositoryError;
 use services::workspace::{WorkspaceOrderBy, WorkspaceOrderDirection};
+use tokio_postgres::types::Type;
 use tracing::debug;
 use uuid::Uuid;
 
@@ -380,20 +380,22 @@ impl WorkspaceRepository {
                 .context("Failed to get database connection")
                 .map_err(RepositoryError::PoolError)?;
 
+            // One-shot typed query: one round trip, see repositories/mod.rs.
             client
-                .cached_query_opt(
+                .query_typed_opt(
                     r#"
                 SELECT
                     w.*,
                     o.id as org_id, o.name as org_name,
                     o.description as org_description, o.created_at as org_created_at,
                     o.updated_at as org_updated_at, o.is_active as org_is_active,
-                    o.rate_limit as org_rate_limit, o.settings as org_settings
+                    o.rate_limit as org_rate_limit, o.settings as org_settings,
+                    o.request_priority as org_request_priority
                 FROM workspaces w
                 JOIN organizations o ON w.organization_id = o.id
                 WHERE w.id = $1 AND w.is_active = true AND o.is_active = true
                 "#,
-                    &[&workspace_id],
+                    &[(&workspace_id, Type::UUID)],
                 )
                 .await
                 .map_err(map_db_error)
@@ -414,6 +416,7 @@ impl WorkspaceRepository {
                 };
 
                 let organization = crate::models::Organization {
+                    request_priority: row.get("org_request_priority"),
                     id: row.get("org_id"),
                     name: row.get("org_name"),
                     description: row.get("org_description"),
@@ -436,6 +439,7 @@ fn db_organization_to_service_organization(
     db_organization: crate::models::Organization,
 ) -> services::organization::Organization {
     services::organization::Organization {
+        request_priority: db_organization.request_priority,
         id: services::organization::ports::OrganizationId(db_organization.id),
         name: db_organization.name,
         description: db_organization.description,

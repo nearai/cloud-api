@@ -290,6 +290,7 @@ fn canonical_model() -> ModelWithPricing {
         datacenters: None,
         is_ready: None,
         deprecation_date: None,
+        successor_model_name: None,
         openrouter_slug: None,
         created_at: chrono::Utc::now(),
     }
@@ -351,6 +352,7 @@ impl UsageRepository for NoopUsageRepository {
     async fn get_usage_history_by_api_key(
         &self,
         _api_key_id: Uuid,
+        _credit_type: Option<&str>,
         _limit: Option<i64>,
         _offset: Option<i64>,
     ) -> anyhow::Result<(Vec<UsageLogEntry>, i64)> {

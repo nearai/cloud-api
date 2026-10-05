@@ -732,8 +732,8 @@ async fn test_admin_transfers_organization_ownership_to_member() {
         .await;
     assert_eq!(
         new_owner_delete.status_code(),
-        200,
-        "New owner should be able to delete the organization: {}",
+        409,
+        "Ownership transfer must not allow deletion of a member's default organization: {}",
         new_owner_delete.text()
     );
 }

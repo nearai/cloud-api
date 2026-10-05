@@ -82,9 +82,15 @@ impl AttestationRepository for RecordingRepository {
         chat_id: &str,
         signing_algo: &str,
     ) -> Result<ChatSignature, AttestationError> {
-        Err(AttestationError::SignatureNotFound(format!(
-            "{chat_id}:{signing_algo}"
-        )))
+        self.stored
+            .lock()
+            .map_err(|_| AttestationError::InternalError("stored lock poisoned".to_string()))?
+            .iter()
+            .find(|(stored_chat_id, signature)| {
+                stored_chat_id == chat_id && signature.signing_algo == signing_algo
+            })
+            .map(|(_, signature)| signature.clone())
+            .ok_or_else(|| AttestationError::SignatureNotFound(format!("{chat_id}:{signing_algo}")))
     }
 }
 
@@ -200,6 +206,7 @@ impl UsageRepository for NoopUsageRepository {
     async fn get_usage_history_by_api_key(
         &self,
         _api_key_id: Uuid,
+        _credit_type: Option<&str>,
         _limit: Option<i64>,
         _offset: Option<i64>,
     ) -> anyhow::Result<(Vec<UsageLogEntry>, i64)> {
@@ -319,6 +326,22 @@ async fn store_and_unpin_stores_gateway_signature_and_releases_pin_on_success() 
         vec![chat_id.to_string()],
         "the signature-fetch routing pin must be released exactly once"
     );
+}
+
+#[tokio::test]
+async fn store_and_unpin_rejects_empty_id_without_storing_and_releases_pin() {
+    let (pool, provider) = pool_with_pinned_chat("").await;
+    let repository = RecordingRepository::default();
+    let service = lifecycle_service(Arc::new(repository.clone()), pool);
+
+    let result = service
+        .store_chat_signature_and_unpin("", "req-hash".to_string(), "resp-hash".to_string())
+        .await;
+
+    assert!(matches!(result, Err(AttestationError::InvalidParameter(_))));
+    assert!(repository.stored().is_empty());
+    assert!(repository.batch_sizes().is_empty());
+    assert_eq!(provider.unpinned_chat_ids(), vec![String::new()]);
 }
 
 #[tokio::test]

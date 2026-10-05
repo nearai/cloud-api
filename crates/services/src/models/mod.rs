@@ -1,4 +1,6 @@
+mod capabilities;
 pub mod ports;
+pub use capabilities::InferenceEndpoint;
 
 use std::collections::HashMap;
 use std::future::Future;
@@ -30,6 +32,71 @@ const MODELS_LIST_CACHE_CAPACITY: u64 = 1;
 
 /// Cache key used for the single model-list entry.
 const MODELS_LIST_CACHE_KEY: &str = "all";
+
+/// TTL backstop for the per-request model-resolve cache. Same-instance admin
+/// writes clear it via `invalidate_models_cache` (best-effort: a resolve that
+/// was in flight during the write can repopulate a stale entry, also bounded
+/// by this TTL, see `resolve_model_cached`); otherwise this bounds staleness for writes made through
+/// other instances.
+const MODEL_RESOLVE_CACHE_TTL_SECS: u64 = 30;
+const MODEL_RESOLVE_CACHE_CAPACITY: u64 = 1_000;
+
+/// Positive-only cache of `ModelsRepository::resolve_and_get_model`, keyed by the
+/// requested model string (alias or canonical name). Cloning shares the cache.
+/// Owned by `ModelsServiceImpl` (which clears it on invalidation) and handed to
+/// the completion service.
+pub type ModelResolveCache = Cache<String, ModelWithPricing>;
+
+pub fn new_model_resolve_cache() -> ModelResolveCache {
+    model_resolve_cache_with_ttl(Duration::from_secs(MODEL_RESOLVE_CACHE_TTL_SECS))
+}
+
+pub fn model_resolve_cache_with_ttl(ttl: Duration) -> ModelResolveCache {
+    Cache::builder()
+        .max_capacity(MODEL_RESOLVE_CACHE_CAPACITY)
+        .time_to_live(ttl)
+        .build()
+}
+
+/// Outcome of a failed single-flight load: not-found is not cached, errors
+/// are shared with the callers coalesced onto the same load.
+enum ResolveMiss {
+    NotFound,
+    Failed(anyhow::Error),
+}
+
+/// `ModelsRepository::resolve_and_get_model` through the positive-only cache.
+/// Concurrent misses for the same identifier are coalesced into one repository
+/// read (moka single-flight). Only found models are cached; `None` is surfaced
+/// as an `Err` to moka so it is never stored and always re-reads, so a newly
+/// activated model works immediately.
+///
+/// Invalidation: `invalidate_all` only discards entries inserted before it, so a
+/// load already in flight when an admin write invalidates can still insert its
+/// pre-write value afterwards. That staleness is bounded by the TTL; moka has no
+/// built-in way to make an in-flight load respect invalidation.
+pub async fn resolve_model_cached(
+    cache: &ModelResolveCache,
+    repository: &dyn ModelsRepository,
+    identifier: &str,
+) -> Result<Option<ModelWithPricing>, anyhow::Error> {
+    let loaded = cache
+        .try_get_with_by_ref(identifier, async {
+            match repository.resolve_and_get_model(identifier).await {
+                Ok(Some(model)) => Ok(model),
+                Ok(None) => Err(ResolveMiss::NotFound),
+                Err(e) => Err(ResolveMiss::Failed(e)),
+            }
+        })
+        .await;
+    match loaded {
+        Ok(model) => Ok(Some(model)),
+        Err(miss) => match &*miss {
+            ResolveMiss::NotFound => Ok(None),
+            ResolveMiss::Failed(e) => Err(anyhow::anyhow!("{e:#}")),
+        },
+    }
+}
 
 fn apply_backend_model_metadata(
     models: &mut [ModelWithPricing],
@@ -70,6 +137,8 @@ pub struct ModelsServiceImpl {
     /// sentinel since pagination has been dropped — there is only ever one
     /// list to serve.
     models_list_cache: Cache<&'static str, Arc<Vec<ModelWithPricing>>>,
+    /// Shared with the completion service; cleared by `invalidate_models_cache`.
+    model_resolve_cache: ModelResolveCache,
 }
 
 impl ModelsServiceImpl {
@@ -85,7 +154,14 @@ impl ModelsServiceImpl {
             inference_provider_pool,
             models_repository,
             models_list_cache,
+            model_resolve_cache: new_model_resolve_cache(),
         }
+    }
+
+    /// Handle to the resolve cache for the completion service. Invalidation on
+    /// this service clears it, so admin writes take effect immediately here.
+    pub fn model_resolve_cache(&self) -> ModelResolveCache {
+        self.model_resolve_cache.clone()
     }
 
     /// Fetch the active-models list through the in-process cache, returning
@@ -153,11 +229,14 @@ impl ModelsServiceTrait for ModelsServiceImpl {
         &self,
         identifier: &str,
     ) -> Result<ModelWithPricing, ModelsError> {
-        self.models_repository
-            .resolve_and_get_model(identifier)
-            .await
-            .map_err(|e| ModelsError::InternalError(e.to_string()))?
-            .ok_or_else(|| ModelsError::NotFound(format!("Model '{identifier}' not found")))
+        resolve_model_cached(
+            &self.model_resolve_cache,
+            self.models_repository.as_ref(),
+            identifier,
+        )
+        .await
+        .map_err(|e| ModelsError::InternalError(e.to_string()))?
+        .ok_or_else(|| ModelsError::NotFound(format!("Model '{identifier}' not found")))
     }
 
     async fn resolve_public_model(
@@ -192,6 +271,7 @@ impl ModelsServiceTrait for ModelsServiceImpl {
 
     async fn invalidate_models_cache(&self) {
         self.models_list_cache.invalidate_all();
+        self.model_resolve_cache.invalidate_all();
     }
 }
 
@@ -260,6 +340,39 @@ mod tests {
         test_catalog_model_with_output(model_name, Some(1024))
     }
 
+    #[test]
+    fn systemone_endpoint_compatibility_preserves_other_modalities() {
+        let mut model = test_catalog_model("fixture");
+        for modalities in [
+            None,
+            Some(vec![]),
+            Some(vec!["text".into()]),
+            Some(vec!["image".into()]),
+            Some(vec!["text".into(), "audio".into()]),
+        ] {
+            model.output_modalities = modalities;
+            assert!(model
+                .validate_endpoint(InferenceEndpoint::ChatCompletions)
+                .is_ok());
+            assert!(model
+                .validate_endpoint(InferenceEndpoint::Responses)
+                .is_ok());
+            assert!(model
+                .validate_endpoint(InferenceEndpoint::SystemOne)
+                .is_err());
+        }
+        model.output_modalities = Some(vec!["decisions".into()]);
+        assert!(model
+            .validate_endpoint(InferenceEndpoint::ChatCompletions)
+            .is_err());
+        assert!(model
+            .validate_endpoint(InferenceEndpoint::Responses)
+            .is_err());
+        assert!(model
+            .validate_endpoint(InferenceEndpoint::SystemOne)
+            .is_ok());
+    }
+
     fn test_catalog_model_with_output(
         model_name: &str,
         max_output_length: Option<i32>,
@@ -293,6 +406,7 @@ mod tests {
             datacenters: None,
             is_ready: None,
             deprecation_date: None,
+            successor_model_name: None,
             openrouter_slug: None,
             created_at: chrono::Utc::now(),
         }

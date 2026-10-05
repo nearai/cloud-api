@@ -96,6 +96,58 @@ pub fn inject_warning_field(body: &[u8], warning: &str) -> Option<Vec<u8>> {
     serde_json::to_vec(&value).ok()
 }
 
+/// [`inject_warning_field`] for a chat completion body. The body is rewritten
+/// anyway, so this also mirrors the reasoning count into the standard usage
+/// field (see [`mirror_reasoning_usage`]).
+pub fn inject_chat_warning_field(body: &[u8], warning: &str) -> Option<Vec<u8>> {
+    let mut value: serde_json::Value = serde_json::from_slice(body).ok()?;
+    value.as_object_mut()?.insert(
+        "warning".to_string(),
+        serde_json::Value::String(warning.to_string()),
+    );
+    mirror_reasoning_usage(&mut value);
+    serde_json::to_vec(&value).ok()
+}
+
+/// Copy a top-level `usage.reasoning_tokens` (SGLang's field) into
+/// `usage.completion_tokens_details.reasoning_tokens`, where OpenAI-compatible
+/// clients read it. JSON counterpart of
+/// `TokenUsage::ensure_standard_reasoning_details`, for bodies the gateway
+/// rewrites without parsing them into typed structs. Only a non-negative
+/// integer is copied, unmodified. An existing standard value, or a
+/// `completion_tokens_details` that is not an object, is left alone, and the
+/// top-level field is kept.
+pub fn mirror_reasoning_usage(body: &mut serde_json::Value) {
+    let Some(usage) = body
+        .get_mut("usage")
+        .and_then(serde_json::Value::as_object_mut)
+    else {
+        return;
+    };
+    let Some(tokens) = usage
+        .get("reasoning_tokens")
+        .filter(|tokens| tokens.as_u64().is_some())
+        .cloned()
+    else {
+        return;
+    };
+    let details = usage
+        .entry("completion_tokens_details")
+        .or_insert(serde_json::Value::Null);
+    if details.is_null() {
+        *details = serde_json::Value::Object(serde_json::Map::new());
+    }
+    let Some(details) = details.as_object_mut() else {
+        return;
+    };
+    let standard = details
+        .entry("reasoning_tokens")
+        .or_insert(serde_json::Value::Null);
+    if standard.is_null() {
+        *standard = tokens;
+    }
+}
+
 /// Validate pagination parameters (limit/offset pattern)
 ///
 /// Ensures:
@@ -172,16 +224,17 @@ pub fn allowlisted_date_trunc(
 /// - `start >= end` → 400
 /// - per-granularity absolute caps prevent unbounded full-table scans:
 ///   - `hour`  → max `max_hour_days` days (caller-specified)
-///   - `day`   → max 366 days
+///   - `day`   → max `max_day_days` days
 ///   - `week`  → max 3 years (1096 days)
 ///   - `month` → max 5 years (1826 days)
-///   - `None`  → max 366 days (non-timeseries endpoints)
+///   - `None`  → max `max_day_days` days (non-timeseries endpoints)
 #[allow(clippy::type_complexity)]
 pub fn parse_metrics_range(
     start: Option<&str>,
     end: Option<&str>,
     granularity: Option<&str>,
     max_hour_days: i64,
+    max_day_days: i64,
 ) -> Result<
     (chrono::DateTime<chrono::Utc>, chrono::DateTime<chrono::Utc>),
     (StatusCode, ResponseJson<ErrorResponse>),
@@ -242,12 +295,12 @@ pub fn parse_metrics_range(
                 ));
             }
         }
-        // "day" or None: absolute cap of 366 days
+        // "day" or None: caller-configured cap for non-hour ranges.
         _ => {
-            if window > chrono::Duration::days(366) {
-                return Err(range_err(
-                    "'day' granularity is limited to 366 days".to_string(),
-                ));
+            if window > chrono::Duration::days(max_day_days) {
+                return Err(range_err(format!(
+                    "'day' granularity is limited to {max_day_days} days"
+                )));
             }
         }
     }
@@ -337,7 +390,8 @@ pub struct EncryptionHeaders {
 /// - `x-client-pub-key`: Must be a valid hex string with correct length based on algorithm
 ///   - Ed25519: 64 hex characters (32 bytes)
 ///   - ECDSA: 128 hex characters (64 bytes) or 130 hex characters (65 bytes with 0x04 prefix)
-/// - `x-model-pub-key`: Must be a valid hex string (reasonable length: 64-130 hex characters)
+/// - `x-model-pub-key`: NEAR hex key (64-130 characters) or Chutes standard
+///   base64 ML-KEM-768 key (1184 decoded bytes); routing alone needs no client key
 /// - `x-encryption-version`: Must be "1" or "2" (selects encryption protocol version)
 ///
 /// Returns:
@@ -357,8 +411,18 @@ pub fn validate_encryption_headers(
         .map(|s| s.to_string());
     let model_pub_key = headers
         .get("x-model-pub-key")
-        .and_then(|h| h.to_str().ok())
-        .map(|s| s.to_string());
+        .map(|h| {
+            h.to_str().map(str::to_string).map_err(|_| {
+                (
+                    StatusCode::BAD_REQUEST,
+                    ResponseJson(ErrorResponse::new(
+                        "X-Model-Pub-Key must be a valid ASCII string".to_string(),
+                        "invalid_parameter".to_string(),
+                    )),
+                )
+            })
+        })
+        .transpose()?;
     let encryption_version = headers
         .get("x-encryption-version")
         .and_then(|h| h.to_str().ok())
@@ -473,26 +537,16 @@ pub fn validate_encryption_headers(
 
     // Validate model public key if provided
     if let Some(ref pub_key) = model_pub_key {
-        // Check if it's a valid hex string
-        if hex::decode(pub_key).is_err() {
+        let near_key = (64..=130).contains(&pub_key.len()) && hex::decode(pub_key).is_ok();
+        let chutes_key =
+            inference_providers::attested::chutes::e2ee::is_encoded_public_key(pub_key);
+        if !near_key && !chutes_key {
             return Err((
                 StatusCode::BAD_REQUEST,
                 ResponseJson(ErrorResponse::new(
-                    "X-Model-Pub-Key must be a valid hex string".to_string(),
-                    "invalid_parameter".to_string(),
-                )),
-            ));
-        }
-
-        // Check reasonable length (64-130 hex characters, which covers both Ed25519 and ECDSA)
-        if pub_key.len() < 64 || pub_key.len() > 130 {
-            return Err((
-                StatusCode::BAD_REQUEST,
-                ResponseJson(ErrorResponse::new(
-                    format!(
-                        "X-Model-Pub-Key must be between 64 and 130 hex characters, got {} characters",
-                        pub_key.len()
-                    ),
+                    "X-Model-Pub-Key must be 64-130 hex characters (NEAR) or a standard base64 \
+                     ML-KEM-768 public key encoding 1184 bytes (Chutes)"
+                        .to_string(),
                     "invalid_parameter".to_string(),
                 )),
             ));
@@ -560,6 +614,14 @@ pub fn map_organization_error(
                 "conflict".to_string(),
             )),
         ),
+        OrganizationError::DefaultOrganization => (
+            StatusCode::CONFLICT,
+            ResponseJson(ErrorResponse::new(
+                "Organization cannot be deleted because it is a member's default organization"
+                    .to_string(),
+                "default_organization".to_string(),
+            )),
+        ),
         OrganizationError::StakingWalletBound => (
             StatusCode::CONFLICT,
             ResponseJson(ErrorResponse::new(
@@ -581,6 +643,40 @@ pub fn map_organization_error(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 ResponseJson(ErrorResponse::new(
                     "Internal server error".to_string(),
+                    "internal_server_error".to_string(),
+                )),
+            )
+        }
+    }
+}
+
+/// Maps an analytics service error to its HTTP response (spec §6.3). A statement-budget
+/// cancellation is a 504 with a structured body, like `reporting_request_timeout`. Every
+/// other error is a 500: admins see the internal error text, customers see only `failure`.
+pub fn analytics_error_response(
+    error: services::admin::AdminError,
+    failure: &str,
+    include_detail: bool,
+) -> (StatusCode, ResponseJson<ErrorResponse>) {
+    tracing::error!(error = %error, "{failure}");
+    match error {
+        services::admin::AdminError::Timeout => (
+            StatusCode::GATEWAY_TIMEOUT,
+            ResponseJson(ErrorResponse::new(
+                "Analytics request timed out".to_string(),
+                "analytics_request_timeout".to_string(),
+            )),
+        ),
+        other => {
+            let message = if include_detail {
+                format!("{failure}: {other}")
+            } else {
+                failure.to_string()
+            };
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                ResponseJson(ErrorResponse::new(
+                    message,
                     "internal_server_error".to_string(),
                 )),
             )
@@ -752,6 +848,65 @@ mod tests {
     }
 
     #[test]
+    fn model_pub_key_accepts_chutes_routing_without_client_encryption() {
+        use base64::Engine;
+        let key = base64::engine::general_purpose::STANDARD.encode([42; 1184]);
+        let mut headers = HeaderMap::new();
+        headers.insert("x-model-pub-key", key.parse().unwrap());
+        let validated = validate_encryption_headers(&headers).unwrap();
+        assert_eq!(validated.model_pub_key.as_deref(), Some(key.as_str()));
+        assert!(validated.client_pub_key.is_none());
+        assert!(validated.signing_algo.is_none());
+        assert!(validated.encryption_version.is_none());
+    }
+
+    #[test]
+    fn model_pub_key_preserves_near_hex_keys() {
+        for key in [
+            "ab".repeat(32),
+            "AB".repeat(64),
+            format!("04{}", "ab".repeat(64)),
+        ] {
+            let mut headers = HeaderMap::new();
+            headers.insert("x-model-pub-key", key.parse().unwrap());
+            let validated = validate_encryption_headers(&headers).unwrap();
+            assert_eq!(validated.model_pub_key, Some(key));
+        }
+    }
+
+    #[test]
+    fn model_pub_key_rejects_malformed_keys_instead_of_dropping_the_pin() {
+        use base64::Engine;
+        let b64 = base64::engine::general_purpose::STANDARD;
+        for key in [
+            String::new(),
+            "ab".repeat(31),
+            "ab".repeat(66),
+            "z".repeat(64),
+            b64.encode([42; 1183]),
+            b64.encode([42; 1185]),
+            b64.encode([42; 1184]).trim_end_matches('=').to_string(),
+            "!".repeat(1580),
+        ] {
+            let mut headers = HeaderMap::new();
+            headers.insert("x-model-pub-key", key.parse().unwrap());
+            assert_eq!(
+                validate_encryption_headers(&headers).unwrap_err().0,
+                StatusCode::BAD_REQUEST
+            );
+        }
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-model-pub-key",
+            axum::http::HeaderValue::from_bytes(b"\xff").unwrap(),
+        );
+        assert_eq!(
+            validate_encryption_headers(&headers).unwrap_err().0,
+            StatusCode::BAD_REQUEST
+        );
+    }
+
+    #[test]
     fn test_validate_encryption_version_valid() {
         let mut headers = HeaderMap::new();
         headers.insert("x-encryption-version", "2".parse().unwrap());
@@ -824,5 +979,111 @@ mod tests {
         // Non-JSON / non-object payloads (e.g. E2EE blobs) must be left alone.
         assert!(inject_warning_field(b"not json", "w").is_none());
         assert!(inject_warning_field(b"[1,2,3]", "w").is_none());
+    }
+
+    #[test]
+    fn test_inject_chat_warning_field_mirrors_reasoning_usage() {
+        let body = br#"{"id":"x","usage":{"prompt_tokens":2,"completion_tokens":30,"total_tokens":32,"reasoning_tokens":12}}"#;
+        let out = inject_chat_warning_field(body, "heads up").unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(v["warning"], "heads up");
+        assert_eq!(
+            v["usage"]["completion_tokens_details"]["reasoning_tokens"],
+            12
+        );
+        assert_eq!(v["usage"]["reasoning_tokens"], 12);
+
+        assert!(inject_chat_warning_field(b"not json", "w").is_none());
+        assert!(inject_chat_warning_field(b"[1,2,3]", "w").is_none());
+    }
+
+    #[test]
+    fn test_mirror_reasoning_usage() {
+        let mirrored = |usage: serde_json::Value| {
+            let mut body = serde_json::json!({ "id": "x", "usage": usage });
+            mirror_reasoning_usage(&mut body);
+            body["usage"].clone()
+        };
+
+        // Copied unmodified, even past completion_tokens; the legacy field stays.
+        assert_eq!(
+            mirrored(serde_json::json!({ "completion_tokens": 10, "reasoning_tokens": 15 })),
+            serde_json::json!({
+                "completion_tokens": 10,
+                "reasoning_tokens": 15,
+                "completion_tokens_details": { "reasoning_tokens": 15 }
+            })
+        );
+        // Other detail fields are kept, and a null standard value is filled.
+        assert_eq!(
+            mirrored(serde_json::json!({
+                "reasoning_tokens": 4,
+                "completion_tokens_details": { "audio_tokens": 1, "reasoning_tokens": null }
+            }))["completion_tokens_details"],
+            serde_json::json!({ "audio_tokens": 1, "reasoning_tokens": 4 })
+        );
+        assert_eq!(
+            mirrored(serde_json::json!({
+                "reasoning_tokens": 4,
+                "completion_tokens_details": null
+            }))["completion_tokens_details"],
+            serde_json::json!({ "reasoning_tokens": 4 })
+        );
+
+        // Left alone: an existing standard value, a non-object details value,
+        // no count, or a count that is not a non-negative integer.
+        for usage in [
+            serde_json::json!({
+                "reasoning_tokens": 4,
+                "completion_tokens_details": { "reasoning_tokens": 3 }
+            }),
+            serde_json::json!({ "reasoning_tokens": 4, "completion_tokens_details": "n/a" }),
+            serde_json::json!({ "completion_tokens": 10 }),
+            serde_json::json!({ "reasoning_tokens": -1 }),
+            serde_json::json!({ "reasoning_tokens": 1.5 }),
+            serde_json::json!({ "reasoning_tokens": "4" }),
+            serde_json::json!({ "reasoning_tokens": null }),
+        ] {
+            assert_eq!(mirrored(usage.clone()), usage);
+        }
+
+        // Bodies without an object `usage` are untouched.
+        for mut body in [
+            serde_json::json!({ "id": "x" }),
+            serde_json::json!({ "usage": null }),
+            serde_json::json!([1, 2]),
+        ] {
+            let before = body.clone();
+            mirror_reasoning_usage(&mut body);
+            assert_eq!(body, before);
+        }
+    }
+
+    #[test]
+    fn analytics_timeout_maps_to_gateway_timeout() {
+        let (status, body) = analytics_error_response(
+            services::admin::AdminError::Timeout,
+            "Failed to retrieve platform metrics",
+            true,
+        );
+        assert_eq!(status, StatusCode::GATEWAY_TIMEOUT);
+        assert_eq!(body.0.error.r#type, "analytics_request_timeout");
+    }
+
+    #[test]
+    fn analytics_internal_errors_hide_detail_from_customers() {
+        let failure = || services::admin::AdminError::InternalError("db down".to_string());
+        let (status, customer) =
+            analytics_error_response(failure(), "Failed to retrieve organization metrics", false);
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(
+            customer.0.error.message,
+            "Failed to retrieve organization metrics"
+        );
+        let (_, admin) = analytics_error_response(failure(), "Failed to retrieve metrics", true);
+        assert_eq!(
+            admin.0.error.message,
+            "Failed to retrieve metrics: Internal error: db down"
+        );
     }
 }

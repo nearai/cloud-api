@@ -13,7 +13,7 @@ use utoipa::ToSchema;
 use uuid::Uuid;
 
 /// Summary metrics for an organization over a time period
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct MetricsSummary {
     pub total_requests: i64,
     pub total_input_tokens: i64,
@@ -23,10 +23,19 @@ pub struct MetricsSummary {
     pub total_cost_usd: f64,
     /// Number of unique API keys used in the period
     pub unique_api_keys: i64,
+    /// Requests with a recorded time to first token; the denominator for the
+    /// `ttft_under_*` shares. See `ModelMetrics::ttft_measured_requests`.
+    pub ttft_measured_requests: i64,
+    /// Requests whose time to first token was strictly under 5000 ms
+    pub ttft_under_5s_requests: i64,
+    /// Requests whose time to first token was strictly under 10000 ms
+    pub ttft_under_10s_requests: i64,
+    /// Requests whose time to first token was strictly under 60000 ms
+    pub ttft_under_60s_requests: i64,
 }
 
 /// Metrics breakdown by workspace
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct WorkspaceMetrics {
     pub workspace_id: Uuid,
     pub workspace_name: String,
@@ -39,7 +48,7 @@ pub struct WorkspaceMetrics {
 }
 
 /// Metrics breakdown by API key
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct ApiKeyMetrics {
     pub api_key_id: Uuid,
     pub api_key_name: String,
@@ -49,7 +58,7 @@ pub struct ApiKeyMetrics {
 }
 
 /// Metrics breakdown by model
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct ModelMetrics {
     pub model_name: String,
     pub requests: i64,
@@ -58,18 +67,31 @@ pub struct ModelMetrics {
     pub cache_read_tokens: i64,
     /// Average time to first token in milliseconds
     pub avg_ttft_ms: Option<f64>,
-    /// 95th percentile time to first token in milliseconds
+    /// 95th percentile time to first token in milliseconds (approx. across hours: sample-weighted mean of hourly p95s; exact with credit_type)
     pub p95_ttft_ms: Option<f64>,
     /// Average inter-token latency in milliseconds
     pub avg_itl_ms: Option<f64>,
-    /// 95th percentile inter-token latency in milliseconds
+    /// 95th percentile inter-token latency in milliseconds (approx. across hours: sample-weighted mean of hourly p95s; exact with credit_type)
     pub p95_itl_ms: Option<f64>,
     /// Cost in USD
     pub cost_usd: f64,
+    /// Requests with a recorded time to first token. Denominator for the `ttft_under_*`
+    /// shares (share = ttft_under_Ns_requests / ttft_measured_requests); usually below
+    /// `requests`: non-streamed requests and native passthrough streams (/v1/messages,
+    /// native Responses) record no TTFT, and streams that end before usage arrives write no
+    /// usage row at all. TTFT runs from request arrival to the first streamed chunk of any
+    /// kind (possibly role-only or usage-only), not necessarily the first generated token.
+    pub ttft_measured_requests: i64,
+    /// Requests whose time to first token was strictly under 5000 ms
+    pub ttft_under_5s_requests: i64,
+    /// Requests whose time to first token was strictly under 10000 ms
+    pub ttft_under_10s_requests: i64,
+    /// Requests whose time to first token was strictly under 60000 ms
+    pub ttft_under_60s_requests: i64,
 }
 
 /// Complete organization metrics response
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct OrganizationMetrics {
     pub organization_id: Uuid,
     pub organization_name: String,
@@ -126,7 +148,7 @@ pub struct PlatformMetrics {
     pub provider_error_or_timeout_rate: f64,
     /// Share of requests whose stop_reason is incomplete, 0.0-1.0
     pub incomplete_stream_rate: f64,
-    /// 95th percentile time-to-first-token across the platform (ms)
+    /// 95th percentile time-to-first-token across the platform (ms; approx. across hours: sample-weighted mean of hourly p95s)
     pub p95_ttft_ms: Option<f64>,
     pub provider_usage: PlatformProviderUsage,
     pub top_models: Vec<TopModelMetrics>,
@@ -219,13 +241,13 @@ pub struct BillingSummary {
     pub active_paid_credit_limit_usd: f64,
     /// Sum of active grant-type spend limits (caps), USD
     pub active_grant_credit_limit_usd: f64,
-    /// All-time consumed cost across all orgs, USD — **all usage** (from
-    /// organization_balance: inference + services). `inference_consumed_usd +
-    /// service_consumed_usd` reconcile to this.
+    /// All-time consumed cost across all orgs, USD — **all usage**, live (from
+    /// organization_balance: inference + services). The splits below need not add up to
+    /// it: the inference split lags and excludes historical duplicate rows (V0045).
     pub total_consumed_usd: f64,
-    /// All-time inference consumed cost, USD (organization_usage_log)
+    /// All-time inference consumed cost, USD
     pub inference_consumed_usd: f64,
-    /// All-time service consumed cost, USD (organization_service_usage_log, e.g. web_search)
+    /// All-time service consumed cost, USD (organization_service_usage_log, e.g. web_search; live)
     pub service_consumed_usd: f64,
     pub paying_org_count: i64,
     pub granted_org_count: i64,
@@ -245,6 +267,7 @@ pub struct ModelRevenueEntry {
     pub verifiable: bool,
     pub provider_type: Option<String>,
     pub avg_ttft_ms: Option<f64>,
+    /// Approx. across hours: sample-weighted mean of hourly p95s.
     pub p95_ttft_ms: Option<f64>,
     pub served_provider_breakdown: Vec<ModelProviderRevenueBreakdown>,
     pub fallback_requests: i64,
@@ -454,11 +477,11 @@ pub struct PerformancePoint {
     /// Number of requests with ttft_ms recorded (streaming only). Use this as the
     /// denominator when interpreting TTFT percentiles.
     pub ttft_sample_count: i64,
-    /// 50th-percentile TTFT, ms (streaming requests only; None if no samples)
+    /// 50th-percentile TTFT, ms (streaming requests only; None if no samples). Approx. across hours: sample-weighted mean of hourly p50s.
     pub p50_ttft_ms: Option<f64>,
-    /// 95th-percentile TTFT, ms (streaming requests only; None if no samples)
+    /// 95th-percentile TTFT, ms (streaming requests only; None if no samples). Approx. across hours: sample-weighted mean of hourly p95s.
     pub p95_ttft_ms: Option<f64>,
-    /// 99th-percentile TTFT, ms (streaming requests only; None if no samples)
+    /// 99th-percentile TTFT, ms (streaming requests only; None if no samples). Approx. across hours: sample-weighted mean of hourly p99s.
     pub p99_ttft_ms: Option<f64>,
     /// stop_reason IN ('provider_error','timeout','incomplete') / requests WHERE stop_reason IS NOT NULL.
     /// Excludes pre-V0037 rows (stop_reason IS NULL) from both numerator and denominator.
@@ -549,6 +572,7 @@ pub trait AnalyticsRepository: Send + Sync {
         org_id: Uuid,
         start: DateTime<Utc>,
         end: DateTime<Utc>,
+        credit_type: Option<&str>,
     ) -> Result<OrganizationMetrics, RepositoryError>;
 
     /// Get platform-wide metrics for admin dashboard
@@ -565,6 +589,7 @@ pub trait AnalyticsRepository: Send + Sync {
         start: DateTime<Utc>,
         end: DateTime<Utc>,
         granularity: &str,
+        credit_type: Option<&str>,
     ) -> Result<TimeSeriesMetrics, RepositoryError>;
 
     /// Get platform-wide time series for admin dashboards
@@ -632,11 +657,12 @@ impl AnalyticsService {
         org_id: Uuid,
         start: DateTime<Utc>,
         end: DateTime<Utc>,
+        credit_type: Option<&str>,
     ) -> Result<OrganizationMetrics, super::AdminError> {
         self.repository
-            .get_organization_metrics(org_id, start, end)
+            .get_organization_metrics(org_id, start, end, credit_type)
             .await
-            .map_err(|e| super::AdminError::InternalError(e.to_string()))
+            .map_err(analytics_error)
     }
 
     /// Get platform-wide metrics for admin dashboard
@@ -654,7 +680,7 @@ impl AnalyticsService {
         self.repository
             .get_platform_metrics(start, end)
             .await
-            .map_err(|e| super::AdminError::InternalError(e.to_string()))
+            .map_err(analytics_error)
     }
 
     /// Get time series metrics for an organization
@@ -666,11 +692,12 @@ impl AnalyticsService {
         start: DateTime<Utc>,
         end: DateTime<Utc>,
         granularity: &str,
+        credit_type: Option<&str>,
     ) -> Result<TimeSeriesMetrics, super::AdminError> {
         self.repository
-            .get_organization_timeseries(org_id, start, end, granularity)
+            .get_organization_timeseries(org_id, start, end, granularity, credit_type)
             .await
-            .map_err(|e| super::AdminError::InternalError(e.to_string()))
+            .map_err(analytics_error)
     }
 
     /// Get platform-wide time series for growth/mix trend charts
@@ -683,7 +710,7 @@ impl AnalyticsService {
         self.repository
             .get_platform_timeseries(start, end, granularity)
             .await
-            .map_err(|e| super::AdminError::InternalError(e.to_string()))
+            .map_err(analytics_error)
     }
 
     /// Get the platform billing summary (credit limits + consumption)
@@ -691,7 +718,7 @@ impl AnalyticsService {
         self.repository
             .get_billing_summary()
             .await
-            .map_err(|e| super::AdminError::InternalError(e.to_string()))
+            .map_err(analytics_error)
     }
 
     /// Get a paginated/filtered per-model consumption ranking
@@ -702,7 +729,7 @@ impl AnalyticsService {
         self.repository
             .get_model_revenue(query)
             .await
-            .map_err(|e| super::AdminError::InternalError(e.to_string()))
+            .map_err(analytics_error)
     }
 
     /// Get a paginated/filtered per-organization consumption ranking
@@ -713,7 +740,7 @@ impl AnalyticsService {
         self.repository
             .get_org_revenue(query)
             .await
-            .map_err(|e| super::AdminError::InternalError(e.to_string()))
+            .map_err(analytics_error)
     }
 
     /// Per-model consumption timeseries (top-N + "Other")
@@ -724,7 +751,7 @@ impl AnalyticsService {
         self.repository
             .get_model_consumption_timeseries(query)
             .await
-            .map_err(|e| super::AdminError::InternalError(e.to_string()))
+            .map_err(analytics_error)
     }
 
     /// Platform-wide (or per-model) performance timeseries
@@ -735,7 +762,7 @@ impl AnalyticsService {
         self.repository
             .get_performance_timeseries(query)
             .await
-            .map_err(|e| super::AdminError::InternalError(e.to_string()))
+            .map_err(analytics_error)
     }
 
     /// Revenue density percentiles (p50/p95/p99/peak USD/s)
@@ -746,6 +773,32 @@ impl AnalyticsService {
         self.repository
             .get_revenue_density(query)
             .await
-            .map_err(|e| super::AdminError::InternalError(e.to_string()))
+            .map_err(analytics_error)
+    }
+}
+
+/// Statement-budget cancellations become `Timeout` (HTTP 504), following
+/// `ReportingUsageError::Timeout`; every other repository error stays internal.
+fn analytics_error(error: RepositoryError) -> super::AdminError {
+    match error {
+        RepositoryError::QueryTimeout => super::AdminError::Timeout,
+        other => super::AdminError::InternalError(other.to_string()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn query_timeout_becomes_admin_timeout() {
+        assert!(matches!(
+            analytics_error(RepositoryError::QueryTimeout),
+            crate::admin::AdminError::Timeout
+        ));
+        assert!(matches!(
+            analytics_error(RepositoryError::NotFound("x".to_string())),
+            crate::admin::AdminError::InternalError(_)
+        ));
     }
 }

@@ -33,25 +33,6 @@ const DEFAULT_ANTHROPIC_VERSION: &str = "2023-06-01";
 /// accept and will reject with its own 400, instead of us silently dropping it).
 const ANTHROPIC_PASSTHROUGH_KEYS: &[&str] = &["thinking", "reasoning_effort"];
 
-/// Anthropic model-name fragments that **reject any non-default `temperature`**
-/// with a 400 (`temperature is deprecated for this model`), even though they
-/// still advertise `temperature` (nearai/cloud-api #696).
-///
-/// These are matched as substrings so both the bare alias (`claude-opus-4-7`)
-/// and the dated form (`claude-opus-4-7-20XXYYZZ`) are covered. opus-4-6 and
-/// earlier still accept `temperature`, so they are intentionally absent — do
-/// not over-strip.
-const ANTHROPIC_MODELS_REJECTING_TEMPERATURE: &[&str] = &["claude-opus-4-7"];
-
-/// Whether `model` rejects a non-default `temperature` (and also `top_p`), so we
-/// must drop BOTH sampling knobs rather than 400 the caller (#696). opus-4-7
-/// returns `temperature is deprecated` / `top_p is deprecated` for either.
-fn rejects_non_default_temperature(model: &str) -> bool {
-    ANTHROPIC_MODELS_REJECTING_TEMPERATURE
-        .iter()
-        .any(|fragment| model.contains(fragment))
-}
-
 /// Whether a requested `response_format` asks for JSON output, which Anthropic
 /// has no native mode for and tends to return markdown-fenced (#668). When
 /// true, we strip code fences from the response so `JSON.parse` works.
@@ -146,16 +127,16 @@ impl AnthropicBackend {
         // Anthropic doesn't allow both temperature and top_p - prefer temperature if both are set.
         // Also clamp temperature to Anthropic's valid range [0.0, 1.0] (OpenAI allows up to 2.0).
         //
-        // #696: some newer models (e.g. claude-opus-4-7) 400 on ANY non-default
-        // `temperature` — AND on any `top_p` ("`top_p` is deprecated for this
-        // model"). So we drop BOTH and forward neither, letting the model use
-        // its own defaults; OpenAI/OpenRouter clients that routinely send
-        // `temperature: 0`/`0.7` (and our own `top_p` default of 1.0) then get a
-        // 200 with the params ignored instead of a 400. NOTE: `top_p` defaults to
-        // `Some(1.0)` at deserialization, so forwarding `params.top_p` here would
-        // send `top_p: 1.0` unconditionally and 400 every request — we must send
-        // `None` for both.
-        let (temperature, top_p) = if rejects_non_default_temperature(model) {
+        // #696: Opus 4.7+, Sonnet 5+ and Fable 400 on `temperature` ("`temperature`
+        // is deprecated for this model") AND on `top_p`. So for every model
+        // outside the older-model allowlist in `anthropic_compat` we drop BOTH
+        // and forward neither, letting the model use its own defaults;
+        // OpenAI/OpenRouter clients that routinely send `temperature: 0`/`0.7`
+        // then get a 200 with the params ignored instead of a 400. NOTE: `top_p`
+        // defaulted to `Some(1.0)` at deserialization until #726, so forwarding
+        // `params.top_p` here sent `top_p: 1.0` unconditionally and 400'd every
+        // request — we must send `None` for both.
+        let (temperature, top_p) = if !anthropic_compat::model_accepts_sampling_parameters(model) {
             (None, None)
         } else if let Some(temp) = params.temperature {
             (Some(temp.clamp(0.0, 1.0)), None)
@@ -684,6 +665,8 @@ mod tests {
 
     fn make_params(temperature: Option<f32>, top_p: Option<f32>) -> ChatCompletionParams {
         ChatCompletionParams {
+            placement: Default::default(),
+            request_priority: 0,
             model: "claude-sonnet-4-5-20250514".to_string(),
             messages: vec![crate::ChatMessage {
                 reasoning_content: None,
@@ -1127,9 +1110,9 @@ mod tests {
     fn test_opus_4_7_drops_both_temperature_and_top_p() {
         let backend = AnthropicBackend::new();
         // opus-4-7 400s on any non-default `temperature` AND on any `top_p`
-        // ("`top_p` is deprecated for this model"). Crucially `top_p` defaults to
-        // Some(1.0) at deserialization, so forwarding it would 400 every request
-        // — we must drop BOTH and let the model use its own defaults (#696).
+        // ("`top_p` is deprecated for this model"). `top_p` defaulted to
+        // Some(1.0) at deserialization until #726, so forwarding it 400'd every
+        // request — we must drop BOTH and let the model use its own defaults.
         let params = make_params(Some(0.0), Some(0.5));
         let request = backend.build_request("claude-opus-4-7", &params, false);
         assert_eq!(
@@ -1153,16 +1136,46 @@ mod tests {
     }
 
     #[test]
-    fn test_opus_4_6_still_accepts_temperature() {
+    fn test_newer_and_unknown_models_drop_both_temperature_and_top_p() {
         let backend = AnthropicBackend::new();
-        // Regression guard against over-stripping: opus-4-6 still accepts it.
-        let params = make_params(Some(0.5), None);
-        let request = backend.build_request("claude-opus-4-6", &params, false);
-        assert_eq!(
-            request.temperature,
-            Some(0.5),
-            "opus-4-6 must still forward temperature"
-        );
+        // Every model released since opus-4-7 rejects sampling controls, and a
+        // model we have never seen is assumed to follow suit (no code change
+        // per release).
+        for model in [
+            "claude-opus-4-8",
+            "claude-opus-5",
+            "claude-opus-5-5",
+            "claude-sonnet-5",
+            "claude-sonnet-5-5",
+            "claude-fable-5",
+            "claude-fable-5-1",
+            "claude-sonnet-6",
+        ] {
+            let request = backend.build_request(model, &make_params(Some(0.7), None), false);
+            assert_eq!(request.temperature, None, "{model}");
+            assert_eq!(request.top_p, None, "{model}");
+
+            let request = backend.build_request(model, &make_params(None, Some(0.9)), false);
+            assert_eq!(request.top_p, None, "{model}");
+        }
+    }
+
+    #[test]
+    fn test_older_models_still_accept_temperature() {
+        let backend = AnthropicBackend::new();
+        // Regression guard against over-stripping: these still accept it.
+        for model in [
+            "claude-opus-4-6",
+            "claude-sonnet-4-6",
+            "claude-sonnet-4-5-20250929",
+            "claude-haiku-4-5-20251001",
+        ] {
+            let request = backend.build_request(model, &make_params(Some(0.5), None), false);
+            assert_eq!(request.temperature, Some(0.5), "{model}");
+
+            let request = backend.build_request(model, &make_params(None, Some(0.9)), false);
+            assert_eq!(request.top_p, Some(0.9), "{model}");
+        }
     }
 
     // ── #668: strip markdown code fences when json output was requested ──────

@@ -65,7 +65,7 @@ where
 /// envelope. Kept as a distinct type (rather than mapping straight to a
 /// `Response`) so the extractor satisfies `FromRequest`'s associated
 /// `Rejection: IntoResponse` bound.
-pub struct OpenAiJsonRejection(JsonRejection);
+pub struct OpenAiJsonRejection(pub(super) JsonRejection);
 
 impl IntoResponse for OpenAiJsonRejection {
     fn into_response(self) -> Response {

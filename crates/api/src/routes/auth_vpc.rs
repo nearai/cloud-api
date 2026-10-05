@@ -125,7 +125,13 @@ pub async fn vpc_login(
     // 1. Get default organization for user
     let orgs = state
         .organization_service
-        .list_organizations_for_user(user.id.clone(), 1, 0, None, None)
+        .list_organizations_for_user(
+            user.id.clone(),
+            1,
+            0,
+            Some(services::organization::OrganizationOrderBy::JoinedAt),
+            Some(services::organization::OrganizationOrderDirection::Asc),
+        )
         .await
         .map_err(|e| {
             tracing::error!("Failed to list organizations for user: {e:?}");

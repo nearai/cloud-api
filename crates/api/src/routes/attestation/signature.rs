@@ -30,11 +30,11 @@ pub struct SignatureResponse {
     pub signing_address: String,
     pub signing_algo: String,
     /// Which key produced this signature: `"provider_tee"` (model-serving TEE)
-    /// or `"gateway"` (cloud-api gateway TEE, used when the gateway rewrites
-    /// the stream bytes — usage accounting/stripping, redaction — and for
-    /// attested fallback providers without per-response signatures). Omitted
-    /// for signatures stored before the kind was recorded, whose provenance is
-    /// unknown.
+    /// or `"gateway"` (cloud-api gateway TEE). Gateway signatures cover
+    /// client-facing bytes, including Incognito completions and rewritten
+    /// responses. They do not prove model execution inside a TEE.
+    /// Omitted for signatures stored before the kind was recorded, whose
+    /// provenance is unknown.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub signature_kind: Option<String>,
 }

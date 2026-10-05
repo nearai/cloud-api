@@ -1,7 +1,10 @@
 use crate::{
     middleware::AuthenticatedUser,
-    models::ErrorResponse,
-    routes::{api::AppState, common::format_amount},
+    models::{CreditType, ErrorResponse},
+    routes::{
+        api::AppState,
+        common::{analytics_error_response, format_amount},
+    },
 };
 use axum::{
     extract::{Path, Query, State},
@@ -97,6 +100,8 @@ pub struct OrganizationBalanceResponse {
     pub total_tokens: i64,
     pub updated_at: String,
     pub credit_limits: Vec<CreditLimitBreakdownResponse>,
+    /// Unresolved cost from completed requests that exceeded all capacity.
+    pub unfunded_amount: i64,
 }
 
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
@@ -106,6 +111,8 @@ pub struct CreditLimitBreakdownResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub source: Option<String>,
     pub amount: i64,
+    pub consumed: i64,
+    pub available: i64,
     pub currency: String,
 }
 
@@ -138,6 +145,8 @@ pub async fn compute_organization_balance_response(
             credit_type: limit.credit_type,
             source: limit.source,
             amount: limit.amount,
+            consumed: limit.consumed,
+            available: limit.available,
             currency: limit.currency,
         })
         .collect();
@@ -145,8 +154,8 @@ pub async fn compute_organization_balance_response(
     match balance {
         Some(balance) => {
             let (spend_limit, spend_limit_display, remaining, remaining_display) =
-                if let Some(limit_info) = limit {
-                    let remaining_amount = limit_info.spend_limit - balance.total_spent;
+                if let Some(limit_info) = limit.as_ref() {
+                    let remaining_amount = limit_info.available;
                     (
                         Some(limit_info.spend_limit),
                         Some(format_amount(limit_info.spend_limit)),
@@ -170,6 +179,7 @@ pub async fn compute_organization_balance_response(
                 total_tokens: balance.total_tokens,
                 updated_at: balance.updated_at.to_rfc3339(),
                 credit_limits,
+                unfunded_amount: limit.as_ref().map_or(0, |value| value.unfunded),
             })
         }
         None => {
@@ -180,13 +190,14 @@ pub async fn compute_organization_balance_response(
                     total_spent_display: format_amount(0),
                     spend_limit: Some(limit_info.spend_limit),
                     spend_limit_display: Some(format_amount(limit_info.spend_limit)),
-                    remaining: Some(limit_info.spend_limit),
-                    remaining_display: Some(format_amount(limit_info.spend_limit)),
+                    remaining: Some(limit_info.available),
+                    remaining_display: Some(format_amount(limit_info.available)),
                     last_usage_at: None,
                     total_requests: 0,
                     total_tokens: 0,
                     updated_at: Utc::now().to_rfc3339(),
                     credit_limits,
+                    unfunded_amount: limit_info.unfunded,
                 })
             } else {
                 Err((
@@ -244,6 +255,15 @@ pub struct UsageHistoryEntryResponse {
     /// Number of images generated (for image generation requests)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub image_count: Option<i32>,
+    /// None denotes legacy usage whose funding was not historically captured.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub credit_allocations: Option<Vec<services::usage::CreditAllocation>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub funded_amount: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub unfunded_amount: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub allocation_policy_version: Option<String>,
 }
 
 /// Usage history response
@@ -268,6 +288,7 @@ pub struct UsageHistoryQuery {
     pub end_time: Option<String>,
     pub workspace_id: Option<Uuid>,
     pub api_key_id: Option<Uuid>,
+    pub credit_type: Option<String>,
 }
 
 impl UsageHistoryQuery {
@@ -278,6 +299,7 @@ impl UsageHistoryQuery {
             || self.end_time.is_some()
             || self.workspace_id.is_some()
             || self.api_key_id.is_some()
+            || self.credit_type.is_some()
     }
 
     const fn has_time_filters(&self) -> bool {
@@ -303,6 +325,14 @@ pub struct ServiceUsageEntryResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub inference_id: Option<String>,
     pub created_at: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub credit_allocations: Option<Vec<services::usage::CreditAllocation>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub funded_amount: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub unfunded_amount: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub allocation_policy_version: Option<String>,
 }
 
 /// Service usage history response
@@ -324,6 +354,7 @@ pub struct ServiceUsageHistoryQuery {
     /// Filter by platform service name (e.g. \"web_search\").
     #[serde(rename = "serviceName")]
     pub service_name: Option<String>,
+    pub credit_type: Option<String>,
 }
 
 /// Get organization balance
@@ -381,7 +412,8 @@ pub async fn get_organization_balance(
         ("start_time" = Option<String>, Query, description = "Inclusive RFC3339 start timestamp. Takes precedence over start_date."),
         ("end_time" = Option<String>, Query, description = "Inclusive RFC3339 end timestamp. Takes precedence over end_date."),
         ("workspace_id" = Option<Uuid>, Query, description = "Filter by workspace ID."),
-        ("api_key_id" = Option<Uuid>, Query, description = "Filter by API key ID.")
+        ("api_key_id" = Option<Uuid>, Query, description = "Filter by API key ID."),
+        ("credit_type" = Option<CreditType>, Query, description = "Filter costs by their saved credit allocation.")
     ),
     responses(
         (status = 200, description = "Usage history", body = UsageHistoryResponse),
@@ -397,7 +429,7 @@ pub async fn get_organization_usage_history(
     State(app_state): State<AppState>,
     Extension(user): Extension<AuthenticatedUser>,
     Path(org_id): Path<String>,
-    Query(query): Query<UsageHistoryQuery>,
+    Query(mut query): Query<UsageHistoryQuery>,
 ) -> Result<ResponseJson<UsageHistoryResponse>, (StatusCode, ResponseJson<ErrorResponse>)> {
     tracing::debug!(
         "Get usage history for org {} by user {}, limit: {}, offset: {}",
@@ -409,6 +441,7 @@ pub async fn get_organization_usage_history(
 
     // Validate pagination parameters
     crate::routes::common::validate_limit_offset(query.limit, query.offset)?;
+    query.credit_type = normalize_credit_type_filter(query.credit_type.as_deref())?;
 
     let organization_id = check_org_membership(&app_state, user, &org_id).await?;
 
@@ -455,6 +488,10 @@ pub async fn get_organization_usage_history(
             provider_request_id: entry.provider_request_id,
             inference_id: entry.inference_id.map(|id| id.to_string()),
             image_count: entry.image_count,
+            credit_allocations: entry.credit_allocations,
+            funded_amount: entry.funded_amount,
+            unfunded_amount: entry.unfunded_amount,
+            allocation_policy_version: entry.allocation_policy_version,
         })
         .collect();
 
@@ -504,6 +541,7 @@ fn usage_history_report_query(
             end_time: None,
             workspace_id: query.workspace_id,
             api_key_id: query.api_key_id,
+            credit_type: query.credit_type.clone(),
             limit: query.limit,
             offset: query.offset,
         });
@@ -518,6 +556,7 @@ fn usage_history_report_query(
         model: None,
         inference_type: None,
         service_name: None,
+        credit_type: query.credit_type.clone(),
         limit: Some(
             u16::try_from(query.limit)
                 .map_err(|_| usage_history_query_bad_request("Limit cannot exceed 1000"))?,
@@ -533,9 +572,21 @@ fn usage_history_report_query(
         end_time: parsed.end_time,
         workspace_id: parsed.workspace_id,
         api_key_id: parsed.api_key_id,
+        credit_type: parsed.credit_type,
         limit: query.limit,
         offset: query.offset,
     })
+}
+
+fn normalize_credit_type_filter(value: Option<&str>) -> Result<Option<String>, UsageError> {
+    value
+        .map(|value| {
+            value
+                .parse::<CreditType>()
+                .map(|credit_type| credit_type.as_str().to_string())
+                .map_err(|_| usage_history_query_bad_request("Invalid credit type"))
+        })
+        .transpose()
 }
 
 fn usage_history_start_time(query: &UsageHistoryQuery) -> Result<Option<String>, UsageError> {
@@ -617,6 +668,10 @@ fn usage_report_row_response(
         provider_request_id: row.provider_request_id,
         inference_id: row.inference_id.map(|id| id.to_string()),
         image_count: row.image_count,
+        credit_allocations: row.credit_allocations,
+        funded_amount: row.funded_amount,
+        unfunded_amount: row.unfunded_amount,
+        allocation_policy_version: row.allocation_policy_version,
     })
 }
 
@@ -668,6 +723,7 @@ fn internal_usage_history_error(message: &str) -> UsageError {
     params(
         ("org_id" = String, Path, description = "Organization ID"),
         ("serviceName" = Option<String>, Query, description = "Filter by platform service name (e.g. web_search)"),
+        ("credit_type" = Option<CreditType>, Query, description = "Filter costs by their saved credit allocation."),
         ("limit" = Option<i64>, Query, description = "Number of records to return (default: 100)"),
         ("offset" = Option<i64>, Query, description = "Offset for pagination (default: 0)")
     ),
@@ -685,7 +741,7 @@ pub async fn get_service_usage_history(
     State(app_state): State<AppState>,
     Extension(user): Extension<AuthenticatedUser>,
     Path(org_id): Path<String>,
-    Query(query): Query<ServiceUsageHistoryQuery>,
+    Query(mut query): Query<ServiceUsageHistoryQuery>,
 ) -> Result<ResponseJson<ServiceUsageHistoryResponse>, (StatusCode, ResponseJson<ErrorResponse>)> {
     tracing::debug!(
         "Get service usage history for org {} by user {}, service: {:?}, limit: {}, offset: {}",
@@ -698,14 +754,22 @@ pub async fn get_service_usage_history(
 
     // Validate pagination parameters
     crate::routes::common::validate_limit_offset(query.limit, query.offset)?;
+    query.credit_type = normalize_credit_type_filter(query.credit_type.as_deref())?;
 
     let organization_id = check_org_membership(&app_state, user, &org_id).await?;
 
     let service_name = query.service_name.as_deref();
+    let credit_type = query.credit_type.as_deref();
 
     let (history, total) = app_state
         .service_usage_service
-        .get_usage_history(organization_id, service_name, query.limit, query.offset)
+        .get_usage_history(
+            organization_id,
+            service_name,
+            credit_type,
+            query.limit,
+            query.offset,
+        )
         .await
         .map_err(|_| {
             tracing::error!("Failed to get service usage history");
@@ -731,6 +795,10 @@ pub async fn get_service_usage_history(
             total_cost_display: format_amount(entry.total_cost),
             inference_id: entry.inference_id.map(|id| id.to_string()),
             created_at: entry.created_at.to_rfc3339(),
+            credit_allocations: entry.credit_allocations,
+            funded_amount: entry.funded_amount,
+            unfunded_amount: entry.unfunded_amount,
+            allocation_policy_version: entry.allocation_policy_version,
         })
         .collect();
 
@@ -753,7 +821,8 @@ pub async fn get_service_usage_history(
         ("workspace_id" = String, Path, description = "Workspace ID"),
         ("api_key_id" = String, Path, description = "API Key ID"),
         ("limit" = Option<i64>, Query, description = "Number of records to return (default: 100)"),
-        ("offset" = Option<i64>, Query, description = "Offset for pagination (default: 0)")
+        ("offset" = Option<i64>, Query, description = "Offset for pagination (default: 0)"),
+        ("credit_type" = Option<CreditType>, Query, description = "Filter costs by their saved credit allocation.")
     ),
     responses(
         (status = 200, description = "Usage history", body = UsageHistoryResponse),
@@ -770,7 +839,7 @@ pub async fn get_api_key_usage_history(
     State(app_state): State<AppState>,
     Extension(user): Extension<AuthenticatedUser>,
     Path((workspace_id, api_key_id)): Path<(String, String)>,
-    Query(query): Query<UsageHistoryQuery>,
+    Query(mut query): Query<UsageHistoryQuery>,
 ) -> Result<ResponseJson<UsageHistoryResponse>, (StatusCode, ResponseJson<ErrorResponse>)> {
     tracing::debug!(
         "Get usage history for API key {} in workspace {} by user {}, limit: {}, offset: {}",
@@ -783,6 +852,7 @@ pub async fn get_api_key_usage_history(
 
     // Validate pagination parameters
     crate::routes::common::validate_limit_offset(query.limit, query.offset)?;
+    query.credit_type = normalize_credit_type_filter(query.credit_type.as_deref())?;
 
     let workspace_uuid = Uuid::parse_str(&workspace_id).map_err(|_| {
         (
@@ -811,6 +881,7 @@ pub async fn get_api_key_usage_history(
             workspace_uuid,
             api_key_uuid,
             user.0.id,
+            query.credit_type.as_deref(),
             Some(query.limit),
             Some(query.offset),
         )
@@ -866,6 +937,10 @@ pub async fn get_api_key_usage_history(
             provider_request_id: entry.provider_request_id,
             inference_id: entry.inference_id.map(|id| id.to_string()),
             image_count: entry.image_count,
+            credit_allocations: entry.credit_allocations,
+            funded_amount: entry.funded_amount,
+            unfunded_amount: entry.unfunded_amount,
+            allocation_policy_version: entry.allocation_policy_version,
         })
         .collect();
 
@@ -913,6 +988,14 @@ pub enum RecordUsageResponse {
         total_cost_display: String,
         /// Timestamp of the recorded entry (RFC3339)
         created_at: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        credit_allocations: Option<Vec<services::usage::CreditAllocation>>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        funded_amount: Option<i64>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        unfunded_amount: Option<i64>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        allocation_policy_version: Option<String>,
     },
     /// Response for image generation usage
     ImageGeneration {
@@ -928,6 +1011,14 @@ pub enum RecordUsageResponse {
         total_cost_display: String,
         /// Timestamp of the recorded entry (RFC3339)
         created_at: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        credit_allocations: Option<Vec<services::usage::CreditAllocation>>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        funded_amount: Option<i64>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        unfunded_amount: Option<i64>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        allocation_policy_version: Option<String>,
     },
 }
 
@@ -953,6 +1044,10 @@ fn build_record_usage_response(entry: services::usage::UsageLogEntry) -> RecordU
             total_cost: entry.total_cost,
             total_cost_display: format_amount(entry.total_cost),
             created_at: entry.created_at.to_rfc3339(),
+            credit_allocations: entry.credit_allocations,
+            funded_amount: entry.funded_amount,
+            unfunded_amount: entry.unfunded_amount,
+            allocation_policy_version: entry.allocation_policy_version,
         },
         _ => RecordUsageResponse::ChatCompletion {
             id: entry.id.to_string(),
@@ -967,6 +1062,10 @@ fn build_record_usage_response(entry: services::usage::UsageLogEntry) -> RecordU
             total_cost: entry.total_cost,
             total_cost_display: format_amount(entry.total_cost),
             created_at: entry.created_at.to_rfc3339(),
+            credit_allocations: entry.credit_allocations,
+            funded_amount: entry.funded_amount,
+            unfunded_amount: entry.unfunded_amount,
+            allocation_policy_version: entry.allocation_policy_version,
         },
     }
 }
@@ -981,7 +1080,9 @@ fn build_record_usage_response(entry: services::usage::UsageLogEntry) -> RecordU
 // that key submit arbitrary usage rows on the org's behalf — and instead
 // requires a shared `CLOUD_API_USAGE_TOKEN` service secret and carries the
 // subject identity (`organization_id`, `workspace_id`, `api_key_id`) in
-// the body.
+// the body. The body may also carry `discount_to_user`, the fraction an
+// aggregator lane publishes in its models document; it is applied after
+// catalog pricing and capped by `INTERNAL_USAGE_MAX_DISCOUNT`.
 //
 // Threat model:
 // - Anyone holding `CLOUD_API_USAGE_TOKEN` can submit usage rows for any
@@ -989,11 +1090,13 @@ fn build_record_usage_response(entry: services::usage::UsageLogEntry) -> RecordU
 //   (inference-proxy CVMs) and is rotated alongside other service secrets.
 //
 // The body shape is the existing `RecordUsageApiRequest` flattened under a
-// wrapper that adds the three identity fields, so reporters keep one builder.
+// wrapper that adds the three identity fields and the optional
+// `discount_to_user`, so reporters keep one builder.
 
 /// Request body for `POST /v1/internal/usage`. The `usage` field is
 /// flattened, so the on-the-wire shape is `RecordUsageApiRequest` JSON with
-/// three extra top-level keys.
+/// four extra top-level keys: the three identity fields and the optional
+/// `discount_to_user`.
 ///
 /// `ToSchema` is intentionally not derived: `RecordUsageApiRequest`
 /// doesn't implement `PartialSchema` (its OpenAPI doc was hand-rolled via
@@ -1016,9 +1119,53 @@ pub struct RecordUsageInternalRequest {
     /// UUID of the API key the usage should be attributed to (for
     /// per-key analytics). Trusted as provided.
     pub api_key_id: String,
+    /// Optional provider-side discount as the fraction of the list price the
+    /// subject is *not* charged (`0.2` = 20% off), mirroring the
+    /// `discount_to_user` an aggregator lane publishes in its models
+    /// document. Applied to every priced component after catalog pricing;
+    /// the list amounts are kept in the row's `billing_details`. Must be in
+    /// `[0, 1)`, be a multiple of `0.0001` (whole basis points) and not
+    /// exceed `INTERNAL_USAGE_MAX_DISCOUNT`. Omitted or `0` bills at list price.
+    pub discount_to_user: Option<f64>,
     /// The standard usage payload.
     #[serde(flatten)]
     pub usage: services::usage::RecordUsageApiRequest,
+}
+
+/// Turn the optional `discount_to_user` fraction into a validated
+/// [`services::usage::UsageDiscount`], enforcing the operator ceiling
+/// `INTERNAL_USAGE_MAX_DISCOUNT` so a misconfigured reporter cannot record
+/// rows far below list price. `None` and `0` mean list price.
+fn resolve_internal_usage_discount(
+    discount_to_user: Option<f64>,
+    max_discount: f64,
+) -> Result<Option<services::usage::UsageDiscount>, UsageError> {
+    let Some(fraction) = discount_to_user else {
+        return Ok(None);
+    };
+    let validation_error = |message: String| {
+        (
+            StatusCode::BAD_REQUEST,
+            ResponseJson(ErrorResponse::new(message, "validation_error".to_string())),
+        )
+    };
+    let discount = services::usage::UsageDiscount::from_fraction(fraction)
+        .map_err(|error| validation_error(error.to_string()))?;
+    if let Some(discount) = discount {
+        // Compare in whole basis points so a ceiling like `0.2` accepts
+        // exactly 0.2. The ceiling is floored (with a tolerance for float
+        // representation) so a value between two basis points never admits
+        // the one above it.
+        let ceiling_bp = (max_discount * 10_000.0 + 1e-6).floor();
+        if f64::from(discount.basis_points()) > ceiling_bp {
+            return Err(validation_error(format!(
+                "discount_to_user {} exceeds the configured maximum {}",
+                discount.fraction(),
+                max_discount
+            )));
+        }
+    }
+    Ok(discount)
 }
 
 /// Validate the `Authorization: Bearer …` header against the configured
@@ -1102,10 +1249,20 @@ pub async fn record_usage_internal(
     let organization_id = parse_uuid(&request.organization_id, "organization_id")?;
     let workspace_id = parse_uuid(&request.workspace_id, "workspace_id")?;
     let api_key_id = parse_uuid(&request.api_key_id, "api_key_id")?;
+    let discount = resolve_internal_usage_discount(
+        request.discount_to_user,
+        app_state.config.internal_usage_max_discount,
+    )?;
 
     let entry = app_state
         .usage_service
-        .record_usage_from_api(organization_id, workspace_id, api_key_id, request.usage)
+        .record_usage_from_api(
+            organization_id,
+            workspace_id,
+            api_key_id,
+            request.usage,
+            discount,
+        )
         .await
         .map_err(|e| match &e {
             services::usage::UsageError::ModelNotFound(_) => (
@@ -1261,6 +1418,7 @@ fn parse_datetime_or_default(
     }
 }
 
+/// Organization usage metrics.
 #[utoipa::path(
     get,
     path = "/v1/organizations/{org_id}/usage/metrics",
@@ -1274,6 +1432,7 @@ fn parse_datetime_or_default(
         (status = 200, description = "Organization usage metrics", body = UserOrganizationMetrics),
         (status = 401, description = "Unauthorized", body = ErrorResponse),
         (status = 403, description = "Forbidden", body = ErrorResponse),
+        (status = 504, description = "Analytics statement budget exceeded", body = ErrorResponse),
         (status = 500, description = "Internal server error", body = ErrorResponse)
     ),
     security(
@@ -1296,17 +1455,10 @@ pub async fn get_user_organization_metrics(
 
     let metrics = app_state
         .analytics_service
-        .get_organization_metrics(organization_id, start, end)
+        .get_organization_metrics(organization_id, start, end, None)
         .await
         .map_err(|e| {
-            tracing::error!("Failed to get organization metrics: {}", e);
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                ResponseJson(ErrorResponse::new(
-                    "Failed to retrieve organization metrics".to_string(),
-                    "internal_server_error".to_string(),
-                )),
-            )
+            analytics_error_response(e, "Failed to retrieve organization metrics", false)
         })?;
 
     Ok(ResponseJson(UserOrganizationMetrics {
@@ -1348,6 +1500,7 @@ pub async fn get_user_organization_metrics(
     }))
 }
 
+/// Organization usage timeseries.
 #[utoipa::path(
     get,
     path = "/v1/organizations/{org_id}/usage/timeseries",
@@ -1362,6 +1515,7 @@ pub async fn get_user_organization_metrics(
         (status = 200, description = "Organization usage timeseries", body = UserTimeSeriesMetrics),
         (status = 401, description = "Unauthorized", body = ErrorResponse),
         (status = 403, description = "Forbidden", body = ErrorResponse),
+        (status = 504, description = "Analytics statement budget exceeded", body = ErrorResponse),
         (status = 500, description = "Internal server error", body = ErrorResponse)
     ),
     security(
@@ -1395,17 +1549,10 @@ pub async fn get_user_organization_timeseries(
 
     let timeseries = app_state
         .analytics_service
-        .get_organization_timeseries(organization_id, start, end, granularity)
+        .get_organization_timeseries(organization_id, start, end, granularity, None)
         .await
         .map_err(|e| {
-            tracing::error!("Failed to get organization timeseries: {}", e);
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                ResponseJson(ErrorResponse::new(
-                    "Failed to retrieve organization timeseries".to_string(),
-                    "internal_server_error".to_string(),
-                )),
-            )
+            analytics_error_response(e, "Failed to retrieve organization timeseries", false)
         })?;
 
     Ok(ResponseJson(UserTimeSeriesMetrics {
@@ -1598,6 +1745,105 @@ mod internal_usage_tests {
         h.insert("authorization", HeaderValue::from_static("svc-token"));
         let err = verify_internal_usage_token(&h, Some("svc-token")).unwrap_err();
         assert_eq!(err.0, StatusCode::UNAUTHORIZED);
+    }
+
+    #[test]
+    fn discount_absent_or_zero_means_list_price() {
+        assert_eq!(resolve_internal_usage_discount(None, 0.5).unwrap(), None);
+        assert_eq!(
+            resolve_internal_usage_discount(Some(0.0), 0.5).unwrap(),
+            None
+        );
+        // A ceiling of zero still lets a reporter send an explicit `0`.
+        assert_eq!(
+            resolve_internal_usage_discount(Some(0.0), 0.0).unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn discount_within_ceiling_is_accepted() {
+        let discount = resolve_internal_usage_discount(Some(0.2), 0.5)
+            .unwrap()
+            .expect("20% is a discount");
+        assert_eq!(discount.basis_points(), 2_000);
+        // Exactly at the ceiling is allowed.
+        let at_ceiling = resolve_internal_usage_discount(Some(0.2), 0.2)
+            .unwrap()
+            .expect("20% is a discount");
+        assert_eq!(at_ceiling.basis_points(), 2_000);
+    }
+
+    #[test]
+    fn discount_outside_unit_interval_is_a_400() {
+        for bad in [1.0, 1.5, -0.1, f64::NAN, f64::INFINITY] {
+            let err = resolve_internal_usage_discount(Some(bad), 0.9).unwrap_err();
+            assert_eq!(err.0, StatusCode::BAD_REQUEST, "{bad}");
+            assert_eq!(err.1 .0.error.r#type, "validation_error");
+        }
+    }
+
+    #[test]
+    fn discount_finer_than_a_basis_point_is_a_400() {
+        let err = resolve_internal_usage_discount(Some(0.12345), 0.9).unwrap_err();
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+        assert!(
+            err.1 .0.error.message.contains("multiple of 0.0001"),
+            "{}",
+            err.1 .0.error.message
+        );
+    }
+
+    #[test]
+    fn discount_above_ceiling_is_a_400() {
+        let err = resolve_internal_usage_discount(Some(0.3), 0.25).unwrap_err();
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+        assert!(
+            err.1 .0.error.message.contains("exceeds"),
+            "{}",
+            err.1 .0.error.message
+        );
+        // A ceiling of zero refuses every non-zero discount.
+        let err = resolve_internal_usage_discount(Some(0.0001), 0.0).unwrap_err();
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn internal_request_body_carries_discount_to_user() {
+        // `usage` is flattened, so pin that the sibling field survives serde's
+        // flatten buffering for both a float and an integer zero.
+        let mut body = serde_json::json!({
+            "organization_id": "11111111-1111-1111-1111-111111111111",
+            "workspace_id": "22222222-2222-2222-2222-222222222222",
+            "api_key_id": "33333333-3333-3333-3333-333333333333",
+            "type": "chat_completion",
+            "model": "m",
+            "input_tokens": 1,
+            "output_tokens": 1,
+            "id": "x",
+            "discount_to_user": 0.2
+        });
+        let parsed: super::RecordUsageInternalRequest =
+            serde_json::from_value(body.clone()).unwrap();
+        assert_eq!(parsed.discount_to_user, Some(0.2));
+        body["discount_to_user"] = serde_json::json!(0);
+        let parsed: super::RecordUsageInternalRequest =
+            serde_json::from_value(body.clone()).unwrap();
+        assert_eq!(parsed.discount_to_user, Some(0.0));
+        body.as_object_mut().unwrap().remove("discount_to_user");
+        let parsed: super::RecordUsageInternalRequest = serde_json::from_value(body).unwrap();
+        assert_eq!(parsed.discount_to_user, None);
+    }
+
+    #[test]
+    fn discount_ceiling_between_basis_points_floors() {
+        // 0.10005 is 1000.5 bp: 0.1001 must be refused, 0.1 accepted.
+        let err = resolve_internal_usage_discount(Some(0.1001), 0.10005).unwrap_err();
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+        let ok = resolve_internal_usage_discount(Some(0.1), 0.10005)
+            .unwrap()
+            .expect("10% is a discount");
+        assert_eq!(ok.basis_points(), 1_000);
     }
 
     #[test]

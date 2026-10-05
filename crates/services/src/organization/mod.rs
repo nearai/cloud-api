@@ -266,6 +266,9 @@ impl OrganizationServiceImpl {
             DeleteOrganizationResult::Unauthorized => Err(OrganizationError::Unauthorized(
                 "Only the owner can delete an organization".to_string(),
             )),
+            DeleteOrganizationResult::DefaultOrganization => {
+                Err(OrganizationError::DefaultOrganization)
+            }
             DeleteOrganizationResult::StakingWalletBound => {
                 Err(OrganizationError::StakingWalletBound)
             }
@@ -353,6 +356,7 @@ impl OrganizationServiceImpl {
             .await
             .map_err(|e| match e {
                 RepositoryError::AlreadyExists => OrganizationError::AlreadyMember,
+                RepositoryError::NotFound(_) => OrganizationError::NotFound,
                 _ => Self::map_repository_error(e),
             })
     }
@@ -1258,7 +1262,10 @@ impl OrganizationServiceImpl {
                 invitation.invited_by_user_id.0,
             )
             .await
-            .map_err(|e| OrganizationError::InternalError(format!("Failed to add member: {e}")))?;
+            .map_err(|e| match e {
+                RepositoryError::NotFound(_) => OrganizationError::NotFound,
+                _ => OrganizationError::InternalError(format!("Failed to add member: {e}")),
+            })?;
 
         // Mark invitation as accepted
         self.invitation_repository
@@ -1984,6 +1991,33 @@ impl OrganizationServiceTrait for OrganizationServiceImpl {
             .await
     }
 
+    async fn get_request_priority_for_admin(
+        &self,
+        organization_id: OrganizationId,
+    ) -> Result<i32, OrganizationError> {
+        Ok(self
+            .get_organization_impl(organization_id)
+            .await?
+            .request_priority)
+    }
+
+    async fn update_request_priority_for_admin(
+        &self,
+        organization_id: OrganizationId,
+        priority: i32,
+    ) -> Result<i32, OrganizationError> {
+        if !(-1000..=1000).contains(&priority) {
+            return Err(OrganizationError::InvalidParams(
+                "priority must be between -1000 and 1000".to_string(),
+            ));
+        }
+        self.repository
+            .set_request_priority(organization_id.0, priority)
+            .await
+            .map_err(Self::map_repository_error)?
+            .ok_or(OrganizationError::NotFound)
+    }
+
     async fn get_fallback_enabled_for_admin(
         &self,
         organization_id: OrganizationId,
@@ -2065,6 +2099,13 @@ mod tests {
             Ok((id.is_nil() || org.id.0 == id).then(|| org.clone()))
         }
 
+        async fn set_request_priority(
+            &self,
+            _: Uuid,
+            _: i32,
+        ) -> Result<Option<i32>, RepositoryError> {
+            unimplemented!()
+        }
         async fn get_by_name(&self, _: &str) -> Result<Option<Organization>, RepositoryError> {
             unimplemented!()
         }
@@ -2538,6 +2579,7 @@ mod tests {
         };
         let org_id = OrganizationId(Uuid::new_v4());
         let org = Organization {
+            request_priority: 0,
             id: org_id.clone(),
             name: "Example Org".to_string(),
             description: None,
@@ -2614,6 +2656,7 @@ mod tests {
         let now = chrono::Utc::now();
         let org_repo = Arc::new(StubOrgRepo {
             org: Mutex::new(Organization {
+                request_priority: 0,
                 id: organization_id.clone(),
                 name: "Settings Org".to_string(),
                 description: None,
@@ -2834,6 +2877,7 @@ mod tests {
         let org_id = OrganizationId(Uuid::new_v4());
         let org_repo = Arc::new(StubOrgRepo {
             org: Mutex::new(Organization {
+                request_priority: 0,
                 id: org_id.clone(),
                 name: "Staking Bound Org".to_string(),
                 description: None,

@@ -263,11 +263,16 @@ async fn require_near_default_org(
         ));
     }
 
-    // The organization service returns active memberships in creation order; until
-    // users have a designated default-org flag, treat the earliest org as default.
+    // Use the earliest active membership, with the same ordering as /users/me.
     let orgs = app_state
         .organization_service
-        .list_organizations_for_user(UserId(user.0.id), 1, 0, None, None)
+        .list_organizations_for_user(
+            UserId(user.0.id),
+            1,
+            0,
+            Some(services::organization::OrganizationOrderBy::JoinedAt),
+            Some(services::organization::OrganizationOrderDirection::Asc),
+        )
         .await
         .map_err(internal_error)?;
 

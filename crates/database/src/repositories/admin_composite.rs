@@ -10,7 +10,7 @@ use services::admin::{
     AdminModelInfo, AdminOrganizationInfo, AdminOrganizationMemberInfo, AdminRepository,
     DeprecateModelOutcome, ModelDeprecationDeliveryRecord, ModelDeprecationEmailStatus,
     ModelDeprecationModel, ModelDeprecationRecipient, ModelHistoryEntry, ModelPricing,
-    ModelPricingSnapshot, OrganizationLimits, OrganizationLimitsHistoryEntry,
+    ModelPricingSnapshot, ModelValidationState, OrganizationLimits, OrganizationLimitsHistoryEntry,
     OrganizationLimitsUpdate, PlatformServiceInfo, PricingChangeDeliveryRecord,
     PricingChangeOpenConflictError, PricingChangeRecipientRow, ScheduledPricingChange,
     ScheduledPricingChangeInsert, ScheduledPricingChangeStatus, UpdateModelAdminRequest, UserInfo,
@@ -42,11 +42,18 @@ pub struct AdminCompositeRepository {
 
 impl AdminCompositeRepository {
     pub fn new(pool: DbPool) -> Self {
+        Self::with_accounting_config(pool, &config::CreditAllocationConfig::default())
+    }
+
+    pub fn with_accounting_config(pool: DbPool, config: &config::CreditAllocationConfig) -> Self {
         Self {
             pool: pool.clone(),
             model_repo: Arc::new(ModelRepository::new(pool.clone())),
             alias_repo: Arc::new(ModelAliasRepository::new(pool.clone())),
-            limits_repo: Arc::new(OrganizationLimitsRepository::new(pool.clone())),
+            limits_repo: Arc::new(OrganizationLimitsRepository::with_accounting_config(
+                pool.clone(),
+                config,
+            )),
             user_repo: Arc::new(UserRepository::new(pool.clone())),
             service_repo: Arc::new(ServiceRepository::new(pool)),
         }
@@ -161,6 +168,7 @@ impl AdminRepository for AdminCompositeRepository {
             datacenters: request.datacenters,
             is_ready: request.is_ready,
             deprecation_date: request.deprecation_date,
+            successor_model_name: request.successor_model_name,
             openrouter_slug: request.openrouter_slug,
             change_reason: request.change_reason,
             changed_by_user_id: request.changed_by_user_id,
@@ -207,23 +215,25 @@ impl AdminRepository for AdminCompositeRepository {
             datacenters: model.datacenters,
             is_ready: model.is_ready,
             deprecation_date: model.deprecation_date,
+            successor_model_name: model.successor_model_name,
             openrouter_slug: model.openrouter_slug,
         })
     }
 
-    async fn get_model_costs(
+    async fn get_model_validation_state(
         &self,
         model_name: &str,
-    ) -> Result<Option<(i64, i64, i64, Option<i64>, bool)>> {
+    ) -> Result<Option<ModelValidationState>> {
         let model = self.model_repo.get_by_internal_name(model_name).await?;
-        Ok(model.map(|m| {
-            (
-                m.input_cost_per_token,
-                m.output_cost_per_token,
-                m.cost_per_image,
-                m.cache_read_cost_per_token,
-                m.allow_free,
-            )
+        Ok(model.map(|m| ModelValidationState {
+            input_cost_per_token: m.input_cost_per_token,
+            output_cost_per_token: m.output_cost_per_token,
+            cost_per_image: m.cost_per_image,
+            cache_read_cost_per_token: m.cache_read_cost_per_token,
+            allow_free: m.allow_free,
+            provider_type: m.provider_type,
+            provider_config: m.provider_config,
+            deprecation_date: m.deprecation_date,
         }))
     }
 
@@ -273,6 +283,7 @@ impl AdminRepository for AdminCompositeRepository {
                     datacenters: h.datacenters,
                     is_ready: h.is_ready,
                     deprecation_date: h.deprecation_date,
+                    successor_model_name: h.successor_model_name,
                     openrouter_slug: h.openrouter_slug,
                     allow_free: h.allow_free,
                     effective_from: h.effective_from,
@@ -392,7 +403,7 @@ impl AdminRepository for AdminCompositeRepository {
             .query_opt(
                 r#"
                 UPDATE models
-                SET is_active = false, updated_at = NOW()
+                SET is_active = false, successor_model_name = $2, updated_at = NOW()
                 WHERE id = $1
                 RETURNING id, model_name, model_display_name, model_description, model_icon,
                           input_cost_per_token, output_cost_per_token, cost_per_image,
@@ -401,9 +412,10 @@ impl AdminRepository for AdminCompositeRepository {
                           attestation_supported, input_modalities, output_modalities, inference_url,
                           datacenters, hugging_face_id, quantization, max_output_length,
                           supported_sampling_parameters, supported_features,
-                          is_ready, deprecation_date, openrouter_slug, allow_free
+                          is_ready, deprecation_date, successor_model_name,
+                          openrouter_slug, allow_free
                 "#,
-                &[&deprecated_id],
+                &[&deprecated_id, &successor_model_name],
             )
             .await
             .context("Failed to deactivate deprecated model")?;
@@ -436,14 +448,15 @@ impl AdminRepository for AdminCompositeRepository {
                 supported_sampling_parameters, supported_features, is_ready, deprecation_date,
                 openrouter_slug, allow_free,
                 effective_from, effective_until, changed_by_user_id,
-                changed_by_user_email, change_reason, created_at, text_pricing
+                changed_by_user_email, change_reason, created_at, text_pricing,
+                successor_model_name
             ) VALUES (
                 $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19,
                 $20, $21, $22, $23,
                 COALESCE($24, ARRAY[]::TEXT[]),
                 COALESCE($25, ARRAY[]::TEXT[]),
                 $26, $27, $28, $29,
-                NOW(), NULL, $30, $31, $32, NOW(), $33
+                NOW(), NULL, $30, $31, $32, NOW(), $33, $34
             )
             "#,
             &[
@@ -525,6 +538,10 @@ impl AdminRepository for AdminCompositeRepository {
                     .try_get::<_, Option<serde_json::Value>>("text_pricing")
                     .ok()
                     .flatten(),
+                &deprecated_row_after
+                    .try_get::<_, Option<String>>("successor_model_name")
+                    .ok()
+                    .flatten(),
             ],
         )
         .await
@@ -583,6 +600,7 @@ impl AdminRepository for AdminCompositeRepository {
                 datacenters: row.try_get("datacenters").ok().flatten(),
                 is_ready: row.try_get("is_ready").ok().flatten(),
                 deprecation_date: row.try_get("deprecation_date").ok().flatten(),
+                successor_model_name: row.try_get("successor_model_name").ok().flatten(),
                 openrouter_slug: row.try_get("openrouter_slug").ok().flatten(),
             })
         };
@@ -597,7 +615,7 @@ impl AdminRepository for AdminCompositeRepository {
                 m.inference_url,
                 m.hugging_face_id, m.quantization, m.max_output_length,
                 m.supported_sampling_parameters, m.supported_features, m.datacenters,
-                m.is_ready, m.deprecation_date, m.openrouter_slug,
+                m.is_ready, m.deprecation_date, m.successor_model_name, m.openrouter_slug,
                 COALESCE(
                     array_agg(ma.alias_name) FILTER (WHERE ma.alias_name IS NOT NULL),
                     '{}'
@@ -836,6 +854,7 @@ impl AdminRepository for AdminCompositeRepository {
                 datacenters: m.datacenters,
                 is_ready: m.is_ready,
                 deprecation_date: m.deprecation_date,
+                successor_model_name: m.successor_model_name,
                 openrouter_slug: m.openrouter_slug,
             })
             .collect();

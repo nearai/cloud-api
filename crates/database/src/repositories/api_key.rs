@@ -1,6 +1,6 @@
 use crate::models::ApiKey;
 use crate::pool::DbPool;
-use crate::repositories::statement_cache::CachedStatements;
+use crate::repositories::usage_hourly::with_usage_rows;
 use crate::repositories::utils::map_db_error;
 use crate::retry_db;
 use anyhow::{Context, Result};
@@ -8,6 +8,7 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use services::common::{extract_api_key_prefix, generate_api_key, hash_api_key, RepositoryError};
 use services::workspace::ports::{ApiKeyOrderBy, ApiKeyOrderDirection, CreateApiKeyRequest};
+use tokio_postgres::types::Type;
 use tracing::debug;
 use uuid::Uuid;
 
@@ -149,8 +150,9 @@ impl ApiKeyRepository {
                 .context("Failed to get database connection")
                 .map_err(RepositoryError::PoolError)?;
 
+            // One-shot typed query: one round trip, see repositories/mod.rs.
             client
-                .cached_query_opt(
+                .query_typed_opt(
                     r#"
             SELECT ak.*
             FROM api_keys ak
@@ -163,7 +165,7 @@ impl ApiKeyRepository {
               AND w.is_active = true
               AND o.is_active = true
             "#,
-                    &[&key_hash],
+                    &[(&key_hash, Type::VARCHAR)],
                 )
                 .await
                 .map_err(map_db_error)
@@ -192,10 +194,11 @@ impl ApiKeyRepository {
                 .context("Failed to get database connection")
                 .map_err(RepositoryError::PoolError)?;
 
+            // One-shot typed query: one round trip, see repositories/mod.rs.
             client
-                .cached_execute(
+                .execute_typed(
                     "UPDATE api_keys SET last_used_at = NOW() WHERE id = $1",
-                    &[&id],
+                    &[(&id, Type::UUID)],
                 )
                 .await
                 .map_err(map_db_error)
@@ -290,9 +293,12 @@ impl ApiKeyRepository {
 
             client
                 .query(
-                    &format!(
-                        r#"
-                SELECT 
+                    &with_usage_rows(
+                        "'-infinity'::timestamptz",
+                        "'infinity'::timestamptz",
+                        &format!(
+                            r#"
+                SELECT
                     ak.id,
                     ak.key_hash,
                     ak.key_prefix,
@@ -312,7 +318,7 @@ impl ApiKeyRepository {
                 FROM api_keys ak
                 LEFT JOIN (
                     SELECT api_key_id, COALESCE(SUM(total_cost), 0)::BIGINT AS total_cost
-                    FROM organization_usage_log
+                    FROM usage_rows
                     WHERE workspace_id = $1
                     GROUP BY api_key_id
                 ) inference_usage ON ak.id = inference_usage.api_key_id
@@ -326,6 +332,7 @@ impl ApiKeyRepository {
                 ORDER BY {order_by_column} {order_dir}{tie_breaker}
                 LIMIT $2 OFFSET $3
                 "#
+                        ),
                     ),
                     &[&workspace_id, &limit, &offset],
                 )
@@ -404,44 +411,6 @@ impl ApiKeyRepository {
         })?;
 
         Ok(rows_affected as i64)
-    }
-
-    /// Get workspace info for an API key - used for auth resolution
-    pub async fn get_workspace_for_api_key(
-        &self,
-        api_key: &ApiKey,
-    ) -> Result<Option<crate::models::Workspace>> {
-        let row = retry_db!("get_workspace_info_for_api_key", {
-            let client = self
-                .pool
-                .get()
-                .await
-                .context("Failed to get database connection")
-                .map_err(RepositoryError::PoolError)?;
-
-            client
-                .query_opt(
-                    "SELECT * FROM workspaces WHERE id = $1 AND is_active = true",
-                    &[&api_key.workspace_id],
-                )
-                .await
-                .map_err(map_db_error)
-        })?;
-
-        match row {
-            Some(row) => Ok(Some(crate::models::Workspace {
-                id: row.get("id"),
-                name: row.get("name"),
-                description: row.get("description"),
-                organization_id: row.get("organization_id"),
-                created_by_user_id: row.get("created_by_user_id"),
-                created_at: row.get("created_at"),
-                updated_at: row.get("updated_at"),
-                is_active: row.get("is_active"),
-                settings: row.get("settings"),
-            })),
-            None => Ok(None),
-        }
     }
 
     /// Update spend limit for an API key

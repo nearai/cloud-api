@@ -6,6 +6,9 @@ use uuid::Uuid;
 /// Organization model - top level entity
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Organization {
+    /// Operator-controlled scheduler priority. Never accepted from or exposed in JSON.
+    #[serde(skip)]
+    pub request_priority: i32,
     pub id: Uuid,
     pub name: String,
     pub description: Option<String>,
@@ -175,6 +178,37 @@ pub struct Session {
     pub user_agent: String,
 }
 
+/// Immutable permission of an admin access token. Unknown persisted values must
+/// fail validation instead of falling back to the backwards-compatible default.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AdminAccessTokenPermission {
+    ReadOnly,
+    #[default]
+    ReadWrite,
+}
+
+impl AdminAccessTokenPermission {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::ReadOnly => "read_only",
+            Self::ReadWrite => "read_write",
+        }
+    }
+}
+
+impl std::str::FromStr for AdminAccessTokenPermission {
+    type Err = &'static str;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "read_only" => Ok(Self::ReadOnly),
+            "read_write" => Ok(Self::ReadWrite),
+            _ => Err("Invalid admin access token permission"),
+        }
+    }
+}
+
 /// Admin access token for tracking and managing admin access tokens
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AdminAccessToken {
@@ -191,6 +225,7 @@ pub struct AdminAccessToken {
     pub revoked_by_user_id: Option<Uuid>,
     pub revocation_reason: Option<String>,
     pub user_agent: Option<String>,
+    pub permission: AdminAccessTokenPermission,
 }
 
 /// Request/Response DTOs
@@ -482,6 +517,9 @@ pub struct Model {
     pub is_ready: Option<bool>,
     /// Planned deprecation date (ISO 8601). NULL = no planned deprecation.
     pub deprecation_date: Option<DateTime<Utc>>,
+    /// Canonical name of the recommended replacement model. Cleared together
+    /// with `deprecation_date`.
+    pub successor_model_name: Option<String>,
     /// OpenRouter `openrouter.slug` override (lowercase `author/slug`). Set when
     /// our canonical `model_name` does not match OpenRouter's slug. NULL = unset;
     /// the public API then omits the nested `openrouter` object.
@@ -544,6 +582,10 @@ pub struct UpdateModelPricingRequest {
     /// Tri-state: `None` = leave unchanged, `Some(None)` = clear to NULL,
     /// `Some(Some(dt))` = set to `dt`.
     pub deprecation_date: Option<Option<DateTime<Utc>>>,
+    /// Recommended replacement model for a planned deprecation.
+    /// Tri-state: `None` = leave unchanged, `Some(None)` = clear to NULL,
+    /// `Some(Some(v))` = set to `v`. Also cleared when `deprecation_date` is.
+    pub successor_model_name: Option<Option<String>>,
     /// OpenRouter `openrouter.slug` override.
     /// Tri-state: `None` = leave unchanged, `Some(None)` = clear to NULL,
     /// `Some(Some(v))` = set to `v`.
@@ -602,6 +644,7 @@ pub struct ModelHistory {
     pub datacenters: Option<Vec<String>>,
     pub is_ready: Option<bool>,
     pub deprecation_date: Option<DateTime<Utc>>,
+    pub successor_model_name: Option<String>,
     /// OpenRouter `openrouter.slug` override the model carried at this point.
     pub openrouter_slug: Option<String>,
 
@@ -727,6 +770,10 @@ pub struct OrganizationUsageLog {
     pub served_provider_type: Option<ServedProviderType>,
     pub served_via_fallback: bool,
     pub was_inserted: bool,
+    pub credit_allocations: Option<Vec<services::usage::CreditAllocation>>,
+    pub funded_amount: Option<i64>,
+    pub unfunded_amount: Option<i64>,
+    pub allocation_policy_version: Option<String>,
 }
 
 /// Organization balance summary - cached aggregate spending
@@ -813,6 +860,10 @@ pub struct OrganizationServiceUsageLog {
     pub total_cost: i64,
     pub inference_id: Option<Uuid>,
     pub created_at: DateTime<Utc>,
+    pub credit_allocations: Option<Vec<services::usage::CreditAllocation>>,
+    pub funded_amount: Option<i64>,
+    pub unfunded_amount: Option<i64>,
+    pub allocation_policy_version: Option<String>,
 }
 
 // ============================================

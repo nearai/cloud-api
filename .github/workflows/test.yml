@@ -9,8 +9,8 @@ name: Tests
 on:
   push:
     branches: [ main, develop ]
+  # Include stacked PRs targeting another feature branch.
   pull_request:
-    branches: [ main, develop ]
 
 env:
   CARGO_TERM_COLOR: always
@@ -198,6 +198,15 @@ jobs:
       with:
         cache-key: e2e
 
+    - name: Run typed-query and credit-allocation regressions
+      run: cargo test --locked -p database --test hot_path_typed_queries --test billing_typed_queries --test credit_allocation
+      env:
+        PGHOST: localhost
+        PGPORT: 5432
+        PGDATABASE: platform_api
+        PGUSER: postgres
+        PGPASSWORD: postgres
+
     - name: Run e2e tests
       run: cargo nextest run --test e2e_all
       env:
@@ -218,6 +227,14 @@ jobs:
         RUST_LOG: debug
         DEV: "true"
 
+  script-test:
+    name: Script tests
+    runs-on: [self-hosted, infra]
+    steps:
+      - uses: actions/checkout@v7
+      - name: Test synthetic rollout verification
+        run: python3 -B -m unittest discover -s scripts/tests -v
+
   # Aggregates all test jobs into a single required status check. The branch
   # ruleset requires "Test Suite", so this job MUST always run and always report
   # a result (note `if: always()` plus no `paths:` filter on the workflow) —
@@ -227,7 +244,7 @@ jobs:
   test-suite:
     name: Test Suite
     runs-on: [self-hosted, infra]
-    needs: [changes, lint, unit-test, integration-test, e2e-test]
+    needs: [changes, lint, unit-test, integration-test, e2e-test, script-test]
     if: always()
     steps:
       - name: Check all tests passed
@@ -236,6 +253,11 @@ jobs:
           # conclude tests were unnecessary.
           if [[ "${{ needs.changes.result }}" != "success" ]]; then
             echo "Change-detection job did not succeed (${{ needs.changes.result }}); failing closed."
+            exit 1
+          fi
+
+          if [[ "${{ needs.script-test.result }}" != "success" ]]; then
+            echo "Script tests did not succeed; failing closed."
             exit 1
           fi
 

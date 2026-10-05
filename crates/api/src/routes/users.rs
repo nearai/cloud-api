@@ -123,11 +123,19 @@ pub async fn get_current_user(
         }
     };
 
+    // Default-dependent clients use the first active membership. Sort in SQL before
+    // pagination by joined_at ASC, organization ID ASC (not organization creation).
     // Get user's organizations with roles — single JOIN query (replaces prior N+1 pattern of
     // list_organizations_for_user + N × get_user_role).
     let organizations = match app_state
         .organization_service
-        .list_organizations_with_roles_for_user(user_id.clone(), 100, 0, None, None)
+        .list_organizations_with_roles_for_user(
+            user_id.clone(),
+            100,
+            0,
+            Some(services::organization::OrganizationOrderBy::JoinedAt),
+            Some(services::organization::OrganizationOrderDirection::Asc),
+        )
         .await
     {
         Ok(orgs) => orgs

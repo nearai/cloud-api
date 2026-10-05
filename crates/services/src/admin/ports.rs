@@ -53,6 +53,13 @@ pub struct UpdateModelAdminRequest {
     /// Tri-state: `None` = leave unchanged, `Some(None)` = clear to NULL,
     /// `Some(Some(dt))` = set to `dt`.
     pub deprecation_date: Option<Option<chrono::DateTime<chrono::Utc>>>,
+    /// Recommended replacement model for a planned deprecation (canonical
+    /// model name). Announced in the `x-model-successor` response header.
+    /// Cleared together with `deprecation_date`.
+    ///
+    /// Tri-state: `None` = leave unchanged, `Some(None)` = clear to NULL,
+    /// `Some(Some(v))` = set to `v`.
+    pub successor_model_name: Option<Option<String>>,
     /// OpenRouter `openrouter.slug` override (validated at the route layer).
     ///
     /// Tri-state: `None` = leave unchanged, `Some(None)` = clear to NULL,
@@ -112,8 +119,23 @@ pub struct ModelPricing {
     pub datacenters: Option<Vec<String>>,
     pub is_ready: Option<bool>,
     pub deprecation_date: Option<chrono::DateTime<chrono::Utc>>,
+    /// Recommended replacement model for the planned deprecation.
+    pub successor_model_name: Option<String>,
     /// OpenRouter `openrouter.slug` override. NULL = unset.
     pub openrouter_slug: Option<String>,
+}
+
+/// Stored fields needed to validate a partial model update before persisting it.
+#[derive(Debug, Clone)]
+pub struct ModelValidationState {
+    pub input_cost_per_token: i64,
+    pub output_cost_per_token: i64,
+    pub cost_per_image: i64,
+    pub cache_read_cost_per_token: Option<i64>,
+    pub allow_free: bool,
+    pub provider_type: String,
+    pub provider_config: Option<serde_json::Value>,
+    pub deprecation_date: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 /// Model history entry - includes pricing, context length, and other model attributes
@@ -149,6 +171,8 @@ pub struct ModelHistoryEntry {
     pub datacenters: Option<Vec<String>>,
     pub is_ready: Option<bool>,
     pub deprecation_date: Option<chrono::DateTime<chrono::Utc>>,
+    /// Recommended replacement model for the planned deprecation.
+    pub successor_model_name: Option<String>,
     /// OpenRouter `openrouter.slug` override the model carried at this point.
     pub openrouter_slug: Option<String>,
     /// If true, this model was allowed to serve without pricing at this point in time.
@@ -278,6 +302,8 @@ pub struct AdminModelInfo {
     pub datacenters: Option<Vec<String>>,
     pub is_ready: Option<bool>,
     pub deprecation_date: Option<chrono::DateTime<chrono::Utc>>,
+    /// Recommended replacement model for the planned deprecation.
+    pub successor_model_name: Option<String>,
     /// OpenRouter `openrouter.slug` override. NULL = unset.
     pub openrouter_slug: Option<String>,
 }
@@ -596,6 +622,8 @@ pub enum AdminError {
     PricingChangeNotFound(String),
     #[error("Unauthorized: {0}")]
     Unauthorized(String),
+    #[error("Analytics query exceeded its statement budget")]
+    Timeout,
     #[error("Internal error: {0}")]
     InternalError(String),
 }
@@ -624,14 +652,12 @@ pub trait AdminRepository: Send + Sync {
         request: UpdateModelAdminRequest,
     ) -> Result<ModelPricing, anyhow::Error>;
 
-    /// Fetch the current pricing costs and allow_free flag for a model by name.
+    /// Fetch the stored fields needed to validate a partial model update.
     /// Returns `None` if the model does not exist (new model).
-    /// Returns `Some((input_cost, output_cost, cost_per_image, cache_read_cost_per_token, allow_free))`,
-    /// where `cache_read_cost_per_token` is `None` when cache pricing is disabled.
-    async fn get_model_costs(
+    async fn get_model_validation_state(
         &self,
         model_name: &str,
-    ) -> Result<Option<(i64, i64, i64, Option<i64>, bool)>, anyhow::Error>;
+    ) -> Result<Option<ModelValidationState>, anyhow::Error>;
 
     /// Get complete history for a model with pagination (includes pricing and other attributes)
     async fn get_model_history(

@@ -1,5 +1,8 @@
 mod fleet;
+mod placement_report;
 mod prefix_router;
+#[cfg(test)]
+mod systemone_tests;
 
 use crate::spki_verifier::{FingerprintState, SharedTlsRoots};
 use crate::{
@@ -8,6 +11,7 @@ use crate::{
 };
 use async_trait::async_trait;
 use fleet::Fleet;
+use placement_report::PlacementRequest;
 use prefix_router::PrefixRouter;
 use reqwest::{header::HeaderValue, Client};
 use serde::Serialize;
@@ -104,6 +108,25 @@ pub(crate) mod tracing_headers {
     pub const WORKSPACE_ID: &str = "x_workspace_id";
 }
 
+/// HTTP headers cloud-api itself sets on an upstream request, never taken
+/// from client input.
+pub mod upstream_headers {
+    /// The replica index placement chose on the target backend, in decimal.
+    /// Set only from the `RouteLease`, and only on the request sent to that
+    /// lease's backend; a key of the same name in `params.extra` is dropped.
+    pub const REPLICA_HINT: &str = "x-nearai-replica";
+    /// The host id placement chose, sent with [`REPLICA_HINT`]. The rotation
+    /// index can drift to another host before the next discovery (the proxy
+    /// maps `-i<N>` over its live healthy set), so the proxy honours the hint
+    /// only when this matches its own host. Same rules as the hint: set only
+    /// from the `RouteLease`, and a key of this name in `params.extra` is
+    /// dropped.
+    pub const REPLICA_HINT_HOST: &str = "x-nearai-replica-host";
+
+    /// Every header above: none may come from client input.
+    pub(crate) const ALL: [&str; 2] = [REPLICA_HINT, REPLICA_HINT_HOST];
+}
+
 /// Encryption header keys used in params.extra for passing encryption information.
 /// `pub(crate)` so other providers (e.g. the Chutes path) can strip/reject these
 /// internal client-E2EE markers instead of hardcoding the strings.
@@ -120,6 +143,16 @@ pub(crate) mod encryption_headers {
     pub const ENCRYPTION_VERSION: &str = "x_encryption_version";
     /// Key for full field encryption opt-in (x-encrypt-all-fields header)
     pub const ENCRYPT_ALL_FIELDS: &str = "x_encrypt_all_fields";
+}
+
+/// Legacy placement keys in `params.extra`. Placement inputs now travel on
+/// the typed, never-serialized `ChatCompletionParams::placement`, so nothing
+/// writes or reads these; they stay on a deny-list so a client-supplied value
+/// is still stripped before any upstream (this provider, Chutes, external).
+pub mod placement_headers {
+    /// The old affinity-key and affinity-source extra keys.
+    pub const LEGACY_DENIED_EXTRA_KEYS: [&str; 2] =
+        ["x_placement_affinity", "x_placement_affinity_source"];
 }
 
 /// Configuration for vLLM provider.
@@ -366,6 +399,23 @@ impl Fleet {
     /// Maximum inline-verification retries when creating a verified index client.
     const INLINE_VERIFY_RETRIES: usize = 2;
 
+    /// How long an index is not verified again after inline verification
+    /// failed the TLS channel-binding check (a non-retryable failure). Bounds
+    /// the attestation load during a certificate-renewal skew, when every
+    /// request to the index would otherwise trigger a new attestation.
+    pub(super) const CHANNEL_BINDING_BACKOFF: Duration = Duration::from_secs(30);
+
+    /// Time left before `index` may be verified again after a channel-binding
+    /// failure, if any.
+    fn channel_binding_backoff_remaining(&self, index: usize) -> Option<Duration> {
+        let failed_at = (*self.channel_binding_failed_at[index]
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()))?;
+        Self::CHANNEL_BINDING_BACKOFF
+            .checked_sub(failed_at.elapsed())
+            .filter(|remaining| !remaining.is_zero())
+    }
+
     /// Spawn background tasks to pre-warm the per-index clients for the live
     /// backend indices (`0..rotation_count()`). No-op without a verifier or
     /// before any fingerprint is pinned (Bootstrap/Blocked) — every task would
@@ -406,7 +456,9 @@ impl Fleet {
     /// (`<canonical>-i<index>.<base>`) so the pinned H2 connection lands on
     /// backend `index`. Bounded by `verification_semaphore`; on exhausted
     /// retries falls back to `fallback_client` only once a fingerprint is
-    /// pinned (else fails closed).
+    /// pinned (else fails closed). A TLS channel-binding failure is not
+    /// retried, and the index is not verified again for
+    /// `CHANNEL_BINDING_BACKOFF`.
     pub(super) async fn get_or_verify_index_client(
         &self,
         index: usize,
@@ -443,6 +495,10 @@ impl Fleet {
             }
         };
 
+        if let Some(remaining) = self.channel_binding_backoff_remaining(index) {
+            return self.channel_binding_backoff(index, remaining);
+        }
+
         // Bound concurrent inline verifications (thundering-herd guard). The
         // permit is held for the whole retry loop; the first success fills the
         // index slot and subsequent waiters take the fast path after re-checking.
@@ -460,6 +516,11 @@ impl Fleet {
             if let Some(ref client) = *guard {
                 return Ok(client.clone());
             }
+        }
+        // A concurrent verification of this index may have just failed the
+        // channel-binding check while this task waited for the permit.
+        if let Some(remaining) = self.channel_binding_backoff_remaining(index) {
+            return self.channel_binding_backoff(index, remaining);
         }
 
         // Verify against the index's rotation SNI so the pinned connection lands
@@ -480,7 +541,9 @@ impl Fleet {
         };
 
         let mut last_err = None;
+        let mut attempts = 0;
         for _attempt in 0..=Self::INLINE_VERIFY_RETRIES {
+            attempts += 1;
             match verifier.create_verified_client(&verify_url).await {
                 Ok(client) => {
                     let mut guard = self.index_clients[index]
@@ -490,6 +553,9 @@ impl Fleet {
                         return Ok(existing.clone());
                     }
                     *guard = Some(client.clone());
+                    *self.channel_binding_failed_at[index]
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner()) = None;
                     return Ok(client);
                 }
                 Err(e) => {
@@ -500,30 +566,69 @@ impl Fleet {
                         return Ok(existing.clone());
                     }
                     drop(guard);
+                    if matches!(e, BackendVerifyError::ChannelBinding(_)) {
+                        // The report and the certificate came from the same
+                        // connection: another attempt reaches the same backend
+                        // and fails the same way, at the cost of a new
+                        // attestation.
+                        *self.channel_binding_failed_at[index]
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner()) = Some(tokio::time::Instant::now());
+                        tracing::warn!(
+                            index,
+                            error = %e,
+                            backoff_secs = Self::CHANNEL_BINDING_BACKOFF.as_secs(),
+                            "Inline backend verification failed the TLS channel binding check; not retrying"
+                        );
+                        last_err = Some(e);
+                        break;
+                    }
                     tracing::warn!(index, error = %e, "Inline backend verification failed, retrying");
                     last_err = Some(e);
                 }
             }
         }
 
-        // Retries exhausted. Fall back to the non-pinned client ONLY if a
-        // fingerprint is already pinned (its verifier still rejects unknown
-        // SPKIs); in Bootstrap, fail closed to avoid unauthenticated connections.
+        // Retries exhausted, or a non-retryable failure. Fall back to the
+        // non-pinned client ONLY if a fingerprint is already pinned (its
+        // verifier still rejects unknown SPKIs); in Bootstrap, fail closed to
+        // avoid unauthenticated connections.
         let err_msg = format!(
-            "Inline backend verification failed after {} attempts: {}",
-            Self::INLINE_VERIFY_RETRIES + 1,
-            last_err.unwrap_or_default()
+            "Inline backend verification failed after {attempts} attempt(s): {}",
+            last_err.map(|e| e.to_string()).unwrap_or_default()
         );
         if self.pinned_fingerprint_count() > 0 {
-            tracing::warn!(index, error = %err_msg, "Inline backend verification exhausted retries; serving with fallback client");
+            tracing::warn!(index, error = %err_msg, "Inline backend verification failed; serving with fallback client");
             Ok(self.fallback_client.clone())
         } else {
             tracing::warn!(
                 index,
                 error = %err_msg,
-                "Inline backend verification exhausted retries in Bootstrap state; \
+                "Inline backend verification failed in Bootstrap state; \
                  refusing fallback to prevent unauthenticated connections"
             );
+            Err(CompletionError::CompletionError(err_msg))
+        }
+    }
+
+    /// `get_or_verify_index_client` for an index that is backing off after a
+    /// channel-binding failure: no verification, straight to the same fallback
+    /// decision. Logged at debug level; the failure itself was logged once.
+    fn channel_binding_backoff(
+        &self,
+        index: usize,
+        remaining: Duration,
+    ) -> Result<Client, CompletionError> {
+        let err_msg = format!(
+            "Inline backend verification of index {index} failed the TLS channel binding check; \
+             not verifying it again for {}s",
+            remaining.as_secs().max(1)
+        );
+        if self.pinned_fingerprint_count() > 0 {
+            tracing::debug!(index, error = %err_msg, "Serving with fallback client");
+            Ok(self.fallback_client.clone())
+        } else {
+            tracing::debug!(index, error = %err_msg, "Refusing fallback in Bootstrap state");
             Err(CompletionError::CompletionError(err_msg))
         }
     }
@@ -611,9 +716,12 @@ impl Provider {
         let completion_timeout = config.completion_timeout();
         let control_timeout = config.control_timeout();
 
-        // General-purpose client for non-completion requests
+        // General-purpose client for non-completion requests. Like the fallback
+        // and bucket clients, it does not follow redirects: every request goes
+        // to a URL derived from `base_url`, and backends do not redirect.
         let client = Client::builder()
             .use_preconfigured_tls(tls_roots.build_config(fingerprint_state.clone()))
+            .redirect(reqwest::redirect::Policy::none())
             .connect_timeout(Duration::from_secs(5))
             .pool_idle_timeout(Duration::from_secs(90))
             .read_timeout(control_timeout)
@@ -625,6 +733,7 @@ impl Provider {
         // when inline bucket verification fails.
         let fallback_client = Client::builder()
             .use_preconfigured_tls(tls_roots.build_config(fingerprint_state.clone()))
+            .redirect(reqwest::redirect::Policy::none())
             .connect_timeout(Duration::from_secs(5))
             .pool_idle_timeout(Duration::from_secs(90))
             .read_timeout(completion_timeout)
@@ -771,6 +880,12 @@ impl Fleet {
             .remove(encryption_headers::MODEL_PUB_KEY)
             .and_then(|value| value.as_str().map(str::to_string));
 
+        // Legacy placement keys are denied: a client-supplied value never
+        // reaches the serialized request body or an HTTP header.
+        for key in placement_headers::LEGACY_DENIED_EXTRA_KEYS {
+            extra.remove(key);
+        }
+
         // Extract and forward x_encryption_version as HTTP header, then remove from extra
         if let Some(version) = extra
             .remove(encryption_headers::ENCRYPTION_VERSION)
@@ -794,6 +909,36 @@ impl Fleet {
         }
 
         pinned_pub_key
+    }
+
+    fn prepare_priority_header(
+        headers: &mut reqwest::header::HeaderMap,
+        params: &mut ChatCompletionParams,
+    ) {
+        headers.insert(
+            "x-nearai-priority",
+            HeaderValue::from(params.request_priority),
+        );
+        params.strip_client_priority();
+    }
+
+    /// `headers` plus the lease's replica hint and its host, when placement
+    /// chose one. Only the request to the lease's own backend carries them: a
+    /// fallback index or the canonical URL lands on a backend whose replicas
+    /// the decision never saw. A host id that is not a valid header value
+    /// sends neither, so the hint never goes out without its host.
+    fn with_replica_hint(
+        headers: &reqwest::header::HeaderMap,
+        lease: &fleet::RouteLease,
+    ) -> reqwest::header::HeaderMap {
+        let mut headers = headers.clone();
+        if let (Some(replica), Some(host)) = (lease.replica(), lease.replica_host()) {
+            if let Ok(host) = HeaderValue::from_str(host) {
+                headers.insert(upstream_headers::REPLICA_HINT, HeaderValue::from(replica));
+                headers.insert(upstream_headers::REPLICA_HINT_HOST, host);
+            }
+        }
+        headers
     }
 
     /// Prepare tracing headers by extracting correlation IDs from `extra` and forwarding
@@ -1220,6 +1365,13 @@ struct TtftProbe<S> {
     index: usize,
     /// Send instant; `None` once the first content TTFT has been recorded.
     start: Option<std::time::Instant>,
+    /// Send instant, kept for the end-of-stream duration.
+    sent: std::time::Instant,
+    /// First and last token chunk (at least one choice), and how many,
+    /// for the inter-token latency.
+    first_token: Option<std::time::Instant>,
+    last_token: Option<std::time::Instant>,
+    token_chunks: u64,
     /// Keeps this backend counted as live until the stream completes or the
     /// caller drops it. `None` is used only by focused unit tests.
     _route_lease: Option<fleet::RouteLease>,
@@ -1238,6 +1390,10 @@ impl<S> TtftProbe<S> {
             stats,
             index,
             start: Some(start),
+            sent: start,
+            first_token: None,
+            last_token: None,
+            token_chunks: 0,
             _route_lease: route_lease,
         }
     }
@@ -1257,9 +1413,18 @@ where
         if let std::task::Poll::Ready(Some(Ok(ref event))) = polled {
             // Only a content-bearing chunk counts as the first token; leading
             // control events (keepalives, blank separators) don't.
+            if event.chunk.as_ref().is_some_and(is_token_chunk) {
+                let now = std::time::Instant::now();
+                self.first_token.get_or_insert(now);
+                self.last_token = Some(now);
+                self.token_chunks = self.token_chunks.saturating_add(1);
+            }
             if event.chunk.is_some() {
                 if let Some(start) = self.start.take() {
                     let ttft_ms = start.elapsed().as_millis() as f64;
+                    if let Some(lease) = self._route_lease.as_ref() {
+                        lease.record_ttft_ms(ttft_ms);
+                    }
                     let index = self.index;
                     let mut stats = self.stats.lock().unwrap_or_else(|e| e.into_inner());
                     if let Some(s) = stats.get_mut(index) {
@@ -1268,14 +1433,124 @@ where
                 }
             }
         } else if matches!(polled, std::task::Poll::Ready(None)) {
+            if let Some(lease) = self._route_lease.as_ref() {
+                lease.record_duration_ms(self.sent.elapsed().as_millis() as f64);
+                if let (Some(first), Some(last)) = (self.first_token, self.last_token) {
+                    let span_ms = last.duration_since(first).as_secs_f64() * 1_000.0;
+                    if let Some(itl) = fleet::mean_itl_ms(span_ms, self.token_chunks) {
+                        lease.record_itl_ms(itl);
+                    }
+                }
+            }
             self._route_lease.take();
         }
         polled
     }
 }
 
+/// A chunk that carries at least one choice, i.e. generated tokens. A
+/// usage-only chunk (`choices: []`) is not one.
+fn is_token_chunk(chunk: &StreamChunk) -> bool {
+    match chunk {
+        StreamChunk::Chat(c) => !c.choices.is_empty(),
+        StreamChunk::Text(c) => !c.choices.is_empty(),
+    }
+}
+
 #[async_trait]
 impl InferenceProvider for Fleet {
+    fn supports_systemone(&self) -> bool {
+        true
+    }
+
+    async fn systemone(
+        &self,
+        request: SystemOneRequest,
+        request_hash: String,
+    ) -> Result<SystemOneResponseWithBytes, CompletionError> {
+        let mut headers = self
+            .build_headers()
+            .map_err(CompletionError::CompletionError)?;
+        headers.insert(
+            "X-Request-Hash",
+            HeaderValue::from_str(&request_hash)
+                .map_err(|_| CompletionError::CompletionError("Invalid request hash".into()))?,
+        );
+        let mut lease = self.acquire_systemone_index(&request_hash);
+        let route_key = lease.as_ref().map(|lease| lease.route_key());
+        let indices = match &lease {
+            Some(lease) => std::iter::once(lease.index())
+                .chain(self.fallback_indices_for(lease.index(), None))
+                .map(Some)
+                .collect::<Vec<_>>(),
+            None => vec![None],
+        };
+        let timeout_seconds = self.config.completion_timeout_seconds.max(1) as u64;
+        let mut last_error = None;
+        for index in indices {
+            let _lease = lease.take().or_else(|| {
+                index
+                    .zip(route_key)
+                    .map(|(index, key)| self.reserve_index(key, index))
+            });
+            let attempt = async {
+                let (client, url) = match index {
+                    Some(index) => (
+                        self.get_or_verify_index_client(index).await?,
+                        self.rotation_url(index as u64, "/v1/systemone")
+                            .expect("rotation lease requires a rotation URL"),
+                    ),
+                    None => (
+                        self.fallback_client.clone(),
+                        format!("{}/v1/systemone", self.config.base_url),
+                    ),
+                };
+                let response = client
+                    .post(url)
+                    .headers(headers.clone())
+                    .json(&request)
+                    .timeout(Duration::from_secs(timeout_seconds))
+                    .send()
+                    .await
+                    .map_err(|e| crate::systemone::transport_error(e, timeout_seconds))?;
+                let response = crate::systemone::read_response(response, &request, false).await?;
+                let decision_id = response.provider_decision_id()?;
+                if let Some(index) = index {
+                    self.signature_rotation
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .insert(decision_id.to_owned(), index as u64);
+                }
+                Ok(response)
+            }
+            .await;
+            match attempt {
+                Ok(response) => return Ok(response),
+                Err(error) => {
+                    // Never replay a successful but malformed response or an
+                    // ambiguous read timeout. Those may already have incurred cost.
+                    let retryable = match &error {
+                        CompletionError::HttpError { status_code, .. } => {
+                            Self::is_rotation_retryable_status(*status_code)
+                        }
+                        CompletionError::CompletionError(_) => true,
+                        _ => false,
+                    };
+                    if !retryable {
+                        return Err(error);
+                    }
+                    if let Some(index) = index {
+                        if matches!(error, CompletionError::CompletionError(_)) {
+                            self.clear_index(index);
+                        }
+                    }
+                    last_error = Some(error);
+                }
+            }
+        }
+        Err(last_error.expect("at least one System One backend was attempted"))
+    }
+
     /// NEAR's own attested fleet. `Provider` (which wraps `Fleet`) is what the pool
     /// actually registers, but mirror the tier here too so the verifiable filter can
     /// never misclassify a `Fleet` as plaintext if one is ever pooled directly.
@@ -1293,7 +1568,8 @@ impl InferenceProvider for Fleet {
         signing_algo: Option<String>,
     ) -> Result<ChatSignature, CompletionError> {
         let signing_algo = signing_algo.unwrap_or_else(|| "ecdsa".to_string());
-        let path_and_query = format!("/v1/signature/{chat_id}?signing_algo={signing_algo}");
+        let encoded_chat_id = urlencoding::encode(chat_id);
+        let path_and_query = format!("/v1/signature/{encoded_chat_id}?signing_algo={signing_algo}");
         let canonical_url = format!("{}{}", self.config.base_url, path_and_query);
         let headers = self
             .build_headers()
@@ -1499,6 +1775,18 @@ impl InferenceProvider for Fleet {
         self.store_backend_count(count);
     }
 
+    async fn poll_backend_count(&self, client: &reqwest::Client) -> crate::CountPoll {
+        self.poll_count(client).await
+    }
+
+    fn count_generation(&self) -> u64 {
+        self.current_count_generation()
+    }
+
+    fn apply_discovery(&self, push: crate::DiscoveryPush) -> bool {
+        self.apply_discovery_push(push)
+    }
+
     async fn get_attestation_report(
         &self,
         model: String,
@@ -1636,59 +1924,6 @@ impl InferenceProvider for Fleet {
         Ok(merge_model_responses(responses))
     }
 
-    /// Exact token count via the backend's `POST /v1/tokenize` passthrough
-    /// (inference-proxy forwards it to the engine's native tokenize endpoint).
-    ///
-    /// Best-effort by design: any transport/HTTP/parse failure returns `None`
-    /// and the caller falls back to its byte-based heuristic — this must never
-    /// fail a request. Goes over `self.client`, whose TLS config enforces the
-    /// pinned attested fingerprints, so the prompt text only ever reaches a
-    /// verified backend. Nothing about the text (or the response body, which
-    /// may echo token ids) is logged.
-    async fn count_tokens(&self, model: &str, text: String) -> Option<u64> {
-        // Tight on purpose: this sits on the request's critical path and is a
-        // best-effort precision upgrade — a slow backend should fail-open to
-        // the caller's heuristic, not add seconds of latency. (Tokenizing
-        // ~1MB of text takes SGLang well under a second when healthy.)
-        const TOKENIZE_TIMEOUT: Duration = Duration::from_secs(2);
-
-        let url = format!("{}/v1/tokenize", self.config.base_url);
-        let headers = self.build_headers().ok()?;
-        let body = serde_json::json!({ "model": model, "prompt": text });
-
-        let response = self
-            .client
-            .post(&url)
-            .headers(headers)
-            .timeout(TOKENIZE_TIMEOUT)
-            .json(&body)
-            .send()
-            .await
-            .map_err(|e| {
-                tracing::debug!(error = %e, "Tokenize request failed; falling back to heuristic");
-            })
-            .ok()?;
-
-        if !response.status().is_success() {
-            tracing::debug!(
-                status = %response.status(),
-                "Tokenize request returned non-2xx; falling back to heuristic"
-            );
-            return None;
-        }
-
-        let parsed: serde_json::Value = response.json().await.ok()?;
-        // Engines differ slightly: vLLM/SGLang return `count` (int); fall back
-        // to the length of a flat `tokens` array. Anything else → None.
-        if let Some(count) = parsed.get("count").and_then(|c| c.as_u64()) {
-            return Some(count);
-        }
-        parsed
-            .get("tokens")
-            .and_then(|t| t.as_array())
-            .map(|arr| arr.len() as u64)
-    }
-
     /// Performs a streaming chat completion request
     async fn chat_completion_stream(
         &self,
@@ -1716,6 +1951,14 @@ impl InferenceProvider for Fleet {
             .map_err(|e| CompletionError::CompletionError(format!("Invalid request hash: {e}")))?;
         headers.insert("X-Request-Hash", request_hash_value);
 
+        Self::prepare_priority_header(&mut headers, &mut streaming_params);
+        // The replica hint and its host are placement's choice alone: a
+        // client-supplied key of either name never reaches the upstream body.
+        for key in upstream_headers::ALL {
+            streaming_params.extra.remove(key);
+        }
+        // Read placement inputs before the helpers below strip them.
+        let placement_request = PlacementRequest::from_params(&streaming_params);
         // Prepare tracing headers (request_id, org_id, workspace_id)
         self.prepare_tracing_headers(&mut headers, &mut streaming_params.extra);
         // Prepare encryption headers
@@ -1729,23 +1972,26 @@ impl InferenceProvider for Fleet {
         // first count, or a non-rotation URL like `localhost`) — serve via the
         // canonical fallback path (no index, no per-backend measurement) so
         // those paths keep working unchanged.
-        let route_lease =
-            match self.acquire_index(&streaming_params.messages, pinned_pub_key.as_deref()) {
-                None => {
-                    let url = format!("{}/v1/chat/completions", self.config.base_url);
-                    let response = self
-                        .send_streaming_request(
-                            &url,
-                            headers.clone(),
-                            &streaming_params,
-                            Some(&self.fallback_client),
-                        )
-                        .await?;
-                    let sse_stream = new_sse_parser(response.bytes_stream(), true);
-                    return Ok(Box::pin(sse_stream));
-                }
-                Some(lease) => lease,
-            };
+        let route_lease = match self.acquire_index_placed(
+            &streaming_params.messages,
+            pinned_pub_key.as_deref(),
+            &placement_request,
+        ) {
+            None => {
+                let url = format!("{}/v1/chat/completions", self.config.base_url);
+                let response = self
+                    .send_streaming_request(
+                        &url,
+                        headers.clone(),
+                        &streaming_params,
+                        Some(&self.fallback_client),
+                    )
+                    .await?;
+                let sse_stream = new_sse_parser(response.bytes_stream(), true);
+                return Ok(Box::pin(sse_stream));
+            }
+            Some(lease) => lease,
+        };
         let index = route_lease.index();
         let route_key = route_lease.route_key();
 
@@ -1753,17 +1999,22 @@ impl InferenceProvider for Fleet {
         // backend (`<canonical>-i<index>.<base>`) via L4 passthrough → prefix
         // cache hits. Index clients are lazily filled: on first use, inline
         // verification connects to the index's backend, verifies attestation,
-        // and pins the client.
-        let url = self
-            .rotation_url(index as u64, "/v1/chat/completions")
-            .unwrap_or_else(|| format!("{}/v1/chat/completions", self.config.base_url));
+        // and pins the client. Only this request carries the replica hint
+        // (never the canonical URL or a fallback index).
+        let rotation_url = self.rotation_url(index as u64, "/v1/chat/completions");
+        let primary_headers = match rotation_url {
+            Some(_) => Self::with_replica_hint(&headers, &route_lease),
+            None => headers.clone(),
+        };
+        let url =
+            rotation_url.unwrap_or_else(|| format!("{}/v1/chat/completions", self.config.base_url));
         let index_client = self.get_or_verify_index_client(index).await?;
         // Capture the send instant for the per-backend TTFT measurement.
         let started = std::time::Instant::now();
         let primary_send = match self
             .send_streaming_request(
                 &url,
-                headers.clone(),
+                primary_headers.clone(),
                 &streaming_params,
                 Some(&index_client),
             )
@@ -1775,7 +2026,7 @@ impl InferenceProvider for Fleet {
                 // clear the index client and re-verify with a fresh attestation.
                 self.clear_index(index);
                 let fresh = self.get_or_verify_index_client(index).await?;
-                self.send_streaming_request(&url, headers.clone(), &streaming_params, Some(&fresh))
+                self.send_streaming_request(&url, primary_headers, &streaming_params, Some(&fresh))
                     .await
             }
             Err(e) => Err(e),
@@ -1872,6 +2123,14 @@ impl InferenceProvider for Fleet {
             .map_err(|e| CompletionError::CompletionError(format!("Invalid request hash: {e}")))?;
         headers.insert("X-Request-Hash", request_hash_value);
 
+        Self::prepare_priority_header(&mut headers, &mut non_streaming_params);
+        // The replica hint and its host are placement's choice alone: a
+        // client-supplied key of either name never reaches the upstream body.
+        for key in upstream_headers::ALL {
+            non_streaming_params.extra.remove(key);
+        }
+        // Read placement inputs before the helpers below strip them.
+        let placement_request = PlacementRequest::from_params(&non_streaming_params);
         // Prepare tracing headers (request_id, org_id, workspace_id)
         self.prepare_tracing_headers(&mut headers, &mut non_streaming_params.extra);
         // Prepare encryption headers
@@ -1900,9 +2159,11 @@ impl InferenceProvider for Fleet {
         // affinity, stable conversation homes, and latency steering). `None`
         // → canonical fallback path (cold-start / non-rotation URL): one shot
         // via the non-pinned fallback client, no index recorded.
-        let route_lease = match self
-            .acquire_index(&non_streaming_params.messages, pinned_pub_key.as_deref())
-        {
+        let route_lease = match self.acquire_index_placed(
+            &non_streaming_params.messages,
+            pinned_pub_key.as_deref(),
+            &placement_request,
+        ) {
             None => {
                 let url = format!("{}/v1/chat/completions", self.config.base_url);
                 let response = self
@@ -1943,10 +2204,16 @@ impl InferenceProvider for Fleet {
         let route_key = route_lease.route_key();
 
         // Route to the index's verified client, posting at the index's rotation
-        // SNI so completion + signature land on the same backend.
-        let url = self
-            .rotation_url(index as u64, "/v1/chat/completions")
-            .unwrap_or_else(|| format!("{}/v1/chat/completions", self.config.base_url));
+        // SNI so completion + signature land on the same backend. Only this
+        // request carries the replica hint (never the canonical URL or a
+        // fallback index).
+        let rotation_url = self.rotation_url(index as u64, "/v1/chat/completions");
+        let primary_headers = match rotation_url {
+            Some(_) => Self::with_replica_hint(&headers, &route_lease),
+            None => headers.clone(),
+        };
+        let url =
+            rotation_url.unwrap_or_else(|| format!("{}/v1/chat/completions", self.config.base_url));
         let index_client = self.get_or_verify_index_client(index).await?;
 
         let send = |client: &Client, hdrs: reqwest::header::HeaderMap| {
@@ -1958,7 +2225,7 @@ impl InferenceProvider for Fleet {
                 .send()
         };
 
-        let response = match send(&index_client, headers.clone()).await {
+        let response = match send(&index_client, primary_headers.clone()).await {
             Ok(r) => r,
             // Connection dropped or fingerprint mismatch on reconnect — clear
             // the index client and re-verify with a fresh attestation. Two
@@ -1979,7 +2246,7 @@ impl InferenceProvider for Fleet {
             {
                 self.clear_index(index);
                 let fresh = self.get_or_verify_index_client(index).await?;
-                send(&fresh, headers.clone()).await.map_err(map_send_err)?
+                send(&fresh, primary_headers).await.map_err(map_send_err)?
             }
             Err(e) => return Err(map_send_err(e)),
         };
@@ -2488,6 +2755,18 @@ impl InferenceProvider for Fleet {
 /// to its Fleet, which holds all NEAR-AI model-proxy state and logic.
 #[async_trait]
 impl InferenceProvider for Provider {
+    fn supports_systemone(&self) -> bool {
+        true
+    }
+
+    async fn systemone(
+        &self,
+        request: SystemOneRequest,
+        request_hash: String,
+    ) -> Result<SystemOneResponseWithBytes, CompletionError> {
+        self.fleet.systemone(request, request_hash).await
+    }
+
     /// NEAR AI's own attested TEE fleet — the primary tier for any model NEAR
     /// serves; an attested third party (Chutes) sits behind it as fallback.
     fn tier(&self) -> crate::ProviderTier {
@@ -2580,8 +2859,23 @@ impl InferenceProvider for Provider {
     fn set_backend_keys(&self, map: std::collections::HashMap<String, Vec<usize>>) {
         self.fleet.set_backend_keys(map)
     }
-    async fn count_tokens(&self, model: &str, text: String) -> Option<u64> {
-        self.fleet.count_tokens(model, text).await
+    fn set_backend_hosts(&self, hosts: crate::BackendHosts) {
+        self.fleet.set_backend_hosts(hosts)
+    }
+    async fn poll_backend_count(&self, client: &reqwest::Client) -> crate::CountPoll {
+        self.fleet.poll_backend_count(client).await
+    }
+    fn count_generation(&self) -> u64 {
+        self.fleet.count_generation()
+    }
+    fn apply_discovery(&self, push: crate::DiscoveryPush) -> bool {
+        self.fleet.apply_discovery(push)
+    }
+    fn set_placement(&self, handles: crate::placement_io::PlacementHandles) {
+        self.fleet.set_placement(handles)
+    }
+    fn placement_tier(&self) -> Option<placement::policy::Tier> {
+        self.fleet.placement_tier()
     }
     async fn get_attestation_report(
         &self,
@@ -3278,6 +3572,115 @@ mod tests {
         );
     }
 
+    /// Regression test: the legacy placement affinity keys
+    /// (`x_placement_affinity`, `x_placement_affinity_source`) are denied,
+    /// like `x_model_pub_key`: a client-supplied value never reaches the
+    /// serialized upstream request body.
+    #[test]
+    fn test_placement_affinity_keys_never_reach_upstream_body() {
+        let provider = create_test_provider();
+
+        let mut extra = std::collections::HashMap::new();
+        for key in placement_headers::LEGACY_DENIED_EXTRA_KEYS {
+            extra.insert(
+                key.to_string(),
+                serde_json::Value::String("00112233445566778899aabbccddeeff".to_string()),
+            );
+        }
+        extra.insert(
+            "some_valid_param".to_string(),
+            serde_json::Value::String("value".to_string()),
+        );
+
+        let mut headers = reqwest::header::HeaderMap::new();
+        let _ = provider
+            .fleet
+            .prepare_encryption_headers(&mut headers, &mut extra);
+
+        for key in placement_headers::LEGACY_DENIED_EXTRA_KEYS {
+            assert!(!extra.contains_key(key), "{key} must be stripped");
+        }
+
+        // Non-affinity extra fields must be preserved.
+        assert_eq!(
+            extra.get("some_valid_param"),
+            Some(&serde_json::Value::String("value".to_string()))
+        );
+
+        // No affinity-related HTTP header should have been added either.
+        assert!(headers.get("X-Placement-Affinity").is_none());
+    }
+
+    /// End-to-end regression: a forged/leftover `x_placement_affinity` /
+    /// `x_placement_affinity_source` in `params.extra` must never appear in
+    /// the actual bytes sent to the upstream vLLM backend. Unlike
+    /// `test_placement_affinity_keys_never_reach_upstream_body` above (which
+    /// checks `prepare_encryption_headers` in isolation), this drives a real
+    /// `ChatCompletionParams` through `Fleet::chat_completion`'s send path
+    /// against a mock HTTP server and inspects the exact request body that
+    /// left the process — the same kind of check as
+    /// `audio_transcription_sends_repeated_timestamp_granularity_fields`.
+    #[tokio::test]
+    async fn chat_completion_never_sends_placement_affinity_keys_upstream() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "chatcmpl-test",
+                "object": "chat.completion",
+                "created": 0,
+                "model": "test-model",
+                "choices": [],
+                "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let provider = Provider::new(Config::new(server.uri(), None, Some(5)));
+
+        let mut params: ChatCompletionParams = serde_json::from_value(serde_json::json!({
+            "model": "test-model",
+            "messages": [{"role": "user", "content": "hi"}],
+        }))
+        .unwrap();
+        for key in placement_headers::LEGACY_DENIED_EXTRA_KEYS {
+            params.extra.insert(
+                key.to_string(),
+                serde_json::Value::String("00112233445566778899aabbccddeeff".to_string()),
+            );
+        }
+        // The typed channel carries a real key; it is never serialized.
+        params.placement = crate::PlacementContext {
+            prompt_tokens: Some(7),
+            prefill_heavy: true,
+            affinity: Some(placement::affinity::AffinityKey::from_bytes([0x5a; 16])),
+            affinity_source: placement::decision::AffinitySource::Client,
+        };
+
+        let result = provider
+            .chat_completion(params, "test-hash".to_string())
+            .await;
+        assert!(
+            result.is_ok(),
+            "expected a successful completion, got: {:?}",
+            result.err()
+        );
+
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 1);
+        let body = String::from_utf8_lossy(&requests[0].body);
+        assert!(
+            !body.contains("x_placement_affinity"),
+            "placement affinity keys must never reach the upstream request body: {body}"
+        );
+        let json: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
+        assert!(
+            json.get("placement").is_none() && !body.contains(&"5a".repeat(16)),
+            "the typed placement context must never be serialized upstream"
+        );
+    }
+
     #[test]
     fn test_index_client_count_is_max_fanout() {
         // Per-index clients are sized to the hard fan-out cap (one slot per
@@ -3311,7 +3714,7 @@ mod tests {
             async fn create_verified_client(
                 &self,
                 _base_url: &str,
-            ) -> Result<reqwest::Client, String> {
+            ) -> Result<reqwest::Client, crate::BackendVerifyError> {
                 Ok(reqwest::Client::new())
             }
         }
@@ -3346,7 +3749,7 @@ mod tests {
             async fn create_verified_client(
                 &self,
                 _base_url: &str,
-            ) -> Result<reqwest::Client, String> {
+            ) -> Result<reqwest::Client, crate::BackendVerifyError> {
                 Ok(reqwest::Client::new())
             }
         }
@@ -3398,8 +3801,8 @@ mod tests {
             async fn create_verified_client(
                 &self,
                 _base_url: &str,
-            ) -> Result<reqwest::Client, String> {
-                Err("simulated attestation timeout".to_string())
+            ) -> Result<reqwest::Client, crate::BackendVerifyError> {
+                Err("simulated attestation timeout".to_string().into())
             }
         }
 
@@ -3444,8 +3847,8 @@ mod tests {
             async fn create_verified_client(
                 &self,
                 _base_url: &str,
-            ) -> Result<reqwest::Client, String> {
-                Err("simulated attestation timeout".to_string())
+            ) -> Result<reqwest::Client, crate::BackendVerifyError> {
+                Err("simulated attestation timeout".to_string().into())
             }
         }
 
@@ -3492,8 +3895,8 @@ mod tests {
             async fn create_verified_client(
                 &self,
                 _base_url: &str,
-            ) -> Result<reqwest::Client, String> {
-                Err("simulated attestation failure".to_string())
+            ) -> Result<reqwest::Client, crate::BackendVerifyError> {
+                Err("simulated attestation failure".to_string().into())
             }
         }
 
@@ -3525,6 +3928,135 @@ mod tests {
         );
     }
 
+    /// Verifier that fails every call with the given error and counts calls.
+    struct FailingVerifier {
+        calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        error: crate::BackendVerifyError,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::BackendVerifier for FailingVerifier {
+        async fn create_verified_client(
+            &self,
+            _base_url: &str,
+        ) -> Result<reqwest::Client, crate::BackendVerifyError> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            // Yield so that concurrent callers queue on the permit.
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            Err(self.error.clone())
+        }
+    }
+
+    fn provider_with_failing_verifier(
+        error: crate::BackendVerifyError,
+        concurrency: usize,
+    ) -> (Provider, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let provider = Provider::new_with_verifier_and_concurrency(
+            Config {
+                base_url: "http://localhost".to_string(),
+                api_key: None,
+                completion_timeout_seconds: 30,
+                control_timeout_seconds: 30,
+            },
+            std::sync::Arc::new(std::sync::RwLock::new(
+                crate::spki_verifier::FingerprintState::Bootstrap,
+            )),
+            std::sync::Arc::new(FailingVerifier {
+                calls: calls.clone(),
+                error,
+            }),
+            concurrency,
+        );
+        (provider, calls)
+    }
+
+    fn channel_binding_mismatch() -> crate::BackendVerifyError {
+        crate::BackendVerifyError::ChannelBinding(
+            "TLS channel binding mismatch: peer SPKI aaaa, attested SPKI bbbb".to_string(),
+        )
+    }
+
+    /// A channel-binding failure repeats for the same backend, so it is not
+    /// retried, and the index is not verified again during the backoff: under a
+    /// persistent mismatch, repeated requests cost one attestation per index per
+    /// backoff period. The fallback decision is unchanged (fallback client once
+    /// a fingerprint is pinned, fail closed before).
+    #[tokio::test(start_paused = true)]
+    async fn channel_binding_failure_is_not_retried_and_backs_off() {
+        use std::sync::atomic::Ordering;
+        for pinned in [false, true] {
+            let (provider, calls) = provider_with_failing_verifier(channel_binding_mismatch(), 4);
+            if pinned {
+                provider.add_verified_fingerprint("deadbeef".to_string());
+            }
+
+            for _ in 0..5 {
+                let result = provider.fleet.get_or_verify_index_client(0).await;
+                assert_eq!(result.is_ok(), pinned, "pinned={pinned}: {result:?}");
+                if let Err(CompletionError::CompletionError(msg)) = result {
+                    assert!(msg.contains("TLS channel binding"), "{msg}");
+                }
+            }
+            assert_eq!(calls.load(Ordering::SeqCst), 1, "pinned={pinned}");
+            assert!(provider.fleet.index_clients[0].lock().unwrap().is_none());
+
+            // Other indices are verified independently.
+            let _ = provider.fleet.get_or_verify_index_client(1).await;
+            assert_eq!(calls.load(Ordering::SeqCst), 2, "pinned={pinned}");
+
+            // After the backoff, the index is verified again.
+            tokio::time::advance(Fleet::CHANNEL_BINDING_BACKOFF).await;
+            let _ = provider.fleet.get_or_verify_index_client(0).await;
+            assert_eq!(calls.load(Ordering::SeqCst), 3, "pinned={pinned}");
+
+            // A backend-count change remaps indices and ends the backoff.
+            let _ = provider.fleet.get_or_verify_index_client(0).await;
+            assert_eq!(calls.load(Ordering::SeqCst), 3, "pinned={pinned}");
+            provider.fleet.store_backend_count(2);
+            let _ = provider.fleet.get_or_verify_index_client(0).await;
+            assert_eq!(calls.load(Ordering::SeqCst), 4, "pinned={pinned}");
+        }
+    }
+
+    /// Requests that queued on the verification permit while a channel-binding
+    /// failure was being recorded do not verify the index again.
+    #[tokio::test(start_paused = true)]
+    async fn concurrent_requests_share_one_channel_binding_failure() {
+        let (provider, calls) = provider_with_failing_verifier(channel_binding_mismatch(), 1);
+        let provider = std::sync::Arc::new(provider);
+        let mut handles = Vec::new();
+        for _ in 0..8 {
+            let provider = provider.clone();
+            handles.push(tokio::spawn(async move {
+                provider.fleet.get_or_verify_index_client(0).await
+            }));
+        }
+        for handle in handles {
+            assert!(
+                handle.await.unwrap().is_err(),
+                "Bootstrap state fails closed"
+            );
+        }
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    /// Other verification failures may be transient: they are still retried,
+    /// and they do not start a backoff.
+    #[tokio::test(start_paused = true)]
+    async fn other_verification_failures_are_retried_without_backoff() {
+        use std::sync::atomic::Ordering;
+        let (provider, calls) = provider_with_failing_verifier(
+            crate::BackendVerifyError::Other("Attestation request timed out".to_string()),
+            4,
+        );
+        let attempts = Fleet::INLINE_VERIFY_RETRIES + 1;
+        assert!(provider.fleet.get_or_verify_index_client(0).await.is_err());
+        assert_eq!(calls.load(Ordering::SeqCst), attempts);
+        assert!(provider.fleet.get_or_verify_index_client(0).await.is_err());
+        assert_eq!(calls.load(Ordering::SeqCst), 2 * attempts);
+    }
+
     /// Fix 1: the semaphore serialises concurrent verifications so that only
     /// N attempts run at once. When the first succeeds and fills the bucket,
     /// later waiters take the fast path (bucket already filled) rather than
@@ -3550,7 +4082,7 @@ mod tests {
             async fn create_verified_client(
                 &self,
                 _base_url: &str,
-            ) -> Result<reqwest::Client, String> {
+            ) -> Result<reqwest::Client, crate::BackendVerifyError> {
                 self.count.fetch_add(1, Ordering::SeqCst);
                 Ok(reqwest::Client::new())
             }
@@ -3640,7 +4172,7 @@ mod tests {
             async fn create_verified_client(
                 &self,
                 _base_url: &str,
-            ) -> Result<reqwest::Client, String> {
+            ) -> Result<reqwest::Client, crate::BackendVerifyError> {
                 Ok(reqwest::Client::builder()
                     .build()
                     .expect("client builds in test"))
@@ -3661,6 +4193,8 @@ mod tests {
         );
 
         let params = ChatCompletionParams {
+            placement: Default::default(),
+            request_priority: 0,
             model: "test-model".to_string(),
             messages: vec![ChatMessage {
                 reasoning_content: None,
@@ -3752,7 +4286,7 @@ mod tests {
             async fn create_verified_client(
                 &self,
                 _base_url: &str,
-            ) -> Result<reqwest::Client, String> {
+            ) -> Result<reqwest::Client, crate::BackendVerifyError> {
                 self.count.fetch_add(1, Ordering::SeqCst);
                 Ok(reqwest::Client::new())
             }
@@ -3871,7 +4405,7 @@ mod tests {
             async fn create_verified_client(
                 &self,
                 _base_url: &str,
-            ) -> Result<reqwest::Client, String> {
+            ) -> Result<reqwest::Client, crate::BackendVerifyError> {
                 self.count.fetch_add(1, Ordering::SeqCst);
                 Ok(reqwest::Client::new())
             }
@@ -4135,7 +4669,7 @@ mod tests {
             async fn create_verified_client(
                 &self,
                 _base_url: &str,
-            ) -> Result<reqwest::Client, String> {
+            ) -> Result<reqwest::Client, crate::BackendVerifyError> {
                 Ok(reqwest::Client::new())
             }
         }
@@ -4833,7 +5367,7 @@ mod tests {
             async fn create_verified_client(
                 &self,
                 _base_url: &str,
-            ) -> Result<reqwest::Client, String> {
+            ) -> Result<reqwest::Client, crate::BackendVerifyError> {
                 Ok(reqwest::Client::new())
             }
         }
@@ -5294,6 +5828,64 @@ mod tests {
         handle.abort();
     }
 
+    /// The general and fallback clients return a backend redirect as an error
+    /// instead of following it.
+    #[tokio::test]
+    async fn general_and_fallback_clients_do_not_follow_redirects() {
+        use crate::InferenceProvider;
+        let server = MockServer::start().await;
+        let moved = format!("{}/moved", server.uri());
+        for (verb, route) in [
+            ("POST", "/v1/chat/completions"),
+            ("GET", "/v1/attestation/report"),
+        ] {
+            Mock::given(method(verb))
+                .and(path(route))
+                .respond_with(ResponseTemplate::new(307).insert_header("location", moved.as_str()))
+                .mount(&server)
+                .await;
+        }
+        Mock::given(path("/moved"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(0)
+            .mount(&server)
+            .await;
+        let provider = Provider::new(Config {
+            base_url: server.uri(),
+            api_key: None,
+            completion_timeout_seconds: 5,
+            control_timeout_seconds: 5,
+        });
+
+        // No rotation for an IP-literal URL: chat goes through the fallback client.
+        let params: ChatCompletionParams = serde_json::from_value(serde_json::json!({
+            "model": "test-model",
+            "messages": [{"role": "user", "content": "hi"}],
+        }))
+        .unwrap();
+        let chat = provider.chat_completion(params, "hash".to_string()).await;
+        assert!(
+            matches!(
+                chat,
+                Err(CompletionError::HttpError {
+                    status_code: 307,
+                    ..
+                })
+            ),
+            "{chat:?}"
+        );
+
+        // The attestation report is fetched with the general client.
+        let report = provider
+            .get_attestation_report("test-model".to_string(), None, None, None, false)
+            .await;
+        assert!(
+            matches!(&report, Err(AttestationError::FetchError(msg)) if msg.contains("307")),
+            "{report:?}"
+        );
+        server.verify().await;
+    }
+
     #[tokio::test]
     async fn get_attestation_report_delegates_to_fleet_without_recursing() {
         use crate::InferenceProvider;
@@ -5340,4 +5932,2112 @@ mod tests {
             "total backoff {total_ms}ms must stay well under FINALIZE_TIMEOUT"
         );
     }
+
+    /// Smart placement hook in front of `Fleet::acquire_index`. Every test
+    /// uses a single eligible host (or a keyed request) so `place()` is
+    /// deterministic regardless of the rng.
+    mod placement_hook {
+        use super::{control_event, data_event, role_msg, rotation_provider, user_msg, Provider};
+        use crate::attested::nearai::placement_report::PlacementRequest;
+        use crate::placement_io::{
+            PlacementHandles, PlacementIo, PlacementMetrics, RoutedAck, Write, METRIC_AFFINITY,
+            METRIC_DECISIONS, METRIC_WRITES_DROPPED, WRITE_QUEUE_CAPACITY,
+        };
+        use crate::BackendHosts;
+        use arc_swap::ArcSwap;
+        use placement::affinity::{pin_id, AffinityKey, PinTable};
+        use placement::decision::{AffinitySource, Placer};
+        use placement::frame::{Lifecycle, Load, ReplicaState};
+        use placement::policy::Tier;
+        use placement::snapshot::{ReplicaView, RoutedCounts, Snapshot};
+        use placement::SlotId;
+        use std::collections::HashMap;
+        use std::sync::{Arc, Mutex};
+        use tokio::sync::mpsc;
+
+        const PIN_SECRET: [u8; 32] = [9u8; 32];
+
+        #[derive(Default)]
+        struct FakeMetrics {
+            counts: Mutex<Vec<(String, i64, Vec<String>)>>,
+            histograms: Mutex<Vec<(String, f64, Vec<String>)>>,
+        }
+
+        impl FakeMetrics {
+            /// The tag sets of every sample recorded under histogram `name`.
+            fn histogram_tags(&self, name: &str) -> Vec<Vec<String>> {
+                self.histograms
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .filter(|(n, _, _)| n == name)
+                    .map(|(_, _, tags)| tags.clone())
+                    .collect()
+            }
+
+            fn decisions_tagged(&self, tag: &str) -> i64 {
+                self.counts
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .filter(|(n, _, tags)| n == METRIC_DECISIONS && tags.iter().any(|t| t == tag))
+                    .map(|(_, v, _)| *v)
+                    .sum()
+            }
+        }
+
+        impl PlacementMetrics for FakeMetrics {
+            fn record_count(&self, name: &str, value: i64, tags: &[&str]) {
+                self.counts.lock().unwrap().push((
+                    name.to_string(),
+                    value,
+                    tags.iter().map(|t| t.to_string()).collect(),
+                ));
+            }
+            fn record_histogram(&self, name: &str, value: f64, tags: &[&str]) {
+                self.histograms.lock().unwrap().push((
+                    name.to_string(),
+                    value,
+                    tags.iter().map(|t| t.to_string()).collect(),
+                ));
+            }
+        }
+
+        fn now_ms() -> u64 {
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_millis() as u64
+        }
+
+        /// A `built_ms` / sample time that stays fresh for about
+        /// `MAX_FUTURE_SKEW_MS + FRESH_MAX_MS` (5 s) of test stall: it sits at
+        /// the edge of the allowed future skew (further ahead is rejected as
+        /// clock skew), and counts as age 0 until the wall clock passes it.
+        fn fresh_ms() -> u64 {
+            now_ms() + placement::consts::MAX_FUTURE_SKEW_MS
+        }
+
+        fn slot(host: &str, replica: u32) -> SlotId {
+            SlotId {
+                host: host.into(),
+                replica,
+            }
+        }
+
+        fn ready_state(index: u32, now: u64) -> ReplicaState {
+            ReplicaState {
+                index,
+                engine_sampled_at_ms: Some(now),
+                lifecycle_state: Lifecycle::Ready,
+                engine_version: None,
+                limits: Default::default(),
+                load: Load {
+                    running: Some(0),
+                    queued: Some(0),
+                    prefill_backlog_tokens: Some(0),
+                    ..Load::default()
+                },
+                proxy_inflight: 0,
+            }
+        }
+
+        /// A ready view of `host#replica`.
+        fn ready_replica(host: &str, replica: u32, now: u64) -> ReplicaView {
+            ReplicaView {
+                slot: slot(host, replica),
+                state: ready_state(replica, now),
+            }
+        }
+
+        /// A ready view of `host#0`.
+        fn ready_view(host: &str, now: u64) -> ReplicaView {
+            ready_replica(host, 0, now)
+        }
+
+        /// A snapshot built at `built_ms` with one ready replica on `host`.
+        fn snapshot(host: &str, built_ms: u64, pins: PinTable) -> Snapshot {
+            Snapshot {
+                built_ms,
+                replicas: vec![ready_view(host, built_ms)],
+                pins: Arc::new(pins),
+                ..Snapshot::default()
+            }
+        }
+
+        struct Harness {
+            provider: Provider,
+            metrics: Arc<FakeMetrics>,
+            writes: mpsc::Receiver<Write>,
+            io: Arc<PlacementIo>,
+        }
+
+        /// A 4-backend rotation provider with placement installed: `host_map`
+        /// becomes the verified host map, `snap` the current snapshot.
+        fn harness(host_map: &[(&str, usize)], snap: Snapshot) -> Harness {
+            harness_with_count(host_map, 4, snap)
+        }
+
+        /// Like [`harness`], but the pushed host map claims `hosts_count`
+        /// backends while the Fleet itself has 4.
+        ///
+        /// Placement only runs on a complete picture, so the map is filled
+        /// to the Fleet's 4 backends with filler hosts, and every mapped host
+        /// without a view in `snap` gets a draining (ineligible) one. The
+        /// hosts `host_map` and `snap` name are the only eligible ones.
+        fn harness_with_count(
+            host_map: &[(&str, usize)],
+            hosts_count: usize,
+            snap: Snapshot,
+        ) -> Harness {
+            harness_on(rotation_provider(4), host_map, hosts_count, snap)
+        }
+
+        /// [`harness_with_count`] on a given 4-backend `provider`.
+        fn harness_on(
+            provider: Provider,
+            host_map: &[(&str, usize)],
+            hosts_count: usize,
+            mut snap: Snapshot,
+        ) -> Harness {
+            let mut full: Vec<(String, usize)> =
+                host_map.iter().map(|(h, i)| (h.to_string(), *i)).collect();
+            for index in 0..4 {
+                if !full.iter().any(|(_, i)| *i == index) {
+                    full.push((format!("h-fill-{index}"), index));
+                }
+            }
+            for (host, _) in &full {
+                if !snap.replicas.iter().any(|v| &v.slot.host == host) {
+                    let mut view = ready_view(host, snap.built_ms);
+                    view.state.lifecycle_state = Lifecycle::Draining;
+                    snap.replicas.push(view);
+                }
+            }
+            install(provider, &full, hosts_count, snap)
+        }
+
+        /// A 4-backend rotation provider with exactly `host_map` pushed and
+        /// `snap` as the current snapshot (no filling).
+        fn harness_exact(
+            host_map: &[(String, usize)],
+            hosts_count: usize,
+            snap: Snapshot,
+        ) -> Harness {
+            install(rotation_provider(4), host_map, hosts_count, snap)
+        }
+
+        /// Installs placement on `provider` with exactly `host_map` pushed
+        /// and `snap` as the current snapshot.
+        fn install(
+            provider: Provider,
+            host_map: &[(String, usize)],
+            hosts_count: usize,
+            snap: Snapshot,
+        ) -> Harness {
+            let metrics = Arc::new(FakeMetrics::default());
+            let (io, writes) = PlacementIo::for_test(metrics.clone());
+            io.snapshot.store(Arc::new(snap));
+            let hosts = Arc::new(ArcSwap::from_pointee(BackendHosts::default()));
+            provider.fleet.set_placement(PlacementHandles {
+                placer: Arc::new(Placer::new(PIN_SECRET, Tier::Base)),
+                io: io.clone(),
+                hosts: hosts.clone(),
+            });
+            // Every mapped host has published: it holds an attested
+            // replica-report key.
+            provider.fleet.set_backend_hosts(BackendHosts {
+                index_by_host: host_map.iter().map(|(h, i)| (h.clone(), *i)).collect(),
+                keys: placement::KeyRegistry {
+                    by_host: host_map
+                        .iter()
+                        .map(|(h, _)| (h.clone(), vec![report_key()]))
+                        .collect(),
+                },
+                count: hosts_count,
+            });
+            // Discovery's push lands in the map the Valkey reader also reads.
+            assert_eq!(hosts.load().index_by_host.len(), host_map.len());
+            Harness {
+                provider,
+                metrics,
+                writes,
+                io,
+            }
+        }
+
+        /// An attested replica-report key, as discovery records for a host
+        /// that publishes frames.
+        fn report_key() -> placement::snapshot::HostKey {
+            let key = ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]).verifying_key();
+            placement::snapshot::HostKey {
+                key_id: placement::frame::key_id(&key),
+                key,
+            }
+        }
+
+        /// Drops every attested replica-report key from `h`'s host map,
+        /// keeping the host bindings: no host behind it has ever published.
+        fn unpublish(h: &Harness) {
+            let hosts = h.provider.fleet.backend_hosts();
+            h.provider.fleet.set_backend_hosts(BackendHosts {
+                index_by_host: hosts.index_by_host.clone(),
+                keys: Default::default(),
+                count: hosts.count,
+            });
+        }
+
+        fn request(model: &str) -> PlacementRequest {
+            PlacementRequest {
+                model: model.to_string(),
+                model_tag: format!("model:{model}"),
+                request_id: "req-1".to_string(),
+                org_id: "org-1".to_string(),
+                prompt_tokens: 0,
+                prefill_heavy: false,
+                affinity: None,
+                affinity_source: AffinitySource::None,
+                priority: 0,
+                size: "size:unknown",
+            }
+        }
+
+        /// Messages whose legacy index is not `avoid`, so a placed index can
+        /// be told apart from the legacy one.
+        fn messages_avoiding(avoid: usize) -> Vec<crate::ChatMessage> {
+            let legacy = rotation_provider(4);
+            (0..1_000)
+                .map(|i| vec![user_msg(&format!("placement prefix {i}"))])
+                .find(|m| legacy.fleet.select_index(m, None) != Some(avoid))
+                .expect("some prefix avoids the index")
+        }
+
+        fn legacy_indices(
+            messages: &[crate::ChatMessage],
+            pinned: Option<&str>,
+            keys: Option<HashMap<String, Vec<usize>>>,
+        ) -> Vec<usize> {
+            let provider = rotation_provider(4);
+            if let Some(keys) = keys {
+                provider.fleet.set_backend_keys(keys);
+            }
+            let leases: Vec<_> = (0..12)
+                .map(|_| {
+                    provider
+                        .fleet
+                        .acquire_index(messages, pinned)
+                        .expect("rotation active")
+                })
+                .collect();
+            leases.iter().map(|l| l.index()).collect()
+        }
+
+        fn placed_indices(
+            provider: &Provider,
+            messages: &[crate::ChatMessage],
+            pinned: Option<&str>,
+            req: &PlacementRequest,
+        ) -> Vec<usize> {
+            let leases: Vec<_> = (0..12)
+                .map(|_| {
+                    provider
+                        .fleet
+                        .acquire_index_placed(messages, pinned, req)
+                        .expect("rotation active")
+                })
+                .collect();
+            leases.iter().map(|l| l.index()).collect()
+        }
+
+        #[test]
+        fn placed_host_maps_to_its_index() {
+            let h = harness(
+                &[("h-a", 2)],
+                snapshot("h-a", fresh_ms(), PinTable::default()),
+            );
+            let messages = messages_avoiding(2);
+            let req = request("z-ai/glm-5.3-flash");
+            assert_eq!(
+                placed_indices(&h.provider, &messages, None, &req),
+                vec![2; 12]
+            );
+            assert_eq!(h.metrics.decisions_tagged("outcome:place"), 12);
+        }
+
+        /// There is no model allow-list: any model whose hosts publish
+        /// frames is placed.
+        #[test]
+        fn any_model_whose_hosts_publish_is_placed() {
+            let h = harness(
+                &[("h-a", 2)],
+                snapshot("h-a", fresh_ms(), PinTable::default()),
+            );
+            let messages = messages_avoiding(2);
+            let req = request("acme/any-new-model");
+            assert_eq!(
+                placed_indices(&h.provider, &messages, None, &req),
+                vec![2; 12]
+            );
+            assert_eq!(h.metrics.decisions_tagged("outcome:place"), 12);
+        }
+
+        /// A model whose hosts publish nothing (no attested replica-report
+        /// key, so the reader never reads for it) keeps its existing
+        /// routing, with no placement writes.
+        #[test]
+        fn model_without_publishing_hosts_is_legacy() {
+            let mut h = harness_exact(&[], 0, Snapshot::default());
+            let messages = messages_avoiding(2);
+            let req = request("acme/any-new-model");
+            assert_eq!(
+                placed_indices(&h.provider, &messages, None, &req),
+                legacy_indices(&messages, None, None)
+            );
+            assert!(h.writes.try_recv().is_err(), "no placement writes");
+            assert_eq!(h.metrics.decisions_tagged("outcome:place"), 0);
+        }
+
+        /// No host behind this endpoint has ever published: the legacy path
+        /// is taken silently, with no decision, histogram or latency sample,
+        /// even over a snapshot that would place.
+        #[test]
+        fn never_published_model_emits_no_placement_metrics() {
+            let mut h = harness(
+                &[("h-a", 2)],
+                snapshot("h-a", fresh_ms(), PinTable::default()),
+            );
+            unpublish(&h);
+            let messages = messages_avoiding(2);
+            let req = request("acme/any-new-model");
+            assert_eq!(
+                placed_indices(&h.provider, &messages, None, &req),
+                legacy_indices(&messages, None, None)
+            );
+            let lease = h
+                .provider
+                .fleet
+                .acquire_index_placed(&messages, None, &req)
+                .expect("rotation active");
+            lease.record_ttft_ms(5.0);
+            lease.record_duration_ms(9.0);
+            assert!(h.writes.try_recv().is_err(), "no placement writes");
+            assert!(h.metrics.counts.lock().unwrap().is_empty());
+            assert!(h.metrics.histograms.lock().unwrap().is_empty());
+        }
+
+        /// Hosts that have published but whose state is unavailable (Valkey
+        /// down: an empty snapshot) are a real outage: every request still
+        /// counts as `legacy/no_state`, tagged with its model, and its
+        /// latency is recorded as `legacy`.
+        #[test]
+        fn published_model_outage_still_counts_no_state() {
+            let h = harness_exact(&[("h-a".to_string(), 2)], 4, Snapshot::default());
+            let messages = messages_avoiding(2);
+            let req = request("acme/any-new-model");
+            assert_eq!(
+                placed_indices(&h.provider, &messages, None, &req),
+                legacy_indices(&messages, None, None)
+            );
+            assert_eq!(h.metrics.decisions_tagged("reason:no_state"), 12);
+            assert_eq!(h.metrics.decisions_tagged("model:acme/any-new-model"), 12);
+            let lease = h
+                .provider
+                .fleet
+                .acquire_index_placed(&messages, None, &req)
+                .expect("rotation active");
+            lease.record_ttft_ms(5.0);
+            assert_eq!(
+                h.metrics
+                    .histogram_tags(crate::placement_io::METRIC_TTFT_MS),
+                vec![vec![
+                    "strategy:legacy".to_string(),
+                    "selection:legacy".to_string(),
+                    "size:unknown".to_string(),
+                    "model:acme/any-new-model".to_string(),
+                ]]
+            );
+        }
+
+        #[test]
+        fn unconfigured_placement_uses_existing_path_unchanged() {
+            let provider = rotation_provider(4);
+            let messages = messages_avoiding(2);
+            let req = request("z-ai/glm-5.3-flash");
+            assert_eq!(
+                placed_indices(&provider, &messages, None, &req),
+                legacy_indices(&messages, None, None)
+            );
+        }
+
+        #[test]
+        fn unmapped_host_falls_back() {
+            let mut h = harness(
+                &[("h-a", 2)],
+                snapshot("h-z", fresh_ms(), PinTable::default()),
+            );
+            let messages = messages_avoiding(2);
+            let req = request("z-ai/glm-5.3-flash");
+            assert_eq!(
+                placed_indices(&h.provider, &messages, None, &req),
+                legacy_indices(&messages, None, None)
+            );
+            assert_eq!(h.metrics.decisions_tagged("reason:host_unmapped"), 12);
+            assert!(h.writes.try_recv().is_err(), "legacy writes nothing");
+        }
+
+        #[test]
+        fn partial_host_map_goes_legacy() {
+            // Only one of the Fleet's 4 backends publishes (partial proxy
+            // rollout): placing would starve the other three, so legacy.
+            let mut h = harness_exact(
+                &[("h-a".to_string(), 2)],
+                4,
+                snapshot("h-a", fresh_ms(), PinTable::default()),
+            );
+            let messages = messages_avoiding(2);
+            let req = request("z-ai/glm-5.3-flash");
+            assert_eq!(
+                placed_indices(&h.provider, &messages, None, &req),
+                legacy_indices(&messages, None, None)
+            );
+            assert_eq!(h.metrics.decisions_tagged("reason:incomplete"), 12);
+            assert!(h.writes.try_recv().is_err(), "legacy writes nothing");
+        }
+
+        #[test]
+        fn mapped_host_without_frames_goes_legacy() {
+            // Every backend is mapped, but h-d has no replica view (e.g. its
+            // proxy restarted with a key not discovered yet): legacy.
+            let map: Vec<(String, usize)> = ["h-a", "h-b", "h-c", "h-d"]
+                .iter()
+                .enumerate()
+                .map(|(i, h)| (h.to_string(), i))
+                .collect();
+            let built = fresh_ms();
+            let snap = Snapshot {
+                built_ms: built,
+                replicas: vec![
+                    ready_view("h-a", built),
+                    ready_view("h-b", built),
+                    ready_view("h-c", built),
+                ],
+                ..Snapshot::default()
+            };
+            let mut h = harness_exact(&map, 4, snap);
+            let messages = messages_avoiding(2);
+            let req = request("z-ai/glm-5.3-flash");
+            assert_eq!(
+                placed_indices(&h.provider, &messages, None, &req),
+                legacy_indices(&messages, None, None)
+            );
+            assert_eq!(h.metrics.decisions_tagged("reason:incomplete"), 12);
+            assert!(h.writes.try_recv().is_err(), "legacy writes nothing");
+        }
+
+        #[test]
+        fn host_map_for_another_backend_count_is_unmapped() {
+            // The pushed map was built for 3 backends but the Fleet now has 4:
+            // its host -> index binding is stale, so the host is unmapped.
+            let mut h = harness_with_count(
+                &[("h-a", 2)],
+                3,
+                snapshot("h-a", fresh_ms(), PinTable::default()),
+            );
+            let messages = messages_avoiding(2);
+            let req = request("z-ai/glm-5.3-flash");
+            assert_eq!(
+                placed_indices(&h.provider, &messages, None, &req),
+                legacy_indices(&messages, None, None)
+            );
+            assert_eq!(h.metrics.decisions_tagged("reason:host_unmapped"), 12);
+            assert!(h.writes.try_recv().is_err(), "legacy writes nothing");
+        }
+
+        #[test]
+        #[cfg_attr(debug_assertions, should_panic(expected = "already installed"))]
+        fn second_install_of_the_same_handles_is_refused() {
+            let metrics = Arc::new(FakeMetrics::default());
+            let (io, _writes) = PlacementIo::for_test(metrics);
+            let handles = PlacementHandles {
+                placer: Arc::new(Placer::new(PIN_SECRET, Tier::Base)),
+                io,
+                hosts: Arc::new(ArcSwap::from_pointee(BackendHosts::default())),
+            };
+            let first = rotation_provider(4);
+            let second = rotation_provider(4);
+            first.fleet.set_placement(handles.clone());
+            // Release builds ignore the second install and keep legacy routing.
+            second.fleet.set_placement(handles);
+            let messages = messages_avoiding(2);
+            let req = request("z-ai/glm-5.3-flash");
+            assert_eq!(
+                placed_indices(&second, &messages, None, &req),
+                legacy_indices(&messages, None, None)
+            );
+        }
+
+        #[test]
+        fn decision_metrics_use_static_tags() {
+            let h = harness(
+                &[("h-a", 2)],
+                snapshot("h-a", fresh_ms(), PinTable::default()),
+            );
+            let messages = messages_avoiding(2);
+            let req = request("z-ai/glm-5.3-flash");
+            placed_indices(&h.provider, &messages, None, &req);
+            let counts = h.metrics.counts.lock().unwrap();
+            let decision = counts
+                .iter()
+                .find(|(n, _, _)| n == METRIC_DECISIONS)
+                .expect("decision metric");
+            assert_eq!(
+                decision.2,
+                vec![
+                    "outcome:place".to_string(),
+                    "tier:base".to_string(),
+                    "class:short".to_string(),
+                    "strategy:short_clean".to_string(),
+                    "priority_band:normal".to_string(),
+                    "selection:best_of_two".to_string(),
+                    "model:z-ai/glm-5.3-flash".to_string(),
+                ]
+            );
+            let backlog = counts
+                .iter()
+                .filter(|(n, _, _)| n == METRIC_AFFINITY)
+                .count();
+            assert_eq!(backlog, 12, "one affinity count per decision");
+        }
+
+        #[test]
+        fn stale_snapshot_falls_back() {
+            let stale = now_ms() - 60_000;
+            let h = harness(&[("h-a", 2)], snapshot("h-a", stale, PinTable::default()));
+            let messages = messages_avoiding(2);
+            let req = request("z-ai/glm-5.3-flash");
+            assert_eq!(
+                placed_indices(&h.provider, &messages, None, &req),
+                legacy_indices(&messages, None, None)
+            );
+            assert_eq!(h.metrics.decisions_tagged("reason:stale"), 12);
+        }
+
+        #[test]
+        fn e2ee_pinned_key_group_respected() {
+            let keys = HashMap::from([("key-a".to_string(), vec![0, 1])]);
+            let mut h = harness(
+                &[("h-a", 2)],
+                snapshot("h-a", fresh_ms(), PinTable::default()),
+            );
+            h.provider.fleet.set_backend_keys(keys.clone());
+            let messages = vec![
+                user_msg("synthetic initial turn"),
+                role_msg(crate::MessageRole::Assistant, "synthetic answer"),
+                user_msg("synthetic follow-up"),
+            ];
+            let req = request("z-ai/glm-5.3-flash");
+            let got = placed_indices(&h.provider, &messages, Some("key-a"), &req);
+            assert!(got.iter().all(|i| [0, 1].contains(i)), "{got:?}");
+            assert_eq!(got, legacy_indices(&messages, Some("key-a"), Some(keys)));
+            assert_eq!(h.metrics.decisions_tagged("reason:key_group"), 12);
+            assert!(h.writes.try_recv().is_err(), "legacy writes nothing");
+        }
+
+        #[test]
+        fn placement_records_routed_write() {
+            let mut h = harness(
+                &[("h-a", 2)],
+                snapshot("h-a", fresh_ms(), PinTable::default()),
+            );
+            // The routed tokens are the pool's prompt estimate, never a
+            // placement-side re-estimate of the messages.
+            let messages = vec![user_msg(&"x".repeat(40))];
+            let mut req = request("z-ai/glm-5.3-flash");
+            req.prompt_tokens = 10;
+            let before_s = now_ms() / 1000;
+            let lease = h
+                .provider
+                .fleet
+                .acquire_index_placed(&messages, None, &req)
+                .expect("rotation active");
+            assert_eq!(lease.index(), 2);
+            match h.writes.try_recv().expect("routed write queued") {
+                Write::Routed {
+                    slot: s, tok, sec, ..
+                } => {
+                    assert_eq!(s, slot("h-a", 0));
+                    assert_eq!(tok, 10);
+                    assert!(sec >= before_s && sec <= now_ms() / 1000);
+                }
+                Write::Pin { .. } => panic!("keyless request writes no pin"),
+            }
+            assert!(h.writes.try_recv().is_err());
+            // This node's own routed count feeds the next decision.
+            let mine = h.provider.fleet.placement_mine(now_ms() / 1000);
+            assert_eq!(
+                mine.get(&slot("h-a", 0)).map(|p| (p.req, p.tok)),
+                Some((1, 10))
+            );
+        }
+
+        /// Places one keyless 10-token request on h-a#0 (backend 2) and
+        /// returns its queued routed write's acknowledgement handle.
+        fn place_one(h: &mut Harness) -> RoutedAck {
+            let mut req = request("z-ai/glm-5.3-flash");
+            req.prompt_tokens = 10;
+            let lease = h
+                .provider
+                .fleet
+                .acquire_index_placed(&messages_avoiding(2), None, &req)
+                .expect("rotation active");
+            assert_eq!(lease.index(), 2);
+            match h.writes.try_recv().expect("routed write queued") {
+                Write::Routed { ack, .. } => ack,
+                Write::Pin { .. } => panic!("keyless request writes no pin"),
+            }
+        }
+
+        /// Replaces the current snapshot with the same replicas, as a later
+        /// reader cycle whose routed read was issued at `routed_read_ms` and
+        /// saw `routed` for h-a#0.
+        fn reread(h: &Harness, routed_read_ms: u64, routed: Option<(u32, u64)>) {
+            let old = h.io.snapshot.load_full();
+            h.io.snapshot.store(Arc::new(Snapshot {
+                built_ms: old.built_ms,
+                replicas: old.replicas.clone(),
+                routed: routed
+                    .map(|(req, tok)| {
+                        (
+                            slot("h-a", 0),
+                            RoutedCounts {
+                                req,
+                                tok,
+                                since_ms: routed_read_ms.saturating_sub(1_000),
+                            },
+                        )
+                    })
+                    .into_iter()
+                    .collect(),
+                routed_read_ms,
+                pins: old.pins.clone(),
+                ..Snapshot::default()
+            }));
+        }
+
+        fn mine_on_a0(h: &Harness) -> Option<(u32, u64)> {
+            h.provider
+                .fleet
+                .placement_mine(now_ms() / 1000)
+                .get(&slot("h-a", 0))
+                .map(|p| (p.req, p.tok))
+        }
+
+        #[test]
+        fn acked_placement_before_read_is_not_counted_twice() {
+            let mut h = harness(
+                &[("h-a", 2)],
+                snapshot("h-a", fresh_ms(), PinTable::default()),
+            );
+            let ack = place_one(&mut h);
+            let acked_ms = now_ms();
+            ack.set(acked_ms);
+
+            // A read issued after the acknowledgement already holds the
+            // placement in `routed`: this node adds nothing on top.
+            reread(&h, acked_ms + 1, Some((1, 10)));
+            assert_eq!(mine_on_a0(&h), None);
+
+            // A read issued at the acknowledgement instant may have missed
+            // it, so it is still counted locally.
+            reread(&h, acked_ms, Some((0, 0)));
+            assert_eq!(mine_on_a0(&h), Some((1, 10)));
+        }
+
+        #[test]
+        fn queued_placement_is_counted() {
+            let mut h = harness(
+                &[("h-a", 2)],
+                snapshot("h-a", fresh_ms(), PinTable::default()),
+            );
+            // The write is still in the queue (never acknowledged), so even
+            // a read issued after the placement cannot hold it.
+            let ack = place_one(&mut h);
+            assert_eq!(ack.acked_ms(), None);
+            reread(&h, now_ms() + 1_000, None);
+            assert_eq!(mine_on_a0(&h), Some((1, 10)));
+        }
+
+        #[test]
+        fn dropped_write_is_still_counted_locally() {
+            let h = harness(
+                &[("h-a", 2)],
+                snapshot("h-a", fresh_ms(), PinTable::default()),
+            );
+            // Fill the write queue so the placement's routed write is
+            // dropped: it never reaches Valkey and is never acknowledged.
+            let filler = || Write::Routed {
+                slot: slot("h-z", 0),
+                tok: 1,
+                sec: 0,
+                ack: RoutedAck::default(),
+            };
+            for _ in 0..WRITE_QUEUE_CAPACITY {
+                h.io.record(filler());
+            }
+            let mut req = request("z-ai/glm-5.3-flash");
+            req.prompt_tokens = 10;
+            h.provider
+                .fleet
+                .acquire_index_placed(&messages_avoiding(2), None, &req)
+                .expect("rotation active");
+            let dropped: i64 = h
+                .metrics
+                .counts
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(n, _, _)| n == METRIC_WRITES_DROPPED)
+                .map(|(_, v, _)| *v)
+                .sum();
+            assert_eq!(dropped, 1);
+
+            // Every later read misses it; this node keeps counting it until
+            // it leaves the routed window.
+            reread(&h, now_ms() + 1_000, None);
+            assert_eq!(mine_on_a0(&h), Some((1, 10)));
+        }
+
+        #[tokio::test]
+        async fn itl_recorded_only_with_two_chunks() {
+            use crate::attested::nearai::fleet::mean_itl_ms;
+            use crate::attested::nearai::TtftProbe;
+            use crate::placement_io::{METRIC_DURATION_MS, METRIC_ITL_MS, METRIC_TTFT_MS};
+            use tokio_stream::StreamExt;
+
+            // (last - first token chunk) / (chunks - 1), nothing below 2.
+            assert_eq!(mean_itl_ms(60.0, 4), Some(20.0));
+            assert_eq!(mean_itl_ms(60.0, 2), Some(60.0));
+            assert_eq!(mean_itl_ms(60.0, 1), None);
+            assert_eq!(mean_itl_ms(60.0, 0), None);
+
+            // A token chunk carries a choice; the trailing usage-only chunk
+            // (`choices: []`) never counts, nor does its arrival time.
+            let token = || {
+                let mut event = data_event();
+                if let Some(crate::StreamChunk::Chat(chunk)) = event.chunk.as_mut() {
+                    chunk.choices = serde_json::from_value(serde_json::json!([
+                        {"index": 0, "delta": {"content": "x"}}
+                    ]))
+                    .unwrap();
+                }
+                event
+            };
+            let usage_only = data_event;
+
+            for chunks in 0..4usize {
+                let h = harness(
+                    &[("h-a", 2)],
+                    snapshot("h-a", fresh_ms(), PinTable::default()),
+                );
+                let mut req = request("z-ai/glm-5.3-flash");
+                req.size = "size:le8k";
+                let lease = h
+                    .provider
+                    .fleet
+                    .acquire_index_placed(&messages_avoiding(2), None, &req)
+                    .expect("rotation active");
+                let mut items = vec![Ok(control_event(": keepalive\n"))];
+                items.extend((0..chunks).map(|_| Ok(token())));
+                items.push(Ok(usage_only()));
+                let inner: crate::StreamingResult = Box::pin(futures_util::stream::iter(items));
+                let start = std::time::Instant::now() - std::time::Duration::from_millis(5);
+                let probe = TtftProbe::new(
+                    inner,
+                    h.provider.fleet.backend_stats.clone(),
+                    lease.index(),
+                    start,
+                    Some(lease),
+                );
+                tokio::pin!(probe);
+                while probe.next().await.is_some() {}
+
+                let duration = h.metrics.histogram_tags(METRIC_DURATION_MS);
+                assert_eq!(duration.len(), 1, "{chunks} chunks");
+                assert_eq!(duration[0][2], "size:le8k");
+                assert_eq!(h.metrics.histogram_tags(METRIC_TTFT_MS).len(), 1);
+                let itl = h.metrics.histogram_tags(METRIC_ITL_MS);
+                if chunks >= 2 {
+                    assert_eq!(itl, duration, "{chunks} chunks: same tags");
+                } else {
+                    assert!(itl.is_empty(), "{chunks} chunks: no ITL");
+                }
+            }
+        }
+
+        #[test]
+        fn placed_lease_carries_replica_index() {
+            // h-a (backend 2) publishes replicas 0 and 3; only 3 is ready.
+            let built = fresh_ms();
+            let mut draining = ready_replica("h-a", 0, built);
+            draining.state.lifecycle_state = Lifecycle::Draining;
+            let snap = Snapshot {
+                built_ms: built,
+                replicas: vec![draining, ready_replica("h-a", 3, built)],
+                ..Snapshot::default()
+            };
+            let mut h = harness(&[("h-a", 2)], snap);
+            let req = request("z-ai/glm-5.3-flash");
+            let lease = h
+                .provider
+                .fleet
+                .acquire_index_placed(&messages_avoiding(2), None, &req)
+                .expect("rotation active");
+            assert_eq!(lease.index(), 2);
+            assert_eq!(lease.replica(), Some(3));
+            // The routed counter and this node's ledger are per replica.
+            match h.writes.try_recv().expect("routed write queued") {
+                Write::Routed { slot: s, .. } => assert_eq!(s, slot("h-a", 3)),
+                Write::Pin { .. } => panic!("keyless request writes no pin"),
+            }
+            let mine = h.provider.fleet.placement_mine(now_ms() / 1000);
+            assert_eq!(mine.keys().collect::<Vec<_>>(), vec![&slot("h-a", 3)]);
+        }
+
+        #[test]
+        fn legacy_lease_has_no_replica() {
+            let stale = now_ms() - 60_000;
+            let h = harness(&[("h-a", 2)], snapshot("h-a", stale, PinTable::default()));
+            let messages = messages_avoiding(2);
+            let glm = request("z-ai/glm-5.3-flash");
+            let other = request("acme/any-new-model");
+            for req in [&glm, &other] {
+                let lease = h
+                    .provider
+                    .fleet
+                    .acquire_index_placed(&messages, None, req)
+                    .expect("rotation active");
+                assert_eq!(lease.replica(), None);
+            }
+            // A plain legacy acquire never carries one either.
+            let lease = h
+                .provider
+                .fleet
+                .acquire_index(&messages, None)
+                .expect("rotation active");
+            assert_eq!(lease.replica(), None);
+            assert_eq!(h.metrics.decisions_tagged("reason:stale"), 2);
+        }
+
+        /// A snapshot with fresh `h-a` and the given `h-b` replicas, `h-b`'s
+        /// frame reported at `h_b_reported_ms`.
+        fn with_h_b(h_b_replicas: Vec<ReplicaView>, h_b_reported_ms: u64) -> Snapshot {
+            let mut snap = snapshot("h-a", fresh_ms(), PinTable::default());
+            snap.replicas.extend(h_b_replicas);
+            snap.host_reported_ms = HashMap::from([
+                ("h-a".to_string(), now_ms()),
+                ("h-b".to_string(), h_b_reported_ms),
+            ]);
+            snap
+        }
+
+        /// A host that is only booting (replicas warming, or ready with no
+        /// engine sample yet) while its frame is fresh is excluded replica by
+        /// replica, not the whole Fleet.
+        #[test]
+        fn booting_host_does_not_make_fleet_legacy() {
+            let messages = messages_avoiding(2);
+            let req = request("z-ai/glm-5.3-flash");
+            let mut warming = ready_replica("h-b", 0, now_ms());
+            warming.state.lifecycle_state = Lifecycle::Warming;
+            let mut unsampled = ready_replica("h-b", 1, now_ms());
+            unsampled.state.engine_sampled_at_ms = None;
+
+            let h = harness(
+                &[("h-a", 2), ("h-b", 3)],
+                with_h_b(vec![warming, unsampled], now_ms()),
+            );
+            placed_indices(&h.provider, &messages, None, &req);
+            assert_eq!(h.metrics.decisions_tagged("reason:host_stale"), 0);
+            assert_eq!(h.metrics.decisions_tagged("outcome:place"), 12);
+        }
+
+        /// A host whose frame is old (a silent host) or far from this node's
+        /// clock (a skewed one) would silently starve: the Fleet routes
+        /// legacy. A host clock ahead beyond the allowed skew is rejected
+        /// before it reaches the snapshot, which the incomplete host map
+        /// already covers.
+        #[test]
+        fn skewed_host_frame_makes_fleet_legacy() {
+            let messages = messages_avoiding(2);
+            let req = request("z-ai/glm-5.3-flash");
+            let replicas = || {
+                vec![
+                    ready_replica("h-b", 0, now_ms()),
+                    ready_replica("h-b", 1, now_ms()),
+                ]
+            };
+
+            let mut h = harness(
+                &[("h-a", 2), ("h-b", 3)],
+                with_h_b(replicas(), now_ms() - 60_000),
+            );
+            assert_eq!(
+                placed_indices(&h.provider, &messages, None, &req),
+                legacy_indices(&messages, None, None)
+            );
+            assert_eq!(h.metrics.decisions_tagged("reason:host_stale"), 12);
+            assert!(h.writes.try_recv().is_err(), "legacy writes nothing");
+
+            // Ahead of this node beyond the allowed skew.
+            let ahead = now_ms() + placement::consts::MAX_FUTURE_SKEW_MS + 60_000;
+            let h = harness(&[("h-a", 2), ("h-b", 3)], with_h_b(replicas(), ahead));
+            placed_indices(&h.provider, &messages, None, &req);
+            assert_eq!(h.metrics.decisions_tagged("reason:host_stale"), 12);
+
+            // A fresh frame: the host is visible, placement runs.
+            let h = harness(&[("h-a", 2), ("h-b", 3)], with_h_b(replicas(), now_ms()));
+            placed_indices(&h.provider, &messages, None, &req);
+            assert_eq!(h.metrics.decisions_tagged("reason:host_stale"), 0);
+            assert_eq!(h.metrics.decisions_tagged("outcome:place"), 12);
+        }
+
+        #[test]
+        fn kill_switch_snapshot_falls_back_without_a_replica() {
+            let mut snap = snapshot("h-a", fresh_ms(), PinTable::default());
+            snap.disabled = true;
+            let mut h = harness(&[("h-a", 2)], snap);
+            let messages = messages_avoiding(2);
+            let req = request("z-ai/glm-5.3-flash");
+            assert_eq!(
+                placed_indices(&h.provider, &messages, None, &req),
+                legacy_indices(&messages, None, None)
+            );
+            assert_eq!(h.metrics.decisions_tagged("reason:disabled"), 12);
+            assert!(h.writes.try_recv().is_err(), "legacy writes nothing");
+        }
+
+        #[test]
+        fn pin_write_is_recorded() {
+            let key = AffinityKey::from_bytes([5u8; 16]);
+            let pid_hex = pin_id(Tier::Base, &key, &PIN_SECRET).to_hex();
+            let id: [u8; 16] = hex::decode(&pid_hex).unwrap().try_into().unwrap();
+            // An existing pin to a host that is no longer eligible: the placer
+            // re-homes the session and rewrites the pin.
+            let now = now_ms();
+            let mut pins = PinTable::default();
+            pins.insert(id, slot("h-gone", 0), now);
+            let mut snap = snapshot("h-a", fresh_ms(), pins);
+            snap.host_boots = HashMap::from([("h-a".to_string(), "boot-a".to_string())]);
+            let mut h = harness(&[("h-a", 2)], snap);
+            let messages = vec![user_msg("keyed request")];
+            let mut req = request("z-ai/glm-5.3-flash");
+            req.affinity = Some(key);
+            req.affinity_source = AffinitySource::Client;
+            let lease = h
+                .provider
+                .fleet
+                .acquire_index_placed(&messages, None, &req)
+                .expect("rotation active");
+            assert_eq!(lease.index(), 2);
+            assert!(matches!(
+                h.writes.try_recv().expect("routed write"),
+                Write::Routed { .. }
+            ));
+            match h.writes.try_recv().expect("pin write queued") {
+                Write::Pin {
+                    id_hex,
+                    slot: s,
+                    at_ms,
+                    boot,
+                } => {
+                    assert_eq!(id_hex, pid_hex);
+                    assert_eq!(s, slot("h-a", 0));
+                    assert!(at_ms >= now);
+                    // The pin carries its host's current boot.
+                    assert_eq!(boot.as_deref(), Some("boot-a"));
+                }
+                Write::Routed { .. } => panic!("expected a pin write"),
+            }
+        }
+
+        /// Cross-task contract: proxy key -> registry -> proxy-sealed host
+        /// frame -> reader `apply` -> `Snapshot` -> `Placer` / `Fleet`.
+        mod contract {
+            use super::*;
+            use base64::Engine as _;
+            use ed25519_dalek::{Signer, SigningKey};
+            use placement::decision::Decision;
+            use placement::frame::{key_id, HostReport, SIGNING_DOMAIN};
+            use placement::snapshot::{HostKey, KeyRegistry};
+            use rand::rngs::StdRng;
+            use rand::SeedableRng;
+
+            /// The golden fixture's host and signing key.
+            const GOLDEN_HOST: &str = "host-a";
+            const GOLDEN_SEED: [u8; 32] = [7u8; 32];
+
+            /// The fields of an attested `ReplicaReportKey` event, as the
+            /// proxy emits it (hex public key, derived key id).
+            struct ProxyKey {
+                key_id: String,
+                public_key_hex: String,
+                host_id: String,
+            }
+
+            fn proxy_key(signing: &SigningKey, host: &str) -> ProxyKey {
+                let vk = signing.verifying_key();
+                ProxyKey {
+                    key_id: key_id(&vk),
+                    public_key_hex: hex::encode(vk.to_bytes()),
+                    host_id: host.to_string(),
+                }
+            }
+
+            /// Builds the registry the way the pool's `backend_hosts()`
+            /// does (it lives in `services`, which this crate cannot depend
+            /// on): hex-decode the attested public key, verify it is a valid
+            /// ed25519 point, keep the key id.
+            fn registry(keys: &[ProxyKey]) -> KeyRegistry {
+                let mut by_host: HashMap<String, Vec<HostKey>> = HashMap::new();
+                for k in keys {
+                    let bytes: [u8; 32] =
+                        hex::decode(&k.public_key_hex).unwrap().try_into().unwrap();
+                    by_host.entry(k.host_id.clone()).or_default().push(HostKey {
+                        key_id: k.key_id.clone(),
+                        key: ed25519_dalek::VerifyingKey::from_bytes(&bytes).unwrap(),
+                    });
+                }
+                KeyRegistry { by_host }
+            }
+
+            /// Envelope JSON sealed exactly as inference-proxy seals it.
+            fn proxy_seal(report: &HostReport, signing: &SigningKey) -> String {
+                let frame = serde_json::to_string(report).unwrap();
+                let mut msg = SIGNING_DOMAIN.to_vec();
+                msg.extend_from_slice(frame.as_bytes());
+                serde_json::json!({
+                    "frame": frame,
+                    "sig": base64::engine::general_purpose::STANDARD
+                        .encode(signing.sign(&msg).to_bytes()),
+                    "key_id": report.report_key_id,
+                })
+                .to_string()
+            }
+
+            /// A one-replica host frame for `host`, sealed by `signing`.
+            fn frame_for(host: &str, signing: &SigningKey, at_ms: u64, ready: bool) -> String {
+                let mut state = ready_state(0, at_ms);
+                if !ready {
+                    state.lifecycle_state = Lifecycle::Draining;
+                }
+                let report = HostReport {
+                    schema: 1,
+                    host_id: host.into(),
+                    boot_id: "boot-a".into(),
+                    seq: 1,
+                    reported_at_ms: at_ms,
+                    engine: "sglang".into(),
+                    report_key_id: key_id(&signing.verifying_key()),
+                    replicas: vec![state],
+                };
+                proxy_seal(&report, signing)
+            }
+
+            #[test]
+            fn golden_frame_through_reader_places_its_host() {
+                let signing = SigningKey::from_bytes(&GOLDEN_SEED);
+                let reg = registry(&[proxy_key(&signing, GOLDEN_HOST)]);
+                let golden =
+                    include_str!("../../../../placement/tests/fixtures/host_frame_v1.json");
+                let frames = HashMap::from([(GOLDEN_HOST.to_string(), golden.to_string())]);
+                // The fixture's own clock: reported at 1700000000500.
+                let now = 1_700_000_000_500;
+                let snap = crate::placement_io::snapshot_from_valkey_values(
+                    &reg,
+                    &frames,
+                    &HashMap::new(),
+                    now,
+                );
+                let slots: Vec<SlotId> = snap.replicas.iter().map(|v| v.slot.clone()).collect();
+                assert_eq!(
+                    slots,
+                    vec![slot(GOLDEN_HOST, 0), slot(GOLDEN_HOST, 1)],
+                    "golden frame accepted, one view per replica"
+                );
+                let input = placement::decision::PlaceInput {
+                    model: "z-ai/glm-5.3-flash".into(),
+                    prompt_tokens: 100,
+                    prefill_heavy: false,
+                    priority: 0,
+                    affinity: None,
+                    affinity_source: AffinitySource::None,
+                    now_ms: now,
+                };
+                let mut rng = StdRng::seed_from_u64(1);
+                match Placer::new(PIN_SECRET, Tier::Base).place(
+                    &input,
+                    &snap,
+                    &HashMap::new(),
+                    &mut rng,
+                ) {
+                    Decision::Place { slot, .. } => assert_eq!(slot.host, GOLDEN_HOST),
+                    Decision::Legacy { reason, .. } => panic!("legacy: {}", reason.as_str()),
+                }
+            }
+
+            /// Four backends: h-a (0) and h-b (1) ready, h-c and h-d
+            /// draining, all publishing fresh proxy-sealed frames; `routed`
+            /// is what the other nodes' routed hashes hold per slot.
+            fn fleet_index(routed: HashMap<SlotId, (u64, u64)>) -> usize {
+                let signing = SigningKey::from_bytes(&GOLDEN_SEED);
+                let hosts = [("h-a", true), ("h-b", true), ("h-c", false), ("h-d", false)];
+                let keys: Vec<ProxyKey> =
+                    hosts.iter().map(|(h, _)| proxy_key(&signing, h)).collect();
+                let reg = registry(&keys);
+                let at = fresh_ms();
+                let frames: HashMap<String, String> = hosts
+                    .iter()
+                    .map(|(h, ready)| (h.to_string(), frame_for(h, &signing, at, *ready)))
+                    .collect();
+                let snap =
+                    crate::placement_io::snapshot_from_valkey_values(&reg, &frames, &routed, at);
+                assert_eq!(snap.replicas.len(), 4, "every proxy frame accepted");
+                let map: Vec<(String, usize)> = hosts
+                    .iter()
+                    .enumerate()
+                    .map(|(i, (h, _))| (h.to_string(), i))
+                    .collect();
+                let h = harness_exact(&map, 4, snap);
+                let req = request("z-ai/glm-5.3-flash");
+                let lease = h
+                    .provider
+                    .fleet
+                    .acquire_index_placed(&messages_avoiding(0), None, &req)
+                    .expect("rotation active");
+                assert_eq!(h.metrics.decisions_tagged("outcome:place"), 1);
+                assert_eq!(lease.replica(), Some(0));
+                lease.index()
+            }
+
+            #[test]
+            fn proxy_frames_through_reader_place_on_the_fleet() {
+                let index = fleet_index(HashMap::new());
+                assert!([0, 1].contains(&index), "placed on a ready host: {index}");
+            }
+
+            #[test]
+            fn routed_counts_through_reader_shift_the_fleet_decision() {
+                // Other nodes routed heavy load to h-a in the current window:
+                // the fleet must place on h-b, and vice versa.
+                let heavy = (20, 200_000);
+                let to_a = HashMap::from([(slot("h-a", 0), heavy)]);
+                let to_b = HashMap::from([(slot("h-b", 0), heavy)]);
+                for _ in 0..8 {
+                    assert_eq!(fleet_index(to_a.clone()), 1);
+                    assert_eq!(fleet_index(to_b.clone()), 0);
+                }
+            }
+        }
+
+        /// The replica hint, end to end through a mock upstream reached over
+        /// the rotation URLs (`glm-i<N>.mock.test`, resolved to the mock).
+        mod replica_hint {
+            use super::*;
+            use crate::attested::nearai::upstream_headers::{REPLICA_HINT, REPLICA_HINT_HOST};
+            use crate::attested::nearai::Config;
+            use crate::{ChatCompletionParams, InferenceProvider};
+            use futures_util::TryStreamExt;
+            use wiremock::matchers::{method, path};
+            use wiremock::{Mock, MockServer, ResponseTemplate};
+
+            /// Hands out clients that resolve every rotation host to the
+            /// mock upstream.
+            struct ResolvingVerifier(std::net::SocketAddr);
+
+            #[async_trait::async_trait]
+            impl crate::BackendVerifier for ResolvingVerifier {
+                async fn create_verified_client(
+                    &self,
+                    _base_url: &str,
+                ) -> Result<reqwest::Client, crate::BackendVerifyError> {
+                    let mut builder = reqwest::Client::builder();
+                    for index in 0..4 {
+                        builder = builder.resolve(&format!("glm-i{index}.mock.test"), self.0);
+                    }
+                    Ok(builder.build().unwrap())
+                }
+            }
+
+            /// A 4-backend rotation provider whose index clients all reach
+            /// `upstream`.
+            fn upstream_provider(upstream: &MockServer) -> Provider {
+                let addr = *upstream.address();
+                let provider = Provider::new_with_verifier(
+                    Config {
+                        base_url: format!("http://glm.mock.test:{}", addr.port()),
+                        api_key: None,
+                        completion_timeout_seconds: 5,
+                        control_timeout_seconds: 5,
+                    },
+                    Arc::new(std::sync::RwLock::new(
+                        crate::spki_verifier::FingerprintState::Bootstrap,
+                    )),
+                    Arc::new(ResolvingVerifier(addr)),
+                );
+                provider.set_backend_count(4);
+                provider
+            }
+
+            /// Answers JSON or SSE by the request's `stream` flag; a request
+            /// to a host starting with `fail_host` gets a 503.
+            fn respond(fail_host: Option<&'static str>) -> impl wiremock::Respond {
+                move |request: &wiremock::Request| {
+                    let host = request.headers["host"].to_str().unwrap_or_default();
+                    if fail_host.is_some_and(|h| host.starts_with(h)) {
+                        return ResponseTemplate::new(503);
+                    }
+                    let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+                    if body["stream"] == true {
+                        let chunk = serde_json::json!({"id": "synthetic",
+                            "object": "chat.completion.chunk", "created": 0,
+                            "model": "synthetic-model", "choices": [{"index": 0,
+                            "delta": {"content": "ok"}, "finish_reason": "stop"}]});
+                        ResponseTemplate::new(200).set_body_raw(
+                            format!("data: {chunk}\n\ndata: [DONE]\n\n"),
+                            "text/event-stream",
+                        )
+                    } else {
+                        ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                            "id": "synthetic", "object": "chat.completion", "created": 0,
+                            "model": "synthetic-model", "choices": [{"index": 0,
+                            "message": {"role": "assistant", "content": "ok"},
+                            "finish_reason": "stop"}],
+                            "usage": {"prompt_tokens": 1, "completion_tokens": 1,
+                                "total_tokens": 2}
+                        }))
+                    }
+                }
+            }
+
+            async fn mock_upstream(fail_host: Option<&'static str>) -> MockServer {
+                let upstream = MockServer::start().await;
+                Mock::given(method("POST"))
+                    .and(path("/v1/chat/completions"))
+                    .respond_with(respond(fail_host))
+                    .mount(&upstream)
+                    .await;
+                upstream
+            }
+
+            fn params(model: &str) -> ChatCompletionParams {
+                serde_json::from_value(serde_json::json!({
+                    "model": model,
+                    "messages": [{"role": "user", "content": "synthetic replica hint"}],
+                }))
+                .unwrap()
+            }
+
+            /// Sends `params` once non-streaming and once streaming.
+            async fn send_both(provider: &Provider, params: ChatCompletionParams) {
+                provider
+                    .chat_completion(params.clone(), "synthetic-hash-json".into())
+                    .await
+                    .expect("json completion");
+                let stream = provider
+                    .chat_completion_stream(params, "synthetic-hash-sse".into())
+                    .await
+                    .expect("sse completion");
+                let _: Vec<_> = stream.try_collect().await.expect("sse stream");
+            }
+
+            fn header_values(requests: &[wiremock::Request], name: &str) -> Vec<Option<String>> {
+                requests
+                    .iter()
+                    .map(|r| r.headers.get(name).map(|v| v.to_str().unwrap().to_string()))
+                    .collect()
+            }
+
+            fn hints(requests: &[wiremock::Request]) -> Vec<Option<String>> {
+                header_values(requests, REPLICA_HINT)
+            }
+
+            fn host_hints(requests: &[wiremock::Request]) -> Vec<Option<String>> {
+                header_values(requests, REPLICA_HINT_HOST)
+            }
+
+            /// h-a (backend 2) publishes replicas 0 (draining) and 3 (ready).
+            fn placed_snapshot(built_ms: u64) -> Snapshot {
+                let mut draining = ready_replica("h-a", 0, built_ms);
+                draining.state.lifecycle_state = Lifecycle::Draining;
+                Snapshot {
+                    built_ms,
+                    replicas: vec![draining, ready_replica("h-a", 3, built_ms)],
+                    ..Snapshot::default()
+                }
+            }
+
+            #[tokio::test]
+            async fn placed_request_sends_replica_hint_header() {
+                let upstream = mock_upstream(None).await;
+                let h = harness_on(
+                    upstream_provider(&upstream),
+                    &[("h-a", 2)],
+                    4,
+                    placed_snapshot(fresh_ms()),
+                );
+                send_both(&h.provider, params("z-ai/glm-5.3-flash")).await;
+
+                let requests = upstream.received_requests().await.unwrap();
+                assert_eq!(hints(&requests), vec![Some("3".to_string()); 2]);
+                for request in &requests {
+                    let host = request.headers["host"].to_str().unwrap();
+                    assert!(host.starts_with("glm-i2."), "sent to backend 2: {host}");
+                }
+                assert_eq!(h.metrics.decisions_tagged("outcome:place"), 2);
+            }
+
+            /// The replica hint travels with the host placement chose, so the
+            /// proxy can refuse it when the rotation index has drifted to a
+            /// different host since discovery.
+            #[tokio::test]
+            async fn placed_request_sends_replica_host_header() {
+                let upstream = mock_upstream(None).await;
+                let h = harness_on(
+                    upstream_provider(&upstream),
+                    &[("h-a", 2)],
+                    4,
+                    placed_snapshot(fresh_ms()),
+                );
+                send_both(&h.provider, params("z-ai/glm-5.3-flash")).await;
+
+                let requests = upstream.received_requests().await.unwrap();
+                assert_eq!(hints(&requests), vec![Some("3".to_string()); 2]);
+                assert_eq!(host_hints(&requests), vec![Some("h-a".to_string()); 2]);
+            }
+
+            /// A client-supplied host hint never reaches an upstream: not as
+            /// a header on a legacy or canonical request, not over the
+            /// placed host, and not in the body.
+            #[tokio::test]
+            async fn client_cannot_inject_replica_host() {
+                let mut injected = params("z-ai/glm-5.3-flash");
+                injected
+                    .extra
+                    .insert(REPLICA_HINT_HOST.to_string(), serde_json::json!("h-evil"));
+
+                let placed_upstream = mock_upstream(None).await;
+                let placed = harness_on(
+                    upstream_provider(&placed_upstream),
+                    &[("h-a", 2)],
+                    4,
+                    placed_snapshot(fresh_ms()),
+                );
+                send_both(&placed.provider, injected.clone()).await;
+                let placed_requests = placed_upstream.received_requests().await.unwrap();
+                assert_eq!(
+                    host_hints(&placed_requests),
+                    vec![Some("h-a".to_string()); 2]
+                );
+
+                let upstream = mock_upstream(None).await;
+                let stale = harness_on(
+                    upstream_provider(&upstream),
+                    &[("h-a", 2)],
+                    4,
+                    placed_snapshot(now_ms() - 60_000),
+                );
+                let canonical = mock_upstream(None).await;
+                let canonical_provider = Provider::new(Config::new(canonical.uri(), None, Some(5)));
+                send_both(&stale.provider, injected.clone()).await;
+                send_both(&canonical_provider, injected).await;
+
+                let mut requests = upstream.received_requests().await.unwrap();
+                requests.extend(canonical.received_requests().await.unwrap());
+                assert_eq!(requests.len(), 4);
+                assert_eq!(host_hints(&requests), vec![None; 4]);
+                requests.extend(placed_requests);
+                for request in &requests {
+                    let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+                    assert!(
+                        body.get(REPLICA_HINT_HOST).is_none(),
+                        "client host hint reached the upstream body"
+                    );
+                }
+            }
+
+            /// The stream path records TTFT and duration once per streamed
+            /// request, by strategy and selection (`legacy` when unplaced,
+            /// nothing on a Fleet whose hosts publish no frames).
+            #[tokio::test]
+            async fn stream_latency_is_recorded_by_strategy() {
+                use crate::placement_io::{METRIC_DURATION_MS, METRIC_TTFT_MS};
+                let stream_once = |provider: Provider, model: &'static str| async move {
+                    let stream = provider
+                        .chat_completion_stream(params(model), "synthetic-hash-sse".into())
+                        .await
+                        .expect("sse completion");
+                    let _: Vec<_> = stream.try_collect().await.expect("sse stream");
+                };
+
+                let upstream = mock_upstream(None).await;
+                let h = harness_on(
+                    upstream_provider(&upstream),
+                    &[("h-a", 2)],
+                    4,
+                    placed_snapshot(fresh_ms()),
+                );
+                stream_once(h.provider, "z-ai/glm-5.3-flash").await;
+                for name in [METRIC_TTFT_MS, METRIC_DURATION_MS] {
+                    let samples = h.metrics.histogram_tags(name);
+                    assert_eq!(samples.len(), 1, "{name}");
+                    assert_eq!(samples[0][0], "strategy:short_clean", "{name}");
+                    assert!(samples[0][1].starts_with("selection:"), "{name}");
+                    assert_ne!(samples[0][1], "selection:unknown", "{name}");
+                }
+
+                let upstream = mock_upstream(None).await;
+                let stale = now_ms() - 60_000;
+                let h = harness_on(
+                    upstream_provider(&upstream),
+                    &[("h-a", 2)],
+                    4,
+                    placed_snapshot(stale),
+                );
+                stream_once(h.provider, "z-ai/glm-5.3-flash").await;
+                for name in [METRIC_TTFT_MS, METRIC_DURATION_MS] {
+                    assert_eq!(
+                        h.metrics.histogram_tags(name),
+                        vec![vec![
+                            "strategy:legacy".to_string(),
+                            "selection:legacy".to_string(),
+                            "size:unknown".to_string(),
+                            "model:z-ai/glm-5.3-flash".to_string(),
+                        ]],
+                        "{name}"
+                    );
+                }
+
+                let upstream = mock_upstream(None).await;
+                let h = install(upstream_provider(&upstream), &[], 0, Snapshot::default());
+                stream_once(h.provider, "acme/any-new-model").await;
+                assert!(h.metrics.histogram_tags(METRIC_TTFT_MS).is_empty());
+                assert!(h.metrics.histogram_tags(METRIC_DURATION_MS).is_empty());
+            }
+
+            /// Provider-side latency carries the pool's prompt-size bucket,
+            /// on placed and legacy leases alike.
+            #[tokio::test]
+            async fn latency_metrics_tag_size_bucket() {
+                use crate::placement_io::{METRIC_DURATION_MS, METRIC_TTFT_MS};
+                let sized = |tokens: Option<u64>| {
+                    let mut params = params("z-ai/glm-5.3-flash");
+                    params.placement.prompt_tokens = tokens;
+                    params
+                };
+                let stream_once = |provider: Provider, params: ChatCompletionParams| async move {
+                    let stream = provider
+                        .chat_completion_stream(params, "synthetic-hash-sse".into())
+                        .await
+                        .expect("sse completion");
+                    let _: Vec<_> = stream.try_collect().await.expect("sse stream");
+                };
+
+                for (built_ms, tokens, strategy, size) in [
+                    (
+                        fresh_ms(),
+                        Some(20_000),
+                        "strategy:short_clean",
+                        "size:le32k",
+                    ),
+                    (fresh_ms(), None, "strategy:short_clean", "size:unknown"),
+                    (
+                        now_ms() - 60_000,
+                        Some(150_000),
+                        "strategy:legacy",
+                        "size:gt100k",
+                    ),
+                    (
+                        now_ms() - 60_000,
+                        Some(5_000),
+                        "strategy:legacy",
+                        "size:le8k",
+                    ),
+                ] {
+                    let upstream = mock_upstream(None).await;
+                    let h = harness_on(
+                        upstream_provider(&upstream),
+                        &[("h-a", 2)],
+                        4,
+                        placed_snapshot(built_ms),
+                    );
+                    stream_once(h.provider, sized(tokens)).await;
+                    for name in [METRIC_TTFT_MS, METRIC_DURATION_MS] {
+                        let samples = h.metrics.histogram_tags(name);
+                        assert_eq!(samples.len(), 1, "{name} {tokens:?}");
+                        assert_eq!(samples[0][0], strategy, "{name} {tokens:?}");
+                        assert_eq!(samples[0][2], size, "{name} {tokens:?}");
+                    }
+                }
+            }
+
+            #[tokio::test]
+            async fn legacy_request_sends_no_replica_hint() {
+                // Rotation with a legacy lease: a stale snapshot, for any
+                // model.
+                let upstream = mock_upstream(None).await;
+                let stale = now_ms() - 60_000;
+                let h = harness_on(
+                    upstream_provider(&upstream),
+                    &[("h-a", 2)],
+                    4,
+                    placed_snapshot(stale),
+                );
+                send_both(&h.provider, params("z-ai/glm-5.3-flash")).await;
+                send_both(&h.provider, params("acme/any-new-model")).await;
+                assert_eq!(h.metrics.decisions_tagged("reason:stale"), 4);
+
+                // No rotation at all: the canonical URL.
+                let canonical = mock_upstream(None).await;
+                let provider = Provider::new(Config::new(canonical.uri(), None, Some(5)));
+                send_both(&provider, params("z-ai/glm-5.3-flash")).await;
+
+                let mut requests = upstream.received_requests().await.unwrap();
+                requests.extend(canonical.received_requests().await.unwrap());
+                assert_eq!(hints(&requests), vec![None; 6]);
+                assert_eq!(host_hints(&requests), vec![None; 6]);
+            }
+
+            #[tokio::test]
+            async fn client_extra_cannot_inject_replica_hint() {
+                let upstream = mock_upstream(None).await;
+                let stale = now_ms() - 60_000;
+                let h = harness_on(
+                    upstream_provider(&upstream),
+                    &[("h-a", 2)],
+                    4,
+                    placed_snapshot(stale),
+                );
+                let canonical = mock_upstream(None).await;
+                let canonical_provider = Provider::new(Config::new(canonical.uri(), None, Some(5)));
+                let mut injected = params("z-ai/glm-5.3-flash");
+                injected
+                    .extra
+                    .insert(REPLICA_HINT.to_string(), serde_json::json!("3"));
+                send_both(&h.provider, injected.clone()).await;
+                send_both(&canonical_provider, injected).await;
+
+                let mut requests = upstream.received_requests().await.unwrap();
+                requests.extend(canonical.received_requests().await.unwrap());
+                assert_eq!(requests.len(), 4);
+                assert_eq!(hints(&requests), vec![None; 4]);
+                for request in &requests {
+                    let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+                    assert!(
+                        body.get(REPLICA_HINT).is_none(),
+                        "client replica hint reached the upstream body"
+                    );
+                }
+            }
+
+            /// Every replica h-a (backend 2) publishes is a full heavy-lane
+            /// member: a heavy request fits none of them.
+            fn saturated_snapshot(built_ms: u64) -> Snapshot {
+                Snapshot {
+                    built_ms,
+                    replicas: (0..4)
+                        .map(|r| {
+                            let mut view = ready_replica("h-a", r, built_ms);
+                            view.state.load.prefill_backlog_tokens =
+                                Some(placement::consts::HEAVY_BACKLOG_CAP);
+                            view
+                        })
+                        .collect(),
+                    ..Snapshot::default()
+                }
+            }
+
+            /// A request the pool classed heavy.
+            fn heavy_params() -> ChatCompletionParams {
+                let mut params = params("z-ai/glm-5.3-flash");
+                params.placement = crate::PlacementContext {
+                    prompt_tokens: Some(100_000),
+                    prefill_heavy: true,
+                    ..Default::default()
+                };
+                params
+            }
+
+            /// Every replica full on a complete, fresh picture: the placer
+            /// answers Legacy(`lane_full`), the reason stays `lane_full` (not
+            /// demoted), and the request is served on the legacy path.
+            #[tokio::test]
+            async fn lane_full_serves_legacy_with_reason_tag() {
+                let upstream = mock_upstream(None).await;
+                let h = harness_on(
+                    upstream_provider(&upstream),
+                    &[("h-a", 2)],
+                    4,
+                    saturated_snapshot(fresh_ms()),
+                );
+                send_both(&h.provider, heavy_params()).await;
+
+                assert_eq!(h.metrics.decisions_tagged("reason:lane_full"), 2);
+                assert_eq!(h.metrics.decisions_tagged("reason:host_stale"), 0);
+                assert_eq!(h.metrics.decisions_tagged("reason:incomplete"), 0);
+                assert_eq!(h.metrics.decisions_tagged("outcome:legacy"), 2);
+                let requests = upstream.received_requests().await.unwrap();
+                assert_eq!(requests.len(), 2, "every legacy request is served");
+                assert_eq!(hints(&requests), vec![None; 2]);
+            }
+
+            /// A full lane on a picture with a stale-framed host still runs
+            /// the legacy path and is served.
+            #[tokio::test]
+            async fn lane_full_with_stale_host_is_served_as_legacy() {
+                let upstream = mock_upstream(None).await;
+                let mut snap = saturated_snapshot(fresh_ms());
+                snap.host_reported_ms = HashMap::from([("h-a".to_string(), now_ms() - 60_000)]);
+                let h = harness_on(upstream_provider(&upstream), &[("h-a", 2)], 4, snap);
+                send_both(&h.provider, heavy_params()).await;
+
+                assert_eq!(h.metrics.decisions_tagged("reason:host_stale"), 2);
+                assert_eq!(h.metrics.decisions_tagged("reason:lane_full"), 0);
+                assert_eq!(h.metrics.decisions_tagged("outcome:legacy"), 2);
+                assert_eq!(h.metrics.decisions_tagged("outcome:place"), 0);
+                let requests = upstream.received_requests().await.unwrap();
+                assert_eq!(requests.len(), 2, "every legacy request is served");
+            }
+
+            /// The kill switch wins: every request is Legacy(disabled) and
+            /// served.
+            #[tokio::test]
+            async fn kill_switch_serves_legacy() {
+                let upstream = mock_upstream(None).await;
+                let mut snap = saturated_snapshot(fresh_ms());
+                snap.disabled = true;
+                let h = harness_on(upstream_provider(&upstream), &[("h-a", 2)], 4, snap);
+                send_both(&h.provider, heavy_params()).await;
+
+                assert_eq!(h.metrics.decisions_tagged("reason:disabled"), 2);
+                let requests = upstream.received_requests().await.unwrap();
+                assert_eq!(requests.len(), 2, "every legacy request is served");
+                assert_eq!(hints(&requests), vec![None; 2]);
+            }
+
+            /// An incomplete host map, or one built for another backend
+            /// count, runs the legacy path, which serves the request.
+            #[tokio::test]
+            async fn full_lane_with_incomplete_host_map_is_served_as_legacy() {
+                let upstream = mock_upstream(None).await;
+                // Only h-a is mapped, of 4 backends.
+                let partial = install(
+                    upstream_provider(&upstream),
+                    &[("h-a".to_string(), 2)],
+                    4,
+                    saturated_snapshot(fresh_ms()),
+                );
+                send_both(&partial.provider, heavy_params()).await;
+                assert_eq!(partial.metrics.decisions_tagged("reason:incomplete"), 2);
+                assert_eq!(partial.metrics.decisions_tagged("reason:lane_full"), 0);
+                assert_eq!(partial.metrics.decisions_tagged("outcome:legacy"), 2);
+
+                // A complete map pushed for 3 backends while the Fleet has 4.
+                let stale_count = harness_on(
+                    upstream_provider(&upstream),
+                    &[("h-a", 2)],
+                    3,
+                    saturated_snapshot(fresh_ms()),
+                );
+                send_both(&stale_count.provider, heavy_params()).await;
+                assert_eq!(stale_count.metrics.decisions_tagged("reason:incomplete"), 2);
+                assert_eq!(stale_count.metrics.decisions_tagged("outcome:legacy"), 2);
+
+                let requests = upstream.received_requests().await.unwrap();
+                assert_eq!(requests.len(), 4, "every legacy request is served");
+                assert_eq!(hints(&requests), vec![None; 4]);
+            }
+
+            #[tokio::test]
+            async fn fallback_index_sends_no_replica_hint() {
+                // The placed backend answers 503: the retry on another index
+                // lands on replicas the decision never saw, so it carries no
+                // hint.
+                let upstream = mock_upstream(Some("glm-i2.")).await;
+                let h = harness_on(
+                    upstream_provider(&upstream),
+                    &[("h-a", 2)],
+                    4,
+                    placed_snapshot(fresh_ms()),
+                );
+                send_both(&h.provider, params("z-ai/glm-5.3-flash")).await;
+
+                let requests = upstream.received_requests().await.unwrap();
+                let by_host: Vec<(bool, Option<String>)> = requests
+                    .iter()
+                    .zip(hints(&requests))
+                    .map(|(r, hint)| {
+                        let host = r.headers["host"].to_str().unwrap();
+                        (host.starts_with("glm-i2."), hint)
+                    })
+                    .collect();
+                assert_eq!(
+                    by_host,
+                    vec![
+                        (true, Some("3".to_string())),
+                        (false, None),
+                        (true, Some("3".to_string())),
+                        (false, None),
+                    ]
+                );
+            }
+
+            /// The fast healthy-count poll: the count endpoint of
+            /// `glm.mock.test` is `mock.test/backends/count`, resolved to a
+            /// mock that also stands in as the provider's upstream.
+            mod count_poll {
+                use super::*;
+                use crate::CountPoll;
+
+                fn count_client(server: &MockServer) -> reqwest::Client {
+                    reqwest::Client::builder()
+                        .resolve("mock.test", *server.address())
+                        .build()
+                        .unwrap()
+                }
+
+                /// Answers `/backends/count` with `healthy`, or 503 for `None`.
+                async fn count_server(healthy: Option<usize>) -> MockServer {
+                    let server = MockServer::start().await;
+                    let response = match healthy {
+                        Some(n) => ResponseTemplate::new(200)
+                            .set_body_json(serde_json::json!({ "healthy": n, "total": n })),
+                        None => ResponseTemplate::new(503),
+                    };
+                    Mock::given(method("GET"))
+                        .and(path("/backends/count"))
+                        .respond_with(response)
+                        .mount(&server)
+                        .await;
+                    server
+                }
+
+                /// A placing 4-backend Fleet (h-a on backend 2) over `server`.
+                fn placing(server: &MockServer) -> Harness {
+                    harness_on(
+                        upstream_provider(server),
+                        &[("h-a", 2)],
+                        4,
+                        snapshot("h-a", fresh_ms(), PinTable::default()),
+                    )
+                }
+
+                fn acquire(h: &Harness) -> crate::attested::nearai::fleet::RouteLease {
+                    h.provider
+                        .fleet
+                        .acquire_index_placed(
+                            &messages_avoiding(2),
+                            None,
+                            &request("z-ai/glm-5.3-flash"),
+                        )
+                        .expect("rotation active")
+                }
+
+                /// A count change is stored at once, so the host map built
+                /// for the old count no longer places: no stale index is used
+                /// while rediscovery runs.
+                #[tokio::test]
+                async fn count_change_makes_fleet_legacy_immediately() {
+                    let server = count_server(Some(5)).await;
+                    let h = placing(&server);
+                    assert_eq!(acquire(&h).index(), 2, "places before the change");
+
+                    let poll = h.provider.poll_backend_count(&count_client(&server)).await;
+                    assert_eq!(poll, CountPoll::Changed { old: 4, new: 5 });
+                    assert_eq!(h.provider.fleet.backend_count(), 5);
+                    assert_eq!(acquire(&h).replica(), None, "legacy lease");
+                    assert_eq!(h.metrics.decisions_tagged("outcome:place"), 1);
+                    assert_eq!(h.metrics.decisions_tagged("outcome:legacy"), 1);
+                }
+
+                #[tokio::test]
+                async fn count_read_failure_changes_nothing() {
+                    let server = count_server(None).await;
+                    let h = placing(&server);
+                    let poll = h.provider.poll_backend_count(&count_client(&server)).await;
+                    assert_eq!(poll, CountPoll::Failed);
+                    assert_eq!(h.provider.fleet.backend_count(), 4);
+                    assert_eq!(acquire(&h).index(), 2, "still places");
+
+                    // The same count again is no change either.
+                    let server = count_server(Some(4)).await;
+                    let h = placing(&server);
+                    let poll = h.provider.poll_backend_count(&count_client(&server)).await;
+                    assert_eq!(poll, CountPoll::Unchanged);
+                    assert_eq!(acquire(&h).index(), 2);
+                }
+
+                /// Only Fleets whose hosts have published are polled: no
+                /// request at all for one without placement or without an
+                /// attested replica-report key.
+                #[tokio::test]
+                async fn count_poll_skipped_for_unpublished_fleets() {
+                    let server = count_server(Some(5)).await;
+                    let client = count_client(&server);
+
+                    let h = placing(&server);
+                    unpublish(&h);
+                    assert_eq!(
+                        h.provider.poll_backend_count(&client).await,
+                        CountPoll::Skipped
+                    );
+                    assert_eq!(h.provider.fleet.backend_count(), 4);
+
+                    let bare = upstream_provider(&server);
+                    assert_eq!(bare.poll_backend_count(&client).await, CountPoll::Skipped);
+
+                    assert!(server.received_requests().await.unwrap().is_empty());
+                }
+
+                /// `h`'s current host map, re-pushed by a discovery cycle
+                /// with `count`, `keys` attested hosts and `complete`.
+                fn push(
+                    h: &Harness,
+                    generation: u64,
+                    count: usize,
+                    keyed: bool,
+                    complete: bool,
+                ) -> crate::DiscoveryPush {
+                    let hosts = h.provider.fleet.backend_hosts();
+                    crate::DiscoveryPush {
+                        generation,
+                        count,
+                        keys: HashMap::new(),
+                        hosts: BackendHosts {
+                            index_by_host: hosts.index_by_host.clone(),
+                            keys: if keyed {
+                                hosts.keys.clone()
+                            } else {
+                                Default::default()
+                            },
+                            count,
+                        },
+                        complete,
+                    }
+                }
+
+                /// A discovery cycle that began before a poll saw the new
+                /// count pushes the old count and host map late: it is
+                /// discarded, and the polled count stands. The poll keeps
+                /// reporting the stale host map until a current push lands.
+                #[tokio::test]
+                async fn older_discovery_push_cannot_overwrite_newer_polled_count() {
+                    let server = count_server(Some(5)).await;
+                    let client = count_client(&server);
+                    let h = placing(&server);
+                    let started = h.provider.count_generation();
+
+                    assert_eq!(
+                        h.provider.poll_backend_count(&client).await,
+                        CountPoll::Changed { old: 4, new: 5 }
+                    );
+                    assert!(!h.provider.apply_discovery(push(&h, started, 4, true, true)));
+                    assert_eq!(h.provider.fleet.backend_count(), 5);
+                    assert_eq!(h.provider.fleet.backend_hosts().count, 4);
+                    assert_eq!(acquire(&h).replica(), None, "still legacy");
+
+                    // The count holds but the host map is from the old one.
+                    assert_eq!(
+                        h.provider.poll_backend_count(&client).await,
+                        CountPoll::HostMapStale
+                    );
+
+                    // A cycle started after the poll lands, and places again.
+                    let current = h.provider.count_generation();
+                    assert!(h.provider.apply_discovery(push(&h, current, 5, true, true)));
+                    assert_eq!(h.provider.fleet.backend_hosts().count, 5);
+                    assert_eq!(
+                        h.provider.poll_backend_count(&client).await,
+                        CountPoll::Unchanged
+                    );
+                    // A push older than that one is discarded too.
+                    assert!(!h.provider.apply_discovery(push(&h, current, 5, true, true)));
+                }
+
+                /// A failed discovery cycle that saw no replica-report key
+                /// keeps the last attested registry, so a publishing model
+                /// keeps reporting its outage. A complete cycle that saw
+                /// none clears it.
+                #[tokio::test]
+                async fn failed_discovery_keeps_last_registry() {
+                    let server = count_server(Some(4)).await;
+                    let h = placing(&server);
+                    let generation = h.provider.count_generation();
+                    assert!(h
+                        .provider
+                        .apply_discovery(push(&h, generation, 4, false, false)));
+                    assert!(!h.provider.fleet.backend_hosts().keys.by_host.is_empty());
+                    assert_eq!(acquire(&h).index(), 2, "still places");
+
+                    let generation = h.provider.count_generation();
+                    assert!(h
+                        .provider
+                        .apply_discovery(push(&h, generation, 4, false, true)));
+                    assert!(h.provider.fleet.backend_hosts().keys.by_host.is_empty());
+                    let before = h.metrics.counts.lock().unwrap().len();
+                    assert_eq!(acquire(&h).replica(), None);
+                    assert_eq!(h.metrics.counts.lock().unwrap().len(), before, "silent");
+                }
+            }
+
+            /// A placed host id that is not a valid header value sends
+            /// neither hint: the replica hint never goes out without its
+            /// host.
+            #[tokio::test]
+            async fn invalid_host_header_value_suppresses_both_headers() {
+                let upstream = mock_upstream(None).await;
+                let bad = "bad\nhost";
+                let h = harness_on(
+                    upstream_provider(&upstream),
+                    &[(bad, 2)],
+                    4,
+                    snapshot(bad, fresh_ms(), PinTable::default()),
+                );
+                send_both(&h.provider, params("z-ai/glm-5.3-flash")).await;
+
+                let requests = upstream.received_requests().await.unwrap();
+                assert_eq!(requests.len(), 2);
+                assert_eq!(h.metrics.decisions_tagged("outcome:place"), 2);
+                assert_eq!(hints(&requests), vec![None; 2]);
+                assert_eq!(host_hints(&requests), vec![None; 2]);
+            }
+        }
+
+        #[test]
+        fn placement_request_reads_the_typed_context() {
+            let key = AffinityKey::from_bytes([3u8; 16]);
+            let mut params = placement_params(vec![user_msg("hi")]);
+            params.model = "m".to_string();
+            params.request_priority = -5;
+            params.extra = HashMap::from([
+                ("x_request_id".to_string(), "req-9".into()),
+                ("x_org_id".to_string(), "org-9".into()),
+            ]);
+            params.placement = crate::PlacementContext {
+                prompt_tokens: Some(120_000),
+                prefill_heavy: true,
+                affinity: Some(key.clone()),
+                affinity_source: AffinitySource::Prefix,
+            };
+            let req = PlacementRequest::from_params(&params);
+            assert_eq!(req.model, "m");
+            assert_eq!(req.priority, -5);
+            assert_eq!(req.request_id, "req-9");
+            assert_eq!(req.org_id, "org-9");
+            assert_eq!(req.prompt_tokens, 120_000);
+            assert!(req.prefill_heavy);
+            let fingerprint = |k: &AffinityKey| pin_id(Tier::Base, k, &PIN_SECRET).to_hex();
+            assert_eq!(
+                req.affinity.as_ref().map(fingerprint),
+                Some(fingerprint(&key))
+            );
+            assert_eq!(req.affinity_source, AffinitySource::Prefix);
+
+            // No pool context: an unknown size, short, and no affinity. A
+            // source without a key is dropped.
+            params.placement = crate::PlacementContext {
+                affinity_source: AffinitySource::Client,
+                ..Default::default()
+            };
+            let req = PlacementRequest::from_params(&params);
+            assert_eq!((req.prompt_tokens, req.prefill_heavy), (0, false));
+            assert!(req.affinity.is_none());
+            assert_eq!(req.affinity_source, AffinitySource::None);
+        }
+
+        /// Legacy affinity keys in a client's extra are never read: only the
+        /// typed context carries routing inputs.
+        #[test]
+        fn legacy_affinity_extra_is_ignored_by_placement() {
+            let mut params = placement_params(vec![user_msg("hi")]);
+            params.extra = HashMap::from([
+                ("x_placement_affinity".to_string(), "03".repeat(16).into()),
+                ("x_placement_affinity_source".to_string(), "client".into()),
+            ]);
+            let req = PlacementRequest::from_params(&params);
+            assert!(req.affinity.is_none());
+            assert_eq!(req.affinity_source, AffinitySource::None);
+        }
+
+        fn placement_params(messages: Vec<crate::ChatMessage>) -> crate::ChatCompletionParams {
+            let mut params: crate::ChatCompletionParams =
+                serde_json::from_value(serde_json::json!({"model": "m", "messages": []})).unwrap();
+            params.messages = messages;
+            params
+        }
+
+        #[test]
+        fn concurrent_try_place_does_not_herd() {
+            use std::sync::Barrier;
+
+            // Two equally scored, eligible hosts (same lifecycle, same empty
+            // load): the placer has no deterministic reason to prefer one
+            // over the other, so any imbalance would come only from a race
+            // in the ledger read-then-reserve step this test targets.
+            let built = fresh_ms();
+            let snap = Snapshot {
+                built_ms: built,
+                replicas: vec![ready_view("h-a", built), ready_view("h-b", built)],
+                ..Snapshot::default()
+            };
+            let h = harness(&[("h-a", 0), ("h-b", 1)], snap);
+            let fleet = h.provider.fleet.clone();
+            let messages = Arc::new(vec![user_msg("concurrent placement race")]);
+
+            const WORKERS: usize = 16;
+            let start = Arc::new(Barrier::new(WORKERS));
+            let (sender, receiver) = std::sync::mpsc::channel();
+            let workers: Vec<_> = (0..WORKERS)
+                .map(|_| {
+                    let fleet = fleet.clone();
+                    let messages = messages.clone();
+                    let start = start.clone();
+                    let sender = sender.clone();
+                    std::thread::spawn(move || {
+                        // Keyless requests: same model, no affinity, so every
+                        // thread reaches `try_place`'s ledger critical
+                        // section the same way.
+                        let req = request("z-ai/glm-5.3-flash");
+                        start.wait();
+                        let lease = fleet
+                            .acquire_index_placed(&messages, None, &req)
+                            .expect("placement active");
+                        sender.send(lease.index()).expect("send placed index");
+                    })
+                })
+                .collect();
+            drop(sender);
+            for worker in workers {
+                worker.join().expect("placement worker should not panic");
+            }
+
+            let mut counts = [0usize; 2];
+            for index in receiver.iter() {
+                counts[index] += 1;
+            }
+            // The ledger lock around `mine_in -> place -> index_for_host ->
+            // ledger_add` is what stops every concurrent request from
+            // reading the same "both hosts idle" view and piling onto one
+            // host. We don't assert an exact split — the placer's tie-break
+            // and OS thread scheduling aren't required to produce one — only
+            // that both equally scored hosts actually received traffic,
+            // which a herd (all N on one host) would fail.
+            assert!(
+                counts[0] > 0 && counts[1] > 0,
+                "placements herded onto one host: {counts:?}"
+            );
+        }
+    }
 }
+
+#[cfg(test)]
+mod priority_tests;

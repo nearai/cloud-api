@@ -14,6 +14,7 @@
 //! cases; model-specific pricing restrictions need separate policy.
 
 use crate::middleware::auth::AuthenticatedApiKey;
+use crate::middleware::RequestedModel;
 use crate::models::AnthropicErrorResponse;
 use crate::routes::api::AppState;
 use crate::routes::common::{
@@ -408,6 +409,7 @@ pub async fn messages(
     Extension(api_key): Extension<AuthenticatedApiKey>,
     RawQuery(query): RawQuery,
     headers: HeaderMap,
+    requested_model: RequestedModel,
     body: Bytes,
 ) -> Response {
     handle_request(
@@ -417,6 +419,7 @@ pub async fn messages(
         headers,
         body,
         AnthropicRawEndpoint::Messages,
+        requested_model,
     )
     .await
 }
@@ -435,6 +438,8 @@ pub async fn count_tokens(
         headers,
         body,
         AnthropicRawEndpoint::CountTokens,
+        // Token counting is not inference: nothing reads this slot.
+        RequestedModel::default(),
     )
     .await
 }
@@ -446,6 +451,7 @@ async fn handle_request(
     headers: HeaderMap,
     body: Bytes,
     endpoint: AnthropicRawEndpoint,
+    requested_model: RequestedModel,
 ) -> Response {
     let prepared = match prepare_request(
         &headers,
@@ -468,6 +474,9 @@ async fn handle_request(
         Ok(model) => model,
         Err(response) => return response,
     };
+    // The canonical name: the client's spelling may have been normalized
+    // before it resolved.
+    requested_model.set(&model.model_name);
 
     let billing_seed = match prepare_billing_seed(
         endpoint,

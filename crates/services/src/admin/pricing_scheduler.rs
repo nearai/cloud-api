@@ -213,6 +213,7 @@ impl ModelPricingScheduler {
             datacenters: None,
             is_ready: None,
             deprecation_date: None,
+            successor_model_name: None,
             openrouter_slug: None,
             change_reason: Some(change_reason),
             changed_by_user_id: change.created_by_user_id,

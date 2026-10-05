@@ -268,7 +268,8 @@ pub trait UsageServiceTrait: Send + Sync {
     ) -> Result<Option<OrganizationBalanceInfo>, UsageError>;
 
     /// Get usage history for an organization
-    /// Returns a tuple of (entries, total_count)
+    /// Returns a tuple of (entries, total), where total is the organization's
+    /// recorded request count rather than a scan of its rows
     async fn get_usage_history(
         &self,
         organization_id: Uuid,
@@ -354,7 +355,8 @@ pub trait UsageRepository: Send + Sync {
     ) -> anyhow::Result<Option<OrganizationBalanceInfo>>;
 
     /// Get usage history for an organization
-    /// Returns a tuple of (entries, total_count)
+    /// Returns a tuple of (entries, total), where total is the organization's
+    /// recorded request count rather than a scan of its rows
     async fn get_usage_history(
         &self,
         organization_id: Uuid,

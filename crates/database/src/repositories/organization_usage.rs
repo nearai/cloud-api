@@ -111,7 +111,7 @@ impl OrganizationUsageRepository {
                 .served_provider_type
                 .map(|provider| provider.as_str());
             let maybe_row = transaction
-                .query_opt(
+                .query_typed_opt(
                     r#"
                     INSERT INTO organization_usage_log (
                         id, organization_id, workspace_id, api_key_id,
@@ -126,35 +126,35 @@ impl OrganizationUsageRepository {
                     RETURNING *
                     "#,
                     &[
-                        &id,
-                        &request.organization_id,
-                        &request.workspace_id,
-                        &request.api_key_id,
-                        &request.model_id,
-                        &request.model_name,
-                        &request.input_tokens,
-                        &request.output_tokens,
-                        &request.cache_read_tokens,
-                        &request.cache_write_tokens,
-                        &total_tokens,
-                        &request.input_cost,
-                        &request.output_cost,
-                        &request.total_cost,
-                        &request.inference_type,
-                        &now,
-                        &request.ttft_ms,
-                        &request.avg_itl_ms,
-                        &request.inference_id,
-                        &request.provider_request_id,
-                        &stop_reason_str,
-                        &response_id_uuid,
-                        &request.image_count,
-                        &served_provider_tier,
-                        &served_provider_type,
-                        &request.served_via_fallback,
-                        &request.billing_details,
-                        &request.service_tier,
-                        &request.context_band,
+                        (&id, Type::UUID),
+                        (&request.organization_id, Type::UUID),
+                        (&request.workspace_id, Type::UUID),
+                        (&request.api_key_id, Type::UUID),
+                        (&request.model_id, Type::UUID),
+                        (&request.model_name, Type::VARCHAR),
+                        (&request.input_tokens, Type::INT4),
+                        (&request.output_tokens, Type::INT4),
+                        (&request.cache_read_tokens, Type::INT4),
+                        (&request.cache_write_tokens, Type::INT4),
+                        (&total_tokens, Type::INT4),
+                        (&request.input_cost, Type::INT8),
+                        (&request.output_cost, Type::INT8),
+                        (&request.total_cost, Type::INT8),
+                        (&request.inference_type, Type::VARCHAR),
+                        (&now, Type::TIMESTAMPTZ),
+                        (&request.ttft_ms, Type::INT4),
+                        (&request.avg_itl_ms, Type::FLOAT8),
+                        (&request.inference_id, Type::UUID),
+                        (&request.provider_request_id, Type::VARCHAR),
+                        (&stop_reason_str, Type::VARCHAR),
+                        (&response_id_uuid, Type::UUID),
+                        (&request.image_count, Type::INT4),
+                        (&served_provider_tier, Type::TEXT),
+                        (&served_provider_type, Type::TEXT),
+                        (&request.served_via_fallback, Type::BOOL),
+                        (&request.billing_details, Type::JSONB),
+                        (&request.service_tier, Type::TEXT),
+                        (&request.context_band, Type::TEXT),
                     ],
                 )
                 .await
@@ -171,7 +171,7 @@ impl OrganizationUsageRepository {
                     )
                     .await?;
                     let row = transaction
-                        .query_one(
+                        .query_typed_one(
                             r#"
                             UPDATE organization_usage_log
                             SET funded_amount = $2, unfunded_amount = $3,
@@ -180,17 +180,17 @@ impl OrganizationUsageRepository {
                             RETURNING *
                             "#,
                             &[
-                                &id,
-                                &allocation.funded_amount,
-                                &allocation.unfunded_amount,
-                                &self.allocation_policy.version,
+                                (&id, Type::UUID),
+                                (&allocation.funded_amount, Type::INT8),
+                                (&allocation.unfunded_amount, Type::INT8),
+                                (&self.allocation_policy.version, Type::VARCHAR),
                             ],
                         )
                         .await
                         .map_err(map_db_error)?;
                     // New insert succeeded — update organization balance
                     transaction
-                        .execute(
+                        .execute_typed(
                             r#"
                             INSERT INTO organization_balance (
                                 organization_id,
@@ -208,11 +208,11 @@ impl OrganizationUsageRepository {
                                 updated_at = $5
                             "#,
                             &[
-                                &request.organization_id,
-                                &request.total_cost,
-                                &now,
-                                &(total_tokens as i64),
-                                &now,
+                                (&request.organization_id, Type::UUID),
+                                (&request.total_cost, Type::INT8),
+                                (&now, Type::TIMESTAMPTZ),
+                                (&(total_tokens as i64), Type::INT8),
+                                (&now, Type::TIMESTAMPTZ),
                             ],
                         )
                         .await
@@ -232,14 +232,17 @@ impl OrganizationUsageRepository {
                     );
 
                     let existing = client
-                        .query_one(
+                        .query_typed_one(
                             r#"
                             SELECT usage_log.*
                             FROM organization_usage_log usage_log
                             WHERE usage_log.organization_id = $1
                               AND usage_log.inference_id = $2
                             "#,
-                            &[&request.organization_id, &request.inference_id],
+                            &[
+                                (&request.organization_id, Type::UUID),
+                                (&request.inference_id, Type::UUID),
+                            ],
                         )
                         .await
                         .map_err(map_db_error)?;

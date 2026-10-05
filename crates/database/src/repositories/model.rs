@@ -270,7 +270,7 @@ impl ModelRepository {
                 .map_err(RepositoryError::PoolError)?;
 
             client
-                .query(
+                .query_typed(
                     r#"
                     SELECT
                         id, model_name, model_display_name, model_description, model_icon,
@@ -281,7 +281,7 @@ impl ModelRepository {
                     FROM models
                     WHERE id = $1
                     "#,
-                    &[&model_id],
+                    &[(model_id, Type::UUID)],
                 )
                 .await
                 .map_err(map_db_error)

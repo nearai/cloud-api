@@ -3221,7 +3221,9 @@ pub struct AdminApiKeyResponse {
     pub is_active: bool,
     /// Set when the key was revoked
     pub deleted_at: Option<DateTime<Utc>>,
-    /// True when the key was provisioned by the Cloud UI's managed Playground
+    /// True when the key's name matches the Cloud UI's managed Playground key
+    /// naming (`Playground-<uuid>-g<generation>`). Best-effort: derived from the
+    /// user-editable key name, not stored provenance.
     pub is_managed_playground: bool,
 }
 

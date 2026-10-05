@@ -155,6 +155,35 @@ async fn test_admin_list_api_keys_filters_scope_results() {
 }
 
 #[tokio::test]
+async fn test_admin_list_api_keys_includes_keys_on_date_bounds() {
+    let server = setup_test_server().await;
+    let org = create_org(&server).await;
+    let _ = get_api_key_for_org(&server, org.id.clone()).await;
+
+    let response = list_admin_api_keys(&server, &format!("organization_id={}", org.id)).await;
+    assert_eq!(response.status_code(), 200);
+    let created_at = response
+        .json::<api::models::ListAdminApiKeysResponse>()
+        .api_keys[0]
+        .created_at
+        .to_rfc3339_opts(chrono::SecondsFormat::AutoSi, true);
+
+    // Both bounds equal to the key's exact created_at: inclusive bounds keep it.
+    let response = list_admin_api_keys(
+        &server,
+        &format!(
+            "organization_id={}&created_after={created_at}&created_before={created_at}",
+            org.id
+        ),
+    )
+    .await;
+    assert_eq!(response.status_code(), 200);
+    let body = response.json::<api::models::ListAdminApiKeysResponse>();
+    assert_eq!(body.total, 1);
+    assert_eq!(body.api_keys.len(), 1);
+}
+
+#[tokio::test]
 async fn test_admin_list_api_keys_rejects_invalid_params() {
     let server = setup_test_server().await;
 

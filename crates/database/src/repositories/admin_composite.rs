@@ -117,6 +117,11 @@ fn row_to_admin_org_info(row: &tokio_postgres::Row) -> AdminOrganizationInfo {
 /// Prisma `uuid()` (see nearai-cloud-ui `lib/playground/service.ts`). The UI
 /// rejects renames of managed keys, so the name is a stable marker. Keep this in
 /// sync with the UI if its naming changes.
+///
+/// Best-effort: key names are user-supplied and the API rename endpoint does not
+/// know about managed keys, so a regular key deliberately given a matching name
+/// is reported as managed, and a managed key renamed through the API directly
+/// (bypassing the UI) is not.
 const MANAGED_PLAYGROUND_KEY_NAME_PATTERN: &str =
     "^Playground-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}-g[0-9]+$";
 

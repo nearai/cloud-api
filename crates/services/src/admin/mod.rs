@@ -1187,6 +1187,33 @@ impl AdminService for AdminServiceImpl {
         Ok((organizations, total))
     }
 
+    async fn list_api_keys(
+        &self,
+        filters: AdminApiKeyFilters,
+        limit: i64,
+        offset: i64,
+    ) -> Result<(Vec<AdminApiKeyInfo>, i64), AdminError> {
+        if let (Some(created_after), Some(created_before)) =
+            (filters.created_after, filters.created_before)
+        {
+            if created_after > created_before {
+                return Err(AdminError::InvalidParams(
+                    "created_after must be before created_before".to_string(),
+                ));
+            }
+        }
+
+        let (api_keys_result, total_result) = tokio::join!(
+            self.repository.list_all_api_keys(&filters, limit, offset),
+            self.repository.count_all_api_keys(&filters)
+        );
+
+        let api_keys = api_keys_result.map_err(|e| AdminError::InternalError(e.to_string()))?;
+        let total = total_result.map_err(|e| AdminError::InternalError(e.to_string()))?;
+
+        Ok((api_keys, total))
+    }
+
     async fn get_organization(
         &self,
         organization_id: uuid::Uuid,

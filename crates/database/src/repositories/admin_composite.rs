@@ -7,10 +7,11 @@ use crate::repositories::{
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use services::admin::{
-    AdminModelInfo, AdminOrganizationInfo, AdminOrganizationMemberInfo, AdminRepository,
-    DeprecateModelOutcome, ModelDeprecationDeliveryRecord, ModelDeprecationEmailStatus,
-    ModelDeprecationModel, ModelDeprecationRecipient, ModelHistoryEntry, ModelPricing,
-    ModelPricingSnapshot, ModelValidationState, OrganizationLimits, OrganizationLimitsHistoryEntry,
+    AdminApiKeyFilters, AdminApiKeyInfo, AdminModelInfo, AdminOrganizationInfo,
+    AdminOrganizationMemberInfo, AdminRepository, DeprecateModelOutcome,
+    ModelDeprecationDeliveryRecord, ModelDeprecationEmailStatus, ModelDeprecationModel,
+    ModelDeprecationRecipient, ModelHistoryEntry, ModelPricing, ModelPricingSnapshot,
+    ModelValidationState, OrganizationLimits, OrganizationLimitsHistoryEntry,
     OrganizationLimitsUpdate, PlatformServiceInfo, PricingChangeDeliveryRecord,
     PricingChangeOpenConflictError, PricingChangeRecipientRow, ScheduledPricingChange,
     ScheduledPricingChangeInsert, ScheduledPricingChangeStatus, UpdateModelAdminRequest, UserInfo,
@@ -108,6 +109,34 @@ fn row_to_admin_org_info(row: &tokio_postgres::Row) -> AdminOrganizationInfo {
         total_requests: row.get("total_requests"),
         total_tokens: row.get("total_tokens"),
         created_at: row.get("created_at"),
+    }
+}
+
+/// Name pattern of API keys provisioned by the Cloud UI's managed Playground:
+/// `Playground-${credential.id}-g${generation}`, where `credential.id` is a
+/// Prisma `uuid()` (see nearai-cloud-ui `lib/playground/service.ts`). The UI
+/// rejects renames of managed keys, so the name is a stable marker. Keep this in
+/// sync with the UI if its naming changes.
+///
+/// Best-effort: key names are user-supplied and the API rename endpoint does not
+/// know about managed keys, so a regular key deliberately given a matching name
+/// is reported as managed, and a managed key renamed through the API directly
+/// (bypassing the UI) is not.
+const MANAGED_PLAYGROUND_KEY_NAME_PATTERN: &str =
+    "^Playground-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}-g[0-9]+$";
+
+/// Map a row from the admin API key SELECT to `AdminApiKeyInfo`.
+fn row_to_admin_api_key_info(row: &tokio_postgres::Row) -> AdminApiKeyInfo {
+    AdminApiKeyInfo {
+        id: row.get("id"),
+        organization_id: row.get("organization_id"),
+        organization_name: row.get("organization_name"),
+        workspace_id: row.get("workspace_id"),
+        created_by_user_id: row.get("created_by_user_id"),
+        created_at: row.get("created_at"),
+        is_active: row.get("is_active"),
+        deleted_at: row.get("deleted_at"),
+        is_managed_playground: row.get("is_managed_playground"),
     }
 }
 
@@ -1613,6 +1642,74 @@ impl AdminRepository for AdminCompositeRepository {
                 WHERE is_active = true
                 "#,
                 &[],
+            )
+            .await?;
+
+        Ok(row.get::<_, i64>("count"))
+    }
+
+    async fn list_all_api_keys(
+        &self,
+        filters: &AdminApiKeyFilters,
+        limit: i64,
+        offset: i64,
+    ) -> Result<Vec<AdminApiKeyInfo>> {
+        let client = self.pool.get().await?;
+
+        let rows = client
+            .query(
+                r#"
+                SELECT
+                    ak.id,
+                    w.organization_id,
+                    o.name AS organization_name,
+                    ak.workspace_id,
+                    ak.created_by_user_id,
+                    ak.created_at,
+                    ak.is_active,
+                    ak.deleted_at,
+                    ak.name ~ $1 AS is_managed_playground
+                FROM api_keys ak
+                JOIN workspaces w ON w.id = ak.workspace_id
+                JOIN organizations o ON o.id = w.organization_id
+                WHERE ($2::uuid IS NULL OR w.organization_id = $2)
+                  AND ($3::timestamptz IS NULL OR ak.created_at >= $3)
+                  AND ($4::timestamptz IS NULL OR ak.created_at <= $4)
+                ORDER BY ak.created_at DESC, ak.id DESC
+                LIMIT $5 OFFSET $6
+                "#,
+                &[
+                    &MANAGED_PLAYGROUND_KEY_NAME_PATTERN,
+                    &filters.organization_id,
+                    &filters.created_after,
+                    &filters.created_before,
+                    &limit,
+                    &offset,
+                ],
+            )
+            .await?;
+
+        Ok(rows.iter().map(row_to_admin_api_key_info).collect())
+    }
+
+    async fn count_all_api_keys(&self, filters: &AdminApiKeyFilters) -> Result<i64> {
+        let client = self.pool.get().await?;
+
+        let row = client
+            .query_one(
+                r#"
+                SELECT COUNT(*) AS count
+                FROM api_keys ak
+                JOIN workspaces w ON w.id = ak.workspace_id
+                WHERE ($1::uuid IS NULL OR w.organization_id = $1)
+                  AND ($2::timestamptz IS NULL OR ak.created_at >= $2)
+                  AND ($3::timestamptz IS NULL OR ak.created_at <= $3)
+                "#,
+                &[
+                    &filters.organization_id,
+                    &filters.created_after,
+                    &filters.created_before,
+                ],
             )
             .await?;
 

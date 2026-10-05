@@ -98,6 +98,7 @@ mod session_logout;
 mod signature_verification;
 mod systemone;
 mod usage_chat_completions;
+mod usage_history_bounds;
 mod usage_hourly;
 mod usage_provider_attribution;
 mod usage_recording;

@@ -53,6 +53,7 @@ const PLACEMENT_FIELDS: &[&str] = &[
     "affinity_eps",
     "kv_max",
     "lane_load_tokens",
+    "pin_hold_factor",
     "pin_ttl_ms",
 ];
 
@@ -68,6 +69,9 @@ pub struct PlacementTuning {
     /// Load at or above which a replica is a heavy-lane member
     /// (4000 - 1000000).
     pub lane_load_tokens: i64,
+    /// Scale on the prompt's cold-prefill cost in the pin-hold test
+    /// (0.5 - 2.0).
+    pub pin_hold_factor: f64,
     /// How long a follow pin stays valid, in ms (60000 - 3600000).
     pub pin_ttl_ms: i64,
 }
@@ -85,6 +89,7 @@ impl From<Tuning> for PlacementTuning {
             affinity_eps: t.affinity_eps,
             kv_max: t.kv_max,
             lane_load_tokens: t.lane_load_tokens as i64,
+            pin_hold_factor: t.pin_hold_factor,
             pin_ttl_ms: t.pin_ttl_ms as i64,
         }
     }
@@ -115,6 +120,7 @@ impl PlacementTuning {
         float("affinity_eps", self.affinity_eps, 0.0, 2.0)?;
         float("kv_max", self.kv_max, 0.5, 1.0)?;
         int("lane_load_tokens", self.lane_load_tokens, 4_000, 1_000_000)?;
+        float("pin_hold_factor", self.pin_hold_factor, 0.5, 2.0)?;
         int("pin_ttl_ms", self.pin_ttl_ms, 60_000, 3_600_000)?;
         Ok(())
     }
@@ -126,6 +132,7 @@ impl PlacementTuning {
             affinity_eps: self.affinity_eps,
             kv_max: self.kv_max,
             lane_load_tokens: self.lane_load_tokens as u64,
+            pin_hold_factor: self.pin_hold_factor,
             pin_ttl_ms: self.pin_ttl_ms as u64,
         }
     }
@@ -500,6 +507,10 @@ mod tests {
                 vec![json!(3_999), json!(1_000_001), json!(0), json!(-1)],
             ),
             (
+                "pin_hold_factor",
+                vec![json!(0.49), json!(2.01), json!(0), json!(-1)],
+            ),
+            (
                 "pin_ttl_ms",
                 vec![json!(59_999), json!(3_600_001), json!(0), json!(-1)],
             ),
@@ -559,6 +570,10 @@ mod tests {
                     kv_max: bad,
                     ..Default::default()
                 },
+                PlacementTuning {
+                    pin_hold_factor: bad,
+                    ..Default::default()
+                },
             ] {
                 assert!(tuning.validate().is_err());
             }
@@ -572,6 +587,7 @@ mod tests {
             affinity_eps: 0.0,
             kv_max: 0.5,
             lane_load_tokens: 4_000,
+            pin_hold_factor: 0.5,
             pin_ttl_ms: 60_000,
         };
         let hi = PlacementTuning {
@@ -579,6 +595,7 @@ mod tests {
             affinity_eps: 2.0,
             kv_max: 1.0,
             lane_load_tokens: 1_000_000,
+            pin_hold_factor: 2.0,
             pin_ttl_ms: 3_600_000,
         };
         assert!(lo.validate().is_ok());
@@ -595,7 +612,8 @@ mod tests {
             v.value,
             json!({
                 "affinity_abs_slack": 0.25, "affinity_eps": 0.25, "kv_max": 0.95,
-                "lane_load_tokens": 64_000, "pin_ttl_ms": 600_000
+                "lane_load_tokens": 64_000, "pin_hold_factor": 1.0,
+                "pin_ttl_ms": 600_000
             })
         );
         assert_eq!(v.updated_at, None);
@@ -622,9 +640,14 @@ mod tests {
 
         // A second patch to another field keeps the first.
         let v = svc
-            .update(KEY_PLACEMENT, json!({"pin_ttl_ms": 120_000}), admin)
+            .update(
+                KEY_PLACEMENT,
+                json!({"pin_ttl_ms": 120_000, "pin_hold_factor": 1.25}),
+                admin,
+            )
             .await
             .unwrap();
+        assert_eq!(v.value["pin_hold_factor"], json!(1.25));
         assert_eq!(v.value["kv_max"], json!(0.9));
         assert_eq!(v.value["pin_ttl_ms"], json!(120_000));
         assert_eq!(v.value["affinity_eps"], json!(0.25));
@@ -632,6 +655,7 @@ mod tests {
             **handle.load(),
             Tuning {
                 kv_max: 0.9,
+                pin_hold_factor: 1.25,
                 pin_ttl_ms: 120_000,
                 ..d
             },
@@ -648,11 +672,12 @@ mod tests {
         assert_eq!(v.value["pin_ttl_ms"], json!(120_000));
         assert_eq!(
             repo.rows.lock().unwrap()[KEY_PLACEMENT].value,
-            json!({"pin_ttl_ms": 120_000})
+            json!({"pin_ttl_ms": 120_000, "pin_hold_factor": 1.25})
         );
         assert_eq!(
             **handle.load(),
             Tuning {
+                pin_hold_factor: 1.25,
                 pin_ttl_ms: 120_000,
                 ..d
             }

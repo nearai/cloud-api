@@ -585,6 +585,30 @@ pub struct AdminOrganizationInfo {
     pub created_at: chrono::DateTime<chrono::Utc>,
 }
 
+/// API key metadata for admin listing. Carries no key material (hash, prefix,
+/// raw key) and no user-supplied key name.
+#[derive(Debug, Clone)]
+pub struct AdminApiKeyInfo {
+    pub id: uuid::Uuid,
+    pub organization_id: uuid::Uuid,
+    pub organization_name: String,
+    pub workspace_id: uuid::Uuid,
+    pub created_by_user_id: uuid::Uuid,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+    pub is_active: bool,
+    pub deleted_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// True when the key was provisioned by the Cloud UI's managed Playground.
+    pub is_managed_playground: bool,
+}
+
+/// Filters for the admin API key listing. Date bounds are inclusive.
+#[derive(Debug, Clone, Default)]
+pub struct AdminApiKeyFilters {
+    pub organization_id: Option<uuid::Uuid>,
+    pub created_after: Option<chrono::DateTime<chrono::Utc>>,
+    pub created_before: Option<chrono::DateTime<chrono::Utc>>,
+}
+
 /// A single organization member with full user details (admin view).
 ///
 /// Unlike the member-facing `/v1/organizations/{id}/members` endpoint (which
@@ -620,6 +644,8 @@ pub enum AdminError {
     PricingChangeConflict(String),
     #[error("Pricing change not found: {0}")]
     PricingChangeNotFound(String),
+    #[error("Invalid parameters: {0}")]
+    InvalidParams(String),
     #[error("Unauthorized: {0}")]
     Unauthorized(String),
     #[error("Analytics query exceeded its statement budget")]
@@ -911,6 +937,18 @@ pub trait AdminRepository: Send + Sync {
     /// Count all active organizations (admin only)
     async fn count_all_organizations(&self) -> Result<i64, anyhow::Error>;
 
+    /// List API keys across all organizations, newest first (admin only).
+    /// Includes revoked and inactive keys.
+    async fn list_all_api_keys(
+        &self,
+        filters: &AdminApiKeyFilters,
+        limit: i64,
+        offset: i64,
+    ) -> Result<Vec<AdminApiKeyInfo>, anyhow::Error>;
+
+    /// Count API keys matching the admin listing filters (admin only)
+    async fn count_all_api_keys(&self, filters: &AdminApiKeyFilters) -> Result<i64, anyhow::Error>;
+
     /// Fetch a single active organization by id with spend limit and usage
     /// (admin only). Returns `None` if not found or inactive.
     async fn get_organization(
@@ -1152,6 +1190,15 @@ pub trait AdminService: Send + Sync {
         limit: i64,
         offset: i64,
     ) -> Result<(Vec<AdminOrganizationInfo>, i64), AdminError>;
+
+    /// List API keys across all organizations with pagination (admin only).
+    /// Returns `InvalidParams` when `created_after` is later than `created_before`.
+    async fn list_api_keys(
+        &self,
+        filters: AdminApiKeyFilters,
+        limit: i64,
+        offset: i64,
+    ) -> Result<(Vec<AdminApiKeyInfo>, i64), AdminError>;
 
     /// Get a single organization by id (admin only). Returns
     /// `OrganizationNotFound` if it does not exist or is inactive.

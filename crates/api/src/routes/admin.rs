@@ -2415,7 +2415,8 @@ fn admin_error_to_response(
     match e {
         services::admin::AdminError::InvalidDeprecation(msg)
         | services::admin::AdminError::InvalidPricing(msg)
-        | services::admin::AdminError::InvalidLimits(msg) => (
+        | services::admin::AdminError::InvalidLimits(msg)
+        | services::admin::AdminError::InvalidParams(msg) => (
             StatusCode::BAD_REQUEST,
             ResponseJson(ErrorResponse::new(msg, "invalid_request".to_string())),
         ),

@@ -3207,6 +3207,33 @@ pub struct ListOrganizationsAdminResponse {
     pub offset: i64,
 }
 
+/// API key metadata for admin listing. Never includes key material (raw key,
+/// hash, or prefix) or the user-supplied key name.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct AdminApiKeyResponse {
+    pub id: String,
+    pub organization_id: String,
+    pub organization_name: String,
+    pub workspace_id: String,
+    /// User who created the key
+    pub created_by_user_id: String,
+    pub created_at: DateTime<Utc>,
+    pub is_active: bool,
+    /// Set when the key was revoked
+    pub deleted_at: Option<DateTime<Utc>>,
+    /// True when the key was provisioned by the Cloud UI's managed Playground
+    pub is_managed_playground: bool,
+}
+
+/// List API keys response model (admin only)
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct ListAdminApiKeysResponse {
+    pub api_keys: Vec<AdminApiKeyResponse>,
+    pub total: i64,
+    pub limit: i64,
+    pub offset: i64,
+}
+
 /// List organization members response model (admin only).
 /// Exposes full user details (email, last login, active status) for each member.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]

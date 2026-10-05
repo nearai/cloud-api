@@ -2390,7 +2390,7 @@ fn build_admin_routes_with_options(
         get_organization_priority, get_organization_timeseries, get_performance_timeseries,
         get_platform_metrics, get_platform_timeseries, get_revenue_density,
         list_admin_access_tokens, list_admin_settings, list_aml_allowlist, list_aml_reports,
-        list_invitation_email_deliveries, list_model_pricing_changes,
+        list_api_keys, list_invitation_email_deliveries, list_model_pricing_changes,
         list_models as admin_list_models, list_organization_members, list_organizations,
         list_users, preview_model_deprecation, preview_model_pricing_changes,
         resend_invitation_email, update_admin_setting, update_aml_report_status,
@@ -2623,6 +2623,7 @@ fn build_admin_routes_with_options(
             "/admin/organizations",
             axum::routing::get(list_organizations),
         )
+        .route("/admin/api-keys", axum::routing::get(list_api_keys))
         .route(
             "/admin/organizations/{org_id}",
             axum::routing::get(get_admin_organization),

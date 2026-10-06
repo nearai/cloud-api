@@ -42,8 +42,10 @@ pub(in crate::attestation) fn decode_nonce_hex(nonce: &str) -> Result<Vec<u8>, A
 /// before using the returned key). Every other parameter that changes the report
 /// contents IS part of the key, so a request can never receive a report built
 /// for a different model / algo / tls-fingerprint / provider tier / signing
-/// address. `signing_algo` is lowercased and defaulted to match the service's
-/// own algo normalization.
+/// address. `signing_algo` is the output of [`normalize_signing_algo`]. An
+/// omitted algorithm keys separately from an explicit `ed25519`: the gateway
+/// quote defaults to ed25519, but the model backend applies its own default
+/// (ecdsa on inference-proxy), so the two requests get different reports.
 fn report_cache_key(
     model: Option<&str>,
     signing_algo: Option<&str>,
@@ -54,17 +56,26 @@ fn report_cache_key(
     format!(
         "m={}|a={}|tls={}|pf={}|sa={}",
         model.unwrap_or("*"),
-        signing_algo.unwrap_or("ed25519").to_ascii_lowercase(),
+        signing_algo.unwrap_or("-"),
         include_tls_fingerprint,
         provider_filter.map(|t| t.as_str()).unwrap_or("-"),
         signing_address.unwrap_or("-"),
     )
 }
 
-fn normalize_signing_algo(signing_algo: Option<&str>) -> Result<String, AttestationError> {
-    let algo = signing_algo
-        .map(str::to_lowercase)
-        .unwrap_or_else(|| "ed25519".to_string());
+/// Gateway quote algorithm when the caller does not choose one.
+const DEFAULT_GATEWAY_SIGNING_ALGO: &str = "ed25519";
+
+/// Validate and lowercase the caller's `signing_algo`. This is the only place
+/// the value is normalized: the cache key, the gateway quote and the request
+/// forwarded to the model backend all use the result, because model backends
+/// accept only the lowercase names. `None` stays `None`, so the model backend
+/// keeps applying its own default.
+fn normalize_signing_algo(signing_algo: Option<&str>) -> Result<Option<String>, AttestationError> {
+    let Some(algo) = signing_algo else {
+        return Ok(None);
+    };
+    let algo = algo.to_lowercase();
 
     if algo != "ecdsa" && algo != "ed25519" {
         return Err(AttestationError::InvalidParameter(format!(
@@ -72,7 +83,7 @@ fn normalize_signing_algo(signing_algo: Option<&str>) -> Result<String, Attestat
         )));
     }
 
-    Ok(algo)
+    Ok(Some(algo))
 }
 
 impl AttestationService {
@@ -86,6 +97,7 @@ impl AttestationService {
         provider_filter: Option<ProviderTier>,
     ) -> Result<AttestationReport, AttestationError> {
         let env_tag = format!("{TAG_ENVIRONMENT}:{}", get_environment());
+        let signing_algo = normalize_signing_algo(signing_algo.as_deref())?;
 
         // Precompute the no-nonce cache key BEFORE the params are moved into the
         // build closure below.
@@ -113,7 +125,10 @@ impl AttestationService {
                 generate_nonce_hex()
             });
             let nonce_bytes = decode_nonce_hex(&nonce)?;
-            let algo = normalize_signing_algo(signing_algo.as_deref())?;
+            let algo = signing_algo
+                .as_deref()
+                .unwrap_or(DEFAULT_GATEWAY_SIGNING_ALGO)
+                .to_string();
 
             // Resolve model alias synchronously (fast DB lookup ~10 ms) before
             // spawning the parallel futures below.
@@ -125,11 +140,7 @@ impl AttestationService {
                     .map_err(|e| {
                         AttestationError::ProviderError(format!("Failed to resolve model: {e}"))
                     })?
-                    .ok_or_else(|| {
-                        AttestationError::ProviderError(format!(
-                            "Model '{m}' not found. It's not a valid model name or alias."
-                        ))
-                    })?;
+                    .ok_or_else(|| AttestationError::UnknownModel(m.clone()))?;
                 let canonical = resolved_model.model_name.clone();
                 if &canonical != m {
                     tracing::debug!(
@@ -201,6 +212,7 @@ impl AttestationService {
                     if let Some(canonical) = resolved_canonical {
                         pool.get_attestation_report(
                             canonical,
+                            // Normalized above; `None` keeps the backend's default.
                             signing_algo,
                             // Key fix: only forward the nonce when the caller supplied one.
                             // When None, inference-proxy serves its 5-min cached report
@@ -288,7 +300,8 @@ impl AttestationService {
 
 #[cfg(test)]
 mod cache_key_tests {
-    use super::report_cache_key;
+    use super::{normalize_signing_algo, report_cache_key};
+    use crate::attestation::AttestationError;
     use inference_providers::ProviderTier;
 
     #[test]
@@ -304,16 +317,37 @@ mod cache_key_tests {
     }
 
     #[test]
-    fn algo_defaults_and_lowercases() {
-        // None defaults to ed25519; case is normalized so ECDSA and ecdsa collide.
-        assert_eq!(
-            report_cache_key(Some("m"), None, false, None, None),
-            report_cache_key(Some("m"), Some("ed25519"), false, None, None),
-        );
-        assert_eq!(
-            report_cache_key(Some("m"), Some("ECDSA"), false, None, None),
-            report_cache_key(Some("m"), Some("ecdsa"), false, None, None),
-        );
+    fn normalize_lowercases_and_keeps_omitted_algo_unset() {
+        for (input, expected) in [
+            ("ECDSA", "ecdsa"),
+            ("ecdsa", "ecdsa"),
+            ("Ed25519", "ed25519"),
+            ("ED25519", "ed25519"),
+        ] {
+            assert_eq!(
+                normalize_signing_algo(Some(input)).unwrap().as_deref(),
+                Some(expected)
+            );
+        }
+        assert_eq!(normalize_signing_algo(None).unwrap(), None);
+        assert!(matches!(
+            normalize_signing_algo(Some("rsa")),
+            Err(AttestationError::InvalidParameter(_))
+        ));
+    }
+
+    #[test]
+    fn algo_casings_share_a_key_but_omitted_algo_does_not() {
+        let key = |algo: Option<&str>| {
+            let algo = normalize_signing_algo(algo).unwrap();
+            report_cache_key(Some("m"), algo.as_deref(), false, None, None)
+        };
+        assert_eq!(key(Some("ECDSA")), key(Some("ecdsa")));
+        assert_eq!(key(Some("Ed25519")), key(Some("ed25519")));
+        // The gateway defaults to ed25519 but the model backend defaults to
+        // ecdsa, so an omitted algo must not be served an explicit-ed25519
+        // report (or vice versa).
+        assert_ne!(key(None), key(Some("ed25519")));
     }
 
     #[test]

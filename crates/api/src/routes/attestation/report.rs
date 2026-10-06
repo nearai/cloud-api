@@ -155,7 +155,7 @@ impl From<services::attestation::models::AttestationReport> for AttestationRespo
     ),
     responses(
         (status = 200, description = "Attestation report retrieved", body = AttestationResponse),
-        (status = 400, description = "Invalid nonce format", body = ErrorResponse),
+        (status = 400, description = "Invalid nonce, signing_algo or provider, or unknown model", body = ErrorResponse),
         (status = 401, description = "Missing or invalid API key", body = ErrorResponse),
         (status = 503, description = "Service unavailable", body = ErrorResponse)
     ),

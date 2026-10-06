@@ -207,8 +207,8 @@ impl ChutesInstanceVerifier for ChutesBackendVerifier {
 
 /// A vetted snapshot of Chutes' published golden measurements (from the public
 /// `GET https://api.chutes.ai/servers/tee/measurements`) across the software
-/// releases we accept (**v1.3.0** and the **v1.3.1** family) and all of Chutes'
-/// GPU hardware platforms.
+/// releases we accept (**v1.3.0**, the **v1.3.1** family, and the live-observed
+/// rows of **v1.4.0** / **v1.4.1**) across Chutes' GPU hardware platforms.
 ///
 /// Within a single software release the hardware rows are byte-identical on MRTD
 /// (firmware), RTMR1 (kernel), RTMR2 (cmdline/initrd) **and the runtime RTMR3**
@@ -218,8 +218,8 @@ impl ChutesInstanceVerifier for ChutesBackendVerifier {
 /// published RTMR0 lets a request land on any of Chutes' vetted hardware
 /// platforms while still authenticating the full software stack against a fixed,
 /// per-release identity. A *different* software release (v1.3.0 vs v1.3.1 vs
-/// v1.3.1-rc1) is a distinct identity (different MRTD and/or RTMR1/2/3) and is
-/// listed as its own family below.
+/// v1.3.1-rc1 vs v1.4.0 vs v1.4.1) is a distinct identity (different MRTD and/or
+/// RTMR1/2/3) and is listed as its own family below.
 ///
 /// Live cross-checks against genuine, DCAP-signature-verified, report-data-bound
 /// quotes (the measurement check runs only *after* the Intel signature chain and
@@ -240,6 +240,11 @@ impl ChutesInstanceVerifier for ChutesBackendVerifier {
 ///   previous snapshot, so every instance failed closed.
 /// - `8xh200 [10.1.0-flat] v1.3.1` — **GLM-5.1-TEE**, observed live the same way
 ///   (2026-07-06).
+/// - `8xb300 [10.2.1, numa-256c] v1.3.1`, two `v1.4.0` rows and seven `v1.4.1`
+///   rows — observed in production's fail-closed reject path between 2026-09-28
+///   and 2026-10-05 (kimi-k3 on the `8xb300` rows; kimi-k2.6, deepseek-v3.2 and
+///   qwen3.5-397b on the `8xh200` rows). Each of the ten register sets matches a
+///   published row on all five full register values.
 ///
 /// ⚠️ Chutes re-measures and re-publishes hardware rows *within* a release as
 /// they roll out platform updates — the bracketed suffixes (`[10.2.1]`,
@@ -263,11 +268,25 @@ impl ChutesInstanceVerifier for ChutesBackendVerifier {
 /// v1.3.1 MRTD/RTMR1/RTMR2/runtime-RTMR3 software identity and differ only in
 /// per-hardware RTMR0.
 ///
+/// Resync #4 fetched the published measurements on 2026-10-05, after Chutes
+/// moved instances to the v1.4.0 and v1.4.1 images. Unlike the earlier resyncs
+/// it does **not** take the full published family. A row was added only if it
+/// is in the published feed **and** the same five full register values were
+/// logged by production's reject path for a quote that had already passed the
+/// Intel signature chain, the TCB floor, the debug-bit check and the
+/// report_data bindings. That yields one more v1.3.1 hardware row, two v1.4.0
+/// rows and seven v1.4.1 rows. v1.4.0 and v1.4.1 keep the v1.3.1 MRTD, share a
+/// new RTMR1, and each has its own RTMR2 and runtime RTMR3. The cost of this
+/// stricter rule is the one the warning above describes: a published v1.4.x
+/// hardware row that has not been observed yet fails closed until it is vetted.
+///
 /// NOT included (fail-closed): the v1.0.0–v1.2.0 rows publish RTMR3 = all-zeros
 /// (a boot template, never matchable against a live extended RTMR3 — the running
 /// app is unmeasured). Both v1.3.1 and v1.3.1-rc1 publish a non-zero runtime
-/// RTMR3, so the app/IMA layer is genuinely measured. Anything not listed here is
-/// rejected.
+/// RTMR3, so the app/IMA layer is genuinely measured. Also not included: the
+/// published v1.4.0 / v1.4.1 hardware rows never observed in a signature-verified
+/// quote, and the whole of v1.5.0 (published, never observed live). Anything not
+/// listed here is rejected.
 pub fn vetted_golden_measurements() -> ChutesMeasurementPolicy {
     // Each family shares one software identity (MRTD/RTMR1/RTMR2/runtime-RTMR3);
     // only RTMR0 (the per-hardware boot/VM-config register) varies across rows.
@@ -316,7 +335,8 @@ pub fn vetted_golden_measurements() -> ChutesMeasurementPolicy {
         // Final v1.3.1 software identity — GLM-5.2-TEE's fleet since Chutes
         // promoted it off the release candidate. Same MRTD as -rc1, distinct
         // RTMR1/2/3. Full published hardware family (resynced 2026-07-06, then
-        // purely additively on 2026-08-12 for new hardware provisioning);
+        // purely additively on 2026-08-12 for new hardware provisioning and on
+        // 2026-10-05 for `8xb300 [10.2.1, numa-256c]`, observed live);
         // `8xb200 [10.2.1]` (GLM-5.2-TEE) and `8xh200 [10.1.0-flat]`
         // (GLM-5.1-TEE) are live cross-checked against signature-verified,
         // nonce-bound prod quotes (2026-07-06). The previous snapshot's plain
@@ -352,6 +372,43 @@ pub fn vetted_golden_measurements() -> ChutesMeasurementPolicy {
                 ("8xb200 [10.2.1, XEON6, 272CPU]", "9673907ceb0c9ca79337437bb91695e7a3d19e82df1e41de1b0d2db8081fccb5d82f26d479a5016553cb20964d5948b9"),
                 ("8xb200 [10.2.1, XEON6, SNC3]", "ccef43242ef633a542405dbfe55d04d823a50586b0a07510d058ea88ad8d1f8281f227f00c664435d92b23431c4d1c3c"),
                 ("8xb200 [10.2.1, ubuntu3]", "ff42d0f7b03cbe84f9e252d8f912b465852c8ee92584c5c047de134a46c8f1e1545683e713bbdd64e2af7d10e8bafaae"),
+                ("8xb300 [10.2.1, numa-256c]", "f24aaec75a6c8783222ab141f003f2180fce573ef9cc6ea3dcdc2fcb91c051650fcd74ec85f02e367f06ed71328d319b"),
+            ],
+        },
+        // v1.4.0 software identity — same MRTD as v1.3.1, new RTMR1/2/3. Only
+        // the two hardware rows observed in signature-verified production
+        // quotes (2026-09-28 → 2026-10-05) are pinned; the other published
+        // v1.4.0 rows stay rejected until they are vetted the same way.
+        Family {
+            version: "1.4.0",
+            mrtd: "261ce538b435e2d0e85fc97e254bc99154c507b7a8e13d59b69f8532384f1d0bfaadfddf3fccc6e0a411203840bbee8d",
+            rtmr1: "d3a862ff47357f374fc72c7f02a480a13790d1805e24aaa8de1f03994256625ce0f593ae35ea8f0c24d09f7df36cb0ed",
+            rtmr2: "8feee49b83c0f912f9ab9366a7423f65417bb60223c1871a5d55e84d92d741c80017b3f856317c45295255db70f8dc3e",
+            rtmr3: "7e7adbc834a3e746278f28c607a94ba93407a7b25055daca4836cc6003e9bfb5f48836fa0e1d6ab6637c187dd142e5f6",
+            hardware_rows: &[
+                ("8xh200 [10.2.1, flat-188c-1128g-nvsw4]", "b72208e4b39593a82bbdbc394569bd6f8395f76bdcff5bce2bc72f4e2ca0b3202238d3b78952b497d725e04999e45435"),
+                ("8xh200 [10.2.1, numa-124c-1128g-nvsw-node1]", "5b509103a3bf3c10dbf27a7da030a3d7ba93a81c0c8844de20e5dfee77611644a39cc7236313e9d0a99a8a8a703bbfc9"),
+            ],
+        },
+        // v1.4.1 software identity — same MRTD and RTMR1 as v1.4.0, distinct
+        // RTMR2 and runtime RTMR3. Only the seven hardware rows observed in
+        // signature-verified production quotes (2026-09-28 → 2026-10-05) are
+        // pinned. Chutes publishes the `flat-188c-1128g-nvsw4` registers under
+        // two names; they are one register set, so one row.
+        Family {
+            version: "1.4.1",
+            mrtd: "261ce538b435e2d0e85fc97e254bc99154c507b7a8e13d59b69f8532384f1d0bfaadfddf3fccc6e0a411203840bbee8d",
+            rtmr1: "d3a862ff47357f374fc72c7f02a480a13790d1805e24aaa8de1f03994256625ce0f593ae35ea8f0c24d09f7df36cb0ed",
+            rtmr2: "da23f73e0fddeb8128f706ecfbecbcf8cee34af7e4907d8fbc85e9b216acee27bf6cc3655eaf4d33cab76adea79fa153",
+            rtmr3: "d9dc4c6079fb12a21ad2aa8e329d8bfa61aaa13d3ffd10a93a2c4e82f0e35efbf28f5cf3bed0c0c1b517a7c327a25226",
+            hardware_rows: &[
+                ("8xb300 [10.2.1, flat-252c-1944g]", "fc71a5a8edcb1f6d307d59e62ce257365df0f233ae2334691f99d2136832d911f8be975b92f88036db8a4906574519c4"),
+                ("8xb300 [10.2.1, numa-flatpci-252c-2304g]", "e861504d4a05ba1e949618ef759d6fbf0c69e4774b667e9fb876b664cb1bb70e3094d2cddc9ac6c52d4b5d352ba2e1d3"),
+                ("8xh200 [10.2.1, flat-188c-1128g-nvsw4]", "b72208e4b39593a82bbdbc394569bd6f8395f76bdcff5bce2bc72f4e2ca0b3202238d3b78952b497d725e04999e45435"),
+                ("8xh200 [10.2.1, numa-124c-1128g-nvsw-node1]", "5b509103a3bf3c10dbf27a7da030a3d7ba93a81c0c8844de20e5dfee77611644a39cc7236313e9d0a99a8a8a703bbfc9"),
+                ("8xh200 [10.2.1, numa-188c-1128g-nvsw-node0]", "052183ad6cca5ad4aef7e31dc3f6c47be2ba90c288a55420bf432301374f1bd9932ea7d6b5da999c4fecf578c4b0a21a"),
+                ("8xh200 [10.2.1, numa-188c-1128g-nvsw-node1]", "ba81dbf034d968fd4be0975c031cbe6451295d63cb509cd857372fc915dada1b24fc4e1b0486db4a276a9efb49d415e6"),
+                ("8xh200 [10.2.1, numa-236c-1128g-nvsw-node1]", "a9cac743d296a96c7a0d6348f03be1e1a407f18ec215f0039e3dc1ea4c132eb1e4a5fe3783022ff3d252d4b30f1dbf9f"),
             ],
         },
     ];
@@ -493,8 +550,9 @@ mod tests {
         fn covers_the_full_v130_hardware_family() {
             // All six published v1.3.0 hardware platforms are accepted — by name,
             // so swapping a row for a different config (count unchanged) still fails.
-            // Total = 6 (v1.3.0) + 3 (v1.3.1-rc1 Blackwell) + 20 (v1.3.1 final).
-            assert_eq!(vetted_golden_measurements().len(), 29);
+            // Total = 6 (v1.3.0) + 3 (v1.3.1-rc1 Blackwell) + 21 (v1.3.1 final)
+            // + 2 (v1.4.0) + 7 (v1.4.1).
+            assert_eq!(vetted_golden_measurements().len(), 39);
             accepts(RTMR0_H200, "8xh200");
             accepts(RTMR0_H200_R2, "8xh200-r2");
             accepts(RTMR0_RTX_PRO_6000, "8xRTX_PRO_6000");
@@ -650,6 +708,152 @@ mod tests {
                     "1.3.1",
                 );
             }
+        }
+
+        // ── v1.4.0 / v1.4.1 (resync of 2026-10-05) ──────────────────────────
+        // Both keep the v1.3.1 MRTD and share RTMR1; RTMR2 and the runtime RTMR3
+        // differ per release.
+        const V14X_RTMR1: &str = "d3a862ff47357f374fc72c7f02a480a13790d1805e24aaa8de1f03994256625ce0f593ae35ea8f0c24d09f7df36cb0ed";
+        const V140_RTMR2: &str = "8feee49b83c0f912f9ab9366a7423f65417bb60223c1871a5d55e84d92d741c80017b3f856317c45295255db70f8dc3e";
+        const V140_RTMR3: &str = "7e7adbc834a3e746278f28c607a94ba93407a7b25055daca4836cc6003e9bfb5f48836fa0e1d6ab6637c187dd142e5f6";
+        const V141_RTMR2: &str = "da23f73e0fddeb8128f706ecfbecbcf8cee34af7e4907d8fbc85e9b216acee27bf6cc3655eaf4d33cab76adea79fa153";
+        const V141_RTMR3: &str = "d9dc4c6079fb12a21ad2aa8e329d8bfa61aaa13d3ffd10a93a2c4e82f0e35efbf28f5cf3bed0c0c1b517a7c327a25226";
+        // Observed live under v1.4.1 (and, for this one, published under v1.4.0
+        // too, but never observed with the v1.4.0 identity).
+        const V14X_RTMR0_B300_FLAT_252C: &str = "fc71a5a8edcb1f6d307d59e62ce257365df0f233ae2334691f99d2136832d911f8be975b92f88036db8a4906574519c4";
+        // Published under v1.4.1, never observed in a signature-verified quote.
+        const V141_RTMR0_B300_FLAT_188C_UNOBSERVED: &str = "bfaaf9a018fb3f10518b2706731ed010bc7d75f3ea3eabcc562ce4a794ab4ee88eba199e38f9013e96e1099a1cf7c49e";
+        // v1.5.0: published, never observed live.
+        const V150_RTMR2: &str = "4a93a5f46e53bf95a858ff5556ca3623ffc9780b18f27edfa518bd317a4b4fcf9cf8e1bed1b05e51eba1d9dc846d3e87";
+        const V150_RTMR3: &str = "bad2ccec446a52c96bc73f6ae8ff8b2b5b87efaa80333d58b1e5897d5683852e1b09a81c94af16b3ec64e1dba3d26f74";
+
+        #[test]
+        fn accepts_the_2026_10_05_live_observed_v131_b300_row() {
+            // kimi-k3 instances on `8xb300 [10.2.1, numa-256c]` ran the final
+            // v1.3.1 identity but this RTMR0 was missing from the snapshot, so
+            // they were rejected. Register set taken from signature-verified
+            // production quotes and matched to the published row.
+            accepts_family(
+                "f24aaec75a6c8783222ab141f003f2180fce573ef9cc6ea3dcdc2fcb91c051650fcd74ec85f02e367f06ed71328d319b",
+                MRTD_V131,
+                FINAL_RTMR1,
+                FINAL_RTMR2,
+                FINAL_RTMR3,
+                "8xb300 [10.2.1, numa-256c]",
+                "1.3.1",
+            );
+        }
+
+        #[test]
+        fn accepts_the_2026_10_05_live_observed_v140_rows() {
+            // The two v1.4.0 register sets logged by the fail-closed reject path
+            // for signature-verified, nonce-bound production quotes.
+            for (matched_name, rtmr0) in [
+                ("8xh200 [10.2.1, flat-188c-1128g-nvsw4]", "b72208e4b39593a82bbdbc394569bd6f8395f76bdcff5bce2bc72f4e2ca0b3202238d3b78952b497d725e04999e45435"),
+                ("8xh200 [10.2.1, numa-124c-1128g-nvsw-node1]", "5b509103a3bf3c10dbf27a7da030a3d7ba93a81c0c8844de20e5dfee77611644a39cc7236313e9d0a99a8a8a703bbfc9"),
+            ] {
+                accepts_family(
+                    rtmr0,
+                    MRTD_V131,
+                    V14X_RTMR1,
+                    V140_RTMR2,
+                    V140_RTMR3,
+                    matched_name,
+                    "1.4.0",
+                );
+            }
+        }
+
+        #[test]
+        fn accepts_the_2026_10_05_live_observed_v141_rows() {
+            // Regression guard for the 2026-10-02 kimi-k3 outage: the model's
+            // Chutes instances had all moved to `8xb300` rows that were not
+            // pinned (these two on v1.4.1, plus the v1.3.1 row above), so every
+            // request was refused. The `8xh200` rows are the ones kimi-k2.6,
+            // deepseek-v3.2 and qwen3.5-397b were rejected on.
+            // All seven register sets come from signature-verified, nonce-bound
+            // production quotes and match a published row on all five registers.
+            for (matched_name, rtmr0) in [
+                ("8xb300 [10.2.1, flat-252c-1944g]", V14X_RTMR0_B300_FLAT_252C),
+                ("8xb300 [10.2.1, numa-flatpci-252c-2304g]", "e861504d4a05ba1e949618ef759d6fbf0c69e4774b667e9fb876b664cb1bb70e3094d2cddc9ac6c52d4b5d352ba2e1d3"),
+                ("8xh200 [10.2.1, flat-188c-1128g-nvsw4]", "b72208e4b39593a82bbdbc394569bd6f8395f76bdcff5bce2bc72f4e2ca0b3202238d3b78952b497d725e04999e45435"),
+                ("8xh200 [10.2.1, numa-124c-1128g-nvsw-node1]", "5b509103a3bf3c10dbf27a7da030a3d7ba93a81c0c8844de20e5dfee77611644a39cc7236313e9d0a99a8a8a703bbfc9"),
+                ("8xh200 [10.2.1, numa-188c-1128g-nvsw-node0]", "052183ad6cca5ad4aef7e31dc3f6c47be2ba90c288a55420bf432301374f1bd9932ea7d6b5da999c4fecf578c4b0a21a"),
+                ("8xh200 [10.2.1, numa-188c-1128g-nvsw-node1]", "ba81dbf034d968fd4be0975c031cbe6451295d63cb509cd857372fc915dada1b24fc4e1b0486db4a276a9efb49d415e6"),
+                ("8xh200 [10.2.1, numa-236c-1128g-nvsw-node1]", "a9cac743d296a96c7a0d6348f03be1e1a407f18ec215f0039e3dc1ea4c132eb1e4a5fe3783022ff3d252d4b30f1dbf9f"),
+            ] {
+                accepts_family(
+                    rtmr0,
+                    MRTD_V131,
+                    V14X_RTMR1,
+                    V141_RTMR2,
+                    V141_RTMR3,
+                    matched_name,
+                    "1.4.1",
+                );
+            }
+        }
+
+        fn rejects(rtmr0: &str, rtmr1: &str, rtmr2: &str, rtmr3: &str) {
+            let policy = vetted_golden_measurements();
+            let err = policy
+                .verify(
+                    &reg(MRTD_V131),
+                    &reg(rtmr0),
+                    &reg(rtmr1),
+                    &reg(rtmr2),
+                    &reg(rtmr3),
+                )
+                .unwrap_err();
+            assert!(matches!(err, MeasurementError::NoMatch { .. }));
+        }
+
+        #[test]
+        fn rejects_published_but_unobserved_v14x_rows() {
+            // Being in the published feed is not enough. These rows are published
+            // but were never seen in a signature-verified quote, so they must
+            // stay rejected until someone vets them (then move them to an
+            // `accepts_*` test).
+            // v1.4.1 on a hardware row that was never observed.
+            rejects(
+                V141_RTMR0_B300_FLAT_188C_UNOBSERVED,
+                V14X_RTMR1,
+                V141_RTMR2,
+                V141_RTMR3,
+            );
+            // An RTMR0 pinned for v1.4.1 does not carry over to v1.4.0, even
+            // though Chutes publishes the same hardware row under both.
+            rejects(
+                V14X_RTMR0_B300_FLAT_252C,
+                V14X_RTMR1,
+                V140_RTMR2,
+                V140_RTMR3,
+            );
+        }
+
+        #[test]
+        fn rejects_the_unobserved_v150_software_identity() {
+            // v1.5.0 is published (same MRTD and RTMR1 as v1.4.x, new RTMR2/3)
+            // but no instance has been observed running it. It must not verify,
+            // not even on a hardware row that is pinned for v1.4.1.
+            rejects(
+                V14X_RTMR0_B300_FLAT_252C,
+                V14X_RTMR1,
+                V150_RTMR2,
+                V150_RTMR3,
+            );
+        }
+
+        #[test]
+        fn rejects_v140_and_v141_identities_stapled_together() {
+            // v1.4.0 boot chain (RTMR2) with the v1.4.1 runtime RTMR3 matches no
+            // single published row — partial matches are rejected.
+            rejects(
+                "5b509103a3bf3c10dbf27a7da030a3d7ba93a81c0c8844de20e5dfee77611644a39cc7236313e9d0a99a8a8a703bbfc9",
+                V14X_RTMR1,
+                V140_RTMR2,
+                V141_RTMR3,
+            );
         }
 
         #[test]

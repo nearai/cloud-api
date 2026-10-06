@@ -82,6 +82,7 @@ mod org_system_prompt;
 mod organization_deletion;
 mod organization_membership_order;
 mod organization_priority;
+mod organization_usage_discount;
 mod pagination_validation;
 mod patroni_failover;
 mod privacy_classify;

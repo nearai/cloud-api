@@ -524,13 +524,13 @@ impl UsageServiceTrait for UsageServiceImpl {
                 cache_write_tokens as i64,
                 &tags_str,
             );
-            metrics.record_count(METRIC_BILLED_INPUT_COST_USD, input_cost, &tags_str);
-            metrics.record_count(METRIC_BILLED_OUTPUT_COST_USD, output_cost, &tags_str);
+            metrics.record_count(METRIC_BILLED_INPUT_COST_USD, log.input_cost, &tags_str);
+            metrics.record_count(METRIC_BILLED_OUTPUT_COST_USD, log.output_cost, &tags_str);
 
             // Existing total-cost metric, kept for backward compatibility with
             // dashboards; now also dimensioned by inference_type.
-            if total_cost > 0 {
-                metrics.record_count(METRIC_COST_USD, total_cost, &tags_str);
+            if log.total_cost > 0 {
+                metrics.record_count(METRIC_COST_USD, log.total_cost, &tags_str);
             }
         } else {
             // Log when we skip metrics for a duplicate (aids debugging)

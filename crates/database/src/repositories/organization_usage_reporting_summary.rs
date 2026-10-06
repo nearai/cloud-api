@@ -82,7 +82,7 @@ where
             FROM organization_usage_log usage_log
             LEFT JOIN LATERAL (
                 SELECT COALESCE(SUM(original.amount), 0)::BIGINT AS amount
-                FROM usage_credit_allocations original
+                FROM effective_usage_credit_allocations original
                 WHERE original.inference_usage_id = usage_log.id
                   AND original.credit_type = $8
             ) allocation ON true

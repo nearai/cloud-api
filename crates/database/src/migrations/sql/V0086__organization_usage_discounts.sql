@@ -5,14 +5,20 @@ CREATE TABLE organization_usage_discounts (
     discount_basis_points INTEGER NOT NULL CHECK (discount_basis_points BETWEEN 1 AND 10000),
     apply_since TIMESTAMPTZ,
     saved_at TIMESTAMPTZ NOT NULL,
-    created_by UUID NOT NULL REFERENCES users(id),
+    created_by UUID REFERENCES users(id) ON DELETE SET NULL,
     status TEXT NOT NULL CHECK (status IN ('applying', 'active')),
     processed_count BIGINT NOT NULL DEFAULT 0 CHECK (processed_count >= 0),
     cursor_created_at TIMESTAMPTZ,
     cursor_usage_id UUID,
+    worker_token UUID,
+    lease_until TIMESTAMPTZ,
+    attempts INTEGER NOT NULL DEFAULT 0 CHECK (attempts >= 0),
+    next_attempt_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
+    last_error TEXT,
+    CHECK ((worker_token IS NULL) = (lease_until IS NULL)),
     CHECK (apply_since IS NULL OR apply_since <= saved_at)
 );
-CREATE INDEX organization_usage_discounts_pending ON organization_usage_discounts(saved_at)
+CREATE INDEX organization_usage_discounts_pending ON organization_usage_discounts(next_attempt_at, saved_at)
     WHERE status = 'applying';
 
 CREATE TABLE usage_discount_adjustments (

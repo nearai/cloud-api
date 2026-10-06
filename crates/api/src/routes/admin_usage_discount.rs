@@ -30,6 +30,9 @@ pub struct UsageDiscountResponse {
     /// `applying` until historical correction finishes; otherwise `active`.
     pub status: String,
     pub processed_count: i64,
+    /// Safe diagnostic while automatic retries are delayed.
+    pub last_error: Option<String>,
+    pub next_retry_at: Option<DateTime<Utc>>,
 }
 impl From<OrganizationUsageDiscount> for UsageDiscountResponse {
     fn from(rule: OrganizationUsageDiscount) -> Self {
@@ -39,6 +42,8 @@ impl From<OrganizationUsageDiscount> for UsageDiscountResponse {
             saved_at: rule.saved_at,
             status: rule.status,
             processed_count: rule.processed_count,
+            last_error: rule.last_error,
+            next_retry_at: rule.next_retry_at,
         }
     }
 }

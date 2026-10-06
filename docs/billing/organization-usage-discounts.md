@@ -35,3 +35,19 @@ aggregate mismatch can be repaired using the existing usage-hourly recompute API
 Once the rule is active, refresh downstream billing snapshots and historical
 usage streams using their existing resync procedure. Compare matching measures
 and time cutoffs; downstream systems should not apply a second percentage.
+
+Before enabling any rule, finish the rolling deployment and verify that **every
+API replica** runs this version. Older replicas do not apply the discount or read
+credit-note reversals. Do not activate a rule during a mixed-version rollout.
+After a rule has been saved, rolling back to an older billing implementation is
+not supported: retain this accounting behavior and deploy a forward fix instead.
+
+Workers claim due organizations with a persisted ten-minute lease. A claim is
+fenced by a unique token, expires after a crash, and runs at most 270 seconds of
+work. At most two jobs run per API replica; a transaction lock also prevents
+concurrent final verification for the same organization. Each completed batch
+rotates behind other due work. Failures retain `applying` status, show a safe
+`last_error` and `next_retry_at`, and back off from 30 seconds up to 30 minutes.
+Successful progress clears those diagnostics. Full accounting/reporting checks
+remain required before activation; pre-existing drift must be repaired rather
+than treating a partially reconciled organization as complete.

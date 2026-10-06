@@ -7,10 +7,30 @@ use chrono::{DateTime, Utc};
 use serde::Serialize;
 use services::common::RepositoryError;
 use services::usage::ports::UsageDiscount;
+use std::time::Duration;
 use tokio_postgres::{Row, Transaction};
 use uuid::Uuid;
 
 pub const BATCH_SIZE: i64 = 500;
+// Longer than the bounded operation plus an in-flight statement's cancellation.
+const WORK_TIMEOUT: Duration = Duration::from_secs(270);
+const VERIFICATION_LOCK_NAMESPACE: i64 = 0x555344495343; // "USDISC"
+
+#[derive(Debug, Clone)]
+pub struct DiscountWorkClaim {
+    pub organization_id: Uuid,
+    token: Uuid,
+}
+
+#[derive(Debug, thiserror::Error)]
+enum WorkerError {
+    #[error("Accounting verification failed. Reconcile organization balances before retry.")]
+    Accounting,
+    #[error("Reporting verification failed. Repair the hourly aggregate before retry.")]
+    Reporting,
+    #[error("Correction timed out and will retry automatically.")]
+    Timeout,
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum DiscountError {
@@ -35,6 +55,8 @@ pub struct OrganizationUsageDiscount {
     pub saved_at: DateTime<Utc>,
     pub status: String,
     pub processed_count: i64,
+    pub last_error: Option<String>,
+    pub next_retry_at: Option<DateTime<Utc>>,
 }
 
 impl OrganizationUsageDiscount {
@@ -46,6 +68,10 @@ impl OrganizationUsageDiscount {
             saved_at: row.get("saved_at"),
             status: row.get("status"),
             processed_count: row.get("processed_count"),
+            last_error: row.get("last_error"),
+            next_retry_at: row
+                .get::<_, Option<String>>("last_error")
+                .map(|_| row.get("next_attempt_at")),
         }
     }
 }
@@ -81,9 +107,12 @@ impl OrganizationUsageDiscountRepository {
     ) -> Result<OrganizationUsageDiscount> {
         // PostgreSQL timestamps have microsecond precision. Normalize before comparing
         // retry terms so an RFC3339 nanosecond input remains idempotent after storage.
-        let apply_since = apply_since.map(|value| {
-            DateTime::from_timestamp_micros(value.timestamp_micros()).expect("valid timestamp")
-        });
+        let apply_since = apply_since
+            .map(|value| {
+                DateTime::from_timestamp_micros(value.timestamp_micros())
+                    .ok_or(DiscountError::Invalid)
+            })
+            .transpose()?;
         if !(1..=10_000).contains(&basis_points) {
             return Err(DiscountError::Invalid.into());
         }
@@ -199,6 +228,14 @@ impl OrganizationUsageDiscountRepository {
     /// One bounded transaction. A skipped organization is retried on the next worker tick.
     /// Returns true if a batch was committed (including the final active transition).
     pub async fn apply_batch(&self, organization_id: Uuid) -> Result<bool> {
+        self.apply_batch_with_claim(organization_id, None).await
+    }
+
+    async fn apply_batch_with_claim(
+        &self,
+        organization_id: Uuid,
+        token: Option<Uuid>,
+    ) -> Result<bool> {
         let mut client = self.pool.get().await?;
         let tx = client.transaction().await?;
         tx.batch_execute("SET LOCAL statement_timeout = '30s'; SET LOCAL lock_timeout = '2s'")
@@ -216,6 +253,9 @@ impl OrganizationUsageDiscountRepository {
         let Some(rule_row) = tx.query_opt("SELECT * FROM organization_usage_discounts WHERE organization_id = $1 AND status = 'applying' FOR UPDATE", &[&organization_id]).await? else {
             return Ok(false);
         };
+        if token.is_some() && rule_row.get::<_, Option<Uuid>>("worker_token") != token {
+            return Ok(false);
+        }
         let rule = OrganizationUsageDiscount::from_row(&rule_row);
         let cursor_at: Option<DateTime<Utc>> = rule_row.get("cursor_created_at");
         let cursor_id: Option<Uuid> = rule_row.get("cursor_usage_id");
@@ -254,8 +294,9 @@ impl OrganizationUsageDiscountRepository {
             // their database timestamps cannot enter the frozen historical window.
             tx.commit().await?;
             drop(client);
-            self.verify_and_activate(organization_id, rule.id).await?;
-            return Ok(true);
+            return self
+                .verify_and_activate(organization_id, rule.id, token)
+                .await;
         }
         let ids: Vec<Uuid> = rows.iter().map(|row| row.get("id")).collect();
         // NUMERIC intermediates match UsageDiscount's checked i128 half-up arithmetic.
@@ -365,7 +406,12 @@ impl OrganizationUsageDiscountRepository {
         Ok(true)
     }
 
-    async fn verify_and_activate(&self, organization_id: Uuid, rule_id: Uuid) -> Result<()> {
+    async fn verify_and_activate(
+        &self,
+        organization_id: Uuid,
+        rule_id: Uuid,
+        token: Option<Uuid>,
+    ) -> Result<bool> {
         let mut client = self.pool.get().await?;
         let tx = client
             .build_transaction()
@@ -375,6 +421,25 @@ impl OrganizationUsageDiscountRepository {
             .await?;
         tx.batch_execute("SET LOCAL statement_timeout = '120s'")
             .await?;
+        // The lease is durable across restarts. This additional transaction lock
+        // prevents overlapping scans even if a paused worker outlives its lease.
+        let locked: bool = tx
+            .query_one(
+                "SELECT pg_try_advisory_xact_lock(hashtextextended($1::UUID::TEXT, $2))",
+                &[&organization_id, &VERIFICATION_LOCK_NAMESPACE],
+            )
+            .await?
+            .get(0);
+        if !locked {
+            return Ok(false);
+        }
+        let owned: bool = tx.query_one(
+            "SELECT EXISTS (SELECT 1 FROM organization_usage_discounts WHERE id=$1 AND status='applying' AND ($2::UUID IS NULL OR worker_token=$2))",
+            &[&rule_id, &token],
+        ).await?.get(0);
+        if !owned {
+            return Ok(false);
+        }
         let consistent: bool = tx.query_one(r#"
             WITH costs AS (
                 SELECT COALESCE(SUM(total_cost),0)::BIGINT AS total,
@@ -399,7 +464,9 @@ impl OrganizationUsageDiscountRepository {
                 AND (SELECT COUNT(*) FROM usage_discount_adjustments WHERE rule_id=$2) =
                     (SELECT processed_count FROM organization_usage_discounts WHERE id=$2)
             "#, &[&organization_id, &rule_id]).await?.get(0);
-        ensure!(consistent, "Discount accounting conservation check failed");
+        if !consistent {
+            return Err(WorkerError::Accounting.into());
+        }
         // Compare the actual reporting read path, including missing old aggregate
         // grains and the raw recent/partial-hour edges, against canonical raw costs.
         let parity_sql = crate::repositories::usage_hourly::with_usage_rows(
@@ -416,22 +483,87 @@ impl OrganizationUsageDiscountRepository {
             .query_one(&parity_sql, &[&organization_id, &rule_id])
             .await?
             .get(0);
-        ensure!(
-            hourly_consistent,
-            "Discount hourly conservation check failed"
-        );
+        if !hourly_consistent {
+            return Err(WorkerError::Reporting.into());
+        }
         tx.commit().await?;
         let tx = client.transaction().await?;
         crate::repositories::credit_allocation::lock_organization_accounting(&tx, organization_id)
             .await?;
-        tx.execute("UPDATE organization_usage_discounts SET status='active' WHERE id=$1 AND status='applying'", &[&rule_id]).await?;
+        let updated = tx.execute("UPDATE organization_usage_discounts SET status='active', last_error=NULL, attempts=0 WHERE id=$1 AND status='applying' AND ($2::UUID IS NULL OR worker_token=$2)", &[&rule_id, &token]).await?;
         tx.commit().await?;
-        Ok(())
+        Ok(updated == 1)
     }
 
-    pub async fn pending_organizations(&self) -> Result<Vec<Uuid>> {
+    /// Claim one due organization, rotating successful batches behind older due work.
+    /// A crashed worker's claim can be reclaimed after ten minutes.
+    pub async fn claim_next(&self) -> Result<Option<DiscountWorkClaim>> {
         let client = self.pool.get().await?;
-        Ok(client.query("SELECT organization_id FROM organization_usage_discounts WHERE status = 'applying' ORDER BY saved_at LIMIT 32", &[]).await?.iter().map(|row| row.get(0)).collect())
+        let token = Uuid::new_v4();
+        let row = client
+            .query_opt(
+                r#"
+            UPDATE organization_usage_discounts SET worker_token=$1,
+                lease_until=clock_timestamp()+INTERVAL '10 minutes'
+            WHERE id=(SELECT id FROM organization_usage_discounts
+                WHERE status='applying' AND next_attempt_at<=CURRENT_TIMESTAMP
+                  AND (lease_until IS NULL OR lease_until<=CURRENT_TIMESTAMP)
+                ORDER BY next_attempt_at, saved_at, id FOR UPDATE SKIP LOCKED LIMIT 1)
+            RETURNING organization_id
+            "#,
+                &[&token],
+            )
+            .await?;
+        Ok(row.map(|row| DiscountWorkClaim {
+            organization_id: row.get(0),
+            token,
+        }))
+    }
+
+    /// Run only our durable claim. Completion/failure updates are token-fenced, so
+    /// an expired worker cannot clear a replacement claim or overwrite its diagnostics.
+    pub async fn run_claimed(&self, claim: DiscountWorkClaim) -> Result<bool> {
+        let result = match tokio::time::timeout(
+            WORK_TIMEOUT,
+            self.apply_batch_with_claim(claim.organization_id, Some(claim.token)),
+        )
+        .await
+        {
+            Ok(result) => result,
+            Err(_) => Err(WorkerError::Timeout.into()),
+        };
+        let client = self.pool.get().await?;
+        match &result {
+            Ok(progress) => {
+                client
+                    .execute(
+                        r#"UPDATE organization_usage_discounts
+                    SET worker_token=NULL, lease_until=NULL,
+                        next_attempt_at=clock_timestamp()+INTERVAL '1 second',
+                        last_error=CASE WHEN $3 THEN NULL ELSE last_error END,
+                        attempts=CASE WHEN $3 THEN 0 ELSE attempts END
+                    WHERE organization_id=$1 AND worker_token=$2"#,
+                        &[&claim.organization_id, &claim.token, progress],
+                    )
+                    .await?;
+            }
+            Err(error) => {
+                // Never persist raw database errors or row payloads in an admin response.
+                let message = error
+                    .downcast_ref::<WorkerError>()
+                    .map(ToString::to_string)
+                    .unwrap_or_else(|| {
+                        "Correction could not complete. It will retry automatically.".into()
+                    });
+                client.execute(r#"UPDATE organization_usage_discounts
+                    SET worker_token=NULL, lease_until=NULL, last_error=$3,
+                        next_attempt_at=clock_timestamp()+INTERVAL '1 second' * LEAST(1800, 30 * POWER(2, LEAST(attempts, 6))),
+                        attempts=LEAST(attempts+1, 16)
+                    WHERE organization_id=$1 AND worker_token=$2"#,
+                    &[&claim.organization_id, &claim.token, &message]).await?;
+            }
+        }
+        result
     }
 }
 
@@ -472,20 +604,30 @@ async fn validate_history(
 pub async fn apply_to_request(
     tx: &Transaction<'_>,
     request: &mut RecordUsageRequest,
-) -> Result<(), RepositoryError> {
-    let existing = if let Some(inference_id) = request.inference_id {
-        tx.query_opt("SELECT billing_details FROM organization_usage_log WHERE organization_id=$1 AND inference_id=$2", &[&request.organization_id, &inference_id]).await.map_err(crate::repositories::utils::map_db_error)?
-    } else {
-        None
+) -> Result<DateTime<Utc>, RepositoryError> {
+    let row = tx
+        .query_one(
+            r#"
+        SELECT clock_timestamp() AS recorded_at, d.id, d.discount_basis_points,
+            CASE WHEN d.id IS NOT NULL AND $2::UUID IS NOT NULL THEN EXISTS (
+                SELECT 1 FROM organization_usage_log u
+                WHERE u.organization_id=$1 AND u.inference_id=$2
+                  AND NOT COALESCE(u.billing_details ? 'contract_discount', FALSE)
+            ) ELSE FALSE END AS existing_without_discount
+        FROM (SELECT 1) anchor
+        LEFT JOIN organization_usage_discounts d ON d.organization_id=$1
+        "#,
+            &[&request.organization_id, &request.inference_id],
+        )
+        .await
+        .map_err(crate::repositories::utils::map_db_error)?;
+    let recorded_at: DateTime<Utc> = row.get("recorded_at");
+    let Some(rule_id) = row.get::<_, Option<Uuid>>("id") else {
+        return Ok(recorded_at);
     };
-    if existing.as_ref().is_some_and(|row| {
-        row.get::<_, Option<serde_json::Value>>(0)
-            .is_none_or(|details| details.get("contract_discount").is_none())
-    }) {
-        return Ok(());
+    if row.get::<_, bool>("existing_without_discount") {
+        return Ok(recorded_at);
     }
-    let Some(row) = tx.query_opt("SELECT id, discount_basis_points FROM organization_usage_discounts WHERE organization_id=$1", &[&request.organization_id]).await.map_err(crate::repositories::utils::map_db_error)? else { return Ok(()); };
-    let rule_id: Uuid = row.get("id");
     let basis_points: i32 = row.get("discount_basis_points");
     let discount = UsageDiscount::from_basis_points(basis_points as u16)
         .map_err(|error| RepositoryError::ValidationFailed(error.to_string()))?;
@@ -520,5 +662,5 @@ pub async fn apply_to_request(
         .map_err(|error| RepositoryError::ValidationFailed(error.to_string()))?;
     request.total_cost = request.input_cost + request.output_cost;
     request.billing_details = Some(details);
-    Ok(())
+    Ok(recorded_at)
 }

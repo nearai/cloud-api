@@ -97,18 +97,13 @@ impl OrganizationUsageRepository {
             // usage row. Otherwise concurrent inserts first acquire FK
             // KEY SHARE locks and can deadlock when allocation upgrades them.
             lock_organization_accounting(&transaction, request.organization_id).await?;
-            crate::repositories::organization_usage_discount::apply_to_request(
+            let now = crate::repositories::organization_usage_discount::apply_to_request(
                 &transaction,
                 &mut request,
             )
             .await?;
 
             let id = Uuid::new_v4();
-            let now: chrono::DateTime<Utc> = transaction
-                .query_one("SELECT clock_timestamp()", &[])
-                .await
-                .map_err(map_db_error)?
-                .get(0);
             let total_tokens = request.input_tokens + request.output_tokens;
 
             // Insert usage log entry (model_name is denormalized for performance).

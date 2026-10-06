@@ -884,3 +884,189 @@ async fn full_discount_zeroes_funding_and_nanosecond_cutoff_retries_are_idempote
         .await
         .assert_status_ok();
 }
+
+#[tokio::test]
+async fn worker_claims_recover_after_crash_and_fence_stale_workers() {
+    let f = fixture().await;
+    save(&f, Some(Utc::now() - Duration::days(1))).await;
+    let repo = OrganizationUsageDiscountRepository::new(f.db.pool().clone());
+    let (left, right) = tokio::join!(repo.claim_next(), repo.claim_next());
+    let mut claims: Vec<_> = [left.unwrap(), right.unwrap()]
+        .into_iter()
+        .flatten()
+        .collect();
+    assert_eq!(
+        claims.len(),
+        1,
+        "concurrent replicas must claim an organization once"
+    );
+    let claim = claims.pop().unwrap();
+    assert_eq!(claim.organization_id, f.org);
+    assert!(repo.claim_next().await.unwrap().is_none());
+    let client = f.db.pool().get().await.unwrap();
+    client.execute("UPDATE organization_usage_discounts SET lease_until=clock_timestamp()-INTERVAL '1 second' WHERE organization_id=$1", &[&f.org]).await.unwrap();
+    drop(client);
+    let replacement = repo.claim_next().await.unwrap().unwrap();
+    assert_eq!(replacement.organization_id, f.org);
+    assert!(!repo.run_claimed(claim).await.unwrap());
+    assert!(
+        repo.claim_next().await.unwrap().is_none(),
+        "stale worker must not clear replacement lease"
+    );
+
+    // Verification has an independent lock: even an expired live process cannot
+    // overlap the replacement's expensive full-history scan.
+    let mut client = f.db.pool().get().await.unwrap();
+    let tx = client.transaction().await.unwrap();
+    tx.query_one(
+        "SELECT pg_advisory_xact_lock(hashtextextended($1::UUID::TEXT,$2))",
+        &[&f.org, &0x555344495343_i64],
+    )
+    .await
+    .unwrap();
+    assert!(!repo.run_claimed(replacement).await.unwrap());
+    tx.rollback().await.unwrap();
+    let state = client.query_one("SELECT attempts,worker_token,last_error FROM organization_usage_discounts WHERE organization_id=$1", &[&f.org]).await.unwrap();
+    assert_eq!(state.get::<_, i32>("attempts"), 0);
+    assert_eq!(state.get::<_, Option<Uuid>>("worker_token"), None);
+    assert_eq!(state.get::<_, Option<String>>("last_error"), None);
+    client.execute("UPDATE organization_usage_discounts SET next_attempt_at=clock_timestamp() WHERE organization_id=$1", &[&f.org]).await.unwrap();
+    drop(client);
+    let restarted = OrganizationUsageDiscountRepository::new(f.db.pool().clone());
+    assert!(restarted
+        .run_claimed(restarted.claim_next().await.unwrap().unwrap())
+        .await
+        .unwrap());
+    assert_eq!(
+        restarted.get(f.org).await.unwrap().unwrap().status,
+        "active"
+    );
+}
+
+#[tokio::test]
+async fn worker_failures_back_off_show_safe_diagnostics_and_clear_after_repair() {
+    let f = fixture().await;
+    // Synthetic pre-existing drift, outside the selected history.
+    f.db.pool()
+        .get()
+        .await
+        .unwrap()
+        .execute(
+            "UPDATE organization_balance SET total_spent=1 WHERE organization_id=$1",
+            &[&f.org],
+        )
+        .await
+        .unwrap();
+    save(&f, Some(Utc::now() - Duration::days(1))).await;
+    let repo = OrganizationUsageDiscountRepository::new(f.db.pool().clone());
+    for (attempts, expected_delay) in [(0_i32, 30_i64), (1, 60), (16, 1800)] {
+        let client = f.db.pool().get().await.unwrap();
+        client.execute("UPDATE organization_usage_discounts SET attempts=$2,next_attempt_at=clock_timestamp() WHERE organization_id=$1", &[&f.org,&attempts]).await.unwrap();
+        drop(client);
+        let claim = repo.claim_next().await.unwrap().unwrap();
+        assert_eq!(claim.organization_id, f.org);
+        assert!(repo.run_claimed(claim).await.is_err());
+        let response = get(
+            &f,
+            &format!("/v1/admin/organizations/{}/usage-discount", f.org),
+        )
+        .await;
+        assert_eq!(response["status"], "applying");
+        assert_eq!(
+            response["last_error"],
+            "Accounting verification failed. Reconcile organization balances before retry."
+        );
+        let retry = DateTime::parse_from_rfc3339(response["next_retry_at"].as_str().unwrap())
+            .unwrap()
+            .with_timezone(&Utc);
+        let delay = (retry - Utc::now()).num_seconds();
+        assert!(
+            (expected_delay - 5..=expected_delay).contains(&delay),
+            "{delay}"
+        );
+        assert!(
+            repo.claim_next().await.unwrap().is_none(),
+            "backoff must prevent another full scan"
+        );
+    }
+    let client = f.db.pool().get().await.unwrap();
+    client.execute("UPDATE organization_balance SET total_spent=0,legacy_unattributed_amount=0 WHERE organization_id=$1", &[&f.org]).await.unwrap();
+    client.execute("UPDATE organization_usage_discounts SET next_attempt_at=clock_timestamp() WHERE organization_id=$1", &[&f.org]).await.unwrap();
+    drop(client);
+    assert!(repo
+        .run_claimed(repo.claim_next().await.unwrap().unwrap())
+        .await
+        .unwrap());
+    let response = get(
+        &f,
+        &format!("/v1/admin/organizations/{}/usage-discount", f.org),
+    )
+    .await;
+    assert_eq!(response["status"], "active");
+    assert_eq!(response["last_error"], Value::Null);
+    assert_eq!(response["next_retry_at"], Value::Null);
+}
+
+#[tokio::test]
+async fn worker_queue_reaches_newer_orgs_behind_more_than_32_failures() {
+    let f = fixture().await;
+    let client = f.db.pool().get().await.unwrap();
+    let user = Uuid::parse_str(MOCK_USER_ID).unwrap();
+    let rows = client.query("WITH org AS (INSERT INTO organizations (name) SELECT 'synthetic-discount-queue-'||uuid_generate_v4() FROM generate_series(1,34) RETURNING id)
+        INSERT INTO organization_usage_discounts (organization_id,discount_basis_points,apply_since,saved_at,created_by,status,next_attempt_at)
+        SELECT id,2500,clock_timestamp()-INTERVAL '2 days',clock_timestamp()-INTERVAL '1 day',$1,'applying',clock_timestamp()-INTERVAL '1 day' FROM org RETURNING organization_id", &[&user]).await.unwrap();
+    let ids: Vec<Uuid> = rows.iter().map(|row| row.get(0)).collect();
+    client
+        .execute(
+            "UPDATE organization_balance SET total_spent=1 WHERE organization_id=ANY($1)",
+            &[&ids],
+        )
+        .await
+        .unwrap();
+    drop(client);
+    let repo = OrganizationUsageDiscountRepository::new(f.db.pool().clone());
+    let mut seen = std::collections::HashSet::new();
+    for _ in 0..34 {
+        let claim = repo.claim_next().await.unwrap().unwrap();
+        assert!(ids.contains(&claim.organization_id));
+        assert!(
+            seen.insert(claim.organization_id),
+            "old failures must yield to every due organization"
+        );
+        assert!(repo.run_claimed(claim).await.is_err());
+    }
+    assert!(repo.claim_next().await.unwrap().is_none());
+    // Keep this global-queue test's failed jobs isolated from later tests.
+    f.db.pool()
+        .get()
+        .await
+        .unwrap()
+        .execute("DELETE FROM organizations WHERE id=ANY($1)", &[&ids])
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn deleting_discount_creator_preserves_rule_and_clears_audit_reference() {
+    let f = fixture().await;
+    let creator = Uuid::new_v4();
+    let client = f.db.pool().get().await.unwrap();
+    client.execute("INSERT INTO users (id,email,username,auth_provider,provider_user_id) VALUES ($1,$2,$3::VARCHAR,'test',$3::VARCHAR)", &[&creator,&format!("{creator}@example.test"),&creator.to_string()]).await.unwrap();
+    drop(client);
+    let repo = OrganizationUsageDiscountRepository::new(f.db.pool().clone());
+    repo.save(f.org, BASIS_POINTS, None, creator).await.unwrap();
+    let client = f.db.pool().get().await.unwrap();
+    client
+        .execute("DELETE FROM users WHERE id=$1", &[&creator])
+        .await
+        .unwrap();
+    let row = client
+        .query_one(
+            "SELECT created_by,status FROM organization_usage_discounts WHERE organization_id=$1",
+            &[&f.org],
+        )
+        .await
+        .unwrap();
+    assert_eq!(row.get::<_, Option<Uuid>>(0), None);
+    assert_eq!(row.get::<_, String>(1), "active");
+}

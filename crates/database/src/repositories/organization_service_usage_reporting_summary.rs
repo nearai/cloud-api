@@ -31,7 +31,7 @@ where
                 INNER JOIN services ON services.id = usage_log.service_id
                 LEFT JOIN LATERAL (
                     SELECT COALESCE(SUM(original.amount), 0)::BIGINT AS amount
-                    FROM usage_credit_allocations original
+                    FROM effective_usage_credit_allocations original
                     WHERE original.service_usage_id = usage_log.id
                       AND original.credit_type = $7
                 ) allocation ON true

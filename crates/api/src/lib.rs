@@ -2651,6 +2651,13 @@ fn build_admin_routes_with_options(
         .with_state(admin_app_state)
         .merge(
             Router::new()
+                .route("/admin/organizations/{org_id}/usage-discount",
+                    axum::routing::get(crate::routes::admin_usage_discount::get_usage_discount)
+                        .put(crate::routes::admin_usage_discount::put_usage_discount))
+                .layer(axum::Extension(database::repositories::organization_usage_discount::OrganizationUsageDiscountRepository::new(database.pool().clone())))
+        )
+        .merge(
+            Router::new()
                 .route(
                     "/admin/usage-hourly/recompute",
                     axum::routing::post(crate::routes::admin_usage_hourly::recompute_usage_hourly),

@@ -347,7 +347,7 @@ async fn admin_metrics_credit_type_timeout_is_shared_and_transaction_local() {
         .batch_execute(&format!(
             "CREATE TEMP VIEW organizations AS
          SELECT '{}'::uuid AS id, 'Slow metrics fixture'::text AS name FROM pg_sleep(0.25);
-         CREATE TEMP VIEW usage_credit_allocations AS
+         CREATE TEMP VIEW effective_usage_credit_allocations AS
          SELECT '{}'::uuid AS inference_usage_id, 'postpay'::text AS credit_type,
                 1000000000::bigint AS amount FROM pg_sleep(0.25);",
             fixture.organization_id, usage_id,

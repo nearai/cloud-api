@@ -184,6 +184,8 @@ use utoipa::{Modify, OpenApi};
         crate::routes::admin::get_model_revenue,
         crate::routes::admin::get_revenue_density,
         crate::routes::admin_usage_hourly::recompute_usage_hourly,
+        crate::routes::admin_usage_discount::get_usage_discount,
+        crate::routes::admin_usage_discount::put_usage_discount,
         crate::routes::admin::get_org_revenue,
         crate::routes::admin::get_infra_summary,
         crate::routes::admin::list_admin_settings,
@@ -233,6 +235,8 @@ use utoipa::{Modify, OpenApi};
             UpdateOrganizationRequest, CreateApiKeyRequest, ApiKeyResponse,
             UpdateApiKeySpendLimitRequest, UpdateApiKeyRequest,
             // usage_hourly repair models
+            crate::routes::admin_usage_discount::UsageDiscountRequest,
+            crate::routes::admin_usage_discount::UsageDiscountResponse,
             crate::routes::admin_usage_hourly::UsageHourlyRepairRequest,
             crate::routes::admin_usage_hourly::UsageHourlyRepairResponse,
             crate::routes::admin_usage_hourly::UsageHourlyDayParity,

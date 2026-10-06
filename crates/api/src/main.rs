@@ -117,6 +117,27 @@ async fn main() {
         .start(config.server.usage_hourly_interval_secs)
         .await;
 
+    // Persisted cursors and accounting locks make correction safe across restarts
+    // and multiple API instances. Each tick commits at most one bounded batch per org.
+    let discount_repository = database::repositories::organization_usage_discount::OrganizationUsageDiscountRepository::new(database.pool().clone());
+    let discount_worker = tokio::spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            interval.tick().await;
+            match discount_repository.pending_organizations().await {
+                Ok(organizations) => {
+                    for organization_id in organizations {
+                        if let Err(error) = discount_repository.apply_batch(organization_id).await {
+                            tracing::error!(%organization_id, %error, "Usage discount batch failed; retrying next tick");
+                        }
+                    }
+                }
+                Err(error) => tracing::error!(%error, "Failed to read pending usage discounts"),
+            }
+        }
+    });
+
     // Start server with graceful shutdown handling
     start_server(
         app,
@@ -125,6 +146,7 @@ async fn main() {
         domain_services.inference_provider_pool,
         pricing_scheduler,
         usage_hourly_scheduler,
+        discount_worker,
     )
     .await;
 }
@@ -148,6 +170,7 @@ async fn start_server(
     inference_provider_pool: Arc<InferenceProviderPool>,
     pricing_scheduler: Arc<ModelPricingScheduler>,
     usage_hourly_scheduler: Arc<services::usage::UsageHourlyScheduler>,
+    discount_worker: tokio::task::JoinHandle<()>,
 ) {
     let bind_address = format!("{}:{}", config.server.host, config.server.port);
     let listener = tokio::net::TcpListener::bind(&bind_address)
@@ -166,7 +189,10 @@ async fn start_server(
 
     let server = axum::serve(listener, app).with_graceful_shutdown(shutdown_signal());
 
-    match server.await {
+    let result = server.await;
+    discount_worker.abort();
+    let _ = discount_worker.await;
+    match result {
         Ok(_) => {
             tracing::info!("Server shutdown successfully, initiating coordinated cleanup");
             perform_coordinated_shutdown(

@@ -84,6 +84,7 @@ impl OrganizationUsageRepository {
     /// returning the existing record instead.
     pub async fn record_usage(&self, request: RecordUsageRequest) -> Result<OrganizationUsageLog> {
         let result = retry_db!("record_organization_usage", {
+            let mut request = request.clone();
             let mut client = self
                 .pool
                 .get()
@@ -96,9 +97,18 @@ impl OrganizationUsageRepository {
             // usage row. Otherwise concurrent inserts first acquire FK
             // KEY SHARE locks and can deadlock when allocation upgrades them.
             lock_organization_accounting(&transaction, request.organization_id).await?;
+            crate::repositories::organization_usage_discount::apply_to_request(
+                &transaction,
+                &mut request,
+            )
+            .await?;
 
             let id = Uuid::new_v4();
-            let now = Utc::now();
+            let now: chrono::DateTime<Utc> = transaction
+                .query_one("SELECT clock_timestamp()", &[])
+                .await
+                .map_err(map_db_error)?
+                .get(0);
             let total_tokens = request.input_tokens + request.output_tokens;
 
             // Insert usage log entry (model_name is denormalized for performance).
@@ -223,15 +233,15 @@ impl OrganizationUsageRepository {
                 }
                 None => {
                     // Duplicate — inference_id already exists for this org.
-                    // Roll back (nothing was written) and fetch the existing record.
-                    transaction.rollback().await.map_err(map_db_error)?;
+                    // Keep the accounting lock through comparison and allocation reads:
+                    // a historical correction must not race this idempotent retry.
 
                     tracing::debug!(
                         organization_id = %request.organization_id,
                         "Duplicate usage recording detected, returning existing record"
                     );
 
-                    let existing = client
+                    let existing = transaction
                         .query_typed_one(
                             r#"
                             SELECT usage_log.*
@@ -284,7 +294,7 @@ impl OrganizationUsageRepository {
                     {
                         Some(
                             load_allocations(
-                                &**client,
+                                &*transaction,
                                 UsageAllocationParent::Inference(existing.get("id")),
                             )
                             .await?,
@@ -292,6 +302,7 @@ impl OrganizationUsageRepository {
                     } else {
                         None
                     };
+                    transaction.commit().await.map_err(map_db_error)?;
                     (existing, false, allocations)
                 }
             };
@@ -392,7 +403,7 @@ impl OrganizationUsageRepository {
                                 'organization_limit_id', a.organization_limit_id,
                                 'policy_version', a.policy_version
                             ) ORDER BY a.created_at, a.priority_position, a.id)
-                            FROM usage_credit_allocations a
+                            FROM effective_usage_credit_allocations a
                             WHERE a.inference_usage_id = ul.id), '[]'::jsonb)
                         END AS credit_allocations
                     FROM organization_usage_log ul
@@ -455,7 +466,7 @@ impl OrganizationUsageRepository {
                     FROM organization_usage_log
                     WHERE api_key_id = $1
                       AND ($2::TEXT IS NULL OR EXISTS (
-                          SELECT 1 FROM usage_credit_allocations a
+                          SELECT 1 FROM effective_usage_credit_allocations a
                           WHERE a.inference_usage_id = organization_usage_log.id
                             AND a.credit_type = $2))
                     "#,
@@ -493,7 +504,7 @@ impl OrganizationUsageRepository {
                     SELECT ul.*,
                         CASE WHEN $2::TEXT IS NULL THEN ul.total_cost ELSE
                             (SELECT COALESCE(SUM(a.amount), 0)::BIGINT
-                             FROM usage_credit_allocations a
+                             FROM effective_usage_credit_allocations a
                              WHERE a.inference_usage_id = ul.id AND a.credit_type = $2)
                         END AS filtered_total_cost,
                         CASE WHEN ul.funded_amount IS NULL THEN NULL ELSE
@@ -502,14 +513,14 @@ impl OrganizationUsageRepository {
                                 'organization_limit_id', a.organization_limit_id,
                                 'policy_version', a.policy_version
                             ) ORDER BY a.created_at, a.priority_position, a.id)
-                            FROM usage_credit_allocations a
+                            FROM effective_usage_credit_allocations a
                             WHERE a.inference_usage_id = ul.id
                               AND ($2::TEXT IS NULL OR a.credit_type = $2)), '[]'::jsonb)
                         END AS credit_allocations
                     FROM organization_usage_log ul
                     WHERE ul.api_key_id = $1
                       AND ($2::TEXT IS NULL OR EXISTS (
-                          SELECT 1 FROM usage_credit_allocations filter_allocation
+                          SELECT 1 FROM effective_usage_credit_allocations filter_allocation
                           WHERE filter_allocation.inference_usage_id = ul.id
                             AND filter_allocation.credit_type = $2))
                     ORDER BY ul.created_at DESC

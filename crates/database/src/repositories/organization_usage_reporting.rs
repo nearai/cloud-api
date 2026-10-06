@@ -50,7 +50,7 @@ impl OrganizationUsageRepository {
                         model_name, inference_type, input_tokens, output_tokens,
                         cache_read_tokens, cache_write_tokens, total_tokens, input_cost, output_cost,
                         CASE WHEN $8::TEXT IS NULL THEN total_cost ELSE
-                            (SELECT COALESCE(SUM(a.amount), 0)::BIGINT FROM usage_credit_allocations a
+                            (SELECT COALESCE(SUM(a.amount), 0)::BIGINT FROM effective_usage_credit_allocations a
                              WHERE a.inference_usage_id = organization_usage_log.id
                                AND a.credit_type = $8)
                         END AS total_cost,
@@ -63,7 +63,7 @@ impl OrganizationUsageRepository {
                                 'organization_limit_id', a.organization_limit_id,
                                 'policy_version', a.policy_version
                             ) ORDER BY a.created_at, a.priority_position, a.id)
-                            FROM usage_credit_allocations a
+                            FROM effective_usage_credit_allocations a
                             WHERE a.inference_usage_id = organization_usage_log.id
                               AND ($8::TEXT IS NULL OR a.credit_type = $8)), '[]'::jsonb)
                         END AS credit_allocations
@@ -76,7 +76,7 @@ impl OrganizationUsageRepository {
                       AND ($6::TEXT IS NULL OR model_name = $6)
                       AND ($7::TEXT IS NULL OR inference_type = $7)
                       AND ($8::TEXT IS NULL OR EXISTS (
-                          SELECT 1 FROM usage_credit_allocations allocation_filter
+                          SELECT 1 FROM effective_usage_credit_allocations allocation_filter
                           WHERE allocation_filter.inference_usage_id = organization_usage_log.id
                             AND allocation_filter.credit_type = $8
                       ))
@@ -152,7 +152,7 @@ impl OrganizationUsageRepository {
                         model_name, inference_type, input_tokens, output_tokens,
                         cache_read_tokens, cache_write_tokens, total_tokens, input_cost, output_cost,
                         CASE WHEN $6::TEXT IS NULL THEN total_cost ELSE
-                            (SELECT COALESCE(SUM(a.amount), 0)::BIGINT FROM usage_credit_allocations a
+                            (SELECT COALESCE(SUM(a.amount), 0)::BIGINT FROM effective_usage_credit_allocations a
                              WHERE a.inference_usage_id = organization_usage_log.id
                                AND a.credit_type = $6)
                         END AS total_cost,
@@ -165,7 +165,7 @@ impl OrganizationUsageRepository {
                                 'organization_limit_id', a.organization_limit_id,
                                 'policy_version', a.policy_version
                             ) ORDER BY a.created_at, a.priority_position, a.id)
-                            FROM usage_credit_allocations a
+                            FROM effective_usage_credit_allocations a
                             WHERE a.inference_usage_id = organization_usage_log.id
                               AND ($6::TEXT IS NULL OR a.credit_type = $6)), '[]'::jsonb)
                         END AS credit_allocations
@@ -176,7 +176,7 @@ impl OrganizationUsageRepository {
                       AND ($4::UUID IS NULL OR workspace_id = $4)
                       AND ($5::UUID IS NULL OR api_key_id = $5)
                       AND ($6::TEXT IS NULL OR EXISTS (
-                          SELECT 1 FROM usage_credit_allocations allocation_filter
+                          SELECT 1 FROM effective_usage_credit_allocations allocation_filter
                           WHERE allocation_filter.inference_usage_id = organization_usage_log.id
                             AND allocation_filter.credit_type = $6
                       ))
@@ -215,7 +215,7 @@ impl OrganizationUsageRepository {
                       AND ($4::UUID IS NULL OR workspace_id = $4)
                       AND ($5::UUID IS NULL OR api_key_id = $5)
                       AND ($6::TEXT IS NULL OR EXISTS (
-                          SELECT 1 FROM usage_credit_allocations allocation_filter
+                          SELECT 1 FROM effective_usage_credit_allocations allocation_filter
                           WHERE allocation_filter.inference_usage_id = organization_usage_log.id
                             AND allocation_filter.credit_type = $6
                       ))

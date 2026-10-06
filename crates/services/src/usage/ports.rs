@@ -665,6 +665,16 @@ pub struct DiscountedCosts {
 }
 
 impl UsageDiscount {
+    /// Organization discounts accept whole basis points, including fully discounted usage.
+    pub fn from_basis_points(basis_points: u16) -> Result<Self, UsageError> {
+        if basis_points == 0 || basis_points > 10_000 {
+            return Err(UsageError::ValidationError(
+                "discount_basis_points must be between 1 and 10000".into(),
+            ));
+        }
+        Ok(Self { basis_points })
+    }
+
     /// Parse a fraction of the list price such as `0.2` (20% off).
     ///
     /// Returns `Ok(None)` for `0` (no discount). Rejects non-finite values,

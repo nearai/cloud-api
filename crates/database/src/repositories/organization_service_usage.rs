@@ -78,7 +78,7 @@ impl OrganizationServiceUsageRepository {
                         r#"SELECT COUNT(*)::BIGINT FROM organization_service_usage_log usage_log
                            WHERE organization_id = $1 AND service_id = $2
                              AND ($3::TEXT IS NULL OR EXISTS (
-                                 SELECT 1 FROM usage_credit_allocations a
+                                 SELECT 1 FROM effective_usage_credit_allocations a
                                  WHERE a.service_usage_id = usage_log.id AND a.credit_type = $3))"#,
                         &[&organization_id, &service_id, &credit_type],
                     )
@@ -92,7 +92,7 @@ impl OrganizationServiceUsageRepository {
                             usage_log.api_key_id, usage_log.service_id, usage_log.quantity,
                             CASE WHEN $3::TEXT IS NULL THEN usage_log.total_cost ELSE
                                 (SELECT COALESCE(SUM(a.amount), 0)::BIGINT
-                                 FROM usage_credit_allocations a
+                                 FROM effective_usage_credit_allocations a
                                  WHERE a.service_usage_id = usage_log.id AND a.credit_type = $3)
                             END AS total_cost,
                             usage_log.inference_id, usage_log.created_at,
@@ -104,14 +104,14 @@ impl OrganizationServiceUsageRepository {
                                     'organization_limit_id', a.organization_limit_id,
                                     'policy_version', a.policy_version
                                 ) ORDER BY a.created_at, a.priority_position, a.id)
-                                FROM usage_credit_allocations a
+                                FROM effective_usage_credit_allocations a
                                 WHERE a.service_usage_id = usage_log.id
                                   AND ($3::TEXT IS NULL OR a.credit_type = $3)), '[]'::jsonb)
                             END AS credit_allocations
                            FROM organization_service_usage_log usage_log
                            WHERE organization_id = $1 AND service_id = $2
                              AND ($3::TEXT IS NULL OR EXISTS (
-                                 SELECT 1 FROM usage_credit_allocations filter_allocation
+                                 SELECT 1 FROM effective_usage_credit_allocations filter_allocation
                                  WHERE filter_allocation.service_usage_id = usage_log.id
                                    AND filter_allocation.credit_type = $3))
                            ORDER BY created_at DESC LIMIT $4 OFFSET $5"#,
@@ -127,7 +127,7 @@ impl OrganizationServiceUsageRepository {
                         r#"SELECT COUNT(*)::BIGINT FROM organization_service_usage_log usage_log
                            WHERE organization_id = $1
                              AND ($2::TEXT IS NULL OR EXISTS (
-                                 SELECT 1 FROM usage_credit_allocations a
+                                 SELECT 1 FROM effective_usage_credit_allocations a
                                  WHERE a.service_usage_id = usage_log.id AND a.credit_type = $2))"#,
                         &[&organization_id, &credit_type],
                     )
@@ -141,7 +141,7 @@ impl OrganizationServiceUsageRepository {
                             usage_log.api_key_id, usage_log.service_id, usage_log.quantity,
                             CASE WHEN $2::TEXT IS NULL THEN usage_log.total_cost ELSE
                                 (SELECT COALESCE(SUM(a.amount), 0)::BIGINT
-                                 FROM usage_credit_allocations a
+                                 FROM effective_usage_credit_allocations a
                                  WHERE a.service_usage_id = usage_log.id AND a.credit_type = $2)
                             END AS total_cost,
                             usage_log.inference_id, usage_log.created_at,
@@ -153,14 +153,14 @@ impl OrganizationServiceUsageRepository {
                                     'organization_limit_id', a.organization_limit_id,
                                     'policy_version', a.policy_version
                                 ) ORDER BY a.created_at, a.priority_position, a.id)
-                                FROM usage_credit_allocations a
+                                FROM effective_usage_credit_allocations a
                                 WHERE a.service_usage_id = usage_log.id
                                   AND ($2::TEXT IS NULL OR a.credit_type = $2)), '[]'::jsonb)
                             END AS credit_allocations
                            FROM organization_service_usage_log usage_log
                            WHERE organization_id = $1
                              AND ($2::TEXT IS NULL OR EXISTS (
-                                 SELECT 1 FROM usage_credit_allocations filter_allocation
+                                 SELECT 1 FROM effective_usage_credit_allocations filter_allocation
                                  WHERE filter_allocation.service_usage_id = usage_log.id
                                    AND filter_allocation.credit_type = $2))
                            ORDER BY created_at DESC LIMIT $3 OFFSET $4"#,
@@ -221,7 +221,7 @@ impl OrganizationServiceUsageRepository {
                         usage_log.api_key_id, usage_log.service_id, services.service_name,
                         usage_log.quantity,
                         CASE WHEN $7::TEXT IS NULL THEN usage_log.total_cost ELSE
-                            (SELECT COALESCE(SUM(a.amount), 0)::BIGINT FROM usage_credit_allocations a
+                            (SELECT COALESCE(SUM(a.amount), 0)::BIGINT FROM effective_usage_credit_allocations a
                              WHERE a.service_usage_id = usage_log.id AND a.credit_type = $7)
                         END AS total_cost,
                         usage_log.inference_id, usage_log.created_at,
@@ -233,7 +233,7 @@ impl OrganizationServiceUsageRepository {
                                 'organization_limit_id', a.organization_limit_id,
                                 'policy_version', a.policy_version
                             ) ORDER BY a.created_at, a.priority_position, a.id)
-                            FROM usage_credit_allocations a
+                            FROM effective_usage_credit_allocations a
                             WHERE a.service_usage_id = usage_log.id
                               AND ($7::TEXT IS NULL OR a.credit_type = $7)), '[]'::jsonb)
                         END AS credit_allocations
@@ -246,7 +246,7 @@ impl OrganizationServiceUsageRepository {
                       AND ($5::TIMESTAMPTZ IS NULL OR usage_log.created_at >= $5)
                       AND ($6::TIMESTAMPTZ IS NULL OR usage_log.created_at <= $6)
                       AND ($7::TEXT IS NULL OR EXISTS (
-                          SELECT 1 FROM usage_credit_allocations allocation_filter
+                          SELECT 1 FROM effective_usage_credit_allocations allocation_filter
                           WHERE allocation_filter.service_usage_id = usage_log.id
                             AND allocation_filter.credit_type = $7
                       ))

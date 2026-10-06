@@ -87,3 +87,5 @@ pub use session::SessionRepository;
 pub use usage_hourly::UsageHourlyRepositoryImpl;
 pub use user::UserRepository;
 pub use workspace::WorkspaceRepository;
+
+pub mod organization_usage_discount;

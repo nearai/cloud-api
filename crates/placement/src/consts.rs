@@ -57,6 +57,30 @@ pub const AFFINITY_EPS: f64 = 0.25;
 /// replica's streams, still above ordinary jitter between replicas.
 pub const AFFINITY_ABS_SLACK: f64 = 0.25;
 
+/// Scales the cold-prefill cost in the pin-hold test: a pin holds iff
+/// `pinned_load <= best_other_load + prompt * PIN_HOLD_FACTOR`. 1.0 is a pure
+/// cost comparison: stay unless waiting on the warm replica costs more than a
+/// cold prefill of the prompt elsewhere. There is no evidence yet for other
+/// values.
+///
+/// This rule now governs every pinned request. Previously, prompts at or below
+/// the base-tier window used the score+slack bound, which released warm pins
+/// (and their prefix cache) whenever the pinned slot was slightly busier than
+/// the best. The factor tunes the rule but cannot restore that old behavior for
+/// short prompts; rollback for that is the placement kill switch (routes
+/// everything legacy) or reverting the change.
+pub const PIN_HOLD_FACTOR: f64 = 1.0;
+
+/// Whether smart placement is on. False routes every request through legacy
+/// routing (`LegacyReason::Disabled`). A PATCH of the `placement` admin setting
+/// applies immediately on the instance that receives it and on other instances
+/// at the next reload (`admin_settings::RELOAD_INTERVAL`, 10 minutes). For an
+/// instant fleet-wide stop, which affects every environment sharing the Valkey,
+/// set the Valkey key `routed:_placement_off`. Set it to false only after every
+/// instance runs a build that knows the field (`PlacementTuning` uses
+/// `deny_unknown_fields`).
+pub const PLACEMENT_ENABLED: bool = true;
+
 /// How long a follow pin stays valid after it's written, in milliseconds.
 /// 10 minutes, matching OpenRouter's sticky-session TTL.
 pub const PIN_TTL_MS: u64 = 600_000;

@@ -3655,7 +3655,7 @@ mod tests {
             prompt_tokens: Some(7),
             prefill_heavy: true,
             affinity: Some(placement::affinity::AffinityKey::from_bytes([0x5a; 16])),
-            affinity_source: placement::decision::AffinitySource::Client,
+            affinity_source: placement::decision::AffinitySource::Header,
         };
 
         let result = provider
@@ -6932,7 +6932,7 @@ mod tests {
             let messages = vec![user_msg("keyed request")];
             let mut req = request("z-ai/glm-5.3-flash");
             req.affinity = Some(key);
-            req.affinity_source = AffinitySource::Client;
+            req.affinity_source = AffinitySource::Header;
             let lease = h
                 .provider
                 .fleet
@@ -7945,7 +7945,7 @@ mod tests {
             // No pool context: an unknown size, short, and no affinity. A
             // source without a key is dropped.
             params.placement = crate::PlacementContext {
-                affinity_source: AffinitySource::Client,
+                affinity_source: AffinitySource::Header,
                 ..Default::default()
             };
             let req = PlacementRequest::from_params(&params);

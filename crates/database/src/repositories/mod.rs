@@ -3,9 +3,9 @@
 // costs one round trip instead of prepare + execute, with no per-connection
 // statement state. Only per-request queries on the inference hot path use it
 // (API key and workspace auth, balance and spend, staking source, model
-// resolve, concurrent limit, chat signatures). Elsewhere keep plain `query*`
-// and do not spread this style without a measured round-trip cost. Each
-// parameter type must match the column type in the migrations.
+// resolve and billing lookup/write, concurrent limit, chat signatures).
+// Elsewhere keep plain `query*` and do not spread this style without a measured
+// round-trip cost. Each parameter type must match the column type in the migrations.
 
 pub mod admin_access_token;
 pub mod admin_composite;

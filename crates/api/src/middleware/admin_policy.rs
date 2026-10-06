@@ -56,6 +56,7 @@ pub(crate) fn admin_operation(method: &Method, matched_path: &str) -> AdminOpera
                 | "/admin/platform/revenue-density"
                 | "/admin/invitation-email-deliveries"
                 | "/admin/users"
+                | "/admin/api-keys"
                 | "/admin/organizations"
                 | "/admin/organizations/{org_id}"
                 | "/admin/organizations/{org_id}/members"
@@ -98,6 +99,15 @@ mod tests {
             assert_eq!(admin_operation(&Method::GET, path), AdminOperation::Read);
             assert_eq!(admin_operation(&Method::PATCH, path), AdminOperation::Write);
             assert_eq!(admin_operation(&Method::PUT, path), AdminOperation::Write);
+        }
+    }
+
+    #[test]
+    fn api_keys_get_is_read() {
+        for path in ["/v1/admin/api-keys", "/admin/api-keys"] {
+            assert_eq!(admin_operation(&Method::GET, path), AdminOperation::Read);
+            assert_eq!(admin_operation(&Method::HEAD, path), AdminOperation::Read);
+            assert_eq!(admin_operation(&Method::POST, path), AdminOperation::Write);
         }
     }
 }

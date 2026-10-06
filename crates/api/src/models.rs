@@ -1227,6 +1227,10 @@ pub struct ModelInfo {
     /// string. Omitted when there is no planned deprecation.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub deprecation_date: Option<String>,
+    /// Recommended replacement for a model with a planned deprecation
+    /// (canonical model id). Omitted when none is set.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub successor_model_id: Option<String>,
     /// Human-readable description (OpenRouter `description`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
@@ -3203,6 +3207,35 @@ pub struct ListOrganizationsAdminResponse {
     pub offset: i64,
 }
 
+/// API key metadata for admin listing. Never includes key material (raw key,
+/// hash, or prefix) or the user-supplied key name.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct AdminApiKeyResponse {
+    pub id: String,
+    pub organization_id: String,
+    pub organization_name: String,
+    pub workspace_id: String,
+    /// User who created the key
+    pub created_by_user_id: String,
+    pub created_at: DateTime<Utc>,
+    pub is_active: bool,
+    /// Set when the key was revoked
+    pub deleted_at: Option<DateTime<Utc>>,
+    /// True when the key's name matches the Cloud UI's managed Playground key
+    /// naming (`Playground-<uuid>-g<generation>`). Best-effort: derived from the
+    /// user-editable key name, not stored provenance.
+    pub is_managed_playground: bool,
+}
+
+/// List API keys response model (admin only)
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct ListAdminApiKeysResponse {
+    pub api_keys: Vec<AdminApiKeyResponse>,
+    pub total: i64,
+    pub limit: i64,
+    pub offset: i64,
+}
+
 /// List organization members response model (admin only).
 /// Exposes full user details (email, last login, active status) for each member.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -3843,6 +3876,10 @@ pub struct ModelMetadata {
     /// string. Omitted when there is no planned deprecation.
     #[serde(rename = "deprecationDate", skip_serializing_if = "Option::is_none")]
     pub deprecation_date: Option<String>,
+    /// Recommended replacement for a model with a planned deprecation
+    /// (canonical model id). Omitted when none is set.
+    #[serde(rename = "successorModelId", skip_serializing_if = "Option::is_none")]
+    pub successor_model_id: Option<String>,
     /// OpenRouter `openrouter.slug` override (lowercase `author/slug`). Omitted
     /// when unset. On public `GET /v1/models` this surfaces as the nested
     /// `openrouter: { slug }` object; the admin view exposes the raw value.
@@ -3977,6 +4014,25 @@ pub struct UpdateModelApiRequest {
     )]
     #[schema(value_type = Option<String>)]
     pub deprecation_date: Nullable<String>,
+    /// Recommended replacement for a model with a planned deprecation: the
+    /// canonical id of an active model (or of a model created in the same
+    /// request). Announced to API users in the `x-model-successor` response
+    /// header and on `GET /v1/models`.
+    ///
+    /// Tri-state PATCH semantics:
+    /// - omitted → leave unchanged
+    /// - `null` → clear
+    /// - a string → set
+    ///
+    /// Clearing `deprecationDate` also clears the successor.
+    #[serde(
+        rename = "successorModelId",
+        default,
+        deserialize_with = "deserialize_nullable",
+        skip_serializing_if = "Option::is_none"
+    )]
+    #[schema(value_type = Option<String>)]
+    pub successor_model_id: Nullable<String>,
     /// OpenRouter `openrouter.slug` override (lowercase `author/slug`, e.g.
     /// `z-ai/glm-5.1`). Set when our canonical `model_name` does not match
     /// OpenRouter's slug; surfaced as the nested `openrouter: { slug }` object
@@ -4342,6 +4398,8 @@ pub struct ModelHistoryEntry {
     pub is_ready: Option<bool>,
     #[serde(rename = "deprecationDate", skip_serializing_if = "Option::is_none")]
     pub deprecation_date: Option<String>,
+    #[serde(rename = "successorModelId", skip_serializing_if = "Option::is_none")]
+    pub successor_model_id: Option<String>,
     /// OpenRouter `openrouter.slug` override the model carried at this point.
     #[serde(rename = "openrouterSlug", skip_serializing_if = "Option::is_none")]
     pub openrouter_slug: Option<String>,

@@ -1507,7 +1507,7 @@ mod tests {
             prompt_tokens: Some(1),
             prefill_heavy: true,
             affinity: Some(placement::affinity::AffinityKey::from_bytes([7; 16])),
-            affinity_source: placement::decision::AffinitySource::Client,
+            affinity_source: placement::decision::AffinitySource::Header,
         };
         let body = serde_json::to_value(&params).unwrap();
         assert!(body.get("placement").is_none());

@@ -192,6 +192,7 @@ use utoipa::{Modify, OpenApi};
         crate::routes::admin::list_invitation_email_deliveries,
         crate::routes::admin::resend_invitation_email,
         crate::routes::admin::list_users,
+        crate::routes::admin::list_api_keys,
         crate::routes::admin::get_organization,
         crate::routes::admin::list_organization_members,
         crate::routes::admin::update_organization_member_role,
@@ -251,6 +252,8 @@ use utoipa::{Modify, OpenApi};
             AdminOrganizationMemberResponse,
             ListAdminOrganizationMembersResponse,
             AdminOrganizationResponse,
+            AdminApiKeyResponse,
+            ListAdminApiKeysResponse,
             MemberRole,
             // Organization Invitation models
             InvitationStatus,

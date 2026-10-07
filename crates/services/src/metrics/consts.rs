@@ -1,8 +1,11 @@
 // Latency metrics
 pub const METRIC_LATENCY_TTFT: &str = "cloud_api.latency.time_to_first_token";
 pub const METRIC_LATENCY_TTFT_TOTAL: &str = "cloud_api.latency.time_to_first_token_total";
-// Streaming-only TTFT histograms emitted after usage arrives, so the actual
-// prompt-token bucket can be attached without mixing in non-streaming latency.
+// The base `time_to_first_token` metric carries an estimated input bucket at
+// the first token for every stream, including interrupted streams. These
+// streaming-only histograms carry the provider's actual prompt-token bucket
+// after usage arrives, covering the billable-completion subset. Both remain
+// useful because they describe different request populations and bucket sources.
 pub const METRIC_LATENCY_STREAMING_TTFT_BY_INPUT: &str =
     "cloud_api.latency.streaming_time_to_first_token_by_input";
 pub const METRIC_LATENCY_STREAMING_TTFT_TOTAL_BY_INPUT: &str =
@@ -112,7 +115,14 @@ pub const TAG_STATUS_CODE: &str = "status_code";
 pub const TAG_ENDPOINT: &str = "endpoint";
 pub const TAG_METHOD: &str = "method";
 pub const TAG_REASON: &str = "reason";
+// `estimated` is the request-side estimate attached at streaming admission to
+// request-count, queue-time, and streaming TTFT metrics. `actual` is the
+// provider-reported `prompt_tokens` bucket used after usage arrives and for
+// non-streaming completion metrics.
 pub const TAG_INPUT_BUCKET: &str = "input_bucket";
+pub const TAG_INPUT_BUCKET_SOURCE: &str = "input_bucket_source";
+pub const INPUT_BUCKET_SOURCE_ESTIMATED: &str = "estimated";
+pub const INPUT_BUCKET_SOURCE_ACTUAL: &str = "actual";
 pub const TAG_INFERENCE_TYPE: &str = "inference_type";
 
 // Error types for TAG_ERROR_TYPE

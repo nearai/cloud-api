@@ -2814,13 +2814,14 @@ impl InferenceProviderPool {
             return Some(providers);
         }
 
-        // Order providers by (health, trust tier, latency, capacity), then round-robin WITHIN the
-        // leading group. The leading group is the healthy providers of the lowest
-        // tier — a NEAR-served model's own attested fleet; requests rotate evenly
+        // Order providers by (context fit, health, trust tier, latency, best-fit
+        // capacity), then round-robin WITHIN the leading group. The leading group is
+        // the providers tied on that full key: typically a NEAR-served model's own
+        // healthy, fast attested fleet of one capacity. Requests rotate evenly
         // among them and only fall through to the next tier (an attested third
-        // party like Chutes) or to demoted providers when the leading group can't
-        // fulfill the request. Rotating within the group (rather than over the full
-        // list before sorting) keeps same-tier load balancing even.
+        // party like Chutes), to slower or demoted providers, when the leading
+        // group can't fulfill the request. Rotating within the group (rather than
+        // over the full list before sorting) keeps same-tier load balancing even.
         //   tier rank: Near (0) < Attested3p (1) < NonAttested (2)
         const MAX_CONSECUTIVE_FAILURES: u32 = 10;
         fn tier_rank(p: &Arc<InferenceProviderTrait>) -> u8 {
@@ -11731,28 +11732,36 @@ mod tests {
     async fn tiered_pool(
         model: &str,
         specs: &[(inference_providers::ProviderTier, Option<u32>)],
-    ) -> (InferenceProviderPool, Vec<Arc<InferenceProviderTrait>>) {
+    ) -> (
+        InferenceProviderPool,
+        Vec<Arc<inference_providers::mock::MockProvider>>,
+    ) {
         use inference_providers::mock::MockProvider;
 
         let pool = InferenceProviderPool::new(None, ExternalProvidersConfig::default());
-        let providers: Vec<Arc<InferenceProviderTrait>> = specs
+        let providers: Vec<Arc<MockProvider>> = specs
             .iter()
-            .map(|(tier, _)| {
-                Arc::new(MockProvider::new_accept_all().with_tier(*tier))
-                    as Arc<InferenceProviderTrait>
-            })
+            .map(|(tier, _)| Arc::new(MockProvider::new_accept_all().with_tier(*tier)))
+            .collect();
+        let as_trait: Vec<Arc<InferenceProviderTrait>> = providers
+            .iter()
+            .map(|p| p.clone() as Arc<InferenceProviderTrait>)
             .collect();
         pool.provider_mappings
             .write()
             .await
             .model_to_providers
-            .insert(model.to_string(), providers.clone());
-        for (p, (_, ctx)) in providers.iter().zip(specs) {
+            .insert(model.to_string(), as_trait.clone());
+        for (p, (_, ctx)) in as_trait.iter().zip(specs) {
             if let Some(ctx) = ctx {
                 pool.set_declared_ctx(p, *ctx);
             }
         }
         (pool, providers)
+    }
+
+    fn as_trait(p: &Arc<inference_providers::mock::MockProvider>) -> Arc<InferenceProviderTrait> {
+        p.clone() as Arc<InferenceProviderTrait>
     }
 
     async fn pool_with_near_and_chutes(
@@ -11764,19 +11773,7 @@ mod tests {
     ) {
         use inference_providers::ProviderTier::{Attested3p, Near};
         let (pool, p) = tiered_pool(model, &[(Near, None), (Attested3p, None)]).await;
-        (pool, p[0].clone(), p[1].clone())
-    }
-
-    async fn pool_with_two_near(
-        model: &str,
-    ) -> (
-        InferenceProviderPool,
-        Arc<InferenceProviderTrait>,
-        Arc<InferenceProviderTrait>,
-    ) {
-        use inference_providers::ProviderTier::Near;
-        let (pool, p) = tiered_pool(model, &[(Near, None), (Near, None)]).await;
-        (pool, p[0].clone(), p[1].clone())
+        (pool, as_trait(&p[0]), as_trait(&p[1]))
     }
 
     async fn pool_with_near_and_two_backups(
@@ -11795,44 +11792,89 @@ mod tests {
             &[(Near, None), (Attested3p, ctx1), (Attested3p, ctx2)],
         )
         .await;
-        (pool, p[0].clone(), p[1].clone(), p[2].clone())
+        (pool, as_trait(&p[0]), as_trait(&p[1]), as_trait(&p[2]))
     }
 
     #[tokio::test]
     async fn latency_demoted_near_still_precedes_healthy_attested_3p() {
         use inference_providers::ProviderTier::{Attested3p, Near};
+        // Slow NEAR registered FIRST so registration order contradicts the
+        // expected order: only latency demotion can put near_fast ahead.
         let (pool, p) =
             tiered_pool("m-lat-1", &[(Near, None), (Near, None), (Attested3p, None)]).await;
-        let (near_fast, near_slow, chutes) = (&p[0], &p[1], &p[2]);
+        let (near_slow, near_fast, chutes) = (as_trait(&p[0]), as_trait(&p[1]), as_trait(&p[2]));
         // near_slow is latency-demoted within NEAR (3000 > 2*200 && > 500).
-        pool.seed_ttft(near_fast, 200.0);
-        pool.seed_ttft(near_slow, 3000.0);
-        pool.seed_ttft(chutes, 100.0);
-        let order = pool
-            .get_providers_with_fallback("m-lat-1", None, &ChatRoutingHints::default())
-            .await
-            .unwrap();
-        assert_eq!(order.len(), 3);
-        assert!(Arc::ptr_eq(&order[0], near_fast));
-        assert!(
-            Arc::ptr_eq(&order[1], near_slow),
-            "latency-demoted NEAR must still precede a healthy 3P"
-        );
-        assert!(Arc::ptr_eq(&order[2], chutes));
+        pool.seed_ttft(&near_fast, 200.0);
+        pool.seed_ttft(&near_slow, 3000.0);
+        pool.seed_ttft(&chutes, 100.0);
+        for _ in 0..4 {
+            let order = pool
+                .get_providers_with_fallback("m-lat-1", None, &ChatRoutingHints::default())
+                .await
+                .unwrap();
+            assert_eq!(order.len(), 3);
+            assert!(Arc::ptr_eq(&order[0], &near_fast));
+            assert!(
+                Arc::ptr_eq(&order[1], &near_slow),
+                "latency-demoted NEAR must still precede a healthy 3P"
+            );
+            assert!(Arc::ptr_eq(&order[2], &chutes));
+        }
     }
 
     #[tokio::test]
     async fn slow_near_replica_still_demoted_behind_fast_near_sibling() {
-        let (pool, near_fast, near_slow) = pool_with_two_near("m-lat-2").await;
+        use inference_providers::ProviderTier::Near;
+        // Slow replica registered first (see test above).
+        let (pool, p) = tiered_pool("m-lat-2", &[(Near, None), (Near, None)]).await;
+        let (near_slow, near_fast) = (as_trait(&p[0]), as_trait(&p[1]));
         pool.seed_ttft(&near_fast, 200.0);
         pool.seed_ttft(&near_slow, 3000.0);
-        let order = pool
-            .get_providers_with_fallback("m-lat-2", None, &ChatRoutingHints::default())
-            .await
-            .unwrap();
-        assert_eq!(order.len(), 2);
-        assert!(Arc::ptr_eq(&order[0], &near_fast));
-        assert!(Arc::ptr_eq(&order[1], &near_slow));
+        for _ in 0..4 {
+            let order = pool
+                .get_providers_with_fallback("m-lat-2", None, &ChatRoutingHints::default())
+                .await
+                .unwrap();
+            assert_eq!(order.len(), 2);
+            assert!(Arc::ptr_eq(&order[0], &near_fast));
+            assert!(Arc::ptr_eq(&order[1], &near_slow));
+        }
+    }
+
+    #[tokio::test]
+    async fn latency_cold_tier_never_demoted() {
+        use inference_providers::ProviderTier::{Attested3p, Near};
+        // (a) A warmed NEAR next to a cold NEAR (no samples): the warmed one is
+        // its own tier minimum, so nothing is demoted and the pair keeps
+        // rotating (both appear first across calls).
+        let (pool, p) = tiered_pool("m-cold-a", &[(Near, None), (Near, None)]).await;
+        let warm = as_trait(&p[0]);
+        pool.seed_ttft(&warm, 3000.0);
+        let mut leaders = Vec::new();
+        for _ in 0..4 {
+            let order = pool
+                .get_providers_with_fallback("m-cold-a", None, &ChatRoutingHints::default())
+                .await
+                .unwrap();
+            leaders.push(Arc::ptr_eq(&order[0], &warm));
+        }
+        assert!(
+            leaders.contains(&true) && leaders.contains(&false),
+            "warm and cold NEAR must stay tied and rotate, got {leaders:?}"
+        );
+
+        // (b) A warmed NEAR next to a cold Attested3p: NEAR stays first.
+        let (pool, p) = tiered_pool("m-cold-b", &[(Attested3p, None), (Near, None)]).await;
+        let (cold_3p, warm_near) = (as_trait(&p[0]), as_trait(&p[1]));
+        pool.seed_ttft(&warm_near, 3000.0);
+        for _ in 0..4 {
+            let order = pool
+                .get_providers_with_fallback("m-cold-b", None, &ChatRoutingHints::default())
+                .await
+                .unwrap();
+            assert!(Arc::ptr_eq(&order[0], &warm_near));
+            assert!(Arc::ptr_eq(&order[1], &cold_3p));
+        }
     }
 
     #[tokio::test]
@@ -11904,37 +11946,11 @@ mod tests {
         InferenceProviderPool,
         Vec<Arc<inference_providers::mock::MockProvider>>,
     ) {
-        use inference_providers::mock::MockProvider;
-        use inference_providers::ProviderTier;
-
-        let pool = InferenceProviderPool::new(None, ExternalProvidersConfig::default());
-        let providers: Vec<Arc<MockProvider>> = caps
+        let specs: Vec<_> = caps
             .iter()
-            .map(|_| Arc::new(MockProvider::new_accept_all().with_tier(ProviderTier::Near)))
+            .map(|c| (inference_providers::ProviderTier::Near, Some(*c)))
             .collect();
-        {
-            let mut m = pool.provider_mappings.write().await;
-            m.model_to_providers.insert(
-                model.to_string(),
-                providers
-                    .iter()
-                    .map(|p| p.clone() as Arc<InferenceProviderTrait>)
-                    .collect(),
-            );
-        }
-        {
-            let mut states = pool
-                .provider_load_state
-                .write()
-                .unwrap_or_else(|e| e.into_inner());
-            for (provider, cap) in providers.iter().zip(caps) {
-                states
-                    .entry(Arc::as_ptr(provider) as *const () as usize)
-                    .or_default()
-                    .max_context_tokens = Some(*cap);
-            }
-        }
-        (pool, providers)
+        tiered_pool(model, &specs).await
     }
 
     /// `fallback_params` with `bytes` of text (countable = bytes / 4).

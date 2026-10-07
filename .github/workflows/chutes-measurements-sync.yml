@@ -69,8 +69,8 @@ jobs:
           done
           echo "PINS_EVIDENCE_DIR=$evidence" >> "$GITHUB_ENV"
 
-      # Build without any secret in the environment, so build scripts of
-      # dependencies never see the Chutes key.
+      # Build in its own step so a failed build is not reported as a failed
+      # probe. Neither step sees any secret.
       - name: Build the sync binary
         run: cargo build --locked --release -p chutes_sync --bin chutes_measurement_sync
 

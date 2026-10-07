@@ -2814,7 +2814,7 @@ impl InferenceProviderPool {
             return Some(providers);
         }
 
-        // Order providers by (health, trust tier), then round-robin WITHIN the
+        // Order providers by (health, trust tier, latency, capacity), then round-robin WITHIN the
         // leading group. The leading group is the healthy providers of the lowest
         // tier — a NEAR-served model's own attested fleet; requests rotate evenly
         // among them and only fall through to the next tier (an attested third
@@ -2949,7 +2949,7 @@ impl InferenceProviderPool {
         tracing::debug!(
             providers_count = ordered.len(),
             leading_group = group_len,
-            "Prepared providers for fallback (tier-ordered, round-robin within leading tier)"
+            "Prepared providers for fallback (tier, then latency, then capacity; round-robin within leading group)"
         );
 
         Some(ordered)
@@ -11800,17 +11800,25 @@ mod tests {
 
     #[tokio::test]
     async fn latency_demoted_near_still_precedes_healthy_attested_3p() {
-        let (pool, near, chutes) = pool_with_near_and_chutes("m-lat-1").await;
-        pool.seed_ttft(&near, 3000.0);
-        pool.seed_ttft(&chutes, 200.0);
+        use inference_providers::ProviderTier::{Attested3p, Near};
+        let (pool, p) =
+            tiered_pool("m-lat-1", &[(Near, None), (Near, None), (Attested3p, None)]).await;
+        let (near_fast, near_slow, chutes) = (&p[0], &p[1], &p[2]);
+        // near_slow is latency-demoted within NEAR (3000 > 2*200 && > 500).
+        pool.seed_ttft(near_fast, 200.0);
+        pool.seed_ttft(near_slow, 3000.0);
+        pool.seed_ttft(chutes, 100.0);
         let order = pool
             .get_providers_with_fallback("m-lat-1", None, &ChatRoutingHints::default())
             .await
             .unwrap();
+        assert_eq!(order.len(), 3);
+        assert!(Arc::ptr_eq(&order[0], near_fast));
         assert!(
-            Arc::ptr_eq(&order[0], &near),
-            "NEAR must lead a healthy 3P even when latency-demoted"
+            Arc::ptr_eq(&order[1], near_slow),
+            "latency-demoted NEAR must still precede a healthy 3P"
         );
+        assert!(Arc::ptr_eq(&order[2], chutes));
     }
 
     #[tokio::test]
@@ -11822,7 +11830,9 @@ mod tests {
             .get_providers_with_fallback("m-lat-2", None, &ChatRoutingHints::default())
             .await
             .unwrap();
+        assert_eq!(order.len(), 2);
         assert!(Arc::ptr_eq(&order[0], &near_fast));
+        assert!(Arc::ptr_eq(&order[1], &near_slow));
     }
 
     #[tokio::test]
@@ -11846,7 +11856,9 @@ mod tests {
             .get_providers_with_fallback("m-lat-4", None, &ChatRoutingHints::default())
             .await
             .unwrap();
+        assert_eq!(order.len(), 2);
         assert!(Arc::ptr_eq(&order[0], &chutes));
+        assert!(Arc::ptr_eq(&order[1], &near));
     }
 
     #[tokio::test]
@@ -11866,7 +11878,7 @@ mod tests {
 
     #[tokio::test]
     async fn distinct_backup_windows_route_oversized_to_fitting_backup() {
-        let (pool, near, _b1, b2) =
+        let (pool, near, b1, b2) =
             pool_with_near_and_two_backups("m-ref", Some(262_144), Some(1_048_576)).await;
         pool.set_declared_ctx(&near, 131_072);
         let hints = ChatRoutingHints {
@@ -11877,7 +11889,10 @@ mod tests {
             .get_providers_with_fallback("m-ref", None, &hints)
             .await
             .unwrap();
+        assert_eq!(order.len(), 3);
         assert!(Arc::ptr_eq(&order[0], &b2));
+        assert!(Arc::ptr_eq(&order[1], &near));
+        assert!(Arc::ptr_eq(&order[2], &b1));
     }
 
     /// A pool serving `model` from NEAR mock providers with the given

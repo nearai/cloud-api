@@ -63,6 +63,9 @@ immediately available for new usage. No admin API call is required.
 
 - Deploy every inference, service, limit, and staking writer together. They
   coordinate through the same per-organization database lock.
+- Inference usage posts through `record_organization_usage` (V0087) in one database
+  statement; the organization lock is held only during server-side accounting.
+  Platform-service usage still uses the Rust transaction path and the same lock.
 - Existing unattributed usage remains unknown and continues reducing aggregate
   admission capacity. Its amount is snapshotted during the allocation-ledger
   migration so usage posting does not rescan lifetime history. Establish

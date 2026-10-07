@@ -2830,7 +2830,7 @@ impl InferenceProviderPool {
                 inference_providers::ProviderTier::NonAttested => 2,
             }
         }
-        // (context_overflow, demoted, latency_demoted, tier_rank): prefer capable, healthy, fast, NEAR.
+        // (context_overflow, demoted, tier_rank, latency_demoted): prefer capable, healthy, NEAR, fast.
         let (mut ordered, group_len) = {
             let counts = self
                 .provider_failure_counts
@@ -2841,20 +2841,27 @@ impl InferenceProviderPool {
                 .read()
                 .unwrap_or_else(|e| e.into_inner());
 
-            // Find the minimum warmed-up TTFT EMA across all providers for relative comparison.
-            let min_ttft_ms = providers
-                .iter()
-                .filter_map(|p| {
-                    let ptr = Arc::as_ptr(p) as *const () as usize;
-                    states
-                        .get(&ptr)
-                        .filter(|s| s.ttft_samples >= TTFT_WARMUP_SAMPLES && s.ttft_ewma_ms > 0.0)
-                })
-                .map(|s| s.ttft_ewma_ms)
-                .fold(f64::MAX, f64::min);
+            // Warmed-up TTFT minimum per trust tier: latency demotion compares a
+            // provider only with its own tier, so a fast attested fallback can
+            // never demote NEAR (spec §3.8, reverses #838's cross-tier soft demotion).
+            let mut min_ttft_by_tier: HashMap<inference_providers::ProviderTier, f64> =
+                HashMap::new();
+            for p in providers.iter() {
+                let ptr = Arc::as_ptr(p) as *const () as usize;
+                if let Some(s) = states
+                    .get(&ptr)
+                    .filter(|s| s.ttft_samples >= TTFT_WARMUP_SAMPLES && s.ttft_ewma_ms > 0.0)
+                {
+                    let e = min_ttft_by_tier.entry(p.tier()).or_insert(f64::MAX);
+                    *e = e.min(s.ttft_ewma_ms);
+                }
+            }
 
-            // Sort key: (context_overflow, hard_demoted, latency_demoted, tier_rank,
-            // capacity_rank). Lower = preferred. The trailing capacity rank makes
+            // Sort key: (context_overflow, hard_demoted, tier_rank, latency_demoted,
+            // capacity_rank). Lower = preferred. Tier ranks above latency so backups
+            // stay backups: a slow-but-healthy NEAR still leads an attested fallback,
+            // while a slow replica still sheds to faster siblings of its own tier.
+            // The trailing capacity rank makes
             // ordering BEST-FIT within an otherwise-equal group: for a model with
             // two NEAR tiers (e.g. glm-5.2's 262k fleet + single-host 1M tier),
             // short requests prefer the smaller/plentiful fleet instead of
@@ -2882,7 +2889,8 @@ impl InferenceProviderPool {
                         .zip(max_context_tokens)
                         .is_some_and(|(req, cap)| req > cap),
                 );
-                // Provider's TTFT EMA is significantly worse than the fastest peer.
+                // Provider's TTFT EMA is significantly worse than the fastest peer of its tier.
+                let min_ttft_ms = min_ttft_by_tier.get(&p.tier()).copied().unwrap_or(f64::MAX);
                 let latency_demoted = u8::from(
                     ttft_samples >= TTFT_WARMUP_SAMPLES
                         && ttft_ewma_ms > TTFT_SLOW_FLOOR_MS
@@ -2900,8 +2908,8 @@ impl InferenceProviderPool {
                 (
                     context_overflow,
                     demoted,
-                    latency_demoted,
                     tier_rank(p),
+                    latency_demoted,
                     capacity_rank,
                 )
             };
@@ -11681,6 +11689,195 @@ mod tests {
             Some((100_000f64 * context_routing::safety_factor()).ceil() as u32 + 4),
             "multi-capacity model: requirement = ceil(countable × factor) + overhead"
         );
+    }
+
+    // ==================== Tier ranks above latency (spec §3.8) ====================
+
+    impl InferenceProviderPool {
+        /// Seed a warmed-up TTFT EWMA for `p`.
+        fn seed_ttft(&self, p: &Arc<InferenceProviderTrait>, ewma_ms: f64) {
+            let mut states = self
+                .provider_load_state
+                .write()
+                .unwrap_or_else(|e| e.into_inner());
+            let s = states
+                .entry(Arc::as_ptr(p) as *const () as usize)
+                .or_default();
+            s.ttft_samples = TTFT_WARMUP_SAMPLES;
+            s.ttft_ewma_ms = ewma_ms;
+        }
+
+        /// Seed a consecutive-failure count for `p`.
+        fn seed_failures(&self, p: &Arc<InferenceProviderTrait>, failures: u32) {
+            self.provider_failure_counts
+                .write()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(Arc::as_ptr(p) as *const () as usize, failures);
+        }
+
+        /// Declare a context window for `p`.
+        fn set_declared_ctx(&self, p: &Arc<InferenceProviderTrait>, ctx: u32) {
+            self.provider_load_state
+                .write()
+                .unwrap_or_else(|e| e.into_inner())
+                .entry(Arc::as_ptr(p) as *const () as usize)
+                .or_default()
+                .max_context_tokens = Some(ctx);
+        }
+    }
+
+    /// A pool serving `model` from the given (tier, declared ctx) providers,
+    /// registered in order.
+    async fn tiered_pool(
+        model: &str,
+        specs: &[(inference_providers::ProviderTier, Option<u32>)],
+    ) -> (InferenceProviderPool, Vec<Arc<InferenceProviderTrait>>) {
+        use inference_providers::mock::MockProvider;
+
+        let pool = InferenceProviderPool::new(None, ExternalProvidersConfig::default());
+        let providers: Vec<Arc<InferenceProviderTrait>> = specs
+            .iter()
+            .map(|(tier, _)| {
+                Arc::new(MockProvider::new_accept_all().with_tier(*tier))
+                    as Arc<InferenceProviderTrait>
+            })
+            .collect();
+        pool.provider_mappings
+            .write()
+            .await
+            .model_to_providers
+            .insert(model.to_string(), providers.clone());
+        for (p, (_, ctx)) in providers.iter().zip(specs) {
+            if let Some(ctx) = ctx {
+                pool.set_declared_ctx(p, *ctx);
+            }
+        }
+        (pool, providers)
+    }
+
+    async fn pool_with_near_and_chutes(
+        model: &str,
+    ) -> (
+        InferenceProviderPool,
+        Arc<InferenceProviderTrait>,
+        Arc<InferenceProviderTrait>,
+    ) {
+        use inference_providers::ProviderTier::{Attested3p, Near};
+        let (pool, p) = tiered_pool(model, &[(Near, None), (Attested3p, None)]).await;
+        (pool, p[0].clone(), p[1].clone())
+    }
+
+    async fn pool_with_two_near(
+        model: &str,
+    ) -> (
+        InferenceProviderPool,
+        Arc<InferenceProviderTrait>,
+        Arc<InferenceProviderTrait>,
+    ) {
+        use inference_providers::ProviderTier::Near;
+        let (pool, p) = tiered_pool(model, &[(Near, None), (Near, None)]).await;
+        (pool, p[0].clone(), p[1].clone())
+    }
+
+    async fn pool_with_near_and_two_backups(
+        model: &str,
+        ctx1: Option<u32>,
+        ctx2: Option<u32>,
+    ) -> (
+        InferenceProviderPool,
+        Arc<InferenceProviderTrait>,
+        Arc<InferenceProviderTrait>,
+        Arc<InferenceProviderTrait>,
+    ) {
+        use inference_providers::ProviderTier::{Attested3p, Near};
+        let (pool, p) = tiered_pool(
+            model,
+            &[(Near, None), (Attested3p, ctx1), (Attested3p, ctx2)],
+        )
+        .await;
+        (pool, p[0].clone(), p[1].clone(), p[2].clone())
+    }
+
+    #[tokio::test]
+    async fn latency_demoted_near_still_precedes_healthy_attested_3p() {
+        let (pool, near, chutes) = pool_with_near_and_chutes("m-lat-1").await;
+        pool.seed_ttft(&near, 3000.0);
+        pool.seed_ttft(&chutes, 200.0);
+        let order = pool
+            .get_providers_with_fallback("m-lat-1", None, &ChatRoutingHints::default())
+            .await
+            .unwrap();
+        assert!(
+            Arc::ptr_eq(&order[0], &near),
+            "NEAR must lead a healthy 3P even when latency-demoted"
+        );
+    }
+
+    #[tokio::test]
+    async fn slow_near_replica_still_demoted_behind_fast_near_sibling() {
+        let (pool, near_fast, near_slow) = pool_with_two_near("m-lat-2").await;
+        pool.seed_ttft(&near_fast, 200.0);
+        pool.seed_ttft(&near_slow, 3000.0);
+        let order = pool
+            .get_providers_with_fallback("m-lat-2", None, &ChatRoutingHints::default())
+            .await
+            .unwrap();
+        assert!(Arc::ptr_eq(&order[0], &near_fast));
+    }
+
+    #[tokio::test]
+    async fn fast_3p_does_not_latency_demote_near_baseline_is_per_tier() {
+        // Single NEAR at 700ms, Chutes at 100ms: NEAR's baseline is its own tier.
+        let (pool, near, chutes) = pool_with_near_and_chutes("m-lat-3").await;
+        pool.seed_ttft(&near, 700.0);
+        pool.seed_ttft(&chutes, 100.0);
+        let order = pool
+            .get_providers_with_fallback("m-lat-3", None, &ChatRoutingHints::default())
+            .await
+            .unwrap();
+        assert!(Arc::ptr_eq(&order[0], &near));
+    }
+
+    #[tokio::test]
+    async fn hard_demoted_near_lets_3p_lead() {
+        let (pool, near, chutes) = pool_with_near_and_chutes("m-lat-4").await;
+        pool.seed_failures(&near, 10); // MAX_CONSECUTIVE_FAILURES
+        let order = pool
+            .get_providers_with_fallback("m-lat-4", None, &ChatRoutingHints::default())
+            .await
+            .unwrap();
+        assert!(Arc::ptr_eq(&order[0], &chutes));
+    }
+
+    #[tokio::test]
+    async fn equal_window_backups_keep_registration_order_behind_near() {
+        let (pool, near, b1, b2) =
+            pool_with_near_and_two_backups("m-tie", Some(262_144), Some(262_144)).await;
+        for _ in 0..4 {
+            let order = pool
+                .get_providers_with_fallback("m-tie", None, &ChatRoutingHints::default())
+                .await
+                .unwrap();
+            assert!(Arc::ptr_eq(&order[0], &near));
+            assert!(Arc::ptr_eq(&order[1], &b1));
+            assert!(Arc::ptr_eq(&order[2], &b2));
+        }
+    }
+
+    #[tokio::test]
+    async fn distinct_backup_windows_route_oversized_to_fitting_backup() {
+        let (pool, near, _b1, b2) =
+            pool_with_near_and_two_backups("m-ref", Some(262_144), Some(1_048_576)).await;
+        pool.set_declared_ctx(&near, 131_072);
+        let hints = ChatRoutingHints {
+            estimated_tokens: Some(500_000),
+            ..Default::default()
+        };
+        let order = pool
+            .get_providers_with_fallback("m-ref", None, &hints)
+            .await
+            .unwrap();
+        assert!(Arc::ptr_eq(&order[0], &b2));
     }
 
     /// A pool serving `model` from NEAR mock providers with the given

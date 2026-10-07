@@ -58,6 +58,11 @@ jobs:
             fi
           fi
 
+      # Build without any secret in the environment, so build scripts of
+      # dependencies never see the Chutes key.
+      - name: Build the sync binary
+        run: cargo build --locked --release -p chutes_sync --bin chutes_measurement_sync
+
       - name: Probe Chutes
         env:
           CHUTES_API_KEY: ${{ secrets.CHUTES_SYNC_API_KEY }}
@@ -66,7 +71,7 @@ jobs:
           PINS_OUT: ${{ env.PINS_FILE }}
           REPORT_OUT: ${{ runner.temp }}/report.md
           OBSERVATIONS_OUT: ${{ runner.temp }}/observations.json
-        run: cargo run --locked --release -p chutes_sync --bin chutes_measurement_sync
+        run: ./target/release/chutes_measurement_sync
 
       - name: Upload audit artifact
         if: always()

@@ -167,6 +167,11 @@ pub async fn run(
     .await
     .map_err(|e| ProbeError::Feed(e.describe()))?;
     let feed = parse_feed(&feed_body).map_err(|e| ProbeError::Feed(e.to_string()))?;
+    // An empty or wholly unparseable feed would make every carried row look
+    // withdrawn and close the open bot PR; fail the run instead.
+    if feed.is_empty() {
+        return Err(ProbeError::Feed("no usable rows".to_string()));
+    }
 
     let mut models = with_retry(cfg.attempts, cfg.backoff, client_retryable, || {
         client.list_models()
@@ -299,6 +304,18 @@ mod tests {
         r#"{"instances": [{"instance_id": "i1", "e2e_pubkey": "cGs=", "nonces": []}]}"#;
     const NULL_EVIDENCE: &str = r#"{"evidence": null}"#;
 
+    /// A feed with one well-formed row.
+    fn feed() -> String {
+        let r = "ab".repeat(48);
+        serde_json::json!([{
+            "version": "1.4.1",
+            "name": "8xb300",
+            "mrtd": r,
+            "runtime_rtmrs": { "RTMR0": r, "RTMR1": r, "RTMR2": r, "RTMR3": r },
+        }])
+        .to_string()
+    }
+
     async fn probe_with(
         server: &MockServer,
         only_models: Option<Vec<String>>,
@@ -328,7 +345,7 @@ mod tests {
     #[tokio::test]
     async fn chute_with_no_instances_is_not_skipped() {
         let server = MockServer::start().await;
-        get(&server, "/servers/tee/measurements", 200, "[]").await;
+        get(&server, "/servers/tee/measurements", 200, &feed()).await;
         get(&server, "/v1/models", 200, &models(&[("m1", "c1")])).await;
         get(&server, "/e2e/instances/c1", 200, NO_INSTANCES).await;
         get(&server, "/chutes/c1/evidence", 200, NULL_EVIDENCE).await;
@@ -340,7 +357,7 @@ mod tests {
     #[tokio::test]
     async fn instance_missing_from_evidence_is_unverified() {
         let server = MockServer::start().await;
-        get(&server, "/servers/tee/measurements", 200, "[]").await;
+        get(&server, "/servers/tee/measurements", 200, &feed()).await;
         get(&server, "/v1/models", 200, &models(&[("m1", "c1")])).await;
         get(&server, "/e2e/instances/c1", 200, ONE_INSTANCE).await;
         get(&server, "/chutes/c1/evidence", 200, r#"{"evidence": []}"#).await;
@@ -358,7 +375,7 @@ mod tests {
     #[tokio::test]
     async fn malformed_quote_is_unverified_at_transform() {
         let server = MockServer::start().await;
-        get(&server, "/servers/tee/measurements", 200, "[]").await;
+        get(&server, "/servers/tee/measurements", 200, &feed()).await;
         get(&server, "/v1/models", 200, &models(&[("m1", "c1")])).await;
         get(&server, "/e2e/instances/c1", 200, ONE_INSTANCE).await;
         get(
@@ -382,7 +399,7 @@ mod tests {
     #[tokio::test]
     async fn forbidden_chute_is_skipped_others_continue() {
         let server = MockServer::start().await;
-        get(&server, "/servers/tee/measurements", 200, "[]").await;
+        get(&server, "/servers/tee/measurements", 200, &feed()).await;
         get(
             &server,
             "/v1/models",
@@ -403,7 +420,7 @@ mod tests {
     #[tokio::test]
     async fn rate_limited_discovery_is_retried() {
         let server = MockServer::start().await;
-        get(&server, "/servers/tee/measurements", 200, "[]").await;
+        get(&server, "/servers/tee/measurements", 200, &feed()).await;
         get(&server, "/v1/models", 200, &models(&[("m1", "c1")])).await;
         Mock::given(method("GET"))
             .and(path("/e2e/instances/c1"))
@@ -421,7 +438,7 @@ mod tests {
     #[tokio::test]
     async fn every_chute_failing_is_an_error() {
         let server = MockServer::start().await;
-        get(&server, "/servers/tee/measurements", 200, "[]").await;
+        get(&server, "/servers/tee/measurements", 200, &feed()).await;
         get(&server, "/v1/models", 200, &models(&[("m1", "c1")])).await;
         get(&server, "/e2e/instances/c1", 500, "").await;
         assert!(matches!(
@@ -438,12 +455,22 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn feed_with_no_usable_rows_is_an_error() {
+        // An empty or unparseable feed must fail the run: otherwise every
+        // carried row looks withdrawn and the open bot PR gets closed.
+        let server = MockServer::start().await;
+        get(&server, "/servers/tee/measurements", 200, "[]").await;
+        get(&server, "/v1/models", 200, &models(&[("m1", "c1")])).await;
+        assert!(matches!(probe(&server).await, Err(ProbeError::Feed(_))));
+    }
+
+    #[tokio::test]
     async fn only_listed_models_are_probed() {
         // CHUTES_SYNC_MODELS fallback: if the key cannot read other chutes,
         // the probe is limited to the listed models. c2 has no mocks, so
         // probing it would show up as a skipped chute.
         let server = MockServer::start().await;
-        get(&server, "/servers/tee/measurements", 200, "[]").await;
+        get(&server, "/servers/tee/measurements", 200, &feed()).await;
         get(
             &server,
             "/v1/models",

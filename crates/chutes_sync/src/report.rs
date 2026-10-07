@@ -69,6 +69,11 @@ pub fn render_markdown(report: &SyncReport, date: &str) -> String {
     );
     list(
         &mut s,
+        "Name already pinned with a different RTMR0 (not pinned; needs a person)",
+        &report.name_collisions,
+    );
+    list(
+        &mut s,
         "All-zero runtime RTMR3 (never pinned)",
         &report.zero_rtmr3,
     );
@@ -129,7 +134,8 @@ pub fn render_markdown(report: &SyncReport, date: &str) -> String {
     );
 
     if s.chars().count() > PR_BODY_LIMIT {
-        let note = "\n\n_Report truncated; the full report is in the workflow run artifact._\n";
+        let note = "\n\n_Report truncated; per-instance results are in observations.json in the \
+                    workflow run artifact._\n";
         let keep = PR_BODY_LIMIT - note.chars().count();
         s = s.chars().take(keep).collect::<String>() + note;
     }
@@ -176,5 +182,9 @@ mod tests {
         let md = render_markdown(&rep, "2026-10-06");
         assert!(md.chars().count() <= PR_BODY_LIMIT);
         assert!(md.contains("truncated"));
+        assert!(
+            md.contains("observations.json"),
+            "point at the untruncated data"
+        );
     }
 }

@@ -113,6 +113,9 @@ pub struct SyncReport {
     pub unverified: Vec<Observation>,
     pub zero_rtmr3: Vec<RowRef>,
     pub identity_anomalies: Vec<RowRef>,
+    /// Published, verified live, but the family already has a row with this
+    /// name and a different RTMR0 (Chutes re-measured it). Needs a person.
+    pub name_collisions: Vec<RowRef>,
     /// Chosen row, and the other published names for the same registers.
     pub aliases: Vec<(RowRef, Vec<String>)>,
     pub withdrawn_before_merge: Vec<RowRef>,
@@ -121,10 +124,22 @@ pub struct SyncReport {
     pub skipped: Vec<SkippedChute>,
 }
 
+/// Why a row could not be inserted.
+enum InsertError {
+    /// The version already has a family with a different software identity.
+    IdentityAnomaly,
+    /// The family already has a row with this name and a different RTMR0.
+    NameCollision,
+}
+
 /// Insert a row into the family with the same version and software identity,
-/// creating the family if that version has none. Returns false (leaving `pins`
-/// untouched) if the version already has a family with a different identity.
-fn insert_row(pins: &mut PinsFile, version: &str, name: &str, regs: &Registers) -> bool {
+/// creating the family if that version has none. On error `pins` is untouched.
+fn insert_row(
+    pins: &mut PinsFile,
+    version: &str,
+    name: &str,
+    regs: &Registers,
+) -> Result<(), InsertError> {
     let row = PinRow {
         name: name.to_string(),
         rtmr0: regs.rtmr0.clone(),
@@ -134,11 +149,14 @@ fn insert_row(pins: &mut PinsFile, version: &str, name: &str, regs: &Registers) 
         .iter_mut()
         .find(|f| f.version == version && f.same_identity(regs))
     {
+        if f.hardware_rows.iter().any(|r| r.name == name) {
+            return Err(InsertError::NameCollision);
+        }
         f.hardware_rows.push(row);
-        return true;
+        return Ok(());
     }
     if pins.families.iter().any(|f| f.version == version) {
-        return false;
+        return Err(InsertError::IdentityAnomaly);
     }
     pins.families.push(PinFamily {
         version: version.to_string(),
@@ -148,7 +166,16 @@ fn insert_row(pins: &mut PinsFile, version: &str, name: &str, regs: &Registers) 
         rtmr3: regs.rtmr3.clone(),
         hardware_rows: vec![row],
     });
-    true
+    Ok(())
+}
+
+impl SyncReport {
+    fn not_inserted(&mut self, err: InsertError, row: RowRef) {
+        match err {
+            InsertError::IdentityAnomaly => self.identity_anomalies.push(row),
+            InsertError::NameCollision => self.name_collisions.push(row),
+        }
+    }
 }
 
 fn row_ref(version: &str, name: &str) -> RowRef {
@@ -207,8 +234,8 @@ pub fn classify(
                 report
                     .withdrawn_before_merge
                     .push(row_ref(&f.version, &r.name));
-            } else if !insert_row(&mut out, &f.version, &r.name, &regs) {
-                report.identity_anomalies.push(row_ref(&f.version, &r.name));
+            } else if let Err(e) = insert_row(&mut out, &f.version, &r.name, &regs) {
+                report.not_inserted(e, row_ref(&f.version, &r.name));
             }
         }
     }
@@ -243,8 +270,8 @@ pub fn classify(
             report.zero_rtmr3.push(row);
             continue;
         }
-        if !insert_row(&mut out, version, &row.name, regs) {
-            report.identity_anomalies.push(row);
+        if let Err(e) = insert_row(&mut out, version, &row.name, regs) {
+            report.not_inserted(e, row);
             continue;
         }
         if names.len() > 1 {
@@ -279,6 +306,7 @@ pub fn classify(
     for v in [
         &mut report.zero_rtmr3,
         &mut report.identity_anomalies,
+        &mut report.name_collisions,
         &mut report.withdrawn_before_merge,
         &mut report.pinned_not_published,
         &mut report.published_not_observed,
@@ -471,6 +499,24 @@ mod tests {
         );
         assert_eq!(out, base);
         assert_eq!(rep.identity_anomalies, vec![row("1.4.1", "odd")]);
+    }
+
+    #[test]
+    fn name_already_used_in_family_is_reported_not_pinned() {
+        // Chutes re-measured a row under the same name: pinning it would give
+        // the family two rows with one name, which the pins file forbids.
+        let pinned = regs('a', 'b', 'c', 'd', 'e');
+        let remeasured = regs('a', '1', 'c', 'd', 'e');
+        let base = pins_with("1.4.1", "8xb300", &pinned);
+        let (out, rep) = classify(
+            &[feed("1.4.1", "8xb300", &remeasured)],
+            &[seen("m", "i", &remeasured)],
+            vec![],
+            &base,
+            None,
+        );
+        assert_eq!(out, base);
+        assert_eq!(rep.name_collisions, vec![row("1.4.1", "8xb300")]);
     }
 
     #[test]

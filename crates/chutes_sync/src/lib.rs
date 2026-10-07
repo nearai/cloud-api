@@ -11,4 +11,5 @@
 //! resulting PR; this crate is tooling and is not part of the API image.
 
 pub mod classify;
+pub mod probe;
 pub mod report;

@@ -190,6 +190,16 @@ impl ChutesClient {
 
     /// Resolve a model id (e.g. `zai-org/GLM-5.1-TEE`) to its `chute_id`.
     pub async fn resolve_chute_id(&self, model: &str) -> Result<String, ChutesClientError> {
+        pick_chute_id(&self.fetch_models().await?, model)
+    }
+
+    /// Every model `/v1/models` lists with a `chute_id`, as `(model_id,
+    /// chute_id)` (the measurement sync probe uses this to enumerate chutes).
+    pub async fn list_models(&self) -> Result<Vec<(String, String)>, ChutesClientError> {
+        Ok(models_with_chute_ids(&self.fetch_models().await?))
+    }
+
+    async fn fetch_models(&self) -> Result<ModelsList, ChutesClientError> {
         let url = format!("{}/v1/models", self.models_base);
         let resp = self
             .http
@@ -199,11 +209,10 @@ impl ChutesClient {
             .send()
             .await?;
         let resp = error_for_status(resp).await?;
-        let list: ModelsList = resp.json().await.map_err(|e| ChutesClientError::Decode {
+        resp.json().await.map_err(|e| ChutesClientError::Decode {
             what: "/v1/models",
             source: e,
-        })?;
-        pick_chute_id(&list, model)
+        })
     }
 
     /// Discover live, E2E-capable instances for a chute (each with its
@@ -349,6 +358,13 @@ async fn read_body_capped(resp: reqwest::Response, max: u64) -> Result<Vec<u8>, 
 }
 
 /// Find a model's `chute_id` in a `/v1/models` listing (pure; unit-tested).
+fn models_with_chute_ids(list: &ModelsList) -> Vec<(String, String)> {
+    list.data
+        .iter()
+        .filter_map(|m| m.chute_id.clone().map(|c| (m.id.clone(), c)))
+        .collect()
+}
+
 fn pick_chute_id(list: &ModelsList, model: &str) -> Result<String, ChutesClientError> {
     let entry = list
         .data
@@ -364,6 +380,18 @@ fn pick_chute_id(list: &ModelsList, model: &str) -> Result<String, ChutesClientE
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn models_list_keeps_entries_with_a_chute_id() {
+        let list: ModelsList = serde_json::from_str(
+            r#"{"data":[{"id":"a/A-TEE","chute_id":"c1"},{"id":"b/B","chute_id":null},{"id":"c/C-TEE"}]}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            models_with_chute_ids(&list),
+            vec![("a/A-TEE".to_string(), "c1".to_string())]
+        );
+    }
 
     #[test]
     fn parses_e2e_instances_response() {

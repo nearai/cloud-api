@@ -396,7 +396,11 @@ where
 
         let input_bucket = get_input_bucket(input_tokens);
         let mut metric_tags = self.metric_tags.clone();
-        CompletionServiceImpl::set_input_bucket_tag(&mut metric_tags, input_bucket);
+        CompletionServiceImpl::set_input_bucket_tag(
+            &mut metric_tags,
+            input_bucket,
+            INPUT_BUCKET_SOURCE_ACTUAL,
+        );
 
         // Spawn critical billing operations on blocking thread pool with timeout.
         // The tokio runtime waits for blocking tasks during graceful shutdown,
@@ -1255,34 +1259,41 @@ impl CompletionServiceImpl {
         ]
     }
 
-    fn set_input_bucket_tag(metric_tags: &mut Vec<String>, input_bucket: &str) {
-        let prefix = format!("{TAG_INPUT_BUCKET}:");
-        metric_tags.retain(|tag| !tag.starts_with(&prefix));
-        metric_tags.push(format!("{prefix}{input_bucket}"));
+    fn set_input_bucket_tag(metric_tags: &mut Vec<String>, input_bucket: &str, source: &str) {
+        metric_tags.retain(|tag| {
+            !tag.strip_prefix(TAG_INPUT_BUCKET)
+                .is_some_and(|rest| rest.starts_with(':'))
+                && !tag
+                    .strip_prefix(TAG_INPUT_BUCKET_SOURCE)
+                    .is_some_and(|rest| rest.starts_with(':'))
+        });
+        metric_tags.push(format!("{TAG_INPUT_BUCKET}:{input_bucket}"));
+        metric_tags.push(format!("{TAG_INPUT_BUCKET_SOURCE}:{source}"));
     }
 
     fn create_estimated_input_metric_tags(
         model_name: &str,
         estimated_input_tokens: u32,
     ) -> Vec<String> {
-        let input_bucket = i32::try_from(estimated_input_tokens).map_or("128k+", get_input_bucket);
+        let input_bucket =
+            get_input_bucket(i32::try_from(estimated_input_tokens).unwrap_or(i32::MAX));
         let mut metric_tags = Self::create_metric_tags(model_name);
-        Self::set_input_bucket_tag(&mut metric_tags, input_bucket);
+        Self::set_input_bucket_tag(
+            &mut metric_tags,
+            input_bucket,
+            INPUT_BUCKET_SOURCE_ESTIMATED,
+        );
         metric_tags
     }
 
     fn record_stream_admission_metrics(
         metrics_service: &dyn MetricsServiceTrait,
-        model_name: &str,
-        estimated_input_tokens: u32,
+        metric_tags: &[String],
         queue_time: Duration,
-    ) -> Vec<String> {
-        let metric_tags =
-            Self::create_estimated_input_metric_tags(model_name, estimated_input_tokens);
+    ) {
         let tags: Vec<&str> = metric_tags.iter().map(String::as_str).collect();
         metrics_service.record_count(METRIC_REQUEST_COUNT, 1, &tags);
         metrics_service.record_latency(METRIC_LATENCY_QUEUE_TIME, queue_time, &tags);
-        metric_tags
     }
 
     pub(crate) fn map_provider_error(
@@ -1707,7 +1718,7 @@ impl CompletionServiceImpl {
         model_id: Uuid,
         model_name: String,
         inference_type: crate::usage::ports::InferenceType,
-        estimated_input_tokens: u32,
+        estimated_metric_input_tokens: u32,
         service_start_time: Instant,
         provider_start_time: Instant,
         concurrent_counter: Option<Arc<AtomicU32>>,
@@ -1720,10 +1731,12 @@ impl CompletionServiceImpl {
         latency_reporter: Option<super::inference_provider_pool::ProviderLatencyReporter>,
     ) -> StreamingResult {
         let queue_time = provider_start_time.duration_since(service_start_time);
-        let metric_tags = Self::record_stream_admission_metrics(
+        // Admission and first-token TTFT use the request estimate; usage-time metrics use provider tokens.
+        let metric_tags =
+            Self::create_estimated_input_metric_tags(&model_name, estimated_metric_input_tokens);
+        Self::record_stream_admission_metrics(
             self.metrics_service.as_ref(),
-            &model_name,
-            estimated_input_tokens,
+            &metric_tags,
             queue_time,
         );
 
@@ -1921,6 +1934,8 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
 
         // Compute routing hints from the request messages for adaptive load balancing.
         let estimated_input_tokens = estimate_input_tokens(&chat_params.messages);
+        let estimated_metric_input_tokens =
+            super::inference_provider_pool::context_routing::metric_input_tokens(&chat_params);
         let routing_hints = super::inference_provider_pool::ChatRoutingHints {
             prefix_hash: Some(compute_prefix_hash(&chat_params.messages)),
             estimated_tokens: Some(estimated_input_tokens),
@@ -1976,7 +1991,7 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
                 model.id,
                 model.model_name.clone(),
                 inference_type,
-                estimated_input_tokens,
+                estimated_metric_input_tokens,
                 service_start_time,
                 provider_start_time,
                 counter,
@@ -2206,7 +2221,11 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
         tokio::spawn(async move {
             let mut tags = CompletionServiceImpl::create_metric_tags(&model_name);
             let input_bucket = get_input_bucket(input_tokens);
-            CompletionServiceImpl::set_input_bucket_tag(&mut tags, input_bucket);
+            CompletionServiceImpl::set_input_bucket_tag(
+                &mut tags,
+                input_bucket,
+                INPUT_BUCKET_SOURCE_ACTUAL,
+            );
             let tags_str: Vec<&str> = tags.iter().map(|s| s.as_str()).collect();
 
             metrics_service.record_count(METRIC_REQUEST_COUNT, 1, &tags_str);
@@ -2823,6 +2842,7 @@ mod tests {
 
         let mut metric_tags = CompletionServiceImpl::create_metric_tags("test-model");
         metric_tags.push(format!("{}:{}", TAG_INPUT_BUCKET, "1-4k"));
+        metric_tags.push("input_bucket_source:estimated".to_string());
 
         let now = Instant::now();
         let mut intercept_stream = InterceptStream {
@@ -2906,6 +2926,17 @@ mod tests {
         assert!(ttft
             .tags
             .contains(&format!("{}:{}", TAG_MODEL, "test-model")));
+        assert!(ttft.tags.contains(&format!("{TAG_INPUT_BUCKET}:1-4k")));
+        assert!(ttft
+            .tags
+            .contains(&"input_bucket_source:estimated".to_string()));
+        assert_eq!(
+            ttft.tags
+                .iter()
+                .filter(|tag| tag.starts_with(&format!("{TAG_INPUT_BUCKET_SOURCE}:")))
+                .count(),
+            1
+        );
 
         let bucketed_ttft = metrics
             .iter()
@@ -2915,6 +2946,9 @@ mod tests {
         assert!(bucketed_ttft
             .tags
             .contains(&format!("{}:{}", TAG_INPUT_BUCKET, "0-1k")));
+        assert!(bucketed_ttft
+            .tags
+            .contains(&"input_bucket_source:actual".to_string()));
         assert_eq!(
             bucketed_ttft
                 .tags
@@ -2923,6 +2957,14 @@ mod tests {
                 .count(),
             1,
             "final usage must replace the estimated input bucket"
+        );
+        assert_eq!(
+            bucketed_ttft
+                .tags
+                .iter()
+                .filter(|tag| tag.starts_with(&format!("{TAG_INPUT_BUCKET_SOURCE}:")))
+                .count(),
+            1
         );
 
         let bucketed_e2e_ttft = metrics
@@ -2933,6 +2975,25 @@ mod tests {
         assert!(bucketed_e2e_ttft
             .tags
             .contains(&format!("{}:{}", TAG_INPUT_BUCKET, "0-1k")));
+        assert!(bucketed_e2e_ttft
+            .tags
+            .contains(&"input_bucket_source:actual".to_string()));
+        assert_eq!(
+            bucketed_e2e_ttft
+                .tags
+                .iter()
+                .filter(|tag| tag.starts_with(&format!("{TAG_INPUT_BUCKET}:")))
+                .count(),
+            1
+        );
+        assert_eq!(
+            bucketed_e2e_ttft
+                .tags
+                .iter()
+                .filter(|tag| tag.starts_with(&format!("{TAG_INPUT_BUCKET_SOURCE}:")))
+                .count(),
+            1
+        );
 
         let total_latency = metrics
             .iter()
@@ -3248,8 +3309,12 @@ mod tests {
     fn set_input_bucket_tag_adds_and_replaces_the_bucket() {
         let mut tags = CompletionServiceImpl::create_metric_tags("test-model");
 
-        CompletionServiceImpl::set_input_bucket_tag(&mut tags, "1-4k");
-        CompletionServiceImpl::set_input_bucket_tag(&mut tags, "0-1k");
+        CompletionServiceImpl::set_input_bucket_tag(
+            &mut tags,
+            "1-4k",
+            INPUT_BUCKET_SOURCE_ESTIMATED,
+        );
+        CompletionServiceImpl::set_input_bucket_tag(&mut tags, "0-1k", INPUT_BUCKET_SOURCE_ACTUAL);
 
         let input_buckets: Vec<_> = tags
             .iter()
@@ -3257,15 +3322,23 @@ mod tests {
             .map(String::as_str)
             .collect();
         assert_eq!(input_buckets, vec!["input_bucket:0-1k"]);
+
+        let input_bucket_sources: Vec<_> = tags
+            .iter()
+            .filter(|tag| tag.starts_with("input_bucket_source:"))
+            .map(String::as_str)
+            .collect();
+        assert_eq!(input_bucket_sources, vec!["input_bucket_source:actual"]);
     }
 
     #[test]
     fn streaming_request_metric_tags_include_estimated_input_bucket() {
         let metrics_service = CapturingMetricsService::new();
+        let metric_tags =
+            CompletionServiceImpl::create_estimated_input_metric_tags("test-model", 4001);
         CompletionServiceImpl::record_stream_admission_metrics(
             &metrics_service,
-            "test-model",
-            4001,
+            &metric_tags,
             Duration::ZERO,
         );
 
@@ -3278,6 +3351,9 @@ mod tests {
         assert!(request_count
             .tags
             .contains(&"input_bucket:4-16k".to_string()));
+        assert!(request_count
+            .tags
+            .contains(&"input_bucket_source:estimated".to_string()));
         assert_eq!(
             request_count
                 .tags
@@ -3286,6 +3362,97 @@ mod tests {
                 .count(),
             1
         );
+        assert_eq!(
+            request_count
+                .tags
+                .iter()
+                .filter(|tag| tag.starts_with(&format!("{TAG_INPUT_BUCKET_SOURCE}:")))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn metric_input_tokens_estimate_tool_schemas_tool_calls_and_media() {
+        let tools = (0..15)
+            .map(|index| {
+                serde_json::json!({
+                    "type": "function",
+                    "function": {
+                        "name": format!("tool_{index}"),
+                        "description": "x".repeat(600),
+                        "parameters": {"type": "object", "properties": {}}
+                    }
+                })
+            })
+            .collect::<Vec<_>>();
+        let params: inference_providers::ChatCompletionParams =
+            serde_json::from_value(serde_json::json!({
+                "model": "test-model",
+                "messages": [
+                    {"role": "user", "content": "Hi"},
+                    {
+                        "role": "assistant",
+                        "content": null,
+                        "tool_calls": [{
+                            "id": "call-1",
+                            "type": "function",
+                            "function": {
+                                "name": "tool_0",
+                                "arguments": r#"{"payload":"tool argument text"}"#
+                            }
+                        }]
+                    },
+                    {
+                        "role": "user",
+                        "content": [{"type": "image_url", "image_url": {"url": "https://example.com/image.png"}}]
+                    }
+                ],
+                "tools": tools
+            }))
+            .expect("tool-rich chat params should deserialize");
+
+        let routing_tokens = estimate_input_tokens(&params.messages);
+        let metric_tokens =
+            crate::inference_provider_pool::context_routing::metric_input_tokens(&params);
+        let metric_tags =
+            CompletionServiceImpl::create_estimated_input_metric_tags("test-model", metric_tokens);
+
+        assert_eq!(routing_tokens, 1, "the routing estimate stays text-only");
+        assert!(metric_tokens > routing_tokens);
+        assert!(metric_tags.contains(&"input_bucket:1-4k".to_string()));
+    }
+
+    #[test]
+    fn metric_input_tokens_estimate_forwarded_tools_when_typed_tools_are_absent() {
+        let mut params: inference_providers::ChatCompletionParams =
+            serde_json::from_value(serde_json::json!({
+                "model": "test-model",
+                "messages": [{"role": "user", "content": "Hi"}]
+            }))
+            .expect("forwarded tool params should deserialize");
+        params.extra.insert(
+            "tools".to_string(),
+            serde_json::json!([{"type": "web_context_search", "description": "x".repeat(6000)}]),
+        );
+        let routing_tokens = estimate_input_tokens(&params.messages);
+        let metric_tokens =
+            crate::inference_provider_pool::context_routing::metric_input_tokens(&params);
+        let metric_tags =
+            CompletionServiceImpl::create_estimated_input_metric_tags("test-model", metric_tokens);
+
+        assert_eq!(routing_tokens, 1);
+        assert!(metric_tokens > routing_tokens);
+        assert!(metric_tags.contains(&"input_bucket:1-4k".to_string()));
+    }
+
+    #[test]
+    fn estimated_input_bucket_above_i32_max_uses_top_bucket() {
+        let tags =
+            CompletionServiceImpl::create_estimated_input_metric_tags("test-model", u32::MAX);
+
+        assert!(tags.contains(&"input_bucket:128k+".to_string()));
+        assert!(tags.contains(&"input_bucket_source:estimated".to_string()));
     }
 
     #[tokio::test]

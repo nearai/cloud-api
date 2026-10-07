@@ -92,6 +92,12 @@ mod tests {
     }
 
     #[test]
+    fn compiled_pins_file_is_canonical() {
+        let pins: TinfoilPins = serde_json::from_str(COMPILED_PINS_JSON).unwrap();
+        assert_eq!(pins.to_canonical_json(), COMPILED_PINS_JSON);
+    }
+
+    #[test]
     fn canonical_json_round_trips() {
         let p: TinfoilPins =
             serde_json::from_str(include_str!("testdata/tinfoil/test_pins.json")).unwrap();

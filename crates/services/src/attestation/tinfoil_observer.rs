@@ -1,11 +1,12 @@
 //! Keyless observation of the Tinfoil router for the daily measurement sync
 //! (`crates/tinfoil_sync`). It runs the same SEV-SNP checks as
-//! [`super::tinfoil::TinfoilPolicyVerifier::verify_router`] but consults no pins.
+//! [`super::tinfoil::TinfoilPolicyVerifier::verify_router`] (via the shared
+//! [`super::tinfoil::observe_bound_router`]) but consults no pins.
 
 use inference_providers::attested::tinfoil::verifier_port::{AtcBundle, TinfoilVerifyError};
 
 use super::snp::Tcb;
-use super::tinfoil::{observe_router, spki_sha256_of_pem_cert};
+use super::tinfoil::observe_bound_router;
 
 /// What a genuine router attestation says about the running router.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -19,11 +20,7 @@ pub struct ObservedRouter {
 /// Verify the router bundle (VCEK chain, report signature, TCB floor, debug
 /// bit, and that the report is bound to the router's TLS key) and describe it.
 pub fn observe(bundle: &AtcBundle) -> Result<ObservedRouter, TinfoilVerifyError> {
-    let report = observe_router(bundle)?;
-    let spki = spki_sha256_of_pem_cert(&bundle.enclave_cert)?;
-    if report.report_data[..32] != spki {
-        return Err(TinfoilVerifyError::ReportDataMismatch);
-    }
+    let (report, spki) = observe_bound_router(bundle)?;
     Ok(ObservedRouter {
         measurement_hex: hex::encode(report.measurement),
         spki_sha256_hex: hex::encode(spki),
@@ -49,15 +46,12 @@ mod tests {
             "2ac79995464edfb139b34e4ee6269f38d0ab63da92b1a431170dec3bdd0c7c84"
         );
         assert!(o.format.ends_with("sev-snp-guest/v2"));
-        assert!(
-            o.tcb
-                >= Tcb {
-                    bootloader: 10,
-                    tee: 0,
-                    snp: 23,
-                    microcode: 84
-                }
-        );
+        assert!(o.tcb.meets(&Tcb {
+            bootloader: 10,
+            tee: 0,
+            snp: 23,
+            microcode: 84
+        }));
     }
 
     #[test]

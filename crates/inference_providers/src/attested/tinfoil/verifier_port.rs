@@ -96,7 +96,7 @@ impl TinfoilVerifyError {
             Self::DebugPolicy => "debug_policy",
             Self::TcbTooLow => "tcb_too_low",
             Self::ReportDataMismatch => "report_data_mismatch",
-            Self::Malformed => "fetch_error",
+            Self::Malformed => "malformed_evidence",
         }
     }
 }

@@ -47,6 +47,8 @@ fn map_snp(e: SnpError) -> TinfoilVerifyError {
 }
 
 /// Verify the SNP report chain/signature/policy without consulting any pins.
+/// This does NOT check that the report is bound to the router's TLS key; use
+/// [`observe_bound_router`] for that.
 pub fn observe_router(bundle: &AtcBundle) -> Result<VerifiedSnpReport, TinfoilVerifyError> {
     if bundle.report.format != SNP_FORMAT {
         return Err(TinfoilVerifyError::UnsupportedRouterPlatform);
@@ -73,6 +75,20 @@ pub fn observe_router(bundle: &AtcBundle) -> Result<VerifiedSnpReport, TinfoilVe
     .map_err(map_snp)
 }
 
+/// [`observe_router`] plus the binding of the report to the router's TLS key:
+/// `report_data[0..32]` must equal the SHA-256 of the enclave certificate's
+/// SPKI. Pin-free; shared by the live verifier and the sync observer.
+pub fn observe_bound_router(
+    bundle: &AtcBundle,
+) -> Result<(VerifiedSnpReport, [u8; 32]), TinfoilVerifyError> {
+    let report = observe_router(bundle)?;
+    let spki_sha256 = spki_sha256_of_pem_cert(&bundle.enclave_cert)?;
+    if report.report_data[..32] != spki_sha256 {
+        return Err(TinfoilVerifyError::ReportDataMismatch);
+    }
+    Ok((report, spki_sha256))
+}
+
 fn registers_eq(a: &[String], b: &[String]) -> bool {
     a.len() == b.len() && a.iter().zip(b).all(|(x, y)| x.eq_ignore_ascii_case(y))
 }
@@ -89,7 +105,7 @@ impl TinfoilPolicyVerifier {
 
 impl TinfoilVerifier for TinfoilPolicyVerifier {
     fn verify_router(&self, bundle: &AtcBundle) -> Result<VerifiedRouter, TinfoilVerifyError> {
-        let report = observe_router(bundle)?;
+        let (report, spki_sha256) = observe_bound_router(bundle)?;
         let measurement_hex = hex::encode(report.measurement);
         let pin = self
             .pins
@@ -97,10 +113,6 @@ impl TinfoilVerifier for TinfoilPolicyVerifier {
             .iter()
             .find(|p| p.measurement.eq_ignore_ascii_case(&measurement_hex))
             .ok_or(TinfoilVerifyError::UnknownRouterMeasurement)?;
-        let spki_sha256 = spki_sha256_of_pem_cert(&bundle.enclave_cert)?;
-        if report.report_data[..32] != spki_sha256 {
-            return Err(TinfoilVerifyError::ReportDataMismatch);
-        }
         Ok(VerifiedRouter {
             spki_sha256,
             measurement_hex,
@@ -241,6 +253,50 @@ mod tests {
                 .unwrap_err(),
             TinfoilVerifyError::UnknownModelMeasurement
         );
+    }
+
+    fn with_report_body(b: &mut AtcBundle, body: String) {
+        b.report.body = body;
+    }
+
+    #[test]
+    fn oversized_or_garbage_report_body_is_malformed() {
+        use base64::Engine;
+        use std::io::Write;
+        let b64 = base64::engine::general_purpose::STANDARD;
+        let gzip = |raw: &[u8]| {
+            let mut enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+            enc.write_all(raw).unwrap();
+            enc.finish().unwrap()
+        };
+
+        // Not base64.
+        let mut b = bundle();
+        with_report_body(&mut b, "!!! not base64 !!!".into());
+        assert_eq!(
+            observe_router(&b).unwrap_err(),
+            TinfoilVerifyError::Malformed
+        );
+
+        // Base64 but not gzip.
+        with_report_body(&mut b, b64.encode(b"plain bytes, not gzip"));
+        assert_eq!(
+            observe_router(&b).unwrap_err(),
+            TinfoilVerifyError::Malformed
+        );
+
+        // Valid gzip that inflates past the 64 KiB cap: truncated to the cap,
+        // which is not a report length, so it is rejected as malformed.
+        with_report_body(&mut b, b64.encode(gzip(&vec![0u8; 1024 * 1024])));
+        assert_eq!(
+            observe_router(&b).unwrap_err(),
+            TinfoilVerifyError::Malformed
+        );
+    }
+
+    #[test]
+    fn malformed_error_reason_is_not_a_fetch_error() {
+        assert_eq!(TinfoilVerifyError::Malformed.reason(), "malformed_evidence");
     }
 
     #[test]

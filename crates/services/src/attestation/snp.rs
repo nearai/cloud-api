@@ -6,23 +6,30 @@
 //!
 //! AMD root chains (`amd_roots/*_cert_chain.pem`, ASK followed by ARK) were
 //! fetched once on 2026-10-07 from
-//! `https://kdsintf.amd.com/vcek/v1/{Milan,Genoa,Turin}/cert_chain`.
+//! `https://kdsintf.amd.com/vcek/v1/{Milan,Genoa,Turin}/cert_chain`. They are
+//! parsed and signature-checked once per process.
 //!
-//! Order of checks: length, parse, VCEK chain, report signature, VCEK<->report
-//! binding (chip id and TCB), policy (debug), TCB floor.
+//! Order of checks: length, parse, VCEK chain (issuer match, signatures,
+//! validity periods of VCEK/ASK/ARK), report signature, VCEK<->report binding
+//! (chip id and TCB), policy (debug, migration agent), TCB floor.
+//!
+//! Out of scope: certificate revocation. AMD publishes a CRL per product on
+//! the KDS; consulting it needs network access, which this verifier never
+//! performs, so a revoked-but-unexpired VCEK is not detected here.
 //!
 //! Products: Milan and Genoa are supported. Turin chains are embedded so a
 //! Turin VCEK is recognised, but it is rejected with [`SnpError::Product`]
 //! because its `reported_tcb` encoding has not been validated against a real
 //! report; we refuse rather than guess.
 
-use p384::ecdsa::{signature::Verifier, Signature, VerifyingKey};
-use rsa::pkcs1::DecodeRsaPublicKey;
-use rsa::pss::{Signature as PssSignature, VerifyingKey as PssVerifyingKey};
-use rsa::RsaPublicKey;
-use sha2_010::Sha384;
-use x509_cert::der::{Decode, Encode};
-use x509_cert::Certificate;
+use std::sync::LazyLock;
+use std::time::{SystemTime, UNIX_EPOCH};
+
+use ring::signature::{UnparsedPublicKey, ECDSA_P384_SHA384_FIXED};
+use x509_parser::certificate::X509Certificate;
+use x509_parser::oid_registry::{OID_PKCS1_RSASSAPSS, OID_SIG_ECDSA_WITH_SHA384};
+use x509_parser::prelude::FromDer;
+use x509_parser::time::ASN1Time;
 
 const REPORT_LEN: usize = 0x4A0;
 const SIGNED_LEN: usize = 0x2A0;
@@ -62,12 +69,22 @@ pub struct SnpEvidence<'a> {
     pub vcek_der: &'a [u8],
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Tcb {
     pub bootloader: u8,
     pub tee: u8,
     pub snp: u8,
     pub microcode: u8,
+}
+
+impl Tcb {
+    /// True when every component is at least the corresponding component of `min`.
+    pub fn meets(&self, min: &Tcb) -> bool {
+        self.bootloader >= min.bootloader
+            && self.tee >= min.tee
+            && self.snp >= min.snp
+            && self.microcode >= min.microcode
+    }
 }
 
 pub struct SnpPolicy {
@@ -82,7 +99,7 @@ pub struct VerifiedSnpReport {
     pub chip_id: [u8; 64],
 }
 
-#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, thiserror::Error, PartialEq, Eq)]
 pub enum SnpError {
     #[error("malformed report")]
     Malformed,
@@ -111,12 +128,18 @@ fn check_policy(policy: u64) -> Result<(), SnpError> {
     Ok(())
 }
 
-fn le_u32(b: &[u8], off: usize) -> u32 {
-    u32::from_le_bytes(b[off..off + 4].try_into().expect("bounds checked"))
+fn le_u32(b: &[u8], off: usize) -> Result<u32, SnpError> {
+    let s = b.get(off..off + 4).ok_or(SnpError::Malformed)?;
+    Ok(u32::from_le_bytes(
+        s.try_into().map_err(|_| SnpError::Malformed)?,
+    ))
 }
 
-fn le_u64(b: &[u8], off: usize) -> u64 {
-    u64::from_le_bytes(b[off..off + 8].try_into().expect("bounds checked"))
+fn le_u64(b: &[u8], off: usize) -> Result<u64, SnpError> {
+    let s = b.get(off..off + 8).ok_or(SnpError::Malformed)?;
+    Ok(u64::from_le_bytes(
+        s.try_into().map_err(|_| SnpError::Malformed)?,
+    ))
 }
 
 /// Milan/Genoa `TCB_VERSION` layout: byte 0 boot loader, 1 TEE, 6 SNP, 7 microcode.
@@ -139,108 +162,201 @@ fn check_product_supported(product: Product) -> Result<(), SnpError> {
 }
 
 /// REPORTED_TCB (0x180) of a full-length report, Milan/Genoa layout.
-fn reported_tcb(report: &[u8]) -> Tcb {
-    parse_tcb(le_u64(report, OFF_REPORTED_TCB))
+fn reported_tcb(report: &[u8]) -> Result<Tcb, SnpError> {
+    Ok(parse_tcb(le_u64(report, OFF_REPORTED_TCB)?))
 }
 
-/// Parses the ASK and ARK (in that order) of an embedded chain and checks the
-/// chain is internally consistent: ARK self-signed, ASK signed by ARK.
-fn load_chain(product: Product) -> Result<(Certificate, Certificate), SnpError> {
-    let pem = match product {
-        Product::Milan => MILAN_CHAIN,
-        Product::Genoa => GENOA_CHAIN,
-        Product::Turin => TURIN_CHAIN,
-    };
-    let certs = Certificate::load_pem_chain(pem).map_err(|_| SnpError::Chain)?;
-    let [ask, ark]: [Certificate; 2] = certs.try_into().map_err(|_| SnpError::Chain)?;
-    verify_cert_sig(&ark, &ark)?;
-    verify_cert_sig(&ask, &ark)?;
-    Ok((ask, ark))
+/// Parses one DER certificate, rejecting trailing bytes.
+fn parse_cert(der: &[u8]) -> Result<X509Certificate<'_>, SnpError> {
+    let (rest, cert) = X509Certificate::from_der(der).map_err(|_| SnpError::Chain)?;
+    if !rest.is_empty() {
+        return Err(SnpError::Chain);
+    }
+    Ok(cert)
 }
 
-/// Verifies `cert`'s RSASSA-PSS (SHA-384, MGF1-SHA-384) signature under `issuer`'s key.
-fn verify_cert_sig(cert: &Certificate, issuer: &Certificate) -> Result<(), SnpError> {
-    let spki = &issuer.tbs_certificate.subject_public_key_info;
-    let key_bytes = spki.subject_public_key.as_bytes().ok_or(SnpError::Chain)?;
-    let pubkey = RsaPublicKey::from_pkcs1_der(key_bytes).map_err(|_| SnpError::Chain)?;
-    let tbs = cert.tbs_certificate.to_der().map_err(|_| SnpError::Chain)?;
-    let sig_bytes = cert.signature.as_bytes().ok_or(SnpError::Chain)?;
-    let sig = PssSignature::try_from(sig_bytes).map_err(|_| SnpError::Chain)?;
-    PssVerifyingKey::<Sha384>::new(pubkey)
-        .verify(&tbs, &sig)
-        .map_err(|_| SnpError::Chain)
+/// Verifies `cert`'s signature under `issuer`'s key (`None`: self-signed).
+/// Only RSASSA-PSS (AMD chains) and ECDSA-SHA384 are accepted; the outer and
+/// signed algorithm identifiers must agree.
+fn verify_cert_sig(
+    cert: &X509Certificate<'_>,
+    issuer: Option<&X509Certificate<'_>>,
+) -> Result<(), SnpError> {
+    let alg = &cert.signature_algorithm;
+    if *alg != cert.tbs_certificate.signature {
+        return Err(SnpError::Chain);
+    }
+    if alg.algorithm != OID_PKCS1_RSASSAPSS && alg.algorithm != OID_SIG_ECDSA_WITH_SHA384 {
+        return Err(SnpError::Chain);
+    }
+    let key = issuer.map(|i| &i.tbs_certificate.subject_pki);
+    cert.verify_signature(key).map_err(|_| SnpError::Chain)
+}
+
+fn check_valid_at(cert: &X509Certificate<'_>, now: ASN1Time) -> Result<(), SnpError> {
+    if cert.validity().is_valid_at(now) {
+        Ok(())
+    } else {
+        Err(SnpError::Chain)
+    }
 }
 
 /// Reads a VCEK extension value (the content of its extnValue OCTET STRING).
-fn ext_value<'a>(cert: &'a Certificate, oid: &str) -> Result<&'a [u8], SnpError> {
-    let exts = cert
-        .tbs_certificate
-        .extensions
-        .as_ref()
-        .ok_or(SnpError::Chain)?;
-    exts.iter()
-        .find(|e| e.extn_id.to_string() == oid)
-        .map(|e| e.extn_value.as_bytes())
+fn ext_value<'a>(cert: &'a X509Certificate<'_>, oid: &str) -> Result<&'a [u8], SnpError> {
+    cert.extensions()
+        .iter()
+        .find(|e| e.oid.to_id_string() == oid)
+        .map(|e| e.value)
         .ok_or(SnpError::Chain)
 }
 
 /// DER INTEGER holding a small non-negative value (TCB component).
-fn ext_u8(cert: &Certificate, oid: &str) -> Result<u8, SnpError> {
-    match ext_value(cert, oid)? {
+fn der_u8(value: &[u8]) -> Result<u8, SnpError> {
+    match value {
         [0x02, 0x01, v] if *v < 0x80 => Ok(*v),
         [0x02, 0x02, 0x00, v] => Ok(*v),
         _ => Err(SnpError::Chain),
     }
 }
 
+fn ext_u8(cert: &X509Certificate<'_>, oid: &str) -> Result<u8, SnpError> {
+    der_u8(ext_value(cert, oid)?)
+}
+
 /// The HWID extension's extnValue is the raw 64-byte chip id (no inner DER wrapper).
-fn ext_hwid(cert: &Certificate) -> Result<[u8; 64], SnpError> {
+fn ext_hwid(cert: &X509Certificate<'_>) -> Result<[u8; 64], SnpError> {
     ext_value(cert, OID_HWID)?
         .try_into()
         .map_err(|_| SnpError::Chain)
 }
 
-/// Verifies the VCEK against the embedded chains and returns the product whose ASK signed it.
-fn verify_vcek_chain(vcek: &Certificate) -> Result<Product, SnpError> {
-    for product in [Product::Milan, Product::Genoa, Product::Turin] {
-        let (ask, _ark) = load_chain(product)?;
-        if vcek.tbs_certificate.issuer == ask.tbs_certificate.subject
-            && verify_cert_sig(vcek, &ask).is_ok()
+/// A verified ARK/ASK pair for one product. The pair is checked for internal
+/// consistency (ARK self-signed, ASK signed by ARK) when constructed.
+struct Anchor {
+    product: Product,
+    ask_der: Vec<u8>,
+    ark_der: Vec<u8>,
+}
+
+impl Anchor {
+    fn new(product: Product, ask_der: Vec<u8>, ark_der: Vec<u8>) -> Result<Self, SnpError> {
         {
-            return Ok(product);
+            let ark = parse_cert(&ark_der)?;
+            let ask = parse_cert(&ask_der)?;
+            verify_cert_sig(&ark, None)?;
+            verify_cert_sig(&ask, Some(&ark))?;
         }
+        Ok(Self {
+            product,
+            ask_der,
+            ark_der,
+        })
+    }
+
+    /// Builds an anchor from a PEM bundle holding the ASK followed by the ARK.
+    fn from_pem_chain(product: Product, pem: &[u8]) -> Result<Self, SnpError> {
+        let mut ders = Vec::new();
+        for p in x509_parser::pem::Pem::iter_from_buffer(pem) {
+            ders.push(p.map_err(|_| SnpError::Chain)?.contents);
+        }
+        let [ask, ark]: [Vec<u8>; 2] = ders.try_into().map_err(|_| SnpError::Chain)?;
+        Self::new(product, ask, ark)
+    }
+}
+
+/// The AMD chains embedded in this binary, verified once per process.
+static EMBEDDED_ANCHORS: LazyLock<Result<Vec<Anchor>, SnpError>> = LazyLock::new(|| {
+    [
+        (Product::Milan, MILAN_CHAIN),
+        (Product::Genoa, GENOA_CHAIN),
+        (Product::Turin, TURIN_CHAIN),
+    ]
+    .into_iter()
+    .map(|(p, pem)| Anchor::from_pem_chain(p, pem))
+    .collect()
+});
+
+fn embedded_anchors() -> Result<&'static [Anchor], SnpError> {
+    EMBEDDED_ANCHORS
+        .as_ref()
+        .map(|v| v.as_slice())
+        .map_err(|e| *e)
+}
+
+/// Verifies the VCEK against `anchors` (selecting the ASK by issuer name before
+/// any signature work) and returns the product whose ASK signed it.
+fn verify_vcek_chain(
+    vcek: &X509Certificate<'_>,
+    anchors: &[Anchor],
+    now: ASN1Time,
+) -> Result<Product, SnpError> {
+    for anchor in anchors {
+        let ask = parse_cert(&anchor.ask_der)?;
+        if vcek.tbs_certificate.issuer.as_raw() != ask.tbs_certificate.subject.as_raw() {
+            continue;
+        }
+        if verify_cert_sig(vcek, Some(&ask)).is_err() {
+            continue;
+        }
+        let ark = parse_cert(&anchor.ark_der)?;
+        check_valid_at(vcek, now)?;
+        check_valid_at(&ask, now)?;
+        check_valid_at(&ark, now)?;
+        return Ok(anchor.product);
     }
     Err(SnpError::Chain)
 }
 
-/// Verifies `ev.report` end to end. See the module docs for the order of checks.
+/// Verifies `ev.report` end to end against the embedded AMD roots at the
+/// current time. See the module docs for the order of checks.
 pub fn verify_snp_report(
     ev: &SnpEvidence<'_>,
     policy: &SnpPolicy,
+) -> Result<VerifiedSnpReport, SnpError> {
+    verify_with_roots(ev, policy, embedded_anchors()?, SystemTime::now())
+}
+
+/// The verifier core. Production callers reach it only through
+/// [`verify_snp_report`], which supplies the embedded AMD roots; tests inject a
+/// synthetic chain and a fixed clock.
+fn verify_with_roots(
+    ev: &SnpEvidence<'_>,
+    policy: &SnpPolicy,
+    anchors: &[Anchor],
+    now: SystemTime,
 ) -> Result<VerifiedSnpReport, SnpError> {
     // 1. Length and header.
     let r = ev.report;
     if r.len() != REPORT_LEN {
         return Err(SnpError::Malformed);
     }
-    if !(2..=5).contains(&le_u32(r, OFF_VERSION)) {
+    if !(2..=5).contains(&le_u32(r, OFF_VERSION)?) {
         return Err(SnpError::Malformed);
     }
-    if le_u32(r, OFF_SIG_ALGO) != SIG_ALGO_ECDSA_P384_SHA384 {
+    if le_u32(r, OFF_SIG_ALGO)? != SIG_ALGO_ECDSA_P384_SHA384 {
         return Err(SnpError::Malformed);
     }
 
     // 2. Parse the VCEK.
-    let vcek = Certificate::from_der(ev.vcek_der).map_err(|_| SnpError::Chain)?;
+    let vcek = parse_cert(ev.vcek_der)?;
+    let secs = now
+        .duration_since(UNIX_EPOCH)
+        .map_err(|_| SnpError::Chain)?
+        .as_secs();
+    let now = i64::try_from(secs)
+        .ok()
+        .and_then(|s| ASN1Time::from_timestamp(s).ok())
+        .ok_or(SnpError::Chain)?;
 
-    // 3. VCEK -> ASK -> ARK (embedded trust anchors).
-    let product = verify_vcek_chain(&vcek)?;
+    // 3. VCEK -> ASK -> ARK (trust anchors) and validity periods.
+    let product = verify_vcek_chain(&vcek, anchors, now)?;
     check_product_supported(product)?;
 
     // 4. Report signature: ECDSA P-384 / SHA-384 over [0, 0x2A0), R and S little-endian.
-    let spki = &vcek.tbs_certificate.subject_public_key_info;
-    let point = spki.subject_public_key.as_bytes().ok_or(SnpError::Chain)?;
-    let key = VerifyingKey::from_sec1_bytes(point).map_err(|_| SnpError::Chain)?;
+    let point = vcek.tbs_certificate.subject_pki.subject_public_key.as_ref();
+    if point.len() != 97 || point[0] != 0x04 {
+        return Err(SnpError::Chain);
+    }
     let sig = &r[SIGNED_LEN..SIGNED_LEN + 144];
     // Each 72-byte component is zero-padded LE; only the low 48 bytes may be non-zero.
     if sig[48..72].iter().any(|b| *b != 0) || sig[72 + 48..144].iter().any(|b| *b != 0) {
@@ -251,13 +367,13 @@ pub fn verify_snp_report(
         rs[i] = sig[47 - i];
         rs[48 + i] = sig[72 + 47 - i];
     }
-    let signature = Signature::from_slice(&rs).map_err(|_| SnpError::Signature)?;
-    key.verify(&r[..SIGNED_LEN], &signature)
+    UnparsedPublicKey::new(&ECDSA_P384_SHA384_FIXED, point)
+        .verify(&r[..SIGNED_LEN], &rs)
         .map_err(|_| SnpError::Signature)?;
 
     // The report is now authentic. Bind it to the VCEK that signed it: the
     // certificate is issued for one chip at one TCB.
-    let reported_tcb = reported_tcb(r);
+    let reported_tcb = reported_tcb(r)?;
     let mut chip_id = [0u8; 64];
     chip_id.copy_from_slice(&r[OFF_CHIP_ID..OFF_CHIP_ID + 64]);
     let cert_tcb = Tcb {
@@ -271,15 +387,10 @@ pub fn verify_snp_report(
     }
 
     // 5. Guest policy.
-    check_policy(le_u64(r, OFF_POLICY))?;
+    check_policy(le_u64(r, OFF_POLICY)?)?;
 
     // 6. TCB floor: every component must meet the minimum.
-    let min = policy.min_tcb;
-    if reported_tcb.bootloader < min.bootloader
-        || reported_tcb.tee < min.tee
-        || reported_tcb.snp < min.snp
-        || reported_tcb.microcode < min.microcode
-    {
+    if !reported_tcb.meets(&policy.min_tcb) {
         return Err(SnpError::Tcb);
     }
 
@@ -304,6 +415,12 @@ mod tests {
             include_bytes!("testdata/tinfoil/router_report.bin").to_vec(),
             include_bytes!("testdata/tinfoil/router_vcek.der").to_vec(),
         )
+    }
+    fn verify_fixture(
+        ev: &SnpEvidence<'_>,
+        policy: &SnpPolicy,
+    ) -> Result<VerifiedSnpReport, SnpError> {
+        verify_with_roots(ev, policy, embedded_anchors()?, fixed_now())
     }
     fn lax() -> SnpPolicy {
         SnpPolicy {
@@ -347,7 +464,7 @@ mod tests {
         let (mut r, v) = fixture();
         r[0x2A0] ^= 1;
         assert_eq!(
-            verify_snp_report(
+            verify_fixture(
                 &SnpEvidence {
                     report: &r,
                     vcek_der: &v
@@ -363,7 +480,7 @@ mod tests {
         let (mut r, v) = fixture();
         r[0x90] ^= 1;
         assert_eq!(
-            verify_snp_report(
+            verify_fixture(
                 &SnpEvidence {
                     report: &r,
                     vcek_der: &v
@@ -386,7 +503,7 @@ mod tests {
             },
         };
         assert_eq!(
-            verify_snp_report(
+            verify_fixture(
                 &SnpEvidence {
                     report: &r,
                     vcek_der: &v
@@ -409,7 +526,7 @@ mod tests {
             },
         };
         assert_eq!(
-            verify_snp_report(
+            verify_fixture(
                 &SnpEvidence {
                     report: &r,
                     vcek_der: &v
@@ -426,7 +543,7 @@ mod tests {
         let n = v.len();
         v[n - 10] ^= 1;
         assert_eq!(
-            verify_snp_report(
+            verify_fixture(
                 &SnpEvidence {
                     report: &r,
                     vcek_der: &v
@@ -441,7 +558,7 @@ mod tests {
     fn rejects_truncated_report() {
         let (r, v) = fixture();
         assert_eq!(
-            verify_snp_report(
+            verify_fixture(
                 &SnpEvidence {
                     report: &r[..100],
                     vcek_der: &v
@@ -456,7 +573,7 @@ mod tests {
     fn rejects_garbage_vcek() {
         let (r, _) = fixture();
         assert_eq!(
-            verify_snp_report(
+            verify_fixture(
                 &SnpEvidence {
                     report: &r,
                     vcek_der: &[1, 2, 3]
@@ -472,7 +589,7 @@ mod tests {
         let (mut r, v) = fixture();
         r[0] = 1;
         assert_eq!(
-            verify_snp_report(
+            verify_fixture(
                 &SnpEvidence {
                     report: &r,
                     vcek_der: &v
@@ -484,7 +601,7 @@ mod tests {
         );
     }
     #[test]
-    fn debug_bit_is_checked_before_signature_is_trusted() {
+    fn check_policy_rejects_debug_bit() {
         assert_eq!(check_policy(1 << 19).unwrap_err(), SnpError::Debug);
         assert!(check_policy(0).is_ok());
     }
@@ -504,7 +621,7 @@ mod tests {
         r[0x38..0x40].copy_from_slice(&[1, 2, 0, 0, 0, 0, 3, 4]);
         r[0x180..0x188].copy_from_slice(&[10, 20, 0, 0, 0, 0, 30, 40]);
         assert_eq!(
-            reported_tcb(&r),
+            reported_tcb(&r).unwrap(),
             Tcb {
                 bootloader: 10,
                 tee: 20,
@@ -526,10 +643,15 @@ mod tests {
     fn rejects_cert_not_chaining_to_any_embedded_ask() {
         // A Milan ASK is signed by the Milan ARK, not by any ASK: it cannot be a VCEK.
         let (r, _) = fixture();
-        let (milan_ask, _) = load_chain(Product::Milan).unwrap();
-        let der = milan_ask.to_der().unwrap();
+        let der = embedded_anchors()
+            .unwrap()
+            .iter()
+            .find(|a| a.product == Product::Milan)
+            .unwrap()
+            .ask_der
+            .clone();
         assert_eq!(
-            verify_snp_report(
+            verify_fixture(
                 &SnpEvidence {
                     report: &r,
                     vcek_der: &der
@@ -542,8 +664,421 @@ mod tests {
     }
     #[test]
     fn embedded_chains_are_self_consistent() {
-        for p in [Product::Milan, Product::Genoa, Product::Turin] {
-            assert!(load_chain(p).is_ok(), "{p:?}");
+        let products: Vec<Product> = embedded_anchors()
+            .unwrap()
+            .iter()
+            .map(|a| a.product)
+            .collect();
+        assert_eq!(products, [Product::Milan, Product::Genoa, Product::Turin]);
+    }
+
+    // ---- synthetic chain: exercises everything behind the signature check ----
+
+    use rcgen::{
+        BasicConstraints, CertificateParams, CustomExtension, DistinguishedName, DnType, IsCa,
+        Issuer, KeyPair, KeyUsagePurpose, PKCS_ECDSA_P384_SHA384,
+    };
+    use ring::rand::SystemRandom;
+    use ring::signature::{EcdsaKeyPair, ECDSA_P384_SHA384_FIXED_SIGNING};
+
+    /// 2026-10-07T00:00:00Z.
+    fn fixed_now() -> SystemTime {
+        UNIX_EPOCH + std::time::Duration::from_secs(1_791_331_200)
+    }
+
+    fn at_year(year: u64) -> SystemTime {
+        UNIX_EPOCH + std::time::Duration::from_secs((year - 1970) * 365 * 86_400)
+    }
+
+    fn p384_key() -> KeyPair {
+        KeyPair::generate_for(&PKCS_ECDSA_P384_SHA384).unwrap()
+    }
+
+    fn ca_params(cn: &str) -> CertificateParams {
+        let mut p = CertificateParams::new(Vec::<String>::new()).unwrap();
+        let mut dn = DistinguishedName::new();
+        dn.push(DnType::CommonName, cn);
+        p.distinguished_name = dn;
+        p.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        p.key_usages = vec![KeyUsagePurpose::KeyCertSign];
+        p.not_before = rcgen::date_time_ymd(2020, 1, 1);
+        p.not_after = rcgen::date_time_ymd(2050, 1, 1);
+        p
+    }
+
+    struct SynthChain {
+        anchors: Vec<Anchor>,
+        ask_issuer: Issuer<'static, KeyPair>,
+    }
+
+    /// A synthetic ARK -> ASK pair (ECDSA P-384) labelled as `product`.
+    fn synth_chain(product: Product, ask_not_after: (i32, u8, u8)) -> SynthChain {
+        let ark_key = p384_key();
+        let ark_params = ca_params("SYNTH-ARK");
+        let ark = ark_params.self_signed(&ark_key).unwrap();
+        let ark_issuer = Issuer::new(ark_params, ark_key);
+        let ask_key = p384_key();
+        let mut ask_params = ca_params("SYNTH-ASK");
+        ask_params.not_after =
+            rcgen::date_time_ymd(ask_not_after.0, ask_not_after.1, ask_not_after.2);
+        let ask = ask_params.signed_by(&ask_key, &ark_issuer).unwrap();
+        let anchor = Anchor::new(product, ask.der().to_vec(), ark.der().to_vec()).unwrap();
+        SynthChain {
+            anchors: vec![anchor],
+            ask_issuer: Issuer::new(ask_params, ask_key),
         }
+    }
+
+    #[derive(Clone)]
+    struct ReportSpec {
+        policy: u64,
+        tcb: Tcb,
+        chip_id: [u8; 64],
+    }
+
+    impl Default for ReportSpec {
+        fn default() -> Self {
+            Self {
+                policy: 0x30000,
+                tcb: Tcb {
+                    bootloader: 10,
+                    tee: 0,
+                    snp: 23,
+                    microcode: 200,
+                },
+                chip_id: [7; 64],
+            }
+        }
+    }
+
+    #[derive(Clone)]
+    struct VcekSpec {
+        tcb: Tcb,
+        hwid: [u8; 64],
+        not_after: (i32, u8, u8),
+    }
+
+    impl VcekSpec {
+        fn matching(r: &ReportSpec) -> Self {
+            Self {
+                tcb: r.tcb,
+                hwid: r.chip_id,
+                not_after: (2040, 1, 1),
+            }
+        }
+    }
+
+    fn int_ext(v: u8) -> Vec<u8> {
+        if v < 0x80 {
+            vec![0x02, 0x01, v]
+        } else {
+            vec![0x02, 0x02, 0x00, v]
+        }
+    }
+
+    fn oid_arcs(s: &str) -> Vec<u64> {
+        s.split('.').map(|x| x.parse().unwrap()).collect()
+    }
+
+    /// Signs a report with a fresh synthetic VCEK issued under `chain`.
+    fn synth_evidence(chain: &SynthChain, rs: &ReportSpec, vs: &VcekSpec) -> (Vec<u8>, Vec<u8>) {
+        let vcek_key = p384_key();
+        let mut params = CertificateParams::new(Vec::<String>::new()).unwrap();
+        let mut dn = DistinguishedName::new();
+        dn.push(DnType::CommonName, "SYNTH-VCEK");
+        params.distinguished_name = dn;
+        params.not_before = rcgen::date_time_ymd(2025, 1, 1);
+        params.not_after = rcgen::date_time_ymd(vs.not_after.0, vs.not_after.1, vs.not_after.2);
+        for (oid, v) in [
+            (OID_BOOTLOADER, vs.tcb.bootloader),
+            (OID_TEE, vs.tcb.tee),
+            (OID_SNP, vs.tcb.snp),
+            (OID_UCODE, vs.tcb.microcode),
+        ] {
+            params
+                .custom_extensions
+                .push(CustomExtension::from_oid_content(
+                    &oid_arcs(oid),
+                    int_ext(v),
+                ));
+        }
+        params
+            .custom_extensions
+            .push(CustomExtension::from_oid_content(
+                &oid_arcs(OID_HWID),
+                vs.hwid.to_vec(),
+            ));
+        let vcek = params.signed_by(&vcek_key, &chain.ask_issuer).unwrap();
+
+        let mut r = vec![0u8; REPORT_LEN];
+        r[OFF_VERSION..OFF_VERSION + 4].copy_from_slice(&2u32.to_le_bytes());
+        r[OFF_SIG_ALGO..OFF_SIG_ALGO + 4].copy_from_slice(&1u32.to_le_bytes());
+        r[OFF_POLICY..OFF_POLICY + 8].copy_from_slice(&rs.policy.to_le_bytes());
+        r[OFF_MEASUREMENT..OFF_MEASUREMENT + 48].copy_from_slice(&[0x42; 48]);
+        r[OFF_REPORT_DATA..OFF_REPORT_DATA + 64].copy_from_slice(&[0x24; 64]);
+        r[OFF_REPORTED_TCB..OFF_REPORTED_TCB + 8].copy_from_slice(&[
+            rs.tcb.bootloader,
+            rs.tcb.tee,
+            0,
+            0,
+            0,
+            0,
+            rs.tcb.snp,
+            rs.tcb.microcode,
+        ]);
+        r[OFF_CHIP_ID..OFF_CHIP_ID + 64].copy_from_slice(&rs.chip_id);
+        let rng = SystemRandom::new();
+        let signer = EcdsaKeyPair::from_pkcs8(
+            &ECDSA_P384_SHA384_FIXED_SIGNING,
+            &vcek_key.serialize_der(),
+            &rng,
+        )
+        .unwrap();
+        let sig = signer.sign(&rng, &r[..SIGNED_LEN]).unwrap();
+        let sig = sig.as_ref();
+        assert_eq!(sig.len(), 96);
+        for i in 0..48 {
+            r[SIGNED_LEN + i] = sig[47 - i];
+            r[SIGNED_LEN + 72 + i] = sig[48 + 47 - i];
+        }
+        (r, vcek.der().to_vec())
+    }
+
+    fn run(
+        chain: &SynthChain,
+        report: &[u8],
+        vcek: &[u8],
+        min: Tcb,
+        now: SystemTime,
+    ) -> Result<VerifiedSnpReport, SnpError> {
+        verify_with_roots(
+            &SnpEvidence {
+                report,
+                vcek_der: vcek,
+            },
+            &SnpPolicy { min_tcb: min },
+            &chain.anchors,
+            now,
+        )
+    }
+
+    fn zero_tcb() -> Tcb {
+        Tcb {
+            bootloader: 0,
+            tee: 0,
+            snp: 0,
+            microcode: 0,
+        }
+    }
+
+    fn happy(product: Product) -> (SynthChain, Vec<u8>, Vec<u8>) {
+        let chain = synth_chain(product, (2040, 1, 1));
+        let rs = ReportSpec::default();
+        let (r, v) = synth_evidence(&chain, &rs, &VcekSpec::matching(&rs));
+        (chain, r, v)
+    }
+
+    #[test]
+    fn synthetic_milan_chain_verifies() {
+        let (chain, r, v) = happy(Product::Milan);
+        let ok = run(&chain, &r, &v, zero_tcb(), fixed_now()).unwrap();
+        assert_eq!(ok.measurement, [0x42; 48]);
+        assert_eq!(ok.chip_id, [7; 64]);
+        assert_eq!(ok.reported_tcb.microcode, 200);
+    }
+
+    #[test]
+    fn synthetic_genoa_chain_verifies() {
+        let (chain, r, v) = happy(Product::Genoa);
+        assert!(run(&chain, &r, &v, zero_tcb(), fixed_now()).is_ok());
+    }
+
+    #[test]
+    fn synthetic_turin_chain_is_product_error() {
+        let (chain, r, v) = happy(Product::Turin);
+        assert_eq!(
+            run(&chain, &r, &v, zero_tcb(), fixed_now()).unwrap_err(),
+            SnpError::Product
+        );
+    }
+
+    #[test]
+    fn synthetic_chain_is_not_accepted_by_the_public_entry() {
+        let (_, r, v) = happy(Product::Milan);
+        assert_eq!(
+            verify_snp_report(
+                &SnpEvidence {
+                    report: &r,
+                    vcek_der: &v
+                },
+                &lax()
+            )
+            .unwrap_err(),
+            SnpError::Chain
+        );
+    }
+
+    #[test]
+    fn synthetic_debug_policy_bit_is_rejected_after_valid_signature() {
+        let chain = synth_chain(Product::Milan, (2040, 1, 1));
+        let rs = ReportSpec {
+            policy: 0x30000 | POLICY_DEBUG_BIT,
+            ..Default::default()
+        };
+        let (r, v) = synth_evidence(&chain, &rs, &VcekSpec::matching(&rs));
+        assert_eq!(
+            run(&chain, &r, &v, zero_tcb(), fixed_now()).unwrap_err(),
+            SnpError::Debug
+        );
+    }
+
+    #[test]
+    fn synthetic_migrate_ma_policy_bit_is_rejected() {
+        let chain = synth_chain(Product::Milan, (2040, 1, 1));
+        let rs = ReportSpec {
+            policy: 0x30000 | POLICY_MIGRATE_MA_BIT,
+            ..Default::default()
+        };
+        let (r, v) = synth_evidence(&chain, &rs, &VcekSpec::matching(&rs));
+        assert_eq!(
+            run(&chain, &r, &v, zero_tcb(), fixed_now()).unwrap_err(),
+            SnpError::MigrateMa
+        );
+    }
+
+    #[test]
+    fn synthetic_chip_id_not_matching_vcek_hwid_is_chain_error() {
+        let chain = synth_chain(Product::Milan, (2040, 1, 1));
+        let rs = ReportSpec::default();
+        let vs = VcekSpec {
+            hwid: [9; 64],
+            ..VcekSpec::matching(&rs)
+        };
+        let (r, v) = synth_evidence(&chain, &rs, &vs);
+        assert_eq!(
+            run(&chain, &r, &v, zero_tcb(), fixed_now()).unwrap_err(),
+            SnpError::Chain
+        );
+    }
+
+    #[test]
+    fn synthetic_reported_tcb_not_matching_vcek_tcb_is_chain_error() {
+        let chain = synth_chain(Product::Milan, (2040, 1, 1));
+        let rs = ReportSpec::default();
+        let mut vs = VcekSpec::matching(&rs);
+        vs.tcb.snp += 1;
+        let (r, v) = synth_evidence(&chain, &rs, &vs);
+        assert_eq!(
+            run(&chain, &r, &v, zero_tcb(), fixed_now()).unwrap_err(),
+            SnpError::Chain
+        );
+    }
+
+    #[test]
+    fn synthetic_tcb_floor_is_enforced() {
+        let (chain, r, v) = happy(Product::Milan);
+        let min = Tcb {
+            microcode: 201,
+            ..zero_tcb()
+        };
+        assert_eq!(
+            run(&chain, &r, &v, min, fixed_now()).unwrap_err(),
+            SnpError::Tcb
+        );
+    }
+
+    #[test]
+    fn synthetic_tampered_report_is_signature_error() {
+        let (chain, mut r, v) = happy(Product::Milan);
+        r[OFF_MEASUREMENT] ^= 1;
+        assert_eq!(
+            run(&chain, &r, &v, zero_tcb(), fixed_now()).unwrap_err(),
+            SnpError::Signature
+        );
+    }
+
+    #[test]
+    fn vcek_outside_validity_period_is_rejected() {
+        let (chain, r, v) = happy(Product::Milan);
+        // VCEK is valid 2025-01-01..2040-01-01.
+        assert_eq!(
+            run(&chain, &r, &v, zero_tcb(), at_year(2021)).unwrap_err(),
+            SnpError::Chain
+        );
+        assert_eq!(
+            run(&chain, &r, &v, zero_tcb(), at_year(2045)).unwrap_err(),
+            SnpError::Chain
+        );
+        assert!(run(&chain, &r, &v, zero_tcb(), at_year(2030)).is_ok());
+    }
+
+    #[test]
+    fn expired_ask_is_rejected() {
+        let chain = synth_chain(Product::Milan, (2028, 1, 1));
+        let rs = ReportSpec::default();
+        let (r, v) = synth_evidence(&chain, &rs, &VcekSpec::matching(&rs));
+        assert!(run(&chain, &r, &v, zero_tcb(), at_year(2027)).is_ok());
+        assert_eq!(
+            run(&chain, &r, &v, zero_tcb(), at_year(2030)).unwrap_err(),
+            SnpError::Chain
+        );
+    }
+
+    #[test]
+    fn vcek_with_trailing_bytes_is_rejected() {
+        let (chain, r, mut v) = happy(Product::Milan);
+        v.push(0);
+        assert_eq!(
+            run(&chain, &r, &v, zero_tcb(), fixed_now()).unwrap_err(),
+            SnpError::Chain
+        );
+    }
+
+    #[test]
+    fn der_u8_decodes_tcb_components() {
+        assert_eq!(der_u8(&[0x02, 0x01, 0x7f]), Ok(0x7f));
+        assert_eq!(der_u8(&[0x02, 0x02, 0x00, 0x80]), Ok(0x80));
+        assert_eq!(der_u8(&[0x02, 0x02, 0x00, 0xff]), Ok(0xff));
+        // 0x80 without the sign-padding byte would be negative.
+        assert_eq!(der_u8(&[0x02, 0x01, 0x80]), Err(SnpError::Chain));
+        assert_eq!(
+            der_u8(&[0x02, 0x03, 0x00, 0x01, 0x02]),
+            Err(SnpError::Chain)
+        );
+        assert_eq!(der_u8(&[0x02, 0x02, 0x00]), Err(SnpError::Chain));
+        assert_eq!(der_u8(&[0x04, 0x01, 0x01]), Err(SnpError::Chain));
+        assert_eq!(der_u8(&[]), Err(SnpError::Chain));
+    }
+
+    #[test]
+    fn short_buffers_are_malformed_not_panics() {
+        assert_eq!(le_u32(&[0; 2], 0), Err(SnpError::Malformed));
+        assert_eq!(le_u64(&[0; 8], 1), Err(SnpError::Malformed));
+        assert_eq!(reported_tcb(&[0; 16]), Err(SnpError::Malformed));
+    }
+
+    #[test]
+    fn tcb_meets_is_component_wise() {
+        let min = Tcb {
+            bootloader: 10,
+            tee: 1,
+            snp: 23,
+            microcode: 84,
+        };
+        let newer_boot_older_tee = Tcb {
+            bootloader: 11,
+            tee: 0,
+            snp: 23,
+            microcode: 84,
+        };
+        assert!(!newer_boot_older_tee.meets(&min));
+        assert!(min.meets(&min));
+        assert!(Tcb {
+            bootloader: 255,
+            tee: 255,
+            snp: 255,
+            microcode: 255
+        }
+        .meets(&min));
     }
 }

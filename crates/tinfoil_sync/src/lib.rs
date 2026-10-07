@@ -12,6 +12,7 @@
 //! tooling and is not part of the API image.
 
 pub mod classify;
+pub mod cli;
 pub mod probe;
 pub mod report;
 pub mod sigstore_verify;
@@ -22,6 +23,10 @@ use services::attestation::tinfoil_pins::TinfoilPins;
 /// Rows that earlier runs verified: the `verified` field of every
 /// `observations.json` audit file below `dir` (the downloaded artifacts of
 /// recent successful runs on `main`). Files that do not parse are skipped.
+///
+/// The directory walk is a deliberate fork of `load_evidence` in
+/// `crates/chutes_sync/src/lib.rs` (spec section 3.4): the two syncs share no
+/// code so neither can break the other.
 pub fn load_evidence(dir: &std::path::Path) -> TinfoilPins {
     #[derive(serde::Deserialize)]
     struct Audit {

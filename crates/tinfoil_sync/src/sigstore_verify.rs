@@ -215,4 +215,45 @@ mod tests {
         )
         .is_err());
     }
+
+    #[test]
+    fn rejects_malformed_statement_shapes() {
+        use base64::Engine;
+        let e = base64::engine::general_purpose::STANDARD;
+        let original = atc();
+        let payload = e
+            .decode(
+                original["sigstoreBundle"]["dsseEnvelope"]["payload"]
+                    .as_str()
+                    .unwrap(),
+            )
+            .unwrap();
+        let stmt: serde_json::Value = serde_json::from_slice(&payload).unwrap();
+        let first = stmt["subject"][0].clone();
+
+        let mut two = stmt.clone();
+        two["subject"] = serde_json::json!([first.clone(), first.clone()]);
+        let mut renamed = stmt.clone();
+        renamed["subject"][0]["name"] = "something-else.json".into();
+        let mut no_digest = stmt.clone();
+        no_digest["subject"][0]["digest"] = serde_json::json!({});
+        let mut no_subject = stmt.clone();
+        no_subject.as_object_mut().unwrap().remove("subject");
+
+        // These guards run before any signature work, so the (now invalid)
+        // signature is irrelevant: each case must fail with its own guard.
+        for (stmt, want) in [
+            (two, "expected exactly one subject"),
+            (renamed, "unexpected subject name"),
+            (no_digest, "no subject digest"),
+            (no_subject, "no subject"),
+        ] {
+            let mut b = original.clone();
+            b["sigstoreBundle"]["dsseEnvelope"]["payload"] = e.encode(stmt.to_string()).into();
+            let err = verify_bundle(&b["sigstoreBundle"], "tinfoilsh/confidential-model-router")
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains(want), "want {want:?}, got {err:?}");
+        }
+    }
 }

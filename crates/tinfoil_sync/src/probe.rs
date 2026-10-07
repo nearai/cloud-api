@@ -21,6 +21,10 @@ pub const PROXY_URL: &str = "https://inference.tinfoil.sh/.well-known/tinfoil-pr
 pub const GITHUB_DOWNLOAD_BASE: &str = "https://github.com";
 pub const GITHUB_API_BASE: &str = "https://api.github.com";
 
+/// Largest response body accepted from any endpoint (the ATC bundle and proxy
+/// document are well under 1 MiB).
+const MAX_BODY_BYTES: u64 = 8 * 1024 * 1024;
+
 pub struct ProbeConfig {
     pub atc_url: String,
     pub proxy_url: String,
@@ -64,6 +68,21 @@ pub enum ProbeError {
     Fetch(String),
 }
 
+/// Reads a response body, failing once it exceeds [`MAX_BODY_BYTES`].
+async fn read_capped(mut r: reqwest::Response) -> Result<String, String> {
+    if r.content_length().is_some_and(|n| n > MAX_BODY_BYTES) {
+        return Err("body too large".into());
+    }
+    let mut buf: Vec<u8> = Vec::new();
+    while let Some(chunk) = r.chunk().await.map_err(|_| "body read error".to_string())? {
+        if buf.len() as u64 + chunk.len() as u64 > MAX_BODY_BYTES {
+            return Err("body too large".into());
+        }
+        buf.extend_from_slice(&chunk);
+    }
+    String::from_utf8(buf).map_err(|_| "body not utf-8".to_string())
+}
+
 async fn get_text(
     client: &reqwest::Client,
     cfg: &ProbeConfig,
@@ -83,9 +102,7 @@ async fn get_text(
             req = req.bearer_auth(t);
         }
         match req.send().await {
-            Ok(r) if r.status().is_success() => {
-                return r.text().await.map_err(|_| "body read error".to_string())
-            }
+            Ok(r) if r.status().is_success() => return read_capped(r).await,
             Ok(r) => {
                 let s = r.status();
                 last = format!("HTTP {}", s.as_u16());
@@ -293,17 +310,228 @@ mod tests {
             router.measurement_hex,
             out.sigstore.router.as_ref().unwrap().snp_measurement
         );
-        assert_eq!(out.observations.models.len(), 17);
+        let proxy: ProxyDoc = serde_json::from_str(PROXY).unwrap();
+        assert_eq!(out.observations.models.len(), proxy.models.len());
         assert!(out
             .sigstore
             .models
             .contains_key("tinfoilsh/confidential-deepseek-v4-1-flash@v0.0.3"));
         // Every other release has no mocked attestation.
         assert_eq!(out.sigstore.models.len(), 1);
+        let unmocked = proxy
+            .models
+            .values()
+            .find(|m| m.repo != "tinfoilsh/confidential-deepseek-v4-1-flash")
+            .expect("fixture has a second release");
+        let key = format!("{}@{}", unmocked.repo, unmocked.tag);
+        assert!(out.notes.iter().any(|n| n.contains(&key)), "{key}");
+    }
+
+    #[tokio::test]
+    async fn router_sigstore_digest_mismatch_is_noted_not_pinned() {
+        let (s, mut cfg) = server().await;
+        let mut atc: serde_json::Value = serde_json::from_str(ATC).unwrap();
+        atc["digest"] = serde_json::json!("00".repeat(32));
+        Mock::given(method("GET"))
+            .and(path("/atc-mismatch"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(atc.to_string()))
+            .mount(&s)
+            .await;
+        cfg.atc_url = format!("{}/atc-mismatch", s.uri());
+        let out = run(&reqwest::Client::new(), &cfg).await.unwrap();
+        assert!(out.observations.router.is_some());
+        assert!(out.sigstore.router.is_none());
         assert!(out
             .notes
             .iter()
-            .any(|n| n.contains("confidential-kimi-k3@v0.0.10")));
+            .any(|n| n == "router: sigstore subject differs from ATC digest"));
+    }
+
+    #[test]
+    fn services_and_sync_atc_captures_agree() {
+        let a: AtcBundle = serde_json::from_str(ATC).unwrap();
+        let b: AtcBundle = serde_json::from_str(include_str!(
+            "../../services/src/attestation/testdata/tinfoil/atc_bundle.json"
+        ))
+        .unwrap();
+        let (oa, ob) = (observe(&a).unwrap(), observe(&b).unwrap());
+        assert_eq!(oa.measurement_hex, ob.measurement_hex);
+        assert_eq!(oa.spki_sha256_hex, ob.spki_sha256_hex);
+    }
+
+    fn counting_cfg(s: &MockServer, attempts: u32) -> ProbeConfig {
+        ProbeConfig {
+            atc_url: format!("{}/atc", s.uri()),
+            proxy_url: format!("{}/proxy", s.uri()),
+            download_base: s.uri(),
+            api_base: s.uri(),
+            github_token: None,
+            attempts,
+            backoff: Duration::ZERO,
+        }
+    }
+
+    #[tokio::test]
+    async fn retries_on_503_then_succeeds() {
+        let s = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/flaky"))
+            .respond_with(ResponseTemplate::new(503))
+            .up_to_n_times(2)
+            .expect(2)
+            .mount(&s)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/flaky"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("ok"))
+            .expect(1)
+            .mount(&s)
+            .await;
+        let cfg = counting_cfg(&s, 3);
+        let body = get_text(
+            &reqwest::Client::new(),
+            &cfg,
+            &format!("{}/flaky", s.uri()),
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(body, "ok");
+        s.verify().await;
+    }
+
+    #[tokio::test]
+    async fn does_not_retry_404() {
+        let s = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/gone"))
+            .respond_with(ResponseTemplate::new(404))
+            .expect(1)
+            .mount(&s)
+            .await;
+        let cfg = counting_cfg(&s, 3);
+        let e = get_text(
+            &reqwest::Client::new(),
+            &cfg,
+            &format!("{}/gone", s.uri()),
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(e, "HTTP 404");
+        s.verify().await;
+    }
+
+    #[tokio::test]
+    async fn gives_up_after_attempts_on_persistent_5xx() {
+        let s = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/down"))
+            .respond_with(ResponseTemplate::new(500))
+            .expect(3)
+            .mount(&s)
+            .await;
+        let cfg = counting_cfg(&s, 3);
+        let e = get_text(
+            &reqwest::Client::new(),
+            &cfg,
+            &format!("{}/down", s.uri()),
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(e, "HTTP 500");
+        s.verify().await;
+    }
+
+    #[tokio::test]
+    async fn oversized_body_is_rejected() {
+        let s = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/big"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(vec![
+                b'a';
+                MAX_BODY_BYTES as usize
+                    + 1
+            ]))
+            .mount(&s)
+            .await;
+        let cfg = counting_cfg(&s, 1);
+        let e = get_text(
+            &reqwest::Client::new(),
+            &cfg,
+            &format!("{}/big", s.uri()),
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(e, "body too large");
+    }
+
+    #[tokio::test]
+    async fn bundle_for_other_tag_is_rejected() {
+        let (s, cfg) = server().await;
+        // Same repo, same digest, but the verified bundle is for v0.0.3.
+        let repo = "tinfoilsh/confidential-deepseek-v4-1-flash";
+        Mock::given(method("GET"))
+            .and(path(format!(
+                "/{repo}/releases/download/v0.0.4/tinfoil.hash"
+            )))
+            .respond_with(ResponseTemplate::new(200).set_body_string(DEEPSEEK_DIGEST))
+            .mount(&s)
+            .await;
+        let e = fetch_release_attestation(&reqwest::Client::new(), &cfg, repo, "v0.0.4")
+            .await
+            .unwrap_err();
+        assert_eq!(e, "no attestation verified for this release");
+        // Control: the right tag verifies.
+        assert!(
+            fetch_release_attestation(&reqwest::Client::new(), &cfg, repo, "v0.0.3")
+                .await
+                .is_ok()
+        );
+    }
+
+    #[tokio::test]
+    async fn malformed_tag_is_rejected_before_request() {
+        let s = MockServer::start().await;
+        let cfg = counting_cfg(&s, 1);
+        for tag in ["", "v1/../x", "v1?x=y", "v 1"] {
+            let e = fetch_release_attestation(
+                &reqwest::Client::new(),
+                &cfg,
+                "tinfoilsh/confidential-x",
+                tag,
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(e, "malformed tag", "{tag:?}");
+        }
+        assert!(s.received_requests().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn malformed_tinfoil_hash_is_rejected() {
+        let s = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path(
+                "/tinfoilsh/confidential-x/releases/download/v1/tinfoil.hash",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_string("not-a-digest"))
+            .mount(&s)
+            .await;
+        let cfg = counting_cfg(&s, 1);
+        let e = fetch_release_attestation(
+            &reqwest::Client::new(),
+            &cfg,
+            "tinfoilsh/confidential-x",
+            "v1",
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(e, "tinfoil.hash: malformed");
+        // Only the hash was requested; no attestations call followed.
+        assert_eq!(s.received_requests().await.unwrap().len(), 1);
     }
 
     #[tokio::test]

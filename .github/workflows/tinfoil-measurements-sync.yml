@@ -1,0 +1,140 @@
+name: Tinfoil Measurements Sync
+
+# Daily: read Tinfoil's public endpoints (no Tinfoil API key), fully verify the
+# router's SEV-SNP attestation, verify each release's Sigstore attestation
+# offline (Fulcio chain, Rekor inclusion, DSSE), and open or update one PR that
+# pins the rows both a live observation and Sigstore agree on. Never merges.
+# See crates/tinfoil_sync.
+
+on:
+  schedule:
+    - cron: "30 6 * * *"
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Write the run summary only; do not push or open a PR"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+  actions: read  # download earlier runs' audit artifacts
+
+concurrency:
+  group: tinfoil-measurements-sync
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  RUSTC_WRAPPER: sccache
+  RUSTFLAGS: "-C debuginfo=0 -C link-arg=-fuse-ld=mold"
+  PINS_FILE: crates/services/src/attestation/tinfoil_golden_measurements.json
+  BOT_BRANCH: bot/tinfoil-measurements
+
+jobs:
+  sync:
+    name: Sync Tinfoil measurements
+    runs-on: [self-hosted, infra]
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: main
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Setup Rust CI
+        uses: ./.github/actions/setup-rust-ci
+        with:
+          cache-key: tinfoil-sync
+
+      # Rows verified on earlier days come from this job's own audit artifacts
+      # (runs on main, last 7 successful), never from the bot branch, which
+      # anyone with write access can push to.
+      - name: Download recent verified observations
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          evidence="$RUNNER_TEMP/evidence"
+          mkdir -p "$evidence"
+          runs="$(gh run list --repo "$GITHUB_REPOSITORY" --workflow tinfoil-measurements-sync.yml \
+            --branch main --status success --limit 7 --json databaseId,headBranch \
+            --jq '.[] | select(.headBranch == "main") | .databaseId')"
+          for id in $runs; do
+            gh run download "$id" --repo "$GITHUB_REPOSITORY" --pattern 'tinfoil-measurements-*' \
+              --dir "$evidence/$id" || echo "::notice::no audit artifact for run $id"
+          done
+
+      # Build in its own step so a failed build is not reported as a failed
+      # probe.
+      - name: Build the sync binary
+        run: cargo build --locked --release -p tinfoil_sync --bin tinfoil_measurement_sync
+
+      # Rewrites $PINS_FILE in place and writes report.md and observations.json
+      # to the out dir. The token is read-only and only raises GitHub's rate
+      # limit for public attestation reads.
+      - name: Probe Tinfoil
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/out"
+          ./target/release/tinfoil_measurement_sync \
+            --pins "$PINS_FILE" \
+            --out-dir "$RUNNER_TEMP/out" \
+            --evidence-dir "$RUNNER_TEMP/evidence"
+
+      - name: Upload audit artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: tinfoil-measurements-${{ github.run_id }}
+          path: |
+            ${{ runner.temp }}/out/report.md
+            ${{ runner.temp }}/out/observations.json
+          if-no-files-found: ignore
+          retention-days: 90
+
+      - name: Run summary
+        if: always()
+        run: |
+          if [ -f "$RUNNER_TEMP/out/report.md" ]; then
+            cat "$RUNNER_TEMP/out/report.md" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Open, update or close the PR
+        if: ${{ inputs.dry_run != true }}
+        env:
+          # Must be a token whose pushes trigger the required "Test Suite"
+          # check; GITHUB_TOKEN pushes do not. Only this step sees it.
+          GH_TOKEN: ${{ secrets.REPOSITORY_DISPATCH_TOKEN }}
+        run: |
+          set -euo pipefail
+          # --head cannot be owner-qualified, so a fork PR could reuse the
+          # branch name; only consider PRs whose head is in this repository.
+          existing="$(gh pr list --head "$BOT_BRANCH" --base main --state open \
+            --json number,isCrossRepository \
+            --jq '[.[] | select(.isCrossRepository == false)][0].number // empty')"
+          if git diff --quiet -- "$PINS_FILE"; then
+            if [ -n "$existing" ]; then
+              gh pr close "$existing" --delete-branch \
+                --comment "Closing: main already pins every row this PR proposed."
+            fi
+            exit 0
+          fi
+          git config user.name "tinfoil-measurements-bot"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git checkout -B "$BOT_BRANCH"
+          git add "$PINS_FILE"
+          git commit -m "chore(tinfoil): pin live-observed measurement rows" \
+            -m "Rows seen live on Tinfoil's router and equal to the release's Sigstore attestation. Generated by .github/workflows/tinfoil-measurements-sync.yml run ${GITHUB_RUN_ID}."
+          gh auth setup-git
+          git push --force origin "$BOT_BRANCH"
+          if [ -n "$existing" ]; then
+            gh pr edit "$existing" --body-file "$RUNNER_TEMP/out/report.md"
+          else
+            gh pr create --base main --head "$BOT_BRANCH" \
+              --title "chore(tinfoil): pin live-observed measurement rows" \
+              --body-file "$RUNNER_TEMP/out/report.md"
+          fi

@@ -8,34 +8,32 @@ use std::future::Future;
 use std::time::Duration;
 
 use inference_providers::attested::chutes::client::{ChutesClient, ChutesClientError};
-use inference_providers::attested::chutes::evidence::InstanceEvidence;
+use inference_providers::attested::chutes::evidence::PublicInstanceEvidence;
 use serde::Serialize;
 use services::attestation::chutes::{ChutesObserver, ChutesVerifyError};
 use services::attestation::chutes_pins::Registers;
 
 use crate::classify::{parse_feed, FeedRow, Observation, ObservationOutcome, SkippedChute};
 
-/// Verifies one instance's evidence and returns its five registers. The real
-/// implementation is [`ChutesObserver`] (DCAP quote, report_data bindings,
-/// NVIDIA NRAS); tests substitute a fake because those checks need the
-/// network and a genuinely signed quote.
+/// Verifies one instance's public evidence and returns its five registers.
+/// The real implementation is [`ChutesObserver`] (DCAP quote, signed-body
+/// freshness binding, NVIDIA NRAS); tests substitute a fake because those
+/// checks need the network and a genuinely signed quote.
 pub trait Observe {
     fn observe(
         &self,
-        evidence: &InstanceEvidence,
-        boot_nonce: &str,
-        e2e_pubkey: &str,
+        evidence: &PublicInstanceEvidence,
+        nonce: &str,
     ) -> impl Future<Output = Result<Registers, ChutesVerifyError>> + Send;
 }
 
 impl Observe for ChutesObserver {
     fn observe(
         &self,
-        evidence: &InstanceEvidence,
-        boot_nonce: &str,
-        e2e_pubkey: &str,
+        evidence: &PublicInstanceEvidence,
+        nonce: &str,
     ) -> impl Future<Output = Result<Registers, ChutesVerifyError>> + Send {
-        self.observe_instance(evidence, boot_nonce, e2e_pubkey)
+        self.observe_instance(evidence, nonce)
     }
 }
 
@@ -47,6 +45,9 @@ pub struct ProbeConfig {
     pub attempts: u32,
     /// Backoff before attempt `n + 1` is `backoff * n`.
     pub backoff: Duration,
+    /// Pause between chutes. Unauthenticated `/evidence` calls are
+    /// rate-limited per client, so the probe spaces them out.
+    pub pace: Duration,
     /// When set (`CHUTES_SYNC_MODELS`), probe only these model ids.
     pub only_models: Option<Vec<String>>,
 }
@@ -55,8 +56,9 @@ impl Default for ProbeConfig {
     fn default() -> Self {
         Self {
             feed_url: DEFAULT_FEED_URL.to_string(),
-            attempts: 3,
-            backoff: Duration::from_secs(2),
+            attempts: 4,
+            backoff: Duration::from_secs(10),
+            pace: Duration::from_secs(5),
             only_models: None,
         }
     }
@@ -69,7 +71,6 @@ pub struct QuoteRecord {
     pub chute_id: String,
     pub instance_id: String,
     pub nonce: String,
-    pub e2e_pubkey: String,
     pub quote_b64: String,
 }
 
@@ -87,7 +88,7 @@ pub enum ProbeError {
     Feed(String),
     #[error("model list: {0}")]
     Models(String),
-    #[error("every chute failed discovery or evidence")]
+    #[error("every chute failed to return evidence")]
     AllChutesFailed,
     #[error("OS random number generator unavailable: {0}")]
     Rng(String),
@@ -181,7 +182,8 @@ fn random_nonce() -> Result<String, ProbeError> {
     Ok(hex::encode(b))
 }
 
-/// Probe every chute `/v1/models` lists (or only `cfg.only_models`). Fails
+/// Probe every chute `/v1/models` lists (or only `cfg.only_models`) using
+/// Chutes' public endpoints only (no API key). Fails
 /// only if the feed or model list is unreachable, or every probed chute fails.
 pub async fn run(
     client: &ChutesClient,
@@ -227,82 +229,67 @@ pub async fn run(
         quotes: vec![],
     };
     let mut probed = 0usize;
-    for (model, chute_id) in &models {
-        let skip = |reason: String| SkippedChute {
-            model: model.clone(),
-            chute_id: chute_id.clone(),
-            reason,
-        };
-        let instances = match with_retry(cfg.attempts, cfg.backoff, client_retryable, || {
-            client.discover_instances(chute_id)
-        })
-        .await
-        {
-            Ok(i) => i.instances,
-            Err(e) => {
-                out.skipped
-                    .push(skip(format!("discover instances: {}", reason(&e))));
-                continue;
-            }
-        };
+    for (i, (model, chute_id)) in models.iter().enumerate() {
+        if i > 0 {
+            tokio::time::sleep(cfg.pace).await;
+        }
         let nonce = random_nonce()?;
         let evidence = match with_retry(cfg.attempts, cfg.backoff, client_retryable, || {
-            client.fetch_evidence(chute_id, &nonce)
+            client.fetch_public_evidence(chute_id, &nonce)
         })
         .await
         {
             Ok(ev) => ev,
             Err(e) => {
-                out.skipped
-                    .push(skip(format!("fetch evidence: {}", reason(&e))));
+                out.skipped.push(SkippedChute {
+                    model: model.clone(),
+                    chute_id: chute_id.clone(),
+                    reason: format!("fetch evidence: {}", reason(&e)),
+                });
                 continue;
             }
         };
         probed += 1;
-        for inst in &instances {
-            let pubkey = inst.e2e_pubkey.trim();
-            let observation = |outcome| Observation {
-                model: model.clone(),
-                chute_id: chute_id.clone(),
-                instance_id: inst.instance_id.clone(),
-                outcome,
-            };
-            if pubkey.is_empty() {
-                out.observations
-                    .push(observation(ObservationOutcome::Failed {
-                        stage: "no_e2e_pubkey".into(),
-                    }));
-                continue;
-            }
-            let Some(ev) = evidence.instance(&inst.instance_id) else {
-                out.observations
-                    .push(observation(ObservationOutcome::Failed {
-                        stage: "missing_evidence".into(),
-                    }));
-                continue;
-            };
+        let observation = |instance_id: &str, outcome| Observation {
+            model: model.clone(),
+            chute_id: chute_id.clone(),
+            instance_id: instance_id.to_string(),
+            outcome,
+        };
+        for failed in &evidence.failed_instance_ids {
+            out.observations.push(observation(
+                failed,
+                ObservationOutcome::Failed {
+                    stage: "evidence_unavailable".into(),
+                },
+            ));
+        }
+        for ev in &evidence.evidence {
+            let instance_id = &ev.evidence.instance_id;
             out.quotes.push(QuoteRecord {
                 model: model.clone(),
                 chute_id: chute_id.clone(),
-                instance_id: inst.instance_id.clone(),
+                instance_id: instance_id.clone(),
                 nonce: nonce.clone(),
-                e2e_pubkey: pubkey.to_string(),
-                quote_b64: ev.quote.clone(),
+                quote_b64: ev.evidence.quote.clone(),
             });
             // One retry for the NVIDIA NRAS stage only (an external service).
             let result = with_retry(
                 cfg.attempts.min(2),
                 cfg.backoff,
                 ChutesVerifyError::is_gpu_failure,
-                || observer.observe(ev, &nonce, pubkey),
+                || observer.observe(ev, &nonce),
             )
             .await;
-            out.observations.push(observation(match result {
-                Ok(registers) => ObservationOutcome::Verified(registers),
-                Err(e) => ObservationOutcome::Failed {
-                    stage: e.stage().into(),
+            out.observations.push(observation(
+                instance_id,
+                match result {
+                    Ok(registers) => ObservationOutcome::Verified(registers),
+                    Err(e) => ObservationOutcome::Failed {
+                        stage: e.stage().into(),
+                    },
                 },
-            }));
+            ));
         }
     }
     if probed == 0 {
@@ -316,14 +303,14 @@ mod tests {
     use std::time::Duration;
 
     use inference_providers::attested::chutes::client::ChutesClient;
+    use inference_providers::attested::chutes::evidence::PublicInstanceEvidence;
     use services::attestation::chutes::ChutesObserver;
+    use services::attestation::chutes_pins::{PinsFile, Registers};
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     use super::*;
     use crate::classify::ObservationOutcome;
-    use inference_providers::attested::chutes::evidence::InstanceEvidence;
-    use services::attestation::chutes_pins::Registers;
 
     async fn get(server: &MockServer, p: &str, status: u16, body: &str) {
         Mock::given(method("GET"))
@@ -341,10 +328,8 @@ mod tests {
         serde_json::json!({ "data": data }).to_string()
     }
 
-    const NO_INSTANCES: &str = r#"{"instances": []}"#;
-    const ONE_INSTANCE: &str =
-        r#"{"instances": [{"instance_id": "i1", "e2e_pubkey": "cGs=", "nonces": []}]}"#;
     const NULL_EVIDENCE: &str = r#"{"evidence": null}"#;
+    const ONE_EVIDENCE: &str = r#"{"evidence": [{"quote": "q", "gpu_evidence": [], "instance_id": "i1", "certificate": "Y2VydA==", "signature": "c2ln", "attested_body": "Ym9keQ=="}]}"#;
 
     /// A feed with one well-formed row.
     fn feed() -> String {
@@ -358,24 +343,31 @@ mod tests {
         .to_string()
     }
 
+    fn cfg(server: &MockServer, only_models: Option<Vec<String>>) -> ProbeConfig {
+        ProbeConfig {
+            feed_url: format!("{}/servers/tee/measurements", server.uri()),
+            attempts: 3,
+            backoff: Duration::from_millis(1),
+            pace: Duration::ZERO,
+            only_models,
+        }
+    }
+
+    fn client(server: &MockServer) -> ChutesClient {
+        ChutesClient::public(5)
+            .unwrap()
+            .with_hosts(server.uri(), server.uri())
+    }
+
     async fn probe_with(
         server: &MockServer,
         only_models: Option<Vec<String>>,
     ) -> Result<ProbeOutput, ProbeError> {
-        let client = ChutesClient::new("k".into(), 5)
-            .unwrap()
-            .with_hosts(server.uri(), server.uri());
-        let cfg = ProbeConfig {
-            feed_url: format!("{}/servers/tee/measurements", server.uri()),
-            attempts: 3,
-            backoff: Duration::from_millis(1),
-            only_models,
-        };
         run(
-            &client,
+            &client(server),
             &reqwest::Client::new(),
             &ChutesObserver::new(None),
-            &cfg,
+            &cfg(server, only_models),
         )
         .await
     }
@@ -384,12 +376,83 @@ mod tests {
         probe_with(server, None).await
     }
 
+    /// Stands in for DCAP and NRAS, which need the network: returns fixed
+    /// registers, optionally after one GPU-stage failure.
+    struct FakeObserver {
+        registers: Registers,
+        fail_gpu_first: std::sync::atomic::AtomicBool,
+    }
+
+    impl Observe for FakeObserver {
+        fn observe(
+            &self,
+            _evidence: &PublicInstanceEvidence,
+            _nonce: &str,
+        ) -> impl Future<Output = Result<Registers, ChutesVerifyError>> + Send {
+            let fail = self
+                .fail_gpu_first
+                .swap(false, std::sync::atomic::Ordering::SeqCst);
+            let registers = self.registers.clone();
+            async move {
+                if fail {
+                    Err(ChutesVerifyError::MissingGpuVerdict)
+                } else {
+                    Ok(registers)
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn verified_instance_becomes_a_verified_observation() {
+        let server = MockServer::start().await;
+        get(&server, "/servers/tee/measurements", 200, &feed()).await;
+        get(&server, "/v1/models", 200, &models(&[("m1", "c1")])).await;
+        get(&server, "/chutes/c1/evidence", 200, ONE_EVIDENCE).await;
+        let r = "ab".repeat(48);
+        let registers = Registers {
+            mrtd: r.clone(),
+            rtmr0: r.clone(),
+            rtmr1: r.clone(),
+            rtmr2: r.clone(),
+            rtmr3: r,
+        };
+        let observer = FakeObserver {
+            registers: registers.clone(),
+            // The first attempt fails at the GPU stage; one retry follows.
+            fail_gpu_first: true.into(),
+        };
+        let out = run(
+            &client(&server),
+            &reqwest::Client::new(),
+            &observer,
+            &cfg(&server, None),
+        )
+        .await
+        .unwrap();
+        assert_eq!(out.observations.len(), 1);
+        assert_eq!(out.observations[0].instance_id, "i1");
+        assert_eq!(
+            out.observations[0].outcome,
+            ObservationOutcome::Verified(registers.clone())
+        );
+        // And the classifier pins it: the feed fixture publishes these
+        // registers.
+        let (pins, _) = crate::classify::classify(
+            &out.feed,
+            &out.observations,
+            &[],
+            vec![],
+            &PinsFile { families: vec![] },
+        );
+        assert!(pins.find(&registers).is_some());
+    }
+
     #[tokio::test]
     async fn chute_with_no_instances_is_not_skipped() {
         let server = MockServer::start().await;
         get(&server, "/servers/tee/measurements", 200, &feed()).await;
         get(&server, "/v1/models", 200, &models(&[("m1", "c1")])).await;
-        get(&server, "/e2e/instances/c1", 200, NO_INSTANCES).await;
         get(&server, "/chutes/c1/evidence", 200, NULL_EVIDENCE).await;
         let out = probe(&server).await.unwrap();
         assert!(out.observations.is_empty());
@@ -397,19 +460,24 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn instance_missing_from_evidence_is_unverified() {
+    async fn instances_whose_evidence_failed_are_reported() {
         let server = MockServer::start().await;
         get(&server, "/servers/tee/measurements", 200, &feed()).await;
         get(&server, "/v1/models", 200, &models(&[("m1", "c1")])).await;
-        get(&server, "/e2e/instances/c1", 200, ONE_INSTANCE).await;
-        get(&server, "/chutes/c1/evidence", 200, r#"{"evidence": []}"#).await;
+        get(
+            &server,
+            "/chutes/c1/evidence",
+            200,
+            r#"{"evidence": [], "failed_instance_ids": ["i9"]}"#,
+        )
+        .await;
         let out = probe(&server).await.unwrap();
         assert_eq!(out.observations.len(), 1);
-        assert_eq!(out.observations[0].instance_id, "i1");
+        assert_eq!(out.observations[0].instance_id, "i9");
         assert_eq!(
             out.observations[0].outcome,
             ObservationOutcome::Failed {
-                stage: "missing_evidence".into()
+                stage: "evidence_unavailable".into()
             }
         );
     }
@@ -419,12 +487,11 @@ mod tests {
         let server = MockServer::start().await;
         get(&server, "/servers/tee/measurements", 200, &feed()).await;
         get(&server, "/v1/models", 200, &models(&[("m1", "c1")])).await;
-        get(&server, "/e2e/instances/c1", 200, ONE_INSTANCE).await;
         get(
             &server,
             "/chutes/c1/evidence",
             200,
-            r#"{"evidence": [{"quote": "!!!", "gpu_evidence": [], "instance_id": "i1", "certificate": "Y2VydA=="}]}"#,
+            &ONE_EVIDENCE.replace(r#""quote": "q""#, r#""quote": "!!!""#),
         )
         .await;
         let out = probe(&server).await.unwrap();
@@ -439,6 +506,27 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn evidence_without_a_signed_body_is_unverified() {
+        let server = MockServer::start().await;
+        get(&server, "/servers/tee/measurements", 200, &feed()).await;
+        get(&server, "/v1/models", 200, &models(&[("m1", "c1")])).await;
+        get(
+            &server,
+            "/chutes/c1/evidence",
+            200,
+            r#"{"evidence": [{"quote": "q", "gpu_evidence": [], "instance_id": "i1", "certificate": "Y2VydA=="}]}"#,
+        )
+        .await;
+        let out = probe(&server).await.unwrap();
+        assert_eq!(
+            out.observations[0].outcome,
+            ObservationOutcome::Failed {
+                stage: "report_data".into()
+            }
+        );
+    }
+
+    #[tokio::test]
     async fn forbidden_chute_is_skipped_others_continue() {
         let server = MockServer::start().await;
         get(&server, "/servers/tee/measurements", 200, &feed()).await;
@@ -449,8 +537,7 @@ mod tests {
             &models(&[("m1", "c1"), ("m2", "c2")]),
         )
         .await;
-        get(&server, "/e2e/instances/c1", 403, "nope").await;
-        get(&server, "/e2e/instances/c2", 200, NO_INSTANCES).await;
+        get(&server, "/chutes/c1/evidence", 403, "nope").await;
         get(&server, "/chutes/c2/evidence", 200, NULL_EVIDENCE).await;
         let out = probe(&server).await.unwrap();
         assert_eq!(out.skipped.len(), 1);
@@ -460,18 +547,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rate_limited_discovery_is_retried() {
+    async fn rate_limited_evidence_is_retried() {
         let server = MockServer::start().await;
         get(&server, "/servers/tee/measurements", 200, &feed()).await;
         get(&server, "/v1/models", 200, &models(&[("m1", "c1")])).await;
         Mock::given(method("GET"))
-            .and(path("/e2e/instances/c1"))
+            .and(path("/chutes/c1/evidence"))
             .respond_with(ResponseTemplate::new(429))
             .up_to_n_times(2)
             .with_priority(1)
             .mount(&server)
             .await;
-        get(&server, "/e2e/instances/c1", 200, NO_INSTANCES).await;
         get(&server, "/chutes/c1/evidence", 200, NULL_EVIDENCE).await;
         let out = probe(&server).await.unwrap();
         assert!(out.skipped.is_empty());
@@ -482,7 +568,7 @@ mod tests {
         let server = MockServer::start().await;
         get(&server, "/servers/tee/measurements", 200, &feed()).await;
         get(&server, "/v1/models", 200, &models(&[("m1", "c1")])).await;
-        get(&server, "/e2e/instances/c1", 500, "").await;
+        get(&server, "/chutes/c1/evidence", 500, "").await;
         assert!(matches!(
             probe(&server).await,
             Err(ProbeError::AllChutesFailed)
@@ -498,12 +584,22 @@ mod tests {
 
     #[tokio::test]
     async fn feed_with_no_usable_rows_is_an_error() {
-        // An empty or unparseable feed must fail the run: otherwise every
-        // carried row looks withdrawn and the open bot PR gets closed.
+        // An empty or unparseable feed must fail the run rather than report
+        // every published row as gone.
         let server = MockServer::start().await;
         get(&server, "/servers/tee/measurements", 200, "[]").await;
         get(&server, "/v1/models", 200, &models(&[("m1", "c1")])).await;
         assert!(matches!(probe(&server).await, Err(ProbeError::Feed(_))));
+    }
+
+    #[tokio::test]
+    async fn empty_model_list_is_an_error() {
+        // A schema or permission change that empties /v1/models must not
+        // produce a green run that attested nothing.
+        let server = MockServer::start().await;
+        get(&server, "/servers/tee/measurements", 200, &feed()).await;
+        get(&server, "/v1/models", 200, r#"{"data": []}"#).await;
+        assert!(matches!(probe(&server).await, Err(ProbeError::Models(_))));
     }
 
     #[tokio::test]
@@ -518,7 +614,6 @@ mod tests {
             .await;
         get(&server, "/servers/tee/measurements", 200, &feed()).await;
         get(&server, "/v1/models", 200, &models(&[("m1", "c1")])).await;
-        get(&server, "/e2e/instances/c1", 200, NO_INSTANCES).await;
         get(&server, "/chutes/c1/evidence", 200, NULL_EVIDENCE).await;
         assert!(probe(&server).await.is_ok());
     }
@@ -536,122 +631,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn empty_model_list_is_an_error() {
-        // A schema or permission change that empties /v1/models must not
-        // produce a green run that attested nothing.
-        let server = MockServer::start().await;
-        get(&server, "/servers/tee/measurements", 200, &feed()).await;
-        get(&server, "/v1/models", 200, r#"{"data": []}"#).await;
-        assert!(matches!(probe(&server).await, Err(ProbeError::Models(_))));
-    }
-
-    #[tokio::test]
-    async fn instance_without_e2e_pubkey_is_reported() {
-        let server = MockServer::start().await;
-        get(&server, "/servers/tee/measurements", 200, &feed()).await;
-        get(&server, "/v1/models", 200, &models(&[("m1", "c1")])).await;
-        get(
-            &server,
-            "/e2e/instances/c1",
-            200,
-            r#"{"instances": [{"instance_id": "i1", "e2e_pubkey": " ", "nonces": []}]}"#,
-        )
-        .await;
-        get(&server, "/chutes/c1/evidence", 200, NULL_EVIDENCE).await;
-        let out = probe(&server).await.unwrap();
-        assert_eq!(
-            out.observations[0].outcome,
-            ObservationOutcome::Failed {
-                stage: "no_e2e_pubkey".into()
-            }
-        );
-    }
-
-    /// Stands in for NRAS and DCAP, which need the network: returns fixed
-    /// registers, optionally after one GPU-stage failure.
-    struct FakeObserver {
-        registers: Registers,
-        fail_gpu_first: std::sync::atomic::AtomicBool,
-    }
-
-    impl Observe for FakeObserver {
-        fn observe(
-            &self,
-            _evidence: &InstanceEvidence,
-            _boot_nonce: &str,
-            _e2e_pubkey: &str,
-        ) -> impl Future<Output = Result<Registers, ChutesVerifyError>> + Send {
-            let fail = self
-                .fail_gpu_first
-                .swap(false, std::sync::atomic::Ordering::SeqCst);
-            let registers = self.registers.clone();
-            async move {
-                if fail {
-                    Err(ChutesVerifyError::MissingGpuVerdict)
-                } else {
-                    Ok(registers)
-                }
-            }
-        }
-    }
-
-    const ONE_EVIDENCE: &str = r#"{"evidence": [{"quote": "q", "gpu_evidence": [], "instance_id": "i1", "certificate": "Y2VydA=="}]}"#;
-
-    #[tokio::test]
-    async fn verified_instance_becomes_a_verified_observation() {
-        let server = MockServer::start().await;
-        get(&server, "/servers/tee/measurements", 200, &feed()).await;
-        get(&server, "/v1/models", 200, &models(&[("m1", "c1")])).await;
-        get(&server, "/e2e/instances/c1", 200, ONE_INSTANCE).await;
-        get(&server, "/chutes/c1/evidence", 200, ONE_EVIDENCE).await;
-        let r = "ab".repeat(48);
-        let registers = Registers {
-            mrtd: r.clone(),
-            rtmr0: r.clone(),
-            rtmr1: r.clone(),
-            rtmr2: r.clone(),
-            rtmr3: r,
-        };
-        let observer = FakeObserver {
-            registers: registers.clone(),
-            // The first attempt fails at the GPU stage; one retry follows.
-            fail_gpu_first: true.into(),
-        };
-        let client = ChutesClient::new("k".into(), 5)
-            .unwrap()
-            .with_hosts(server.uri(), server.uri());
-        let cfg = ProbeConfig {
-            feed_url: format!("{}/servers/tee/measurements", server.uri()),
-            attempts: 3,
-            backoff: Duration::from_millis(1),
-            only_models: None,
-        };
-        let out = run(&client, &reqwest::Client::new(), &observer, &cfg)
-            .await
-            .unwrap();
-        assert_eq!(out.observations.len(), 1);
-        assert_eq!(out.observations[0].instance_id, "i1");
-        assert_eq!(
-            out.observations[0].outcome,
-            ObservationOutcome::Verified(registers.clone())
-        );
-        // And the classifier pins it: the feed fixture publishes these
-        // registers.
-        let (pins, _) = crate::classify::classify(
-            &out.feed,
-            &out.observations,
-            &[],
-            vec![],
-            &services::attestation::chutes_pins::PinsFile { families: vec![] },
-        );
-        assert!(pins.find(&registers).is_some());
-    }
-
-    #[tokio::test]
     async fn only_listed_models_are_probed() {
-        // CHUTES_SYNC_MODELS fallback: if the key cannot read other chutes,
-        // the probe is limited to the listed models. c2 has no mocks, so
-        // probing it would show up as a skipped chute.
+        // CHUTES_SYNC_MODELS limits the run to the listed models. c2 has no
+        // mocks, so probing it would show up as a skipped chute.
         let server = MockServer::start().await;
         get(&server, "/servers/tee/measurements", 200, &feed()).await;
         get(
@@ -661,9 +643,36 @@ mod tests {
             &models(&[("m1", "c1"), ("m2", "c2")]),
         )
         .await;
-        get(&server, "/e2e/instances/c1", 200, NO_INSTANCES).await;
         get(&server, "/chutes/c1/evidence", 200, NULL_EVIDENCE).await;
         let out = probe_with(&server, Some(vec!["m1".into()])).await.unwrap();
         assert!(out.skipped.is_empty());
+    }
+
+    /// LIVE (ignored): run the keyless probe against real Chutes, DCAP
+    /// collateral and NVIDIA NRAS for one model. Network only; no key.
+    ///   cargo nextest run -p chutes_sync --run-ignored only -E 'test(live_)'
+    /// Override the model with `CHUTES_PROBE_MODEL`.
+    #[tokio::test]
+    #[ignore]
+    async fn live_keyless_probe_verifies_a_real_instance() {
+        let model = std::env::var("CHUTES_PROBE_MODEL")
+            .unwrap_or_else(|_| "moonshotai/Kimi-K3-TEE".to_string());
+        let cfg = ProbeConfig {
+            only_models: Some(vec![model]),
+            ..ProbeConfig::default()
+        };
+        let out = run(
+            &ChutesClient::public(60).unwrap(),
+            &reqwest::Client::new(),
+            &ChutesObserver::new(None),
+            &cfg,
+        )
+        .await
+        .expect("probe");
+        eprintln!("{:#?}", out.observations);
+        assert!(out
+            .observations
+            .iter()
+            .any(|o| matches!(o.outcome, ObservationOutcome::Verified(_))));
     }
 }

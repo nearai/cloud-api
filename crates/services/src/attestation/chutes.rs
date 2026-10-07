@@ -28,11 +28,12 @@ use std::collections::HashSet;
 
 use inference_providers::attested::chutes::attestation as transform;
 use inference_providers::attested::chutes::evidence::InstanceEvidence;
+use inference_providers::attested::chutes::evidence::PublicInstanceEvidence;
 use inference_providers::attested::chutes::measurements::{
     ChutesMeasurementPolicy, MeasurementError,
 };
 use inference_providers::attested::chutes::report_data::{
-    freshness_digest, ChutesReportDataVerifier, ReportDataError,
+    freshness_digest, ChutesReportDataVerifier, PublicEvidenceVerifier, ReportDataError,
 };
 
 use inference_providers::attested::chutes::verifier_port::{
@@ -150,7 +151,8 @@ impl ChutesBackendVerifier {
         let measurement_config = format!("{} v{}", matched.name, matched.version);
 
         // 4. GPU via NRAS, bound to the Chutes-derived nonce.
-        let gpu_verdict = verify_gpu(&self.inner, evidence, boot_nonce, e2e_pubkey).await?;
+        let gpu_nonce = hex::encode(freshness_digest(boot_nonce, e2e_pubkey));
+        let gpu_verdict = verify_gpu(&self.inner, evidence, &gpu_nonce).await?;
 
         Ok(ChutesVerifiedInstance {
             instance_id: evidence.instance_id.clone(),
@@ -175,6 +177,7 @@ fn shared_stage_verifier(pccs_url: Option<String>) -> AttestationVerifier {
 /// Stages 1 + 2 passed: the quote is genuine, fresh, and bound to this
 /// instance's E2EE key and certificate.
 struct BoundQuote {
+    report_data: [u8; 64],
     mrtd: [u8; REGISTER_LEN],
     rtmr0: [u8; REGISTER_LEN],
     rtmr1: [u8; REGISTER_LEN],
@@ -184,12 +187,9 @@ struct BoundQuote {
 }
 
 /// 1. DCAP-verify the TDX quote (signature chain, TCB floor, debug bit).
-/// 2. report_data bindings: freshness + e2e-key [0:32], cert SPKI [32:64].
-async fn verify_quote_and_bindings(
+async fn verify_quote(
     inner: &AttestationVerifier,
     evidence: &InstanceEvidence,
-    boot_nonce: &str,
-    e2e_pubkey: &str,
 ) -> Result<BoundQuote, ChutesVerifyError> {
     let quote_hex = transform::intel_quote_hex(evidence)?;
     let verified = inner.verify_tdx_quote(&quote_hex).await?;
@@ -198,9 +198,8 @@ async fn verify_quote_and_bindings(
         .report
         .as_td10()
         .ok_or(ChutesVerifyError::NotTd10)?;
-    let cert_der = transform::certificate_der(evidence)?;
-    ChutesReportDataVerifier.verify(&td.report_data, boot_nonce, e2e_pubkey, &cert_der)?;
     Ok(BoundQuote {
+        report_data: td.report_data,
         mrtd: td.mr_td,
         rtmr0: td.rt_mr0,
         rtmr1: td.rt_mr1,
@@ -210,16 +209,29 @@ async fn verify_quote_and_bindings(
     })
 }
 
-/// 4. GPU: the SPDM evidence is bound to the Chutes-derived nonce — the same
-///    SHA256(boot_nonce ‖ e2e_pubkey) that lands in report_data[0:32] — not the
-///    raw caller nonce. Inject it and verify via NRAS.
-async fn verify_gpu(
+/// 1 + 2. DCAP quote, then the serving bindings: freshness + e2e-key [0:32],
+/// cert SPKI [32:64].
+async fn verify_quote_and_bindings(
     inner: &AttestationVerifier,
     evidence: &InstanceEvidence,
     boot_nonce: &str,
     e2e_pubkey: &str,
+) -> Result<BoundQuote, ChutesVerifyError> {
+    let q = verify_quote(inner, evidence).await?;
+    let cert_der = transform::certificate_der(evidence)?;
+    ChutesReportDataVerifier.verify(&q.report_data, boot_nonce, e2e_pubkey, &cert_der)?;
+    Ok(q)
+}
+
+/// 4. GPU: the SPDM evidence is bound to the Chutes-derived nonce
+///    (`gpu_nonce`, hex) — the value in report_data[0:32] — not the raw caller
+///    nonce. Inject it and verify via NRAS.
+async fn verify_gpu(
+    inner: &AttestationVerifier,
+    evidence: &InstanceEvidence,
+    gpu_nonce: &str,
 ) -> Result<String, ChutesVerifyError> {
-    let gpu_nonce = hex::encode(freshness_digest(boot_nonce, e2e_pubkey));
+    let gpu_nonce = gpu_nonce.to_string();
     let mut nvidia_payload = transform::nvidia_payload(evidence)?;
     // Fatal if the payload isn't an object: proceeding without injecting the
     // nonce would submit GPU evidence unbound to our freshness anchor.
@@ -243,10 +255,17 @@ async fn verify_gpu(
 }
 
 /// Records which register sets genuine Chutes instances run, for the daily
-/// measurement sync. It runs the same quote, report_data and GPU checks as
-/// [`ChutesBackendVerifier`] but has no allow-list and does not implement
-/// [`ChutesInstanceVerifier`], so it can never be handed to the provider pool
-/// to serve traffic.
+/// measurement sync, from Chutes' **public** evidence (no API key).
+///
+/// It runs the same DCAP quote and NVIDIA NRAS checks as
+/// [`ChutesBackendVerifier`], but the freshness proof differs: the public
+/// evidence carries no E2EE key, so instead of `report_data[0:32]` the observer
+/// checks that the quote binds the instance certificate and that the
+/// certificate's key signed a body containing our nonce and this quote
+/// ([`PublicEvidenceVerifier`]). The GPU evidence is checked against
+/// `report_data[0:32]`, the nonce Chutes bound it to. It has no allow-list and
+/// does not implement [`ChutesInstanceVerifier`], so it can never be handed to
+/// the provider pool to serve traffic.
 pub struct ChutesObserver {
     inner: AttestationVerifier,
 }
@@ -258,15 +277,32 @@ impl ChutesObserver {
         }
     }
 
-    /// Run stages 1, 2 and 4 and return the quote's five registers.
+    /// Verify one instance's public evidence and return its five registers.
     pub async fn observe_instance(
         &self,
-        evidence: &InstanceEvidence,
-        boot_nonce: &str,
-        e2e_pubkey: &str,
+        evidence: &PublicInstanceEvidence,
+        nonce: &str,
     ) -> Result<Registers, ChutesVerifyError> {
-        let q = verify_quote_and_bindings(&self.inner, evidence, boot_nonce, e2e_pubkey).await?;
-        verify_gpu(&self.inner, evidence, boot_nonce, e2e_pubkey).await?;
+        // Without the signed body there is no freshness proof; refuse before
+        // any network call.
+        let (Some(body), Some(signature)) = (&evidence.attested_body, &evidence.signature) else {
+            return Err(ReportDataError::SignedBody(
+                "public evidence has no attested_body/signature".to_string(),
+            )
+            .into());
+        };
+        let instance = &evidence.evidence;
+        let q = verify_quote(&self.inner, instance).await?;
+        let cert_der = transform::certificate_der(instance)?;
+        PublicEvidenceVerifier.verify(
+            &q.report_data,
+            nonce,
+            &cert_der,
+            &instance.quote,
+            body,
+            signature,
+        )?;
+        verify_gpu(&self.inner, instance, &hex::encode(&q.report_data[..32])).await?;
         Ok(Registers {
             mrtd: hex::encode(q.mrtd),
             rtmr0: hex::encode(q.rtmr0),
@@ -403,16 +439,39 @@ mod tests {
         );
     }
 
+    fn public_evidence(quote: &str, signed: bool) -> PublicInstanceEvidence {
+        PublicInstanceEvidence {
+            evidence: dummy_evidence(quote),
+            signature: signed.then(|| "c2ln".to_string()),
+            attested_body: signed.then(|| "Ym9keQ==".to_string()),
+        }
+    }
+
     #[tokio::test]
     async fn observer_reaches_transform_without_any_measurement_policy() {
         // The observer has no allow-list at all: on a malformed quote it fails
         // in the transform stage, before any network call, and labels it so.
         let err = ChutesObserver::new(None)
-            .observe_instance(&dummy_evidence("!!! not base64 !!!"), &"a".repeat(64), "pk")
+            .observe_instance(
+                &public_evidence("!!! not base64 !!!", true),
+                &"a".repeat(64),
+            )
             .await
             .unwrap_err();
         assert!(matches!(err, ChutesVerifyError::Transform(_)));
         assert_eq!(err.stage(), "transform");
+    }
+
+    #[tokio::test]
+    async fn observer_requires_the_signed_body_before_any_network_call() {
+        // Without `attested_body` and `signature` there is no freshness proof,
+        // so the observer refuses before fetching DCAP collateral.
+        let err = ChutesObserver::new(None)
+            .observe_instance(&public_evidence("BAACAIE=", false), &"a".repeat(64))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ChutesVerifyError::ReportData(_)), "{err}");
+        assert_eq!(err.stage(), "report_data");
     }
 
     #[tokio::test]

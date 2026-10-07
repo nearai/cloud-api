@@ -1,7 +1,8 @@
 name: Chutes Measurements Sync
 
-# Daily: probe every Chutes TEE instance, verify its quote (Intel signature
-# chain, TCB, debug bit, report_data bindings, NVIDIA NRAS), and open or
+# Daily: probe every Chutes TEE instance through Chutes' public endpoints (no
+# Chutes API key), verify its quote (Intel signature chain, TCB, debug bit,
+# freshness via the instance's signed evidence, NVIDIA NRAS), and open or
 # update one PR that pins the measurement rows Chutes publishes AND a verified
 # live quote showed. Never merges. See crates/chutes_sync.
 
@@ -75,7 +76,6 @@ jobs:
 
       - name: Probe Chutes
         env:
-          CHUTES_API_KEY: ${{ secrets.CHUTES_SYNC_API_KEY }}
           CHUTES_SYNC_MODELS: ${{ vars.CHUTES_SYNC_MODELS }}
           PINS_BASE: ${{ runner.temp }}/base.json
           PINS_OUT: ${{ env.PINS_FILE }}

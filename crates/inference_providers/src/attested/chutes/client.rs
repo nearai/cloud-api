@@ -14,7 +14,7 @@
 
 use serde::Deserialize;
 
-use super::evidence::EvidenceResponse;
+use super::evidence::{EvidenceResponse, PublicEvidenceResponse};
 
 /// Errors from talking to Chutes' HTTP endpoints.
 #[derive(Debug, thiserror::Error)]
@@ -122,7 +122,9 @@ pub struct ChutesClient {
     stream_http: reqwest::Client,
     api_base: String,
     models_base: String,
-    api_key: String,
+    /// `None` for the keyless client ([`Self::public`]), which sends no
+    /// `Authorization` header.
+    api_key: Option<String>,
     /// Total-request timeout (seconds) applied per-request to the *non-streaming*
     /// calls (discovery, evidence, non-stream invoke) via `.timeout(...)`.
     request_timeout_secs: u64,
@@ -172,9 +174,31 @@ impl ChutesClient {
             stream_http,
             api_base: DEFAULT_API_BASE.to_string(),
             models_base: DEFAULT_MODELS_BASE.to_string(),
-            api_key,
+            api_key: Some(api_key),
             request_timeout_secs: timeout_seconds.max(1),
         })
+    }
+
+    /// A client for Chutes' public endpoints (`/v1/models`, `/evidence`) with no
+    /// API key. Chutes rejects an unknown bearer even on public endpoints, so
+    /// this client sends no `Authorization` header at all.
+    pub fn public(timeout_seconds: u64) -> Result<Self, ChutesClientError> {
+        let mut client = Self::new(String::new(), timeout_seconds)?;
+        client.api_key = None;
+        Ok(client)
+    }
+
+    /// The `Authorization` header for this client, if it has a key.
+    fn auth_headers(&self) -> reqwest::header::HeaderMap {
+        let mut headers = reqwest::header::HeaderMap::new();
+        if let Some(key) = &self.api_key {
+            if let Ok(mut v) = reqwest::header::HeaderValue::from_str(&format!("Bearer {key}")) {
+                // Same as `bearer_auth`: keep the key out of Debug output.
+                v.set_sensitive(true);
+                headers.insert(reqwest::header::AUTHORIZATION, v);
+            }
+        }
+        headers
     }
 
     /// Override the hosts (tests / staging).
@@ -204,7 +228,7 @@ impl ChutesClient {
         let resp = self
             .http
             .get(&url)
-            .bearer_auth(&self.api_key)
+            .headers(self.auth_headers())
             .timeout(std::time::Duration::from_secs(self.request_timeout_secs))
             .send()
             .await?;
@@ -225,7 +249,7 @@ impl ChutesClient {
         let resp = self
             .http
             .get(&url)
-            .bearer_auth(&self.api_key)
+            .headers(self.auth_headers())
             .timeout(std::time::Duration::from_secs(self.request_timeout_secs))
             .send()
             .await?;
@@ -248,7 +272,31 @@ impl ChutesClient {
             .http
             .get(&url)
             .query(&[("nonce", boot_nonce)])
-            .bearer_auth(&self.api_key)
+            .headers(self.auth_headers())
+            .timeout(std::time::Duration::from_secs(self.request_timeout_secs))
+            .send()
+            .await?;
+        let resp = error_for_status(resp).await?;
+        resp.json().await.map_err(|e| ChutesClientError::Decode {
+            what: "/evidence",
+            source: e,
+        })
+    }
+
+    /// Fetch the **public** evidence for every live instance of a chute (no API
+    /// key needed): the quote, GPU evidence and certificate, plus the
+    /// `attested_body` the instance signed with our nonce in it.
+    pub async fn fetch_public_evidence(
+        &self,
+        chute_id: &str,
+        nonce: &str,
+    ) -> Result<PublicEvidenceResponse, ChutesClientError> {
+        let url = format!("{}/chutes/{}/evidence", self.api_base, chute_id);
+        let resp = self
+            .http
+            .get(&url)
+            .query(&[("nonce", nonce)])
+            .headers(self.auth_headers())
             .timeout(std::time::Duration::from_secs(self.request_timeout_secs))
             .send()
             .await?;
@@ -301,7 +349,7 @@ impl ChutesClient {
         };
         client
             .post(&url)
-            .bearer_auth(&self.api_key)
+            .headers(self.auth_headers())
             .header("Content-Type", "application/octet-stream")
             .header("X-Chute-Id", req.chute_id)
             .header("X-Instance-Id", req.instance_id)
@@ -382,6 +430,51 @@ fn pick_chute_id(list: &ModelsList, model: &str) -> Result<String, ChutesClientE
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Matches requests that carry no `Authorization` header.
+    struct NoAuthHeader;
+    impl wiremock::Match for NoAuthHeader {
+        fn matches(&self, request: &wiremock::Request) -> bool {
+            !request.headers.contains_key("authorization")
+        }
+    }
+
+    #[tokio::test]
+    async fn public_client_sends_no_authorization_header() {
+        // Chutes answers 401 to an unknown bearer even on public endpoints,
+        // so the keyless client must omit the header entirely.
+        use wiremock::matchers::{method, path};
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(method("GET"))
+            .and(path("/v1/models"))
+            .and(NoAuthHeader)
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_string(r#"{"data":[{"id":"a/A-TEE","chute_id":"c1"}]}"#),
+            )
+            .mount(&server)
+            .await;
+        wiremock::Mock::given(method("GET"))
+            .and(path("/chutes/c1/evidence"))
+            .and(NoAuthHeader)
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_string(
+                r#"{"evidence":[{"quote":"q","instance_id":"i1","certificate":"c","signature":"s","attested_body":"b"}]}"#,
+            ))
+            .mount(&server)
+            .await;
+        let client = ChutesClient::public(5)
+            .unwrap()
+            .with_hosts(server.uri(), server.uri());
+        assert_eq!(
+            client.list_models().await.unwrap(),
+            vec![("a/A-TEE".to_string(), "c1".to_string())]
+        );
+        let ev = client
+            .fetch_public_evidence("c1", &"ab".repeat(32))
+            .await
+            .unwrap();
+        assert_eq!(ev.evidence[0].signature.as_deref(), Some("s"));
+    }
 
     #[test]
     fn models_list_keeps_entries_with_a_chute_id() {

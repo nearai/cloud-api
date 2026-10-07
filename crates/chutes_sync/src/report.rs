@@ -43,9 +43,10 @@ pub fn render_markdown(report: &SyncReport, date: &str) -> String {
     let _ = writeln!(s, "## Chutes measurement sync ({date})\n");
     let _ = writeln!(
         s,
-        "A row is pinned only if Chutes publishes it **and** a quote that passed the Intel \
-         signature chain, TCB floor, debug-bit check, report_data bindings and NVIDIA NRAS \
-         showed the same five registers. Review, then merge; it takes effect with the next \
+        "A row is pinned only if Chutes publishes it **and** a live quote showed the same five \
+         registers. Each quote passed the Intel signature chain, TCB floor and debug-bit check, \
+         was bound to this run's nonce (the instance certificate the quote binds signed it), and \
+         its GPUs passed NVIDIA NRAS. Review, then merge; it takes effect with the next \
          release.\n"
     );
     let _ = writeln!(s, "### Rows to pin ({})\n", report.added.len());
@@ -58,8 +59,17 @@ pub fn render_markdown(report: &SyncReport, date: &str) -> String {
              and still published"
                 .to_string()
         } else {
-            on.iter()
-                .map(|o| format!("{} {}", code(&o.model), code(&o.instance_id)))
+            // Per model with a count; instance ids are in the run artifact.
+            let mut per_model: std::collections::BTreeMap<&str, usize> = Default::default();
+            for o in on {
+                *per_model.entry(o.model.as_str()).or_default() += 1;
+            }
+            per_model
+                .into_iter()
+                .map(|(m, n)| {
+                    let unit = if n == 1 { "instance" } else { "instances" };
+                    format!("{} ({n} {unit})", code(m))
+                })
                 .collect::<Vec<_>>()
                 .join(", ")
         };
@@ -181,7 +191,7 @@ mod tests {
         ));
         let md = render_markdown(&rep, "2026-10-06");
         assert!(md.contains("v1.4.1 `8xb300`"));
-        assert!(md.contains("`kimi` `i1`"));
+        assert!(md.contains("`kimi` (1 instance)"));
         assert!(md.contains("2026-10-06"));
     }
 
@@ -248,6 +258,28 @@ mod tests {
                 assert_eq!(line[..at].matches('`').count() % 2, 1, "{line}");
             }
         }
+    }
+
+    #[test]
+    fn sightings_are_grouped_by_model_with_counts() {
+        let mut rep = SyncReport::default();
+        let on = |model: &str, id: &str| SeenOn {
+            model: model.into(),
+            instance_id: id.into(),
+        };
+        rep.added.push((
+            RowRef {
+                version: "1.4.1".into(),
+                name: "8xb300".into(),
+            },
+            vec![on("b", "i1"), on("a", "i2"), on("b", "i3")],
+        ));
+        let md = render_markdown(&rep, "2026-10-06");
+        assert!(
+            md.contains("seen on `a` (1 instance), `b` (2 instances)"),
+            "{md}"
+        );
+        assert!(!md.contains("i3"), "instance ids stay in the artifact");
     }
 
     #[test]

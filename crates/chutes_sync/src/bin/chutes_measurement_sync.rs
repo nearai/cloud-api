@@ -2,7 +2,9 @@
 //! `.github/workflows/chutes-measurements-sync.yml`).
 //!
 //! Env:
-//! - `CHUTES_API_KEY` (required): Chutes key for discovery and evidence.
+//! No Chutes API key is used: the probe reads Chutes' public `/v1/models`,
+//! `/servers/tee/measurements` and `/chutes/{id}/evidence` endpoints.
+//!
 //! - `PCCS_URL` (optional): DCAP collateral server.
 //! - `CHUTES_SYNC_MODELS` (optional): comma-separated model ids; when set,
 //!   only these models are probed.
@@ -29,7 +31,7 @@ use inference_providers::attested::chutes::client::ChutesClient;
 use services::attestation::chutes::ChutesObserver;
 use services::attestation::chutes_pins::PinsFile;
 
-/// Per-request timeout for discovery and evidence calls, in seconds.
+/// Per-request timeout for model-list and evidence calls, in seconds.
 const CHUTES_TIMEOUT_SECS: u64 = 60;
 
 type Failure = (u8, String);
@@ -67,7 +69,6 @@ async fn main() -> ExitCode {
 }
 
 async fn run() -> Result<(), Failure> {
-    let api_key = required("CHUTES_API_KEY")?;
     let base = read_pins(&required("PINS_BASE")?)?;
     let out_path = required("PINS_OUT")?;
     let report_path = required("REPORT_OUT")?;
@@ -77,7 +78,7 @@ async fn run() -> Result<(), Failure> {
         .unwrap_or_default();
     let only_models = optional("CHUTES_SYNC_MODELS").map(|s| parse_model_list(&s));
 
-    let client = ChutesClient::new(api_key, CHUTES_TIMEOUT_SECS)
+    let client = ChutesClient::public(CHUTES_TIMEOUT_SECS)
         .map_err(|e| bad(format!("Chutes client: {e}")))?;
     let observer = ChutesObserver::new(optional("PCCS_URL"));
     let cfg = ProbeConfig {

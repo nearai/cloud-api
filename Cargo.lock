@@ -1980,6 +1980,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "chutes_sync"
+version = "0.0.0"
+dependencies = [
+ "chrono",
+ "getrandom 0.4.1",
+ "hex",
+ "inference_providers",
+ "reqwest 0.12.28",
+ "serde",
+ "serde_json",
+ "services",
+ "thiserror 2.0.18",
+ "tokio",
+ "wiremock",
+]
+
+[[package]]
 name = "cipher"
 version = "0.4.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"

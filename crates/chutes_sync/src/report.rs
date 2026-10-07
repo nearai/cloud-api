@@ -38,7 +38,8 @@ pub fn render_markdown(report: &SyncReport, date: &str) -> String {
     }
     for (row, on) in &report.added {
         let where_ = if on.is_empty() {
-            "not seen live today; found by an earlier run of this job and still published"
+            "not seen live today; verified by a recent run of this job (see its artifact) \
+             and still published"
                 .to_string()
         } else {
             on.iter()
@@ -57,11 +58,6 @@ pub fn render_markdown(report: &SyncReport, date: &str) -> String {
         &mut s,
         "Pinned, no longer published (kept)",
         &report.pinned_not_published,
-    );
-    list(
-        &mut s,
-        "Found earlier, withdrawn before merge (dropped)",
-        &report.withdrawn_before_merge,
     );
     list(
         &mut s,

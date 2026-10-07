@@ -17,6 +17,7 @@ on:
 
 permissions:
   contents: read
+  actions: read  # download earlier runs' audit artifacts
 
 concurrency:
   group: chutes-measurements-sync
@@ -47,22 +48,25 @@ jobs:
         with:
           cache-key: chutes-sync
 
-      # Rows found on earlier days are carried only from a branch head this job
-      # wrote. If anyone else pushed to the bot branch, its rows are ignored and
-      # the PR is rebuilt from main plus today's verified observations.
-      - name: Load pins from the open bot branch
+      # Rows verified on earlier days come from this job's own audit artifacts
+      # (runs on main, last 7 successful), never from the bot branch, which
+      # anyone with write access can push to.
+      - name: Download recent verified observations
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           cp "$PINS_FILE" "$RUNNER_TEMP/base.json"
-          if git ls-remote --exit-code --heads origin "$BOT_BRANCH" >/dev/null; then
-            git fetch --no-tags origin "$BOT_BRANCH"
-            author="$(git log -1 --format=%an "origin/$BOT_BRANCH")"
-            if [ "$author" != "chutes-measurements-bot" ]; then
-              echo "::notice::$BOT_BRANCH head was not written by this job; not carrying its rows"
-            elif git show "origin/$BOT_BRANCH:$PINS_FILE" > "$RUNNER_TEMP/carry.json"; then
-              echo "PINS_CARRY=$RUNNER_TEMP/carry.json" >> "$GITHUB_ENV"
-            fi
-          fi
+          evidence="$RUNNER_TEMP/evidence"
+          mkdir -p "$evidence"
+          runs="$(gh run list --repo "$GITHUB_REPOSITORY" --workflow chutes-measurements-sync.yml \
+            --branch main --status success --limit 7 --json databaseId,headBranch \
+            --jq '.[] | select(.headBranch == "main") | .databaseId')"
+          for id in $runs; do
+            gh run download "$id" --repo "$GITHUB_REPOSITORY" --pattern 'chutes-measurements-*' \
+              --dir "$evidence/$id" || echo "::notice::no audit artifact for run $id"
+          done
+          echo "PINS_EVIDENCE_DIR=$evidence" >> "$GITHUB_ENV"
 
       # Build without any secret in the environment, so build scripts of
       # dependencies never see the Chutes key.

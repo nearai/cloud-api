@@ -1101,61 +1101,75 @@ pub async fn init_inference_providers(
     if config.external_providers.enable_chutes {
         match &config.external_providers.chutes_api_key {
             Some(api_key) if !config.external_providers.chutes_models.is_empty() => {
-                let pccs_url = config.external_providers.pccs_url.clone();
-                let allow_streaming = config.external_providers.chutes_enable_streaming;
-                let verifier: Arc<
-                    dyn inference_providers::attested::chutes::verifier_port::ChutesInstanceVerifier,
-                > = Arc::new(services::attestation::chutes::ChutesBackendVerifier::new(
-                    services::attestation::chutes::vetted_golden_measurements(),
-                    pccs_url,
-                ));
-                for entry in &config.external_providers.chutes_models {
-                    // The provider talks to Chutes with the chute SLUG (request_body
-                    // pins it + cached_chute_id resolves it); we expose/route under
-                    // the CANONICAL id (the NEAR-served id when NEAR also serves the
-                    // model, else the OpenRouter id) — never the raw `-TEE` slug.
-                    let cfg = inference_providers::attested::chutes::Config::new(
-                        api_key.clone(),
-                        entry.chute_slug.clone(),
-                        config.external_providers.timeout_seconds,
-                    )
-                    .with_canonical_id(entry.canonical_id.clone())
-                    .with_streaming(allow_streaming);
-                    match inference_providers::attested::chutes::Provider::new(
-                        cfg,
-                        verifier.clone(),
-                    ) {
-                        Ok(provider) => {
-                            // Ensure a catalog row exists under the canonical id so the
-                            // data plane resolves the model (and usage bills against a
-                            // real id). If NEAR already serves this id, its row is left
-                            // untouched and we just add Chutes as a fallback provider.
-                            let role =
-                                ensure_chutes_catalog_row(&models_repo, &entry.canonical_id).await;
-                            // Register the stable role from catalog configuration,
-                            // independently of whether discovery happened to find a live
-                            // primary during this startup.
-                            pool.register_pinned_provider(
-                                entry.canonical_id.clone(),
-                                Arc::new(provider),
-                                entry.max_context_tokens,
-                                role,
+                // The pins are compiled in and CI checks they parse; if a bad
+                // build ever slips through, Chutes stays off and the rest of the
+                // API still starts.
+                match services::attestation::chutes::vetted_golden_measurements() {
+                    Err(e) => tracing::error!(
+                        error = %e,
+                        "Chutes golden measurements failed to parse; not registering any Chutes provider"
+                    ),
+                    Ok(policy) => {
+                        let pccs_url = config.external_providers.pccs_url.clone();
+                        let allow_streaming = config.external_providers.chutes_enable_streaming;
+                        let verifier: Arc<
+                        dyn inference_providers::attested::chutes::verifier_port::ChutesInstanceVerifier,
+                    > = Arc::new(services::attestation::chutes::ChutesBackendVerifier::new(
+                        policy,
+                        pccs_url,
+                    ));
+                        for entry in &config.external_providers.chutes_models {
+                            // The provider talks to Chutes with the chute SLUG (request_body
+                            // pins it + cached_chute_id resolves it); we expose/route under
+                            // the CANONICAL id (the NEAR-served id when NEAR also serves the
+                            // model, else the OpenRouter id) — never the raw `-TEE` slug.
+                            let cfg = inference_providers::attested::chutes::Config::new(
+                                api_key.clone(),
+                                entry.chute_slug.clone(),
+                                config.external_providers.timeout_seconds,
                             )
-                            .await;
-                            tracing::info!(
-                                canonical = %entry.canonical_id,
-                                chute_slug = %entry.chute_slug,
-                                role = ?role,
-                                "Registered Chutes attested provider"
-                            );
-                        }
-                        Err(e) => {
-                            tracing::warn!(
-                                canonical = %entry.canonical_id,
-                                chute_slug = %entry.chute_slug,
-                                error = %e,
-                                "Failed to build Chutes provider"
-                            );
+                            .with_canonical_id(entry.canonical_id.clone())
+                            .with_streaming(allow_streaming);
+                            match inference_providers::attested::chutes::Provider::new(
+                                cfg,
+                                verifier.clone(),
+                            ) {
+                                Ok(provider) => {
+                                    // Ensure a catalog row exists under the canonical id so the
+                                    // data plane resolves the model (and usage bills against a
+                                    // real id). If NEAR already serves this id, its row is left
+                                    // untouched and we just add Chutes as a fallback provider.
+                                    let role = ensure_chutes_catalog_row(
+                                        &models_repo,
+                                        &entry.canonical_id,
+                                    )
+                                    .await;
+                                    // Register the stable role from catalog configuration,
+                                    // independently of whether discovery happened to find a live
+                                    // primary during this startup.
+                                    pool.register_pinned_provider(
+                                        entry.canonical_id.clone(),
+                                        Arc::new(provider),
+                                        entry.max_context_tokens,
+                                        role,
+                                    )
+                                    .await;
+                                    tracing::info!(
+                                        canonical = %entry.canonical_id,
+                                        chute_slug = %entry.chute_slug,
+                                        role = ?role,
+                                        "Registered Chutes attested provider"
+                                    );
+                                }
+                                Err(e) => {
+                                    tracing::warn!(
+                                        canonical = %entry.canonical_id,
+                                        chute_slug = %entry.chute_slug,
+                                        error = %e,
+                                        "Failed to build Chutes provider"
+                                    );
+                                }
+                            }
                         }
                     }
                 }

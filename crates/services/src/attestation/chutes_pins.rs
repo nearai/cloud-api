@@ -124,10 +124,10 @@ impl PinsFile {
         Ok(pins)
     }
 
-    /// The compiled-in pins. Panics only if the checked-in file is malformed,
-    /// which `compiled_pins_parse_and_are_enforceable` rules out in CI.
-    pub fn compiled() -> Self {
-        Self::parse(COMPILED_PINS_JSON).expect("chutes_golden_measurements.json must parse")
+    /// The compiled-in pins. `compiled_pins_parse_and_are_enforceable` rules
+    /// out a parse error in CI; callers still handle it rather than panic.
+    pub fn compiled() -> Result<Self, serde_json::Error> {
+        Self::parse(COMPILED_PINS_JSON)
     }
 
     pub fn rows(&self) -> impl Iterator<Item = (&PinFamily, &PinRow)> {
@@ -187,7 +187,7 @@ mod tests {
 
     #[test]
     fn compiled_pins_parse_and_are_enforceable() {
-        let pins = PinsFile::compiled();
+        let pins = PinsFile::compiled().expect("compiled pins parse");
         assert!(!pins.families.is_empty());
         pins.to_policy()
             .assert_enforceable()
@@ -198,19 +198,24 @@ mod tests {
     fn compiled_pins_file_is_canonical() {
         // The sync bot writes `to_canonical_json()`; the checked-in file must
         // already be in that form so bot diffs only show added rows.
-        assert_eq!(PinsFile::compiled().to_canonical_json(), COMPILED_PINS_JSON);
+        assert_eq!(
+            PinsFile::compiled()
+                .expect("compiled pins parse")
+                .to_canonical_json(),
+            COMPILED_PINS_JSON
+        );
     }
 
     #[test]
     fn compiled_pins_have_no_zero_runtime_rtmr3() {
-        for f in &PinsFile::compiled().families {
+        for f in &PinsFile::compiled().expect("compiled pins parse").families {
             assert_ne!(f.rtmr3, ZERO, "v{} pins an unmeasured runtime", f.version);
         }
     }
 
     #[test]
     fn compiled_pins_have_unique_names_and_identities() {
-        let pins = PinsFile::compiled();
+        let pins = PinsFile::compiled().expect("compiled pins parse");
         let mut idents = std::collections::HashSet::new();
         for f in &pins.families {
             assert!(
@@ -277,7 +282,7 @@ mod tests {
 
     #[test]
     fn find_requires_all_five_registers() {
-        let pins = PinsFile::compiled();
+        let pins = PinsFile::compiled().expect("compiled pins parse");
         let (fam, row) = pins.rows().next().unwrap();
         let exact = fam.registers_for(row);
         assert!(pins.find(&exact).is_some());

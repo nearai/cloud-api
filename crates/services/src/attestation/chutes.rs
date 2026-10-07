@@ -326,8 +326,10 @@ impl ChutesInstanceVerifier for ChutesBackendVerifier {
 ///
 /// History: #849, #865 and #918 pinned full published families; #1192
 /// switched to live-observed rows only and added v1.4.0 / v1.4.1.
-pub fn vetted_golden_measurements() -> ChutesMeasurementPolicy {
-    super::chutes_pins::PinsFile::compiled().to_policy()
+///
+/// Errors only if the compiled-in file does not parse (CI rules this out).
+pub fn vetted_golden_measurements() -> Result<ChutesMeasurementPolicy, serde_json::Error> {
+    Ok(super::chutes_pins::PinsFile::compiled()?.to_policy())
 }
 
 #[cfg(test)]
@@ -464,7 +466,7 @@ mod tests {
         // Accept the v1.3.0 software identity on `rtmr0`, asserting the matched
         // row is `name`. Drives the full register set through `verify()`.
         fn accepts(rtmr0: &str, name: &str) {
-            let policy = vetted_golden_measurements();
+            let policy = vetted_golden_measurements().expect("compiled pins parse");
             let matched = policy
                 .verify(
                     &reg(MRTD),
@@ -486,6 +488,7 @@ mod tests {
             // runs `assert_enforceable()` per-request, so an InvalidGolden row
             // would otherwise only surface in production as a fail-closed reject.
             vetted_golden_measurements()
+                .expect("compiled pins parse")
                 .assert_enforceable()
                 .expect("all pinned golden rows must be valid 48-byte hex");
         }
@@ -531,7 +534,7 @@ mod tests {
             name: &str,
             version: &str,
         ) {
-            let policy = vetted_golden_measurements();
+            let policy = vetted_golden_measurements().expect("compiled pins parse");
             let matched = policy
                 .verify(
                     &reg(mrtd),
@@ -736,7 +739,13 @@ mod tests {
         }
 
         fn rejects(rtmr0: &str, rtmr1: &str, rtmr2: &str, rtmr3: &str) {
-            rejects_with(&vetted_golden_measurements(), rtmr0, rtmr1, rtmr2, rtmr3);
+            rejects_with(
+                &vetted_golden_measurements().expect("compiled pins parse"),
+                rtmr0,
+                rtmr1,
+                rtmr2,
+                rtmr3,
+            );
         }
 
         fn rejects_with(
@@ -840,7 +849,7 @@ mod tests {
             // final v1.3.1 family on the assumption they'd persist; Chutes instead
             // re-measured them, and never published `8xb200`@7c028a01… for the
             // final release. The stale combination must no longer verify.
-            let policy = vetted_golden_measurements();
+            let policy = vetted_golden_measurements().expect("compiled pins parse");
             let err = policy
                 .verify(
                     &reg(MRTD_V131),
@@ -858,7 +867,7 @@ mod tests {
             // The -rc1 and final v1.3.1 identities must not cross-match: an -rc1
             // boot/kernel (RTMR1/2) stapled to the final runtime RTMR3 matches no
             // single published row — partial matches are rejected (fail-closed).
-            let policy = vetted_golden_measurements();
+            let policy = vetted_golden_measurements().expect("compiled pins parse");
             let err = policy
                 .verify(
                     &reg(MRTD_V131),
@@ -889,7 +898,7 @@ mod tests {
             // — a genuine, signature-verified, nonce-bound quote — was rejected with
             // "observed measurements match no accepted Chutes config". These are its
             // live-observed registers; they must now verify.
-            let policy = vetted_golden_measurements();
+            let policy = vetted_golden_measurements().expect("compiled pins parse");
             let matched = policy
                 .verify(
                     &reg(MRTD),
@@ -905,7 +914,7 @@ mod tests {
 
         #[test]
         fn still_accepts_h200_the_original_glm_config() {
-            let policy = vetted_golden_measurements();
+            let policy = vetted_golden_measurements().expect("compiled pins parse");
             let matched = policy
                 .verify(
                     &reg(MRTD),
@@ -924,7 +933,7 @@ mod tests {
             // matches no published row — fail-closed, never a soft pass.
             let mut bogus_rtmr0 = reg(RTMR0_H200);
             bogus_rtmr0[0] ^= 0xff;
-            let policy = vetted_golden_measurements();
+            let policy = vetted_golden_measurements().expect("compiled pins parse");
             let err = policy
                 .verify(
                     &reg(MRTD),

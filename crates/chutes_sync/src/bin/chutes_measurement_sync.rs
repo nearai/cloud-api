@@ -7,7 +7,9 @@
 //! - `CHUTES_SYNC_MODELS` (optional): comma-separated model ids; when set,
 //!   only these models are probed.
 //! - `PINS_BASE` (required): main's pins file.
-//! - `PINS_CARRY` (optional): pins file from the open bot PR branch.
+//! - `PINS_EVIDENCE_DIR` (optional): downloaded artifacts of recent
+//!   successful runs on `main`; rows their `observations.json` files show as
+//!   verified are pinned while Chutes still publishes them.
 //! - `PINS_OUT` (required): where to write the merged pins file.
 //! - `REPORT_OUT` (required): markdown report path.
 //! - `OBSERVATIONS_OUT` (required): JSON audit file (observations, skipped
@@ -20,9 +22,9 @@ use std::collections::BTreeSet;
 use std::process::ExitCode;
 
 use chutes_sync::classify::classify;
-use chutes_sync::parse_model_list;
 use chutes_sync::probe::{self, ProbeConfig};
 use chutes_sync::report::render_markdown;
+use chutes_sync::{load_evidence, parse_model_list};
 use inference_providers::attested::chutes::client::ChutesClient;
 use services::attestation::chutes::ChutesObserver;
 use services::attestation::chutes_pins::PinsFile;
@@ -70,14 +72,9 @@ async fn run() -> Result<(), Failure> {
     let out_path = required("PINS_OUT")?;
     let report_path = required("REPORT_OUT")?;
     let obs_path = required("OBSERVATIONS_OUT")?;
-    // A carried file that no longer parses is ignored, not fatal: the next PR
-    // is rebuilt from main plus today's observations.
-    let carry = match optional("PINS_CARRY") {
-        Some(p) => read_pins(&p)
-            .inspect_err(|(_, m)| eprintln!("chutes-measurement-sync: ignoring carried pins: {m}"))
-            .ok(),
-        None => None,
-    };
+    let earlier = optional("PINS_EVIDENCE_DIR")
+        .map(|d| load_evidence(std::path::Path::new(&d)))
+        .unwrap_or_default();
     let only_models = optional("CHUTES_SYNC_MODELS").map(|s| parse_model_list(&s));
 
     let client = ChutesClient::new(api_key, CHUTES_TIMEOUT_SECS)
@@ -94,9 +91,9 @@ async fn run() -> Result<(), Failure> {
     let (pins, report) = classify(
         &out.feed,
         &out.observations,
+        &earlier,
         out.skipped.clone(),
         &base,
-        carry.as_ref(),
     );
     let date = chrono::Utc::now().format("%Y-%m-%d").to_string();
     write(&out_path, &pins.to_canonical_json())?;

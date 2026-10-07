@@ -188,6 +188,11 @@ pub async fn run(
             ));
         }
     }
+    // An empty listing (schema change, permissions) must not pass as a run
+    // that attested nothing.
+    if models.is_empty() {
+        return Err(ProbeError::Models("no chutes listed".to_string()));
+    }
 
     let mut out = ProbeOutput {
         feed,
@@ -228,7 +233,7 @@ pub async fn run(
             }
         };
         probed += 1;
-        for inst in instances.iter().filter(|i| !i.e2e_pubkey.trim().is_empty()) {
+        for inst in &instances {
             let pubkey = inst.e2e_pubkey.trim();
             let observation = |outcome| Observation {
                 model: model.clone(),
@@ -236,6 +241,13 @@ pub async fn run(
                 instance_id: inst.instance_id.clone(),
                 outcome,
             };
+            if pubkey.is_empty() {
+                out.observations
+                    .push(observation(ObservationOutcome::Failed {
+                        stage: "no_e2e_pubkey".into(),
+                    }));
+                continue;
+            }
             let Some(ev) = evidence.instance(&inst.instance_id) else {
                 out.observations
                     .push(observation(ObservationOutcome::Failed {
@@ -267,7 +279,7 @@ pub async fn run(
             }));
         }
     }
-    if probed == 0 && !models.is_empty() {
+    if probed == 0 {
         return Err(ProbeError::AllChutesFailed);
     }
     Ok(out)
@@ -493,6 +505,38 @@ mod tests {
             .mount(&server)
             .await;
         assert!(matches!(probe(&server).await, Err(ProbeError::Feed(_))));
+    }
+
+    #[tokio::test]
+    async fn empty_model_list_is_an_error() {
+        // A schema or permission change that empties /v1/models must not
+        // produce a green run that attested nothing.
+        let server = MockServer::start().await;
+        get(&server, "/servers/tee/measurements", 200, &feed()).await;
+        get(&server, "/v1/models", 200, r#"{"data": []}"#).await;
+        assert!(matches!(probe(&server).await, Err(ProbeError::Models(_))));
+    }
+
+    #[tokio::test]
+    async fn instance_without_e2e_pubkey_is_reported() {
+        let server = MockServer::start().await;
+        get(&server, "/servers/tee/measurements", 200, &feed()).await;
+        get(&server, "/v1/models", 200, &models(&[("m1", "c1")])).await;
+        get(
+            &server,
+            "/e2e/instances/c1",
+            200,
+            r#"{"instances": [{"instance_id": "i1", "e2e_pubkey": " ", "nonces": []}]}"#,
+        )
+        .await;
+        get(&server, "/chutes/c1/evidence", 200, NULL_EVIDENCE).await;
+        let out = probe(&server).await.unwrap();
+        assert_eq!(
+            out.observations[0].outcome,
+            ObservationOutcome::Failed {
+                stage: "no_e2e_pubkey".into()
+            }
+        );
     }
 
     #[tokio::test]

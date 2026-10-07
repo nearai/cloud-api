@@ -78,7 +78,7 @@ pub fn parse_feed(json: &str) -> Result<Vec<FeedRow>, serde_json::Error> {
         .collect())
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "result", rename_all = "snake_case")]
 pub enum ObservationOutcome {
     Verified(Registers),
@@ -86,7 +86,7 @@ pub enum ObservationOutcome {
 }
 
 /// What the probe saw for one instance.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Observation {
     pub model: String,
     pub chute_id: String,
@@ -116,8 +116,8 @@ pub struct SeenOn {
 
 #[derive(Debug, Default)]
 pub struct SyncReport {
-    /// Rows in the output that are not in `base` (today's additions plus
-    /// carried rows from an unmerged bot PR), with where they were seen today.
+    /// Rows in the output that `base` lacks, with where they were seen today
+    /// (empty when only an earlier run of this job saw them).
     pub added: Vec<(RowRef, Vec<SeenOn>)>,
     /// Distinct verified register sets seen today that main already pins.
     pub already_pinned: usize,
@@ -128,9 +128,9 @@ pub struct SyncReport {
     /// Published, verified live, but the family already has a row with this
     /// name and a different RTMR0 (Chutes re-measured it). Needs a person.
     pub name_collisions: Vec<RowRef>,
-    /// Chosen row, and the other published names for the same registers.
+    /// Chosen row, and the other published `v<version> <name>` pairs for the
+    /// same registers.
     pub aliases: Vec<(RowRef, Vec<String>)>,
-    pub withdrawn_before_merge: Vec<RowRef>,
     pub pinned_not_published: Vec<RowRef>,
     pub published_not_observed: Vec<RowRef>,
     pub skipped: Vec<SkippedChute>,
@@ -197,33 +197,32 @@ fn row_ref(version: &str, name: &str) -> RowRef {
     }
 }
 
-/// Merge `base` (main's pins), `carry` (pins from the open bot PR) and today's
-/// verified observations into the new pins file, and describe the result.
+/// Merge `base` (main's pins) with every published row whose registers a
+/// verified quote showed: today (`observations`) or in an earlier run of this
+/// job (`earlier`, read from that run's audit artifact). Only `Verified`
+/// outcomes count; everything not pinned is described in the report.
 pub fn classify(
     feed: &[FeedRow],
     observations: &[Observation],
+    earlier: &[Observation],
     skipped: Vec<SkippedChute>,
     base: &PinsFile,
-    carry: Option<&PinsFile>,
 ) -> (PinsFile, SyncReport) {
     let mut report = SyncReport {
         skipped,
         ..Default::default()
     };
 
-    // Published register sets -> (version, names). The same registers under
-    // several names collapse to one entry; the smallest name is used.
-    let mut published: BTreeMap<Registers, (String, BTreeSet<String>)> = BTreeMap::new();
+    // Published register sets -> every (version, name) pair Chutes published
+    // them under. The smallest pair is pinned, so the choice is a real
+    // published pair and does not depend on feed order.
+    let mut published: BTreeMap<Registers, BTreeSet<(String, String)>> = BTreeMap::new();
     for row in feed {
         published
             .entry(row.registers.clone())
-            .or_insert_with(|| (row.version.clone(), BTreeSet::new()))
-            .1
-            .insert(row.name.clone());
+            .or_default()
+            .insert((row.version.clone(), row.name.clone()));
     }
-    let chosen_name = |names: &BTreeSet<String>| names.iter().next().cloned().unwrap_or_default();
-
-    let mut out = base.clone();
 
     // Pinned rows Chutes no longer publishes: kept, reported.
     for (f, r) in base.rows() {
@@ -234,30 +233,13 @@ pub fn classify(
         }
     }
 
-    // Rows from an unmerged bot PR that main lacks: kept while still published,
-    // otherwise dropped as withdrawn.
-    if let Some(carry) = carry {
-        for (f, r) in carry.rows() {
-            let regs = f.registers_for(r);
-            if base.find(&regs).is_some() {
-                continue;
-            }
-            if !published.contains_key(&regs) || regs.rtmr3_is_zero() {
-                report
-                    .withdrawn_before_merge
-                    .push(row_ref(&f.version, &r.name));
-            } else if let Err(e) = insert_row(&mut out, &f.version, &r.name, &regs) {
-                report.not_inserted(e, row_ref(&f.version, &r.name));
-            }
-        }
-    }
-
-    // Today's verified observations, grouped by register set.
-    let mut seen: BTreeMap<Registers, BTreeSet<SeenOn>> = BTreeMap::new();
+    // Verified register sets: today's with where they were seen, and the
+    // union with earlier runs' for deciding what to pin.
+    let mut seen_today: BTreeMap<Registers, BTreeSet<SeenOn>> = BTreeMap::new();
     for o in observations {
         match &o.outcome {
             ObservationOutcome::Verified(r) => {
-                seen.entry(r.clone()).or_default().insert(SeenOn {
+                seen_today.entry(r.clone()).or_default().insert(SeenOn {
                     model: o.model.clone(),
                     instance_id: o.instance_id.clone(),
                 });
@@ -265,35 +247,52 @@ pub fn classify(
             ObservationOutcome::Failed { .. } => report.unverified.push(o.clone()),
         }
     }
+    let mut verified: BTreeSet<Registers> = seen_today.keys().cloned().collect();
+    for o in earlier {
+        if let ObservationOutcome::Verified(r) = &o.outcome {
+            verified.insert(r.clone());
+        }
+    }
 
-    for (regs, on) in &seen {
+    let mut out = base.clone();
+    for regs in &verified {
         if base.find(regs).is_some() {
-            report.already_pinned += 1;
+            if seen_today.contains_key(regs) {
+                report.already_pinned += 1;
+            }
             continue;
         }
-        // Carried from the open bot PR: already in `out`, reported as added.
-        if out.find(regs).is_some() {
-            continue;
-        }
-        let Some((version, names)) = published.get(regs) else {
-            report
-                .unpublished
-                .push((regs.clone(), on.iter().cloned().collect()));
+        let Some(pairs) = published.get(regs) else {
+            // Only today's sightings are reported; earlier ones were reported
+            // by the run that made them.
+            if let Some(on) = seen_today.get(regs) {
+                report
+                    .unpublished
+                    .push((regs.clone(), on.iter().cloned().collect()));
+            }
             continue;
         };
-        let row = row_ref(version, &chosen_name(names));
+        let Some((version, name)) = pairs.iter().next() else {
+            continue;
+        };
+        let row = row_ref(version, name);
         if regs.rtmr3_is_zero() {
-            report.zero_rtmr3.push(row);
+            // Reported below with every other published zero row.
             continue;
         }
-        if let Err(e) = insert_row(&mut out, version, &row.name, regs) {
+        if let Err(e) = insert_row(&mut out, version, name, regs) {
             report.not_inserted(e, row);
             continue;
         }
-        if names.len() > 1 {
-            report
-                .aliases
-                .push((row, names.iter().skip(1).cloned().collect()));
+        if pairs.len() > 1 {
+            report.aliases.push((
+                row,
+                pairs
+                    .iter()
+                    .skip(1)
+                    .map(|(v, n)| format!("v{v} {n}"))
+                    .collect(),
+            ));
         }
     }
 
@@ -302,7 +301,7 @@ pub fn classify(
     for (f, r) in out.rows() {
         let regs = f.registers_for(r);
         if base.find(&regs).is_none() {
-            let on = seen
+            let on = seen_today
                 .get(&regs)
                 .map(|s| s.iter().cloned().collect())
                 .unwrap_or_default();
@@ -310,12 +309,19 @@ pub fn classify(
         }
     }
 
-    // Published rows neither pinned nor seen today (e.g. a future release).
-    for (regs, (version, names)) in &published {
-        if out.find(regs).is_none() && !seen.contains_key(regs) && !regs.rtmr3_is_zero() {
-            report
-                .published_not_observed
-                .push(row_ref(version, &chosen_name(names)));
+    // Published rows not pinned: all-zero runtime RTMR3 rows can never be
+    // pinned; the rest are waiting to be seen live (e.g. a future release).
+    for (regs, pairs) in &published {
+        if out.find(regs).is_some() {
+            continue;
+        }
+        let Some((version, name)) = pairs.iter().next() else {
+            continue;
+        };
+        if regs.rtmr3_is_zero() {
+            report.zero_rtmr3.push(row_ref(version, name));
+        } else if !verified.contains(regs) {
+            report.published_not_observed.push(row_ref(version, name));
         }
     }
 
@@ -323,7 +329,6 @@ pub fn classify(
         &mut report.zero_rtmr3,
         &mut report.identity_anomalies,
         &mut report.name_collisions,
-        &mut report.withdrawn_before_merge,
         &mut report.pinned_not_published,
         &mut report.published_not_observed,
     ] {
@@ -398,9 +403,9 @@ mod tests {
         let (out, rep) = classify(
             &[feed("1.4.1", "8xb300", &r)],
             &[seen("kimi", "i1", &r)],
+            &[],
             vec![],
             &empty(),
-            None,
         );
         assert!(out.find(&r).is_some());
         assert_eq!(rep.added.len(), 1);
@@ -415,9 +420,9 @@ mod tests {
         let (out, rep) = classify(
             &[feed("1.4.1", "x", &published)],
             &[seen("m", "i", &live)],
+            &[],
             vec![],
             &empty(),
-            None,
         );
         assert!(out.families.is_empty());
         assert_eq!(rep.unpublished.len(), 1);
@@ -431,9 +436,9 @@ mod tests {
         let (out, rep) = classify(
             &[feed("1.4.1", "x", &r)],
             &[seen("m", "i", &r)],
+            &[],
             vec![],
             &base,
-            None,
         );
         assert_eq!(out, base);
         assert_eq!(rep.already_pinned, 1);
@@ -446,9 +451,9 @@ mod tests {
         let (out, rep) = classify(
             &[feed("1.2.0", "x", &r)],
             &[seen("m", "i", &r)],
+            &[],
             vec![],
             &empty(),
-            None,
         );
         assert!(out.families.is_empty());
         assert_eq!(rep.zero_rtmr3, vec![row("1.2.0", "x")]);
@@ -465,7 +470,7 @@ mod tests {
                 stage: "quote".into(),
             },
         };
-        let (out, rep) = classify(&[feed("1.4.1", "x", &r)], &[failed], vec![], &empty(), None);
+        let (out, rep) = classify(&[feed("1.4.1", "x", &r)], &[failed], &[], vec![], &empty());
         assert!(out.families.is_empty());
         assert_eq!(rep.unverified.len(), 1);
     }
@@ -476,13 +481,13 @@ mod tests {
         let (out, rep) = classify(
             &[feed("1.4.1", "zeta", &r), feed("1.4.1", "alpha", &r)],
             &[seen("m", "i", &r)],
+            &[],
             vec![],
             &empty(),
-            None,
         );
         assert_eq!(out.families[0].hardware_rows.len(), 1);
         assert_eq!(out.families[0].hardware_rows[0].name, "alpha");
-        assert_eq!(rep.aliases[0].1, vec!["zeta".to_string()]);
+        assert_eq!(rep.aliases[0].1, vec!["v1.4.1 zeta".to_string()]);
     }
 
     #[test]
@@ -493,9 +498,9 @@ mod tests {
         let (out, _) = classify(
             &[feed("1.4.1", "new", &new)],
             &[seen("m", "i", &new)],
+            &[],
             vec![],
             &base,
-            None,
         );
         assert_eq!(out.families.len(), 1);
         assert_eq!(out.families[0].hardware_rows.len(), 2);
@@ -509,9 +514,9 @@ mod tests {
         let (out, rep) = classify(
             &[feed("1.4.1", "odd", &odd)],
             &[seen("m", "i", &odd)],
+            &[],
             vec![],
             &base,
-            None,
         );
         assert_eq!(out, base);
         assert_eq!(rep.identity_anomalies, vec![row("1.4.1", "odd")]);
@@ -527,60 +532,118 @@ mod tests {
         let (out, rep) = classify(
             &[feed("1.4.1", "8xb300", &remeasured)],
             &[seen("m", "i", &remeasured)],
+            &[],
             vec![],
             &base,
-            None,
         );
         assert_eq!(out, base);
         assert_eq!(rep.name_collisions, vec![row("1.4.1", "8xb300")]);
     }
 
     #[test]
-    fn carried_row_still_published_is_kept_without_new_observation() {
+    fn row_verified_by_an_earlier_run_is_pinned_while_published() {
         let r = regs('a', 'b', 'c', 'd', 'e');
-        let carry = pins_with("1.4.1", "x", &r);
         let (out, rep) = classify(
             &[feed("1.4.1", "x", &r)],
             &[],
+            &[seen("m", "i0", &r)],
             vec![],
             &empty(),
-            Some(&carry),
         );
         assert!(out.find(&r).is_some());
-        assert_eq!(rep.added.len(), 1, "carried rows are listed as additions");
+        assert_eq!(rep.added.len(), 1);
         assert!(rep.added[0].1.is_empty(), "not seen today");
     }
 
     #[test]
-    fn carried_row_seen_today_is_added_not_counted_as_already_pinned() {
+    fn row_verified_earlier_but_no_longer_published_is_not_pinned() {
         let r = regs('a', 'b', 'c', 'd', 'e');
-        let carry = pins_with("1.4.1", "x", &r);
-        let (_, rep) = classify(
-            &[feed("1.4.1", "x", &r)],
-            &[seen("m", "i", &r)],
-            vec![],
-            &empty(),
-            Some(&carry),
+        let (out, rep) = classify(&[], &[], &[seen("m", "i0", &r)], vec![], &empty());
+        assert!(out.families.is_empty());
+        assert!(rep.added.is_empty());
+        assert!(
+            rep.unpublished.is_empty(),
+            "only today's sightings are reported"
         );
-        assert_eq!(rep.already_pinned, 0, "not pinned on main yet");
-        assert_eq!(rep.added.len(), 1);
-        assert_eq!(rep.added[0].1[0].instance_id, "i");
     }
 
     #[test]
-    fn carried_row_withdrawn_from_feed_is_dropped() {
+    fn earlier_failed_observations_are_ignored() {
+        let failed = Observation {
+            model: "m".into(),
+            chute_id: "c".into(),
+            instance_id: "i".into(),
+            outcome: ObservationOutcome::Failed {
+                stage: "quote".into(),
+            },
+        };
+        let (_, rep) = classify(&[], &[], &[failed], vec![], &empty());
+        assert!(rep.unverified.is_empty());
+    }
+
+    #[test]
+    fn row_seen_earlier_and_today_is_added_with_todays_sighting() {
         let r = regs('a', 'b', 'c', 'd', 'e');
-        let carry = pins_with("1.4.1", "x", &r);
-        let (out, rep) = classify(&[], &[], vec![], &empty(), Some(&carry));
-        assert!(out.families.is_empty());
-        assert_eq!(rep.withdrawn_before_merge, vec![row("1.4.1", "x")]);
+        let (_, rep) = classify(
+            &[feed("1.4.1", "x", &r)],
+            &[seen("m", "i1", &r)],
+            &[seen("m", "i0", &r)],
+            vec![],
+            &empty(),
+        );
+        assert_eq!(rep.already_pinned, 0, "not pinned on main yet");
+        assert_eq!(rep.added.len(), 1);
+        assert_eq!(rep.added[0].1[0].instance_id, "i1");
+    }
+
+    #[test]
+    fn same_registers_under_two_versions_keep_a_published_pair() {
+        // The pinned (version, name) must be a pair Chutes actually published,
+        // chosen independently of feed order.
+        let r = regs('a', 'b', 'c', 'd', 'e');
+        for order in [
+            [feed("1.4.1", "b", &r), feed("1.4.0", "z", &r)],
+            [feed("1.4.0", "z", &r), feed("1.4.1", "b", &r)],
+        ] {
+            let (out, rep) = classify(&order, &[seen("m", "i", &r)], &[], vec![], &empty());
+            assert_eq!(out.families[0].version, "1.4.0");
+            assert_eq!(out.families[0].hardware_rows[0].name, "z");
+            assert_eq!(rep.aliases[0].1, vec!["v1.4.1 b".to_string()]);
+        }
+    }
+
+    #[test]
+    fn unobserved_zero_rtmr3_rows_are_reported() {
+        let r = regs('a', 'b', 'c', 'd', '0');
+        let (_, rep) = classify(&[feed("1.2.0", "x", &r)], &[], &[], vec![], &empty());
+        assert_eq!(rep.zero_rtmr3, vec![row("1.2.0", "x")]);
+        assert!(rep.published_not_observed.is_empty());
+    }
+
+    #[test]
+    fn observations_round_trip_through_the_audit_json() {
+        let r = regs('a', 'b', 'c', 'd', 'e');
+        let obs = vec![
+            seen("m", "i", &r),
+            Observation {
+                model: "m".into(),
+                chute_id: "c".into(),
+                instance_id: "j".into(),
+                outcome: ObservationOutcome::Failed {
+                    stage: "gpu".into(),
+                },
+            },
+        ];
+        let json = serde_json::to_string(&obs).unwrap();
+        let back: Vec<Observation> = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, obs);
     }
 
     #[test]
     fn base_row_missing_from_feed_is_kept_and_reported() {
         let r = regs('a', 'b', 'c', 'd', 'e');
         let base = pins_with("1.3.1", "gone", &r);
-        let (out, rep) = classify(&[], &[], vec![], &base, None);
+        let (out, rep) = classify(&[], &[], &[], vec![], &base);
         assert_eq!(out, base);
         assert_eq!(rep.pinned_not_published, vec![row("1.3.1", "gone")]);
     }
@@ -593,16 +656,16 @@ mod tests {
         let (o1, _) = classify(
             &f,
             &[seen("m", "i1", &r1), seen("m", "i2", &r2)],
+            &[],
             vec![],
             &empty(),
-            None,
         );
         let (o2, _) = classify(
             &f,
             &[seen("m", "i2", &r2), seen("m", "i1", &r1)],
+            &[],
             vec![],
             &empty(),
-            None,
         );
         assert_eq!(o1.to_canonical_json(), o2.to_canonical_json());
     }

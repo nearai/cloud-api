@@ -75,6 +75,33 @@ fn cache_hit_rate_percent(cached_tokens: i32, prompt_tokens: i32) -> Option<f64>
     Some((cached as f64 / prompt_tokens as f64) * 100.0)
 }
 
+fn spawn_usage_write<F>(
+    handle: &tokio::runtime::Handle,
+    write: F,
+    inference_id: Uuid,
+    hard_cap: Duration,
+) -> tokio::task::JoinHandle<()>
+where
+    F: Future<Output = Result<(), crate::usage::UsageError>> + Send + 'static,
+{
+    handle.spawn(async move {
+        match tokio::time::timeout(hard_cap, write).await {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                tracing::error!(%inference_id, %error, "Failed to record usage");
+            }
+            Err(error) => {
+                tracing::error!(
+                    %inference_id,
+                    %error,
+                    timeout_seconds = hard_cap.as_secs_f64(),
+                    "Usage write exceeded hard cap"
+                );
+            }
+        }
+    })
+}
+
 fn get_input_bucket(token_count: i32) -> &'static str {
     match token_count {
         0..=1000 => "0-1k",
@@ -398,10 +425,11 @@ where
         let mut metric_tags = self.metric_tags.clone();
         metric_tags.push(format!("{TAG_INPUT_BUCKET}:{input_bucket}"));
 
-        // Spawn critical billing operations on blocking thread pool with timeout.
-        // The tokio runtime waits for blocking tasks during graceful shutdown,
-        // which helps prevent data loss compared to regular spawn.
+        // Keep metrics on the blocking thread and run the database write independently
+        // so the two-second wait cannot cancel an in-flight billing transaction.
         let handle_clone = handle.clone();
+        let write_handle = handle.clone();
+        let write_span = span.clone();
         handle.spawn_blocking(move || {
             // These streaming-only TTFT series require the final usage chunk so
             // the real input-token bucket is known. They intentionally exclude
@@ -429,96 +457,85 @@ where
 
             handle_clone.block_on(
                 async move {
-                    let result = tokio::time::timeout(Duration::from_secs(2), async move {
-                        let stop_reason = Some(crate::usage::StopReason::for_stream_outcome(
-                            last_error.as_ref(),
-                            stream_completed,
-                            last_finish_reason.as_ref(),
-                        ));
-
-                        if usage_service
-                            .record_usage(RecordUsageServiceRequest {
-                                discount: None,
-                                organization_id,
-                                workspace_id,
-                                api_key_id,
-                                model_id,
-                                input_tokens,
-                                output_tokens,
-                                cache_read_tokens,
-                                cache_write,
-                                profiled_cache_write_tokens,
-                                requested_service_tier,
-                                provider_service_tier,
-                                inference_type,
-                                ttft_ms,
-                                avg_itl_ms,
-                                inference_id: Some(inference_id),
-                                provider_request_id: Some(chat_id),
-                                stop_reason,
-                                response_id,
-                                image_count: None,
-                                provider_attribution,
-                            })
-                            .await
-                            .is_err()
-                        {
-                            tracing::error!("Failed to record usage");
+                    let stop_reason = Some(crate::usage::StopReason::for_stream_outcome(
+                        last_error.as_ref(),
+                        stream_completed,
+                        last_finish_reason.as_ref(),
+                    ));
+                    let usage_request = RecordUsageServiceRequest {
+                        discount: None,
+                        organization_id,
+                        workspace_id,
+                        api_key_id,
+                        model_id,
+                        input_tokens,
+                        output_tokens,
+                        cache_read_tokens,
+                        cache_write,
+                        profiled_cache_write_tokens,
+                        requested_service_tier,
+                        provider_service_tier,
+                        inference_type,
+                        ttft_ms,
+                        avg_itl_ms,
+                        inference_id: Some(inference_id),
+                        provider_request_id: Some(chat_id),
+                        stop_reason,
+                        response_id,
+                        image_count: None,
+                        provider_attribution,
+                    };
+                    let usage_write = spawn_usage_write(
+                        &write_handle,
+                        async move { usage_service.record_usage(usage_request).await.map(|_| ()) }
+                            .instrument(write_span),
+                        inference_id,
+                        Duration::from_secs(30),
+                    );
+                    match tokio::time::timeout(Duration::from_secs(2), usage_write).await {
+                        Ok(Ok(())) => {}
+                        Ok(Err(error)) => {
+                            tracing::error!(%inference_id, %error, "Usage write task failed");
                         }
-
-                        // Record metrics
-                        let tags: Vec<&str> = metric_tags.iter().map(|s| s.as_str()).collect();
-                        metrics_service.record_latency(METRIC_LATENCY_TOTAL, e2e_duration, &tags);
-
-                        if let Some(first_token_instant) = first_token_time {
-                            let decoding_duration = first_token_instant.elapsed();
-                            metrics_service.record_latency(
-                                METRIC_LATENCY_DECODING_TIME,
-                                decoding_duration,
-                                &tags,
+                        Err(_) => {
+                            tracing::warn!(
+                                %inference_id,
+                                "Usage write still in progress after 2s, continuing in background"
                             );
-
-                            let decode_secs = decoding_duration.as_secs_f64();
-                            if decode_secs > 0.0 {
-                                let tps = output_tokens as f64 / decode_secs;
-                                metrics_service.record_histogram(
-                                    METRIC_TOKENS_PER_SECOND,
-                                    tps,
-                                    &tags,
-                                );
-                            }
                         }
+                    }
 
-                        metrics_service.record_count(
-                            METRIC_TOKENS_INPUT,
-                            input_tokens as i64,
+                    // Record metrics
+                    let tags: Vec<&str> = metric_tags.iter().map(|s| s.as_str()).collect();
+                    metrics_service.record_latency(METRIC_LATENCY_TOTAL, e2e_duration, &tags);
+
+                    if let Some(first_token_instant) = first_token_time {
+                        let decoding_duration = first_token_instant.elapsed();
+                        metrics_service.record_latency(
+                            METRIC_LATENCY_DECODING_TIME,
+                            decoding_duration,
                             &tags,
                         );
-                        metrics_service.record_count(
-                            METRIC_TOKENS_OUTPUT,
-                            output_tokens as i64,
-                            &tags,
-                        );
-                        // Prefix-cache-hit observability: cache-read token count
-                        // (token-weighted hit rate = cached/input) + per-request
-                        // hit-rate distribution.
-                        metrics_service.record_count(
-                            METRIC_TOKENS_CACHED,
-                            cache_read_tokens as i64,
-                            &tags,
-                        );
-                        if let Some(rate) = cache_hit_rate_percent(cache_read_tokens, input_tokens)
-                        {
-                            metrics_service.record_histogram(METRIC_CACHE_HIT_RATE, rate, &tags);
+
+                        let decode_secs = decoding_duration.as_secs_f64();
+                        if decode_secs > 0.0 {
+                            let tps = output_tokens as f64 / decode_secs;
+                            metrics_service.record_histogram(METRIC_TOKENS_PER_SECOND, tps, &tags);
                         }
-                    })
-                    .await;
+                    }
 
-                    if result.is_err() {
-                        tracing::error!(
-                            "Timeout recording usage and metrics (2s exceeded), inference_id={}",
-                            inference_id
-                        );
+                    metrics_service.record_count(METRIC_TOKENS_INPUT, input_tokens as i64, &tags);
+                    metrics_service.record_count(METRIC_TOKENS_OUTPUT, output_tokens as i64, &tags);
+                    // Prefix-cache-hit observability: cache-read token count
+                    // (token-weighted hit rate = cached/input) + per-request
+                    // hit-rate distribution.
+                    metrics_service.record_count(
+                        METRIC_TOKENS_CACHED,
+                        cache_read_tokens as i64,
+                        &tags,
+                    );
+                    if let Some(rate) = cache_hit_rate_percent(cache_read_tokens, input_tokens) {
+                        metrics_service.record_histogram(METRIC_CACHE_HIT_RATE, rate, &tags);
                     }
                 }
                 .instrument(span),
@@ -2569,6 +2586,54 @@ mod tests {
     use futures::{stream, StreamExt};
     use inference_providers::models::{ChatChoice, ChatCompletionChunk, FinishReason, TokenUsage};
     use std::time::Duration;
+
+    #[tokio::test]
+    async fn background_usage_write_survives_wait_timeout() {
+        let (finished_tx, finished_rx) = tokio::sync::oneshot::channel();
+        let write = async move {
+            tokio::time::sleep(Duration::from_millis(80)).await;
+            let _ = finished_tx.send(());
+            Ok(())
+        };
+        let task = spawn_usage_write(
+            &tokio::runtime::Handle::current(),
+            write,
+            Uuid::new_v4(),
+            Duration::from_secs(1),
+        );
+
+        assert!(tokio::time::timeout(Duration::from_millis(10), task)
+            .await
+            .is_err());
+        assert!(
+            tokio::time::timeout(Duration::from_millis(300), finished_rx)
+                .await
+                .expect("background write should finish")
+                .is_ok()
+        );
+    }
+
+    #[tokio::test]
+    async fn background_usage_write_has_hard_cap() {
+        let (held_tx, held_rx) = tokio::sync::oneshot::channel::<()>();
+        let write = async move {
+            let _held_tx = held_tx;
+            std::future::pending::<()>().await;
+            Ok(())
+        };
+        let task = spawn_usage_write(
+            &tokio::runtime::Handle::current(),
+            write,
+            Uuid::new_v4(),
+            Duration::from_millis(30),
+        );
+
+        assert!(tokio::time::timeout(Duration::from_millis(300), task)
+            .await
+            .expect("hard cap should finish the task")
+            .is_ok());
+        assert!(held_rx.await.is_err(), "hard cap should cancel the write");
+    }
 
     fn terminal_test_stream(
         events: Vec<Result<SSEEvent, inference_providers::CompletionError>>,

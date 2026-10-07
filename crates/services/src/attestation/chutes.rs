@@ -39,6 +39,9 @@ use inference_providers::attested::chutes::verifier_port::{
     ChutesInstanceVerifier, VerifiedInstanceInfo,
 };
 
+use inference_providers::attested::chutes::measurements::REGISTER_LEN;
+
+use super::chutes_pins::Registers;
 use super::measurement::MeasurementPolicy;
 use super::verification::{AttestationVerificationError, AttestationVerifier};
 
@@ -48,8 +51,10 @@ use super::verification::{AttestationVerificationError, AttestationVerifier};
 pub enum ChutesVerifyError {
     #[error("evidence transform: {0}")]
     Transform(#[from] transform::TransformError),
-    #[error("TDX quote / GPU verification: {0}")]
+    #[error("TDX quote verification: {0}")]
     Verifier(#[from] AttestationVerificationError),
+    #[error("GPU verification: {0}")]
+    Gpu(AttestationVerificationError),
     #[error("report_data binding: {0}")]
     ReportData(#[from] ReportDataError),
     #[error("measurement register-pin: {0}")]
@@ -60,6 +65,20 @@ pub enum ChutesVerifyError {
     MalformedGpuPayload,
     #[error("GPU evidence required but the verifier returned no verdict")]
     MissingGpuVerdict,
+}
+
+impl ChutesVerifyError {
+    /// Short, stable stage label for reports and logs.
+    pub fn stage(&self) -> &'static str {
+        match self {
+            Self::Transform(_) => "transform",
+            Self::Verifier(_) => "quote",
+            Self::ReportData(_) => "report_data",
+            Self::Measurement(_) => "measurement",
+            Self::NotTd10 => "not_td10",
+            Self::Gpu(_) | Self::MalformedGpuPayload | Self::MissingGpuVerdict => "gpu",
+        }
+    }
 }
 
 /// A Chutes instance whose full attestation chain verified.
@@ -88,20 +107,8 @@ pub struct ChutesBackendVerifier {
 impl ChutesBackendVerifier {
     /// Build a verifier from a vetted golden-measurement snapshot.
     pub fn new(measurement_policy: ChutesMeasurementPolicy, pccs_url: Option<String>) -> Self {
-        // `attested3p` gives the flags we need for the shared steps:
-        // require_tcb_up_to_date = true and require_gpu_evidence = true. Its
-        // image-hash allowlist is intentionally empty and unused — Chutes
-        // measurement is register-pinned via `measurement_policy`, and we never
-        // call the inner verifier's `verify_attestation_report` (only
-        // `verify_tdx_quote` + `verify_gpu_evidence`), so the allowlist is never
-        // consulted. Were it ever consulted, an empty attested3p allowlist
-        // fails closed.
-        let inner = AttestationVerifier::with_policy(
-            MeasurementPolicy::attested3p(HashSet::new()),
-            pccs_url,
-        );
         Self {
-            inner,
+            inner: shared_stage_verifier(pccs_url),
             measurement_policy,
         }
     }
@@ -123,57 +130,155 @@ impl ChutesBackendVerifier {
         // Fail-closed up front: refuse if no golden measurements are configured.
         self.measurement_policy.assert_enforceable()?;
 
-        // 1. DCAP-verify the TDX quote (signature chain, TCB floor, debug bit).
-        let quote_hex = transform::intel_quote_hex(evidence)?;
-        let verified = self.inner.verify_tdx_quote(&quote_hex).await?;
-        let tcb_status = verified.status.clone();
-        let td = verified
-            .report
-            .as_td10()
-            .ok_or(ChutesVerifyError::NotTd10)?;
-
-        // 2. report_data bindings: freshness + e2e-key [0:32], cert SPKI [32:64].
-        let cert_der = transform::certificate_der(evidence)?;
-        ChutesReportDataVerifier.verify(&td.report_data, boot_nonce, e2e_pubkey, &cert_der)?;
+        // 1 + 2. DCAP quote, then report_data bindings.
+        let q = verify_quote_and_bindings(&self.inner, evidence, boot_nonce, e2e_pubkey).await?;
 
         // 3. Register-pin the full chain — MRTD + RTMR0-2 (boot: firmware/kernel/
         //    cmdline) AND the runtime RTMR3 (running app/IMA layer) — to a vetted
         //    config (Chutes publishes the runtime RTMR3 in `runtime_rtmrs`).
         let matched = self
             .measurement_policy
-            .verify(&td.mr_td, &td.rt_mr0, &td.rt_mr1, &td.rt_mr2, &td.rt_mr3)?;
+            .verify(&q.mrtd, &q.rtmr0, &q.rtmr1, &q.rtmr2, &q.rtmr3)?;
         let measurement_config = format!("{} v{}", matched.name, matched.version);
 
-        // 4. GPU: the SPDM evidence is bound to the Chutes-derived nonce — the
-        //    same SHA256(boot_nonce ‖ e2e_pubkey) that lands in report_data[0:32]
-        //    — not the raw caller nonce. Inject it and verify via NRAS.
-        let gpu_nonce = hex::encode(freshness_digest(boot_nonce, e2e_pubkey));
-        let mut nvidia_payload = transform::nvidia_payload(evidence)?;
-        // Fatal if the payload isn't an object: proceeding without injecting the
-        // nonce would submit GPU evidence unbound to our freshness anchor.
-        nvidia_payload
-            .as_object_mut()
-            .ok_or(ChutesVerifyError::MalformedGpuPayload)?
-            .insert(
-                "nonce".to_string(),
-                serde_json::Value::String(gpu_nonce.clone()),
-            );
-        let mut report = serde_json::Map::new();
-        report.insert(
-            "nvidia_payload".to_string(),
-            serde_json::Value::String(nvidia_payload.to_string()),
-        );
-        let gpu_verdict = self
-            .inner
-            .verify_gpu_evidence(&report, &gpu_nonce)
-            .await?
-            .ok_or(ChutesVerifyError::MissingGpuVerdict)?;
+        // 4. GPU via NRAS, bound to the Chutes-derived nonce.
+        let gpu_verdict = verify_gpu(&self.inner, evidence, boot_nonce, e2e_pubkey).await?;
 
         Ok(ChutesVerifiedInstance {
             instance_id: evidence.instance_id.clone(),
             e2e_pubkey: e2e_pubkey.to_string(),
             measurement_config,
-            tcb_status,
+            tcb_status: q.tcb_status,
+            gpu_verdict,
+        })
+    }
+}
+
+/// The inner verifier used only for the shared DCAP-quote and NRAS-GPU steps.
+/// `attested3p` gives require_tcb_up_to_date = true and require_gpu_evidence =
+/// true. Its image-hash allowlist is intentionally empty and never consulted:
+/// Chutes measurement is register-pinned, and only `verify_tdx_quote` and
+/// `verify_gpu_evidence` are called. Were it ever consulted, an empty
+/// attested3p allowlist fails closed.
+fn shared_stage_verifier(pccs_url: Option<String>) -> AttestationVerifier {
+    AttestationVerifier::with_policy(MeasurementPolicy::attested3p(HashSet::new()), pccs_url)
+}
+
+/// Stages 1 + 2 passed: the quote is genuine, fresh, and bound to this
+/// instance's E2EE key and certificate.
+struct BoundQuote {
+    mrtd: [u8; REGISTER_LEN],
+    rtmr0: [u8; REGISTER_LEN],
+    rtmr1: [u8; REGISTER_LEN],
+    rtmr2: [u8; REGISTER_LEN],
+    rtmr3: [u8; REGISTER_LEN],
+    tcb_status: String,
+}
+
+/// 1. DCAP-verify the TDX quote (signature chain, TCB floor, debug bit).
+/// 2. report_data bindings: freshness + e2e-key [0:32], cert SPKI [32:64].
+async fn verify_quote_and_bindings(
+    inner: &AttestationVerifier,
+    evidence: &InstanceEvidence,
+    boot_nonce: &str,
+    e2e_pubkey: &str,
+) -> Result<BoundQuote, ChutesVerifyError> {
+    let quote_hex = transform::intel_quote_hex(evidence)?;
+    let verified = inner.verify_tdx_quote(&quote_hex).await?;
+    let tcb_status = verified.status.clone();
+    let td = verified
+        .report
+        .as_td10()
+        .ok_or(ChutesVerifyError::NotTd10)?;
+    let cert_der = transform::certificate_der(evidence)?;
+    ChutesReportDataVerifier.verify(&td.report_data, boot_nonce, e2e_pubkey, &cert_der)?;
+    Ok(BoundQuote {
+        mrtd: td.mr_td,
+        rtmr0: td.rt_mr0,
+        rtmr1: td.rt_mr1,
+        rtmr2: td.rt_mr2,
+        rtmr3: td.rt_mr3,
+        tcb_status,
+    })
+}
+
+/// 4. GPU: the SPDM evidence is bound to the Chutes-derived nonce — the same
+///    SHA256(boot_nonce ‖ e2e_pubkey) that lands in report_data[0:32] — not the
+///    raw caller nonce. Inject it and verify via NRAS.
+async fn verify_gpu(
+    inner: &AttestationVerifier,
+    evidence: &InstanceEvidence,
+    boot_nonce: &str,
+    e2e_pubkey: &str,
+) -> Result<String, ChutesVerifyError> {
+    let gpu_nonce = hex::encode(freshness_digest(boot_nonce, e2e_pubkey));
+    let mut nvidia_payload = transform::nvidia_payload(evidence)?;
+    // Fatal if the payload isn't an object: proceeding without injecting the
+    // nonce would submit GPU evidence unbound to our freshness anchor.
+    nvidia_payload
+        .as_object_mut()
+        .ok_or(ChutesVerifyError::MalformedGpuPayload)?
+        .insert(
+            "nonce".to_string(),
+            serde_json::Value::String(gpu_nonce.clone()),
+        );
+    let mut report = serde_json::Map::new();
+    report.insert(
+        "nvidia_payload".to_string(),
+        serde_json::Value::String(nvidia_payload.to_string()),
+    );
+    inner
+        .verify_gpu_evidence(&report, &gpu_nonce)
+        .await
+        .map_err(ChutesVerifyError::Gpu)?
+        .ok_or(ChutesVerifyError::MissingGpuVerdict)
+}
+
+/// A Chutes instance whose quote passed the quote, report_data and GPU checks,
+/// with its five registers. Not checked against any measurement allow-list.
+#[derive(Debug, Clone)]
+pub struct ObservedInstance {
+    pub instance_id: String,
+    pub registers: Registers,
+    pub tcb_status: String,
+    pub gpu_verdict: String,
+}
+
+/// Records which register sets genuine Chutes instances run, for the daily
+/// measurement sync. It runs the same quote, report_data and GPU checks as
+/// [`ChutesBackendVerifier`] but has no allow-list and does not implement
+/// [`ChutesInstanceVerifier`], so it can never be handed to the provider pool
+/// to serve traffic.
+pub struct ChutesObserver {
+    inner: AttestationVerifier,
+}
+
+impl ChutesObserver {
+    pub fn new(pccs_url: Option<String>) -> Self {
+        Self {
+            inner: shared_stage_verifier(pccs_url),
+        }
+    }
+
+    /// Run stages 1, 2 and 4 and return the quote's registers.
+    pub async fn observe_instance(
+        &self,
+        evidence: &InstanceEvidence,
+        boot_nonce: &str,
+        e2e_pubkey: &str,
+    ) -> Result<ObservedInstance, ChutesVerifyError> {
+        let q = verify_quote_and_bindings(&self.inner, evidence, boot_nonce, e2e_pubkey).await?;
+        let gpu_verdict = verify_gpu(&self.inner, evidence, boot_nonce, e2e_pubkey).await?;
+        Ok(ObservedInstance {
+            instance_id: evidence.instance_id.clone(),
+            registers: Registers {
+                mrtd: hex::encode(q.mrtd),
+                rtmr0: hex::encode(q.rtmr0),
+                rtmr1: hex::encode(q.rtmr1),
+                rtmr2: hex::encode(q.rtmr2),
+                rtmr3: hex::encode(q.rtmr3),
+            },
+            tcb_status: q.tcb_status,
             gpu_verdict,
         })
     }
@@ -284,6 +389,29 @@ mod tests {
         .await
         .unwrap_err();
         assert!(err.contains("measurement") || err.contains("attest"));
+    }
+
+    #[tokio::test]
+    async fn observer_reaches_transform_without_any_measurement_policy() {
+        // The observer has no allow-list at all: on a malformed quote it fails
+        // in the transform stage, before any network call, and labels it so.
+        let err = ChutesObserver::new(None)
+            .observe_instance(&dummy_evidence("!!! not base64 !!!"), &"a".repeat(64), "pk")
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ChutesVerifyError::Transform(_)));
+        assert_eq!(err.stage(), "transform");
+    }
+
+    #[tokio::test]
+    async fn verify_instance_still_rejects_empty_policy_first() {
+        let v = ChutesBackendVerifier::new(ChutesMeasurementPolicy::new(vec![]), None);
+        let err = v
+            .verify_instance(&dummy_evidence("!!! not base64 !!!"), &"a".repeat(64), "pk")
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ChutesVerifyError::Measurement(_)));
+        assert_eq!(err.stage(), "measurement");
     }
 
     #[tokio::test]

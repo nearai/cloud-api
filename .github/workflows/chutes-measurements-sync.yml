@@ -109,7 +109,11 @@ jobs:
           GH_TOKEN: ${{ secrets.REPOSITORY_DISPATCH_TOKEN }}
         run: |
           set -euo pipefail
-          existing="$(gh pr list --head "$BOT_BRANCH" --base main --state open --json number --jq '.[0].number // empty')"
+          # --head cannot be owner-qualified, so a fork PR could reuse the
+          # branch name; only consider PRs whose head is in this repository.
+          existing="$(gh pr list --head "$BOT_BRANCH" --base main --state open \
+            --json number,isCrossRepository \
+            --jq '[.[] | select(.isCrossRepository == false)][0].number // empty')"
           if git diff --quiet -- "$PINS_FILE"; then
             if [ -n "$existing" ]; then
               gh pr close "$existing" --delete-branch \

@@ -12,6 +12,22 @@ fn short(h: &str) -> &str {
     h.char_indices().nth(16).map_or(h, |(i, _)| &h[..i])
 }
 
+/// Render an upstream identifier (model, chute or instance id) as an inline code
+/// span it cannot break out of: backticks become `'` and control characters
+/// (including line breaks) become spaces, so it cannot add headings, links or
+/// mentions to the PR body.
+fn code(s: &str) -> String {
+    let clean: String = s
+        .chars()
+        .map(|c| match c {
+            '`' => '\'',
+            c if c.is_control() => ' ',
+            c => c,
+        })
+        .collect();
+    format!("`{clean}`")
+}
+
 fn list(s: &mut String, title: &str, rows: &[RowRef]) {
     if rows.is_empty() {
         return;
@@ -43,7 +59,7 @@ pub fn render_markdown(report: &SyncReport, date: &str) -> String {
                 .to_string()
         } else {
             on.iter()
-                .map(|o| format!("{} `{}`", o.model, o.instance_id))
+                .map(|o| format!("{} {}", code(&o.model), code(&o.instance_id)))
                 .collect::<Vec<_>>()
                 .join(", ")
         };
@@ -93,7 +109,7 @@ pub fn render_markdown(report: &SyncReport, date: &str) -> String {
             report.unpublished.len()
         );
         for (r, on) in &report.unpublished {
-            let models: BTreeSet<_> = on.iter().map(|o| o.model.as_str()).collect();
+            let models: BTreeSet<_> = on.iter().map(|o| code(&o.model)).collect();
             let _ = writeln!(
                 s,
                 "- mrtd `{}…` rtmr0 `{}…` rtmr1 `{}…` rtmr2 `{}…` rtmr3 `{}…` on {}",
@@ -114,14 +130,20 @@ pub fn render_markdown(report: &SyncReport, date: &str) -> String {
         );
         for o in &report.unverified {
             if let ObservationOutcome::Failed { stage } = &o.outcome {
-                let _ = writeln!(s, "- {} `{}`: {stage}", o.model, o.instance_id);
+                let _ = writeln!(s, "- {} {}: {stage}", code(&o.model), code(&o.instance_id));
             }
         }
     }
     if !report.skipped.is_empty() {
         let _ = writeln!(s, "\n### Chutes not probed ({})\n", report.skipped.len());
         for c in &report.skipped {
-            let _ = writeln!(s, "- {} (`{}`): {}", c.model, c.chute_id, c.reason);
+            let _ = writeln!(
+                s,
+                "- {} ({}): {}",
+                code(&c.model),
+                code(&c.chute_id),
+                c.reason
+            );
         }
     }
     let _ = writeln!(
@@ -159,7 +181,7 @@ mod tests {
         ));
         let md = render_markdown(&rep, "2026-10-06");
         assert!(md.contains("v1.4.1 `8xb300`"));
-        assert!(md.contains("kimi `i1`"));
+        assert!(md.contains("`kimi` `i1`"));
         assert!(md.contains("2026-10-06"));
     }
 
@@ -183,6 +205,49 @@ mod tests {
         ));
         let md = render_markdown(&rep, "2026-10-06");
         assert!(md.contains("not seen live today"));
+    }
+
+    #[test]
+    fn upstream_ids_cannot_break_out_of_their_code_span() {
+        let hostile = "m\n# Rows to pin (0)\n@team `x` [link](http://e)";
+        let mut rep = SyncReport::default();
+        rep.added.push((
+            RowRef {
+                version: "1.4.1".into(),
+                name: "8xb300".into(),
+            },
+            vec![SeenOn {
+                model: hostile.into(),
+                instance_id: hostile.into(),
+            }],
+        ));
+        rep.unverified.push(Observation {
+            model: hostile.into(),
+            chute_id: hostile.into(),
+            instance_id: hostile.into(),
+            outcome: ObservationOutcome::Failed {
+                stage: "quote".into(),
+            },
+        });
+        rep.skipped.push(crate::classify::SkippedChute {
+            model: hostile.into(),
+            chute_id: hostile.into(),
+            reason: "HTTP 403".into(),
+        });
+        let md = render_markdown(&rep, "2026-10-06");
+        // No injected line breaks, so no forged heading lines.
+        let headings = md
+            .lines()
+            .filter(|l| l.trim_start().starts_with('#') && l.contains("Rows to pin"))
+            .count();
+        assert_eq!(headings, 1);
+        for line in md.lines() {
+            // Every '@' sits inside a code span: an even number of backticks
+            // precedes it on its line.
+            if let Some(at) = line.find('@') {
+                assert_eq!(line[..at].matches('`').count() % 2, 1, "{line}");
+            }
+        }
     }
 
     #[test]

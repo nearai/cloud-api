@@ -8,10 +8,36 @@ use std::future::Future;
 use std::time::Duration;
 
 use inference_providers::attested::chutes::client::{ChutesClient, ChutesClientError};
+use inference_providers::attested::chutes::evidence::InstanceEvidence;
 use serde::Serialize;
 use services::attestation::chutes::{ChutesObserver, ChutesVerifyError};
+use services::attestation::chutes_pins::Registers;
 
 use crate::classify::{parse_feed, FeedRow, Observation, ObservationOutcome, SkippedChute};
+
+/// Verifies one instance's evidence and returns its five registers. The real
+/// implementation is [`ChutesObserver`] (DCAP quote, report_data bindings,
+/// NVIDIA NRAS); tests substitute a fake because those checks need the
+/// network and a genuinely signed quote.
+pub trait Observe {
+    fn observe(
+        &self,
+        evidence: &InstanceEvidence,
+        boot_nonce: &str,
+        e2e_pubkey: &str,
+    ) -> impl Future<Output = Result<Registers, ChutesVerifyError>> + Send;
+}
+
+impl Observe for ChutesObserver {
+    fn observe(
+        &self,
+        evidence: &InstanceEvidence,
+        boot_nonce: &str,
+        e2e_pubkey: &str,
+    ) -> impl Future<Output = Result<Registers, ChutesVerifyError>> + Send {
+        self.observe_instance(evidence, boot_nonce, e2e_pubkey)
+    }
+}
 
 pub const DEFAULT_FEED_URL: &str = "https://api.chutes.ai/servers/tee/measurements";
 
@@ -160,7 +186,7 @@ fn random_nonce() -> Result<String, ProbeError> {
 pub async fn run(
     client: &ChutesClient,
     http: &reqwest::Client,
-    observer: &ChutesObserver,
+    observer: &impl Observe,
     cfg: &ProbeConfig,
 ) -> Result<ProbeOutput, ProbeError> {
     let feed_body = with_retry(cfg.attempts, cfg.backoff, FeedFetchError::retryable, || {
@@ -268,7 +294,7 @@ pub async fn run(
                 cfg.attempts.min(2),
                 cfg.backoff,
                 ChutesVerifyError::is_gpu_failure,
-                || observer.observe_instance(ev, &nonce, pubkey),
+                || observer.observe(ev, &nonce, pubkey),
             )
             .await;
             out.observations.push(observation(match result {
@@ -296,6 +322,8 @@ mod tests {
 
     use super::*;
     use crate::classify::ObservationOutcome;
+    use inference_providers::attested::chutes::evidence::InstanceEvidence;
+    use services::attestation::chutes_pins::Registers;
 
     async fn get(server: &MockServer, p: &str, status: u16, body: &str) {
         Mock::given(method("GET"))
@@ -537,6 +565,86 @@ mod tests {
                 stage: "no_e2e_pubkey".into()
             }
         );
+    }
+
+    /// Stands in for NRAS and DCAP, which need the network: returns fixed
+    /// registers, optionally after one GPU-stage failure.
+    struct FakeObserver {
+        registers: Registers,
+        fail_gpu_first: std::sync::atomic::AtomicBool,
+    }
+
+    impl Observe for FakeObserver {
+        fn observe(
+            &self,
+            _evidence: &InstanceEvidence,
+            _boot_nonce: &str,
+            _e2e_pubkey: &str,
+        ) -> impl Future<Output = Result<Registers, ChutesVerifyError>> + Send {
+            let fail = self
+                .fail_gpu_first
+                .swap(false, std::sync::atomic::Ordering::SeqCst);
+            let registers = self.registers.clone();
+            async move {
+                if fail {
+                    Err(ChutesVerifyError::MissingGpuVerdict)
+                } else {
+                    Ok(registers)
+                }
+            }
+        }
+    }
+
+    const ONE_EVIDENCE: &str = r#"{"evidence": [{"quote": "q", "gpu_evidence": [], "instance_id": "i1", "certificate": "Y2VydA=="}]}"#;
+
+    #[tokio::test]
+    async fn verified_instance_becomes_a_verified_observation() {
+        let server = MockServer::start().await;
+        get(&server, "/servers/tee/measurements", 200, &feed()).await;
+        get(&server, "/v1/models", 200, &models(&[("m1", "c1")])).await;
+        get(&server, "/e2e/instances/c1", 200, ONE_INSTANCE).await;
+        get(&server, "/chutes/c1/evidence", 200, ONE_EVIDENCE).await;
+        let r = "ab".repeat(48);
+        let registers = Registers {
+            mrtd: r.clone(),
+            rtmr0: r.clone(),
+            rtmr1: r.clone(),
+            rtmr2: r.clone(),
+            rtmr3: r,
+        };
+        let observer = FakeObserver {
+            registers: registers.clone(),
+            // The first attempt fails at the GPU stage; one retry follows.
+            fail_gpu_first: true.into(),
+        };
+        let client = ChutesClient::new("k".into(), 5)
+            .unwrap()
+            .with_hosts(server.uri(), server.uri());
+        let cfg = ProbeConfig {
+            feed_url: format!("{}/servers/tee/measurements", server.uri()),
+            attempts: 3,
+            backoff: Duration::from_millis(1),
+            only_models: None,
+        };
+        let out = run(&client, &reqwest::Client::new(), &observer, &cfg)
+            .await
+            .unwrap();
+        assert_eq!(out.observations.len(), 1);
+        assert_eq!(out.observations[0].instance_id, "i1");
+        assert_eq!(
+            out.observations[0].outcome,
+            ObservationOutcome::Verified(registers.clone())
+        );
+        // And the classifier pins it: the feed fixture publishes these
+        // registers.
+        let (pins, _) = crate::classify::classify(
+            &out.feed,
+            &out.observations,
+            &[],
+            vec![],
+            &services::attestation::chutes_pins::PinsFile { families: vec![] },
+        );
+        assert!(pins.find(&registers).is_some());
     }
 
     #[tokio::test]

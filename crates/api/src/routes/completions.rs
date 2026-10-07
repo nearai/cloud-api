@@ -106,19 +106,10 @@ fn insert_request_id_header(
 pub(crate) const HEADER_INFERENCE_ID: &str = "Inference-Id";
 
 // Custom header surfacing which trust tier served a completion.
-// Value is "near" for NEAR AI's own TEE fleet, "chutes" for the attested Chutes
-// fallback, or "non-attested" for external (non-TEE) providers.
+// Value is "near" for NEAR AI's own TEE fleet, "non-attested" for external
+// (non-TEE) providers, or the attested third party's source name ("chutes",
+// "tinfoil").
 const HEADER_SERVING_PROVIDER: &str = "x-serving-provider";
-
-/// Map a [`inference_providers::ProviderTier`] to the string value emitted in
-/// the `x-serving-provider` response header.
-pub(super) fn provider_tier_to_str(tier: inference_providers::ProviderTier) -> &'static str {
-    match tier {
-        inference_providers::ProviderTier::Near => "near",
-        inference_providers::ProviderTier::Attested3p => "chutes",
-        inference_providers::ProviderTier::NonAttested => "non-attested",
-    }
-}
 
 /// True when a client encryption header was supplied. `X-Model-Pub-Key` alone
 /// only pins routing and does not make the request or response encrypted.
@@ -2406,7 +2397,9 @@ async fn chat_completions_inner(
                         .filter_map(std::future::ready),
                     );
 
-                let serving_tier = serving_provider.as_ref().map(|provider| provider.tier());
+                let serving = serving_provider
+                    .as_ref()
+                    .map(|provider| inference_providers::ServingProvider::of(provider.as_ref()));
 
                 // Return raw streaming response with SSE headers
                 let mut response_builder = Response::builder()
@@ -2429,9 +2422,9 @@ async fn chat_completions_inner(
                 }
 
                 // Surface which provider tier served this streaming completion.
-                if let Some(tier) = serving_tier {
-                    response_builder = response_builder
-                        .header(HEADER_SERVING_PROVIDER, provider_tier_to_str(tier));
+                if let Some(serving) = serving {
+                    response_builder =
+                        response_builder.header(HEADER_SERVING_PROVIDER, serving.label());
                     exposed_headers.push(HEADER_SERVING_PROVIDER);
                 }
 
@@ -2591,10 +2584,8 @@ async fn chat_completions_inner(
                 }
 
                 // Surface which provider tier served this non-streaming completion.
-                response_builder = response_builder.header(
-                    HEADER_SERVING_PROVIDER,
-                    provider_tier_to_str(response_with_bytes.serving_tier),
-                );
+                response_builder = response_builder
+                    .header(HEADER_SERVING_PROVIDER, response_with_bytes.serving.label());
                 exposed_headers.push(HEADER_SERVING_PROVIDER);
 
                 // Announce alias substitution so it is never silent (issue #573).
@@ -2890,10 +2881,10 @@ async fn completions_inner(
                     );
                 }
 
-                let serving_tier = if let Some(ref chat_id) = stream_chat_id {
+                let serving = if let Some(ref chat_id) = stream_chat_id {
                     app_state
                         .inference_provider_pool
-                        .get_provider_tier_for_chat_id(chat_id)
+                        .get_serving_provider_for_chat_id(chat_id)
                         .await
                 } else {
                     None
@@ -3062,9 +3053,9 @@ async fn completions_inner(
                         response_builder.header(HEADER_INFERENCE_ID, uuid.to_string());
                     exposed_headers.push(HEADER_INFERENCE_ID);
                 }
-                if let Some(tier) = serving_tier {
-                    response_builder = response_builder
-                        .header(HEADER_SERVING_PROVIDER, provider_tier_to_str(tier));
+                if let Some(serving) = serving {
+                    response_builder =
+                        response_builder.header(HEADER_SERVING_PROVIDER, serving.label());
                     exposed_headers.push(HEADER_SERVING_PROVIDER);
                 }
                 // Announce alias substitution so it is never silent (issue #573)
@@ -3164,10 +3155,8 @@ async fn completions_inner(
                     .header(HEADER_INFERENCE_ID, inference_id.to_string());
 
                 let mut exposed_headers: Vec<&str> = vec![HEADER_INFERENCE_ID];
-                response_builder = response_builder.header(
-                    HEADER_SERVING_PROVIDER,
-                    provider_tier_to_str(response_with_bytes.serving_tier),
-                );
+                response_builder = response_builder
+                    .header(HEADER_SERVING_PROVIDER, response_with_bytes.serving.label());
                 exposed_headers.push(HEADER_SERVING_PROVIDER);
                 // Announce alias substitution so it is never silent (issue #573)
                 if let Some(canonical) = &alias_canonical {

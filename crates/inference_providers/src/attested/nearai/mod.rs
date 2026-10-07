@@ -1166,7 +1166,7 @@ impl Fleet {
             return Ok(ChatCompletionResponseWithBytes {
                 response: chat_completion_response,
                 raw_bytes,
-                serving_tier: crate::ProviderTier::Near,
+                serving: crate::ServingProvider::of(self),
             });
         }
         Err(last_error)
@@ -2195,7 +2195,7 @@ impl InferenceProvider for Fleet {
                 return Ok(ChatCompletionResponseWithBytes {
                     response: chat_completion_response,
                     raw_bytes,
-                    serving_tier: crate::ProviderTier::Near,
+                    serving: crate::ServingProvider::of(self),
                 });
             }
             Some(lease) => lease,
@@ -2304,7 +2304,7 @@ impl InferenceProvider for Fleet {
         Ok(ChatCompletionResponseWithBytes {
             response: chat_completion_response,
             raw_bytes,
-            serving_tier: crate::ProviderTier::Near,
+            serving: crate::ServingProvider::of(self),
         })
     }
 

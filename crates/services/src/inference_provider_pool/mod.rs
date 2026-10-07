@@ -2721,12 +2721,14 @@ impl InferenceProviderPool {
     ///
     /// Returns `None` if no mapping exists (e.g. stream failed before the first chunk
     /// carried a chat_id).
-    pub async fn get_provider_tier_for_chat_id(
+    pub async fn get_serving_provider_for_chat_id(
         &self,
         chat_id: &str,
-    ) -> Option<inference_providers::ProviderTier> {
+    ) -> Option<inference_providers::ServingProvider> {
         let mapping = self.chat_id_mapping.read().await;
-        mapping.get(chat_id).map(|p| p.tier())
+        mapping
+            .get(chat_id)
+            .map(|p| inference_providers::ServingProvider::of(p.as_ref()))
     }
 
     /// Get providers with load balancing support

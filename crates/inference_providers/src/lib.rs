@@ -177,6 +177,32 @@ impl ProviderSource {
     }
 }
 
+/// Who served a request: the trust tier plus the concrete source. Drives the
+/// `x-serving-provider` response header label.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ServingProvider {
+    pub tier: ProviderTier,
+    pub source: ProviderSource,
+}
+
+impl ServingProvider {
+    pub fn of<P: InferenceProvider + ?Sized>(p: &P) -> Self {
+        Self {
+            tier: p.tier(),
+            source: p.provider_source(),
+        }
+    }
+
+    /// `x-serving-provider` value: "near" | "non-attested" | <3P source name>.
+    pub const fn label(self) -> &'static str {
+        match self.tier {
+            ProviderTier::Near => "near",
+            ProviderTier::NonAttested => "non-attested",
+            ProviderTier::Attested3p => self.source.as_str(),
+        }
+    }
+}
+
 impl ProviderTier {
     /// Whether this tier carries a verifiable TEE attestation we gate a
     /// "verified" badge on. True for [`Near`](ProviderTier::Near) and
@@ -620,7 +646,45 @@ pub trait InferenceProvider {
 
 #[cfg(test)]
 mod provider_tier_tests {
-    use super::ProviderTier;
+    use super::{ProviderSource, ProviderTier, ServingProvider};
+
+    #[test]
+    fn serving_label_is_near_non_attested_or_3p_source() {
+        use ProviderSource::*;
+        use ProviderTier::*;
+        assert_eq!(
+            ServingProvider {
+                tier: Near,
+                source: Vllm
+            }
+            .label(),
+            "near"
+        );
+        assert_eq!(
+            ServingProvider {
+                tier: NonAttested,
+                source: External
+            }
+            .label(),
+            "non-attested"
+        );
+        assert_eq!(
+            ServingProvider {
+                tier: Attested3p,
+                source: Chutes
+            }
+            .label(),
+            "chutes"
+        );
+        assert_eq!(
+            ServingProvider {
+                tier: Attested3p,
+                source: Tinfoil
+            }
+            .label(),
+            "tinfoil"
+        );
+    }
 
     #[test]
     fn attested_tiers_gate_the_verified_badge() {

@@ -12,12 +12,18 @@ use axum::{
     response::{IntoResponse, Response},
     Json,
 };
-use inference_providers::{CompletionError, SystemOneRequest, SystemOneResponse};
+use inference_providers::{
+    CompletionError, ProviderSource, ProviderTier, ServingProvider, SystemOneRequest,
+    SystemOneResponse,
+};
 use services::{
     attestation::SignatureKind,
     completions::hash_inference_id_to_uuid,
     models::ModelsError,
-    usage::{InferenceType, RecordUsageServiceRequest, ServedProviderTier, StopReason},
+    usage::{
+        InferenceType, ProviderAttribution, RecordUsageServiceRequest, ServedProviderTier,
+        ServedProviderType, StopReason,
+    },
 };
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
@@ -203,15 +209,7 @@ pub async fn systemone(
                 "System One"
             ),
         );
-        let tier = completions::provider_tier_to_str(
-            match served.provider_attribution.served_provider_tier {
-                Some(ServedProviderTier::Near) => inference_providers::ProviderTier::Near,
-                Some(ServedProviderTier::Attested3p) => {
-                    inference_providers::ProviderTier::Attested3p
-                }
-                _ => inference_providers::ProviderTier::NonAttested,
-            },
-        );
+        let tier = serving_from_attribution(&served.provider_attribution).label();
         let mut response = Response::builder()
             .header(header::CONTENT_TYPE, "application/json")
             .header(HEADER_GENERATION_ID, decision_id)
@@ -283,9 +281,72 @@ fn provider_error(err: CompletionError) -> Response {
     error(status, "System One provider could not complete the request")
 }
 
+/// Rebuild the serving provider from the recorded usage attribution so the
+/// `x-serving-provider` label matches the chat-completions routes.
+fn serving_from_attribution(a: &ProviderAttribution) -> ServingProvider {
+    let tier = match a.served_provider_tier {
+        Some(ServedProviderTier::Near) => ProviderTier::Near,
+        Some(ServedProviderTier::Attested3p) => ProviderTier::Attested3p,
+        _ => ProviderTier::NonAttested,
+    };
+    let source = match a.served_provider_type {
+        Some(ServedProviderType::Vllm) => ProviderSource::Vllm,
+        Some(ServedProviderType::Chutes) => ProviderSource::Chutes,
+        Some(ServedProviderType::Tinfoil) => ProviderSource::Tinfoil,
+        Some(ServedProviderType::External) | None => ProviderSource::External,
+    };
+    ServingProvider { tier, source }
+}
+
 #[cfg(test)]
 mod tests {
+    use super::*;
     use utoipa::OpenApi;
+
+    fn attribution(
+        tier: Option<ServedProviderTier>,
+        ty: Option<ServedProviderType>,
+    ) -> ProviderAttribution {
+        ProviderAttribution {
+            served_provider_tier: tier,
+            served_provider_type: ty,
+            served_via_fallback: false,
+        }
+    }
+
+    #[test]
+    fn serving_label_from_attribution() {
+        let label = |t, y| serving_from_attribution(&attribution(t, y)).label();
+        assert_eq!(
+            label(
+                Some(ServedProviderTier::Near),
+                Some(ServedProviderType::Vllm)
+            ),
+            "near"
+        );
+        assert_eq!(
+            label(
+                Some(ServedProviderTier::Attested3p),
+                Some(ServedProviderType::Chutes)
+            ),
+            "chutes"
+        );
+        assert_eq!(
+            label(
+                Some(ServedProviderTier::Attested3p),
+                Some(ServedProviderType::Tinfoil)
+            ),
+            "tinfoil"
+        );
+        assert_eq!(
+            label(
+                Some(ServedProviderTier::NonAttested),
+                Some(ServedProviderType::External)
+            ),
+            "non-attested"
+        );
+        assert_eq!(label(None, None), "non-attested");
+    }
 
     #[tokio::test]
     async fn systemone_upstream_rate_limit_is_distinct_from_gateway_limit() {

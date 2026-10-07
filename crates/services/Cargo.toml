@@ -72,6 +72,7 @@ moka = { version = "0.12.15", features = ["future"] }
 bloomfilter = "3.0.1"
 mockall = { version = "0.14", optional = true }
 base64 = "0.22"
+flate2 = "1"
 
 [features]
 default = []

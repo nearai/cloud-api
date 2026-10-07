@@ -6645,6 +6645,7 @@ dependencies = [
  "dstack-sdk",
  "dstack-sdk-types",
  "ed25519-dalek",
+ "flate2",
  "futures",
  "futures-util",
  "hex",

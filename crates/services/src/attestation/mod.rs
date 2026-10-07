@@ -21,6 +21,8 @@ pub mod report_data;
 mod report_tests;
 mod service_trait;
 pub mod snp;
+pub mod tinfoil;
+pub mod tinfoil_pins;
 pub mod verification;
 
 use std::sync::Arc;

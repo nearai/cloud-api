@@ -28,7 +28,7 @@ use chutes_sync::probe::{self, ProbeConfig};
 use chutes_sync::report::render_markdown;
 use chutes_sync::{load_evidence, parse_model_list};
 use inference_providers::attested::chutes::client::ChutesClient;
-use services::attestation::chutes::ChutesObserver;
+use services::attestation::chutes_observer::ChutesObserver;
 use services::attestation::chutes_pins::PinsFile;
 
 /// Per-request timeout for model-list and evidence calls, in seconds.

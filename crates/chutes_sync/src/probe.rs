@@ -10,7 +10,8 @@ use std::time::Duration;
 use inference_providers::attested::chutes::client::{ChutesClient, ChutesClientError};
 use inference_providers::attested::chutes::evidence::PublicInstanceEvidence;
 use serde::Serialize;
-use services::attestation::chutes::{ChutesObserver, ChutesVerifyError};
+use services::attestation::chutes::ChutesVerifyError;
+use services::attestation::chutes_observer::ChutesObserver;
 use services::attestation::chutes_pins::Registers;
 
 use crate::classify::{parse_feed, FeedRow, Observation, ObservationOutcome, SkippedChute};
@@ -304,7 +305,7 @@ mod tests {
 
     use inference_providers::attested::chutes::client::ChutesClient;
     use inference_providers::attested::chutes::evidence::PublicInstanceEvidence;
-    use services::attestation::chutes::ChutesObserver;
+    use services::attestation::chutes_observer::ChutesObserver;
     use services::attestation::chutes_pins::{PinsFile, Registers};
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};

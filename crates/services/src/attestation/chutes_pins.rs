@@ -5,6 +5,12 @@
 //! Chutes software identities cloud-api accepts. The daily
 //! `chutes-measurements-sync` workflow rewrites this file with
 //! [`PinsFile::to_canonical_json`]; keep it in that form.
+//!
+//! JSON has no comments, so the evidence for each row lives elsewhere: rows
+//! pinned before the file existed are documented in the history of
+//! `vetted_golden_measurements()` in `chutes.rs` (`git log -p` up to #1192);
+//! rows added by the sync job are documented in that job's PR body (instance,
+//! model and date seen) and its 90-day run artifact (raw quotes and nonces).
 
 use inference_providers::attested::chutes::measurements::{
     is_register_hex, normalize_register, ChutesMeasurementPolicy, ExpectedMeasurement,
@@ -102,8 +108,20 @@ impl PinFamily {
 }
 
 impl PinsFile {
+    /// Parse a pins file, normalising every register to lowercase hex without
+    /// `0x` so comparisons with feed and live values are exact.
     pub fn parse(json: &str) -> Result<Self, serde_json::Error> {
-        serde_json::from_str(json)
+        let mut pins: Self = serde_json::from_str(json)?;
+        for f in &mut pins.families {
+            f.mrtd = normalize_register(&f.mrtd);
+            f.rtmr1 = normalize_register(&f.rtmr1);
+            f.rtmr2 = normalize_register(&f.rtmr2);
+            f.rtmr3 = normalize_register(&f.rtmr3);
+            for r in &mut f.hardware_rows {
+                r.rtmr0 = normalize_register(&r.rtmr0);
+            }
+        }
+        Ok(pins)
     }
 
     /// The compiled-in pins. Panics only if the checked-in file is malformed,
@@ -240,6 +258,21 @@ mod tests {
         assert!(r.rtmr3_is_zero());
         r.rtmr3 = "0001".into();
         assert!(!r.rtmr3_is_zero());
+    }
+
+    #[test]
+    fn parse_normalises_registers() {
+        // A hand-edited or carried file may use uppercase or 0x; comparisons
+        // with feed and live values (lowercase, no prefix) must still match.
+        let up = "AB".repeat(48);
+        let json = format!(
+            r#"{{"families":[{{"version":"1.4.1","mrtd":"0x{up}","rtmr1":"{up}","rtmr2":"{up}","rtmr3":"{up}","hardware_rows":[{{"name":"x","rtmr0":"0X{up}"}}]}}]}}"#
+        );
+        let pins = PinsFile::parse(&json).unwrap();
+        let low = "ab".repeat(48);
+        assert_eq!(pins.families[0].mrtd, low);
+        assert_eq!(pins.families[0].rtmr3, low);
+        assert_eq!(pins.families[0].hardware_rows[0].rtmr0, low);
     }
 
     #[test]

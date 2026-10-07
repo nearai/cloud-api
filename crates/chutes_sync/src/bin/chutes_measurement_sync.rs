@@ -20,6 +20,7 @@ use std::collections::BTreeSet;
 use std::process::ExitCode;
 
 use chutes_sync::classify::classify;
+use chutes_sync::parse_model_list;
 use chutes_sync::probe::{self, ProbeConfig};
 use chutes_sync::report::render_markdown;
 use inference_providers::attested::chutes::client::ChutesClient;
@@ -77,12 +78,7 @@ async fn run() -> Result<(), Failure> {
             .ok(),
         None => None,
     };
-    let only_models = optional("CHUTES_SYNC_MODELS").map(|s| {
-        s.split(',')
-            .map(|m| m.trim().to_string())
-            .filter(|m| !m.is_empty())
-            .collect()
-    });
+    let only_models = optional("CHUTES_SYNC_MODELS").map(|s| parse_model_list(&s));
 
     let client = ChutesClient::new(api_key, CHUTES_TIMEOUT_SECS)
         .map_err(|e| bad(format!("Chutes client: {e}")))?;

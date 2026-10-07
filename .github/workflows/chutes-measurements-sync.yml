@@ -47,13 +47,19 @@ jobs:
         with:
           cache-key: chutes-sync
 
+      # Rows found on earlier days are carried only from a branch head this job
+      # wrote. If anyone else pushed to the bot branch, its rows are ignored and
+      # the PR is rebuilt from main plus today's verified observations.
       - name: Load pins from the open bot branch
         run: |
           set -euo pipefail
           cp "$PINS_FILE" "$RUNNER_TEMP/base.json"
           if git ls-remote --exit-code --heads origin "$BOT_BRANCH" >/dev/null; then
             git fetch --no-tags origin "$BOT_BRANCH"
-            if git show "origin/$BOT_BRANCH:$PINS_FILE" > "$RUNNER_TEMP/carry.json"; then
+            author="$(git log -1 --format=%an "origin/$BOT_BRANCH")"
+            if [ "$author" != "chutes-measurements-bot" ]; then
+              echo "::notice::$BOT_BRANCH head was not written by this job; not carrying its rows"
+            elif git show "origin/$BOT_BRANCH:$PINS_FILE" > "$RUNNER_TEMP/carry.json"; then
               echo "PINS_CARRY=$RUNNER_TEMP/carry.json" >> "$GITHUB_ENV"
             fi
           fi

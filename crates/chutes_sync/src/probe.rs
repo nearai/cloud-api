@@ -63,6 +63,8 @@ pub enum ProbeError {
     Models(String),
     #[error("every chute failed discovery or evidence")]
     AllChutesFailed,
+    #[error("OS random number generator unavailable: {0}")]
+    Rng(String),
 }
 
 /// Run `f` up to `attempts` times while `retryable` says the error is
@@ -147,10 +149,10 @@ async fn fetch_feed(http: &reqwest::Client, url: &str) -> Result<String, FeedFet
     resp.text().await.map_err(transport)
 }
 
-fn random_nonce() -> String {
+fn random_nonce() -> Result<String, ProbeError> {
     let mut b = [0u8; 32];
-    getrandom::fill(&mut b).expect("OS RNG unavailable");
-    hex::encode(b)
+    getrandom::fill(&mut b).map_err(|e| ProbeError::Rng(e.to_string()))?;
+    Ok(hex::encode(b))
 }
 
 /// Probe every chute `/v1/models` lists (or only `cfg.only_models`). Fails
@@ -212,7 +214,7 @@ pub async fn run(
                 continue;
             }
         };
-        let nonce = random_nonce();
+        let nonce = random_nonce()?;
         let evidence = match with_retry(cfg.attempts, cfg.backoff, client_retryable, || {
             client.fetch_evidence(chute_id, &nonce)
         })
@@ -253,12 +255,12 @@ pub async fn run(
             let result = with_retry(
                 cfg.attempts.min(2),
                 cfg.backoff,
-                |e: &ChutesVerifyError| e.stage() == "gpu",
+                ChutesVerifyError::is_gpu_failure,
                 || observer.observe_instance(ev, &nonce, pubkey),
             )
             .await;
             out.observations.push(observation(match result {
-                Ok(o) => ObservationOutcome::Verified(o.registers),
+                Ok(registers) => ObservationOutcome::Verified(registers),
                 Err(e) => ObservationOutcome::Failed {
                     stage: e.stage().into(),
                 },
@@ -461,6 +463,35 @@ mod tests {
         let server = MockServer::start().await;
         get(&server, "/servers/tee/measurements", 200, "[]").await;
         get(&server, "/v1/models", 200, &models(&[("m1", "c1")])).await;
+        assert!(matches!(probe(&server).await, Err(ProbeError::Feed(_))));
+    }
+
+    #[tokio::test]
+    async fn transient_feed_5xx_is_retried_then_succeeds() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/servers/tee/measurements"))
+            .respond_with(ResponseTemplate::new(503))
+            .up_to_n_times(2)
+            .with_priority(1)
+            .mount(&server)
+            .await;
+        get(&server, "/servers/tee/measurements", 200, &feed()).await;
+        get(&server, "/v1/models", 200, &models(&[("m1", "c1")])).await;
+        get(&server, "/e2e/instances/c1", 200, NO_INSTANCES).await;
+        get(&server, "/chutes/c1/evidence", 200, NULL_EVIDENCE).await;
+        assert!(probe(&server).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn feed_retries_stop_after_the_configured_attempts() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/servers/tee/measurements"))
+            .respond_with(ResponseTemplate::new(503))
+            .expect(3)
+            .mount(&server)
+            .await;
         assert!(matches!(probe(&server).await, Err(ProbeError::Feed(_))));
     }
 

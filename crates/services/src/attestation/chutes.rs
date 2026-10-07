@@ -79,6 +79,14 @@ impl ChutesVerifyError {
             Self::Gpu(_) | Self::MalformedGpuPayload | Self::MissingGpuVerdict => "gpu",
         }
     }
+
+    /// Whether this failed at the NVIDIA NRAS (GPU) stage.
+    pub fn is_gpu_failure(&self) -> bool {
+        matches!(
+            self,
+            Self::Gpu(_) | Self::MalformedGpuPayload | Self::MissingGpuVerdict
+        )
+    }
 }
 
 /// A Chutes instance whose full attestation chain verified.
@@ -234,16 +242,6 @@ async fn verify_gpu(
         .ok_or(ChutesVerifyError::MissingGpuVerdict)
 }
 
-/// A Chutes instance whose quote passed the quote, report_data and GPU checks,
-/// with its five registers. Not checked against any measurement allow-list.
-#[derive(Debug, Clone)]
-pub struct ObservedInstance {
-    pub instance_id: String,
-    pub registers: Registers,
-    pub tcb_status: String,
-    pub gpu_verdict: String,
-}
-
 /// Records which register sets genuine Chutes instances run, for the daily
 /// measurement sync. It runs the same quote, report_data and GPU checks as
 /// [`ChutesBackendVerifier`] but has no allow-list and does not implement
@@ -260,26 +258,21 @@ impl ChutesObserver {
         }
     }
 
-    /// Run stages 1, 2 and 4 and return the quote's registers.
+    /// Run stages 1, 2 and 4 and return the quote's five registers.
     pub async fn observe_instance(
         &self,
         evidence: &InstanceEvidence,
         boot_nonce: &str,
         e2e_pubkey: &str,
-    ) -> Result<ObservedInstance, ChutesVerifyError> {
+    ) -> Result<Registers, ChutesVerifyError> {
         let q = verify_quote_and_bindings(&self.inner, evidence, boot_nonce, e2e_pubkey).await?;
-        let gpu_verdict = verify_gpu(&self.inner, evidence, boot_nonce, e2e_pubkey).await?;
-        Ok(ObservedInstance {
-            instance_id: evidence.instance_id.clone(),
-            registers: Registers {
-                mrtd: hex::encode(q.mrtd),
-                rtmr0: hex::encode(q.rtmr0),
-                rtmr1: hex::encode(q.rtmr1),
-                rtmr2: hex::encode(q.rtmr2),
-                rtmr3: hex::encode(q.rtmr3),
-            },
-            tcb_status: q.tcb_status,
-            gpu_verdict,
+        verify_gpu(&self.inner, evidence, boot_nonce, e2e_pubkey).await?;
+        Ok(Registers {
+            mrtd: hex::encode(q.mrtd),
+            rtmr0: hex::encode(q.rtmr0),
+            rtmr1: hex::encode(q.rtmr1),
+            rtmr2: hex::encode(q.rtmr2),
+            rtmr3: hex::encode(q.rtmr3),
         })
     }
 }
@@ -389,6 +382,23 @@ mod tests {
         .await
         .unwrap_err();
         assert!(err.contains("measurement") || err.contains("attest"));
+    }
+
+    #[test]
+    fn every_gpu_failure_is_a_gpu_failure() {
+        // The sync probe retries NRAS failures by this predicate.
+        let nras = ChutesVerifyError::Gpu(AttestationVerificationError::GpuVerificationFailed(
+            "x".into(),
+        ));
+        assert!(nras.is_gpu_failure());
+        assert!(ChutesVerifyError::MissingGpuVerdict.is_gpu_failure());
+        assert!(!ChutesVerifyError::NotTd10.is_gpu_failure());
+        assert!(
+            !ChutesVerifyError::Verifier(AttestationVerificationError::TdxVerificationFailed(
+                "x".into()
+            ))
+            .is_gpu_failure()
+        );
     }
 
     #[tokio::test]

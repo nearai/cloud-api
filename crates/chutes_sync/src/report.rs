@@ -9,7 +9,7 @@ use crate::classify::{ObservationOutcome, RowRef, SyncReport};
 pub const PR_BODY_LIMIT: usize = 60_000;
 
 fn short(h: &str) -> &str {
-    &h[..h.len().min(16)]
+    h.char_indices().nth(16).map_or(h, |(i, _)| &h[..i])
 }
 
 fn list(s: &mut String, title: &str, rows: &[RowRef]) {
@@ -38,7 +38,8 @@ pub fn render_markdown(report: &SyncReport, date: &str) -> String {
     }
     for (row, on) in &report.added {
         let where_ = if on.is_empty() {
-            "found by an earlier run, still published".to_string()
+            "not seen live today; found by an earlier run of this job and still published"
+                .to_string()
         } else {
             on.iter()
                 .map(|o| format!("{} `{}`", o.model, o.instance_id))
@@ -164,6 +165,28 @@ mod tests {
         assert!(md.contains("v1.4.1 `8xb300`"));
         assert!(md.contains("kimi `i1`"));
         assert!(md.contains("2026-10-06"));
+    }
+
+    #[test]
+    fn short_never_splits_a_character() {
+        assert_eq!(short("abc"), "abc");
+        // Byte 16 falls inside a two-byte character.
+        let s = format!("a{}", "é".repeat(20));
+        assert!(s.starts_with(short(&s)));
+    }
+
+    #[test]
+    fn carried_rows_say_they_were_not_seen_today() {
+        let mut rep = SyncReport::default();
+        rep.added.push((
+            RowRef {
+                version: "1.4.1".into(),
+                name: "8xb300".into(),
+            },
+            vec![],
+        ));
+        let md = render_markdown(&rep, "2026-10-06");
+        assert!(md.contains("not seen live today"));
     }
 
     #[test]

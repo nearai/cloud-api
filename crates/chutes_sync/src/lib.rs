@@ -13,3 +13,27 @@
 pub mod classify;
 pub mod probe;
 pub mod report;
+
+/// Parse `CHUTES_SYNC_MODELS`: comma-separated model ids, trimmed, empties
+/// dropped.
+pub fn parse_model_list(raw: &str) -> Vec<String> {
+    raw.split(',')
+        .map(str::trim)
+        .filter(|m| !m.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn model_list_is_split_and_trimmed() {
+        assert_eq!(
+            parse_model_list(" a/A-TEE, b/B-TEE ,,"),
+            vec!["a/A-TEE".to_string(), "b/B-TEE".to_string()]
+        );
+        assert!(parse_model_list(" , ").is_empty());
+    }
+}

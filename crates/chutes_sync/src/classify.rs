@@ -41,8 +41,19 @@ struct RawRtmrs {
     rtmr3: Option<String>,
 }
 
+/// Feed names and versions are written into the pins file and the PR body, and
+/// the feed is unsigned: accept only the characters Chutes uses (letters,
+/// digits, space and `._,-/+[]()`), up to 80 characters.
+fn is_safe_label(s: &str) -> bool {
+    !s.is_empty()
+        && s.chars().count() <= 80
+        && s.chars()
+            .all(|c| c.is_ascii_alphanumeric() || " ._,-/+[]()".contains(c))
+}
+
 /// Parse the published feed. Uses `runtime_rtmrs` (RTMR3 is the runtime value).
-/// Rows with missing or malformed registers are skipped.
+/// Rows with missing or malformed registers, or an unexpected name or version,
+/// are skipped.
 pub fn parse_feed(json: &str) -> Result<Vec<FeedRow>, serde_json::Error> {
     let raw: Vec<RawFeedRow> = serde_json::from_str(json)?;
     Ok(raw
@@ -57,11 +68,12 @@ pub fn parse_feed(json: &str) -> Result<Vec<FeedRow>, serde_json::Error> {
                 rtmr3: rt.rtmr3?,
             }
             .normalised();
-            registers.is_well_formed().then_some(FeedRow {
-                version: r.version,
-                name: r.name,
-                registers,
-            })
+            (registers.is_well_formed() && is_safe_label(&r.version) && is_safe_label(&r.name))
+                .then_some(FeedRow {
+                    version: r.version,
+                    name: r.name,
+                    registers,
+                })
         })
         .collect())
 }
@@ -107,7 +119,7 @@ pub struct SyncReport {
     /// Rows in the output that are not in `base` (today's additions plus
     /// carried rows from an unmerged bot PR), with where they were seen today.
     pub added: Vec<(RowRef, Vec<SeenOn>)>,
-    /// Distinct verified register sets seen today that were already pinned.
+    /// Distinct verified register sets seen today that main already pins.
     pub already_pinned: usize,
     pub unpublished: Vec<(Registers, Vec<SeenOn>)>,
     pub unverified: Vec<Observation>,
@@ -255,8 +267,12 @@ pub fn classify(
     }
 
     for (regs, on) in &seen {
-        if out.find(regs).is_some() {
+        if base.find(regs).is_some() {
             report.already_pinned += 1;
+            continue;
+        }
+        // Carried from the open bot PR: already in `out`, reported as added.
+        if out.find(regs).is_some() {
             continue;
         }
         let Some((version, names)) = published.get(regs) else {
@@ -536,6 +552,22 @@ mod tests {
     }
 
     #[test]
+    fn carried_row_seen_today_is_added_not_counted_as_already_pinned() {
+        let r = regs('a', 'b', 'c', 'd', 'e');
+        let carry = pins_with("1.4.1", "x", &r);
+        let (_, rep) = classify(
+            &[feed("1.4.1", "x", &r)],
+            &[seen("m", "i", &r)],
+            vec![],
+            &empty(),
+            Some(&carry),
+        );
+        assert_eq!(rep.already_pinned, 0, "not pinned on main yet");
+        assert_eq!(rep.added.len(), 1);
+        assert_eq!(rep.added[0].1[0].instance_id, "i");
+    }
+
+    #[test]
     fn carried_row_withdrawn_from_feed_is_dropped() {
         let r = regs('a', 'b', 'c', 'd', 'e');
         let carry = pins_with("1.4.1", "x", &r);
@@ -585,6 +617,36 @@ mod tests {
         let rows = parse_feed(&json).unwrap();
         assert_eq!(rows[0].registers.mrtd, "ab".repeat(48));
         assert_eq!(rows[0].registers.rtmr3, "cd".repeat(48));
+    }
+
+    #[test]
+    fn feed_rows_with_unsafe_names_are_skipped() {
+        // Names and versions reach the PR body and the pins file; only the
+        // characters Chutes actually uses are accepted.
+        let g = "cd".repeat(48);
+        let row = |version: &str, name: &str| {
+            serde_json::json!({
+                "version": version, "name": name, "mrtd": g,
+                "runtime_rtmrs": {"RTMR0": g, "RTMR1": g, "RTMR2": g, "RTMR3": g},
+            })
+        };
+        let json = serde_json::json!([
+            row(
+                "1.4.1",
+                "8xpro_6000 [10.2.1, numa-124c-768g] (58443435b208)"
+            ),
+            row("1.4.1", "x`@team"),
+            row("1.4.1", "line\nbreak"),
+            row("1.4.1<", "ok"),
+            row("1.4.1", &"y".repeat(81)),
+        ])
+        .to_string();
+        let rows = parse_feed(&json).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0].name,
+            "8xpro_6000 [10.2.1, numa-124c-768g] (58443435b208)"
+        );
     }
 
     #[test]

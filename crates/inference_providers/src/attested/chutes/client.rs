@@ -357,7 +357,8 @@ async fn read_body_capped(resp: reqwest::Response, max: u64) -> Result<Vec<u8>, 
     Ok(out)
 }
 
-/// Find a model's `chute_id` in a `/v1/models` listing (pure; unit-tested).
+/// Every `(model_id, chute_id)` pair in a `/v1/models` listing that has a
+/// `chute_id` (pure; unit-tested).
 fn models_with_chute_ids(list: &ModelsList) -> Vec<(String, String)> {
     list.data
         .iter()
@@ -365,6 +366,7 @@ fn models_with_chute_ids(list: &ModelsList) -> Vec<(String, String)> {
         .collect()
 }
 
+/// Find a model's `chute_id` in a `/v1/models` listing (pure; unit-tested).
 fn pick_chute_id(list: &ModelsList, model: &str) -> Result<String, ChutesClientError> {
     let entry = list
         .data

@@ -120,6 +120,7 @@ pub fn test_config() -> ApiConfig {
             username: std::env::var("DATABASE_USERNAME").unwrap_or_else(|_| "postgres".to_string()),
             password: std::env::var("DATABASE_PASSWORD").unwrap_or_else(|_| "postgres".to_string()),
             max_connections: 4,
+            recycling_method: config::DatabaseRecyclingMethod::Fast,
             tls_enabled: false,
             tls_ca_cert_path: None,
             refresh_interval: 30,

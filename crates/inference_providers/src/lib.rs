@@ -203,6 +203,32 @@ impl ServingProvider {
     }
 }
 
+/// Which providers an attestation report request is restricted to
+/// (`?provider=near|chutes|tinfoil`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ProviderFilter {
+    /// NEAR AI's own attested fleet.
+    Near,
+    /// Attested third-party providers of one concrete source.
+    Source(ProviderSource),
+}
+
+impl ProviderFilter {
+    pub fn matches<P: InferenceProvider + ?Sized>(self, p: &P) -> bool {
+        match self {
+            Self::Near => p.tier() == ProviderTier::Near,
+            Self::Source(s) => p.tier() == ProviderTier::Attested3p && p.provider_source() == s,
+        }
+    }
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Near => "near",
+            Self::Source(s) => s.as_str(),
+        }
+    }
+}
+
 impl ProviderTier {
     /// Whether this tier carries a verifiable TEE attestation we gate a
     /// "verified" badge on. True for [`Near`](ProviderTier::Near) and

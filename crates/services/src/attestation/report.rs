@@ -6,7 +6,7 @@ use super::{models::AttestationReport, AttestationError, AttestationService, Gat
 use crate::metrics::consts::{
     get_environment, METRIC_ATTESTATION_REPORT_CACHE, TAG_ENVIRONMENT, TAG_RESULT,
 };
-use inference_providers::ProviderTier;
+use inference_providers::ProviderFilter;
 
 pub(in crate::attestation) fn generate_nonce_hex() -> String {
     let mut nonce_bytes = [0u8; 32];
@@ -50,7 +50,7 @@ fn report_cache_key(
     model: Option<&str>,
     signing_algo: Option<&str>,
     include_tls_fingerprint: bool,
-    provider_filter: Option<ProviderTier>,
+    provider_filter: Option<ProviderFilter>,
     signing_address: Option<&str>,
 ) -> String {
     format!(
@@ -58,7 +58,7 @@ fn report_cache_key(
         model.unwrap_or("*"),
         signing_algo.unwrap_or("-"),
         include_tls_fingerprint,
-        provider_filter.map(|t| t.as_str()).unwrap_or("-"),
+        provider_filter.map(ProviderFilter::as_str).unwrap_or("-"),
         signing_address.unwrap_or("-"),
     )
 }
@@ -94,7 +94,7 @@ impl AttestationService {
         nonce: Option<String>,
         signing_address: Option<String>,
         include_tls_fingerprint: bool,
-        provider_filter: Option<ProviderTier>,
+        provider_filter: Option<ProviderFilter>,
     ) -> Result<AttestationReport, AttestationError> {
         let env_tag = format!("{TAG_ENVIRONMENT}:{}", get_environment());
         let signing_algo = normalize_signing_algo(signing_algo.as_deref())?;
@@ -302,7 +302,28 @@ impl AttestationService {
 mod cache_key_tests {
     use super::{normalize_signing_algo, report_cache_key};
     use crate::attestation::AttestationError;
-    use inference_providers::ProviderTier;
+    use inference_providers::{ProviderFilter, ProviderSource};
+
+    #[test]
+    fn report_cache_key_distinguishes_3p_sources() {
+        let c = report_cache_key(
+            Some("m"),
+            None,
+            false,
+            Some(ProviderFilter::Source(ProviderSource::Chutes)),
+            None,
+        );
+        let t = report_cache_key(
+            Some("m"),
+            None,
+            false,
+            Some(ProviderFilter::Source(ProviderSource::Tinfoil)),
+            None,
+        );
+        let n = report_cache_key(Some("m"), None, false, Some(ProviderFilter::Near), None);
+        assert!(c.contains("pf=chutes") && t.contains("pf=tinfoil") && n.contains("pf=near"));
+        assert_ne!(c, t);
+    }
 
     #[test]
     fn key_is_independent_of_nonce_by_construction() {
@@ -372,7 +393,7 @@ mod cache_key_tests {
                 Some("m"),
                 Some("ecdsa"),
                 false,
-                Some(ProviderTier::Near),
+                Some(ProviderFilter::Near),
                 None
             )
         );
@@ -386,14 +407,14 @@ mod cache_key_tests {
                 Some("m"),
                 Some("ecdsa"),
                 false,
-                Some(ProviderTier::Near),
+                Some(ProviderFilter::Near),
                 None
             ),
             report_cache_key(
                 Some("m"),
                 Some("ecdsa"),
                 false,
-                Some(ProviderTier::Attested3p),
+                Some(ProviderFilter::Source(ProviderSource::Chutes)),
                 None
             ),
         );

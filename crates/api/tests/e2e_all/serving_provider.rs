@@ -170,6 +170,37 @@ async fn test_attestation_report_provider_filter_chutes_not_found() {
     );
 }
 
+/// `?provider=tinfoil` on a model served only by the (NonAttested) default mock
+/// must return a non-200 error.
+#[tokio::test]
+async fn test_attestation_report_provider_filter_tinfoil_not_found() {
+    let server = setup_test_server().await;
+    setup_qwen_model(&server).await;
+    let org = setup_org_with_credits(&server, 10_000_000_000i64).await;
+    let api_key = get_api_key_for_org(&server, org.id).await;
+
+    let encoded_model =
+        url::form_urlencoded::byte_serialize(E2E_QWEN_MODEL_NAME.as_bytes()).collect::<String>();
+    let url = format!("/v1/attestation/report?model={encoded_model}&provider=tinfoil");
+
+    let response = server
+        .get(&url)
+        .add_header("Authorization", format!("Bearer {api_key}"))
+        .await;
+
+    assert_ne!(
+        response.status_code(),
+        200,
+        "expected non-200 when no Tinfoil provider is registered, got 200: {}",
+        response.text()
+    );
+    assert_ne!(
+        response.status_code(),
+        400,
+        "?provider=tinfoil must not return 400 (it is a valid value)"
+    );
+}
+
 /// `?provider=<unknown>` must return 400 with a descriptive error.
 #[tokio::test]
 async fn test_attestation_report_provider_filter_unknown_returns_400() {
@@ -198,6 +229,10 @@ async fn test_attestation_report_provider_filter_unknown_returns_400() {
     assert!(
         body.contains("foobar"),
         "400 error body should mention the unknown value: {body}"
+    );
+    assert!(
+        body.contains("'near'") && body.contains("'chutes'") && body.contains("'tinfoil'"),
+        "400 error body should list accepted values: {body}"
     );
 }
 

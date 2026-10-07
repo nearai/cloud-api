@@ -9,7 +9,7 @@ use axum::{
     http::{HeaderMap, StatusCode},
     response::Json as ResponseJson,
 };
-use inference_providers::ProviderTier;
+use inference_providers::{ProviderFilter, ProviderSource};
 use serde::{Deserialize, Serialize};
 use utoipa::{IntoParams, ToSchema};
 
@@ -178,12 +178,15 @@ pub async fn get_attestation_report(
         .as_deref()
     {
         None => None,
-        Some("near") => Some(ProviderTier::Near),
-        Some("chutes") => Some(ProviderTier::Attested3p),
+        Some("near") => Some(ProviderFilter::Near),
+        Some("chutes") => Some(ProviderFilter::Source(ProviderSource::Chutes)),
+        Some("tinfoil") => Some(ProviderFilter::Source(ProviderSource::Tinfoil)),
         Some(unknown) => {
             return Err(error_response(
                 StatusCode::BAD_REQUEST,
-                format!("Unknown provider '{unknown}'. Accepted values: 'near', 'chutes'."),
+                format!(
+                    "Unknown provider '{unknown}'. Accepted values: 'near', 'chutes', 'tinfoil'."
+                ),
                 "invalid_request_error",
                 Some("provider"),
             ));

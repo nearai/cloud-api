@@ -4190,8 +4190,8 @@ impl InferenceProviderPool {
         }
     }
 
-    /// `provider_filter`: when `Some`, only providers whose `tier()` matches are
-    /// tried. `None` preserves the existing behaviour (first successful wins).
+    /// `provider_filter`: when `Some`, only providers matching the filter (NEAR tier,
+    /// or attested 3P of the given source) are tried. `None` preserves the existing behaviour (first successful wins).
     ///
     /// `signing_algo` is forwarded to each backend verbatim. Backends accept
     /// only lowercase `ecdsa` / `ed25519`, so callers must pass a normalized
@@ -4203,18 +4203,18 @@ impl InferenceProviderPool {
         nonce: Option<String>,
         signing_address: Option<String>,
         include_tls_fingerprint: bool,
-        provider_filter: Option<inference_providers::ProviderTier>,
+        provider_filter: Option<inference_providers::ProviderFilter>,
     ) -> Result<Vec<serde_json::Map<String, serde_json::Value>>, AttestationError> {
         let all_providers = self
             .get_providers_for_model(&model)
             .await
             .ok_or_else(|| AttestationError::ProviderNotFound(model.clone()))?;
 
-        // Apply tier filter when requested.
+        // Apply provider filter when requested.
         let providers: Vec<_> = match provider_filter {
-            Some(tier) => all_providers
+            Some(f) => all_providers
                 .into_iter()
-                .filter(|p| p.tier() == tier)
+                .filter(|p| f.matches(p.as_ref()))
                 .collect(),
             None => all_providers,
         };

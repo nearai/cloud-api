@@ -44,6 +44,7 @@ pub enum ServedProviderType {
     Vllm,
     External,
     Chutes,
+    Tinfoil,
 }
 
 impl ServedProviderType {
@@ -52,6 +53,7 @@ impl ServedProviderType {
             ServedProviderType::Vllm => "vllm",
             ServedProviderType::External => "external",
             ServedProviderType::Chutes => "chutes",
+            ServedProviderType::Tinfoil => "tinfoil",
         }
     }
 }
@@ -70,6 +72,7 @@ impl std::str::FromStr for ServedProviderType {
             "vllm" => Ok(ServedProviderType::Vllm),
             "external" => Ok(ServedProviderType::External),
             "chutes" => Ok(ServedProviderType::Chutes),
+            "tinfoil" => Ok(ServedProviderType::Tinfoil),
             _ => Err(format!("Unknown served provider type: {s}")),
         }
     }
@@ -83,4 +86,18 @@ pub struct ProviderAttribution {
     pub served_provider_type: Option<ServedProviderType>,
     #[serde(default)]
     pub served_via_fallback: bool,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn served_provider_type_round_trips_tinfoil() {
+        assert_eq!(
+            "tinfoil".parse::<ServedProviderType>().unwrap(),
+            ServedProviderType::Tinfoil
+        );
+        assert_eq!(ServedProviderType::Tinfoil.as_str(), "tinfoil");
+    }
 }

@@ -67,5 +67,6 @@ fn served_provider_type(source: ProviderSource) -> crate::usage::ServedProviderT
         ProviderSource::Vllm => crate::usage::ServedProviderType::Vllm,
         ProviderSource::External => crate::usage::ServedProviderType::External,
         ProviderSource::Chutes => crate::usage::ServedProviderType::Chutes,
+        ProviderSource::Tinfoil => crate::usage::ServedProviderType::Tinfoil,
     }
 }

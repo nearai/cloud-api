@@ -200,6 +200,6 @@ async fn admin_model_revenue_rejects_invalid_provider_type() {
     assert_eq!(error.error.r#type, "invalid_parameter");
     assert_eq!(
         error.error.message,
-        "invalid provider_type 'banana'; expected one of: vllm, external, chutes"
+        "invalid provider_type 'banana'; expected one of: vllm, external, chutes, tinfoil"
     );
 }

@@ -103,6 +103,7 @@ const fn provider_source_metric_tag(source: inference_providers::ProviderSource)
         inference_providers::ProviderSource::Vllm => "provider_type:vllm",
         inference_providers::ProviderSource::External => "provider_type:external",
         inference_providers::ProviderSource::Chutes => "provider_type:chutes",
+        inference_providers::ProviderSource::Tinfoil => "provider_type:tinfoil",
     }
 }
 

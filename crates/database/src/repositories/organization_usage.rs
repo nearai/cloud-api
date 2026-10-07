@@ -819,18 +819,58 @@ pub struct UsageByModel {
     pub request_count: i64,
 }
 
+/// Unknown stored values read as `None` (with a content-free warning) so a
+/// binary never fails to read usage rows written by a newer binary that knows
+/// more provider types/tiers (spec section 3.7: tolerant readers before any writer).
 fn parse_served_provider_tier(value: Option<String>) -> Result<Option<ServedProviderTier>> {
-    value
-        .as_deref()
-        .map(str::parse)
-        .transpose()
-        .map_err(|message| anyhow::anyhow!("Invalid served_provider_tier in usage log: {message}"))
+    Ok(value.as_deref().and_then(|s| match s.parse() {
+        Ok(t) => Some(t),
+        Err(_) => {
+            tracing::warn!(
+                served_provider_tier = %s,
+                "Unknown served_provider_tier in usage log; treating as unattributed"
+            );
+            None
+        }
+    }))
 }
 
+/// See [`parse_served_provider_tier`].
 fn parse_served_provider_type(value: Option<String>) -> Result<Option<ServedProviderType>> {
-    value
-        .as_deref()
-        .map(str::parse)
-        .transpose()
-        .map_err(|message| anyhow::anyhow!("Invalid served_provider_type in usage log: {message}"))
+    Ok(value.as_deref().and_then(|s| match s.parse() {
+        Ok(t) => Some(t),
+        Err(_) => {
+            tracing::warn!(
+                served_provider_type = %s,
+                "Unknown served_provider_type in usage log; treating as unattributed"
+            );
+            None
+        }
+    }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unknown_served_provider_type_reads_as_none() {
+        assert!(
+            parse_served_provider_type(Some("some_future_provider".to_string()))
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            parse_served_provider_type(Some("chutes".into())).unwrap(),
+            Some(ServedProviderType::Chutes)
+        );
+        assert!(parse_served_provider_type(None).unwrap().is_none());
+        assert!(parse_served_provider_tier(Some("future_tier".into()))
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            parse_served_provider_tier(Some("near".into())).unwrap(),
+            Some(ServedProviderTier::Near)
+        );
+    }
 }

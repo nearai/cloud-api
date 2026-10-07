@@ -162,6 +162,8 @@ pub enum ProviderSource {
     External,
     /// A Chutes-attested third party (`attested::chutes`).
     Chutes,
+    /// A Tinfoil-attested third party (attested::tinfoil).
+    Tinfoil,
 }
 
 impl ProviderSource {
@@ -170,6 +172,7 @@ impl ProviderSource {
             ProviderSource::Vllm => "vllm",
             ProviderSource::External => "external",
             ProviderSource::Chutes => "chutes",
+            ProviderSource::Tinfoil => "tinfoil",
         }
     }
 }

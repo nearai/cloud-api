@@ -1,3 +1,28 @@
+use deadpool::managed::TimeoutType;
+use services::common::RepositoryError;
+
+pub fn should_retry(err: &RepositoryError) -> bool {
+    match err {
+        RepositoryError::TransactionConflict | RepositoryError::ConnectionFailed(_) => true,
+        RepositoryError::PoolError(source) => !source.chain().any(|cause| {
+            matches!(
+                cause.downcast_ref::<deadpool_postgres::PoolError>(),
+                Some(deadpool_postgres::PoolError::Timeout(TimeoutType::Wait))
+            )
+        }),
+        RepositoryError::NotFound(_)
+        | RepositoryError::AlreadyExists
+        | RepositoryError::RequiredFieldMissing(_)
+        | RepositoryError::ForeignKeyViolation(_)
+        | RepositoryError::ValidationFailed(_)
+        | RepositoryError::DependencyExists(_)
+        | RepositoryError::AuthenticationFailed
+        | RepositoryError::QueryTimeout
+        | RepositoryError::DatabaseError(_)
+        | RepositoryError::DataConversionError(_) => false,
+    }
+}
+
 /// Retry a database operation with exponential backoff
 #[macro_export]
 macro_rules! retry_db {
@@ -7,13 +32,6 @@ macro_rules! retry_db {
         const MAX_ATTEMPTS: u32 = 3;
         const INITIAL_BACKOFF_MS: u64 = 100;
         const BACKOFF_MULTIPLIER: f64 = 2.0;
-
-        let should_retry = |err: &RepositoryError| matches!(
-            err,
-            RepositoryError::TransactionConflict
-                | RepositoryError::ConnectionFailed(_)
-                | RepositoryError::PoolError(_)
-        );
 
         let mut attempt = 0u32;
         let mut backoff_ms = INITIAL_BACKOFF_MS;
@@ -38,7 +56,7 @@ macro_rules! retry_db {
                     }
                     break Ok(value);
                 }
-                Err(err) if should_retry(&err) && attempt < MAX_ATTEMPTS => {
+                Err(err) if $crate::repositories::retry::should_retry(&err) && attempt < MAX_ATTEMPTS => {
                     tracing::warn!(
                         operation = $operation,
                         attempt = attempt,
@@ -64,4 +82,40 @@ macro_rules! retry_db {
             }
         }
     }};
+}
+
+#[cfg(test)]
+mod tests {
+    use super::should_retry;
+    use anyhow::Context;
+    use deadpool::managed::TimeoutType;
+    use services::common::RepositoryError;
+
+    fn pool_timeout(kind: TimeoutType) -> RepositoryError {
+        let error: Result<(), deadpool_postgres::PoolError> =
+            Err(deadpool_postgres::PoolError::Timeout(kind));
+        RepositoryError::PoolError(
+            error
+                .context("Failed to get database connection")
+                .unwrap_err(),
+        )
+    }
+
+    #[test]
+    fn pool_wait_timeout_is_not_retried() {
+        assert!(!should_retry(&pool_timeout(TimeoutType::Wait)));
+    }
+
+    #[test]
+    fn other_pool_timeouts_and_connection_errors_are_retried() {
+        assert!(should_retry(&pool_timeout(TimeoutType::Create)));
+        assert!(should_retry(&pool_timeout(TimeoutType::Recycle)));
+        assert!(should_retry(&RepositoryError::PoolError(
+            deadpool_postgres::PoolError::Closed.into()
+        )));
+        assert!(should_retry(&RepositoryError::ConnectionFailed(
+            "connection closed".into()
+        )));
+        assert!(should_retry(&RepositoryError::TransactionConflict));
+    }
 }

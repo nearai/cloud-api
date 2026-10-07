@@ -12,7 +12,7 @@ use sha2::{Digest, Sha256};
 use super::snp::{self, SnpError, SnpEvidence, SnpPolicy, Tcb, VerifiedSnpReport};
 use super::tinfoil_pins::{TinfoilPins, COMPILED_PINS_JSON};
 
-const SNP_FORMAT_SUFFIX: &str = "sev-snp-guest/v2";
+const SNP_FORMAT: &str = "https://tinfoil.sh/predicate/sev-snp-guest/v2";
 
 /// Reported TCB observed on the live router (Genoa VCEK): boot 10 / tee 0 /
 /// snp 23 / microcode 84. Anything older is rejected.
@@ -48,7 +48,7 @@ fn map_snp(e: SnpError) -> TinfoilVerifyError {
 
 /// Verify the SNP report chain/signature/policy without consulting any pins.
 pub fn observe_router(bundle: &AtcBundle) -> Result<VerifiedSnpReport, TinfoilVerifyError> {
-    if !bundle.report.format.ends_with(SNP_FORMAT_SUFFIX) {
+    if bundle.report.format != SNP_FORMAT {
         return Err(TinfoilVerifyError::UnsupportedRouterPlatform);
     }
     let b64 = base64::engine::general_purpose::STANDARD;
@@ -73,24 +73,22 @@ pub fn observe_router(bundle: &AtcBundle) -> Result<VerifiedSnpReport, TinfoilVe
     .map_err(map_snp)
 }
 
+fn registers_eq(a: &[String], b: &[String]) -> bool {
+    a.len() == b.len() && a.iter().zip(b).all(|(x, y)| x.eq_ignore_ascii_case(y))
+}
+
 pub struct TinfoilPolicyVerifier {
     pins: TinfoilPins,
-    snp_policy: SnpPolicy,
 }
 
 impl TinfoilPolicyVerifier {
     pub fn new(pins: TinfoilPins) -> Self {
-        Self {
-            pins,
-            snp_policy: SnpPolicy { min_tcb: MIN_TCB },
-        }
+        Self { pins }
     }
 }
 
 impl TinfoilVerifier for TinfoilPolicyVerifier {
     fn verify_router(&self, bundle: &AtcBundle) -> Result<VerifiedRouter, TinfoilVerifyError> {
-        // `observe_router` applies the same policy as `self.snp_policy`.
-        debug_assert_eq!(self.snp_policy.min_tcb, MIN_TCB);
         let report = observe_router(bundle)?;
         let measurement_hex = hex::encode(report.measurement);
         let pin = self
@@ -117,7 +115,7 @@ impl TinfoilVerifier for TinfoilPolicyVerifier {
     ) -> Result<PinnedModel, TinfoilVerifyError> {
         let pinned = self.pins.models.get(slug).is_some_and(|ps| {
             ps.iter()
-                .any(|p| p.registers == entry.measurement.registers)
+                .any(|p| registers_eq(&p.registers, &entry.measurement.registers))
         });
         if !pinned {
             return Err(TinfoilVerifyError::UnknownModelMeasurement);
@@ -243,5 +241,73 @@ mod tests {
                 .unwrap_err(),
             TinfoilVerifyError::UnknownModelMeasurement
         );
+    }
+
+    #[test]
+    fn map_snp_maps_every_error() {
+        use TinfoilVerifyError as E;
+        for (from, to) in [
+            (SnpError::Tcb, E::TcbTooLow),
+            (SnpError::Debug, E::DebugPolicy),
+            (SnpError::MigrateMa, E::DebugPolicy),
+            (SnpError::Chain, E::BadSignature),
+            (SnpError::Signature, E::BadSignature),
+            (SnpError::Malformed, E::Malformed),
+            (SnpError::Product, E::Malformed),
+        ] {
+            assert_eq!(map_snp(from), to);
+        }
+    }
+
+    #[test]
+    fn non_matching_router_pins_are_unknown_measurement() {
+        use super::super::tinfoil_pins::RouterPin;
+        let pins = TinfoilPins {
+            router: vec![RouterPin {
+                measurement: "00".repeat(48),
+                repo: "r".into(),
+                tag: "t".into(),
+            }],
+            models: Default::default(),
+        };
+        assert_eq!(
+            TinfoilPolicyVerifier::new(pins)
+                .verify_router(&bundle())
+                .unwrap_err(),
+            TinfoilVerifyError::UnknownRouterMeasurement
+        );
+    }
+
+    #[test]
+    fn pinned_slug_with_different_registers_is_unknown_model() {
+        use super::super::tinfoil_pins::ModelPin;
+        let proxy: ProxyDoc =
+            serde_json::from_str(include_str!("testdata/tinfoil/proxy.json")).unwrap();
+        let mut pins = TinfoilPins::default();
+        pins.models.insert(
+            "glm-5-3".into(),
+            vec![ModelPin {
+                registers: vec!["aa".into(), "bb".into(), "cc".into()],
+                repo: "r".into(),
+                tag: "t".into(),
+            }],
+        );
+        assert_eq!(
+            TinfoilPolicyVerifier::new(pins)
+                .check_model("glm-5-3", &proxy.models["glm-5-3"])
+                .unwrap_err(),
+            TinfoilVerifyError::UnknownModelMeasurement
+        );
+    }
+
+    #[test]
+    fn model_registers_compare_case_insensitively() {
+        let mut proxy: ProxyDoc =
+            serde_json::from_str(include_str!("testdata/tinfoil/proxy.json")).unwrap();
+        let entry = proxy.models.get_mut("glm-5-3").unwrap();
+        for r in &mut entry.measurement.registers {
+            *r = r.to_uppercase();
+        }
+        assert!(test_verifier().check_model("glm-5-3", entry).is_ok());
     }
 }

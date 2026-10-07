@@ -85,7 +85,12 @@ async fn run() -> Result<(), Failure> {
         github_token: std::env::var("GITHUB_TOKEN").ok().filter(|t| !t.is_empty()),
         ..ProbeConfig::default()
     };
-    let out = probe::run(&reqwest::Client::new(), &cfg)
+    let client = reqwest::Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(10))
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+        .map_err(|e| bad(format!("http client: {e}")))?;
+    let out = probe::run(&client, &cfg)
         .await
         .map_err(|e| (1, e.to_string()))?;
 

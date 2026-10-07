@@ -36,6 +36,15 @@ pub fn verify_bundle(
     bundle: &serde_json::Value,
     repo: &str,
 ) -> Result<SigstoreResult, SigstoreError> {
+    verify_bundle_for(bundle, repo, WORKFLOW, OIDC_ISSUER)
+}
+
+fn verify_bundle_for(
+    bundle: &serde_json::Value,
+    repo: &str,
+    workflow: &str,
+    issuer: &str,
+) -> Result<SigstoreResult, SigstoreError> {
     use base64::Engine;
     use sigstore_verify::trust_root::{SigstoreInstance, TrustedRoot};
     use sigstore_verify::types::{Bundle, Sha256Hash};
@@ -69,11 +78,11 @@ pub fn verify_bundle(
     let verifier = Verifier::new(&root).map_err(bad)?;
     // The tag is part of the signer identity, so the identity is checked
     // below instead of through an exact-match policy.
-    let policy = VerificationPolicy::any_identity().require_issuer(OIDC_ISSUER);
+    let policy = VerificationPolicy::any_identity().require_issuer(issuer);
     let result = verifier.verify(digest, &parsed, &policy).map_err(bad)?;
 
     let san = result.identity().ok_or_else(|| bad("no signer identity"))?;
-    let prefix = format!("https://github.com/{repo}/{WORKFLOW}@refs/tags/");
+    let prefix = format!("https://github.com/{repo}/{workflow}@refs/tags/");
     let tag = san
         .as_str()
         .strip_prefix(&prefix)
@@ -162,11 +171,48 @@ mod tests {
                     .unwrap(),
             )
             .unwrap();
-        let i = payload.iter().position(|&c| c == b'b').unwrap(); // inside the measurement hex
-        payload[i] = b'c';
+        // Flip a byte inside the snp_measurement value: the statement stays
+        // well formed, so only the DSSE signature check can reject it.
+        let marker = br#""snp_measurement":""#;
+        let at = payload
+            .windows(marker.len())
+            .position(|w| w == marker)
+            .unwrap()
+            + marker.len();
+        payload[at] = if payload[at] == b'0' { b'1' } else { b'0' };
         b["sigstoreBundle"]["dsseEnvelope"]["payload"] = e.encode(payload).into();
+        let err = verify_bundle(&b["sigstoreBundle"], "tinfoilsh/confidential-model-router")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("DSSE signature"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn sigstore_rejects_wrong_workflow_in_expected_identity() {
+        let b = atc();
+        let err = verify_bundle_for(
+            &b["sigstoreBundle"],
+            "tinfoilsh/confidential-model-router",
+            ".github/workflows/other.yml",
+            OIDC_ISSUER,
+        )
+        .unwrap_err()
+        .to_string();
         assert!(
-            verify_bundle(&b["sigstoreBundle"], "tinfoilsh/confidential-model-router").is_err()
+            err.contains("does not match repo"),
+            "unexpected error: {err}"
         );
+    }
+
+    #[test]
+    fn sigstore_rejects_wrong_oidc_issuer() {
+        let b = atc();
+        assert!(verify_bundle_for(
+            &b["sigstoreBundle"],
+            "tinfoilsh/confidential-model-router",
+            WORKFLOW,
+            "https://issuer.example",
+        )
+        .is_err());
     }
 }

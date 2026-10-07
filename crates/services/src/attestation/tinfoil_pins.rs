@@ -121,4 +121,19 @@ mod tests {
         base.merge_never_remove(&TinfoilPins::default());
         assert_eq!(base, before);
     }
+
+    #[test]
+    fn canonical_json_sorts_and_dedups_unsorted_input() {
+        let p = TinfoilPins {
+            router: vec![rp("b"), rp("a"), rp("b")],
+            models: BTreeMap::from([
+                ("z".to_string(), vec![mp("2"), mp("1"), mp("2")]),
+                ("empty".to_string(), vec![]),
+            ]),
+        };
+        let back: TinfoilPins = serde_json::from_str(&p.to_canonical_json()).unwrap();
+        assert_eq!(back.router, vec![rp("a"), rp("b")]);
+        assert_eq!(back.models["z"], vec![mp("1"), mp("2")]);
+        assert!(!back.models.contains_key("empty"));
+    }
 }

@@ -28,13 +28,15 @@ const REPORT_LEN: usize = 0x4A0;
 const SIGNED_LEN: usize = 0x2A0;
 const OFF_VERSION: usize = 0x000;
 const OFF_POLICY: usize = 0x008;
-const OFF_TCB: usize = 0x038;
+// 0x038 is CURRENT_TCB (unused); the VCEK is bound to REPORTED_TCB at 0x180.
+const OFF_REPORTED_TCB: usize = 0x180;
 const OFF_REPORT_DATA: usize = 0x050;
 const OFF_MEASUREMENT: usize = 0x090;
 const OFF_CHIP_ID: usize = 0x1A0;
 const OFF_SIG_ALGO: usize = 0x034;
 const SIG_ALGO_ECDSA_P384_SHA384: u32 = 1;
 
+const POLICY_MIGRATE_MA_BIT: u64 = 1 << 18;
 const POLICY_DEBUG_BIT: u64 = 1 << 19;
 
 // VCEK X.509 extension OIDs (AMD KDS interface spec 57230).
@@ -90,16 +92,21 @@ pub enum SnpError {
     Signature,
     #[error("debug policy")]
     Debug,
+    #[error("migration agent allowed")]
+    MigrateMa,
     #[error("tcb too low")]
     Tcb,
     #[error("unknown product")]
     Product,
 }
 
-/// Rejects reports whose guest policy permits debugging.
+/// Rejects reports whose guest policy permits debugging or a migration agent.
 fn check_policy(policy: u64) -> Result<(), SnpError> {
     if policy & POLICY_DEBUG_BIT != 0 {
         return Err(SnpError::Debug);
+    }
+    if policy & POLICY_MIGRATE_MA_BIT != 0 {
+        return Err(SnpError::MigrateMa);
     }
     Ok(())
 }
@@ -121,6 +128,19 @@ fn parse_tcb(raw: u64) -> Tcb {
         snp: b[6],
         microcode: b[7],
     }
+}
+
+/// Turin's reported_tcb / VCEK TCB encoding is not validated here, so refuse it.
+fn check_product_supported(product: Product) -> Result<(), SnpError> {
+    match product {
+        Product::Milan | Product::Genoa => Ok(()),
+        Product::Turin => Err(SnpError::Product),
+    }
+}
+
+/// REPORTED_TCB (0x180) of a full-length report, Milan/Genoa layout.
+fn reported_tcb(report: &[u8]) -> Tcb {
+    parse_tcb(le_u64(report, OFF_REPORTED_TCB))
 }
 
 /// Parses the ASK and ARK (in that order) of an embedded chain and checks the
@@ -215,10 +235,7 @@ pub fn verify_snp_report(
 
     // 3. VCEK -> ASK -> ARK (embedded trust anchors).
     let product = verify_vcek_chain(&vcek)?;
-    if product == Product::Turin {
-        // Turin's reported_tcb / VCEK TCB encoding is not validated here.
-        return Err(SnpError::Product);
-    }
+    check_product_supported(product)?;
 
     // 4. Report signature: ECDSA P-384 / SHA-384 over [0, 0x2A0), R and S little-endian.
     let spki = &vcek.tbs_certificate.subject_public_key_info;
@@ -240,7 +257,7 @@ pub fn verify_snp_report(
 
     // The report is now authentic. Bind it to the VCEK that signed it: the
     // certificate is issued for one chip at one TCB.
-    let reported_tcb = parse_tcb(le_u64(r, OFF_TCB));
+    let reported_tcb = reported_tcb(r);
     let mut chip_id = [0u8; 64];
     chip_id.copy_from_slice(&r[OFF_CHIP_ID..OFF_CHIP_ID + 64]);
     let cert_tcb = Tcb {
@@ -408,7 +425,7 @@ mod tests {
         let (r, mut v) = fixture();
         let n = v.len();
         v[n - 10] ^= 1;
-        assert!(matches!(
+        assert_eq!(
             verify_snp_report(
                 &SnpEvidence {
                     report: &r,
@@ -417,8 +434,8 @@ mod tests {
                 &lax()
             )
             .unwrap_err(),
-            SnpError::Chain | SnpError::Signature
-        ));
+            SnpError::Chain
+        );
     }
     #[test]
     fn rejects_truncated_report() {
@@ -470,6 +487,58 @@ mod tests {
     fn debug_bit_is_checked_before_signature_is_trusted() {
         assert_eq!(check_policy(1 << 19).unwrap_err(), SnpError::Debug);
         assert!(check_policy(0).is_ok());
+    }
+    #[test]
+    fn migrate_ma_bit_is_rejected() {
+        assert_eq!(check_policy(1 << 18).unwrap_err(), SnpError::MigrateMa);
+        assert_eq!(
+            check_policy((1 << 18) | (1 << 19)).unwrap_err(),
+            SnpError::Debug
+        );
+        // The captured router policy (0x30000) has neither bit set.
+        assert!(check_policy(0x30000).is_ok());
+    }
+    #[test]
+    fn reported_tcb_is_read_from_0x180_not_0x38() {
+        let mut r = vec![0u8; REPORT_LEN];
+        r[0x38..0x40].copy_from_slice(&[1, 2, 0, 0, 0, 0, 3, 4]);
+        r[0x180..0x188].copy_from_slice(&[10, 20, 0, 0, 0, 0, 30, 40]);
+        assert_eq!(
+            reported_tcb(&r),
+            Tcb {
+                bootloader: 10,
+                tee: 20,
+                snp: 30,
+                microcode: 40
+            }
+        );
+    }
+    #[test]
+    fn turin_product_is_rejected() {
+        assert_eq!(
+            check_product_supported(Product::Turin).unwrap_err(),
+            SnpError::Product
+        );
+        assert!(check_product_supported(Product::Milan).is_ok());
+        assert!(check_product_supported(Product::Genoa).is_ok());
+    }
+    #[test]
+    fn rejects_cert_not_chaining_to_any_embedded_ask() {
+        // A Milan ASK is signed by the Milan ARK, not by any ASK: it cannot be a VCEK.
+        let (r, _) = fixture();
+        let (milan_ask, _) = load_chain(Product::Milan).unwrap();
+        let der = milan_ask.to_der().unwrap();
+        assert_eq!(
+            verify_snp_report(
+                &SnpEvidence {
+                    report: &r,
+                    vcek_der: &der
+                },
+                &lax()
+            )
+            .unwrap_err(),
+            SnpError::Chain
+        );
     }
     #[test]
     fn embedded_chains_are_self_consistent() {

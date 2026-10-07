@@ -500,6 +500,11 @@ impl Fleet {
     }
 
     fn route_key(&self, messages: &[crate::ChatMessage]) -> u64 {
+        // Opt-in: one key for every turn, so turn 2 lands where turn 1 built the KV cache
+        // (NEARAI_PREFIX_ROUTE_THROUGH_FIRST_USER=1). The hot-prefix burst spill still applies.
+        if self.prefix_router.through_first_user() {
+            return self.prefix_router.route_through_first_user(messages);
+        }
         if has_conversation_history(messages) {
             self.prefix_router.route_conversation(messages)
         } else {

@@ -10,11 +10,57 @@ use sha2::{Digest, Sha256};
 
 /// Stateless router that derives a stable key from the reusable request prefix.
 #[derive(Default)]
-pub struct PrefixRouter;
+pub struct PrefixRouter {
+    /// Key every turn through the first user message (see [`Self::route_through_first_user`]).
+    /// Off by default; enabled with `NEARAI_PREFIX_ROUTE_THROUGH_FIRST_USER=1`.
+    through_first_user: bool,
+}
+
+/// Env flag that makes every turn of a conversation share one routing key.
+pub const ROUTE_THROUGH_FIRST_USER_ENV: &str = "NEARAI_PREFIX_ROUTE_THROUGH_FIRST_USER";
 
 impl PrefixRouter {
     pub fn new() -> Self {
-        Self
+        Self {
+            through_first_user: std::env::var(ROUTE_THROUGH_FIRST_USER_ENV)
+                .map(|value| value == "1" || value.eq_ignore_ascii_case("true"))
+                .unwrap_or(false),
+        }
+    }
+
+    /// Router with an explicit keying mode (tests).
+    #[cfg(test)]
+    pub fn with_through_first_user(through_first_user: bool) -> Self {
+        Self { through_first_user }
+    }
+
+    /// Whether every turn is keyed through the first user message.
+    pub fn through_first_user(&self) -> bool {
+        self.through_first_user
+    }
+
+    /// Return a routing key that is the same on every turn of a conversation: the messages up
+    /// to and including the first user message (system/developer preamble plus the opening
+    /// request). Later assistant, tool and user messages are appended after that point, so
+    /// turn 1 and every follow-up hash the same prefix and land on the same backend, which is
+    /// where turn 1 built the KV cache. This is the prefix the in-CVM proxy's conversation
+    /// affinity also keys on, so host and replica stickiness agree.
+    pub fn route_through_first_user(&self, messages: &[ChatMessage]) -> u64 {
+        if messages.is_empty() {
+            return 0;
+        }
+        let end = messages
+            .iter()
+            .position(|message| matches!(message.role, MessageRole::User))
+            .map(|index| index + 1)
+            .unwrap_or(messages.len().min(1));
+        let mut hasher = Sha256::new();
+        hasher.update(b"nearai-conversation-route-v2");
+        hasher.update((end as u64).to_be_bytes());
+        for message in &messages[..end] {
+            hash_message(&mut hasher, message);
+        }
+        key_from(hasher)
     }
 
     /// Return a deterministic routing key based on the first message.
@@ -123,6 +169,58 @@ mod tests {
 
     fn text_message(role: MessageRole, content: &str) -> ChatMessage {
         message(role, Some(serde_json::Value::String(content.to_string())))
+    }
+
+    #[test]
+    fn through_first_user_key_is_stable_across_turns() {
+        let router = PrefixRouter::with_through_first_user(true);
+        let turn1 = vec![
+            text_message(MessageRole::System, "You are a coding agent."),
+            text_message(MessageRole::User, "Fix the failing test in repo X."),
+        ];
+        let mut turn2 = turn1.clone();
+        turn2.push(text_message(
+            MessageRole::Assistant,
+            "Looking at the test...",
+        ));
+        turn2.push(text_message(MessageRole::Tool, "test output"));
+        turn2.push(text_message(MessageRole::User, "Now run it again."));
+        assert_eq!(
+            router.route_through_first_user(&turn1),
+            router.route_through_first_user(&turn2)
+        );
+        // The legacy keys differ between those turns (the turn-2 host switch this flag removes).
+        assert_ne!(router.route(&turn1), router.route_conversation(&turn2));
+    }
+
+    #[test]
+    fn through_first_user_key_separates_conversations_with_a_shared_system_prompt() {
+        let router = PrefixRouter::with_through_first_user(true);
+        let a = vec![
+            text_message(MessageRole::System, "You are a coding agent."),
+            text_message(MessageRole::User, "Task A"),
+        ];
+        let b = vec![
+            text_message(MessageRole::System, "You are a coding agent."),
+            text_message(MessageRole::User, "Task B"),
+        ];
+        assert_ne!(
+            router.route_through_first_user(&a),
+            router.route_through_first_user(&b)
+        );
+        // No user message: key the first message only; empty input keys to 0.
+        let system_only = vec![text_message(MessageRole::System, "You are a coding agent.")];
+        assert_eq!(
+            router.route_through_first_user(&system_only),
+            router.route_through_first_user(&system_only[..1])
+        );
+        assert_eq!(router.route_through_first_user(&[]), 0);
+    }
+
+    #[test]
+    fn through_first_user_is_off_by_default() {
+        assert!(!PrefixRouter::default().through_first_user());
+        assert!(!PrefixRouter::with_through_first_user(false).through_first_user());
     }
 
     #[test]

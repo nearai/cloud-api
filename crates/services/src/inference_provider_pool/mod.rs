@@ -1008,6 +1008,9 @@ pub struct InferenceProviderPool {
     /// `placement_settings::PlacementSettingsService`; the defaults until it
     /// loads a stored setting, and for good when placement is off.
     placement_tuning: Arc<arc_swap::ArcSwap<placement::Tuning>>,
+    /// Attested third-party sources an admin has switched off (admin setting
+    /// `attested_3p`). Chat routing and attestation reports skip them.
+    attested_3p_disabled: Arc<arc_swap::ArcSwap<inference_providers::DisabledSources>>,
     /// Providers explicitly registered as fallbacks, keyed by model id. This
     /// role is configuration metadata rather than an inference from whichever
     /// providers happen to be live, so it survives primary discovery failures
@@ -1383,8 +1386,18 @@ impl InferenceProviderPool {
             placement_tuning: Arc::new(arc_swap::ArcSwap::from_pointee(
                 placement::Tuning::default(),
             )),
+            attested_3p_disabled: Arc::new(arc_swap::ArcSwap::from_pointee(
+                inference_providers::DisabledSources::default(),
+            )),
             fallback_providers: Arc::new(std::sync::RwLock::new(HashMap::new())),
         }
+    }
+
+    /// The handle to the disabled attested third-party sources (see the field).
+    pub fn attested_3p_disabled(
+        &self,
+    ) -> Arc<arc_swap::ArcSwap<inference_providers::DisabledSources>> {
+        self.attested_3p_disabled.clone()
     }
 
     /// The handle to the live placement tuning (see the field).
@@ -2807,6 +2820,16 @@ impl InferenceProviderPool {
             providers
         };
 
+        let disabled = **self.attested_3p_disabled.load();
+        let providers: Vec<_> = if disabled == inference_providers::DisabledSources::default() {
+            providers
+        } else {
+            providers
+                .into_iter()
+                .filter(|p| !disabled.contains(p.provider_source()))
+                .collect()
+        };
+
         if providers.is_empty() {
             // The model exists, but its only eligible providers were excluded by
             // request policy. Preserve that distinction from an unknown model.
@@ -4209,6 +4232,16 @@ impl InferenceProviderPool {
             .get_providers_for_model(&model)
             .await
             .ok_or_else(|| AttestationError::ProviderNotFound(model.clone()))?;
+
+        let disabled = **self.attested_3p_disabled.load();
+        let all_providers: Vec<_> = if disabled == inference_providers::DisabledSources::default() {
+            all_providers
+        } else {
+            all_providers
+                .into_iter()
+                .filter(|p| !disabled.contains(p.provider_source()))
+                .collect()
+        };
 
         // Apply provider filter when requested.
         let providers: Vec<_> = match provider_filter {
@@ -8604,6 +8637,55 @@ mod tests {
             vec![ProviderTier::Near, ProviderTier::Attested3p],
             "verifiable model: NEAR primary, Chutes fallback, NON-attested dropped entirely"
         );
+    }
+
+    #[tokio::test]
+    async fn disabled_source_is_excluded_from_chat_and_attestation() {
+        use inference_providers::mock::MockProvider;
+        use inference_providers::{DisabledSources, ProviderFilter, ProviderSource, ProviderTier};
+
+        let pool = InferenceProviderPool::new(None, ExternalProvidersConfig::default());
+        let model = "m-ks".to_string();
+        let near: Arc<InferenceProviderTrait> =
+            Arc::new(MockProvider::new().with_tier(ProviderTier::Near));
+        let chutes: Arc<InferenceProviderTrait> = Arc::new(
+            MockProvider::new()
+                .with_tier(ProviderTier::Attested3p)
+                .with_provider_source(ProviderSource::Chutes),
+        );
+        pool.register_pinned_secondary_provider(model.clone(), near.clone(), None)
+            .await;
+        pool.register_pinned_secondary_provider(model.clone(), chutes.clone(), None)
+            .await;
+
+        let before = pool
+            .get_providers_with_fallback(&model, None, &ChatRoutingHints::default())
+            .await
+            .unwrap();
+        assert!(before.iter().any(|p| Arc::ptr_eq(p, &chutes)));
+
+        let mut d = DisabledSources::default();
+        d.insert(ProviderSource::Chutes);
+        pool.attested_3p_disabled().store(Arc::new(d));
+
+        let order = pool
+            .get_providers_with_fallback(&model, None, &ChatRoutingHints::default())
+            .await
+            .unwrap();
+        assert!(!order.is_empty());
+        assert!(order.iter().all(|p| !Arc::ptr_eq(p, &chutes)));
+        let err = pool
+            .get_attestation_report(
+                model.clone(),
+                None,
+                None,
+                None,
+                false,
+                Some(ProviderFilter::Source(ProviderSource::Chutes)),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, AttestationError::ProviderNotFound(_)));
     }
 
     /// A Chutes-only model (NEAR does not serve it) has the single attested

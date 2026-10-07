@@ -596,6 +596,7 @@ pub async fn init_domain_services_with_pool(
             database::repositories::PostgresAdminSettingsRepository::new(database.pool().clone()),
         ),
         inference_provider_pool.placement_tuning(),
+        inference_provider_pool.attested_3p_disabled(),
     ));
     admin_settings_service.clone().start().await;
 

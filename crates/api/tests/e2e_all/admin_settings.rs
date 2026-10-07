@@ -188,3 +188,47 @@ async fn read_only_token_can_get_but_not_patch() {
 
     reset(&server).await;
 }
+
+#[tokio::test]
+async fn attested_3p_kill_switch_round_trips_and_validates() {
+    let server = setup_test_server().await;
+    let token = get_session_id();
+    let path = "/v1/admin/settings/attested_3p";
+
+    let response = patch_as(
+        &server,
+        &token,
+        path,
+        json!({"disabled_sources": ["chutes"]}),
+    )
+    .await;
+    assert_eq!(response.status_code(), StatusCode::OK);
+    let got = get_as(&server, &token, path).await;
+    assert_eq!(got.status_code(), StatusCode::OK);
+    assert_eq!(
+        got.json::<Value>()["value"],
+        json!({"disabled_sources": ["chutes"]})
+    );
+
+    for body in [
+        json!({"disabled_sources": ["vllm"]}),
+        json!({"disabled_sources": ["nope"]}),
+        json!({"other": 1}),
+    ] {
+        let response = patch_as(&server, &token, path, body.clone()).await;
+        assert_eq!(response.status_code(), StatusCode::BAD_REQUEST, "{body}");
+    }
+    let got = get_as(&server, &token, path).await;
+    assert_eq!(
+        got.json::<Value>()["value"],
+        json!({"disabled_sources": ["chutes"]})
+    );
+
+    let response = patch_as(&server, &token, path, json!({"disabled_sources": null})).await;
+    assert_eq!(response.status_code(), StatusCode::OK);
+    let got = get_as(&server, &token, path).await;
+    assert_eq!(
+        got.json::<Value>()["value"],
+        json!({"disabled_sources": []})
+    );
+}

@@ -175,6 +175,38 @@ impl ProviderSource {
             ProviderSource::Tinfoil => "tinfoil",
         }
     }
+
+    /// Every source, in discriminant order (`DisabledSources` bit order).
+    pub const ALL: [ProviderSource; 4] = [Self::Vllm, Self::External, Self::Chutes, Self::Tinfoil];
+
+    pub fn parse(s: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|v| v.as_str() == s)
+    }
+}
+
+/// A set of provider sources, one bit per [`ProviderSource`]. `Copy` so it
+/// can live in the admin settings snapshot.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct DisabledSources(u8);
+
+impl DisabledSources {
+    const fn bit(s: ProviderSource) -> u8 {
+        1 << (s as u8)
+    }
+
+    pub const fn contains(self, s: ProviderSource) -> bool {
+        self.0 & Self::bit(s) != 0
+    }
+
+    pub fn insert(&mut self, s: ProviderSource) {
+        self.0 |= Self::bit(s)
+    }
+
+    pub fn iter(self) -> impl Iterator<Item = ProviderSource> {
+        ProviderSource::ALL
+            .into_iter()
+            .filter(move |s| self.contains(*s))
+    }
 }
 
 /// Who served a request: the trust tier plus the concrete source. Drives the

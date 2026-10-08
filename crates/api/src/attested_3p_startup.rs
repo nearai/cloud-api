@@ -273,7 +273,8 @@ pub(crate) enum TinfoilEntrySkip {
     ExceedsPublished { ctx: u32, published: u32 },
 }
 
-/// Validate an entry's `@ctx` against the router's published window.
+/// The one `@ctx` validator for a `TINFOIL_MODELS` entry: `@ctx` is required,
+/// and must not exceed the router's published window when that is known.
 pub(crate) fn tinfoil_entry_ctx(
     entry: &AttestedThirdPartyModelEntry,
     published: Option<u32>,
@@ -370,18 +371,21 @@ pub async fn register_tinfoil_models(
 ) {
     let mut registered: Vec<(String, String)> = Vec::new();
     for entry in &cfg.tinfoil_models {
-        // @ctx is checked first so a bad entry costs no network call.
-        if entry.max_context_tokens.is_none() {
-            tracing::error!(
-                canonical = %entry.canonical_id,
-                "TINFOIL_MODELS entry lacks @ctx; not registered"
-            );
-            continue;
-        }
-        let published = session.published_context_window(&entry.upstream_id).await;
-        let ctx = match tinfoil_entry_ctx(entry, published) {
+        // The single @ctx validator. Unverified at boot (no published window
+        // yet) is not a reason to skip: the provider re-checks the declaration
+        // after every verification and fails closed if it is too large.
+        let ctx = match tinfoil_entry_ctx(
+            entry,
+            session.published_context_window(&entry.upstream_id),
+        ) {
             Ok(ctx) => ctx,
-            Err(TinfoilEntrySkip::MissingCtx) => continue,
+            Err(TinfoilEntrySkip::MissingCtx) => {
+                tracing::error!(
+                    canonical = %entry.canonical_id,
+                    "TINFOIL_MODELS entry lacks @ctx; not registered"
+                );
+                continue;
+            }
             Err(TinfoilEntrySkip::ExceedsPublished { ctx, published }) => {
                 tracing::error!(
                     canonical = %entry.canonical_id,
@@ -407,7 +411,8 @@ pub async fn register_tinfoil_models(
             pcfg,
             entry.upstream_id.clone(),
             entry.canonical_id.clone(),
-        );
+        )
+        .with_declared_ctx(ctx);
         pool.register_pinned_provider(
             entry.canonical_id.clone(),
             Arc::new(provider),
@@ -424,7 +429,7 @@ pub async fn register_tinfoil_models(
         registered.push((entry.canonical_id.clone(), entry.upstream_id.clone()));
     }
     if !registered.is_empty() {
-        spawn_tinfoil_metrics(session.clone(), registered, metrics);
+        let _ = spawn_tinfoil_metrics(session.clone(), registered, metrics);
     }
 }
 
@@ -509,7 +514,7 @@ fn spawn_tinfoil_metrics(
     session: Arc<TinfoilRouterSession>,
     models: Vec<(String, String)>,
     metrics: Arc<dyn MetricsServiceTrait>,
-) {
+) -> tokio::task::JoinHandle<()> {
     let weak = Arc::downgrade(&session);
     drop(session);
     tokio::spawn(async move {
@@ -522,7 +527,7 @@ fn spawn_tinfoil_metrics(
             let Some(session) = weak.upgrade() else { break };
             emit_tinfoil_metrics(&session, &models, metrics.as_ref(), &mut last_auth);
         }
-    });
+    })
 }
 
 /// Ensure an attested model has a catalog row in the `models` table.
@@ -800,22 +805,6 @@ mod tests {
     }
 
     #[test]
-    fn compiled_tinfoil_pins_currently_fail_closed() {
-        // Until the first pins PR merges the compiled router list is empty, so
-        // the real startup path must not register Tinfoil.
-        let r = tinfoil_preflight(
-            &tinfoil_cfg(Some("k"), "m-tf=gpt-oss-120b@131072"),
-            services::attestation::tinfoil::vetted_tinfoil_pins(),
-        );
-        if services::attestation::tinfoil::vetted_tinfoil_pins()
-            .map(|p| p.router.is_empty())
-            .unwrap_or(true)
-        {
-            assert_eq!(r.unwrap_err(), TinfoilSkip::PinsUnusable);
-        }
-    }
-
-    #[test]
     fn tinfoil_entry_ctx_rules() {
         let e = |raw: &str| {
             parse_attested_3p_models("TINFOIL_MODELS", raw)
@@ -949,7 +938,15 @@ mod tests {
         let mut last = 0u64;
         emit_tinfoil_samples(None, &[], 2, &m, &mut last);
         assert_eq!(last, 2);
-        let first = m.get_metrics().len();
+        assert_eq!(
+            counts(&m, consts::METRIC_TINFOIL_VERIFICATION),
+            vec![vec!["result:ok".to_string(), "reason:none".to_string()]]
+        );
+        assert_eq!(
+            m.get_metrics().len(),
+            2,
+            "one verification + one auth delta"
+        );
         // Same total: nothing for auth failures. Higher total: only the delta.
         emit_tinfoil_samples(None, &[], 2, &m, &mut last);
         emit_tinfoil_samples(None, &[], 5, &m, &mut last);
@@ -963,7 +960,60 @@ mod tests {
             })
             .collect();
         assert_eq!(auth, vec![2, 3]);
-        assert!(first >= 1);
+        // Three polls: three verification samples, two auth deltas, nothing else.
+        assert_eq!(all.len(), 5);
+    }
+
+    fn unverified_session() -> Arc<TinfoilRouterSession> {
+        let verifier = Arc::new(services::attestation::tinfoil::TinfoilPolicyVerifier::new(
+            TinfoilPins::default(),
+        ));
+        TinfoilRouterSession::new(tinfoil_provider::Config::new("k".to_string(), 30), verifier)
+            .unwrap()
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn metrics_task_emits_every_proxy_reread_and_exits_when_the_session_drops() {
+        use services::metrics::capturing::CapturingMetricsService;
+        let m = Arc::new(CapturingMetricsService::new());
+        let session = unverified_session();
+        let handle = spawn_tinfoil_metrics(
+            session.clone(),
+            vec![("m-tf".to_string(), "gpt-oss-120b".to_string())],
+            m.clone(),
+        );
+        let per_poll = |m: &CapturingMetricsService| {
+            (
+                counts(m, consts::METRIC_TINFOIL_VERIFICATION).len(),
+                counts(m, consts::METRIC_TINFOIL_AVAILABLE).len(),
+            )
+        };
+        // The first poll is immediate.
+        for _ in 0..5 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(per_poll(&m), (1, 1));
+        // Nothing more until PROXY_REREAD elapses.
+        tokio::time::advance(tinfoil_provider::PROXY_REREAD / 2).await;
+        for _ in 0..5 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(per_poll(&m), (1, 1));
+        tokio::time::advance(tinfoil_provider::PROXY_REREAD).await;
+        for _ in 0..5 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(per_poll(&m), (2, 2));
+        assert!(!handle.is_finished());
+
+        // Last strong reference gone: the next tick ends the task, emitting nothing.
+        drop(session);
+        tokio::time::advance(tinfoil_provider::PROXY_REREAD).await;
+        tokio::time::timeout(std::time::Duration::from_secs(1), handle)
+            .await
+            .expect("metrics task must exit once the session is dropped")
+            .unwrap();
+        assert_eq!(per_poll(&m), (2, 2));
     }
 
     #[test]

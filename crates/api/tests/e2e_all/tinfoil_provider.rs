@@ -326,37 +326,56 @@ fn metrics() -> Arc<dyn services::metrics::MetricsServiceTrait> {
     Arc::new(services::metrics::MockMetricsService)
 }
 
-/// A first verification that did not succeed still registers the provider; it
-/// answers 503-class errors until a later re-verify works. The session here is
-/// never verified (the same state a failed `verify_now` leaves behind).
+/// The production registration path with a first verification that fails (the
+/// ATC is unreachable): the provider is still registered, and every request is
+/// answered with the Tinfoil-unavailable 503 until a re-verify works (the HTTP
+/// layer maps a pool-wide retryable 503 to its 429 overload shape).
 #[tokio::test]
-async fn unverified_session_still_registers_and_serves_nothing() {
+async fn failed_first_verification_still_registers_and_answers_503() {
     let (server, pool, _mock, database) = setup_test_server_with_pool().await;
     let model = format!("nearai/test-tinfoil-reg-{}", uuid::Uuid::new_v4());
     tinfoil_catalog_row(&server, &model).await;
     let cfg = tinfoil_cfg(&model, "@131072");
     let repo = database::repositories::ModelRepository::new(database.pool().clone());
-    let pcfg = inference_providers::attested::tinfoil::Config::new("tk_test_key".into(), 5);
-    let verifier = Arc::new(services::attestation::tinfoil::TinfoilPolicyVerifier::new(
-        router_pins(),
-    ));
-    let session =
-        inference_providers::attested::tinfoil::TinfoilRouterSession::new(pcfg.clone(), verifier)
-            .unwrap();
-    api::attested_3p_startup::register_tinfoil_models(
+    api::attested_3p_startup::register_tinfoil_with(
         &pool,
         &repo,
         &cfg,
-        &session,
-        &pcfg,
+        Ok(router_pins()),
+        |mut pcfg, verifier| {
+            // Nothing listens on port 1: the first verify fails immediately.
+            pcfg.atc_url = "https://127.0.0.1:1/attestation".to_string();
+            inference_providers::attested::tinfoil::TinfoilRouterSession::new(pcfg, verifier)
+        },
         metrics(),
     )
     .await;
     assert!(
         pool.has_provider(&model).await,
-        "registered despite no verify"
+        "registered despite the failed first verification"
     );
 
+    // The pool sees the provider's own 503 and message ...
+    let params: inference_providers::ChatCompletionParams = serde_json::from_value(
+        json!({"model": model, "messages": [{"role":"user","content":"Hello"}], "max_tokens": 8}),
+    )
+    .unwrap();
+    match pool.chat_completion(params, "hash".to_string()).await {
+        Err(inference_providers::CompletionError::HttpError {
+            status_code,
+            message,
+            ..
+        }) => {
+            assert_eq!(status_code, 503);
+            assert!(
+                message.contains("Tinfoil temporarily unavailable"),
+                "{message}"
+            );
+        }
+        other => panic!("expected the Tinfoil 503, got {:?}", other.map(|_| ())),
+    }
+
+    // ... and the HTTP API surfaces the gateway's retryable overload shape.
     let org = setup_org_with_credits(&server, 10_000_000_000i64).await;
     let api_key = get_api_key_for_org(&server, org.id).await;
     let r = server
@@ -364,12 +383,9 @@ async fn unverified_session_still_registers_and_serves_nothing() {
         .add_header("Authorization", format!("Bearer {api_key}"))
         .json(&json!({"model": model, "messages": [{"role":"user","content":"Hello"}], "max_tokens": 8}))
         .await;
-    assert!(
-        matches!(r.status_code().as_u16(), 429 | 503),
-        "unverified router must not serve: {} {}",
-        r.status_code(),
-        r.text()
-    );
+    assert_eq!(r.status_code().as_u16(), 429, "{}", r.text());
+    let body: Value = r.json();
+    assert_eq!(body["error"]["type"], "service_overloaded", "{body}");
 }
 
 #[tokio::test]

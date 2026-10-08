@@ -4450,7 +4450,9 @@ pub async fn get_admin_setting(
 /// Partial update: fields in the body are merged into the stored value, `null`
 /// resets a field to its default. The result is validated as a whole; an invalid
 /// value is rejected with 400 and nothing is stored. Takes effect immediately on the
-/// instance that handles it, and on the others within 10 minutes.
+/// instance that handles it, and on the others within 10 minutes (there is no
+/// cross-instance push). For a faster stop of an attested third party use
+/// per-org `fallback_disabled` or redeploy.
 #[utoipa::path(
     patch,
     path = "/v1/admin/settings/{key}",

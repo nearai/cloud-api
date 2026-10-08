@@ -667,8 +667,8 @@ async fn spki_mismatch_reverifies_once_then_503() {
     );
     assert_eq!(
         e.verifier.router_calls.load(Ordering::SeqCst),
-        2,
-        "exactly one re-verify"
+        1 + super::session::ATC_ATTEMPTS,
+        "exactly one re-verify (each tries a bounded number of fresh bundles)"
     );
     assert!(
         e.server.last_chat.lock().unwrap().is_none(),
@@ -688,7 +688,10 @@ async fn spki_mismatch_reverifies_once_then_503() {
         503,
     );
     assert!(msg.contains("not_verified"));
-    assert_eq!(e.verifier.router_calls.load(Ordering::SeqCst), 2);
+    assert_eq!(
+        e.verifier.router_calls.load(Ordering::SeqCst),
+        1 + super::session::ATC_ATTEMPTS
+    );
 }
 
 #[tokio::test]

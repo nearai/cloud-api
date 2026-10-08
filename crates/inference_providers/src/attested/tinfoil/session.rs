@@ -22,6 +22,9 @@ use super::verifier_port::{
 };
 use crate::spki_verifier::{FingerprintState, SharedTlsRoots};
 
+/// Fresh-bundle attempts per verification (see `do_verify`).
+pub(super) const ATC_ATTEMPTS: usize = 6;
+
 /// Timeout for evidence and model-document fetches.
 const FETCH_TIMEOUT: Duration = Duration::from_secs(15);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
@@ -63,6 +66,10 @@ pub struct TinfoilRouterSession {
     /// Count of upstream 401/402/403 responses. Exposed for the metric
     /// `cloud_api.tinfoil.upstream_auth_failure`, which this crate cannot emit.
     auth_failures: AtomicU64,
+    /// Outcome of the last completed verification attempt (`None` = it passed
+    /// or none has run). Polled by the API layer for
+    /// `cloud_api.tinfoil.verification`, which this crate cannot emit.
+    last_error: std::sync::Mutex<Option<TinfoilVerifyError>>,
 }
 
 fn build_pinned_client(
@@ -112,6 +119,7 @@ impl TinfoilRouterSession {
             last_mismatch_reverify: std::sync::Mutex::new(None),
             refresh_started: AtomicBool::new(false),
             auth_failures: AtomicU64::new(0),
+            last_error: std::sync::Mutex::new(None),
         }))
     }
 
@@ -141,6 +149,14 @@ impl TinfoilRouterSession {
     /// Number of upstream 401/402/403 responses seen (key or billing problems).
     pub fn upstream_auth_failures(&self) -> u64 {
         self.auth_failures.load(Ordering::Relaxed)
+    }
+
+    /// Why the last verification attempt failed, or `None` if it passed.
+    pub fn last_verify_error(&self) -> Option<TinfoilVerifyError> {
+        self.last_error
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
     }
 
     pub(super) fn record_auth_failure(&self) {
@@ -212,6 +228,7 @@ impl TinfoilRouterSession {
     async fn verify_locked(&self) -> Result<(), TinfoilVerifyError> {
         let result = self.do_verify().await;
         self.verify_gen.fetch_add(1, Ordering::SeqCst);
+        *self.last_error.lock().unwrap_or_else(|e| e.into_inner()) = result.as_ref().err().cloned();
         if let Err(e) = &result {
             self.fail_closed();
             tracing::warn!(reason = e.reason(), "Tinfoil verification failed; closed");
@@ -219,7 +236,23 @@ impl TinfoilRouterSession {
         result
     }
 
+    /// The ATC serves bundles for more than one router host (observed live:
+    /// `inference.tinfoil.sh` and `router-0.tinfoil.sh`, chosen per request).
+    /// Only the first carries the key `inference.tinfoil.sh` presents, so a
+    /// pin taken from the other makes the proxy fetch fail. That failure is
+    /// retried with a fresh bundle; it never relaxes any check.
     async fn do_verify(&self) -> Result<(), TinfoilVerifyError> {
+        let mut last = TinfoilVerifyError::Fetch;
+        for _ in 0..ATC_ATTEMPTS {
+            match self.verify_once().await {
+                Err(TinfoilVerifyError::Fetch) => last = TinfoilVerifyError::Fetch,
+                other => return other,
+            }
+        }
+        Err(last)
+    }
+
+    async fn verify_once(&self) -> Result<(), TinfoilVerifyError> {
         let bundle: AtcBundle = Self::fetch_json(&self.atc_client, &self.atc_url).await?;
         let router = self.verifier.verify_router(&bundle)?;
         let fp = hex::encode(router.spki_sha256);

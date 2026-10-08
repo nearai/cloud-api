@@ -3,10 +3,13 @@
 //! external/discovery load (fail-closed id reservation), and
 //! `register_attested_3p` runs AFTER the refresh task is started.
 
-use config::ExternalProvidersConfig;
+use config::{AttestedThirdPartyModelEntry, ExternalProvidersConfig};
 use database::repositories::ModelRepository;
+use inference_providers::attested::tinfoil::{self as tinfoil_provider, TinfoilRouterSession};
 use inference_providers::ProviderSource;
+use services::attestation::tinfoil_pins::TinfoilPins;
 use services::inference_provider_pool::{InferenceProviderPool, ProviderPoolRole};
+use services::metrics::{consts, MetricsServiceTrait};
 use std::sync::Arc;
 
 /// Standard OpenAI sampling knobs Chutes (sglang) honors, expressed in
@@ -108,9 +111,10 @@ pub(crate) async fn register_attested_3p(
     pool: &Arc<InferenceProviderPool>,
     models_repo: &ModelRepository,
     cfg: &ExternalProvidersConfig,
+    metrics: Arc<dyn MetricsServiceTrait>,
 ) {
     let chutes_registered = register_chutes(pool, models_repo, cfg).await;
-    register_tinfoil(cfg);
+    register_tinfoil(pool, models_repo, cfg, metrics).await;
     tracing::debug!(chutes_registered, "Attested 3P registration finished");
 }
 
@@ -234,15 +238,235 @@ async fn register_chutes(
     registered
 }
 
-/// Tinfoil provider registration is added in a follow-up PR; ids stay
-/// reserved (fail-closed).
-fn register_tinfoil(cfg: &ExternalProvidersConfig) {
-    if !cfg.tinfoil_models.is_empty() {
+/// Why Tinfoil registration is skipped before any network work (fail-closed:
+/// the canonical ids stay reserved with no provider, so requests 404/503).
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum TinfoilSkip {
+    NoModels,
+    NoKey,
+    PinsUnusable,
+}
+
+/// Decide whether Tinfoil can be registered at all. Pure so every skip branch
+/// is unit-testable without a network.
+pub(crate) fn tinfoil_preflight(
+    cfg: &ExternalProvidersConfig,
+    pins: Result<TinfoilPins, String>,
+) -> Result<(String, TinfoilPins), TinfoilSkip> {
+    if cfg.tinfoil_models.is_empty() {
+        return Err(TinfoilSkip::NoModels);
+    }
+    let Some(key) = cfg.tinfoil_api_key.clone() else {
+        return Err(TinfoilSkip::NoKey);
+    };
+    match pins {
+        Ok(p) if !p.router.is_empty() => Ok((key, p)),
+        _ => Err(TinfoilSkip::PinsUnusable),
+    }
+}
+
+/// Why one `TINFOIL_MODELS` entry is not registered.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum TinfoilEntrySkip {
+    MissingCtx,
+    ExceedsPublished { ctx: u32, published: u32 },
+}
+
+/// Validate an entry's `@ctx` against the router's published window.
+pub(crate) fn tinfoil_entry_ctx(
+    entry: &AttestedThirdPartyModelEntry,
+    published: Option<u32>,
+) -> Result<u32, TinfoilEntrySkip> {
+    let ctx = entry
+        .max_context_tokens
+        .ok_or(TinfoilEntrySkip::MissingCtx)?;
+    match published {
+        Some(w) if ctx > w => Err(TinfoilEntrySkip::ExceedsPublished { ctx, published: w }),
+        _ => Ok(ctx),
+    }
+}
+
+/// Tinfoil attested backup. Fail-closed at every step: no key, no usable pins,
+/// a missing/oversized `@ctx` or a missing catalog row means that provider is
+/// not registered (its id stays reserved). A failed first verification still
+/// registers: providers answer 503 until a later re-verify succeeds.
+async fn register_tinfoil(
+    pool: &Arc<InferenceProviderPool>,
+    models_repo: &ModelRepository,
+    cfg: &ExternalProvidersConfig,
+    metrics: Arc<dyn MetricsServiceTrait>,
+) {
+    let (api_key, pins) =
+        match tinfoil_preflight(cfg, services::attestation::tinfoil::vetted_tinfoil_pins()) {
+            Ok(ok) => ok,
+            Err(TinfoilSkip::NoModels) => return,
+            Err(TinfoilSkip::NoKey) => {
+                tracing::warn!(
+                "TINFOIL_MODELS set but TINFOIL_API_KEY missing; ids stay reserved (fail-closed)"
+            );
+                return;
+            }
+            Err(TinfoilSkip::PinsUnusable) => {
+                tracing::warn!("Tinfoil pins empty or invalid; not registering (fail-closed)");
+                return;
+            }
+        };
+    let verifier = Arc::new(services::attestation::tinfoil::TinfoilPolicyVerifier::new(
+        pins,
+    ));
+    let pcfg = tinfoil_provider::Config::new(api_key, cfg.timeout_seconds);
+    let session = match TinfoilRouterSession::new(pcfg.clone(), verifier) {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::warn!(error = %e, "Failed to build Tinfoil router session; not registering");
+            return;
+        }
+    };
+    session.spawn_refresh();
+    if let Err(e) = session.verify_now().await {
         tracing::warn!(
-            count = cfg.tinfoil_models.len(),
-            "TINFOIL_MODELS is set but this build has no Tinfoil provider; ids stay reserved (fail-closed)"
+            reason = e.reason(),
+            "Initial Tinfoil verification failed; registering anyway (503 until a re-verify succeeds)"
         );
     }
+
+    let mut registered: Vec<(String, String)> = Vec::new();
+    for entry in &cfg.tinfoil_models {
+        let published = session.published_context_window(&entry.upstream_id).await;
+        let ctx = match tinfoil_entry_ctx(entry, published) {
+            Ok(ctx) => ctx,
+            Err(TinfoilEntrySkip::MissingCtx) => {
+                tracing::error!(
+                    canonical = %entry.canonical_id,
+                    "TINFOIL_MODELS entry lacks @ctx; not registered"
+                );
+                continue;
+            }
+            Err(TinfoilEntrySkip::ExceedsPublished { ctx, published }) => {
+                tracing::error!(
+                    canonical = %entry.canonical_id,
+                    ctx,
+                    published,
+                    "TINFOIL_MODELS @ctx exceeds the router's published context window; not registered"
+                );
+                continue;
+            }
+        };
+        let Some(role) = ensure_attested_3p_catalog_row(
+            models_repo,
+            ProviderSource::Tinfoil,
+            &entry.canonical_id,
+            None,
+        )
+        .await
+        else {
+            continue;
+        };
+        let provider = tinfoil_provider::Provider::new(
+            session.clone(),
+            &pcfg,
+            entry.upstream_id.clone(),
+            entry.canonical_id.clone(),
+        );
+        pool.register_pinned_provider(
+            entry.canonical_id.clone(),
+            Arc::new(provider),
+            Some(ctx),
+            role,
+        )
+        .await;
+        tracing::info!(
+            canonical = %entry.canonical_id,
+            slug = %entry.upstream_id,
+            role = ?role,
+            "Registered Tinfoil attested provider"
+        );
+        registered.push((entry.canonical_id.clone(), entry.upstream_id.clone()));
+    }
+    if !registered.is_empty() {
+        spawn_tinfoil_metrics(session, registered, metrics);
+    }
+}
+
+/// One metrics sample set from the session's current state. `last_auth` holds
+/// the auth-failure count already reported so only the delta is emitted.
+///
+/// `inference_providers` cannot depend on the metrics crate, so the API layer
+/// polls the session (same cadence as the router's 60 s proxy re-read) instead
+/// of the provider pushing. `available` is a 0/1 histogram sample: the metrics
+/// service has no gauge instrument.
+pub(crate) fn emit_tinfoil_metrics(
+    session: &TinfoilRouterSession,
+    models: &[(String, String)],
+    metrics: &dyn MetricsServiceTrait,
+    last_auth: &mut u64,
+) {
+    let count = |reason: &str| {
+        let result = if reason == "none" { "ok" } else { "failed" };
+        metrics.record_count(
+            consts::METRIC_TINFOIL_VERIFICATION,
+            1,
+            &[&format!("result:{result}"), &format!("reason:{reason}")],
+        );
+    };
+    use inference_providers::attested::tinfoil::verifier_port::TinfoilVerifyError;
+    let statuses: Vec<_> = models
+        .iter()
+        .map(|(canonical, slug)| (canonical, session.model_status(slug)))
+        .collect();
+    // `model_status` reports `Fetch` for every slug while the router is not
+    // verified, so that also covers "never verified yet" (no error recorded).
+    let router_down = statuses
+        .iter()
+        .any(|(_, s)| matches!(s, Err(TinfoilVerifyError::Fetch)));
+    match session.last_verify_error() {
+        Some(e) => count(e.reason()),
+        None if router_down => count(TinfoilVerifyError::Fetch.reason()),
+        None => count("none"),
+    }
+    for (canonical, status) in &statuses {
+        // A closed model on a healthy router is a model-pin problem
+        // (`unknown_model_measurement`) with its own reason.
+        if let Err(e) = status {
+            if !router_down {
+                count(e.reason());
+            }
+        }
+        metrics.record_histogram(
+            consts::METRIC_TINFOIL_AVAILABLE,
+            if status.is_ok() { 1.0 } else { 0.0 },
+            &[&format!("{}:{canonical}", consts::TAG_MODEL)],
+        );
+    }
+    let total = session.upstream_auth_failures();
+    if total > *last_auth {
+        metrics.record_count(
+            consts::METRIC_TINFOIL_UPSTREAM_AUTH_FAILURE,
+            (total - *last_auth) as i64,
+            &[],
+        );
+        *last_auth = total;
+    }
+}
+
+fn spawn_tinfoil_metrics(
+    session: Arc<TinfoilRouterSession>,
+    models: Vec<(String, String)>,
+    metrics: Arc<dyn MetricsServiceTrait>,
+) {
+    let weak = Arc::downgrade(&session);
+    drop(session);
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(tinfoil_provider::PROXY_REREAD);
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let mut last_auth = 0u64;
+        loop {
+            tick.tick().await;
+            // Providers hold the only other strong references; stop once gone.
+            let Some(session) = weak.upgrade() else { break };
+            emit_tinfoil_metrics(&session, &models, metrics.as_ref(), &mut last_auth);
+        }
+    });
 }
 
 /// Ensure an attested model has a catalog row in the `models` table.
@@ -471,6 +695,131 @@ mod tests {
             )])
             .await;
         assert!(pool.has_provider("m-ch").await);
+    }
+
+    fn tinfoil_cfg(key: Option<&str>, models: &str) -> ExternalProvidersConfig {
+        ExternalProvidersConfig {
+            tinfoil_api_key: key.map(String::from),
+            tinfoil_models: parse_attested_3p_models("TINFOIL_MODELS", models),
+            ..Default::default()
+        }
+    }
+
+    fn pins_with_router() -> TinfoilPins {
+        TinfoilPins {
+            router: vec![services::attestation::tinfoil_pins::RouterPin {
+                measurement: "00".repeat(48),
+                repo: "tinfoilsh/confidential-model-router".to_string(),
+                tag: "v0.0.0-test".to_string(),
+            }],
+            models: Default::default(),
+        }
+    }
+
+    #[test]
+    fn tinfoil_preflight_skips_fail_closed() {
+        let models = "m-tf=gpt-oss-120b@131072";
+        assert_eq!(
+            tinfoil_preflight(&tinfoil_cfg(Some("k"), ""), Ok(pins_with_router())).unwrap_err(),
+            TinfoilSkip::NoModels
+        );
+        assert_eq!(
+            tinfoil_preflight(&tinfoil_cfg(None, models), Ok(pins_with_router())).unwrap_err(),
+            TinfoilSkip::NoKey
+        );
+        // Empty router pins (the compiled state on this branch) and a parse
+        // failure both refuse to register.
+        assert_eq!(
+            tinfoil_preflight(&tinfoil_cfg(Some("k"), models), Ok(TinfoilPins::default()))
+                .unwrap_err(),
+            TinfoilSkip::PinsUnusable
+        );
+        assert_eq!(
+            tinfoil_preflight(&tinfoil_cfg(Some("k"), models), Err("bad".into())).unwrap_err(),
+            TinfoilSkip::PinsUnusable
+        );
+        let (key, _) =
+            tinfoil_preflight(&tinfoil_cfg(Some("k"), models), Ok(pins_with_router())).unwrap();
+        assert_eq!(key, "k");
+    }
+
+    #[test]
+    fn compiled_tinfoil_pins_currently_fail_closed() {
+        // Until the first pins PR merges the compiled router list is empty, so
+        // the real startup path must not register Tinfoil.
+        let r = tinfoil_preflight(
+            &tinfoil_cfg(Some("k"), "m-tf=gpt-oss-120b@131072"),
+            services::attestation::tinfoil::vetted_tinfoil_pins(),
+        );
+        if services::attestation::tinfoil::vetted_tinfoil_pins()
+            .map(|p| p.router.is_empty())
+            .unwrap_or(true)
+        {
+            assert_eq!(r.unwrap_err(), TinfoilSkip::PinsUnusable);
+        }
+    }
+
+    #[test]
+    fn tinfoil_entry_ctx_rules() {
+        let e = |raw: &str| {
+            parse_attested_3p_models("TINFOIL_MODELS", raw)
+                .into_iter()
+                .next()
+                .unwrap()
+        };
+        assert_eq!(
+            tinfoil_entry_ctx(&e("m=slug"), Some(131072)).unwrap_err(),
+            TinfoilEntrySkip::MissingCtx
+        );
+        assert_eq!(
+            tinfoil_entry_ctx(&e("m=slug@200000"), Some(131072)).unwrap_err(),
+            TinfoilEntrySkip::ExceedsPublished {
+                ctx: 200000,
+                published: 131072
+            }
+        );
+        assert_eq!(
+            tinfoil_entry_ctx(&e("m=slug@131072"), Some(131072)),
+            Ok(131072)
+        );
+        // Unknown published window (fetch failed): the declared value stands.
+        assert_eq!(tinfoil_entry_ctx(&e("m=slug@200000"), None), Ok(200000));
+    }
+
+    #[test]
+    fn unverified_tinfoil_session_reports_closed_and_fetch_error() {
+        use services::metrics::capturing::{CapturingMetricsService, MetricValue};
+        let verifier = Arc::new(services::attestation::tinfoil::TinfoilPolicyVerifier::new(
+            TinfoilPins::default(),
+        ));
+        let session =
+            TinfoilRouterSession::new(tinfoil_provider::Config::new("k".to_string(), 30), verifier)
+                .unwrap();
+        let metrics = CapturingMetricsService::new();
+        let mut last_auth = 0u64;
+        let models = vec![("m-tf".to_string(), "gpt-oss-120b".to_string())];
+        emit_tinfoil_metrics(&session, &models, &metrics, &mut last_auth);
+        let got = metrics.get_metrics();
+        let avail = got
+            .iter()
+            .find(|m| m.name == consts::METRIC_TINFOIL_AVAILABLE)
+            .expect("availability sample");
+        assert!(matches!(avail.value, MetricValue::Histogram(v) if v == 0.0));
+        assert_eq!(avail.tags, vec!["model:m-tf".to_string()]);
+        let ver = got
+            .iter()
+            .find(|m| m.name == consts::METRIC_TINFOIL_VERIFICATION)
+            .expect("verification sample");
+        assert_eq!(
+            ver.tags,
+            vec![
+                "result:failed".to_string(),
+                "reason:fetch_error".to_string()
+            ]
+        );
+        assert!(!got
+            .iter()
+            .any(|m| m.name == consts::METRIC_TINFOIL_UPSTREAM_AUTH_FAILURE));
     }
 
     #[test]

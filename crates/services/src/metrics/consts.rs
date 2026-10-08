@@ -58,6 +58,17 @@ pub const METRIC_BACKEND_KEY_DIVERGENCE: &str = "cloud_api.backend.key_divergenc
 // (match|mismatch|unattested|missing).
 pub const METRIC_BACKEND_CHANNEL_BINDING: &str = "cloud_api.backend.channel_binding";
 
+// Tinfoil attested backup (polled by the API layer from the router session,
+// since `inference_providers` cannot depend on this crate).
+// `verification`: one per poll, tags `result` (ok|failed) and `reason`
+// (a `TinfoilVerifyError::reason()`, or `none`). `available`: per canonical
+// model, 1 = router verified and model pinned, 0 = fail-closed; recorded as a
+// 0/1 sample (the metrics service has no gauge instrument). `upstream_auth_failure`:
+// upstream 401/402/403 (key or billing problem); pages immediately.
+pub const METRIC_TINFOIL_VERIFICATION: &str = "cloud_api.tinfoil.verification";
+pub const METRIC_TINFOIL_AVAILABLE: &str = "cloud_api.tinfoil.available";
+pub const METRIC_TINFOIL_UPSTREAM_AUTH_FAILURE: &str = "cloud_api.tinfoil.upstream_auth_failure";
+
 // Error metrics
 pub const METRIC_REQUEST_ERRORS: &str = "cloud_api.request.errors";
 

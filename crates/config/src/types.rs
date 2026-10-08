@@ -2719,7 +2719,9 @@ mod tests {
         let out = format!("{cfg:?}");
         assert!(!out.contains("SECRET"), "key leaked in Debug: {out}");
         assert!(out.contains("<redacted>"));
-        assert!(format!("{:?}", ExternalProvidersConfig::default()).contains("tinfoil_api_key: None"));
+        assert!(
+            format!("{:?}", ExternalProvidersConfig::default()).contains("tinfoil_api_key: None")
+        );
     }
 
     #[test]

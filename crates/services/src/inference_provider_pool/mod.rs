@@ -1400,6 +1400,22 @@ impl InferenceProviderPool {
         self.attested_3p_disabled.clone()
     }
 
+    /// Drop providers whose source an admin has switched off (`attested_3p`
+    /// kill switch). No-op fast path when nothing is disabled.
+    fn drop_disabled_sources(
+        &self,
+        providers: Vec<Arc<InferenceProviderTrait>>,
+    ) -> Vec<Arc<InferenceProviderTrait>> {
+        let disabled = **self.attested_3p_disabled.load();
+        if disabled == inference_providers::DisabledSources::default() {
+            return providers;
+        }
+        providers
+            .into_iter()
+            .filter(|p| !disabled.contains(p.provider_source()))
+            .collect()
+    }
+
     /// The handle to the live placement tuning (see the field).
     pub fn placement_tuning(&self) -> Arc<arc_swap::ArcSwap<placement::Tuning>> {
         self.placement_tuning.clone()
@@ -2820,15 +2836,7 @@ impl InferenceProviderPool {
             providers
         };
 
-        let disabled = **self.attested_3p_disabled.load();
-        let providers: Vec<_> = if disabled == inference_providers::DisabledSources::default() {
-            providers
-        } else {
-            providers
-                .into_iter()
-                .filter(|p| !disabled.contains(p.provider_source()))
-                .collect()
-        };
+        let providers = self.drop_disabled_sources(providers);
 
         if providers.is_empty() {
             // The model exists, but its only eligible providers were excluded by
@@ -4233,15 +4241,7 @@ impl InferenceProviderPool {
             .await
             .ok_or_else(|| AttestationError::ProviderNotFound(model.clone()))?;
 
-        let disabled = **self.attested_3p_disabled.load();
-        let all_providers: Vec<_> = if disabled == inference_providers::DisabledSources::default() {
-            all_providers
-        } else {
-            all_providers
-                .into_iter()
-                .filter(|p| !disabled.contains(p.provider_source()))
-                .collect()
-        };
+        let all_providers = self.drop_disabled_sources(all_providers);
 
         // Apply provider filter when requested.
         let providers: Vec<_> = match provider_filter {

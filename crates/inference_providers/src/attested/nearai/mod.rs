@@ -166,7 +166,7 @@ pub mod placement_headers {
 ///   here just delays the user's error message when something is actually wrong.
 ///
 /// Both are tunable per-deployment via env vars (see `Config::new`).
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct Config {
     pub base_url: String,
     pub api_key: Option<String>,
@@ -174,6 +174,20 @@ pub struct Config {
     pub completion_timeout_seconds: i64,
     /// Total per-request timeout for control-plane operations and streaming TTFB.
     pub control_timeout_seconds: i64,
+}
+
+impl std::fmt::Debug for Config {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Config")
+            .field("base_url", &self.base_url)
+            .field("api_key", &self.api_key.as_ref().map(|_| "<redacted>"))
+            .field(
+                "completion_timeout_seconds",
+                &self.completion_timeout_seconds,
+            )
+            .field("control_timeout_seconds", &self.control_timeout_seconds)
+            .finish()
+    }
 }
 
 impl Config {

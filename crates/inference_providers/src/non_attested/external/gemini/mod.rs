@@ -397,10 +397,7 @@ impl ExternalBackend for GeminiBackend {
         Ok(ChatCompletionResponseWithBytes {
             response: openai_response,
             raw_bytes: serialized_bytes,
-            serving: crate::ServingProvider {
-                tier: crate::ProviderTier::NonAttested,
-                source: crate::ProviderSource::External,
-            },
+            serving: crate::ServingProvider::EXTERNAL,
         })
     }
 

@@ -21,6 +21,9 @@ pub fn map_upstream_status(status: u16) -> UpstreamDisposition {
         // Our key or billing: must not short-circuit past the other providers.
         401..=403 => UpstreamDisposition::Retryable503,
         429 => UpstreamDisposition::Passthrough429,
+        // Not the caller's fault: the router has no such route (404), timed out
+        // reading the request (408) or rejected an early-data replay (425).
+        404 | 408 | 425 => UpstreamDisposition::Retryable503,
         400..=499 => UpstreamDisposition::ReturnAs4xx(status),
         // 5xx, and anything unexpected (redirects are never followed).
         _ => UpstreamDisposition::Retryable503,

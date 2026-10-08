@@ -126,7 +126,9 @@ impl TinfoilVerifier for TinfoilPolicyVerifier {
         let measurement_hex = hex::encode(report.measurement);
         // The domain decides where requests go: it must be a bare tinfoil.sh
         // host that the attested certificate itself names.
-        inference_providers::attested::tinfoil::validate_router_domain(&bundle.domain)?;
+        inference_providers::attested::tinfoil::verifier_port::validate_router_domain(
+            &bundle.domain,
+        )?;
         if !pem_cert_has_dns_name(&bundle.enclave_cert, &bundle.domain)? {
             return Err(TinfoilVerifyError::Malformed);
         }

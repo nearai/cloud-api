@@ -44,9 +44,17 @@ fn status_mapping_matches_spec() {
     for s in [401, 402, 403] {
         assert_eq!(map_upstream_status(s), UpstreamDisposition::Retryable503);
     }
+    // Not the caller's fault: fall through to the next provider.
+    for st in [404, 408, 425] {
+        assert_eq!(map_upstream_status(st), UpstreamDisposition::Retryable503);
+    }
     assert_eq!(
         map_upstream_status(400),
         UpstreamDisposition::ReturnAs4xx(400)
+    );
+    assert_eq!(
+        map_upstream_status(413),
+        UpstreamDisposition::ReturnAs4xx(413)
     );
     assert_eq!(
         map_upstream_status(422),
@@ -288,6 +296,22 @@ struct TestServer {
     chat: Arc<Mutex<ChatReply>>,
     last_chat: LastChat,
     atc_domain: Arc<Mutex<String>>,
+    /// Requests served per path.
+    hits: Arc<Mutex<std::collections::HashMap<String, usize>>>,
+    /// While set, `/attestation` never answers (a stalled ATC).
+    atc_stall: Arc<std::sync::atomic::AtomicBool>,
+    /// Delay before the chat reply is sent, in ms.
+    chat_delay_ms: Arc<std::sync::atomic::AtomicU64>,
+    /// While set, the chat reply sends its headers and then stalls the body.
+    chat_stall_body: Arc<std::sync::atomic::AtomicBool>,
+    /// Replaces the `/v1/models` body when set.
+    models_body: Arc<Mutex<Option<Vec<u8>>>>,
+}
+
+impl TestServer {
+    fn hits(&self, path: &str) -> usize {
+        self.hits.lock().unwrap().get(path).copied().unwrap_or(0)
+    }
 }
 
 async fn start_server(pki: &TestPki) -> TestServer {
@@ -299,15 +323,24 @@ async fn start_server(pki: &TestPki) -> TestServer {
     }));
     let last_chat = Arc::new(Mutex::new(None));
     let atc_domain = Arc::new(Mutex::new("inference.tinfoil.sh".to_string()));
+    let hits: Arc<Mutex<std::collections::HashMap<String, usize>>> = Arc::default();
+    let atc_stall = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let chat_delay_ms = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let chat_stall_body = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let models_body: Arc<Mutex<Option<Vec<u8>>>> = Arc::default();
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let (acc2, chat2, last2) = (acc.clone(), chat.clone(), last_chat.clone());
     let domain2 = atc_domain.clone();
+    let (hits2, stall2, delay2) = (hits.clone(), atc_stall.clone(), chat_delay_ms.clone());
+    let (body_stall2, models2) = (chat_stall_body.clone(), models_body.clone());
     tokio::spawn(async move {
         while let Ok((tcp, _)) = listener.accept().await {
             let a = acc2.lock().unwrap().clone();
             let (chat, last) = (chat2.clone(), last2.clone());
             let domain = domain2.lock().unwrap().clone();
+            let (hits, stall, delay) = (hits2.clone(), stall2.clone(), delay2.clone());
+            let (body_stall, models) = (body_stall2.clone(), models2.clone());
             tokio::spawn(async move {
                 let Ok(mut tls) = a.accept(tcp).await else {
                     return;
@@ -340,10 +373,29 @@ async fn start_server(pki: &TestPki) -> TestServer {
                 }
                 let body = buf[head_end..head_end + len].to_vec();
                 let path = head.split_whitespace().nth(1).unwrap_or("").to_string();
+                *hits.lock().unwrap().entry(path.clone()).or_default() += 1;
+                if path == "/attestation" && stall.load(Ordering::SeqCst) {
+                    tokio::time::sleep(std::time::Duration::from_secs(300)).await;
+                    return;
+                }
+                if path == "/v1/chat/completions" {
+                    let ms = delay.load(Ordering::SeqCst);
+                    if ms > 0 {
+                        tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
+                    }
+                }
                 let (status, ct, out): (u16, &str, Vec<u8>) = match path.as_str() {
                     "/attestation" => (200, "application/json", atc_json(&domain)),
                     "/.well-known/tinfoil-proxy" => (200, "application/json", proxy_json()),
-                    "/v1/models" => (200, "application/json", fixture("models.json")),
+                    "/v1/models" => (
+                        200,
+                        "application/json",
+                        models
+                            .lock()
+                            .unwrap()
+                            .clone()
+                            .unwrap_or_else(|| fixture("models.json")),
+                    ),
                     "/v1/chat/completions" => {
                         *last.lock().unwrap() = Some((head.clone(), body));
                         let r = chat.lock().unwrap().clone();
@@ -356,6 +408,11 @@ async fn start_server(pki: &TestPki) -> TestServer {
                     out.len()
                 );
                 let _ = tls.write_all(resp.as_bytes()).await;
+                if path == "/v1/chat/completions" && body_stall.load(Ordering::SeqCst) {
+                    // Headers promised a body that never arrives.
+                    tokio::time::sleep(std::time::Duration::from_secs(300)).await;
+                    return;
+                }
                 let _ = tls.write_all(&out).await;
                 let _ = tls.shutdown().await;
             });
@@ -367,6 +424,11 @@ async fn start_server(pki: &TestPki) -> TestServer {
         chat,
         last_chat,
         atc_domain,
+        hits,
+        atc_stall,
+        chat_delay_ms,
+        chat_stall_body,
+        models_body,
     }
 }
 
@@ -510,6 +572,18 @@ fn expect_http<T>(r: Result<T, CompletionError>, status: u16) -> String {
     }
 }
 
+/// Poll `cond` until it holds, within a real-time deadline.
+async fn wait_for(mut cond: impl FnMut() -> bool) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while !cond() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "condition not reached"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+}
+
 #[tokio::test]
 async fn session_starts_blocked_and_unverified_calls_are_503() {
     let e = env().await;
@@ -648,6 +722,16 @@ async fn upstream_statuses_map_per_spec() {
             .await,
         429,
     );
+    for s in [404u16, 408, 425] {
+        set(s);
+        expect_http(
+            e.provider
+                .chat_completion(params(false, None), "h".into())
+                .await,
+            503,
+        );
+    }
+    assert_eq!(e.session.upstream_auth_failures(), 3, "not auth failures");
     set(400);
     expect_http(
         e.provider
@@ -679,6 +763,9 @@ async fn spki_mismatch_reverifies_once_then_503() {
             .await,
         503,
     );
+    // The re-verify runs detached from the request.
+    wait_for(|| e.verifier.router_calls.load(Ordering::SeqCst) == 2).await;
+    wait_for(|| matches!(e.session.fingerprint_state(), FingerprintState::Blocked)).await;
     assert_eq!(
         e.verifier.router_calls.load(Ordering::SeqCst),
         2,
@@ -754,12 +841,10 @@ async fn published_context_window_reads_models() {
     let e = env().await;
     e.session.verify_now().await.unwrap();
     assert_eq!(
-        e.session
-            .published_context_window("deepseek-v4-1-flash")
-            .await,
-        Some(1048576)
+        e.session.published_context_window("gpt-oss-120b"),
+        Some(131072)
     );
-    assert_eq!(e.session.published_context_window("missing").await, None);
+    assert_eq!(e.session.published_context_window("missing"), None);
 }
 
 #[tokio::test]
@@ -793,6 +878,7 @@ async fn attestation_report_payload_shape() {
         },
         models,
         verified_at: Instant::now(),
+        context_windows: BTreeMap::new(),
         bundle,
         transport: Arc::new(
             e.session
@@ -871,6 +957,11 @@ fn router_domain_syntax() {
         ".tinfoil.sh",
         "..tinfoil.sh",
         "Router-0.tinfoil.sh",
+        "xn--rter-pta.tinfoil.sh",
+        "a.xn--b.tinfoil.sh",
+        "a..tinfoil.sh",
+        "a.tinfoil.sh.",
+        "inference.tinfoil.sh.",
         "r\u{00f6}uter.tinfoil.sh",
         "-x.tinfoil.sh",
         "x.tinfoil.sh.evil.com",
@@ -903,7 +994,7 @@ async fn bundle_domain_selects_the_request_host() {
             .contains("host: router-0.tinfoil.sh"),
         "{head}"
     );
-    assert!(session.published_context_window(SLUG).await.is_some());
+    assert!(session.published_context_window(SLUG).is_some());
 }
 
 #[tokio::test]
@@ -944,4 +1035,364 @@ async fn failed_proxy_fetch_does_not_publish_the_new_pin() {
         FingerprintState::Blocked
     ));
     assert!(matches!(before, FingerprintState::Pinned(_)));
+}
+
+// ------------------------------------------------------- review-fix coverage
+
+fn provider_with_timeout(e: &Env, secs: i64) -> Provider {
+    let cfg = Config::new("tk_test_key".into(), secs);
+    Provider::new(e.session.clone(), &cfg, SLUG.into(), CANON.into())
+}
+
+async fn rotate_to_unattested_cert(e: &Env) {
+    *e.server.acceptor.lock().unwrap() = acceptor(&e.pki.leaf_b, &e.pki.key_b);
+}
+
+#[tokio::test]
+async fn connect_failure_returns_503_promptly_while_the_reverify_stalls() {
+    let e = env().await;
+    e.session.verify_now().await.unwrap();
+    rotate_to_unattested_cert(&e).await;
+    e.server.atc_stall.store(true, Ordering::SeqCst);
+
+    let started = std::time::Instant::now();
+    let r = tokio::time::timeout(
+        std::time::Duration::from_secs(3),
+        e.provider.chat_completion(params(false, None), "h".into()),
+    )
+    .await
+    .expect("a connect failure must not wait for the re-verify");
+    let msg = expect_http(r, 503);
+    assert!(msg.contains("connect_failed"), "{msg}");
+    assert!(started.elapsed() < std::time::Duration::from_secs(3));
+
+    // The detached verify reached the (stalled) ATC exactly once; a second
+    // failure while it is pending neither waits nor starts another.
+    wait_for(|| e.server.hits("/attestation") == 2).await;
+    let r = tokio::time::timeout(
+        std::time::Duration::from_secs(3),
+        e.provider.chat_completion(params(false, None), "h".into()),
+    )
+    .await
+    .expect("second failure must not wait either");
+    expect_http(r, 503);
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    assert_eq!(e.server.hits("/attestation"), 2, "no second verify");
+    assert_eq!(
+        e.verifier.router_calls.load(Ordering::SeqCst),
+        1,
+        "the stalled verify never reached the verifier"
+    );
+    assert!(e.server.last_chat.lock().unwrap().is_none());
+}
+
+#[tokio::test]
+async fn second_connect_failure_within_cooldown_does_not_reverify() {
+    let e = env().await;
+    e.session.verify_now().await.unwrap();
+    let g = e.session.generation();
+    e.session.on_connect_failure(g);
+    wait_for(|| {
+        e.verifier.router_calls.load(Ordering::SeqCst) == 2 && !e.session.reverify_pending()
+    })
+    .await;
+    // A fresh generation, nothing pending: only the cooldown can stop this one.
+    e.session.on_connect_failure(e.session.generation());
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    assert!(!e.session.reverify_pending());
+    assert_eq!(e.verifier.router_calls.load(Ordering::SeqCst), 2);
+    // A stale generation is deduped against the verify that already ran.
+    e.session.on_connect_failure(g);
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    assert_eq!(e.verifier.router_calls.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
+async fn request_timeout_maps_to_503_timeout() {
+    let e = env().await;
+    e.session.verify_now().await.unwrap();
+    e.server.chat_delay_ms.store(3000, Ordering::SeqCst);
+    let p = provider_with_timeout(&e, 1);
+    let started = std::time::Instant::now();
+    let msg = expect_http(
+        p.chat_completion(params(false, None), "h".into()).await,
+        503,
+    );
+    assert!(msg.contains("timeout"), "{msg}");
+    assert!(started.elapsed() < std::time::Duration::from_millis(2500));
+    // A timeout is not a connection failure: no re-verification.
+    assert_eq!(e.verifier.router_calls.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn stalled_error_body_is_bounded_by_the_request_timeout() {
+    let e = env().await;
+    e.session.verify_now().await.unwrap();
+    *e.server.chat.lock().unwrap() = ChatReply {
+        status: 500,
+        content_type: "application/json",
+        body: vec![b'x'; 100],
+    };
+    e.server.chat_stall_body.store(true, Ordering::SeqCst);
+    let p = provider_with_timeout(&e, 1);
+    let started = std::time::Instant::now();
+    let msg = expect_http(
+        p.chat_completion(params(false, None), "h".into()).await,
+        503,
+    );
+    assert!(msg.contains("upstream_error"), "{msg}");
+    assert!(started.elapsed() < std::time::Duration::from_secs(4));
+}
+
+#[tokio::test]
+async fn oversized_error_body_is_truncated() {
+    let e = env().await;
+    e.session.verify_now().await.unwrap();
+    let big = super::session::MAX_DOC_BYTES + 4096;
+    *e.server.chat.lock().unwrap() = ChatReply {
+        status: 500,
+        content_type: "text/plain",
+        body: vec![b'x'; big],
+    };
+    let snap = e.session.snapshot();
+    let t = snap.as_ref().as_ref().unwrap().transport.clone();
+    let resp = t
+        .client
+        .post(format!("{}/v1/chat/completions", t.base))
+        .json(&serde_json::json!({}))
+        .send()
+        .await
+        .unwrap();
+    let text = super::read_capped_text(resp).await;
+    assert_eq!(text.len(), super::session::MAX_DOC_BYTES);
+    // The same cap through the provider: a 4xx surfaces, bounded.
+    *e.server.chat.lock().unwrap() = ChatReply {
+        status: 400,
+        content_type: "text/plain",
+        body: vec![b'y'; big],
+    };
+    match e
+        .provider
+        .chat_completion(params(false, None), "h".into())
+        .await
+    {
+        Err(CompletionError::HttpError {
+            status_code: 400,
+            message,
+            ..
+        }) => assert!(message.len() <= super::session::MAX_DOC_BYTES + 256),
+        other => panic!("{other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn oversized_models_document_is_rejected_without_failing_the_verify() {
+    let e = env().await;
+    *e.server.models_body.lock().unwrap() = Some(vec![b' '; super::session::MAX_DOC_BYTES + 1]);
+    e.session.verify_now().await.unwrap();
+    assert!(e.session.model_status(SLUG).is_ok());
+    assert_eq!(e.session.published_context_window(SLUG), None);
+}
+
+#[tokio::test]
+async fn client_e2ee_pubkey_is_rejected_before_any_upstream_request() {
+    use crate::attested::nearai::encryption_headers as eh;
+    let e = env().await;
+    e.session.verify_now().await.unwrap();
+    let mk = |stream| {
+        let mut p = params(stream, None);
+        p.extra
+            .insert(eh::CLIENT_PUB_KEY.to_string(), serde_json::json!("abcd"));
+        p
+    };
+    for result in [
+        e.provider
+            .chat_completion(mk(false), "h".into())
+            .await
+            .map(|_| ()),
+        e.provider
+            .chat_completion_stream(mk(true), "h".into())
+            .await
+            .map(|_| ()),
+    ] {
+        match result {
+            Err(CompletionError::CompletionError(m)) => assert!(m.contains("E2EE"), "{m}"),
+            other => panic!("expected an E2EE rejection, got {other:?}"),
+        }
+    }
+    assert_eq!(e.server.hits("/v1/chat/completions"), 0);
+    assert!(e.server.last_chat.lock().unwrap().is_none());
+}
+
+#[tokio::test]
+async fn continuous_usage_stats_alone_counts_as_asking_for_usage() {
+    let e = env().await;
+    e.session.verify_now().await.unwrap();
+    *e.server.chat.lock().unwrap() = ChatReply {
+        status: 200,
+        content_type: "text/event-stream",
+        body: fixture("chat_stream.sse"),
+    };
+    let mut p = params(true, None);
+    p.stream_options =
+        Some(serde_json::from_value(serde_json::json!({"continuous_usage_stats": true})).unwrap());
+    let s = e
+        .provider
+        .chat_completion_stream(p, "h".into())
+        .await
+        .unwrap();
+    let evs: Vec<_> = s.map(|x| x.unwrap()).collect().await;
+    let usage_chunks = evs
+        .iter()
+        .filter_map(client_json)
+        .filter(|v| v.get("usage").is_some())
+        .count();
+    assert_eq!(usage_chunks, 1, "the final usage chunk reaches the client");
+}
+
+#[tokio::test]
+async fn proxy_reread_fetch_failure_escalates_to_full_verify_and_fails_closed() {
+    let e = env().await;
+    e.session.verify_now().await.unwrap();
+    assert_eq!(e.verifier.router_calls.load(Ordering::SeqCst), 1);
+    rotate_to_unattested_cert(&e).await;
+    e.session.reread_proxy().await;
+    assert_eq!(
+        e.verifier.router_calls.load(Ordering::SeqCst),
+        2,
+        "the failed re-read escalated to a full verification"
+    );
+    assert!(matches!(
+        e.session.fingerprint_state(),
+        FingerprintState::Blocked
+    ));
+    assert!(e.session.model_status(SLUG).is_err());
+    assert_eq!(
+        e.session.last_verify_error(),
+        Some(TinfoilVerifyError::Fetch)
+    );
+}
+
+#[tokio::test]
+async fn reread_proxy_when_unverified_runs_full_verify() {
+    let e = env().await;
+    assert!(e.session.model_status(SLUG).is_err());
+    e.session.reread_proxy().await;
+    assert_eq!(e.verifier.router_calls.load(Ordering::SeqCst), 1);
+    assert!(e.session.model_status(SLUG).is_ok());
+}
+
+#[tokio::test]
+async fn declared_ctx_above_the_published_window_fails_closed() {
+    let e = env().await;
+    // Registered while unverified: the provider exists, the check applies later.
+    let cfg = Config::new("tk_test_key".into(), 5);
+    let over = Provider::new(e.session.clone(), &cfg, SLUG.into(), CANON.into())
+        .with_declared_ctx(200_000);
+    let fits = Provider::new(e.session.clone(), &cfg, SLUG.into(), CANON.into())
+        .with_declared_ctx(131_072);
+    let msg = expect_http(
+        over.chat_completion(params(false, None), "h".into()).await,
+        503,
+    );
+    assert!(msg.contains("not_verified"), "{msg}");
+
+    e.session.verify_now().await.unwrap();
+    for _ in 0..2 {
+        let msg = expect_http(
+            over.chat_completion(params(false, None), "h".into()).await,
+            503,
+        );
+        assert!(msg.contains("ctx_exceeds_published"), "{msg}");
+    }
+    expect_http(
+        over.chat_completion_stream(params(true, None), "h".into())
+            .await,
+        503,
+    );
+    assert!(
+        e.server.last_chat.lock().unwrap().is_none(),
+        "no request left the gateway for the oversized declaration"
+    );
+    fits.chat_completion(params(false, None), "h".into())
+        .await
+        .unwrap();
+    assert!(e.server.last_chat.lock().unwrap().is_some());
+}
+
+#[tokio::test]
+async fn unknown_published_window_leaves_the_declared_ctx_standing() {
+    let e = env().await;
+    *e.server.models_body.lock().unwrap() = Some(b"{}".to_vec());
+    e.session.verify_now().await.unwrap();
+    let cfg = Config::new("tk_test_key".into(), 5);
+    Provider::new(e.session.clone(), &cfg, SLUG.into(), CANON.into())
+        .with_declared_ctx(200_000)
+        .chat_completion(params(false, None), "h".into())
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn spawn_refresh_rereads_proxy_then_reverifies_and_stops_when_dropped() {
+    use std::time::Duration;
+    let Env {
+        session,
+        verifier,
+        server,
+        provider,
+        pki: _pki,
+    } = env().await;
+    session.verify_now().await.unwrap();
+    // Pause only after the real-network setup: auto-advance during a live TLS
+    // handshake would trip the fetch timeouts.
+    tokio::time::pause();
+    let proxy_path = "/.well-known/tinfoil-proxy";
+    let proxy0 = server.hits(proxy_path);
+    assert_eq!(verifier.router_calls.load(Ordering::SeqCst), 1);
+
+    let rt = tokio::runtime::Handle::current();
+    let before = rt.metrics().num_alive_tasks();
+    session.spawn_refresh();
+    let with_task = rt.metrics().num_alive_tasks();
+    assert_eq!(with_task, before + 1);
+    session.spawn_refresh();
+    assert_eq!(
+        rt.metrics().num_alive_tasks(),
+        with_task,
+        "a second spawn_refresh adds no task"
+    );
+
+    // Let the task create its intervals (at the paused "now") before advancing.
+    for _ in 0..10 {
+        tokio::task::yield_now().await;
+    }
+
+    // PROXY_REREAD: the model document is re-read, the router is not re-verified.
+    tokio::time::advance(super::PROXY_REREAD + Duration::from_secs(1)).await;
+    paused_wait(|| server.hits(proxy_path) > proxy0).await;
+    assert_eq!(verifier.router_calls.load(Ordering::SeqCst), 1);
+
+    // ROUTER_REVERIFY: a full verification runs.
+    tokio::time::advance(super::ROUTER_REVERIFY).await;
+    paused_wait(|| verifier.router_calls.load(Ordering::SeqCst) >= 2).await;
+
+    // Dropping the last strong reference ends the task.
+    drop(provider);
+    drop(session);
+    paused_wait(|| rt.metrics().num_alive_tasks() < with_task).await;
+}
+
+/// Wait for `cond` under a paused clock. Short sleeps (not `yield_now`, which
+/// starves the IO driver) let loopback IO progress; the clock only auto-advances
+/// when the runtime is idle, in 1 ms steps here.
+async fn paused_wait(mut cond: impl FnMut() -> bool) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    while !cond() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "condition not reached"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+    }
 }

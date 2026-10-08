@@ -16,9 +16,10 @@ use std::time::{Duration, Instant};
 
 use arc_swap::ArcSwap;
 
-use super::config::{Config, PROXY_REREAD, ROUTER_REVERIFY};
+use super::config::{Config, Redirect, PROXY_REREAD, ROUTER_REVERIFY};
 use super::verifier_port::{
-    AtcBundle, PinnedModel, ProxyDoc, TinfoilVerifier, TinfoilVerifyError, VerifiedRouter,
+    validate_router_domain, AtcBundle, PinnedModel, ProxyDoc, TinfoilVerifier, TinfoilVerifyError,
+    VerifiedRouter,
 };
 use crate::spki_verifier::{FingerprintState, SharedTlsRoots};
 
@@ -39,6 +40,10 @@ pub struct VerifiedState {
     /// Per published slug: pinned, or the reason it is closed.
     pub models: BTreeMap<String, Result<PinnedModel, TinfoilVerifyError>>,
     pub verified_at: Instant,
+    /// Context window the router publishes per slug (`GET /v1/models`, fetched
+    /// over the pinned client at verification). A slug missing here has no
+    /// known window (the document was unavailable or omitted it).
+    pub context_windows: BTreeMap<String, u32>,
     /// The attestation bundle that was verified (served by `get_attestation_report`).
     pub bundle: AtcBundle,
     /// Pinned client and request base for exactly this verification. Swapped
@@ -50,33 +55,39 @@ pub struct VerifiedState {
 /// Everything needed to talk to the verified router.
 pub(crate) struct Transport {
     pub(crate) client: reqwest::Client,
-    /// `https://{bundle.domain}` (a test override takes precedence in tests).
+    /// `https://{bundle.domain}`.
     pub(crate) base: String,
     pub(crate) domain: String,
     pub(crate) spki_hex: String,
 }
 
-/// A router host must be a bare lowercase ASCII `*.tinfoil.sh` hostname: no
-/// scheme, port, path, userinfo, uppercase or IDN. The ATC serves bundles for
-/// several router hosts, and the domain decides where requests are sent, so it
-/// is validated before it is trusted.
-pub fn validate_router_domain(domain: &str) -> Result<(), TinfoilVerifyError> {
-    const SUFFIX: &str = ".tinfoil.sh";
-    let Some(prefix) = domain.strip_suffix(SUFFIX) else {
-        return Err(TinfoilVerifyError::Malformed);
-    };
-    let label_ok = |l: &str| {
-        !l.is_empty()
-            && l.len() <= 63
-            && !l.starts_with('-')
-            && !l.ends_with('-')
-            && l.bytes()
-                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
-    };
-    if domain.len() > 253 || !prefix.split('.').all(label_ok) {
-        return Err(TinfoilVerifyError::Malformed);
+/// How a capped body read ended.
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum BodyRead {
+    Complete,
+    /// More than `cap` bytes were available; the buffer holds the first `cap`.
+    Truncated,
+    /// The stream errored; the buffer holds what arrived before that.
+    Failed,
+}
+
+/// Read a response body, never holding more than `cap` bytes.
+pub(super) async fn read_capped(resp: reqwest::Response, cap: usize) -> (Vec<u8>, BodyRead) {
+    use futures_util::StreamExt;
+    let mut buf: Vec<u8> = Vec::new();
+    let mut stream = resp.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let Ok(chunk) = chunk else {
+            return (buf, BodyRead::Failed);
+        };
+        let room = cap - buf.len();
+        if chunk.len() > room {
+            buf.extend_from_slice(&chunk[..room]);
+            return (buf, BodyRead::Truncated);
+        }
+        buf.extend_from_slice(&chunk);
     }
-    Ok(())
+    (buf, BodyRead::Complete)
 }
 
 pub struct TinfoilRouterSession {
@@ -91,10 +102,9 @@ pub struct TinfoilRouterSession {
     verify_gen: AtomicU64,
     last_mismatch_reverify: std::sync::Mutex<Option<Instant>>,
     refresh_started: AtomicBool,
-    #[cfg(test)]
-    base_override: Option<String>,
-    #[cfg(test)]
-    route: Option<std::net::SocketAddr>,
+    /// A request-path re-verification is scheduled or running (dedupe flag).
+    reverify_pending: AtomicBool,
+    redirect: Redirect,
     /// Count of upstream 401/402/403 responses. Exposed for the metric
     /// `cloud_api.tinfoil.upstream_auth_failure`, which this crate cannot emit.
     auth_failures: AtomicU64,
@@ -132,10 +142,8 @@ impl TinfoilRouterSession {
             verify_gen: AtomicU64::new(0),
             last_mismatch_reverify: std::sync::Mutex::new(None),
             refresh_started: AtomicBool::new(false),
-            #[cfg(test)]
-            base_override: cfg.base_override.clone(),
-            #[cfg(test)]
-            route: cfg.route,
+            reverify_pending: AtomicBool::new(false),
+            redirect: cfg.redirect.clone(),
             auth_failures: AtomicU64::new(0),
             last_error: std::sync::Mutex::new(None),
         }))
@@ -159,22 +167,19 @@ impl TinfoilRouterSession {
         let fp = Arc::new(RwLock::new(FingerprintState::Pinned(HashSet::from([
             spki_hex.to_string(),
         ]))));
-        #[allow(unused_mut)]
         let mut builder = reqwest::Client::builder()
             .use_preconfigured_tls(self.tls_roots.build_config(fp))
             .redirect(reqwest::redirect::Policy::none())
             .connect_timeout(CONNECT_TIMEOUT);
-        #[allow(unused_mut)]
         let mut base = format!("https://{domain}");
-        #[cfg(test)]
-        {
-            if let Some(addr) = self.route {
-                builder = builder.resolve(domain, addr);
-                base = format!("https://{domain}:{}", addr.port());
-            }
-            if let Some(o) = &self.base_override {
-                base = o.clone();
-            }
+        // `redirect` is default (a no-op) in production; only test constructors
+        // set it, so the same builder runs in tests and release.
+        if let Some(addr) = self.redirect.resolve {
+            builder = builder.resolve(domain, addr);
+            base = format!("https://{domain}:{}", addr.port());
+        }
+        if let Some(o) = &self.redirect.base {
+            base = o.clone();
         }
         Ok(Transport {
             client: builder
@@ -192,6 +197,12 @@ impl TinfoilRouterSession {
 
     pub(super) fn generation(&self) -> u64 {
         self.verify_gen.load(Ordering::SeqCst)
+    }
+
+    /// Whether a request-path re-verification is scheduled or running.
+    #[cfg(test)]
+    pub(super) fn reverify_pending(&self) -> bool {
+        self.reverify_pending.load(Ordering::SeqCst)
     }
 
     /// Number of upstream 401/402/403 responses seen (key or billing problems).
@@ -247,8 +258,15 @@ impl TinfoilRouterSession {
         if !resp.status().is_success() {
             return Err(TinfoilVerifyError::Fetch);
         }
-        let bytes = resp.bytes().await.map_err(|_| TinfoilVerifyError::Fetch)?;
-        if bytes.len() > MAX_DOC_BYTES {
+        // Refuse an oversized body up front, and never buffer more than the cap.
+        if resp
+            .content_length()
+            .is_some_and(|n| n > MAX_DOC_BYTES as u64)
+        {
+            return Err(TinfoilVerifyError::Fetch);
+        }
+        let (bytes, outcome) = read_capped(resp, MAX_DOC_BYTES).await;
+        if outcome != BodyRead::Complete {
             return Err(TinfoilVerifyError::Fetch);
         }
         serde_json::from_slice(&bytes).map_err(|_| TinfoilVerifyError::Fetch)
@@ -312,6 +330,9 @@ impl TinfoilRouterSession {
         )
         .await?;
         let models = self.check_models(&doc);
+        // Published windows are best effort: an unavailable document leaves
+        // them unknown (declared contexts then stand), never fails the verify.
+        let context_windows = Self::fetch_context_windows(&transport).await;
         tracing::info!(
             router_tag = %router.tag,
             router_measurement = %router.measurement_hex,
@@ -331,6 +352,7 @@ impl TinfoilRouterSession {
             router,
             models,
             verified_at: Instant::now(),
+            context_windows,
             bundle,
             transport,
         })));
@@ -365,6 +387,7 @@ impl TinfoilRouterSession {
                     router: cur.router.clone(),
                     models,
                     verified_at: cur.verified_at,
+                    context_windows: cur.context_windows.clone(),
                     bundle: cur.bundle.clone(),
                     transport: cur.transport.clone(),
                 })));
@@ -376,11 +399,16 @@ impl TinfoilRouterSession {
     }
 
     /// A request-path connection failure (typically an SPKI mismatch after the
-    /// router rotated its key). Re-verifies once, deduplicated against any
-    /// verification that finished since `seen_generation` and rate limited.
-    pub(super) async fn on_connect_failure(&self, seen_generation: u64) {
-        let _guard = self.verify_lock.lock().await;
+    /// router rotated its key). Schedules ONE detached re-verification and returns
+    /// immediately, so the failing request is never held behind the (slow) ATC
+    /// round trip or behind another verification holding the lock. Deduplicated
+    /// three ways: against a verification that finished since `seen_generation`,
+    /// against one already pending, and by a cooldown.
+    pub(super) fn on_connect_failure(self: &Arc<Self>, seen_generation: u64) {
         if self.verify_gen.load(Ordering::SeqCst) != seen_generation {
+            return;
+        }
+        if self.reverify_pending.swap(true, Ordering::SeqCst) {
             return;
         }
         {
@@ -389,11 +417,25 @@ impl TinfoilRouterSession {
                 .lock()
                 .unwrap_or_else(|e| e.into_inner());
             if last.is_some_and(|t| t.elapsed() < MISMATCH_REVERIFY_COOLDOWN) {
+                self.reverify_pending.store(false, Ordering::SeqCst);
                 return;
             }
             *last = Some(Instant::now());
         }
-        let _ = self.verify_locked().await;
+        let weak = Arc::downgrade(self);
+        tokio::spawn(async move {
+            let Some(session) = weak.upgrade() else {
+                return;
+            };
+            {
+                let _guard = session.verify_lock.lock().await;
+                // A scheduled refresh may have verified while we queued.
+                if session.verify_gen.load(Ordering::SeqCst) == seen_generation {
+                    let _ = session.verify_locked().await;
+                }
+            }
+            session.reverify_pending.store(false, Ordering::SeqCst);
+        });
     }
 
     /// Start the proxy re-read (60 s) and full re-verify (300 s) loop. Holds a
@@ -430,20 +472,32 @@ impl TinfoilRouterSession {
         });
     }
 
-    /// The router's published context window for `slug` (`GET /v1/models`,
-    /// unauthenticated, over the pinned client).
-    pub async fn published_context_window(&self, slug: &str) -> Option<u32> {
+    /// The router's published context window for `slug` as of the last
+    /// verification. `None` when the router is not verified, does not publish the
+    /// slug, or its model list was unavailable then.
+    pub fn published_context_window(&self, slug: &str) -> Option<u32> {
         let snap = self.state.load_full();
-        let t = &snap.as_ref().as_ref()?.transport;
-        let v: serde_json::Value = Self::fetch_json(&t.client, &format!("{}/v1/models", t.base))
-            .await
-            .ok()?;
-        v.get("data")?
-            .as_array()?
-            .iter()
-            .find(|m| m.get("id").and_then(|i| i.as_str()) == Some(slug))?
-            .get("context_window")?
-            .as_u64()
-            .and_then(|n| u32::try_from(n).ok())
+        snap.as_ref().as_ref()?.context_windows.get(slug).copied()
+    }
+
+    /// `GET /v1/models` (unauthenticated) over the pinned client, as slug ->
+    /// `context_window`. Empty on any failure.
+    async fn fetch_context_windows(t: &Transport) -> BTreeMap<String, u32> {
+        let Ok(v) =
+            Self::fetch_json::<serde_json::Value>(&t.client, &format!("{}/v1/models", t.base))
+                .await
+        else {
+            return BTreeMap::new();
+        };
+        let Some(data) = v.get("data").and_then(|d| d.as_array()) else {
+            return BTreeMap::new();
+        };
+        data.iter()
+            .filter_map(|m| {
+                let id = m.get("id")?.as_str()?;
+                let w = u32::try_from(m.get("context_window")?.as_u64()?).ok()?;
+                Some((id.to_string(), w))
+            })
+            .collect()
     }
 }

@@ -22,7 +22,8 @@ use serde_json::{json, Value};
 
 pub use self::availability::{map_upstream_status, unavailable, UpstreamDisposition};
 pub use self::config::{Config, ATC_URL, BASE_URL, PROXY_REREAD, ROUTER_REVERIFY};
-pub use self::session::{validate_router_domain, TinfoilRouterSession, VerifiedState};
+pub use self::session::{TinfoilRouterSession, VerifiedState};
+pub use self::verifier_port::validate_router_domain;
 use crate::attested::openai_wire::request_body;
 use crate::{
     AttestationError, AudioTranscriptionError, AudioTranscriptionParams,
@@ -45,6 +46,11 @@ pub struct Provider {
     canonical_id: String,
     api_key: String,
     timeout: std::time::Duration,
+    /// The `@ctx` the operator declared for this model, checked against the
+    /// router's published window after every verification.
+    declared_ctx: Option<u32>,
+    /// The `ctx_exceeds_published` error is logged once per provider.
+    ctx_logged: std::sync::atomic::AtomicBool,
 }
 
 impl std::fmt::Debug for Provider {
@@ -70,20 +76,53 @@ impl Provider {
             canonical_id,
             api_key: cfg.api_key().to_string(),
             timeout: cfg.timeout,
+            declared_ctx: None,
+            ctx_logged: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
-    /// Closed unless the router is verified and this slug is pinned.
-    fn ensure_available(&self) -> Result<(), CompletionError> {
+    /// Declare the operator's `@ctx` for this model. If the router's published
+    /// window is (or becomes) smaller, the provider fails closed with
+    /// `ctx_exceeds_published` rather than serving a request the router rejects.
+    pub fn with_declared_ctx(mut self, ctx: u32) -> Self {
+        self.declared_ctx = Some(ctx);
+        self
+    }
+
+    /// Closed unless the router is verified, this slug is pinned and the
+    /// declared context fits the published window. Returns the exact transport
+    /// the checks were made against (so the request cannot pair a different
+    /// verification's host with this one's pin) and the generation it belongs to.
+    fn ensure_available(&self) -> Result<(Arc<session::Transport>, u64), CompletionError> {
+        let generation = self.session.generation();
         let snap = self.session.snapshot();
         let Some(state) = &*snap else {
             return Err(unavailable("not_verified"));
         };
         match state.models.get(&self.slug) {
-            Some(Ok(_)) => Ok(()),
-            Some(Err(e)) => Err(unavailable(e.reason())),
-            None => Err(unavailable("model_not_published")),
+            Some(Ok(_)) => {}
+            Some(Err(e)) => return Err(unavailable(e.reason())),
+            None => return Err(unavailable("model_not_published")),
         }
+        if let (Some(declared), Some(published)) =
+            (self.declared_ctx, state.context_windows.get(&self.slug))
+        {
+            if declared > *published {
+                if !self
+                    .ctx_logged
+                    .swap(true, std::sync::atomic::Ordering::Relaxed)
+                {
+                    tracing::error!(
+                        canonical = %self.canonical_id,
+                        declared,
+                        published,
+                        "Tinfoil declared @ctx exceeds the router's published window; failing closed"
+                    );
+                }
+                return Err(unavailable("ctx_exceeds_published"));
+            }
+        }
+        Ok((state.transport.clone(), generation))
     }
 
     fn reject_client_e2ee(params: &ChatCompletionParams) -> Result<(), CompletionError> {
@@ -130,18 +169,12 @@ impl Provider {
         stream: bool,
     ) -> Result<reqwest::Response, CompletionError> {
         Self::reject_client_e2ee(&params)?;
-        self.ensure_available()?;
+        let (transport, generation) = self.ensure_available()?;
         crate::strip_cache_control(&mut params.messages);
         crate::strip_reasoning_content(&mut params.messages);
         let body =
             request_body(&self.slug, &params, stream).map_err(CompletionError::CompletionError)?;
 
-        let generation = self.session.generation();
-        let snap = self.session.snapshot();
-        let Some(state) = &*snap else {
-            return Err(unavailable("not_verified"));
-        };
-        let transport = state.transport.clone();
         let send = transport
             .client
             .post(format!("{}{CHAT_PATH}", transport.base))
@@ -156,9 +189,10 @@ impl Provider {
             Ok(Err(e)) => {
                 if e.is_connect() {
                     // Includes TLS failures such as an SPKI mismatch after a
-                    // key rotation: re-verify once, never retry unpinned.
-                    tracing::warn!("Tinfoil connection failed; re-verifying router");
-                    self.session.on_connect_failure(generation).await;
+                    // key rotation: schedule one detached re-verify (this
+                    // request is not held for it), never retry unpinned.
+                    tracing::warn!("Tinfoil connection failed; scheduling router re-verify");
+                    self.session.on_connect_failure(generation);
                     return Err(unavailable("connect_failed"));
                 }
                 tracing::warn!("Tinfoil transport error");
@@ -168,7 +202,11 @@ impl Provider {
         };
         let status = resp.status();
         if !status.is_success() {
-            let text = read_capped_text(resp).await;
+            // The body read shares the request timeout: a peer that sends headers
+            // and then stalls must not hold the request open.
+            let text = tokio::time::timeout(self.timeout, read_capped_text(resp))
+                .await
+                .unwrap_or_default();
             return Err(self.status_error(status.as_u16(), &text));
         }
         Ok(resp)
@@ -177,16 +215,7 @@ impl Provider {
 
 /// Read an upstream error body, stopping at `MAX_DOC_BYTES`.
 async fn read_capped_text(resp: reqwest::Response) -> String {
-    use futures_util::StreamExt;
-    let mut buf: Vec<u8> = Vec::new();
-    let mut stream = resp.bytes_stream();
-    while let Some(Ok(chunk)) = stream.next().await {
-        let room = session::MAX_DOC_BYTES.saturating_sub(buf.len());
-        buf.extend_from_slice(&chunk[..chunk.len().min(room)]);
-        if buf.len() >= session::MAX_DOC_BYTES {
-            break;
-        }
-    }
+    let (buf, _) = session::read_capped(resp, session::MAX_DOC_BYTES).await;
     String::from_utf8_lossy(&buf).into_owned()
 }
 

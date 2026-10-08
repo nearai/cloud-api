@@ -14,6 +14,19 @@ pub const PROXY_REREAD: Duration = Duration::from_secs(60);
 /// How often the router attestation is fully re-verified.
 pub const ROUTER_REVERIFY: Duration = Duration::from_secs(300);
 
+/// Where requests actually go, as seen by the transport builder. The production
+/// value is `Redirect::default()` (no change: connect to the attested domain
+/// over normal DNS). Only the test constructors below ever set it, so tests and
+/// release run the same `build_transport` code path. Not configurable from the
+/// environment or any public API.
+#[derive(Clone, Default)]
+pub(super) struct Redirect {
+    /// Resolve whatever domain the bundle names to this address (and port).
+    pub(super) resolve: Option<std::net::SocketAddr>,
+    /// Send requests to this base URL regardless of the attested domain.
+    pub(super) base: Option<String>,
+}
+
 /// Fallback when a non-positive timeout is supplied.
 const DEFAULT_TIMEOUT_SECONDS: u64 = 300;
 
@@ -22,13 +35,8 @@ pub struct Config {
     /// Tinfoil API key. A secret: private, with a redacting `Debug`.
     api_key: String,
     pub atc_url: String,
-    /// Test only: send requests here regardless of the attested domain.
-    #[cfg(test)]
-    pub(super) base_override: Option<String>,
-    /// Test only: resolve whatever domain the bundle names to this local
-    /// address (and port), so the host selection itself can be exercised.
-    #[cfg(test)]
-    pub(super) route: Option<std::net::SocketAddr>,
+    /// Always default outside the crate-private test constructors.
+    pub(super) redirect: Redirect,
     pub timeout: Duration,
 }
 
@@ -41,10 +49,7 @@ impl Config {
         Self {
             api_key,
             atc_url: ATC_URL.to_string(),
-            #[cfg(test)]
-            base_override: None,
-            #[cfg(test)]
-            route: None,
+            redirect: Redirect::default(),
             timeout: Duration::from_secs(secs),
         }
     }
@@ -52,7 +57,7 @@ impl Config {
     /// Point at a local test server. Test builds only.
     #[cfg(test)]
     pub fn with_urls(mut self, base: &str, atc: &str) -> Self {
-        self.base_override = Some(base.trim_end_matches('/').to_string());
+        self.redirect.base = Some(base.trim_end_matches('/').to_string());
         self.atc_url = atc.to_string();
         self
     }
@@ -60,7 +65,7 @@ impl Config {
     /// Test only: map the attested domain to a local server.
     #[cfg(test)]
     pub fn with_route(mut self, addr: std::net::SocketAddr, atc: &str) -> Self {
-        self.route = Some(addr);
+        self.redirect.resolve = Some(addr);
         self.atc_url = atc.to_string();
         self
     }

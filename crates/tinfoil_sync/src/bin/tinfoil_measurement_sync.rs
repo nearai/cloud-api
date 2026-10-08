@@ -1,5 +1,5 @@
 //! Daily Tinfoil measurement sync (run by
-//! `.github/workflows/tinfoil-measurements-sync.yml`).
+//! `.github/workflows/chutes-measurements-sync.yml`).
 //!
 //! Usage: `tinfoil_measurement_sync --pins <path> --out-dir <dir> [--evidence-dir <dir>]`
 //!

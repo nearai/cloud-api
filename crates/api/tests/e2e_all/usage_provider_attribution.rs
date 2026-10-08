@@ -285,7 +285,7 @@ async fn duplicate_usage_preserves_original_provider_attribution() {
 
 #[tokio::test]
 async fn tinfoil_served_provider_type_is_persisted_and_read_back() {
-    // Given: a migrated e2e database (V0087 widened the CHECK to allow tinfoil).
+    // Given: a migrated e2e database (V0087 dropped the served_provider_type CHECK).
     let fixture = setup_provider_usage_fixture().await;
     let repository = OrganizationUsageRepository::new(fixture.database.pool().clone());
 
@@ -310,12 +310,22 @@ async fn tinfoil_served_provider_type_is_persisted_and_read_back() {
         row.id == recorded.id && row.served_provider_type == Some(ServedProviderType::Tinfoil)
     }));
 
-    // And: the CHECK still rejects an unknown provider type.
-    let banana = insert_raw_attribution_row(&fixture, "attested_3p", "banana").await;
-    assert!(
-        banana.is_err(),
-        "served_provider_type='banana' must be rejected"
-    );
+    // And: the DB does not constrain provider type; an unknown value inserts
+    // and reads back through the tolerant reader as unattributed.
+    let unknown = insert_raw_attribution_row(&fixture, "attested_3p", "banana").await;
+    assert_eq!(unknown.expect("unknown type accepted: no CHECK"), 1);
     let tinfoil = insert_raw_attribution_row(&fixture, "attested_3p", "tinfoil").await;
-    assert_eq!(tinfoil.expect("tinfoil type accepted by CHECK"), 1);
+    assert_eq!(tinfoil.expect("tinfoil type accepted"), 1);
+    let (rows, _) = repository
+        .get_usage_history(fixture.organization_id, Some(10), Some(0))
+        .await
+        .expect("usage history should read rows with unknown provider type");
+    assert_eq!(rows.len(), 3);
+    assert_eq!(
+        rows.iter()
+            .filter(|row| row.served_provider_type.is_none())
+            .count(),
+        1,
+        "unknown provider type reads back as None"
+    );
 }

@@ -134,7 +134,7 @@ jobs:
             fi
             exit 0
           fi
-          bot_user="${APP_SLUG}[bot]"
+          bot_user="${APP_SLUG:?app-slug output is empty; cannot set bot commit identity}[bot]"
           bot_id="$(gh api "/users/${bot_user}" --jq .id)"
           git config user.name "$bot_user"
           git config user.email "${bot_id}+${bot_user}@users.noreply.github.com"

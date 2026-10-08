@@ -13,6 +13,12 @@ pub struct AtcBundle {
     #[serde(rename = "enclaveCert")]
     pub enclave_cert: String,
     pub digest: String,
+    /// Sigstore (DSSE/Rekor) bundle over the ATC document. Intentionally an
+    /// opaque pass-through here: the runtime verifier does not read it (it
+    /// anchors on the SNP report chain plus the compiled pins). It is verified
+    /// only by the offline `tinfoil_sync` tooling, whose Sigstore dependencies
+    /// must stay out of this crate's (and `api`'s) dependency tree, so no typed
+    /// bundle lives in this port.
     #[serde(rename = "sigstoreBundle")]
     pub sigstore_bundle: serde_json::Value,
 }
@@ -58,11 +64,12 @@ pub struct VerifiedRouter {
     pub tag: String,
 }
 
+/// A proxy model entry whose registers, repo and tag all matched one compiled
+/// pin for `slug`. `entry.repo` and `entry.tag` are therefore the pinned
+/// provenance.
 #[derive(Debug, Clone)]
 pub struct PinnedModel {
     pub slug: String,
-    pub repo: String,
-    pub tag: String,
     pub entry: ProxyModelEntry,
 }
 
@@ -82,8 +89,10 @@ pub enum TinfoilVerifyError {
     TcbTooLow,
     #[error("report data mismatch")]
     ReportDataMismatch,
-    #[error("malformed evidence")]
-    Malformed,
+    /// `stage` names the decode step that failed (a fixed, non-sensitive
+    /// tag); it is for diagnosis only and is not part of [`Self::reason`].
+    #[error("malformed evidence ({stage})")]
+    Malformed { stage: &'static str },
 }
 
 impl TinfoilVerifyError {
@@ -96,13 +105,19 @@ impl TinfoilVerifyError {
             Self::DebugPolicy => "debug_policy",
             Self::TcbTooLow => "tcb_too_low",
             Self::ReportDataMismatch => "report_data_mismatch",
-            Self::Malformed => "malformed_evidence",
+            Self::Malformed { .. } => "malformed_evidence",
         }
     }
 }
 
 pub trait TinfoilVerifier: Send + Sync {
     fn verify_router(&self, bundle: &AtcBundle) -> Result<VerifiedRouter, TinfoilVerifyError>;
+    /// Verifies that `entry` matches a compiled pin for `slug`: the measurement
+    /// registers, `repo` and `tag` must all equal one pinned row. Enclave
+    /// metadata (`enclaves`) is passed through unverified. `entry` is
+    /// caller-supplied, so callers must obtain it from a source whose
+    /// integrity is established separately (the router's attested TLS
+    /// channel); a pin match alone does not authenticate where it came from.
     fn check_model(
         &self,
         slug: &str,

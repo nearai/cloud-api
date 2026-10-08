@@ -17,22 +17,31 @@ pub mod probe;
 pub mod report;
 pub mod sigstore_verify;
 
-use classify::Observations;
+use classify::{Earlier, Observations};
 use services::attestation::tinfoil_pins::TinfoilPins;
 
 /// Rows that earlier runs verified: the `verified` field of every
 /// `observations.json` audit file below `dir` (the downloaded artifacts of
-/// recent successful runs on `main`). Files that do not parse are skipped.
+/// recent successful runs on `main`), each with the time that run observed it.
+/// Files that do not parse are skipped.
 ///
 /// The directory walk is a deliberate fork of `load_evidence` in
 /// `crates/chutes_sync/src/lib.rs` (spec section 3.4): the two syncs share no
 /// code so neither can break the other.
-pub fn load_evidence(dir: &std::path::Path) -> TinfoilPins {
+pub fn load_evidence(dir: &std::path::Path) -> Earlier {
     #[derive(serde::Deserialize)]
     struct Audit {
         verified: TinfoilPins,
+        #[serde(default)]
+        observations: Option<AuditObservations>,
+        #[serde(default)]
+        date: Option<String>,
     }
-    let mut out = TinfoilPins::default();
+    #[derive(serde::Deserialize)]
+    struct AuditObservations {
+        observed_at: String,
+    }
+    let mut out = Earlier::default();
     let mut stack = vec![dir.to_path_buf()];
     while let Some(d) = stack.pop() {
         let Ok(entries) = std::fs::read_dir(&d) else {
@@ -47,7 +56,14 @@ pub fn load_evidence(dir: &std::path::Path) -> TinfoilPins {
                     .ok()
                     .and_then(|s| serde_json::from_str::<Audit>(&s).ok())
                 {
-                    Some(a) => out.merge_never_remove(&a.verified),
+                    Some(a) => {
+                        let at = a
+                            .observations
+                            .map(|o| o.observed_at)
+                            .or(a.date)
+                            .unwrap_or_else(|| "unknown".to_string());
+                        out.merge(&a.verified, &at)
+                    }
                     None => eprintln!(
                         "tinfoil-measurement-sync: skipping unreadable evidence {}",
                         path.display()
@@ -101,6 +117,7 @@ mod tests {
         let loaded = load_evidence(&dir);
         std::fs::remove_dir_all(&dir).unwrap();
         let ms: Vec<_> = loaded
+            .pins
             .router
             .iter()
             .map(|r| r.measurement.as_str())

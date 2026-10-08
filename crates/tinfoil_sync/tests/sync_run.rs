@@ -1,5 +1,6 @@
 //! Runs the sync core against a mock probe and a temp pins file.
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use services::attestation::tinfoil_pins::TinfoilPins;
@@ -38,14 +39,27 @@ async fn server() -> (MockServer, ProbeConfig) {
         )))
         .mount(&s)
         .await;
+    // The pinned proxy fetch is covered in `probe.rs` against a local TLS
+    // server; here a plain mock stands in for it so the rest of the sync runs.
+    let proxy_url = format!("{}/proxy", s.uri());
     let cfg = ProbeConfig {
         atc_url: format!("{}/atc", s.uri()),
-        proxy_url: format!("{}/proxy", s.uri()),
+        proxy_fetcher: Some(Arc::new(move |_target| {
+            let url = proxy_url.clone();
+            Box::pin(async move {
+                reqwest::get(&url)
+                    .await
+                    .map_err(|e| e.to_string())?
+                    .text()
+                    .await
+                    .map_err(|e| e.to_string())
+            })
+        })),
         download_base: s.uri(),
         api_base: s.uri(),
-        github_token: None,
         attempts: 1,
         backoff: Duration::ZERO,
+        ..ProbeConfig::default()
     };
     (s, cfg)
 }
@@ -76,7 +90,7 @@ async fn sync_writes_canonical_pins_and_round_trippable_evidence() {
 
     // The audit file's `verified` rows round-trip through load_evidence.
     assert!(dir.join("out/report.md").is_file());
-    assert_eq!(load_evidence(&dir.join("out")), pins);
+    assert_eq!(load_evidence(&dir.join("out")).pins, pins);
 
     // A second run adds nothing and leaves the pins file byte-identical.
     let second = run_sync(&args, &client, &cfg).await.unwrap();

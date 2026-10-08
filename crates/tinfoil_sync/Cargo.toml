@@ -12,7 +12,7 @@ inference_providers = { path = "../inference_providers" }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 tokio = { version = "1", features = ["full"] }
-reqwest = { version = "0.12", features = ["json"] }
+reqwest = { version = "0.12", features = ["json", "rustls-tls-native-roots"] }
 thiserror = "2.0"
 anyhow = "1.0"
 hex = "0.4"
@@ -24,3 +24,6 @@ sigstore-verify = { version = "0.14", default-features = false }
 
 [dev-dependencies]
 wiremock = "0.6"
+rcgen = "0.14"
+rustls = { version = "0.23.45", features = ["aws-lc-rs"] }
+tokio-rustls = "0.26"

@@ -31,9 +31,9 @@ pub fn vetted_tinfoil_pins() -> Result<TinfoilPins, String> {
 /// SHA-256 of the DER SubjectPublicKeyInfo of a PEM certificate.
 pub fn spki_sha256_of_pem_cert(pem: &str) -> Result<[u8; 32], TinfoilVerifyError> {
     let (_, p) = x509_parser::pem::parse_x509_pem(pem.as_bytes())
-        .map_err(|_| TinfoilVerifyError::Malformed)?;
+        .map_err(|_| TinfoilVerifyError::Malformed { stage: "cert_pem" })?;
     let (_, cert) = x509_parser::parse_x509_certificate(&p.contents)
-        .map_err(|_| TinfoilVerifyError::Malformed)?;
+        .map_err(|_| TinfoilVerifyError::Malformed { stage: "cert_x509" })?;
     Ok(Sha256::digest(cert.tbs_certificate.subject_pki.raw).into())
 }
 
@@ -42,7 +42,12 @@ fn map_snp(e: SnpError) -> TinfoilVerifyError {
         SnpError::Chain | SnpError::Signature => TinfoilVerifyError::BadSignature,
         SnpError::Debug | SnpError::MigrateMa => TinfoilVerifyError::DebugPolicy,
         SnpError::Tcb => TinfoilVerifyError::TcbTooLow,
-        SnpError::Malformed | SnpError::Product => TinfoilVerifyError::Malformed,
+        SnpError::Malformed => TinfoilVerifyError::Malformed {
+            stage: "snp_report",
+        },
+        SnpError::Product => TinfoilVerifyError::Malformed {
+            stage: "snp_product",
+        },
     }
 }
 
@@ -56,15 +61,21 @@ pub fn observe_router(bundle: &AtcBundle) -> Result<VerifiedSnpReport, TinfoilVe
     let b64 = base64::engine::general_purpose::STANDARD;
     let gz = b64
         .decode(bundle.report.body.trim())
-        .map_err(|_| TinfoilVerifyError::Malformed)?;
+        .map_err(|_| TinfoilVerifyError::Malformed {
+            stage: "report_base64",
+        })?;
     let mut report = Vec::new();
     flate2::read::GzDecoder::new(&gz[..])
         .take(64 * 1024)
         .read_to_end(&mut report)
-        .map_err(|_| TinfoilVerifyError::Malformed)?;
+        .map_err(|_| TinfoilVerifyError::Malformed {
+            stage: "report_gzip",
+        })?;
     let vcek = b64
         .decode(bundle.vcek.trim())
-        .map_err(|_| TinfoilVerifyError::Malformed)?;
+        .map_err(|_| TinfoilVerifyError::Malformed {
+            stage: "vcek_base64",
+        })?;
     snp::verify_snp_report(
         &SnpEvidence {
             report: &report,
@@ -125,17 +136,21 @@ impl TinfoilVerifier for TinfoilPolicyVerifier {
         slug: &str,
         entry: &ProxyModelEntry,
     ) -> Result<PinnedModel, TinfoilVerifyError> {
+        // Registers, repo and tag must all equal one pinned row: a pin proves
+        // a specific release, so reused registers under other provenance are
+        // not accepted.
         let pinned = self.pins.models.get(slug).is_some_and(|ps| {
-            ps.iter()
-                .any(|p| registers_eq(&p.registers, &entry.measurement.registers))
+            ps.iter().any(|p| {
+                registers_eq(&p.registers, &entry.measurement.registers)
+                    && p.repo == entry.repo
+                    && p.tag == entry.tag
+            })
         });
         if !pinned {
             return Err(TinfoilVerifyError::UnknownModelMeasurement);
         }
         Ok(PinnedModel {
             slug: slug.to_string(),
-            repo: entry.repo.clone(),
-            tag: entry.tag.clone(),
             entry: entry.clone(),
         })
     }
@@ -275,14 +290,18 @@ mod tests {
         with_report_body(&mut b, "!!! not base64 !!!".into());
         assert_eq!(
             observe_router(&b).unwrap_err(),
-            TinfoilVerifyError::Malformed
+            TinfoilVerifyError::Malformed {
+                stage: "report_base64"
+            }
         );
 
         // Base64 but not gzip.
         with_report_body(&mut b, b64.encode(b"plain bytes, not gzip"));
         assert_eq!(
             observe_router(&b).unwrap_err(),
-            TinfoilVerifyError::Malformed
+            TinfoilVerifyError::Malformed {
+                stage: "report_gzip"
+            }
         );
 
         // Valid gzip that inflates past the 64 KiB cap: truncated to the cap,
@@ -290,13 +309,18 @@ mod tests {
         with_report_body(&mut b, b64.encode(gzip(&vec![0u8; 1024 * 1024])));
         assert_eq!(
             observe_router(&b).unwrap_err(),
-            TinfoilVerifyError::Malformed
+            TinfoilVerifyError::Malformed {
+                stage: "snp_report"
+            }
         );
     }
 
     #[test]
     fn malformed_error_reason_is_not_a_fetch_error() {
-        assert_eq!(TinfoilVerifyError::Malformed.reason(), "malformed_evidence");
+        assert_eq!(
+            TinfoilVerifyError::Malformed { stage: "x" }.reason(),
+            "malformed_evidence"
+        );
     }
 
     #[test]
@@ -308,8 +332,18 @@ mod tests {
             (SnpError::MigrateMa, E::DebugPolicy),
             (SnpError::Chain, E::BadSignature),
             (SnpError::Signature, E::BadSignature),
-            (SnpError::Malformed, E::Malformed),
-            (SnpError::Product, E::Malformed),
+            (
+                SnpError::Malformed,
+                E::Malformed {
+                    stage: "snp_report",
+                },
+            ),
+            (
+                SnpError::Product,
+                E::Malformed {
+                    stage: "snp_product",
+                },
+            ),
         ] {
             assert_eq!(map_snp(from), to);
         }
@@ -365,5 +399,27 @@ mod tests {
             *r = r.to_uppercase();
         }
         assert!(test_verifier().check_model("glm-5-3", entry).is_ok());
+    }
+
+    #[test]
+    fn pinned_registers_with_other_tag_or_repo_are_unknown_model() {
+        let proxy: ProxyDoc =
+            serde_json::from_str(include_str!("testdata/tinfoil/proxy.json")).unwrap();
+        let pinned = test_verifier()
+            .check_model("glm-5-3", &proxy.models["glm-5-3"])
+            .unwrap();
+        assert_eq!(pinned.entry.repo, "tinfoilsh/confidential-glm5-3-nvfp4");
+        assert_eq!(pinned.entry.tag, "v0.0.3");
+
+        let mut other_tag = proxy.models["glm-5-3"].clone();
+        other_tag.tag = "v9.9.9".into();
+        let mut other_repo = proxy.models["glm-5-3"].clone();
+        other_repo.repo = "tinfoilsh/confidential-other".into();
+        for entry in [other_tag, other_repo] {
+            assert_eq!(
+                test_verifier().check_model("glm-5-3", &entry).unwrap_err(),
+                TinfoilVerifyError::UnknownModelMeasurement
+            );
+        }
     }
 }

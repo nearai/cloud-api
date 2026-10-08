@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 
 use services::attestation::tinfoil_pins::TinfoilPins;
 
-use crate::classify::classify_with_earlier;
+use crate::classify::{classify_with_earlier, rejections};
 use crate::probe::{self, ProbeConfig};
 use crate::report::render_markdown;
 use crate::{audit_json, load_evidence};
@@ -75,6 +75,10 @@ pub async fn run_sync(
         .map_err(|e| (1, e.to_string()))?;
 
     let (pins, added) = classify_with_earlier(&base, &earlier, &out.observations, &out.sigstore);
+    // Disagreements between a live row and its verified Sigstore predicate are
+    // reported with the other not-pinned notes.
+    let mut notes = out.notes.clone();
+    notes.extend(rejections(&out.observations, &out.sigstore));
     let (verified, _) =
         crate::classify::classify(&TinfoilPins::default(), &out.observations, &out.sigstore);
     let date = chrono::Utc::now().format("%Y-%m-%d").to_string();
@@ -85,24 +89,18 @@ pub async fn run_sync(
     }
     write(
         &args.out_dir.join("report.md"),
-        &render_markdown(&added, &out.notes, &date),
+        &render_markdown(&added, &notes, &date),
     )?;
     write(
         &args.out_dir.join("observations.json"),
-        &audit_json(
-            &date,
-            &out.observations,
-            &out.sigstore,
-            &verified,
-            &out.notes,
-        ),
+        &audit_json(&date, &out.observations, &out.sigstore, &verified, &notes),
     )?;
     Ok(format!(
         "router_observed={} models_published={} releases_verified={} not_pinned={} rows_added={}",
         out.observations.router.is_some(),
         out.observations.models.len(),
         out.sigstore.models.len() + usize::from(out.sigstore.router.is_some()),
-        out.notes.len(),
+        notes.len(),
         added.len(),
     ))
 }

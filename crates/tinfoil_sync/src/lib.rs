@@ -1,5 +1,5 @@
 //! Daily Tinfoil measurement sync, run by
-//! `.github/workflows/tinfoil-measurements-sync.yml`.
+//! `.github/workflows/chutes-measurements-sync.yml`.
 //!
 //! The probe ([`probe`]) reads Tinfoil's public endpoints (no API key): the
 //! router's ATC attestation bundle and `/.well-known/tinfoil-proxy`. The router

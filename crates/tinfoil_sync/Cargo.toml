@@ -1,0 +1,26 @@
+[package]
+name = "tinfoil_sync"
+edition.workspace = true
+version.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Daily Tinfoil measurement sync: observe the live router, verify its Sigstore release attestations, and propose pins for rows both agree on"
+
+[dependencies]
+services = { path = "../services" }
+inference_providers = { path = "../inference_providers" }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+tokio = { version = "1", features = ["full"] }
+reqwest = { version = "0.12", features = ["json"] }
+thiserror = "2.0"
+anyhow = "1.0"
+hex = "0.4"
+base64 = "0.22"
+chrono = "0.4"
+# Sigstore bundle verification, offline against the crate's embedded
+# public-good trusted root. Tooling only: never a dependency of `api`.
+sigstore-verify = { version = "0.14", default-features = false }
+
+[dev-dependencies]
+wiremock = "0.6"

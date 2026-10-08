@@ -181,6 +181,55 @@ async fn admin_model_revenue_filters_chutes_served_usage() {
 }
 
 #[tokio::test]
+async fn admin_model_revenue_filters_tinfoil_served_usage() {
+    let fixture = setup_platform_provider_usage_fixture().await;
+    let now = chrono::Utc::now();
+    for (minutes, input, ty) in [(2, 30, "tinfoil"), (1, 50, "chutes")] {
+        insert_platform_provider_usage_row(
+            &fixture,
+            ProviderUsageSeedRow {
+                created_at: now - chrono::Duration::minutes(minutes),
+                input_tokens: input,
+                output_tokens: 5,
+                cache_read_tokens: 0,
+                total_cost: 1_000_000_000,
+                served_provider_type: Some(ty),
+                served_provider_tier: Some("attested_3p"),
+                served_via_fallback: true,
+            },
+        )
+        .await;
+    }
+    crate::usage_hourly::recompute_recent_usage().await;
+
+    let start =
+        (now - chrono::Duration::hours(1)).to_rfc3339_opts(chrono::SecondsFormat::Nanos, true);
+    let end =
+        (now + chrono::Duration::hours(1)).to_rfc3339_opts(chrono::SecondsFormat::Nanos, true);
+    let model_search = &fixture.model_name;
+    let response = fixture
+        .server
+        .get(
+            format!(
+                "/v1/admin/platform/model-revenue?start={start}&end={end}&provider_type=tinfoil&model_search={model_search}"
+            )
+            .as_str(),
+        )
+        .add_header("Authorization", format!("Bearer {}", get_session_id()))
+        .add_header("User-Agent", MOCK_USER_AGENT)
+        .await;
+    assert_eq!(response.status_code(), 200, "tinfoil filter should 200");
+    let report: ModelRevenueReport = serde_json::from_str(&response.text()).expect("parse report");
+    let entry = model_revenue_entry(&report, &fixture.model_name);
+    assert_eq!(entry.requests, 1);
+    assert_eq!(entry.tokens, 35);
+    assert_eq!(
+        model_provider_breakdown(entry, Some("tinfoil"), Some("attested_3p"), true).requests,
+        1
+    );
+}
+
+#[tokio::test]
 async fn admin_model_revenue_rejects_invalid_provider_type() {
     ensure_platform_provider_usage_harness_env();
     let (server, _) = setup_test_server_with_mock_web_search().await;

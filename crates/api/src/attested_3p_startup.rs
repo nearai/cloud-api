@@ -79,29 +79,25 @@ pub(crate) fn reserve_attested_3p(
     cfg: &ExternalProvidersConfig,
 ) {
     if cfg.enable_chutes {
-        let canonical_ids: Vec<String> = cfg
-            .chutes_models
-            .iter()
-            .map(|e| e.canonical_id.clone())
-            .collect();
-        if !canonical_ids.is_empty() {
-            pool.reserve_pinned_models(&canonical_ids);
-            tracing::info!(
-                count = canonical_ids.len(),
-                "Reserved Chutes canonical ids as verifiable (fail-closed) before external load"
-            );
-        }
+        reserve_source(pool, ProviderSource::Chutes, &cfg.chutes_models);
     }
-    let tinfoil_ids: Vec<String> = cfg
-        .tinfoil_models
-        .iter()
-        .map(|e| e.canonical_id.clone())
-        .collect();
-    if !tinfoil_ids.is_empty() {
-        pool.reserve_pinned_models(&tinfoil_ids);
+    reserve_source(pool, ProviderSource::Tinfoil, &cfg.tinfoil_models);
+}
+
+/// Reserve one source's canonical ids as pinned (verifiable) models. The
+/// single place the fail-closed reservation is done, so sources can't drift.
+fn reserve_source(
+    pool: &Arc<InferenceProviderPool>,
+    source: ProviderSource,
+    entries: &[config::AttestedThirdPartyModelEntry],
+) {
+    let canonical_ids: Vec<String> = entries.iter().map(|e| e.canonical_id.clone()).collect();
+    if !canonical_ids.is_empty() {
+        pool.reserve_pinned_models(&canonical_ids);
         tracing::info!(
-            count = tinfoil_ids.len(),
-            "Reserved Tinfoil canonical ids as verifiable (fail-closed) before external load"
+            count = canonical_ids.len(),
+            "Reserved {} canonical ids as verifiable (fail-closed) before external load",
+            source_label(source)
         );
     }
 }
@@ -178,14 +174,19 @@ async fn register_chutes(
                                     // data plane resolves the model (and usage bills against a
                                     // real id). If NEAR already serves this id, its row is left
                                     // untouched and we just add Chutes as a fallback provider.
-                                    let role = ensure_attested_3p_catalog_row(
+                                    let Some(role) = ensure_attested_3p_catalog_row(
                                         models_repo,
                                         ProviderSource::Chutes,
                                         &entry.canonical_id,
                                         Some(&CHUTES_SEED),
                                     )
                                     .await
-                                    .unwrap_or(ProviderPoolRole::Fallback);
+                                    else {
+                                        // `None` = out of scope (no catalog row and no
+                                        // seed): skip registration entirely. Unreachable
+                                        // for Chutes, which always passes a seed.
+                                        continue;
+                                    };
                                     // Register the stable role from catalog configuration,
                                     // independently of whether discovery happened to find a live
                                     // primary during this startup.

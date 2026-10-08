@@ -23,8 +23,8 @@ pub struct AttestationQuery {
     /// Include the TLS certificate SPKI fingerprint in the report-data binding.
     /// Defaults to false; when true, report_data[..32] = SHA256(signing_address || tls_cert_fingerprint).
     pub include_tls_fingerprint: Option<bool>,
-    /// Restrict the report to a specific serving tier.
-    /// Accepted values: `near` (NEAR AI's own TEE fleet) or `chutes` (attested Chutes fallback).
+    /// Restrict the report to a specific provider.
+    /// Accepted values: `near` (NEAR AI's own TEE fleet), `chutes`, or `tinfoil` (attested third-party sources).
     /// When omitted, the first successfully responding provider is used.
     pub provider: Option<String>,
 }

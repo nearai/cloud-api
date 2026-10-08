@@ -159,8 +159,10 @@ const ATTESTED_3P_FIELDS: &[&str] = &["disabled_sources"];
 ///
 /// Propagation: a PATCH applies immediately on the instance that handled it
 /// and within `RELOAD_INTERVAL` (10 min) on every other instance (there is no
-/// cross-instance push). For a faster stop use per-org `fallback_disabled` or
-/// redeploy.
+/// cross-instance push). For a faster stop on other instances, redeploy. Per-org
+/// `fallback_disabled` is NOT a substitute: it only excludes registered
+/// fallback providers for that organization, not standalone primaries or
+/// attestation reports.
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct Attested3pSettings {
     pub disabled_sources: DisabledSources,

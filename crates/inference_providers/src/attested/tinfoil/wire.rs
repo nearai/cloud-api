@@ -95,15 +95,27 @@ pub(super) fn map_event(
     canonical: &str,
     client_wants_usage: bool,
 ) -> Result<SSEEvent, CompletionError> {
-    if ev.chunk.is_none() {
-        return Ok(ev);
-    }
     let s = std::str::from_utf8(&ev.raw_bytes).map_err(|_| invalid("event"))?;
-    let data = s
-        .trim()
-        .strip_prefix("data:")
-        .map(str::trim)
-        .unwrap_or(s.trim());
+    let line = s.trim();
+    if ev.chunk.is_none() {
+        // The shared parser only recognizes `data: ` (with the space), so a
+        // chunk-less event may be a valid `data:{...}` frame. Only blank lines,
+        // SSE comments and the exact `[DONE]` terminator pass through verbatim;
+        // any other `data:` frame is sanitized below, and anything else
+        // (`event:`, `id:`, bare text) is rejected, never forwarded.
+        let is_control = line.is_empty()
+            || line.starts_with(':')
+            || line
+                .strip_prefix("data:")
+                .is_some_and(|d| d.trim() == "[DONE]");
+        if is_control {
+            return Ok(ev);
+        }
+        if !line.starts_with("data:") {
+            return Err(invalid("event"));
+        }
+    }
+    let data = line.strip_prefix("data:").map(str::trim).unwrap_or(line);
     let mut v: Value = serde_json::from_str(data).map_err(|_| invalid("event"))?;
     let obj = v.as_object_mut().ok_or_else(|| invalid("event"))?;
     sanitize(obj, canonical);

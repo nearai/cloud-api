@@ -1396,3 +1396,63 @@ async fn paused_wait(mut cond: impl FnMut() -> bool) {
         tokio::time::sleep(std::time::Duration::from_millis(1)).await;
     }
 }
+
+async fn map_raw_sse(raw: &str) -> Vec<Result<crate::SSEEvent, crate::CompletionError>> {
+    let s = futures_util::stream::iter(vec![Ok::<_, reqwest::Error>(bytes::Bytes::from(
+        raw.to_string(),
+    ))]);
+    let parsed: crate::StreamingResult =
+        Box::pin(crate::sse_parser::new_external_sse_parser(s, true));
+    wire::map_stream(parsed, CANON.to_string(), false)
+        .collect()
+        .await
+}
+
+const LEAKY: &str = r#"{"id":"c","object":"chat.completion.chunk","created":0,"model":"upstream-slug","prompt_text":"SECRET","prompt_token_ids":[1,2],"choices":[{"index":0,"token_ids":[9],"delta":{"content":"hi","token_ids":[9]}}]}"#;
+
+#[tokio::test]
+async fn data_frame_without_space_is_sanitized_not_passed_through() {
+    let out = map_raw_sse(&format!("data:{LEAKY}\n\ndata: [DONE]\n\n")).await;
+    let mut saw_chunk = false;
+    for ev in out {
+        let ev = ev.unwrap();
+        let raw = String::from_utf8_lossy(&ev.raw_bytes).to_string();
+        for k in ["prompt_text", "SECRET", "token_ids", "upstream-slug"] {
+            assert!(!raw.contains(k), "{k} leaked: {raw}");
+        }
+        if let Some(v) = client_json(&ev) {
+            assert_eq!(v["model"], CANON);
+            saw_chunk = true;
+        }
+    }
+    assert!(saw_chunk);
+}
+
+#[tokio::test]
+async fn data_done_without_space_still_terminates() {
+    let out = map_raw_sse("data:[DONE]\n\n").await;
+    assert!(out.into_iter().any(|e| e.unwrap().is_done_marker()));
+}
+
+#[tokio::test]
+async fn unknown_lines_are_never_forwarded() {
+    for line in [
+        format!("event: {LEAKY}\n\n"),
+        format!("id: {LEAKY}\n\n"),
+        format!("{LEAKY}\n\n"),
+        format!("retry: 5 {LEAKY}\n\n"),
+    ] {
+        let out = map_raw_sse(&line).await;
+        assert!(out.iter().any(|r| r.is_err()), "not rejected: {line}");
+        for ev in out.iter().flatten() {
+            let raw = String::from_utf8_lossy(&ev.raw_bytes);
+            assert!(!raw.contains("SECRET"), "unknown line forwarded: {raw}");
+        }
+    }
+}
+
+#[tokio::test]
+async fn blank_and_comment_lines_still_pass_through() {
+    let out = map_raw_sse(": keepalive\n\n").await;
+    assert!(!out.is_empty() && out.iter().all(|r| r.is_ok()));
+}

@@ -20,10 +20,7 @@ use services::{
     attestation::SignatureKind,
     completions::hash_inference_id_to_uuid,
     models::ModelsError,
-    usage::{
-        InferenceType, ProviderAttribution, RecordUsageServiceRequest, ServedProviderTier,
-        ServedProviderType, StopReason,
-    },
+    usage::{InferenceType, ProviderAttribution, RecordUsageServiceRequest, StopReason},
 };
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
@@ -284,23 +281,19 @@ fn provider_error(err: CompletionError) -> Response {
 /// Rebuild the serving provider from the recorded usage attribution so the
 /// `x-serving-provider` label matches the chat-completions routes.
 fn serving_from_attribution(a: &ProviderAttribution) -> ServingProvider {
-    let tier = match a.served_provider_tier {
-        Some(ServedProviderTier::Near) => ProviderTier::Near,
-        Some(ServedProviderTier::Attested3p) => ProviderTier::Attested3p,
-        _ => ProviderTier::NonAttested,
-    };
-    let source = match a.served_provider_type {
-        Some(ServedProviderType::Vllm) => ProviderSource::Vllm,
-        Some(ServedProviderType::Chutes) => ProviderSource::Chutes,
-        Some(ServedProviderType::Tinfoil) => ProviderSource::Tinfoil,
-        Some(ServedProviderType::External) | None => ProviderSource::External,
-    };
+    let tier = a
+        .served_provider_tier
+        .map_or(ProviderTier::NonAttested, ProviderTier::from);
+    let source = a
+        .served_provider_type
+        .map_or(ProviderSource::External, ProviderSource::from);
     ServingProvider { tier, source }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use services::usage::{ServedProviderTier, ServedProviderType};
     use utoipa::OpenApi;
 
     fn attribution(

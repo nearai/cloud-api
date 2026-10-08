@@ -1,4 +1,4 @@
-use inference_providers::{InferenceProvider, ProviderSource, ProviderTier, StreamingResult};
+use inference_providers::{InferenceProvider, StreamingResult};
 use std::sync::Arc;
 
 pub struct AttributedChatCompletion {
@@ -48,25 +48,8 @@ pub(super) fn served_provider_attribution(
     served_via_fallback: bool,
 ) -> crate::usage::ProviderAttribution {
     crate::usage::ProviderAttribution {
-        served_provider_tier: Some(served_provider_tier(provider.tier())),
-        served_provider_type: Some(served_provider_type(provider.provider_source())),
+        served_provider_tier: Some(provider.tier().into()),
+        served_provider_type: Some(provider.provider_source().into()),
         served_via_fallback,
-    }
-}
-
-fn served_provider_tier(tier: ProviderTier) -> crate::usage::ServedProviderTier {
-    match tier {
-        ProviderTier::Near => crate::usage::ServedProviderTier::Near,
-        ProviderTier::Attested3p => crate::usage::ServedProviderTier::Attested3p,
-        ProviderTier::NonAttested => crate::usage::ServedProviderTier::NonAttested,
-    }
-}
-
-fn served_provider_type(source: ProviderSource) -> crate::usage::ServedProviderType {
-    match source {
-        ProviderSource::Vllm => crate::usage::ServedProviderType::Vllm,
-        ProviderSource::External => crate::usage::ServedProviderType::External,
-        ProviderSource::Chutes => crate::usage::ServedProviderType::Chutes,
-        ProviderSource::Tinfoil => crate::usage::ServedProviderType::Tinfoil,
     }
 }

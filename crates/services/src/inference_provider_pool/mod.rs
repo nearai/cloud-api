@@ -8663,6 +8663,17 @@ mod tests {
             .await
             .unwrap();
         assert!(before.iter().any(|p| Arc::ptr_eq(p, &chutes)));
+        // Baseline: the Chutes attestation report succeeds before disabling.
+        pool.get_attestation_report(
+            model.clone(),
+            None,
+            None,
+            None,
+            false,
+            Some(ProviderFilter::Source(ProviderSource::Chutes)),
+        )
+        .await
+        .expect("attestation succeeds before the source is disabled");
 
         let mut d = DisabledSources::default();
         d.insert(ProviderSource::Chutes);
@@ -8686,6 +8697,66 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, AttestationError::ProviderNotFound(_)));
+    }
+
+    #[tokio::test]
+    async fn disabled_sole_3p_source_returns_empty_not_unknown_model() {
+        use inference_providers::mock::MockProvider;
+        use inference_providers::{DisabledSources, ProviderSource, ProviderTier};
+
+        let pool = InferenceProviderPool::new(None, ExternalProvidersConfig::default());
+        let model = "m-ks-sole".to_string();
+        let chutes: Arc<InferenceProviderTrait> = Arc::new(
+            MockProvider::new()
+                .with_tier(ProviderTier::Attested3p)
+                .with_provider_source(ProviderSource::Chutes),
+        );
+        pool.register_pinned_secondary_provider(model.clone(), chutes, None)
+            .await;
+        let mut d = DisabledSources::default();
+        d.insert(ProviderSource::Chutes);
+        pool.attested_3p_disabled().store(Arc::new(d));
+
+        let r = pool
+            .get_providers_with_fallback(&model, None, &ChatRoutingHints::default())
+            .await;
+        assert_eq!(
+            r.map(|v| v.len()),
+            Some(0),
+            "known model, no eligible provider"
+        );
+    }
+
+    #[tokio::test]
+    async fn disabled_tinfoil_is_excluded_but_chutes_stays() {
+        use inference_providers::mock::MockProvider;
+        use inference_providers::{DisabledSources, ProviderSource, ProviderTier};
+
+        let pool = InferenceProviderPool::new(None, ExternalProvidersConfig::default());
+        let model = "m-ks-tin".to_string();
+        let mk = |src| -> Arc<InferenceProviderTrait> {
+            Arc::new(
+                MockProvider::new()
+                    .with_tier(ProviderTier::Attested3p)
+                    .with_provider_source(src),
+            )
+        };
+        let chutes = mk(ProviderSource::Chutes);
+        let tinfoil = mk(ProviderSource::Tinfoil);
+        pool.register_pinned_secondary_provider(model.clone(), chutes.clone(), None)
+            .await;
+        pool.register_pinned_secondary_provider(model.clone(), tinfoil.clone(), None)
+            .await;
+        let mut d = DisabledSources::default();
+        d.insert(ProviderSource::Tinfoil);
+        pool.attested_3p_disabled().store(Arc::new(d));
+
+        let order = pool
+            .get_providers_with_fallback(&model, None, &ChatRoutingHints::default())
+            .await
+            .unwrap();
+        assert!(order.iter().any(|p| Arc::ptr_eq(p, &chutes)));
+        assert!(order.iter().all(|p| !Arc::ptr_eq(p, &tinfoil)));
     }
 
     /// A Chutes-only model (NEAR does not serve it) has the single attested

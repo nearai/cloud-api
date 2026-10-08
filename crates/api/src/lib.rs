@@ -1,4 +1,5 @@
-mod attested_3p_startup;
+#[doc(hidden)]
+pub mod attested_3p_startup;
 pub mod consts;
 pub mod conversions;
 pub mod database_encryption;
@@ -867,13 +868,8 @@ pub async fn init_inference_providers(
         .await;
 
     // Attested third-party providers (Chutes, then Tinfoil).
-    let attested_3p =
-        attested_3p_startup::register_attested_3p(&pool, &models_repo, &config.external_providers)
-            .await;
-    tracing::debug!(
-        chutes_registered = attested_3p.chutes_registered,
-        "Attested 3P registration complete"
-    );
+    attested_3p_startup::register_attested_3p(&pool, &models_repo, &config.external_providers)
+        .await;
 
     pool
 }

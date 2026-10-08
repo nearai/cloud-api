@@ -1,7 +1,4 @@
-use crate::models::{
-    OrganizationBalance, OrganizationUsageLog, RecordUsageRequest, ServedProviderTier,
-    ServedProviderType, StopReason,
-};
+use crate::models::{OrganizationBalance, OrganizationUsageLog, RecordUsageRequest, StopReason};
 use crate::pool::DbPool;
 use crate::repositories::credit_allocation::{
     allocate_usage, load_allocations, lock_organization_accounting, CreditAllocationPolicy,
@@ -856,6 +853,7 @@ fn tolerant<T: std::str::FromStr>(column: &'static str, value: Option<String>) -
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::models::{ServedProviderTier, ServedProviderType};
 
     #[test]
     fn unknown_served_provider_type_reads_as_none() {

@@ -40,7 +40,7 @@ pub(crate) const CHUTES_SUPPORTED_SAMPLING_PARAMS: &[&str] = &[
 pub(crate) const CHUTES_SUPPORTED_FEATURES: &[&str] = &["tools", "json_mode"];
 
 /// Catalog-row seed for an attested provider's auto-created model row.
-pub(crate) struct CatalogSeed {
+pub struct CatalogSeed {
     pub description: &'static str,
     pub supported_features: &'static [&'static str],
     pub supported_sampling_parameters: &'static [&'static str],
@@ -52,17 +52,12 @@ pub(crate) const CHUTES_SEED: CatalogSeed = CatalogSeed {
     supported_sampling_parameters: CHUTES_SUPPORTED_SAMPLING_PARAMS,
 };
 
-/// Result of `register_attested_3p`; reserved for later reporting.
-#[derive(Debug, Default)]
-pub(crate) struct Attested3pStartup {
-    pub chutes_registered: usize,
-}
-
 fn source_label(source: ProviderSource) -> &'static str {
     match source {
         ProviderSource::Chutes => "Chutes",
         ProviderSource::Tinfoil => "Tinfoil",
-        _ => "attested 3P",
+        ProviderSource::Vllm => "NEAR vLLM",
+        ProviderSource::External => "external",
     }
 }
 
@@ -113,10 +108,10 @@ pub(crate) async fn register_attested_3p(
     pool: &Arc<InferenceProviderPool>,
     models_repo: &ModelRepository,
     cfg: &ExternalProvidersConfig,
-) -> Attested3pStartup {
+) {
     let chutes_registered = register_chutes(pool, models_repo, cfg).await;
-    register_tinfoil(pool, models_repo, cfg).await;
-    Attested3pStartup { chutes_registered }
+    register_tinfoil(cfg);
+    tracing::debug!(chutes_registered, "Attested 3P registration finished");
 }
 
 /// Chutes attested provider — hard-off by default (`ENABLE_CHUTES`). Each model
@@ -239,12 +234,9 @@ async fn register_chutes(
     registered
 }
 
-/// Tinfoil registration hook. Task D3 replaces this body.
-async fn register_tinfoil(
-    _pool: &Arc<InferenceProviderPool>,
-    _models_repo: &ModelRepository,
-    cfg: &ExternalProvidersConfig,
-) {
+/// Tinfoil provider registration is added in a follow-up PR; ids stay
+/// reserved (fail-closed).
+fn register_tinfoil(cfg: &ExternalProvidersConfig) {
     if !cfg.tinfoil_models.is_empty() {
         tracing::warn!(
             count = cfg.tinfoil_models.len(),
@@ -269,7 +261,7 @@ async fn register_tinfoil(
 ///
 /// With `seed: None` and no existing row, nothing is seeded and `None` is
 /// returned (3P-only models are out of scope).
-pub(crate) async fn ensure_attested_3p_catalog_row(
+pub async fn ensure_attested_3p_catalog_row(
     models_repo: &ModelRepository,
     source: ProviderSource,
     model_name: &str,

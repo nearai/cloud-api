@@ -2706,6 +2706,23 @@ mod tests {
     }
 
     #[test]
+    fn external_providers_debug_never_prints_api_keys() {
+        let cfg = ExternalProvidersConfig {
+            openai_api_key: Some("sk-openai-SECRET".into()),
+            anthropic_api_key: Some("sk-ant-SECRET".into()),
+            gemini_api_key: Some("gem-SECRET".into()),
+            typesafe_api_key: Some("ts-SECRET".into()),
+            chutes_api_key: Some("cpk_SECRET".into()),
+            tinfoil_api_key: Some("tin-SECRET".into()),
+            ..Default::default()
+        };
+        let out = format!("{cfg:?}");
+        assert!(!out.contains("SECRET"), "key leaked in Debug: {out}");
+        assert!(out.contains("<redacted>"));
+        assert!(format!("{:?}", ExternalProvidersConfig::default()).contains("tinfoil_api_key: None"));
+    }
+
+    #[test]
     #[serial]
     fn native_anthropic_beta_denylist_is_trimmed_and_deduplicated() {
         let previous = std::env::var_os("ANTHROPIC_DENIED_BETAS");
@@ -2836,8 +2853,11 @@ pub fn parse_attested_3p_models(var: &str, raw: &str) -> Vec<AttestedThirdPartyM
 }
 
 /// External providers configuration for third-party AI providers
-/// API keys are loaded from environment variables or secret files
-#[derive(Debug, Clone, Default)]
+/// API keys are loaded from environment variables or secret files.
+///
+/// `Debug` is implemented by hand so no API key can ever reach a log line
+/// (the whole config is debug-printed at startup).
+#[derive(Clone, Default)]
 pub struct ExternalProvidersConfig {
     /// OpenAI API key (for OpenAI-compatible providers)
     pub openai_api_key: Option<String>,
@@ -2881,6 +2901,31 @@ pub struct ExternalProvidersConfig {
     /// Intel PCCS URL for DCAP collateral (shared with the NEAR attestation
     /// verifier), from `PCCS_URL`. One source of truth instead of ad-hoc env reads.
     pub pccs_url: Option<String>,
+}
+
+impl std::fmt::Debug for ExternalProvidersConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        fn redact(k: &Option<String>) -> Option<&'static str> {
+            k.as_ref().map(|_| "<redacted>")
+        }
+        f.debug_struct("ExternalProvidersConfig")
+            .field("openai_api_key", &redact(&self.openai_api_key))
+            .field("anthropic_api_key", &redact(&self.anthropic_api_key))
+            .field("enable_anthropic_messages", &self.enable_anthropic_messages)
+            .field("anthropic_denied_betas", &self.anthropic_denied_betas)
+            .field("gemini_api_key", &redact(&self.gemini_api_key))
+            .field("typesafe_api_key", &redact(&self.typesafe_api_key))
+            .field("timeout_seconds", &self.timeout_seconds)
+            .field("refresh_interval_secs", &self.refresh_interval_secs)
+            .field("enable_chutes", &self.enable_chutes)
+            .field("chutes_api_key", &redact(&self.chutes_api_key))
+            .field("chutes_models", &self.chutes_models)
+            .field("tinfoil_api_key", &redact(&self.tinfoil_api_key))
+            .field("tinfoil_models", &self.tinfoil_models)
+            .field("chutes_enable_streaming", &self.chutes_enable_streaming)
+            .field("pccs_url", &self.pccs_url)
+            .finish()
+    }
 }
 
 impl ExternalProvidersConfig {

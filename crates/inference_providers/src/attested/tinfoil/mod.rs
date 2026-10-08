@@ -399,8 +399,8 @@ impl InferenceProvider for Provider {
             "model_entry".into(),
             json!({
                 "slug": pinned.slug,
-                "repo": pinned.repo,
-                "tag": pinned.tag,
+                "repo": pinned.entry.repo,
+                "tag": pinned.entry.tag,
                 "registers": pinned.entry.measurement.registers,
                 "replicas": replicas,
             }),

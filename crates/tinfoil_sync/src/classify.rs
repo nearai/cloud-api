@@ -9,6 +9,11 @@ use crate::sigstore_verify::SigstoreResult;
 
 pub const ROUTER_REPO: &str = "tinfoilsh/confidential-model-router";
 
+/// The Sigstore predicate type whose `snp_measurement` is the router's SEV-SNP
+/// launch measurement. A differently shaped predicate may use that field name
+/// for something else, so router rows are accepted only for this type.
+pub const ROUTER_PREDICATE_TYPE: &str = "https://tinfoil.sh/predicate/snp-tdx-multiplatform/v1";
+
 /// The router as seen live: `observe()` returned Ok for it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RouterObservation {
@@ -62,16 +67,56 @@ pub struct Added {
     pub source: Source,
 }
 
+/// Rows verified by earlier runs (their audit artifacts), with the time each
+/// was first observed, so a report can say when an earlier row was seen rather
+/// than claim it was seen now.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Earlier {
+    pub pins: TinfoilPins,
+    observed_at: BTreeMap<Row, String>,
+}
+
+impl Earlier {
+    /// Rows without a recorded observation time (reported as `unknown`).
+    pub fn from_pins(pins: TinfoilPins) -> Self {
+        let mut e = Self::default();
+        e.merge(&pins, "unknown");
+        e
+    }
+
+    /// Add `verified`, observed at `observed_at`. A row keeps the earliest
+    /// time it was recorded with; a known time replaces `unknown`.
+    pub fn merge(&mut self, verified: &TinfoilPins, observed_at: &str) {
+        self.pins.merge_never_remove(verified);
+        for row in rows(verified) {
+            let slot = self
+                .observed_at
+                .entry(row)
+                .or_insert_with(|| observed_at.to_string());
+            if *slot == "unknown" || (observed_at != "unknown" && observed_at < slot.as_str()) {
+                *slot = observed_at.to_string();
+            }
+        }
+    }
+
+    fn observed_at(&self, row: &Row) -> String {
+        self.observed_at
+            .get(row)
+            .cloned()
+            .unwrap_or_else(|| "unknown".to_string())
+    }
+}
+
 pub fn classify(
     base: &TinfoilPins,
     observed: &Observations,
     sigstore: &SigstoreResults,
 ) -> (TinfoilPins, Vec<Added>) {
-    classify_with_earlier(base, &TinfoilPins::default(), observed, sigstore)
+    classify_with_earlier(base, &Earlier::default(), observed, sigstore)
 }
 
 /// One pin row, router or model.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 enum Row {
     Router(RouterPin),
     Model(String, ModelPin),
@@ -94,11 +139,20 @@ fn has(p: &TinfoilPins, row: &Row) -> bool {
 }
 
 /// Rows seen in this run whose measurements equal the verified Sigstore
-/// predicate.
-fn live_rows(observed: &Observations, sigstore: &SigstoreResults) -> TinfoilPins {
+/// predicate, and a note for each observed row whose Sigstore result exists but
+/// disagrees with it (categories only: that disagreement is the anomaly a
+/// reviewer must see).
+fn evaluate(observed: &Observations, sigstore: &SigstoreResults) -> (TinfoilPins, Vec<String>) {
     let mut live = TinfoilPins::default();
+    let mut rejected = Vec::new();
     if let (Some(o), Some(s)) = (&observed.router, &sigstore.router) {
-        if s.repo == ROUTER_REPO && o.measurement_hex.eq_ignore_ascii_case(&s.snp_measurement) {
+        if s.repo != ROUTER_REPO {
+            rejected.push("router: sigstore repo is not the router repo".to_string());
+        } else if s.predicate_type != ROUTER_PREDICATE_TYPE {
+            rejected.push("router: unexpected sigstore predicate type".to_string());
+        } else if !o.measurement_hex.eq_ignore_ascii_case(&s.snp_measurement) {
+            rejected.push("router: live measurement differs from sigstore predicate".to_string());
+        } else {
             live.router.push(RouterPin {
                 measurement: o.measurement_hex.to_ascii_lowercase(),
                 repo: ROUTER_REPO.to_string(),
@@ -107,7 +161,8 @@ fn live_rows(observed: &Observations, sigstore: &SigstoreResults) -> TinfoilPins
         }
     }
     for m in &observed.models {
-        let Some(s) = sigstore.models.get(&format!("{}@{}", m.repo, m.tag)) else {
+        let release = format!("{}@{}", m.repo, m.tag);
+        let Some(s) = sigstore.models.get(&release) else {
             continue;
         };
         let equal = s.repo == m.repo
@@ -128,9 +183,20 @@ fn live_rows(observed: &Observations, sigstore: &SigstoreResults) -> TinfoilPins
                     repo: m.repo.clone(),
                     tag: m.tag.clone(),
                 });
+        } else {
+            rejected.push(format!(
+                "model {}: live registers differ from sigstore predicate for {release}",
+                m.slug
+            ));
         }
     }
-    live
+    (live, rejected)
+}
+
+/// Why observed rows were not pinned although their release has a verified
+/// Sigstore attestation. Append to the run's notes.
+pub fn rejections(observed: &Observations, sigstore: &SigstoreResults) -> Vec<String> {
+    evaluate(observed, sigstore).1
 }
 
 /// `earlier` holds rows verified by earlier runs on `main` (their audit
@@ -139,32 +205,37 @@ fn live_rows(observed: &Observations, sigstore: &SigstoreResults) -> TinfoilPins
 /// lists the rows not already in `base`. Rows are never removed.
 pub fn classify_with_earlier(
     base: &TinfoilPins,
-    earlier: &TinfoilPins,
+    earlier: &Earlier,
     observed: &Observations,
     sigstore: &SigstoreResults,
 ) -> (TinfoilPins, Vec<Added>) {
-    let live = live_rows(observed, sigstore);
+    let (live, _) = evaluate(observed, sigstore);
     let mut pins = base.clone();
     pins.merge_never_remove(&live);
-    pins.merge_never_remove(earlier);
+    pins.merge_never_remove(&earlier.pins);
 
     let mut added: Vec<Added> = Vec::new();
-    let candidates = rows(&live)
-        .into_iter()
-        .map(|r| (r, Source::Live))
-        .chain(rows(earlier).into_iter().map(|r| (r, Source::Earlier)));
+    let candidates = rows(&live).into_iter().map(|r| (r, Source::Live)).chain(
+        rows(&earlier.pins)
+            .into_iter()
+            .map(|r| (r, Source::Earlier)),
+    );
     let mut seen = Vec::new();
     for (row, source) in candidates {
         if has(base, &row) || seen.contains(&row) {
             continue;
         }
+        let observed_at = match source {
+            Source::Live => observed.observed_at.clone(),
+            Source::Earlier => earlier.observed_at(&row),
+        };
         added.push(match &row {
             Row::Router(r) => Added {
                 slug: None,
                 repo: r.repo.clone(),
                 tag: r.tag.clone(),
                 measurement: vec![r.measurement.clone()],
-                observed_at: observed.observed_at.clone(),
+                observed_at: observed_at.clone(),
                 source,
             },
             Row::Model(slug, m) => Added {
@@ -172,7 +243,7 @@ pub fn classify_with_earlier(
                 repo: m.repo.clone(),
                 tag: m.tag.clone(),
                 measurement: m.registers.clone(),
-                observed_at: observed.observed_at.clone(),
+                observed_at: observed_at.clone(),
                 source,
             },
         });
@@ -192,7 +263,7 @@ mod tests {
         SigstoreResult {
             repo: ROUTER_REPO.into(),
             tag: "v1".into(),
-            predicate_type: "p".into(),
+            predicate_type: ROUTER_PREDICATE_TYPE.into(),
             subject_sha256: "d".into(),
             snp_measurement: m.into(),
             rtmr1: Some("r1".into()),
@@ -240,6 +311,7 @@ mod tests {
     fn model_sig(snp: &str) -> SigstoreResults {
         let mut r = sig(snp);
         r.repo = "tinfoilsh/x".into();
+        r.predicate_type = "p".into();
         SigstoreResults {
             router: None,
             models: BTreeMap::from([("tinfoilsh/x@v1".to_string(), r)]),
@@ -331,17 +403,81 @@ mod tests {
 
     #[test]
     fn earlier_verified_rows_are_added_and_marked_earlier() {
-        let earlier = TinfoilPins {
-            router: vec![rp("prev")],
-            models: BTreeMap::new(),
-        };
+        let mut earlier = Earlier::default();
+        earlier.merge(
+            &TinfoilPins {
+                router: vec![rp("prev")],
+                models: BTreeMap::new(),
+            },
+            "2026-10-01T06:30:00Z",
+        );
         let (p, added) = classify_with_earlier(
             &TinfoilPins::default(),
             &earlier,
-            &Observations::default(),
+            &Observations {
+                observed_at: "2026-10-07T06:30:00Z".into(),
+                ..Observations::default()
+            },
             &SigstoreResults::default(),
         );
         assert_eq!(p.router, vec![rp("prev")]);
         assert_eq!(added[0].source, Source::Earlier);
+        // The report says when the earlier run saw the row, not this run's time.
+        assert_eq!(added[0].observed_at, "2026-10-01T06:30:00Z");
+    }
+
+    #[test]
+    fn earlier_row_keeps_its_earliest_known_time() {
+        let pins = TinfoilPins {
+            router: vec![rp("prev")],
+            models: BTreeMap::new(),
+        };
+        let mut e = Earlier::default();
+        e.merge(&pins, "2026-10-05T00:00:00Z");
+        e.merge(&pins, "2026-10-03T00:00:00Z");
+        e.merge(&pins, "2026-10-06T00:00:00Z");
+        let (_, added) = classify_with_earlier(
+            &TinfoilPins::default(),
+            &e,
+            &Observations::default(),
+            &SigstoreResults::default(),
+        );
+        assert_eq!(added[0].observed_at, "2026-10-03T00:00:00Z");
+        let (_, added) = classify_with_earlier(
+            &TinfoilPins::default(),
+            &Earlier::from_pins(pins),
+            &Observations::default(),
+            &SigstoreResults::default(),
+        );
+        assert_eq!(added[0].observed_at, "unknown");
+    }
+
+    #[test]
+    fn router_row_needs_the_router_predicate_type() {
+        let mut s = router_sig(M);
+        s.router.as_mut().unwrap().predicate_type = "https://example.test/other/v1".into();
+        let (p, added) = classify(&TinfoilPins::default(), &obs_router(M), &s);
+        assert!(p.router.is_empty() && added.is_empty());
+        assert_eq!(
+            rejections(&obs_router(M), &s),
+            vec!["router: unexpected sigstore predicate type"]
+        );
+    }
+
+    #[test]
+    fn disagreements_with_the_sigstore_predicate_are_reported() {
+        assert_eq!(
+            rejections(&obs_router(M), &router_sig(M2)),
+            vec!["router: live measurement differs from sigstore predicate"]
+        );
+        assert_eq!(
+            rejections(&model_obs(&["bb", "r1", "r2"]), &model_sig("aa")),
+            vec!["model m: live registers differ from sigstore predicate for tinfoilsh/x@v1"]
+        );
+        // Agreement, and rows with no Sigstore result at all (noted by the
+        // probe), produce no rejection.
+        assert!(rejections(&obs_router(M), &router_sig(M)).is_empty());
+        assert!(rejections(&model_obs(&["aa", "r1", "r2"]), &model_sig("aa")).is_empty());
+        assert!(rejections(&model_obs(&["aa"]), &SigstoreResults::default()).is_empty());
     }
 }

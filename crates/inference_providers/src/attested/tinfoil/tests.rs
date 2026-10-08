@@ -507,8 +507,6 @@ impl TinfoilVerifier for StubVerifier {
         }
         Ok(PinnedModel {
             slug: slug.into(),
-            repo: entry.repo.clone(),
-            tag: entry.tag.clone(),
             entry: entry.clone(),
         })
     }
@@ -859,8 +857,6 @@ async fn attestation_report_payload_shape() {
         SLUG.to_string(),
         Ok(PinnedModel {
             slug: SLUG.into(),
-            repo: entry.repo.clone(),
-            tag: entry.tag.clone(),
             entry: entry.clone(),
         }),
     );
@@ -967,7 +963,13 @@ fn router_domain_syntax() {
         "x.tinfoil.sh.evil.com",
         "",
     ] {
-        assert_eq!(ok(bad), Err(TinfoilVerifyError::Malformed), "{bad}");
+        assert_eq!(
+            ok(bad),
+            Err(TinfoilVerifyError::Malformed {
+                stage: "router_domain"
+            }),
+            "{bad}"
+        );
     }
 }
 
@@ -1010,7 +1012,9 @@ async fn invalid_bundle_domain_is_rejected_and_closed() {
         *e.server.atc_domain.lock().unwrap() = bad.to_string();
         assert_eq!(
             e.session.verify_now().await,
-            Err(TinfoilVerifyError::Malformed),
+            Err(TinfoilVerifyError::Malformed {
+                stage: "router_domain"
+            }),
             "{bad}"
         );
         assert!(e.session.model_status(SLUG).is_err());

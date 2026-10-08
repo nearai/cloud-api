@@ -343,7 +343,7 @@ impl TinfoilRouterSession {
         for (slug, m) in &models {
             match m {
                 Ok(p) => {
-                    tracing::info!(slug = %slug, repo = %p.repo, tag = %p.tag, "Tinfoil model pinned")
+                    tracing::info!(slug = %slug, repo = %p.entry.repo, tag = %p.entry.tag, "Tinfoil model pinned")
                 }
                 Err(e) => tracing::warn!(slug = %slug, reason = e.reason(), "Tinfoil model closed"),
             }

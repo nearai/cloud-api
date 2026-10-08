@@ -2,15 +2,18 @@
 
 use crate::classify::{Added, Source};
 
+/// GitHub rejects PR bodies over 65536 characters. The report stays well under
+/// that; the audit artifact (`observations.json`) always has the full set.
+const BODY_BUDGET: usize = 60_000;
+
 /// Keep only characters that can appear in slugs, repos, tags and hex, so
-/// upstream-supplied text cannot inject markdown or mentions into the PR body.
+/// upstream-supplied text cannot inject markdown or mentions (`@` is not
+/// allowed) into the PR body.
 pub fn sanitize(s: &str) -> String {
     s.chars()
         .take(200)
         .map(|c| {
-            if c.is_ascii_alphanumeric()
-                || matches!(c, '.' | '_' | '-' | '/' | '@' | ':' | ' ' | '=')
-            {
+            if c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-' | '/' | ':' | ' ' | '=') {
                 c
             } else {
                 '?'
@@ -19,11 +22,21 @@ pub fn sanitize(s: &str) -> String {
         .collect()
 }
 
+/// Append `line` only if the body stays within `limit` bytes.
+fn push_within(out: &mut String, line: &str, limit: usize) -> bool {
+    if out.len() + line.len() > limit {
+        return false;
+    }
+    out.push_str(line);
+    true
+}
+
 pub fn render_markdown(added: &[Added], notes: &[String], date: &str) -> String {
     let mut out = format!("# Tinfoil measurement sync, {date}\n\n");
     if added.is_empty() {
         out.push_str(
-            "No new rows: every live measurement that Sigstore confirms is already pinned.\n",
+            "No new rows: every live measurement that Sigstore confirms is already pinned. \
+             Anything observed but not pinned is listed under \"Not pinned\".\n",
         );
     } else {
         out.push_str(
@@ -37,12 +50,13 @@ pub fn render_markdown(added: &[Added], notes: &[String], date: &str) -> String 
         );
         out.push_str("| Kind | Slug | Repo | Tag | Measurement | Source | Observed |\n");
         out.push_str("|---|---|---|---|---|---|---|\n");
+        let mut omitted = 0usize;
         for a in added {
             let source = match a.source {
                 Source::Live => "live",
                 Source::Earlier => "earlier run",
             };
-            out.push_str(&format!(
+            let row = format!(
                 "| {} | {} | {} | {} | `{}` | {} | {} |\n",
                 if a.slug.is_none() { "router" } else { "model" },
                 a.slug.as_deref().map(sanitize).unwrap_or_default(),
@@ -55,13 +69,31 @@ pub fn render_markdown(added: &[Added], notes: &[String], date: &str) -> String 
                     .join(","),
                 source,
                 sanitize(&a.observed_at),
+            );
+            // Leave room for the notes and the truncation lines.
+            if !push_within(&mut out, &row, BODY_BUDGET / 2) {
+                omitted += 1;
+            }
+        }
+        if omitted > 0 {
+            out.push_str(&format!(
+                "\n{omitted} more row(s) omitted to fit the PR body limit; the full list is in \
+                 `observations.json` of the run's audit artifact.\n"
             ));
         }
     }
     if !notes.is_empty() {
         out.push_str("\n## Not pinned\n\n");
+        let mut omitted = 0usize;
         for n in notes {
-            out.push_str(&format!("- {}\n", sanitize(n)));
+            if !push_within(&mut out, &format!("- {}\n", sanitize(n)), BODY_BUDGET - 200) {
+                omitted += 1;
+            }
+        }
+        if omitted > 0 {
+            out.push_str(&format!(
+                "\n{omitted} more note(s) omitted; see the audit artifact.\n"
+            ));
         }
     }
     out
@@ -101,5 +133,38 @@ mod tests {
         let md = render_markdown(&[], &["x: [evil](http://e) `a`".into()], "2026-10-07");
         assert!(md.contains("No new rows"));
         assert!(md.contains("- x: ?evil??http://e? ?a?"));
+    }
+
+    #[test]
+    fn mentions_cannot_survive_sanitising() {
+        assert_eq!(
+            sanitize("@org/team and user@host"),
+            "?org/team and user?host"
+        );
+        let md = render_markdown(&[], &["see @org/team".into()], "2026-10-07");
+        assert!(md.contains("- see ?org/team"));
+        assert!(!md.contains('@'));
+    }
+
+    #[test]
+    fn oversized_reports_are_truncated_within_the_pr_body_limit() {
+        let many: Vec<Added> = (0..2_000)
+            .map(|i| {
+                let mut a = added(Some(&format!("model-{i}")), "v1");
+                a.measurement = vec!["a".repeat(200); 3];
+                a
+            })
+            .collect();
+        let notes: Vec<String> = (0..5_000)
+            .map(|i| format!("note {i} {}", "x".repeat(150)))
+            .collect();
+        let md = render_markdown(&many, &notes, "2026-10-07");
+        assert!(md.len() <= 65_000, "{} bytes", md.len());
+        assert!(md.contains("more row(s) omitted"));
+        assert!(md.contains("more note(s) omitted"));
+        assert!(md.contains("| model | model-0 |"), "earliest rows are kept");
+        // A small report is untouched.
+        let small = render_markdown(&many[..2], &notes[..2], "2026-10-07");
+        assert!(!small.contains("omitted"));
     }
 }

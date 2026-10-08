@@ -13,6 +13,12 @@ pub struct AtcBundle {
     #[serde(rename = "enclaveCert")]
     pub enclave_cert: String,
     pub digest: String,
+    /// Sigstore (DSSE/Rekor) bundle over the ATC document. Intentionally an
+    /// opaque pass-through here: the runtime verifier does not read it (it
+    /// anchors on the SNP report chain plus the compiled pins). It is verified
+    /// only by the offline `tinfoil_sync` tooling, whose Sigstore dependencies
+    /// must stay out of this crate's (and `api`'s) dependency tree, so no typed
+    /// bundle lives in this port.
     #[serde(rename = "sigstoreBundle")]
     pub sigstore_bundle: serde_json::Value,
 }
@@ -68,11 +74,12 @@ pub struct RouterTcb {
     pub microcode: u8,
 }
 
+/// A proxy model entry whose registers, repo and tag all matched one compiled
+/// pin for `slug`. `entry.repo` and `entry.tag` are therefore the pinned
+/// provenance.
 #[derive(Debug, Clone)]
 pub struct PinnedModel {
     pub slug: String,
-    pub repo: String,
-    pub tag: String,
     pub entry: ProxyModelEntry,
 }
 
@@ -92,8 +99,10 @@ pub enum TinfoilVerifyError {
     TcbTooLow,
     #[error("report data mismatch")]
     ReportDataMismatch,
-    #[error("malformed evidence")]
-    Malformed,
+    /// `stage` names the decode step that failed (a fixed, non-sensitive
+    /// tag); it is for diagnosis only and is not part of [`Self::reason`].
+    #[error("malformed evidence ({stage})")]
+    Malformed { stage: &'static str },
     /// Evidence or the router's model document could not be fetched or decoded.
     #[error("fetch error")]
     Fetch,
@@ -109,7 +118,7 @@ impl TinfoilVerifyError {
             Self::DebugPolicy => "debug_policy",
             Self::TcbTooLow => "tcb_too_low",
             Self::ReportDataMismatch => "report_data_mismatch",
-            Self::Malformed => "malformed_evidence",
+            Self::Malformed { .. } => "malformed_evidence",
             Self::Fetch => "fetch_error",
         }
     }
@@ -123,7 +132,9 @@ impl TinfoilVerifyError {
 pub fn validate_router_domain(domain: &str) -> Result<(), TinfoilVerifyError> {
     const SUFFIX: &str = ".tinfoil.sh";
     let Some(prefix) = domain.strip_suffix(SUFFIX) else {
-        return Err(TinfoilVerifyError::Malformed);
+        return Err(TinfoilVerifyError::Malformed {
+            stage: "router_domain",
+        });
     };
     let label_ok = |l: &str| {
         !l.is_empty()
@@ -135,7 +146,9 @@ pub fn validate_router_domain(domain: &str) -> Result<(), TinfoilVerifyError> {
                 .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
     };
     if domain.len() > 253 || !prefix.split('.').all(label_ok) {
-        return Err(TinfoilVerifyError::Malformed);
+        return Err(TinfoilVerifyError::Malformed {
+            stage: "router_domain",
+        });
     }
     Ok(())
 }
@@ -147,6 +160,12 @@ pub fn validate_router_domain(domain: &str) -> Result<(), TinfoilVerifyError> {
 /// certificate's SAN names that domain, inside `verify_router`.
 pub trait TinfoilVerifier: Send + Sync {
     fn verify_router(&self, bundle: &AtcBundle) -> Result<VerifiedRouter, TinfoilVerifyError>;
+    /// Verifies that `entry` matches a compiled pin for `slug`: the measurement
+    /// registers, `repo` and `tag` must all equal one pinned row. Enclave
+    /// metadata (`enclaves`) is passed through unverified. `entry` is
+    /// caller-supplied, so callers must obtain it from a source whose
+    /// integrity is established separately (the router's attested TLS
+    /// channel); a pin match alone does not authenticate where it came from.
     fn check_model(
         &self,
         slug: &str,

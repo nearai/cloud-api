@@ -237,9 +237,13 @@ jobs:
             --json number,isCrossRepository \
             --jq '[.[] | select(.isCrossRepository == false)][0].number // empty')"
           if git diff --quiet -- "$PINS_FILE"; then
+            # An empty diff only shows this run proposes nothing beyond main.
+            # It does not show that main holds the rows on an open bot PR (a
+            # proposed row can stop being live and its audit artifact age out
+            # of the evidence window), so never close or delete the PR here: a
+            # person merges or closes it.
             if [ -n "$existing" ]; then
-              gh pr close "$existing" --delete-branch \
-                --comment "Closing: main already pins every row this PR proposed."
+              echo "::notice::no new rows this run; leaving open PR #$existing for review"
             fi
             exit 0
           fi

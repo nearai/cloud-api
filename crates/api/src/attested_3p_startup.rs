@@ -429,7 +429,7 @@ pub async fn register_tinfoil_models(
         registered.push((entry.canonical_id.clone(), entry.upstream_id.clone()));
     }
     if !registered.is_empty() {
-        let _ = spawn_tinfoil_metrics(session.clone(), registered, metrics);
+        drop(spawn_tinfoil_metrics(session.clone(), registered, metrics));
     }
 }
 

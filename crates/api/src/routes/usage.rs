@@ -1634,6 +1634,10 @@ pub struct UsageByModelQuery {
     /// `day` (last 24h), `week` (last 7d), or `month` (last 30d). Defaults to `month`.
     #[serde(default = "default_period")]
     pub period: UsageByModelPeriod,
+    /// Custom range start (ISO 8601). When `start` or `end` is set, `period` is ignored.
+    pub start: Option<String>,
+    /// Custom range end, exclusive (ISO 8601). Defaults to now when only `start` is set.
+    pub end: Option<String>,
 }
 
 fn default_period() -> UsageByModelPeriod {
@@ -1657,12 +1661,16 @@ pub struct UsageByModelEntryResponse {
 pub struct UsageByModelResponse {
     pub period: String,
     pub start_date: String,
+    /// Set only for custom ranges.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub end_date: Option<String>,
     pub data: Vec<UsageByModelEntryResponse>,
 }
 
 /// Get organization usage broken down by model.
 ///
-/// Returns one row per model, summed over a rolling window ending now:
+/// Returns one row per model, summed over a rolling window ending now (or a custom
+/// `start`/`end` range, capped at the same maximum span as other usage reports):
 /// `day` = last 24h, `week` = last 7 days, `month` = last 30 days (NOT calendar
 /// day/week/month-to-date). Used by the dashboard pie chart to show which models
 /// drive spend.
@@ -1672,7 +1680,9 @@ pub struct UsageByModelResponse {
     tag = "Usage",
     params(
         ("org_id" = String, Path, description = "Organization ID"),
-        ("period" = Option<String>, Query, description = "Rolling window: `day` (last 24h), `week` (last 7d), or `month` (last 30d). Default: `month`")
+        ("period" = Option<String>, Query, description = "Rolling window: `day` (last 24h), `week` (last 7d), or `month` (last 30d). Default: `month`. Ignored when `start` or `end` is set"),
+        ("start" = Option<String>, Query, description = "Custom range start (ISO 8601). Defaults to `end` minus 30 days"),
+        ("end" = Option<String>, Query, description = "Custom range end, exclusive (ISO 8601). Defaults to now")
     ),
     responses(
         (status = 200, description = "Per-model usage breakdown", body = UsageByModelResponse),
@@ -1692,11 +1702,18 @@ pub async fn get_organization_usage_by_model(
     Query(query): Query<UsageByModelQuery>,
 ) -> Result<ResponseJson<UsageByModelResponse>, (StatusCode, ResponseJson<ErrorResponse>)> {
     let organization_id = check_org_membership(&app_state, user, &org_id).await?;
-    let start_date = query.period.since();
+    let (start_date, end_date, period) = if query.start.is_some() || query.end.is_some() {
+        let end = parse_datetime_or_default(&query.end, Utc::now())?;
+        let start = parse_datetime_or_default(&query.start, end - Duration::days(30))?;
+        validate_date_range(start, end)?;
+        (start, Some(end), "custom")
+    } else {
+        (query.period.since(), None, query.period.as_str())
+    };
 
     let entries = app_state
         .usage_service
-        .get_usage_by_model(organization_id, start_date)
+        .get_usage_by_model(organization_id, start_date, end_date)
         .await
         .map_err(|e| match e {
             services::usage::UsageError::ReportingTimeout => {
@@ -1728,8 +1745,9 @@ pub async fn get_organization_usage_by_model(
         .collect();
 
     Ok(ResponseJson(UsageByModelResponse {
-        period: query.period.as_str().to_string(),
+        period: period.to_string(),
         start_date: start_date.to_rfc3339(),
+        end_date: end_date.map(|d| d.to_rfc3339()),
         data,
     }))
 }

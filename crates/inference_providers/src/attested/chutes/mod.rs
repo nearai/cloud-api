@@ -722,7 +722,10 @@ fn strip_internal_response_fields(obj: &mut serde_json::Map<String, Value>) {
 /// NOTE: this gates only `raw_bytes` (the bytes the passthrough route forwards to the
 /// client). The parsed `chunk.usage` is left intact so `InterceptStream` can still
 /// read it for billing/limits — see [`rewrite_sse_event_model`].
-fn gate_stream_usage(obj: &mut serde_json::Map<String, Value>, include_usage: bool) -> bool {
+pub(crate) fn gate_stream_usage(
+    obj: &mut serde_json::Map<String, Value>,
+    include_usage: bool,
+) -> bool {
     if !obj.contains_key("usage") {
         return false;
     }
@@ -1341,7 +1344,11 @@ fn stream_with_think_extraction(
 
 /// An OpenAI request body (as JSON) with `model` pinned, `stream` set, and all
 /// internal/tracing/E2EE-marker keys stripped (never sent to the third party).
-fn request_body(model: &str, params: &ChatCompletionParams, stream: bool) -> Result<Value, String> {
+pub(crate) fn request_body(
+    model: &str,
+    params: &ChatCompletionParams,
+    stream: bool,
+) -> Result<Value, String> {
     let mut v = serde_json::to_value(params).map_err(|e| format!("serialize params: {e}"))?;
     if let Some(obj) = v.as_object_mut() {
         obj.insert("model".to_string(), json!(model));

@@ -84,6 +84,9 @@ pub enum TinfoilVerifyError {
     ReportDataMismatch,
     #[error("malformed evidence")]
     Malformed,
+    /// Evidence or the router's model document could not be fetched or decoded.
+    #[error("fetch error")]
+    Fetch,
 }
 
 impl TinfoilVerifyError {
@@ -97,6 +100,7 @@ impl TinfoilVerifyError {
             Self::TcbTooLow => "tcb_too_low",
             Self::ReportDataMismatch => "report_data_mismatch",
             Self::Malformed => "malformed_evidence",
+            Self::Fetch => "fetch_error",
         }
     }
 }

@@ -10855,6 +10855,61 @@ mod tests {
         );
     }
 
+    /// A Tinfoil 401/402/403 (our key or billing) is mapped by the provider to a
+    /// retryable external 503, so it never short-circuits past Chutes and the
+    /// client never sees an upstream auth error.
+    #[tokio::test]
+    async fn tinfoil_auth_failure_falls_through_to_chutes() {
+        use inference_providers::mock::{MockProvider, RequestMatcher, ResponseTemplate};
+        use inference_providers::{CompletionError, ProviderSource, ProviderTier};
+
+        let pool = InferenceProviderPool::new(None, ExternalProvidersConfig::default());
+        let model_id = "z-ai/glm-5.1".to_string();
+
+        let unavailable = || CompletionError::HttpError {
+            status_code: 503,
+            message: "Tinfoil temporarily unavailable (upstream_auth)".to_string(),
+            is_external: true,
+        };
+        let near = Arc::new(MockProvider::new_accept_all().with_tier(ProviderTier::Near));
+        near.set_error_override(Some(unavailable())).await;
+        let tinfoil = Arc::new(
+            MockProvider::new_accept_all()
+                .with_tier(ProviderTier::Attested3p)
+                .with_provider_source(ProviderSource::Tinfoil),
+        );
+        tinfoil.set_error_override(Some(unavailable())).await;
+        let chutes = Arc::new(
+            MockProvider::new_accept_all()
+                .with_tier(ProviderTier::Attested3p)
+                .with_provider_source(ProviderSource::Chutes),
+        );
+        chutes
+            .when(RequestMatcher::Any)
+            .respond_with(ResponseTemplate::new("served-by-chutes"))
+            .await;
+
+        {
+            let mut m = pool.provider_mappings.write().await;
+            m.model_to_providers.insert(
+                model_id.clone(),
+                vec![
+                    near.clone() as Arc<InferenceProviderTrait>,
+                    tinfoil.clone() as Arc<InferenceProviderTrait>,
+                    chutes.clone() as Arc<InferenceProviderTrait>,
+                ],
+            );
+        }
+
+        let resp = pool
+            .chat_completion(fallback_params(&model_id), "test-hash".to_string())
+            .await
+            .expect("a Tinfoil auth failure must fall through to Chutes");
+        assert!(tinfoil.last_chat_params().await.is_some());
+        assert!(chutes.last_chat_params().await.is_some());
+        assert!(String::from_utf8_lossy(&resp.raw_bytes).contains("served-by-chutes"));
+    }
+
     /// When the NEAR primary AND the Chutes fallback both fail with a retryable
     /// 5xx, the error must SURFACE to the client — the pool must not invent a
     /// false success once every provider is exhausted.

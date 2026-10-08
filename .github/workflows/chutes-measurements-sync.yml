@@ -147,6 +147,10 @@ jobs:
     name: Sync Tinfoil measurements
     runs-on: [self-hosted, infra]
     timeout-minutes: 60
+    # A Tinfoil failure must not fail the run: the Chutes job only reads
+    # evidence from successful runs, so a red run would hide its artifacts.
+    # Tinfoil failures stay visible on this job and in the tinfoil.verification metric.
+    continue-on-error: true
     concurrency:
       group: tinfoil-measurements-sync
       cancel-in-progress: false

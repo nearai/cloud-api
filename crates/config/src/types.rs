@@ -2640,8 +2640,52 @@ mod tests {
     }
 
     #[test]
-    fn chutes_models_empty_when_unset() {
+    fn chutes_models_empty_input_yields_no_entries() {
         assert!(parse_attested_3p_models("CHUTES_MODELS", "").is_empty());
+    }
+
+    #[test]
+    #[serial]
+    fn attested_3p_models_and_keys_are_read_from_env() {
+        let vars = [
+            "CHUTES_MODELS",
+            "CHUTES_API_KEY",
+            "CHUTES_API_KEY_FILE",
+            "TINFOIL_MODELS",
+            "TINFOIL_API_KEY",
+            "TINFOIL_API_KEY_FILE",
+        ];
+        let previous: Vec<_> = vars.iter().map(std::env::var_os).collect();
+        for v in vars {
+            std::env::remove_var(v);
+        }
+        std::env::set_var("CHUTES_MODELS", "z-ai/glm=zai-org/GLM-TEE@1048576");
+        std::env::set_var("CHUTES_API_KEY", "cpk_SECRET");
+        std::env::set_var("TINFOIL_MODELS", "gpt-oss-120b@131072");
+        std::env::set_var("TINFOIL_API_KEY", "tin-SECRET");
+
+        let cfg = ExternalProvidersConfig::from_env();
+        assert_eq!(cfg.chutes_models.len(), 1);
+        assert_eq!(cfg.chutes_models[0].canonical_id, "z-ai/glm");
+        assert_eq!(cfg.chutes_api_key.as_deref(), Some("cpk_SECRET"));
+        assert_eq!(cfg.tinfoil_models.len(), 1);
+        assert_eq!(cfg.tinfoil_models[0].canonical_id, "gpt-oss-120b");
+        assert_eq!(cfg.tinfoil_models[0].max_context_tokens, Some(131_072));
+        assert_eq!(cfg.tinfoil_api_key.as_deref(), Some("tin-SECRET"));
+
+        // Unset -> empty (the `unwrap_or_default` wiring) and empty key -> None.
+        std::env::remove_var("TINFOIL_MODELS");
+        std::env::set_var("TINFOIL_API_KEY", "");
+        let cfg = ExternalProvidersConfig::from_env();
+        assert!(cfg.tinfoil_models.is_empty());
+        assert_eq!(cfg.tinfoil_api_key, None);
+
+        for (v, prev) in vars.iter().zip(previous) {
+            match prev {
+                Some(value) => std::env::set_var(v, value),
+                None => std::env::remove_var(v),
+            }
+        }
     }
 
     #[test]
@@ -2774,14 +2818,15 @@ mod tests {
 /// or a bare `name` meaning `canonical_id == upstream_id`. We deliberately keep
 /// the two ids distinct: the **canonical id** is what we expose in `/v1/models`
 /// and route under (the NEAR-served id when NEAR also serves the model, else the
-/// OpenRouter id) — never the raw `-TEE` chute slug; the **upstream id** (for Chutes, the chute slug) is the
-/// internal upstream identity we send to Chutes and resolve to a `chute_id`.
+/// OpenRouter id) — never the provider's internal id; the **upstream id** is the
+/// internal upstream identity we send to the provider (Chutes: the chute slug,
+/// resolved to a `chute_id`; Tinfoil: the upstream model name).
 ///
-/// The slug side takes an optional `@<max_context_tokens>` suffix (e.g.
-/// `z-ai/glm-5.2=zai-org/GLM-5.2-TEE@1048576`) declaring the chute's context
-/// window, so the pool's context-length routing knows whether Chutes can take
-/// a long request. Unset means "no declared limit" (today's behavior: Chutes
-/// is never filtered by size).
+/// The upstream side takes an optional `@<max_context_tokens>` suffix (e.g.
+/// `z-ai/glm-5.2=zai-org/GLM-5.2-TEE@1048576`) declaring the upstream model's
+/// context window, so the pool's context-length routing knows whether the
+/// provider can take a long request. Unset means "no declared limit" (today's
+/// behavior: the provider is never filtered by size).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AttestedThirdPartyModelEntry {
     /// User-facing / catalog model id (e.g. `zai-org/GLM-5.1-FP8`).
@@ -2789,7 +2834,7 @@ pub struct AttestedThirdPartyModelEntry {
     /// Upstream id sent to the provider (Chutes: chute slug, e.g.
     /// `zai-org/GLM-5.1-TEE`; Tinfoil: upstream model name).
     pub upstream_id: String,
-    /// Declared context window of the chute (`@<n>` suffix), if any.
+    /// Declared context window of the upstream model (`@<n>` suffix), if any.
     pub max_context_tokens: Option<u32>,
 }
 
@@ -2910,24 +2955,63 @@ impl std::fmt::Debug for ExternalProvidersConfig {
         fn redact(k: &Option<String>) -> Option<&'static str> {
             k.as_ref().map(|_| "<redacted>")
         }
+        // Exhaustive destructure (no `..`): adding a field to the struct is a
+        // compile error here until it is listed (and, if a secret, redacted).
+        let Self {
+            openai_api_key,
+            anthropic_api_key,
+            enable_anthropic_messages,
+            anthropic_denied_betas,
+            gemini_api_key,
+            typesafe_api_key,
+            timeout_seconds,
+            refresh_interval_secs,
+            enable_chutes,
+            chutes_api_key,
+            chutes_models,
+            tinfoil_api_key,
+            tinfoil_models,
+            chutes_enable_streaming,
+            pccs_url,
+        } = self;
         f.debug_struct("ExternalProvidersConfig")
-            .field("openai_api_key", &redact(&self.openai_api_key))
-            .field("anthropic_api_key", &redact(&self.anthropic_api_key))
-            .field("enable_anthropic_messages", &self.enable_anthropic_messages)
-            .field("anthropic_denied_betas", &self.anthropic_denied_betas)
-            .field("gemini_api_key", &redact(&self.gemini_api_key))
-            .field("typesafe_api_key", &redact(&self.typesafe_api_key))
-            .field("timeout_seconds", &self.timeout_seconds)
-            .field("refresh_interval_secs", &self.refresh_interval_secs)
-            .field("enable_chutes", &self.enable_chutes)
-            .field("chutes_api_key", &redact(&self.chutes_api_key))
-            .field("chutes_models", &self.chutes_models)
-            .field("tinfoil_api_key", &redact(&self.tinfoil_api_key))
-            .field("tinfoil_models", &self.tinfoil_models)
-            .field("chutes_enable_streaming", &self.chutes_enable_streaming)
-            .field("pccs_url", &self.pccs_url)
+            .field("openai_api_key", &redact(openai_api_key))
+            .field("anthropic_api_key", &redact(anthropic_api_key))
+            .field("enable_anthropic_messages", enable_anthropic_messages)
+            .field("anthropic_denied_betas", anthropic_denied_betas)
+            .field("gemini_api_key", &redact(gemini_api_key))
+            .field("typesafe_api_key", &redact(typesafe_api_key))
+            .field("timeout_seconds", timeout_seconds)
+            .field("refresh_interval_secs", refresh_interval_secs)
+            .field("enable_chutes", enable_chutes)
+            .field("chutes_api_key", &redact(chutes_api_key))
+            .field("chutes_models", chutes_models)
+            .field("tinfoil_api_key", &redact(tinfoil_api_key))
+            .field("tinfoil_models", tinfoil_models)
+            .field("chutes_enable_streaming", chutes_enable_streaming)
+            .field("pccs_url", pccs_url)
             .finish()
     }
+}
+
+/// Read an attested-3P API key: `file_var` (path; contents trimmed) wins over
+/// `env_var` (used as-is). A failed file read warns with the PATH only — never
+/// the key — and yields `None`. An empty key is not a key: `""` is treated as
+/// absent so a misconfigured secret can't pass as `Some("")` and silently
+/// fail at request time.
+fn read_secret_env(file_var: &str, env_var: &str) -> Option<String> {
+    if let Ok(path) = env::var(file_var) {
+        match std::fs::read_to_string(&path) {
+            Ok(s) => Some(s.trim().to_string()),
+            Err(e) => {
+                eprintln!("WARN: failed to read {file_var} ({path}): {e}");
+                None
+            }
+        }
+    } else {
+        env::var(env_var).ok()
+    }
+    .filter(|s| !s.is_empty())
 }
 
 impl ExternalProvidersConfig {
@@ -3015,40 +3099,12 @@ impl ExternalProvidersConfig {
             .ok()
             .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
             .unwrap_or(false);
-        let chutes_api_key = if let Ok(path) = env::var("CHUTES_API_KEY_FILE") {
-            match std::fs::read_to_string(&path) {
-                Ok(s) => Some(s.trim().to_string()),
-                Err(e) => {
-                    // Path only — never the key contents.
-                    eprintln!("WARN: failed to read CHUTES_API_KEY_FILE ({path}): {e}");
-                    None
-                }
-            }
-        } else {
-            env::var("CHUTES_API_KEY").ok()
-        }
-        // An empty key is not a key — treat "" as absent so a misconfigured
-        // secret can't pass as Some("") and silently fail at request time.
-        .filter(|s| !s.is_empty());
+        let chutes_api_key = read_secret_env("CHUTES_API_KEY_FILE", "CHUTES_API_KEY");
         let chutes_models = parse_attested_3p_models(
             "CHUTES_MODELS",
             &env::var("CHUTES_MODELS").unwrap_or_default(),
         );
-        let tinfoil_api_key = if let Ok(path) = env::var("TINFOIL_API_KEY_FILE") {
-            match std::fs::read_to_string(&path) {
-                Ok(s) => Some(s.trim().to_string()),
-                Err(e) => {
-                    // Path only — never the key contents.
-                    eprintln!("WARN: failed to read TINFOIL_API_KEY_FILE ({path}): {e}");
-                    None
-                }
-            }
-        } else {
-            env::var("TINFOIL_API_KEY").ok()
-        }
-        // An empty key is not a key — treat "" as absent so a misconfigured
-        // secret can't pass as Some("") and silently fail at request time.
-        .filter(|s| !s.is_empty());
+        let tinfoil_api_key = read_secret_env("TINFOIL_API_KEY_FILE", "TINFOIL_API_KEY");
         let tinfoil_models = parse_attested_3p_models(
             "TINFOIL_MODELS",
             &env::var("TINFOIL_MODELS").unwrap_or_default(),

@@ -4451,8 +4451,10 @@ pub async fn get_admin_setting(
 /// resets a field to its default. The result is validated as a whole; an invalid
 /// value is rejected with 400 and nothing is stored. Takes effect immediately on the
 /// instance that handles it, and on the others within 10 minutes (there is no
-/// cross-instance push). For a faster stop of an attested third party use
-/// per-org `fallback_disabled` or redeploy.
+/// cross-instance push). For a faster stop of an attested third party on the
+/// other instances, redeploy; per-org `fallback_disabled` only excludes
+/// registered fallback providers for that organization and is not a
+/// source-wide stop.
 #[utoipa::path(
     patch,
     path = "/v1/admin/settings/{key}",

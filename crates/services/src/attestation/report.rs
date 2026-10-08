@@ -101,12 +101,27 @@ impl AttestationService {
 
         // Precompute the no-nonce cache key BEFORE the params are moved into the
         // build closure below.
-        let cache_key = report_cache_key(
-            model.as_deref(),
-            signing_algo.as_deref(),
-            include_tls_fingerprint,
-            provider_filter,
-            signing_address.as_deref(),
+        let cache_key = format!(
+            "{}|off={}",
+            report_cache_key(
+                model.as_deref(),
+                signing_algo.as_deref(),
+                include_tls_fingerprint,
+                provider_filter,
+                signing_address.as_deref(),
+            ),
+            // The live `attested_3p` kill-switch policy is part of the key: a
+            // cache hit skips the build (and the pool's disabled-source
+            // filter), so a report cached before a source was disabled must
+            // not be reachable once the policy changes. Applies on this
+            // instance immediately, for filtered and unfiltered requests.
+            self.inference_provider_pool
+                .attested_3p_disabled()
+                .load()
+                .iter()
+                .map(inference_providers::ProviderSource::as_str)
+                .collect::<Vec<_>>()
+                .join(","),
         );
 
         // The full (expensive) report build. `nonce` is the closure parameter so

@@ -248,7 +248,7 @@ async fn test_attestation_report_no_provider_filter_succeeds() {
     );
 }
 
-/// Both `near` and `chutes` values are accepted (case-insensitive) — the
+/// The `near`, `chutes` and `tinfoil` values are accepted (case-insensitive) — the
 /// filter must not reject them with 400 even when no matching provider exists.
 #[tokio::test]
 async fn test_attestation_report_provider_filter_case_insensitive() {
@@ -260,7 +260,7 @@ async fn test_attestation_report_provider_filter_case_insensitive() {
     let encoded_model =
         url::form_urlencoded::byte_serialize(E2E_QWEN_MODEL_NAME.as_bytes()).collect::<String>();
 
-    for value in &["NEAR", "CHUTES", "Near", "Chutes"] {
+    for value in &["NEAR", "CHUTES", "TINFOIL", "Near", "Chutes", "Tinfoil"] {
         let url = format!("/v1/attestation/report?model={encoded_model}&provider={value}");
         let response = server
             .get(&url)

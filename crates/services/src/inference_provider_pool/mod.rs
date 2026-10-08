@@ -11879,15 +11879,64 @@ mod tests {
 
     #[tokio::test]
     async fn fast_3p_does_not_latency_demote_near_baseline_is_per_tier() {
-        // Single NEAR at 700ms, Chutes at 100ms: NEAR's baseline is its own tier.
-        let (pool, near, chutes) = pool_with_near_and_chutes("m-lat-3").await;
-        pool.seed_ttft(&near, 700.0);
+        use inference_providers::ProviderTier::{Attested3p, Near};
+        // Slow NEAR (3000ms) registered before a faster NEAR (700ms), plus a
+        // 100ms backup. With a GLOBAL baseline (100ms) both NEAR providers are
+        // latency-demoted, tie, and rotate. With a per-tier baseline (700ms)
+        // only the 3000ms one is demoted, so the 700ms NEAR leads every call.
+        let (pool, p) =
+            tiered_pool("m-lat-3", &[(Near, None), (Near, None), (Attested3p, None)]).await;
+        let (near_slow, near_mid, chutes) = (as_trait(&p[0]), as_trait(&p[1]), as_trait(&p[2]));
+        pool.seed_ttft(&near_slow, 3000.0);
+        pool.seed_ttft(&near_mid, 700.0);
         pool.seed_ttft(&chutes, 100.0);
-        let order = pool
-            .get_providers_with_fallback("m-lat-3", None, &ChatRoutingHints::default())
+        for _ in 0..4 {
+            let order = pool
+                .get_providers_with_fallback("m-lat-3", None, &ChatRoutingHints::default())
+                .await
+                .unwrap();
+            assert_eq!(order.len(), 3);
+            assert!(Arc::ptr_eq(&order[0], &near_mid));
+            assert!(Arc::ptr_eq(&order[1], &near_slow));
+            assert!(Arc::ptr_eq(&order[2], &chutes));
+        }
+    }
+
+    /// End-to-end through the retry loop: a latency-demoted-looking NEAR
+    /// (slow, but the only NEAR) must serve the request, not a faster
+    /// Attested3p backup, and the result must not be attributed as fallback.
+    #[tokio::test]
+    async fn chat_completion_keeps_slow_near_ahead_of_attested_backup() {
+        use inference_providers::mock::MockProvider;
+        use inference_providers::ProviderTier;
+
+        let pool = InferenceProviderPool::new(None, ExternalProvidersConfig::default());
+        let model_id = "m-e2e-slow-near".to_string();
+        let near = Arc::new(MockProvider::new_accept_all().with_tier(ProviderTier::Near));
+        let backup = Arc::new(MockProvider::new_accept_all().with_tier(ProviderTier::Attested3p));
+        let near_dyn = as_trait(&near);
+        let backup_dyn = as_trait(&backup);
+        pool.register_provider(model_id.clone(), near_dyn.clone())
+            .await;
+        pool.register_pinned_secondary_provider(model_id.clone(), backup_dyn.clone(), None)
+            .await;
+        pool.seed_ttft(&near_dyn, 3000.0);
+        pool.seed_ttft(&backup_dyn, 100.0);
+
+        let served = pool
+            .chat_completion_stream_with_attribution(
+                fallback_params(&model_id),
+                "slow-near".to_string(),
+                ChatRoutingHints::default(),
+            )
             .await
-            .unwrap();
-        assert!(Arc::ptr_eq(&order[0], &near));
+            .expect("slow NEAR must still serve");
+        assert!(near.last_chat_params().await.is_some());
+        assert!(
+            backup.last_chat_params().await.is_none(),
+            "faster attested backup must not serve while NEAR is available"
+        );
+        assert!(!served.provider_attribution.served_via_fallback);
     }
 
     #[tokio::test]

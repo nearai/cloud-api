@@ -616,8 +616,10 @@ impl OrganizationUsageRepository {
         // Convert response_id from UUID to ResponseId
         let response_id_uuid: Option<Uuid> = row.get("response_id");
         let response_id = response_id_uuid.map(ResponseId::from);
-        let served_provider_tier = parse_served_provider_tier(row.get("served_provider_tier"))?;
-        let served_provider_type = parse_served_provider_type(row.get("served_provider_type"))?;
+        let served_provider_tier =
+            tolerant("served_provider_tier", row.get("served_provider_tier"));
+        let served_provider_type =
+            tolerant("served_provider_type", row.get("served_provider_type"));
 
         let credit_allocations = match allocations_override {
             Some(value) => Some(value),
@@ -819,34 +821,36 @@ pub struct UsageByModel {
     pub request_count: i64,
 }
 
-/// Unknown stored values read as `None` (with a content-free warning) so a
-/// binary never fails to read usage rows written by a newer binary that knows
-/// more provider types/tiers (spec section 3.7: tolerant readers before any writer).
-fn parse_served_provider_tier(value: Option<String>) -> Result<Option<ServedProviderTier>> {
-    Ok(value.as_deref().and_then(|s| match s.parse() {
-        Ok(t) => Some(t),
-        Err(_) => {
-            tracing::warn!(
-                served_provider_tier = %s,
-                "Unknown served_provider_tier in usage log; treating as unattributed"
-            );
-            None
-        }
-    }))
-}
+/// Unknown stored values read as `None` so a binary never fails to read usage
+/// rows written by a newer binary that knows more provider types/tiers (spec
+/// section 3.7: tolerant readers before any writer). Each distinct unknown
+/// value warns at most once per process (values are enum-like system strings,
+/// never customer data), so a large listing cannot flood the logs.
+fn tolerant<T: std::str::FromStr>(column: &'static str, value: Option<String>) -> Option<T> {
+    use std::collections::HashSet;
+    use std::sync::{Mutex, OnceLock};
+    /// Bound on remembered distinct values, so a pathological column cannot grow it forever.
+    const MAX_REMEMBERED: usize = 64;
+    static WARNED: OnceLock<Mutex<HashSet<(&'static str, String)>>> = OnceLock::new();
 
-/// See [`parse_served_provider_tier`].
-fn parse_served_provider_type(value: Option<String>) -> Result<Option<ServedProviderType>> {
-    Ok(value.as_deref().and_then(|s| match s.parse() {
-        Ok(t) => Some(t),
+    let raw = value?;
+    match raw.parse() {
+        Ok(v) => Some(v),
         Err(_) => {
-            tracing::warn!(
-                served_provider_type = %s,
-                "Unknown served_provider_type in usage log; treating as unattributed"
-            );
+            let mut warned = WARNED
+                .get_or_init(Default::default)
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            if warned.len() < MAX_REMEMBERED && warned.insert((column, raw.clone())) {
+                tracing::warn!(
+                    column,
+                    value = %raw,
+                    "Unknown provider attribution value in usage log; treating as unattributed"
+                );
+            }
             None
         }
-    }))
+    }
 }
 
 #[cfg(test)]
@@ -855,21 +859,28 @@ mod tests {
 
     #[test]
     fn unknown_served_provider_type_reads_as_none() {
+        assert!(tolerant::<ServedProviderType>(
+            "served_provider_type",
+            Some("some_future_provider".into())
+        )
+        .is_none());
+        // Repeated unknown values stay None (and warn only once).
+        assert!(tolerant::<ServedProviderType>(
+            "served_provider_type",
+            Some("some_future_provider".into())
+        )
+        .is_none());
+        assert_eq!(
+            tolerant::<ServedProviderType>("served_provider_type", Some("chutes".into())),
+            Some(ServedProviderType::Chutes)
+        );
+        assert!(tolerant::<ServedProviderType>("served_provider_type", None).is_none());
         assert!(
-            parse_served_provider_type(Some("some_future_provider".to_string()))
-                .unwrap()
+            tolerant::<ServedProviderTier>("served_provider_tier", Some("future_tier".into()))
                 .is_none()
         );
         assert_eq!(
-            parse_served_provider_type(Some("chutes".into())).unwrap(),
-            Some(ServedProviderType::Chutes)
-        );
-        assert!(parse_served_provider_type(None).unwrap().is_none());
-        assert!(parse_served_provider_tier(Some("future_tier".into()))
-            .unwrap()
-            .is_none());
-        assert_eq!(
-            parse_served_provider_tier(Some("near".into())).unwrap(),
+            tolerant::<ServedProviderTier>("served_provider_tier", Some("near".into())),
             Some(ServedProviderTier::Near)
         );
     }

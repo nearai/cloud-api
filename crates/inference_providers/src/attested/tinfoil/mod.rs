@@ -23,7 +23,7 @@ use serde_json::{json, Value};
 pub use self::availability::{map_upstream_status, unavailable, UpstreamDisposition};
 pub use self::config::{Config, ATC_URL, BASE_URL, PROXY_REREAD, ROUTER_REVERIFY};
 pub use self::session::{validate_router_domain, TinfoilRouterSession, VerifiedState};
-use crate::attested::chutes::request_body;
+use crate::attested::openai_wire::request_body;
 use crate::{
     AttestationError, AudioTranscriptionError, AudioTranscriptionParams,
     AudioTranscriptionResponse, ChatCompletionParams, ChatCompletionResponseWithBytes,

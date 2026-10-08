@@ -49,7 +49,7 @@ use serde_json::{json, Value};
 
 use self::client::{ChutesClient, ChutesClientError, InvokeMode, InvokeRequest};
 use self::verifier_port::ChutesInstanceVerifier;
-use crate::attested::nearai::placement_headers as ph;
+use crate::attested::openai_wire::{gate_stream_usage, request_body, sanitize_response_object};
 use crate::{
     AttestationError, AudioTranscriptionError, AudioTranscriptionParams,
     AudioTranscriptionResponse, ChatCompletionParams, ChatCompletionResponse,
@@ -596,147 +596,22 @@ impl Provider {
     }
 }
 
-/// Internal `extra` keys that must never reach Chutes (a third party): the
-/// tracing identifiers and the client-facing-E2EE markers. `ChatCompletionParams`
-/// flattens `extra` into the top-level body, so these would otherwise leak.
-const INTERNAL_KEYS: &[&str] = {
-    use crate::attested::nearai::{encryption_headers as eh, tracing_headers as th};
-    &[
-        th::REQUEST_ID,
-        th::ORG_ID,
-        th::WORKSPACE_ID,
-        eh::SIGNING_ALGO,
-        eh::CLIENT_PUB_KEY,
-        eh::MODEL_PUB_KEY,
-        eh::ENCRYPTION_VERSION,
-        eh::ENCRYPT_ALL_FIELDS,
-    ]
-};
+/// Fields Chutes surfaces beyond the common OpenAI shape: `chutes_verification`
+/// (the attestation receipt, deliberately surfaced) and `hidden_states` (the
+/// intentional unmodeled passthrough).
+const CHUTES_EXTRA_TOP_FIELDS: &[&str] = &["chutes_verification", "hidden_states"];
 
-/// Standard OpenAI chat-response / chunk fields kept at the TOP LEVEL, plus the two
-/// extras this crate deliberately passes through. This is an ALLOWLIST (#780 →
-/// #781 follow-up): model-specific serving internals vary too much to denylist
-/// reliably (e.g. kimi-k2.6 emits `templated_prompt`, `prompt_token_ids`,
-/// `prompt_logprobs`, `kv_transfer_params`, … alongside the already-known
-/// `prompt_sha256`/`template_sha256`/`metadata`), so anything NOT on this list is
-/// dropped by default.
-///
-/// Kept:
-/// - the standard OpenAI top-level fields — incl. `system_fingerprint` and
-///   `service_tier`, which ARE standard (do NOT confuse them with serving internals);
-/// - `chutes_verification` — the attestation receipt, deliberately surfaced;
-/// - `hidden_states` — the intentional unmodeled passthrough.
-const ALLOWED_TOP_LEVEL_FIELDS: &[&str] = &[
-    "id",
-    "object",
-    "created",
-    "model",
-    "choices",
-    "usage",
-    "system_fingerprint",
-    "service_tier",
-    "chutes_verification",
-    "hidden_states",
-];
+/// `reasoning` and `reasoning_content` are BOTH kept on a message (some models
+/// emit one, some the other, some both; we never drop a legit reasoning field).
+const CHUTES_EXTRA_MESSAGE_FIELDS: &[&str] = &["reasoning"];
 
-/// Standard OpenAI fields kept on each element of `choices` (both the non-stream
-/// `message`-bearing shape and the stream `delta`-bearing shape). Anything else
-/// (e.g. sglang's `matched_stop`, `token_ids`, `stop_reason`) is dropped. `message`
-/// and `delta` are recursed into via [`ALLOWED_MESSAGE_FIELDS`].
-const ALLOWED_CHOICE_FIELDS: &[&str] = &["index", "delta", "message", "finish_reason", "logprobs"];
-
-/// Standard OpenAI fields kept on a `choices[].message` (non-stream) or
-/// `choices[].delta` (stream). Drops model-specific message internals (e.g. a
-/// delta-nested `matched_stop`/`token_ids`). `reasoning` and `reasoning_content`
-/// are BOTH kept (some models emit one, some the other, some both — we never drop a
-/// legit reasoning field).
-const ALLOWED_MESSAGE_FIELDS: &[&str] = &[
-    "role",
-    "content",
-    "reasoning_content",
-    "reasoning",
-    "tool_calls",
-    "function_call",
-    "refusal",
-    "annotations",
-    "name",
-    "tool_call_id",
-];
-
-/// Drop from `obj` every key that is NOT on `allowed`, in place.
-fn retain_allowed(obj: &mut serde_json::Map<String, Value>, allowed: &[&str]) {
-    obj.retain(|k, _| allowed.contains(&k.as_str()));
-}
-
-/// Sanitize a decrypted response object to the standard OpenAI shape by ALLOWLIST
-/// (#780 → #781 follow-up), in place: keep only [`ALLOWED_TOP_LEVEL_FIELDS`] at the
-/// top level, [`ALLOWED_CHOICE_FIELDS`] on each `choices[]` element, and
-/// [`ALLOWED_MESSAGE_FIELDS`] on each `choices[].message` / `choices[].delta`.
-/// Everything else — known internals (`prompt_sha256`, `template_sha256`,
-/// `metadata`, `matched_stop`, …) AND unknown future internals — is dropped, so a
-/// Chutes response matches the clean shape returned for first-party / Anthropic /
-/// OpenAI models. The deliberately-kept extras `chutes_verification` (attestation
-/// receipt) and `hidden_states` (passthrough) are on the top-level allowlist and
-/// survive untouched. Takes the object map directly — the caller has already
-/// established it's a JSON object (a non-object body is kept verbatim). Used on both
-/// non-stream paths and per `data:` chunk on the stream path.
-///
-/// Conservative under-strip: when in doubt a field is added to the allowlist
-/// (keeping a stray field is safer than dropping a legitimate one), but the known
-/// serving internals above are deliberately absent and therefore dropped.
+/// Sanitize a decrypted Chutes response object to the standard OpenAI shape by
+/// ALLOWLIST (see [`openai_wire::sanitize_response_object`]), in place, plus the
+/// two deliberately kept extras above. Takes the object map directly: the caller
+/// has already established it is a JSON object. Used on both non-stream paths and
+/// per `data:` chunk on the stream path.
 fn strip_internal_response_fields(obj: &mut serde_json::Map<String, Value>) {
-    retain_allowed(obj, ALLOWED_TOP_LEVEL_FIELDS);
-    if let Some(choices) = obj.get_mut("choices").and_then(Value::as_array_mut) {
-        for choice in choices {
-            if let Some(choice_obj) = choice.as_object_mut() {
-                retain_allowed(choice_obj, ALLOWED_CHOICE_FIELDS);
-                // Recurse into the message (non-stream) and delta (stream) shapes.
-                for inner in ["message", "delta"] {
-                    if let Some(m) = choice_obj.get_mut(inner).and_then(Value::as_object_mut) {
-                        retain_allowed(m, ALLOWED_MESSAGE_FIELDS);
-                    }
-                }
-            }
-        }
-    }
-}
-
-/// Gate the `usage` field of a streamed chunk object to the OpenAI spec (#781 L1),
-/// in place. Per spec, intermediate chunks carry `usage: null`; `usage` appears only
-/// on the FINAL chunk, and only when the request set `stream_options.include_usage`.
-/// We force `include_usage: true` upstream so billing always sees usage (see
-/// [`request_body`]), so this gates only what reaches the CLIENT:
-///
-/// - a chunk with a non-empty `choices` array is an INTERMEDIATE content chunk → its
-///   `usage` is always stripped (covers vLLM's `continuous_usage_stats`, which would
-///   otherwise populate `usage` on every chunk);
-/// - a chunk with an empty `choices` array is the FINAL usage-only chunk → its
-///   `usage` is kept iff `include_usage` was requested, else stripped.
-///
-/// Returns `true` when the chunk was the FINAL usage-only chunk and the client did
-/// NOT request usage: OpenAI emits no final usage chunk at all in that case, so the
-/// caller must suppress the whole chunk from the client stream rather than forward
-/// a gutted `choices: []` husk (strict SDK parsers reject it, and cost-tracking
-/// clients read it as zero usage) — see [`rewrite_sse_event_model`].
-///
-/// NOTE: this gates only `raw_bytes` (the bytes the passthrough route forwards to the
-/// client). The parsed `chunk.usage` is left intact so `InterceptStream` can still
-/// read it for billing/limits — see [`rewrite_sse_event_model`].
-pub(crate) fn gate_stream_usage(
-    obj: &mut serde_json::Map<String, Value>,
-    include_usage: bool,
-) -> bool {
-    if !obj.contains_key("usage") {
-        return false;
-    }
-    let is_final = obj
-        .get("choices")
-        .and_then(Value::as_array)
-        .is_none_or(|c| c.is_empty());
-    if !is_final || !include_usage {
-        obj.remove("usage");
-    }
-    is_final && !include_usage
+    sanitize_response_object(obj, CHUTES_EXTRA_TOP_FIELDS, CHUTES_EXTRA_MESSAGE_FIELDS);
 }
 
 /// Rewrite the `model` field of a decrypted OpenAI SSE event to the canonical id
@@ -1342,52 +1217,6 @@ fn stream_with_think_extraction(
     Box::pin(s)
 }
 
-/// An OpenAI request body (as JSON) with `model` pinned, `stream` set, and all
-/// internal/tracing/E2EE-marker keys stripped (never sent to the third party).
-pub(crate) fn request_body(
-    model: &str,
-    params: &ChatCompletionParams,
-    stream: bool,
-) -> Result<Value, String> {
-    let mut v = serde_json::to_value(params).map_err(|e| format!("serialize params: {e}"))?;
-    if let Some(obj) = v.as_object_mut() {
-        obj.insert("model".to_string(), json!(model));
-        obj.insert("stream".to_string(), json!(stream));
-        if stream {
-            // Force usage onto the final stream chunk so streamed tokens are
-            // billed and counted against org limits (the OpenAI-compatible
-            // default omits it, and our SSE adapter drops Chutes' outer
-            // usage-only events). Matches every other provider.
-            //
-            // Merge into any client-supplied `stream_options` (e.g.
-            // `continuous_usage_stats`) rather than clobbering the whole object —
-            // we only need to *guarantee* `include_usage`.
-            match obj.get_mut("stream_options").and_then(Value::as_object_mut) {
-                Some(existing) => {
-                    existing.insert("include_usage".to_string(), json!(true));
-                }
-                None => {
-                    obj.insert(
-                        "stream_options".to_string(),
-                        json!({ "include_usage": true }),
-                    );
-                }
-            }
-        }
-        // Strip internal identifiers + client-E2EE markers so they never reach
-        // Chutes inside the (encrypted) request body.
-        for k in INTERNAL_KEYS {
-            obj.remove(*k);
-        }
-        for k in ph::LEGACY_DENIED_EXTRA_KEYS {
-            obj.remove(k);
-        }
-    } else {
-        return Err("chat params did not serialize to a JSON object".to_string());
-    }
-    Ok(v)
-}
-
 /// Reject a request that carries client-facing E2EE intent (the client asked
 /// cloud-api to encrypt the response to its key). The attested Chutes path does
 /// not implement that response encryption, so we **reject** rather than silently
@@ -1815,6 +1644,8 @@ mod tests {
     use super::*;
     use crate::attested::chutes::evidence::InstanceEvidence;
     use crate::attested::chutes::verifier_port::VerifiedInstanceInfo;
+    use crate::attested::nearai::placement_headers as ph;
+    use crate::attested::openai_wire::INTERNAL_KEYS;
 
     /// Issue #774: a Chutes upstream HTTP status (notably the `/e2e/instances`
     /// rate-limit 429) must surface as a RETRYABLE `HttpError { status_code }`, not
@@ -2217,6 +2048,76 @@ mod tests {
             assert_eq!(v["choices"][0]["index"], 0);
             assert_eq!(v["choices"][0]["message"]["content"], "hi");
         }
+    }
+
+    /// Guard for the shared `openai_wire` refactor: the Chutes allow-lists must
+    /// keep exactly the keys the pre-refactor in-file lists kept (literals copied
+    /// from before the move), at every level.
+    #[test]
+    fn chutes_allowlists_match_the_pre_refactor_lists() {
+        const TOP: &[&str] = &[
+            "id",
+            "object",
+            "created",
+            "model",
+            "choices",
+            "usage",
+            "system_fingerprint",
+            "service_tier",
+            "chutes_verification",
+            "hidden_states",
+        ];
+        const CHOICE: &[&str] = &["index", "delta", "message", "finish_reason", "logprobs"];
+        const MESSAGE: &[&str] = &[
+            "role",
+            "content",
+            "reasoning_content",
+            "reasoning",
+            "tool_calls",
+            "function_call",
+            "refusal",
+            "annotations",
+            "name",
+            "tool_call_id",
+        ];
+        let probe = |allowed: &[&str]| {
+            let mut m = serde_json::Map::new();
+            for k in allowed.iter().chain(
+                [
+                    "prompt_text",
+                    "token_ids",
+                    "p",
+                    "metadata",
+                    "matched_stop",
+                    "usage_",
+                ]
+                .iter(),
+            ) {
+                m.insert((*k).to_string(), json!(1));
+            }
+            m
+        };
+        let mut top = probe(TOP);
+        let mut choice = probe(CHOICE);
+        choice.insert("delta".into(), Value::Object(probe(MESSAGE)));
+        choice.insert("message".into(), Value::Object(probe(MESSAGE)));
+        top.insert("choices".into(), json!([Value::Object(choice)]));
+        strip_internal_response_fields(&mut top);
+        let keys = |m: &serde_json::Map<String, Value>| {
+            let mut k: Vec<_> = m.keys().cloned().collect();
+            k.sort();
+            k
+        };
+        let sorted = |a: &[&str]| {
+            let mut k: Vec<String> = a.iter().map(|s| s.to_string()).collect();
+            k.sort();
+            k
+        };
+        assert_eq!(keys(&top), sorted(TOP));
+        let c = top["choices"][0].as_object().unwrap();
+        assert_eq!(keys(c), sorted(CHOICE));
+        assert_eq!(keys(c["delta"].as_object().unwrap()), sorted(MESSAGE));
+        assert_eq!(keys(c["message"].as_object().unwrap()), sorted(MESSAGE));
     }
 
     #[test]

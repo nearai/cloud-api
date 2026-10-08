@@ -10,34 +10,12 @@
 use futures_util::StreamExt;
 use serde_json::{Map, Value};
 
-use crate::attested::chutes::gate_stream_usage;
+use crate::attested::openai_wire::{gate_stream_usage, retain_allowed, sanitize_response_object};
 use crate::{
     ChatCompletionChunk, ChatCompletionResponse, CompletionError, SSEEvent, StreamChunk,
     StreamingResult,
 };
 
-const TOP_LEVEL: &[&str] = &[
-    "id",
-    "object",
-    "created",
-    "model",
-    "choices",
-    "usage",
-    "system_fingerprint",
-    "service_tier",
-];
-const CHOICE: &[&str] = &["index", "delta", "message", "finish_reason", "logprobs"];
-const MESSAGE: &[&str] = &[
-    "role",
-    "content",
-    "reasoning_content",
-    "tool_calls",
-    "function_call",
-    "refusal",
-    "annotations",
-    "name",
-    "tool_call_id",
-];
 const USAGE: &[&str] = &[
     "prompt_tokens",
     "completion_tokens",
@@ -46,13 +24,9 @@ const USAGE: &[&str] = &[
     "completion_tokens_details",
 ];
 
-fn retain(obj: &mut Map<String, Value>, allowed: &[&str]) {
-    obj.retain(|k, _| allowed.contains(&k.as_str()));
-}
-
 fn retain_only(obj: &mut Map<String, Value>, key: &str, allowed: &[&str]) {
     match obj.get_mut(key) {
-        Some(Value::Object(inner)) => retain(inner, allowed),
+        Some(Value::Object(inner)) => retain_allowed(inner, allowed),
         // `null` details carry nothing.
         Some(_) => {
             obj.remove(key);
@@ -62,26 +36,20 @@ fn retain_only(obj: &mut Map<String, Value>, key: &str, allowed: &[&str]) {
 }
 
 /// Sanitize one response/chunk object in place: slug -> canonical `model`,
-/// `reasoning` -> `reasoning_content`, then the allowlists.
+/// Tinfoil's `reasoning` -> our `reasoning_content`, the shared OpenAI
+/// allowlists, then Tinfoil's tighter `usage` sub-filtering.
 fn sanitize(obj: &mut Map<String, Value>, canonical: &str) {
     obj.insert("model".to_string(), Value::String(canonical.to_string()));
-    retain(obj, TOP_LEVEL);
-    if let Some(Value::Object(usage)) = obj.get_mut("usage") {
-        retain(usage, USAGE);
-        retain_only(usage, "prompt_tokens_details", &["cached_tokens"]);
-        retain_only(usage, "completion_tokens_details", &["reasoning_tokens"]);
-    }
     if let Some(choices) = obj.get_mut("choices").and_then(Value::as_array_mut) {
         for choice in choices {
-            let Some(c) = choice.as_object_mut() else {
-                continue;
-            };
-            retain(c, CHOICE);
             for inner in ["message", "delta"] {
-                let Some(m) = c.get_mut(inner).and_then(Value::as_object_mut) else {
+                let Some(m) = choice
+                    .as_object_mut()
+                    .and_then(|c| c.get_mut(inner))
+                    .and_then(Value::as_object_mut)
+                else {
                     continue;
                 };
-                // Tinfoil's field name is `reasoning`; ours is `reasoning_content`.
                 if let Some(r) = m.remove("reasoning") {
                     if r.is_string()
                         && !matches!(m.get("reasoning_content"), Some(Value::String(_)))
@@ -89,9 +57,15 @@ fn sanitize(obj: &mut Map<String, Value>, canonical: &str) {
                         m.insert("reasoning_content".to_string(), r);
                     }
                 }
-                retain(m, MESSAGE);
             }
         }
+    }
+    // Tinfoil emits no extras of its own: nothing beyond the common shape.
+    sanitize_response_object(obj, &[], &[]);
+    if let Some(Value::Object(usage)) = obj.get_mut("usage") {
+        retain_allowed(usage, USAGE);
+        retain_only(usage, "prompt_tokens_details", &["cached_tokens"]);
+        retain_only(usage, "completion_tokens_details", &["reasoning_tokens"]);
     }
 }
 

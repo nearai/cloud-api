@@ -22,9 +22,6 @@ use super::verifier_port::{
 };
 use crate::spki_verifier::{FingerprintState, SharedTlsRoots};
 
-/// Fresh-bundle attempts per verification (see `do_verify`).
-pub(super) const ATC_ATTEMPTS: usize = 6;
-
 /// Timeout for evidence and model-document fetches.
 const FETCH_TIMEOUT: Duration = Duration::from_secs(15);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
@@ -32,7 +29,7 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// connection failures, so a persistently bad peer cannot hammer the ATC.
 const MISMATCH_REVERIFY_COOLDOWN: Duration = Duration::from_secs(10);
 /// Cap on evidence / model-document bodies.
-const MAX_DOC_BYTES: usize = 8 * 1024 * 1024;
+pub(super) const MAX_DOC_BYTES: usize = 8 * 1024 * 1024;
 
 const PROXY_PATH: &str = "/.well-known/tinfoil-proxy";
 
@@ -44,18 +41,49 @@ pub struct VerifiedState {
     pub verified_at: Instant,
     /// The attestation bundle that was verified (served by `get_attestation_report`).
     pub bundle: AtcBundle,
+    /// Pinned client and request base for exactly this verification. Swapped
+    /// atomically with the rest of the state, so a request never pairs one
+    /// router's pin with another's host.
+    pub(crate) transport: Arc<Transport>,
+}
+
+/// Everything needed to talk to the verified router.
+pub(crate) struct Transport {
+    pub(crate) client: reqwest::Client,
+    /// `https://{bundle.domain}` (a test override takes precedence in tests).
+    pub(crate) base: String,
+    pub(crate) domain: String,
+    pub(crate) spki_hex: String,
+}
+
+/// A router host must be a bare lowercase ASCII `*.tinfoil.sh` hostname: no
+/// scheme, port, path, userinfo, uppercase or IDN. The ATC serves bundles for
+/// several router hosts, and the domain decides where requests are sent, so it
+/// is validated before it is trusted.
+pub fn validate_router_domain(domain: &str) -> Result<(), TinfoilVerifyError> {
+    const SUFFIX: &str = ".tinfoil.sh";
+    let Some(prefix) = domain.strip_suffix(SUFFIX) else {
+        return Err(TinfoilVerifyError::Malformed);
+    };
+    let label_ok = |l: &str| {
+        !l.is_empty()
+            && l.len() <= 63
+            && !l.starts_with('-')
+            && !l.ends_with('-')
+            && l.bytes()
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+    };
+    if domain.len() > 253 || !prefix.split('.').all(label_ok) {
+        return Err(TinfoilVerifyError::Malformed);
+    }
+    Ok(())
 }
 
 pub struct TinfoilRouterSession {
-    base_url: String,
     atc_url: String,
     verifier: Arc<dyn TinfoilVerifier>,
     state: ArcSwap<Option<VerifiedState>>,
-    fingerprint: Arc<RwLock<FingerprintState>>,
     tls_roots: SharedTlsRoots,
-    /// Pinned client for all router traffic. Rebuilt when the pin changes so no
-    /// pooled connection outlives the pin it was established under.
-    pinned_client: ArcSwap<reqwest::Client>,
     /// Fetches the ATC evidence bundle (WebPKI only; content is verified).
     atc_client: reqwest::Client,
     verify_lock: tokio::sync::Mutex<()>,
@@ -63,6 +91,10 @@ pub struct TinfoilRouterSession {
     verify_gen: AtomicU64,
     last_mismatch_reverify: std::sync::Mutex<Option<Instant>>,
     refresh_started: AtomicBool,
+    #[cfg(test)]
+    base_override: Option<String>,
+    #[cfg(test)]
+    route: Option<std::net::SocketAddr>,
     /// Count of upstream 401/402/403 responses. Exposed for the metric
     /// `cloud_api.tinfoil.upstream_auth_failure`, which this crate cannot emit.
     auth_failures: AtomicU64,
@@ -70,18 +102,6 @@ pub struct TinfoilRouterSession {
     /// or none has run). Polled by the API layer for
     /// `cloud_api.tinfoil.verification`, which this crate cannot emit.
     last_error: std::sync::Mutex<Option<TinfoilVerifyError>>,
-}
-
-fn build_pinned_client(
-    roots: &SharedTlsRoots,
-    fp: &Arc<RwLock<FingerprintState>>,
-) -> Result<reqwest::Client, String> {
-    reqwest::Client::builder()
-        .use_preconfigured_tls(roots.build_config(fp.clone()))
-        .redirect(reqwest::redirect::Policy::none())
-        .connect_timeout(CONNECT_TIMEOUT)
-        .build()
-        .map_err(|e| format!("build pinned Tinfoil client: {e}"))
 }
 
 impl TinfoilRouterSession {
@@ -94,9 +114,6 @@ impl TinfoilRouterSession {
         verifier: Arc<dyn TinfoilVerifier>,
         tls_roots: SharedTlsRoots,
     ) -> Result<Arc<Self>, String> {
-        // Starts Blocked: nothing is reachable until verification pins the SPKI.
-        let fingerprint = Arc::new(RwLock::new(FingerprintState::Blocked));
-        let pinned = build_pinned_client(&tls_roots, &fingerprint)?;
         let atc_client = reqwest::Client::builder()
             .use_preconfigured_tls(
                 tls_roots.build_config(Arc::new(RwLock::new(FingerprintState::Bootstrap))),
@@ -106,36 +123,67 @@ impl TinfoilRouterSession {
             .build()
             .map_err(|e| format!("build Tinfoil ATC client: {e}"))?;
         Ok(Arc::new(Self {
-            base_url: cfg.base_url.clone(),
             atc_url: cfg.atc_url.clone(),
             verifier,
             state: ArcSwap::from_pointee(None),
-            fingerprint,
             tls_roots,
-            pinned_client: ArcSwap::from_pointee(pinned),
             atc_client,
             verify_lock: tokio::sync::Mutex::new(()),
             verify_gen: AtomicU64::new(0),
             last_mismatch_reverify: std::sync::Mutex::new(None),
             refresh_started: AtomicBool::new(false),
+            #[cfg(test)]
+            base_override: cfg.base_override.clone(),
+            #[cfg(test)]
+            route: cfg.route,
             auth_failures: AtomicU64::new(0),
             last_error: std::sync::Mutex::new(None),
         }))
     }
 
+    /// Pin currently enforced: `Blocked` unless the router is verified.
     pub fn fingerprint_state(&self) -> FingerprintState {
-        self.fingerprint
-            .read()
-            .unwrap_or_else(|e| e.into_inner())
-            .clone()
+        match &**self.state.load() {
+            None => FingerprintState::Blocked,
+            Some(st) => FingerprintState::Pinned(HashSet::from([st.transport.spki_hex.clone()])),
+        }
     }
 
-    pub fn base_url(&self) -> &str {
-        &self.base_url
-    }
-
-    pub(super) fn client(&self) -> Arc<reqwest::Client> {
-        self.pinned_client.load_full()
+    /// Pinned client + base for `domain`, enforcing exactly `spki_hex`. Built
+    /// fresh so no pooled connection outlives the pin it was made under.
+    pub(super) fn build_transport(
+        &self,
+        domain: &str,
+        spki_hex: &str,
+    ) -> Result<Transport, String> {
+        let fp = Arc::new(RwLock::new(FingerprintState::Pinned(HashSet::from([
+            spki_hex.to_string(),
+        ]))));
+        #[allow(unused_mut)]
+        let mut builder = reqwest::Client::builder()
+            .use_preconfigured_tls(self.tls_roots.build_config(fp))
+            .redirect(reqwest::redirect::Policy::none())
+            .connect_timeout(CONNECT_TIMEOUT);
+        #[allow(unused_mut)]
+        let mut base = format!("https://{domain}");
+        #[cfg(test)]
+        {
+            if let Some(addr) = self.route {
+                builder = builder.resolve(domain, addr);
+                base = format!("https://{domain}:{}", addr.port());
+            }
+            if let Some(o) = &self.base_override {
+                base = o.clone();
+            }
+        }
+        Ok(Transport {
+            client: builder
+                .build()
+                .map_err(|e| format!("build pinned Tinfoil client: {e}"))?,
+            base,
+            domain: domain.to_string(),
+            spki_hex: spki_hex.to_string(),
+        })
     }
 
     pub(super) fn snapshot(&self) -> Arc<Option<VerifiedState>> {
@@ -183,7 +231,6 @@ impl TinfoilRouterSession {
     }
 
     fn fail_closed(&self) {
-        *self.fingerprint.write().unwrap_or_else(|e| e.into_inner()) = FingerprintState::Blocked;
         self.state.store(Arc::new(None));
     }
 
@@ -236,46 +283,34 @@ impl TinfoilRouterSession {
         result
     }
 
+    /// ATC -> `verify_router` -> domain check -> proxy document fetched over a
+    /// client pinned to the NEW key and host -> publish pin, host and state
+    /// together. Nothing is published unless every step passes.
+    ///
     /// The ATC serves bundles for more than one router host (observed live:
-    /// `inference.tinfoil.sh` and `router-0.tinfoil.sh`, chosen per request).
-    /// Only the first carries the key `inference.tinfoil.sh` presents, so a
-    /// pin taken from the other makes the proxy fetch fail. That failure is
-    /// retried with a fresh bundle; it never relaxes any check.
+    /// `inference.tinfoil.sh` and `router-0.tinfoil.sh`, chosen per request),
+    /// each attesting its own key, so requests go to the attested domain.
     async fn do_verify(&self) -> Result<(), TinfoilVerifyError> {
-        let mut last = TinfoilVerifyError::Fetch;
-        for _ in 0..ATC_ATTEMPTS {
-            match self.verify_once().await {
-                Err(TinfoilVerifyError::Fetch) => last = TinfoilVerifyError::Fetch,
-                other => return other,
-            }
-        }
-        Err(last)
-    }
-
-    async fn verify_once(&self) -> Result<(), TinfoilVerifyError> {
         let bundle: AtcBundle = Self::fetch_json(&self.atc_client, &self.atc_url).await?;
         let router = self.verifier.verify_router(&bundle)?;
+        validate_router_domain(&bundle.domain)?;
         let fp = hex::encode(router.spki_sha256);
 
-        let changed = !matches!(
-            &*self.fingerprint.read().unwrap_or_else(|e| e.into_inner()),
-            FingerprintState::Pinned(set) if set.len() == 1 && set.contains(&fp)
-        );
-        if changed {
-            // Drop pooled connections made under the previous pin.
-            let client = build_pinned_client(&self.tls_roots, &self.fingerprint)
-                .map_err(|_| TinfoilVerifyError::Fetch)?;
-            self.pinned_client.store(Arc::new(client));
-            let mut set = HashSet::new();
-            set.insert(fp);
-            self.fingerprint
-                .write()
-                .unwrap_or_else(|e| e.into_inner())
-                .replace_with(set);
-        }
-
-        let doc: ProxyDoc =
-            Self::fetch_json(&self.client(), &format!("{}{PROXY_PATH}", self.base_url)).await?;
+        let current = self.state.load_full();
+        let transport = match &*current {
+            Some(st) if st.transport.spki_hex == fp && st.transport.domain == bundle.domain => {
+                st.transport.clone()
+            }
+            _ => Arc::new(
+                self.build_transport(&bundle.domain, &fp)
+                    .map_err(|_| TinfoilVerifyError::Fetch)?,
+            ),
+        };
+        let doc: ProxyDoc = Self::fetch_json(
+            &transport.client,
+            &format!("{}{PROXY_PATH}", transport.base),
+        )
+        .await?;
         let models = self.check_models(&doc);
         tracing::info!(
             router_tag = %router.tag,
@@ -297,6 +332,7 @@ impl TinfoilRouterSession {
             models,
             verified_at: Instant::now(),
             bundle,
+            transport,
         })));
         Ok(())
     }
@@ -311,8 +347,11 @@ impl TinfoilRouterSession {
             let _ = self.verify_locked().await;
             return;
         };
-        let doc: Result<ProxyDoc, _> =
-            Self::fetch_json(&self.client(), &format!("{}{PROXY_PATH}", self.base_url)).await;
+        let doc: Result<ProxyDoc, _> = Self::fetch_json(
+            &cur.transport.client,
+            &format!("{}{PROXY_PATH}", cur.transport.base),
+        )
+        .await;
         match doc {
             Ok(doc) => {
                 let models = self.check_models(&doc);
@@ -327,6 +366,7 @@ impl TinfoilRouterSession {
                     models,
                     verified_at: cur.verified_at,
                     bundle: cur.bundle.clone(),
+                    transport: cur.transport.clone(),
                 })));
             }
             Err(_) => {
@@ -393,10 +433,11 @@ impl TinfoilRouterSession {
     /// The router's published context window for `slug` (`GET /v1/models`,
     /// unauthenticated, over the pinned client).
     pub async fn published_context_window(&self, slug: &str) -> Option<u32> {
-        let v: serde_json::Value =
-            Self::fetch_json(&self.client(), &format!("{}/v1/models", self.base_url))
-                .await
-                .ok()?;
+        let snap = self.state.load_full();
+        let t = &snap.as_ref().as_ref()?.transport;
+        let v: serde_json::Value = Self::fetch_json(&t.client, &format!("{}/v1/models", t.base))
+            .await
+            .ok()?;
         v.get("data")?
             .as_array()?
             .iter()

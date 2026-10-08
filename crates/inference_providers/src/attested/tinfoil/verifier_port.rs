@@ -56,6 +56,16 @@ pub struct VerifiedRouter {
     pub spki_sha256: [u8; 32],
     pub measurement_hex: String,
     pub tag: String,
+    /// Reported TCB from the verified SNP report.
+    pub tcb: RouterTcb,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RouterTcb {
+    pub bootloader: u8,
+    pub tee: u8,
+    pub snp: u8,
+    pub microcode: u8,
 }
 
 #[derive(Debug, Clone)]

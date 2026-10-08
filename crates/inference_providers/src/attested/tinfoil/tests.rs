@@ -81,7 +81,6 @@ fn api_key_never_in_debug() {
 #[test]
 fn production_urls_are_constants() {
     let c = Config::new("k".into(), 30);
-    assert_eq!(c.base_url, super::BASE_URL);
     assert_eq!(c.atc_url, super::ATC_URL);
     assert_eq!(super::BASE_URL, "https://inference.tinfoil.sh");
     assert_eq!(super::ATC_URL, "https://atc.tinfoil.sh/attestation");
@@ -235,7 +234,11 @@ fn test_pki() -> TestPki {
     let issuer = rcgen::Issuer::new(ca_params, ca_key);
     let mk = || {
         let k = rcgen::KeyPair::generate().unwrap();
-        let p = rcgen::CertificateParams::new(vec!["127.0.0.1".to_string()]).unwrap();
+        let p = rcgen::CertificateParams::new(vec![
+            "127.0.0.1".to_string(),
+            "router-0.tinfoil.sh".to_string(),
+        ])
+        .unwrap();
         let c = p.signed_by(&k, &issuer).unwrap();
         (
             c.der().clone(),
@@ -284,6 +287,7 @@ struct TestServer {
     acceptor: Arc<Mutex<tokio_rustls::TlsAcceptor>>,
     chat: Arc<Mutex<ChatReply>>,
     last_chat: LastChat,
+    atc_domain: Arc<Mutex<String>>,
 }
 
 async fn start_server(pki: &TestPki) -> TestServer {
@@ -294,13 +298,16 @@ async fn start_server(pki: &TestPki) -> TestServer {
         body: fixture("chat_nonstream.json"),
     }));
     let last_chat = Arc::new(Mutex::new(None));
+    let atc_domain = Arc::new(Mutex::new("inference.tinfoil.sh".to_string()));
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let (acc2, chat2, last2) = (acc.clone(), chat.clone(), last_chat.clone());
+    let domain2 = atc_domain.clone();
     tokio::spawn(async move {
         while let Ok((tcp, _)) = listener.accept().await {
             let a = acc2.lock().unwrap().clone();
             let (chat, last) = (chat2.clone(), last2.clone());
+            let domain = domain2.lock().unwrap().clone();
             tokio::spawn(async move {
                 let Ok(mut tls) = a.accept(tcp).await else {
                     return;
@@ -334,7 +341,7 @@ async fn start_server(pki: &TestPki) -> TestServer {
                 let body = buf[head_end..head_end + len].to_vec();
                 let path = head.split_whitespace().nth(1).unwrap_or("").to_string();
                 let (status, ct, out): (u16, &str, Vec<u8>) = match path.as_str() {
-                    "/attestation" => (200, "application/json", atc_json()),
+                    "/attestation" => (200, "application/json", atc_json(&domain)),
                     "/.well-known/tinfoil-proxy" => (200, "application/json", proxy_json()),
                     "/v1/models" => (200, "application/json", fixture("models.json")),
                     "/v1/chat/completions" => {
@@ -359,12 +366,13 @@ async fn start_server(pki: &TestPki) -> TestServer {
         acceptor: acc,
         chat,
         last_chat,
+        atc_domain,
     }
 }
 
-fn atc_json() -> Vec<u8> {
+fn atc_json(domain: &str) -> Vec<u8> {
     serde_json::to_vec(&serde_json::json!({
-        "domain": "inference.tinfoil.sh",
+        "domain": domain,
         "enclaveAttestationReport": {"format": "sev-snp-guest/v2", "body": "cmVwb3J0"},
         "vcek": "dmNlaw==",
         "enclaveCert": "Y2VydA==",
@@ -419,6 +427,12 @@ impl TinfoilVerifier for StubVerifier {
             spki_sha256: *self.spki.lock().unwrap(),
             measurement_hex: "ab".repeat(48),
             tag: "tinfoilsh/confidential-model-router@v0.0.155".into(),
+            tcb: RouterTcb {
+                bootloader: 10,
+                tee: 0,
+                snp: 23,
+                microcode: 84,
+            },
         })
     }
     fn check_model(
@@ -667,8 +681,8 @@ async fn spki_mismatch_reverifies_once_then_503() {
     );
     assert_eq!(
         e.verifier.router_calls.load(Ordering::SeqCst),
-        1 + super::session::ATC_ATTEMPTS,
-        "exactly one re-verify (each tries a bounded number of fresh bundles)"
+        2,
+        "exactly one re-verify"
     );
     assert!(
         e.server.last_chat.lock().unwrap().is_none(),
@@ -688,10 +702,7 @@ async fn spki_mismatch_reverifies_once_then_503() {
         503,
     );
     assert!(msg.contains("not_verified"));
-    assert_eq!(
-        e.verifier.router_calls.load(Ordering::SeqCst),
-        1 + super::session::ATC_ATTEMPTS
-    );
+    assert_eq!(e.verifier.router_calls.load(Ordering::SeqCst), 2);
 }
 
 #[tokio::test]
@@ -755,7 +766,7 @@ async fn published_context_window_reads_models() {
 async fn attestation_report_payload_shape() {
     let e = env().await;
     // No network: install a verified state directly.
-    let bundle: AtcBundle = serde_json::from_slice(&atc_json()).unwrap();
+    let bundle: AtcBundle = serde_json::from_slice(&atc_json("inference.tinfoil.sh")).unwrap();
     let doc: ProxyDoc = serde_json::from_value(proxy_doc()).unwrap();
     let entry = doc.models.get(SLUG).unwrap();
     let mut models = BTreeMap::new();
@@ -773,10 +784,21 @@ async fn attestation_report_payload_shape() {
             spki_sha256: [1; 32],
             measurement_hex: "ab".repeat(48),
             tag: "r@v1".into(),
+            tcb: RouterTcb {
+                bootloader: 10,
+                tee: 0,
+                snp: 23,
+                microcode: 84,
+            },
         },
         models,
         verified_at: Instant::now(),
         bundle,
+        transport: Arc::new(
+            e.session
+                .build_transport("inference.tinfoil.sh", &"01".repeat(32))
+                .unwrap(),
+        ),
     });
     let m = e
         .provider
@@ -790,6 +812,10 @@ async fn attestation_report_payload_shape() {
     assert_eq!(m["router"]["format"], "sev-snp-guest/v2");
     assert_eq!(m["router"]["measurement"], "ab".repeat(48));
     assert_eq!(m["router"]["tag"], "r@v1");
+    assert_eq!(
+        m["router"]["tcb"],
+        serde_json::json!({"bootloader": 10, "tee": 0, "snp": 23, "microcode": 84})
+    );
     assert_eq!(m["router"]["report_b64"], "cmVwb3J0");
     assert_eq!(m["model_entry"]["slug"], SLUG);
     assert_eq!(
@@ -825,4 +851,97 @@ async fn trait_surface() {
     assert!(p.supports_streaming());
     let m = p.models().await.unwrap();
     assert_eq!(m.data[0].id, CANON);
+}
+
+// ------------------------------------------------------------ attested domain
+
+#[test]
+fn router_domain_syntax() {
+    use super::validate_router_domain as ok;
+    assert!(ok("inference.tinfoil.sh").is_ok());
+    assert!(ok("router-0.tinfoil.sh").is_ok());
+    assert!(ok("a.b.tinfoil.sh").is_ok());
+    for bad in [
+        "https://inference.tinfoil.sh",
+        "inference.tinfoil.sh:443",
+        "inference.tinfoil.sh/x",
+        "user@inference.tinfoil.sh",
+        "inference.example.com",
+        "tinfoil.sh",
+        ".tinfoil.sh",
+        "..tinfoil.sh",
+        "Router-0.tinfoil.sh",
+        "r\u{00f6}uter.tinfoil.sh",
+        "-x.tinfoil.sh",
+        "x.tinfoil.sh.evil.com",
+        "",
+    ] {
+        assert_eq!(ok(bad), Err(TinfoilVerifyError::Malformed), "{bad}");
+    }
+}
+
+#[tokio::test]
+async fn bundle_domain_selects_the_request_host() {
+    let pki = test_pki();
+    let server = start_server(&pki).await;
+    *server.atc_domain.lock().unwrap() = "router-0.tinfoil.sh".to_string();
+    let cfg = Config::new("tk_test_key".into(), 5)
+        .with_route(server.addr, &format!("https://{}/attestation", server.addr));
+    let verifier =
+        StubVerifier::new(&compute_spki_fingerprint_from_der(pki.leaf_a.as_ref()).unwrap());
+    let session =
+        TinfoilRouterSession::new_with_roots(cfg.clone(), verifier, pki.roots.clone()).unwrap();
+    session.verify_now().await.unwrap();
+    let provider = Provider::new(session.clone(), &cfg, SLUG.into(), CANON.into());
+    provider
+        .chat_completion(params(false, None), "h".into())
+        .await
+        .unwrap();
+    let head = server.last_chat.lock().unwrap().clone().unwrap().0;
+    assert!(
+        head.to_ascii_lowercase()
+            .contains("host: router-0.tinfoil.sh"),
+        "{head}"
+    );
+    assert!(session.published_context_window(SLUG).await.is_some());
+}
+
+#[tokio::test]
+async fn invalid_bundle_domain_is_rejected_and_closed() {
+    let e = env().await;
+    for bad in [
+        "https://inference.tinfoil.sh",
+        "inference.tinfoil.sh:443",
+        "inference.example.com",
+        "tinfoil.sh",
+        "Inference.tinfoil.sh",
+    ] {
+        *e.server.atc_domain.lock().unwrap() = bad.to_string();
+        assert_eq!(
+            e.session.verify_now().await,
+            Err(TinfoilVerifyError::Malformed),
+            "{bad}"
+        );
+        assert!(e.session.model_status(SLUG).is_err());
+        assert!(matches!(
+            e.session.fingerprint_state(),
+            FingerprintState::Blocked
+        ));
+    }
+}
+
+#[tokio::test]
+async fn failed_proxy_fetch_does_not_publish_the_new_pin() {
+    let e = env().await;
+    e.session.verify_now().await.unwrap();
+    let before = e.session.fingerprint_state();
+    // The new key is not what the server presents: the proxy fetch over the
+    // candidate client fails, and the (closed) session never adopts the new pin.
+    *e.verifier.spki.lock().unwrap() = [7u8; 32];
+    assert_eq!(e.session.verify_now().await, Err(TinfoilVerifyError::Fetch));
+    assert!(matches!(
+        e.session.fingerprint_state(),
+        FingerprintState::Blocked
+    ));
+    assert!(matches!(before, FingerprintState::Pinned(_)));
 }

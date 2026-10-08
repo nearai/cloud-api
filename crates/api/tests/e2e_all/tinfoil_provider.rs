@@ -52,14 +52,16 @@ async fn fixture(with_chutes: bool) -> Fixture {
                 .with_chat_signature_support(false),
         )
     };
+    // Tinfoil registers BEFORE Chutes so it is the first failover: a kill
+    // switch test that only shows Chutes serving would otherwise pass vacuously.
+    let tinfoil = attested(ProviderSource::Tinfoil);
+    pool.register_pinned_secondary_provider(model.clone(), tinfoil.clone(), None)
+        .await;
     let chutes = with_chutes.then(|| attested(ProviderSource::Chutes));
     if let Some(c) = &chutes {
         pool.register_pinned_secondary_provider(model.clone(), c.clone(), None)
             .await;
     }
-    let tinfoil = attested(ProviderSource::Tinfoil);
-    pool.register_pinned_secondary_provider(model.clone(), tinfoil.clone(), None)
-        .await;
 
     let mut batch = BatchUpdateModelApiRequest::new();
     batch.insert(
@@ -221,22 +223,34 @@ async fn usage_row_records_tinfoil_as_served_provider() {
 async fn serial_kill_switch_fails_over_to_next_provider() {
     let f = fixture(true).await;
     let chutes = f.chutes.clone().unwrap();
+    let served = |r: &axum_test::TestResponse| {
+        r.maybe_header("x-serving-provider")
+            .map(|h| h.to_str().unwrap().to_string())
+    };
+
+    // Baseline, switch off: Tinfoil (first failover) serves; Chutes is not used.
+    let r = f.chat(false, 20).await;
+    assert_eq!(r.status_code(), 200, "{}", r.text());
+    assert_eq!(served(&r).as_deref(), Some("tinfoil"));
+    assert!(f.tinfoil.last_chat_params().await.is_some());
+    assert!(chutes.last_chat_params().await.is_none());
+
+    // Switch on for Tinfoil: Chutes serves and Tinfoil is not called again.
     f.set_disabled(json!(["tinfoil"])).await;
     let r = f.chat(false, 21).await;
-    let (status, header, body) = (
-        r.status_code(),
-        r.maybe_header("x-serving-provider")
-            .map(|h| h.to_str().unwrap().to_string()),
-        r.text(),
-    );
-    let tinfoil_called = f.tinfoil.last_chat_params().await.is_some();
-    let chutes_called = chutes.last_chat_params().await.is_some();
+    let (status, header, body) = (r.status_code(), served(&r), r.text());
+    let tinfoil_last = f.tinfoil.last_chat_params().await.unwrap().max_tokens;
+    let chutes_last = chutes.last_chat_params().await.map(|p| p.max_tokens);
     // Reset before asserting so a failure cannot leak the setting.
     f.set_disabled(json!(null)).await;
     assert_eq!(status, 200, "{body}");
     assert_eq!(header.as_deref(), Some("chutes"));
-    assert!(!tinfoil_called, "a disabled source must not be invoked");
-    assert!(chutes_called);
+    assert_eq!(
+        tinfoil_last,
+        Some(20),
+        "a disabled source must not be invoked"
+    );
+    assert_eq!(chutes_last, Some(Some(21)));
 }
 
 #[tokio::test]
@@ -260,4 +274,143 @@ async fn serial_kill_switch_with_no_provider_left_errors_and_blocks_report() {
         tinfoil_report_calls, 0,
         "report must not reach a disabled source"
     );
+}
+
+// ---------------------------------------------------------------- registration
+
+fn tinfoil_cfg(model: &str, ctx: &str) -> config::ExternalProvidersConfig {
+    config::ExternalProvidersConfig {
+        tinfoil_api_key: Some("tk_test_key".to_string()),
+        tinfoil_models: config::parse_attested_3p_models(
+            "TINFOIL_MODELS",
+            &format!("{model}=gpt-oss-120b{ctx}"),
+        ),
+        timeout_seconds: 5,
+        ..Default::default()
+    }
+}
+
+async fn tinfoil_catalog_row(server: &axum_test::TestServer, model: &str) {
+    let mut batch = BatchUpdateModelApiRequest::new();
+    batch.insert(
+        model.to_string(),
+        serde_json::from_value(json!({
+            "inputCostPerToken": { "amount": 1_000_000, "currency": "USD" },
+            "outputCostPerToken": { "amount": 2_000_000, "currency": "USD" },
+            "modelDisplayName": "Tinfoil registration fixture",
+            "modelDescription": "Tinfoil registration test model",
+            "contextLength": 131072,
+            "maxOutputLength": 1024,
+            "verifiable": true,
+            "isActive": true,
+            "attestationSupported": true,
+            "providerType": "tinfoil"
+        }))
+        .unwrap(),
+    );
+    admin_batch_upsert_models(server, batch, get_session_id()).await;
+}
+
+fn router_pins() -> services::attestation::tinfoil_pins::TinfoilPins {
+    services::attestation::tinfoil_pins::TinfoilPins {
+        router: vec![services::attestation::tinfoil_pins::RouterPin {
+            measurement: "00".repeat(48),
+            repo: "tinfoilsh/confidential-model-router".to_string(),
+            tag: "v0.0.0-test".to_string(),
+        }],
+        models: Default::default(),
+    }
+}
+
+fn metrics() -> Arc<dyn services::metrics::MetricsServiceTrait> {
+    Arc::new(services::metrics::MockMetricsService)
+}
+
+/// A first verification that did not succeed still registers the provider; it
+/// answers 503-class errors until a later re-verify works. The session here is
+/// never verified (the same state a failed `verify_now` leaves behind).
+#[tokio::test]
+async fn unverified_session_still_registers_and_serves_nothing() {
+    let (server, pool, _mock, database) = setup_test_server_with_pool().await;
+    let model = format!("nearai/test-tinfoil-reg-{}", uuid::Uuid::new_v4());
+    tinfoil_catalog_row(&server, &model).await;
+    let cfg = tinfoil_cfg(&model, "@131072");
+    let repo = database::repositories::ModelRepository::new(database.pool().clone());
+    let pcfg = inference_providers::attested::tinfoil::Config::new("tk_test_key".into(), 5);
+    let verifier = Arc::new(services::attestation::tinfoil::TinfoilPolicyVerifier::new(
+        router_pins(),
+    ));
+    let session =
+        inference_providers::attested::tinfoil::TinfoilRouterSession::new(pcfg.clone(), verifier)
+            .unwrap();
+    api::attested_3p_startup::register_tinfoil_models(
+        &pool,
+        &repo,
+        &cfg,
+        &session,
+        &pcfg,
+        metrics(),
+    )
+    .await;
+    assert!(
+        pool.has_provider(&model).await,
+        "registered despite no verify"
+    );
+
+    let org = setup_org_with_credits(&server, 10_000_000_000i64).await;
+    let api_key = get_api_key_for_org(&server, org.id).await;
+    let r = server
+        .post("/v1/chat/completions")
+        .add_header("Authorization", format!("Bearer {api_key}"))
+        .json(&json!({"model": model, "messages": [{"role":"user","content":"Hello"}], "max_tokens": 8}))
+        .await;
+    assert!(
+        matches!(r.status_code().as_u16(), 429 | 503),
+        "unverified router must not serve: {} {}",
+        r.status_code(),
+        r.text()
+    );
+}
+
+#[tokio::test]
+async fn entry_without_ctx_is_not_registered() {
+    let (server, pool, _mock, database) = setup_test_server_with_pool().await;
+    let model = format!("nearai/test-tinfoil-noctx-{}", uuid::Uuid::new_v4());
+    tinfoil_catalog_row(&server, &model).await;
+    let repo = database::repositories::ModelRepository::new(database.pool().clone());
+    let pcfg = inference_providers::attested::tinfoil::Config::new("tk_test_key".into(), 5);
+    let verifier = Arc::new(services::attestation::tinfoil::TinfoilPolicyVerifier::new(
+        router_pins(),
+    ));
+    let session =
+        inference_providers::attested::tinfoil::TinfoilRouterSession::new(pcfg.clone(), verifier)
+            .unwrap();
+    api::attested_3p_startup::register_tinfoil_models(
+        &pool,
+        &repo,
+        &tinfoil_cfg(&model, ""),
+        &session,
+        &pcfg,
+        metrics(),
+    )
+    .await;
+    assert!(!pool.has_provider(&model).await);
+}
+
+#[tokio::test]
+async fn session_build_failure_registers_nothing() {
+    let (server, pool, _mock, database) = setup_test_server_with_pool().await;
+    let model = format!("nearai/test-tinfoil-nobuild-{}", uuid::Uuid::new_v4());
+    tinfoil_catalog_row(&server, &model).await;
+    let repo = database::repositories::ModelRepository::new(database.pool().clone());
+    api::attested_3p_startup::register_tinfoil_with(
+        &pool,
+        &repo,
+        &tinfoil_cfg(&model, "@131072"),
+        Ok(router_pins()),
+        |_, _| Err("cannot build".to_string()),
+        metrics(),
+    )
+    .await;
+    assert!(!pool.has_provider(&model).await);
 }

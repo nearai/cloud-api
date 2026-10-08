@@ -22,7 +22,7 @@ use serde_json::{json, Value};
 
 pub use self::availability::{map_upstream_status, unavailable, UpstreamDisposition};
 pub use self::config::{Config, ATC_URL, BASE_URL, PROXY_REREAD, ROUTER_REVERIFY};
-pub use self::session::{TinfoilRouterSession, VerifiedState};
+pub use self::session::{validate_router_domain, TinfoilRouterSession, VerifiedState};
 use crate::attested::chutes::request_body;
 use crate::{
     AttestationError, AudioTranscriptionError, AudioTranscriptionParams,
@@ -137,9 +137,14 @@ impl Provider {
             request_body(&self.slug, &params, stream).map_err(CompletionError::CompletionError)?;
 
         let generation = self.session.generation();
-        let client = self.session.client();
-        let send = client
-            .post(format!("{}{CHAT_PATH}", self.session.base_url()))
+        let snap = self.session.snapshot();
+        let Some(state) = &*snap else {
+            return Err(unavailable("not_verified"));
+        };
+        let transport = state.transport.clone();
+        let send = transport
+            .client
+            .post(format!("{}{CHAT_PATH}", transport.base))
             .bearer_auth(&self.api_key)
             .json(&body)
             .send();
@@ -163,11 +168,26 @@ impl Provider {
         };
         let status = resp.status();
         if !status.is_success() {
-            let text = resp.text().await.unwrap_or_default();
+            let text = read_capped_text(resp).await;
             return Err(self.status_error(status.as_u16(), &text));
         }
         Ok(resp)
     }
+}
+
+/// Read an upstream error body, stopping at `MAX_DOC_BYTES`.
+async fn read_capped_text(resp: reqwest::Response) -> String {
+    use futures_util::StreamExt;
+    let mut buf: Vec<u8> = Vec::new();
+    let mut stream = resp.bytes_stream();
+    while let Some(Ok(chunk)) = stream.next().await {
+        let room = session::MAX_DOC_BYTES.saturating_sub(buf.len());
+        buf.extend_from_slice(&chunk[..chunk.len().min(room)]);
+        if buf.len() >= session::MAX_DOC_BYTES {
+            break;
+        }
+    }
+    String::from_utf8_lossy(&buf).into_owned()
 }
 
 #[async_trait]
@@ -338,6 +358,12 @@ impl InferenceProvider for Provider {
                 "measurement": state.router.measurement_hex,
                 "tag": state.router.tag,
                 "spki_sha256": hex::encode(state.router.spki_sha256),
+                "tcb": {
+                    "bootloader": state.router.tcb.bootloader,
+                    "tee": state.router.tcb.tee,
+                    "snp": state.router.tcb.snp,
+                    "microcode": state.router.tcb.microcode,
+                },
             }),
         );
         m.insert(

@@ -5,6 +5,7 @@
 
 use config::{AttestedThirdPartyModelEntry, ExternalProvidersConfig};
 use database::repositories::ModelRepository;
+use inference_providers::attested::tinfoil::verifier_port::TinfoilVerifyError;
 use inference_providers::attested::tinfoil::{self as tinfoil_provider, TinfoilRouterSession};
 use inference_providers::ProviderSource;
 use services::attestation::tinfoil_pins::TinfoilPins;
@@ -286,36 +287,60 @@ pub(crate) fn tinfoil_entry_ctx(
     }
 }
 
-/// Tinfoil attested backup. Fail-closed at every step: no key, no usable pins,
-/// a missing/oversized `@ctx` or a missing catalog row means that provider is
-/// not registered (its id stays reserved). A failed first verification still
-/// registers: providers answer 503 until a later re-verify succeeds.
+/// Production entry: compiled pins and the real session constructor.
 async fn register_tinfoil(
     pool: &Arc<InferenceProviderPool>,
     models_repo: &ModelRepository,
     cfg: &ExternalProvidersConfig,
     metrics: Arc<dyn MetricsServiceTrait>,
 ) {
-    let (api_key, pins) =
-        match tinfoil_preflight(cfg, services::attestation::tinfoil::vetted_tinfoil_pins()) {
-            Ok(ok) => ok,
-            Err(TinfoilSkip::NoModels) => return,
-            Err(TinfoilSkip::NoKey) => {
-                tracing::warn!(
+    register_tinfoil_with(
+        pool,
+        models_repo,
+        cfg,
+        services::attestation::tinfoil::vetted_tinfoil_pins(),
+        |pcfg, verifier| TinfoilRouterSession::new(pcfg, verifier),
+        metrics,
+    )
+    .await;
+}
+
+/// Tinfoil attested backup. Fail-closed at every step: no key, no usable pins,
+/// a session that cannot be built, a missing/oversized `@ctx` or a missing
+/// catalog row means that provider is not registered (its id stays reserved).
+/// A failed first verification still registers: providers answer 503 until a
+/// later re-verify succeeds. Pins and the session constructor are injected so
+/// the branches can be tested without the network.
+pub async fn register_tinfoil_with(
+    pool: &Arc<InferenceProviderPool>,
+    models_repo: &ModelRepository,
+    cfg: &ExternalProvidersConfig,
+    pins: Result<TinfoilPins, String>,
+    build_session: impl FnOnce(
+        tinfoil_provider::Config,
+        Arc<services::attestation::tinfoil::TinfoilPolicyVerifier>,
+    ) -> Result<Arc<TinfoilRouterSession>, String>,
+    metrics: Arc<dyn MetricsServiceTrait>,
+) {
+    let (api_key, pins) = match tinfoil_preflight(cfg, pins) {
+        Ok(ok) => ok,
+        Err(TinfoilSkip::NoModels) => return,
+        Err(TinfoilSkip::NoKey) => {
+            tracing::warn!(
                 "TINFOIL_MODELS set but TINFOIL_API_KEY missing; ids stay reserved (fail-closed)"
             );
-                return;
-            }
-            Err(TinfoilSkip::PinsUnusable) => {
-                tracing::warn!("Tinfoil pins empty or invalid; not registering (fail-closed)");
-                return;
-            }
-        };
+            return;
+        }
+        Err(TinfoilSkip::PinsUnusable) => {
+            tracing::warn!("Tinfoil pins empty or invalid; not registering (fail-closed)");
+            return;
+        }
+    };
     let verifier = Arc::new(services::attestation::tinfoil::TinfoilPolicyVerifier::new(
         pins,
     ));
     let pcfg = tinfoil_provider::Config::new(api_key, cfg.timeout_seconds);
-    let session = match TinfoilRouterSession::new(pcfg.clone(), verifier) {
+    let session = match build_session(pcfg.clone(), verifier) {
         Ok(s) => s,
         Err(e) => {
             tracing::warn!(error = %e, "Failed to build Tinfoil router session; not registering");
@@ -329,19 +354,34 @@ async fn register_tinfoil(
             "Initial Tinfoil verification failed; registering anyway (503 until a re-verify succeeds)"
         );
     }
+    register_tinfoil_models(pool, models_repo, cfg, &session, &pcfg, metrics).await;
+}
 
+/// Per-entry registration against an existing session. The no-catalog-row skip
+/// is covered end-to-end by
+/// `chutes_catalog::ensure_catalog_row_without_seed_and_without_row_returns_none`.
+pub async fn register_tinfoil_models(
+    pool: &Arc<InferenceProviderPool>,
+    models_repo: &ModelRepository,
+    cfg: &ExternalProvidersConfig,
+    session: &Arc<TinfoilRouterSession>,
+    pcfg: &tinfoil_provider::Config,
+    metrics: Arc<dyn MetricsServiceTrait>,
+) {
     let mut registered: Vec<(String, String)> = Vec::new();
     for entry in &cfg.tinfoil_models {
+        // @ctx is checked first so a bad entry costs no network call.
+        if entry.max_context_tokens.is_none() {
+            tracing::error!(
+                canonical = %entry.canonical_id,
+                "TINFOIL_MODELS entry lacks @ctx; not registered"
+            );
+            continue;
+        }
         let published = session.published_context_window(&entry.upstream_id).await;
         let ctx = match tinfoil_entry_ctx(entry, published) {
             Ok(ctx) => ctx,
-            Err(TinfoilEntrySkip::MissingCtx) => {
-                tracing::error!(
-                    canonical = %entry.canonical_id,
-                    "TINFOIL_MODELS entry lacks @ctx; not registered"
-                );
-                continue;
-            }
+            Err(TinfoilEntrySkip::MissingCtx) => continue,
             Err(TinfoilEntrySkip::ExceedsPublished { ctx, published }) => {
                 tracing::error!(
                     canonical = %entry.canonical_id,
@@ -364,7 +404,7 @@ async fn register_tinfoil(
         };
         let provider = tinfoil_provider::Provider::new(
             session.clone(),
-            &pcfg,
+            pcfg,
             entry.upstream_id.clone(),
             entry.canonical_id.clone(),
         );
@@ -384,7 +424,7 @@ async fn register_tinfoil(
         registered.push((entry.canonical_id.clone(), entry.upstream_id.clone()));
     }
     if !registered.is_empty() {
-        spawn_tinfoil_metrics(session, registered, metrics);
+        spawn_tinfoil_metrics(session.clone(), registered, metrics);
     }
 }
 
@@ -401,6 +441,27 @@ pub(crate) fn emit_tinfoil_metrics(
     metrics: &dyn MetricsServiceTrait,
     last_auth: &mut u64,
 ) {
+    let statuses: Vec<(String, Result<(), TinfoilVerifyError>)> = models
+        .iter()
+        .map(|(canonical, slug)| (canonical.clone(), session.model_status(slug).map(|_| ())))
+        .collect();
+    emit_tinfoil_samples(
+        session.last_verify_error(),
+        &statuses,
+        session.upstream_auth_failures(),
+        metrics,
+        last_auth,
+    );
+}
+
+/// The pure half of [`emit_tinfoil_metrics`], so every state can be tested.
+pub(crate) fn emit_tinfoil_samples(
+    router_error: Option<TinfoilVerifyError>,
+    statuses: &[(String, Result<(), TinfoilVerifyError>)],
+    auth_total: u64,
+    metrics: &dyn MetricsServiceTrait,
+    last_auth: &mut u64,
+) {
     let count = |reason: &str| {
         let result = if reason == "none" { "ok" } else { "failed" };
         metrics.record_count(
@@ -409,24 +470,20 @@ pub(crate) fn emit_tinfoil_metrics(
             &[&format!("result:{result}"), &format!("reason:{reason}")],
         );
     };
-    use inference_providers::attested::tinfoil::verifier_port::TinfoilVerifyError;
-    let statuses: Vec<_> = models
-        .iter()
-        .map(|(canonical, slug)| (canonical, session.model_status(slug)))
-        .collect();
     // `model_status` reports `Fetch` for every slug while the router is not
     // verified, so that also covers "never verified yet" (no error recorded).
     let router_down = statuses
         .iter()
         .any(|(_, s)| matches!(s, Err(TinfoilVerifyError::Fetch)));
-    match session.last_verify_error() {
+    match router_error {
         Some(e) => count(e.reason()),
         None if router_down => count(TinfoilVerifyError::Fetch.reason()),
         None => count("none"),
     }
-    for (canonical, status) in &statuses {
+    for (canonical, status) in statuses {
         // A closed model on a healthy router is a model-pin problem
-        // (`unknown_model_measurement`) with its own reason.
+        // (`unknown_model_measurement`) with its own reason; an unverified
+        // router is already counted once above.
         if let Err(e) = status {
             if !router_down {
                 count(e.reason());
@@ -438,14 +495,13 @@ pub(crate) fn emit_tinfoil_metrics(
             &[&format!("{}:{canonical}", consts::TAG_MODEL)],
         );
     }
-    let total = session.upstream_auth_failures();
-    if total > *last_auth {
+    if auth_total > *last_auth {
         metrics.record_count(
             consts::METRIC_TINFOIL_UPSTREAM_AUTH_FAILURE,
-            (total - *last_auth) as i64,
+            (auth_total - *last_auth) as i64,
             &[],
         );
-        *last_auth = total;
+        *last_auth = auth_total;
     }
 }
 
@@ -820,6 +876,94 @@ mod tests {
         assert!(!got
             .iter()
             .any(|m| m.name == consts::METRIC_TINFOIL_UPSTREAM_AUTH_FAILURE));
+    }
+
+    fn counts(
+        m: &services::metrics::capturing::CapturingMetricsService,
+        name: &str,
+    ) -> Vec<Vec<String>> {
+        m.get_metrics()
+            .into_iter()
+            .filter(|r| r.name == name)
+            .map(|r| r.tags)
+            .collect()
+    }
+
+    #[test]
+    fn verified_router_with_unpinned_model_counts_the_model_reason_once() {
+        use services::metrics::capturing::CapturingMetricsService;
+        let m = CapturingMetricsService::new();
+        let mut last = 0u64;
+        let statuses = vec![
+            ("pinned".to_string(), Ok(())),
+            (
+                "unpinned".to_string(),
+                Err(TinfoilVerifyError::UnknownModelMeasurement),
+            ),
+        ];
+        emit_tinfoil_samples(None, &statuses, 0, &m, &mut last);
+        let v = |r: &str, why: &str| vec![format!("result:{r}"), format!("reason:{why}")];
+        assert_eq!(
+            counts(&m, consts::METRIC_TINFOIL_VERIFICATION),
+            vec![v("ok", "none"), v("failed", "unknown_model_measurement")],
+            "router counted ok once; the model reason once; nothing doubled"
+        );
+        let avail: Vec<_> = m
+            .get_metrics()
+            .into_iter()
+            .filter(|r| r.name == consts::METRIC_TINFOIL_AVAILABLE)
+            .map(|r| (r.tags[0].clone(), format!("{:?}", r.value)))
+            .collect();
+        assert_eq!(avail.len(), 2);
+        assert!(avail[0].0 == "model:pinned" && avail[0].1.contains("1.0"));
+        assert!(avail[1].0 == "model:unpinned" && avail[1].1.contains("0.0"));
+    }
+
+    #[test]
+    fn router_failure_is_counted_once_not_per_model() {
+        use services::metrics::capturing::CapturingMetricsService;
+        let m = CapturingMetricsService::new();
+        let mut last = 0u64;
+        let down = || Err(TinfoilVerifyError::Fetch);
+        let statuses = vec![("a".to_string(), down()), ("b".to_string(), down())];
+        emit_tinfoil_samples(
+            Some(TinfoilVerifyError::UnknownRouterMeasurement),
+            &statuses,
+            0,
+            &m,
+            &mut last,
+        );
+        assert_eq!(
+            counts(&m, consts::METRIC_TINFOIL_VERIFICATION),
+            vec![vec![
+                "result:failed".to_string(),
+                "reason:unknown_router_measurement".to_string()
+            ]]
+        );
+    }
+
+    #[test]
+    fn second_poll_emits_only_the_auth_failure_increment() {
+        use services::metrics::capturing::{CapturingMetricsService, MetricValue};
+        let m = CapturingMetricsService::new();
+        let mut last = 0u64;
+        emit_tinfoil_samples(None, &[], 2, &m, &mut last);
+        assert_eq!(last, 2);
+        let first = m.get_metrics().len();
+        // Same total: nothing for auth failures. Higher total: only the delta.
+        emit_tinfoil_samples(None, &[], 2, &m, &mut last);
+        emit_tinfoil_samples(None, &[], 5, &m, &mut last);
+        let all = m.get_metrics();
+        let auth: Vec<_> = all
+            .iter()
+            .filter(|r| r.name == consts::METRIC_TINFOIL_UPSTREAM_AUTH_FAILURE)
+            .map(|r| match r.value {
+                MetricValue::Count(n) => n,
+                _ => -1,
+            })
+            .collect();
+        assert_eq!(auth, vec![2, 3]);
+        assert!(first >= 1);
     }
 
     #[test]

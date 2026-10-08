@@ -3,7 +3,9 @@
 
 use std::time::Duration;
 
-/// Tinfoil's inference router.
+/// Tinfoil's inference router. Requests actually go to `https://{domain}` of
+/// the verified ATC bundle (a validated `*.tinfoil.sh` host); this is the
+/// canonical host the ATC normally names.
 pub const BASE_URL: &str = "https://inference.tinfoil.sh";
 /// Attestation transparency endpoint that serves the router's attestation bundle.
 pub const ATC_URL: &str = "https://atc.tinfoil.sh/attestation";
@@ -19,8 +21,14 @@ const DEFAULT_TIMEOUT_SECONDS: u64 = 300;
 pub struct Config {
     /// Tinfoil API key. A secret: private, with a redacting `Debug`.
     api_key: String,
-    pub base_url: String,
     pub atc_url: String,
+    /// Test only: send requests here regardless of the attested domain.
+    #[cfg(test)]
+    pub(super) base_override: Option<String>,
+    /// Test only: resolve whatever domain the bundle names to this local
+    /// address (and port), so the host selection itself can be exercised.
+    #[cfg(test)]
+    pub(super) route: Option<std::net::SocketAddr>,
     pub timeout: Duration,
 }
 
@@ -32,8 +40,11 @@ impl Config {
             .unwrap_or(DEFAULT_TIMEOUT_SECONDS);
         Self {
             api_key,
-            base_url: BASE_URL.to_string(),
             atc_url: ATC_URL.to_string(),
+            #[cfg(test)]
+            base_override: None,
+            #[cfg(test)]
+            route: None,
             timeout: Duration::from_secs(secs),
         }
     }
@@ -41,7 +52,15 @@ impl Config {
     /// Point at a local test server. Test builds only.
     #[cfg(test)]
     pub fn with_urls(mut self, base: &str, atc: &str) -> Self {
-        self.base_url = base.trim_end_matches('/').to_string();
+        self.base_override = Some(base.trim_end_matches('/').to_string());
+        self.atc_url = atc.to_string();
+        self
+    }
+
+    /// Test only: map the attested domain to a local server.
+    #[cfg(test)]
+    pub fn with_route(mut self, addr: std::net::SocketAddr, atc: &str) -> Self {
+        self.route = Some(addr);
         self.atc_url = atc.to_string();
         self
     }
@@ -55,7 +74,6 @@ impl std::fmt::Debug for Config {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Config")
             .field("api_key", &"<redacted>")
-            .field("base_url", &self.base_url)
             .field("atc_url", &self.atc_url)
             .field("timeout", &self.timeout)
             .finish()

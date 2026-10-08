@@ -10857,7 +10857,9 @@ mod tests {
 
     /// A Tinfoil 401/402/403 (our key or billing) is mapped by the provider to a
     /// retryable external 503, so it never short-circuits past Chutes and the
-    /// client never sees an upstream auth error.
+    /// client never sees an upstream auth error. This test injects the 503 the
+    /// provider produces; the real status -> 503 mapping is exercised by
+    /// `inference_providers::attested::tinfoil::tests::upstream_statuses_map_per_spec`.
     #[tokio::test]
     async fn tinfoil_auth_failure_falls_through_to_chutes() {
         use inference_providers::mock::{MockProvider, RequestMatcher, ResponseTemplate};

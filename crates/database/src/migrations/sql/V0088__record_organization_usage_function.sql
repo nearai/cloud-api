@@ -1,3 +1,7 @@
+-- FORWARD-ONLY. refinery runs with abort_missing=true (refinery-core 0.9.1
+-- default): once this migration is applied, a binary whose migrations folder
+-- lacks this file fails at startup with MissingVersion. Reverting the code that
+-- calls record_organization_usage must KEEP this file; the function is then unused.
 CREATE FUNCTION record_organization_usage(
     p_id UUID,
     p_organization_id UUID,

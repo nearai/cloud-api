@@ -10978,7 +10978,12 @@ mod tests {
             is_external: true,
         };
         let near = Arc::new(MockProvider::new_accept_all().with_tier(ProviderTier::Near));
-        near.set_error_override(Some(unavailable())).await;
+        near.set_error_override(Some(CompletionError::HttpError {
+            status_code: 503,
+            message: "backend overloaded".to_string(),
+            is_external: true,
+        }))
+        .await;
         let tinfoil = Arc::new(
             MockProvider::new_accept_all()
                 .with_tier(ProviderTier::Attested3p)
@@ -11016,6 +11021,7 @@ mod tests {
             .chat_completion(fallback_params(&model_id), "test-hash".to_string())
             .await
             .expect("a Tinfoil auth failure must fall through to Chutes");
+        assert!(near.last_chat_params().await.is_some());
         assert!(tinfoil.last_chat_params().await.is_some());
         assert!(chutes.last_chat_params().await.is_some());
         assert!(String::from_utf8_lossy(&resp.raw_bytes).contains("served-by-chutes"));

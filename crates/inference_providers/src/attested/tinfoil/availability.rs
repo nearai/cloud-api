@@ -16,10 +16,16 @@ pub enum UpstreamDisposition {
     ReturnAs4xx(u16),
 }
 
+/// Upstream 401/402/403: our key or billing, not the caller's fault. Single
+/// source of truth for both the status mapping and the auth-failure bookkeeping.
+pub fn is_auth_status(status: u16) -> bool {
+    matches!(status, 401..=403)
+}
+
 pub fn map_upstream_status(status: u16) -> UpstreamDisposition {
     match status {
         // Our key or billing: must not short-circuit past the other providers.
-        401..=403 => UpstreamDisposition::Retryable503,
+        s if is_auth_status(s) => UpstreamDisposition::Retryable503,
         429 => UpstreamDisposition::Passthrough429,
         // Not the caller's fault: the router has no such route (404), timed out
         // reading the request (408) or rejected an early-data replay (425).
@@ -36,5 +42,21 @@ pub fn unavailable(reason: &'static str) -> CompletionError {
         status_code: 503,
         message: format!("Tinfoil temporarily unavailable ({reason})"),
         is_external: true,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn auth_statuses_are_one_source_of_truth() {
+        for s in [401u16, 402, 403] {
+            assert!(is_auth_status(s));
+            assert_eq!(map_upstream_status(s), UpstreamDisposition::Retryable503);
+        }
+        for s in [400u16, 404, 429, 500] {
+            assert!(!is_auth_status(s));
+        }
     }
 }

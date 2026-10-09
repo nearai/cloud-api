@@ -20,7 +20,9 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use serde_json::{json, Value};
 
-pub use self::availability::{map_upstream_status, unavailable, UpstreamDisposition};
+pub use self::availability::{
+    is_auth_status, map_upstream_status, unavailable, UpstreamDisposition,
+};
 pub use self::config::{Config, ATC_URL, BASE_URL, PROXY_REREAD, ROUTER_REVERIFY};
 pub use self::session::{TinfoilRouterSession, VerifiedState};
 pub use self::verifier_port::validate_router_domain;
@@ -139,7 +141,7 @@ impl Provider {
     fn status_error(&self, status: u16, body: &str) -> CompletionError {
         match map_upstream_status(status) {
             UpstreamDisposition::Retryable503 => {
-                if matches!(status, 401..=403) {
+                if is_auth_status(status) {
                     self.session.record_auth_failure();
                     tracing::error!(
                         status,

@@ -18,7 +18,10 @@ use std::sync::Arc;
 enum TinfoilSkip {
     NoModels,
     NoKey,
-    PinsUnusable,
+    /// The compiled pins failed to parse (reason is a config/parse error, not sensitive).
+    PinsInvalid(String),
+    /// Pins parsed but list no router release.
+    PinsEmpty,
 }
 
 /// Decide whether Tinfoil can be registered at all. Pure so every skip branch
@@ -35,8 +38,22 @@ fn tinfoil_preflight(
     };
     match pins {
         Ok(p) if !p.router.is_empty() => Ok((key, p)),
-        _ => Err(TinfoilSkip::PinsUnusable),
+        Ok(_) => Err(TinfoilSkip::PinsEmpty),
+        Err(e) => Err(TinfoilSkip::PinsInvalid(e)),
     }
+}
+
+/// Configured entries whose upstream slug has no row in the compiled model pins.
+/// They still register (closed; `model_status` fails closed at runtime), so the
+/// caller only warns.
+fn unpinned_models<'a>(
+    entries: &'a [AttestedThirdPartyModelEntry],
+    pins: &TinfoilPins,
+) -> Vec<&'a AttestedThirdPartyModelEntry> {
+    entries
+        .iter()
+        .filter(|e| !pins.models.contains_key(&e.upstream_id))
+        .collect()
 }
 
 /// `@ctx` is required. The router's published window is only known after the
@@ -129,11 +146,22 @@ pub async fn register_tinfoil_with(
             );
             return;
         }
-        Err(TinfoilSkip::PinsUnusable) => {
-            tracing::warn!("Tinfoil pins empty or invalid; not registering (fail-closed)");
+        Err(TinfoilSkip::PinsEmpty) => {
+            tracing::warn!("Tinfoil router pins empty; not registering (fail-closed)");
+            return;
+        }
+        Err(TinfoilSkip::PinsInvalid(e)) => {
+            tracing::warn!(error = %e, "Tinfoil pins invalid; not registering (fail-closed)");
             return;
         }
     };
+    for entry in unpinned_models(&cfg.tinfoil_models, &pins) {
+        tracing::warn!(
+            canonical = %entry.canonical_id,
+            slug = %entry.upstream_id,
+            "TINFOIL_MODELS entry has no row in the compiled model pins; it is registered closed and serves 503 until the pins include it"
+        );
+    }
     let verifier = Arc::new(services::attestation::tinfoil::TinfoilPolicyVerifier::new(
         pins,
     ));
@@ -301,7 +329,14 @@ fn spawn_tinfoil_metrics(
             tick.tick().await;
             // Providers hold the only other strong references; stop once gone.
             let Some(session) = weak.upgrade() else { break };
-            emit_tinfoil_metrics(&session, &models, metrics.as_ref(), &mut last_auth);
+            // The JoinHandle is dropped, so a panic here would silently end all
+            // Tinfoil metrics. Log it (no payload) and keep polling.
+            let emitted = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                emit_tinfoil_metrics(&session, &models, metrics.as_ref(), &mut last_auth);
+            }));
+            if emitted.is_err() {
+                tracing::error!("Tinfoil metrics poll panicked; continuing with the next poll");
+            }
         }
     })
 }
@@ -342,19 +377,31 @@ mod tests {
             TinfoilSkip::NoKey
         );
         // Empty router pins (the compiled state on this branch) and a parse
-        // failure both refuse to register.
+        // failure both refuse to register, each carrying its own reason.
         assert_eq!(
             tinfoil_preflight(&tinfoil_cfg(Some("k"), models), Ok(TinfoilPins::default()))
                 .unwrap_err(),
-            TinfoilSkip::PinsUnusable
+            TinfoilSkip::PinsEmpty
         );
         assert_eq!(
             tinfoil_preflight(&tinfoil_cfg(Some("k"), models), Err("bad".into())).unwrap_err(),
-            TinfoilSkip::PinsUnusable
+            TinfoilSkip::PinsInvalid("bad".to_string())
         );
         let (key, _) =
             tinfoil_preflight(&tinfoil_cfg(Some("k"), models), Ok(pins_with_router())).unwrap();
         assert_eq!(key, "k");
+    }
+
+    #[test]
+    fn unpinned_models_lists_entries_without_a_model_pin_row() {
+        let cfg = tinfoil_cfg(Some("k"), "a-tf=pinned-slug@1000,b-tf=missing-slug@1000");
+        let mut pins = pins_with_router();
+        pins.models.insert("pinned-slug".to_string(), Vec::new());
+        let missing: Vec<_> = unpinned_models(&cfg.tinfoil_models, &pins)
+            .into_iter()
+            .map(|e| e.canonical_id.as_str())
+            .collect();
+        assert_eq!(missing, vec!["b-tf"]);
     }
 
     #[test]
@@ -516,6 +563,57 @@ mod tests {
         ));
         TinfoilRouterSession::new(tinfoil_provider::Config::new("k".to_string(), 30), verifier)
             .unwrap()
+    }
+
+    /// Panics on the first `record_count`, then records normally.
+    #[derive(Default)]
+    struct PanicOnceMetrics {
+        panicked: std::sync::atomic::AtomicBool,
+        inner: services::metrics::capturing::CapturingMetricsService,
+    }
+
+    impl MetricsServiceTrait for PanicOnceMetrics {
+        fn record_latency(&self, name: &str, d: std::time::Duration, tags: &[&str]) {
+            self.inner.record_latency(name, d, tags)
+        }
+        fn record_count(&self, name: &str, value: i64, tags: &[&str]) {
+            if !self
+                .panicked
+                .swap(true, std::sync::atomic::Ordering::SeqCst)
+            {
+                panic!("injected metrics panic");
+            }
+            self.inner.record_count(name, value, tags)
+        }
+        fn record_histogram(&self, name: &str, value: f64, tags: &[&str]) {
+            self.inner.record_histogram(name, value, tags)
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn metrics_task_survives_a_panicking_poll() {
+        let m = Arc::new(PanicOnceMetrics::default());
+        let session = unverified_session();
+        let handle = spawn_tinfoil_metrics(
+            session.clone(),
+            vec![("m-tf".to_string(), "gpt-oss-120b".to_string())],
+            m.clone(),
+        );
+        for _ in 0..5 {
+            tokio::task::yield_now().await;
+        }
+        // First poll panicked inside the sampler; the task must still be alive.
+        assert!(!handle.is_finished());
+        assert!(counts(&m.inner, consts::METRIC_TINFOIL_VERIFICATION).is_empty());
+        tokio::time::advance(tinfoil_provider::PROXY_REREAD).await;
+        for _ in 0..5 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            counts(&m.inner, consts::METRIC_TINFOIL_VERIFICATION).len(),
+            1
+        );
+        assert!(!handle.is_finished());
     }
 
     #[tokio::test(start_paused = true)]

@@ -12,9 +12,15 @@ use serde_json::{json, Value};
 use crate::attested::nearai::placement_headers as ph;
 use crate::ChatCompletionParams;
 
-/// Internal `extra` keys that must never reach Chutes (a third party): the
-/// tracing identifiers and the client-facing-E2EE markers. `ChatCompletionParams`
-/// flattens `extra` into the top-level body, so these would otherwise leak.
+/// Internal `extra` keys that must never reach an attested third-party provider
+/// (Chutes, Tinfoil): the tracing identifiers and the client-facing-E2EE markers.
+/// `ChatCompletionParams` flattens `extra` into the top-level body, so these
+/// would otherwise leak.
+///
+/// Keep in sync: the keys come from nearai's tracing/encryption header constants
+/// (`tracing_headers`, `encryption_headers`) and, in [`request_body`], from
+/// `placement_headers::LEGACY_DENIED_EXTRA_KEYS`. Any new nearai-internal marker
+/// key that can land in `extra` must be added to one of those lists.
 pub(crate) const INTERNAL_KEYS: &[&str] = {
     use crate::attested::nearai::{encryption_headers as eh, tracing_headers as th};
     &[
@@ -58,6 +64,13 @@ const CHOICE_FIELDS: &[&str] = &["index", "delta", "message", "finish_reason", "
 /// Standard OpenAI fields kept on a `choices[].message` (non-stream) or
 /// `choices[].delta` (stream). Drops model-specific message internals (e.g. a
 /// delta-nested `matched_stop`/`token_ids`).
+///
+/// `reasoning` is deliberately NOT listed: it is a provider-specific spelling,
+/// not the standard field (`reasoning_content`). Caller contract: a provider that
+/// receives reasoning text must either pass `"reasoning"` via `extra_message`
+/// (Chutes: `CHUTES_EXTRA_MESSAGE_FIELDS`) or rewrite it to `reasoning_content`
+/// before sanitizing (Tinfoil does this). A new provider that does neither will
+/// have its reasoning text silently dropped.
 const MESSAGE_FIELDS: &[&str] = &[
     "role",
     "content",
@@ -249,7 +262,8 @@ pub(crate) fn sanitize_response_object(
 /// NOT request usage: OpenAI emits no final usage chunk at all in that case, so the
 /// caller must suppress the whole chunk from the client stream rather than forward
 /// a gutted `choices: []` husk (strict SDK parsers reject it, and cost-tracking
-/// clients read it as zero usage) — see the Chutes `rewrite_sse_event_model`.
+/// clients read it as zero usage) — see the Chutes `rewrite_sse_event_model`
+/// (the Chutes call site of this shared helper).
 ///
 /// NOTE: this gates only `raw_bytes` (the bytes the passthrough route forwards to the
 /// client). The parsed `chunk.usage` is left intact so `InterceptStream` can still
@@ -273,6 +287,8 @@ pub(crate) fn gate_stream_usage(
 
 /// An OpenAI request body (as JSON) with `model` pinned, `stream` set, and all
 /// internal/tracing/E2EE-marker keys stripped (never sent to the third party).
+/// Keep in sync with [`INTERNAL_KEYS`] and `ph::LEGACY_DENIED_EXTRA_KEYS`: a new
+/// nearai marker key must be added there or it is forwarded upstream.
 pub(crate) fn request_body(
     model: &str,
     params: &ChatCompletionParams,
@@ -285,8 +301,9 @@ pub(crate) fn request_body(
         if stream {
             // Force usage onto the final stream chunk so streamed tokens are
             // billed and counted against org limits (the OpenAI-compatible
-            // default omits it, and our SSE adapter drops Chutes' outer
-            // usage-only events). Matches every other provider.
+            // default omits it, and our SSE adapters drop the upstream's
+            // outer usage-only events, known for Chutes). Matches every other
+            // provider.
             //
             // Merge into any client-supplied `stream_options` (e.g.
             // `continuous_usage_stats`) rather than clobbering the whole object —
@@ -304,7 +321,7 @@ pub(crate) fn request_body(
             }
         }
         // Strip internal identifiers + client-E2EE markers so they never reach
-        // Chutes inside the (encrypted) request body.
+        // the third party inside the (encrypted) request body.
         for k in INTERNAL_KEYS {
             obj.remove(*k);
         }

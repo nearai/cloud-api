@@ -6,13 +6,14 @@ use super::verifier_port::VerifiedInstanceInfo;
 use super::*;
 use crate::attested::nearai::encryption_headers::MODEL_PUB_KEY;
 use std::sync::Mutex;
-use wiremock::matchers::{method, path};
+use wiremock::matchers::{header, method, path};
 use wiremock::{Mock, MockGuard, MockServer, Request, ResponseTemplate};
 
 #[derive(Default)]
 struct RecordingVerifier {
     calls: Mutex<Vec<(String, String)>>,
     reject: bool,
+    pause: Option<Arc<tokio::sync::Barrier>>,
 }
 
 #[async_trait]
@@ -28,6 +29,10 @@ impl ChutesInstanceVerifier for RecordingVerifier {
             .lock()
             .unwrap()
             .push((evidence.instance_id.clone(), e2e_pubkey.to_string()));
+        if let Some(barrier) = &self.pause {
+            barrier.wait().await;
+            barrier.wait().await;
+        }
         if self.reject {
             return Err("test attestation rejection".to_string());
         }
@@ -245,6 +250,7 @@ async fn discovery_refreshes_when_only_other_keys_have_cached_nonces() {
                 nonces: vec!["unused".into()],
             }],
             expires_at: std::time::Instant::now() + std::time::Duration::from_secs(60),
+            generation: 1,
         };
         let _invoke = mount_invoke(&server, "pinned", dk, streaming).await;
         chat(&provider, Some(&key), streaming).await.unwrap();
@@ -320,6 +326,7 @@ async fn nonce_consumption_rechecks_key_after_concurrent_cache_rotation() {
             nonces: vec!["new-nonce".into()],
         }],
         expires_at: std::time::Instant::now() + std::time::Duration::from_secs(60),
+        generation: 1,
     };
     assert!(provider
         .take_nonce("chute", "same-id", "old-key")
@@ -329,7 +336,150 @@ async fn nonce_consumption_rechecks_key_after_concurrent_cache_rotation() {
         provider
             .take_nonce("chute", "same-id", "new-key")
             .await
+            .map(|nonce| nonce.token)
             .as_deref(),
         Some("new-nonce")
     );
+}
+
+#[tokio::test]
+async fn nonce_expiring_during_attestation_is_not_sent_to_inference() {
+    for streaming in [false, true] {
+        let (_, pk) = instance_keypair();
+        let key = b64(&pk);
+        let barrier = Arc::new(tokio::sync::Barrier::new(2));
+        let verifier = Arc::new(RecordingVerifier {
+            pause: Some(barrier.clone()),
+            ..Default::default()
+        });
+        let (provider, server) = fixture(&[("pinned", &key)], verifier.clone()).await;
+        let expire_during_verification = async {
+            barrier.wait().await;
+            provider.chute_cache("chute").lock().await.expires_at = std::time::Instant::now();
+            barrier.wait().await;
+        };
+        let (result, ()) = tokio::join!(
+            chat(&provider, Some(&key), streaming),
+            expire_during_verification
+        );
+        assert!(matches!(
+            result,
+            Err(CompletionError::HttpError {
+                status_code: 503,
+                ..
+            })
+        ));
+        assert_eq!(verifier.calls.lock().unwrap().len(), 1);
+        assert!(server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .all(|r| r.url.path() != "/e2e/invoke"));
+
+        // The next attempt refreshes rather than consuming the expired token.
+        provider.discover_cached("chute", Some(&key)).await.unwrap();
+        assert!(provider.take_nonce("chute", "pinned", &key).await.is_some());
+        assert_eq!(
+            server
+                .received_requests()
+                .await
+                .unwrap()
+                .iter()
+                .filter(|r| r.url.path() == "/e2e/instances/chute")
+                .count(),
+            2
+        );
+    }
+}
+
+#[tokio::test]
+async fn rejected_nonce_discards_remaining_batch_and_reverifies_before_retry() {
+    for streaming in [false, true] {
+        let (dk, pk) = instance_keypair();
+        let key = b64(&pk);
+        let verifier = Arc::new(RecordingVerifier::default());
+        let (provider, server) = fixture(&[("pinned", &key)], verifier.clone()).await;
+        // Keep a second token in the rejected batch: retry must refresh
+        // discovery, not simply pop another token from the same batch.
+        Mock::given(path("/e2e/instances/chute"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "nonce_expires_in": 120,
+                "instances": [{"instance_id": "pinned", "e2e_pubkey": key,
+                               "nonces": ["stale-unused", "stale-rejected"]}]
+            })))
+            .with_priority(1)
+            .up_to_n_times(1)
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/e2e/invoke"))
+            .and(header("X-E2E-Nonce", "stale-rejected"))
+            .respond_with(ResponseTemplate::new(403).set_body_json(json!({
+                "detail": "Invalid, expired, or already-used nonce"
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        assert!(matches!(
+            chat(&provider, Some(&key), streaming).await,
+            Err(CompletionError::HttpError {
+                status_code: 503,
+                is_external: true,
+                ..
+            })
+        ));
+
+        let _invoke = mount_invoke(&server, "pinned", dk, streaming).await;
+        chat(&provider, Some(&key), streaming).await.unwrap();
+        assert_eq!(
+            *verifier.calls.lock().unwrap(),
+            [("pinned".into(), key.clone()), ("pinned".into(), key)]
+        );
+        assert_eq!(
+            server
+                .received_requests()
+                .await
+                .unwrap()
+                .iter()
+                .filter(|r| r.url.path() == "/e2e/instances/chute")
+                .count(),
+            2
+        );
+    }
+}
+
+#[tokio::test]
+async fn late_nonce_rejection_does_not_invalidate_a_refreshed_batch() {
+    let (_, pk) = instance_keypair();
+    let key = b64(&pk);
+    let (provider, _server) = fixture(&[("pinned", &key)], Arc::default()).await;
+    let prepared = provider
+        .verify_and_prepare(&json!({}), Some(&key))
+        .await
+        .unwrap();
+    // Another request refreshes the drained pool while the first invoke is in flight.
+    provider.discover_cached("chute", Some(&key)).await.unwrap();
+    let error = provider
+        .handle_invoke_error(
+            "Chutes /e2e/invoke",
+            "chute",
+            "pinned",
+            &prepared.nonce,
+            client::ChutesClientError::Status {
+                status: 403,
+                body: json!({"detail": "Invalid, expired, or already-used nonce"}).to_string(),
+            },
+        )
+        .await;
+    assert!(matches!(
+        error,
+        CompletionError::HttpError {
+            status_code: 503,
+            ..
+        }
+    ));
+    let nonce = provider.take_nonce("chute", "pinned", &key).await.unwrap();
+    assert!(nonce.generation > prepared.nonce.generation);
 }

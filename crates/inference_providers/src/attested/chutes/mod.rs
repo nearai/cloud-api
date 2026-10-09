@@ -208,6 +208,8 @@ pub struct Provider {
 struct CachedInstances {
     instances: Vec<client::E2eInstance>,
     expires_at: std::time::Instant,
+    /// A late rejection must not invalidate a newer discovery batch.
+    generation: u64,
 }
 
 /// Base64 keys are case-sensitive. Match the same trimmed discovery value that
@@ -225,8 +227,16 @@ impl CachedInstances {
         Self {
             instances: Vec::new(),
             expires_at: std::time::Instant::now(),
+            generation: 0,
         }
     }
+}
+
+struct InvokeNonce {
+    token: String,
+    generation: u64,
+    /// Local cache deadline, including the safety margin, not server expiry.
+    expires_at: std::time::Instant,
 }
 
 /// Everything needed to invoke a verified instance: the targeting headers, the
@@ -234,7 +244,7 @@ impl CachedInstances {
 struct PreparedInvoke {
     chute_id: String,
     instance_id: String,
-    nonce_token: String,
+    nonce: InvokeNonce,
     blob: Vec<u8>,
     session: e2ee::ResponseSession,
 }
@@ -330,6 +340,9 @@ impl Provider {
             .iter()
             .any(|i| is_candidate(i, model_pub_key));
         if guard.expires_at <= std::time::Instant::now() || !usable {
+            // Include discovery latency in the lifetime instead of extending
+            // the upstream TTL by however long the response takes to arrive.
+            let discovery_started = std::time::Instant::now();
             let fresh = self
                 .client
                 .discover_instances(chute_id)
@@ -346,9 +359,10 @@ impl Provider {
                 .unwrap_or(30);
             *guard = CachedInstances {
                 instances: fresh.instances,
-                expires_at: std::time::Instant::now()
+                expires_at: discovery_started
                     + std::time::Duration::from_secs(ttl)
                         .saturating_sub(std::time::Duration::from_secs(5)),
+                generation: guard.generation + 1,
             };
         }
         Ok(guard.instances.clone())
@@ -357,22 +371,70 @@ impl Provider {
     /// Atomically consume one single-use nonce token for `instance_id` from the
     /// cached snapshot (the point that PREVENTS reuse: a popped token is gone from
     /// the cache, so no concurrent request can hand out the same one). Returns
-    /// `None` if the instance/key is no longer present or its pool is already drained —
-    /// the caller then moves to the next candidate (and a fully drained chute
-    /// refreshes on the next [`Self::discover_cached`]).
+    /// `None` if the batch expired during verification, the instance/key changed,
+    /// or the pool drained. The provider pool retries with fresh discovery and
+    /// attestation when no candidate has a usable nonce.
     async fn take_nonce(
         &self,
         chute_id: &str,
         instance_id: &str,
         e2e_pubkey: &str,
-    ) -> Option<String> {
+    ) -> Option<InvokeNonce> {
         let cell = self.chute_cache(chute_id);
         let mut guard = cell.lock().await;
+        if guard.expires_at <= std::time::Instant::now() {
+            tracing::debug!(
+                chute_id,
+                instance_id,
+                "Chutes nonce batch expired during verification"
+            );
+            return None;
+        }
         let inst = guard
             .instances
             .iter_mut()
             .find(|i| i.instance_id == instance_id && i.e2e_pubkey.trim() == e2e_pubkey)?;
-        inst.nonces.pop()
+        let token = inst.nonces.pop()?;
+        Some(InvokeNonce {
+            token,
+            generation: guard.generation,
+            expires_at: guard.expires_at,
+        })
+    }
+
+    /// Discard a rejected batch before the provider pool retries. This applies
+    /// only before an invoke response/stream is accepted, never mid-stream.
+    async fn handle_invoke_error(
+        &self,
+        ctx: &str,
+        chute_id: &str,
+        instance_id: &str,
+        nonce: &InvokeNonce,
+        error: client::ChutesClientError,
+    ) -> CompletionError {
+        if let client::ChutesClientError::Status { status, body } = &error {
+            if availability::stale_invoke_target(ctx, *status, body) {
+                let cell = self.chute_cache(chute_id);
+                let mut guard = cell.lock().await;
+                let invalidated = guard.generation == nonce.generation;
+                let now = std::time::Instant::now();
+                if invalidated {
+                    guard.expires_at = now;
+                }
+                tracing::warn!(
+                    chute_id,
+                    instance_id,
+                    upstream_status = status,
+                    nonce_batch = nonce.generation,
+                    cache_invalidated = invalidated,
+                    nonce_cache_expired = nonce.expires_at <= now,
+                    nonce_cache_remaining_ms =
+                        nonce.expires_at.saturating_duration_since(now).as_millis() as u64,
+                    "Chutes rejected invoke nonce; retry requires a fresh discovery batch"
+                );
+            }
+        }
+        Self::map_client_error(ctx, error)
     }
 
     /// Map a Chutes HTTP-client error to a `CompletionError`. Only statuses that
@@ -390,7 +452,8 @@ impl Provider {
     ///   retry the round). Preserving 408 still beats the prior flat 502 because
     ///   it surfaces the timeout and enables that same-round fallthrough.
     ///
-    /// Every other status — notably `400 / 413 / 422` — is deliberately collapsed
+    /// Stale invoke targets (400 or the nonce-specific 403) become retryable 503s.
+    /// Every other status — notably `400 / 403 / 413 / 422` — is deliberately collapsed
     /// to a generic `CompletionError(msg)` (which masks as a 502). Discovery /
     /// evidence / invoke requests are internally constructed, so a 4xx there is
     /// never the customer's fault; preserving it would hit `map_provider_error`'s
@@ -401,8 +464,8 @@ impl Provider {
     fn map_client_error(ctx: &str, e: client::ChutesClientError) -> CompletionError {
         let msg = format!("{ctx}: {e}");
         match e {
-            client::ChutesClientError::Status { status: 400, body }
-                if availability::stale_invoke_target(ctx, &body) =>
+            client::ChutesClientError::Status { status, body }
+                if availability::stale_invoke_target(ctx, status, &body) =>
             {
                 availability::retryable_provider_unavailable(ctx, "stale Chutes E2E target")
             }
@@ -551,9 +614,9 @@ impl Provider {
             // Consume a single-use nonce token from the CACHE (not from the local
             // snapshot's `inst.nonces`), so it can never be handed to a concurrent
             // request for the same instance (#774). A token drained between the
-            // snapshot and here just moves us to the next candidate; if every
-            // candidate's pool is drained the request fails (retryable), and the
-            // next request's `discover_cached` refreshes the now-empty chute.
+            // snapshot and here just moves us to the next candidate. An expired
+            // batch or fully drained pool returns a retryable error so the next
+            // attempt refreshes discovery and repeats verification.
             let nonce = match self
                 .take_nonce(&chute_id, &inst.instance_id, e2e_pubkey)
                 .await
@@ -561,25 +624,26 @@ impl Provider {
                 Some(n) => n,
                 None => {
                     last_err = format!(
-                        "instance {} nonce pool drained or key changed",
+                        "instance {} nonce batch expired, pool drained, or key changed",
                         inst.instance_id
                     );
                     last_err_retryable = true;
                     continue;
                 }
             };
-            // IDs only (privacy-safe): which attested instance + vetted config
-            // served the request, so an operator can trace it during an incident.
+            // Record the selected instance and local nonce lifetime, never the token.
             tracing::info!(
                 instance_id = %inst.instance_id,
                 measurement_config = %info.measurement_config,
                 gpu_verdict = %info.gpu_verdict,
+                nonce_batch = nonce.generation,
+                nonce_cache_remaining_ms = nonce.expires_at.saturating_duration_since(std::time::Instant::now()).as_millis() as u64,
                 "Chutes instance verified; routing request"
             );
             return Ok(PreparedInvoke {
                 chute_id,
                 instance_id: inst.instance_id.clone(),
-                nonce_token: nonce,
+                nonce,
                 blob,
                 session,
             });
@@ -1439,18 +1503,31 @@ impl InferenceProvider for Provider {
             .and_then(Value::as_str);
         let prep = self.verify_and_prepare(&body, model_pub_key).await?;
 
-        let resp_blob = self
+        let resp_blob = match self
             .client
             .invoke_nonstream(&InvokeRequest {
                 chute_id: &prep.chute_id,
                 instance_id: &prep.instance_id,
-                nonce_token: &prep.nonce_token,
+                nonce_token: &prep.nonce.token,
                 path: CHAT_PATH,
                 mode: InvokeMode::NonStream,
                 blob: prep.blob,
             })
             .await
-            .map_err(|e| Self::map_client_error("Chutes /e2e/invoke", e))?;
+        {
+            Ok(response) => response,
+            Err(error) => {
+                return Err(self
+                    .handle_invoke_error(
+                        "Chutes /e2e/invoke",
+                        &prep.chute_id,
+                        &prep.instance_id,
+                        &prep.nonce,
+                        error,
+                    )
+                    .await);
+            }
+        };
 
         let plaintext = prep
             .session
@@ -1543,18 +1620,31 @@ impl InferenceProvider for Provider {
             .and_then(Value::as_str);
         let prep = self.verify_and_prepare(&body, model_pub_key).await?;
 
-        let resp = self
+        let resp = match self
             .client
             .invoke_stream(&InvokeRequest {
                 chute_id: &prep.chute_id,
                 instance_id: &prep.instance_id,
-                nonce_token: &prep.nonce_token,
+                nonce_token: &prep.nonce.token,
                 path: CHAT_PATH,
                 mode: InvokeMode::Stream,
                 blob: prep.blob,
             })
             .await
-            .map_err(|e| Self::map_client_error("Chutes /e2e/invoke (stream)", e))?;
+        {
+            Ok(response) => response,
+            Err(error) => {
+                return Err(self
+                    .handle_invoke_error(
+                        "Chutes /e2e/invoke (stream)",
+                        &prep.chute_id,
+                        &prep.instance_id,
+                        &prep.nonce,
+                        error,
+                    )
+                    .await);
+            }
+        };
 
         // Decrypt the E2EE SSE into OpenAI SSEEvents (transport errors → CompletionError).
         let byte_stream = resp.bytes_stream().map(|r| {
@@ -1888,7 +1978,7 @@ mod tests {
     fn map_client_error_masks_internal_4xx_to_avoid_client_blame_and_leak() {
         use client::ChutesClientError;
 
-        for status in [400u16, 413, 422] {
+        for status in [400u16, 403, 413, 422] {
             let mapped = Provider::map_client_error(
                 "Chutes /e2e/invoke",
                 ChutesClientError::Status {
@@ -1980,6 +2070,7 @@ mod tests {
                 })
                 .collect(),
             expires_at: std::time::Instant::now() + std::time::Duration::from_secs(3600),
+            generation: 1,
         }
     }
 
@@ -2072,7 +2163,10 @@ mod tests {
         // The cell really is the consumption point: seed it and consume via take_nonce.
         *a1.lock().await = cached(&[("i1", &["only-token"])]);
         assert_eq!(
-            p.take_nonce("chute-A", "i1", "cGs=").await.as_deref(),
+            p.take_nonce("chute-A", "i1", "cGs=")
+                .await
+                .map(|nonce| nonce.token)
+                .as_deref(),
             Some("only-token"),
             "take_nonce consumes from the shared cell"
         );

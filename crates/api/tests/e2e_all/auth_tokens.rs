@@ -365,7 +365,7 @@ async fn test_create_access_token_success_user_agent_mismatch() {
 
 #[tokio::test]
 #[ignore] // Requires real database to test token rotation properly
-async fn test_refresh_token_rotation_invalidates_old_token() {
+async fn test_refresh_token_rotation_reuses_predecessor_briefly() {
     let server = setup_test_server().await;
     let old_refresh_token = get_session_id();
 
@@ -408,18 +408,17 @@ async fn test_refresh_token_rotation_invalidates_old_token() {
         "Refresh token expiration should be in the future. Now: {now:?}, Expiration: {actual_expiration:?}"
     );
 
-    // Try to use the old refresh token again (should fail - token rotation invalidated it)
+    // A duplicate request within the reuse window must receive the same
+    // successor, allowing clients to recover from concurrent refreshes.
     let response2 = server
         .post("/v1/users/me/access-tokens")
         .add_header("Authorization", format!("Bearer {old_refresh_token}"))
         .add_header("User-Agent", MOCK_USER_AGENT)
         .await;
 
-    assert_eq!(
-        response2.status_code(),
-        401,
-        "Old refresh token should be invalidated after rotation"
-    );
+    assert_eq!(response2.status_code(), 200);
+    let duplicate = response2.json::<api::models::AccessAndRefreshTokenResponse>();
+    assert_eq!(duplicate.refresh_token, new_refresh_token);
 
     // Verify the new refresh token works
     let response3 = server

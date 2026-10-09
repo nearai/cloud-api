@@ -13,7 +13,9 @@ use crate::workspace::{ApiKey, ApiKeyRepository, WorkspaceId, WorkspaceRepositor
 use async_trait::async_trait;
 use bloomfilter::Bloom;
 use chrono::Utc;
+use hmac::{Hmac, KeyInit, Mac};
 use moka::future::Cache;
+use sha2::Sha256;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -27,6 +29,14 @@ const BLOOM_FILTER_ITEMS: usize = 10_000_000;
 const BLOOM_FILTER_FP_RATE: f64 = 0.001;
 const BLOOM_FILTER_SYNC_INTERVAL_SECS: u64 = 10;
 const BLOOM_FILTER_FULL_REBUILD_INTERVAL_SECS: u64 = 60 * 60;
+
+fn refresh_token_successor(old_token: &str, encoding_key: &str) -> Result<String, AuthError> {
+    let mut mac = Hmac::<Sha256>::new_from_slice(encoding_key.as_bytes())
+        .map_err(|e| AuthError::InternalError(format!("Invalid refresh rotation key: {e}")))?;
+    mac.update(b"nearai-refresh-token-rotation-v1\0");
+    mac.update(old_token.as_bytes());
+    Ok(format!("rt_{}", hex::encode(mac.finalize().into_bytes())))
+}
 
 #[async_trait]
 impl AuthServiceTrait for AuthService {
@@ -246,17 +256,23 @@ impl AuthServiceTrait for AuthService {
         &self,
         user_id: UserId,
         session_id: SessionId,
-        old_token_hash: &str,
+        old_token: &str,
         encoding_key: String,
         access_token_expires_in_hours: i64,
         refresh_token_expires_in_hours: i64,
     ) -> Result<(String, Session, String), AuthError> {
+        let successor_token = refresh_token_successor(old_token, &encoding_key)?;
         // Rotate the refresh token first; only mint an access token for a
         // session that is confirmed live. Rotation keeps the session id, so
         // the new access token stays bound to the same session.
         let (rotated_session, new_refresh_token) = self
             .session_repository
-            .rotate(session_id, old_token_hash, refresh_token_expires_in_hours)
+            .rotate(
+                session_id,
+                old_token,
+                &successor_token,
+                refresh_token_expires_in_hours,
+            )
             .await
             .map_err(|e| {
                 let error_msg = e.to_string();
@@ -629,6 +645,24 @@ mod tests {
     use tokio::sync::RwLock;
     use uuid::Uuid;
 
+    #[test]
+    fn refresh_successor_is_stable_and_keyed() {
+        let first = refresh_token_successor("rt_original", "signing-key").unwrap();
+        assert_eq!(
+            first,
+            refresh_token_successor("rt_original", "signing-key").unwrap()
+        );
+        assert!(first.starts_with("rt_"));
+        assert_ne!(
+            first,
+            refresh_token_successor("rt_other", "signing-key").unwrap()
+        );
+        assert_ne!(
+            first,
+            refresh_token_successor("rt_original", "other-key").unwrap()
+        );
+    }
+
     fn make_user(email: &str, provider: &str) -> User {
         User {
             id: UserId(Uuid::new_v4()),
@@ -758,7 +792,13 @@ mod tests {
         async fn extend(&self, _: SessionId, _: i64) -> anyhow::Result<bool> {
             unimplemented!()
         }
-        async fn rotate(&self, _: SessionId, _: &str, _: i64) -> anyhow::Result<(Session, String)> {
+        async fn rotate(
+            &self,
+            _: SessionId,
+            _: &str,
+            _: &str,
+            _: i64,
+        ) -> anyhow::Result<(Session, String)> {
             unimplemented!()
         }
         async fn revoke(&self, _: SessionId) -> anyhow::Result<bool> {
@@ -834,7 +874,13 @@ mod tests {
         async fn extend(&self, _: SessionId, _: i64) -> anyhow::Result<bool> {
             unimplemented!()
         }
-        async fn rotate(&self, _: SessionId, _: &str, _: i64) -> anyhow::Result<(Session, String)> {
+        async fn rotate(
+            &self,
+            _: SessionId,
+            _: &str,
+            _: &str,
+            _: i64,
+        ) -> anyhow::Result<(Session, String)> {
             unimplemented!()
         }
         async fn revoke(&self, session_id: SessionId) -> anyhow::Result<bool> {

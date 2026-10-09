@@ -39,6 +39,12 @@ async fn main() {
 
     // Initialize core services
     let database = init_database(&config.database).await;
+    // Apply additive migrations from the candidate image before switching
+    // traffic to its new refresh-token code.
+    if std::env::args().skip(1).any(|arg| arg == "--migrate-only") {
+        tracing::info!("Migrations completed; exiting without serving traffic");
+        return;
+    }
     if config.usage_reporting.enabled {
         database::ensure_usage_reporting_indexes(database.pool())
             .await

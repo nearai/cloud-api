@@ -14,6 +14,9 @@ pub struct SessionRepository {
     pool: DbPool,
 }
 
+// Covers the UI's 30-second upstream timeout plus network jitter.
+const REFRESH_REUSE_WINDOW_SECONDS: i64 = 60;
+
 impl SessionRepository {
     pub fn new(pool: DbPool) -> Self {
         Self { pool }
@@ -136,10 +139,16 @@ impl SessionRepository {
             client
                 .query_opt(
                     r#"
-            SELECT * FROM refresh_tokens 
-            WHERE token_hash = $1 AND expires_at > $2
+            SELECT * FROM refresh_tokens
+            WHERE expires_at > $2
+              AND (token_hash = $1 OR
+                   (previous_token_hash = $1 AND rotated_at > $3))
             "#,
-                    &[&token_hash, &now],
+                    &[
+                        &token_hash,
+                        &now,
+                        &(now - chrono::Duration::seconds(REFRESH_REUSE_WINDOW_SECONDS)),
+                    ],
                 )
                 .await
                 .map_err(map_db_error)
@@ -240,22 +249,20 @@ impl SessionRepository {
 
     /// Rotates a refresh token session.
     ///
-    /// This operation atomically updates the token hash and expiration time in the database,
-    /// invalidating the old token. This ensures that the previous token can no longer be used.
-    ///
-    /// The old_token_hash is included in the WHERE clause to prevent race conditions where
-    /// two requests try to rotate the same token simultaneously. If the token was already
-    /// rotated, no row will be updated and an error will be returned.
-    ///
-    /// Returns the updated session and the new plaintext token.
+    /// Serializes rotation per session. A duplicate use of the immediate
+    /// predecessor within the reuse window returns the same successor; a request
+    /// with the current token during that window does not rotate again. This
+    /// prevents out-of-order HTTP responses from overwriting the browser's
+    /// cookie with a superseded token.
     pub async fn rotate(
         &self,
         session_id: Uuid,
-        old_token_hash: &str,
+        old_token: &str,
+        successor_token: &str,
         expires_in_hours: i64,
     ) -> Result<(Session, String)> {
-        let new_session_token = Self::generate_session_token();
-        let new_token_hash = Self::hash_session_token(&new_session_token);
+        let old_token_hash = Self::hash_session_token(old_token);
+        let successor_hash = Self::hash_session_token(successor_token);
         let new_expires_at = Utc::now()
             + chrono::Duration::seconds(
                 expires_in_hours
@@ -263,42 +270,67 @@ impl SessionRepository {
                     .context("Invalid expiration hours: value too large")?,
             );
 
-        let row = retry_db!("rotate_refresh_token_session", {
-            let client = self
+        let (row, token) = retry_db!("rotate_refresh_token_session", {
+            let mut client = self
                 .pool
                 .get()
                 .await
                 .context("Failed to get database connection")
                 .map_err(RepositoryError::PoolError)?;
 
-            client
+            let tx = client.transaction().await.map_err(map_db_error)?;
+            let row = tx
                 .query_opt(
-                    r#"
-                UPDATE refresh_tokens
-                SET token_hash = $1, expires_at = $2
-                WHERE id = $3 AND token_hash = $4
-                RETURNING *
-                "#,
-                    &[
-                        &new_token_hash,
-                        &new_expires_at,
-                        &session_id,
-                        &old_token_hash,
-                    ],
+                    "SELECT * FROM refresh_tokens WHERE id = $1 AND expires_at > $2 FOR UPDATE",
+                    &[&session_id, &Utc::now()],
                 )
                 .await
-                .map_err(map_db_error)
-        })?;
+                .map_err(map_db_error)?
+                .ok_or_else(|| {
+                    RepositoryError::DatabaseError(anyhow::anyhow!(
+                        "Token rotation failed: session not found"
+                    ))
+                })?;
+            let current_hash: String = row.get("token_hash");
+            let previous_hash: Option<String> = row.get("previous_token_hash");
+            let rotated_at: Option<chrono::DateTime<Utc>> = row.get("rotated_at");
+            let in_reuse_window = rotated_at.is_some_and(|at| {
+                at > Utc::now() - chrono::Duration::seconds(REFRESH_REUSE_WINDOW_SECONDS)
+            });
 
-        let row = row.ok_or_else(|| {
-            anyhow::anyhow!("Token rotation failed: token not found or already rotated")
+            let result = if current_hash == old_token_hash {
+                if in_reuse_window {
+                    // The current credential already refreshed recently.
+                    (row, old_token.to_string())
+                } else {
+                    let updated = tx
+                        .query_one(
+                            "UPDATE refresh_tokens SET token_hash = $1, previous_token_hash = $2, rotated_at = $3, expires_at = $4 WHERE id = $5 RETURNING *",
+                            &[&successor_hash, &old_token_hash, &Utc::now(), &new_expires_at, &session_id],
+                        )
+                        .await
+                        .map_err(map_db_error)?;
+                    (updated, successor_token.to_string())
+                }
+            } else if in_reuse_window
+                && previous_hash.as_deref() == Some(old_token_hash.as_str())
+                && current_hash == successor_hash
+            {
+                (row, successor_token.to_string())
+            } else {
+                return Err(RepositoryError::DatabaseError(anyhow::anyhow!(
+                    "Token rotation failed: token not found or already rotated"
+                )));
+            };
+            tx.commit().await.map_err(map_db_error)?;
+            Ok(result)
         })?;
 
         debug!("Rotated refresh token session: {session_id}",);
 
         let session = self.row_to_session(row)?;
 
-        Ok((session, new_session_token))
+        Ok((session, token))
     }
 
     /// Revoke a refresh token session
@@ -473,11 +505,18 @@ impl services::auth::SessionRepository for SessionRepository {
     async fn rotate(
         &self,
         session_id: services::auth::SessionId,
-        old_token_hash: &str,
+        old_token: &str,
+        successor_token: &str,
         expires_in_hours: i64,
     ) -> anyhow::Result<(services::auth::Session, String)> {
-        let (db_session, token) =
-            SessionRepository::rotate(self, session_id.0, old_token_hash, expires_in_hours).await?;
+        let (db_session, token) = SessionRepository::rotate(
+            self,
+            session_id.0,
+            old_token,
+            successor_token,
+            expires_in_hours,
+        )
+        .await?;
 
         let service_session = services::auth::Session {
             id: services::auth::SessionId(db_session.id),

@@ -70,6 +70,7 @@ pub struct DatabaseConfig {
     pub password: String,
     pub max_write_connections: u32,
     pub max_read_connections: u32,
+    pub recycling_method: config::DatabaseRecyclingMethod,
     pub tls_enabled: bool,
     pub tls_ca_cert_path: Option<String>,
 }
@@ -248,6 +249,9 @@ impl ClusterManager {
         cfg.dbname = Some(self.database_config.database.clone());
         cfg.user = Some(self.database_config.username.clone());
         cfg.password = Some(self.database_config.password.clone());
+        cfg.manager = Some(deadpool_postgres::ManagerConfig {
+            recycling_method: crate::pool_recycling_method(self.database_config.recycling_method),
+        });
         cfg.pool = Some(deadpool_postgres::PoolConfig {
             max_size: max_connections as usize,
             timeouts: deadpool_postgres::Timeouts {
@@ -495,6 +499,7 @@ mod tests {
             password: std::env::var("DATABASE_PASSWORD").unwrap_or_else(|_| "postgres".to_string()),
             max_write_connections: 2,
             max_read_connections: 2,
+            recycling_method: config::DatabaseRecyclingMethod::Fast,
             tls_enabled: false,
             tls_ca_cert_path: None,
         }

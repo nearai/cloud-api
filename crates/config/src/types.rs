@@ -805,6 +805,25 @@ impl std::str::FromStr for DatabaseConnectionMode {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum DatabaseRecyclingMethod {
+    #[default]
+    Fast,
+    Verified,
+}
+
+impl std::str::FromStr for DatabaseRecyclingMethod {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "fast" => Ok(Self::Fast),
+            "verified" => Ok(Self::Verified),
+            _ => Err("DATABASE_RECYCLING_METHOD must be exactly 'fast' or 'verified' (lowercase, no surrounding whitespace)".into()),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct DatabaseConfig {
     pub connection_mode: DatabaseConnectionMode,
@@ -816,6 +835,7 @@ pub struct DatabaseConfig {
     pub username: String,
     pub password: String,
     pub max_connections: usize,
+    pub recycling_method: DatabaseRecyclingMethod,
     /// Enable TLS. Direct mode requires encryption and verifies certificates/hostname.
     /// Legacy Patroni/test mode retains its existing native-tls behavior.
     pub tls_enabled: bool,
@@ -880,6 +900,9 @@ impl DatabaseConfig {
                 .unwrap_or_else(|_| "16".to_string())
                 .parse()
                 .map_err(|_| "DATABASE_MAX_CONNECTIONS must be a valid number")?,
+            recycling_method: env::var("DATABASE_RECYCLING_METHOD")
+                .unwrap_or_else(|_| "fast".to_string())
+                .parse()?,
             tls_enabled: env::var("DATABASE_TLS_ENABLED")
                 .unwrap_or_else(|_| "true".to_string())
                 .parse()
@@ -1522,6 +1545,24 @@ mod tests {
     }
 
     #[test]
+    fn database_recycling_method_requires_exact_values() {
+        assert_eq!(
+            "fast".parse::<DatabaseRecyclingMethod>().unwrap(),
+            DatabaseRecyclingMethod::Fast
+        );
+        assert_eq!(
+            "verified".parse::<DatabaseRecyclingMethod>().unwrap(),
+            DatabaseRecyclingMethod::Verified
+        );
+        for value in ["FAST", "verified ", "", "clean"] {
+            assert!(value
+                .parse::<DatabaseRecyclingMethod>()
+                .unwrap_err()
+                .contains("DATABASE_RECYCLING_METHOD"));
+        }
+    }
+
+    #[test]
     #[serial]
     fn database_connection_mode_environment() {
         let keys = [
@@ -1533,6 +1574,7 @@ mod tests {
             "DATABASE_PASSWORD",
             "DATABASE_PASSWORD_FILE",
             "DATABASE_MAX_CONNECTIONS",
+            "DATABASE_RECYCLING_METHOD",
             "DATABASE_TLS_ENABLED",
             "DATABASE_TLS_CA_CERT_PATH",
             "DATABASE_REFRESH_INTERVAL",
@@ -1576,6 +1618,17 @@ mod tests {
         let config = DatabaseConfig::from_env().unwrap();
         assert_eq!(config.connection_mode, DatabaseConnectionMode::Direct);
         assert!(config.tls_enabled);
+        assert_eq!(config.recycling_method, DatabaseRecyclingMethod::Fast);
+        env::set_var("DATABASE_RECYCLING_METHOD", "verified");
+        assert_eq!(
+            DatabaseConfig::from_env().unwrap().recycling_method,
+            DatabaseRecyclingMethod::Verified
+        );
+        env::set_var("DATABASE_RECYCLING_METHOD", "VERIFIED");
+        assert!(DatabaseConfig::from_env()
+            .unwrap_err()
+            .contains("DATABASE_RECYCLING_METHOD"));
+        env::remove_var("DATABASE_RECYCLING_METHOD");
         env::set_var("DATABASE_CONNECTION_MODE", "typo");
         assert!(DatabaseConfig::from_env()
             .unwrap_err()

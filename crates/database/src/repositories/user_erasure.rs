@@ -637,4 +637,108 @@ impl UserErasureRepository for PostgresUserErasureRepository {
         })?;
         Ok(footprint)
     }
+    async fn find_erasures(&self, by: ErasureLookup) -> Result<Vec<ErasureRecord>> {
+        let records = retry_db!("find_user_erasures", {
+            let client = self
+                .pool
+                .get()
+                .await
+                .context("Failed to get database connection")
+                .map_err(RepositoryError::PoolError)?;
+
+            let select = r#"
+                SELECT l.user_id, l.admin_user_id, l.requested_at, l.erased_at,
+                       l.erased_organization_ids, l.retained_organization_ids,
+                       u.is_active, u.auth_provider
+                FROM user_erasure_log l
+                JOIN users u ON u.id = l.user_id
+            "#;
+            let rows = match &by {
+                ErasureLookup::EmailDigest(digest) => {
+                    let digest: &[u8] = digest;
+                    client
+                        .query(
+                            &format!(
+                                "{select} WHERE l.email_sha256 = $1 ORDER BY l.erased_at DESC, l.id DESC"
+                            ),
+                            &[&digest],
+                        )
+                        .await
+                }
+                ErasureLookup::UserId(user_id) => {
+                    client
+                        .query(
+                            &format!(
+                                "{select} WHERE l.user_id = $1 ORDER BY l.erased_at DESC, l.id DESC"
+                            ),
+                            &[user_id],
+                        )
+                        .await
+                }
+            }
+            .map_err(map_db_error)?;
+
+            let mut org_ids: Vec<Uuid> = Vec::new();
+            for r in &rows {
+                org_ids.extend(r.get::<_, Vec<Uuid>>("erased_organization_ids"));
+                org_ids.extend(r.get::<_, Vec<Uuid>>("retained_organization_ids"));
+            }
+            org_ids.sort();
+            org_ids.dedup();
+
+            let org_rows = client
+                .query(
+                    &format!(
+                        "SELECT o.id, o.is_active, {ORG_ALL_MEMBERS_ERASED_SQL} AS all_members_erased \
+                         FROM organizations o WHERE o.id = ANY($1)"
+                    ),
+                    &[&org_ids],
+                )
+                .await
+                .map_err(map_db_error)?;
+            let lifecycles: std::collections::HashMap<Uuid, OrganizationLifecycle> = org_rows
+                .iter()
+                .map(|r| {
+                    (
+                        r.get("id"),
+                        OrganizationLifecycle::from_columns(
+                            r.get("is_active"),
+                            r.get("all_members_erased"),
+                        ),
+                    )
+                })
+                .collect();
+            let orgs = |ids: Vec<Uuid>| -> Vec<ErasureRecordOrg> {
+                ids.into_iter()
+                    .filter_map(|organization_id| {
+                        lifecycles
+                            .get(&organization_id)
+                            .map(|&lifecycle| ErasureRecordOrg {
+                                organization_id,
+                                lifecycle,
+                            })
+                    })
+                    .collect()
+            };
+
+            rows.iter()
+                .map(|r| {
+                    Ok(ErasureRecord {
+                        user_id: r.get("user_id"),
+                        user_lifecycle: UserLifecycle::from_columns(
+                            r.get("is_active"),
+                            r.get::<_, &str>("auth_provider"),
+                        )
+                        .map_err(|e| RepositoryError::DataConversionError(e.into()))?,
+                        admin_user_id: r.get("admin_user_id"),
+                        requested_at: r.get("requested_at"),
+                        erased_at: r.get("erased_at"),
+                        erased_organizations: orgs(r.get("erased_organization_ids")),
+                        retained_organizations: orgs(r.get("retained_organization_ids")),
+                    })
+                })
+                .collect::<Result<Vec<_>, RepositoryError>>()
+        })?;
+        Ok(records)
+    }
 }

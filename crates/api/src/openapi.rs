@@ -158,6 +158,7 @@ use utoipa::{Modify, OpenApi};
         crate::routes::admin::preview_model_pricing_changes,
         crate::routes::admin::preview_user_erasure,
         crate::routes::admin::erase_user,
+        crate::routes::admin::lookup_user_erasures,
         crate::routes::admin::confirm_model_pricing_changes,
         crate::routes::admin::list_model_pricing_changes,
         crate::routes::admin::cancel_model_pricing_change,
@@ -317,6 +318,8 @@ use utoipa::{Modify, OpenApi};
             ListUsersResponse, AdminUserResponse,
             ErasurePreviewResponse, ErasedOrganizationResponse, RetainedOrganizationResponse,
             ErasureLogResponse, EraseUserRequest, EraseUserResponse, ErasureBlockedResponse,
+            LookupUserErasuresRequest, LookupUserErasuresResponse, UserErasureRecordResponse,
+            ErasureLookupOrganizationResponse,
             services::user_erasure::ErasureBlocker,
             // AML models (Admin)
             AdminAmlReportResponse, ListAdminAmlReportsResponse, UpdateAmlReportStatusRequest,

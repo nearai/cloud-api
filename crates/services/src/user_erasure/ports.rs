@@ -68,6 +68,31 @@ pub struct ExecuteRequest<'a> {
     pub requested_at: DateTime<Utc>,
 }
 
+/// How to find erasure log rows. The repository never sees a raw email.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ErasureLookup {
+    EmailDigest([u8; 32]),
+    UserId(Uuid),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ErasureRecordOrg {
+    pub organization_id: Uuid,
+    pub lifecycle: OrganizationLifecycle,
+}
+
+/// One `user_erasure_log` row with the current lifecycle of the user and its orgs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ErasureRecord {
+    pub user_id: Uuid,
+    pub user_lifecycle: UserLifecycle,
+    pub admin_user_id: Uuid,
+    pub requested_at: DateTime<Utc>,
+    pub erased_at: DateTime<Utc>,
+    pub erased_organizations: Vec<ErasureRecordOrg>,
+    pub retained_organizations: Vec<ErasureRecordOrg>,
+}
+
 #[async_trait]
 pub trait UserErasureRepository: Send + Sync {
     /// Read-only. `None` when the user does not exist.
@@ -82,4 +107,7 @@ pub trait UserErasureRepository: Send + Sync {
     /// For an erased user: re-delete content written into erased workspaces after the
     /// original commit, and return the erased orgs and workspaces.
     async fn sweep_erased(&self, user_id: Uuid) -> anyhow::Result<ErasedFootprint>;
+    /// Read-only. Erasure log rows matching `by`, newest `erased_at` first. An org id
+    /// whose row no longer exists is skipped.
+    async fn find_erasures(&self, by: ErasureLookup) -> anyhow::Result<Vec<ErasureRecord>>;
 }

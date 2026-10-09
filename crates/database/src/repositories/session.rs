@@ -84,13 +84,14 @@ impl SessionRepository {
                 .map_err(RepositoryError::PoolError)?;
 
             client
-                .query_one(
+                .query_opt(
                     r#"
             INSERT INTO refresh_tokens (
                 id, user_id, token_hash, created_at, expires_at,
                 ip_address, user_agent
             )
-            VALUES ($1, $2, $3, $4, $5, $6, $7)
+            SELECT $1, $2, $3, $4, $5, $6, $7
+            WHERE EXISTS (SELECT 1 FROM users WHERE id = $2 AND is_active = true)
             RETURNING *
             "#,
                     &[
@@ -104,7 +105,8 @@ impl SessionRepository {
                     ],
                 )
                 .await
-                .map_err(map_db_error)
+                .map_err(map_db_error)?
+                .ok_or_else(|| RepositoryError::NotFound("active user".to_string()))
         })?;
 
         debug!(

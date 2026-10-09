@@ -41,13 +41,20 @@ async fn predicate_agrees_with_derivation_for_an_all_erased_org() -> anyhow::Res
         )
         .await?;
 
+    let mut failures: Vec<String> = Vec::new();
     for (filter, expected) in [(F::Erased, 1), (F::Deleted, 0), (F::Active, 0), (F::All, 1)] {
         let sql = format!(
             "SELECT o.id FROM organizations o WHERE o.id = $1 AND {}",
             org_lifecycle_predicate(filter)
         );
-        let rows = client.query(sql.as_str(), &[&org_id]).await?;
-        assert_eq!(rows.len(), expected, "{filter:?}");
+        match client.query(sql.as_str(), &[&org_id]).await {
+            Ok(rows) if rows.len() == expected => {}
+            Ok(rows) => failures.push(format!(
+                "{filter:?}: expected {expected}, got {}",
+                rows.len()
+            )),
+            Err(e) => failures.push(format!("{filter:?}: query error: {e}")),
+        }
     }
 
     client
@@ -62,6 +69,7 @@ async fn predicate_agrees_with_derivation_for_an_all_erased_org() -> anyhow::Res
     client
         .execute("DELETE FROM users WHERE id = $1", &[&user_id])
         .await?;
+    assert!(failures.is_empty(), "{failures:?}");
     Ok(())
 }
 

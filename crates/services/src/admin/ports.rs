@@ -1268,3 +1268,7 @@ pub trait AdminService: Send + Sync {
         is_active: Option<bool>,
     ) -> Result<PlatformServiceInfo, AdminError>;
 }
+
+#[cfg(test)]
+#[path = "email_loop_tests.rs"]
+mod email_loop_tests;

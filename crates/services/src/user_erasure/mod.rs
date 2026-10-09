@@ -99,7 +99,10 @@ impl UserErasureService {
                 self.repository
                     .rename_retained_signup_orgs(user_id)
                     .await
-                    .map_err(UserErasureError::Internal)?;
+                    .map_err(|e| {
+                        tracing::warn!(%user_id, "erasure committed but retained signup org rename failed; re-post the erase to sweep and retry the idempotent rename");
+                        UserErasureError::Internal(e)
+                    })?;
                 (false, footprint)
             }
             ExecuteOutcome::AlreadyErased => {
@@ -112,7 +115,10 @@ impl UserErasureService {
                 self.repository
                     .rename_retained_signup_orgs(user_id)
                     .await
-                    .map_err(UserErasureError::Internal)?;
+                    .map_err(|e| {
+                        tracing::warn!(%user_id, "erasure committed but retained signup org rename failed; re-post the erase to sweep and retry the idempotent rename");
+                        UserErasureError::Internal(e)
+                    })?;
                 (true, footprint)
             }
             ExecuteOutcome::Blocked(blockers) => return Err(UserErasureError::Blocked(blockers)),

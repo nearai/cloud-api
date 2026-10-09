@@ -5130,7 +5130,32 @@ mod openrouter_slug_tests {
     }
 }
 
+/// Static category of a repository failure, safe to log: never the error text,
+/// which can carry row values.
+fn repository_error_kind(error: &anyhow::Error) -> &'static str {
+    use services::common::RepositoryError as R;
+    let Some(repo_error) = error.chain().find_map(|e| e.downcast_ref::<R>()) else {
+        return "other";
+    };
+    match repo_error {
+        R::NotFound(_) => "not_found",
+        R::AlreadyExists => "already_exists",
+        R::RequiredFieldMissing(_) => "required_field_missing",
+        R::ForeignKeyViolation(_) => "foreign_key_violation",
+        R::ValidationFailed(_) => "validation_failed",
+        R::DependencyExists(_) => "dependency_exists",
+        R::TransactionConflict => "transaction_conflict",
+        R::ConnectionFailed(_) => "connection_failed",
+        R::AuthenticationFailed => "authentication_failed",
+        R::QueryTimeout => "query_timeout",
+        R::PoolError(_) => "pool",
+        R::DatabaseError(_) => "database",
+        R::DataConversionError(_) => "data_conversion",
+    }
+}
+
 fn erasure_error_to_response(
+    user_id: uuid::Uuid,
     err: services::user_erasure::UserErasureError,
 ) -> axum::response::Response {
     use axum::http::StatusCode;
@@ -5152,8 +5177,12 @@ fn erasure_error_to_response(
             "confirm_email_mismatch",
             "confirm_email does not match the user's current email",
         ),
-        E::Internal(_) => {
-            tracing::error!("User erasure failed");
+        E::Internal(e) => {
+            tracing::error!(
+                user_id = %user_id,
+                error_kind = repository_error_kind(&e),
+                "User erasure failed"
+            );
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "internal_error",
@@ -5204,7 +5233,7 @@ pub async fn erase_user(
             req.requested_at,
         )
         .await
-        .map_err(erasure_error_to_response)?;
+        .map_err(|e| erasure_error_to_response(user_id, e))?;
 
     Ok(ResponseJson(EraseUserResponse {
         user_id: r.user_id.to_string(),
@@ -5241,7 +5270,7 @@ pub async fn preview_user_erasure(
         .user_erasure_service
         .preview(user_id)
         .await
-        .map_err(erasure_error_to_response)?;
+        .map_err(|e| erasure_error_to_response(user_id, e))?;
 
     Ok(ResponseJson(ErasurePreviewResponse {
         user_id: plan.user_id.to_string(),
@@ -5272,4 +5301,41 @@ pub async fn preview_user_erasure(
             erased_at: l.erased_at,
         }),
     }))
+}
+
+#[cfg(test)]
+mod repository_error_kind_tests {
+    use super::repository_error_kind;
+    use services::common::RepositoryError as R;
+
+    #[test]
+    fn maps_repository_errors_to_static_kinds() {
+        let cases: Vec<(anyhow::Error, &str)> = vec![
+            (R::NotFound("x".into()).into(), "not_found"),
+            (R::TransactionConflict.into(), "transaction_conflict"),
+            (R::QueryTimeout.into(), "query_timeout"),
+            (R::PoolError(anyhow::anyhow!("secret")).into(), "pool"),
+            (
+                R::DatabaseError(anyhow::anyhow!("secret")).into(),
+                "database",
+            ),
+            (
+                R::DataConversionError(anyhow::anyhow!("secret")).into(),
+                "data_conversion",
+            ),
+        ];
+        for (error, expected) in cases {
+            assert_eq!(repository_error_kind(&error), expected);
+        }
+    }
+
+    #[test]
+    fn sees_through_context_and_defaults_to_other() {
+        use anyhow::Context;
+        let wrapped = Err::<(), _>(R::TransactionConflict)
+            .context("while erasing")
+            .unwrap_err();
+        assert_eq!(repository_error_kind(&wrapped), "transaction_conflict");
+        assert_eq!(repository_error_kind(&anyhow::anyhow!("boom")), "other");
+    }
 }

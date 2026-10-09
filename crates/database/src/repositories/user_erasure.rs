@@ -370,15 +370,6 @@ impl UserErasureRepository for PostgresUserErasureRepository {
                 )
                 .await
                 .map_err(map_db_error)?;
-            transaction
-                .execute(
-                    "DELETE FROM feature_request_targets t \
-                     WHERE EXISTS (SELECT 1 FROM feature_request_votes v WHERE v.target_id = t.id AND v.user_id = $1) \
-                       AND NOT EXISTS (SELECT 1 FROM feature_request_votes v WHERE v.target_id = t.id AND v.user_id <> $1)",
-                    &[&user_id],
-                )
-                .await
-                .map_err(map_db_error)?;
             for sql in [
                 "DELETE FROM feature_request_votes WHERE user_id = $1",
                 "DELETE FROM mcp_connector_usage WHERE user_id = $1",

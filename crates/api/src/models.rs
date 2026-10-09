@@ -3069,7 +3069,8 @@ pub struct ErasureBlockedResponse {
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct EraseUserRequest {
-    /// The user's current email, typed by the operator as a guard against erasing the wrong id.
+    /// Must match the user's current email, ignoring case and surrounding whitespace.
+    /// Typed by the operator as a guard against erasing the wrong id.
     pub confirm_email: String,
     /// When the person asked (starts the GDPR response clock). Defaults to now.
     pub requested_at: Option<DateTime<Utc>>,

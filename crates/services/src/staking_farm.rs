@@ -143,7 +143,7 @@ pub trait StakingFarmRepository: Send + Sync {
         organization_id: Uuid,
         credit_nano_usd: i64,
         changed_by_user_id: Option<Uuid>,
-    ) -> anyhow::Result<()>;
+    ) -> anyhow::Result<bool>;
 }
 
 #[async_trait]
@@ -379,9 +379,20 @@ impl StakingFarmService {
         let next_credit = computed_credit.max(source.last_synced_credit_nano_usd.unwrap_or(0));
 
         if Some(next_credit) != source.last_synced_credit_nano_usd {
-            self.repository
+            let applied = self
+                .repository
                 .update_staking_farm_limit(source.organization_id, next_credit, changed_by_user_id)
                 .await?;
+            if !applied {
+                // The source was disconnected (or its org deactivated) while the
+                // AML and contract calls were in flight. Write nothing further and
+                // hand back the stored row unchanged.
+                return self
+                    .repository
+                    .get_source_by_organization(source.organization_id)
+                    .await?
+                    .ok_or_else(|| anyhow::anyhow!("staking farm source no longer exists"));
+            }
         }
 
         self.repository
@@ -567,13 +578,28 @@ mod tests {
     use super::*;
     use std::sync::Mutex;
 
-    #[derive(Default)]
     struct MockStakingFarmRepository {
         source: Mutex<Option<OrganizationStakingFarmSource>>,
         upserts: Mutex<Vec<UpsertStakingFarmSourceRequest>>,
         sync_updates: Mutex<Vec<StakingFarmSourceSyncUpdate>>,
         limit_updates: Mutex<Vec<(Uuid, i64, Option<Uuid>)>>,
         source_reads: std::sync::atomic::AtomicUsize,
+        /// What `update_staking_farm_limit` reports; false simulates a source
+        /// disconnected by erasure while the sync was in flight.
+        limit_write_applies: bool,
+    }
+
+    impl Default for MockStakingFarmRepository {
+        fn default() -> Self {
+            Self {
+                source: Mutex::new(None),
+                upserts: Mutex::new(vec![]),
+                sync_updates: Mutex::new(vec![]),
+                limit_updates: Mutex::new(vec![]),
+                source_reads: std::sync::atomic::AtomicUsize::new(0),
+                limit_write_applies: true,
+            }
+        }
     }
 
     #[async_trait]
@@ -651,13 +677,13 @@ mod tests {
             organization_id: Uuid,
             credit_nano_usd: i64,
             changed_by_user_id: Option<Uuid>,
-        ) -> anyhow::Result<()> {
+        ) -> anyhow::Result<bool> {
             self.limit_updates.lock().unwrap().push((
                 organization_id,
                 credit_nano_usd,
                 changed_by_user_id,
             ));
-            Ok(())
+            Ok(self.limit_write_applies)
         }
     }
 
@@ -873,6 +899,33 @@ mod tests {
         assert_eq!(synced.last_synced_credit_nano_usd, Some(2_000_000_000));
         let limit_updates = repo.limit_updates.lock().unwrap();
         assert!(limit_updates.is_empty());
+    }
+
+    #[tokio::test]
+    async fn sync_skips_sync_state_when_limit_write_is_refused() {
+        let organization_id = Uuid::new_v4();
+        let mut source = source_fixture(organization_id);
+        source.last_synced_credit_nano_usd = Some(0);
+        let repo = Arc::new(MockStakingFarmRepository {
+            limit_write_applies: false,
+            ..Default::default()
+        });
+        *repo.source.lock().unwrap() = Some(source.clone());
+        let client = Arc::new(MockStakingFarmContractClient::returning(farm_account(
+            "1000000000000000000000000",
+        )));
+        let service = StakingFarmService::new(repo.clone(), client, None, enabled_config());
+
+        let returned = service
+            .sync_for_source(source.clone(), Some(Uuid::new_v4()))
+            .await
+            .unwrap();
+
+        assert_eq!(repo.limit_updates.lock().unwrap().len(), 1);
+        assert!(repo.sync_updates.lock().unwrap().is_empty());
+        assert_eq!(returned.id, source.id);
+        assert_eq!(returned.sync_status, source.sync_status);
+        assert_eq!(returned.last_synced_credit_nano_usd, Some(0));
     }
 
     #[tokio::test]

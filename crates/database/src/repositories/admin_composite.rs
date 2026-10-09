@@ -1034,7 +1034,9 @@ impl AdminRepository for AdminCompositeRepository {
                     $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13,
                     $14, $15
                 WHERE EXISTS (
-                    SELECT 1 FROM users WHERE id = $6 AND is_active = true
+                    -- FOR SHARE blocks behind erasure's FOR UPDATE on the user
+                    -- row (same pattern as the refresh_tokens insert in session.rs).
+                    SELECT 1 FROM users WHERE id = $6 AND is_active = true FOR SHARE
                 )
                 ON CONFLICT (
                     model_id, successor_model_name, deprecation_date,
@@ -1494,7 +1496,9 @@ impl AdminRepository for AdminCompositeRepository {
                 ) SELECT
                     $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12
                 WHERE EXISTS (
-                    SELECT 1 FROM users WHERE id = $2 AND is_active = true
+                    -- FOR SHARE blocks behind erasure's FOR UPDATE on the user
+                    -- row (same pattern as the refresh_tokens insert in session.rs).
+                    SELECT 1 FROM users WHERE id = $2 AND is_active = true FOR SHARE
                 )
                 ON CONFLICT (batch_id, recipient_user_id, organization_id)
                 DO UPDATE SET

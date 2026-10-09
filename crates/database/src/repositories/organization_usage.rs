@@ -1,7 +1,4 @@
-use crate::models::{
-    OrganizationBalance, OrganizationUsageLog, RecordUsageRequest, ServedProviderTier,
-    ServedProviderType, StopReason,
-};
+use crate::models::{OrganizationBalance, OrganizationUsageLog, RecordUsageRequest, StopReason};
 use crate::pool::DbPool;
 use crate::repositories::credit_allocation::CreditAllocationPolicy;
 use crate::repositories::usage_hourly::with_usage_rows;
@@ -382,12 +379,14 @@ impl OrganizationUsageRepository {
             .collect()
     }
 
-    /// Aggregate usage by model for an organization since `start_date` (exact, via `usage_rows`).
+    /// Aggregate usage by model for an organization over `[start_date, end_date)`; an absent
+    /// `end_date` leaves the window open-ended (exact, via `usage_rows`).
     /// Runs under the reporting statement timeout, including the raw edge and recent rows.
     pub async fn get_usage_by_model_since(
         &self,
         organization_id: Uuid,
         start_date: chrono::DateTime<Utc>,
+        end_date: Option<chrono::DateTime<Utc>>,
     ) -> Result<Vec<UsageByModel>> {
         let deadline = crate::repositories::reporting_query::reporting_deadline(
             self.reporting_statement_timeout,
@@ -417,7 +416,7 @@ impl OrganizationUsageRepository {
                 .query(
                     &with_usage_rows(
                         "$2",
-                        "'infinity'::timestamptz",
+                        "COALESCE($3::timestamptz, 'infinity'::timestamptz)",
                         r#"
                     SELECT
                         model_name,
@@ -432,7 +431,7 @@ impl OrganizationUsageRepository {
                     ORDER BY total_cost DESC
                     "#,
                     ),
-                    &[&organization_id, &start_date],
+                    &[&organization_id, &start_date, &end_date],
                 )
                 .await
                 .map_err(map_db_error)?;
@@ -466,8 +465,10 @@ impl OrganizationUsageRepository {
         // Convert response_id from UUID to ResponseId
         let response_id_uuid: Option<Uuid> = row.get("response_id");
         let response_id = response_id_uuid.map(ResponseId::from);
-        let served_provider_tier = parse_served_provider_tier(row.get("served_provider_tier"))?;
-        let served_provider_type = parse_served_provider_type(row.get("served_provider_type"))?;
+        let served_provider_tier =
+            tolerant("served_provider_tier", row.get("served_provider_tier"));
+        let served_provider_type =
+            tolerant("served_provider_type", row.get("served_provider_type"));
 
         let credit_allocations = match allocations_override {
             Some(value) => Some(value),
@@ -669,18 +670,68 @@ pub struct UsageByModel {
     pub request_count: i64,
 }
 
-fn parse_served_provider_tier(value: Option<String>) -> Result<Option<ServedProviderTier>> {
-    value
-        .as_deref()
-        .map(str::parse)
-        .transpose()
-        .map_err(|message| anyhow::anyhow!("Invalid served_provider_tier in usage log: {message}"))
+/// Unknown stored values read as `None` so a binary never fails to read usage
+/// rows written by a newer binary that knows more provider types/tiers (spec
+/// section 3.7: tolerant readers before any writer). Each distinct unknown
+/// value warns at most once per process (values are enum-like system strings,
+/// never customer data), so a large listing cannot flood the logs.
+fn tolerant<T: std::str::FromStr>(column: &'static str, value: Option<String>) -> Option<T> {
+    use std::collections::HashSet;
+    use std::sync::{Mutex, OnceLock};
+    /// Bound on remembered distinct values, so a pathological column cannot grow it forever.
+    const MAX_REMEMBERED: usize = 64;
+    static WARNED: OnceLock<Mutex<HashSet<(&'static str, String)>>> = OnceLock::new();
+
+    let raw = value?;
+    match raw.parse() {
+        Ok(v) => Some(v),
+        Err(_) => {
+            let mut warned = WARNED
+                .get_or_init(Default::default)
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            if warned.len() < MAX_REMEMBERED && warned.insert((column, raw.clone())) {
+                tracing::warn!(
+                    column,
+                    value = %raw,
+                    "Unknown provider attribution value in usage log; treating as unattributed"
+                );
+            }
+            None
+        }
+    }
 }
 
-fn parse_served_provider_type(value: Option<String>) -> Result<Option<ServedProviderType>> {
-    value
-        .as_deref()
-        .map(str::parse)
-        .transpose()
-        .map_err(|message| anyhow::anyhow!("Invalid served_provider_type in usage log: {message}"))
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::models::{ServedProviderTier, ServedProviderType};
+
+    #[test]
+    fn unknown_served_provider_type_reads_as_none() {
+        assert!(tolerant::<ServedProviderType>(
+            "served_provider_type",
+            Some("some_future_provider".into())
+        )
+        .is_none());
+        // Repeated unknown values stay None (and warn only once).
+        assert!(tolerant::<ServedProviderType>(
+            "served_provider_type",
+            Some("some_future_provider".into())
+        )
+        .is_none());
+        assert_eq!(
+            tolerant::<ServedProviderType>("served_provider_type", Some("chutes".into())),
+            Some(ServedProviderType::Chutes)
+        );
+        assert!(tolerant::<ServedProviderType>("served_provider_type", None).is_none());
+        assert!(
+            tolerant::<ServedProviderTier>("served_provider_tier", Some("future_tier".into()))
+                .is_none()
+        );
+        assert_eq!(
+            tolerant::<ServedProviderTier>("served_provider_tier", Some("near".into())),
+            Some(ServedProviderTier::Near)
+        );
+    }
 }

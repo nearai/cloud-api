@@ -1,0 +1,153 @@
+name: Chutes Measurements Sync
+
+# Daily: probe every Chutes TEE instance through Chutes' public endpoints (no
+# Chutes API key), verify its quote (Intel signature chain, TCB, debug bit,
+# freshness via the instance's signed evidence, NVIDIA NRAS), and open or
+# update one PR that pins the measurement rows Chutes publishes AND a verified
+# live quote showed. Never merges. See crates/chutes_sync.
+
+on:
+  schedule:
+    - cron: "0 6 * * *"
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Write the run summary only; do not push or open a PR"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+  actions: read  # download earlier runs' audit artifacts
+
+concurrency:
+  group: chutes-measurements-sync
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  RUSTC_WRAPPER: sccache
+  RUSTFLAGS: "-C debuginfo=0 -C link-arg=-fuse-ld=mold"
+  PINS_FILE: crates/services/src/attestation/chutes_golden_measurements.json
+  BOT_BRANCH: bot/chutes-measurements
+
+jobs:
+  sync:
+    name: Sync Chutes measurements
+    runs-on: [self-hosted, infra]
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: main
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Setup Rust CI
+        uses: ./.github/actions/setup-rust-ci
+        with:
+          cache-key: chutes-sync
+
+      # Rows verified on earlier days come from this job's own audit artifacts
+      # (runs on main, last 7 successful), never from the bot branch, which
+      # anyone with write access can push to.
+      - name: Download recent verified observations
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          cp "$PINS_FILE" "$RUNNER_TEMP/base.json"
+          evidence="$RUNNER_TEMP/evidence"
+          mkdir -p "$evidence"
+          runs="$(gh run list --repo "$GITHUB_REPOSITORY" --workflow chutes-measurements-sync.yml \
+            --branch main --status success --limit 7 --json databaseId,headBranch \
+            --jq '.[] | select(.headBranch == "main") | .databaseId')"
+          for id in $runs; do
+            gh run download "$id" --repo "$GITHUB_REPOSITORY" --pattern 'chutes-measurements-*' \
+              --dir "$evidence/$id" || echo "::notice::no audit artifact for run $id"
+          done
+          echo "PINS_EVIDENCE_DIR=$evidence" >> "$GITHUB_ENV"
+
+      # Build in its own step so a failed build is not reported as a failed
+      # probe. Neither step sees any secret.
+      - name: Build the sync binary
+        run: cargo build --locked --release -p chutes_sync --bin chutes_measurement_sync
+
+      - name: Probe Chutes
+        env:
+          CHUTES_SYNC_MODELS: ${{ vars.CHUTES_SYNC_MODELS }}
+          PINS_BASE: ${{ runner.temp }}/base.json
+          PINS_OUT: ${{ env.PINS_FILE }}
+          REPORT_OUT: ${{ runner.temp }}/report.md
+          OBSERVATIONS_OUT: ${{ runner.temp }}/observations.json
+        run: ./target/release/chutes_measurement_sync
+
+      - name: Upload audit artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: chutes-measurements-${{ github.run_id }}
+          path: |
+            ${{ runner.temp }}/report.md
+            ${{ runner.temp }}/observations.json
+          if-no-files-found: ignore
+          retention-days: 90
+
+      - name: Run summary
+        if: always()
+        run: |
+          if [ -f "$RUNNER_TEMP/report.md" ]; then
+            cat "$RUNNER_TEMP/report.md" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      # Pushes must trigger the required "Test Suite" check, which GITHUB_TOKEN
+      # pushes do not. The repository's bot GitHub App mints a short-lived
+      # token narrowed to contents and pull requests; only the next step
+      # sees it.
+      - name: Mint bot token
+        if: ${{ inputs.dry_run != true }}
+        id: bot-token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1  # v3.2.0
+        with:
+          client-id: ${{ vars.CLOUD_API_BOT_APP_CLIENT_ID }}
+          private-key: ${{ secrets.CLOUD_API_BOT_APP_PRIVATE_KEY }}
+          permission-contents: write
+          permission-pull-requests: write
+
+      - name: Open, update or close the PR
+        if: ${{ inputs.dry_run != true }}
+        env:
+          GH_TOKEN: ${{ steps.bot-token.outputs.token }}
+          APP_SLUG: ${{ steps.bot-token.outputs.app-slug }}
+        run: |
+          set -euo pipefail
+          # --head cannot be owner-qualified, so a fork PR could reuse the
+          # branch name; only consider PRs whose head is in this repository.
+          existing="$(gh pr list --head "$BOT_BRANCH" --base main --state open \
+            --json number,isCrossRepository \
+            --jq '[.[] | select(.isCrossRepository == false)][0].number // empty')"
+          if git diff --quiet -- "$PINS_FILE"; then
+            if [ -n "$existing" ]; then
+              gh pr close "$existing" --delete-branch \
+                --comment "Closing: main already pins every row this PR proposed, or Chutes withdrew them from its published list."
+            fi
+            exit 0
+          fi
+          bot_user="${APP_SLUG:?app-slug output is empty; cannot set bot commit identity}[bot]"
+          bot_id="$(gh api "/users/${bot_user}" --jq .id)"
+          git config user.name "$bot_user"
+          git config user.email "${bot_id}+${bot_user}@users.noreply.github.com"
+          git checkout -B "$BOT_BRANCH"
+          git add "$PINS_FILE"
+          git commit -m "chore(chutes): pin live-observed measurement rows" \
+            -m "Rows published at https://api.chutes.ai/servers/tee/measurements and seen in a verified live quote. Generated by .github/workflows/chutes-measurements-sync.yml run ${GITHUB_RUN_ID}."
+          gh auth setup-git
+          git push --force origin "$BOT_BRANCH"
+          if [ -n "$existing" ]; then
+            gh pr edit "$existing" --body-file "$RUNNER_TEMP/report.md"
+          else
+            gh pr create --base main --head "$BOT_BRANCH" \
+              --title "chore(chutes): pin live-observed measurement rows" \
+              --body-file "$RUNNER_TEMP/report.md"
+          fi

@@ -1500,7 +1500,7 @@ impl InferenceProvider for Provider {
         Ok(ChatCompletionResponseWithBytes {
             response,
             raw_bytes,
-            serving_tier: crate::ProviderTier::Attested3p,
+            serving: crate::ServingProvider::of(self),
         })
     }
 

@@ -2,6 +2,8 @@
 mod chat_signature_lifecycle_tests;
 mod chat_signatures;
 pub mod chutes;
+pub mod chutes_observer;
+pub mod chutes_pins;
 mod environment;
 mod gateway_quote;
 mod gateway_signatures;

@@ -20,6 +20,7 @@ use std::time::Duration;
 
 use arc_swap::ArcSwap;
 use chrono::{DateTime, Utc};
+use inference_providers::{DisabledSources, ProviderSource};
 use placement::Tuning;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
@@ -31,9 +32,10 @@ pub use ports::{AdminSettingsRepository, StoredSetting};
 pub const RELOAD_INTERVAL: Duration = Duration::from_secs(10 * 60);
 
 /// Every key a setting can be stored under.
-pub const KNOWN_KEYS: &[&str] = &[KEY_PLACEMENT];
+pub const KNOWN_KEYS: &[&str] = &[KEY_PLACEMENT, KEY_ATTESTED_3P];
 
 pub const KEY_PLACEMENT: &str = "placement";
+pub const KEY_ATTESTED_3P: &str = "attested_3p";
 
 #[derive(Debug, thiserror::Error)]
 pub enum AdminSettingsError {
@@ -149,10 +151,91 @@ impl PlacementTuning {
     }
 }
 
+const ATTESTED_3P_FIELDS: &[&str] = &["disabled_sources"];
+
+/// The attested third-party kill switch: sources listed here are skipped by
+/// chat routing and attestation reports. Only attested third parties can be
+/// switched off.
+///
+/// Propagation: a PATCH applies immediately on the instance that handled it
+/// and within `RELOAD_INTERVAL` (10 min) on every other instance (there is no
+/// cross-instance push). For a faster stop on other instances, redeploy. Per-org
+/// `fallback_disabled` is NOT a substitute: it only excludes registered
+/// fallback providers for that organization, not standalone primaries or
+/// attestation reports.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct Attested3pSettings {
+    pub disabled_sources: DisabledSources,
+}
+
+#[derive(Default, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct Attested3pWire {
+    disabled_sources: Vec<String>,
+}
+
+impl Serialize for Attested3pSettings {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        Attested3pWire {
+            disabled_sources: self
+                .disabled_sources
+                .iter()
+                .map(|s| s.as_str().to_string())
+                .collect(),
+        }
+        .serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for Attested3pSettings {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let wire = Attested3pWire::deserialize(deserializer)?;
+        let mut disabled_sources = DisabledSources::default();
+        for name in &wire.disabled_sources {
+            match ProviderSource::parse(name) {
+                Some(s @ (ProviderSource::Chutes | ProviderSource::Tinfoil)) => {
+                    disabled_sources.insert(s)
+                }
+                _ => {
+                    return Err(serde::de::Error::custom(
+                        "disabled_sources accepts: chutes, tinfoil",
+                    ))
+                }
+            }
+        }
+        Ok(Self { disabled_sources })
+    }
+}
+
+impl Attested3pSettings {
+    /// Read a STORED row leniently: source names this binary does not know
+    /// (written by a newer binary) are ignored, never resetting the known ones
+    /// to empty, which would silently turn the kill switch off. Unknown names
+    /// are logged (names only). PATCH input goes through the strict
+    /// `Deserialize` instead.
+    fn from_stored(value: &Value) -> Self {
+        let mut disabled_sources = DisabledSources::default();
+        let names = value.get("disabled_sources").and_then(Value::as_array);
+        for name in names.into_iter().flatten().filter_map(Value::as_str) {
+            match ProviderSource::parse(name) {
+                Some(s @ (ProviderSource::Chutes | ProviderSource::Tinfoil)) => {
+                    disabled_sources.insert(s)
+                }
+                _ => tracing::warn!(
+                    source = %name,
+                    "Stored attested_3p setting names an unknown source; ignoring it"
+                ),
+            }
+        }
+        Self { disabled_sources }
+    }
+}
+
 /// The typed snapshot of every setting's effective value.
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct AdminSettings {
     pub placement: PlacementTuning,
+    pub attested_3p: Attested3pSettings,
 }
 
 /// One setting as an admin sees it: the effective value, and when and by
@@ -167,7 +250,15 @@ pub struct SettingView {
 
 /// Deserializes and validates a stored (sparse) value: stored fields over
 /// the defaults. The one place that knows each key's type.
-fn parse(key: &str, stored: Option<&Value>) -> Result<ParsedSetting, AdminSettingsError> {
+///
+/// `strict` is for input being validated (PATCH): unknown values are errors.
+/// Stored rows are read leniently so a row written by a newer binary cannot
+/// reset known values (see [`Attested3pSettings::from_stored`]).
+fn parse_with(
+    key: &str,
+    stored: Option<&Value>,
+    strict: bool,
+) -> Result<ParsedSetting, AdminSettingsError> {
     match key {
         KEY_PLACEMENT => {
             let typed: PlacementTuning = match stored {
@@ -178,18 +269,39 @@ fn parse(key: &str, stored: Option<&Value>) -> Result<ParsedSetting, AdminSettin
             typed.validate()?;
             Ok(ParsedSetting::Placement(typed))
         }
+        KEY_ATTESTED_3P => {
+            let typed: Attested3pSettings = match stored {
+                Some(v) if strict => serde_json::from_value(v.clone())
+                    .map_err(|e| AdminSettingsError::Invalid(e.to_string()))?,
+                Some(v) => Attested3pSettings::from_stored(v),
+                None => Attested3pSettings::default(),
+            };
+            Ok(ParsedSetting::Attested3p(typed))
+        }
         _ => Err(AdminSettingsError::UnknownKey),
     }
 }
 
+/// Strict parse (validating input).
+fn parse(key: &str, stored: Option<&Value>) -> Result<ParsedSetting, AdminSettingsError> {
+    parse_with(key, stored, true)
+}
+
+/// Lenient parse of a value read back from storage.
+fn parse_stored(key: &str, stored: Option<&Value>) -> Result<ParsedSetting, AdminSettingsError> {
+    parse_with(key, stored, false)
+}
+
 enum ParsedSetting {
     Placement(PlacementTuning),
+    Attested3p(Attested3pSettings),
 }
 
 impl ParsedSetting {
     fn effective_json(&self) -> Value {
         match self {
             ParsedSetting::Placement(p) => serde_json::to_value(p).unwrap_or(Value::Null),
+            ParsedSetting::Attested3p(a) => serde_json::to_value(a).unwrap_or(Value::Null),
         }
     }
 }
@@ -198,6 +310,7 @@ impl ParsedSetting {
 fn known_fields(key: &str) -> &'static [&'static str] {
     match key {
         KEY_PLACEMENT => PLACEMENT_FIELDS,
+        KEY_ATTESTED_3P => ATTESTED_3P_FIELDS,
         _ => &[],
     }
 }
@@ -249,7 +362,7 @@ fn view(
 ) -> Result<SettingView, AdminSettingsError> {
     Ok(SettingView {
         key,
-        value: parse(key, stored.map(|s| &s.value))?.effective_json(),
+        value: parse_stored(key, stored.map(|s| &s.value))?.effective_json(),
         updated_at: stored.map(|s| s.updated_at),
         updated_by_user_id: stored.and_then(|s| s.updated_by_user_id),
     })
@@ -260,8 +373,9 @@ fn view(
 fn snapshot(rows: &[StoredSetting]) -> AdminSettings {
     let mut s = AdminSettings::default();
     for row in rows {
-        match parse(&row.key, Some(&row.value)) {
+        match parse_stored(&row.key, Some(&row.value)) {
             Ok(ParsedSetting::Placement(p)) => s.placement = p,
+            Ok(ParsedSetting::Attested3p(a)) => s.attested_3p = a,
             Err(AdminSettingsError::UnknownKey) => {}
             Err(_) => tracing::warn!(
                 setting = %row.key,
@@ -277,6 +391,8 @@ pub struct AdminSettingsService {
     current: ArcSwap<AdminSettings>,
     /// The handle the placers read (`InferenceProviderPool::placement_tuning`).
     placement: Arc<ArcSwap<Tuning>>,
+    /// The handle the pool reads (`InferenceProviderPool::attested_3p_disabled`).
+    attested_3p: Arc<ArcSwap<DisabledSources>>,
     /// Held across every read-then-apply of the snapshot (`update` and
     /// `reload`), so an older read can never be applied after a newer one.
     refresh: tokio::sync::Mutex<()>,
@@ -286,11 +402,13 @@ impl AdminSettingsService {
     pub fn new(
         repository: Arc<dyn AdminSettingsRepository>,
         placement: Arc<ArcSwap<Tuning>>,
+        attested_3p: Arc<ArcSwap<DisabledSources>>,
     ) -> Self {
         Self {
             repository,
             current: ArcSwap::from_pointee(AdminSettings::default()),
             placement,
+            attested_3p,
             refresh: tokio::sync::Mutex::new(()),
         }
     }
@@ -302,6 +420,8 @@ impl AdminSettingsService {
 
     fn apply(&self, s: AdminSettings) {
         self.placement.store(Arc::new(s.placement.to_tuning()));
+        self.attested_3p
+            .store(Arc::new(s.attested_3p.disabled_sources));
         self.current.store(Arc::new(s));
     }
 
@@ -352,10 +472,15 @@ impl AdminSettingsService {
             .map_err(AdminSettingsError::Storage)?;
         // Applied from the value just saved, not a re-read: the write has
         // committed, so nothing after it may fail the request.
-        match parse(key, Some(&saved.value)) {
+        match parse_stored(key, Some(&saved.value)) {
             Ok(ParsedSetting::Placement(p)) => {
                 let mut s = **self.current.load();
                 s.placement = p;
+                self.apply(s);
+            }
+            Ok(ParsedSetting::Attested3p(a)) => {
+                let mut s = **self.current.load();
+                s.attested_3p = a;
                 self.apply(s);
             }
             Err(_) => {}
@@ -472,8 +597,101 @@ mod tests {
     fn service() -> (AdminSettingsService, Arc<FakeRepo>, Arc<ArcSwap<Tuning>>) {
         let repo = Arc::new(FakeRepo::default());
         let handle = Arc::new(ArcSwap::from_pointee(Tuning::default()));
-        let svc = AdminSettingsService::new(repo.clone(), handle.clone());
+        let svc = AdminSettingsService::new(
+            repo.clone(),
+            handle.clone(),
+            Arc::new(ArcSwap::from_pointee(DisabledSources::default())),
+        );
         (svc, repo, handle)
+    }
+
+    #[test]
+    fn attested_3p_parses_and_rejects_unknown_sources() {
+        let ok = parse(
+            KEY_ATTESTED_3P,
+            Some(&json!({"disabled_sources": ["tinfoil"]})),
+        )
+        .unwrap();
+        assert!(
+            matches!(ok, ParsedSetting::Attested3p(s) if s.disabled_sources.contains(ProviderSource::Tinfoil))
+        );
+        assert!(parse(
+            KEY_ATTESTED_3P,
+            Some(&json!({"disabled_sources": ["vllm"]}))
+        )
+        .is_err());
+        assert!(parse(KEY_ATTESTED_3P, Some(&json!({"other": 1}))).is_err());
+        assert_eq!(
+            parse(KEY_ATTESTED_3P, None).unwrap().effective_json(),
+            json!({"disabled_sources": []})
+        );
+    }
+
+    #[tokio::test]
+    async fn stored_row_with_unknown_source_keeps_known_ones_disabled() {
+        let repo = Arc::new(FakeRepo::default());
+        let handle = Arc::new(ArcSwap::from_pointee(DisabledSources::default()));
+        let svc = AdminSettingsService::new(
+            repo.clone(),
+            Arc::new(ArcSwap::from_pointee(Tuning::default())),
+            handle.clone(),
+        );
+        repo.put(
+            KEY_ATTESTED_3P,
+            json!({"disabled_sources": ["tinfoil", "future_x"], "future_field": 1}),
+        );
+        svc.reload().await;
+        assert!(handle.load().contains(ProviderSource::Tinfoil));
+        assert!(!handle.load().contains(ProviderSource::Chutes));
+        // PATCH input stays strict.
+        let err = svc
+            .update(
+                KEY_ATTESTED_3P,
+                json!({"disabled_sources": ["future_x"]}),
+                Uuid::new_v4(),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, AdminSettingsError::Invalid(_)));
+    }
+
+    #[tokio::test]
+    async fn attested_3p_update_and_reload_push_to_the_handle() {
+        let repo = Arc::new(FakeRepo::default());
+        let handle = Arc::new(ArcSwap::from_pointee(DisabledSources::default()));
+        let svc = AdminSettingsService::new(
+            repo.clone(),
+            Arc::new(ArcSwap::from_pointee(Tuning::default())),
+            handle.clone(),
+        );
+        let v = svc
+            .update(
+                KEY_ATTESTED_3P,
+                json!({"disabled_sources": ["chutes"]}),
+                Uuid::new_v4(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(v.value, json!({"disabled_sources": ["chutes"]}));
+        assert!(handle.load().contains(ProviderSource::Chutes));
+        assert!(!handle.load().contains(ProviderSource::Tinfoil));
+
+        repo.put(KEY_ATTESTED_3P, json!({"disabled_sources": ["tinfoil"]}));
+        svc.reload().await;
+        assert!(handle.load().contains(ProviderSource::Tinfoil));
+        assert!(!handle.load().contains(ProviderSource::Chutes));
+
+        let err = svc
+            .update(
+                KEY_ATTESTED_3P,
+                json!({"disabled_sources": ["external"]}),
+                Uuid::new_v4(),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, AdminSettingsError::Invalid(m) if m == "disabled_sources accepts: chutes, tinfoil")
+        );
     }
 
     async fn invalid(svc: &AdminSettingsService, patch: Value) {
@@ -727,6 +945,7 @@ mod tests {
             .unwrap();
         let all = svc.get_all().await.unwrap();
         assert_eq!(all.len(), KNOWN_KEYS.len());
+        assert!(all.iter().any(|v| v.key == KEY_ATTESTED_3P));
         assert_eq!(all[0].key, KEY_PLACEMENT);
         assert_eq!(all[0].value["affinity_eps"], json!(0.5));
         assert_eq!(all[0].value["kv_max"], json!(0.95));

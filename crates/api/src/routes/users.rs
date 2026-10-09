@@ -186,17 +186,30 @@ pub async fn get_current_user(
         workspaces,
     );
 
-    if user.0.auth_provider == "near" {
-        if let Some(binding) = app_state.staking_farm_service.binding() {
-            response.staking_organization_id = binding
-                .wallet_organization(&user.0.provider_user_id, user.0.id)
+    populate_staking_organization(&app_state, &user_data, &mut response).await;
+    Ok(Json(response))
+}
+
+async fn populate_staking_organization(
+    app: &AppState,
+    user: &services::auth::User,
+    response: &mut crate::models::UserResponse,
+) {
+    if user.auth_provider == "near" {
+        if let Some(binding) = app.staking_farm_service.binding() {
+            response.staking_organization_id = match binding
+                .wallet_organization(&user.provider_user_id, user.id.0)
                 .await
-                .ok()
-                .flatten()
-                .map(|id| id.to_string());
+            {
+                Ok(id) => id.map(|id| id.to_string()),
+                Err(_) => {
+                    // Repository errors can include customer identifiers; log the event, not raw SQL.
+                    error!(user_id = %user.id.0, error_category = "staking_binding_lookup_failed", "Failed to resolve staking wallet binding");
+                    None
+                }
+            };
         }
     }
-    Ok(Json(response))
 }
 
 /// Get current user's account eligibility status
@@ -292,7 +305,11 @@ pub async fn update_current_user_profile(
         .update_profile(user_id, request.display_name, request.avatar_url)
         .await
     {
-        Ok(updated_user) => Ok(Json(services_user_to_api_user(&updated_user))),
+        Ok(updated_user) => {
+            let mut response = services_user_to_api_user(&updated_user);
+            populate_staking_organization(&app_state, &updated_user, &mut response).await;
+            Ok(Json(response))
+        }
         Err(UserServiceError::UserNotFound) => Err((
             StatusCode::NOT_FOUND,
             Json(ErrorResponse::new(

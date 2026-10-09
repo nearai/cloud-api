@@ -289,36 +289,7 @@ impl AuthServiceTrait for AuthService {
             .map_err(|e| AuthError::InternalError(format!("Failed to check existing user: {e}")))?;
 
         if let Some(user) = existing_user {
-            self.user_repository
-                .update_last_login(user.id.clone())
-                .await
-                .map_err(|e| {
-                    AuthError::InternalError(format!("Failed to update last login: {e}"))
-                })?;
-
-            if user.email != oauth_info.email {
-                self.user_repository
-                    .update_email(user.id.clone(), oauth_info.email)
-                    .await
-                    .map_err(|e| {
-                        AuthError::InternalError(format!("Failed to update user email: {e}"))
-                    })?;
-            }
-
-            if user.display_name != oauth_info.display_name
-                || user.avatar_url != oauth_info.avatar_url
-            {
-                self.user_repository
-                    .update(
-                        user.id.clone(),
-                        oauth_info.display_name,
-                        oauth_info.avatar_url,
-                    )
-                    .await
-                    .map_err(|e| AuthError::InternalError(format!("Failed to update user: {e}")))?;
-            }
-
-            return Ok(user);
+            return self.sync_existing_oauth_user(user, &oauth_info).await;
         }
 
         // Create new user
@@ -342,11 +313,11 @@ impl AuthServiceTrait for AuthService {
                     .user_repository
                     .get_by_provider(&oauth_info.provider, &oauth_info.provider_user_id)
                     .await
-                    .map_err(|_| {
-                        AuthError::InternalError("Failed to resolve user identity".into())
+                    .map_err(|e| {
+                        AuthError::InternalError(format!("Failed to resolve user identity: {e}"))
                     })?
                 {
-                    return Ok(user);
+                    return self.sync_existing_oauth_user(user, &oauth_info).await;
                 }
                 return Err(AuthError::InternalError(format!(
                     "Failed to create user: {error}"
@@ -488,6 +459,40 @@ impl AuthServiceTrait for AuthService {
 }
 
 impl AuthService {
+    async fn sync_existing_oauth_user(
+        &self,
+        user: User,
+        oauth_info: &OAuthUserInfo,
+    ) -> Result<User, AuthError> {
+        self.user_repository
+            .update_last_login(user.id.clone())
+            .await
+            .map_err(|e| AuthError::InternalError(format!("Failed to update last login: {e}")))?;
+
+        if user.email != oauth_info.email {
+            self.user_repository
+                .update_email(user.id.clone(), oauth_info.email.clone())
+                .await
+                .map_err(|e| {
+                    AuthError::InternalError(format!("Failed to update user email: {e}"))
+                })?;
+        }
+
+        if user.display_name != oauth_info.display_name || user.avatar_url != oauth_info.avatar_url
+        {
+            self.user_repository
+                .update(
+                    user.id.clone(),
+                    oauth_info.display_name.clone(),
+                    oauth_info.avatar_url.clone(),
+                )
+                .await
+                .map_err(|e| AuthError::InternalError(format!("Failed to update user: {e}")))?;
+        }
+
+        Ok(user)
+    }
+
     pub fn new(
         user_repository: Arc<dyn UserRepository>,
         session_repository: Arc<dyn SessionRepository>,
@@ -671,6 +676,9 @@ mod tests {
         email_updated: Mutex<Option<String>>,
         last_login_updated: Mutex<bool>,
         profile_updated: Mutex<bool>,
+        provider_lookups: Mutex<usize>,
+        creation_race: bool,
+        fallback_lookup_fails: bool,
     }
 
     impl MockUserRepo {
@@ -680,7 +688,22 @@ mod tests {
                 email_updated: Mutex::new(None),
                 last_login_updated: Mutex::new(false),
                 profile_updated: Mutex::new(false),
+                provider_lookups: Mutex::new(0),
+                creation_race: false,
+                fallback_lookup_fails: false,
             }
+        }
+    }
+
+    impl MockUserRepo {
+        fn creation_failure(user: Option<User>) -> Self {
+            let mut repo = Self::with_user(
+                user.clone()
+                    .unwrap_or_else(|| make_user("unused@example.test", "near")),
+            );
+            repo.user = Mutex::new(user);
+            repo.creation_race = true;
+            repo
         }
     }
 
@@ -704,7 +727,7 @@ mod tests {
             _: String,
             _: String,
         ) -> anyhow::Result<User> {
-            unimplemented!()
+            Err(anyhow::anyhow!("test creation conflict"))
         }
         async fn get_by_id(&self, id: UserId) -> anyhow::Result<Option<User>> {
             let user = self.user.lock().unwrap();
@@ -718,6 +741,14 @@ mod tests {
             auth_provider: &str,
             _provider_user_id: &str,
         ) -> anyhow::Result<Option<User>> {
+            let mut calls = self.provider_lookups.lock().unwrap();
+            *calls += 1;
+            if self.creation_race && *calls == 1 {
+                return Ok(None);
+            }
+            if self.fallback_lookup_fails {
+                return Err(anyhow::anyhow!("test lookup unavailable"));
+            }
             let user = self.user.lock().unwrap();
             Ok(user
                 .as_ref()
@@ -1489,6 +1520,57 @@ mod tests {
             *repo.email_updated.lock().unwrap(),
             Some("new@example.com".to_string())
         );
+    }
+
+    fn race_oauth_info() -> OAuthUserInfo {
+        OAuthUserInfo {
+            provider: "near".into(),
+            provider_user_id: "alice.near".into(),
+            email: "alice.near@near".into(),
+            username: "alice.near".into(),
+            display_name: Some("Updated wallet profile".into()),
+            avatar_url: Some("https://example.test/avatar".into()),
+        }
+    }
+
+    #[tokio::test]
+    async fn creation_race_reuses_identity_and_syncs_last_login_and_profile() {
+        let existing = make_user("old@near", "near");
+        let repo = Arc::new(MockUserRepo::creation_failure(Some(existing.clone())));
+        let service = build_auth_service(repo.clone());
+        let result = service
+            .get_or_create_oauth_user(race_oauth_info())
+            .await
+            .unwrap();
+        assert_eq!(result.id, existing.id);
+        assert!(*repo.last_login_updated.lock().unwrap());
+        assert!(*repo.profile_updated.lock().unwrap());
+        assert_eq!(
+            *repo.email_updated.lock().unwrap(),
+            Some("alice.near@near".into())
+        );
+    }
+
+    #[tokio::test]
+    async fn creation_failure_without_matching_identity_preserves_original_error() {
+        let repo = Arc::new(MockUserRepo::creation_failure(None));
+        let error = build_auth_service(repo.clone())
+            .get_or_create_oauth_user(race_oauth_info())
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("test creation conflict"));
+        assert!(!*repo.last_login_updated.lock().unwrap());
+    }
+
+    #[tokio::test]
+    async fn creation_race_lookup_failure_preserves_lookup_cause() {
+        let mut repo = MockUserRepo::creation_failure(None);
+        repo.fallback_lookup_fails = true;
+        let error = build_auth_service(Arc::new(repo))
+            .get_or_create_oauth_user(race_oauth_info())
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("test lookup unavailable"));
     }
 
     const TEST_ENCODING_KEY: &str = "test_encoding_key";

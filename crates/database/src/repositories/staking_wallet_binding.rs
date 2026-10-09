@@ -64,12 +64,24 @@ impl BindingRepository for PostgresStakingBindingRepository {
         let mut client = self.pool.get().await?;
         let tx = client.transaction().await?;
         authorize(&tx, c.organization_id, c.actor_user_id, true).await?;
+        if tx
+            .query_opt(
+                "SELECT id FROM organization_staking_farm_sources WHERE organization_id=$1",
+                &[&c.organization_id],
+            )
+            .await?
+            .is_some()
+        {
+            return Err(BindingError::Conflict.into());
+        }
         // Durable per-actor rate limit across replicas, including different orgs.
         tx.query_one(
             "SELECT pg_advisory_xact_lock(hashtextextended($1, 88))",
             &[&c.actor_user_id.to_string()],
         )
         .await?;
+        // Retain consumed audit records; expired unused challenges are short-lived.
+        tx.execute("DELETE FROM staking_wallet_binding_challenges WHERE actor_user_id=$1 AND consumed_at IS NULL AND expires_at<now() AND created_at<now()-interval '1 day'", &[&c.actor_user_id]).await?;
         let count: i64 = tx.query_one("SELECT count(*) FROM staking_wallet_binding_challenges WHERE actor_user_id=$1 AND created_at > now()-interval '10 minutes'", &[&c.actor_user_id]).await?.get(0);
         if count >= 10 {
             return Err(BindingError::RateLimited.into());
@@ -142,16 +154,22 @@ impl BindingRepository for PostgresStakingBindingRepository {
             )],
         )
         .await?;
-        let existing_sources = tx.query("SELECT organization_id, near_account_id FROM organization_staking_farm_sources WHERE (near_account_id=$1 AND network_id=$2 AND contract_id=$3) OR (organization_id=$4 AND network_id=$2 AND contract_id=$3)",
+        let existing_sources = tx.query("SELECT organization_id, near_account_id, network_id, contract_id FROM organization_staking_farm_sources WHERE (near_account_id=$1 AND network_id=$2 AND contract_id=$3) OR organization_id=$4",
             &[&r.near_account_id,&r.network_id,&r.contract_id,&r.organization_id]).await?;
         if existing_sources.iter().any(|existing| {
             existing.get::<_, Uuid>(0) != r.organization_id
                 || existing.get::<_, String>(1) != r.near_account_id
+                || existing.get::<_, String>(2) != r.network_id
+                || existing.get::<_, String>(3) != r.contract_id
         }) {
             return Err(BindingError::Conflict.into());
         }
         let email = format!("{}@near", r.near_account_id);
-        let user = tx.query_one("INSERT INTO users(email,username,display_name,auth_provider,provider_user_id) VALUES($1,$2,$2,'near',$2) ON CONFLICT(auth_provider,provider_user_id) DO UPDATE SET provider_user_id=EXCLUDED.provider_user_id RETURNING id,is_active", &[&email,&r.near_account_id]).await?;
+        let user = tx.query_one("INSERT INTO users(email,username,display_name,auth_provider,provider_user_id) VALUES($1,$2,$2,'near',$2) ON CONFLICT(auth_provider,provider_user_id) DO UPDATE SET provider_user_id=EXCLUDED.provider_user_id RETURNING id,is_active", &[&email,&r.near_account_id]).await.map_err(|error| {
+            if error.code() == Some(&tokio_postgres::error::SqlState::UNIQUE_VIOLATION) {
+                anyhow::Error::from(BindingError::Conflict)
+            } else { error.into() }
+        })?;
         if !user.get::<_, bool>(1) {
             return Err(BindingError::AccountUnavailable.into());
         }
@@ -171,7 +189,9 @@ impl BindingRepository for PostgresStakingBindingRepository {
             status: "active".into(),
         };
         tx.execute("UPDATE staking_wallet_binding_challenges SET consumed_at=now(),idempotency_key=$2,proof_digest=$3,public_key=$4,wallet_user_id=$5,previous_role=$6,result=$7 WHERE id=$1",
-            &[&c.challenge_id,&key,&digest,&public_key,&wallet_user_id,&previous,&serde_json::to_value(&result)?]).await?;
+            &[&c.challenge_id,&key,&digest,&public_key,&wallet_user_id,&previous,&serde_json::to_value(&result)?]).await.map_err(|error| {
+                if error.code() == Some(&tokio_postgres::error::SqlState::UNIQUE_VIOLATION) { anyhow::Error::from(BindingError::InvalidChallenge) } else { error.into() }
+            })?;
         tx.commit().await?;
         Ok(result)
     }

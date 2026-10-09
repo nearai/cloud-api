@@ -252,7 +252,9 @@ pub async fn verify_wallet_control(
             network,
         )
         .await
-        .map_err(|_| {
+        .map_err(|error| {
+            // Preserve an observable error category without logging proof/RPC payloads.
+            tracing::warn!(error_category = ?std::mem::discriminant(&error), "NEP-413 verifier error");
             anyhow::anyhow!(NearAuthError::SignatureVerificationFailed(
                 "wallet verification unavailable".into()
             ))

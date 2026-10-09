@@ -510,7 +510,9 @@ impl StakingFarmConfig {
                 .and_then(|value| value.parse::<bool>().ok())
                 .unwrap_or(false),
             selected_org_binding_enabled: env::var("STAKING_FARM_SELECTED_ORG_BINDING_ENABLED")
-                .is_ok_and(|v| v == "true"),
+                .ok()
+                .and_then(|value| value.parse::<bool>().ok())
+                .unwrap_or(false),
             network_id: near.network_id.clone(),
             contract_id: env::var("NEAR_STAKING_CONTRACT_ID").unwrap_or_default(),
             farm_product_id: env::var("STAKING_FARM_PRODUCT_ID").unwrap_or_default(),
@@ -1850,6 +1852,7 @@ mod tests {
     fn clear_staking_farm_env() {
         for key in [
             "STAKING_FARM_ENABLED",
+            "STAKING_FARM_SELECTED_ORG_BINDING_ENABLED",
             "NEAR_STAKING_CONTRACT_ID",
             "STAKING_FARM_PRODUCT_ID",
             "STAKING_FARM_PRICE_ID",

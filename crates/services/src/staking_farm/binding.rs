@@ -238,7 +238,7 @@ impl StakingBindingService {
     ) -> anyhow::Result<WalletMembership> {
         self.enabled()?;
         let challenge = self.repository.get_challenge(id, org, actor).await?;
-        if terms != BINDING_TERMS_VERSION
+        if terms != challenge.binding_terms_version
             || message.account_id.as_str() != challenge.near_account_id
         {
             return Err(BindingError::InvalidProof.into());
@@ -389,10 +389,19 @@ mod tests {
     }
     #[tokio::test]
     async fn invalid_expired_wrong_actor_or_unacknowledged_proof_never_commits() {
-        for case in ["expired", "wrong_actor", "wrong_wallet", "missing_terms"] {
+        for case in [
+            "expired",
+            "wrong_actor",
+            "wrong_wallet",
+            "missing_terms",
+            "stored_terms_changed",
+        ] {
             let mut c = challenge();
             if case == "expired" {
                 c.expires_at = Utc::now() - Duration::seconds(1);
+            }
+            if case == "stored_terms_changed" {
+                c.binding_terms_version = "previous-version".into();
             }
             let repo = repository(&c);
             let verifier = MockBindingVerifier::new();
@@ -438,7 +447,11 @@ mod tests {
     #[tokio::test]
     async fn proof_and_source_wallet_aml_are_required_before_commit() {
         for blocked in [false, true] {
-            let c = challenge();
+            let mut c = challenge();
+            if !blocked {
+                c.binding_terms_version = "previous-version".into();
+                c.payload.message.push_str(" Terms: previous-version");
+            }
             let mut repo = repository(&c);
             repo.expect_begin_attempt()
                 .times(1)
@@ -477,7 +490,7 @@ mod tests {
                     c.actor_user_id,
                     c.challenge_id,
                     Uuid::new_v4(),
-                    BINDING_TERMS_VERSION,
+                    &c.binding_terms_version,
                     proof(&c.payload).await,
                 )
                 .await;

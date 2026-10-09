@@ -193,7 +193,7 @@ async fn revoked_actor_and_conflicting_wallet_leave_no_partial_binding_or_member
         .confirm(&c, request(&c), Uuid::new_v4(), "key", "digest")
         .await?;
     let d = challenge(org, actor, account());
-    repo.prepare(&d).await?;
+    assert!(repo.prepare(&d).await.is_err());
     assert!(repo
         .confirm(&d, request(&d), Uuid::new_v4(), "key", "digest2")
         .await
@@ -302,5 +302,130 @@ async fn concurrent_confirmations_choose_one_wallet_and_postpay_blocks_binding(
         .confirm(&c, request(&c), Uuid::new_v4(), "key", "digest")
         .await
         .is_err());
+    Ok(())
+}
+
+#[tokio::test]
+async fn configuration_changes_cannot_create_a_second_organization_source() -> anyhow::Result<()> {
+    let (pool, org, actor) = fixture().await?;
+    let repo = PostgresStakingBindingRepository::new(pool.clone());
+    let a = challenge(org, actor, account());
+    let mut b = challenge(org, actor, account());
+    b.network_id = "mainnet".into();
+    b.contract_id = "new-staking.near".into();
+    repo.prepare(&a).await?;
+    repo.prepare(&b).await?;
+    repo.confirm(&a, request(&a), Uuid::new_v4(), "key", "a")
+        .await?;
+    let error = repo
+        .confirm(&b, request(&b), Uuid::new_v4(), "key", "b")
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        error.downcast_ref::<BindingError>(),
+        Some(BindingError::Conflict)
+    ));
+    assert!(repo.prepare(&b).await.is_err());
+    let client = pool.get().await?;
+    let row = client.query_one("SELECT count(*), min(near_account_id) FROM organization_staking_farm_sources WHERE organization_id=$1", &[&org]).await?;
+    assert_eq!(row.get::<_, i64>(0), 1);
+    assert_eq!(row.get::<_, String>(1), a.near_account_id);
+    assert_eq!(
+        client
+            .query_one(
+                "SELECT count(*) FROM users WHERE auth_provider='near' AND provider_user_id=$1",
+                &[&b.near_account_id]
+            )
+            .await?
+            .get::<_, i64>(0),
+        0
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn synthetic_email_collision_returns_typed_conflict_and_rolls_back() -> anyhow::Result<()> {
+    let (pool, org, actor) = fixture().await?;
+    let repo = PostgresStakingBindingRepository::new(pool.clone());
+    let c = challenge(org, actor, account());
+    let client = pool.get().await?;
+    let existing = Uuid::new_v4();
+    client.execute("INSERT INTO users(id,email,username,auth_provider,provider_user_id) VALUES($1,$2,'other-provider','google',$3)", &[&existing, &format!("{}@near", c.near_account_id), &existing.to_string()]).await?;
+    repo.prepare(&c).await?;
+    let error = repo
+        .confirm(&c, request(&c), Uuid::new_v4(), "key", "digest")
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        error.downcast_ref::<BindingError>(),
+        Some(BindingError::Conflict)
+    ));
+    assert_eq!(
+        client
+            .query_one(
+                "SELECT count(*) FROM organization_staking_farm_sources WHERE organization_id=$1",
+                &[&org]
+            )
+            .await?
+            .get::<_, i64>(0),
+        0
+    );
+    assert_eq!(
+        client
+            .query_one(
+                "SELECT count(*) FROM users WHERE auth_provider='near' AND provider_user_id=$1",
+                &[&c.near_account_id]
+            )
+            .await?
+            .get::<_, i64>(0),
+        0
+    );
+    assert_eq!(
+        client
+            .query_one(
+                "SELECT count(*) FROM organization_members WHERE organization_id=$1",
+                &[&org]
+            )
+            .await?
+            .get::<_, i64>(0),
+        1
+    );
+    assert!(client
+        .query_one(
+            "SELECT consumed_at FROM staking_wallet_binding_challenges WHERE id=$1",
+            &[&c.challenge_id]
+        )
+        .await?
+        .get::<_, Option<chrono::DateTime<chrono::Utc>>>(0)
+        .is_none());
+    Ok(())
+}
+
+#[tokio::test]
+async fn challenge_cleanup_preserves_consumed_audit_and_recent_rate_limit_history(
+) -> anyhow::Result<()> {
+    let (pool, org, actor) = fixture().await?;
+    let repo = PostgresStakingBindingRepository::new(pool.clone());
+    let old = challenge(org, actor, account());
+    let consumed = challenge(org, actor, account());
+    let recent = challenge(org, actor, account());
+    for c in [&old, &consumed, &recent] {
+        repo.prepare(c).await?;
+    }
+    let client = pool.get().await?;
+    client.execute("UPDATE staking_wallet_binding_challenges SET created_at=now()-interval '2 days', expires_at=now()-interval '1 day' WHERE id IN ($1,$2)", &[&old.challenge_id, &consumed.challenge_id]).await?;
+    client.execute("UPDATE staking_wallet_binding_challenges SET consumed_at=now()-interval '1 day' WHERE id=$1", &[&consumed.challenge_id]).await?;
+    client.execute("UPDATE staking_wallet_binding_challenges SET expires_at=now()-interval '1 minute' WHERE id=$1", &[&recent.challenge_id]).await?;
+    repo.prepare(&challenge(org, actor, account())).await?;
+    let rows = client
+        .query(
+            "SELECT id FROM staking_wallet_binding_challenges WHERE actor_user_id=$1",
+            &[&actor],
+        )
+        .await?;
+    let ids: Vec<Uuid> = rows.iter().map(|row| row.get(0)).collect();
+    assert!(!ids.contains(&old.challenge_id));
+    assert!(ids.contains(&consumed.challenge_id));
+    assert!(ids.contains(&recent.challenge_id));
     Ok(())
 }

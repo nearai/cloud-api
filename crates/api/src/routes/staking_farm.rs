@@ -3,7 +3,7 @@ use crate::models::ErrorResponse;
 use crate::routes::admin::AdminAppState;
 use crate::routes::api::AppState;
 use axum::{
-    extract::{Path, State},
+    extract::{Path, Query, State},
     http::StatusCode,
     response::Json as ResponseJson,
     Extension,
@@ -97,14 +97,15 @@ pub async fn get_staking_farm_config(
     path = "/v1/organizations/{org_id}/staking/farm",
     tag = "Staking Farm",
     params(
-        ("org_id" = String, Path, description = "Organization ID")
+        ("org_id" = String, Path, description = "Organization ID"),
+        ("include_binding_state" = Option<bool>, Query, description = "Opt into binding state while the rollout flag is disabled")
     ),
     responses(
         (status = 200, description = "Organization staking farm state", body = OrganizationStakingState),
+        (status = 404, description = "Unbound source for legacy clients with explicit binding disabled", body = ErrorResponse),
         (status = 400, description = "Invalid organization ID", body = ErrorResponse),
         (status = 401, description = "Unauthorized", body = ErrorResponse),
         (status = 403, description = "Forbidden", body = ErrorResponse),
-        (status = 404, description = "No staking farm source found", body = ErrorResponse),
         (status = 500, description = "Internal server error", body = ErrorResponse)
     ),
     security(
@@ -115,6 +116,7 @@ pub async fn get_organization_staking_farm(
     State(app_state): State<AppState>,
     Extension(user): Extension<AuthenticatedUser>,
     Path(org_id): Path<String>,
+    Query(options): Query<std::collections::HashMap<String, String>>,
 ) -> RouteResult<OrganizationStakingState> {
     let org = parse_uuid(&org_id, "Invalid organization ID")?;
     let role = require_org_role(&app_state, &user, org, false).await?;
@@ -123,10 +125,21 @@ pub async fn get_organization_staking_farm(
         .get_source(org)
         .await
         .map_err(internal_error)?;
-    let manage = matches!(
-        role,
-        services::organization::MemberRole::Owner | services::organization::MemberRole::Admin
-    );
+    // Preserve legacy 404 semantics during staged deployment. New consumers
+    // explicitly request the capability envelope even with the rollout flag off.
+    if source.is_none()
+        && !app_state.config.staking_farm.selected_org_binding_enabled
+        && options.get("include_binding_state").map(String::as_str) != Some("true")
+    {
+        return Err((
+            StatusCode::NOT_FOUND,
+            ResponseJson(ErrorResponse::new(
+                "No staking farm source found".into(),
+                "not_found".into(),
+            )),
+        ));
+    }
+    let manage = role.can_manage_organization();
     let legacy = !app_state.config.staking_farm.selected_org_binding_enabled
         && require_near_default_org(&app_state, &user, org)
             .await
@@ -229,14 +242,14 @@ pub async fn sync_organization_staking_farm(
     path = "/v1/admin/organizations/{org_id}/staking/farm",
     tag = "Admin",
     params(
-        ("org_id" = String, Path, description = "Organization ID")
+        ("org_id" = String, Path, description = "Organization ID"),
+        ("include_binding_state" = Option<bool>, Query, description = "Opt into binding state while the rollout flag is disabled")
     ),
     responses(
         (status = 200, description = "Organization staking farm state", body = StakingFarmStateResponse),
         (status = 400, description = "Invalid organization ID", body = ErrorResponse),
         (status = 401, description = "Unauthorized", body = ErrorResponse),
         (status = 403, description = "Forbidden", body = ErrorResponse),
-        (status = 404, description = "No staking farm source found", body = ErrorResponse),
         (status = 500, description = "Internal server error", body = ErrorResponse)
     ),
     security(
@@ -275,7 +288,6 @@ pub async fn get_admin_organization_staking_farm(
         (status = 400, description = "Invalid organization ID", body = ErrorResponse),
         (status = 401, description = "Unauthorized", body = ErrorResponse),
         (status = 403, description = "Forbidden", body = ErrorResponse),
-        (status = 404, description = "No staking farm source found", body = ErrorResponse),
         (status = 500, description = "Internal server error", body = ErrorResponse)
     ),
     security(
@@ -613,10 +625,12 @@ fn binding_error(error: anyhow::Error) -> (StatusCode, ResponseJson<ErrorRespons
         Some(BindingError::AccountUnavailable) => (StatusCode::FORBIDDEN, "account_error"),
         Some(_) => (StatusCode::BAD_REQUEST, "invalid_binding_proof"),
         None => {
-            if matches!(
-                error.downcast_ref::<services::auth::near::NearAuthError>(),
-                Some(services::auth::near::NearAuthError::InvalidSignature)
-            ) {
+            if error.chain().any(|e| {
+                matches!(
+                    e.downcast_ref::<services::auth::near::NearAuthError>(),
+                    Some(services::auth::near::NearAuthError::InvalidSignature)
+                )
+            }) {
                 return (
                     StatusCode::BAD_REQUEST,
                     ResponseJson(ErrorResponse::new(
@@ -660,6 +674,14 @@ fn binding_error(error: anyhow::Error) -> (StatusCode, ResponseJson<ErrorRespons
 #[cfg(test)]
 mod binding_request_tests {
     use super::*;
+    #[test]
+    fn nested_invalid_signature_remains_a_client_error() {
+        let error = anyhow::Error::from(services::auth::near::NearAuthError::InvalidSignature)
+            .context("proof verification");
+        let (status, body) = binding_error(error);
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body.0.error.r#type, "invalid_binding_proof");
+    }
     #[test]
     fn binding_requires_explicit_phase_and_rejects_confirm_overrides() {
         assert!(serde_json::from_value::<BindRequest>(

@@ -1,6 +1,8 @@
 -- Refuse ambiguous legacy data instead of silently replacing accounting sources.
 CREATE UNIQUE INDEX organization_staking_farm_sources_one_org_wallet
     ON organization_staking_farm_sources (organization_id, network_id, contract_id);
+CREATE UNIQUE INDEX organization_staking_farm_sources_one_per_org
+    ON organization_staking_farm_sources (organization_id);
 
 CREATE TABLE staking_wallet_binding_challenges (
     id UUID PRIMARY KEY,
@@ -20,3 +22,7 @@ CREATE TABLE staking_wallet_binding_challenges (
     UNIQUE (organization_id, actor_user_id, idempotency_key)
 );
 CREATE INDEX staking_wallet_binding_actor_created ON staking_wallet_binding_challenges(actor_user_id, created_at);
+
+CREATE INDEX staking_wallet_binding_org_wallet_consumed
+    ON staking_wallet_binding_challenges (organization_id, wallet_user_id)
+    WHERE consumed_at IS NOT NULL;

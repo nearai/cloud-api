@@ -5,7 +5,8 @@ use std::io::Read;
 
 use base64::Engine;
 use inference_providers::attested::tinfoil::verifier_port::{
-    AtcBundle, PinnedModel, ProxyModelEntry, TinfoilVerifier, TinfoilVerifyError, VerifiedRouter,
+    AtcBundle, PinnedModel, ProxyModelEntry, RouterTcb, TinfoilVerifier, TinfoilVerifyError,
+    VerifiedRouter,
 };
 use sha2::{Digest, Sha256};
 
@@ -35,6 +36,22 @@ pub fn spki_sha256_of_pem_cert(pem: &str) -> Result<[u8; 32], TinfoilVerifyError
     let (_, cert) = x509_parser::parse_x509_certificate(&p.contents)
         .map_err(|_| TinfoilVerifyError::Malformed { stage: "cert_x509" })?;
     Ok(Sha256::digest(cert.tbs_certificate.subject_pki.raw).into())
+}
+
+/// True when the certificate's SAN lists `name` as a dNSName (exact match).
+pub fn pem_cert_has_dns_name(pem: &str, name: &str) -> Result<bool, TinfoilVerifyError> {
+    use x509_parser::extensions::{GeneralName, ParsedExtension};
+    let (_, p) = x509_parser::pem::parse_x509_pem(pem.as_bytes())
+        .map_err(|_| TinfoilVerifyError::Malformed { stage: "cert_pem" })?;
+    let (_, cert) = x509_parser::parse_x509_certificate(&p.contents)
+        .map_err(|_| TinfoilVerifyError::Malformed { stage: "cert_x509" })?;
+    Ok(cert.extensions().iter().any(|ext| {
+        matches!(
+            ext.parsed_extension(),
+            ParsedExtension::SubjectAlternativeName(san)
+                if san.general_names.iter().any(|g| matches!(g, GeneralName::DNSName(d) if *d == name))
+        )
+    }))
 }
 
 fn map_snp(e: SnpError) -> TinfoilVerifyError {
@@ -118,6 +135,16 @@ impl TinfoilVerifier for TinfoilPolicyVerifier {
     fn verify_router(&self, bundle: &AtcBundle) -> Result<VerifiedRouter, TinfoilVerifyError> {
         let (report, spki_sha256) = observe_bound_router(bundle)?;
         let measurement_hex = hex::encode(report.measurement);
+        // The domain decides where requests go: it must be a bare tinfoil.sh
+        // host that the attested certificate itself names.
+        inference_providers::attested::tinfoil::verifier_port::validate_router_domain(
+            &bundle.domain,
+        )?;
+        if !pem_cert_has_dns_name(&bundle.enclave_cert, &bundle.domain)? {
+            return Err(TinfoilVerifyError::Malformed {
+                stage: "domain_not_in_san",
+            });
+        }
         let pin = self
             .pins
             .router
@@ -128,6 +155,12 @@ impl TinfoilVerifier for TinfoilPolicyVerifier {
             spki_sha256,
             measurement_hex,
             tag: pin.tag.clone(),
+            tcb: RouterTcb {
+                bootloader: report.reported_tcb.bootloader,
+                tee: report.reported_tcb.tee,
+                snp: report.reported_tcb.snp,
+                microcode: report.reported_tcb.microcode,
+            },
         })
     }
 
@@ -184,6 +217,55 @@ mod tests {
             "2ac79995464edfb139b34e4ee6269f38d0ab63da92b1a431170dec3bdd0c7c84"
         );
         assert_eq!(v.tag, "v0.0.0-test");
+    }
+
+    #[test]
+    fn router_tcb_comes_from_the_verified_report() {
+        let v = test_verifier().verify_router(&bundle()).unwrap();
+        let r = observe_router(&bundle()).unwrap();
+        assert_eq!(v.tcb.bootloader, r.reported_tcb.bootloader);
+        assert_eq!(v.tcb.tee, r.reported_tcb.tee);
+        assert_eq!(v.tcb.snp, r.reported_tcb.snp);
+        assert_eq!(v.tcb.microcode, r.reported_tcb.microcode);
+        assert!(r.reported_tcb.meets(&MIN_TCB));
+    }
+
+    #[test]
+    fn domain_must_be_named_by_the_cert_san() {
+        let mut b = bundle();
+        assert!(pem_cert_has_dns_name(&b.enclave_cert, &b.domain).unwrap());
+        // Syntactically valid, but not a name the attested certificate carries.
+        b.domain = "router-0.tinfoil.sh".into();
+        assert_eq!(
+            test_verifier().verify_router(&b).unwrap_err(),
+            TinfoilVerifyError::Malformed {
+                stage: "domain_not_in_san"
+            }
+        );
+    }
+
+    #[test]
+    fn invalid_domains_are_malformed() {
+        for bad in [
+            "https://inference.tinfoil.sh",
+            "inference.tinfoil.sh:443",
+            "inference.tinfoil.sh/x",
+            "u@inference.tinfoil.sh",
+            "inference.example.com",
+            "tinfoil.sh",
+            ".tinfoil.sh",
+            "Inference.tinfoil.sh",
+        ] {
+            let mut b = bundle();
+            b.domain = bad.into();
+            assert_eq!(
+                test_verifier().verify_router(&b).unwrap_err(),
+                TinfoilVerifyError::Malformed {
+                    stage: "router_domain"
+                },
+                "{bad}"
+            );
+        }
     }
 
     #[test]

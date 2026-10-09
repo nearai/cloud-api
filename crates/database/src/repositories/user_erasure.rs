@@ -11,6 +11,9 @@ use services::user_erasure::ports::*;
 use tokio_postgres::GenericClient;
 use uuid::Uuid;
 
+/// Upper bound on rows returned by an erasure lookup.
+const MAX_ERASURE_LOOKUP_RESULTS: i64 = 100;
+
 #[derive(Debug, Clone)]
 pub struct PostgresUserErasureRepository {
     pool: DbPool,
@@ -637,6 +640,8 @@ impl UserErasureRepository for PostgresUserErasureRepository {
         })?;
         Ok(footprint)
     }
+    /// Newest first, capped at [`MAX_ERASURE_LOOKUP_RESULTS`] rows: one email can be
+    /// re-registered and erased again, but never anywhere near this many times.
     async fn find_erasures(&self, by: ErasureLookup) -> Result<Vec<ErasureRecord>> {
         let records = retry_db!("find_user_erasures", {
             let client = self
@@ -659,7 +664,7 @@ impl UserErasureRepository for PostgresUserErasureRepository {
                     client
                         .query(
                             &format!(
-                                "{select} WHERE l.email_sha256 = $1 ORDER BY l.erased_at DESC, l.id DESC"
+                                "{select} WHERE l.email_sha256 = $1 ORDER BY l.erased_at DESC, l.id DESC LIMIT {MAX_ERASURE_LOOKUP_RESULTS}"
                             ),
                             &[&digest],
                         )
@@ -669,7 +674,7 @@ impl UserErasureRepository for PostgresUserErasureRepository {
                     client
                         .query(
                             &format!(
-                                "{select} WHERE l.user_id = $1 ORDER BY l.erased_at DESC, l.id DESC"
+                                "{select} WHERE l.user_id = $1 ORDER BY l.erased_at DESC, l.id DESC LIMIT {MAX_ERASURE_LOOKUP_RESULTS}"
                             ),
                             &[user_id],
                         )
@@ -685,6 +690,9 @@ impl UserErasureRepository for PostgresUserErasureRepository {
             }
             org_ids.sort();
             org_ids.dedup();
+            if rows.is_empty() {
+                return Ok(Vec::new());
+            }
 
             let org_rows = client
                 .query(

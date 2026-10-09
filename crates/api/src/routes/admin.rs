@@ -5178,6 +5178,11 @@ fn erasure_error_to_response(
             "validation_error",
             "Provide exactly one of email or user_id",
         ),
+        E::InvalidUserId => (
+            StatusCode::BAD_REQUEST,
+            "validation_error",
+            "user_id must be a valid UUID",
+        ),
         E::ConfirmEmailMismatch => (
             StatusCode::UNPROCESSABLE_ENTITY,
             "confirm_email_mismatch",
@@ -5317,8 +5322,8 @@ pub async fn preview_user_erasure(
     tag = "Admin",
     request_body = LookupUserErasuresRequest,
     responses(
-        (status = 200, description = "Matching erasure records, newest first", body = LookupUserErasuresResponse),
-        (status = 400, description = "Exactly one of email or user_id is required", body = ErrorResponse),
+        (status = 200, description = "Matching erasure records, newest first (at most 100)", body = LookupUserErasuresResponse),
+        (status = 400, description = "Exactly one of a non-blank email or a valid user_id UUID is required", body = ErrorResponse),
         (status = 401, description = "Unauthorized", body = ErrorResponse),
         (status = 403, description = "Admin API tokens cannot look up erasures", body = ErrorResponse),
         (status = 500, description = "Internal server error", body = ErrorResponse)
@@ -5335,7 +5340,7 @@ pub async fn lookup_user_erasures(
         Some(raw) => Some(raw.trim().parse::<uuid::Uuid>().map_err(|_| {
             erasure_error_to_response(
                 None,
-                services::user_erasure::UserErasureError::InvalidLookup,
+                services::user_erasure::UserErasureError::InvalidUserId,
             )
         })?),
     };

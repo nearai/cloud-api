@@ -106,7 +106,14 @@ async fn lookup_returns_every_erasure_of_a_reused_email() {
     assert_eq!(items.len(), 2, "{items:?}");
     assert_eq!(items[0]["user_id"], second.to_string(), "newest first");
     assert_eq!(items[1]["user_id"], first.to_string());
-    assert!(items[0]["erased_at"].as_str() >= items[1]["erased_at"].as_str());
+    let erased_at = |item: &serde_json::Value| {
+        item["erased_at"]
+            .as_str()
+            .expect("erased_at is a string")
+            .parse::<chrono::DateTime<chrono::Utc>>()
+            .expect("erased_at is RFC 3339")
+    };
+    assert!(erased_at(&items[0]) >= erased_at(&items[1]));
 }
 
 #[tokio::test]
@@ -144,6 +151,8 @@ async fn lookup_rejects_both_or_neither() {
         serde_json::json!({}),
         serde_json::json!({ "email": "a@test.com", "user_id": uuid::Uuid::new_v4().to_string() }),
         serde_json::json!({ "user_id": "not-a-uuid" }),
+        serde_json::json!({ "email": "   ", "user_id": uuid::Uuid::new_v4().to_string() }),
+        serde_json::json!({ "email": "   " }),
     ] {
         let r = lookup(&server, &get_session_id(), body.clone()).await;
         assert_eq!(r.status_code(), 400, "{body} {}", r.text());

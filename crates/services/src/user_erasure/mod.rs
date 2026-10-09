@@ -35,6 +35,8 @@ pub enum UserErasureError {
     ConfirmEmailMismatch,
     #[error("lookup needs exactly one of email or user_id")]
     InvalidLookup,
+    #[error("user_id is not a valid UUID")]
+    InvalidUserId,
     #[error("erasure failed")]
     Internal(#[source] anyhow::Error),
 }
@@ -64,16 +66,18 @@ impl UserErasureService {
     }
 
     /// Find erasure records by the erased person's email or by user id (exactly one).
-    /// The email is digested here; the repository never sees it. Newest first. A blank
-    /// email counts as absent.
+    /// The email is digested here; the repository never sees it. Newest first. Supplying
+    /// both fields is rejected even if the email is blank, and a blank email on its own
+    /// is rejected too.
     pub async fn lookup(
         &self,
         email: Option<&str>,
         user_id: Option<Uuid>,
     ) -> Result<Vec<ErasureRecord>, UserErasureError> {
-        let email = email.filter(|e| !e.trim().is_empty());
         let by = match (email, user_id) {
-            (Some(email), None) => ErasureLookup::EmailDigest(erased_email_digest(email)),
+            (Some(email), None) if !email.trim().is_empty() => {
+                ErasureLookup::EmailDigest(erased_email_digest(email))
+            }
             (None, Some(user_id)) => ErasureLookup::UserId(user_id),
             _ => return Err(UserErasureError::InvalidLookup),
         };
@@ -336,6 +340,7 @@ mod tests {
             (Some("a@b.c"), Some(Uuid::new_v4())),
             (None, None),
             (Some("   "), None),
+            (Some("   "), Some(Uuid::new_v4())),
         ] {
             let repo = FakeRepo::new(ExecuteOutcome::NotFound, ErasedFootprint::default());
             let err = UserErasureService::new(repo.clone())

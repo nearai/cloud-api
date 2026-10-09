@@ -13,10 +13,12 @@ on:
   pull_request:
 
 # A new push to a PR supersedes the previous run, so cancel it instead of letting
-# it hold self-hosted runners. Pushes to main/develop are never cancelled.
+# it hold self-hosted runners. Non-PR runs get a unique group (run_id): a shared
+# group would serialize main/develop pushes and GitHub would cancel the pending
+# run whenever a third arrives, leaving that commit untested.
 concurrency:
-  group: tests-${{ github.ref }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+  group: tests-${{ github.event_name == 'pull_request' && github.ref || github.run_id }}
+  cancel-in-progress: true
 
 env:
   CARGO_TERM_COLOR: always

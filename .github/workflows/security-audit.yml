@@ -8,9 +8,11 @@ on:
   schedule:
     - cron: '0 0 * * *'  # Run daily at midnight UTC
 
+# Cancel superseded PR runs only; main pushes and the daily cron each get a
+# unique group so they never queue behind or cancel one another.
 concurrency:
-  group: security-audit-${{ github.ref }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+  group: security-audit-${{ github.event_name == 'pull_request' && github.ref || github.run_id }}
+  cancel-in-progress: true
 
 permissions:
   issues: write

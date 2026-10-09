@@ -101,14 +101,29 @@ pub(super) fn map_event(
         // The shared parser only recognizes `data: ` (with the space), so a
         // chunk-less event may be a valid `data:{...}` frame. Only blank lines,
         // SSE comments and the exact `[DONE]` terminator pass through verbatim;
-        // any other `data:` frame is sanitized below, and anything else
-        // (`event:`, `id:`, bare text) is rejected, never forwarded.
+        // any other `data:` frame is sanitized below, the standard `event:` /
+        // `id:` / `retry:` fields are replaced by a fixed empty comment (their
+        // content is never forwarded), and anything else (bare text) is rejected.
+        //
+        // A lone CR is a line break to some SSE clients but not to our `\n`
+        // splitter, so `: x\rdata:{...}` would smuggle an unsanitized frame
+        // inside a "comment". Trimming already removed the line terminator, so
+        // any remaining CR means the line is not safe to treat as one line.
+        if line.contains('\r') {
+            return Err(invalid("event"));
+        }
         let is_control = line.is_empty()
             || line.starts_with(':')
             || line
                 .strip_prefix("data:")
                 .is_some_and(|d| d.trim() == "[DONE]");
         if is_control {
+            return Ok(ev);
+        }
+        // Field names are case-sensitive per the SSE spec.
+        let field = line.split_once(':').map_or(line, |(name, _)| name);
+        if matches!(field, "event" | "id" | "retry") {
+            ev.raw_bytes = bytes::Bytes::from_static(b":\n");
             return Ok(ev);
         }
         if !line.starts_with("data:") {

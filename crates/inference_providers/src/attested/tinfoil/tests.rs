@@ -1441,10 +1441,9 @@ async fn data_done_without_space_still_terminates() {
 #[tokio::test]
 async fn unknown_lines_are_never_forwarded() {
     for line in [
-        format!("event: {LEAKY}\n\n"),
-        format!("id: {LEAKY}\n\n"),
         format!("{LEAKY}\n\n"),
-        format!("retry: 5 {LEAKY}\n\n"),
+        format!("Event: {LEAKY}\n\n"),
+        format!("bare text {LEAKY}\n\n"),
     ] {
         let out = map_raw_sse(&line).await;
         assert!(out.iter().any(|r| r.is_err()), "not rejected: {line}");
@@ -1459,4 +1458,47 @@ async fn unknown_lines_are_never_forwarded() {
 async fn blank_and_comment_lines_still_pass_through() {
     let out = map_raw_sse(": keepalive\n\n").await;
     assert!(!out.is_empty() && out.iter().all(|r| r.is_ok()));
+}
+
+#[tokio::test]
+async fn comment_with_embedded_cr_is_rejected() {
+    for raw in [
+        format!(": x\rdata:{LEAKY}\n\n"),
+        ": x\r\rdata: y\n\n".to_string(),
+        format!("data: [DONE]\rdata:{LEAKY}\n\n"),
+    ] {
+        let out = map_raw_sse(&raw).await;
+        assert!(out.iter().any(|r| r.is_err()), "CR line not rejected");
+        for ev in out.iter().flatten() {
+            let b = String::from_utf8_lossy(&ev.raw_bytes);
+            assert!(!b.contains("SECRET") && !b.contains('\r'), "forwarded: {b}");
+        }
+    }
+}
+
+#[tokio::test]
+async fn comment_with_crlf_terminator_still_passes() {
+    let out = map_raw_sse(": keepalive\r\n\r\n").await;
+    assert!(!out.is_empty() && out.iter().all(|r| r.is_ok()));
+}
+
+#[tokio::test]
+async fn standard_fields_map_to_fixed_comment() {
+    for raw in [
+        "event: SECRETEVT\n\n",
+        "id: 1SECRETID\n\n",
+        "retry: 5000\n\n",
+        "event:SECRETEVT\n\n",
+        "event\n\n",
+    ] {
+        let out = map_raw_sse(raw).await;
+        assert!(out.iter().all(|r| r.is_ok()), "stream aborted for {raw:?}");
+        let first = out[0].as_ref().unwrap();
+        assert_eq!(&first.raw_bytes[..], b":\n", "{raw:?}");
+        assert!(first.chunk.is_none());
+        for ev in out.iter().flatten() {
+            let b = String::from_utf8_lossy(&ev.raw_bytes);
+            assert!(!b.contains("SECRET") && !b.contains("5000"), "leaked: {b}");
+        }
+    }
 }

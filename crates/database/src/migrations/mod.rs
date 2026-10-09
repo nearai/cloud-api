@@ -5,10 +5,13 @@ use tracing::info;
 
 /// Run database migrations
 pub async fn run(pool: &DbPool) -> Result<()> {
-    let mut client = pool
-        .get()
-        .await
-        .context("Failed to get database connection for migrations")?;
+    // Detach the migration connection so cancellation/errors close it rather
+    // than returning a session-level advisory lock to the reusable pool.
+    let mut client = deadpool_postgres::Client::take(
+        pool.get()
+            .await
+            .context("Failed to get database connection for migrations")?,
+    );
 
     // Load the migration SQL files from the migrations/sql folder
     // Priority: 1) DATABASE_MIGRATIONS_PATH env var, 2) relative path from current dir, 3) compile-time path
@@ -42,8 +45,15 @@ pub async fn run(pool: &DbPool) -> Result<()> {
     let migrations = load_sql_migrations(migrations_path)
         .with_context(|| format!("Failed to load migrations from {migrations_path:?}"))?;
 
+    // Serialize schema-history reads and writes across processes/replicas.
+    // An in-process OnceCell cannot protect concurrent startup callers.
+    const MIGRATION_LOCK_KEY: i64 = 0x6e65_6172_6d69_6772;
+    client
+        .query_one("SELECT pg_advisory_lock($1)", &[&MIGRATION_LOCK_KEY])
+        .await
+        .context("Failed to acquire migration bootstrap lock")?;
     let migration_report = refinery::Runner::new(&migrations)
-        .run_async(&mut **client)
+        .run_async(&mut *client)
         .await
         .context("Failed to run migrations")?;
 

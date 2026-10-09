@@ -1,4 +1,198 @@
 {
-  "router": [],
-  "models": {}
+  "router": [
+    {
+      "measurement": "b3be62c7199d8e4d24f130e5651bdc8a62a2532f72c7e87c986bec54bf5f90bab703ad4dbfc5e45bfd385f8972dfc66c",
+      "repo": "tinfoilsh/confidential-model-router",
+      "tag": "v0.0.155"
+    }
+  ],
+  "models": {
+    "deepseek-v4-1-flash": [
+      {
+        "registers": [
+          "d355ba669dc58b6439d90d895cf5f36994f6b4565fe92828b09c38dfe19035dce204bc7d9b1e384e127868e8467ae177",
+          "3246c8c822eade4b4ac78e5817776032a371d50475950395ff357076e9f991f62d7bf5b0ce973799f36b0ab97387e51d",
+          "53af717c3a6b67ef4d18da6907cbb4cf1709d499f771274ccab612acdfedf55c5cdafae758324d104e3e5d2b63f3b758"
+        ],
+        "repo": "tinfoilsh/confidential-deepseek-v4-1-flash",
+        "tag": "v0.0.3"
+      }
+    ],
+    "doc-upload": [
+      {
+        "registers": [
+          "2d0417d46044c94ed72cb74e9f9a6bf7afac3f94ea9e2f2457b7ffc03bd7365b089895a12bf992d007efee9defa90c85",
+          "a787299fe2e84295a406dde367abac5b40128c1e13aa81dfde4a5c2e39682e45cde7bb84cefc7f33f25ac645fc265030",
+          "8645c6410d812f81679c5970333bef4e35892350f7762177cca4f949596cd81321fb35038ce03e5f319a337c6b1d7efd"
+        ],
+        "repo": "tinfoilsh/confidential-doc-upload",
+        "tag": "v0.0.36"
+      }
+    ],
+    "gemma4-31b": [
+      {
+        "registers": [
+          "42fbc892c9ad2446f82571b5bf1b9de153af87c0c8a63dad1e6f20e9ece0c77ab8380d7e426cab5e32b9b6f73db2febf",
+          "a787299fe2e84295a406dde367abac5b40128c1e13aa81dfde4a5c2e39682e45cde7bb84cefc7f33f25ac645fc265030",
+          "233677c2518eadf59ff45e8c22ee776ff828d066675dc87d86043e2bc2c4352c4f915898044bf317993749045056f811"
+        ],
+        "repo": "tinfoilsh/confidential-gemma4-31b",
+        "tag": "v0.0.25"
+      }
+    ],
+    "glm-5-3": [
+      {
+        "registers": [
+          "29717ea101027e824b19fbf94da1b7a6404287016368de32c4aae13f5732566b8683f08211f1ade53ecc191e7909ad6c",
+          "a787299fe2e84295a406dde367abac5b40128c1e13aa81dfde4a5c2e39682e45cde7bb84cefc7f33f25ac645fc265030",
+          "024d442593b797df275b0a229df8f9cc3c3333345d59a0b95e7b0242a30a9d82b0a965ef4b0039ef0423e870c6828845"
+        ],
+        "repo": "tinfoilsh/confidential-glm5-3-nvfp4",
+        "tag": "v0.0.3"
+      }
+    ],
+    "glm-5-3-flash": [
+      {
+        "registers": [
+          "0e6d534734ac23151075b7d0863a0e940931fa73e883ad0db6ff4763576a45ac1d4f7919c4a57163d57e4bf9438cdb73",
+          "a787299fe2e84295a406dde367abac5b40128c1e13aa81dfde4a5c2e39682e45cde7bb84cefc7f33f25ac645fc265030",
+          "77b227020ef0c8339c74c3543be4aa016efd31a20ab29609b471a09299cd9991786196765c0335a14c67c43e1432b231"
+        ],
+        "repo": "tinfoilsh/confidential-glm5-3-flash",
+        "tag": "v0.0.8"
+      }
+    ],
+    "gpt-oss-120b": [
+      {
+        "registers": [
+          "fc301c823b6e8c4f942a91bd0aa8fca062b06169f37480629ebbbcd9189a8cc266908b762eff9a75629e244576729b62",
+          "a787299fe2e84295a406dde367abac5b40128c1e13aa81dfde4a5c2e39682e45cde7bb84cefc7f33f25ac645fc265030",
+          "2a3ef603ddb6020819386c1a2c518c23e6836f94b2902b15f65d8a18900c701640d6d7042d0991d29f0cec27e7267cf4"
+        ],
+        "repo": "tinfoilsh/confidential-gpt-oss-120b",
+        "tag": "v0.0.28"
+      }
+    ],
+    "gpt-oss-safeguard-120b": [
+      {
+        "registers": [
+          "dcb421fed4cec9bb5d1680deb6ce89909905f7327121cae87462550a224812e2a2af840ecf14c39297226d57e27f090c",
+          "a787299fe2e84295a406dde367abac5b40128c1e13aa81dfde4a5c2e39682e45cde7bb84cefc7f33f25ac645fc265030",
+          "0bd03dad9c937314de39e12e92e45fa278965a84d6378dc4121dfbefd235b238173f79137abf5038b58bd404de0c4144"
+        ],
+        "repo": "tinfoilsh/confidential-gpt-oss-safeguard-120b",
+        "tag": "v0.0.10"
+      }
+    ],
+    "kimi-k3": [
+      {
+        "registers": [
+          "350dee767e8de1dcf8c2cc9920b880ce4b55b02ca567a7534bc0622c519fa8c84845a9f7402b3738b75fa569cd4435d4",
+          "a787299fe2e84295a406dde367abac5b40128c1e13aa81dfde4a5c2e39682e45cde7bb84cefc7f33f25ac645fc265030",
+          "5400648724a55fd12e857f310cafa7e8f55ddd3b03c02f2db5e83f73852f7290a16aed500d97b116fd1a1ba4f0e40f72"
+        ],
+        "repo": "tinfoilsh/confidential-kimi-k3",
+        "tag": "v0.0.10"
+      }
+    ],
+    "llama3-3-70b": [
+      {
+        "registers": [
+          "b99fec0d07a1313e686406c945ab07cd900ee11cdeef59f77efcd572943376853f6dae2d26bff905ba28fc61000a14d3",
+          "a787299fe2e84295a406dde367abac5b40128c1e13aa81dfde4a5c2e39682e45cde7bb84cefc7f33f25ac645fc265030",
+          "d05901d119685ef5354210c57f4cdd4f756f57c10bc4c2b1f811d6662326a6b9eb326d71c05871c216b94a84827a5dd2"
+        ],
+        "repo": "tinfoilsh/confidential-llama3-3-70b",
+        "tag": "v0.0.26"
+      }
+    ],
+    "nomic-embed-text": [
+      {
+        "registers": [
+          "cd510739f28c9f450eeb40696998eab8029f687a09daa3764a18cb86e947a062a1fdcf5a1c1f6dfd0d03796d6a330b20",
+          "a787299fe2e84295a406dde367abac5b40128c1e13aa81dfde4a5c2e39682e45cde7bb84cefc7f33f25ac645fc265030",
+          "6007113f70c3d9ef0dd5d5e89b185316bcb4241a5c650af483dcde368dd777954897dd5d326293d7f378008370fb1b02"
+        ],
+        "repo": "tinfoilsh/confidential-nomic-embed-text",
+        "tag": "v0.0.29"
+      }
+    ],
+    "pii-filter": [
+      {
+        "registers": [
+          "3c4e2f83d30061f7cdd5a3509cbe81bb7fd1a75c7653dcb695aadf35f7ca5e6476d3a24d30b704cb448773be12d0481b",
+          "1d24ed393a65d7904860874e517c44242dd984ea9c8094ab346f70e996f79a87c3048cea0af5d7a2641d2a93f5b8f613",
+          "dc08fb06b60eefe8f430cb167ce2ee98da3e38b2cf432968836142786ee5163d3cd20b6b7c4751b9596011cc52a8dbf8"
+        ],
+        "repo": "tinfoilsh/confidential-pii-cpu",
+        "tag": "v0.3.1"
+      }
+    ],
+    "qwen3-tts": [
+      {
+        "registers": [
+          "a7dca91524f27e091156e393190228254f2e6a7ab4b20f36c11f2574263da7f25695fec398e74156950d27baad2c6116",
+          "a787299fe2e84295a406dde367abac5b40128c1e13aa81dfde4a5c2e39682e45cde7bb84cefc7f33f25ac645fc265030",
+          "2ecb988783dcee4f5edc8065871d3ce8e7d0d31316f5a258152dd60a860d51aa783b6123bd58cf886e1bcdc5b7e6b937"
+        ],
+        "repo": "tinfoilsh/confidential-realtime-models",
+        "tag": "v0.0.13"
+      }
+    ],
+    "voxtral-mini-4b-realtime": [
+      {
+        "registers": [
+          "a7dca91524f27e091156e393190228254f2e6a7ab4b20f36c11f2574263da7f25695fec398e74156950d27baad2c6116",
+          "a787299fe2e84295a406dde367abac5b40128c1e13aa81dfde4a5c2e39682e45cde7bb84cefc7f33f25ac645fc265030",
+          "2ecb988783dcee4f5edc8065871d3ce8e7d0d31316f5a258152dd60a860d51aa783b6123bd58cf886e1bcdc5b7e6b937"
+        ],
+        "repo": "tinfoilsh/confidential-realtime-models",
+        "tag": "v0.0.13"
+      }
+    ],
+    "voxtral-small-24b": [
+      {
+        "registers": [
+          "6a69ffe12a59ab03f53eeb4b5e236c03e28f338b98dc8d7112d688a22d24b25c4b735b1221dd4b2188dcc44407d0b1cb",
+          "a787299fe2e84295a406dde367abac5b40128c1e13aa81dfde4a5c2e39682e45cde7bb84cefc7f33f25ac645fc265030",
+          "df5f9857c8ce66a71cf272d96c70698f050c83f16ae9fe3134859a49564a8af57cd213d4e0826f3049dcc76bb7446051"
+        ],
+        "repo": "tinfoilsh/confidential-voxtral-small-24b",
+        "tag": "v0.0.13"
+      }
+    ],
+    "voxtral-tts": [
+      {
+        "registers": [
+          "a7dca91524f27e091156e393190228254f2e6a7ab4b20f36c11f2574263da7f25695fec398e74156950d27baad2c6116",
+          "a787299fe2e84295a406dde367abac5b40128c1e13aa81dfde4a5c2e39682e45cde7bb84cefc7f33f25ac645fc265030",
+          "2ecb988783dcee4f5edc8065871d3ce8e7d0d31316f5a258152dd60a860d51aa783b6123bd58cf886e1bcdc5b7e6b937"
+        ],
+        "repo": "tinfoilsh/confidential-realtime-models",
+        "tag": "v0.0.13"
+      }
+    ],
+    "websearch": [
+      {
+        "registers": [
+          "67221ad236d779a275bace2528d692030da2693b4396285758f37385e6f242aa40c218069edbfbcef51130326611aafb",
+          "a787299fe2e84295a406dde367abac5b40128c1e13aa81dfde4a5c2e39682e45cde7bb84cefc7f33f25ac645fc265030",
+          "16ce6c0a4b0df9859fad29f3bddf94d4562abb6469c6b6b2509a9eaab0579efc7cbb3c176f2fe6a642ca1b45f023ced2"
+        ],
+        "repo": "tinfoilsh/confidential-websearch",
+        "tag": "v0.5.13"
+      }
+    ],
+    "whisper-large-v3-turbo": [
+      {
+        "registers": [
+          "a7dca91524f27e091156e393190228254f2e6a7ab4b20f36c11f2574263da7f25695fec398e74156950d27baad2c6116",
+          "a787299fe2e84295a406dde367abac5b40128c1e13aa81dfde4a5c2e39682e45cde7bb84cefc7f33f25ac645fc265030",
+          "2ecb988783dcee4f5edc8065871d3ce8e7d0d31316f5a258152dd60a860d51aa783b6123bd58cf886e1bcdc5b7e6b937"
+        ],
+        "repo": "tinfoilsh/confidential-realtime-models",
+        "tag": "v0.0.13"
+      }
+    ]
+  }
 }

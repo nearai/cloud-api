@@ -102,12 +102,25 @@ jobs:
             cat "$RUNNER_TEMP/report.md" >> "$GITHUB_STEP_SUMMARY"
           fi
 
+      # Pushes must trigger the required "Test Suite" check, which GITHUB_TOKEN
+      # pushes do not. The repository's bot GitHub App mints a short-lived
+      # token narrowed to contents and pull requests; only the next step
+      # sees it.
+      - name: Mint bot token
+        if: ${{ inputs.dry_run != true }}
+        id: bot-token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1  # v3.2.0
+        with:
+          client-id: ${{ vars.CLOUD_API_BOT_APP_CLIENT_ID }}
+          private-key: ${{ secrets.CLOUD_API_BOT_APP_PRIVATE_KEY }}
+          permission-contents: write
+          permission-pull-requests: write
+
       - name: Open, update or close the PR
         if: ${{ inputs.dry_run != true }}
         env:
-          # Must be a token whose pushes trigger the required "Test Suite"
-          # check; GITHUB_TOKEN pushes do not. Only this step sees it.
-          GH_TOKEN: ${{ secrets.REPOSITORY_DISPATCH_TOKEN }}
+          GH_TOKEN: ${{ steps.bot-token.outputs.token }}
+          APP_SLUG: ${{ steps.bot-token.outputs.app-slug }}
         run: |
           set -euo pipefail
           # --head cannot be owner-qualified, so a fork PR could reuse the
@@ -122,8 +135,10 @@ jobs:
             fi
             exit 0
           fi
-          git config user.name "chutes-measurements-bot"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          bot_user="${APP_SLUG:?app-slug output is empty; cannot set bot commit identity}[bot]"
+          bot_id="$(gh api "/users/${bot_user}" --jq .id)"
+          git config user.name "$bot_user"
+          git config user.email "${bot_id}+${bot_user}@users.noreply.github.com"
           git checkout -B "$BOT_BRANCH"
           git add "$PINS_FILE"
           git commit -m "chore(chutes): pin live-observed measurement rows" \

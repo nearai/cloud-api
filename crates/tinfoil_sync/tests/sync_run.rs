@@ -124,3 +124,62 @@ async fn unchanged_pins_file_is_not_rewritten() {
     assert_eq!(std::fs::read_to_string(&pins_path).unwrap(), odd);
     std::fs::remove_dir_all(&dir).unwrap();
 }
+
+/// Seeds a pins file with a full set of rows in a non-canonical layout, then
+/// runs a sync against `cfg` that must fail.
+async fn failing_run_keeps_pins_and_writes_evidence(cfg: &ProbeConfig, tag: &str) {
+    let (_s, good) = server().await;
+    let dir = std::env::temp_dir().join(format!("tinfoil-sync-{tag}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let pins_path = dir.join("pins.json");
+    std::fs::write(&pins_path, TinfoilPins::default().to_canonical_json()).unwrap();
+    let args = Args {
+        pins: pins_path.clone(),
+        out_dir: dir.join("out"),
+        evidence_dir: None,
+    };
+    let client = reqwest::Client::new();
+    run_sync(&args, &client, &good).await.unwrap();
+    let full: TinfoilPins =
+        serde_json::from_str(&std::fs::read_to_string(&pins_path).unwrap()).unwrap();
+    let odd = serde_json::to_string(&full).unwrap();
+    std::fs::write(&pins_path, &odd).unwrap();
+    std::fs::remove_dir_all(dir.join("out")).unwrap();
+
+    let (code, msg) = run_sync(&args, &client, cfg).await.unwrap_err();
+    assert_eq!(code, 1, "{msg}");
+    assert_eq!(std::fs::read_to_string(&pins_path).unwrap(), odd);
+    assert!(dir.join("out/report.md").is_file());
+    assert!(dir.join("out/observations.json").is_file());
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[tokio::test]
+async fn unverified_router_fails_the_run_after_writing_evidence() {
+    let (s, mut cfg) = server().await;
+    let mut atc: serde_json::Value = serde_json::from_str(ATC).unwrap();
+    atc["enclaveAttestationReport"]["format"] =
+        serde_json::json!("https://tinfoil.sh/predicate/tdx-guest/v2");
+    Mock::given(method("GET"))
+        .and(path("/atc-unverified"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(atc.to_string()))
+        .mount(&s)
+        .await;
+    cfg.atc_url = format!("{}/atc-unverified", s.uri());
+    failing_run_keeps_pins_and_writes_evidence(&cfg, "router").await;
+}
+
+#[tokio::test]
+async fn unfetched_proxy_document_fails_the_run_after_writing_evidence() {
+    let (_s, mut cfg) = server().await;
+    cfg.proxy_fetcher = Some(Arc::new(|_t| Box::pin(async { Err("down".to_string()) })));
+    failing_run_keeps_pins_and_writes_evidence(&cfg, "proxy").await;
+}
+
+#[tokio::test]
+async fn malformed_proxy_document_fails_the_run() {
+    let (_s, mut cfg) = server().await;
+    cfg.proxy_fetcher = Some(Arc::new(|_t| Box::pin(async { Ok("{".to_string()) })));
+    failing_run_keeps_pins_and_writes_evidence(&cfg, "malformed").await;
+}

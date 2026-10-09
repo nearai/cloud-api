@@ -51,7 +51,8 @@ fn write(path: &Path, contents: &str) -> Result<(), Failure> {
 
 /// Runs one sync: probe, classify, rewrite the pins file (only if rows were
 /// added) and write `report.md` and `observations.json`. Returns a counts-only
-/// summary line.
+/// summary line, or exit code 1 (after writing both files, pins untouched)
+/// when the router did not verify or the proxy document was not obtained.
 pub async fn run_sync(
     args: &Args,
     client: &reqwest::Client,
@@ -84,7 +85,9 @@ pub async fn run_sync(
     let date = chrono::Utc::now().format("%Y-%m-%d").to_string();
     // Leave the file untouched when nothing was added, so an unchanged run
     // produces no diff (and so no PR).
-    if pins != base {
+    // An incomplete probe (router not verified, or no proxy document) leaves
+    // the pins file alone and fails the run once the evidence is written.
+    if out.complete && pins != base {
         write(&args.pins, &pins.to_canonical_json())?;
     }
     write(
@@ -95,14 +98,18 @@ pub async fn run_sync(
         &args.out_dir.join("observations.json"),
         &audit_json(&date, &out.observations, &out.sigstore, &verified, &notes),
     )?;
-    Ok(format!(
+    let summary = format!(
         "router_observed={} models_published={} releases_verified={} not_pinned={} rows_added={}",
         out.observations.router.is_some(),
         out.observations.models.len(),
         out.sigstore.models.len() + usize::from(out.sigstore.router.is_some()),
         notes.len(),
         added.len(),
-    ))
+    );
+    if !out.complete {
+        return Err((1, format!("incomplete probe: {summary}")));
+    }
+    Ok(summary)
 }
 
 #[cfg(test)]

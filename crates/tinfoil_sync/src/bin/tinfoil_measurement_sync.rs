@@ -7,7 +7,8 @@
 //! `<out-dir>/report.md` (the PR body) and `<out-dir>/observations.json` (the
 //! audit artifact). No Tinfoil key is used; the optional `GITHUB_TOKEN` only
 //! raises GitHub's rate limit for public attestation reads. Exit codes: 0 ok
-//! (changed or not), 1 probe failed, 2 bad input. Logs counts only.
+//! (changed or not), 1 probe failed or incomplete (router not verified or no
+//! proxy document; report and audit are still written, pins untouched), 2 bad input. Logs counts only.
 
 use std::process::ExitCode;
 

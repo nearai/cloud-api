@@ -1,5 +1,6 @@
 use crate::models::{UpdateModelPricingRequest, UpdateOrganizationLimitsDbRequest};
 use crate::pool::DbPool;
+use crate::repositories::lifecycle::{org_lifecycle_predicate, ORG_ALL_MEMBERS_ERASED_SQL};
 use crate::repositories::{
     ModelAliasRepository, ModelRepository, OrganizationLimitsRepository, ServiceRepository,
     UserRepository,
@@ -11,12 +12,13 @@ use services::admin::{
     AdminOrganizationMemberInfo, AdminRepository, DeprecateModelOutcome,
     ModelDeprecationDeliveryRecord, ModelDeprecationEmailStatus, ModelDeprecationModel,
     ModelDeprecationRecipient, ModelHistoryEntry, ModelPricing, ModelPricingSnapshot,
-    ModelValidationState, OrganizationLimits, OrganizationLimitsHistoryEntry,
-    OrganizationLimitsUpdate, PlatformServiceInfo, PricingChangeDeliveryRecord,
-    PricingChangeOpenConflictError, PricingChangeRecipientRow, ScheduledPricingChange,
-    ScheduledPricingChangeInsert, ScheduledPricingChangeStatus, UpdateModelAdminRequest, UserInfo,
-    UserOrganizationInfo,
+    ModelValidationState, OrganizationLifecycleFilter, OrganizationLimits,
+    OrganizationLimitsHistoryEntry, OrganizationLimitsUpdate, PlatformServiceInfo,
+    PricingChangeDeliveryRecord, PricingChangeOpenConflictError, PricingChangeRecipientRow,
+    ScheduledPricingChange, ScheduledPricingChangeInsert, ScheduledPricingChangeStatus,
+    UpdateModelAdminRequest, UserInfo, UserOrganizationInfo,
 };
+use services::lifecycle::OrganizationLifecycle;
 use services::service_usage::ports::ServiceUnit;
 use std::sync::Arc;
 use uuid::Uuid;
@@ -98,7 +100,7 @@ fn row_to_scheduled_pricing_change(
 /// Map a row from the admin organization SELECT (used by both the list and
 /// single-org queries) to `AdminOrganizationInfo`. The row must select
 /// `id, name, description, created_at, spend_limit, total_spent,
-/// total_requests, total_tokens`.
+/// total_requests, total_tokens, is_active, all_members_erased`.
 fn row_to_admin_org_info(row: &tokio_postgres::Row) -> AdminOrganizationInfo {
     AdminOrganizationInfo {
         id: row.get("id"),
@@ -109,6 +111,10 @@ fn row_to_admin_org_info(row: &tokio_postgres::Row) -> AdminOrganizationInfo {
         total_requests: row.get("total_requests"),
         total_tokens: row.get("total_tokens"),
         created_at: row.get("created_at"),
+        lifecycle: OrganizationLifecycle::from_columns(
+            row.get("is_active"),
+            row.get("all_members_erased"),
+        ),
     }
 }
 
@@ -1574,12 +1580,12 @@ impl AdminRepository for AdminCompositeRepository {
         &self,
         limit: i64,
         offset: i64,
+        lifecycle: OrganizationLifecycleFilter,
     ) -> Result<Vec<AdminOrganizationInfo>> {
         let client = self.pool.get().await?;
 
-        let rows = client
-            .query(
-                r#"
+        let sql = format!(
+            r#"
                 SELECT
                     o.id,
                     o.name,
@@ -1588,7 +1594,9 @@ impl AdminRepository for AdminCompositeRepository {
                     olh.spend_limit,
                     ob.total_spent,
                     ob.total_requests,
-                    ob.total_tokens
+                    ob.total_tokens,
+                    o.is_active,
+                    {all_erased} AS all_members_erased
                 FROM organizations o
                 LEFT JOIN LATERAL (
                     SELECT SUM(spend_limit)::BIGINT AS spend_limit
@@ -1597,13 +1605,14 @@ impl AdminRepository for AdminCompositeRepository {
                       AND effective_until IS NULL
                 ) olh ON true
                 LEFT JOIN organization_balance ob ON o.id = ob.organization_id
-                WHERE o.is_active = true
+                WHERE {predicate}
                 ORDER BY o.created_at DESC
                 LIMIT $1 OFFSET $2
                 "#,
-                &[&limit, &offset],
-            )
-            .await?;
+            all_erased = ORG_ALL_MEMBERS_ERASED_SQL,
+            predicate = org_lifecycle_predicate(lifecycle),
+        );
+        let rows = client.query(sql.as_str(), &[&limit, &offset]).await?;
 
         let organizations = rows.iter().map(row_to_admin_org_info).collect();
 
@@ -1616,9 +1625,8 @@ impl AdminRepository for AdminCompositeRepository {
     ) -> Result<Option<AdminOrganizationInfo>> {
         let client = self.pool.get().await?;
 
-        let row = client
-            .query_opt(
-                r#"
+        let sql = format!(
+            r#"
                 SELECT
                     o.id,
                     o.name,
@@ -1627,7 +1635,9 @@ impl AdminRepository for AdminCompositeRepository {
                     olh.spend_limit,
                     ob.total_spent,
                     ob.total_requests,
-                    ob.total_tokens
+                    ob.total_tokens,
+                    o.is_active,
+                    {all_erased} AS all_members_erased
                 FROM organizations o
                 LEFT JOIN LATERAL (
                     SELECT SUM(spend_limit)::BIGINT AS spend_limit
@@ -1639,26 +1649,21 @@ impl AdminRepository for AdminCompositeRepository {
                 WHERE o.id = $1
                   AND o.is_active = true
                 "#,
-                &[&organization_id],
-            )
-            .await?;
+            all_erased = ORG_ALL_MEMBERS_ERASED_SQL,
+        );
+        let row = client.query_opt(sql.as_str(), &[&organization_id]).await?;
 
         Ok(row.as_ref().map(row_to_admin_org_info))
     }
 
-    async fn count_all_organizations(&self) -> Result<i64> {
+    async fn count_all_organizations(&self, lifecycle: OrganizationLifecycleFilter) -> Result<i64> {
         let client = self.pool.get().await?;
 
-        let row = client
-            .query_one(
-                r#"
-                SELECT COUNT(*) as count
-                FROM organizations
-                WHERE is_active = true
-                "#,
-                &[],
-            )
-            .await?;
+        let sql = format!(
+            "SELECT COUNT(*) as count FROM organizations o WHERE {}",
+            org_lifecycle_predicate(lifecycle)
+        );
+        let row = client.query_one(sql.as_str(), &[]).await?;
 
         Ok(row.get::<_, i64>("count"))
     }

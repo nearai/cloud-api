@@ -2563,6 +2563,11 @@ pub async fn list_users(
                     created_at: u.created_at,
                     last_login_at: u.last_login_at,
                     is_active: u.is_active,
+                    lifecycle: crate::conversions::admin_user_lifecycle(
+                        u.id,
+                        u.is_active,
+                        &u.auth_provider,
+                    ),
                     auth_provider: u.auth_provider,
                     provider_user_id: u.provider_user_id,
                     organizations,
@@ -2610,6 +2615,11 @@ pub async fn list_users(
                 created_at: u.created_at,
                 last_login_at: u.last_login_at,
                 is_active: u.is_active,
+                lifecycle: crate::conversions::admin_user_lifecycle(
+                    u.id,
+                    u.is_active,
+                    &u.auth_provider,
+                ),
                 auth_provider: u.auth_provider,
                 provider_user_id: u.provider_user_id,
                 organizations: None,
@@ -2639,7 +2649,8 @@ pub async fn list_users(
     tag = "Admin",
     params(
         ("limit" = Option<i64>, Query, description = "Maximum number of organizations to return (default: 100)"),
-        ("offset" = Option<i64>, Query, description = "Number of organizations to skip (default: 0)")
+        ("offset" = Option<i64>, Query, description = "Number of organizations to skip (default: 0)"),
+        ("lifecycle" = Option<String>, Query, description = "Filter by lifecycle: active (default), deleted, erased or all")
     ),
     responses(
         (status = 200, description = "Organizations retrieved successfully", body = ListOrganizationsAdminResponse),
@@ -2665,7 +2676,7 @@ pub async fn list_organizations(
 
     let (organizations, total) = app_state
         .admin_service
-        .list_organizations(params.limit, params.offset)
+        .list_organizations(params.limit, params.offset, params.lifecycle)
         .await
         .map_err(|e| {
             error!("Failed to list organizations: {:?}", e);
@@ -3027,6 +3038,7 @@ fn admin_org_info_to_response(
         }),
         current_usage,
         created_at: org.created_at,
+        lifecycle: org.lifecycle,
     }
 }
 
@@ -3147,6 +3159,11 @@ pub async fn list_organization_members(
                 created_at: m.user.created_at,
                 last_login_at: m.user.last_login_at,
                 is_active: m.user.is_active,
+                lifecycle: crate::conversions::admin_user_lifecycle(
+                    m.user.id,
+                    m.user.is_active,
+                    &m.user.auth_provider,
+                ),
                 auth_provider: m.user.auth_provider,
                 provider_user_id: m.user.provider_user_id,
                 organizations: None,
@@ -3793,6 +3810,9 @@ pub struct ListOrganizationsQueryParams {
     pub limit: i64,
     #[serde(default)]
     pub offset: i64,
+    /// Used by the organization list only; the members list ignores it.
+    #[serde(default)]
+    pub lifecycle: services::admin::OrganizationLifecycleFilter,
 }
 
 #[derive(Debug, serde::Deserialize)]

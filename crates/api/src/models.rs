@@ -3092,6 +3092,9 @@ pub struct AdminUserResponse {
     pub is_active: bool,
     pub auth_provider: String,
     pub provider_user_id: String,
+    /// Omitted when the row's `is_active`/`auth_provider` columns are inconsistent.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lifecycle: Option<services::lifecycle::UserLifecycle>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub organizations: Option<Vec<AdminUserOrganizationDetails>>,
 }
@@ -3246,6 +3249,8 @@ pub struct AdminOrganizationResponse {
     #[serde(rename = "currentUsage", skip_serializing_if = "Option::is_none")]
     pub current_usage: Option<OrganizationUsage>,
     pub created_at: DateTime<Utc>,
+    /// Always `active` on org detail, which only returns active organizations.
+    pub lifecycle: services::lifecycle::OrganizationLifecycle,
 }
 
 /// List organizations response model (admin only)

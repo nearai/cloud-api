@@ -1195,11 +1195,13 @@ impl AdminService for AdminServiceImpl {
         &self,
         limit: i64,
         offset: i64,
+        lifecycle: OrganizationLifecycleFilter,
     ) -> Result<(Vec<AdminOrganizationInfo>, i64), AdminError> {
         // Execute both queries in parallel for better performance
         let (organizations_result, total_result) = tokio::join!(
-            self.repository.list_all_organizations(limit, offset),
-            self.repository.count_all_organizations()
+            self.repository
+                .list_all_organizations(limit, offset, lifecycle),
+            self.repository.count_all_organizations(lifecycle)
         );
 
         let organizations =

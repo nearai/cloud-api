@@ -988,3 +988,45 @@ async fn near_user_can_log_in_again_after_erasure() {
     let (_s2, second, _) = signup(&database, "near", &account, &email).await;
     assert_ne!(first, second);
 }
+
+#[tokio::test]
+async fn admin_user_list_shows_lifecycle() {
+    let (server, database) = setup_test_server_with_database().await;
+    let (_session, user_id, email) = new_user(&database).await;
+    assert_eq!(erase(&server, user_id, &email).await.status_code(), 200);
+    let users = server
+        .get(format!("/v1/admin/users?search={user_id}").as_str())
+        .add_header("Authorization", format!("Bearer {}", get_session_id()))
+        .await
+        .json::<serde_json::Value>();
+    let user = users["users"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|u| u["id"] == user_id.to_string())
+        .unwrap_or_else(|| panic!("erased user missing from list: {users}"));
+    assert_eq!(user["lifecycle"], "erased");
+}
+
+#[tokio::test]
+async fn admin_org_list_lifecycle_filter_returns_only_matching_rows() {
+    let (server, database) = setup_test_server_with_database().await;
+    let (_session, user_id, email) = new_user(&database).await;
+    assert_eq!(erase(&server, user_id, &email).await.status_code(), 200);
+    for filter in ["erased", "deleted", "active"] {
+        let body = server
+            .get(format!("/v1/admin/organizations?lifecycle={filter}&limit=50&offset=0").as_str())
+            .add_header("Authorization", format!("Bearer {}", get_session_id()))
+            .await
+            .json::<serde_json::Value>();
+        // Property over whatever the first page holds; no completeness or ordering claim.
+        assert!(
+            body["organizations"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|o| o["lifecycle"] == filter),
+            "{filter}: {body}"
+        );
+    }
+}

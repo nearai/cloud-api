@@ -583,6 +583,18 @@ pub struct AdminOrganizationInfo {
     pub total_requests: Option<i64>,
     pub total_tokens: Option<i64>,
     pub created_at: chrono::DateTime<chrono::Utc>,
+    pub lifecycle: crate::lifecycle::OrganizationLifecycle,
+}
+
+/// Which organizations the admin list returns. Defaults to `Active`, the historical behavior.
+#[derive(Debug, Clone, Copy, Default, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum OrganizationLifecycleFilter {
+    #[default]
+    Active,
+    Deleted,
+    Erased,
+    All,
 }
 
 /// API key metadata for admin listing. Carries no key material (hash, prefix,
@@ -931,15 +943,19 @@ pub trait AdminRepository: Send + Sync {
         organization_id: uuid::Uuid,
     ) -> Result<Option<u32>, anyhow::Error>;
 
-    /// List all organizations with pagination (admin only)
+    /// List organizations matching the lifecycle filter with pagination (admin only)
     async fn list_all_organizations(
         &self,
         limit: i64,
         offset: i64,
+        lifecycle: OrganizationLifecycleFilter,
     ) -> Result<Vec<AdminOrganizationInfo>, anyhow::Error>;
 
-    /// Count all active organizations (admin only)
-    async fn count_all_organizations(&self) -> Result<i64, anyhow::Error>;
+    /// Count organizations matching the lifecycle filter (admin only)
+    async fn count_all_organizations(
+        &self,
+        lifecycle: OrganizationLifecycleFilter,
+    ) -> Result<i64, anyhow::Error>;
 
     /// List API keys across all organizations, newest first (admin only).
     /// Includes revoked and inactive keys.
@@ -1188,11 +1204,12 @@ pub trait AdminService: Send + Sync {
         organization_id: uuid::Uuid,
     ) -> Result<Option<u32>, AdminError>;
 
-    /// List all organizations with pagination (admin only)
+    /// List organizations matching the lifecycle filter with pagination (admin only)
     async fn list_organizations(
         &self,
         limit: i64,
         offset: i64,
+        lifecycle: OrganizationLifecycleFilter,
     ) -> Result<(Vec<AdminOrganizationInfo>, i64), AdminError>;
 
     /// List API keys across all organizations with pagination (admin only).

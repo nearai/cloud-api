@@ -1,5 +1,6 @@
 use crate::pool::DbPool;
 use crate::repositories::lifecycle::ORG_ALL_MEMBERS_ERASED_SQL;
+use crate::repositories::organization::deactivate_organization_children;
 use crate::repositories::utils::map_db_error;
 use crate::retry_db;
 use anyhow::{Context, Result};
@@ -75,7 +76,6 @@ pub(crate) fn erased_org_ids(memberships: &[Membership]) -> Vec<Uuid> {
 }
 
 /// Orgs the user leaves: anyone else is still a member.
-#[allow(dead_code)]
 pub(crate) fn retained_org_ids(memberships: &[Membership]) -> Vec<Uuid> {
     memberships
         .iter()
@@ -137,6 +137,25 @@ pub(crate) async fn load_blockers<C: GenericClient + Sync>(
         blockers.push(ErasureBlocker::ActiveAdminTokens { count: tokens });
     }
     Ok(blockers)
+}
+
+/// Delete user content in the given workspaces. Conversations first: responses and
+/// response_items cascade from them; then any responses without a conversation; then files.
+async fn delete_workspace_content<C: GenericClient + Sync>(
+    client: &C,
+    workspace_ids: &[Uuid],
+) -> Result<(), RepositoryError> {
+    for sql in [
+        "DELETE FROM conversations WHERE workspace_id = ANY($1)",
+        "DELETE FROM responses WHERE workspace_id = ANY($1)",
+        "DELETE FROM files WHERE workspace_id = ANY($1)",
+    ] {
+        client
+            .execute(sql, &[&workspace_ids])
+            .await
+            .map_err(map_db_error)?;
+    }
+    Ok(())
 }
 
 #[async_trait]
@@ -226,25 +245,334 @@ impl UserErasureRepository for PostgresUserErasureRepository {
                         files: r.get("files"),
                     })
                     .collect(),
-                retained_organizations: memberships
-                    .iter()
-                    .filter(|m| m.other_members > 0)
-                    .map(|m| RetainedOrgSummary {
-                        id: m.organization_id,
-                        role: m.role.clone(),
-                    })
-                    .collect(),
+                retained_organizations: {
+                    let retained = retained_org_ids(&memberships);
+                    memberships
+                        .iter()
+                        .filter(|m| retained.contains(&m.organization_id))
+                        .map(|m| RetainedOrgSummary {
+                            id: m.organization_id,
+                            role: m.role.clone(),
+                        })
+                        .collect()
+                },
                 log,
             }))
         })?;
         Ok(plan)
     }
 
-    async fn execute(&self, _request: ExecuteRequest<'_>) -> Result<ExecuteOutcome> {
-        anyhow::bail!("user erasure execute is wired in a later task")
+    async fn execute(&self, request: ExecuteRequest<'_>) -> Result<ExecuteOutcome> {
+        let user_id = request.user_id;
+        let confirm = request.confirm_email.trim().to_lowercase();
+        let outcome = retry_db!("execute_user_erasure", {
+            let mut client = self
+                .pool
+                .get()
+                .await
+                .context("Failed to get database connection")
+                .map_err(RepositoryError::PoolError)?;
+            let transaction = client.transaction().await.map_err(map_db_error)?;
+
+            let Some(user) = transaction
+                .query_opt(
+                    "SELECT email, is_active, auth_provider FROM users WHERE id = $1 FOR UPDATE",
+                    &[&user_id],
+                )
+                .await
+                .map_err(map_db_error)?
+            else {
+                transaction.rollback().await.map_err(map_db_error)?;
+                return Ok(ExecuteOutcome::NotFound);
+            };
+            let lifecycle = UserLifecycle::from_columns(
+                user.get("is_active"),
+                user.get::<_, &str>("auth_provider"),
+            )
+            .map_err(|e| RepositoryError::DataConversionError(e.into()))?;
+            if lifecycle == UserLifecycle::Erased {
+                transaction.rollback().await.map_err(map_db_error)?;
+                return Ok(ExecuteOutcome::AlreadyErased);
+            }
+            let user_email: String = user.get("email");
+            if user_email.to_lowercase() != confirm {
+                transaction.rollback().await.map_err(map_db_error)?;
+                return Ok(ExecuteOutcome::ConfirmEmailMismatch);
+            }
+
+            // Lock U's membership rows (a role change or removal touches these rows), then
+            // row-lock only the orgs being erased. Retained team orgs are never row-locked:
+            // usage recording takes FOR UPDATE on the org row (credit_allocation.rs:54).
+            transaction
+                .query(
+                    "SELECT 1 FROM organization_members WHERE user_id = $1 ORDER BY organization_id FOR UPDATE",
+                    &[&user_id],
+                )
+                .await
+                .map_err(map_db_error)?;
+            let first = load_memberships(&*transaction, user_id).await?;
+            let erased = erased_org_ids(&first);
+            transaction
+                .query(
+                    "SELECT id FROM organizations WHERE id = ANY($1) ORDER BY id FOR UPDATE",
+                    &[&erased],
+                )
+                .await
+                .map_err(map_db_error)?;
+            // add-member takes FOR SHARE on the org row; re-read under the lock and retry
+            // if someone joined an org we were about to erase.
+            let memberships = load_memberships(&*transaction, user_id).await?;
+            if erased_org_ids(&memberships) != erased {
+                transaction.rollback().await.map_err(map_db_error)?;
+                return Err(RepositoryError::TransactionConflict);
+            }
+            let blockers = load_blockers(&*transaction, user_id, &memberships).await?;
+            if !blockers.is_empty() {
+                transaction.rollback().await.map_err(map_db_error)?;
+                return Ok(ExecuteOutcome::Blocked(blockers));
+            }
+            let retained = retained_org_ids(&memberships);
+            let workspace_ids: Vec<Uuid> = transaction
+                .query(
+                    "SELECT id FROM workspaces WHERE organization_id = ANY($1) ORDER BY id",
+                    &[&erased],
+                )
+                .await
+                .map_err(map_db_error)?
+                .iter()
+                .map(|r| r.get("id"))
+                .collect();
+            let tombstone = format!("erased+{user_id}@erased.invalid");
+            let email_local = user_email.split('@').next().unwrap_or_default().to_string();
+
+            // Deletes.
+            delete_workspace_content(&*transaction, &workspace_ids).await?;
+            transaction
+                .execute(
+                    "DELETE FROM mcp_connectors WHERE organization_id = ANY($1)",
+                    &[&erased],
+                )
+                .await
+                .map_err(map_db_error)?;
+            transaction
+                .execute(
+                    "DELETE FROM organization_invitations WHERE organization_id = ANY($1) OR lower(email) = lower($2)",
+                    &[&erased, &user_email],
+                )
+                .await
+                .map_err(map_db_error)?;
+            transaction
+                .execute(
+                    "DELETE FROM organization_members WHERE user_id = $1 AND organization_id = ANY($2)",
+                    &[&user_id, &retained],
+                )
+                .await
+                .map_err(map_db_error)?;
+            transaction
+                .execute(
+                    "DELETE FROM feature_request_targets t \
+                     WHERE EXISTS (SELECT 1 FROM feature_request_votes v WHERE v.target_id = t.id AND v.user_id = $1) \
+                       AND NOT EXISTS (SELECT 1 FROM feature_request_votes v WHERE v.target_id = t.id AND v.user_id <> $1)",
+                    &[&user_id],
+                )
+                .await
+                .map_err(map_db_error)?;
+            for sql in [
+                "DELETE FROM feature_request_votes WHERE user_id = $1",
+                "DELETE FROM mcp_connector_usage WHERE user_id = $1",
+                "DELETE FROM refresh_tokens WHERE user_id = $1",
+            ] {
+                transaction
+                    .execute(sql, &[&user_id])
+                    .await
+                    .map_err(map_db_error)?;
+            }
+
+            // Scrubs: erased orgs and everything under them.
+            for org in &erased {
+                deactivate_organization_children(&*transaction, *org).await?;
+            }
+            transaction
+                .execute(
+                    "UPDATE api_keys SET name = 'erased', key_prefix = 'sk_****' WHERE workspace_id = ANY($1)",
+                    &[&workspace_ids],
+                )
+                .await
+                .map_err(map_db_error)?;
+            transaction
+                .execute(
+                    "UPDATE organization_reporting_tokens SET name = 'erased' WHERE organization_id = ANY($1)",
+                    &[&erased],
+                )
+                .await
+                .map_err(map_db_error)?;
+            transaction
+                .execute(
+                    "UPDATE workspaces SET name = 'erased-' || id::text, description = NULL, settings = NULL, \
+                     is_active = false, updated_at = NOW() WHERE id = ANY($1)",
+                    &[&workspace_ids],
+                )
+                .await
+                .map_err(map_db_error)?;
+            transaction
+                .execute(
+                    "UPDATE organizations SET name = 'erased-' || id::text, description = NULL, settings = NULL, \
+                     is_active = false, updated_at = NOW() WHERE id = ANY($1)",
+                    &[&erased],
+                )
+                .await
+                .map_err(map_db_error)?;
+            transaction
+                .execute(
+                    "UPDATE organization_staking_farm_sources SET status = 'disconnected', updated_at = NOW() \
+                     WHERE organization_id = ANY($1)",
+                    &[&erased],
+                )
+                .await
+                .map_err(map_db_error)?;
+
+            // Retained orgs still carrying the signup name built from U's email.
+            let auto_prefix = format!("{email_local}-org-");
+            transaction
+                .execute(
+                    r#"
+                    WITH renamed AS (
+                        SELECT id, name AS old_name, 'org-' || id::text AS new_name
+                        FROM organizations
+                        WHERE id = ANY($1)
+                          AND left(name, length($2)) = $2
+                          AND length(name) = length($2) + 4
+                          AND right(name, 4) ~ '^[a-z0-9]{4}$'
+                    ), ws AS (
+                        UPDATE workspaces w
+                        SET description = 'Default workspace for ' || r.new_name, updated_at = NOW()
+                        FROM renamed r
+                        WHERE w.organization_id = r.id AND w.description = 'Default workspace for ' || r.old_name
+                    ), dep AS (
+                        UPDATE model_deprecation_email_deliveries d SET organization_name = r.new_name
+                        FROM renamed r WHERE d.organization_id = r.id AND d.organization_name = r.old_name
+                    ), pri AS (
+                        UPDATE model_pricing_change_email_deliveries d SET organization_name = r.new_name
+                        FROM renamed r WHERE d.organization_id = r.id AND d.organization_name = r.old_name
+                    )
+                    UPDATE organizations o SET name = r.new_name, updated_at = NOW()
+                    FROM renamed r WHERE o.id = r.id
+                    "#,
+                    &[&retained, &auto_prefix],
+                )
+                .await
+                .map_err(map_db_error)?;
+
+            // Denormalized copies of U's email, provider metadata, org names.
+            for sql in [
+                "UPDATE organization_limits_history SET changed_by_user_email = $2 WHERE changed_by_user_id = $1",
+                "UPDATE model_history SET changed_by_user_email = $2 WHERE changed_by_user_id = $1",
+                "UPDATE scheduled_model_pricing_changes SET created_by_user_email = $2 WHERE created_by_user_id = $1",
+                "UPDATE scheduled_model_pricing_changes SET cancelled_by_user_email = $2 WHERE cancelled_by_user_id = $1",
+                "UPDATE model_deprecation_email_deliveries SET recipient_email = $2, email_last_error = NULL, email_message_id = NULL WHERE recipient_user_id = $1",
+                "UPDATE model_deprecation_email_deliveries SET initiated_by_user_email = $2 WHERE initiated_by_user_id = $1",
+                "UPDATE model_pricing_change_email_deliveries SET recipient_email = $2, email_last_error = NULL, email_message_id = NULL WHERE recipient_user_id = $1",
+                "UPDATE model_pricing_change_email_deliveries SET initiated_by_user_email = $2 WHERE initiated_by_user_id = $1",
+            ] {
+                transaction
+                    .execute(sql, &[&user_id, &tombstone])
+                    .await
+                    .map_err(map_db_error)?;
+            }
+            for sql in [
+                "UPDATE model_deprecation_email_deliveries SET organization_name = 'erased-' || organization_id::text WHERE organization_id = ANY($1)",
+                "UPDATE model_pricing_change_email_deliveries SET organization_name = 'erased-' || organization_id::text WHERE organization_id = ANY($1)",
+            ] {
+                transaction
+                    .execute(sql, &[&erased])
+                    .await
+                    .map_err(map_db_error)?;
+            }
+            transaction
+                .execute(
+                    "UPDATE admin_access_token SET name = 'erased', creation_reason = 'erased', \
+                     revocation_reason = CASE WHEN revocation_reason IS NULL THEN NULL ELSE 'erased' END, \
+                     user_agent = NULL WHERE created_by_user_id = $1",
+                    &[&user_id],
+                )
+                .await
+                .map_err(map_db_error)?;
+
+            // The user row, then the log row, then commit.
+            transaction
+                .execute(
+                    "UPDATE users SET email = $2, username = 'erased', display_name = NULL, avatar_url = NULL, \
+                     auth_provider = 'erased', provider_user_id = $1::text, last_login_at = NULL, \
+                     is_active = false, tokens_revoked_at = NOW(), updated_at = NOW() WHERE id = $1",
+                    &[&user_id, &tombstone],
+                )
+                .await
+                .map_err(map_db_error)?;
+            let erased_count = erased.len() as i32;
+            transaction
+                .execute(
+                    "INSERT INTO user_erasure_log (user_id, admin_user_id, requested_at, erased_organization_count) \
+                     VALUES ($1, $2, $3, $4)",
+                    &[
+                        &user_id,
+                        &request.admin_user_id,
+                        &request.requested_at,
+                        &erased_count,
+                    ],
+                )
+                .await
+                .map_err(map_db_error)?;
+
+            transaction.commit().await.map_err(map_db_error)?;
+            Ok(ExecuteOutcome::Erased(ErasedFootprint {
+                organization_ids: erased.clone(),
+                workspace_ids,
+            }))
+        })?;
+        Ok(outcome)
     }
 
-    async fn sweep_erased(&self, _user_id: Uuid) -> Result<ErasedFootprint> {
-        anyhow::bail!("user erasure sweep is wired in a later task")
+    async fn sweep_erased(&self, user_id: Uuid) -> Result<ErasedFootprint> {
+        let footprint = retry_db!("sweep_erased_user", {
+            let mut client = self
+                .pool
+                .get()
+                .await
+                .context("Failed to get database connection")
+                .map_err(RepositoryError::PoolError)?;
+            let transaction = client.transaction().await.map_err(map_db_error)?;
+            let orgs: Vec<Uuid> = transaction
+                .query(
+                    &format!(
+                        "SELECT o.id FROM organizations o \
+                         JOIN organization_members m ON m.organization_id = o.id \
+                         WHERE m.user_id = $1 AND NOT o.is_active AND {ORG_ALL_MEMBERS_ERASED_SQL} \
+                         ORDER BY o.id"
+                    ),
+                    &[&user_id],
+                )
+                .await
+                .map_err(map_db_error)?
+                .iter()
+                .map(|r| r.get("id"))
+                .collect();
+            let workspaces: Vec<Uuid> = transaction
+                .query(
+                    "SELECT id FROM workspaces WHERE organization_id = ANY($1) ORDER BY id",
+                    &[&orgs],
+                )
+                .await
+                .map_err(map_db_error)?
+                .iter()
+                .map(|r| r.get("id"))
+                .collect();
+            delete_workspace_content(&*transaction, &workspaces).await?;
+            transaction.commit().await.map_err(map_db_error)?;
+            Ok(ErasedFootprint {
+                organization_ids: orgs,
+                workspace_ids: workspaces,
+            })
+        })?;
+        Ok(footprint)
     }
 }

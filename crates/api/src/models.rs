@@ -3062,6 +3062,22 @@ pub struct ErasurePreviewResponse {
     pub log: Option<ErasureLogResponse>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct EraseUserRequest {
+    /// The user's current email, typed by the operator as a guard against erasing the wrong id.
+    pub confirm_email: String,
+    /// When the person asked (starts the GDPR response clock). Defaults to now.
+    pub requested_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct EraseUserResponse {
+    pub user_id: String,
+    pub lifecycle: services::lifecycle::UserLifecycle,
+    pub already_erased: bool,
+    pub erased_organization_ids: Vec<String>,
+}
+
 /// Admin user response model (for owners/admins)
 /// Contains sensitive information only visible to organization owners/admins
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]

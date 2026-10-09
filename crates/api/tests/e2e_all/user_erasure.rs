@@ -453,3 +453,269 @@ async fn preview_blocks_active_admin_tokens_only() {
     assert_eq!(blocker_codes(&body), vec!["active_admin_tokens"]);
     assert_eq!(body["blockers"][0]["count"], 1);
 }
+
+async fn erase(
+    server: &axum_test::TestServer,
+    user_id: uuid::Uuid,
+    confirm_email: &str,
+) -> axum_test::TestResponse {
+    server
+        .post(format!("/v1/admin/users/{user_id}/erasure").as_str())
+        .add_header("Authorization", format!("Bearer {}", get_session_id()))
+        .add_header("User-Agent", MOCK_USER_AGENT)
+        .json(&serde_json::json!({ "confirm_email": confirm_email }))
+        .await
+}
+
+/// Runs one real inference so the org has a usage row (billing ledger) to keep.
+async fn make_usage(server: &axum_test::TestServer, org_id: &str, api_key: &str) {
+    add_credits_with_type(
+        server,
+        org_id,
+        "grant",
+        None,
+        10_000_000_000,
+        "USD",
+        &get_session_id(),
+    )
+    .await;
+    let model = setup_qwen_model(server).await;
+    let r = server
+        .post("/v1/chat/completions")
+        .add_header("Authorization", format!("Bearer {api_key}"))
+        .add_header("User-Agent", MOCK_USER_AGENT)
+        .json(&serde_json::json!({
+            "model": model,
+            "messages": [{"role": "user", "content": "erasure usage fixture"}],
+            "stream": false,
+            "max_tokens": 20
+        }))
+        .await;
+    assert_eq!(r.status_code(), 200, "{}", r.text());
+}
+
+async fn wait_for_usage(client: &deadpool_postgres::Object, org: uuid::Uuid) -> i64 {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        let n = count(
+            client,
+            "SELECT COUNT(*) FROM organization_usage_log WHERE organization_id = $1",
+            &org,
+        )
+        .await;
+        if n > 0 || std::time::Instant::now() > deadline {
+            return n;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+}
+
+#[tokio::test]
+async fn erase_personal_org_user_removes_content_and_identity_keeps_usage() {
+    let (server, database) = setup_test_server_with_database().await;
+    let (session, user_id, email) = new_user(&database).await;
+    let org_id = personal_org_id(&server, &session).await;
+    let org: uuid::Uuid = org_id.parse().unwrap();
+    let api_key = get_api_key_for_org_with_session(&server, org_id.clone(), &session).await;
+    let client = database.pool().get().await.unwrap();
+
+    make_usage(&server, &org_id, &api_key).await;
+    let usage_before = wait_for_usage(&client, org).await;
+    assert!(usage_before > 0, "fixture must produce a usage row");
+
+    let conv = server
+        .post("/v1/conversations")
+        .add_header("Authorization", format!("Bearer {api_key}"))
+        .json(&serde_json::json!({}))
+        .await;
+    assert_eq!(conv.status_code(), 201, "{}", conv.text());
+    let file = server
+        .post("/v1/files")
+        .add_header("Authorization", format!("Bearer {api_key}"))
+        .multipart(
+            axum_test::multipart::MultipartForm::new()
+                .add_text("purpose", "user_data")
+                .add_part(
+                    "file",
+                    axum_test::multipart::Part::bytes(b"secret".to_vec())
+                        .file_name("notes.txt")
+                        .mime_type("text/plain"),
+                ),
+        )
+        .await;
+    assert_eq!(file.status_code(), 201, "{}", file.text());
+
+    let response = erase(&server, user_id, &email).await;
+    assert_eq!(response.status_code(), 200, "{}", response.text());
+    let body = response.json::<serde_json::Value>();
+    assert_eq!(body["lifecycle"], "erased");
+    assert_eq!(body["already_erased"], false);
+    assert_eq!(body["erased_organization_ids"][0], org_id);
+
+    let after = server
+        .post("/v1/conversations")
+        .add_header("Authorization", format!("Bearer {api_key}"))
+        .json(&serde_json::json!({}))
+        .await;
+    assert_eq!(after.status_code(), 401, "{}", after.text());
+
+    let in_org = "SELECT COUNT(*) FROM {} WHERE workspace_id IN (SELECT id FROM workspaces WHERE organization_id = $1)";
+    for table in ["conversations", "responses", "files"] {
+        assert_eq!(
+            count(&client, &in_org.replace("{}", table), &org).await,
+            0,
+            "{table}"
+        );
+    }
+    assert_eq!(
+        count(
+            &client,
+            "SELECT COUNT(*) FROM refresh_tokens WHERE user_id = $1",
+            &user_id
+        )
+        .await,
+        0
+    );
+    assert_eq!(
+        count(
+            &client,
+            "SELECT COUNT(*) FROM organization_usage_log WHERE organization_id = $1",
+            &org
+        )
+        .await,
+        usage_before,
+        "billing ledger survives erasure"
+    );
+
+    let u = client
+        .query_one(
+            "SELECT email, username, display_name, auth_provider, provider_user_id, is_active FROM users WHERE id = $1",
+            &[&user_id],
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        u.get::<_, String>("email"),
+        format!("erased+{user_id}@erased.invalid")
+    );
+    assert_eq!(u.get::<_, String>("username"), "erased");
+    assert_eq!(u.get::<_, Option<String>>("display_name"), None);
+    assert_eq!(u.get::<_, String>("auth_provider"), "erased");
+    assert_eq!(u.get::<_, String>("provider_user_id"), user_id.to_string());
+    assert!(!u.get::<_, bool>("is_active"));
+
+    let o = client
+        .query_one(
+            "SELECT name, description, settings, is_active FROM organizations WHERE id = $1",
+            &[&org],
+        )
+        .await
+        .unwrap();
+    assert_eq!(o.get::<_, String>("name"), format!("erased-{org}"));
+    assert_eq!(o.get::<_, Option<String>>("description"), None);
+    assert!(o.get::<_, Option<serde_json::Value>>("settings").is_none());
+    assert!(!o.get::<_, bool>("is_active"));
+    assert_eq!(
+        count(
+            &client,
+            "SELECT COUNT(*) FROM organization_members WHERE organization_id = $1",
+            &org
+        )
+        .await,
+        1
+    );
+    let prefixes: Vec<Option<String>> = client
+        .query(
+            "SELECT key_prefix FROM api_keys WHERE workspace_id IN (SELECT id FROM workspaces WHERE organization_id = $1)",
+            &[&org],
+        )
+        .await
+        .unwrap()
+        .iter()
+        .map(|r| r.get(0))
+        .collect();
+    assert!(prefixes.iter().all(|p| p.as_deref() == Some("sk_****")));
+
+    let log = client
+        .query_one(
+            "SELECT erased_organization_count FROM user_erasure_log WHERE user_id = $1",
+            &[&user_id],
+        )
+        .await
+        .unwrap();
+    assert_eq!(log.get::<_, i32>("erased_organization_count"), 1);
+}
+
+#[tokio::test]
+async fn erased_user_can_sign_up_again_with_same_identity() {
+    let (server, database) = setup_test_server_with_database().await;
+    let u = uuid::Uuid::new_v4();
+    let provider_id = format!("gh-{u}");
+    let email = format!("again-{u}@test.com");
+    let (_s, first, _) = signup(&database, "github", &provider_id, &email).await;
+    assert_eq!(erase(&server, first, &email).await.status_code(), 200);
+    let (_s2, second, _) = signup(&database, "github", &provider_id, &email).await;
+    assert_ne!(first, second, "re-signup must create a fresh account");
+}
+
+#[tokio::test]
+async fn erase_rejects_mismatched_email_and_accepts_case_and_whitespace_variants() {
+    let (server, database) = setup_test_server_with_database().await;
+    let (_session, user_id, email) = new_user(&database).await;
+    let wrong = erase(&server, user_id, "someone-else@test.com").await;
+    assert_eq!(wrong.status_code(), 422, "{}", wrong.text());
+    assert_eq!(
+        wrong.json::<serde_json::Value>()["error"]["type"],
+        "confirm_email_mismatch"
+    );
+    assert_eq!(
+        erase(&server, user_id, &format!("  {}  ", email.to_uppercase()))
+            .await
+            .status_code(),
+        200
+    );
+}
+
+#[tokio::test]
+async fn erase_again_reports_already_erased() {
+    let (server, database) = setup_test_server_with_database().await;
+    let (_session, user_id, email) = new_user(&database).await;
+    let first = erase(&server, user_id, &email)
+        .await
+        .json::<serde_json::Value>();
+    let again = erase(&server, user_id, "anything").await;
+    assert_eq!(again.status_code(), 200, "{}", again.text());
+    let again = again.json::<serde_json::Value>();
+    assert_eq!(again["already_erased"], true);
+    assert_eq!(
+        again["erased_organization_ids"],
+        first["erased_organization_ids"]
+    );
+}
+
+#[tokio::test]
+async fn erase_blocked_returns_structured_blockers_and_changes_nothing() {
+    let (server, database) = setup_test_server_with_database().await;
+    let (session, owner, email) = new_user(&database).await;
+    let (_s2, teammate, _) = new_user(&database).await;
+    let team = create_org_with_session(&server, &session).await;
+    add_member(&database, &team.id, teammate, "member").await;
+
+    let response = erase(&server, owner, &email).await;
+    assert_eq!(response.status_code(), 409, "{}", response.text());
+    let body = response.json::<serde_json::Value>();
+    assert_eq!(body["blockers"][0]["code"], "sole_owner_of_shared_org");
+    let row = database
+        .pool()
+        .get()
+        .await
+        .unwrap()
+        .query_one(
+            "SELECT is_active, email FROM users WHERE id = $1",
+            &[&owner],
+        )
+        .await
+        .unwrap();
+    assert!(row.get::<_, bool>("is_active"));
+    assert_eq!(row.get::<_, String>("email"), email);
+}

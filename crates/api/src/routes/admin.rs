@@ -12,8 +12,9 @@ use crate::models::{
     AdminUserResponse, BatchUpdateModelApiRequest, CreateAdminAccessTokenRequest,
     CreateServiceRequest, CreditType, DecimalPrice, DecimalPriceRequest,
     DeleteAdminAccessTokenRequest, DeleteModelRequest, DeprecateModelRequest,
-    DeprecateModelResponse, ErasedOrganizationResponse, ErasureLogResponse, ErasurePreviewResponse,
-    ErrorResponse, GetOrganizationConcurrentLimitResponse, ListAdminAccessTokensResponse,
+    DeprecateModelResponse, EraseUserRequest, EraseUserResponse, ErasedOrganizationResponse,
+    ErasureLogResponse, ErasurePreviewResponse, ErrorResponse,
+    GetOrganizationConcurrentLimitResponse, ListAdminAccessTokensResponse,
     ListAdminAmlAllowlistResponse, ListAdminAmlReportsResponse, ListAdminApiKeysResponse,
     ListAdminInvitationEmailDeliveriesResponse, ListAdminOrganizationMembersResponse,
     ListOrganizationsAdminResponse, ListPricingChangesResponse, ListUsersResponse, MemberRole,
@@ -5146,6 +5147,53 @@ fn erasure_error_to_response(
         body["blockers"] = serde_json::Value::Array(b);
     }
     (status, ResponseJson(body))
+}
+
+/// Erase a user (GDPR Art. 17). Irreversible. Run the preview first. Admin session only.
+#[utoipa::path(
+    post,
+    path = "/v1/admin/users/{user_id}/erasure",
+    tag = "Admin",
+    params(("user_id" = String, Path, description = "User ID")),
+    request_body = EraseUserRequest,
+    responses(
+        (status = 200, description = "User erased (or already erased)", body = EraseUserResponse),
+        (status = 404, description = "User not found", body = ErrorResponse),
+        (status = 409, description = "Erasure blocked; body includes `blockers`", body = ErrorResponse),
+        (status = 422, description = "confirm_email mismatch", body = ErrorResponse),
+        (status = 401, description = "Unauthorized", body = ErrorResponse),
+        (status = 403, description = "Admin API tokens cannot erase", body = ErrorResponse),
+        (status = 500, description = "Internal server error", body = ErrorResponse)
+    ),
+    security(("session_token" = []))
+)]
+pub async fn erase_user(
+    State(app_state): State<AdminAppState>,
+    Path(user_id): Path<uuid::Uuid>,
+    Extension(admin_user): Extension<AdminUser>,
+    ResponseJson(req): ResponseJson<EraseUserRequest>,
+) -> Result<ResponseJson<EraseUserResponse>, (StatusCode, ResponseJson<serde_json::Value>)> {
+    let r = app_state
+        .user_erasure_service
+        .erase(
+            user_id,
+            admin_user.0.id,
+            &req.confirm_email,
+            req.requested_at,
+        )
+        .await
+        .map_err(erasure_error_to_response)?;
+
+    Ok(ResponseJson(EraseUserResponse {
+        user_id: r.user_id.to_string(),
+        lifecycle: services::lifecycle::UserLifecycle::Erased,
+        already_erased: r.already_erased,
+        erased_organization_ids: r
+            .erased_organization_ids
+            .iter()
+            .map(uuid::Uuid::to_string)
+            .collect(),
+    }))
 }
 
 /// Preview a user erasure: blockers and what would be erased (Admin only, read).

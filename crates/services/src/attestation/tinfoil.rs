@@ -203,10 +203,21 @@ mod tests {
         )
     }
 
+    /// The compiled pins come only from the sync bot's reviewed PRs, so their
+    /// content changes over time; this checks they always parse and that no
+    /// row is missing its measurement.
     #[test]
-    fn compiled_pins_parse_and_are_empty() {
+    fn compiled_pins_parse() {
         let p = vetted_tinfoil_pins().unwrap();
-        assert!(p.router.is_empty() && p.models.is_empty());
+        assert!(p
+            .router
+            .iter()
+            .all(|r| !r.measurement.is_empty() && !r.repo.is_empty() && !r.tag.is_empty()));
+        assert!(p
+            .models
+            .values()
+            .flatten()
+            .all(|m| !m.registers.is_empty() && !m.repo.is_empty() && !m.tag.is_empty()));
     }
 
     #[test]

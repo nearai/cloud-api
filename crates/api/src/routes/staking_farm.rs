@@ -500,11 +500,11 @@ pub enum BindRequest {
 #[derive(Serialize, ToSchema)]
 #[serde(untagged)]
 pub enum BindResponse {
-    Prepare(services::staking_farm::binding::BindingChallenge),
+    Prepare(Box<services::staking_farm::binding::BindingChallenge>),
     Confirm {
         phase: String,
         binding_status: String,
-        source: StakingFarmStateResponse,
+        source: Box<StakingFarmStateResponse>,
         wallet_membership: services::staking_farm::binding::WalletMembership,
     },
 }
@@ -558,12 +558,14 @@ pub async fn bind_organization_staking_farm(
         binding_error(services::staking_farm::binding::BindingError::Unavailable.into())
     })?;
     match request {
-        BindRequest::Prepare { near_account_id } => Ok(ResponseJson(BindResponse::Prepare(
-            binding
-                .prepare(org, user.0.id, near_account_id)
-                .await
-                .map_err(binding_error)?,
-        ))),
+        BindRequest::Prepare { near_account_id } => {
+            Ok(ResponseJson(BindResponse::Prepare(Box::new(
+                binding
+                    .prepare(org, user.0.id, near_account_id)
+                    .await
+                    .map_err(binding_error)?,
+            ))))
+        }
         BindRequest::Confirm {
             challenge_id,
             signed_message,
@@ -594,7 +596,7 @@ pub async fn bind_organization_staking_farm(
             Ok(ResponseJson(BindResponse::Confirm {
                 phase: "confirm".into(),
                 binding_status: "bound".into(),
-                source: source_to_response(source),
+                source: Box::new(source_to_response(source)),
                 wallet_membership,
             }))
         }

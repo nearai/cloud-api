@@ -361,11 +361,7 @@ mod tests {
         let public_key = signer.get_public_key().await.unwrap();
         let account_id: AccountId = "alice.testnet".parse().unwrap();
         let signature = signer
-            .sign_message_nep413(
-                account_id.clone(),
-                public_key.clone(),
-                &payload.nep413().unwrap(),
-            )
+            .sign_message_nep413(account_id.clone(), public_key, &payload.nep413().unwrap())
             .await
             .unwrap();
         SignedMessage {

@@ -237,6 +237,32 @@ impl NearAuthService {
     }
 }
 
+/// Verify a NEP-413 signature and its account access key without creating a session.
+/// The caller owns challenge scoping, expiry and atomic replay prevention.
+pub async fn verify_wallet_control(
+    payload: &NEP413Payload,
+    message: &SignedMessage,
+    network: &NetworkConfig,
+) -> anyhow::Result<()> {
+    let valid = payload
+        .verify(
+            &message.account_id,
+            message.public_key,
+            &message.signature,
+            network,
+        )
+        .await
+        .map_err(|_| {
+            anyhow::anyhow!(NearAuthError::SignatureVerificationFailed(
+                "wallet verification unavailable".into()
+            ))
+        })?;
+    if !valid {
+        return Err(anyhow::anyhow!(NearAuthError::InvalidSignature));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -374,30 +400,4 @@ mod tests {
             "Error should mention invalid timestamp, got: {err_msg}"
         );
     }
-}
-
-/// Verify a NEP-413 signature and its account access key without creating a session.
-/// The caller owns challenge scoping, expiry and atomic replay prevention.
-pub async fn verify_wallet_control(
-    payload: &NEP413Payload,
-    message: &SignedMessage,
-    network: &NetworkConfig,
-) -> anyhow::Result<()> {
-    let valid = payload
-        .verify(
-            &message.account_id,
-            message.public_key.clone(),
-            &message.signature,
-            network,
-        )
-        .await
-        .map_err(|_| {
-            anyhow::anyhow!(NearAuthError::SignatureVerificationFailed(
-                "wallet verification unavailable".into()
-            ))
-        })?;
-    if !valid {
-        return Err(anyhow::anyhow!(NearAuthError::InvalidSignature));
-    }
-    Ok(())
 }

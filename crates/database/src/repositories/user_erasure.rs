@@ -343,7 +343,6 @@ impl UserErasureRepository for PostgresUserErasureRepository {
                 .map(|r| r.get("id"))
                 .collect();
             let tombstone = format!("erased+{user_id}@erased.invalid");
-            let email_local = user_email.split('@').next().unwrap_or_default().to_string();
 
             // Deletes.
             delete_workspace_content(&*transaction, &workspace_ids).await?;
@@ -431,18 +430,24 @@ impl UserErasureRepository for PostgresUserErasureRepository {
                 .await
                 .map_err(map_db_error)?;
 
-            // Retained orgs still carrying the signup name built from U's email.
-            let auto_prefix = format!("{email_local}-org-");
+            // Retained orgs that are still U's untouched signup org. Identified
+            // structurally (not by U's current email, which may have changed since
+            // signup): the name has the auto-generated shape and U created a default
+            // workspace whose description embeds that exact name.
             transaction
                 .execute(
                     r#"
                     WITH renamed AS (
-                        SELECT id, name AS old_name, 'org-' || id::text AS new_name
-                        FROM organizations
-                        WHERE id = ANY($1)
-                          AND left(name, length($2)) = $2
-                          AND length(name) = length($2) + 4
-                          AND right(name, 4) ~ '^[a-z0-9]{4}$'
+                        SELECT o.id, o.name AS old_name, 'org-' || o.id::text AS new_name
+                        FROM organizations o
+                        WHERE o.id = ANY($1)
+                          AND o.name ~ '^.+-org-[a-z0-9]{4}$'
+                          AND EXISTS (
+                              SELECT 1 FROM workspaces sw
+                              WHERE sw.organization_id = o.id
+                                AND sw.created_by_user_id = $2
+                                AND sw.description = 'Default workspace for ' || o.name
+                          )
                     ), ws AS (
                         UPDATE workspaces w
                         SET description = 'Default workspace for ' || r.new_name, updated_at = NOW()
@@ -458,7 +463,7 @@ impl UserErasureRepository for PostgresUserErasureRepository {
                     UPDATE organizations o SET name = r.new_name, updated_at = NOW()
                     FROM renamed r WHERE o.id = r.id
                     "#,
-                    &[&retained, &auto_prefix],
+                    &[&retained, &user_id],
                 )
                 .await
                 .map_err(map_db_error)?;
@@ -502,9 +507,9 @@ impl UserErasureRepository for PostgresUserErasureRepository {
             transaction
                 .execute(
                     "UPDATE users SET email = $2, username = 'erased', display_name = NULL, avatar_url = NULL, \
-                     auth_provider = 'erased', provider_user_id = $1::text, last_login_at = NULL, \
+                     auth_provider = $3, provider_user_id = $1::text, last_login_at = NULL, \
                      is_active = false, tokens_revoked_at = NOW(), updated_at = NOW() WHERE id = $1",
-                    &[&user_id, &tombstone],
+                    &[&user_id, &tombstone, &services::lifecycle::ERASED_AUTH_PROVIDER],
                 )
                 .await
                 .map_err(map_db_error)?;
@@ -533,6 +538,9 @@ impl UserErasureRepository for PostgresUserErasureRepository {
     }
 
     async fn sweep_erased(&self, user_id: Uuid) -> Result<ErasedFootprint> {
+        // No row locks are taken, which is safe: the sweep only deletes content in
+        // orgs that are already inactive and fully erased, deletion is idempotent,
+        // and a late write landing after the sweep is caught by the next retry.
         let footprint = retry_db!("sweep_erased_user", {
             let mut client = self
                 .pool

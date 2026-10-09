@@ -22,3 +22,14 @@ pub fn org_lifecycle_predicate(filter: services::admin::OrganizationLifecycleFil
         F::All => "true".to_string(),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn erased_sql_fragment_uses_the_service_sentinel() {
+        let literal = format!("'{}'", services::lifecycle::ERASED_AUTH_PROVIDER);
+        assert!(ORG_ALL_MEMBERS_ERASED_SQL.contains(&literal));
+    }
+}

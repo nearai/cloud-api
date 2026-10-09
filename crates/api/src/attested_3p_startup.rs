@@ -3,11 +3,17 @@
 //! external/discovery load (fail-closed id reservation), and
 //! `register_attested_3p` runs AFTER the refresh task is started.
 
+mod tinfoil;
+
 use config::ExternalProvidersConfig;
 use database::repositories::ModelRepository;
 use inference_providers::ProviderSource;
 use services::inference_provider_pool::{InferenceProviderPool, ProviderPoolRole};
+use services::metrics::MetricsServiceTrait;
 use std::sync::Arc;
+use tinfoil::register_tinfoil;
+
+pub use tinfoil::{register_tinfoil_models, register_tinfoil_with};
 
 /// Standard OpenAI sampling knobs Chutes (sglang) honors, expressed in
 /// OpenRouter's fixed `supported_sampling_parameters` vocabulary. Seeded onto
@@ -104,9 +110,10 @@ pub(crate) async fn register_attested_3p(
     pool: &Arc<InferenceProviderPool>,
     models_repo: &ModelRepository,
     cfg: &ExternalProvidersConfig,
+    metrics: Arc<dyn MetricsServiceTrait>,
 ) {
     let chutes_registered = register_chutes(pool, models_repo, cfg).await;
-    register_tinfoil(cfg);
+    register_tinfoil(pool, models_repo, cfg, metrics).await;
     tracing::debug!(chutes_registered, "Attested 3P registration finished");
 }
 
@@ -233,17 +240,6 @@ async fn register_chutes(
         );
     }
     registered
-}
-
-/// Tinfoil provider registration is added in a follow-up PR; ids stay
-/// reserved (fail-closed).
-fn register_tinfoil(cfg: &ExternalProvidersConfig) {
-    if !cfg.tinfoil_models.is_empty() {
-        tracing::warn!(
-            count = cfg.tinfoil_models.len(),
-            "TINFOIL_MODELS is set but this build has no Tinfoil provider; ids stay reserved (fail-closed)"
-        );
-    }
 }
 
 /// Ensure an attested model has a catalog row in the `models` table.
@@ -473,7 +469,6 @@ mod tests {
             .await;
         assert!(pool.has_provider("m-ch").await);
     }
-
     #[test]
     fn chutes_seed_advertises_nonempty_capabilities() {
         assert!(!CHUTES_SEED.supported_sampling_parameters.is_empty());

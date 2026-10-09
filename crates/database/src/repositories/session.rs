@@ -7,7 +7,7 @@ use regex::Regex;
 use services::common::RepositoryError;
 use sha2::{Digest, Sha256};
 use std::sync::OnceLock;
-use tracing::debug;
+use tracing::{debug, warn};
 use uuid::Uuid;
 
 pub struct SessionRepository {
@@ -254,6 +254,10 @@ impl SessionRepository {
     /// with the current token during that window does not rotate again. This
     /// prevents out-of-order HTTP responses from overwriting the browser's
     /// cookie with a superseded token.
+    ///
+    /// Callers must derive `successor_token` deterministically from `old_token`
+    /// so concurrent retries present the same successor. Otherwise they fail
+    /// instead of reusing the existing rotation.
     pub async fn rotate(
         &self,
         session_id: Uuid,
@@ -270,7 +274,7 @@ impl SessionRepository {
                     .context("Invalid expiration hours: value too large")?,
             );
 
-        let (row, token) = retry_db!("rotate_refresh_token_session", {
+        let (row, token, predecessor_reused) = retry_db!("rotate_refresh_token_session", {
             let mut client = self
                 .pool
                 .get()
@@ -301,7 +305,7 @@ impl SessionRepository {
             let result = if current_hash == old_token_hash {
                 if in_reuse_window {
                     // The current credential already refreshed recently.
-                    (row, old_token.to_string())
+                    (row, old_token.to_string(), false)
                 } else {
                     let updated = tx
                         .query_one(
@@ -310,13 +314,13 @@ impl SessionRepository {
                         )
                         .await
                         .map_err(map_db_error)?;
-                    (updated, successor_token.to_string())
+                    (updated, successor_token.to_string(), false)
                 }
             } else if in_reuse_window
                 && previous_hash.as_deref() == Some(old_token_hash.as_str())
                 && current_hash == successor_hash
             {
-                (row, successor_token.to_string())
+                (row, successor_token.to_string(), true)
             } else {
                 return Err(RepositoryError::DatabaseError(anyhow::anyhow!(
                     "Token rotation failed: token not found or already rotated"
@@ -326,7 +330,11 @@ impl SessionRepository {
             Ok(result)
         })?;
 
-        debug!("Rotated refresh token session: {session_id}",);
+        if predecessor_reused {
+            warn!(session_id = %session_id, "Refresh token predecessor reused within grace window");
+        } else {
+            debug!(session_id = %session_id, "Refresh token session accepted");
+        }
 
         let session = self.row_to_session(row)?;
 

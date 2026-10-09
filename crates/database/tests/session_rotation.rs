@@ -1,6 +1,7 @@
 #[allow(dead_code)]
 mod support;
 
+use chrono::{Duration, Utc};
 use database::repositories::SessionRepository;
 use std::sync::Arc;
 use support::test_pool;
@@ -53,8 +54,8 @@ async fn concurrent_refreshes_reuse_one_successor_and_reject_stale_tokens() -> a
 
     client
         .execute(
-            "UPDATE refresh_tokens SET rotated_at = NOW() - INTERVAL '40 seconds' WHERE id = $1",
-            &[&session.id],
+            "UPDATE refresh_tokens SET rotated_at = $2 WHERE id = $1",
+            &[&session.id, &(Utc::now() - Duration::seconds(40))],
         )
         .await?;
     let (_, delayed_result) = repository
@@ -64,8 +65,8 @@ async fn concurrent_refreshes_reuse_one_successor_and_reject_stale_tokens() -> a
 
     client
         .execute(
-            "UPDATE refresh_tokens SET rotated_at = NOW() - INTERVAL '61 seconds' WHERE id = $1",
-            &[&session.id],
+            "UPDATE refresh_tokens SET rotated_at = $2 WHERE id = $1",
+            &[&session.id, &(Utc::now() - Duration::seconds(61))],
         )
         .await?;
     assert!(repository

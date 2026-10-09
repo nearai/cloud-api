@@ -319,7 +319,8 @@ pub trait AuthServiceTrait: Send + Sync {
     async fn logout(&self, session_id: SessionId) -> Result<bool, AuthError>;
 
     /// Rotate a refresh token session (refresh token rotation)
-    /// This atomically updates the token hash and expiration, ensuring only one valid token at a time.
+    /// This atomically updates the token hash and expiration. The immediate
+    /// predecessor remains valid for a bounded concurrent-request grace window.
     /// The presented token and its server-derived successor make a concurrent
     /// retry return the same active successor instead of rotating twice.
     async fn rotate_session(

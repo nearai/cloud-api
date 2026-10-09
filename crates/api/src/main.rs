@@ -42,7 +42,7 @@ async fn main() {
     // Apply additive migrations from the candidate image before switching
     // traffic to its new refresh-token code.
     if std::env::args().skip(1).any(|arg| arg == "--migrate-only") {
-        tracing::info!("Migrations completed; exiting without serving traffic");
+        tracing::info!("SQL migrations completed; install and verify the out-of-band refresh index before serving traffic");
         return;
     }
     database::ensure_refresh_rotation_index(database.pool())

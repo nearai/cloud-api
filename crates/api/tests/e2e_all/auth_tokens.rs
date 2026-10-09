@@ -454,7 +454,7 @@ async fn test_refresh_token_rotation_reuses_predecessor_briefly() {
         "Rotated refresh token expiration should be approximately 7 days from now. Expected: {expected_expiration_after_rotation:?}, Actual: {actual_expiration_after_rotation:?}"
     );
 
-    println!("✅ Refresh token rotation correctly invalidates old token and extends expiration");
+    println!("✅ Refresh token rotation reuses the predecessor within the grace window");
 }
 
 // Note: Specific refresh token revocation (DELETE /users/me/refresh-tokens/{id})

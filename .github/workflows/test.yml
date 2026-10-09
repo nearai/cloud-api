@@ -12,6 +12,12 @@ on:
   # Include stacked PRs targeting another feature branch.
   pull_request:
 
+# A new push to a PR supersedes the previous run, so cancel it instead of letting
+# it hold self-hosted runners. Pushes to main/develop are never cancelled.
+concurrency:
+  group: tests-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
@@ -45,7 +51,9 @@ jobs:
   # classify (new branch, detection error) is treated as "run the tests".
   changes:
     name: Detect changes
-    runs-on: [self-hosted, infra]
+    # Lightweight jobs run on GitHub-hosted runners (free for this public repo)
+    # so they never queue behind Rust builds for a self-hosted slot.
+    runs-on: ubuntu-latest
     permissions:
       contents: read
     outputs:
@@ -229,7 +237,7 @@ jobs:
 
   script-test:
     name: Script tests
-    runs-on: [self-hosted, infra]
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
       - name: Test synthetic rollout verification
@@ -243,7 +251,7 @@ jobs:
   # gate passes; otherwise every test job must have succeeded.
   test-suite:
     name: Test Suite
-    runs-on: [self-hosted, infra]
+    runs-on: ubuntu-latest
     needs: [changes, lint, unit-test, integration-test, e2e-test, script-test]
     if: always()
     steps:
@@ -284,23 +292,3 @@ jobs:
             exit 1
           fi
           echo "All test jobs passed"
-
-  # Release build, only on main pushes. Split into its own job so it does
-  # not block the test jobs and does not pull in PostgreSQL or test env vars
-  # (there is no build.rs; cargo build --release needs none of them).
-  build-release:
-    name: Build release
-    needs: changes
-    if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && needs.changes.outputs.rust == 'true' }}
-    runs-on: [self-hosted, infra]
-
-    steps:
-    - uses: actions/checkout@v7
-
-    - name: Setup Rust CI
-      uses: ./.github/actions/setup-rust-ci
-      with:
-        cache-key: release
-
-    - name: Build release
-      run: cargo build --release

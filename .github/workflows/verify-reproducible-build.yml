@@ -6,6 +6,13 @@ on:
     branches:
       - 'main'
 
+# Each run ties up three self-hosted runners for 12-24 minutes. Only the newest
+# main commit needs verifying, so a new push cancels the in-flight run. This
+# workflow only checks digests; images are built and deployed by build.yml.
+concurrency:
+  group: verify-reproducible-build-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   # Build in parallel on the self-hosted infra fleet. With roughly one runner
   # per host, the two instances usually land on different machines, giving
@@ -15,8 +22,7 @@ jobs:
   # Debian apt snapshot, SOURCE_DATE_EPOCH=0, rewrite-timestamp), so the host OS
   # cannot affect the output digest. That is why this no longer uses the old
   # ubuntu-latest / ubuntu-22.04 / ubuntu-24.04 cross-OS matrix — the pinning
-  # already guarantees host-independence, and GitHub-hosted runners are no
-  # longer available to this repo anyway (CI migrated to [self-hosted, infra]).
+  # already guarantees host-independence.
   build:
     name: Cross-machine build ${{ matrix.instance }}
     runs-on: [self-hosted, infra]
@@ -165,7 +171,7 @@ jobs:
   verify:
     name: Verify Reproducibility
     needs: [build, sequential-builds]
-    runs-on: [self-hosted, infra]
+    runs-on: ubuntu-latest
     steps:
       - name: Download all digest artifacts
         uses: actions/download-artifact@v8
@@ -298,7 +304,7 @@ jobs:
     name: Notify Slack on failure
     needs: [build, sequential-builds, verify]
     if: always() && contains(needs.*.result, 'failure')
-    runs-on: [self-hosted, infra]
+    runs-on: ubuntu-latest
     steps:
       - name: Send Slack notification
         env:

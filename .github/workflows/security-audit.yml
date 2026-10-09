@@ -8,6 +8,10 @@ on:
   schedule:
     - cron: '0 0 * * *'  # Run daily at midnight UTC
 
+concurrency:
+  group: security-audit-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 permissions:
   issues: write
   checks: write
@@ -15,7 +19,7 @@ permissions:
 jobs:
   security_audit:
     name: cargo audit
-    runs-on: [self-hosted, infra]
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
       - uses: actions-rust-lang/setup-rust-toolchain@v1

@@ -634,7 +634,7 @@ async fn erase_personal_org_user_removes_content_and_identity_keeps_usage() {
         .iter()
         .map(|r| r.get(0))
         .collect();
-    assert!(prefixes.iter().all(|p| p.as_deref() == Some("sk_****")));
+    assert!(prefixes.iter().all(|p| p.as_deref() == Some("sk-****")));
 
     let log = client
         .query_one(

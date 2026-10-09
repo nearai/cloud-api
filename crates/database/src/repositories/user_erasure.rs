@@ -394,7 +394,7 @@ impl UserErasureRepository for PostgresUserErasureRepository {
             }
             transaction
                 .execute(
-                    "UPDATE api_keys SET name = 'erased', key_prefix = 'sk_****' WHERE workspace_id = ANY($1)",
+                    "UPDATE api_keys SET name = 'erased', key_prefix = 'sk-****' WHERE workspace_id = ANY($1)",
                     &[&workspace_ids],
                 )
                 .await

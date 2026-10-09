@@ -3094,7 +3094,7 @@ pub async fn list_organization_members(
     State(app_state): State<AdminAppState>,
     Extension(_admin_user): Extension<AdminUser>, // Require admin auth
     Path(org_id): Path<Uuid>,
-    Query(params): Query<ListOrganizationsQueryParams>,
+    Query(params): Query<ListOrganizationMembersQueryParams>,
 ) -> Result<
     ResponseJson<ListAdminOrganizationMembersResponse>,
     (StatusCode, ResponseJson<ErrorResponse>),
@@ -3810,9 +3810,16 @@ pub struct ListOrganizationsQueryParams {
     pub limit: i64,
     #[serde(default)]
     pub offset: i64,
-    /// Used by the organization list only; the members list ignores it.
     #[serde(default)]
     pub lifecycle: services::admin::OrganizationLifecycleFilter,
+}
+
+#[derive(Debug, serde::Deserialize)]
+pub struct ListOrganizationMembersQueryParams {
+    #[serde(default = "crate::routes::common::default_limit")]
+    pub limit: i64,
+    #[serde(default)]
+    pub offset: i64,
 }
 
 #[derive(Debug, serde::Deserialize)]

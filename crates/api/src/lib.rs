@@ -2095,11 +2095,11 @@ fn build_admin_routes_with_options(
         list_admin_settings, list_aml_allowlist, list_aml_reports, list_api_keys,
         list_invitation_email_deliveries, list_model_pricing_changes,
         list_models as admin_list_models, list_organization_members, list_organizations,
-        list_users, preview_model_deprecation, preview_model_pricing_changes, preview_user_erasure,
-        resend_invitation_email, update_admin_setting, update_aml_report_status,
-        update_organization_concurrent_limit, update_organization_fallback,
-        update_organization_limits, update_organization_member_role, update_organization_priority,
-        update_service, upsert_aml_allowlist_entry, AdminAppState,
+        list_users, lookup_user_erasures, preview_model_deprecation, preview_model_pricing_changes,
+        preview_user_erasure, resend_invitation_email, update_admin_setting,
+        update_aml_report_status, update_organization_concurrent_limit,
+        update_organization_fallback, update_organization_limits, update_organization_member_role,
+        update_organization_priority, update_service, upsert_aml_allowlist_entry, AdminAppState,
     };
     use crate::routes::staking_farm::{
         get_admin_organization_staking_farm, sync_admin_organization_staking_farm,
@@ -2330,6 +2330,10 @@ fn build_admin_routes_with_options(
         .route(
             "/admin/users/{user_id}/erasure",
             axum::routing::post(erase_user),
+        )
+        .route(
+            "/admin/user-erasures/lookup",
+            axum::routing::post(lookup_user_erasures),
         )
         .route(
             "/admin/organizations",

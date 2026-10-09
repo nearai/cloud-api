@@ -108,6 +108,7 @@ mod usage_provider_attribution;
 mod usage_recording;
 mod usage_responses;
 mod user_erasure;
+mod user_erasure_lookup;
 mod vpc_login;
 mod web_context_search;
 mod web_search_citations;

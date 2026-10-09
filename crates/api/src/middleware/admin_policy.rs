@@ -22,7 +22,8 @@ pub(crate) fn admin_operation(method: &Method, matched_path: &str) -> AdminOpera
         matched_path
     };
 
-    if path == "/admin/users/{user_id}/erasure" {
+    // Confirms whether an email was ever a customer, so no admin tokens.
+    if path == "/admin/users/{user_id}/erasure" || path == "/admin/user-erasures/lookup" {
         return AdminOperation::SessionOnly;
     }
 
@@ -105,6 +106,19 @@ mod tests {
             );
             assert_eq!(
                 admin_operation(&Method::POST, &execute),
+                AdminOperation::SessionOnly
+            );
+        }
+    }
+
+    #[test]
+    fn user_erasure_lookup_is_session_only() {
+        for path in [
+            "/v1/admin/user-erasures/lookup",
+            "/admin/user-erasures/lookup",
+        ] {
+            assert_eq!(
+                admin_operation(&Method::POST, path),
                 AdminOperation::SessionOnly
             );
         }

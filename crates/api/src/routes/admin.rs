@@ -13,23 +13,24 @@ use crate::models::{
     CreateServiceRequest, CreditType, DecimalPrice, DecimalPriceRequest,
     DeleteAdminAccessTokenRequest, DeleteModelRequest, DeprecateModelRequest,
     DeprecateModelResponse, EraseUserRequest, EraseUserResponse, ErasedOrganizationResponse,
-    ErasureBlockedResponse, ErasureLogResponse, ErasurePreviewResponse, ErrorResponse,
-    GetOrganizationConcurrentLimitResponse, ListAdminAccessTokensResponse,
-    ListAdminAmlAllowlistResponse, ListAdminAmlReportsResponse, ListAdminApiKeysResponse,
-    ListAdminInvitationEmailDeliveriesResponse, ListAdminOrganizationMembersResponse,
-    ListOrganizationsAdminResponse, ListPricingChangesResponse, ListUsersResponse, MemberRole,
-    ModelArchitecture, ModelDeprecationConfirmResponse, ModelDeprecationPreviewResponse,
-    ModelDeprecationRequest, ModelHistoryEntry, ModelHistoryResponse, ModelMetadata,
-    ModelWithPricing, OrgLimitsHistoryEntry, OrgLimitsHistoryResponse,
-    OrganizationFallbackResponse, OrganizationMemberResponse, OrganizationPriorityResponse,
-    OrganizationUsage, PricingChangeBatchRequest, PricingChangeConfirmResponse,
-    PricingChangeModelPreviewDto, PricingChangePreviewResponse, PricingFieldUpdates, PricingFields,
-    RetainedOrganizationResponse, ScheduledPricingChangeDto, SpendLimit,
-    UpdateAmlReportStatusRequest, UpdateOrganizationConcurrentLimitRequest,
+    ErasureBlockedResponse, ErasureLogResponse, ErasureLookupOrganizationResponse,
+    ErasurePreviewResponse, ErrorResponse, GetOrganizationConcurrentLimitResponse,
+    ListAdminAccessTokensResponse, ListAdminAmlAllowlistResponse, ListAdminAmlReportsResponse,
+    ListAdminApiKeysResponse, ListAdminInvitationEmailDeliveriesResponse,
+    ListAdminOrganizationMembersResponse, ListOrganizationsAdminResponse,
+    ListPricingChangesResponse, ListUsersResponse, LookupUserErasuresRequest,
+    LookupUserErasuresResponse, MemberRole, ModelArchitecture, ModelDeprecationConfirmResponse,
+    ModelDeprecationPreviewResponse, ModelDeprecationRequest, ModelHistoryEntry,
+    ModelHistoryResponse, ModelMetadata, ModelWithPricing, OrgLimitsHistoryEntry,
+    OrgLimitsHistoryResponse, OrganizationFallbackResponse, OrganizationMemberResponse,
+    OrganizationPriorityResponse, OrganizationUsage, PricingChangeBatchRequest,
+    PricingChangeConfirmResponse, PricingChangeModelPreviewDto, PricingChangePreviewResponse,
+    PricingFieldUpdates, PricingFields, RetainedOrganizationResponse, ScheduledPricingChangeDto,
+    SpendLimit, UpdateAmlReportStatusRequest, UpdateOrganizationConcurrentLimitRequest,
     UpdateOrganizationConcurrentLimitResponse, UpdateOrganizationFallbackRequest,
     UpdateOrganizationLimitsRequest, UpdateOrganizationLimitsResponse,
     UpdateOrganizationMemberRequest, UpdateOrganizationPriorityRequest, UpdateServiceRequest,
-    UpsertAmlAllowlistEntryRequest,
+    UpsertAmlAllowlistEntryRequest, UserErasureRecordResponse,
 };
 use crate::routes::common::{analytics_error_response, format_amount};
 use crate::routes::usage::{compute_organization_balance_response, OrganizationBalanceResponse};
@@ -5155,7 +5156,7 @@ fn repository_error_kind(error: &anyhow::Error) -> &'static str {
 }
 
 fn erasure_error_to_response(
-    user_id: uuid::Uuid,
+    user_id: Option<uuid::Uuid>,
     err: services::user_erasure::UserErasureError,
 ) -> axum::response::Response {
     use axum::http::StatusCode;
@@ -5172,6 +5173,16 @@ fn erasure_error_to_response(
             )
                 .into_response();
         }
+        E::InvalidLookup => (
+            StatusCode::BAD_REQUEST,
+            "validation_error",
+            "Provide exactly one of email or user_id",
+        ),
+        E::InvalidUserId => (
+            StatusCode::BAD_REQUEST,
+            "validation_error",
+            "user_id must be a valid UUID",
+        ),
         E::ConfirmEmailMismatch => (
             StatusCode::UNPROCESSABLE_ENTITY,
             "confirm_email_mismatch",
@@ -5179,7 +5190,7 @@ fn erasure_error_to_response(
         ),
         E::Internal(e) => {
             tracing::error!(
-                user_id = %user_id,
+                user_id = user_id.map(tracing::field::display),
                 error_kind = repository_error_kind(&e),
                 "User erasure failed"
             );
@@ -5233,7 +5244,7 @@ pub async fn erase_user(
             req.requested_at,
         )
         .await
-        .map_err(|e| erasure_error_to_response(user_id, e))?;
+        .map_err(|e| erasure_error_to_response(Some(user_id), e))?;
 
     Ok(ResponseJson(EraseUserResponse {
         user_id: r.user_id.to_string(),
@@ -5270,7 +5281,7 @@ pub async fn preview_user_erasure(
         .user_erasure_service
         .preview(user_id)
         .await
-        .map_err(|e| erasure_error_to_response(user_id, e))?;
+        .map_err(|e| erasure_error_to_response(Some(user_id), e))?;
 
     Ok(ResponseJson(ErasurePreviewResponse {
         user_id: plan.user_id.to_string(),
@@ -5300,6 +5311,66 @@ pub async fn preview_user_erasure(
             requested_at: l.requested_at,
             erased_at: l.erased_at,
         }),
+    }))
+}
+
+/// Find erasure records by the erased person's email or user id (Admin session only).
+/// The email travels in the body, never the URL. No match is a 200 with an empty list.
+#[utoipa::path(
+    post,
+    path = "/v1/admin/user-erasures/lookup",
+    tag = "Admin",
+    request_body = LookupUserErasuresRequest,
+    responses(
+        (status = 200, description = "Matching erasure records, newest first (at most 100)", body = LookupUserErasuresResponse),
+        (status = 400, description = "Exactly one of a non-blank email or a valid user_id UUID is required", body = ErrorResponse),
+        (status = 401, description = "Unauthorized", body = ErrorResponse),
+        (status = 403, description = "Admin API tokens cannot look up erasures", body = ErrorResponse),
+        (status = 500, description = "Internal server error", body = ErrorResponse)
+    ),
+    security(("session_token" = []))
+)]
+pub async fn lookup_user_erasures(
+    State(app_state): State<AdminAppState>,
+    Extension(_admin_user): Extension<AdminUser>,
+    ResponseJson(req): ResponseJson<LookupUserErasuresRequest>,
+) -> Result<ResponseJson<LookupUserErasuresResponse>, axum::response::Response> {
+    let user_id = match req.user_id.as_deref() {
+        None => None,
+        Some(raw) => Some(raw.trim().parse::<uuid::Uuid>().map_err(|_| {
+            erasure_error_to_response(
+                None,
+                services::user_erasure::UserErasureError::InvalidUserId,
+            )
+        })?),
+    };
+    let records = app_state
+        .user_erasure_service
+        .lookup(req.email.as_deref(), user_id)
+        .await
+        .map_err(|e| erasure_error_to_response(user_id, e))?;
+
+    let orgs = |orgs: Vec<services::user_erasure::ErasureRecordOrg>| {
+        orgs.into_iter()
+            .map(|o| ErasureLookupOrganizationResponse {
+                organization_id: o.organization_id.to_string(),
+                lifecycle: o.lifecycle,
+            })
+            .collect::<Vec<_>>()
+    };
+    Ok(ResponseJson(LookupUserErasuresResponse {
+        erasures: records
+            .into_iter()
+            .map(|r| UserErasureRecordResponse {
+                user_id: r.user_id.to_string(),
+                user_lifecycle: r.user_lifecycle,
+                admin_user_id: r.admin_user_id.to_string(),
+                requested_at: r.requested_at,
+                erased_at: r.erased_at,
+                erased_organizations: orgs(r.erased_organizations),
+                retained_organizations: orgs(r.retained_organizations),
+            })
+            .collect(),
     }))
 }
 

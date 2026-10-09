@@ -3084,6 +3084,37 @@ pub struct EraseUserResponse {
     pub erased_organization_ids: Vec<String>,
 }
 
+/// Body of the erasure lookup: exactly one of `email` or `user_id`. The email is
+/// compared as a digest and must never appear in a URL or query string.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct LookupUserErasuresRequest {
+    pub email: Option<String>,
+    pub user_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct ErasureLookupOrganizationResponse {
+    pub organization_id: String,
+    pub lifecycle: services::lifecycle::OrganizationLifecycle,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct UserErasureRecordResponse {
+    pub user_id: String,
+    pub user_lifecycle: services::lifecycle::UserLifecycle,
+    pub admin_user_id: String,
+    pub requested_at: DateTime<Utc>,
+    pub erased_at: DateTime<Utc>,
+    pub erased_organizations: Vec<ErasureLookupOrganizationResponse>,
+    pub retained_organizations: Vec<ErasureLookupOrganizationResponse>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct LookupUserErasuresResponse {
+    /// Newest `erased_at` first; empty when nothing matches.
+    pub erasures: Vec<UserErasureRecordResponse>,
+}
+
 /// Admin user response model (for owners/admins)
 /// Contains sensitive information only visible to organization owners/admins
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]

@@ -33,6 +33,10 @@ pub enum UserErasureError {
     Blocked(Vec<ErasureBlocker>),
     #[error("confirm_email does not match")]
     ConfirmEmailMismatch,
+    #[error("lookup needs exactly one of email or user_id")]
+    InvalidLookup,
+    #[error("user_id is not a valid UUID")]
+    InvalidUserId,
     #[error("erasure failed")]
     Internal(#[source] anyhow::Error),
 }
@@ -59,6 +63,28 @@ impl UserErasureService {
             .await
             .map_err(UserErasureError::Internal)?
             .ok_or(UserErasureError::NotFound)
+    }
+
+    /// Find erasure records by the erased person's email or by user id (exactly one).
+    /// The email is digested here; the repository never sees it. Newest first. Supplying
+    /// both fields is rejected even if the email is blank, and a blank email on its own
+    /// is rejected too.
+    pub async fn lookup(
+        &self,
+        email: Option<&str>,
+        user_id: Option<Uuid>,
+    ) -> Result<Vec<ErasureRecord>, UserErasureError> {
+        let by = match (email, user_id) {
+            (Some(email), None) if !email.trim().is_empty() => {
+                ErasureLookup::EmailDigest(erased_email_digest(email))
+            }
+            (None, Some(user_id)) => ErasureLookup::UserId(user_id),
+            _ => return Err(UserErasureError::InvalidLookup),
+        };
+        self.repository
+            .find_erasures(by)
+            .await
+            .map_err(UserErasureError::Internal)
     }
 
     /// Erase `user_id` in one database transaction. Calling again on an erased user
@@ -180,6 +206,7 @@ mod tests {
         footprint: ErasedFootprint,
         sweeps: Mutex<u32>,
         renames: Mutex<u32>,
+        lookups: Mutex<Vec<ErasureLookup>>,
     }
 
     impl FakeRepo {
@@ -189,6 +216,7 @@ mod tests {
                 footprint,
                 sweeps: Mutex::new(0),
                 renames: Mutex::new(0),
+                lookups: Mutex::new(Vec::new()),
             })
         }
     }
@@ -208,6 +236,10 @@ mod tests {
         async fn sweep_erased(&self, _: Uuid) -> anyhow::Result<ErasedFootprint> {
             *self.sweeps.lock().unwrap() += 1;
             Ok(self.footprint.clone())
+        }
+        async fn find_erasures(&self, by: ErasureLookup) -> anyhow::Result<Vec<ErasureRecord>> {
+            self.lookups.lock().unwrap().push(by);
+            Ok(Vec::new())
         }
     }
 
@@ -270,6 +302,53 @@ mod tests {
                 .await
                 .unwrap_err();
             assert!(format!("{err:?}").starts_with(expected), "{err:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn lookup_by_email_passes_the_normalized_digest() {
+        let repo = FakeRepo::new(ExecuteOutcome::NotFound, ErasedFootprint::default());
+        UserErasureService::new(repo.clone())
+            .lookup(Some("  Alice@Example.COM "), None)
+            .await
+            .unwrap();
+        assert_eq!(
+            *repo.lookups.lock().unwrap(),
+            vec![ErasureLookup::EmailDigest(erased_email_digest(
+                "alice@example.com"
+            ))]
+        );
+    }
+
+    #[tokio::test]
+    async fn lookup_by_user_id_passes_it_through() {
+        let repo = FakeRepo::new(ExecuteOutcome::NotFound, ErasedFootprint::default());
+        let id = Uuid::new_v4();
+        UserErasureService::new(repo.clone())
+            .lookup(None, Some(id))
+            .await
+            .unwrap();
+        assert_eq!(
+            *repo.lookups.lock().unwrap(),
+            vec![ErasureLookup::UserId(id)]
+        );
+    }
+
+    #[tokio::test]
+    async fn lookup_rejects_both_or_neither() {
+        for (email, user_id) in [
+            (Some("a@b.c"), Some(Uuid::new_v4())),
+            (None, None),
+            (Some("   "), None),
+            (Some("   "), Some(Uuid::new_v4())),
+        ] {
+            let repo = FakeRepo::new(ExecuteOutcome::NotFound, ErasedFootprint::default());
+            let err = UserErasureService::new(repo.clone())
+                .lookup(email, user_id)
+                .await
+                .unwrap_err();
+            assert!(matches!(err, UserErasureError::InvalidLookup), "{err:?}");
+            assert!(repo.lookups.lock().unwrap().is_empty());
         }
     }
 }

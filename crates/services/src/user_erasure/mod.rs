@@ -78,15 +78,28 @@ impl UserErasureService {
                     erased_organizations = footprint.organization_ids.len(),
                     "User erased"
                 );
+                // The rename runs in its own transaction after the erase committed. If it
+                // fails, the operator re-posts: the retry reports `already_erased` and
+                // re-runs the (idempotent) rename below.
+                self.repository
+                    .rename_retained_signup_orgs(user_id)
+                    .await
+                    .map_err(UserErasureError::Internal)?;
                 (false, footprint)
             }
-            ExecuteOutcome::AlreadyErased => (
-                true,
-                self.repository
+            ExecuteOutcome::AlreadyErased => {
+                let footprint = self
+                    .repository
                     .sweep_erased(user_id)
                     .await
-                    .map_err(UserErasureError::Internal)?,
-            ),
+                    .map_err(UserErasureError::Internal)?;
+                // Repairs a crash between the erase commit and the rename.
+                self.repository
+                    .rename_retained_signup_orgs(user_id)
+                    .await
+                    .map_err(UserErasureError::Internal)?;
+                (true, footprint)
+            }
             ExecuteOutcome::Blocked(blockers) => return Err(UserErasureError::Blocked(blockers)),
             ExecuteOutcome::ConfirmEmailMismatch => {
                 return Err(UserErasureError::ConfirmEmailMismatch)
@@ -112,6 +125,7 @@ mod tests {
         outcome: Mutex<ExecuteOutcome>,
         footprint: ErasedFootprint,
         sweeps: Mutex<u32>,
+        renames: Mutex<u32>,
     }
 
     impl FakeRepo {
@@ -120,6 +134,7 @@ mod tests {
                 outcome: Mutex::new(outcome),
                 footprint,
                 sweeps: Mutex::new(0),
+                renames: Mutex::new(0),
             })
         }
     }
@@ -131,6 +146,10 @@ mod tests {
         }
         async fn execute(&self, _: ExecuteRequest<'_>) -> anyhow::Result<ExecuteOutcome> {
             Ok(self.outcome.lock().unwrap().clone())
+        }
+        async fn rename_retained_signup_orgs(&self, _: Uuid) -> anyhow::Result<()> {
+            *self.renames.lock().unwrap() += 1;
+            Ok(())
         }
         async fn sweep_erased(&self, _: Uuid) -> anyhow::Result<ErasedFootprint> {
             *self.sweeps.lock().unwrap() += 1;
@@ -164,6 +183,7 @@ mod tests {
             0,
             "first erase does not sweep"
         );
+        assert_eq!(*repo.renames.lock().unwrap(), 1, "fresh erase renames");
     }
 
     #[tokio::test]
@@ -177,6 +197,7 @@ mod tests {
         assert!(r.already_erased);
         assert_eq!(r.erased_organization_ids, vec![org]);
         assert_eq!(*repo.sweeps.lock().unwrap(), 1, "retry sweeps late content");
+        assert_eq!(*repo.renames.lock().unwrap(), 1, "retry re-runs the rename");
     }
 
     #[tokio::test]

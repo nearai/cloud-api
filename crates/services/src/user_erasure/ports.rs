@@ -71,6 +71,11 @@ pub trait UserErasureRepository: Send + Sync {
     async fn plan(&self, user_id: Uuid) -> anyhow::Result<Option<ErasurePlan>>;
     /// One transaction: lock, re-check, delete, scrub, write the log row.
     async fn execute(&self, request: ExecuteRequest<'_>) -> anyhow::Result<ExecuteOutcome>;
+    /// Rename the user's still-active auto-named signup orgs (retained team orgs) to
+    /// `org-<uuid>`. Runs in its own short org-first transaction, after `execute`
+    /// commits, because it must row-lock orgs that still have active teammates.
+    /// Idempotent.
+    async fn rename_retained_signup_orgs(&self, user_id: Uuid) -> anyhow::Result<()>;
     /// For an erased user: re-delete content written into erased workspaces after the
     /// original commit, and return the erased orgs and workspaces.
     async fn sweep_erased(&self, user_id: Uuid) -> anyhow::Result<ErasedFootprint>;

@@ -300,16 +300,12 @@ impl UserErasureRepository for PostgresUserErasureRepository {
                 return Ok(ExecuteOutcome::ConfirmEmailMismatch);
             }
 
-            // Lock U's membership rows (a role change or removal touches these rows), then
-            // row-lock only the orgs being erased. Retained team orgs are never row-locked:
-            // usage recording takes FOR UPDATE on the org row (credit_allocation.rs:54).
-            transaction
-                .query(
-                    "SELECT 1 FROM organization_members WHERE user_id = $1 ORDER BY organization_id FOR UPDATE",
-                    &[&user_id],
-                )
-                .await
-                .map_err(map_db_error)?;
+            // Lock order matches organization.rs (org row, then member row): read U's
+            // memberships unlocked to find the candidate erased orgs, lock those org
+            // rows, then lock U's member rows. Retained team orgs are never row-locked
+            // here: usage recording takes FOR UPDATE on the org row
+            // (credit_allocation.rs:54). The signup-org rename runs after commit in
+            // its own short org-first transaction (rename_retained_signup_orgs).
             let first = load_memberships(&*transaction, user_id).await?;
             let erased = erased_org_ids(&first);
             transaction
@@ -319,8 +315,15 @@ impl UserErasureRepository for PostgresUserErasureRepository {
                 )
                 .await
                 .map_err(map_db_error)?;
-            // add-member takes FOR SHARE on the org row; re-read under the lock and retry
-            // if someone joined an org we were about to erase.
+            transaction
+                .query(
+                    "SELECT 1 FROM organization_members WHERE user_id = $1 ORDER BY organization_id FOR UPDATE",
+                    &[&user_id],
+                )
+                .await
+                .map_err(map_db_error)?;
+            // add-member takes FOR SHARE on the org row; re-read under the locks and
+            // retry if someone joined or left an org we were about to erase.
             let memberships = load_memberships(&*transaction, user_id).await?;
             if erased_org_ids(&memberships) != erased {
                 transaction.rollback().await.map_err(map_db_error)?;
@@ -430,44 +433,6 @@ impl UserErasureRepository for PostgresUserErasureRepository {
                 .await
                 .map_err(map_db_error)?;
 
-            // Retained orgs that are still U's untouched signup org. Identified
-            // structurally (not by U's current email, which may have changed since
-            // signup): the name has the auto-generated shape and U created a default
-            // workspace whose description embeds that exact name.
-            transaction
-                .execute(
-                    r#"
-                    WITH renamed AS (
-                        SELECT o.id, o.name AS old_name, 'org-' || o.id::text AS new_name
-                        FROM organizations o
-                        WHERE o.id = ANY($1)
-                          AND o.name ~ '^.+-org-[a-z0-9]{4}$'
-                          AND EXISTS (
-                              SELECT 1 FROM workspaces sw
-                              WHERE sw.organization_id = o.id
-                                AND sw.created_by_user_id = $2
-                                AND sw.description = 'Default workspace for ' || o.name
-                          )
-                    ), ws AS (
-                        UPDATE workspaces w
-                        SET description = 'Default workspace for ' || r.new_name, updated_at = NOW()
-                        FROM renamed r
-                        WHERE w.organization_id = r.id AND w.description = 'Default workspace for ' || r.old_name
-                    ), dep AS (
-                        UPDATE model_deprecation_email_deliveries d SET organization_name = r.new_name
-                        FROM renamed r WHERE d.organization_id = r.id AND d.organization_name = r.old_name
-                    ), pri AS (
-                        UPDATE model_pricing_change_email_deliveries d SET organization_name = r.new_name
-                        FROM renamed r WHERE d.organization_id = r.id AND d.organization_name = r.old_name
-                    )
-                    UPDATE organizations o SET name = r.new_name, updated_at = NOW()
-                    FROM renamed r WHERE o.id = r.id
-                    "#,
-                    &[&retained, &user_id],
-                )
-                .await
-                .map_err(map_db_error)?;
-
             // Denormalized copies of U's email, provider metadata, org names.
             for sql in [
                 "UPDATE organization_limits_history SET changed_by_user_email = $2 WHERE changed_by_user_id = $1",
@@ -535,6 +500,95 @@ impl UserErasureRepository for PostgresUserErasureRepository {
             }))
         })?;
         Ok(outcome)
+    }
+
+    async fn rename_retained_signup_orgs(&self, user_id: Uuid) -> Result<()> {
+        // Own short transaction, org rows locked first (ordered by id), so it never
+        // inverts the org-then-member lock order used by organization.rs. Retained
+        // orgs still have active teammates, so this must not run inside the erase
+        // transaction. Idempotent: a renamed org no longer matches the name pattern.
+        retry_db!("rename_retained_signup_orgs", {
+            let mut client = self
+                .pool
+                .get()
+                .await
+                .context("Failed to get database connection")
+                .map_err(RepositoryError::PoolError)?;
+            let transaction = client.transaction().await.map_err(map_db_error)?;
+            // Retained orgs are still U's untouched signup org when identified
+            // structurally (not by U's current email, which may have changed since
+            // signup): the name has the auto-generated shape and U created a default
+            // workspace whose description embeds that exact name.
+            let candidates: Vec<Uuid> = transaction
+                .query(
+                    r#"
+                    SELECT o.id FROM organizations o
+                    WHERE o.is_active
+                      AND o.name ~ '^.+-org-[a-z0-9]{4}$'
+                      AND EXISTS (
+                          SELECT 1 FROM workspaces sw
+                          WHERE sw.organization_id = o.id
+                            AND sw.created_by_user_id = $1
+                            AND sw.description = 'Default workspace for ' || o.name
+                      )
+                    ORDER BY o.id
+                    "#,
+                    &[&user_id],
+                )
+                .await
+                .map_err(map_db_error)?
+                .iter()
+                .map(|r| r.get("id"))
+                .collect();
+            if candidates.is_empty() {
+                transaction.rollback().await.map_err(map_db_error)?;
+                return Ok(());
+            }
+            transaction
+                .query(
+                    "SELECT id FROM organizations WHERE id = ANY($1) ORDER BY id FOR UPDATE",
+                    &[&candidates],
+                )
+                .await
+                .map_err(map_db_error)?;
+            transaction
+                .execute(
+                    r#"
+                    WITH renamed AS (
+                        SELECT o.id, o.name AS old_name, 'org-' || o.id::text AS new_name
+                        FROM organizations o
+                        WHERE o.id = ANY($1)
+                          AND o.is_active
+                          AND o.name ~ '^.+-org-[a-z0-9]{4}$'
+                          AND EXISTS (
+                              SELECT 1 FROM workspaces sw
+                              WHERE sw.organization_id = o.id
+                                AND sw.created_by_user_id = $2
+                                AND sw.description = 'Default workspace for ' || o.name
+                          )
+                    ), ws AS (
+                        UPDATE workspaces w
+                        SET description = 'Default workspace for ' || r.new_name, updated_at = NOW()
+                        FROM renamed r
+                        WHERE w.organization_id = r.id AND w.description = 'Default workspace for ' || r.old_name
+                    ), dep AS (
+                        UPDATE model_deprecation_email_deliveries d SET organization_name = r.new_name
+                        FROM renamed r WHERE d.organization_id = r.id AND d.organization_name = r.old_name
+                    ), pri AS (
+                        UPDATE model_pricing_change_email_deliveries d SET organization_name = r.new_name
+                        FROM renamed r WHERE d.organization_id = r.id AND d.organization_name = r.old_name
+                    )
+                    UPDATE organizations o SET name = r.new_name, updated_at = NOW()
+                    FROM renamed r WHERE o.id = r.id
+                    "#,
+                    &[&candidates, &user_id],
+                )
+                .await
+                .map_err(map_db_error)?;
+            transaction.commit().await.map_err(map_db_error)?;
+            Ok(())
+        })?;
+        Ok(())
     }
 
     async fn sweep_erased(&self, user_id: Uuid) -> Result<ErasedFootprint> {

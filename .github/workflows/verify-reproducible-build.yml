@@ -7,10 +7,12 @@ on:
       - 'main'
 
 # Each run ties up three self-hosted runners for 12-24 minutes. Only the newest
-# main commit needs verifying, so a new push cancels the in-flight run. This
-# workflow only checks digests; images are built and deployed by build.yml.
+# main commit needs verifying, so a new push cancels the in-flight push run.
+# Manual workflow_dispatch runs get a unique group (run_id) so routine pushes
+# never cancel a deliberate re-verification. This workflow only checks digests;
+# images are built and deployed by build.yml.
 concurrency:
-  group: verify-reproducible-build-${{ github.ref }}
+  group: verify-reproducible-build-${{ github.event_name == 'push' && github.ref || github.run_id }}
   cancel-in-progress: true
 
 jobs:

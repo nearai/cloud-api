@@ -24,7 +24,9 @@ use inference_providers::spki_verifier::{
     canonical_spki_fingerprint, FingerprintState, SharedTlsRoots,
 };
 
-use inference_providers::attested::tinfoil::verifier_port::{AtcBundle, ProxyDoc};
+use inference_providers::attested::tinfoil::verifier_port::{
+    validate_router_domain, AtcBundle, ProxyDoc,
+};
 use services::attestation::tinfoil_observer::observe;
 
 use crate::classify::{
@@ -113,6 +115,9 @@ pub struct ProbeOutput {
     pub sigstore: SigstoreResults,
     /// Why something was not observed or verified. Categories only.
     pub notes: Vec<String>,
+    /// The router verified and its proxy document was fetched and decoded. A
+    /// run without both has nothing to sync and must not look like a success.
+    pub complete: bool,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -233,17 +238,6 @@ async fn fetch_release_attestation(
     Err("no attestation verified for this release".into())
 }
 
-/// A plain DNS hostname (it is placed in a URL and used as the TLS server
-/// name).
-fn is_hostname(d: &str) -> bool {
-    !d.is_empty()
-        && d.len() <= 253
-        && !d.starts_with(['.', '-'])
-        && !d.ends_with(['.', '-'])
-        && d.chars()
-            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '.'))
-}
-
 /// An HTTP client whose every connection must present a certificate that both
 /// passes WebPKI for the connected name and has exactly the attested SPKI.
 /// Redirects are not followed, and TLS session resumption is off (see
@@ -266,7 +260,7 @@ fn pinned_client(net: &ProxyNet, target: &ProxyTarget) -> Result<reqwest::Client
 /// The proxy document, fetched from the attested router's domain through a
 /// client pinned to its attested TLS key.
 async fn fetch_proxy_pinned(cfg: &ProbeConfig, target: &ProxyTarget) -> Result<String, String> {
-    if !is_hostname(&target.domain) {
+    if validate_router_domain(&target.domain).is_err() {
         return Err("attested domain is not a hostname".into());
     }
     let client = pinned_client(&cfg.proxy_net, target)?;
@@ -348,6 +342,7 @@ pub async fn run(client: &reqwest::Client, cfg: &ProbeConfig) -> Result<ProbeOut
             }
         }
     };
+    let complete = proxy.is_some();
     let proxy = proxy.unwrap_or(ProxyDoc {
         models: BTreeMap::new(),
     });
@@ -375,6 +370,7 @@ pub async fn run(client: &reqwest::Client, cfg: &ProbeConfig) -> Result<ProbeOut
         observations,
         sigstore,
         notes,
+        complete,
     })
 }
 
@@ -841,6 +837,34 @@ mod tests {
                 );
             }
             assert_eq!(s.requests.load(Ordering::SeqCst), 0);
+        }
+
+        #[tokio::test]
+        async fn attested_domain_must_be_a_tinfoil_router_host() {
+            let s = tls_server("x").await;
+            for d in [
+                "evil.example.com",
+                "tinfoil.sh",
+                "inference.tinfoil.sh.evil.com",
+                "eviltinfoil.sh",
+                "Inference.tinfoil.sh",
+                "xn--a.tinfoil.sh",
+                "a..tinfoil.sh",
+                "localhost",
+                "127.0.0.1",
+            ] {
+                let t = ProxyTarget {
+                    domain: d.into(),
+                    spki_sha256_hex: s.leaf_spki_hex.clone(),
+                };
+                assert_eq!(
+                    fetch_proxy_pinned(&cfg_for(&s), &t).await.unwrap_err(),
+                    "attested domain is not a hostname",
+                    "{d:?}"
+                );
+            }
+            assert_eq!(s.requests.load(Ordering::SeqCst), 0);
+            assert!(validate_router_domain("inference.tinfoil.sh").is_ok());
         }
 
         #[tokio::test]

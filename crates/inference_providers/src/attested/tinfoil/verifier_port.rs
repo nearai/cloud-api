@@ -110,6 +110,35 @@ impl TinfoilVerifyError {
     }
 }
 
+/// A router host must be a bare lowercase ASCII `*.tinfoil.sh` hostname: no
+/// scheme, port, path, userinfo, uppercase, trailing dot or IDN (`xn--` punycode
+/// labels are rejected too). The ATC serves bundles for several router hosts and
+/// the domain decides where requests are sent, so it is validated before it is
+/// trusted. Pure: no I/O.
+pub fn validate_router_domain(domain: &str) -> Result<(), TinfoilVerifyError> {
+    const SUFFIX: &str = ".tinfoil.sh";
+    let Some(prefix) = domain.strip_suffix(SUFFIX) else {
+        return Err(TinfoilVerifyError::Malformed {
+            stage: "router_domain",
+        });
+    };
+    let label_ok = |l: &str| {
+        !l.is_empty()
+            && l.len() <= 63
+            && !l.starts_with('-')
+            && !l.ends_with('-')
+            && !l.starts_with("xn--")
+            && l.bytes()
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+    };
+    if domain.len() > 253 || !prefix.split('.').all(label_ok) {
+        return Err(TinfoilVerifyError::Malformed {
+            stage: "router_domain",
+        });
+    }
+    Ok(())
+}
+
 pub trait TinfoilVerifier: Send + Sync {
     fn verify_router(&self, bundle: &AtcBundle) -> Result<VerifiedRouter, TinfoilVerifyError>;
     /// Verifies that `entry` matches a compiled pin for `slug`: the measurement

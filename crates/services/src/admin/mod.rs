@@ -751,7 +751,18 @@ impl AdminService for AdminServiceImpl {
             let email_key = recipient.email.to_lowercase();
             let already_sent_for_row =
                 already_sent.contains(&(recipient.user_id, recipient.organization_id));
-            let result = if already_sent_for_row || already_sent_emails.contains(&email_key) {
+            let recipient_active = self
+                .repository
+                .is_user_active(recipient.user_id)
+                .await
+                .map_err(|e| AdminError::InternalError(e.to_string()))?;
+            let result = if !recipient_active {
+                (
+                    ModelDeprecationEmailStatus::Skipped,
+                    None,
+                    Some("Recipient account is no longer active".to_string()),
+                )
+            } else if already_sent_for_row || already_sent_emails.contains(&email_key) {
                 (
                     ModelDeprecationEmailStatus::Skipped,
                     None,
@@ -1000,7 +1011,18 @@ impl AdminService for AdminServiceImpl {
                 .rows
                 .iter()
                 .any(|row| already_sent.contains(&(row.user_id, row.organization_id)));
-            let result = if any_row_sent {
+            let recipient_active = self
+                .repository
+                .is_user_active(aggregate.rows[0].user_id)
+                .await
+                .map_err(|e| AdminError::InternalError(e.to_string()))?;
+            let result = if !recipient_active {
+                (
+                    ModelDeprecationEmailStatus::Skipped,
+                    None,
+                    Some("Recipient account is no longer active".to_string()),
+                )
+            } else if any_row_sent {
                 (
                     ModelDeprecationEmailStatus::Skipped,
                     None,

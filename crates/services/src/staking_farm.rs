@@ -305,6 +305,11 @@ impl StakingFarmService {
         source: OrganizationStakingFarmSource,
         changed_by_user_id: Option<Uuid>,
     ) -> anyhow::Result<OrganizationStakingFarmSource> {
+        // A disconnected source belongs to an erased or detached org: never call
+        // the contract, the AML gate, or write credits for it (user erasure, spec §10.7).
+        if source.status != StakingFarmSourceStatus::Active.as_str() {
+            return Ok(source);
+        }
         ensure_configured(&self.config)?;
         self.enforce_aml_for_source(&source, changed_by_user_id)
             .await?;
@@ -966,6 +971,38 @@ mod tests {
                 "alice.near".to_string(),
                 AmlFlow::StakingFarmSync
             )]
+        );
+    }
+
+    #[tokio::test]
+    async fn sync_for_source_skips_disconnected_source() {
+        let organization_id = Uuid::new_v4();
+        let mut source = source_fixture(organization_id);
+        source.status = StakingFarmSourceStatus::Disconnected.as_str().to_string();
+        let repo = Arc::new(MockStakingFarmRepository::default());
+        *repo.source.lock().unwrap() = Some(source.clone());
+        let client = Arc::new(MockStakingFarmContractClient::returning(farm_account(
+            "3000000000000000000000000",
+        )));
+        let aml_gate = Arc::new(MockStakingFarmAmlGate::blocking());
+        let service = StakingFarmService::new(
+            repo.clone(),
+            client.clone(),
+            Some(aml_gate.clone()),
+            enabled_config(),
+        );
+
+        let out = service
+            .sync_for_source(source.clone(), None)
+            .await
+            .expect("a disconnected source is returned unchanged");
+
+        assert_eq!(out.status, source.status);
+        assert!(client.calls.lock().unwrap().is_empty(), "no contract call");
+        assert!(aml_gate.calls.lock().unwrap().is_empty(), "no AML check");
+        assert!(
+            repo.limit_updates.lock().unwrap().is_empty(),
+            "no credits written"
         );
     }
 

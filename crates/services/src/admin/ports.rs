@@ -808,6 +808,10 @@ pub trait AdminRepository: Send + Sync {
         deprecation_date: chrono::DateTime<chrono::Utc>,
     ) -> Result<Vec<(uuid::Uuid, uuid::Uuid)>, anyhow::Error>;
 
+    /// True when the user exists and is active. Email batches call this right
+    /// before each send so a recipient erased mid-batch is skipped.
+    async fn is_user_active(&self, user_id: uuid::Uuid) -> Result<bool, anyhow::Error>;
+
     /// Persist one deprecation email delivery outcome.
     async fn record_model_deprecation_delivery(
         &self,

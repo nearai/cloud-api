@@ -992,6 +992,17 @@ impl AdminRepository for AdminCompositeRepository {
             .collect())
     }
 
+    async fn is_user_active(&self, user_id: Uuid) -> Result<bool> {
+        let client = self.pool.get().await?;
+        let row = client
+            .query_one(
+                "SELECT EXISTS (SELECT 1 FROM users WHERE id = $1 AND is_active = true)",
+                &[&user_id],
+            )
+            .await?;
+        Ok(row.get(0))
+    }
+
     async fn record_model_deprecation_delivery(
         &self,
         record: ModelDeprecationDeliveryRecord,
@@ -1013,9 +1024,11 @@ impl AdminRepository for AdminCompositeRepository {
                     organization_id, organization_name, status, email_sent_at,
                     email_message_id, email_last_error, initiated_by_user_id,
                     initiated_by_user_email
-                ) VALUES (
+                ) SELECT
                     $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13,
                     $14, $15
+                WHERE EXISTS (
+                    SELECT 1 FROM users WHERE id = $6 AND is_active = true
                 )
                 ON CONFLICT (
                     model_id, successor_model_name, deprecation_date,
@@ -1472,8 +1485,10 @@ impl AdminRepository for AdminCompositeRepository {
                     organization_id, organization_name, model_names, status,
                     email_sent_at, email_message_id, email_last_error,
                     initiated_by_user_id, initiated_by_user_email
-                ) VALUES (
+                ) SELECT
                     $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12
+                WHERE EXISTS (
+                    SELECT 1 FROM users WHERE id = $2 AND is_active = true
                 )
                 ON CONFLICT (batch_id, recipient_user_id, organization_id)
                 DO UPDATE SET

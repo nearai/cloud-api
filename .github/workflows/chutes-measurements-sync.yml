@@ -145,7 +145,10 @@ jobs:
           gh auth setup-git
           git push --force origin "$BOT_BRANCH"
           if [ -n "$existing" ]; then
-            gh pr edit "$existing" --body-file "$RUNNER_TEMP/report.md"
+            # REST, not `gh pr edit`: older gh queries the removed classic
+            # Projects field (projectCards) during edit and exits non-zero.
+            gh api --method PATCH "repos/${GITHUB_REPOSITORY}/pulls/${existing}" \
+              -F body=@"$RUNNER_TEMP/report.md" --silent
           else
             gh pr create --base main --head "$BOT_BRANCH" \
               --title "chore(chutes): pin live-observed measurement rows" \

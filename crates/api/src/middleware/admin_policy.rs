@@ -22,6 +22,10 @@ pub(crate) fn admin_operation(method: &Method, matched_path: &str) -> AdminOpera
         matched_path
     };
 
+    if path == "/admin/users/{user_id}/erasure" {
+        return AdminOperation::SessionOnly;
+    }
+
     if path == "/admin/access-tokens" || path.starts_with("/admin/access-tokens/") {
         return AdminOperation::SessionOnly;
     }
@@ -77,6 +81,7 @@ pub(crate) fn admin_operation(method: &Method, matched_path: &str) -> AdminOpera
             "/admin/models/pricing-changes/preview"
                 | "/admin/models/{model_name}/deprecation/preview"
                 | "/admin/database-encryption/scan"
+                | "/admin/users/{user_id}/erasure/preview"
         )
     {
         return AdminOperation::Read;
@@ -88,6 +93,22 @@ pub(crate) fn admin_operation(method: &Method, matched_path: &str) -> AdminOpera
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn user_erasure_preview_is_read_and_execute_is_session_only() {
+        for prefix in ["/v1", ""] {
+            let preview = format!("{prefix}/admin/users/{{user_id}}/erasure/preview");
+            let execute = format!("{prefix}/admin/users/{{user_id}}/erasure");
+            assert_eq!(
+                admin_operation(&Method::POST, &preview),
+                AdminOperation::Read
+            );
+            assert_eq!(
+                admin_operation(&Method::POST, &execute),
+                AdminOperation::SessionOnly
+            );
+        }
+    }
 
     #[test]
     fn settings_get_is_read_and_patch_is_write() {

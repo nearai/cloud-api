@@ -3028,6 +3028,62 @@ pub struct AdminUserOrganizationDetails {
     pub current_usage: Option<OrganizationUsage>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct ErasedOrganizationResponse {
+    pub id: String,
+    pub lifecycle: services::lifecycle::OrganizationLifecycle,
+    pub workspaces: i64,
+    pub api_keys: i64,
+    pub conversations: i64,
+    pub files: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct RetainedOrganizationResponse {
+    pub id: String,
+    pub role: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct ErasureLogResponse {
+    pub requested_at: DateTime<Utc>,
+    pub erased_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct ErasurePreviewResponse {
+    pub user_id: String,
+    pub lifecycle: services::lifecycle::UserLifecycle,
+    pub blockers: Vec<services::user_erasure::ErasureBlocker>,
+    pub erased_organizations: Vec<ErasedOrganizationResponse>,
+    pub retained_organizations: Vec<RetainedOrganizationResponse>,
+    pub log: Option<ErasureLogResponse>,
+}
+
+/// Body of the 409 returned when erasure is blocked: the usual error envelope plus the blockers.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct ErasureBlockedResponse {
+    pub error: ErrorDetail,
+    pub blockers: Vec<services::user_erasure::ErasureBlocker>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct EraseUserRequest {
+    /// Must match the user's current email, ignoring case and surrounding whitespace.
+    /// Typed by the operator as a guard against erasing the wrong id.
+    pub confirm_email: String,
+    /// When the person asked (starts the GDPR response clock). Defaults to now.
+    pub requested_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct EraseUserResponse {
+    pub user_id: String,
+    pub lifecycle: services::lifecycle::UserLifecycle,
+    pub already_erased: bool,
+    pub erased_organization_ids: Vec<String>,
+}
+
 /// Admin user response model (for owners/admins)
 /// Contains sensitive information only visible to organization owners/admins
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -3042,6 +3098,9 @@ pub struct AdminUserResponse {
     pub is_active: bool,
     pub auth_provider: String,
     pub provider_user_id: String,
+    /// Omitted when the row's `is_active`/`auth_provider` columns are inconsistent.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lifecycle: Option<services::lifecycle::UserLifecycle>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub organizations: Option<Vec<AdminUserOrganizationDetails>>,
 }
@@ -3196,6 +3255,8 @@ pub struct AdminOrganizationResponse {
     #[serde(rename = "currentUsage", skip_serializing_if = "Option::is_none")]
     pub current_usage: Option<OrganizationUsage>,
     pub created_at: DateTime<Utc>,
+    /// Always `active` on org detail, which only returns active organizations.
+    pub lifecycle: services::lifecycle::OrganizationLifecycle,
 }
 
 /// List organizations response model (admin only)

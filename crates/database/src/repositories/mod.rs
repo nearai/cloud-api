@@ -18,6 +18,7 @@ pub mod conversation;
 pub mod credit_allocation;
 pub mod feature_request;
 pub mod file;
+pub mod lifecycle;
 pub mod mcp_connector;
 pub mod model;
 pub mod model_alias;
@@ -47,6 +48,7 @@ pub mod session;
 pub mod usage_hourly;
 pub mod usage_repository_impl;
 pub mod user;
+pub mod user_erasure;
 pub mod utils;
 pub mod workspace;
 
@@ -86,6 +88,7 @@ pub use service_usage_repository_impl::ServiceUsageRepositoryImpl;
 pub use session::SessionRepository;
 pub use usage_hourly::UsageHourlyRepositoryImpl;
 pub use user::UserRepository;
+pub use user_erasure::PostgresUserErasureRepository;
 pub use workspace::WorkspaceRepository;
 
 pub mod organization_usage_discount;

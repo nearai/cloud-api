@@ -107,6 +107,7 @@ mod usage_hourly;
 mod usage_provider_attribution;
 mod usage_recording;
 mod usage_responses;
+mod user_erasure;
 mod vpc_login;
 mod web_context_search;
 mod web_search_citations;

@@ -87,3 +87,43 @@ async fn concurrent_refreshes_reuse_one_successor_and_reject_stale_tokens() -> a
         .await?;
     Ok(())
 }
+
+#[tokio::test]
+async fn mobile_os_update_accepts_a_session_with_legacy_stored_user_agent() -> anyhow::Result<()> {
+    let pool = test_pool().await?;
+    let client = pool.get().await?;
+    let user_id = Uuid::new_v4();
+    let suffix = user_id.simple().to_string();
+    client
+        .execute(
+            "INSERT INTO users (id, email, username, auth_provider, provider_user_id) VALUES ($1, $2, $3, 'test', $4)",
+            &[&user_id, &format!("ua-upgrade-{suffix}@example.test"), &format!("ua-upgrade-{suffix}"), &suffix],
+        )
+        .await?;
+
+    let repository = SessionRepository::new(pool.clone());
+    let (session, token) = repository
+        .create(user_id, None, "legacy mobile agent".into(), 168)
+        .await?;
+    // This is what the previous normalization stored: browser versions were
+    // removed, but the iOS version remained in the session row.
+    let legacy_user_agent =
+        "Mozilla (iPhone; CPU iPhone OS 17_5 like Mac OS X) AppleWebKit Version Mobile Safari";
+    client
+        .execute(
+            "UPDATE refresh_tokens SET user_agent = $2 WHERE id = $1",
+            &[&session.id, &legacy_user_agent],
+        )
+        .await?;
+
+    let updated_user_agent = "Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) AppleWebKit/605.1.15 Version/18.0 Mobile/15E148 Safari/604.1";
+    assert!(repository
+        .validate(&token, updated_user_agent)
+        .await?
+        .is_some());
+
+    client
+        .execute("DELETE FROM users WHERE id = $1", &[&user_id])
+        .await?;
+    Ok(())
+}

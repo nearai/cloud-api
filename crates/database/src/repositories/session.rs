@@ -34,25 +34,34 @@ impl SessionRepository {
         hex::encode(hasher.finalize())
     }
 
-    /// Normalize User-Agent string by removing version numbers.
+    /// Normalize User-Agent string by removing browser and platform versions.
     ///
-    /// This removes version numbers (e.g., "/129.0.6668.92") to prevent
-    /// session invalidation when browsers update. Examples:
+    /// This removes product versions (e.g., "/129.0.6668.92") and OS versions
+    /// (e.g., "iPhone OS 17_5" or "Android 14") so routine updates do not
+    /// invalidate the session. Keep the platform and device names for binding.
+    /// Examples:
     /// - "Chrome/129.0.6668.92" -> "Chrome"
     /// - "Safari/605.1.15" -> "Safari"
     /// - "Firefox/131.0" -> "Firefox"
     /// - "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/129.0.0.0 Safari/537.36"
-    ///   -> "Mozilla (Windows NT 10.0; Win64; x64) AppleWebKit (KHTML, like Gecko) Chrome Safari"
+    ///   -> "Mozilla (Windows NT; Win64; x64) AppleWebKit (KHTML, like Gecko) Chrome Safari"
     fn normalize_user_agent(user_agent: &str) -> String {
-        // Remove version patterns: "/" followed by digits and dots
-        // This matches patterns like "/129.0.6668.92", "/605.1.15", "/131.0", "/537.36"
         static VERSION_PATTERN: OnceLock<Regex> = OnceLock::new();
+        static PLATFORM_VERSION_PATTERN: OnceLock<Regex> = OnceLock::new();
 
-        let pattern = VERSION_PATTERN.get_or_init(|| {
+        let product_version = VERSION_PATTERN.get_or_init(|| {
             Regex::new(r"/[A-Za-z0-9._-]+").expect("Failed to compile version pattern regex")
         });
+        let platform_version = PLATFORM_VERSION_PATTERN.get_or_init(|| {
+            Regex::new(r"(?i)\b(OS|Android|Mac OS X|Windows NT)\s+\d+(?:[._]\d+)*")
+                .expect("Failed to compile platform version pattern regex")
+        });
 
-        pattern.replace_all(user_agent, "").trim().to_string()
+        let without_product_versions = product_version.replace_all(user_agent, "");
+        platform_version
+            .replace_all(&without_product_versions, "$1")
+            .trim()
+            .to_string()
     }
 
     /// Create a new refresh token session
@@ -161,6 +170,7 @@ impl SessionRepository {
                 if stored_normalized == normalized_user_agent {
                     Ok(Some(session))
                 } else {
+                    warn!(session_id = %session.id, reason = "user_agent_mismatch", "Refresh token rejected");
                     Ok(None)
                 }
             }
@@ -545,5 +555,38 @@ impl services::auth::SessionRepository for SessionRepository {
 
     async fn cleanup_expired(&self) -> anyhow::Result<usize> {
         self.cleanup_expired().await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::SessionRepository;
+
+    #[test]
+    fn mobile_os_updates_keep_the_same_user_agent_binding() {
+        let old_iphone = "Mozilla/5.0 (iPhone; CPU iPhone OS 17_5 like Mac OS X) AppleWebKit/605.1.15 Version/17.5 Mobile/15E148 Safari/604.1";
+        let new_iphone = "Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) AppleWebKit/605.1.15 Version/18.0 Mobile/15E148 Safari/604.1";
+        assert_eq!(
+            SessionRepository::normalize_user_agent(old_iphone),
+            SessionRepository::normalize_user_agent(new_iphone)
+        );
+
+        let old_android = "Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 Chrome/126.0.0.0 Mobile Safari/537.36";
+        let new_android = "Mozilla/5.0 (Linux; Android 15; Pixel 8) AppleWebKit/537.36 Chrome/127.0.0.0 Mobile Safari/537.36";
+        assert_eq!(
+            SessionRepository::normalize_user_agent(old_android),
+            SessionRepository::normalize_user_agent(new_android)
+        );
+        assert!(SessionRepository::normalize_user_agent(new_android).contains("Android; Pixel 8"));
+    }
+
+    #[test]
+    fn different_device_still_fails_the_user_agent_binding() {
+        let pixel_8 = "Mozilla/5.0 (Linux; Android 14; Pixel 8) Chrome/126.0.0.0";
+        let pixel_9 = "Mozilla/5.0 (Linux; Android 15; Pixel 9) Chrome/127.0.0.0";
+        assert_ne!(
+            SessionRepository::normalize_user_agent(pixel_8),
+            SessionRepository::normalize_user_agent(pixel_9)
+        );
     }
 }

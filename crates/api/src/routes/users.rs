@@ -180,12 +180,22 @@ pub async fn get_current_user(
     };
 
     // Build response with all data
-    let response = crate::conversions::services_user_to_api_user_with_relations(
+    let mut response = crate::conversions::services_user_to_api_user_with_relations(
         &user_data,
         organizations,
         workspaces,
     );
 
+    if user.0.auth_provider == "near" {
+        if let Some(binding) = app_state.staking_farm_service.binding() {
+            response.staking_organization_id = binding
+                .wallet_organization(&user.0.provider_user_id, user.0.id)
+                .await
+                .ok()
+                .flatten()
+                .map(|id| id.to_string());
+        }
+    }
     Ok(Json(response))
 }
 

@@ -322,7 +322,7 @@ impl AuthServiceTrait for AuthService {
         }
 
         // Create new user
-        let new_user = self
+        let creation = self
             .user_repository
             .create_from_oauth(
                 oauth_info.email.clone(),
@@ -332,8 +332,27 @@ impl AuthServiceTrait for AuthService {
                 oauth_info.provider.clone(),
                 oauth_info.provider_user_id.clone(),
             )
-            .await
-            .map_err(|e| AuthError::InternalError(format!("Failed to create user: {e}")))?;
+            .await;
+        let new_user = match creation {
+            Ok(user) => user,
+            Err(error) => {
+                // Explicit binding may provision the provider identity concurrently
+                // with first login. Reuse it without creating another destination.
+                if let Some(user) = self
+                    .user_repository
+                    .get_by_provider(&oauth_info.provider, &oauth_info.provider_user_id)
+                    .await
+                    .map_err(|_| {
+                        AuthError::InternalError("Failed to resolve user identity".into())
+                    })?
+                {
+                    return Ok(user);
+                }
+                return Err(AuthError::InternalError(format!(
+                    "Failed to create user: {error}"
+                )));
+            }
+        };
 
         // Create default organization and workspace for new user
         debug!(

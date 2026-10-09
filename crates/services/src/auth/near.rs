@@ -183,21 +183,7 @@ impl NearAuthService {
         })?;
 
         // 5. Verify signature AND public key ownership via near-api
-        let is_valid = payload
-            .verify(
-                &signed_message.account_id,
-                signed_message.public_key,
-                &signed_message.signature,
-                &self.network_config,
-            )
-            .await
-            .map_err(|e| {
-                anyhow::anyhow!(NearAuthError::SignatureVerificationFailed(e.to_string()))
-            })?;
-
-        if !is_valid {
-            return Err(anyhow::anyhow!(NearAuthError::InvalidSignature));
-        }
+        verify_wallet_control(&payload, &signed_message, &self.network_config).await?;
 
         // 6. Consume nonce AFTER signature verification (replay protection)
         // This prevents attackers from burning legitimate nonces with invalid signatures
@@ -388,4 +374,30 @@ mod tests {
             "Error should mention invalid timestamp, got: {err_msg}"
         );
     }
+}
+
+/// Verify a NEP-413 signature and its account access key without creating a session.
+/// The caller owns challenge scoping, expiry and atomic replay prevention.
+pub async fn verify_wallet_control(
+    payload: &NEP413Payload,
+    message: &SignedMessage,
+    network: &NetworkConfig,
+) -> anyhow::Result<()> {
+    let valid = payload
+        .verify(
+            &message.account_id,
+            message.public_key.clone(),
+            &message.signature,
+            network,
+        )
+        .await
+        .map_err(|_| {
+            anyhow::anyhow!(NearAuthError::SignatureVerificationFailed(
+                "wallet verification unavailable".into()
+            ))
+        })?;
+    if !valid {
+        return Err(anyhow::anyhow!(NearAuthError::InvalidSignature));
+    }
+    Ok(())
 }

@@ -96,6 +96,10 @@ pub fn build_management_router(app_state: AppState, auth_state: AuthState) -> Ro
             "/{id}/members/{user_id}",
             put(update_organization_member).delete(remove_organization_member),
         )
+        .route(
+            "/{id}/staking/farm/bind",
+            post(crate::routes::staking_farm::bind_organization_staking_farm),
+        )
         // // MCP Connector management
         // .route(
         //     "/{id}/mcp-connectors",

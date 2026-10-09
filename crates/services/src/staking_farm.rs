@@ -1,3 +1,4 @@
+pub mod binding;
 use async_trait::async_trait;
 use chrono::{DateTime, Duration, Utc};
 use config::StakingFarmConfig;
@@ -227,6 +228,7 @@ pub struct StakingFarmService {
     /// Organizations known to have no staking source. Invalidated locally when a
     /// source is created or linked; the TTL covers links made by other instances.
     no_source_orgs: moka::future::Cache<Uuid, ()>,
+    binding: Option<Arc<binding::StakingBindingService>>,
 }
 
 impl StakingFarmService {
@@ -242,6 +244,7 @@ impl StakingFarmService {
             aml_gate,
             config,
             active_syncs: Arc::new(Mutex::new(HashSet::new())),
+            binding: None,
             no_source_orgs: moka::future::Cache::builder()
                 .max_capacity(NO_SOURCE_CACHE_CAPACITY)
                 .time_to_live(std::time::Duration::from_secs(NO_SOURCE_CACHE_TTL_SECS))
@@ -256,6 +259,19 @@ impl StakingFarmService {
             .time_to_live(ttl)
             .build();
         self
+    }
+
+    pub fn with_binding(mut self, binding: Arc<binding::StakingBindingService>) -> Self {
+        self.binding = Some(binding);
+        self
+    }
+
+    pub fn binding(&self) -> Option<&Arc<binding::StakingBindingService>> {
+        self.binding.as_ref()
+    }
+
+    pub async fn invalidate_source_cache(&self, org_id: Uuid) {
+        self.no_source_orgs.invalidate(&org_id).await;
     }
 
     pub fn config(&self) -> &StakingFarmConfig {
@@ -744,6 +760,7 @@ mod tests {
     fn enabled_config() -> StakingFarmConfig {
         StakingFarmConfig {
             enabled: true,
+            selected_org_binding_enabled: false,
             network_id: "testnet".to_string(),
             contract_id: "stake.testnet".to_string(),
             farm_product_id: "cloud-credits".to_string(),

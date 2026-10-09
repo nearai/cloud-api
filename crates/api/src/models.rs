@@ -3049,6 +3049,8 @@ pub struct AdminUserResponse {
 /// User response model (full user profile)
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct UserResponse {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub staking_organization_id: Option<String>,
     pub id: String,
     pub email: String,
     pub username: String,

@@ -796,6 +796,74 @@ async fn erase_renames_retained_org_still_named_after_user_email() {
 }
 
 #[tokio::test]
+async fn erase_renames_retained_signup_org_after_email_change() {
+    let (server, database) = setup_test_server_with_database().await;
+    let (session, owner, _signup_email) = new_user(&database).await;
+    let (teammate_session, teammate, _) = new_user(&database).await;
+    let personal = personal_org_id(&server, &session).await;
+    add_member(&database, &personal, teammate, "member").await;
+    transfer_ownership(&server, &personal, teammate).await;
+    // U also belongs to the teammate's own signup org, which has the same name
+    // shape but a default workspace U did not create.
+    let teammate_org = personal_org_id(&server, &teammate_session).await;
+    add_member(&database, &teammate_org, owner, "member").await;
+
+    let client = database.pool().get().await.unwrap();
+    let new_email = format!("changed-{}@test.com", uuid::Uuid::new_v4());
+    client
+        .execute(
+            "UPDATE users SET email = $2 WHERE id = $1",
+            &[&owner, &new_email],
+        )
+        .await
+        .unwrap();
+    let org: uuid::Uuid = personal.parse().unwrap();
+    let other_org: uuid::Uuid = teammate_org.parse().unwrap();
+    let other_name_before: String = client
+        .query_one(
+            "SELECT name FROM organizations WHERE id = $1",
+            &[&other_org],
+        )
+        .await
+        .unwrap()
+        .get(0);
+
+    assert_eq!(erase(&server, owner, &new_email).await.status_code(), 200);
+
+    let name: String = client
+        .query_one("SELECT name FROM organizations WHERE id = $1", &[&org])
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(name, format!("org-{org}"));
+    let desc: Option<String> = client
+        .query_one(
+            "SELECT description FROM workspaces WHERE organization_id = $1 AND name = 'default'",
+            &[&org],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(
+        desc.as_deref(),
+        Some(format!("Default workspace for org-{org}").as_str())
+    );
+
+    let other_name_after: String = client
+        .query_one(
+            "SELECT name FROM organizations WHERE id = $1",
+            &[&other_org],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(
+        other_name_after, other_name_before,
+        "another user's signup org must not be renamed"
+    );
+}
+
+#[tokio::test]
 async fn erase_leaves_owner_deleted_shared_org_without_blocking() {
     let (server, database) = setup_test_server_with_database().await;
     let (session, owner, email) = new_user(&database).await;
@@ -848,6 +916,16 @@ async fn erase_user_with_no_memberships() {
             .len(),
         0
     );
+    let stored: String = database
+        .pool()
+        .get()
+        .await
+        .unwrap()
+        .query_one("SELECT email FROM users WHERE id = $1", &[&user_id])
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(stored, format!("erased+{user_id}@erased.invalid"));
 }
 
 #[tokio::test]
@@ -1008,11 +1086,53 @@ async fn admin_user_list_shows_lifecycle() {
     assert_eq!(user["lifecycle"], "erased");
 }
 
+/// Bounded scan of the admin org list for `org_id` under an optional lifecycle filter.
+async fn org_list_contains(
+    server: &axum_test::TestServer,
+    lifecycle: Option<&str>,
+    org_id: &str,
+) -> bool {
+    const LIMIT: usize = 50;
+    for page in 0..20 {
+        let filter = lifecycle
+            .map(|l| format!("&lifecycle={l}"))
+            .unwrap_or_default();
+        let body = server
+            .get(
+                format!(
+                    "/v1/admin/organizations?limit={LIMIT}&offset={}{filter}",
+                    page * LIMIT
+                )
+                .as_str(),
+            )
+            .add_header("Authorization", format!("Bearer {}", get_session_id()))
+            .await
+            .json::<serde_json::Value>();
+        let orgs = body["organizations"].as_array().unwrap();
+        if orgs.iter().any(|o| o["id"] == org_id) {
+            return true;
+        }
+        if orgs.is_empty() {
+            return false;
+        }
+    }
+    false
+}
+
 #[tokio::test]
 async fn admin_org_list_lifecycle_filter_returns_only_matching_rows() {
     let (server, database) = setup_test_server_with_database().await;
-    let (_session, user_id, email) = new_user(&database).await;
+    let (session, user_id, email) = new_user(&database).await;
+    let erased_org = personal_org_id(&server, &session).await;
     assert_eq!(erase(&server, user_id, &email).await.status_code(), 200);
+    assert!(
+        org_list_contains(&server, Some("erased"), &erased_org).await,
+        "the erased org must be listed under lifecycle=erased"
+    );
+    assert!(
+        !org_list_contains(&server, None, &erased_org).await,
+        "the erased org must not be listed under the default filter"
+    );
     for filter in ["erased", "deleted", "active"] {
         let body = server
             .get(format!("/v1/admin/organizations?lifecycle={filter}&limit=50&offset=0").as_str())
@@ -1029,4 +1149,167 @@ async fn admin_org_list_lifecycle_filter_returns_only_matching_rows() {
             "{filter}: {body}"
         );
     }
+}
+
+#[tokio::test]
+async fn erase_rejects_admin_access_token() {
+    let (server, database) = setup_test_server_with_database().await;
+    let (_session, user_id, email) = new_user(&database).await;
+    let created = server
+        .post("/v1/admin/access-tokens")
+        .add_header("Authorization", format!("Bearer {}", get_session_id()))
+        .add_header("User-Agent", MOCK_USER_AGENT)
+        .json(&serde_json::json!({
+            "name": format!("erasure-{}", uuid::Uuid::new_v4()),
+            "reason": "erasure access token test",
+            "expires_in_hours": 1
+        }))
+        .await;
+    assert_eq!(created.status_code(), 200, "{}", created.text());
+    let token = created.json::<serde_json::Value>()["access_token"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let preview = server
+        .post(format!("/v1/admin/users/{user_id}/erasure/preview").as_str())
+        .add_header("Authorization", format!("Bearer {token}"))
+        .add_header("User-Agent", MOCK_USER_AGENT)
+        .json(&serde_json::json!({}))
+        .await;
+    assert_eq!(preview.status_code(), 200, "{}", preview.text());
+
+    let execute = server
+        .post(format!("/v1/admin/users/{user_id}/erasure").as_str())
+        .add_header("Authorization", format!("Bearer {token}"))
+        .add_header("User-Agent", MOCK_USER_AGENT)
+        .json(&serde_json::json!({ "confirm_email": email }))
+        .await;
+    assert!(
+        matches!(execute.status_code().as_u16(), 401 | 403),
+        "{} {}",
+        execute.status_code(),
+        execute.text()
+    );
+    let active: bool = database
+        .pool()
+        .get()
+        .await
+        .unwrap()
+        .query_one("SELECT is_active FROM users WHERE id = $1", &[&user_id])
+        .await
+        .unwrap()
+        .get(0);
+    assert!(active, "a rejected erase must leave the user active");
+}
+
+#[tokio::test]
+async fn concurrent_erase_executes_once() {
+    let (server, database) = setup_test_server_with_database().await;
+    let (_session, user_id, email) = new_user(&database).await;
+    let (a, b) = tokio::join!(
+        erase(&server, user_id, &email),
+        erase(&server, user_id, &email)
+    );
+    assert!(a.status_code().is_success(), "{}", a.text());
+    assert!(b.status_code().is_success(), "{}", b.text());
+    let fresh = [a, b]
+        .iter()
+        .filter(|r| r.json::<serde_json::Value>()["already_erased"] == false)
+        .count();
+    assert_eq!(fresh, 1, "exactly one call performs the erasure");
+    let client = database.pool().get().await.unwrap();
+    assert_eq!(
+        count(
+            &client,
+            "SELECT COUNT(*) FROM user_erasure_log WHERE user_id = $1",
+            &user_id
+        )
+        .await,
+        1
+    );
+}
+
+#[tokio::test]
+async fn retry_does_not_sweep_retained_team_org() {
+    let (server, database) = setup_test_server_with_database().await;
+    let (session, owner, email) = new_user(&database).await;
+    let (_s2, teammate, _) = new_user(&database).await;
+    let team = create_org_with_session(&server, &session).await;
+    add_member(&database, &team.id, teammate, "member").await;
+    let team_key = get_api_key_for_org_with_session(&server, team.id.clone(), &session).await;
+    let created = server
+        .post("/v1/conversations")
+        .add_header("Authorization", format!("Bearer {team_key}"))
+        .json(&serde_json::json!({}))
+        .await;
+    assert_eq!(created.status_code(), 201, "{}", created.text());
+    transfer_ownership(&server, &team.id, teammate).await;
+
+    assert_eq!(erase(&server, owner, &email).await.status_code(), 200);
+    let again = erase(&server, owner, &email).await;
+    assert_eq!(again.status_code(), 200, "{}", again.text());
+    assert_eq!(again.json::<serde_json::Value>()["already_erased"], true);
+
+    let client = database.pool().get().await.unwrap();
+    let team_uuid: uuid::Uuid = team.id.parse().unwrap();
+    assert_eq!(
+        count(
+            &client,
+            "SELECT COUNT(*) FROM conversations WHERE workspace_id IN \
+             (SELECT id FROM workspaces WHERE organization_id = $1)",
+            &team_uuid
+        )
+        .await,
+        1,
+        "the retained org's content must survive the retry sweep"
+    );
+    assert!(client
+        .query_one(
+            "SELECT is_active FROM organizations WHERE id = $1",
+            &[&team_uuid]
+        )
+        .await
+        .unwrap()
+        .get::<_, bool>(0));
+}
+
+#[tokio::test]
+async fn preview_blocks_staking_source_created_by_user_in_retained_org() {
+    let (server, database) = setup_test_server_with_database().await;
+    let (session, owner, _) = new_user(&database).await;
+    let (_s2, teammate, _) = new_user(&database).await;
+    let team = create_org_with_session(&server, &session).await;
+    add_member(&database, &team.id, teammate, "member").await;
+    transfer_ownership(&server, &team.id, teammate).await;
+    let team_uuid: uuid::Uuid = team.id.parse().unwrap();
+    let client = database.pool().get().await.unwrap();
+    insert_staking_source(&client, team_uuid, owner, r#"[{"amount":"10"}]"#, 1).await;
+
+    let body = preview(&server, owner).await.json::<serde_json::Value>();
+    assert_eq!(blocker_codes(&body), vec!["staking_active"], "{body}");
+}
+
+#[tokio::test]
+async fn erase_deactivated_user() {
+    let (server, database) = setup_test_server_with_database().await;
+    let (_session, user_id, email) = new_user(&database).await;
+    database
+        .pool()
+        .get()
+        .await
+        .unwrap()
+        .execute(
+            "UPDATE users SET is_active = false WHERE id = $1",
+            &[&user_id],
+        )
+        .await
+        .unwrap();
+    let p = preview(&server, user_id).await;
+    assert_eq!(p.status_code(), 200, "{}", p.text());
+    let r = erase(&server, user_id, &email).await;
+    assert_eq!(r.status_code(), 200, "{}", r.text());
+    let body = r.json::<serde_json::Value>();
+    assert_eq!(body["lifecycle"], "erased");
+    assert_eq!(body["already_erased"], false);
 }

@@ -219,6 +219,29 @@ async fn read_capped_text(resp: reqwest::Response) -> String {
     String::from_utf8_lossy(&buf).into_owned()
 }
 
+/// Upper bound on a successful non-stream response body. Generous (a completion
+/// is far smaller) but finite, so a misbehaving or compromised upstream cannot
+/// make us buffer without limit; larger bodies fall through as retryable 503.
+pub(super) const MAX_RESPONSE_BYTES: usize = 32 * 1024 * 1024;
+
+/// Read a successful response body under `cap` and the request `timeout`.
+/// Exceeding the cap or a body-stream error is the same retryable 503 the
+/// status mapping uses for upstream failures.
+async fn read_success_body(
+    resp: reqwest::Response,
+    cap: usize,
+    timeout: std::time::Duration,
+) -> Result<Vec<u8>, CompletionError> {
+    let (buf, outcome) = tokio::time::timeout(timeout, session::read_capped(resp, cap))
+        .await
+        .map_err(|_| unavailable("timeout"))?;
+    match outcome {
+        session::BodyRead::Complete => Ok(buf),
+        session::BodyRead::Truncated => Err(unavailable("response_too_large")),
+        session::BodyRead::Failed => Err(unavailable("transport")),
+    }
+}
+
 #[async_trait]
 impl InferenceProvider for Provider {
     async fn models(&self) -> Result<ModelsResponse, ListModelsError> {
@@ -243,10 +266,7 @@ impl InferenceProvider for Provider {
         _request_hash: String,
     ) -> Result<ChatCompletionResponseWithBytes, CompletionError> {
         let resp = self.post_chat(params, false).await?;
-        let bytes = tokio::time::timeout(self.timeout, resp.bytes())
-            .await
-            .map_err(|_| unavailable("timeout"))?
-            .map_err(|_| unavailable("transport"))?;
+        let bytes = read_success_body(resp, MAX_RESPONSE_BYTES, self.timeout).await?;
         let (raw_bytes, response) = wire::map_response(&bytes, &self.canonical_id)?;
         Ok(ChatCompletionResponseWithBytes {
             response,
@@ -383,7 +403,7 @@ impl InferenceProvider for Provider {
                 "format": state.bundle.report.format,
                 "report_b64": state.bundle.report.body,
                 "vcek_b64": state.bundle.vcek,
-                "cert_b64": state.bundle.enclave_cert,
+                "cert_pem": state.bundle.enclave_cert,
                 "measurement": state.router.measurement_hex,
                 "tag": state.router.tag,
                 "spki_sha256": hex::encode(state.router.spki_sha256),

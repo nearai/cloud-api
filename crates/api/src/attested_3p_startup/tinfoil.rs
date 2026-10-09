@@ -39,26 +39,49 @@ fn tinfoil_preflight(
     }
 }
 
-/// Why one `TINFOIL_MODELS` entry is not registered.
-#[derive(Debug, PartialEq, Eq)]
-enum TinfoilEntrySkip {
-    MissingCtx,
-    ExceedsPublished { ctx: u32, published: u32 },
+/// `@ctx` is required. The router's published window is only known after the
+/// first (background) verification, so oversize is enforced per request by the
+/// provider (`ctx_exceeds_published`, fail-closed) and warned about by
+/// [`warn_ctx_over_published`], never at startup.
+fn tinfoil_entry_ctx(entry: &AttestedThirdPartyModelEntry) -> Option<u32> {
+    entry.max_context_tokens
 }
 
-/// The one `@ctx` validator for a `TINFOIL_MODELS` entry: `@ctx` is required,
-/// and must not exceed the router's published window when that is known.
-fn tinfoil_entry_ctx(
-    entry: &AttestedThirdPartyModelEntry,
-    published: Option<u32>,
-) -> Result<u32, TinfoilEntrySkip> {
-    let ctx = entry
-        .max_context_tokens
-        .ok_or(TinfoilEntrySkip::MissingCtx)?;
-    match published {
-        Some(w) if ctx > w => Err(TinfoilEntrySkip::ExceedsPublished { ctx, published: w }),
-        _ => Ok(ctx),
-    }
+/// Declared `@ctx` above the router's published window: `(ctx, published)`.
+fn ctx_over_published(ctx: u32, published: Option<u32>) -> Option<(u32, u32)> {
+    published.filter(|w| ctx > *w).map(|w| (ctx, w))
+}
+
+/// Background first verification: never blocks startup. Providers are already
+/// registered and answer 503 until this (or a later refresh) succeeds.
+fn spawn_initial_verification(
+    session: Arc<TinfoilRouterSession>,
+    entries: Vec<AttestedThirdPartyModelEntry>,
+) {
+    tokio::spawn(async move {
+        match session.verify_now().await {
+            Ok(()) => {
+                for entry in &entries {
+                    let Some(ctx) = tinfoil_entry_ctx(entry) else { continue };
+                    if let Some((ctx, published)) =
+                        ctx_over_published(ctx, session.published_context_window(&entry.upstream_id))
+                    {
+                        tracing::warn!(
+                            canonical = %entry.canonical_id,
+                            ctx,
+                            published,
+                            "TINFOIL_MODELS @ctx exceeds the router's published context window; requests fail closed"
+                        );
+                    }
+                }
+                tracing::info!(models = entries.len(), "Initial Tinfoil verification succeeded");
+            }
+            Err(e) => tracing::warn!(
+                reason = e.reason(),
+                "Initial Tinfoil verification failed; providers answer 503 until a re-verify succeeds"
+            ),
+        }
+    });
 }
 
 /// Production entry: compiled pins and the real session constructor.
@@ -80,10 +103,11 @@ pub(super) async fn register_tinfoil(
 }
 
 /// Tinfoil attested backup. Fail-closed at every step: no key, no usable pins,
-/// a session that cannot be built, a missing/oversized `@ctx` or a missing
-/// catalog row means that provider is not registered (its id stays reserved).
-/// A failed first verification still registers: providers answer 503 until a
-/// later re-verify succeeds. Pins and the session constructor are injected so
+/// a session that cannot be built, a missing `@ctx` or a missing catalog row
+/// means that provider is not registered (its id stays reserved). Providers
+/// are registered before the first verification, which runs in the background:
+/// they answer 503 until it (or a later re-verify) succeeds, and an oversized
+/// `@ctx` fails closed per request. Pins and the session constructor are injected so
 /// the branches can be tested without the network.
 pub async fn register_tinfoil_with(
     pool: &Arc<InferenceProviderPool>,
@@ -122,13 +146,10 @@ pub async fn register_tinfoil_with(
         }
     };
     session.spawn_refresh();
-    if let Err(e) = session.verify_now().await {
-        tracing::warn!(
-            reason = e.reason(),
-            "Initial Tinfoil verification failed; registering anyway (503 until a re-verify succeeds)"
-        );
-    }
+    // Register first (session starts closed -> 503), verify in the background
+    // so API startup never waits on the network.
     register_tinfoil_models(pool, models_repo, cfg, &session, &pcfg, metrics).await;
+    spawn_initial_verification(session, cfg.tinfoil_models.clone());
 }
 
 /// Per-entry registration against an existing session. The no-catalog-row skip
@@ -144,30 +165,12 @@ pub async fn register_tinfoil_models(
 ) {
     let mut registered: Vec<(String, String)> = Vec::new();
     for entry in &cfg.tinfoil_models {
-        // The single @ctx validator. Unverified at boot (no published window
-        // yet) is not a reason to skip: the provider re-checks the declaration
-        // after every verification and fails closed if it is too large.
-        let ctx = match tinfoil_entry_ctx(
-            entry,
-            session.published_context_window(&entry.upstream_id),
-        ) {
-            Ok(ctx) => ctx,
-            Err(TinfoilEntrySkip::MissingCtx) => {
-                tracing::error!(
-                    canonical = %entry.canonical_id,
-                    "TINFOIL_MODELS entry lacks @ctx; not registered"
-                );
-                continue;
-            }
-            Err(TinfoilEntrySkip::ExceedsPublished { ctx, published }) => {
-                tracing::error!(
-                    canonical = %entry.canonical_id,
-                    ctx,
-                    published,
-                    "TINFOIL_MODELS @ctx exceeds the router's published context window; not registered"
-                );
-                continue;
-            }
+        let Some(ctx) = tinfoil_entry_ctx(entry) else {
+            tracing::error!(
+                canonical = %entry.canonical_id,
+                "TINFOIL_MODELS entry lacks @ctx; not registered"
+            );
+            continue;
         };
         let Some(role) = ensure_attested_3p_catalog_row(
             models_repo,
@@ -362,23 +365,16 @@ mod tests {
                 .next()
                 .unwrap()
         };
+        assert_eq!(tinfoil_entry_ctx(&e("m=slug")), None);
+        assert_eq!(tinfoil_entry_ctx(&e("m=slug@131072")), Some(131072));
+        // Oversize is no longer a startup skip; it is only detected (for a
+        // warning) once a published window is known.
         assert_eq!(
-            tinfoil_entry_ctx(&e("m=slug"), Some(131072)).unwrap_err(),
-            TinfoilEntrySkip::MissingCtx
+            ctx_over_published(200000, Some(131072)),
+            Some((200000, 131072))
         );
-        assert_eq!(
-            tinfoil_entry_ctx(&e("m=slug@200000"), Some(131072)).unwrap_err(),
-            TinfoilEntrySkip::ExceedsPublished {
-                ctx: 200000,
-                published: 131072
-            }
-        );
-        assert_eq!(
-            tinfoil_entry_ctx(&e("m=slug@131072"), Some(131072)),
-            Ok(131072)
-        );
-        // Unknown published window (fetch failed): the declared value stands.
-        assert_eq!(tinfoil_entry_ctx(&e("m=slug@200000"), None), Ok(200000));
+        assert_eq!(ctx_over_published(131072, Some(131072)), None);
+        assert_eq!(ctx_over_published(200000, None), None);
     }
 
     #[test]

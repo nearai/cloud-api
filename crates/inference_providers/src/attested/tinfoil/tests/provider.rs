@@ -151,6 +151,57 @@ async fn oversized_error_body_is_truncated() {
 }
 
 #[tokio::test]
+async fn successful_body_is_read_under_a_cap() {
+    let e = env().await;
+    e.session.verify_now().await.unwrap();
+    let snap = e.session.snapshot();
+    let t = snap.as_ref().as_ref().unwrap().transport.clone();
+    let post = || async {
+        t.client
+            .post(format!("{}/v1/chat/completions", t.base))
+            .json(&serde_json::json!({}))
+            .send()
+            .await
+            .unwrap()
+    };
+    let body = vec![b'z'; 5000];
+    *e.server.chat.lock().unwrap() = ChatReply {
+        status: 200,
+        content_type: "application/json",
+        body: body.clone(),
+    };
+    let timeout = std::time::Duration::from_secs(5);
+    // At the cap: passes. One byte over: the retryable 503.
+    let ok = super::super::read_success_body(post().await, body.len(), timeout)
+        .await
+        .unwrap();
+    assert_eq!(ok, body);
+    let msg = expect_http(
+        super::super::read_success_body(post().await, body.len() - 1, timeout).await,
+        503,
+    );
+    assert!(msg.contains("response_too_large"), "{msg}");
+}
+
+#[tokio::test]
+async fn oversized_success_body_through_the_provider_is_retryable_503() {
+    let e = env().await;
+    e.session.verify_now().await.unwrap();
+    *e.server.chat.lock().unwrap() = ChatReply {
+        status: 200,
+        content_type: "application/json",
+        body: vec![b' '; super::super::MAX_RESPONSE_BYTES + 1],
+    };
+    let msg = expect_http(
+        e.provider
+            .chat_completion(params(false, None), "h".into())
+            .await,
+        503,
+    );
+    assert!(msg.contains("response_too_large"), "{msg}");
+}
+
+#[tokio::test]
 async fn oversized_models_document_is_rejected_without_failing_the_verify() {
     let e = env().await;
     *e.server.models_body.lock().unwrap() =
@@ -345,16 +396,12 @@ async fn spawn_refresh_rereads_proxy_then_reverifies_and_stops_when_dropped() {
     let proxy0 = server.hits(proxy_path);
     assert_eq!(verifier.router_calls.load(Ordering::SeqCst), 1);
 
-    let rt = tokio::runtime::Handle::current();
-    let before = rt.metrics().num_alive_tasks();
-    session.spawn_refresh();
-    let with_task = rt.metrics().num_alive_tasks();
-    assert_eq!(with_task, before + 1);
-    session.spawn_refresh();
-    assert_eq!(
-        rt.metrics().num_alive_tasks(),
-        with_task,
-        "a second spawn_refresh adds no task"
+    let refresh = session
+        .spawn_refresh_task()
+        .expect("first spawn_refresh starts the loop");
+    assert!(
+        session.spawn_refresh_task().is_none(),
+        "a second spawn_refresh starts no task"
     );
 
     // Let the task create its intervals (at the paused "now") before advancing.
@@ -371,8 +418,12 @@ async fn spawn_refresh_rereads_proxy_then_reverifies_and_stops_when_dropped() {
     tokio::time::advance(super::super::ROUTER_REVERIFY).await;
     paused_wait(|| verifier.router_calls.load(Ordering::SeqCst) >= 2).await;
 
-    // Dropping the last strong reference ends the task.
+    // Dropping the last strong reference ends THIS task: it only holds a Weak,
+    // and exits at its next tick when the upgrade fails.
+    assert!(!refresh.is_finished());
     drop(provider);
     drop(session);
-    paused_wait(|| rt.metrics().num_alive_tasks() < with_task).await;
+    tokio::time::advance(super::super::PROXY_REREAD + Duration::from_secs(1)).await;
+    paused_wait(|| refresh.is_finished()).await;
+    assert!(refresh.await.is_ok(), "refresh task exits cleanly");
 }

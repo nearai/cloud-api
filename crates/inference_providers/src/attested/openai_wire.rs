@@ -75,15 +75,139 @@ pub(crate) fn retain_allowed(obj: &mut serde_json::Map<String, Value>, allowed: 
     obj.retain(|k, _| allowed.contains(&k.as_str()));
 }
 
+// Nested OpenAI schemas. Every retained container is allow-listed recursively so
+// an unknown key (e.g. a vLLM `prompt_text` echo) cannot ride inside a container
+// whose parent key is standard. Opaque content leaves (`content`, `reasoning*`,
+// `function.arguments`, `custom.input`, `logprobs[].token`) are kept as-is.
+const TOOL_CALL_FIELDS: &[&str] = &["index", "id", "type", "function", "custom"];
+const TOOL_FUNCTION_FIELDS: &[&str] = &["name", "arguments"];
+const TOOL_CUSTOM_FIELDS: &[&str] = &["name", "input"];
+const ANNOTATION_FIELDS: &[&str] = &["type", "url_citation"];
+const URL_CITATION_FIELDS: &[&str] = &["start_index", "end_index", "url", "title"];
+const LOGPROBS_FIELDS: &[&str] = &["content", "refusal"];
+const LOGPROB_ENTRY_FIELDS: &[&str] = &["token", "logprob", "bytes", "top_logprobs"];
+const TOP_LOGPROB_FIELDS: &[&str] = &["token", "logprob", "bytes"];
+const USAGE_DETAIL_PROMPT: &[&str] = &["cached_tokens", "audio_tokens"];
+const USAGE_DETAIL_COMPLETION: &[&str] = &[
+    "reasoning_tokens",
+    "audio_tokens",
+    "accepted_prediction_tokens",
+    "rejected_prediction_tokens",
+];
+
+/// Allow-list the object stored at `obj[key]`. Scalars (null, string, number,
+/// bool) cannot carry a nested key and are left alone; an array in an object
+/// slot is not a valid shape and is removed.
+fn sanitize_child(
+    obj: &mut serde_json::Map<String, Value>,
+    key: &str,
+    allowed: &[&str],
+    nested: fn(&mut serde_json::Map<String, Value>),
+) {
+    match obj.get_mut(key) {
+        Some(Value::Object(inner)) => {
+            retain_allowed(inner, allowed);
+            nested(inner);
+        }
+        Some(Value::Array(_)) => {
+            obj.remove(key);
+        }
+        Some(_) | None => {}
+    }
+}
+
+/// Allow-list every element of the array at `obj[key]` (object elements only;
+/// scalar elements are left alone). An object in an array slot is not a valid
+/// shape and is removed; scalars are left alone.
+fn sanitize_array(
+    obj: &mut serde_json::Map<String, Value>,
+    key: &str,
+    allowed: &[&str],
+    nested: fn(&mut serde_json::Map<String, Value>),
+) {
+    match obj.get_mut(key) {
+        Some(Value::Array(items)) => {
+            for item in items {
+                if let Some(o) = item.as_object_mut() {
+                    retain_allowed(o, allowed);
+                    nested(o);
+                }
+            }
+        }
+        Some(Value::Object(_)) => {
+            obj.remove(key);
+        }
+        Some(_) | None => {}
+    }
+}
+
+fn no_nested(_: &mut serde_json::Map<String, Value>) {}
+
+fn sanitize_tool_call(tc: &mut serde_json::Map<String, Value>) {
+    sanitize_child(tc, "function", TOOL_FUNCTION_FIELDS, no_nested);
+    sanitize_child(tc, "custom", TOOL_CUSTOM_FIELDS, no_nested);
+}
+
+fn sanitize_annotation(a: &mut serde_json::Map<String, Value>) {
+    sanitize_child(a, "url_citation", URL_CITATION_FIELDS, no_nested);
+}
+
+fn sanitize_logprob_entry(e: &mut serde_json::Map<String, Value>) {
+    sanitize_array(e, "top_logprobs", TOP_LOGPROB_FIELDS, no_nested);
+}
+
+fn sanitize_logprobs(l: &mut serde_json::Map<String, Value>) {
+    sanitize_array(l, "content", LOGPROB_ENTRY_FIELDS, sanitize_logprob_entry);
+    sanitize_array(l, "refusal", LOGPROB_ENTRY_FIELDS, sanitize_logprob_entry);
+}
+
+/// `choices[].message` / `choices[].delta`: top-level keys by allow-list, then
+/// each retained container recursively. Per-field choices: `audio` is not on
+/// [`MESSAGE_FIELDS`] (dropped; we neither request nor bill audio output);
+/// `refusal` is a string or null, a container there is dropped; `annotations` keep
+/// only the standard `url_citation` shape; `content` and `reasoning*` are the
+/// completion itself and pass through untouched.
+fn sanitize_message(m: &mut serde_json::Map<String, Value>, extra_message: &[&str]) {
+    m.retain(|k, _| MESSAGE_FIELDS.contains(&k.as_str()) || extra_message.contains(&k.as_str()));
+    sanitize_array(m, "tool_calls", TOOL_CALL_FIELDS, sanitize_tool_call);
+    sanitize_child(m, "function_call", TOOL_FUNCTION_FIELDS, no_nested);
+    sanitize_array(m, "annotations", ANNOTATION_FIELDS, sanitize_annotation);
+    if m.get("refusal")
+        .is_some_and(|r| r.is_object() || r.is_array())
+    {
+        m.remove("refusal");
+    }
+}
+
+/// `usage`: the standard counters and the two nested detail objects, each
+/// allow-listed. Unknown numeric keys are kept (a stray counter is harmless and
+/// dropping one could hide billing data); anything else unknown (strings such as
+/// a `prompt_text` echo, containers) is dropped.
+fn sanitize_usage(u: &mut serde_json::Map<String, Value>) {
+    u.retain(|k, v| {
+        v.is_number() || k == "prompt_tokens_details" || k == "completion_tokens_details"
+    });
+    sanitize_child(u, "prompt_tokens_details", USAGE_DETAIL_PROMPT, no_nested);
+    sanitize_child(
+        u,
+        "completion_tokens_details",
+        USAGE_DETAIL_COMPLETION,
+        no_nested,
+    );
+}
+
 /// Sanitize a response/chunk object to the standard OpenAI shape by ALLOWLIST, in
 /// place: the top level keeps [`TOP_LEVEL_FIELDS`] plus `extra_top`, each
 /// `choices[]` element keeps [`CHOICE_FIELDS`], and each `choices[].message` /
-/// `choices[].delta` keeps [`MESSAGE_FIELDS`] plus `extra_message`. Everything
-/// else, known internals and unknown future ones alike, is dropped.
+/// `choices[].delta` keeps [`MESSAGE_FIELDS`] plus `extra_message`. Retained
+/// containers (`tool_calls`, `function_call`, `annotations`, `logprobs`, `usage`
+/// details) are allow-listed recursively. Everything else, known internals and
+/// unknown future ones alike, is dropped.
 ///
 /// Conservative under-strip: when in doubt a field is added to the allowlist
 /// (keeping a stray field is safer than dropping a legitimate one), but the known
-/// serving internals are deliberately absent and therefore dropped.
+/// serving internals are deliberately absent and therefore dropped. `extra_top`
+/// / `extra_message` values are provider-owned and not inspected.
 pub(crate) fn sanitize_response_object(
     obj: &mut serde_json::Map<String, Value>,
     extra_top: &[&str],
@@ -94,17 +218,18 @@ pub(crate) fn sanitize_response_object(
         for choice in choices {
             if let Some(choice_obj) = choice.as_object_mut() {
                 retain_allowed(choice_obj, CHOICE_FIELDS);
+                sanitize_child(choice_obj, "logprobs", LOGPROBS_FIELDS, sanitize_logprobs);
                 // Recurse into the message (non-stream) and delta (stream) shapes.
                 for inner in ["message", "delta"] {
                     if let Some(m) = choice_obj.get_mut(inner).and_then(Value::as_object_mut) {
-                        m.retain(|k, _| {
-                            MESSAGE_FIELDS.contains(&k.as_str())
-                                || extra_message.contains(&k.as_str())
-                        });
+                        sanitize_message(m, extra_message);
                     }
                 }
             }
         }
+    }
+    if let Some(usage) = obj.get_mut("usage").and_then(Value::as_object_mut) {
+        sanitize_usage(usage);
     }
 }
 
@@ -190,4 +315,113 @@ pub(crate) fn request_body(
         return Err("chat params did not serialize to a JSON object".to_string());
     }
     Ok(v)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const ARGS: &str = r#"{"city":"Paris","note":"  keep \"exact\" "}"#;
+
+    fn tool_call() -> Value {
+        json!({
+            "index": 0, "id": "call_1", "type": "function",
+            "prompt_text": "LEAK",
+            "function": {"name": "get_weather", "arguments": ARGS, "prompt_text": "LEAK"}
+        })
+    }
+
+    fn logprobs() -> Value {
+        json!({
+            "unknown": "LEAK",
+            "content": [{"token": "a", "logprob": -0.1, "bytes": [97], "prompt_text": "LEAK",
+                "top_logprobs": [{"token": "a", "logprob": -0.1, "bytes": [97], "prompt_text": "LEAK"}]}],
+            "refusal": [{"token": "n", "logprob": -1.0, "bytes": null, "prompt_text": "LEAK", "top_logprobs": []}]
+        })
+    }
+
+    fn usage() -> Value {
+        json!({
+            "prompt_tokens": 3, "completion_tokens": 4, "total_tokens": 7,
+            "prompt_text": "LEAK", "unknown_obj": {"prompt_text": "LEAK"},
+            "prompt_tokens_details": {"cached_tokens": 1, "audio_tokens": 0, "prompt_text": "LEAK"},
+            "completion_tokens_details": {"reasoning_tokens": 2, "audio_tokens": 0,
+                "accepted_prediction_tokens": 0, "rejected_prediction_tokens": 0, "prompt_text": "LEAK"}
+        })
+    }
+
+    fn message() -> Value {
+        json!({
+            "role": "assistant", "content": "hi",
+            "tool_calls": [tool_call()],
+            "function_call": {"name": "f", "arguments": ARGS, "prompt_text": "LEAK"},
+            "refusal": null,
+            "annotations": [{"type": "url_citation", "prompt_text": "LEAK",
+                "url_citation": {"start_index": 0, "end_index": 2, "url": "u", "title": "t", "prompt_text": "LEAK"}}],
+            "audio": {"data": "LEAK"}
+        })
+    }
+
+    fn body(inner: &str) -> serde_json::Map<String, Value> {
+        let v = json!({
+            "id": "x", "object": "o", "created": 1, "model": "m",
+            "choices": [{"index": 0, "finish_reason": null, "logprobs": logprobs(), inner: message()}],
+            "usage": usage()
+        });
+        v.as_object().unwrap().clone()
+    }
+
+    #[test]
+    fn nested_containers_are_allowlisted_in_message_and_delta() {
+        for inner in ["message", "delta"] {
+            let mut obj = body(inner);
+            sanitize_response_object(&mut obj, &[], &[]);
+            let ser = serde_json::to_string(&obj).unwrap();
+            assert!(!ser.contains("LEAK"), "{inner}: {ser}");
+            let c = &obj["choices"][0];
+            let tc = &c[inner]["tool_calls"][0];
+            assert_eq!(tc["index"], 0);
+            assert_eq!(tc["id"], "call_1");
+            assert_eq!(tc["type"], "function");
+            assert_eq!(tc["function"]["name"], "get_weather");
+            assert_eq!(tc["function"]["arguments"].as_str().unwrap(), ARGS);
+            assert_eq!(
+                c[inner]["function_call"]["arguments"].as_str().unwrap(),
+                ARGS
+            );
+            assert_eq!(c[inner]["annotations"][0]["url_citation"]["url"], "u");
+            assert!(c[inner].get("audio").is_none());
+            assert_eq!(c["logprobs"]["content"][0]["top_logprobs"][0]["token"], "a");
+            assert_eq!(c["logprobs"]["content"][0]["bytes"], json!([97]));
+            assert_eq!(c["logprobs"]["refusal"][0]["token"], "n");
+            let u = &obj["usage"];
+            assert_eq!(u["total_tokens"], 7);
+            assert_eq!(u["prompt_tokens_details"]["cached_tokens"], 1);
+            assert_eq!(u["completion_tokens_details"]["reasoning_tokens"], 2);
+        }
+    }
+
+    #[test]
+    fn wrongly_shaped_containers_are_dropped_and_scalars_left_alone() {
+        let mut obj = json!({"choices": [{"index": 0, "logprobs": ["LEAK"],
+            "message": {"tool_calls": {"prompt_text": "LEAK"}, "function_call": ["LEAK"],
+                "annotations": {"a": "LEAK"}, "refusal": {"a": "LEAK"}}}],
+            "usage": {"prompt_tokens_details": ["LEAK"], "x": {"a": "LEAK"}, "y": [1], "z": 5}})
+        .as_object()
+        .unwrap()
+        .clone();
+        sanitize_response_object(&mut obj, &[], &[]);
+        assert!(!serde_json::to_string(&obj).unwrap().contains("LEAK"));
+        assert_eq!(obj["usage"]["z"], 5);
+
+        // Scalars carry no nested key: untouched (keeps Chutes output stable).
+        let mut obj = json!({"choices": [{"index": 0, "logprobs": 1,
+            "message": {"tool_calls": 1, "function_call": 1, "annotations": 1, "refusal": "no"}}]})
+        .as_object()
+        .unwrap()
+        .clone();
+        let before = obj.clone();
+        sanitize_response_object(&mut obj, &[], &[]);
+        assert_eq!(obj, before);
+    }
 }

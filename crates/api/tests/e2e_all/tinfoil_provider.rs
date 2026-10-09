@@ -52,14 +52,16 @@ async fn fixture(with_chutes: bool) -> Fixture {
                 .with_chat_signature_support(false),
         )
     };
-    // Tinfoil registers BEFORE Chutes so it is the first failover: a kill
-    // switch test that only shows Chutes serving would otherwise pass vacuously.
+    // Tinfoil must be the first failover so a kill switch test that only shows
+    // Chutes serving can't pass vacuously. On a tie Chutes leads (source
+    // tie-break), so Tinfoil gets the smaller sufficient window and leads by
+    // best-fit instead.
     let tinfoil = attested(ProviderSource::Tinfoil);
-    pool.register_pinned_secondary_provider(model.clone(), tinfoil.clone(), None)
+    pool.register_pinned_secondary_provider(model.clone(), tinfoil.clone(), Some(128_000))
         .await;
     let chutes = with_chutes.then(|| attested(ProviderSource::Chutes));
     if let Some(c) = &chutes {
-        pool.register_pinned_secondary_provider(model.clone(), c.clone(), None)
+        pool.register_pinned_secondary_provider(model.clone(), c.clone(), Some(1_000_000))
             .await;
     }
 
@@ -228,7 +230,7 @@ async fn serial_kill_switch_fails_over_to_next_provider() {
             .map(|h| h.to_str().unwrap().to_string())
     };
 
-    // Baseline, switch off: Tinfoil (first failover) serves; Chutes is not used.
+    // Baseline, switch off: Tinfoil (first failover by best-fit) serves; Chutes is not used.
     let r = f.chat(false, 20).await;
     assert_eq!(r.status_code(), 200, "{}", r.text());
     assert_eq!(served(&r).as_deref(), Some("tinfoil"));
@@ -386,6 +388,57 @@ async fn failed_first_verification_still_registers_and_answers_503() {
     assert_eq!(r.status_code().as_u16(), 429, "{}", r.text());
     let body: Value = r.json();
     assert_eq!(body["error"]["type"], "service_overloaded", "{body}");
+}
+
+/// Startup must not await network verification: with an ATC that accepts the
+/// connection and never answers, registration returns promptly, the provider is
+/// registered, and requests fail closed with the Tinfoil 503 meanwhile.
+#[tokio::test]
+async fn startup_does_not_wait_for_a_hanging_first_verification() {
+    let (server, pool, _mock, database) = setup_test_server_with_pool().await;
+    let model = format!("nearai/test-tinfoil-slow-{}", uuid::Uuid::new_v4());
+    tinfoil_catalog_row(&server, &model).await;
+    // Oversized @ctx is registered too (enforced per request once a published
+    // window is known), not skipped at startup.
+    let cfg = tinfoil_cfg(&model, "@999999999");
+    let repo = database::repositories::ModelRepository::new(database.pool().clone());
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let _hold = std::thread::spawn(move || {
+        // Accept and hold the connection open without ever responding.
+        let conns: Vec<_> = listener.incoming().take(4).collect();
+        std::thread::sleep(std::time::Duration::from_secs(60));
+        drop(conns);
+    });
+    let started = std::time::Instant::now();
+    api::attested_3p_startup::register_tinfoil_with(
+        &pool,
+        &repo,
+        &cfg,
+        Ok(router_pins()),
+        move |mut pcfg, verifier| {
+            pcfg.atc_url = format!("https://127.0.0.1:{port}/attestation");
+            inference_providers::attested::tinfoil::TinfoilRouterSession::new(pcfg, verifier)
+        },
+        metrics(),
+    )
+    .await;
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(3),
+        "startup waited on verification: {:?}",
+        started.elapsed()
+    );
+    assert!(pool.has_provider(&model).await);
+    let params: inference_providers::ChatCompletionParams = serde_json::from_value(
+        json!({"model": model, "messages": [{"role":"user","content":"Hello"}], "max_tokens": 8}),
+    )
+    .unwrap();
+    match pool.chat_completion(params, "hash".to_string()).await {
+        Err(inference_providers::CompletionError::HttpError { status_code, .. }) => {
+            assert_eq!(status_code, 503)
+        }
+        other => panic!("expected the Tinfoil 503, got {:?}", other.map(|_| ())),
+    }
 }
 
 #[tokio::test]

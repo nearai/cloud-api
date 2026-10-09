@@ -289,3 +289,57 @@ async fn standard_fields_map_to_fixed_comment() {
         }
     }
 }
+
+const NESTED_ARGS: &str = r#"{"q":"a \"b\" c"}"#;
+
+fn nested_leaky(inner: &str, object: &str) -> String {
+    serde_json::json!({
+        "id": "c", "object": object, "created": 0, "model": "upstream-slug",
+        "choices": [{"index": 0, "finish_reason": null,
+            "logprobs": {"content": [{"token": "a", "logprob": -0.5, "bytes": [97],
+                "prompt_text": "SECRET", "top_logprobs": [{"token": "a", "logprob": -0.5, "bytes": [97], "prompt_text": "SECRET"}]}]},
+            inner: {"role": "assistant", "content": "hi", "tool_calls": [{"index": 0, "id": "call_1", "type": "function",
+                "prompt_text": "SECRET",
+                "function": {"name": "f", "arguments": NESTED_ARGS, "prompt_text": "SECRET"}}]}}],
+        "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2,
+            "prompt_tokens_details": {"cached_tokens": 0, "prompt_text": "SECRET"}}
+    })
+    .to_string()
+}
+
+fn assert_nested_clean(raw: &str, v: &serde_json::Value, inner: &str) {
+    assert!(
+        !raw.contains("SECRET") && !raw.contains("prompt_text"),
+        "{raw}"
+    );
+    let tc = &v["choices"][0][inner]["tool_calls"][0];
+    assert_eq!(tc["id"], "call_1");
+    assert_eq!(tc["index"], 0);
+    assert_eq!(tc["function"]["arguments"].as_str().unwrap(), NESTED_ARGS);
+    assert_eq!(v["choices"][0]["logprobs"]["content"][0]["bytes"][0], 97);
+}
+
+#[test]
+fn nested_prompt_text_is_stripped_from_non_stream_responses() {
+    let body = nested_leaky("message", "chat.completion");
+    let (raw, _) = wire::map_response(body.as_bytes(), CANON).unwrap();
+    let raw = String::from_utf8(raw).unwrap();
+    let v: serde_json::Value = serde_json::from_str(&raw).unwrap();
+    assert_nested_clean(&raw, &v, "message");
+}
+
+#[tokio::test]
+async fn nested_prompt_text_is_stripped_from_stream_chunks() {
+    let body = nested_leaky("delta", "chat.completion.chunk");
+    let out = map_raw_sse(&format!("data: {body}\n\ndata: [DONE]\n\n")).await;
+    let mut seen = false;
+    for ev in out {
+        let ev = ev.unwrap();
+        let raw = String::from_utf8_lossy(&ev.raw_bytes).to_string();
+        if let Some(v) = client_json(&ev) {
+            assert_nested_clean(&raw, &v, "delta");
+            seen = true;
+        }
+    }
+    assert!(seen);
+}

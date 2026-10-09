@@ -450,11 +450,17 @@ impl TinfoilRouterSession {
     /// Start the proxy re-read (60 s) and full re-verify (300 s) loop. Holds a
     /// `Weak` reference, so it ends once the session is dropped. Idempotent.
     pub fn spawn_refresh(self: &Arc<Self>) {
+        drop(self.spawn_refresh_task());
+    }
+
+    /// [`Self::spawn_refresh`], returning the task's handle (`None` when a
+    /// refresh loop was already started) so tests can observe its exit.
+    pub(super) fn spawn_refresh_task(self: &Arc<Self>) -> Option<tokio::task::JoinHandle<()>> {
         if self.refresh_started.swap(true, Ordering::SeqCst) {
-            return;
+            return None;
         }
         let weak: Weak<Self> = Arc::downgrade(self);
-        tokio::spawn(async move {
+        Some(tokio::spawn(async move {
             let mut proxy = tokio::time::interval(PROXY_REREAD);
             let mut router = tokio::time::interval(ROUTER_REVERIFY);
             for t in [&mut proxy, &mut router] {
@@ -478,7 +484,7 @@ impl TinfoilRouterSession {
                     }
                 }
             }
-        });
+        }))
     }
 
     /// The router's published context window for `slug` as of the last

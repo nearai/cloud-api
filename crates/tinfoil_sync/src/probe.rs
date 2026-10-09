@@ -44,6 +44,12 @@ pub const GITHUB_API_BASE: &str = "https://api.github.com";
 /// document are well under 1 MiB).
 const MAX_BODY_BYTES: u64 = 8 * 1024 * 1024;
 
+/// Most distinct repo/tag releases a proxy document may list before it is
+/// rejected unchecked; Tinfoil serves roughly 10-20 models today, so this is
+/// generous headroom while bounding the per-release fetches a hostile or
+/// compromised router can trigger.
+const MAX_RELEASES: usize = 64;
+
 /// Who the proxy document is requested from: the router a verified ATC bundle
 /// describes.
 #[derive(Debug, Clone)]
@@ -329,7 +335,22 @@ pub async fn run(client: &reqwest::Client, cfg: &ProbeConfig) -> Result<ProbeOut
             };
             match fetched {
                 Ok(text) => match serde_json::from_str::<ProxyDoc>(&text) {
-                    Ok(p) => Some(p),
+                    Ok(p) => {
+                        let distinct = p
+                            .models
+                            .values()
+                            .map(|m| (&m.repo, &m.tag))
+                            .collect::<std::collections::BTreeSet<_>>()
+                            .len();
+                        if distinct > MAX_RELEASES {
+                            notes.push(format!(
+                                "proxy document: {distinct} distinct releases exceeds limit of {MAX_RELEASES}"
+                            ));
+                            None
+                        } else {
+                            Some(p)
+                        }
+                    }
                     Err(_) => {
                         notes.push("proxy document: malformed".into());
                         None
@@ -935,5 +956,63 @@ mod tests {
             out.observations.router.unwrap().spki_sha256_hex
         );
         assert!(out.notes.iter().any(|n| n == "proxy document: stop"));
+    }
+
+    /// A valid proxy document padded to `n` distinct releases (cloned
+    /// first model, unique tags).
+    fn proxy_with_releases(n: usize) -> String {
+        let mut doc: serde_json::Value = serde_json::from_str(PROXY).unwrap();
+        let models = doc["models"].as_object_mut().unwrap();
+        let template = models.values().next().unwrap().clone();
+        models.clear();
+        for i in 0..n {
+            let mut m = template.clone();
+            m["tag"] = serde_json::json!(format!("v9.9.{i}"));
+            models.insert(format!("m{i}"), m);
+        }
+        doc.to_string()
+    }
+
+    async fn run_with_proxy_body(body: String) -> (MockServer, ProbeOutput) {
+        let (s, mut cfg) = server().await;
+        Mock::given(method("GET"))
+            .and(path("/proxy-padded"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(body))
+            .mount(&s)
+            .await;
+        cfg.proxy_fetcher = Some(mock_proxy_fetcher(format!("{}/proxy-padded", s.uri())));
+        let out = run(&reqwest::Client::new(), &cfg).await.unwrap();
+        (s, out)
+    }
+
+    async fn release_requests(s: &MockServer) -> usize {
+        s.received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .filter(|r| r.url.path() != "/atc" && !r.url.path().starts_with("/proxy"))
+            .count()
+    }
+
+    #[tokio::test]
+    async fn proxy_document_over_release_limit_makes_no_release_fetches() {
+        let (s, out) = run_with_proxy_body(proxy_with_releases(MAX_RELEASES + 1)).await;
+        assert!(!out.complete);
+        assert!(out.observations.models.is_empty());
+        assert!(out.sigstore.models.is_empty());
+        assert_eq!(release_requests(&s).await, 0);
+        assert!(out
+            .notes
+            .iter()
+            .any(|n| n.starts_with("proxy document:") && n.contains("exceeds limit")));
+    }
+
+    #[tokio::test]
+    async fn proxy_document_at_release_limit_is_still_processed() {
+        let (s, out) = run_with_proxy_body(proxy_with_releases(MAX_RELEASES)).await;
+        assert!(out.complete);
+        assert_eq!(out.observations.models.len(), MAX_RELEASES);
+        // Each release is attempted (none has a mocked hash, so each is noted).
+        assert!(release_requests(&s).await >= MAX_RELEASES);
     }
 }

@@ -38,25 +38,6 @@ async fn main() -> Result<()> {
         .context("Failed to run migrations")?;
     info!("Database migrations completed");
 
-    // This binary is for local setup. Production builds the same index from
-    // migrations/out_of_band before starting the new API version.
-    let client = database
-        .pool()
-        .get()
-        .await
-        .context("Failed to get database connection for refresh index")?;
-    client
-        .batch_execute(
-            "CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_refresh_tokens_previous_hash \
-             ON refresh_tokens(previous_token_hash) \
-             WHERE previous_token_hash IS NOT NULL",
-        )
-        .await
-        .context("Failed to create local refresh rotation index")?;
-    drop(client);
-    database::ensure_refresh_rotation_index(database.pool()).await?;
-    info!("Refresh rotation index ready");
-
     // Run seed scripts
     run_seed_scripts(&database).await?;
     info!("Database seeding completed");

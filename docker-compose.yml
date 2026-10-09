@@ -55,11 +55,8 @@ services:
     build: .
     ports:
       - "3000:3000"
-    env_file: .env
     environment:
       CONFIG_FILE: config/docker.yaml
-      DATABASE_HOST: postgres
-      GATEWAY_SUBDOMAIN: postgres
       RUST_LOG: debug
       RUST_BACKTRACE: "1"
       # OTLP configuration to send metrics to Datadog agent
@@ -74,35 +71,6 @@ services:
         condition: service_healthy
       datadog-agent:
         condition: service_healthy
-      refresh-index:
-        condition: service_completed_successfully
-
-  # Local bootstrap mirrors the production rollout: migrate, build the index,
-  # then allow the API startup check to run. Neither step serves traffic.
-  api-migrate:
-    build: .
-    command: ["./api", "--migrate-only"]
-    env_file: .env
-    environment:
-      DATABASE_HOST: postgres
-      GATEWAY_SUBDOMAIN: postgres
-    depends_on:
-      postgres:
-        condition: service_healthy
-
-  refresh-index:
-    image: postgres:16-alpine
-    environment:
-      PGHOST: postgres
-      PGDATABASE: platform_api
-      PGUSER: postgres
-      PGPASSWORD: postgres
-    volumes:
-      - ./crates/database/src/migrations/out_of_band/refresh_token_rotation_index.sql:/refresh_token_rotation_index.sql:ro
-    command: ["psql", "-v", "ON_ERROR_STOP=1", "-f", "/refresh_token_rotation_index.sql"]
-    depends_on:
-      api-migrate:
-        condition: service_completed_successfully
 
 volumes:
   postgres_data:

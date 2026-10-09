@@ -330,9 +330,18 @@ impl TinfoilRouterSession {
         )
         .await?;
         let models = self.check_models(&doc);
-        // Published windows are best effort: an unavailable document leaves
-        // them unknown (declared contexts then stand), never fails the verify.
-        let context_windows = Self::fetch_context_windows(&transport).await;
+        // Published windows are best effort and never fail the verify. A failed
+        // fetch keeps the last known windows so an oversized declared context
+        // cannot start passing just because `/v1/models` is briefly down; only a
+        // successful fetch replaces them.
+        let context_windows = match Self::fetch_context_windows(&transport).await {
+            Some(fresh) => fresh,
+            None => current
+                .as_ref()
+                .as_ref()
+                .map(|st| st.context_windows.clone())
+                .unwrap_or_default(),
+        };
         tracing::info!(
             router_tag = %router.tag,
             router_measurement = %router.measurement_hex,
@@ -481,23 +490,24 @@ impl TinfoilRouterSession {
     }
 
     /// `GET /v1/models` (unauthenticated) over the pinned client, as slug ->
-    /// `context_window`. Empty on any failure.
-    async fn fetch_context_windows(t: &Transport) -> BTreeMap<String, u32> {
+    /// `context_window`. `None` on any failure (unreachable, oversized, not
+    /// JSON, no `data` array), so callers can tell it from an empty listing.
+    async fn fetch_context_windows(t: &Transport) -> Option<BTreeMap<String, u32>> {
         let Ok(v) =
             Self::fetch_json::<serde_json::Value>(&t.client, &format!("{}/v1/models", t.base))
                 .await
         else {
-            return BTreeMap::new();
+            return None;
         };
-        let Some(data) = v.get("data").and_then(|d| d.as_array()) else {
-            return BTreeMap::new();
-        };
-        data.iter()
-            .filter_map(|m| {
-                let id = m.get("id")?.as_str()?;
-                let w = u32::try_from(m.get("context_window")?.as_u64()?).ok()?;
-                Some((id.to_string(), w))
-            })
-            .collect()
+        let data = v.get("data").and_then(|d| d.as_array())?;
+        Some(
+            data.iter()
+                .filter_map(|m| {
+                    let id = m.get("id")?.as_str()?;
+                    let w = u32::try_from(m.get("context_window")?.as_u64()?).ok()?;
+                    Some((id.to_string(), w))
+                })
+                .collect(),
+        )
     }
 }

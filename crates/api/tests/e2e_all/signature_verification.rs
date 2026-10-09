@@ -42,7 +42,7 @@ async fn setup_non_attested_signature_model(
     (model_name, mock)
 }
 
-async fn assert_gateway_signatures(
+pub(crate) async fn assert_gateway_signatures(
     server: &axum_test::TestServer,
     api_key: &str,
     chat_id: &str,

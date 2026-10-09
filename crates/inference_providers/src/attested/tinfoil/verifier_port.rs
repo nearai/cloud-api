@@ -62,6 +62,16 @@ pub struct VerifiedRouter {
     pub spki_sha256: [u8; 32],
     pub measurement_hex: String,
     pub tag: String,
+    /// Reported TCB from the verified SNP report.
+    pub tcb: RouterTcb,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RouterTcb {
+    pub bootloader: u8,
+    pub tee: u8,
+    pub snp: u8,
+    pub microcode: u8,
 }
 
 /// A proxy model entry whose registers, repo and tag all matched one compiled
@@ -93,6 +103,9 @@ pub enum TinfoilVerifyError {
     /// tag); it is for diagnosis only and is not part of [`Self::reason`].
     #[error("malformed evidence ({stage})")]
     Malformed { stage: &'static str },
+    /// Evidence or the router's model document could not be fetched or decoded.
+    #[error("fetch error")]
+    Fetch,
 }
 
 impl TinfoilVerifyError {
@@ -106,6 +119,7 @@ impl TinfoilVerifyError {
             Self::TcbTooLow => "tcb_too_low",
             Self::ReportDataMismatch => "report_data_mismatch",
             Self::Malformed { .. } => "malformed_evidence",
+            Self::Fetch => "fetch_error",
         }
     }
 }
@@ -139,6 +153,11 @@ pub fn validate_router_domain(domain: &str) -> Result<(), TinfoilVerifyError> {
     Ok(())
 }
 
+/// Verifies Tinfoil evidence. The session calls `validate_router_domain` itself
+/// on the verified bundle's domain, as a deliberate seam guard (the domain picks
+/// the request host, so the session never relies on the verifier alone), but
+/// implementations MUST still enforce it, and MUST also check that the attested
+/// certificate's SAN names that domain, inside `verify_router`.
 pub trait TinfoilVerifier: Send + Sync {
     fn verify_router(&self, bundle: &AtcBundle) -> Result<VerifiedRouter, TinfoilVerifyError>;
     /// Verifies that `entry` matches a compiled pin for `slug`: the measurement

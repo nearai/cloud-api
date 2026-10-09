@@ -127,6 +127,7 @@ impl Database {
             password: config.password.clone(),
             max_write_connections: config.max_connections as u32,
             max_read_connections: config.max_connections as u32,
+            recycling_method: config.recycling_method,
             tls_enabled: config.tls_enabled,
             tls_ca_cert_path: config.tls_ca_cert_path.clone(),
         };
@@ -245,6 +246,9 @@ impl Database {
         pg_config.dbname = Some(config.database.clone());
         pg_config.user = Some(config.username.clone());
         pg_config.password = Some(config.password.clone());
+        pg_config.manager = Some(deadpool_postgres::ManagerConfig {
+            recycling_method: pool_recycling_method(config.recycling_method),
+        });
 
         let pool = if config.tls_enabled {
             create_pool_with_native_tls(pg_config, true)?
@@ -253,6 +257,15 @@ impl Database {
         };
 
         Ok(Self::new(DbPool::new(pool)))
+    }
+}
+
+pub(crate) const fn pool_recycling_method(
+    method: config::DatabaseRecyclingMethod,
+) -> deadpool_postgres::RecyclingMethod {
+    match method {
+        config::DatabaseRecyclingMethod::Fast => deadpool_postgres::RecyclingMethod::Fast,
+        config::DatabaseRecyclingMethod::Verified => deadpool_postgres::RecyclingMethod::Verified,
     }
 }
 
@@ -295,7 +308,7 @@ fn direct_pool_config(config: &config::DatabaseConfig) -> Result<deadpool_postgr
         queue_mode: deadpool::managed::QueueMode::Fifo,
     });
     pg.manager = Some(deadpool_postgres::ManagerConfig {
-        recycling_method: deadpool_postgres::RecyclingMethod::Verified,
+        recycling_method: pool_recycling_method(config.recycling_method),
     });
     pg.ssl_mode = Some(deadpool_postgres::SslMode::Require);
     pg.connect_timeout = Some(Duration::from_secs(10));
@@ -317,6 +330,7 @@ mod direct_connection_tests {
             username: "application".into(),
             password: "test-only".into(),
             max_connections: 7,
+            recycling_method: config::DatabaseRecyclingMethod::Fast,
             tls_enabled: true,
             tls_ca_cert_path: None,
             refresh_interval: 30,
@@ -339,11 +353,22 @@ mod direct_connection_tests {
         assert_eq!(settings.timeouts.recycle, Some(Duration::from_secs(5)));
         assert!(matches!(
             pool.manager.unwrap().recycling_method,
-            deadpool_postgres::RecyclingMethod::Verified
+            deadpool_postgres::RecyclingMethod::Fast
         ));
         assert!(matches!(
             pool.ssl_mode,
             Some(deadpool_postgres::SslMode::Require)
+        ));
+    }
+
+    #[test]
+    fn direct_pool_honors_verified_recycling_override() {
+        let mut source = config();
+        source.recycling_method = config::DatabaseRecyclingMethod::Verified;
+        let pool = direct_pool_config(&source).unwrap();
+        assert!(matches!(
+            pool.manager.unwrap().recycling_method,
+            deadpool_postgres::RecyclingMethod::Verified
         ));
     }
 

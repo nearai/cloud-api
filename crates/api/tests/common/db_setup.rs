@@ -275,6 +275,7 @@ async fn bootstrap_shared_db_once() -> Result<()> {
         username: user,
         password,
         max_connections: 2,
+        recycling_method: config::DatabaseRecyclingMethod::Fast,
         tls_enabled: false,
         tls_ca_cert_path: None,
         refresh_interval: 30,

@@ -64,12 +64,14 @@ impl UserErasureService {
     }
 
     /// Find erasure records by the erased person's email or by user id (exactly one).
-    /// The email is digested here; the repository never sees it. Newest first.
+    /// The email is digested here; the repository never sees it. Newest first. A blank
+    /// email counts as absent.
     pub async fn lookup(
         &self,
         email: Option<&str>,
         user_id: Option<Uuid>,
     ) -> Result<Vec<ErasureRecord>, UserErasureError> {
+        let email = email.filter(|e| !e.trim().is_empty());
         let by = match (email, user_id) {
             (Some(email), None) => ErasureLookup::EmailDigest(erased_email_digest(email)),
             (None, Some(user_id)) => ErasureLookup::UserId(user_id),
@@ -330,7 +332,11 @@ mod tests {
 
     #[tokio::test]
     async fn lookup_rejects_both_or_neither() {
-        for (email, user_id) in [(Some("a@b.c"), Some(Uuid::new_v4())), (None, None)] {
+        for (email, user_id) in [
+            (Some("a@b.c"), Some(Uuid::new_v4())),
+            (None, None),
+            (Some("   "), None),
+        ] {
             let repo = FakeRepo::new(ExecuteOutcome::NotFound, ErasedFootprint::default());
             let err = UserErasureService::new(repo.clone())
                 .lookup(email, user_id)

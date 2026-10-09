@@ -1444,6 +1444,17 @@ fn parse_datetime_or_default(
     }
 }
 
+/// `end` defaults to now and `start` to 30 days before `end`.
+fn parse_date_range(
+    start: &Option<String>,
+    end: &Option<String>,
+) -> Result<(chrono::DateTime<Utc>, chrono::DateTime<Utc>), UsageError> {
+    let end = parse_datetime_or_default(end, Utc::now())?;
+    let start = parse_datetime_or_default(start, end - Duration::days(30))?;
+    validate_date_range(start, end)?;
+    Ok((start, end))
+}
+
 /// Organization usage metrics.
 #[utoipa::path(
     get,
@@ -1473,11 +1484,7 @@ pub async fn get_user_organization_metrics(
 ) -> Result<ResponseJson<UserOrganizationMetrics>, (StatusCode, ResponseJson<ErrorResponse>)> {
     let organization_id = check_org_membership(&app_state, user, &org_id).await?;
 
-    let now = Utc::now();
-    let end = parse_datetime_or_default(&query.end, now)?;
-    let start = parse_datetime_or_default(&query.start, end - Duration::days(30))?;
-
-    validate_date_range(start, end)?;
+    let (start, end) = parse_date_range(&query.start, &query.end)?;
 
     let metrics = app_state
         .analytics_service
@@ -1567,11 +1574,7 @@ pub async fn get_user_organization_timeseries(
         ));
     }
 
-    let now = Utc::now();
-    let end = parse_datetime_or_default(&query.end, now)?;
-    let start = parse_datetime_or_default(&query.start, end - Duration::days(30))?;
-
-    validate_date_range(start, end)?;
+    let (start, end) = parse_date_range(&query.start, &query.end)?;
 
     let timeseries = app_state
         .analytics_service
@@ -1608,15 +1611,19 @@ pub enum UsageByModelPeriod {
     Day,
     Week,
     Month,
+    /// The `start`/`end` range instead of a rolling window.
+    Custom,
 }
 
 impl UsageByModelPeriod {
-    fn since(self) -> chrono::DateTime<Utc> {
+    /// Start of the rolling window; `None` for `Custom`.
+    fn since(self) -> Option<chrono::DateTime<Utc>> {
         let now = Utc::now();
         match self {
-            UsageByModelPeriod::Day => now - Duration::days(1),
-            UsageByModelPeriod::Week => now - Duration::days(7),
-            UsageByModelPeriod::Month => now - Duration::days(30),
+            UsageByModelPeriod::Day => Some(now - Duration::days(1)),
+            UsageByModelPeriod::Week => Some(now - Duration::days(7)),
+            UsageByModelPeriod::Month => Some(now - Duration::days(30)),
+            UsageByModelPeriod::Custom => None,
         }
     }
 
@@ -1625,18 +1632,21 @@ impl UsageByModelPeriod {
             UsageByModelPeriod::Day => "day",
             UsageByModelPeriod::Week => "week",
             UsageByModelPeriod::Month => "month",
+            UsageByModelPeriod::Custom => "custom",
         }
     }
 }
 
 #[derive(Debug, Deserialize)]
 pub struct UsageByModelQuery {
-    /// `day` (last 24h), `week` (last 7d), or `month` (last 30d). Defaults to `month`.
+    /// `day` (last 24h), `week` (last 7d), `month` (last 30d), or `custom` for the
+    /// `start`/`end` range. Defaults to `month`.
     #[serde(default = "default_period")]
     pub period: UsageByModelPeriod,
-    /// Custom range start (ISO 8601). When `start` or `end` is set, `period` is ignored.
+    /// Custom range start (ISO 8601). Setting `start` or `end` selects the custom range
+    /// whatever `period` says.
     pub start: Option<String>,
-    /// Custom range end, exclusive (ISO 8601). Defaults to now when only `start` is set.
+    /// Custom range end, exclusive (ISO 8601). Defaults to now.
     pub end: Option<String>,
 }
 
@@ -1659,9 +1669,10 @@ pub struct UsageByModelEntryResponse {
 /// Per-model usage breakdown response
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub struct UsageByModelResponse {
+    /// `day`, `week` or `month` for a rolling window; `custom` for a `start`/`end` range.
     pub period: String,
     pub start_date: String,
-    /// Set only for custom ranges.
+    /// Exclusive end of a custom range. Absent for rolling windows, which end now.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub end_date: Option<String>,
     pub data: Vec<UsageByModelEntryResponse>,
@@ -1669,23 +1680,24 @@ pub struct UsageByModelResponse {
 
 /// Get organization usage broken down by model.
 ///
-/// Returns one row per model, summed over a rolling window ending now (or a custom
-/// `start`/`end` range, capped at the same maximum span as other usage reports):
+/// Returns one row per model, summed over a rolling window ending now:
 /// `day` = last 24h, `week` = last 7 days, `month` = last 30 days (NOT calendar
-/// day/week/month-to-date). Used by the dashboard pie chart to show which models
-/// drive spend.
+/// day/week/month-to-date). Setting `start` or `end` (or `period=custom`) sums a custom
+/// range instead; a range longer than 366 days is rejected with 400. Used by the
+/// dashboard pie chart to show which models drive spend.
 #[utoipa::path(
     get,
     path = "/v1/organizations/{org_id}/usage/by-model",
     tag = "Usage",
     params(
         ("org_id" = String, Path, description = "Organization ID"),
-        ("period" = Option<String>, Query, description = "Rolling window: `day` (last 24h), `week` (last 7d), or `month` (last 30d). Default: `month`. Ignored when `start` or `end` is set"),
+        ("period" = Option<String>, Query, description = "Rolling window: `day` (last 24h), `week` (last 7d), or `month` (last 30d); or `custom` for the `start`/`end` range. Default: `month`. Setting `start` or `end` selects the custom range whatever `period` says"),
         ("start" = Option<String>, Query, description = "Custom range start (ISO 8601). Defaults to `end` minus 30 days"),
         ("end" = Option<String>, Query, description = "Custom range end, exclusive (ISO 8601). Defaults to now")
     ),
     responses(
         (status = 200, description = "Per-model usage breakdown", body = UsageByModelResponse),
+        (status = 400, description = "Invalid date or date range", body = ErrorResponse),
         (status = 401, description = "Unauthorized", body = ErrorResponse),
         (status = 403, description = "Forbidden", body = ErrorResponse),
         (status = 500, description = "Internal server error", body = ErrorResponse),
@@ -1702,13 +1714,17 @@ pub async fn get_organization_usage_by_model(
     Query(query): Query<UsageByModelQuery>,
 ) -> Result<ResponseJson<UsageByModelResponse>, (StatusCode, ResponseJson<ErrorResponse>)> {
     let organization_id = check_org_membership(&app_state, user, &org_id).await?;
-    let (start_date, end_date, period) = if query.start.is_some() || query.end.is_some() {
-        let end = parse_datetime_or_default(&query.end, Utc::now())?;
-        let start = parse_datetime_or_default(&query.start, end - Duration::days(30))?;
-        validate_date_range(start, end)?;
-        (start, Some(end), "custom")
+    let period = if query.start.is_some() || query.end.is_some() {
+        UsageByModelPeriod::Custom
     } else {
-        (query.period.since(), None, query.period.as_str())
+        query.period
+    };
+    let (start_date, end_date) = match period.since() {
+        Some(since) => (since, None),
+        None => {
+            let (start, end) = parse_date_range(&query.start, &query.end)?;
+            (start, Some(end))
+        }
     };
 
     let entries = app_state
@@ -1745,7 +1761,7 @@ pub async fn get_organization_usage_by_model(
         .collect();
 
     Ok(ResponseJson(UsageByModelResponse {
-        period: period.to_string(),
+        period: period.as_str().to_string(),
         start_date: start_date.to_rfc3339(),
         end_date: end_date.map(|d| d.to_rfc3339()),
         data,

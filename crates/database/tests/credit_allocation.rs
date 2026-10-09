@@ -672,9 +672,21 @@ async fn every_credit_source_automatically_settles_overage() -> anyhow::Result<(
         assert_eq!(original.unfunded_amount, Some(5));
 
         let expected_source = if credit_type == "staking_farm" {
-            OrganizationStakingFarmSourcesRepository::new(pool.clone())
+            // update_staking_farm_limit only writes for an org with an active source.
+            pool.get()
+                .await?
+                .execute(
+                    "INSERT INTO organization_staking_farm_sources (
+                        organization_id, near_account_id, network_id, contract_id,
+                        farm_product_id, credit_nano_usd_per_reward_unit, status
+                    ) VALUES ($1, $2, 'testnet', 'stake.test', 'cloud-credits', 1, 'active')",
+                    &[&org.org_id, &format!("alloc-{}.test", org.org_id.simple())],
+                )
+                .await?;
+            let applied = OrganizationStakingFarmSourcesRepository::new(pool.clone())
                 .update_staking_farm_limit(org.org_id, 7, None)
                 .await?;
+            assert!(applied);
             CREDIT_SOURCE_HOUSE_OF_STAKE.to_string()
         } else {
             set_limit(&limits, org.org_id, credit_type, 7).await?;
@@ -714,6 +726,13 @@ async fn every_credit_source_automatically_settles_overage() -> anyhow::Result<(
             .await?
             .get(0);
         assert_eq!(phase, "overage_settlement");
+        pool.get()
+            .await?
+            .execute(
+                "DELETE FROM organization_staking_farm_sources WHERE organization_id = $1",
+                &[&org.org_id],
+            )
+            .await?;
         cleanup_usage_fixtures(&pool, &[org.org_id], &[]).await?;
     }
 

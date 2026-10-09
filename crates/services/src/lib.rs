@@ -24,6 +24,7 @@ pub mod service_usage;
 pub mod staking_farm;
 pub mod usage;
 pub mod user;
+pub mod user_erasure;
 pub mod web_search;
 pub mod workspace;
 

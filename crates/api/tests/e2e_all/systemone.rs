@@ -257,9 +257,15 @@ async fn systemone_uses_actual_provider_trust_and_signature_capability() {
         let upstream_id = format!("decision-{}", uuid::Uuid::new_v4());
         let raw = serde_json::to_vec_pretty(&result(Some(&upstream_id))).unwrap();
         let response_bytes = raw.clone();
+        let source = match tier {
+            ProviderTier::Near => inference_providers::ProviderSource::Vllm,
+            ProviderTier::Attested3p => inference_providers::ProviderSource::Chutes,
+            ProviderTier::NonAttested => inference_providers::ProviderSource::External,
+        };
         let provider = Arc::new(
             MockProvider::new_accept_all()
                 .with_tier(tier)
+                .with_provider_source(source)
                 .with_chat_signature_support(signatures)
                 .with_systemone_handler(move |req| {
                     SystemOneResponseWithBytes::parse(response_bytes.clone(), &req)

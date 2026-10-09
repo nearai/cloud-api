@@ -188,3 +188,116 @@ async fn read_only_token_can_get_but_not_patch() {
 
     reset(&server).await;
 }
+
+#[tokio::test]
+async fn attested_3p_kill_switch_round_trips_and_validates() {
+    let server = setup_test_server().await;
+    let token = get_session_id();
+    let path = "/v1/admin/settings/attested_3p";
+
+    let response = patch_as(
+        &server,
+        &token,
+        path,
+        json!({"disabled_sources": ["chutes"]}),
+    )
+    .await;
+    assert_eq!(response.status_code(), StatusCode::OK);
+    let got = get_as(&server, &token, path).await;
+    assert_eq!(got.status_code(), StatusCode::OK);
+    assert_eq!(
+        got.json::<Value>()["value"],
+        json!({"disabled_sources": ["chutes"]})
+    );
+
+    for body in [
+        json!({"disabled_sources": ["vllm"]}),
+        json!({"disabled_sources": ["nope"]}),
+        json!({"other": 1}),
+    ] {
+        let response = patch_as(&server, &token, path, body.clone()).await;
+        assert_eq!(response.status_code(), StatusCode::BAD_REQUEST, "{body}");
+    }
+    let got = get_as(&server, &token, path).await;
+    assert_eq!(
+        got.json::<Value>()["value"],
+        json!({"disabled_sources": ["chutes"]})
+    );
+
+    let response = patch_as(&server, &token, path, json!({"disabled_sources": null})).await;
+    assert_eq!(response.status_code(), StatusCode::OK);
+    let got = get_as(&server, &token, path).await;
+    assert_eq!(
+        got.json::<Value>()["value"],
+        json!({"disabled_sources": []})
+    );
+}
+
+/// With NEAR failing and Chutes as its fallback, switching the `chutes` source
+/// off stops traffic to it: the fallback is never invoked.
+#[tokio::test]
+async fn attested_3p_kill_switch_stops_serving_from_source() {
+    let (server, pool, _mock, _database) = setup_test_server_with_pool().await;
+    let (model_name, near, chutes) = crate::signature_verification::setup_chutes_signature_model(
+        &server,
+        &pool,
+        Some(false),
+        None,
+    )
+    .await;
+    let org = setup_org_with_credits(&server, 10_000_000_000i64).await;
+    let api_key = get_api_key_for_org(&server, org.id).await;
+    let token = get_session_id();
+    let path = "/v1/admin/settings/attested_3p";
+    let chat = |max_tokens: i64| {
+        server
+            .post("/v1/chat/completions")
+            .add_header("Authorization", format!("Bearer {api_key}"))
+            .json(&json!({
+                "model": model_name,
+                "messages": [{"role": "user", "content": "Hello"}],
+                "stream": false,
+                "max_tokens": max_tokens
+            }))
+    };
+
+    // Baseline: NEAR fails, so Chutes serves the request.
+    let response = chat(16).await;
+    assert_eq!(
+        response.status_code(),
+        StatusCode::OK,
+        "{}",
+        response.text()
+    );
+    assert_eq!(response.header("x-serving-provider"), "chutes");
+    assert_eq!(
+        chutes.last_chat_params().await.unwrap().max_tokens,
+        Some(16)
+    );
+
+    // Kill switch on: Chutes is never invoked again.
+    let patched = patch_as(
+        &server,
+        &token,
+        path,
+        json!({"disabled_sources": ["chutes"]}),
+    )
+    .await;
+    assert_eq!(patched.status_code(), StatusCode::OK);
+    let response = chat(17).await;
+    let status = response.status_code();
+    let body = response.text();
+    let chutes_last = chutes.last_chat_params().await.unwrap().max_tokens;
+
+    // Reset before asserting so a failure cannot leak the setting.
+    let reset = patch_as(&server, &token, path, json!({"disabled_sources": null})).await;
+    assert_eq!(reset.status_code(), StatusCode::OK);
+
+    assert_eq!(
+        chutes_last,
+        Some(16),
+        "a disabled source must not be invoked"
+    );
+    assert_eq!(near.last_chat_params().await.unwrap().max_tokens, Some(17));
+    assert_eq!(status.as_u16(), 429, "{body}"); // NEAR 503 surfaces as service_overloaded
+}

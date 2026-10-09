@@ -1,3 +1,4 @@
+use inference_providers::{ProviderSource, ProviderTier};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -44,6 +45,7 @@ pub enum ServedProviderType {
     Vllm,
     External,
     Chutes,
+    Tinfoil,
 }
 
 impl ServedProviderType {
@@ -52,6 +54,7 @@ impl ServedProviderType {
             ServedProviderType::Vllm => "vllm",
             ServedProviderType::External => "external",
             ServedProviderType::Chutes => "chutes",
+            ServedProviderType::Tinfoil => "tinfoil",
         }
     }
 }
@@ -70,7 +73,51 @@ impl std::str::FromStr for ServedProviderType {
             "vllm" => Ok(ServedProviderType::Vllm),
             "external" => Ok(ServedProviderType::External),
             "chutes" => Ok(ServedProviderType::Chutes),
+            "tinfoil" => Ok(ServedProviderType::Tinfoil),
             _ => Err(format!("Unknown served provider type: {s}")),
+        }
+    }
+}
+
+// Provider identity <-> recorded attribution, both directions, exhaustive.
+impl From<ProviderTier> for ServedProviderTier {
+    fn from(tier: ProviderTier) -> Self {
+        match tier {
+            ProviderTier::Near => Self::Near,
+            ProviderTier::Attested3p => Self::Attested3p,
+            ProviderTier::NonAttested => Self::NonAttested,
+        }
+    }
+}
+
+impl From<ServedProviderTier> for ProviderTier {
+    fn from(tier: ServedProviderTier) -> Self {
+        match tier {
+            ServedProviderTier::Near => Self::Near,
+            ServedProviderTier::Attested3p => Self::Attested3p,
+            ServedProviderTier::NonAttested => Self::NonAttested,
+        }
+    }
+}
+
+impl From<ProviderSource> for ServedProviderType {
+    fn from(source: ProviderSource) -> Self {
+        match source {
+            ProviderSource::Vllm => Self::Vllm,
+            ProviderSource::External => Self::External,
+            ProviderSource::Chutes => Self::Chutes,
+            ProviderSource::Tinfoil => Self::Tinfoil,
+        }
+    }
+}
+
+impl From<ServedProviderType> for ProviderSource {
+    fn from(ty: ServedProviderType) -> Self {
+        match ty {
+            ServedProviderType::Vllm => Self::Vllm,
+            ServedProviderType::External => Self::External,
+            ServedProviderType::Chutes => Self::Chutes,
+            ServedProviderType::Tinfoil => Self::Tinfoil,
         }
     }
 }
@@ -83,4 +130,33 @@ pub struct ProviderAttribution {
     pub served_provider_type: Option<ServedProviderType>,
     #[serde(default)]
     pub served_via_fallback: bool,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn served_provider_type_round_trips_tinfoil() {
+        assert_eq!(
+            "tinfoil".parse::<ServedProviderType>().unwrap(),
+            ServedProviderType::Tinfoil
+        );
+        assert_eq!(ServedProviderType::Tinfoil.as_str(), "tinfoil");
+    }
+
+    #[test]
+    fn identity_conversions_round_trip() {
+        for s in ProviderSource::ALL {
+            assert_eq!(ProviderSource::from(ServedProviderType::from(s)), s);
+            assert_eq!(ServedProviderType::from(s).as_str(), s.as_str());
+        }
+        for t in [
+            ProviderTier::Near,
+            ProviderTier::Attested3p,
+            ProviderTier::NonAttested,
+        ] {
+            assert_eq!(ProviderTier::from(ServedProviderTier::from(t)), t);
+        }
+    }
 }

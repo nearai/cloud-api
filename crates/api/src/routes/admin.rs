@@ -4130,7 +4130,7 @@ pub struct ModelRevenueQueryParams {
     pub offset: i64,
     /// Filter by verifiable (TEE) models only / non-verifiable only.
     pub verifiable: Option<bool>,
-    /// Filter by provider type ("vllm", "external", or "chutes").
+    /// Filter by provider type ("vllm", "external", "chutes", or "tinfoil").
     pub provider_type: Option<String>,
     /// Case-insensitive substring match on model name.
     pub model_search: Option<String>,
@@ -4154,7 +4154,7 @@ pub struct ModelRevenueQueryParams {
         ("limit" = Option<i64>, Query, description = "Page size (1-1000, default 100)"),
         ("offset" = Option<i64>, Query, description = "Page offset (default 0)"),
         ("verifiable" = Option<bool>, Query, description = "Filter to verifiable (true) or non-verifiable (false) models"),
-        ("provider_type" = Option<String>, Query, description = "Filter by provider type (e.g. vllm, external, chutes)"),
+        ("provider_type" = Option<String>, Query, description = "Filter by provider type (e.g. vllm, external, chutes, tinfoil)"),
         ("sort" = Option<String>, Query, description = "Sort: revenue (default), requests, tokens")
     ),
     responses(
@@ -4191,9 +4191,9 @@ pub async fn get_model_revenue(
     let sort = services::admin::RevenueSort::from_query(params.sort.as_deref())
         .map_err(|m| bad_request(m, "invalid_parameter"))?;
     if let Some(pt) = params.provider_type.as_deref() {
-        if !matches!(pt, "vllm" | "external" | "chutes") {
+        if !matches!(pt, "vllm" | "external" | "chutes" | "tinfoil") {
             return Err(bad_request(
-                format!("invalid provider_type '{pt}'; expected one of: vllm, external, chutes"),
+                format!("invalid provider_type '{pt}'; expected one of: vllm, external, chutes, tinfoil"),
                 "invalid_parameter",
             ));
         }
@@ -4450,7 +4450,11 @@ pub async fn get_admin_setting(
 /// Partial update: fields in the body are merged into the stored value, `null`
 /// resets a field to its default. The result is validated as a whole; an invalid
 /// value is rejected with 400 and nothing is stored. Takes effect immediately on the
-/// instance that handles it, and on the others within 10 minutes.
+/// instance that handles it, and on the others within 10 minutes (there is no
+/// cross-instance push). For a faster stop of an attested third party on the
+/// other instances, redeploy; per-org `fallback_disabled` only excludes
+/// registered fallback providers for that organization and is not a
+/// source-wide stop.
 #[utoipa::path(
     patch,
     path = "/v1/admin/settings/{key}",
@@ -4668,7 +4672,7 @@ pub async fn get_performance_timeseries(
 pub struct RevenueDensityParams {
     pub start: Option<String>,
     pub end: Option<String>,
-    /// Optional provider type filter (e.g. "vllm", "external", "chutes").
+    /// Optional provider type filter (e.g. "vllm", "external", "chutes", "tinfoil").
     pub provider_type: Option<String>,
 }
 
@@ -4688,7 +4692,7 @@ pub struct RevenueDensityParams {
     params(
         ("start" = Option<String>, Query, description = "Start of time range (ISO 8601). Defaults to 30 days ago. Window may not exceed 90 days."),
         ("end" = Option<String>, Query, description = "End of time range (ISO 8601). Defaults to now. Window may not exceed 90 days."),
-        ("provider_type" = Option<String>, Query, description = "Filter by provider type (vllm, external, or chutes)")
+        ("provider_type" = Option<String>, Query, description = "Filter by provider type (vllm, external, chutes, or tinfoil)")
     ),
     responses(
         (status = 200, description = "Revenue density retrieved successfully", body = services::admin::RevenueDensityReport),

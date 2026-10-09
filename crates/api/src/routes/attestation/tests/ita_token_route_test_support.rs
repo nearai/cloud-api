@@ -98,7 +98,7 @@ impl services::attestation::ports::AttestationServiceTrait for RecordingItaAttes
         _nonce: Option<String>,
         _signing_address: Option<String>,
         _include_tls_fingerprint: bool,
-        _provider_filter: Option<inference_providers::ProviderTier>,
+        _provider_filter: Option<inference_providers::ProviderFilter>,
     ) -> Result<services::attestation::models::AttestationReport, AttestationError> {
         Err(AttestationError::InternalError("unused".to_string()))
     }

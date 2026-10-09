@@ -73,7 +73,7 @@ jobs:
           # and none of it is Rust-relevant.
           RUST=true
           if [ -n "$CHANGED" ] && ! echo "$CHANGED" | grep -qE \
-            '(\.rs$|(^|/)Cargo\.(toml|lock)$|^crates/database/src/migrations/|^\.github/workflows/test\.yml$|^\.github/actions/setup-rust-ci/|^\.config/nextest\.toml$|^rust-toolchain\.toml$|^\.cargo/config\.toml$)'; then
+            '(\.rs$|(^|/)Cargo\.(toml|lock)$|^crates/[^/]+/src/.*\.json$|^crates/database/src/migrations/|^\.github/workflows/test\.yml$|^\.github/actions/setup-rust-ci/|^\.config/nextest\.toml$|^rust-toolchain\.toml$|^\.cargo/config\.toml$)'; then
             RUST=false
           fi
           echo "rust=$RUST" >> "$GITHUB_OUTPUT"

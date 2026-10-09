@@ -125,17 +125,11 @@ async fn test_attestation_report_provider_filter_near_not_found() {
         .add_header("Authorization", format!("Bearer {api_key}"))
         .await;
 
-    assert_ne!(
+    assert_eq!(
         response.status_code(),
-        200,
-        "expected non-200 when no NEAR provider is registered, got 200: {}",
+        503,
+        "?provider=near with no matching provider must map ProviderNotFound to 503: {}",
         response.text()
-    );
-    // The provider filter was accepted (not a 400 bad request).
-    assert_ne!(
-        response.status_code(),
-        400,
-        "?provider=near must not return 400 (it is a valid value)"
     );
 }
 
@@ -157,16 +151,37 @@ async fn test_attestation_report_provider_filter_chutes_not_found() {
         .add_header("Authorization", format!("Bearer {api_key}"))
         .await;
 
-    assert_ne!(
+    assert_eq!(
         response.status_code(),
-        200,
-        "expected non-200 when no Chutes provider is registered, got 200: {}",
+        503,
+        "?provider=chutes with no matching provider must map ProviderNotFound to 503: {}",
         response.text()
     );
-    assert_ne!(
+}
+
+/// `?provider=tinfoil` on a model served only by the (NonAttested) default mock
+/// must return a non-200 error.
+#[tokio::test]
+async fn test_attestation_report_provider_filter_tinfoil_not_found() {
+    let server = setup_test_server().await;
+    setup_qwen_model(&server).await;
+    let org = setup_org_with_credits(&server, 10_000_000_000i64).await;
+    let api_key = get_api_key_for_org(&server, org.id).await;
+
+    let encoded_model =
+        url::form_urlencoded::byte_serialize(E2E_QWEN_MODEL_NAME.as_bytes()).collect::<String>();
+    let url = format!("/v1/attestation/report?model={encoded_model}&provider=tinfoil");
+
+    let response = server
+        .get(&url)
+        .add_header("Authorization", format!("Bearer {api_key}"))
+        .await;
+
+    assert_eq!(
         response.status_code(),
-        400,
-        "?provider=chutes must not return 400 (it is a valid value)"
+        503,
+        "?provider=tinfoil with no matching provider must map ProviderNotFound to 503: {}",
+        response.text()
     );
 }
 
@@ -199,6 +214,10 @@ async fn test_attestation_report_provider_filter_unknown_returns_400() {
         body.contains("foobar"),
         "400 error body should mention the unknown value: {body}"
     );
+    assert!(
+        body.contains("'near'") && body.contains("'chutes'") && body.contains("'tinfoil'"),
+        "400 error body should list accepted values: {body}"
+    );
 }
 
 /// Omitting `?provider=` keeps the existing first-successful behaviour
@@ -229,7 +248,7 @@ async fn test_attestation_report_no_provider_filter_succeeds() {
     );
 }
 
-/// Both `near` and `chutes` values are accepted (case-insensitive) — the
+/// The `near`, `chutes` and `tinfoil` values are accepted (case-insensitive) — the
 /// filter must not reject them with 400 even when no matching provider exists.
 #[tokio::test]
 async fn test_attestation_report_provider_filter_case_insensitive() {
@@ -241,7 +260,7 @@ async fn test_attestation_report_provider_filter_case_insensitive() {
     let encoded_model =
         url::form_urlencoded::byte_serialize(E2E_QWEN_MODEL_NAME.as_bytes()).collect::<String>();
 
-    for value in &["NEAR", "CHUTES", "Near", "Chutes"] {
+    for value in &["NEAR", "CHUTES", "TINFOIL", "Near", "Chutes", "Tinfoil"] {
         let url = format!("/v1/attestation/report?model={encoded_model}&provider={value}");
         let response = server
             .get(&url)
@@ -258,4 +277,61 @@ async fn test_attestation_report_provider_filter_case_insensitive() {
             response.text()
         );
     }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Part 3 – attested 3P source label on the legacy completions streaming path
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// `/v1/completions` streaming resolves the serving provider from the chat id
+/// (`get_serving_provider_for_chat_id`); an attested-3P Tinfoil provider must
+/// surface as `x-serving-provider: tinfoil`.
+#[tokio::test]
+async fn test_completions_stream_serving_provider_is_3p_source() {
+    use api::models::BatchUpdateModelApiRequest;
+    use inference_providers::{mock::MockProvider, ProviderSource, ProviderTier};
+    use std::sync::Arc;
+
+    let (server, pool, _mock, _database) = setup_test_server_with_pool().await;
+    let model_name = format!("nearai/test-tinfoil-label-{}", uuid::Uuid::new_v4());
+    let tinfoil = Arc::new(
+        MockProvider::new_accept_all()
+            .with_tier(ProviderTier::Attested3p)
+            .with_provider_source(ProviderSource::Tinfoil),
+    );
+    pool.register_pinned_secondary_provider(model_name.clone(), tinfoil, None)
+        .await;
+    let mut batch = BatchUpdateModelApiRequest::new();
+    batch.insert(
+        model_name.clone(),
+        serde_json::from_value(serde_json::json!({
+            "inputCostPerToken": { "amount": 1_000_000, "currency": "USD" },
+            "outputCostPerToken": { "amount": 2_000_000, "currency": "USD" },
+            "modelDisplayName": "Tinfoil label fixture",
+            "modelDescription": "Serving-provider label test model",
+            "contextLength": 128000,
+            "maxOutputLength": 1024,
+            "verifiable": true,
+            "isActive": true,
+            "attestationSupported": true,
+            "providerType": "tinfoil"
+        }))
+        .unwrap(),
+    );
+    admin_batch_upsert_models(&server, batch, get_session_id()).await;
+    let org = setup_org_with_credits(&server, 10_000_000_000i64).await;
+    let api_key = get_api_key_for_org(&server, org.id).await;
+
+    let response = server
+        .post("/v1/completions")
+        .add_header("Authorization", format!("Bearer {api_key}"))
+        .json(&serde_json::json!({
+            "model": model_name,
+            "prompt": "Say hello",
+            "stream": true,
+            "max_tokens": 16
+        }))
+        .await;
+    assert_eq!(response.status_code(), 200, "{}", response.text());
+    assert_eq!(response.header(X_SERVING_PROVIDER), "tinfoil");
 }

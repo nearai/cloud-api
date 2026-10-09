@@ -272,3 +272,57 @@ async fn no_nonce_cache_is_keyed_on_the_normalized_algo() {
         MOCK_ED25519_PUBLIC_KEY
     );
 }
+
+/// A nonce-less report cached before a source is disabled must not be served
+/// afterwards: a cache hit skips the pool's disabled-source filter, so the
+/// live policy is part of the cache key. Covers filtered and unfiltered.
+#[tokio::test]
+async fn no_nonce_cache_does_not_serve_a_source_disabled_after_caching() {
+    use inference_providers::{DisabledSources, ProviderFilter, ProviderSource, ProviderTier};
+
+    let pool = Arc::new(InferenceProviderPool::new(
+        None,
+        ExternalProvidersConfig::default(),
+    ));
+    let chutes: Arc<dyn inference_providers::InferenceProvider + Send + Sync> = Arc::new(
+        MockProvider::new()
+            .with_tier(ProviderTier::Attested3p)
+            .with_provider_source(ProviderSource::Chutes),
+    );
+    pool.register_pinned_secondary_provider(MODEL.to_string(), chutes, None)
+        .await;
+    let disabled = pool.attested_3p_disabled();
+
+    let mut service = lifecycle_service(Arc::new(RecordingRepository::default()), pool);
+    service.models_repository = Arc::new(SingleModelRepository);
+    service.gateway_quote_collector = Arc::new(EchoGatewayQuoteCollector);
+    service.report_cache = Some(
+        moka::future::Cache::builder()
+            .max_capacity(16)
+            .time_to_live(Duration::from_secs(60))
+            .build(),
+    );
+    let fetch = |filter: Option<ProviderFilter>| {
+        service.get_attestation_report(Some(MODEL.to_string()), None, None, None, false, filter)
+    };
+    let chutes_filter = Some(ProviderFilter::Source(ProviderSource::Chutes));
+
+    // Warm both cache entries while Chutes is enabled.
+    fetch(None).await.expect("unfiltered report while enabled");
+    fetch(chutes_filter)
+        .await
+        .expect("filtered report while enabled");
+
+    let mut d = DisabledSources::default();
+    d.insert(ProviderSource::Chutes);
+    disabled.store(Arc::new(d));
+
+    assert!(
+        fetch(None).await.is_err(),
+        "unfiltered request must not be served a cached report from a disabled source"
+    );
+    assert!(
+        fetch(chutes_filter).await.is_err(),
+        "filtered request must not be served a cached report from a disabled source"
+    );
+}

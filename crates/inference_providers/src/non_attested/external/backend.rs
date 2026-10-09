@@ -17,7 +17,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 /// Configuration for a backend connection
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct BackendConfig {
     /// Base URL for the provider API
     pub base_url: String,
@@ -29,6 +29,18 @@ pub struct BackendConfig {
     pub extra: HashMap<String, String>,
     /// Extra fields injected into outgoing JSON request bodies (e.g., OpenRouter `provider` preferences)
     pub extra_request_body: HashMap<String, serde_json::Value>,
+}
+
+impl std::fmt::Debug for BackendConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BackendConfig")
+            .field("base_url", &self.base_url)
+            .field("api_key", &"<redacted>")
+            .field("timeout_seconds", &self.timeout_seconds)
+            .field("extra", &self.extra)
+            .field("extra_request_body", &self.extra_request_body)
+            .finish()
+    }
 }
 
 impl Default for BackendConfig {

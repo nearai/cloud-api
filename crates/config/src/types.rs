@@ -2582,27 +2582,25 @@ mod tests {
     #[test]
     #[serial]
     fn chutes_models_parses_canonical_slug_pairs_and_bare_entries() {
-        // `canonical=chute_slug` pairs; a bare entry means canonical == slug.
+        // `canonical=upstream_id` pairs; a bare entry means canonical == slug.
         // Surrounding whitespace is trimmed; empty/half-empty tokens dropped.
-        std::env::set_var(
+        let parsed = parse_attested_3p_models(
             "CHUTES_MODELS",
             "zai-org/GLM-5.1-FP8=zai-org/GLM-5.1-TEE , moonshotai/Kimi-K2.6-TEE ,, =bad, alsobad=",
         );
-        let cfg = ExternalProvidersConfig::from_env();
-        std::env::remove_var("CHUTES_MODELS");
 
         assert_eq!(
-            cfg.chutes_models,
+            parsed,
             vec![
-                ChutesModelEntry {
+                AttestedThirdPartyModelEntry {
                     canonical_id: "zai-org/GLM-5.1-FP8".to_string(),
-                    chute_slug: "zai-org/GLM-5.1-TEE".to_string(),
+                    upstream_id: "zai-org/GLM-5.1-TEE".to_string(),
                     max_context_tokens: None,
                 },
                 // Bare entry: canonical == slug.
-                ChutesModelEntry {
+                AttestedThirdPartyModelEntry {
                     canonical_id: "moonshotai/Kimi-K2.6-TEE".to_string(),
-                    chute_slug: "moonshotai/Kimi-K2.6-TEE".to_string(),
+                    upstream_id: "moonshotai/Kimi-K2.6-TEE".to_string(),
                     max_context_tokens: None,
                 },
             ],
@@ -2611,33 +2609,30 @@ mod tests {
     }
 
     #[test]
-    #[serial]
     fn chutes_models_parses_optional_max_context_suffix() {
-        std::env::set_var(
+        let parsed = parse_attested_3p_models(
             "CHUTES_MODELS",
             "z-ai/glm-5.2=zai-org/GLM-5.2-TEE@1048576, bare/model@131072, weird/slug@notanumber",
         );
-        let cfg = ExternalProvidersConfig::from_env();
-        std::env::remove_var("CHUTES_MODELS");
 
         assert_eq!(
-            cfg.chutes_models,
+            parsed,
             vec![
-                ChutesModelEntry {
+                AttestedThirdPartyModelEntry {
                     canonical_id: "z-ai/glm-5.2".to_string(),
-                    chute_slug: "zai-org/GLM-5.2-TEE".to_string(),
+                    upstream_id: "zai-org/GLM-5.2-TEE".to_string(),
                     max_context_tokens: Some(1_048_576),
                 },
                 // Bare entry: suffix stripped BEFORE canonical == slug.
-                ChutesModelEntry {
+                AttestedThirdPartyModelEntry {
                     canonical_id: "bare/model".to_string(),
-                    chute_slug: "bare/model".to_string(),
+                    upstream_id: "bare/model".to_string(),
                     max_context_tokens: Some(131_072),
                 },
                 // Unparseable suffix stays part of the slug (fail-open).
-                ChutesModelEntry {
+                AttestedThirdPartyModelEntry {
                     canonical_id: "weird/slug@notanumber".to_string(),
-                    chute_slug: "weird/slug@notanumber".to_string(),
+                    upstream_id: "weird/slug@notanumber".to_string(),
                     max_context_tokens: None,
                 },
             ],
@@ -2645,41 +2640,97 @@ mod tests {
     }
 
     #[test]
-    #[serial]
-    fn chutes_models_empty_when_unset() {
-        std::env::remove_var("CHUTES_MODELS");
-        let cfg = ExternalProvidersConfig::from_env();
-        assert!(cfg.chutes_models.is_empty());
+    fn chutes_models_empty_input_yields_no_entries() {
+        assert!(parse_attested_3p_models("CHUTES_MODELS", "").is_empty());
     }
 
     #[test]
     #[serial]
+    fn attested_3p_models_and_keys_are_read_from_env() {
+        let vars = [
+            "CHUTES_MODELS",
+            "CHUTES_API_KEY",
+            "CHUTES_API_KEY_FILE",
+            "TINFOIL_MODELS",
+            "TINFOIL_API_KEY",
+            "TINFOIL_API_KEY_FILE",
+        ];
+        let previous: Vec<_> = vars.iter().map(std::env::var_os).collect();
+        for v in vars {
+            std::env::remove_var(v);
+        }
+        std::env::set_var("CHUTES_MODELS", "z-ai/glm=zai-org/GLM-TEE@1048576");
+        std::env::set_var("CHUTES_API_KEY", "cpk_SECRET");
+        std::env::set_var("TINFOIL_MODELS", "gpt-oss-120b@131072");
+        std::env::set_var("TINFOIL_API_KEY", "tin-SECRET");
+
+        let cfg = ExternalProvidersConfig::from_env();
+        assert_eq!(cfg.chutes_models.len(), 1);
+        assert_eq!(cfg.chutes_models[0].canonical_id, "z-ai/glm");
+        assert_eq!(cfg.chutes_api_key.as_deref(), Some("cpk_SECRET"));
+        assert_eq!(cfg.tinfoil_models.len(), 1);
+        assert_eq!(cfg.tinfoil_models[0].canonical_id, "gpt-oss-120b");
+        assert_eq!(cfg.tinfoil_models[0].max_context_tokens, Some(131_072));
+        assert_eq!(cfg.tinfoil_api_key.as_deref(), Some("tin-SECRET"));
+
+        // Unset -> empty (the `unwrap_or_default` wiring) and empty key -> None.
+        std::env::remove_var("TINFOIL_MODELS");
+        std::env::set_var("TINFOIL_API_KEY", "");
+        let cfg = ExternalProvidersConfig::from_env();
+        assert!(cfg.tinfoil_models.is_empty());
+        assert_eq!(cfg.tinfoil_api_key, None);
+
+        for (v, prev) in vars.iter().zip(previous) {
+            match prev {
+                Some(value) => std::env::set_var(v, value),
+                None => std::env::remove_var(v),
+            }
+        }
+    }
+
+    #[test]
     fn chutes_models_dedup_duplicate_canonical_ids_first_wins() {
         // Duplicate canonical id (even with a different slug) is dropped so a
         // misconfig can't register redundant fallback providers — first wins.
-        std::env::set_var(
+        let parsed = parse_attested_3p_models(
             "CHUTES_MODELS",
             "zai-org/GLM-5.1-FP8=zai-org/GLM-5.1-TEE,zai-org/GLM-5.1-FP8=zai-org/GLM-5-TEE,other/model",
         );
-        let cfg = ExternalProvidersConfig::from_env();
-        std::env::remove_var("CHUTES_MODELS");
 
         assert_eq!(
-            cfg.chutes_models,
+            parsed,
             vec![
-                ChutesModelEntry {
+                AttestedThirdPartyModelEntry {
                     canonical_id: "zai-org/GLM-5.1-FP8".to_string(),
-                    chute_slug: "zai-org/GLM-5.1-TEE".to_string(),
+                    upstream_id: "zai-org/GLM-5.1-TEE".to_string(),
                     max_context_tokens: None,
                 },
-                ChutesModelEntry {
+                AttestedThirdPartyModelEntry {
                     canonical_id: "other/model".to_string(),
-                    chute_slug: "other/model".to_string(),
+                    upstream_id: "other/model".to_string(),
                     max_context_tokens: None,
                 },
             ],
             "duplicate canonical id dropped (first wins); the second slug is ignored"
         );
+    }
+
+    #[test]
+    fn parse_attested_3p_models_reads_ctx_and_bare_entries() {
+        let v = parse_attested_3p_models(
+            "TINFOIL_MODELS",
+            "z-ai/glm-5.3=glm-5-3@1048576, gpt-oss-120b@131072",
+        );
+        assert_eq!(
+            v[0],
+            AttestedThirdPartyModelEntry {
+                canonical_id: "z-ai/glm-5.3".into(),
+                upstream_id: "glm-5-3".into(),
+                max_context_tokens: Some(1_048_576),
+            }
+        );
+        assert_eq!(v[1].canonical_id, "gpt-oss-120b");
+        assert_eq!(v[1].max_context_tokens, Some(131_072));
     }
 
     #[test]
@@ -2696,6 +2747,25 @@ mod tests {
             Some(value) => std::env::set_var("ENABLE_ANTHROPIC_MESSAGES", value),
             None => std::env::remove_var("ENABLE_ANTHROPIC_MESSAGES"),
         }
+    }
+
+    #[test]
+    fn external_providers_debug_never_prints_api_keys() {
+        let cfg = ExternalProvidersConfig {
+            openai_api_key: Some("sk-openai-SECRET".into()),
+            anthropic_api_key: Some("sk-ant-SECRET".into()),
+            gemini_api_key: Some("gem-SECRET".into()),
+            typesafe_api_key: Some("ts-SECRET".into()),
+            chutes_api_key: Some("cpk_SECRET".into()),
+            tinfoil_api_key: Some("tin-SECRET".into()),
+            ..Default::default()
+        };
+        let out = format!("{cfg:?}");
+        assert!(!out.contains("SECRET"), "key leaked in Debug: {out}");
+        assert!(out.contains("<redacted>"));
+        assert!(
+            format!("{:?}", ExternalProvidersConfig::default()).contains("tinfoil_api_key: None")
+        );
     }
 
     #[test]
@@ -2741,33 +2811,100 @@ mod tests {
     }
 }
 
-/// One Chutes model to register, parsed from a single `CHUTES_MODELS` token.
+/// One attested third-party model to register, parsed from a single
+/// `CHUTES_MODELS` / `TINFOIL_MODELS` token.
 ///
-/// The token is `canonical_id=chute_slug` (e.g. `zai-org/GLM-5.1-FP8=zai-org/GLM-5.1-TEE`),
-/// or a bare `name` meaning `canonical_id == chute_slug`. We deliberately keep
+/// The token is `canonical_id=upstream_id` (e.g. `zai-org/GLM-5.1-FP8=zai-org/GLM-5.1-TEE`),
+/// or a bare `name` meaning `canonical_id == upstream_id`. We deliberately keep
 /// the two ids distinct: the **canonical id** is what we expose in `/v1/models`
 /// and route under (the NEAR-served id when NEAR also serves the model, else the
-/// OpenRouter id) — never the raw `-TEE` chute slug; the **chute slug** is the
-/// internal upstream identity we send to Chutes and resolve to a `chute_id`.
+/// OpenRouter id) — never the provider's internal id; the **upstream id** is the
+/// internal upstream identity we send to the provider (Chutes: the chute slug,
+/// resolved to a `chute_id`; Tinfoil: the upstream model name).
 ///
-/// The slug side takes an optional `@<max_context_tokens>` suffix (e.g.
-/// `z-ai/glm-5.2=zai-org/GLM-5.2-TEE@1048576`) declaring the chute's context
-/// window, so the pool's context-length routing knows whether Chutes can take
-/// a long request. Unset means "no declared limit" (today's behavior: Chutes
-/// is never filtered by size).
+/// The upstream side takes an optional `@<max_context_tokens>` suffix (e.g.
+/// `z-ai/glm-5.2=zai-org/GLM-5.2-TEE@1048576`) declaring the upstream model's
+/// context window, so the pool's context-length routing knows whether the
+/// provider can take a long request. Unset means "no declared limit" (today's
+/// behavior: the provider is never filtered by size).
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ChutesModelEntry {
+pub struct AttestedThirdPartyModelEntry {
     /// User-facing / catalog model id (e.g. `zai-org/GLM-5.1-FP8`).
     pub canonical_id: String,
-    /// Chutes chute slug sent upstream (e.g. `zai-org/GLM-5.1-TEE`).
-    pub chute_slug: String,
-    /// Declared context window of the chute (`@<n>` suffix), if any.
+    /// Upstream id sent to the provider (Chutes: chute slug, e.g.
+    /// `zai-org/GLM-5.1-TEE`; Tinfoil: upstream model name).
+    pub upstream_id: String,
+    /// Declared context window of the upstream model (`@<n>` suffix), if any.
     pub max_context_tokens: Option<u32>,
 }
 
+/// Parse a comma-separated `canonical_id=upstream_id[@ctx]` model list
+/// (`CHUTES_MODELS` / `TINFOIL_MODELS`); `var` is only used in warnings.
+///
+/// A bare token means `canonical_id == upstream_id`. Drop tokens missing either
+/// side, and dedup by canonical id (first wins) so a misconfig can't register
+/// duplicate fallback providers that every refresh would re-attach.
+pub fn parse_attested_3p_models(var: &str, raw: &str) -> Vec<AttestedThirdPartyModelEntry> {
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut entries: Vec<AttestedThirdPartyModelEntry> = Vec::new();
+    for tok in raw.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()) {
+        // Optional `@<max_context_tokens>` suffix on the upstream side. A
+        // suffix that doesn't parse as a number is treated as part of
+        // the id (fail-open: no declared limit) rather than dropped.
+        let split_ctx = |slug: &str| -> (String, Option<u32>) {
+            match slug.rsplit_once('@') {
+                Some((base, ctx)) => match ctx.trim().parse::<u32>() {
+                    Ok(n) if !base.trim().is_empty() => (base.trim().to_string(), Some(n)),
+                    _ => (slug.to_string(), None),
+                },
+                None => (slug.to_string(), None),
+            }
+        };
+        let entry = match tok.split_once('=') {
+            Some((canonical, slug)) => {
+                let (upstream_id, max_context_tokens) = split_ctx(slug.trim());
+                AttestedThirdPartyModelEntry {
+                    canonical_id: canonical.trim().to_string(),
+                    upstream_id,
+                    max_context_tokens,
+                }
+            }
+            None => {
+                let (upstream_id, max_context_tokens) = split_ctx(tok);
+                AttestedThirdPartyModelEntry {
+                    canonical_id: upstream_id.clone(),
+                    upstream_id,
+                    max_context_tokens,
+                }
+            }
+        };
+        if entry.canonical_id.is_empty() || entry.upstream_id.is_empty() {
+            continue;
+        }
+        if !seen.insert(entry.canonical_id.clone()) {
+            // `eprintln!` (not `tracing::warn!`) on purpose: the `config`
+            // crate has no `tracing` dependency, and `from_env` runs during
+            // startup config parsing — potentially before the tracing
+            // subscriber is installed, where a `tracing::warn!` would be
+            // dropped. stderr is always captured by the container log
+            // pipeline. Consistent with the sibling CHUTES_API_KEY_FILE warn.
+            eprintln!(
+                "WARN: duplicate {var} canonical id '{}' ignored (first wins)",
+                entry.canonical_id
+            );
+            continue;
+        }
+        entries.push(entry);
+    }
+    entries
+}
+
 /// External providers configuration for third-party AI providers
-/// API keys are loaded from environment variables or secret files
-#[derive(Debug, Clone, Default)]
+/// API keys are loaded from environment variables or secret files.
+///
+/// `Debug` is implemented by hand so no API key can ever reach a log line
+/// (the whole config is debug-printed at startup).
+#[derive(Clone, Default)]
 pub struct ExternalProvidersConfig {
     /// OpenAI API key (for OpenAI-compatible providers)
     pub openai_api_key: Option<String>,
@@ -2794,9 +2931,14 @@ pub struct ExternalProvidersConfig {
     /// Chutes API key (`cpk_...`), from `CHUTES_API_KEY[_FILE]`. A secret.
     pub chutes_api_key: Option<String>,
     /// Chutes models to register, from `CHUTES_MODELS` (comma-separated
-    /// `canonical_id=chute_slug` pairs; a bare entry means the two are equal).
-    /// See [`ChutesModelEntry`].
-    pub chutes_models: Vec<ChutesModelEntry>,
+    /// `canonical_id=upstream_id` pairs; a bare entry means the two are equal).
+    /// See [`AttestedThirdPartyModelEntry`].
+    pub chutes_models: Vec<AttestedThirdPartyModelEntry>,
+    /// Tinfoil API key, from `TINFOIL_API_KEY[_FILE]`. A secret.
+    pub tinfoil_api_key: Option<String>,
+    /// Tinfoil models, from `TINFOIL_MODELS` (same token grammar as
+    /// `CHUTES_MODELS`). Ids are reserved fail-closed whenever non-empty.
+    pub tinfoil_models: Vec<AttestedThirdPartyModelEntry>,
     /// Expose Chutes **streaming** as an attested path (`CHUTES_ENABLE_STREAMING`,
     /// default off). Off because Chutes' stream protocol has no authenticated
     /// frame sequence numbers, so an on-path gateway could drop/reorder frames
@@ -2806,6 +2948,70 @@ pub struct ExternalProvidersConfig {
     /// Intel PCCS URL for DCAP collateral (shared with the NEAR attestation
     /// verifier), from `PCCS_URL`. One source of truth instead of ad-hoc env reads.
     pub pccs_url: Option<String>,
+}
+
+impl std::fmt::Debug for ExternalProvidersConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        fn redact(k: &Option<String>) -> Option<&'static str> {
+            k.as_ref().map(|_| "<redacted>")
+        }
+        // Exhaustive destructure (no `..`): adding a field to the struct is a
+        // compile error here until it is listed (and, if a secret, redacted).
+        let Self {
+            openai_api_key,
+            anthropic_api_key,
+            enable_anthropic_messages,
+            anthropic_denied_betas,
+            gemini_api_key,
+            typesafe_api_key,
+            timeout_seconds,
+            refresh_interval_secs,
+            enable_chutes,
+            chutes_api_key,
+            chutes_models,
+            tinfoil_api_key,
+            tinfoil_models,
+            chutes_enable_streaming,
+            pccs_url,
+        } = self;
+        f.debug_struct("ExternalProvidersConfig")
+            .field("openai_api_key", &redact(openai_api_key))
+            .field("anthropic_api_key", &redact(anthropic_api_key))
+            .field("enable_anthropic_messages", enable_anthropic_messages)
+            .field("anthropic_denied_betas", anthropic_denied_betas)
+            .field("gemini_api_key", &redact(gemini_api_key))
+            .field("typesafe_api_key", &redact(typesafe_api_key))
+            .field("timeout_seconds", timeout_seconds)
+            .field("refresh_interval_secs", refresh_interval_secs)
+            .field("enable_chutes", enable_chutes)
+            .field("chutes_api_key", &redact(chutes_api_key))
+            .field("chutes_models", chutes_models)
+            .field("tinfoil_api_key", &redact(tinfoil_api_key))
+            .field("tinfoil_models", tinfoil_models)
+            .field("chutes_enable_streaming", chutes_enable_streaming)
+            .field("pccs_url", pccs_url)
+            .finish()
+    }
+}
+
+/// Read an attested-3P API key: `file_var` (path; contents trimmed) wins over
+/// `env_var` (used as-is). A failed file read warns with the PATH only — never
+/// the key — and yields `None`. An empty key is not a key: `""` is treated as
+/// absent so a misconfigured secret can't pass as `Some("")` and silently
+/// fail at request time.
+fn read_secret_env(file_var: &str, env_var: &str) -> Option<String> {
+    if let Ok(path) = env::var(file_var) {
+        match std::fs::read_to_string(&path) {
+            Ok(s) => Some(s.trim().to_string()),
+            Err(e) => {
+                eprintln!("WARN: failed to read {file_var} ({path}): {e}");
+                None
+            }
+        }
+    } else {
+        env::var(env_var).ok()
+    }
+    .filter(|s| !s.is_empty())
 }
 
 impl ExternalProvidersConfig {
@@ -2893,80 +3099,16 @@ impl ExternalProvidersConfig {
             .ok()
             .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
             .unwrap_or(false);
-        let chutes_api_key = if let Ok(path) = env::var("CHUTES_API_KEY_FILE") {
-            match std::fs::read_to_string(&path) {
-                Ok(s) => Some(s.trim().to_string()),
-                Err(e) => {
-                    // Path only — never the key contents.
-                    eprintln!("WARN: failed to read CHUTES_API_KEY_FILE ({path}): {e}");
-                    None
-                }
-            }
-        } else {
-            env::var("CHUTES_API_KEY").ok()
-        }
-        // An empty key is not a key — treat "" as absent so a misconfigured
-        // secret can't pass as Some("") and silently fail at request time.
-        .filter(|s| !s.is_empty());
-        // `canonical_id=chute_slug` per comma-separated token; a bare token means
-        // canonical_id == chute_slug. Drop tokens missing either side, and dedup by
-        // canonical id (first wins) so a misconfig can't register duplicate
-        // fallback providers that every refresh would re-attach.
-        let chutes_models = {
-            let raw = env::var("CHUTES_MODELS").unwrap_or_default();
-            let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
-            let mut entries: Vec<ChutesModelEntry> = Vec::new();
-            for tok in raw.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()) {
-                // Optional `@<max_context_tokens>` suffix on the slug side. A
-                // suffix that doesn't parse as a number is treated as part of
-                // the slug (fail-open: no declared limit) rather than dropped.
-                let split_ctx = |slug: &str| -> (String, Option<u32>) {
-                    match slug.rsplit_once('@') {
-                        Some((base, ctx)) => match ctx.trim().parse::<u32>() {
-                            Ok(n) if !base.trim().is_empty() => (base.trim().to_string(), Some(n)),
-                            _ => (slug.to_string(), None),
-                        },
-                        None => (slug.to_string(), None),
-                    }
-                };
-                let entry = match tok.split_once('=') {
-                    Some((canonical, slug)) => {
-                        let (chute_slug, max_context_tokens) = split_ctx(slug.trim());
-                        ChutesModelEntry {
-                            canonical_id: canonical.trim().to_string(),
-                            chute_slug,
-                            max_context_tokens,
-                        }
-                    }
-                    None => {
-                        let (chute_slug, max_context_tokens) = split_ctx(tok);
-                        ChutesModelEntry {
-                            canonical_id: chute_slug.clone(),
-                            chute_slug,
-                            max_context_tokens,
-                        }
-                    }
-                };
-                if entry.canonical_id.is_empty() || entry.chute_slug.is_empty() {
-                    continue;
-                }
-                if !seen.insert(entry.canonical_id.clone()) {
-                    // `eprintln!` (not `tracing::warn!`) on purpose: the `config`
-                    // crate has no `tracing` dependency, and `from_env` runs during
-                    // startup config parsing — potentially before the tracing
-                    // subscriber is installed, where a `tracing::warn!` would be
-                    // dropped. stderr is always captured by the container log
-                    // pipeline. Consistent with the sibling CHUTES_API_KEY_FILE warn.
-                    eprintln!(
-                        "WARN: duplicate CHUTES_MODELS canonical id '{}' ignored (first wins)",
-                        entry.canonical_id
-                    );
-                    continue;
-                }
-                entries.push(entry);
-            }
-            entries
-        };
+        let chutes_api_key = read_secret_env("CHUTES_API_KEY_FILE", "CHUTES_API_KEY");
+        let chutes_models = parse_attested_3p_models(
+            "CHUTES_MODELS",
+            &env::var("CHUTES_MODELS").unwrap_or_default(),
+        );
+        let tinfoil_api_key = read_secret_env("TINFOIL_API_KEY_FILE", "TINFOIL_API_KEY");
+        let tinfoil_models = parse_attested_3p_models(
+            "TINFOIL_MODELS",
+            &env::var("TINFOIL_MODELS").unwrap_or_default(),
+        );
         let chutes_enable_streaming = env::var("CHUTES_ENABLE_STREAMING")
             .ok()
             .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
@@ -2985,6 +3127,8 @@ impl ExternalProvidersConfig {
             enable_chutes,
             chutes_api_key,
             chutes_models,
+            tinfoil_api_key,
+            tinfoil_models,
             chutes_enable_streaming,
             pccs_url,
         }

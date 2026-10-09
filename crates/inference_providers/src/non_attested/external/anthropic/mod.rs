@@ -382,7 +382,7 @@ impl ExternalBackend for AnthropicBackend {
         Ok(ChatCompletionResponseWithBytes {
             response: openai_response,
             raw_bytes: serialized_bytes,
-            serving_tier: crate::ProviderTier::NonAttested,
+            serving: crate::ServingProvider::EXTERNAL,
         })
     }
 

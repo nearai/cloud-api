@@ -30,6 +30,7 @@ mod admin_services;
 mod admin_settings;
 mod admin_token_permissions;
 mod admin_usage_hourly_repair;
+mod anthropic_profiled_cache_write;
 mod api_key_usage_hourly;
 mod api_keys;
 mod attestation_auth;

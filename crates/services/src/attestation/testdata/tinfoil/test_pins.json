@@ -1,0 +1,22 @@
+{
+  "router": [
+    {
+      "measurement": "b3be62c7199d8e4d24f130e5651bdc8a62a2532f72c7e87c986bec54bf5f90bab703ad4dbfc5e45bfd385f8972dfc66c",
+      "repo": "tinfoilsh/confidential-model-router",
+      "tag": "v0.0.0-test"
+    }
+  ],
+  "models": {
+    "glm-5-3": [
+      {
+        "registers": [
+          "29717ea101027e824b19fbf94da1b7a6404287016368de32c4aae13f5732566b8683f08211f1ade53ecc191e7909ad6c",
+          "a787299fe2e84295a406dde367abac5b40128c1e13aa81dfde4a5c2e39682e45cde7bb84cefc7f33f25ac645fc265030",
+          "024d442593b797df275b0a229df8f9cc3c3333345d59a0b95e7b0242a30a9d82b0a965ef4b0039ef0423e870c6828845"
+        ],
+        "repo": "tinfoilsh/confidential-glm5-3-nvfp4",
+        "tag": "v0.0.3"
+      }
+    ]
+  }
+}

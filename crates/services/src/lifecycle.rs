@@ -7,12 +7,22 @@
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
+/// Sentinel stored in `users.auth_provider` when an account is erased.
+///
+/// All write paths (and SQL that classifies users) must use this constant:
+/// [`UserLifecycle::from_columns`] matches it exactly (case-sensitive, no
+/// trimming), so a divergent literal would silently break erasure classification.
 pub const ERASED_AUTH_PROVIDER: &str = "erased";
 
+/// Returned when a user's `is_active` and `auth_provider` columns contradict each
+/// other (an active user carrying [`ERASED_AUTH_PROVIDER`]).
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[error("active user carries the erased auth_provider sentinel")]
-pub struct LifecycleError;
+pub struct UserLifecycleError;
 
+/// Account state derived only from operator-owned columns (`users.is_active` +
+/// `users.auth_provider`). Serialized as `active`, `deactivated` or `erased`; this
+/// lowercase spelling is part of the public API vocabulary.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum UserLifecycle {
@@ -22,16 +32,21 @@ pub enum UserLifecycle {
 }
 
 impl UserLifecycle {
-    pub fn from_columns(is_active: bool, auth_provider: &str) -> Result<Self, LifecycleError> {
+    /// Maps `(is_active, auth_provider)`; `auth_provider == ERASED_AUTH_PROVIDER`
+    /// marks erasure. An active user carrying the erased sentinel is contradictory
+    /// and returns [`UserLifecycleError`] rather than a guess.
+    pub fn from_columns(is_active: bool, auth_provider: &str) -> Result<Self, UserLifecycleError> {
         match (is_active, auth_provider == ERASED_AUTH_PROVIDER) {
             (true, false) => Ok(Self::Active),
             (false, false) => Ok(Self::Deactivated),
             (false, true) => Ok(Self::Erased),
-            (true, true) => Err(LifecycleError),
+            (true, true) => Err(UserLifecycleError),
         }
     }
 }
 
+/// Organization state derived from `organizations.is_active` and its membership
+/// rows. Serialized as `active`, `deleted` or `erased` (public API vocabulary).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum OrganizationLifecycle {
@@ -41,6 +56,16 @@ pub enum OrganizationLifecycle {
 }
 
 impl OrganizationLifecycle {
+    /// `all_members_erased` must be computed as "at least one member, and every
+    /// member erased": an org with no membership rows is `false`, never vacuously
+    /// "all erased", so an empty deleted org reads `Deleted`.
+    ///
+    /// `is_active` is authoritative: it gates every organization lookup, so an org
+    /// that is still active is `Active` even if `all_members_erased` is true. Erasure
+    /// deactivates an org in the same transaction that erases its last member, so
+    /// `(true, true)` is not expected. Unlike [`UserLifecycle::from_columns`] this
+    /// does not error, because the flag is a derived aggregate rather than a stored
+    /// sentinel. Any SQL mirror of this mapping must keep the same precedence.
     pub fn from_columns(is_active: bool, all_members_erased: bool) -> Self {
         match (is_active, all_members_erased) {
             (true, _) => Self::Active,
@@ -102,6 +127,8 @@ mod tests {
             serde_json::to_value(OrganizationLifecycle::Deleted).unwrap(),
             "deleted"
         );
+        let u: UserLifecycle = serde_json::from_value("deactivated".into()).unwrap();
+        assert_eq!(u, UserLifecycle::Deactivated);
         let f: OrganizationLifecycle = serde_json::from_value("erased".into()).unwrap();
         assert_eq!(f, OrganizationLifecycle::Erased);
     }

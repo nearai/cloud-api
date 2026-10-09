@@ -820,7 +820,7 @@ pub async fn init_inference_providers(
             config.external_providers.clone(),
         ),
     );
-    pool.set_metrics_service(metrics_service);
+    pool.set_metrics_service(metrics_service.clone());
     install_placement(&pool, &config.placement);
 
     let models_repo = Arc::new(database::repositories::ModelRepository::new(
@@ -868,8 +868,13 @@ pub async fn init_inference_providers(
         .await;
 
     // Attested third-party providers (Chutes, then Tinfoil).
-    attested_3p_startup::register_attested_3p(&pool, &models_repo, &config.external_providers)
-        .await;
+    attested_3p_startup::register_attested_3p(
+        &pool,
+        &models_repo,
+        &config.external_providers,
+        metrics_service,
+    )
+    .await;
 
     pool
 }

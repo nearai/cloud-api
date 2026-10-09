@@ -656,8 +656,8 @@ impl PgOrganizationRepository {
 
 /// Deactivate everything under an organization in the caller's transaction:
 /// API keys (inactive + `deleted_at`), reporting tokens (revoked), workspaces
-/// (inactive). Shared by owner org deletion and user erasure so the cascade
-/// has one definition.
+/// (inactive). Extracted from owner org deletion so the cascade has one
+/// definition; the user-erasure path in the stacked follow-up reuses it.
 ///
 /// Deactivating only the organization row leaves its workspaces and
 /// API keys marked active while every lookup for them joins

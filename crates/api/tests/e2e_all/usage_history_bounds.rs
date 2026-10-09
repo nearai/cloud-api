@@ -3,7 +3,7 @@
 //! rows, and every history and by-model query stops at the statement timeout.
 
 use crate::common::*;
-use chrono::{Duration, Utc};
+use chrono::{Duration, SecondsFormat, Utc};
 use serde_json::Value;
 use uuid::Uuid;
 
@@ -40,6 +40,99 @@ async fn usage_by_model_combines_hourly_counts_with_recent_requests() {
     assert_eq!(rows[0]["input_tokens"], 23);
     assert_eq!(rows[0]["total_tokens"], 23);
     assert_eq!(rows[0]["total_cost"], 207);
+}
+
+#[tokio::test]
+async fn usage_by_model_custom_range_includes_start_and_excludes_end() {
+    use crate::admin_provider_attribution_support::setup_platform_provider_usage_fixture;
+    use crate::usage_hourly::{insert_raw, random_past_hour, recompute_usage_hours};
+
+    let fixture = setup_platform_provider_usage_fixture().await;
+    // Both bounds fall mid-hour: the range reads raw rows at each edge and the hourly
+    // aggregate for the whole hours between them.
+    let hour = random_past_hour();
+    let start = hour + Duration::minutes(30);
+    let end = hour + Duration::hours(3) + Duration::minutes(30);
+    // Each cost is its own decimal digit, so the summed cost names the rows counted.
+    for (created_at, cost) in [
+        (start - Duration::milliseconds(1), 1),
+        (start, 10),
+        (hour + Duration::hours(1), 100),
+        (hour + Duration::hours(2) + Duration::minutes(59), 1_000),
+        (end - Duration::milliseconds(1), 10_000),
+        (end, 100_000),
+    ] {
+        insert_raw(&fixture, created_at, cost, 1, None, None, Some("external")).await;
+    }
+    recompute_usage_hours(hour, hour + Duration::hours(4)).await;
+
+    let range = format!(
+        "start={}&end={}",
+        start.to_rfc3339_opts(SecondsFormat::Secs, true),
+        end.to_rfc3339_opts(SecondsFormat::Secs, true)
+    );
+    // `start`/`end` select the custom range with or without a `period`.
+    for query in [
+        range.clone(),
+        format!("period=custom&{range}"),
+        format!("period=day&{range}"),
+    ] {
+        let body = get_by_model(&fixture.server, fixture.organization_id, &query).await;
+        assert_eq!(body["period"], "custom", "{query}");
+        assert_eq!(body["start_date"], start.to_rfc3339(), "{query}");
+        assert_eq!(body["end_date"], end.to_rfc3339(), "{query}");
+        let rows = body["data"].as_array().expect("by-model entries");
+        assert_eq!(rows.len(), 1, "{query}");
+        assert_eq!(rows[0]["request_count"], 4, "{query}");
+        assert_eq!(rows[0]["total_cost"], 11_110, "{query}");
+    }
+
+    // A rolling window is open-ended and far from these rows.
+    let body = get_by_model(&fixture.server, fixture.organization_id, "period=month").await;
+    assert_eq!(body["period"], "month");
+    assert!(body.get("end_date").is_none());
+    assert!(body["data"]
+        .as_array()
+        .expect("by-model entries")
+        .is_empty());
+}
+
+#[tokio::test]
+async fn usage_by_model_validates_custom_range() {
+    let server = setup_test_server().await;
+    let org = create_org(&server).await;
+
+    // 366 days is the longest range allowed.
+    let longest = "start=2025-01-01T00:00:00Z&end=2026-01-02T00:00:00Z";
+    assert_eq!(
+        get_by_model(&server, &org.id, longest).await["period"],
+        "custom"
+    );
+
+    for (query, error_type) in [
+        (
+            "start=2025-01-01T00:00:00Z&end=2026-01-02T00:00:01Z",
+            "date_range_too_large",
+        ),
+        (
+            "start=2026-01-02T00:00:00Z&end=2026-01-01T00:00:00Z",
+            "invalid_date_range",
+        ),
+        // `end` defaults to now, so a future `start` is an empty range.
+        ("start=2999-01-01T00:00:00Z", "invalid_date_range"),
+        ("end=2026-01-01", "invalid_date"),
+    ] {
+        let response = server
+            .get(format!("/v1/organizations/{}/usage/by-model?{query}", org.id).as_str())
+            .add_header("Authorization", format!("Bearer {}", get_session_id()))
+            .await;
+        assert_eq!(response.status_code(), 400, "{query}: {}", response.text());
+        assert_eq!(
+            response.json::<Value>()["error"]["type"],
+            error_type,
+            "{query}"
+        );
+    }
 }
 
 #[tokio::test]
@@ -181,6 +274,19 @@ async fn usage_dashboard_database_timeout_returns_504_and_stops_query() {
         assert_eq!(active_query_count, 0, "{path}: timed-out query must stop");
     }
     transaction.rollback().await.expect("release test lock");
+}
+
+async fn get_by_model(
+    server: &axum_test::TestServer,
+    organization_id: impl std::fmt::Display,
+    query: &str,
+) -> Value {
+    let response = server
+        .get(format!("/v1/organizations/{organization_id}/usage/by-model?{query}").as_str())
+        .add_header("Authorization", format!("Bearer {}", get_session_id()))
+        .await;
+    assert_eq!(response.status_code(), 200, "{query}: {}", response.text());
+    response.json()
 }
 
 async fn get_history(

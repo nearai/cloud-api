@@ -333,6 +333,7 @@ impl UsageServiceTrait for MockUsageService {
         &self,
         _organization_id: Uuid,
         _start_date: chrono::DateTime<chrono::Utc>,
+        _end_date: Option<chrono::DateTime<chrono::Utc>>,
     ) -> Result<Vec<crate::usage::UsageByModelEntry>, UsageError> {
         Ok(vec![])
     }
@@ -614,6 +615,7 @@ impl UsageServiceTrait for CapturingUsageService {
         &self,
         _organization_id: Uuid,
         _start_date: chrono::DateTime<chrono::Utc>,
+        _end_date: Option<chrono::DateTime<chrono::Utc>>,
     ) -> Result<Vec<crate::usage::UsageByModelEntry>, UsageError> {
         Ok(vec![])
     }

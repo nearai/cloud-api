@@ -12,18 +12,19 @@ use crate::models::{
     AdminUserResponse, BatchUpdateModelApiRequest, CreateAdminAccessTokenRequest,
     CreateServiceRequest, CreditType, DecimalPrice, DecimalPriceRequest,
     DeleteAdminAccessTokenRequest, DeleteModelRequest, DeprecateModelRequest,
-    DeprecateModelResponse, ErrorResponse, GetOrganizationConcurrentLimitResponse,
-    ListAdminAccessTokensResponse, ListAdminAmlAllowlistResponse, ListAdminAmlReportsResponse,
-    ListAdminApiKeysResponse, ListAdminInvitationEmailDeliveriesResponse,
-    ListAdminOrganizationMembersResponse, ListOrganizationsAdminResponse,
-    ListPricingChangesResponse, ListUsersResponse, MemberRole, ModelArchitecture,
-    ModelDeprecationConfirmResponse, ModelDeprecationPreviewResponse, ModelDeprecationRequest,
-    ModelHistoryEntry, ModelHistoryResponse, ModelMetadata, ModelWithPricing,
-    OrgLimitsHistoryEntry, OrgLimitsHistoryResponse, OrganizationFallbackResponse,
-    OrganizationMemberResponse, OrganizationPriorityResponse, OrganizationUsage,
-    PricingChangeBatchRequest, PricingChangeConfirmResponse, PricingChangeModelPreviewDto,
-    PricingChangePreviewResponse, PricingFieldUpdates, PricingFields, ScheduledPricingChangeDto,
-    SpendLimit, UpdateAmlReportStatusRequest, UpdateOrganizationConcurrentLimitRequest,
+    DeprecateModelResponse, ErasedOrganizationResponse, ErasureLogResponse, ErasurePreviewResponse,
+    ErrorResponse, GetOrganizationConcurrentLimitResponse, ListAdminAccessTokensResponse,
+    ListAdminAmlAllowlistResponse, ListAdminAmlReportsResponse, ListAdminApiKeysResponse,
+    ListAdminInvitationEmailDeliveriesResponse, ListAdminOrganizationMembersResponse,
+    ListOrganizationsAdminResponse, ListPricingChangesResponse, ListUsersResponse, MemberRole,
+    ModelArchitecture, ModelDeprecationConfirmResponse, ModelDeprecationPreviewResponse,
+    ModelDeprecationRequest, ModelHistoryEntry, ModelHistoryResponse, ModelMetadata,
+    ModelWithPricing, OrgLimitsHistoryEntry, OrgLimitsHistoryResponse,
+    OrganizationFallbackResponse, OrganizationMemberResponse, OrganizationPriorityResponse,
+    OrganizationUsage, PricingChangeBatchRequest, PricingChangeConfirmResponse,
+    PricingChangeModelPreviewDto, PricingChangePreviewResponse, PricingFieldUpdates, PricingFields,
+    RetainedOrganizationResponse, ScheduledPricingChangeDto, SpendLimit,
+    UpdateAmlReportStatusRequest, UpdateOrganizationConcurrentLimitRequest,
     UpdateOrganizationConcurrentLimitResponse, UpdateOrganizationFallbackRequest,
     UpdateOrganizationLimitsRequest, UpdateOrganizationLimitsResponse,
     UpdateOrganizationMemberRequest, UpdateOrganizationPriorityRequest, UpdateServiceRequest,
@@ -196,6 +197,7 @@ pub struct AdminAppState {
     pub github_dispatcher: Arc<dyn GitHubDispatcher>,
     pub infra_service: Arc<services::admin::InfraService>,
     pub admin_settings_service: Arc<services::admin_settings::AdminSettingsService>,
+    pub user_erasure_service: Arc<services::user_erasure::UserErasureService>,
 }
 
 /// Small helper for 400 responses from analytics query-param validation.
@@ -5098,4 +5100,106 @@ mod openrouter_slug_tests {
             );
         }
     }
+}
+
+fn blockers_json(blockers: &[services::user_erasure::ErasureBlocker]) -> Vec<serde_json::Value> {
+    blockers
+        .iter()
+        .map(|b| serde_json::to_value(b).expect("blocker serializes"))
+        .collect()
+}
+
+fn erasure_error_to_response(
+    err: services::user_erasure::UserErasureError,
+) -> (StatusCode, ResponseJson<serde_json::Value>) {
+    use services::user_erasure::UserErasureError as E;
+    let (status, error_type, message, blockers) = match err {
+        E::NotFound => (StatusCode::NOT_FOUND, "not_found", "User not found", None),
+        E::Blocked(b) => (
+            StatusCode::CONFLICT,
+            "erasure_blocked",
+            "Erasure blocked",
+            Some(blockers_json(&b)),
+        ),
+        E::ConfirmEmailMismatch => (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "confirm_email_mismatch",
+            "confirm_email does not match the user's current email",
+            None,
+        ),
+        E::Internal(_) => {
+            tracing::error!("User erasure failed");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "internal_error",
+                "Internal server error",
+                None,
+            )
+        }
+    };
+    let mut body = serde_json::to_value(ErrorResponse::new(
+        message.to_string(),
+        error_type.to_string(),
+    ))
+    .expect("error response serializes");
+    if let Some(b) = blockers {
+        body["blockers"] = serde_json::Value::Array(b);
+    }
+    (status, ResponseJson(body))
+}
+
+/// Preview a user erasure: blockers and what would be erased (Admin only, read).
+#[utoipa::path(
+    post,
+    path = "/v1/admin/users/{user_id}/erasure/preview",
+    tag = "Admin",
+    params(("user_id" = String, Path, description = "User ID")),
+    responses(
+        (status = 200, description = "Erasure preview", body = ErasurePreviewResponse),
+        (status = 404, description = "User not found", body = ErrorResponse),
+        (status = 401, description = "Unauthorized", body = ErrorResponse),
+        (status = 500, description = "Internal server error", body = ErrorResponse)
+    ),
+    security(("session_token" = []))
+)]
+pub async fn preview_user_erasure(
+    State(app_state): State<AdminAppState>,
+    Path(user_id): Path<uuid::Uuid>,
+    Extension(_admin_user): Extension<AdminUser>,
+) -> Result<ResponseJson<ErasurePreviewResponse>, (StatusCode, ResponseJson<serde_json::Value>)> {
+    let plan = app_state
+        .user_erasure_service
+        .preview(user_id)
+        .await
+        .map_err(erasure_error_to_response)?;
+
+    Ok(ResponseJson(ErasurePreviewResponse {
+        user_id: plan.user_id.to_string(),
+        lifecycle: plan.lifecycle,
+        blockers: blockers_json(&plan.blockers),
+        erased_organizations: plan
+            .erased_organizations
+            .iter()
+            .map(|o| ErasedOrganizationResponse {
+                id: o.id.to_string(),
+                lifecycle: o.lifecycle,
+                workspaces: o.workspaces,
+                api_keys: o.api_keys,
+                conversations: o.conversations,
+                files: o.files,
+            })
+            .collect(),
+        retained_organizations: plan
+            .retained_organizations
+            .iter()
+            .map(|o| RetainedOrganizationResponse {
+                id: o.id.to_string(),
+                role: o.role.clone(),
+            })
+            .collect(),
+        log: plan.log.map(|l| ErasureLogResponse {
+            requested_at: l.requested_at,
+            erased_at: l.erased_at,
+        }),
+    }))
 }

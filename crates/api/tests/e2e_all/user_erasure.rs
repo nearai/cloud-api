@@ -192,3 +192,70 @@ async fn is_user_active_reflects_erasure_state() {
             .unwrap()
     );
 }
+
+async fn personal_org_id(server: &axum_test::TestServer, session: &str) -> String {
+    let me = server
+        .get("/v1/users/me")
+        .add_header("Authorization", format!("Bearer {session}"))
+        .add_header("User-Agent", MOCK_USER_AGENT)
+        .await
+        .json::<serde_json::Value>();
+    me["organizations"][0]["id"]
+        .as_str()
+        .expect("personal org")
+        .to_string()
+}
+
+async fn preview(server: &axum_test::TestServer, user_id: uuid::Uuid) -> axum_test::TestResponse {
+    server
+        .post(format!("/v1/admin/users/{user_id}/erasure/preview").as_str())
+        .add_header("Authorization", format!("Bearer {}", get_session_id()))
+        .add_header("User-Agent", MOCK_USER_AGENT)
+        .json(&serde_json::json!({}))
+        .await
+}
+
+#[tokio::test]
+async fn preview_lists_personal_org_as_erased_and_writes_nothing() {
+    let (server, database) = setup_test_server_with_database().await;
+    let (session, user_id, _email) = new_user(&database).await;
+    let org_id = personal_org_id(&server, &session).await;
+
+    let response = preview(&server, user_id).await;
+    assert_eq!(response.status_code(), 200, "{}", response.text());
+    let body = response.json::<serde_json::Value>();
+    assert_eq!(body["lifecycle"], "active");
+    assert_eq!(body["blockers"].as_array().unwrap().len(), 0);
+    assert_eq!(body["erased_organizations"][0]["id"], org_id);
+    assert_eq!(body["erased_organizations"][0]["workspaces"], 1);
+    assert!(body["log"].is_null());
+
+    let client = database.pool().get().await.unwrap();
+    let row = client
+        .query_one(
+            "SELECT is_active, auth_provider FROM users WHERE id = $1",
+            &[&user_id],
+        )
+        .await
+        .unwrap();
+    assert!(row.get::<_, bool>("is_active"), "preview must not write");
+    assert_eq!(row.get::<_, String>("auth_provider"), "github");
+    assert_eq!(
+        count(
+            &client,
+            "SELECT COUNT(*) FROM user_erasure_log WHERE user_id = $1",
+            &user_id
+        )
+        .await,
+        0
+    );
+}
+
+#[tokio::test]
+async fn preview_unknown_user_is_404() {
+    let (server, _database) = setup_test_server_with_database().await;
+    assert_eq!(
+        preview(&server, uuid::Uuid::new_v4()).await.status_code(),
+        404
+    );
+}

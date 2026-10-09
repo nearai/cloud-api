@@ -3028,6 +3028,40 @@ pub struct AdminUserOrganizationDetails {
     pub current_usage: Option<OrganizationUsage>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct ErasedOrganizationResponse {
+    pub id: String,
+    pub lifecycle: services::lifecycle::OrganizationLifecycle,
+    pub workspaces: i64,
+    pub api_keys: i64,
+    pub conversations: i64,
+    pub files: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct RetainedOrganizationResponse {
+    pub id: String,
+    pub role: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct ErasureLogResponse {
+    pub requested_at: DateTime<Utc>,
+    pub erased_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct ErasurePreviewResponse {
+    pub user_id: String,
+    pub lifecycle: services::lifecycle::UserLifecycle,
+    /// Each entry: {"code": "sole_owner_of_shared_org" | "staking_active", "organization_id": ...}
+    /// or {"code": "active_admin_tokens", "count": n}
+    pub blockers: Vec<serde_json::Value>,
+    pub erased_organizations: Vec<ErasedOrganizationResponse>,
+    pub retained_organizations: Vec<RetainedOrganizationResponse>,
+    pub log: Option<ErasureLogResponse>,
+}
+
 /// Admin user response model (for owners/admins)
 /// Contains sensitive information only visible to organization owners/admins
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]

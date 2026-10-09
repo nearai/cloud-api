@@ -1176,6 +1176,11 @@ pub fn build_app_with_config_and_options(
             organization_service: domain_services.organization_service.clone(),
             usage_service: domain_services.usage_service.clone(),
             admin_settings_service: domain_services.admin_settings_service.clone(),
+            user_erasure_service: Arc::new(services::user_erasure::UserErasureService::new(
+                Arc::new(database::repositories::PostgresUserErasureRepository::new(
+                    database.pool().clone(),
+                )),
+            )),
         },
     );
 
@@ -2045,6 +2050,7 @@ pub struct AdminRouteServices {
         Arc<dyn services::organization::OrganizationServiceTrait + Send + Sync>,
     pub usage_service: Arc<dyn services::usage::UsageServiceTrait + Send + Sync>,
     pub admin_settings_service: Arc<services::admin_settings::AdminSettingsService>,
+    pub user_erasure_service: Arc<services::user_erasure::UserErasureService>,
 }
 
 pub fn build_admin_routes(
@@ -2083,7 +2089,7 @@ fn build_admin_routes_with_options(
         list_admin_access_tokens, list_admin_settings, list_aml_allowlist, list_aml_reports,
         list_api_keys, list_invitation_email_deliveries, list_model_pricing_changes,
         list_models as admin_list_models, list_organization_members, list_organizations,
-        list_users, preview_model_deprecation, preview_model_pricing_changes,
+        list_users, preview_model_deprecation, preview_model_pricing_changes, preview_user_erasure,
         resend_invitation_email, update_admin_setting, update_aml_report_status,
         update_organization_concurrent_limit, update_organization_fallback,
         update_organization_limits, update_organization_member_role, update_organization_priority,
@@ -2147,6 +2153,7 @@ fn build_admin_routes_with_options(
         github_dispatcher,
         infra_service,
         admin_settings_service: services.admin_settings_service,
+        user_erasure_service: services.user_erasure_service,
     };
 
     let database_encryption_state = crate::database_encryption::DatabaseEncryptionState::new(
@@ -2310,6 +2317,10 @@ fn build_admin_routes_with_options(
             axum::routing::post(resend_invitation_email),
         )
         .route("/admin/users", axum::routing::get(list_users))
+        .route(
+            "/admin/users/{user_id}/erasure/preview",
+            axum::routing::post(preview_user_erasure),
+        )
         .route(
             "/admin/organizations",
             axum::routing::get(list_organizations),

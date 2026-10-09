@@ -1122,6 +1122,7 @@ async fn record_native_usage(
     // OpenAI-compatible plane. Random fallback keeps the row when the
     // upstream response carried no id.
     let inference_id = usage.inference_id().unwrap_or_else(Uuid::new_v4);
+    let cache_write_tokens = usage.cache_write_tokens_for_billing();
     let request = RecordUsageServiceRequest {
         discount: None,
         organization_id: context.organization_id,
@@ -1131,11 +1132,14 @@ async fn record_native_usage(
         input_tokens,
         output_tokens,
         cache_read_tokens: usage.cache_read_tokens_for_billing(),
-        cache_write: (usage.cache_write_tokens_for_billing() > 0).then_some(CacheWriteBilling {
-            tokens: usage.cache_write_tokens_for_billing(),
+        // The usage service applies exactly one of the next two fields: the
+        // explicit five-minute rate for a flat-priced model, or the profile's
+        // own cache-write rate when the model has a text pricing profile.
+        cache_write: (cache_write_tokens > 0).then_some(CacheWriteBilling {
+            tokens: cache_write_tokens,
             cost_per_token: context.cache_write_cost_per_token,
         }),
-        profiled_cache_write_tokens: 0,
+        profiled_cache_write_tokens: cache_write_tokens,
         requested_service_tier: None,
         provider_service_tier: None,
         inference_type: context.inference_type,
@@ -1963,6 +1967,37 @@ redact-thinking-2026-02-12";
         assert_eq!(recorded.stop_reason, Some(StopReason::Completed));
         assert_eq!(recorded.input_tokens, 4);
         assert_eq!(recorded.output_tokens, 9);
+    }
+
+    #[tokio::test]
+    async fn cache_writes_are_reported_for_flat_and_profiled_pricing() {
+        let usage_service = Arc::new(RecordingUsageService::default());
+        let usage = parse_non_stream_usage(
+            br#"{"id":"msg_1","stop_reason":"end_turn","usage":{"input_tokens":4,"cache_read_input_tokens":0,"cache_creation_input_tokens":5134,"output_tokens":28}}"#,
+        )
+        .unwrap();
+
+        // The recording service answers every call with an error.
+        let _ = record_native_usage(
+            billing_context(usage_service.clone()),
+            usage,
+            StopReason::Completed,
+        )
+        .await;
+
+        let recorded = wait_for_recorded_usage(&usage_service).await;
+        assert_eq!(recorded.input_tokens, 5138);
+        // The usage service bills through exactly one of these, depending on
+        // whether the model has a text pricing profile, so both must carry
+        // the cache-creation count.
+        assert_eq!(recorded.profiled_cache_write_tokens, 5134);
+        assert_eq!(
+            recorded
+                .cache_write
+                .expect("flat cache-write billing")
+                .tokens,
+            5134
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

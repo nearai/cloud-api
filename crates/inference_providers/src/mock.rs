@@ -748,7 +748,8 @@ pub struct MockProvider {
     /// `NonAttested`. Set via [`MockProvider::with_tier`] to exercise tiered
     /// provider selection (e.g. a `Near` primary with an `Attested3p` fallback).
     tier: crate::ProviderTier,
-    provider_source: crate::ProviderSource,
+    /// Explicit source; `None` derives it from the tier (Attested3p => Chutes).
+    provider_source: Option<crate::ProviderSource>,
     /// Value reported by [`InferenceProvider::supports_streaming`]; defaults to
     /// `true`. Set via [`MockProvider::with_streaming_support`] to exercise the
     /// streaming-capability filter (e.g. a Chutes-like fallback with streaming off).
@@ -835,7 +836,7 @@ impl MockProvider {
             chat_request_priorities: Arc::new(Mutex::new(Vec::new())),
             fail_attestation: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             tier: crate::ProviderTier::NonAttested,
-            provider_source: crate::ProviderSource::External,
+            provider_source: None,
             supports_streaming: true,
             supports_client_e2ee: true,
             supports_chat_signatures: true,
@@ -867,7 +868,7 @@ impl MockProvider {
             chat_request_priorities: Arc::new(Mutex::new(Vec::new())),
             fail_attestation: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             tier: crate::ProviderTier::NonAttested,
-            provider_source: crate::ProviderSource::External,
+            provider_source: None,
             supports_streaming: true,
             supports_client_e2ee: true,
             supports_chat_signatures: true,
@@ -897,7 +898,7 @@ impl MockProvider {
             chat_request_priorities: Arc::new(Mutex::new(Vec::new())),
             fail_attestation: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             tier: crate::ProviderTier::NonAttested,
-            provider_source: crate::ProviderSource::External,
+            provider_source: None,
             supports_streaming: true,
             supports_client_e2ee: true,
             supports_chat_signatures: true,
@@ -919,7 +920,7 @@ impl MockProvider {
     }
 
     pub fn with_provider_source(mut self, provider_source: crate::ProviderSource) -> Self {
-        self.provider_source = provider_source;
+        self.provider_source = Some(provider_source);
         self
     }
 
@@ -1205,7 +1206,12 @@ impl crate::InferenceProvider for MockProvider {
     }
 
     fn provider_source(&self) -> crate::ProviderSource {
-        self.provider_source
+        self.provider_source.unwrap_or(match self.tier {
+            crate::ProviderTier::Attested3p => crate::ProviderSource::Chutes,
+            crate::ProviderTier::Near | crate::ProviderTier::NonAttested => {
+                crate::ProviderSource::External
+            }
+        })
     }
 
     fn supports_streaming(&self) -> bool {
@@ -1453,7 +1459,7 @@ impl crate::InferenceProvider for MockProvider {
         Ok(ChatCompletionResponseWithBytes {
             response,
             raw_bytes,
-            serving_tier: self.tier(),
+            serving: crate::ServingProvider::of(self),
         })
     }
 

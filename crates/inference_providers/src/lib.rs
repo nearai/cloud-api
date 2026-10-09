@@ -162,6 +162,8 @@ pub enum ProviderSource {
     External,
     /// A Chutes-attested third party (`attested::chutes`).
     Chutes,
+    /// A Tinfoil-attested third party (attested::tinfoil).
+    Tinfoil,
 }
 
 impl ProviderSource {
@@ -170,6 +172,102 @@ impl ProviderSource {
             ProviderSource::Vllm => "vllm",
             ProviderSource::External => "external",
             ProviderSource::Chutes => "chutes",
+            ProviderSource::Tinfoil => "tinfoil",
+        }
+    }
+
+    /// Every source, in discriminant order (`DisabledSources` bit order).
+    pub const ALL: [ProviderSource; 4] = [Self::Vllm, Self::External, Self::Chutes, Self::Tinfoil];
+
+    pub fn parse(s: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|v| v.as_str() == s)
+    }
+}
+
+/// A set of provider sources, one bit per [`ProviderSource`]. `Copy` so it
+/// can live in the admin settings snapshot.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct DisabledSources(u8);
+
+impl DisabledSources {
+    const fn bit(s: ProviderSource) -> u8 {
+        1 << (s as u8)
+    }
+
+    pub const fn contains(self, s: ProviderSource) -> bool {
+        self.0 & Self::bit(s) != 0
+    }
+
+    pub fn insert(&mut self, s: ProviderSource) {
+        self.0 |= Self::bit(s)
+    }
+
+    pub fn iter(self) -> impl Iterator<Item = ProviderSource> {
+        ProviderSource::ALL
+            .into_iter()
+            .filter(move |s| self.contains(*s))
+    }
+}
+
+/// Who served a request: the trust tier plus the concrete source. Drives the
+/// `x-serving-provider` response header label.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ServingProvider {
+    pub tier: ProviderTier,
+    pub source: ProviderSource,
+}
+
+impl ServingProvider {
+    pub fn of<P: InferenceProvider + ?Sized>(p: &P) -> Self {
+        Self {
+            tier: p.tier(),
+            source: p.provider_source(),
+        }
+    }
+
+    /// A plaintext, non-attested external provider (OpenAI-compatible, Anthropic, Gemini).
+    pub const EXTERNAL: ServingProvider = ServingProvider {
+        tier: ProviderTier::NonAttested,
+        source: ProviderSource::External,
+    };
+
+    /// `x-serving-provider` value: "near" | "non-attested" | <3P source name>.
+    /// An `Attested3p` tier with a non-3P source (inconsistent attribution)
+    /// is clamped to "attested-3p" rather than emitting "vllm"/"external".
+    pub const fn label(self) -> &'static str {
+        match self.tier {
+            ProviderTier::Near => "near",
+            ProviderTier::NonAttested => "non-attested",
+            ProviderTier::Attested3p => match self.source {
+                ProviderSource::Chutes | ProviderSource::Tinfoil => self.source.as_str(),
+                ProviderSource::Vllm | ProviderSource::External => "attested-3p",
+            },
+        }
+    }
+}
+
+/// Which providers an attestation report request is restricted to
+/// (`?provider=near|chutes|tinfoil`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ProviderFilter {
+    /// NEAR AI's own attested fleet.
+    Near,
+    /// Attested third-party providers of one concrete source.
+    Source(ProviderSource),
+}
+
+impl ProviderFilter {
+    pub fn matches<P: InferenceProvider + ?Sized>(self, p: &P) -> bool {
+        match self {
+            Self::Near => p.tier() == ProviderTier::Near,
+            Self::Source(s) => p.tier() == ProviderTier::Attested3p && p.provider_source() == s,
+        }
+    }
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Near => "near",
+            Self::Source(s) => s.as_str(),
         }
     }
 }
@@ -617,7 +715,45 @@ pub trait InferenceProvider {
 
 #[cfg(test)]
 mod provider_tier_tests {
-    use super::ProviderTier;
+    use super::{ProviderSource, ProviderTier, ServingProvider};
+
+    #[test]
+    fn serving_label_is_near_non_attested_or_3p_source() {
+        use ProviderSource::*;
+        use ProviderTier::*;
+        assert_eq!(
+            ServingProvider {
+                tier: Near,
+                source: Vllm
+            }
+            .label(),
+            "near"
+        );
+        assert_eq!(
+            ServingProvider {
+                tier: NonAttested,
+                source: External
+            }
+            .label(),
+            "non-attested"
+        );
+        assert_eq!(
+            ServingProvider {
+                tier: Attested3p,
+                source: Chutes
+            }
+            .label(),
+            "chutes"
+        );
+        assert_eq!(
+            ServingProvider {
+                tier: Attested3p,
+                source: Tinfoil
+            }
+            .label(),
+            "tinfoil"
+        );
+    }
 
     #[test]
     fn attested_tiers_gate_the_verified_badge() {
@@ -671,5 +807,94 @@ mod extract_error_message_tests {
         let body =
             r#"{"error":{"message":"from envelope"},"message":"from flat","type":"whatever"}"#;
         assert_eq!(extract_error_message(body), "from envelope");
+    }
+}
+
+#[cfg(test)]
+mod provider_identity_tests {
+    use super::*;
+    use crate::mock::MockProvider;
+
+    fn mock(tier: ProviderTier, source: ProviderSource) -> MockProvider {
+        MockProvider::new()
+            .with_tier(tier)
+            .with_provider_source(source)
+    }
+
+    #[test]
+    fn filter_source_matches_only_same_attested_3p_source() {
+        let chutes = mock(ProviderTier::Attested3p, ProviderSource::Chutes);
+        let tinfoil = mock(ProviderTier::Attested3p, ProviderSource::Tinfoil);
+        assert!(ProviderFilter::Source(ProviderSource::Chutes).matches(&chutes));
+        assert!(!ProviderFilter::Source(ProviderSource::Chutes).matches(&tinfoil));
+        assert!(ProviderFilter::Source(ProviderSource::Tinfoil).matches(&tinfoil));
+        assert!(!ProviderFilter::Near.matches(&chutes));
+    }
+
+    #[test]
+    fn filter_source_never_matches_near_or_non_attested() {
+        for source in ProviderSource::ALL {
+            for tier in [ProviderTier::Near, ProviderTier::NonAttested] {
+                let p = mock(tier, source);
+                assert!(!ProviderFilter::Source(source).matches(&p));
+            }
+        }
+        assert!(ProviderFilter::Near.matches(&mock(ProviderTier::Near, ProviderSource::Vllm)));
+        assert!(!ProviderFilter::Near
+            .matches(&mock(ProviderTier::NonAttested, ProviderSource::External)));
+    }
+
+    #[test]
+    fn disabled_sources_round_trips_every_source() {
+        let mut d = DisabledSources::default();
+        assert_eq!(d.iter().count(), 0);
+        for (i, s) in ProviderSource::ALL.into_iter().enumerate() {
+            assert!(!d.contains(s));
+            d.insert(s);
+            assert!(d.contains(s));
+            assert_eq!(d.iter().count(), i + 1);
+            assert_eq!(ProviderSource::parse(s.as_str()), Some(s));
+        }
+        assert_eq!(d.iter().collect::<Vec<_>>(), ProviderSource::ALL.to_vec());
+        assert_eq!(ProviderSource::parse("banana"), None);
+        let mut one = DisabledSources::default();
+        one.insert(ProviderSource::Tinfoil);
+        assert_eq!(
+            one.iter().collect::<Vec<_>>(),
+            vec![ProviderSource::Tinfoil]
+        );
+    }
+
+    #[test]
+    fn serving_label_clamps_inconsistent_attested_3p_source() {
+        let l = |tier, source| ServingProvider { tier, source }.label();
+        assert_eq!(
+            l(ProviderTier::Attested3p, ProviderSource::Chutes),
+            "chutes"
+        );
+        assert_eq!(
+            l(ProviderTier::Attested3p, ProviderSource::Tinfoil),
+            "tinfoil"
+        );
+        assert_eq!(
+            l(ProviderTier::Attested3p, ProviderSource::External),
+            "attested-3p"
+        );
+        assert_eq!(
+            l(ProviderTier::Attested3p, ProviderSource::Vllm),
+            "attested-3p"
+        );
+        assert_eq!(l(ProviderTier::Near, ProviderSource::External), "near");
+        assert_eq!(ServingProvider::EXTERNAL.label(), "non-attested");
+    }
+
+    #[test]
+    fn mock_attested_3p_defaults_source_to_chutes() {
+        let m = MockProvider::new().with_tier(ProviderTier::Attested3p);
+        assert_eq!(m.provider_source(), ProviderSource::Chutes);
+        let m = MockProvider::new()
+            .with_provider_source(ProviderSource::Tinfoil)
+            .with_tier(ProviderTier::Attested3p);
+        assert_eq!(m.provider_source(), ProviderSource::Tinfoil);
     }
 }

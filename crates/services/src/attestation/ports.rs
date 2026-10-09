@@ -3,7 +3,7 @@ use crate::attestation::models::{
     AttestationError, AttestationReport, ChatSignature, SignatureLookupResult,
 };
 use async_trait::async_trait;
-use inference_providers::ProviderTier;
+use inference_providers::ProviderFilter;
 
 #[async_trait]
 pub trait AttestationServiceTrait: Send + Sync {
@@ -79,7 +79,7 @@ pub trait AttestationServiceTrait: Send + Sync {
 
     /// Fetch a hardware attestation report.
     ///
-    /// `provider_filter`: when `Some`, only the matching trust tier is queried.
+    /// `provider_filter`: when `Some`, only the matching provider (NEAR fleet or 3P source) is queried.
     /// `None` keeps the existing behaviour (first successful provider wins).
     async fn get_attestation_report(
         &self,
@@ -88,7 +88,7 @@ pub trait AttestationServiceTrait: Send + Sync {
         nonce: Option<String>,
         signing_address: Option<String>,
         include_tls_fingerprint: bool,
-        provider_filter: Option<ProviderTier>,
+        provider_filter: Option<ProviderFilter>,
     ) -> Result<AttestationReport, AttestationError>;
 
     async fn get_ita_attestation_token(

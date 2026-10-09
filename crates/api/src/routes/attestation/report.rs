@@ -9,7 +9,7 @@ use axum::{
     http::{HeaderMap, StatusCode},
     response::Json as ResponseJson,
 };
-use inference_providers::ProviderTier;
+use inference_providers::{ProviderFilter, ProviderSource};
 use serde::{Deserialize, Serialize};
 use utoipa::{IntoParams, ToSchema};
 
@@ -23,8 +23,8 @@ pub struct AttestationQuery {
     /// Include the TLS certificate SPKI fingerprint in the report-data binding.
     /// Defaults to false; when true, report_data[..32] = SHA256(signing_address || tls_cert_fingerprint).
     pub include_tls_fingerprint: Option<bool>,
-    /// Restrict the report to a specific serving tier.
-    /// Accepted values: `near` (NEAR AI's own TEE fleet) or `chutes` (attested Chutes fallback).
+    /// Restrict the report to a specific provider.
+    /// Accepted values: `near` (NEAR AI's own TEE fleet), `chutes`, or `tinfoil` (attested third-party sources).
     /// When omitted, the first successfully responding provider is used.
     pub provider: Option<String>,
 }
@@ -178,12 +178,15 @@ pub async fn get_attestation_report(
         .as_deref()
     {
         None => None,
-        Some("near") => Some(ProviderTier::Near),
-        Some("chutes") => Some(ProviderTier::Attested3p),
+        Some("near") => Some(ProviderFilter::Near),
+        Some("chutes") => Some(ProviderFilter::Source(ProviderSource::Chutes)),
+        Some("tinfoil") => Some(ProviderFilter::Source(ProviderSource::Tinfoil)),
         Some(unknown) => {
             return Err(error_response(
                 StatusCode::BAD_REQUEST,
-                format!("Unknown provider '{unknown}'. Accepted values: 'near', 'chutes'."),
+                format!(
+                    "Unknown provider '{unknown}'. Accepted values: 'near', 'chutes', 'tinfoil'."
+                ),
                 "invalid_request_error",
                 Some("provider"),
             ));

@@ -1,4 +1,7 @@
-//! Admin-driven GDPR erasure of a user. See the user erasure design spec.
+//! Admin-driven GDPR erasure of a user. An admin first previews the erasure
+//! (blockers and footprint), then executes it with a session only. Execute runs in
+//! one transaction that deletes content, tombstones identity, and keeps usage
+//! ledgers. Calling execute again on an erased user sweeps late-written content.
 
 pub mod ports;
 
@@ -46,7 +49,9 @@ impl UserErasureService {
 
     /// Erase `user_id` in one database transaction. Calling again on an erased user
     /// sweeps content written into erased workspaces after the original commit and
-    /// reports `already_erased`. S3 objects are not deleted in v1 (spec §10.3).
+    /// reports `already_erased`. File rows are deleted, but
+    /// object bytes stay because the buckets are versioned and replicated; purging
+    /// them is a follow-up.
     pub async fn erase(
         &self,
         user_id: Uuid,

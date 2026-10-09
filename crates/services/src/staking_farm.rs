@@ -305,8 +305,9 @@ impl StakingFarmService {
         source: OrganizationStakingFarmSource,
         changed_by_user_id: Option<Uuid>,
     ) -> anyhow::Result<OrganizationStakingFarmSource> {
-        // A disconnected source belongs to an erased or detached org: never call
-        // the contract, the AML gate, or write credits for it (user erasure, spec §10.7).
+        // A source disconnected by user erasure (or otherwise) must not be re-synced:
+        // that would re-run the AML check and write credits for an erased org, so
+        // never call the contract, the AML gate, or write credits for it.
         if source.status != StakingFarmSourceStatus::Active.as_str() {
             return Ok(source);
         }

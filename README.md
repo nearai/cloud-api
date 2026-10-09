@@ -20,7 +20,8 @@ A Rust-based cloud API for AI model inference, conversation management, and orga
 
 2. **Start services with Docker Compose**:
    ```bash
-   docker-compose up -d
+   cp env.example .env
+   docker compose up -d
    ```
 
    This starts:
@@ -34,6 +35,7 @@ A Rust-based cloud API for AI model inference, conversation management, and orga
 
    This automatically:
    - Runs all database migrations
+   - Creates the local refresh-token index
    - Seeds the database with development data
    - Starts the API server on http://localhost:3000
 

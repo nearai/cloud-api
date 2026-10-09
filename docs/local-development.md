@@ -33,8 +33,9 @@ cp env.example .env
 make dev
 ```
 
-`make dev` runs migrations, seeds the mock admin user, and starts the API
-on `http://localhost:3000`. Useful endpoints once it's up:
+`make dev` runs migrations, creates the local refresh-token index, seeds the
+mock admin user, and starts the API on `http://localhost:3000`. Useful
+endpoints once it's up:
 
 | Path                          | Purpose                              |
 | ----------------------------- | ------------------------------------ |
@@ -53,9 +54,10 @@ docker compose down -v    # nukes data; useful if seed conflicts
 
 ### Running everything in Docker
 
-`docker compose up -d` brings up Postgres, the Datadog agent, and the API
-in containers. It's slower to iterate on (full image rebuild per change)
-but useful for reproducing a containerized environment. Set `DD_API_KEY`
+`docker compose up -d` uses the `.env` file created above and brings up
+Postgres, runs migrations and the refresh-token index script, then starts the
+Datadog agent and API in containers. It's slower to iterate on (full image
+rebuild per change) but useful for reproducing a containerized environment. Set `DD_API_KEY`
 in `.env` if you want the Datadog agent to actually report; otherwise the
 agent will start, complain in logs, and the API will still work.
 

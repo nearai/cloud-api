@@ -320,12 +320,14 @@ pub trait UsageServiceTrait: Send + Sync {
         inference_ids: Vec<Uuid>,
     ) -> Result<Vec<InferenceCost>, UsageError>;
 
-    /// Get per-model usage aggregation for an organization since `start_date`.
+    /// Get per-model usage aggregation for an organization from `start_date` up to
+    /// `end_date` (exclusive; open-ended when `None`).
     /// Returns one row per model: summed tokens, summed cost (nano-dollars), and request count.
     async fn get_usage_by_model(
         &self,
         organization_id: Uuid,
         start_date: DateTime<Utc>,
+        end_date: Option<DateTime<Utc>>,
     ) -> Result<Vec<UsageByModelEntry>, UsageError>;
 
     async fn list_inference_usage_report(
@@ -399,11 +401,13 @@ pub trait UsageRepository: Send + Sync {
         provider_request_id: &str,
     ) -> anyhow::Result<Option<StopReason>>;
 
-    /// Get per-model usage aggregation for an organization since `start_date`.
+    /// Get per-model usage aggregation for an organization from `start_date` up to
+    /// `end_date` (exclusive; open-ended when `None`).
     async fn get_usage_by_model(
         &self,
         organization_id: Uuid,
         start_date: DateTime<Utc>,
+        end_date: Option<DateTime<Utc>>,
     ) -> anyhow::Result<Vec<UsageByModelEntry>>;
 
     async fn list_inference_usage_report(

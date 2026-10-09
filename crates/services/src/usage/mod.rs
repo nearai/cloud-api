@@ -995,9 +995,10 @@ impl UsageServiceTrait for UsageServiceImpl {
         &self,
         organization_id: Uuid,
         start_date: chrono::DateTime<chrono::Utc>,
+        end_date: Option<chrono::DateTime<chrono::Utc>>,
     ) -> Result<Vec<UsageByModelEntry>, UsageError> {
         self.usage_repository
-            .get_usage_by_model(organization_id, start_date)
+            .get_usage_by_model(organization_id, start_date, end_date)
             .await
             .map_err(|e| {
                 if crate::common::is_query_timeout(&e) {

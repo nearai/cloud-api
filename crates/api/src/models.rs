@@ -3054,12 +3054,17 @@ pub struct ErasureLogResponse {
 pub struct ErasurePreviewResponse {
     pub user_id: String,
     pub lifecycle: services::lifecycle::UserLifecycle,
-    /// Each entry: {"code": "sole_owner_of_shared_org" | "staking_active", "organization_id": ...}
-    /// or {"code": "active_admin_tokens", "count": n}
-    pub blockers: Vec<serde_json::Value>,
+    pub blockers: Vec<services::user_erasure::ErasureBlocker>,
     pub erased_organizations: Vec<ErasedOrganizationResponse>,
     pub retained_organizations: Vec<RetainedOrganizationResponse>,
     pub log: Option<ErasureLogResponse>,
+}
+
+/// Body of the 409 returned when erasure is blocked: the usual error envelope plus the blockers.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct ErasureBlockedResponse {
+    pub error: ErrorDetail,
+    pub blockers: Vec<services::user_erasure::ErasureBlocker>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]

@@ -13,7 +13,7 @@ use crate::models::{
     CreateServiceRequest, CreditType, DecimalPrice, DecimalPriceRequest,
     DeleteAdminAccessTokenRequest, DeleteModelRequest, DeprecateModelRequest,
     DeprecateModelResponse, EraseUserRequest, EraseUserResponse, ErasedOrganizationResponse,
-    ErasureLogResponse, ErasurePreviewResponse, ErrorResponse,
+    ErasureBlockedResponse, ErasureLogResponse, ErasurePreviewResponse, ErrorResponse,
     GetOrganizationConcurrentLimitResponse, ListAdminAccessTokensResponse,
     ListAdminAmlAllowlistResponse, ListAdminAmlReportsResponse, ListAdminApiKeysResponse,
     ListAdminInvitationEmailDeliveriesResponse, ListAdminOrganizationMembersResponse,
@@ -5123,30 +5123,27 @@ mod openrouter_slug_tests {
     }
 }
 
-fn blockers_json(blockers: &[services::user_erasure::ErasureBlocker]) -> Vec<serde_json::Value> {
-    blockers
-        .iter()
-        .map(|b| serde_json::to_value(b).expect("blocker serializes"))
-        .collect()
-}
-
 fn erasure_error_to_response(
     err: services::user_erasure::UserErasureError,
-) -> (StatusCode, ResponseJson<serde_json::Value>) {
+) -> axum::response::Response {
+    use axum::http::StatusCode;
+    use axum::response::IntoResponse;
     use services::user_erasure::UserErasureError as E;
-    let (status, error_type, message, blockers) = match err {
-        E::NotFound => (StatusCode::NOT_FOUND, "not_found", "User not found", None),
-        E::Blocked(b) => (
-            StatusCode::CONFLICT,
-            "erasure_blocked",
-            "Erasure blocked",
-            Some(blockers_json(&b)),
-        ),
+    let (status, error_type, message) = match err {
+        E::NotFound => (StatusCode::NOT_FOUND, "not_found", "User not found"),
+        E::Blocked(blockers) => {
+            let ErrorResponse { error } =
+                ErrorResponse::new("Erasure blocked".to_string(), "erasure_blocked".to_string());
+            return (
+                StatusCode::CONFLICT,
+                ResponseJson(ErasureBlockedResponse { error, blockers }),
+            )
+                .into_response();
+        }
         E::ConfirmEmailMismatch => (
             StatusCode::UNPROCESSABLE_ENTITY,
             "confirm_email_mismatch",
             "confirm_email does not match the user's current email",
-            None,
         ),
         E::Internal(_) => {
             tracing::error!("User erasure failed");
@@ -5154,19 +5151,17 @@ fn erasure_error_to_response(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "internal_error",
                 "Internal server error",
-                None,
             )
         }
     };
-    let mut body = serde_json::to_value(ErrorResponse::new(
-        message.to_string(),
-        error_type.to_string(),
-    ))
-    .expect("error response serializes");
-    if let Some(b) = blockers {
-        body["blockers"] = serde_json::Value::Array(b);
-    }
-    (status, ResponseJson(body))
+    (
+        status,
+        ResponseJson(ErrorResponse::new(
+            message.to_string(),
+            error_type.to_string(),
+        )),
+    )
+        .into_response()
 }
 
 /// Erase a user (GDPR Art. 17). Irreversible. Run the preview first. Admin session only.
@@ -5179,7 +5174,7 @@ fn erasure_error_to_response(
     responses(
         (status = 200, description = "User erased (or already erased)", body = EraseUserResponse),
         (status = 404, description = "User not found", body = ErrorResponse),
-        (status = 409, description = "Erasure blocked; body includes `blockers`", body = ErrorResponse),
+        (status = 409, description = "Erasure blocked; body includes `blockers`", body = ErasureBlockedResponse),
         (status = 422, description = "confirm_email mismatch", body = ErrorResponse),
         (status = 401, description = "Unauthorized", body = ErrorResponse),
         (status = 403, description = "Admin API tokens cannot erase", body = ErrorResponse),
@@ -5192,7 +5187,7 @@ pub async fn erase_user(
     Path(user_id): Path<uuid::Uuid>,
     Extension(admin_user): Extension<AdminUser>,
     ResponseJson(req): ResponseJson<EraseUserRequest>,
-) -> Result<ResponseJson<EraseUserResponse>, (StatusCode, ResponseJson<serde_json::Value>)> {
+) -> Result<ResponseJson<EraseUserResponse>, axum::response::Response> {
     let r = app_state
         .user_erasure_service
         .erase(
@@ -5234,7 +5229,7 @@ pub async fn preview_user_erasure(
     State(app_state): State<AdminAppState>,
     Path(user_id): Path<uuid::Uuid>,
     Extension(_admin_user): Extension<AdminUser>,
-) -> Result<ResponseJson<ErasurePreviewResponse>, (StatusCode, ResponseJson<serde_json::Value>)> {
+) -> Result<ResponseJson<ErasurePreviewResponse>, axum::response::Response> {
     let plan = app_state
         .user_erasure_service
         .preview(user_id)
@@ -5244,7 +5239,7 @@ pub async fn preview_user_erasure(
     Ok(ResponseJson(ErasurePreviewResponse {
         user_id: plan.user_id.to_string(),
         lifecycle: plan.lifecycle,
-        blockers: blockers_json(&plan.blockers),
+        blockers: plan.blockers.clone(),
         erased_organizations: plan
             .erased_organizations
             .iter()

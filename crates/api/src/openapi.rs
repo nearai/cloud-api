@@ -316,7 +316,8 @@ use utoipa::{Modify, OpenApi};
             // User models (Admin)
             ListUsersResponse, AdminUserResponse,
             ErasurePreviewResponse, ErasedOrganizationResponse, RetainedOrganizationResponse,
-            ErasureLogResponse, EraseUserRequest, EraseUserResponse,
+            ErasureLogResponse, EraseUserRequest, EraseUserResponse, ErasureBlockedResponse,
+            services::user_erasure::ErasureBlocker,
             // AML models (Admin)
             AdminAmlReportResponse, ListAdminAmlReportsResponse, UpdateAmlReportStatusRequest,
             AdminAmlAllowlistEntryResponse, ListAdminAmlAllowlistResponse,

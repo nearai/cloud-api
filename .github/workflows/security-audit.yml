@@ -36,7 +36,11 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-      - uses: EmbarkStudios/cargo-deny-action@v2
+      # Install the prebuilt cargo-deny binary from GitHub releases instead of
+      # EmbarkStudios/cargo-deny-action, which builds a container from an
+      # unauthenticated Docker Hub pull and fails on Docker Hub's rate limit.
+      - uses: taiki-e/install-action@ab6895351a88b908e96a4697860d4ffea5e57dbe  # v2.87.27
         with:
-          command: check advisories
-          arguments: --all-features
+          tool: cargo-deny@0.20.2
+      - name: Run cargo deny advisories
+        run: cargo deny --all-features check advisories

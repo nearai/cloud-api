@@ -1197,6 +1197,91 @@ async fn admin_org_list_lifecycle_filter_returns_only_matching_rows() {
 }
 
 #[tokio::test]
+async fn deleted_org_with_live_member_is_listed_only_under_deleted() {
+    let (server, database) = setup_test_server_with_database().await;
+    let (owner_session, _owner, _) = new_user(&database).await;
+    let (_member_session, member, _) = new_user(&database).await;
+    // A non-default org owned by `owner` with a live second member.
+    let org = create_org_with_session(&server, &owner_session).await;
+    add_member(&database, &org.id, member, "member").await;
+    let response = server
+        .delete(&format!("/v1/organizations/{}", org.id))
+        .add_header("Authorization", format!("Bearer {owner_session}"))
+        .await;
+    assert_eq!(response.status_code(), 200, "{}", response.text());
+
+    assert!(
+        org_list_contains(&server, Some("deleted"), &org.id).await,
+        "an owner-deleted org must be listed under lifecycle=deleted"
+    );
+    assert!(
+        !org_list_contains(&server, Some("erased"), &org.id).await,
+        "an org with a live member is not erased"
+    );
+    assert!(
+        !org_list_contains(&server, None, &org.id).await,
+        "a deleted org must not be listed under the default filter"
+    );
+}
+
+#[tokio::test]
+async fn pricing_change_delivery_rows_are_not_written_for_inactive_recipients() {
+    let (_server, database) = setup_test_server_with_database().await;
+    let (_s, inactive_user, _email) = new_user(&database).await;
+    let (_s2, active_user, _email2) = new_user(&database).await;
+    let client = database.pool().get().await.unwrap();
+    client
+        .execute(
+            "UPDATE users SET is_active = false WHERE id = $1",
+            &[&inactive_user],
+        )
+        .await
+        .unwrap();
+    let org_of = |user: uuid::Uuid| {
+        let client = &client;
+        async move {
+            client
+                .query_one(
+                    "SELECT organization_id FROM organization_members WHERE user_id = $1",
+                    &[&user],
+                )
+                .await
+                .unwrap()
+                .get::<_, uuid::Uuid>(0)
+        }
+    };
+    let repo = database::repositories::AdminCompositeRepository::new(database.pool().clone());
+    let batch_id = uuid::Uuid::new_v4();
+    for user in [inactive_user, active_user] {
+        let record = services::admin::PricingChangeDeliveryRecord {
+            batch_id,
+            recipient_user_id: user,
+            recipient_email: "x@test.com".to_string(),
+            organization_id: org_of(user).await,
+            organization_name: "erasure-test-org".to_string(),
+            model_names: vec![format!("erasure-test-model-{batch_id}")],
+            status: services::admin::ModelDeprecationEmailStatus::Sent,
+            email_message_id: None,
+            email_last_error: None,
+            initiated_by_user_id: None,
+            initiated_by_user_email: None,
+        };
+        services::admin::AdminRepository::record_pricing_change_delivery(&repo, record)
+            .await
+            .unwrap();
+    }
+
+    let sql =
+        "SELECT COUNT(*) FROM model_pricing_change_email_deliveries WHERE recipient_user_id = $1";
+    assert_eq!(count(&client, sql, &inactive_user).await, 0);
+    assert_eq!(
+        count(&client, sql, &active_user).await,
+        1,
+        "positive control: an active recipient gets a row"
+    );
+}
+
+#[tokio::test]
 async fn erase_rejects_admin_access_token() {
     let (server, database) = setup_test_server_with_database().await;
     let (_session, user_id, email) = new_user(&database).await;

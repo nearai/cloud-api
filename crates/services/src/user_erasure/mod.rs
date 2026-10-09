@@ -11,6 +11,20 @@ use uuid::Uuid;
 
 pub use ports::*;
 
+/// Domain-separation prefix so these digests don't match generic SHA-256(email) lists.
+const ERASED_EMAIL_DIGEST_PREFIX: &str = "nearai-user-erasure-v1:";
+
+/// One-way lookup digest of an erased user's email (trimmed, lowercased). Unkeyed by
+/// design (v0): it hides the email from casual reads of the erasure log but does not
+/// stop someone with the database from confirming a guessed address.
+pub fn erased_email_digest(email: &str) -> [u8; 32] {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(ERASED_EMAIL_DIGEST_PREFIX.as_bytes());
+    hasher.update(email.trim().to_lowercase().as_bytes());
+    hasher.finalize().into()
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum UserErasureError {
     #[error("user not found")]
@@ -65,6 +79,7 @@ impl UserErasureService {
                 user_id,
                 admin_user_id,
                 confirm_email,
+                email_sha256: erased_email_digest(confirm_email),
                 requested_at: requested_at.unwrap_or_else(chrono::Utc::now),
             })
             .await
@@ -120,6 +135,39 @@ mod tests {
     use super::*;
     use async_trait::async_trait;
     use std::sync::Mutex;
+
+    #[test]
+    fn email_digest_is_deterministic() {
+        assert_eq!(
+            erased_email_digest("alice@example.com"),
+            erased_email_digest("alice@example.com")
+        );
+    }
+
+    #[test]
+    fn email_digest_ignores_case_and_surrounding_whitespace() {
+        assert_eq!(
+            erased_email_digest("alice@example.com"),
+            erased_email_digest("  Alice@Example.COM \n")
+        );
+    }
+
+    #[test]
+    fn email_digest_differs_between_emails() {
+        assert_ne!(
+            erased_email_digest("alice@example.com"),
+            erased_email_digest("bob@example.com")
+        );
+    }
+
+    #[test]
+    fn email_digest_matches_known_vector() {
+        // printf 'nearai-user-erasure-v1:alice@example.com' | shasum -a 256
+        assert_eq!(
+            hex::encode(erased_email_digest("alice@example.com")),
+            "8824074f2e471186e93c0a3a804fa8d9259482e007bd24a3e14c4e589043d787"
+        );
+    }
 
     struct FakeRepo {
         outcome: Mutex<ExecuteOutcome>,

@@ -303,8 +303,8 @@ impl UserErasureRepository for PostgresUserErasureRepository {
             // Lock order matches organization.rs (org row, then member row): read U's
             // memberships unlocked to find the candidate erased orgs, lock those org
             // rows, then lock U's member rows. Retained team orgs are never row-locked
-            // here: usage recording takes FOR UPDATE on the org row
-            // (credit_allocation.rs:54). The signup-org rename runs after commit in
+            // here: usage recording (the record_organization_usage SQL function,
+            // V0088) takes FOR UPDATE on the org row. The signup-org rename runs after commit in
             // its own short org-first transaction (rename_retained_signup_orgs).
             let first = load_memberships(&*transaction, user_id).await?;
             let erased = erased_org_ids(&first);
@@ -481,13 +481,17 @@ impl UserErasureRepository for PostgresUserErasureRepository {
             let erased_count = erased.len() as i32;
             transaction
                 .execute(
-                    "INSERT INTO user_erasure_log (user_id, admin_user_id, requested_at, erased_organization_count) \
-                     VALUES ($1, $2, $3, $4)",
+                    "INSERT INTO user_erasure_log (user_id, admin_user_id, requested_at, erased_organization_count, \
+                     email_sha256, erased_organization_ids, retained_organization_ids) \
+                     VALUES ($1, $2, $3, $4, $5, $6, $7)",
                     &[
                         &user_id,
                         &request.admin_user_id,
                         &request.requested_at,
                         &erased_count,
+                        &request.email_sha256.as_slice(),
+                        &erased,
+                        &retained,
                     ],
                 )
                 .await

@@ -62,6 +62,9 @@ pub struct ExecuteRequest<'a> {
     pub user_id: Uuid,
     pub admin_user_id: Uuid,
     pub confirm_email: &'a str,
+    /// `erased_email_digest` of the user's email (execute only proceeds when
+    /// `confirm_email` matches the stored email).
+    pub email_sha256: [u8; 32],
     pub requested_at: DateTime<Utc>,
 }
 

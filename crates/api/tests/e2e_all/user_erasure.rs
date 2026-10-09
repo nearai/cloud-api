@@ -1443,3 +1443,54 @@ async fn erase_deactivated_user() {
     assert_eq!(body["lifecycle"], "erased");
     assert_eq!(body["already_erased"], false);
 }
+
+#[tokio::test]
+async fn erasure_log_records_email_digest_and_org_ids() {
+    let (server, database) = setup_test_server_with_database().await;
+    let (session, user_id, email) = new_user(&database).await;
+    let (other_session, _other, _) = new_user(&database).await;
+    let personal: uuid::Uuid = personal_org_id(&server, &session).await.parse().unwrap();
+    let team = create_org_with_session(&server, &other_session).await;
+    add_member(&database, &team.id, user_id, "member").await;
+    let team: uuid::Uuid = team.id.parse().unwrap();
+
+    let mixed_case = format!("  {}  ", email.to_uppercase());
+    assert_eq!(
+        erase(&server, user_id, &mixed_case).await.status_code(),
+        200
+    );
+
+    let client = database.pool().get().await.unwrap();
+    let row = client
+        .query_one(
+            "SELECT email_sha256, erased_organization_ids, retained_organization_ids, \
+             erased_organization_count FROM user_erasure_log WHERE user_id = $1",
+            &[&user_id],
+        )
+        .await
+        .unwrap();
+    let digest: Vec<u8> = row.get("email_sha256");
+    assert_eq!(
+        digest,
+        services::user_erasure::erased_email_digest(&email.to_uppercase()).to_vec()
+    );
+    assert_eq!(
+        row.get::<_, Vec<uuid::Uuid>>("erased_organization_ids"),
+        vec![personal]
+    );
+    assert_eq!(
+        row.get::<_, Vec<uuid::Uuid>>("retained_organization_ids"),
+        vec![team]
+    );
+    assert_eq!(row.get::<_, i32>("erased_organization_count"), 1);
+
+    let leaked: i64 = client
+        .query_one(
+            "SELECT COUNT(*) FROM user_erasure_log l WHERE l.user_id = $1 AND position($2 in lower(l::text)) > 0",
+            &[&user_id, &email.to_lowercase()],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(leaked, 0, "the erasure log must not contain the raw email");
+}

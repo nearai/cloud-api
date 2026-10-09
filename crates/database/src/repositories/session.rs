@@ -91,7 +91,7 @@ impl SessionRepository {
                 ip_address, user_agent
             )
             SELECT $1, $2, $3, $4, $5, $6, $7
-            WHERE EXISTS (SELECT 1 FROM users WHERE id = $2 AND is_active = true)
+            WHERE EXISTS (SELECT 1 FROM users WHERE id = $2 AND is_active = true FOR SHARE)
             RETURNING *
             "#,
                     &[

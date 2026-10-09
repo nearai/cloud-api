@@ -289,7 +289,9 @@ jobs:
           gh auth setup-git
           git push --force origin "$BOT_BRANCH"
           if [ -n "$existing" ]; then
-            gh pr edit "$existing" --body-file "$RUNNER_TEMP/out/report.md"
+            # REST, not `gh pr edit`: see the sync job's matching step.
+            gh api --method PATCH "repos/${GITHUB_REPOSITORY}/pulls/${existing}" \
+              -F body=@"$RUNNER_TEMP/out/report.md" --silent
           else
             gh pr create --base main --head "$BOT_BRANCH" \
               --title "chore(tinfoil): pin live-observed measurement rows" \

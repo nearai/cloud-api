@@ -529,12 +529,14 @@ impl OrganizationUsageRepository {
             .collect()
     }
 
-    /// Aggregate usage by model for an organization since `start_date` (exact, via `usage_rows`).
+    /// Aggregate usage by model for an organization over `[start_date, end_date)`; an absent
+    /// `end_date` leaves the window open-ended (exact, via `usage_rows`).
     /// Runs under the reporting statement timeout, including the raw edge and recent rows.
     pub async fn get_usage_by_model_since(
         &self,
         organization_id: Uuid,
         start_date: chrono::DateTime<Utc>,
+        end_date: Option<chrono::DateTime<Utc>>,
     ) -> Result<Vec<UsageByModel>> {
         let deadline = crate::repositories::reporting_query::reporting_deadline(
             self.reporting_statement_timeout,
@@ -564,7 +566,7 @@ impl OrganizationUsageRepository {
                 .query(
                     &with_usage_rows(
                         "$2",
-                        "'infinity'::timestamptz",
+                        "COALESCE($3::timestamptz, 'infinity'::timestamptz)",
                         r#"
                     SELECT
                         model_name,
@@ -579,7 +581,7 @@ impl OrganizationUsageRepository {
                     ORDER BY total_cost DESC
                     "#,
                     ),
-                    &[&organization_id, &start_date],
+                    &[&organization_id, &start_date, &end_date],
                 )
                 .await
                 .map_err(map_db_error)?;

@@ -426,6 +426,7 @@ mod tests {
             &self,
             _organization_id: Uuid,
             _start_date: chrono::DateTime<chrono::Utc>,
+            _end_date: Option<chrono::DateTime<chrono::Utc>>,
         ) -> Result<Vec<UsageByModelEntry>, UsageError> {
             unimplemented!()
         }

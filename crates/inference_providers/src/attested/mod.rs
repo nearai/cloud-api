@@ -4,3 +4,4 @@
 
 pub mod chutes;
 pub mod nearai;
+pub mod tinfoil;

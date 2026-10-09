@@ -629,6 +629,11 @@ impl UserErasureRepository for PostgresUserErasureRepository {
                 .map(|r| r.get("id"))
                 .collect();
             delete_workspace_content(&*transaction, &workspaces).await?;
+            // A login racing the erase can leave a refresh token behind; drop survivors.
+            transaction
+                .execute("DELETE FROM refresh_tokens WHERE user_id = $1", &[&user_id])
+                .await
+                .map_err(map_db_error)?;
             transaction.commit().await.map_err(map_db_error)?;
             Ok(ErasedFootprint {
                 organization_ids: orgs,

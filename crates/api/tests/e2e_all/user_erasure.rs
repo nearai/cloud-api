@@ -957,6 +957,51 @@ async fn retry_sweeps_content_written_after_erasure() {
 }
 
 #[tokio::test]
+async fn retry_sweep_deletes_late_refresh_token() {
+    let (server, database) = setup_test_server_with_database().await;
+    let (_session, user_id, email) = new_user(&database).await;
+    assert_eq!(erase(&server, user_id, &email).await.status_code(), 200);
+
+    // A login that raced the erase leaves a live refresh token behind.
+    let client = database.pool().get().await.unwrap();
+    client
+        .execute(
+            "INSERT INTO refresh_tokens (id, user_id, token_hash, created_at, expires_at, ip_address, user_agent) \
+             VALUES ($1, $2, $3, NOW(), NOW() + INTERVAL '1 day', NULL, 'late-login')",
+            &[
+                &uuid::Uuid::new_v4(),
+                &user_id,
+                &format!("late-{}", uuid::Uuid::new_v4()),
+            ],
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        count(
+            &client,
+            "SELECT COUNT(*) FROM refresh_tokens WHERE user_id = $1",
+            &user_id
+        )
+        .await,
+        1
+    );
+
+    let again = erase(&server, user_id, "x")
+        .await
+        .json::<serde_json::Value>();
+    assert_eq!(again["already_erased"], true);
+    assert_eq!(
+        count(
+            &client,
+            "SELECT COUNT(*) FROM refresh_tokens WHERE user_id = $1",
+            &user_id
+        )
+        .await,
+        0
+    );
+}
+
+#[tokio::test]
 async fn erase_scrubs_denormalized_emails_tokens_votes_and_invitations() {
     let (server, database) = setup_test_server_with_database().await;
     let (session, user_id, email) = new_user(&database).await;

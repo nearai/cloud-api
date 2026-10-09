@@ -6,6 +6,7 @@ pub mod mock;
 pub mod models;
 pub mod patroni_discovery;
 pub mod pool;
+mod refresh_rotation_index;
 pub mod repositories;
 pub mod shutdown_coordinator;
 mod usage_reporting_indexes;
@@ -13,6 +14,7 @@ mod usage_reporting_indexes;
 pub use constants::*;
 pub use models::*;
 pub use pool::DbPool;
+pub use refresh_rotation_index::ensure_refresh_rotation_index;
 pub use repositories::{
     ApiKeyRepository, McpConnectorRepository, OAuthStateRepository,
     OrganizationReportingTokenRepository, PgAttestationRepository, PgConversationRepository,

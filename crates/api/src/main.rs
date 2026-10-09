@@ -45,6 +45,9 @@ async fn main() {
         tracing::info!("Migrations completed; exiting without serving traffic");
         return;
     }
+    database::ensure_refresh_rotation_index(database.pool())
+        .await
+        .expect("Refresh rotation index prerequisite is not satisfied");
     if config.usage_reporting.enabled {
         database::ensure_usage_reporting_indexes(database.pool())
             .await

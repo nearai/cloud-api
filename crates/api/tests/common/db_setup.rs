@@ -307,6 +307,23 @@ async fn bootstrap_shared_db_once() -> Result<()> {
         .run_migrations()
         .await
         .context("run migrations on the shared e2e database")?;
+    // CI creates a fresh database. Production builds this index out of band
+    // before starting the new API; do the equivalent here before tests start.
+    database
+        .pool()
+        .get()
+        .await
+        .context("get e2e database connection for refresh index")?
+        .batch_execute(
+            "CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_refresh_tokens_previous_hash \
+             ON refresh_tokens(previous_token_hash) \
+             WHERE previous_token_hash IS NOT NULL",
+        )
+        .await
+        .context("build refresh rotation index in the shared e2e database")?;
+    database::ensure_refresh_rotation_index(database.pool())
+        .await
+        .context("verify refresh rotation index in the shared e2e database")?;
     seed_shared_test_fixtures(&database).await?;
 
     debug!(database = %db_name, "Shared e2e database is ready");

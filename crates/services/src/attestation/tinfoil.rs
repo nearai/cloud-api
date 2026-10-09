@@ -209,15 +209,25 @@ mod tests {
     #[test]
     fn compiled_pins_parse() {
         let p = vetted_tinfoil_pins().unwrap();
-        assert!(p
-            .router
-            .iter()
-            .all(|r| !r.measurement.is_empty() && !r.repo.is_empty() && !r.tag.is_empty()));
-        assert!(p
-            .models
-            .values()
-            .flatten()
-            .all(|m| !m.registers.is_empty() && !m.repo.is_empty() && !m.tag.is_empty()));
+        // SEV-SNP measurements and model registers are 48-byte digests (96 hex).
+        let hex96 = |s: &str| s.len() == 96 && s.chars().all(|c| c.is_ascii_hexdigit());
+        for r in &p.router {
+            assert!(
+                hex96(&r.measurement) && !r.repo.is_empty() && !r.tag.is_empty(),
+                "bad router pin: {r:?}"
+            );
+        }
+        for (slug, pins) in &p.models {
+            for m in pins {
+                assert!(
+                    !m.registers.is_empty()
+                        && m.registers.iter().all(|reg| hex96(reg))
+                        && !m.repo.is_empty()
+                        && !m.tag.is_empty(),
+                    "bad model pin for {slug}: {m:?}"
+                );
+            }
+        }
     }
 
     #[test]

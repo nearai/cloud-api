@@ -601,6 +601,14 @@ impl Provider {
 /// intentional unmodeled passthrough).
 const CHUTES_EXTRA_TOP_FIELDS: &[&str] = &["chutes_verification", "hidden_states"];
 
+/// Compatibility note (shared `openai_wire` module, #1213): Chutes output is
+/// byte-for-byte unchanged for standard OpenAI shapes (pinned by
+/// `standard_nested_*` tests below). The one intentional change is that unknown
+/// keys nested inside retained containers (tool calls, `function`, logprobs
+/// entries, annotations, usage details) are now stripped too; the pre-refactor
+/// Chutes sanitizer only filtered the top level, each choice and the
+/// message/delta object.
+///
 /// `reasoning` and `reasoning_content` are BOTH kept on a message (some models
 /// emit one, some the other, some both; we never drop a legit reasoning field).
 const CHUTES_EXTRA_MESSAGE_FIELDS: &[&str] = &["reasoning"];
@@ -2118,6 +2126,102 @@ mod tests {
         assert_eq!(keys(c), sorted(CHOICE));
         assert_eq!(keys(c["delta"].as_object().unwrap()), sorted(MESSAGE));
         assert_eq!(keys(c["message"].as_object().unwrap()), sorted(MESSAGE));
+    }
+
+    // ---- Nested-sanitization compatibility (#1213 review) ------------------
+    //
+    // Chutes output is unchanged for standard OpenAI shapes; unknown keys nested
+    // inside retained containers are now stripped (INTENTIONAL, since the shared
+    // `openai_wire` module was introduced). The pre-refactor sanitizer filtered
+    // only the top level, each choice and the message/delta object, so for a
+    // standard-only payload its output was the input re-serialized (serde_json
+    // sorts keys, so the literals below are written in sorted key order and the
+    // expected bytes are the input bytes).
+
+    /// Standard non-stream body with every nested container populated.
+    const STD_NESTED_BODY: &str = r#"{"choices":[{"finish_reason":"tool_calls","index":0,"logprobs":{"content":[{"bytes":[104,105],"logprob":-0.5,"token":"hi","top_logprobs":[{"bytes":[104,105],"logprob":-0.5,"token":"hi"}]}],"refusal":null},"message":{"annotations":[{"type":"url_citation","url_citation":{"end_index":5,"start_index":0,"title":"T","url":"https://example.com"}}],"content":"hi","role":"assistant","tool_calls":[{"function":{"arguments":"{\"a\":1}","name":"f"},"id":"call_1","index":0,"type":"function"}]}}],"created":0,"id":"c","model":"m","object":"chat.completion","usage":{"completion_tokens":2,"completion_tokens_details":{"reasoning_tokens":1},"prompt_tokens":3,"prompt_tokens_details":{"cached_tokens":1},"total_tokens":5}}"#;
+
+    /// Same shape as a stream chunk (`delta`).
+    const STD_NESTED_CHUNK: &str = r#"{"choices":[{"delta":{"annotations":[{"type":"url_citation","url_citation":{"end_index":5,"start_index":0,"title":"T","url":"https://example.com"}}],"content":"hi","role":"assistant","tool_calls":[{"function":{"arguments":"{\"a\":1}","name":"f"},"id":"call_1","index":0,"type":"function"}]},"finish_reason":"tool_calls","index":0,"logprobs":{"content":[{"bytes":[104,105],"logprob":-0.5,"token":"hi","top_logprobs":[{"bytes":[104,105],"logprob":-0.5,"token":"hi"}]}],"refusal":null}}],"created":0,"id":"c","model":"m","object":"chat.completion.chunk"}"#;
+
+    /// Final usage-only stream chunk (what a client that asked for usage receives).
+    const STD_USAGE_CHUNK: &str = r#"{"choices":[],"created":0,"id":"c","model":"m","object":"chat.completion.chunk","usage":{"completion_tokens":2,"completion_tokens_details":{"reasoning_tokens":1},"prompt_tokens":3,"prompt_tokens_details":{"cached_tokens":1},"total_tokens":5}}"#;
+
+    /// The standard payload with an unknown key injected into every nested
+    /// container (tool call, function, logprob entry, top_logprob, annotation,
+    /// url_citation, both usage detail objects).
+    fn with_nested_unknowns(std: &str) -> String {
+        let mut v: Value = serde_json::from_str(std).unwrap();
+        fn inject(v: &mut Value) {
+            v.as_object_mut()
+                .unwrap()
+                .insert("x_internal".into(), json!("leak"));
+        }
+        let msg_key = if v["choices"][0].get("delta").is_some() {
+            "delta"
+        } else {
+            "message"
+        };
+        if v["choices"][0].is_object() {
+            let m = &mut v["choices"][0][msg_key];
+            inject(&mut m["tool_calls"][0]);
+            inject(&mut m["tool_calls"][0]["function"]);
+            inject(&mut m["annotations"][0]);
+            inject(&mut m["annotations"][0]["url_citation"]);
+        }
+        if v["choices"][0].is_object() {
+            let l = &mut v["choices"][0]["logprobs"];
+            inject(l);
+            inject(&mut l["content"][0]);
+            inject(&mut l["content"][0]["top_logprobs"][0]);
+        }
+        if v.get("usage").is_some() {
+            inject(&mut v["usage"]);
+            inject(&mut v["usage"]["prompt_tokens_details"]);
+            inject(&mut v["usage"]["completion_tokens_details"]);
+        }
+        serde_json::to_string(&v).unwrap()
+    }
+
+    fn sse_through_chutes(payload: &str) -> String {
+        let ev = SSEEvent {
+            raw_bytes: bytes::Bytes::from(format!("data: {payload}\n\n")),
+            chunk: Some(crate::StreamChunk::Chat(
+                serde_json::from_str(payload).expect("parse chunk"),
+            )),
+            raw_passthrough: true,
+        };
+        let out = rewrite_sse_event_model(ev, None, true);
+        String::from_utf8(out.raw_bytes.to_vec()).unwrap()
+    }
+
+    #[test]
+    fn standard_nested_non_stream_body_is_byte_identical() {
+        let out = transform_response_json(STD_NESTED_BODY.as_bytes(), None).expect("transform");
+        assert_eq!(String::from_utf8(out).unwrap(), STD_NESTED_BODY);
+    }
+
+    #[test]
+    fn standard_nested_sse_event_is_byte_identical() {
+        for std in [STD_NESTED_CHUNK, STD_USAGE_CHUNK] {
+            assert_eq!(sse_through_chutes(std), format!("data: {std}\n\n"));
+        }
+    }
+
+    #[test]
+    fn unknown_keys_nested_in_retained_containers_are_stripped_intentionally() {
+        // INTENTIONAL compatibility change from the shared `openai_wire` module:
+        // the pre-refactor Chutes sanitizer left these nested keys in place.
+        let dirty = with_nested_unknowns(STD_NESTED_BODY);
+        assert!(dirty.contains("x_internal"));
+        let out = transform_response_json(dirty.as_bytes(), None).expect("transform");
+        assert_eq!(String::from_utf8(out).unwrap(), STD_NESTED_BODY);
+
+        for std in [STD_NESTED_CHUNK, STD_USAGE_CHUNK] {
+            let dirty = with_nested_unknowns(std);
+            assert!(dirty.contains("x_internal"));
+            assert_eq!(sse_through_chutes(&dirty), format!("data: {std}\n\n"));
+        }
     }
 
     #[test]

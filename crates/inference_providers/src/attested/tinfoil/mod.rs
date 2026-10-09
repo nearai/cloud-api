@@ -169,7 +169,7 @@ impl Provider {
         &self,
         mut params: ChatCompletionParams,
         stream: bool,
-    ) -> Result<reqwest::Response, CompletionError> {
+    ) -> Result<(reqwest::Response, tokio::time::Instant), CompletionError> {
         Self::reject_client_e2ee(&params)?;
         let (transport, generation) = self.ensure_available()?;
         crate::strip_cache_control(&mut params.messages);
@@ -177,13 +177,16 @@ impl Provider {
         let body =
             request_body(&self.slug, &params, stream).map_err(CompletionError::CompletionError)?;
 
+        // One deadline for the whole request: headers, and (via the returned
+        // deadline) the body read. A stalled peer cannot stack timeouts.
+        let deadline = tokio::time::Instant::now() + self.timeout;
         let send = transport
             .client
             .post(format!("{}{CHAT_PATH}", transport.base))
             .bearer_auth(&self.api_key)
             .json(&body)
             .send();
-        let resp = match tokio::time::timeout(self.timeout, send).await {
+        let resp = match tokio::time::timeout_at(deadline, send).await {
             Err(_) => {
                 tracing::warn!("Tinfoil request timed out");
                 return Err(unavailable("timeout"));
@@ -204,14 +207,14 @@ impl Provider {
         };
         let status = resp.status();
         if !status.is_success() {
-            // The body read shares the request timeout: a peer that sends headers
-            // and then stalls must not hold the request open.
-            let text = tokio::time::timeout(self.timeout, read_capped_text(resp))
+            // The error body gets only the time left on the request deadline: a
+            // peer that sends headers and then stalls must not extend it.
+            let text = tokio::time::timeout_at(deadline, read_capped_text(resp))
                 .await
                 .unwrap_or_default();
             return Err(self.status_error(status.as_u16(), &text));
         }
-        Ok(resp)
+        Ok((resp, deadline))
     }
 }
 
@@ -226,15 +229,15 @@ async fn read_capped_text(resp: reqwest::Response) -> String {
 /// make us buffer without limit; larger bodies fall through as retryable 503.
 pub(super) const MAX_RESPONSE_BYTES: usize = 32 * 1024 * 1024;
 
-/// Read a successful response body under `cap` and the request `timeout`.
+/// Read a successful response body under `cap` and the request `deadline`.
 /// Exceeding the cap or a body-stream error is the same retryable 503 the
 /// status mapping uses for upstream failures.
 async fn read_success_body(
     resp: reqwest::Response,
     cap: usize,
-    timeout: std::time::Duration,
+    deadline: tokio::time::Instant,
 ) -> Result<Vec<u8>, CompletionError> {
-    let (buf, outcome) = tokio::time::timeout(timeout, session::read_capped(resp, cap))
+    let (buf, outcome) = tokio::time::timeout_at(deadline, session::read_capped(resp, cap))
         .await
         .map_err(|_| unavailable("timeout"))?;
     match outcome {
@@ -267,8 +270,8 @@ impl InferenceProvider for Provider {
         params: ChatCompletionParams,
         _request_hash: String,
     ) -> Result<ChatCompletionResponseWithBytes, CompletionError> {
-        let resp = self.post_chat(params, false).await?;
-        let bytes = read_success_body(resp, MAX_RESPONSE_BYTES, self.timeout).await?;
+        let (resp, deadline) = self.post_chat(params, false).await?;
+        let bytes = read_success_body(resp, MAX_RESPONSE_BYTES, deadline).await?;
         let (raw_bytes, response) = wire::map_response(&bytes, &self.canonical_id)?;
         Ok(ChatCompletionResponseWithBytes {
             response,
@@ -287,7 +290,9 @@ impl InferenceProvider for Provider {
         let client_wants_usage = params.stream_options.as_ref().is_some_and(|so| {
             so.include_usage == Some(true) || so.continuous_usage_stats == Some(true)
         });
-        let resp = self.post_chat(params, true).await?;
+        // The deadline bounds only send/headers (and a non-2xx body); the
+        // streaming body itself is unbounded here, as before.
+        let (resp, _) = self.post_chat(params, true).await?;
         let sse = crate::sse_parser::new_external_sse_parser(resp.bytes_stream(), true);
         Ok(wire::map_stream(
             Box::pin(sse),

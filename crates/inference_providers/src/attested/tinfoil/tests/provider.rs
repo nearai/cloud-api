@@ -109,6 +109,45 @@ async fn stalled_error_body_is_bounded_by_the_request_timeout() {
     assert!(started.elapsed() < std::time::Duration::from_secs(4));
 }
 
+/// Headers arrive after 1.8s of a 2s timeout, then the body stalls: the whole
+/// request must fail at about 2s (one deadline), not ~3.8s (a fresh timeout for
+/// the body). The upper bound leaves headroom for slow CI runners. Real time, like the sibling timeout tests (real TLS sockets).
+async fn assert_single_deadline(e: &Env, status: u16) {
+    *e.server.chat.lock().unwrap() = ChatReply {
+        status,
+        content_type: "application/json",
+        body: vec![b'x'; 100],
+    };
+    e.server.chat_delay_ms.store(1800, Ordering::SeqCst);
+    e.server.chat_stall_body.store(true, Ordering::SeqCst);
+    let p = provider_with_timeout(e, 2);
+    let started = std::time::Instant::now();
+    let msg = expect_http(
+        p.chat_completion(params(false, None), "h".into()).await,
+        503,
+    );
+    let took = started.elapsed();
+    assert!(
+        took >= std::time::Duration::from_millis(1900)
+            && took < std::time::Duration::from_millis(3200),
+        "request took {took:?}, expected ~2s (single deadline): {msg}"
+    );
+}
+
+#[tokio::test]
+async fn error_response_with_stalled_body_shares_one_deadline() {
+    let e = env().await;
+    e.session.verify_now().await.unwrap();
+    assert_single_deadline(&e, 500).await;
+}
+
+#[tokio::test]
+async fn success_response_with_stalled_body_shares_one_deadline() {
+    let e = env().await;
+    e.session.verify_now().await.unwrap();
+    assert_single_deadline(&e, 200).await;
+}
+
 #[tokio::test]
 async fn oversized_error_body_is_truncated() {
     let e = env().await;
@@ -170,14 +209,14 @@ async fn successful_body_is_read_under_a_cap() {
         content_type: "application/json",
         body: body.clone(),
     };
-    let timeout = std::time::Duration::from_secs(5);
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
     // At the cap: passes. One byte over: the retryable 503.
-    let ok = super::super::read_success_body(post().await, body.len(), timeout)
+    let ok = super::super::read_success_body(post().await, body.len(), deadline)
         .await
         .unwrap();
     assert_eq!(ok, body);
     let msg = expect_http(
-        super::super::read_success_body(post().await, body.len() - 1, timeout).await,
+        super::super::read_success_body(post().await, body.len() - 1, deadline).await,
         503,
     );
     assert!(msg.contains("response_too_large"), "{msg}");

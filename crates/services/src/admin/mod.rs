@@ -773,6 +773,21 @@ impl AdminService for AdminServiceImpl {
                         ),
                     ),
                 }
+            } else if !self
+                .repository
+                .is_user_active(recipient.user_id)
+                .await
+                .map_err(|e| AdminError::InternalError(e.to_string()))?
+            {
+                // Checked only when a real send is next, and cached under the email
+                // key so the same user's other org rows hit the dedup branch above.
+                let outcome = (
+                    ModelDeprecationEmailStatus::Skipped,
+                    None,
+                    Some("Recipient account is no longer active".to_string()),
+                );
+                email_results.insert(email_key.clone(), outcome.clone());
+                outcome
             } else {
                 let email = ModelDeprecationEmail {
                     recipient_email: recipient.email.clone(),
@@ -1006,6 +1021,17 @@ impl AdminService for AdminServiceImpl {
                     None,
                     Some("Already sent for this batch".to_string()),
                 )
+            } else if !self
+                .repository
+                .is_user_active(aggregate.rows[0].user_id)
+                .await
+                .map_err(|e| AdminError::InternalError(e.to_string()))?
+            {
+                (
+                    ModelDeprecationEmailStatus::Skipped,
+                    None,
+                    Some("Recipient account is no longer active".to_string()),
+                )
             } else {
                 let email = PricingChangeEmail {
                     recipient_email: aggregate.rows[0].email.clone(),
@@ -1173,11 +1199,13 @@ impl AdminService for AdminServiceImpl {
         &self,
         limit: i64,
         offset: i64,
+        lifecycle: OrganizationLifecycleFilter,
     ) -> Result<(Vec<AdminOrganizationInfo>, i64), AdminError> {
         // Execute both queries in parallel for better performance
         let (organizations_result, total_result) = tokio::join!(
-            self.repository.list_all_organizations(limit, offset),
-            self.repository.count_all_organizations()
+            self.repository
+                .list_all_organizations(limit, offset, lifecycle),
+            self.repository.count_all_organizations(lifecycle)
         );
 
         let organizations =

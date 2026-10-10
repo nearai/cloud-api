@@ -12,6 +12,7 @@ pub mod files;
 pub mod github_dispatch;
 pub mod id_prefixes;
 pub mod inference_provider_pool;
+pub mod lifecycle;
 pub mod mcp;
 pub mod metrics;
 pub mod models;
@@ -23,6 +24,7 @@ pub mod service_usage;
 pub mod staking_farm;
 pub mod usage;
 pub mod user;
+pub mod user_erasure;
 pub mod web_search;
 pub mod workspace;
 

@@ -67,4 +67,3 @@ BEGIN
     RETURN personal_org;
 END;
 $$;
-

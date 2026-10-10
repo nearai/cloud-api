@@ -198,7 +198,8 @@ jobs:
           --health-retries 5
           --shm-size=256mb
         ports:
-          - 5432:5432
+          # E2E clients run on the host; keep the temporary test database local.
+          - 127.0.0.1:5432:5432
 
     steps:
     - uses: actions/checkout@v7
@@ -208,8 +209,8 @@ jobs:
       with:
         cache-key: e2e
 
-    - name: Run typed-query, credit-allocation, and session regressions
-      run: cargo test --locked -p database --test hot_path_typed_queries --test billing_typed_queries --test credit_allocation --test session_rotation -- --test-threads=4
+    - name: Run typed-query, credit-allocation, session, and binding regressions
+      run: cargo test --locked -p database --test hot_path_typed_queries --test billing_typed_queries --test credit_allocation --test session_rotation --test staking_wallet_binding -- --test-threads=4
       env:
         PGHOST: localhost
         PGPORT: 5432

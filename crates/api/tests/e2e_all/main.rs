@@ -99,6 +99,7 @@ mod score;
 mod serving_provider;
 mod session_logout;
 mod signature_verification;
+mod staking_wallet_binding;
 mod systemone;
 mod tinfoil_provider;
 mod usage_chat_completions;

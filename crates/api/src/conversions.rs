@@ -265,6 +265,7 @@ pub fn current_unix_timestamp() -> i64 {
 /// Convert services User to API UserResponse (without organizations and workspaces)
 pub fn services_user_to_api_user(user: &services::auth::User) -> crate::models::UserResponse {
     crate::models::UserResponse {
+        staking_organization_id: None,
         id: user.id.0.to_string(),
         email: user.email.clone(),
         username: user.username.clone(),
@@ -287,6 +288,7 @@ pub fn services_user_to_api_user_with_relations(
     workspaces: Vec<crate::models::UserWorkspaceResponse>,
 ) -> crate::models::UserResponse {
     crate::models::UserResponse {
+        staking_organization_id: None,
         id: user.id.0.to_string(),
         email: user.email.clone(),
         username: user.username.clone(),

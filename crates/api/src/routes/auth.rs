@@ -127,7 +127,7 @@ pub struct NearAuthRequest {
 }
 
 /// Signed message from wallet (NEP-413 SignedMessage)
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, utoipa::ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct NearSignedMessageJson {
     /// NEAR account ID (e.g., "alice.near")

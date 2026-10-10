@@ -161,38 +161,61 @@ async fn delete_workspace_content<C: GenericClient + Sync>(
     Ok(())
 }
 
-/// Orgs whose name still carries the erased user's identity, over `o` (organizations),
-/// with `$1` = user id and `$2` = normalised email local part (NULL to skip rule B).
-/// `org-<uuid>` is excluded explicitly because a short local part (for example `org`
-/// or a hex run) can occur inside a uuid.
-///   A. the exact auto-generated signup name (`<local>-org-xxxx`), active or deleted,
-///      with a default workspace the user created embedding that name. Identified
-///      structurally, since the user's email may have changed since signup.
-///   B. a deleted org the user was retained in whose name contains the local part.
-///      Position, not LIKE: a local part may contain `_`, `%` or `.`.
-const RENAME_PREDICATE_SQL: &str = r#"
+/// Rule A, over `o` (organizations) with `$1` = user id: the exact auto-generated
+/// signup name (`<local>-org-xxxx`) with a default workspace the user created that
+/// embeds that name. Identified structurally, since the user's email may have changed
+/// since signup. `org-<uuid>` (already renamed) is excluded explicitly because a short
+/// local part (for example `org` or a hex run) can occur inside a uuid.
+const SIGNUP_ORG_NAME_SQL: &str = r#"
     o.name <> 'org-' || o.id::text
-    AND (
-        (
-            o.name ~ '^.+-org-[a-z0-9]{4}$'
-            AND EXISTS (
-                SELECT 1 FROM workspaces sw
-                WHERE sw.organization_id = o.id
-                  AND sw.created_by_user_id = $1
-                  AND sw.description = 'Default workspace for ' || o.name
-            )
-        )
-        OR (
-            NOT o.is_active
-            AND $2::text IS NOT NULL
-            AND char_length($2::text) >= 3
-            AND EXISTS (
-                SELECT 1 FROM user_erasure_log l
-                WHERE l.user_id = $1 AND o.id = ANY(l.retained_organization_ids)
-            )
-            AND position(lower($2::text) in lower(o.name)) > 0
-        )
+    AND o.name ~ '^.+-org-[a-z0-9]{4}$'
+    AND EXISTS (
+        SELECT 1 FROM workspaces sw
+        WHERE sw.organization_id = o.id
+          AND sw.created_by_user_id = $1
+          AND sw.description = 'Default workspace for ' || o.name
     )
+"#;
+
+/// Rule B, over `o` with `$2` = normalised email local part (NULL skips the rule): the
+/// name contains the local part. Position, not LIKE: a local part may contain `_`, `%`
+/// or `.`.
+const NAME_CONTAINS_LOCAL_SQL: &str = r#"
+    o.name <> 'org-' || o.id::text
+    AND $2::text IS NOT NULL
+    AND char_length($2::text) >= 3
+    AND position(lower($2::text) in lower(o.name)) > 0
+"#;
+
+/// Shortest email local part rule B will use; shorter ones would match too much.
+const MIN_LOCAL_PART_CHARS: usize = 3;
+
+/// The part of `email` before the last `@`, trimmed and lowercased, when it is long
+/// enough to match on. Personal data: never log it.
+fn rename_local_part(email: &str) -> Option<String> {
+    let (local, _) = email.trim().rsplit_once('@')?;
+    let local = local.trim().to_lowercase();
+    (local.chars().count() >= MIN_LOCAL_PART_CHARS).then_some(local)
+}
+
+/// Applies a rename to the `renamed(id, old_name)` CTE that precedes it: org name to
+/// `org-<uuid>`, plus the default-workspace description and the denormalised
+/// `organization_name` in both email delivery tables where they equal the old name.
+const RENAME_UPDATES_SQL: &str = r#"
+    , ws AS (
+        UPDATE workspaces w
+        SET description = 'Default workspace for org-' || r.id::text, updated_at = NOW()
+        FROM renamed r
+        WHERE w.organization_id = r.id AND w.description = 'Default workspace for ' || r.old_name
+    ), dep AS (
+        UPDATE model_deprecation_email_deliveries d SET organization_name = 'org-' || r.id::text
+        FROM renamed r WHERE d.organization_id = r.id AND d.organization_name = r.old_name
+    ), pri AS (
+        UPDATE model_pricing_change_email_deliveries d SET organization_name = 'org-' || r.id::text
+        FROM renamed r WHERE d.organization_id = r.id AND d.organization_name = r.old_name
+    )
+    UPDATE organizations o SET name = 'org-' || r.id::text, updated_at = NOW()
+    FROM renamed r WHERE o.id = r.id
 "#;
 
 #[async_trait]
@@ -341,8 +364,9 @@ impl UserErasureRepository for PostgresUserErasureRepository {
             // memberships unlocked to find the candidate erased orgs, lock those org
             // rows, then lock U's member rows. Retained team orgs are never row-locked
             // here: usage recording (the record_organization_usage SQL function,
-            // V0088) takes FOR UPDATE on the org row. The signup-org rename runs after commit in
-            // its own short org-first transaction (rename_retained_org_names).
+            // V0088) takes FOR UPDATE on the org row. The rename of retained ACTIVE signup orgs
+            // runs after commit in its own short org-first transaction
+            // (rename_retained_org_names).
             let first = load_memberships(&*transaction, user_id).await?;
             let erased = erased_org_ids(&first);
             transaction
@@ -407,6 +431,53 @@ impl UserErasureRepository for PostgresUserErasureRepository {
                 )
                 .await
                 .map_err(map_db_error)?;
+            // Deleted retained orgs that still carry U's identity in their name. This
+            // runs inside the erase transaction so it is all-or-nothing with the erasure
+            // and needs no retry repair. Locking the org rows after U's member rows
+            // (the inverse of organization.rs) cannot form a cycle here: these orgs are
+            // inactive, so they serve no new requests; the API refuses member and role
+            // writes on inactive orgs; and record_organization_usage only takes the org
+            // row lock, never member rows. Active orgs are renamed after commit instead.
+            // The local part comes from the stored email, not the request.
+            let email_local = rename_local_part(&user_email);
+            let deleted_candidates: Vec<Uuid> = transaction
+                .query(
+                    &format!(
+                        "SELECT o.id FROM organizations o \
+                         WHERE o.id = ANY($3) AND NOT o.is_active \
+                           AND (({SIGNUP_ORG_NAME_SQL}) OR ({NAME_CONTAINS_LOCAL_SQL})) \
+                         ORDER BY o.id"
+                    ),
+                    &[&user_id, &email_local, &retained],
+                )
+                .await
+                .map_err(map_db_error)?
+                .iter()
+                .map(|r| r.get("id"))
+                .collect();
+            if !deleted_candidates.is_empty() {
+                transaction
+                    .query(
+                        "SELECT id FROM organizations WHERE id = ANY($1) ORDER BY id FOR UPDATE",
+                        &[&deleted_candidates],
+                    )
+                    .await
+                    .map_err(map_db_error)?;
+                // Re-check the predicate now that the rows are locked.
+                transaction
+                    .execute(
+                        &format!(
+                            "WITH renamed AS (\
+                                 SELECT o.id, o.name AS old_name FROM organizations o \
+                                 WHERE o.id = ANY($3) AND NOT o.is_active \
+                                   AND (({SIGNUP_ORG_NAME_SQL}) OR ({NAME_CONTAINS_LOCAL_SQL}))\
+                             ){RENAME_UPDATES_SQL}"
+                        ),
+                        &[&user_id, &email_local, &deleted_candidates],
+                    )
+                    .await
+                    .map_err(map_db_error)?;
+            }
             for sql in [
                 "DELETE FROM feature_request_votes WHERE user_id = $1",
                 "DELETE FROM mcp_connector_usage WHERE user_id = $1",
@@ -534,21 +605,12 @@ impl UserErasureRepository for PostgresUserErasureRepository {
         Ok(outcome)
     }
 
-    async fn rename_retained_org_names(
-        &self,
-        user_id: Uuid,
-        email_local: Option<&str>,
-    ) -> Result<()> {
+    async fn rename_retained_org_names(&self, user_id: Uuid) -> Result<()> {
         // Own short transaction, org rows locked first (ordered by id), so it never
-        // inverts the org-then-member lock order used by organization.rs. Retained
-        // orgs still have active teammates, so this must not run inside the erase
-        // transaction. Idempotent: a renamed org (`org-<uuid>`) matches neither rule.
-        //
-        // Only a local part of at least 3 characters is used; shorter ones would match
-        // too much. Lowercased here and again in SQL so callers need not normalise.
-        let email_local: Option<String> = email_local
-            .map(|l| l.trim().to_lowercase())
-            .filter(|l| l.chars().count() >= 3);
+        // inverts the org-then-member lock order used by organization.rs. Active
+        // retained orgs still have teammates, so this must not run inside the erase
+        // transaction (deleted ones are renamed there). Idempotent: a renamed org
+        // (`org-<uuid>`) no longer matches.
         retry_db!("rename_retained_org_names", {
             let mut client = self
                 .pool
@@ -560,9 +622,10 @@ impl UserErasureRepository for PostgresUserErasureRepository {
             let candidates: Vec<Uuid> = transaction
                 .query(
                     &format!(
-                        "SELECT o.id FROM organizations o WHERE ({RENAME_PREDICATE_SQL}) ORDER BY o.id"
+                        "SELECT o.id FROM organizations o \
+                         WHERE o.is_active AND ({SIGNUP_ORG_NAME_SQL}) ORDER BY o.id"
                     ),
-                    &[&user_id, &email_local],
+                    &[&user_id],
                 )
                 .await
                 .map_err(map_db_error)?
@@ -584,28 +647,12 @@ impl UserErasureRepository for PostgresUserErasureRepository {
             transaction
                 .execute(
                     &format!(
-                        r#"
-                    WITH renamed AS (
-                        SELECT o.id, o.name AS old_name, 'org-' || o.id::text AS new_name
-                        FROM organizations o
-                        WHERE o.id = ANY($3) AND ({RENAME_PREDICATE_SQL})
-                    ), ws AS (
-                        UPDATE workspaces w
-                        SET description = 'Default workspace for ' || r.new_name, updated_at = NOW()
-                        FROM renamed r
-                        WHERE w.organization_id = r.id AND w.description = 'Default workspace for ' || r.old_name
-                    ), dep AS (
-                        UPDATE model_deprecation_email_deliveries d SET organization_name = r.new_name
-                        FROM renamed r WHERE d.organization_id = r.id AND d.organization_name = r.old_name
-                    ), pri AS (
-                        UPDATE model_pricing_change_email_deliveries d SET organization_name = r.new_name
-                        FROM renamed r WHERE d.organization_id = r.id AND d.organization_name = r.old_name
-                    )
-                    UPDATE organizations o SET name = r.new_name, updated_at = NOW()
-                    FROM renamed r WHERE o.id = r.id
-                    "#
+                        "WITH renamed AS (\
+                             SELECT o.id, o.name AS old_name FROM organizations o \
+                             WHERE o.id = ANY($2) AND o.is_active AND ({SIGNUP_ORG_NAME_SQL})\
+                         ){RENAME_UPDATES_SQL}"
                     ),
-                    &[&user_id, &email_local, &candidates],
+                    &[&user_id, &candidates],
                 )
                 .await
                 .map_err(map_db_error)?;

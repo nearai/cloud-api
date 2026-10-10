@@ -99,18 +99,11 @@ pub trait UserErasureRepository: Send + Sync {
     async fn plan(&self, user_id: Uuid) -> anyhow::Result<Option<ErasurePlan>>;
     /// One transaction: lock, re-check, delete, scrub, write the log row.
     async fn execute(&self, request: ExecuteRequest<'_>) -> anyhow::Result<ExecuteOutcome>;
-    /// Rename retained orgs that still carry the user's identity in their name to
-    /// `org-<uuid>`: auto-named signup orgs (active or deleted), and, when
-    /// `email_local` (the user's email local part, at least 3 characters) is given,
-    /// deleted orgs the user was retained in whose name contains it. Runs in its own
-    /// short org-first transaction, after `execute` commits, because it must row-lock
-    /// orgs that still have active teammates. Idempotent. Pass `None` once the email
-    /// is tombstoned; the local-part rule is then skipped.
-    async fn rename_retained_org_names(
-        &self,
-        user_id: Uuid,
-        email_local: Option<&str>,
-    ) -> anyhow::Result<()>;
+    /// Rename retained ACTIVE orgs that still carry the user's auto-generated signup
+    /// name to `org-<uuid>`. Runs in its own short org-first transaction, after
+    /// `execute` commits, because it must row-lock orgs that still have active
+    /// teammates. Idempotent. Deleted retained orgs are renamed inside `execute`.
+    async fn rename_retained_org_names(&self, user_id: Uuid) -> anyhow::Result<()>;
     /// For an erased user: re-delete content written into erased workspaces after the
     /// original commit, and return the erased orgs and workspaces.
     async fn sweep_erased(&self, user_id: Uuid) -> anyhow::Result<ErasedFootprint>;

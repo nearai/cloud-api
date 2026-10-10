@@ -259,6 +259,45 @@ async fn erase_renames_retained_org_still_named_after_user_email() {
 }
 
 #[tokio::test]
+async fn erase_renames_deleted_signup_org() {
+    let (server, database) = setup_test_server_with_database().await;
+    let (session, owner, email) = new_user(&database).await;
+    let (_s2, teammate, _) = new_user(&database).await;
+    // The signup org: auto-generated `<local>-org-xxxx` plus its default workspace.
+    let personal = personal_org_id(&server, &session).await;
+    add_member(&database, &personal, teammate, "member").await;
+    transfer_ownership(&server, &personal, teammate).await;
+    let org: uuid::Uuid = personal.parse().unwrap();
+    let client = database.pool().get().await.unwrap();
+    let old: String = org_name(&client, org).await;
+    assert!(old.starts_with(&format!("{}-org-", email.split('@').next().unwrap())));
+    // The API refuses to delete a shared org here, so mark it deleted directly.
+    client
+        .execute(
+            "UPDATE organizations SET is_active = false WHERE id = $1",
+            &[&org],
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(erase(&server, owner, &email).await.status_code(), 200);
+
+    assert_eq!(org_name(&client, org).await, format!("org-{org}"));
+    let desc: Option<String> = client
+        .query_one(
+            "SELECT description FROM workspaces WHERE organization_id = $1 AND name = 'default'",
+            &[&org],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(
+        desc.as_deref(),
+        Some(format!("Default workspace for org-{org}").as_str())
+    );
+}
+
+#[tokio::test]
 async fn erase_renames_retained_signup_org_after_email_change() {
     let (server, database) = setup_test_server_with_database().await;
     let (session, owner, _signup_email) = new_user(&database).await;

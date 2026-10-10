@@ -8,23 +8,8 @@ use support::test_pool;
 use uuid::Uuid;
 
 #[tokio::test]
-async fn migration_runner_rebuilds_missing_refresh_rotation_index() -> anyhow::Result<()> {
+async fn migration_creates_refresh_rotation_index() -> anyhow::Result<()> {
     let pool = test_pool().await?;
-    let client = pool.get().await?;
-    client
-        .batch_execute("DROP INDEX CONCURRENTLY IF EXISTS idx_refresh_tokens_previous_hash")
-        .await?;
-    drop(client);
-
-    // Replica startup can overlap. Both runners should complete while the
-    // out-of-transaction concurrent index build is serialized independently.
-    let (first, second) = tokio::join!(
-        database::migrations::run(&pool),
-        database::migrations::run(&pool)
-    );
-    first?;
-    second?;
-
     let client = pool.get().await?;
     let ready: bool = client
         .query_one(

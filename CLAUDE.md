@@ -344,6 +344,21 @@ Comprehensive C4 diagrams and flows: `docs/architecture/c4-diagrams.md`
 - Use `refinery` for migration management
 - Name format: `V{number}__{description}.sql`
 
+#### Prefer typed Rust parsing over new migrations
+- Avoid adding a migration when existing columns can encode the new state.
+  Add a typed Rust layer in the repository that parses or derives the state from
+  row data into an enum, and have services consume the enum rather than raw
+  columns.
+- Only operator-owned columns with a known value set may carry state (flags,
+  provider names, status values, relationships between rows). Never encode state
+  in customer-editable or free-form data such as `organizations.settings`,
+  names, or descriptions: customers can write those, so the state could be
+  forged or erased.
+- Parsing is strict: a combination of column values that maps to no variant is
+  an error, never a silent default.
+- Propose a migration only when no existing column can carry the state, and
+  state that trade-off explicitly in the design or PR description.
+
 ### Error Handling
 - API errors use `api::models::ErrorResponse`
 - Standard error types: `unauthorized`, `forbidden`, `not_found`, `conflict`, `validation_error`

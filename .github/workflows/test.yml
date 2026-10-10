@@ -12,6 +12,14 @@ on:
   # Include stacked PRs targeting another feature branch.
   pull_request:
 
+# A new push to a PR supersedes the previous run, so cancel it instead of letting
+# it hold self-hosted runners. Non-PR runs get a unique group (run_id): a shared
+# group would serialize main/develop pushes and GitHub would cancel the pending
+# run whenever a third arrives, leaving that commit untested.
+concurrency:
+  group: tests-${{ github.event_name == 'pull_request' && github.ref || github.run_id }}
+  cancel-in-progress: true
+
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
@@ -45,7 +53,9 @@ jobs:
   # classify (new branch, detection error) is treated as "run the tests".
   changes:
     name: Detect changes
-    runs-on: [self-hosted, infra]
+    # Lightweight jobs run on GitHub-hosted runners (free for this public repo)
+    # so they never queue behind Rust builds for a self-hosted slot.
+    runs-on: ubuntu-latest
     permissions:
       contents: read
     outputs:
@@ -198,8 +208,8 @@ jobs:
       with:
         cache-key: e2e
 
-    - name: Run typed-query and credit-allocation regressions
-      run: cargo test --locked -p database --test hot_path_typed_queries --test billing_typed_queries --test credit_allocation
+    - name: Run typed-query, credit-allocation, and session regressions
+      run: cargo test --locked -p database --test hot_path_typed_queries --test billing_typed_queries --test credit_allocation --test session_rotation -- --test-threads=4
       env:
         PGHOST: localhost
         PGPORT: 5432
@@ -229,7 +239,7 @@ jobs:
 
   script-test:
     name: Script tests
-    runs-on: [self-hosted, infra]
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
       - name: Test synthetic rollout verification
@@ -243,7 +253,7 @@ jobs:
   # gate passes; otherwise every test job must have succeeded.
   test-suite:
     name: Test Suite
-    runs-on: [self-hosted, infra]
+    runs-on: ubuntu-latest
     needs: [changes, lint, unit-test, integration-test, e2e-test, script-test]
     if: always()
     steps:
@@ -284,23 +294,3 @@ jobs:
             exit 1
           fi
           echo "All test jobs passed"
-
-  # Release build, only on main pushes. Split into its own job so it does
-  # not block the test jobs and does not pull in PostgreSQL or test env vars
-  # (there is no build.rs; cargo build --release needs none of them).
-  build-release:
-    name: Build release
-    needs: changes
-    if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && needs.changes.outputs.rust == 'true' }}
-    runs-on: [self-hosted, infra]
-
-    steps:
-    - uses: actions/checkout@v7
-
-    - name: Setup Rust CI
-      uses: ./.github/actions/setup-rust-ci
-      with:
-        cache-key: release
-
-    - name: Build release
-      run: cargo build --release

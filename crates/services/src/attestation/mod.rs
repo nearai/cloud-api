@@ -20,6 +20,12 @@ pub mod report_data;
 #[cfg(test)]
 mod report_tests;
 mod service_trait;
+pub mod snp;
+pub mod tinfoil;
+#[cfg(test)]
+mod tinfoil_live_tests;
+pub mod tinfoil_observer;
+pub mod tinfoil_pins;
 pub mod verification;
 
 use std::sync::Arc;

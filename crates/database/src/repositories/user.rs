@@ -157,7 +157,7 @@ impl UserRepository {
 
             client
                 .execute(
-                    "UPDATE users SET last_login_at = NOW() WHERE id = $1",
+                    "UPDATE users SET last_login_at = NOW() WHERE id = $1 AND is_active = true",
                     &[&id],
                 )
                 .await
@@ -633,7 +633,7 @@ impl services::auth::UserRepository for UserRepository {
 
             client
                 .execute(
-                    "UPDATE users SET email = $2, updated_at = NOW() WHERE id = $1",
+                    "UPDATE users SET email = $2, updated_at = NOW() WHERE id = $1 AND is_active = true",
                     &[&id.0, &email],
                 )
                 .await

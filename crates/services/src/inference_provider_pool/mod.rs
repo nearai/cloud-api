@@ -2893,7 +2893,7 @@ impl InferenceProviderPool {
             }
 
             // Sort key: (context_overflow, hard_demoted, tier_rank, latency_demoted,
-            // capacity_rank). Lower = preferred. Tier ranks above latency so backups
+            // capacity_rank, source_rank). Lower = preferred. Tier ranks above latency so backups
             // stay backups: a slow-but-healthy NEAR still leads an attested fallback,
             // while a slow replica still sheds to faster siblings of its own tier.
             // The trailing capacity rank makes
@@ -2908,7 +2908,7 @@ impl InferenceProviderPool {
             // to fitting — which may well serve the real, smaller request — must
             // be tried before a guaranteed-400 small fleet. Models whose providers
             // all share one capacity (or declare none) order exactly as before.
-            let key_of = |p: &Arc<InferenceProviderTrait>| -> (u8, u8, u8, u8, u32) {
+            let key_of = |p: &Arc<InferenceProviderTrait>| -> (u8, u8, u8, u8, u32, u8) {
                 let ptr = Arc::as_ptr(p) as *const () as usize;
                 let failures = counts.get(&ptr).copied().unwrap_or(0);
                 let (ttft_ewma_ms, ttft_samples, max_context_tokens) = states
@@ -2940,12 +2940,17 @@ impl InferenceProviderPool {
                     // Fitting providers: smallest sufficient window first.
                     capacity
                 };
+                // Tie-break after best-fit: Chutes (0) is the first failover, so the
+                // rotated leading group never mixes it with Tinfoil (1).
+                let source_rank =
+                    u8::from(p.provider_source() == inference_providers::ProviderSource::Tinfoil);
                 (
                     context_overflow,
                     demoted,
                     tier_rank(p),
                     latency_demoted,
                     capacity_rank,
+                    source_rank,
                 )
             };
             let mut ordered = providers;
@@ -8736,6 +8741,96 @@ mod tests {
         );
     }
 
+    /// Registers `specs` as Attested3p mocks of the given source and declared
+    /// ctx, in order, and returns the pool plus the providers.
+    async fn attested_3p_pool(
+        model: &str,
+        specs: &[(inference_providers::ProviderSource, Option<u32>)],
+    ) -> (InferenceProviderPool, Vec<Arc<InferenceProviderTrait>>) {
+        use inference_providers::mock::MockProvider;
+        use inference_providers::ProviderTier;
+
+        let pool = InferenceProviderPool::new(None, ExternalProvidersConfig::default());
+        let providers: Vec<Arc<InferenceProviderTrait>> = specs
+            .iter()
+            .map(|(src, _)| {
+                Arc::new(
+                    MockProvider::new()
+                        .with_tier(ProviderTier::Attested3p)
+                        .with_provider_source(*src),
+                ) as Arc<InferenceProviderTrait>
+            })
+            .collect();
+        for (p, (_, ctx)) in providers.iter().zip(specs) {
+            pool.register_pinned_secondary_provider(model.to_string(), p.clone(), None)
+                .await;
+            if let Some(ctx) = ctx {
+                pool.set_declared_ctx(p, *ctx);
+            }
+        }
+        (pool, providers)
+    }
+
+    #[tokio::test]
+    async fn equal_capacity_chutes_always_precedes_tinfoil() {
+        use inference_providers::ProviderSource::{Chutes, Tinfoil};
+        // Tinfoil registered first so a mixed rotation would surface it first.
+        let (pool, p) = attested_3p_pool(
+            "m-src-a",
+            &[(Tinfoil, Some(200_000)), (Chutes, Some(200_000))],
+        )
+        .await;
+        for _ in 0..8 {
+            let order = pool
+                .get_providers_with_fallback("m-src-a", None, &ChatRoutingHints::default())
+                .await
+                .unwrap();
+            assert!(Arc::ptr_eq(&order[0], &p[1]), "Chutes must lead");
+            assert!(Arc::ptr_eq(&order[1], &p[0]));
+        }
+    }
+
+    #[tokio::test]
+    async fn tinfoil_with_smaller_sufficient_ctx_still_precedes_chutes() {
+        use inference_providers::ProviderSource::{Chutes, Tinfoil};
+        let (pool, p) = attested_3p_pool(
+            "m-src-b",
+            &[(Chutes, Some(1_000_000)), (Tinfoil, Some(128_000))],
+        )
+        .await;
+        for _ in 0..4 {
+            let order = pool
+                .get_providers_with_fallback("m-src-b", None, &ChatRoutingHints::default())
+                .await
+                .unwrap();
+            assert!(Arc::ptr_eq(&order[0], &p[1]), "best-fit Tinfoil leads");
+        }
+    }
+
+    #[tokio::test]
+    async fn same_source_attested_replicas_still_rotate() {
+        use inference_providers::ProviderSource::{Chutes, Tinfoil};
+        let (pool, p) = attested_3p_pool(
+            "m-src-c",
+            &[
+                (Chutes, Some(200_000)),
+                (Chutes, Some(200_000)),
+                (Tinfoil, Some(200_000)),
+            ],
+        )
+        .await;
+        let mut leaders = std::collections::HashSet::new();
+        for _ in 0..6 {
+            let order = pool
+                .get_providers_with_fallback("m-src-c", None, &ChatRoutingHints::default())
+                .await
+                .unwrap();
+            assert!(Arc::ptr_eq(&order[2], &p[2]), "Tinfoil stays last");
+            leaders.insert(Arc::as_ptr(&order[0]) as *const () as usize);
+        }
+        assert_eq!(leaders.len(), 2, "both Chutes replicas must lead in turn");
+    }
+
     #[tokio::test]
     async fn disabled_tinfoil_is_excluded_but_chutes_stays() {
         use inference_providers::mock::MockProvider;
@@ -10862,6 +10957,74 @@ mod tests {
             elapsed < std::time::Duration::from_secs(5),
             "fallback should be immediate, took {elapsed:?}"
         );
+    }
+
+    /// A Tinfoil 401/402/403 (our key or billing) is mapped by the provider to a
+    /// retryable external 503, so it never short-circuits past Chutes and the
+    /// client never sees an upstream auth error. This test injects the 503 the
+    /// provider produces; the real status -> 503 mapping is exercised by
+    /// `inference_providers::attested::tinfoil::tests::upstream_statuses_map_per_spec`.
+    #[tokio::test]
+    async fn tinfoil_auth_failure_falls_through_to_chutes() {
+        use inference_providers::mock::{MockProvider, RequestMatcher, ResponseTemplate};
+        use inference_providers::{CompletionError, ProviderSource, ProviderTier};
+
+        let pool = InferenceProviderPool::new(None, ExternalProvidersConfig::default());
+        let model_id = "z-ai/glm-5.1".to_string();
+
+        let unavailable = || CompletionError::HttpError {
+            status_code: 503,
+            message: "Tinfoil temporarily unavailable (upstream_auth)".to_string(),
+            is_external: true,
+        };
+        let near = Arc::new(MockProvider::new_accept_all().with_tier(ProviderTier::Near));
+        near.set_error_override(Some(CompletionError::HttpError {
+            status_code: 503,
+            message: "backend overloaded".to_string(),
+            is_external: true,
+        }))
+        .await;
+        let tinfoil = Arc::new(
+            MockProvider::new_accept_all()
+                .with_tier(ProviderTier::Attested3p)
+                .with_provider_source(ProviderSource::Tinfoil),
+        );
+        tinfoil.set_error_override(Some(unavailable())).await;
+        let chutes = Arc::new(
+            MockProvider::new_accept_all()
+                .with_tier(ProviderTier::Attested3p)
+                .with_provider_source(ProviderSource::Chutes),
+        );
+        chutes
+            .when(RequestMatcher::Any)
+            .respond_with(ResponseTemplate::new("served-by-chutes"))
+            .await;
+
+        {
+            let mut m = pool.provider_mappings.write().await;
+            m.model_to_providers.insert(
+                model_id.clone(),
+                vec![
+                    near.clone() as Arc<InferenceProviderTrait>,
+                    tinfoil.clone() as Arc<InferenceProviderTrait>,
+                    chutes.clone() as Arc<InferenceProviderTrait>,
+                ],
+            );
+        }
+
+        // Tinfoil's smaller window sorts it ahead of Chutes (best-fit precedes the
+        // Chutes-first source tie-break), so it is attempted first and must fall through.
+        pool.set_declared_ctx(&(tinfoil.clone() as Arc<InferenceProviderTrait>), 128_000);
+        pool.set_declared_ctx(&(chutes.clone() as Arc<InferenceProviderTrait>), 1_000_000);
+
+        let resp = pool
+            .chat_completion(fallback_params(&model_id), "test-hash".to_string())
+            .await
+            .expect("a Tinfoil auth failure must fall through to Chutes");
+        assert!(near.last_chat_params().await.is_some());
+        assert!(tinfoil.last_chat_params().await.is_some());
+        assert!(chutes.last_chat_params().await.is_some());
+        assert!(String::from_utf8_lossy(&resp.raw_bytes).contains("served-by-chutes"));
     }
 
     /// When the NEAR primary AND the Chutes fallback both fail with a retryable

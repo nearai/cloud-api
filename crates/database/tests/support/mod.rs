@@ -236,5 +236,11 @@ fn pool_config() -> Config {
         Some(std::env::var("PGDATABASE").unwrap_or_else(|_| "platform_api".to_string()));
     config.user = Some(std::env::var("PGUSER").unwrap_or_else(|_| "postgres".to_string()));
     config.password = Some(std::env::var("PGPASSWORD").unwrap_or_else(|_| "postgres".to_string()));
+    // CI reaches the PostgreSQL service through Docker's published port. Probe
+    // pooled connections before reuse so a hard-closed socket is discarded
+    // instead of failing the fixture's next SQL statement.
+    config.manager = Some(deadpool_postgres::ManagerConfig {
+        recycling_method: deadpool_postgres::RecyclingMethod::Verified,
+    });
     config
 }

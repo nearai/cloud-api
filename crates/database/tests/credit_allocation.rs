@@ -252,7 +252,35 @@ async fn retry_keeps_original_split_and_conflicting_retry_is_rejected() -> anyho
     let request = usage(&org, &model, inference_id, 12);
     let original = repository.record_usage(request.clone()).await?;
     set_limit(&limits, org.org_id, "grant", 100).await?;
+    let balance_before = pool
+        .get()
+        .await?
+        .query_one(
+            "SELECT total_spent, total_requests, total_tokens, unresolved_unfunded_amount FROM organization_balance WHERE organization_id = $1",
+            &[&org.org_id],
+        )
+        .await?;
     let retried = repository.record_usage(request.clone()).await?;
+
+    let balance_after = pool
+        .get()
+        .await?
+        .query_one(
+            "SELECT total_spent, total_requests, total_tokens, unresolved_unfunded_amount FROM organization_balance WHERE organization_id = $1",
+            &[&org.org_id],
+        )
+        .await?;
+    for column in [
+        "total_spent",
+        "total_requests",
+        "total_tokens",
+        "unresolved_unfunded_amount",
+    ] {
+        assert_eq!(
+            balance_before.get::<_, i64>(column),
+            balance_after.get::<_, i64>(column)
+        );
+    }
 
     assert!(!retried.was_inserted);
     assert_eq!(retried.id, original.id);
@@ -644,9 +672,21 @@ async fn every_credit_source_automatically_settles_overage() -> anyhow::Result<(
         assert_eq!(original.unfunded_amount, Some(5));
 
         let expected_source = if credit_type == "staking_farm" {
-            OrganizationStakingFarmSourcesRepository::new(pool.clone())
+            // update_staking_farm_limit only writes for an org with an active source.
+            pool.get()
+                .await?
+                .execute(
+                    "INSERT INTO organization_staking_farm_sources (
+                        organization_id, near_account_id, network_id, contract_id,
+                        farm_product_id, credit_nano_usd_per_reward_unit, status
+                    ) VALUES ($1, $2, 'testnet', 'stake.test', 'cloud-credits', 1, 'active')",
+                    &[&org.org_id, &format!("alloc-{}.test", org.org_id.simple())],
+                )
+                .await?;
+            let applied = OrganizationStakingFarmSourcesRepository::new(pool.clone())
                 .update_staking_farm_limit(org.org_id, 7, None)
                 .await?;
+            assert!(applied);
             CREDIT_SOURCE_HOUSE_OF_STAKE.to_string()
         } else {
             set_limit(&limits, org.org_id, credit_type, 7).await?;
@@ -686,6 +726,13 @@ async fn every_credit_source_automatically_settles_overage() -> anyhow::Result<(
             .await?
             .get(0);
         assert_eq!(phase, "overage_settlement");
+        pool.get()
+            .await?
+            .execute(
+                "DELETE FROM organization_staking_farm_sources WHERE organization_id = $1",
+                &[&org.org_id],
+            )
+            .await?;
         cleanup_usage_fixtures(&pool, &[org.org_id], &[]).await?;
     }
 
@@ -1152,6 +1199,166 @@ async fn credit_status_reads_one_snapshot_during_concurrent_usage() -> anyhow::R
     let total = status.iter().map(|s| s.consumed).sum::<i64>() + unfunded;
     assert_eq!(total, UNIT_COST * WRITES as i64);
 
+    cleanup_usage_fixtures(&pool, &[org.org_id], &[model.id]).await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn inference_function_matches_service_allocation_for_credit_boundaries() -> anyhow::Result<()>
+{
+    let pool = test_pool().await?;
+    let client = pool.get().await?;
+    let functions: i64 = client
+        .query_one(
+            "SELECT COUNT(*) FROM pg_proc WHERE proname = 'record_organization_usage'",
+            &[],
+        )
+        .await?
+        .get(0);
+    assert_eq!(functions, 1);
+    drop(client);
+
+    let limits = OrganizationLimitsRepository::new(pool.clone());
+    let inference_repo = OrganizationUsageRepository::new(pool.clone());
+    let service_repo = OrganizationServiceUsageRepository::new(pool.clone());
+    let model = insert_model(&pool, "function-allocation-parity").await?;
+    for (cost, credit_limits, legacy) in [
+        (9_i64, vec![], 0_i64),
+        (5, vec![("grant", 10)], 0),
+        (9, vec![("grant", 3), ("payment", 10)], 0),
+        (9, vec![("grant", 5), ("payment", 6)], 4),
+        (0, vec![("grant", 10)], 0),
+    ] {
+        let inference_org = insert_org_fixture(&pool).await?;
+        let service_org = insert_org_fixture(&pool).await?;
+        for (credit_type, amount) in &credit_limits {
+            set_limit(&limits, inference_org.org_id, credit_type, *amount).await?;
+            set_limit(&limits, service_org.org_id, credit_type, *amount).await?;
+        }
+        if legacy > 0 {
+            let client = pool.get().await?;
+            for org_id in [inference_org.org_id, service_org.org_id] {
+                client
+                    .execute(
+                        "UPDATE organization_balance SET legacy_unattributed_amount = $2 WHERE organization_id = $1",
+                        &[&org_id, &legacy],
+                    )
+                    .await?;
+            }
+        }
+        let service_id = Uuid::new_v4();
+        pool.get()
+            .await?
+            .execute(
+                "INSERT INTO services (id, service_name, display_name, unit, cost_per_unit) VALUES ($1, $2, 'Parity service', 'request', $3)",
+                &[&service_id, &format!("function-parity-{service_id}"), &cost],
+            )
+            .await?;
+        let inference = inference_repo
+            .record_usage(usage(&inference_org, &model, Uuid::new_v4(), cost))
+            .await?;
+        let service = service_repo
+            .record_usage(&RecordServiceUsageRequest {
+                organization_id: service_org.org_id,
+                workspace_id: service_org.workspace_a_id,
+                api_key_id: service_org.api_key_a_id,
+                service_id,
+                quantity: 1,
+                total_cost: cost,
+                inference_id: Some(Uuid::new_v4()),
+            })
+            .await?;
+        let normalize = |allocations: Option<Vec<services::usage::CreditAllocation>>| {
+            allocations
+                .unwrap_or_default()
+                .into_iter()
+                .map(|allocation| {
+                    (
+                        allocation.credit_type,
+                        allocation.amount,
+                        allocation.source,
+                        allocation.policy_version,
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            normalize(inference.credit_allocations),
+            normalize(service.credit_allocations)
+        );
+        assert_eq!(inference.funded_amount, service.funded_amount);
+        assert_eq!(inference.unfunded_amount, service.unfunded_amount);
+        let client = pool.get().await?;
+        let mut accounting = Vec::new();
+        for org_id in [inference_org.org_id, service_org.org_id] {
+            let row = client
+                .query_one(
+                    "SELECT total_spent, unresolved_unfunded_amount FROM organization_balance WHERE organization_id = $1",
+                    &[&org_id],
+                )
+                .await?;
+            let consumption: serde_json::Value = client
+                .query_one(
+                    "SELECT COALESCE(jsonb_agg(jsonb_build_object('type', credit_type, 'amount', amount) ORDER BY credit_type), '[]'::jsonb) FROM organization_credit_consumption WHERE organization_id = $1",
+                    &[&org_id],
+                )
+                .await?
+                .get(0);
+            accounting.push((row.get::<_, i64>(0), row.get::<_, i64>(1), consumption));
+        }
+        assert_eq!(accounting[0], accounting[1]);
+        drop(client);
+        cleanup_usage_fixtures(&pool, &[inference_org.org_id, service_org.org_id], &[]).await?;
+        pool.get()
+            .await?
+            .execute("DELETE FROM services WHERE id = $1", &[&service_id])
+            .await?;
+    }
+    cleanup_usage_fixtures(&pool, &[], &[model.id]).await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn inference_function_preserves_missing_account_errors() -> anyhow::Result<()> {
+    let pool = test_pool().await?;
+    let repository = OrganizationUsageRepository::new(pool.clone());
+    let model = insert_model(&pool, "function-missing-account").await?;
+    let org = insert_org_fixture(&pool).await?;
+    let mut missing = usage(&org, &model, Uuid::new_v4(), 3);
+    missing.organization_id = Uuid::new_v4();
+    let error = repository.record_usage(missing).await.unwrap_err();
+    assert!(matches!(
+        error.downcast_ref::<services::common::RepositoryError>(),
+        Some(services::common::RepositoryError::NotFound(message))
+            if message.contains("Organization not found:")
+    ));
+
+    pool.get()
+        .await?
+        .execute(
+            "DELETE FROM organization_balance WHERE organization_id = $1",
+            &[&org.org_id],
+        )
+        .await?;
+    let error = repository
+        .record_usage(usage(&org, &model, Uuid::new_v4(), 3))
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        error.downcast_ref::<services::common::RepositoryError>(),
+        Some(services::common::RepositoryError::ValidationFailed(message))
+            if message == "organization accounting balance is missing"
+    ));
+    let count: i64 = pool
+        .get()
+        .await?
+        .query_one(
+            "SELECT COUNT(*) FROM organization_usage_log WHERE organization_id = $1",
+            &[&org.org_id],
+        )
+        .await?
+        .get(0);
+    assert_eq!(count, 0);
     cleanup_usage_fixtures(&pool, &[org.org_id], &[model.id]).await?;
     Ok(())
 }

@@ -820,7 +820,7 @@ pub async fn init_inference_providers(
             config.external_providers.clone(),
         ),
     );
-    pool.set_metrics_service(metrics_service);
+    pool.set_metrics_service(metrics_service.clone());
     install_placement(&pool, &config.placement);
 
     let models_repo = Arc::new(database::repositories::ModelRepository::new(
@@ -868,8 +868,13 @@ pub async fn init_inference_providers(
         .await;
 
     // Attested third-party providers (Chutes, then Tinfoil).
-    attested_3p_startup::register_attested_3p(&pool, &models_repo, &config.external_providers)
-        .await;
+    attested_3p_startup::register_attested_3p(
+        &pool,
+        &models_repo,
+        &config.external_providers,
+        metrics_service,
+    )
+    .await;
 
     pool
 }
@@ -1176,6 +1181,11 @@ pub fn build_app_with_config_and_options(
             organization_service: domain_services.organization_service.clone(),
             usage_service: domain_services.usage_service.clone(),
             admin_settings_service: domain_services.admin_settings_service.clone(),
+            user_erasure_service: Arc::new(services::user_erasure::UserErasureService::new(
+                Arc::new(database::repositories::PostgresUserErasureRepository::new(
+                    database.pool().clone(),
+                )),
+            )),
         },
     );
 
@@ -2045,6 +2055,7 @@ pub struct AdminRouteServices {
         Arc<dyn services::organization::OrganizationServiceTrait + Send + Sync>,
     pub usage_service: Arc<dyn services::usage::UsageServiceTrait + Send + Sync>,
     pub admin_settings_service: Arc<services::admin_settings::AdminSettingsService>,
+    pub user_erasure_service: Arc<services::user_erasure::UserErasureService>,
 }
 
 pub fn build_admin_routes(
@@ -2074,20 +2085,21 @@ fn build_admin_routes_with_options(
         batch_upsert_models, cancel_model_pricing_change, confirm_model_deprecation,
         confirm_model_pricing_changes, create_admin_access_token, create_service,
         delete_admin_access_token, delete_aml_allowlist_entry, delete_model, deprecate_model,
-        get_admin_organization_balance, get_admin_setting, get_billing_summary, get_infra_summary,
-        get_model_consumption_timeseries, get_model_history, get_model_revenue, get_org_revenue,
-        get_organization as get_admin_organization, get_organization_concurrent_limit,
-        get_organization_fallback, get_organization_limits_history, get_organization_metrics,
-        get_organization_priority, get_organization_timeseries, get_performance_timeseries,
-        get_platform_metrics, get_platform_timeseries, get_revenue_density,
-        list_admin_access_tokens, list_admin_settings, list_aml_allowlist, list_aml_reports,
-        list_api_keys, list_invitation_email_deliveries, list_model_pricing_changes,
+        erase_user, get_admin_organization_balance, get_admin_setting, get_billing_summary,
+        get_infra_summary, get_model_consumption_timeseries, get_model_history, get_model_revenue,
+        get_org_revenue, get_organization as get_admin_organization,
+        get_organization_concurrent_limit, get_organization_fallback,
+        get_organization_limits_history, get_organization_metrics, get_organization_priority,
+        get_organization_timeseries, get_performance_timeseries, get_platform_metrics,
+        get_platform_timeseries, get_revenue_density, list_admin_access_tokens,
+        list_admin_settings, list_aml_allowlist, list_aml_reports, list_api_keys,
+        list_invitation_email_deliveries, list_model_pricing_changes,
         list_models as admin_list_models, list_organization_members, list_organizations,
-        list_users, preview_model_deprecation, preview_model_pricing_changes,
-        resend_invitation_email, update_admin_setting, update_aml_report_status,
-        update_organization_concurrent_limit, update_organization_fallback,
-        update_organization_limits, update_organization_member_role, update_organization_priority,
-        update_service, upsert_aml_allowlist_entry, AdminAppState,
+        list_users, lookup_user_erasures, preview_model_deprecation, preview_model_pricing_changes,
+        preview_user_erasure, resend_invitation_email, update_admin_setting,
+        update_aml_report_status, update_organization_concurrent_limit,
+        update_organization_fallback, update_organization_limits, update_organization_member_role,
+        update_organization_priority, update_service, upsert_aml_allowlist_entry, AdminAppState,
     };
     use crate::routes::staking_farm::{
         get_admin_organization_staking_farm, sync_admin_organization_staking_farm,
@@ -2147,6 +2159,7 @@ fn build_admin_routes_with_options(
         github_dispatcher,
         infra_service,
         admin_settings_service: services.admin_settings_service,
+        user_erasure_service: services.user_erasure_service,
     };
 
     let database_encryption_state = crate::database_encryption::DatabaseEncryptionState::new(
@@ -2310,6 +2323,18 @@ fn build_admin_routes_with_options(
             axum::routing::post(resend_invitation_email),
         )
         .route("/admin/users", axum::routing::get(list_users))
+        .route(
+            "/admin/users/{user_id}/erasure/preview",
+            axum::routing::post(preview_user_erasure),
+        )
+        .route(
+            "/admin/users/{user_id}/erasure",
+            axum::routing::post(erase_user),
+        )
+        .route(
+            "/admin/user-erasures/lookup",
+            axum::routing::post(lookup_user_erasures),
+        )
         .route(
             "/admin/organizations",
             axum::routing::get(list_organizations),
@@ -2902,6 +2927,7 @@ mod tests {
                 username: "test_user".to_string(),
                 password: "test_pass".to_string(),
                 max_connections: 5,
+                recycling_method: config::DatabaseRecyclingMethod::Fast,
                 tls_enabled: false,
                 tls_ca_cert_path: None,
                 refresh_interval: 30,
@@ -2974,6 +3000,7 @@ mod tests {
             username: "test_user".to_string(),
             password: "test_pass".to_string(),
             max_connections: 5,
+            recycling_method: config::DatabaseRecyclingMethod::Fast,
             tls_enabled: false,
             tls_ca_cert_path: None,
             refresh_interval: 30,
@@ -3024,6 +3051,7 @@ mod tests {
                 username: "test_user".to_string(),
                 password: "test_pass".to_string(),
                 max_connections: 5,
+                recycling_method: config::DatabaseRecyclingMethod::Fast,
                 tls_enabled: false,
                 tls_ca_cert_path: None,
                 refresh_interval: 30,

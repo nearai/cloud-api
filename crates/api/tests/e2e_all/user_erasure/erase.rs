@@ -355,6 +355,94 @@ async fn erase_leaves_owner_deleted_shared_org_without_blocking() {
     assert_eq!(left, 0);
 }
 
+async fn org_name(client: &deadpool_postgres::Object, org: uuid::Uuid) -> String {
+    client
+        .query_one("SELECT name FROM organizations WHERE id = $1", &[&org])
+        .await
+        .unwrap()
+        .get(0)
+}
+
+#[tokio::test]
+async fn erase_renames_deleted_shared_org_named_after_user() {
+    let (server, database) = setup_test_server_with_database().await;
+    let (session, owner, email) = new_user(&database).await;
+    let (_s2, teammate, _) = new_user(&database).await;
+    let team = create_org_with_session(&server, &session).await;
+    add_member(&database, &team.id, teammate, "member").await;
+    let team_uuid: uuid::Uuid = team.id.parse().unwrap();
+    let local = email.split('@').next().unwrap();
+    let client = database.pool().get().await.unwrap();
+    // A name the user chose, not the signup shape.
+    client
+        .execute(
+            "UPDATE organizations SET name = $2, is_active = false WHERE id = $1",
+            &[&team_uuid, &format!("{local}-org-1")],
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(erase(&server, owner, &email).await.status_code(), 200);
+
+    assert_eq!(
+        org_name(&client, team_uuid).await,
+        format!("org-{team_uuid}")
+    );
+}
+
+#[tokio::test]
+async fn erase_keeps_active_shared_org_custom_name() {
+    let (server, database) = setup_test_server_with_database().await;
+    let (session, owner, email) = new_user(&database).await;
+    let (_s2, teammate, _) = new_user(&database).await;
+    let team = create_org_with_session(&server, &session).await;
+    add_member(&database, &team.id, teammate, "member").await;
+    transfer_ownership(&server, &team.id, teammate).await;
+    let team_uuid: uuid::Uuid = team.id.parse().unwrap();
+    let local = email.split('@').next().unwrap();
+    let custom = format!("{local}-org-1");
+    let client = database.pool().get().await.unwrap();
+    client
+        .execute(
+            "UPDATE organizations SET name = $2 WHERE id = $1",
+            &[&team_uuid, &custom],
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(erase(&server, owner, &email).await.status_code(), 200);
+
+    assert_eq!(
+        org_name(&client, team_uuid).await,
+        custom,
+        "a live team's chosen name is never renamed"
+    );
+}
+
+#[tokio::test]
+async fn erase_does_not_rename_unrelated_deleted_org() {
+    let (server, database) = setup_test_server_with_database().await;
+    let (_session, owner, email) = new_user(&database).await;
+    let (teammate_session, _teammate, _) = new_user(&database).await;
+    let other = create_org_with_session(&server, &teammate_session).await;
+    let other_uuid: uuid::Uuid = other.id.parse().unwrap();
+    let local = email.split('@').next().unwrap();
+    let name = format!("{local}-org-1");
+    let client = database.pool().get().await.unwrap();
+    // Deleted, name contains the local part, but the user was never a member.
+    client
+        .execute(
+            "UPDATE organizations SET name = $2, is_active = false WHERE id = $1",
+            &[&other_uuid, &name],
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(erase(&server, owner, &email).await.status_code(), 200);
+
+    assert_eq!(org_name(&client, other_uuid).await, name);
+}
+
 #[tokio::test]
 async fn erase_user_with_no_memberships() {
     let (server, database) = setup_test_server_with_database().await;

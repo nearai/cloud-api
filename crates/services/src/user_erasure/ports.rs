@@ -51,7 +51,13 @@ pub struct ErasedFootprint {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ExecuteOutcome {
-    Erased(ErasedFootprint),
+    Erased {
+        footprint: ErasedFootprint,
+        /// Retained orgs that were still active, with a name matching the erased
+        /// user's email, when the erase scanned them. They were not renamed; the
+        /// post-commit rename renames any that have since been deleted. Ids only.
+        rename_watch_org_ids: Vec<Uuid>,
+    },
     AlreadyErased,
     Blocked(Vec<ErasureBlocker>),
     ConfirmEmailMismatch,
@@ -99,11 +105,18 @@ pub trait UserErasureRepository: Send + Sync {
     async fn plan(&self, user_id: Uuid) -> anyhow::Result<Option<ErasurePlan>>;
     /// One transaction: lock, re-check, delete, scrub, write the log row.
     async fn execute(&self, request: ExecuteRequest<'_>) -> anyhow::Result<ExecuteOutcome>;
-    /// Rename the user's still-active auto-named signup orgs (retained team orgs) to
-    /// `org-<uuid>`. Runs in its own short org-first transaction, after `execute`
-    /// commits, because it must row-lock orgs that still have active teammates.
-    /// Idempotent.
-    async fn rename_retained_signup_orgs(&self, user_id: Uuid) -> anyhow::Result<()>;
+    /// Post-commit, in its own short org-first transaction (it row-locks orgs that may
+    /// still have active teammates). Renames retained orgs to `org-<uuid>`: (a) ACTIVE
+    /// ones with the user's auto-generated signup name; (b) DELETED ones the erasure log
+    /// retained, with that signup name; (c) DELETED ones among `watch_org_ids`, which
+    /// matched the user's email while active at erase time and were deleted
+    /// concurrently. Also refreshes stale default-workspace descriptions. Idempotent.
+    /// Deleted retained orgs matching by email are renamed inside `execute`.
+    async fn rename_retained_org_names(
+        &self,
+        user_id: Uuid,
+        watch_org_ids: &[Uuid],
+    ) -> anyhow::Result<()>;
     /// For an erased user: re-delete content written into erased workspaces after the
     /// original commit, and return the erased orgs and workspaces.
     async fn sweep_erased(&self, user_id: Uuid) -> anyhow::Result<ErasedFootprint>;

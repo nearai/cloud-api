@@ -259,6 +259,45 @@ async fn erase_renames_retained_org_still_named_after_user_email() {
 }
 
 #[tokio::test]
+async fn erase_renames_deleted_signup_org() {
+    let (server, database) = setup_test_server_with_database().await;
+    let (session, owner, email) = new_user(&database).await;
+    let (_s2, teammate, _) = new_user(&database).await;
+    // The signup org: auto-generated `<local>-org-xxxx` plus its default workspace.
+    let personal = personal_org_id(&server, &session).await;
+    add_member(&database, &personal, teammate, "member").await;
+    transfer_ownership(&server, &personal, teammate).await;
+    let org: uuid::Uuid = personal.parse().unwrap();
+    let client = database.pool().get().await.unwrap();
+    let old: String = org_name(&client, org).await;
+    assert!(old.starts_with(&format!("{}-org-", email.split('@').next().unwrap())));
+    // The API refuses to delete a shared org here, so mark it deleted directly.
+    client
+        .execute(
+            "UPDATE organizations SET is_active = false WHERE id = $1",
+            &[&org],
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(erase(&server, owner, &email).await.status_code(), 200);
+
+    assert_eq!(org_name(&client, org).await, format!("org-{org}"));
+    let desc: Option<String> = client
+        .query_one(
+            "SELECT description FROM workspaces WHERE organization_id = $1 AND name = 'default'",
+            &[&org],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(
+        desc.as_deref(),
+        Some(format!("Default workspace for org-{org}").as_str())
+    );
+}
+
+#[tokio::test]
 async fn erase_renames_retained_signup_org_after_email_change() {
     let (server, database) = setup_test_server_with_database().await;
     let (session, owner, _signup_email) = new_user(&database).await;
@@ -355,6 +394,94 @@ async fn erase_leaves_owner_deleted_shared_org_without_blocking() {
     assert_eq!(left, 0);
 }
 
+async fn org_name(client: &deadpool_postgres::Object, org: uuid::Uuid) -> String {
+    client
+        .query_one("SELECT name FROM organizations WHERE id = $1", &[&org])
+        .await
+        .unwrap()
+        .get(0)
+}
+
+#[tokio::test]
+async fn erase_renames_deleted_shared_org_named_after_user() {
+    let (server, database) = setup_test_server_with_database().await;
+    let (session, owner, email) = new_user(&database).await;
+    let (_s2, teammate, _) = new_user(&database).await;
+    let team = create_org_with_session(&server, &session).await;
+    add_member(&database, &team.id, teammate, "member").await;
+    let team_uuid: uuid::Uuid = team.id.parse().unwrap();
+    let local = email.split('@').next().unwrap();
+    let client = database.pool().get().await.unwrap();
+    // A name the user chose, not the signup shape.
+    client
+        .execute(
+            "UPDATE organizations SET name = $2, is_active = false WHERE id = $1",
+            &[&team_uuid, &format!("{local}-org-1")],
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(erase(&server, owner, &email).await.status_code(), 200);
+
+    assert_eq!(
+        org_name(&client, team_uuid).await,
+        format!("org-{team_uuid}")
+    );
+}
+
+#[tokio::test]
+async fn erase_keeps_active_shared_org_custom_name() {
+    let (server, database) = setup_test_server_with_database().await;
+    let (session, owner, email) = new_user(&database).await;
+    let (_s2, teammate, _) = new_user(&database).await;
+    let team = create_org_with_session(&server, &session).await;
+    add_member(&database, &team.id, teammate, "member").await;
+    transfer_ownership(&server, &team.id, teammate).await;
+    let team_uuid: uuid::Uuid = team.id.parse().unwrap();
+    let local = email.split('@').next().unwrap();
+    let custom = format!("{local}-org-1");
+    let client = database.pool().get().await.unwrap();
+    client
+        .execute(
+            "UPDATE organizations SET name = $2 WHERE id = $1",
+            &[&team_uuid, &custom],
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(erase(&server, owner, &email).await.status_code(), 200);
+
+    assert_eq!(
+        org_name(&client, team_uuid).await,
+        custom,
+        "a live team's chosen name is never renamed"
+    );
+}
+
+#[tokio::test]
+async fn erase_does_not_rename_unrelated_deleted_org() {
+    let (server, database) = setup_test_server_with_database().await;
+    let (_session, owner, email) = new_user(&database).await;
+    let (teammate_session, _teammate, _) = new_user(&database).await;
+    let other = create_org_with_session(&server, &teammate_session).await;
+    let other_uuid: uuid::Uuid = other.id.parse().unwrap();
+    let local = email.split('@').next().unwrap();
+    let name = format!("{local}-org-1");
+    let client = database.pool().get().await.unwrap();
+    // Deleted, name contains the local part, but the user was never a member.
+    client
+        .execute(
+            "UPDATE organizations SET name = $2, is_active = false WHERE id = $1",
+            &[&other_uuid, &name],
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(erase(&server, owner, &email).await.status_code(), 200);
+
+    assert_eq!(org_name(&client, other_uuid).await, name);
+}
+
 #[tokio::test]
 async fn erase_user_with_no_memberships() {
     let (server, database) = setup_test_server_with_database().await;
@@ -424,4 +551,233 @@ async fn erase_deactivated_user() {
     let body = r.json::<serde_json::Value>();
     assert_eq!(body["lifecycle"], "erased");
     assert_eq!(body["already_erased"], false);
+}
+
+/// A retained org U shares with a teammate. It is deleted and named `name`.
+async fn deleted_shared_org_named(
+    server: &axum_test::TestServer,
+    database: &std::sync::Arc<database::Database>,
+    session: &str,
+    teammate: uuid::Uuid,
+    name: &str,
+) -> uuid::Uuid {
+    let team = create_org_with_session(server, session).await;
+    add_member(database, &team.id, teammate, "member").await;
+    let team_uuid: uuid::Uuid = team.id.parse().unwrap();
+    database
+        .pool()
+        .get()
+        .await
+        .unwrap()
+        .execute(
+            "UPDATE organizations SET name = $2, is_active = false WHERE id = $1",
+            &[&team_uuid, &name],
+        )
+        .await
+        .unwrap();
+    team_uuid
+}
+
+#[tokio::test]
+async fn erase_skips_coincidental_substring_in_deleted_org() {
+    let (server, database) = setup_test_server_with_database().await;
+    let (session, owner, email) = new_user(&database).await;
+    let (_s2, teammate, _) = new_user(&database).await;
+    let local = email.split('@').next().unwrap();
+    let substring_name = format!("{local}x-team");
+    let token_name = format!("team-{local}");
+    let substring_org =
+        deleted_shared_org_named(&server, &database, &session, teammate, &substring_name).await;
+    let token_org =
+        deleted_shared_org_named(&server, &database, &session, teammate, &token_name).await;
+    let client = database.pool().get().await.unwrap();
+
+    assert_eq!(erase(&server, owner, &email).await.status_code(), 200);
+
+    assert_eq!(
+        org_name(&client, substring_org).await,
+        substring_name,
+        "the local part followed by an alphanumeric is not a name token"
+    );
+    assert_eq!(
+        org_name(&client, token_org).await,
+        format!("org-{token_org}"),
+        "positive control: a bounded token is renamed"
+    );
+}
+
+#[tokio::test]
+async fn erase_renames_deleted_org_delivery_copies() {
+    let (server, database) = setup_test_server_with_database().await;
+    let (session, owner, email) = new_user(&database).await;
+    let (_s2, teammate, _) = new_user(&database).await;
+    let local = email.split('@').next().unwrap();
+    let old_name = format!("{local}-org-1");
+    let org = deleted_shared_org_named(&server, &database, &session, teammate, &old_name).await;
+    let client = database.pool().get().await.unwrap();
+
+    let model_name = setup_qwen_model(&server).await;
+    let model_id: uuid::Uuid = client
+        .query_one(
+            "SELECT id FROM models WHERE model_name = $1",
+            &[&model_name],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    client
+        .execute(
+            "INSERT INTO model_deprecation_email_deliveries \
+               (model_id, model_name, model_display_name, successor_model_name, deprecation_date, \
+                recipient_user_id, recipient_email, organization_id, organization_name, status) \
+             VALUES ($1, $2, $2, $2, NOW(), $3, 'recipient@test.com', $4, $5, 'sent')",
+            &[&model_id, &model_name, &teammate, &org, &old_name],
+        )
+        .await
+        .unwrap();
+    client
+        .execute(
+            "INSERT INTO model_pricing_change_email_deliveries \
+               (batch_id, recipient_user_id, recipient_email, organization_id, organization_name, \
+                model_names, status) \
+             VALUES ($1, $2, 'recipient@test.com', $3, $4, ARRAY['erasure-test-model'], 'sent')",
+            &[&uuid::Uuid::new_v4(), &teammate, &org, &old_name],
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(erase(&server, owner, &email).await.status_code(), 200);
+
+    let expected = format!("org-{org}");
+    for table in [
+        "model_deprecation_email_deliveries",
+        "model_pricing_change_email_deliveries",
+    ] {
+        let name: String = client
+            .query_one(
+                &format!("SELECT organization_name FROM {table} WHERE organization_id = $1"),
+                &[&org],
+            )
+            .await
+            .unwrap()
+            .get(0);
+        assert_eq!(name, expected, "{table} copy must be renamed");
+    }
+}
+
+#[tokio::test]
+async fn erase_renames_org_deleted_during_erase() {
+    let (server, database) = setup_test_server_with_database().await;
+    let (session, owner, email) = new_user(&database).await;
+    let (_s2, teammate, _) = new_user(&database).await;
+    let (_s3, admin, _) = new_user(&database).await;
+    let team = create_org_with_session(&server, &session).await;
+    add_member(&database, &team.id, teammate, "member").await;
+    transfer_ownership(&server, &team.id, teammate).await;
+    let org: uuid::Uuid = team.id.parse().unwrap();
+    let local = email.split('@').next().unwrap();
+    let old_name = format!("{local}-org-1");
+    let client = database.pool().get().await.unwrap();
+    client
+        .execute(
+            "UPDATE organizations SET name = $2 WHERE id = $1",
+            &[&org, &old_name],
+        )
+        .await
+        .unwrap();
+
+    // Drive the repository directly to observe the execute outcome.
+    let repo = database::repositories::PostgresUserErasureRepository::new(database.pool().clone());
+    let outcome = services::user_erasure::UserErasureRepository::execute(
+        &repo,
+        services::user_erasure::ExecuteRequest {
+            user_id: owner,
+            admin_user_id: admin,
+            confirm_email: &email,
+            email_sha256: services::user_erasure::erased_email_digest(&email),
+            requested_at: chrono::Utc::now(),
+        },
+    )
+    .await
+    .unwrap();
+    let services::user_erasure::ExecuteOutcome::Erased {
+        rename_watch_org_ids,
+        ..
+    } = outcome
+    else {
+        panic!("expected the erase to commit");
+    };
+    assert_eq!(
+        rename_watch_org_ids,
+        vec![org],
+        "the active matching org is watched"
+    );
+    assert_eq!(
+        org_name(&client, org).await,
+        old_name,
+        "an active team org's chosen name is not renamed by the erase"
+    );
+
+    // A concurrent delete lands after the erase scan.
+    client
+        .execute(
+            "UPDATE organizations SET is_active = false WHERE id = $1",
+            &[&org],
+        )
+        .await
+        .unwrap();
+    services::user_erasure::UserErasureRepository::rename_retained_org_names(
+        &repo,
+        owner,
+        &rename_watch_org_ids,
+    )
+    .await
+    .unwrap();
+    assert_eq!(org_name(&client, org).await, format!("org-{org}"));
+}
+
+#[tokio::test]
+async fn erase_refreshes_drifted_default_workspace_description() {
+    let (server, database) = setup_test_server_with_database().await;
+    let (session, owner, email) = new_user(&database).await;
+    let (_s2, teammate, _) = new_user(&database).await;
+    let personal = personal_org_id(&server, &session).await;
+    add_member(&database, &personal, teammate, "member").await;
+    transfer_ownership(&server, &personal, teammate).await;
+    let org: uuid::Uuid = personal.parse().unwrap();
+    let client = database.pool().get().await.unwrap();
+    let custom = format!("acme-{}", uuid::Uuid::new_v4());
+    // The owner renamed the org after signup; the description still embeds the old name.
+    client
+        .execute(
+            "UPDATE organizations SET name = $2 WHERE id = $1",
+            &[&org, &custom],
+        )
+        .await
+        .unwrap();
+    let before: Option<String> = client
+        .query_one(
+            "SELECT description FROM workspaces WHERE organization_id = $1 AND name = 'default'",
+            &[&org],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    assert!(before.unwrap().starts_with("Default workspace for "));
+
+    assert_eq!(erase(&server, owner, &email).await.status_code(), 200);
+
+    assert_eq!(org_name(&client, org).await, custom, "org name is kept");
+    let desc: Option<String> = client
+        .query_one(
+            "SELECT description FROM workspaces WHERE organization_id = $1 AND name = 'default'",
+            &[&org],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(
+        desc.as_deref(),
+        Some(format!("Default workspace for {custom}").as_str())
+    );
 }

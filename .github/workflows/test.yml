@@ -209,7 +209,7 @@ jobs:
         cache-key: e2e
 
     - name: Run typed-query, credit-allocation, and session regressions
-      run: cargo test --locked -p database --test hot_path_typed_queries --test billing_typed_queries --test credit_allocation --test session_rotation
+      run: cargo test --locked -p database --test hot_path_typed_queries --test billing_typed_queries --test credit_allocation --test session_rotation -- --test-threads=4
       env:
         PGHOST: localhost
         PGPORT: 5432

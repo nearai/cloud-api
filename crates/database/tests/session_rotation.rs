@@ -16,7 +16,14 @@ async fn migration_runner_rebuilds_missing_refresh_rotation_index() -> anyhow::R
         .await?;
     drop(client);
 
-    database::migrations::run(&pool).await?;
+    // Replica startup can overlap. Both runners should complete while the
+    // out-of-transaction concurrent index build is serialized independently.
+    let (first, second) = tokio::join!(
+        database::migrations::run(&pool),
+        database::migrations::run(&pool)
+    );
+    first?;
+    second?;
 
     let client = pool.get().await?;
     let ready: bool = client

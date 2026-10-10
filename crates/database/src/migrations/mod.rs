@@ -2,69 +2,77 @@ use crate::pool::DbPool;
 use anyhow::{Context, Result};
 use deadpool_postgres::Client;
 use refinery::load_sql_migrations;
+use std::time::Duration;
 use tracing::info;
 
-// "NEARMIGR" as an i64. Session-level advisory locks are scoped to a single
-// database, so independent databases can still migrate in parallel.
-const MIGRATION_LOCK_KEY: i64 = 0x4e45_4152_4d49_4752;
+// "NEARINDX" as an i64. PostgreSQL permits only one concurrent index build on
+// a table at a time, so application replicas must serialize this bootstrap.
+const REFRESH_ROTATION_INDEX_LOCK_KEY: i64 = 0x4e45_4152_494e_4458;
 const REFRESH_ROTATION_INDEX: &str = "idx_refresh_tokens_previous_hash";
 
-/// Holds the dedicated connection that owns the PostgreSQL advisory lock.
-///
-/// If this future is cancelled or unlocking fails, discard the connection
-/// instead of returning a session that may still own the lock to the pool.
-struct MigrationLock {
+/// Holds the connection that serializes the out-of-transaction index build.
+struct RefreshRotationIndexLock {
     client: Option<Client>,
-    safe_to_reuse: bool,
 }
 
-impl MigrationLock {
-    async fn acquire(pool: &DbPool) -> Result<Self> {
-        let client = pool
-            .get()
-            .await
-            .context("Failed to get database connection for migrations")?;
+impl RefreshRotationIndexLock {
+    async fn acquire(client: Client) -> Result<Self> {
         let mut guard = Self {
             client: Some(client),
-            safe_to_reuse: false,
         };
 
-        guard
-            .client()
-            .query_one("SELECT pg_advisory_lock($1)", &[&MIGRATION_LOCK_KEY])
-            .await
-            .context("Failed to acquire database migration lock")?;
+        loop {
+            let acquired: bool = guard
+                .client()
+                .query_one(
+                    "SELECT pg_try_advisory_lock($1)",
+                    &[&REFRESH_ROTATION_INDEX_LOCK_KEY],
+                )
+                .await
+                .context("Failed to acquire refresh rotation index lock")?
+                .get(0);
+            if acquired {
+                return Ok(guard);
+            }
 
-        Ok(guard)
+            // Do not wait inside pg_advisory_lock: that open statement holds a
+            // virtual transaction which CREATE INDEX CONCURRENTLY may need to
+            // wait for, creating a deadlock with the lock holder.
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
     }
 
     fn client(&mut self) -> &mut tokio_postgres::Client {
         self.client
             .as_mut()
-            .expect("migration lock must own its connection")
+            .expect("refresh rotation index lock must own its connection")
     }
 
     async fn release(mut self) -> Result<()> {
         let row = self
             .client()
-            .query_one("SELECT pg_advisory_unlock($1)", &[&MIGRATION_LOCK_KEY])
+            .query_one(
+                "SELECT pg_advisory_unlock($1)",
+                &[&REFRESH_ROTATION_INDEX_LOCK_KEY],
+            )
             .await
-            .context("Failed to release database migration lock")?;
+            .context("Failed to release refresh rotation index lock")?;
         let unlocked: bool = row.get(0);
-        anyhow::ensure!(unlocked, "Database migration lock was not held");
-        self.safe_to_reuse = true;
+        anyhow::ensure!(unlocked, "Refresh rotation index lock was not held");
+
+        // The session no longer owns the lock and can safely return to the pool.
+        drop(self.client.take());
         Ok(())
     }
 }
 
-impl Drop for MigrationLock {
+impl Drop for RefreshRotationIndexLock {
     fn drop(&mut self) {
-        if !self.safe_to_reuse {
-            if let Some(client) = self.client.take() {
-                // Closing the PostgreSQL session releases any advisory lock it
-                // may still own. Do not put this connection back in the pool.
-                drop(Client::take(client));
-            }
+        if let Some(client) = self.client.take() {
+            // Cancellation or an unlock failure must not return a session that
+            // may still own the advisory lock to the pool. Closing the session
+            // releases the lock.
+            drop(Client::take(client));
         }
     }
 }
@@ -96,8 +104,8 @@ async fn refresh_rotation_index_is_ready(client: &tokio_postgres::Client) -> Res
 }
 
 /// Build the refresh-token predecessor index without blocking authentication
-/// writes. This runs outside Refinery's transaction while the migration
-/// advisory lock still serializes application instances.
+/// writes. This runs outside Refinery's transaction and is serialized separately
+/// because PostgreSQL allows only one concurrent index build per table.
 async fn ensure_refresh_rotation_index(client: &tokio_postgres::Client) -> Result<()> {
     match refresh_rotation_index_is_ready(client).await? {
         Some(true) => return Ok(()),
@@ -134,10 +142,10 @@ async fn ensure_refresh_rotation_index(client: &tokio_postgres::Client) -> Resul
 
 /// Run database migrations
 pub async fn run(pool: &DbPool) -> Result<()> {
-    // Refinery's schema history check and insert are not atomic across runner
-    // processes. Serialize the whole operation so concurrent application
-    // instances and integration-test binaries cannot apply the same version.
-    let mut lock = MigrationLock::acquire(pool).await?;
+    let mut client = pool
+        .get()
+        .await
+        .context("Failed to get database connection for migrations")?;
 
     // Load the migration SQL files from the migrations/sql folder
     // Priority: 1) DATABASE_MIGRATIONS_PATH env var, 2) relative path from current dir, 3) compile-time path
@@ -171,27 +179,29 @@ pub async fn run(pool: &DbPool) -> Result<()> {
     let migrations = load_sql_migrations(migrations_path)
         .with_context(|| format!("Failed to load migrations from {migrations_path:?}"))?;
 
-    let migration_result: Result<_> = async {
-        let report = refinery::Runner::new(&migrations)
-            .run_async(lock.client())
-            .await
-            .context("Failed to run migrations")?;
-        ensure_refresh_rotation_index(lock.client()).await?;
-        Ok(report)
-    }
-    .await;
-    let unlock_result = lock.release().await;
+    let migration_report = refinery::Runner::new(&migrations)
+        .run_async(&mut **client)
+        .await
+        .context("Failed to run migrations")?;
 
-    let migration_report = match (migration_result, unlock_result) {
-        (Ok(report), Ok(())) => report,
-        (Err(migration_error), Ok(())) => return Err(migration_error),
-        (Ok(_), Err(unlock_error)) => return Err(unlock_error),
-        (Err(migration_error), Err(unlock_error)) => {
-            return Err(migration_error).context(format!(
-                "Failed to run migrations; additionally failed to release migration lock: {unlock_error:#}"
-            ));
+    // Regular migrations retain Refinery's existing behavior. Only replicas
+    // that observe a missing or invalid out-of-transaction index contend on
+    // the dedicated bootstrap lock; the normal startup path takes no lock.
+    if refresh_rotation_index_is_ready(&client).await? != Some(true) {
+        let mut index_lock = RefreshRotationIndexLock::acquire(client).await?;
+        let index_result = ensure_refresh_rotation_index(index_lock.client()).await;
+        let unlock_result = index_lock.release().await;
+        match (index_result, unlock_result) {
+            (Ok(()), Ok(())) => {}
+            (Err(index_error), Ok(())) => return Err(index_error),
+            (Ok(()), Err(unlock_error)) => return Err(unlock_error),
+            (Err(index_error), Err(unlock_error)) => {
+                return Err(index_error).context(format!(
+                    "Failed to prepare refresh rotation index; additionally failed to release its lock: {unlock_error:#}"
+                ));
+            }
         }
-    };
+    }
 
     for migration in migration_report.applied_migrations() {
         info!("Applied migration: {}", migration.name());

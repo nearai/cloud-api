@@ -454,6 +454,13 @@ async fn binding_creates_personal_default_before_admin_membership() -> anyhow::R
     assert_eq!(memberships.len(), 2);
     let personal: Uuid = memberships[0].get(0);
     assert_ne!(personal, org);
+    let name: String = client
+        .query_one("SELECT name FROM organizations WHERE id=$1", &[&personal])
+        .await?
+        .get(0);
+    let prefix = format!("{}-org-", c.near_account_id);
+    assert!(name.starts_with(&prefix));
+    assert_eq!(name.len(), prefix.len() + 4);
     assert_eq!(memberships[0].get::<_, String>(1), "owner");
     assert_eq!(memberships[1].get::<_, Uuid>(0), org);
     assert_eq!(memberships[1].get::<_, String>(1), "admin");

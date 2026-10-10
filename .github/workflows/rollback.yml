@@ -210,34 +210,14 @@ jobs:
     # ensuring a transient registry blip on the audit copy doesn't block the
     # redeploy. The :prod retag step has no continue-on-error, so a retag
     # failure correctly blocks the redeploy.
-    runs-on: [self-hosted, infra]
+    runs-on: ubuntu-latest
+    timeout-minutes: 125
+    permissions:
+      contents: read
     steps:
-      # cvm-ansible-playbooks `Update Cloud API Prod` re-reads :prod from
-      # Docker Hub, which we just re-pointed at the rolled-back digest. We
-      # trigger its existing workflow_dispatch (not repository_dispatch) so
-      # this rollback workflow stays self-contained — no change required in
-      # cvm-ansible-playbooks. REPOSITORY_DISPATCH_TOKEN is already used by
-      # build.yml for cross-repo dispatch into the same target repo.
-      - name: Dispatch Update Cloud API Prod
+      - name: Checkout repository
+        uses: actions/checkout@v7
+      - name: Deploy latest prod image and wait for health checks
         env:
           GH_TOKEN: ${{ secrets.REPOSITORY_DISPATCH_TOKEN }}
-        run: |
-          set -euo pipefail
-          gh workflow run update_cloud_api_prod.yml \
-            --repo nearai/cvm-ansible-playbooks \
-            --ref main
-
-      - name: Summary
-        run: |
-          {
-            echo "## Redeploy dispatched"
-            echo ""
-            echo "- target tag: \`${{ needs.rollback-prod.outputs.target_tag }}\`"
-            echo "- target digest: \`${{ needs.rollback-prod.outputs.target_digest }}\`"
-            echo "- audit tag: \`${{ needs.rollback-prod.outputs.audit_tag }}\`"
-            echo ""
-            echo "Triggered \`Update Cloud API Prod\` on \`nearai/cvm-ansible-playbooks\`."
-            echo "Track the deploy: https://github.com/nearai/cvm-ansible-playbooks/actions/workflows/update_cloud_api_prod.yml"
-            echo ""
-            echo "Verify when deploy completes: https://cloud-api.near.ai/v1/health"
-          } >> "$GITHUB_STEP_SUMMARY"
+        run: python3 scripts/deploy_prod.py

@@ -237,7 +237,8 @@ pub trait SessionRepository: Send + Sync {
     async fn rotate(
         &self,
         session_id: SessionId,
-        old_token_hash: &str,
+        old_token: &str,
+        successor_token: &str,
         expires_in_hours: i64,
     ) -> anyhow::Result<(Session, String)>;
 
@@ -318,13 +319,15 @@ pub trait AuthServiceTrait: Send + Sync {
     async fn logout(&self, session_id: SessionId) -> Result<bool, AuthError>;
 
     /// Rotate a refresh token session (refresh token rotation)
-    /// This atomically updates the token hash and expiration, ensuring only one valid token at a time.
-    /// The old_token_hash is used to prevent race conditions where multiple requests try to rotate the same token.
+    /// This atomically updates the token hash and expiration. The immediate
+    /// predecessor remains valid for a bounded concurrent-request grace window.
+    /// The presented token and its server-derived successor make a concurrent
+    /// retry return the same active successor instead of rotating twice.
     async fn rotate_session(
         &self,
         user_id: UserId,
         session_id: SessionId,
-        old_token_hash: &str,
+        old_token: &str,
         encoding_key: String,
         access_token_expires_in_hours: i64,
         refresh_token_expires_in_hours: i64,
@@ -614,7 +617,7 @@ impl AuthServiceTrait for MockAuthService {
         &self,
         _user_id: UserId,
         _session_id: SessionId,
-        _old_token_hash: &str,
+        _old_token: &str,
         encoding_key: String,
         access_token_expires_in_hours: i64,
         refresh_token_expires_in_hours: i64,

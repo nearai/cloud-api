@@ -112,21 +112,30 @@ impl UserErasureService {
             .map_err(UserErasureError::Internal)?;
 
         let (already_erased, footprint) = match outcome {
-            ExecuteOutcome::Erased(footprint) => {
+            ExecuteOutcome::Erased {
+                footprint,
+                rename_watch_org_ids,
+            } => {
                 tracing::info!(
                     %user_id,
                     %admin_user_id,
                     erased_organizations = footprint.organization_ids.len(),
                     "User erased"
                 );
-                // The rename runs in its own transaction after the erase committed. If it
-                // fails, the operator re-posts: the retry reports `already_erased` and
-                // re-runs the (idempotent) rename below.
+                // Deleted retained orgs matching the email were renamed inside the erase
+                // transaction. Active ones are renamed here, in their own transaction
+                // after the commit, with the watch list of orgs that matched the email
+                // while active, in case one was deleted before the commit. If this fails,
+                // the operator re-posts: the retry reports `already_erased` and re-runs
+                // the idempotent rename. A retry has no watch list, so an org deleted
+                // concurrently with the erase is repaired only if this step succeeded
+                // the first time (the window: a concurrent org deletion during the
+                // erase, followed by a post-commit failure).
                 self.repository
-                    .rename_retained_signup_orgs(user_id)
+                    .rename_retained_org_names(user_id, &rename_watch_org_ids)
                     .await
                     .map_err(|e| {
-                        tracing::warn!(%user_id, "erasure committed but retained signup org rename failed; re-post the erase to sweep and retry the idempotent rename");
+                        tracing::warn!(%user_id, "erasure committed but retained org rename failed; re-post the erase to sweep and retry the idempotent rename");
                         UserErasureError::Internal(e)
                     })?;
                 (false, footprint)
@@ -137,12 +146,13 @@ impl UserErasureService {
                     .sweep_erased(user_id)
                     .await
                     .map_err(UserErasureError::Internal)?;
-                // Repairs a crash between the erase commit and the rename.
+                // Repairs a crash between the erase commit and the post-commit rename
+                // (without the watch list; see above).
                 self.repository
-                    .rename_retained_signup_orgs(user_id)
+                    .rename_retained_org_names(user_id, &[])
                     .await
                     .map_err(|e| {
-                        tracing::warn!(%user_id, "erasure committed but retained signup org rename failed; re-post the erase to sweep and retry the idempotent rename");
+                        tracing::warn!(%user_id, "erasure committed but retained org rename failed; re-post the erase to sweep and retry the idempotent rename");
                         UserErasureError::Internal(e)
                     })?;
                 (true, footprint)
@@ -202,6 +212,7 @@ mod tests {
     }
 
     struct FakeRepo {
+        rename_args: Mutex<Vec<(Uuid, Vec<Uuid>)>>,
         outcome: Mutex<ExecuteOutcome>,
         footprint: ErasedFootprint,
         sweeps: Mutex<u32>,
@@ -216,6 +227,7 @@ mod tests {
                 footprint,
                 sweeps: Mutex::new(0),
                 renames: Mutex::new(0),
+                rename_args: Mutex::new(Vec::new()),
                 lookups: Mutex::new(Vec::new()),
             })
         }
@@ -229,7 +241,15 @@ mod tests {
         async fn execute(&self, _: ExecuteRequest<'_>) -> anyhow::Result<ExecuteOutcome> {
             Ok(self.outcome.lock().unwrap().clone())
         }
-        async fn rename_retained_signup_orgs(&self, _: Uuid) -> anyhow::Result<()> {
+        async fn rename_retained_org_names(
+            &self,
+            user_id: Uuid,
+            watch_org_ids: &[Uuid],
+        ) -> anyhow::Result<()> {
+            self.rename_args
+                .lock()
+                .unwrap()
+                .push((user_id, watch_org_ids.to_vec()));
             *self.renames.lock().unwrap() += 1;
             Ok(())
         }
@@ -240,6 +260,13 @@ mod tests {
         async fn find_erasures(&self, by: ErasureLookup) -> anyhow::Result<Vec<ErasureRecord>> {
             self.lookups.lock().unwrap().push(by);
             Ok(Vec::new())
+        }
+    }
+
+    fn erased(footprint: ErasedFootprint, rename_watch_org_ids: Vec<Uuid>) -> ExecuteOutcome {
+        ExecuteOutcome::Erased {
+            footprint,
+            rename_watch_org_ids,
         }
     }
 
@@ -257,7 +284,7 @@ mod tests {
     #[tokio::test]
     async fn erase_returns_erased_orgs() {
         let (org, fp) = footprint();
-        let repo = FakeRepo::new(ExecuteOutcome::Erased(fp.clone()), fp);
+        let repo = FakeRepo::new(erased(fp.clone(), vec![]), fp);
         let r = UserErasureService::new(repo.clone())
             .erase(Uuid::new_v4(), Uuid::new_v4(), "a@b.c", None)
             .await
@@ -273,17 +300,48 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn fresh_erase_renames_with_the_user_id() {
+        let (_, fp) = footprint();
+        let repo = FakeRepo::new(erased(fp.clone(), vec![]), fp);
+        let user_id = Uuid::new_v4();
+        UserErasureService::new(repo.clone())
+            .erase(user_id, Uuid::new_v4(), "Alice.B@Example.com", None)
+            .await
+            .unwrap();
+        assert_eq!(*repo.rename_args.lock().unwrap(), vec![(user_id, vec![])]);
+    }
+
+    #[tokio::test]
+    async fn fresh_erase_passes_the_watch_ids_to_the_rename() {
+        let (_, fp) = footprint();
+        let watch = vec![Uuid::new_v4(), Uuid::new_v4()];
+        let repo = FakeRepo::new(erased(fp.clone(), watch.clone()), fp);
+        let user_id = Uuid::new_v4();
+        UserErasureService::new(repo.clone())
+            .erase(user_id, Uuid::new_v4(), "a@b.c", None)
+            .await
+            .unwrap();
+        assert_eq!(*repo.rename_args.lock().unwrap(), vec![(user_id, watch)]);
+    }
+
+    #[tokio::test]
     async fn retry_on_erased_user_sweeps_and_reports_already_erased() {
         let (org, fp) = footprint();
         let repo = FakeRepo::new(ExecuteOutcome::AlreadyErased, fp);
+        let user_id = Uuid::new_v4();
         let r = UserErasureService::new(repo.clone())
-            .erase(Uuid::new_v4(), Uuid::new_v4(), "ignored", None)
+            .erase(user_id, Uuid::new_v4(), "ignored", None)
             .await
             .unwrap();
         assert!(r.already_erased);
         assert_eq!(r.erased_organization_ids, vec![org]);
         assert_eq!(*repo.sweeps.lock().unwrap(), 1, "retry sweeps late content");
         assert_eq!(*repo.renames.lock().unwrap(), 1, "retry re-runs the rename");
+        assert_eq!(
+            *repo.rename_args.lock().unwrap(),
+            vec![(user_id, vec![])],
+            "retry renames with the user id and no watch list"
+        );
     }
 
     #[tokio::test]

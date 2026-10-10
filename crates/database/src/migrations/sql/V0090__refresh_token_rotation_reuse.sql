@@ -1,4 +1,4 @@
--- These nullable columns remain compatible with replicas running the previous
+-- V0090 adds nullable columns compatible with replicas running the previous
 -- refresh-token implementation during a rolling deployment. The migration
 -- runner builds the lookup index concurrently after this transaction commits.
 -- Fail fast rather than queue authentication writes behind this DDL if another

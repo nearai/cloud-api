@@ -129,6 +129,37 @@ async fn test_provider_error_429_propagated() {
     assert_retry_after_present(&response);
 }
 
+#[tokio::test]
+async fn test_stream_error_before_first_event_uses_http_error_response() {
+    let (server, _pool, mock_provider, _db) = setup_test_server_with_pool().await;
+    setup_qwen_model(&server).await;
+    let org = setup_org_with_credits(&server, 10_000_000_000i64).await;
+    let api_key = get_api_key_for_org(&server, org.id).await;
+    mock_provider
+        .set_default_response(
+            inference_providers::mock::ResponseTemplate::new("unused").with_stream_error_after(
+                0,
+                inference_providers::CompletionError::HttpError {
+                    status_code: 429,
+                    message: "provider is rate limited".to_string(),
+                    is_external: false,
+                },
+            ),
+        )
+        .await;
+
+    let response = server
+        .post("/v1/chat/completions")
+        .add_header("Authorization", format!("Bearer {api_key}"))
+        .json(&chat_request("Qwen/Qwen3-30B-A3B-Instruct-2507", true))
+        .await;
+
+    assert_eq!(response.status_code(), 429);
+    assert_eq!(response.content_type(), "application/json");
+    let body: api::models::ErrorResponse = response.json();
+    assert!(body.error.message.contains("Rate limit"));
+}
+
 /// Test that the non-streaming Responses API propagates provider 429s as HTTP 429
 /// instead of returning HTTP 200 with status=failed.
 #[tokio::test]

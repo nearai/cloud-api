@@ -301,6 +301,53 @@ async fn auto_redact_continuous_stream_uses_gateway_signature() {
 }
 
 #[tokio::test]
+async fn auto_redact_stream_error_does_not_flush_buffered_content() {
+    let (server, _pool, mock_provider, _db) = setup_test_server_with_pool().await;
+    setup_qwen_model(&server).await;
+    setup_privacy_filter_model(&server).await;
+    let org = setup_org_with_credits(&server, 10_000_000_000i64).await;
+    let api_key = get_api_key_for_org(&server, org.id).await;
+
+    mock_provider
+        .set_default_response(
+            inference_providers::mock::ResponseTemplate::new("redacted1@example.com now.")
+                .with_disconnect_after(1),
+        )
+        .await;
+
+    let resp = server
+        .post("/v1/chat/completions")
+        .add_header("Authorization", format!("Bearer {api_key}"))
+        .add_header("User-Agent", MOCK_USER_AGENT)
+        .add_header("x-auto-redact", "on")
+        .json(&serde_json::json!({
+            "model": E2E_QWEN_MODEL_NAME,
+            "messages": [{ "role": "user", "content": "email alice@example.com" }],
+            "stream": true
+        }))
+        .await;
+
+    assert_eq!(resp.status_code(), 200);
+    let wire = resp.text();
+    let lines: Vec<&str> = wire.lines().collect();
+    let error_index = lines
+        .iter()
+        .position(|line| line.starts_with("data: ") && line.contains("\"error\""))
+        .unwrap_or_else(|| panic!("missing SSE error frame: {wire}"));
+    for line in &lines[error_index + 1..] {
+        if let Some(data) = line.strip_prefix("data: ") {
+            assert_ne!(data, "[DONE]", "failed stream ended successfully: {wire}");
+            let value: serde_json::Value =
+                serde_json::from_str(data).expect("all post-error data must be valid JSON");
+            assert!(
+                value.get("choices").is_none(),
+                "buffered ordinary content followed the SSE error: {wire}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
 async fn auto_redact_fail_closed_when_pii_model_missing() {
     let (server, pool, _mock, _db) = setup_test_server_with_pool().await;
     setup_qwen_model(&server).await;

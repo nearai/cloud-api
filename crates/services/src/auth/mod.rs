@@ -341,6 +341,12 @@ impl AuthServiceTrait for AuthService {
             }
         };
 
+        // NEAR identities are provisioned with their personal organization and
+        // workspace atomically by the repository, shared with wallet binding.
+        if oauth_info.provider == "near" {
+            return Ok(new_user);
+        }
+
         // Create default organization and workspace for new user
         debug!(
             user_id = %new_user.id.0,

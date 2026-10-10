@@ -174,6 +174,11 @@ impl BindingRepository for PostgresStakingBindingRepository {
             return Err(BindingError::AccountUnavailable.into());
         }
         let wallet_user_id: Uuid = user.get(0);
+        tx.query_one(
+            "SELECT ensure_near_personal_organization($1)",
+            &[&wallet_user_id],
+        )
+        .await?;
         let previous = tx.query_opt("SELECT role FROM organization_members WHERE organization_id=$1 AND user_id=$2 FOR UPDATE", &[&r.organization_id,&wallet_user_id]).await?.map(|row| row.get::<_, String>(0));
         // A source already established by this flow must not re-grant access.
         if tx.query_opt("SELECT id FROM staking_wallet_binding_challenges WHERE organization_id=$1 AND wallet_user_id=$2 AND consumed_at IS NOT NULL", &[&r.organization_id,&wallet_user_id]).await?.is_some() {

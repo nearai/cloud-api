@@ -190,5 +190,13 @@ async fn binding_route_verifies_proof_authorization_retry_and_profile_responses(
         .add_header("User-Agent", MOCK_USER_AGENT)
         .await;
     assert_eq!(me.status_code(), 200);
-    assert_eq!(me.json::<Value>()["staking_organization_id"], org.id);
+    let me = me.json::<Value>();
+    assert_eq!(me["staking_organization_id"], org.id);
+    assert_eq!(me["organizations"][0]["role"], "owner");
+    assert_ne!(me["organizations"][0]["id"], org.id);
+    assert!(me["organizations"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|membership| membership["id"] == org.id && membership["role"] == "admin"));
 }

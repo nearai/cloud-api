@@ -258,6 +258,14 @@ async fn existing_wallet_member_is_promoted_owner_is_preserved_and_disabled_iden
                     "admin"
                 }
             );
+            if existing != "owner" {
+                let first = client.query_one(
+                    "SELECT role,organization_id FROM organization_members WHERE user_id=$1 ORDER BY joined_at,organization_id LIMIT 1",
+                    &[&user],
+                ).await?;
+                assert_eq!(first.get::<_, String>(0), "owner");
+                assert_ne!(first.get::<_, Uuid>(1), org);
+            }
         } else {
             assert!(result.is_err());
             assert_eq!(client.query_one("SELECT count(*) FROM organization_staking_farm_sources WHERE organization_id=$1", &[&org]).await?.get::<_,i64>(0),0);
@@ -427,5 +435,123 @@ async fn challenge_cleanup_preserves_consumed_audit_and_recent_rate_limit_histor
     assert!(!ids.contains(&old.challenge_id));
     assert!(ids.contains(&consumed.challenge_id));
     assert!(ids.contains(&recent.challenge_id));
+    Ok(())
+}
+
+#[tokio::test]
+async fn binding_creates_personal_default_before_admin_membership() -> anyhow::Result<()> {
+    let (pool, org, actor) = fixture().await?;
+    let repo = PostgresStakingBindingRepository::new(pool.clone());
+    let c = challenge(org, actor, account());
+    repo.prepare(&c).await?;
+    let key = Uuid::new_v4();
+    let result = repo.confirm(&c, request(&c), key, "key", "digest").await?;
+    let client = pool.get().await?;
+    let memberships = client.query(
+        "SELECT m.organization_id,m.role FROM organization_members m JOIN organizations o ON o.id=m.organization_id AND o.is_active WHERE m.user_id=$1 ORDER BY m.joined_at,m.organization_id",
+        &[&result.user_id],
+    ).await?;
+    assert_eq!(memberships.len(), 2);
+    let personal: Uuid = memberships[0].get(0);
+    assert_ne!(personal, org);
+    assert_eq!(memberships[0].get::<_, String>(1), "owner");
+    assert_eq!(memberships[1].get::<_, Uuid>(0), org);
+    assert_eq!(memberships[1].get::<_, String>(1), "admin");
+    assert_eq!(client.query_one("SELECT count(*) FROM workspaces WHERE organization_id=$1 AND created_by_user_id=$2 AND name='default'", &[&personal,&result.user_id]).await?.get::<_,i64>(0),1);
+    repo.confirm(&c, request(&c), key, "key", "digest").await?;
+    assert_eq!(
+        client
+            .query_one(
+                "SELECT count(*) FROM organization_members WHERE user_id=$1",
+                &[&result.user_id]
+            )
+            .await?
+            .get::<_, i64>(0),
+        2
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn first_login_and_binding_share_personal_organization_provisioning() -> anyhow::Result<()> {
+    let (pool, org, actor) = fixture().await?;
+    let repo = PostgresStakingBindingRepository::new(pool.clone());
+    let users = database::repositories::UserRepository::new(pool.clone());
+    let account = account();
+    let c = challenge(org, actor, account.clone());
+    repo.prepare(&c).await?;
+    let (login, binding) = tokio::join!(
+        users.create_from_oauth(
+            format!("{account}@near"),
+            account.clone(),
+            None,
+            None,
+            "near".into(),
+            account.clone()
+        ),
+        repo.confirm(&c, request(&c), Uuid::new_v4(), "key", "digest")
+    );
+    let result = binding?;
+    // If binding wins the identity insert, OAuth resolves the uniqueness error
+    // through its existing provider-identity lookup.
+    let user = users.get_by_provider("near", &account).await?.unwrap();
+    assert_eq!(user.id, result.user_id);
+    if let Ok(login) = login {
+        assert_eq!(login.id, result.user_id);
+    }
+    let client = pool.get().await?;
+    assert_eq!(
+        client
+            .query_one(
+                "SELECT count(*) FROM organization_members WHERE user_id=$1 AND role='owner'",
+                &[&result.user_id]
+            )
+            .await?
+            .get::<_, i64>(0),
+        1
+    );
+    assert_eq!(client.query_one("SELECT count(*) FROM organization_members WHERE organization_id=$1 AND user_id=$2 AND role='admin'", &[&org,&result.user_id]).await?.get::<_,i64>(0),1);
+    Ok(())
+}
+
+#[tokio::test]
+async fn binding_preserves_existing_personal_organization_and_workspace() -> anyhow::Result<()> {
+    let (pool, org, actor) = fixture().await?;
+    let users = database::repositories::UserRepository::new(pool.clone());
+    let account = account();
+    let user = users
+        .create_from_oauth(
+            format!("{account}@near"),
+            account.clone(),
+            None,
+            None,
+            "near".into(),
+            account.clone(),
+        )
+        .await?;
+    let client = pool.get().await?;
+    let personal: Uuid = client
+        .query_one(
+            "SELECT organization_id FROM organization_members WHERE user_id=$1 AND role='owner'",
+            &[&user.id],
+        )
+        .await?
+        .get(0);
+    let repo = PostgresStakingBindingRepository::new(pool.clone());
+    let c = challenge(org, actor, account);
+    repo.prepare(&c).await?;
+    repo.confirm(&c, request(&c), Uuid::new_v4(), "key", "digest")
+        .await?;
+    assert_eq!(client.query_one("SELECT organization_id FROM organization_members WHERE user_id=$1 AND role='owner'", &[&user.id]).await?.get::<_,Uuid>(0),personal);
+    assert_eq!(
+        client
+            .query_one(
+                "SELECT count(*) FROM workspaces WHERE created_by_user_id=$1",
+                &[&user.id]
+            )
+            .await?
+            .get::<_, i64>(0),
+        1
+    );
     Ok(())
 }

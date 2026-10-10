@@ -10,7 +10,7 @@ use crate::{
 };
 use axum::{
     extract::{Extension, Json, Path, State},
-    http::StatusCode,
+    http::{HeaderMap, StatusCode},
 };
 use serde::Deserialize;
 use serde::Serialize;
@@ -504,6 +504,7 @@ pub async fn revoke_all_user_tokens(
 )]
 pub async fn create_access_token(
     State(app_state): State<AppState>,
+    headers: HeaderMap,
     Extension((session, user)): Extension<(services::auth::Session, AuthenticatedUser)>,
 ) -> Result<Json<crate::models::AccessAndRefreshTokenResponse>, (StatusCode, Json<ErrorResponse>)> {
     debug!(
@@ -512,13 +513,26 @@ pub async fn create_access_token(
     );
 
     // Rotate the refresh token session
+    let old_token = headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("Bearer "))
+        .ok_or_else(|| {
+            (
+                StatusCode::UNAUTHORIZED,
+                Json(ErrorResponse::new(
+                    "Refresh token is required".to_string(),
+                    "unauthorized".to_string(),
+                )),
+            )
+        })?;
     let expires_in_hours = 7 * 24;
     let result = app_state
         .auth_service
         .rotate_session(
             session.user_id,
             session.id,
-            &session.token_hash,
+            old_token,
             app_state.config.auth.encoding_key.to_string(),
             1,                // access token expires in 1 hour
             expires_in_hours, // refresh token expires in 7 days

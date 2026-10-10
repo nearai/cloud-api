@@ -357,11 +357,27 @@ impl Provider {
                 .filter(|s| *s > 0)
                 .map(|s| (s as u64).min(120))
                 .unwrap_or(30);
+            let ttl = std::time::Duration::from_secs(ttl);
+            // Leave usable time for short-lived batches without extending the
+            // upstream lifetime when discovery itself is slow.
+            let margin = std::time::Duration::from_secs(5).min(ttl / 2);
+            let expires_at = discovery_started + (ttl - margin);
+            let now = std::time::Instant::now();
+            if expires_at <= now {
+                tracing::warn!(
+                    chute_id,
+                    nonce_ttl_ms = ttl.as_millis() as u64,
+                    discovery_elapsed_ms = now.duration_since(discovery_started).as_millis() as u64,
+                    "Chutes discovery exhausted the usable nonce lifetime"
+                );
+                return Err(availability::retryable_provider_unavailable(
+                    "discover instances",
+                    "nonce batch expired before discovery completed",
+                ));
+            }
             *guard = CachedInstances {
                 instances: fresh.instances,
-                expires_at: discovery_started
-                    + std::time::Duration::from_secs(ttl)
-                        .saturating_sub(std::time::Duration::from_secs(5)),
+                expires_at,
                 generation: guard.generation + 1,
             };
         }
@@ -371,15 +387,14 @@ impl Provider {
     /// Atomically consume one single-use nonce token for `instance_id` from the
     /// cached snapshot (the point that PREVENTS reuse: a popped token is gone from
     /// the cache, so no concurrent request can hand out the same one). Returns
-    /// `None` if the batch expired during verification, the instance/key changed,
-    /// or the pool drained. The provider pool retries with fresh discovery and
-    /// attestation when no candidate has a usable nonce.
+    /// `None` if the instance/key changed or its pool drained. An expired batch
+    /// returns a retryable error immediately: no remaining candidate can use it.
     async fn take_nonce(
         &self,
         chute_id: &str,
         instance_id: &str,
         e2e_pubkey: &str,
-    ) -> Option<InvokeNonce> {
+    ) -> Result<Option<InvokeNonce>, CompletionError> {
         let cell = self.chute_cache(chute_id);
         let mut guard = cell.lock().await;
         if guard.expires_at <= std::time::Instant::now() {
@@ -388,18 +403,24 @@ impl Provider {
                 instance_id,
                 "Chutes nonce batch expired during verification"
             );
-            return None;
+            return Err(availability::retryable_provider_unavailable(
+                "consume Chutes nonce",
+                "nonce batch expired during verification",
+            ));
         }
-        let inst = guard
+        let Some(inst) = guard
             .instances
             .iter_mut()
-            .find(|i| i.instance_id == instance_id && i.e2e_pubkey.trim() == e2e_pubkey)?;
-        let token = inst.nonces.pop()?;
-        Some(InvokeNonce {
+            .find(|i| i.instance_id == instance_id && i.e2e_pubkey.trim() == e2e_pubkey)
+        else {
+            return Ok(None);
+        };
+        let token = inst.nonces.pop();
+        Ok(token.map(|token| InvokeNonce {
             token,
             generation: guard.generation,
             expires_at: guard.expires_at,
-        })
+        }))
     }
 
     /// Discard a rejected batch before the provider pool retries. This applies
@@ -619,12 +640,12 @@ impl Provider {
             // attempt refreshes discovery and repeats verification.
             let nonce = match self
                 .take_nonce(&chute_id, &inst.instance_id, e2e_pubkey)
-                .await
+                .await?
             {
                 Some(n) => n,
                 None => {
                     last_err = format!(
-                        "instance {} nonce batch expired, pool drained, or key changed",
+                        "instance {} nonce pool drained or key changed",
                         inst.instance_id
                     );
                     last_err_retryable = true;
@@ -2165,17 +2186,24 @@ mod tests {
         assert_eq!(
             p.take_nonce("chute-A", "i1", "cGs=")
                 .await
+                .unwrap()
                 .map(|nonce| nonce.token)
                 .as_deref(),
             Some("only-token"),
             "take_nonce consumes from the shared cell"
         );
         assert!(
-            p.take_nonce("chute-A", "i1", "cGs=").await.is_none(),
+            p.take_nonce("chute-A", "i1", "cGs=")
+                .await
+                .unwrap()
+                .is_none(),
             "second take on a 1-token pool drains it → None (no reuse)"
         );
         assert!(
-            p.take_nonce("chute-A", "absent", "cGs=").await.is_none(),
+            p.take_nonce("chute-A", "absent", "cGs=")
+                .await
+                .unwrap()
+                .is_none(),
             "missing instance → None"
         );
     }

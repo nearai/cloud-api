@@ -13,7 +13,8 @@ use wiremock::{Mock, MockGuard, MockServer, Request, ResponseTemplate};
 struct RecordingVerifier {
     calls: Mutex<Vec<(String, String)>>,
     reject: bool,
-    pause: Option<Arc<tokio::sync::Barrier>>,
+    reject_after_first: bool,
+    pause_first: Option<Arc<tokio::sync::Barrier>>,
 }
 
 #[async_trait]
@@ -25,15 +26,18 @@ impl ChutesInstanceVerifier for RecordingVerifier {
         e2e_pubkey: &str,
     ) -> Result<VerifiedInstanceInfo, String> {
         assert_eq!(boot_nonce.len(), 64);
-        self.calls
-            .lock()
-            .unwrap()
-            .push((evidence.instance_id.clone(), e2e_pubkey.to_string()));
-        if let Some(barrier) = &self.pause {
-            barrier.wait().await;
-            barrier.wait().await;
+        let call_count = {
+            let mut calls = self.calls.lock().unwrap();
+            calls.push((evidence.instance_id.clone(), e2e_pubkey.to_string()));
+            calls.len()
+        };
+        if call_count == 1 {
+            if let Some(barrier) = &self.pause_first {
+                barrier.wait().await;
+                barrier.wait().await;
+            }
         }
-        if self.reject {
+        if self.reject || (self.reject_after_first && call_count > 1) {
             return Err("test attestation rejection".to_string());
         }
         Ok(VerifiedInstanceInfo {
@@ -50,9 +54,9 @@ fn b64(bytes: &[u8]) -> String {
     base64::engine::general_purpose::STANDARD.encode(bytes)
 }
 
-fn discovery(instances: &[(&str, &str)]) -> ResponseTemplate {
+fn discovery(instances: &[(&str, &str)], nonce_expires_in: u64) -> ResponseTemplate {
     ResponseTemplate::new(200).set_body_json(json!({
-        "nonce_expires_in": 120,
+        "nonce_expires_in": nonce_expires_in,
         "instances": instances.iter().map(|(id, key)| json!({
             "instance_id": id, "e2e_pubkey": key, "nonces": [format!("nonce-{id}")]
         })).collect::<Vec<_>>()
@@ -73,7 +77,7 @@ async fn fixture(
         .await;
     Mock::given(method("GET"))
         .and(path("/e2e/instances/chute"))
-        .respond_with(discovery(instances))
+        .respond_with(discovery(instances, 120))
         .mount(&server)
         .await;
     Mock::given(method("GET"))
@@ -273,7 +277,7 @@ async fn key_rotation_fails_closed_but_unconstrained_chat_can_use_the_new_key() 
         // The old key's only nonce was consumed. The next request must refresh
         // discovery, where the SAME instance id now advertises a different key.
         Mock::given(path("/e2e/instances/chute"))
-            .respond_with(discovery(&[("pinned", &new_key)]))
+            .respond_with(discovery(&[("pinned", &new_key)], 120))
             .with_priority(1)
             .mount(&server)
             .await;
@@ -331,11 +335,13 @@ async fn nonce_consumption_rechecks_key_after_concurrent_cache_rotation() {
     assert!(provider
         .take_nonce("chute", "same-id", "old-key")
         .await
+        .unwrap()
         .is_none());
     assert_eq!(
         provider
             .take_nonce("chute", "same-id", "new-key")
             .await
+            .unwrap()
             .map(|nonce| nonce.token)
             .as_deref(),
         Some("new-nonce")
@@ -343,16 +349,20 @@ async fn nonce_consumption_rechecks_key_after_concurrent_cache_rotation() {
 }
 
 #[tokio::test]
-async fn nonce_expiring_during_attestation_is_not_sent_to_inference() {
+async fn expired_batch_stops_candidate_verification_and_remains_retryable() {
     for streaming in [false, true] {
         let (_, pk) = instance_keypair();
         let key = b64(&pk);
         let barrier = Arc::new(tokio::sync::Barrier::new(2));
         let verifier = Arc::new(RecordingVerifier {
-            pause: Some(barrier.clone()),
+            pause_first: Some(barrier.clone()),
+            reject_after_first: true,
             ..Default::default()
         });
-        let (provider, server) = fixture(&[("pinned", &key)], verifier.clone()).await;
+        // Whichever candidate is selected first verifies successfully. A later
+        // rejection must not replace the retryable expired-batch error.
+        let (provider, server) =
+            fixture(&[("first", &key), ("second", &key)], verifier.clone()).await;
         let expire_during_verification = async {
             barrier.wait().await;
             provider.chute_cache("chute").lock().await.expires_at = std::time::Instant::now();
@@ -379,7 +389,11 @@ async fn nonce_expiring_during_attestation_is_not_sent_to_inference() {
 
         // The next attempt refreshes rather than consuming the expired token.
         provider.discover_cached("chute", Some(&key)).await.unwrap();
-        assert!(provider.take_nonce("chute", "pinned", &key).await.is_some());
+        assert!(provider
+            .take_nonce("chute", "first", &key)
+            .await
+            .unwrap()
+            .is_some());
         assert_eq!(
             server
                 .received_requests()
@@ -390,6 +404,52 @@ async fn nonce_expiring_during_attestation_is_not_sent_to_inference() {
                 .count(),
             2
         );
+    }
+}
+
+#[tokio::test]
+async fn short_nonce_lifetime_can_still_serve_a_chat() {
+    for streaming in [false, true] {
+        let (dk, pk) = instance_keypair();
+        let key = b64(&pk);
+        let (provider, server) = fixture(&[("pinned", &key)], Arc::default()).await;
+        Mock::given(path("/e2e/instances/chute"))
+            .respond_with(discovery(&[("pinned", &key)], 3))
+            .with_priority(1)
+            .expect(1)
+            .mount(&server)
+            .await;
+        let _invoke = mount_invoke(&server, "pinned", dk, streaming).await;
+        chat(&provider, Some(&key), streaming).await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn discovery_that_exhausts_the_nonce_lifetime_skips_attestation() {
+    for streaming in [false, true] {
+        let (_, pk) = instance_keypair();
+        let key = b64(&pk);
+        let verifier = Arc::new(RecordingVerifier::default());
+        let (provider, server) = fixture(&[("pinned", &key)], verifier.clone()).await;
+        Mock::given(path("/e2e/instances/chute"))
+            .respond_with(
+                discovery(&[("pinned", &key)], 1).set_delay(std::time::Duration::from_millis(1100)),
+            )
+            .with_priority(1)
+            .expect(1)
+            .mount(&server)
+            .await;
+        assert!(matches!(
+            chat(&provider, Some(&key), streaming).await,
+            Err(CompletionError::HttpError {
+                status_code: 503,
+                ..
+            })
+        ));
+        assert!(verifier.calls.lock().unwrap().is_empty());
+        assert!(server.received_requests().await.unwrap().iter().all(|r| {
+            r.url.path() != "/chutes/chute/evidence" && r.url.path() != "/e2e/invoke"
+        }));
     }
 }
 
@@ -417,7 +477,7 @@ async fn rejected_nonce_discards_remaining_batch_and_reverifies_before_retry() {
             .and(path("/e2e/invoke"))
             .and(header("X-E2E-Nonce", "stale-rejected"))
             .respond_with(ResponseTemplate::new(403).set_body_json(json!({
-                "detail": "Invalid, expired, or already-used nonce"
+                "detail": availability::NONCE_REJECTED_DETAIL
             })))
             .expect(1)
             .mount(&server)
@@ -469,7 +529,7 @@ async fn late_nonce_rejection_does_not_invalidate_a_refreshed_batch() {
             &prepared.nonce,
             client::ChutesClientError::Status {
                 status: 403,
-                body: json!({"detail": "Invalid, expired, or already-used nonce"}).to_string(),
+                body: json!({"detail": availability::NONCE_REJECTED_DETAIL}).to_string(),
             },
         )
         .await;
@@ -480,6 +540,10 @@ async fn late_nonce_rejection_does_not_invalidate_a_refreshed_batch() {
             ..
         }
     ));
-    let nonce = provider.take_nonce("chute", "pinned", &key).await.unwrap();
+    let nonce = provider
+        .take_nonce("chute", "pinned", &key)
+        .await
+        .unwrap()
+        .unwrap();
     assert!(nonce.generation > prepared.nonce.generation);
 }

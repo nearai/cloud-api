@@ -14,6 +14,17 @@ pub use ports::*;
 /// Domain-separation prefix so these digests don't match generic SHA-256(email) lists.
 const ERASED_EMAIL_DIGEST_PREFIX: &str = "nearai-user-erasure-v1:";
 
+/// The part of `email` before the last `@`, trimmed and lowercased (empty when there
+/// is no `@`). Personal data: never log it.
+fn email_local_part(email: &str) -> String {
+    email
+        .trim()
+        .rsplit_once('@')
+        .map_or("", |(local, _)| local)
+        .trim()
+        .to_lowercase()
+}
+
 /// One-way lookup digest of an erased user's email (trimmed, lowercased). Unkeyed by
 /// design (v0): it hides the email from casual reads of the erasure log but does not
 /// stop someone with the database from confirming a guessed address.
@@ -122,11 +133,14 @@ impl UserErasureService {
                 // The rename runs in its own transaction after the erase committed. If it
                 // fails, the operator re-posts: the retry reports `already_erased` and
                 // re-runs the (idempotent) rename below.
+                // `confirm_email` matched the stored email (ignoring case and whitespace),
+                // so its local part is the user's. Never logged.
+                let email_local = email_local_part(confirm_email);
                 self.repository
-                    .rename_retained_signup_orgs(user_id)
+                    .rename_retained_org_names(user_id, Some(&email_local))
                     .await
                     .map_err(|e| {
-                        tracing::warn!(%user_id, "erasure committed but retained signup org rename failed; re-post the erase to sweep and retry the idempotent rename");
+                        tracing::warn!(%user_id, "erasure committed but retained org rename failed; re-post the erase to sweep and retry the idempotent rename (the retry cannot match orgs by email local part)");
                         UserErasureError::Internal(e)
                     })?;
                 (false, footprint)
@@ -137,12 +151,14 @@ impl UserErasureService {
                     .sweep_erased(user_id)
                     .await
                     .map_err(UserErasureError::Internal)?;
-                // Repairs a crash between the erase commit and the rename.
+                // Repairs a crash between the erase commit and the rename. The email is
+                // already tombstoned, so only the structural signup-name rule can run
+                // (no local part: orgs named after the user by hand are not repaired).
                 self.repository
-                    .rename_retained_signup_orgs(user_id)
+                    .rename_retained_org_names(user_id, None)
                     .await
                     .map_err(|e| {
-                        tracing::warn!(%user_id, "erasure committed but retained signup org rename failed; re-post the erase to sweep and retry the idempotent rename");
+                        tracing::warn!(%user_id, "erasure committed but retained org rename failed; re-post the erase to sweep and retry the idempotent rename");
                         UserErasureError::Internal(e)
                     })?;
                 (true, footprint)
@@ -202,6 +218,7 @@ mod tests {
     }
 
     struct FakeRepo {
+        rename_args: Mutex<Vec<Option<String>>>,
         outcome: Mutex<ExecuteOutcome>,
         footprint: ErasedFootprint,
         sweeps: Mutex<u32>,
@@ -216,6 +233,7 @@ mod tests {
                 footprint,
                 sweeps: Mutex::new(0),
                 renames: Mutex::new(0),
+                rename_args: Mutex::new(Vec::new()),
                 lookups: Mutex::new(Vec::new()),
             })
         }
@@ -229,7 +247,15 @@ mod tests {
         async fn execute(&self, _: ExecuteRequest<'_>) -> anyhow::Result<ExecuteOutcome> {
             Ok(self.outcome.lock().unwrap().clone())
         }
-        async fn rename_retained_signup_orgs(&self, _: Uuid) -> anyhow::Result<()> {
+        async fn rename_retained_org_names(
+            &self,
+            _: Uuid,
+            email_local: Option<&str>,
+        ) -> anyhow::Result<()> {
+            self.rename_args
+                .lock()
+                .unwrap()
+                .push(email_local.map(str::to_string));
             *self.renames.lock().unwrap() += 1;
             Ok(())
         }
@@ -273,6 +299,25 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn fresh_erase_passes_normalised_email_local_part() {
+        let (_, fp) = footprint();
+        let repo = FakeRepo::new(ExecuteOutcome::Erased(fp.clone()), fp);
+        UserErasureService::new(repo.clone())
+            .erase(
+                Uuid::new_v4(),
+                Uuid::new_v4(),
+                "  Alice.B@Example.com ",
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            *repo.rename_args.lock().unwrap(),
+            vec![Some("alice.b".to_string())]
+        );
+    }
+
+    #[tokio::test]
     async fn retry_on_erased_user_sweeps_and_reports_already_erased() {
         let (org, fp) = footprint();
         let repo = FakeRepo::new(ExecuteOutcome::AlreadyErased, fp);
@@ -284,6 +329,11 @@ mod tests {
         assert_eq!(r.erased_organization_ids, vec![org]);
         assert_eq!(*repo.sweeps.lock().unwrap(), 1, "retry sweeps late content");
         assert_eq!(*repo.renames.lock().unwrap(), 1, "retry re-runs the rename");
+        assert_eq!(
+            *repo.rename_args.lock().unwrap(),
+            vec![None],
+            "the email is tombstoned, so the retry has no local part"
+        );
     }
 
     #[tokio::test]

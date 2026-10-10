@@ -174,6 +174,7 @@ pub trait OrganizationConcurrentLimitRepository: Send + Sync {
     async fn get_concurrent_limit(&self, org_id: Uuid) -> Result<Option<u32>, anyhow::Error>;
 }
 
+#[cfg_attr(test, mockall::automock)]
 #[async_trait]
 pub trait CompletionServiceTrait: Send + Sync {
     /// Acquire one organization/model concurrency slot for a direct transport

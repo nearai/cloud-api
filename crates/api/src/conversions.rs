@@ -738,6 +738,20 @@ pub fn services_invitation_resend_result_to_api(
     }
 }
 
+/// Lifecycle for admin user responses. `None` (with a warning) when the columns are
+/// inconsistent, so one corrupt row cannot fail a whole admin list.
+pub fn admin_user_lifecycle(
+    user_id: uuid::Uuid,
+    is_active: bool,
+    auth_provider: &str,
+) -> Option<services::lifecycle::UserLifecycle> {
+    services::lifecycle::UserLifecycle::from_columns(is_active, auth_provider)
+        .map_err(
+            |_| tracing::warn!(user_id = %user_id, "User row has inconsistent lifecycle columns"),
+        )
+        .ok()
+}
+
 /// Convert database::User to AdminUserResponse (for owners/admins only)  
 pub fn db_user_to_admin_user(user: &database::User) -> AdminUserResponse {
     AdminUserResponse {
@@ -751,6 +765,7 @@ pub fn db_user_to_admin_user(user: &database::User) -> AdminUserResponse {
         is_active: user.is_active,
         auth_provider: user.auth_provider.clone(),
         provider_user_id: user.provider_user_id.clone(),
+        lifecycle: admin_user_lifecycle(user.id, user.is_active, &user.auth_provider),
         organizations: None,
     }
 }

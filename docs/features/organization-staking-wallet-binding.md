@@ -15,7 +15,7 @@ GET farm state is member-readable. New clients request `?include_binding_state=t
 
 ## Rollout
 
-1. Apply V0089. Its new one-source-per-organization unique index deliberately refuses ambiguous legacy rows; reconcile these before retrying migration. Preflight with `SELECT organization_id, count(*) FROM organization_staking_farm_sources GROUP BY organization_id HAVING count(*) > 1;` using the deployment operator's approved production access. Do not delete financial history to bypass the constraint.
+1. Apply V0090. Its new one-source-per-organization unique index deliberately refuses ambiguous legacy rows; reconcile these before retrying migration. Preflight with `SELECT organization_id, count(*) FROM organization_staking_farm_sources GROUP BY organization_id HAVING count(*) > 1;` using the deployment operator's approved production access. Do not delete financial history to bypass the constraint.
 2. Deploy backend and matching nearai-cloud-ui. Leave `STAKING_FARM_SELECTED_ORG_BINDING_ENABLED=false` until both are ready. Existing sources remain usable and bound responses preserve old field names.
 3. Enable the flag with staking enabled and configured. New source creation now requires explicit binding; unbound sync returns `staking_farm_not_bound`. Existing sources continue syncing regardless of member login provider.
 4. Verify a full-access NEP-413 wallet in the deployed environment. Fireblocks/contract multisig are not claimed as supported by this proof path.

@@ -218,8 +218,10 @@ impl StakingFarmRepository for OrganizationStakingFarmSourcesRepository {
                 .context("Failed to get database connection")
                 .map_err(RepositoryError::PoolError)?;
 
-            client
-                .query_one(
+            // Only an active source is written: a source disconnected by erasure
+            // while the contract call was in flight must stay untouched.
+            let updated = client
+                .query_opt(
                     r#"
                     UPDATE organization_staking_farm_sources
                     SET sync_status = $1,
@@ -231,7 +233,7 @@ impl StakingFarmRepository for OrganizationStakingFarmSourcesRepository {
                         last_synced_credit_nano_usd = GREATEST(last_synced_credit_nano_usd, $6),
                         active_positions = $7,
                         updated_at = now()
-                    WHERE id = $8
+                    WHERE id = $8 AND status = 'active'
                     RETURNING id, organization_id, near_account_id, network_id, contract_id,
                               farm_product_id, farm_price_id, credit_nano_usd_per_reward_unit,
                               status, sync_status, last_sync_error, created_by_user_id,
@@ -253,7 +255,29 @@ impl StakingFarmRepository for OrganizationStakingFarmSourcesRepository {
                     ],
                 )
                 .await
-                .map_err(map_db_error)
+                .map_err(map_db_error)?;
+
+            match updated {
+                Some(row) => Ok::<Row, RepositoryError>(row),
+                None => client
+                    .query_one(
+                        r#"
+                        SELECT id, organization_id, near_account_id, network_id, contract_id,
+                               farm_product_id, farm_price_id, credit_nano_usd_per_reward_unit,
+                               status, sync_status, last_sync_error, created_by_user_id,
+                               created_at, updated_at, last_synced_at,
+                               last_synced_accumulated_reward_units_24::text AS last_synced_accumulated_reward_units_24,
+                               last_synced_pending_reward_units_24::text AS last_synced_pending_reward_units_24,
+                               last_synced_reward_units_24::text AS last_synced_reward_units_24,
+                               last_synced_credit_nano_usd, active_positions
+                        FROM organization_staking_farm_sources
+                        WHERE id = $1
+                        "#,
+                        &[&source_id],
+                    )
+                    .await
+                    .map_err(map_db_error),
+            }
         })?;
 
         Ok(Self::row_to_source(&row))
@@ -264,8 +288,8 @@ impl StakingFarmRepository for OrganizationStakingFarmSourcesRepository {
         organization_id: Uuid,
         credit_nano_usd: i64,
         changed_by_user_id: Option<Uuid>,
-    ) -> Result<()> {
-        retry_db!("update_staking_farm_organization_limit", {
+    ) -> Result<bool> {
+        let written = retry_db!("update_staking_farm_organization_limit", {
             let mut client = self
                 .pool
                 .get()
@@ -281,13 +305,32 @@ impl StakingFarmRepository for OrganizationStakingFarmSourcesRepository {
             )
             .await?;
 
+            // The org lock serializes with erasure. Re-check under it that the
+            // source is still active and its org not deactivated, so a sync whose
+            // contract call overlapped an erasure writes nothing.
+            let still_active = transaction
+                .query_opt(
+                    r#"
+                    SELECT 1 FROM organization_staking_farm_sources s
+                    JOIN organizations o ON o.id = s.organization_id
+                    WHERE s.organization_id = $1 AND s.status = 'active' AND o.is_active
+                    "#,
+                    &[&organization_id],
+                )
+                .await
+                .map_err(map_db_error)?;
+            if still_active.is_none() {
+                transaction.rollback().await.map_err(map_db_error)?;
+                return Ok::<bool, RepositoryError>(false);
+            }
+
             let current: i64 = transaction.query_one(
                 "SELECT COALESCE(MAX(spend_limit), 0) FROM organization_limits_history WHERE organization_id=$1 AND credit_type='staking_farm' AND effective_until IS NULL",
                 &[&organization_id],
             ).await.map_err(map_db_error)?.get(0);
             if credit_nano_usd <= current {
                 transaction.commit().await.map_err(map_db_error)?;
-                return Ok(());
+                return Ok::<bool, RepositoryError>(true);
             }
 
             transaction
@@ -341,10 +384,10 @@ impl StakingFarmRepository for OrganizationStakingFarmSourcesRepository {
             .await?;
 
             transaction.commit().await.map_err(map_db_error)?;
-            Ok::<(), RepositoryError>(())
+            Ok::<bool, RepositoryError>(true)
         })?;
 
-        Ok(())
+        Ok(written)
     }
 }
 

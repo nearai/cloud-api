@@ -12,22 +12,25 @@ use crate::models::{
     AdminUserResponse, BatchUpdateModelApiRequest, CreateAdminAccessTokenRequest,
     CreateServiceRequest, CreditType, DecimalPrice, DecimalPriceRequest,
     DeleteAdminAccessTokenRequest, DeleteModelRequest, DeprecateModelRequest,
-    DeprecateModelResponse, ErrorResponse, GetOrganizationConcurrentLimitResponse,
+    DeprecateModelResponse, EraseUserRequest, EraseUserResponse, ErasedOrganizationResponse,
+    ErasureBlockedResponse, ErasureLogResponse, ErasureLookupOrganizationResponse,
+    ErasurePreviewResponse, ErrorResponse, GetOrganizationConcurrentLimitResponse,
     ListAdminAccessTokensResponse, ListAdminAmlAllowlistResponse, ListAdminAmlReportsResponse,
     ListAdminApiKeysResponse, ListAdminInvitationEmailDeliveriesResponse,
     ListAdminOrganizationMembersResponse, ListOrganizationsAdminResponse,
-    ListPricingChangesResponse, ListUsersResponse, MemberRole, ModelArchitecture,
-    ModelDeprecationConfirmResponse, ModelDeprecationPreviewResponse, ModelDeprecationRequest,
-    ModelHistoryEntry, ModelHistoryResponse, ModelMetadata, ModelWithPricing,
-    OrgLimitsHistoryEntry, OrgLimitsHistoryResponse, OrganizationFallbackResponse,
-    OrganizationMemberResponse, OrganizationPriorityResponse, OrganizationUsage,
-    PricingChangeBatchRequest, PricingChangeConfirmResponse, PricingChangeModelPreviewDto,
-    PricingChangePreviewResponse, PricingFieldUpdates, PricingFields, ScheduledPricingChangeDto,
+    ListPricingChangesResponse, ListUsersResponse, LookupUserErasuresRequest,
+    LookupUserErasuresResponse, MemberRole, ModelArchitecture, ModelDeprecationConfirmResponse,
+    ModelDeprecationPreviewResponse, ModelDeprecationRequest, ModelHistoryEntry,
+    ModelHistoryResponse, ModelMetadata, ModelWithPricing, OrgLimitsHistoryEntry,
+    OrgLimitsHistoryResponse, OrganizationFallbackResponse, OrganizationMemberResponse,
+    OrganizationPriorityResponse, OrganizationUsage, PricingChangeBatchRequest,
+    PricingChangeConfirmResponse, PricingChangeModelPreviewDto, PricingChangePreviewResponse,
+    PricingFieldUpdates, PricingFields, RetainedOrganizationResponse, ScheduledPricingChangeDto,
     SpendLimit, UpdateAmlReportStatusRequest, UpdateOrganizationConcurrentLimitRequest,
     UpdateOrganizationConcurrentLimitResponse, UpdateOrganizationFallbackRequest,
     UpdateOrganizationLimitsRequest, UpdateOrganizationLimitsResponse,
     UpdateOrganizationMemberRequest, UpdateOrganizationPriorityRequest, UpdateServiceRequest,
-    UpsertAmlAllowlistEntryRequest,
+    UpsertAmlAllowlistEntryRequest, UserErasureRecordResponse,
 };
 use crate::routes::common::{analytics_error_response, format_amount};
 use crate::routes::usage::{compute_organization_balance_response, OrganizationBalanceResponse};
@@ -196,6 +199,7 @@ pub struct AdminAppState {
     pub github_dispatcher: Arc<dyn GitHubDispatcher>,
     pub infra_service: Arc<services::admin::InfraService>,
     pub admin_settings_service: Arc<services::admin_settings::AdminSettingsService>,
+    pub user_erasure_service: Arc<services::user_erasure::UserErasureService>,
 }
 
 /// Small helper for 400 responses from analytics query-param validation.
@@ -2560,6 +2564,11 @@ pub async fn list_users(
                     created_at: u.created_at,
                     last_login_at: u.last_login_at,
                     is_active: u.is_active,
+                    lifecycle: crate::conversions::admin_user_lifecycle(
+                        u.id,
+                        u.is_active,
+                        &u.auth_provider,
+                    ),
                     auth_provider: u.auth_provider,
                     provider_user_id: u.provider_user_id,
                     organizations,
@@ -2607,6 +2616,11 @@ pub async fn list_users(
                 created_at: u.created_at,
                 last_login_at: u.last_login_at,
                 is_active: u.is_active,
+                lifecycle: crate::conversions::admin_user_lifecycle(
+                    u.id,
+                    u.is_active,
+                    &u.auth_provider,
+                ),
                 auth_provider: u.auth_provider,
                 provider_user_id: u.provider_user_id,
                 organizations: None,
@@ -2636,7 +2650,8 @@ pub async fn list_users(
     tag = "Admin",
     params(
         ("limit" = Option<i64>, Query, description = "Maximum number of organizations to return (default: 100)"),
-        ("offset" = Option<i64>, Query, description = "Number of organizations to skip (default: 0)")
+        ("offset" = Option<i64>, Query, description = "Number of organizations to skip (default: 0)"),
+        ("lifecycle" = Option<String>, Query, description = "Filter by lifecycle: active (default), deleted, erased or all")
     ),
     responses(
         (status = 200, description = "Organizations retrieved successfully", body = ListOrganizationsAdminResponse),
@@ -2662,7 +2677,7 @@ pub async fn list_organizations(
 
     let (organizations, total) = app_state
         .admin_service
-        .list_organizations(params.limit, params.offset)
+        .list_organizations(params.limit, params.offset, params.lifecycle)
         .await
         .map_err(|e| {
             error!("Failed to list organizations: {:?}", e);
@@ -3024,6 +3039,7 @@ fn admin_org_info_to_response(
         }),
         current_usage,
         created_at: org.created_at,
+        lifecycle: org.lifecycle,
     }
 }
 
@@ -3079,7 +3095,7 @@ pub async fn list_organization_members(
     State(app_state): State<AdminAppState>,
     Extension(_admin_user): Extension<AdminUser>, // Require admin auth
     Path(org_id): Path<Uuid>,
-    Query(params): Query<ListOrganizationsQueryParams>,
+    Query(params): Query<ListOrganizationMembersQueryParams>,
 ) -> Result<
     ResponseJson<ListAdminOrganizationMembersResponse>,
     (StatusCode, ResponseJson<ErrorResponse>),
@@ -3144,6 +3160,11 @@ pub async fn list_organization_members(
                 created_at: m.user.created_at,
                 last_login_at: m.user.last_login_at,
                 is_active: m.user.is_active,
+                lifecycle: crate::conversions::admin_user_lifecycle(
+                    m.user.id,
+                    m.user.is_active,
+                    &m.user.auth_provider,
+                ),
                 auth_provider: m.user.auth_provider,
                 provider_user_id: m.user.provider_user_id,
                 organizations: None,
@@ -3786,6 +3807,16 @@ pub struct ListUsersQueryParams {
 
 #[derive(Debug, serde::Deserialize)]
 pub struct ListOrganizationsQueryParams {
+    #[serde(default = "crate::routes::common::default_limit")]
+    pub limit: i64,
+    #[serde(default)]
+    pub offset: i64,
+    #[serde(default)]
+    pub lifecycle: services::admin::OrganizationLifecycleFilter,
+}
+
+#[derive(Debug, serde::Deserialize)]
+pub struct ListOrganizationMembersQueryParams {
     #[serde(default = "crate::routes::common::default_limit")]
     pub limit: i64,
     #[serde(default)]
@@ -5097,5 +5128,285 @@ mod openrouter_slug_tests {
                 "expected '{slug}' to be rejected"
             );
         }
+    }
+}
+
+/// Static category of a repository failure, safe to log: never the error text,
+/// which can carry row values.
+fn repository_error_kind(error: &anyhow::Error) -> &'static str {
+    use services::common::RepositoryError as R;
+    let Some(repo_error) = error.chain().find_map(|e| e.downcast_ref::<R>()) else {
+        return "other";
+    };
+    match repo_error {
+        R::NotFound(_) => "not_found",
+        R::AlreadyExists => "already_exists",
+        R::RequiredFieldMissing(_) => "required_field_missing",
+        R::ForeignKeyViolation(_) => "foreign_key_violation",
+        R::ValidationFailed(_) => "validation_failed",
+        R::DependencyExists(_) => "dependency_exists",
+        R::TransactionConflict => "transaction_conflict",
+        R::ConnectionFailed(_) => "connection_failed",
+        R::AuthenticationFailed => "authentication_failed",
+        R::QueryTimeout => "query_timeout",
+        R::PoolError(_) => "pool",
+        R::DatabaseError(_) => "database",
+        R::DataConversionError(_) => "data_conversion",
+    }
+}
+
+fn erasure_error_to_response(
+    user_id: Option<uuid::Uuid>,
+    err: services::user_erasure::UserErasureError,
+) -> axum::response::Response {
+    use axum::http::StatusCode;
+    use axum::response::IntoResponse;
+    use services::user_erasure::UserErasureError as E;
+    let (status, error_type, message) = match err {
+        E::NotFound => (StatusCode::NOT_FOUND, "not_found", "User not found"),
+        E::Blocked(blockers) => {
+            let ErrorResponse { error } =
+                ErrorResponse::new("Erasure blocked".to_string(), "erasure_blocked".to_string());
+            return (
+                StatusCode::CONFLICT,
+                ResponseJson(ErasureBlockedResponse { error, blockers }),
+            )
+                .into_response();
+        }
+        E::InvalidLookup => (
+            StatusCode::BAD_REQUEST,
+            "validation_error",
+            "Provide exactly one of email or user_id",
+        ),
+        E::InvalidUserId => (
+            StatusCode::BAD_REQUEST,
+            "validation_error",
+            "user_id must be a valid UUID",
+        ),
+        E::ConfirmEmailMismatch => (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "confirm_email_mismatch",
+            "confirm_email does not match the user's current email",
+        ),
+        E::Internal(e) => {
+            tracing::error!(
+                user_id = user_id.map(tracing::field::display),
+                error_kind = repository_error_kind(&e),
+                "User erasure failed"
+            );
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "internal_error",
+                "Internal server error",
+            )
+        }
+    };
+    (
+        status,
+        ResponseJson(ErrorResponse::new(
+            message.to_string(),
+            error_type.to_string(),
+        )),
+    )
+        .into_response()
+}
+
+/// Erase a user (GDPR Art. 17). Irreversible. Run the preview first. Admin session only.
+#[utoipa::path(
+    post,
+    path = "/v1/admin/users/{user_id}/erasure",
+    tag = "Admin",
+    params(("user_id" = String, Path, description = "User ID")),
+    request_body = EraseUserRequest,
+    responses(
+        (status = 200, description = "User erased (or already erased)", body = EraseUserResponse),
+        (status = 404, description = "User not found", body = ErrorResponse),
+        (status = 409, description = "Erasure blocked; body includes `blockers`", body = ErasureBlockedResponse),
+        (status = 422, description = "confirm_email mismatch", body = ErrorResponse),
+        (status = 401, description = "Unauthorized", body = ErrorResponse),
+        (status = 403, description = "Admin API tokens cannot erase", body = ErrorResponse),
+        (status = 500, description = "Internal server error", body = ErrorResponse)
+    ),
+    security(("session_token" = []))
+)]
+pub async fn erase_user(
+    State(app_state): State<AdminAppState>,
+    Path(user_id): Path<uuid::Uuid>,
+    Extension(admin_user): Extension<AdminUser>,
+    ResponseJson(req): ResponseJson<EraseUserRequest>,
+) -> Result<ResponseJson<EraseUserResponse>, axum::response::Response> {
+    let r = app_state
+        .user_erasure_service
+        .erase(
+            user_id,
+            admin_user.0.id,
+            &req.confirm_email,
+            req.requested_at,
+        )
+        .await
+        .map_err(|e| erasure_error_to_response(Some(user_id), e))?;
+
+    Ok(ResponseJson(EraseUserResponse {
+        user_id: r.user_id.to_string(),
+        lifecycle: services::lifecycle::UserLifecycle::Erased,
+        already_erased: r.already_erased,
+        erased_organization_ids: r
+            .erased_organization_ids
+            .iter()
+            .map(uuid::Uuid::to_string)
+            .collect(),
+    }))
+}
+
+/// Preview a user erasure: blockers and what would be erased (Admin only, read).
+#[utoipa::path(
+    post,
+    path = "/v1/admin/users/{user_id}/erasure/preview",
+    tag = "Admin",
+    params(("user_id" = String, Path, description = "User ID")),
+    responses(
+        (status = 200, description = "Erasure preview", body = ErasurePreviewResponse),
+        (status = 404, description = "User not found", body = ErrorResponse),
+        (status = 401, description = "Unauthorized", body = ErrorResponse),
+        (status = 500, description = "Internal server error", body = ErrorResponse)
+    ),
+    security(("session_token" = []))
+)]
+pub async fn preview_user_erasure(
+    State(app_state): State<AdminAppState>,
+    Path(user_id): Path<uuid::Uuid>,
+    Extension(_admin_user): Extension<AdminUser>,
+) -> Result<ResponseJson<ErasurePreviewResponse>, axum::response::Response> {
+    let plan = app_state
+        .user_erasure_service
+        .preview(user_id)
+        .await
+        .map_err(|e| erasure_error_to_response(Some(user_id), e))?;
+
+    Ok(ResponseJson(ErasurePreviewResponse {
+        user_id: plan.user_id.to_string(),
+        lifecycle: plan.lifecycle,
+        blockers: plan.blockers.clone(),
+        erased_organizations: plan
+            .erased_organizations
+            .iter()
+            .map(|o| ErasedOrganizationResponse {
+                id: o.id.to_string(),
+                lifecycle: o.lifecycle,
+                workspaces: o.workspaces,
+                api_keys: o.api_keys,
+                conversations: o.conversations,
+                files: o.files,
+            })
+            .collect(),
+        retained_organizations: plan
+            .retained_organizations
+            .iter()
+            .map(|o| RetainedOrganizationResponse {
+                id: o.id.to_string(),
+                role: o.role.clone(),
+            })
+            .collect(),
+        log: plan.log.map(|l| ErasureLogResponse {
+            requested_at: l.requested_at,
+            erased_at: l.erased_at,
+        }),
+    }))
+}
+
+/// Find erasure records by the erased person's email or user id (Admin session only).
+/// The email travels in the body, never the URL. No match is a 200 with an empty list.
+#[utoipa::path(
+    post,
+    path = "/v1/admin/user-erasures/lookup",
+    tag = "Admin",
+    request_body = LookupUserErasuresRequest,
+    responses(
+        (status = 200, description = "Matching erasure records, newest first (at most 100)", body = LookupUserErasuresResponse),
+        (status = 400, description = "Exactly one of a non-blank email or a valid user_id UUID is required", body = ErrorResponse),
+        (status = 401, description = "Unauthorized", body = ErrorResponse),
+        (status = 403, description = "Admin API tokens cannot look up erasures", body = ErrorResponse),
+        (status = 500, description = "Internal server error", body = ErrorResponse)
+    ),
+    security(("session_token" = []))
+)]
+pub async fn lookup_user_erasures(
+    State(app_state): State<AdminAppState>,
+    Extension(_admin_user): Extension<AdminUser>,
+    ResponseJson(req): ResponseJson<LookupUserErasuresRequest>,
+) -> Result<ResponseJson<LookupUserErasuresResponse>, axum::response::Response> {
+    let user_id = match req.user_id.as_deref() {
+        None => None,
+        Some(raw) => Some(raw.trim().parse::<uuid::Uuid>().map_err(|_| {
+            erasure_error_to_response(
+                None,
+                services::user_erasure::UserErasureError::InvalidUserId,
+            )
+        })?),
+    };
+    let records = app_state
+        .user_erasure_service
+        .lookup(req.email.as_deref(), user_id)
+        .await
+        .map_err(|e| erasure_error_to_response(user_id, e))?;
+
+    let orgs = |orgs: Vec<services::user_erasure::ErasureRecordOrg>| {
+        orgs.into_iter()
+            .map(|o| ErasureLookupOrganizationResponse {
+                organization_id: o.organization_id.to_string(),
+                lifecycle: o.lifecycle,
+            })
+            .collect::<Vec<_>>()
+    };
+    Ok(ResponseJson(LookupUserErasuresResponse {
+        erasures: records
+            .into_iter()
+            .map(|r| UserErasureRecordResponse {
+                user_id: r.user_id.to_string(),
+                user_lifecycle: r.user_lifecycle,
+                admin_user_id: r.admin_user_id.to_string(),
+                requested_at: r.requested_at,
+                erased_at: r.erased_at,
+                erased_organizations: orgs(r.erased_organizations),
+                retained_organizations: orgs(r.retained_organizations),
+            })
+            .collect(),
+    }))
+}
+
+#[cfg(test)]
+mod repository_error_kind_tests {
+    use super::repository_error_kind;
+    use services::common::RepositoryError as R;
+
+    #[test]
+    fn maps_repository_errors_to_static_kinds() {
+        let cases: Vec<(anyhow::Error, &str)> = vec![
+            (R::NotFound("x".into()).into(), "not_found"),
+            (R::TransactionConflict.into(), "transaction_conflict"),
+            (R::QueryTimeout.into(), "query_timeout"),
+            (R::PoolError(anyhow::anyhow!("secret")).into(), "pool"),
+            (
+                R::DatabaseError(anyhow::anyhow!("secret")).into(),
+                "database",
+            ),
+            (
+                R::DataConversionError(anyhow::anyhow!("secret")).into(),
+                "data_conversion",
+            ),
+        ];
+        for (error, expected) in cases {
+            assert_eq!(repository_error_kind(&error), expected);
+        }
+    }
+
+    #[test]
+    fn sees_through_context_and_defaults_to_other() {
+        use anyhow::Context;
+        let wrapped = Err::<(), _>(R::TransactionConflict)
+            .context("while erasing")
+            .unwrap_err();
+        assert_eq!(repository_error_kind(&wrapped), "transaction_conflict");
+        assert_eq!(repository_error_kind(&anyhow::anyhow!("boom")), "other");
     }
 }

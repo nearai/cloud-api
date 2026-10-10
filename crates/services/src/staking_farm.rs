@@ -144,7 +144,7 @@ pub trait StakingFarmRepository: Send + Sync {
         organization_id: Uuid,
         credit_nano_usd: i64,
         changed_by_user_id: Option<Uuid>,
-    ) -> anyhow::Result<()>;
+    ) -> anyhow::Result<bool>;
 }
 
 #[async_trait]
@@ -321,6 +321,12 @@ impl StakingFarmService {
         source: OrganizationStakingFarmSource,
         changed_by_user_id: Option<Uuid>,
     ) -> anyhow::Result<OrganizationStakingFarmSource> {
+        // A source disconnected by user erasure (or otherwise) must not be re-synced:
+        // that would re-run the AML check and write credits for an erased org, so
+        // never call the contract, the AML gate, or write credits for it.
+        if source.status != StakingFarmSourceStatus::Active.as_str() {
+            return Ok(source);
+        }
         ensure_configured(&self.config)?;
         self.enforce_aml_for_source(&source, changed_by_user_id)
             .await?;
@@ -389,9 +395,20 @@ impl StakingFarmService {
         let next_credit = computed_credit.max(source.last_synced_credit_nano_usd.unwrap_or(0));
 
         if Some(next_credit) != source.last_synced_credit_nano_usd {
-            self.repository
+            let applied = self
+                .repository
                 .update_staking_farm_limit(source.organization_id, next_credit, changed_by_user_id)
                 .await?;
+            if !applied {
+                // The source was disconnected (or its org deactivated) while the
+                // AML and contract calls were in flight. Write nothing further and
+                // hand back the stored row unchanged.
+                return self
+                    .repository
+                    .get_source_by_organization(source.organization_id)
+                    .await?
+                    .ok_or_else(|| anyhow::anyhow!("staking farm source no longer exists"));
+            }
         }
 
         self.repository
@@ -577,13 +594,28 @@ mod tests {
     use super::*;
     use std::sync::Mutex;
 
-    #[derive(Default)]
     struct MockStakingFarmRepository {
         source: Mutex<Option<OrganizationStakingFarmSource>>,
         upserts: Mutex<Vec<UpsertStakingFarmSourceRequest>>,
         sync_updates: Mutex<Vec<StakingFarmSourceSyncUpdate>>,
         limit_updates: Mutex<Vec<(Uuid, i64, Option<Uuid>)>>,
         source_reads: std::sync::atomic::AtomicUsize,
+        /// What `update_staking_farm_limit` reports; false simulates a source
+        /// disconnected by erasure while the sync was in flight.
+        limit_write_applies: bool,
+    }
+
+    impl Default for MockStakingFarmRepository {
+        fn default() -> Self {
+            Self {
+                source: Mutex::new(None),
+                upserts: Mutex::new(vec![]),
+                sync_updates: Mutex::new(vec![]),
+                limit_updates: Mutex::new(vec![]),
+                source_reads: std::sync::atomic::AtomicUsize::new(0),
+                limit_write_applies: true,
+            }
+        }
     }
 
     #[async_trait]
@@ -661,13 +693,13 @@ mod tests {
             organization_id: Uuid,
             credit_nano_usd: i64,
             changed_by_user_id: Option<Uuid>,
-        ) -> anyhow::Result<()> {
+        ) -> anyhow::Result<bool> {
             self.limit_updates.lock().unwrap().push((
                 organization_id,
                 credit_nano_usd,
                 changed_by_user_id,
             ));
-            Ok(())
+            Ok(self.limit_write_applies)
         }
     }
 
@@ -887,6 +919,33 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn sync_skips_sync_state_when_limit_write_is_refused() {
+        let organization_id = Uuid::new_v4();
+        let mut source = source_fixture(organization_id);
+        source.last_synced_credit_nano_usd = Some(0);
+        let repo = Arc::new(MockStakingFarmRepository {
+            limit_write_applies: false,
+            ..Default::default()
+        });
+        *repo.source.lock().unwrap() = Some(source.clone());
+        let client = Arc::new(MockStakingFarmContractClient::returning(farm_account(
+            "1000000000000000000000000",
+        )));
+        let service = StakingFarmService::new(repo.clone(), client, None, enabled_config());
+
+        let returned = service
+            .sync_for_source(source.clone(), Some(Uuid::new_v4()))
+            .await
+            .unwrap();
+
+        assert_eq!(repo.limit_updates.lock().unwrap().len(), 1);
+        assert!(repo.sync_updates.lock().unwrap().is_empty());
+        assert_eq!(returned.id, source.id);
+        assert_eq!(returned.sync_status, source.sync_status);
+        assert_eq!(returned.last_synced_credit_nano_usd, Some(0));
+    }
+
+    #[tokio::test]
     async fn sync_failure_marks_source_failed_without_limit_update() {
         let organization_id = Uuid::new_v4();
         let source = source_fixture(organization_id);
@@ -983,6 +1042,38 @@ mod tests {
                 "alice.near".to_string(),
                 AmlFlow::StakingFarmSync
             )]
+        );
+    }
+
+    #[tokio::test]
+    async fn sync_for_source_skips_disconnected_source() {
+        let organization_id = Uuid::new_v4();
+        let mut source = source_fixture(organization_id);
+        source.status = StakingFarmSourceStatus::Disconnected.as_str().to_string();
+        let repo = Arc::new(MockStakingFarmRepository::default());
+        *repo.source.lock().unwrap() = Some(source.clone());
+        let client = Arc::new(MockStakingFarmContractClient::returning(farm_account(
+            "3000000000000000000000000",
+        )));
+        let aml_gate = Arc::new(MockStakingFarmAmlGate::blocking());
+        let service = StakingFarmService::new(
+            repo.clone(),
+            client.clone(),
+            Some(aml_gate.clone()),
+            enabled_config(),
+        );
+
+        let out = service
+            .sync_for_source(source.clone(), None)
+            .await
+            .expect("a disconnected source is returned unchanged");
+
+        assert_eq!(out.status, source.status);
+        assert!(client.calls.lock().unwrap().is_empty(), "no contract call");
+        assert!(aml_gate.calls.lock().unwrap().is_empty(), "no AML check");
+        assert!(
+            repo.limit_updates.lock().unwrap().is_empty(),
+            "no credits written"
         );
     }
 

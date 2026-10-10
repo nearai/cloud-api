@@ -164,6 +164,7 @@ const APPROVED: &[ApprovedGroup] = &[
     ApprovedGroup { table: "responses", columns: &["model", "status", "usage", "next_response_ids"], reason: "Queryable response lifecycle, routing, usage, and structural relationship data" },
     ApprovedGroup { table: "scheduled_model_pricing_changes", columns: &["model_name", "model_display_name", "status", "last_error", "cancelled_by_user_email", "created_by_user_email", "change_reason", "old_text_pricing", "new_text_pricing"], reason: "Restricted administrator pricing workflow and audit data" },
     ApprovedGroup { table: "services", columns: &["service_name", "display_name", "description", "unit"], reason: "Public service catalog" },
+    ApprovedGroup { table: "user_erasure_log", columns: &["erased_organization_ids", "retained_organization_ids"], reason: "Restricted erasure audit: organization UUIDs only, no customer content; the email is stored as a one-way digest" },
     ApprovedGroup { table: "usage_credit_allocations", columns: &["credit_type", "source", "policy_version", "allocation_phase"], reason: "Immutable restricted billing attribution records" },
     ApprovedGroup { table: "organization_usage_discounts", columns: &["status", "last_error"], reason: "Restricted administrator billing correction state" },
     ApprovedGroup { table: "usage_discount_adjustments", columns: &["original_billing_details"], reason: "Restricted immutable billing correction audit" },

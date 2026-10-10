@@ -198,7 +198,8 @@ jobs:
           --health-retries 5
           --shm-size=256mb
         ports:
-          - 5432:5432
+          # E2E clients run on the host; keep the temporary test database local.
+          - 127.0.0.1:5432:5432
 
     steps:
     - uses: actions/checkout@v7

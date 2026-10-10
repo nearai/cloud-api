@@ -7,6 +7,7 @@ use tracing::info;
 // "NEARMIGR" as an i64. Session-level advisory locks are scoped to a single
 // database, so independent databases can still migrate in parallel.
 const MIGRATION_LOCK_KEY: i64 = 0x4e45_4152_4d49_4752;
+const REFRESH_ROTATION_INDEX: &str = "idx_refresh_tokens_previous_hash";
 
 /// Holds the dedicated connection that owns the PostgreSQL advisory lock.
 ///
@@ -68,6 +69,69 @@ impl Drop for MigrationLock {
     }
 }
 
+async fn refresh_rotation_index_is_ready(client: &tokio_postgres::Client) -> Result<Option<bool>> {
+    let row = client
+        .query_opt(
+            r#"
+            SELECT index_state.indisvalid AND index_state.indisready
+            FROM pg_namespace AS namespace
+            JOIN pg_class AS table_class
+              ON table_class.relnamespace = namespace.oid
+             AND table_class.relname = 'refresh_tokens'
+             AND table_class.relkind IN ('r', 'p')
+            JOIN pg_index AS index_state
+              ON index_state.indrelid = table_class.oid
+            JOIN pg_class AS index_class
+              ON index_class.oid = index_state.indexrelid
+             AND index_class.relnamespace = namespace.oid
+             AND index_class.relname = $1
+             AND index_class.relkind = 'i'
+            WHERE namespace.nspname = current_schema()
+            "#,
+            &[&REFRESH_ROTATION_INDEX],
+        )
+        .await
+        .context("Failed to inspect refresh rotation index")?;
+    Ok(row.map(|row| row.get(0)))
+}
+
+/// Build the refresh-token predecessor index without blocking authentication
+/// writes. This runs outside Refinery's transaction while the migration
+/// advisory lock still serializes application instances.
+async fn ensure_refresh_rotation_index(client: &tokio_postgres::Client) -> Result<()> {
+    match refresh_rotation_index_is_ready(client).await? {
+        Some(true) => return Ok(()),
+        Some(false) => {
+            // PostgreSQL can leave an INVALID index behind when a concurrent
+            // build is interrupted. IF NOT EXISTS would otherwise skip it.
+            client
+                .batch_execute("DROP INDEX CONCURRENTLY IF EXISTS idx_refresh_tokens_previous_hash")
+                .await
+                .context("Failed to drop invalid refresh rotation index")?;
+        }
+        None => {}
+    }
+
+    client
+        .batch_execute(
+            "CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_refresh_tokens_previous_hash \
+             ON refresh_tokens(previous_token_hash) \
+             WHERE previous_token_hash IS NOT NULL",
+        )
+        .await
+        .context("Failed to create refresh rotation index concurrently")?;
+
+    anyhow::ensure!(
+        refresh_rotation_index_is_ready(client).await? == Some(true),
+        "Refresh rotation index is missing, invalid, or unready after creation"
+    );
+    info!(
+        index = REFRESH_ROTATION_INDEX,
+        "Refresh rotation index ready"
+    );
+    Ok(())
+}
+
 /// Run database migrations
 pub async fn run(pool: &DbPool) -> Result<()> {
     // Refinery's schema history check and insert are not atomic across runner
@@ -107,16 +171,20 @@ pub async fn run(pool: &DbPool) -> Result<()> {
     let migrations = load_sql_migrations(migrations_path)
         .with_context(|| format!("Failed to load migrations from {migrations_path:?}"))?;
 
-    let migration_result = refinery::Runner::new(&migrations)
-        .run_async(lock.client())
-        .await;
+    let migration_result: Result<_> = async {
+        let report = refinery::Runner::new(&migrations)
+            .run_async(lock.client())
+            .await
+            .context("Failed to run migrations")?;
+        ensure_refresh_rotation_index(lock.client()).await?;
+        Ok(report)
+    }
+    .await;
     let unlock_result = lock.release().await;
 
     let migration_report = match (migration_result, unlock_result) {
         (Ok(report), Ok(())) => report,
-        (Err(migration_error), Ok(())) => {
-            return Err(migration_error).context("Failed to run migrations");
-        }
+        (Err(migration_error), Ok(())) => return Err(migration_error),
         (Ok(_), Err(unlock_error)) => return Err(unlock_error),
         (Err(migration_error), Err(unlock_error)) => {
             return Err(migration_error).context(format!(

@@ -8,6 +8,42 @@ use support::test_pool;
 use uuid::Uuid;
 
 #[tokio::test]
+async fn migration_runner_rebuilds_missing_refresh_rotation_index() -> anyhow::Result<()> {
+    let pool = test_pool().await?;
+    let client = pool.get().await?;
+    client
+        .batch_execute("DROP INDEX CONCURRENTLY IF EXISTS idx_refresh_tokens_previous_hash")
+        .await?;
+    drop(client);
+
+    database::migrations::run(&pool).await?;
+
+    let client = pool.get().await?;
+    let ready: bool = client
+        .query_one(
+            r#"
+            SELECT index_state.indisvalid AND index_state.indisready
+            FROM pg_namespace AS namespace
+            JOIN pg_class AS table_class
+              ON table_class.relnamespace = namespace.oid
+             AND table_class.relname = 'refresh_tokens'
+            JOIN pg_index AS index_state
+              ON index_state.indrelid = table_class.oid
+            JOIN pg_class AS index_class
+              ON index_class.oid = index_state.indexrelid
+             AND index_class.relnamespace = namespace.oid
+             AND index_class.relname = 'idx_refresh_tokens_previous_hash'
+            WHERE namespace.nspname = current_schema()
+            "#,
+            &[],
+        )
+        .await?
+        .get(0);
+    assert!(ready, "refresh rotation index must be valid and ready");
+    Ok(())
+}
+
+#[tokio::test]
 async fn concurrent_refreshes_reuse_one_successor_and_reject_stale_tokens() -> anyhow::Result<()> {
     let pool = test_pool().await?;
     let user_id = Uuid::new_v4();

@@ -1,4 +1,5 @@
 use crate::common::*;
+use database::repositories::SessionRepository;
 
 // ============================================
 // Refresh Token and Access Token Tests
@@ -364,10 +365,30 @@ async fn test_create_access_token_success_user_agent_mismatch() {
 }
 
 #[tokio::test]
-#[ignore] // Requires real database to test token rotation properly
 async fn test_refresh_token_rotation_reuses_predecessor_briefly() {
-    let server = setup_test_server().await;
-    let old_refresh_token = get_session_id();
+    let (server, database) =
+        setup_test_server_with_config_and_database(|config| config.auth.mock = false).await;
+    let user_id = uuid::Uuid::new_v4();
+    let suffix = user_id.simple().to_string();
+    let client = database.pool().get().await.unwrap();
+    client
+        .execute(
+            "INSERT INTO users (id, email, username, auth_provider, provider_user_id, created_at, updated_at) \
+             VALUES ($1, $2, $3, 'test', $4, NOW() - INTERVAL '30 days', NOW())",
+            &[
+                &user_id,
+                &format!("rotation-http-{suffix}@example.test"),
+                &format!("rotation-http-{suffix}"),
+                &suffix,
+            ],
+        )
+        .await
+        .unwrap();
+    drop(client);
+    let (_, old_refresh_token) = SessionRepository::new(database.pool().clone())
+        .create(user_id, None, MOCK_USER_AGENT.to_string(), 7 * 24)
+        .await
+        .unwrap();
 
     // Create an access token using the old refresh token
     let response1 = server
@@ -438,6 +459,10 @@ async fn test_refresh_token_rotation_reuses_predecessor_briefly() {
         !token_response3.access_token.is_empty(),
         "Should receive access token with new refresh token"
     );
+    assert_eq!(
+        token_response3.refresh_token, new_refresh_token,
+        "The current refresh token must not rotate again inside the reuse window"
+    );
 
     // Validate that the rotated refresh token also has extended expiration
     let now_after_rotation = chrono::Utc::now();
@@ -453,6 +478,15 @@ async fn test_refresh_token_rotation_reuses_predecessor_briefly() {
             && actual_expiration_after_rotation <= max_expected_after,
         "Rotated refresh token expiration should be approximately 7 days from now. Expected: {expected_expiration_after_rotation:?}, Actual: {actual_expiration_after_rotation:?}"
     );
+
+    database
+        .pool()
+        .get()
+        .await
+        .unwrap()
+        .execute("DELETE FROM users WHERE id = $1", &[&user_id])
+        .await
+        .unwrap();
 
     println!("✅ Refresh token rotation reuses the predecessor within the grace window");
 }

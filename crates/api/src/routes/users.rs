@@ -76,11 +76,9 @@ pub struct ContactEmailStatusResponse {
 /// `Retry-After` with the seconds until the next send is allowed.
 fn contact_email_error_response(error: ContactEmailError) -> Response {
     let (status, message, error_type) = match &error {
-        ContactEmailError::Disabled => (
-            StatusCode::SERVICE_UNAVAILABLE,
-            "Contact email verification is not enabled",
-            "contact_email_verification_disabled",
-        ),
+        // While the feature is off the endpoints answer as if they were not
+        // there, so no caller can draw a 5xx from a deployment that has it off.
+        ContactEmailError::Disabled => (StatusCode::NOT_FOUND, "Not found", "not_found"),
         ContactEmailError::UserNotFound => (StatusCode::NOT_FOUND, "User not found", "not_found"),
         ContactEmailError::NotSupported => (
             StatusCode::FORBIDDEN,
@@ -397,7 +395,9 @@ pub async fn update_current_user_profile(
 /// Sends a single-use verification link, valid for 24 hours, to the given
 /// address. The address is only saved once the link is confirmed with
 /// `POST /v1/users/contact-email/verify`. The answer is the same whether or not
-/// the address belongs to another account; that is reported at confirmation.
+/// the address belongs to another account (that is reported at confirmation),
+/// and whether or not the address already got its emails for the day (then
+/// nothing is sent).
 #[utoipa::path(
     post,
     path = "/v1/users/me/contact-email",
@@ -407,11 +407,10 @@ pub async fn update_current_user_profile(
         (status = 200, description = "Verification email sent", body = ContactEmailStatusResponse),
         (status = 400, description = "Invalid email address", body = ErrorResponse),
         (status = 401, description = "Unauthorized", body = ErrorResponse),
-        (status = 403, description = "The account already signs in with an email address", body = ErrorResponse),
-        (status = 404, description = "User not found", body = ErrorResponse),
-        (status = 429, description = "Too many verification emails for this user or this address; see the Retry-After header", body = ErrorResponse),
+        (status = 403, description = "The account does not sign in with a NEAR wallet", body = ErrorResponse),
+        (status = 404, description = "Contact email verification is not enabled, or user not found", body = ErrorResponse),
+        (status = 429, description = "Too many verification emails for this user, or the daily limit across all users is reached; see the Retry-After header", body = ErrorResponse),
         (status = 502, description = "The verification email could not be sent", body = ErrorResponse),
-        (status = 503, description = "Contact email verification is not enabled", body = ErrorResponse),
         (status = 500, description = "Internal server error", body = ErrorResponse)
     ),
     security(
@@ -442,6 +441,47 @@ pub async fn request_contact_email(
     }
 }
 
+/// Remove the contact email
+///
+/// Clears the account's contact email, with its verification and opt-in times,
+/// and expires any verification link not yet used. Safe to repeat: it succeeds
+/// when there is nothing to remove. Available whether or not contact email
+/// verification is enabled, so an address can always be withdrawn.
+#[utoipa::path(
+    delete,
+    path = "/v1/users/me/contact-email",
+    tag = "Users",
+    responses(
+        (status = 204, description = "Contact email removed, or there was none"),
+        (status = 401, description = "Unauthorized", body = ErrorResponse),
+        (status = 404, description = "User not found", body = ErrorResponse),
+        (status = 500, description = "Internal server error", body = ErrorResponse)
+    ),
+    security(
+        ("session_token" = [])
+    )
+)]
+pub async fn remove_contact_email(
+    State(app_state): State<AppState>,
+    Extension(user): Extension<AuthenticatedUser>,
+) -> Result<StatusCode, Response> {
+    debug!("Contact email removal requested by user: {}", user.0.id);
+
+    match app_state
+        .contact_email_service
+        .remove_contact_email(UserId(user.0.id))
+        .await
+    {
+        Ok(()) => Ok(StatusCode::NO_CONTENT),
+        Err(e) => {
+            if matches!(e, ContactEmailError::Internal(_)) {
+                error!(user_id = %user.0.id, "Failed to remove contact email");
+            }
+            Err(contact_email_error_response(e))
+        }
+    }
+}
+
 /// Confirm a contact email (public endpoint)
 ///
 /// Confirms the address behind a verification token and records the opt-in.
@@ -456,8 +496,8 @@ pub async fn request_contact_email(
     responses(
         (status = 200, description = "Contact email verified", body = ContactEmailStatusResponse),
         (status = 400, description = "Unknown, expired or already used token", body = ErrorResponse),
+        (status = 404, description = "Contact email verification is not enabled", body = ErrorResponse),
         (status = 409, description = "The address is already used by another account", body = ErrorResponse),
-        (status = 503, description = "Contact email verification is not enabled", body = ErrorResponse),
         (status = 500, description = "Internal server error", body = ErrorResponse)
     )
 )]

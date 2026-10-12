@@ -115,6 +115,7 @@ use utoipa::{Modify, OpenApi};
         crate::routes::users::get_user_status,
         crate::routes::users::update_current_user_profile,
         crate::routes::users::request_contact_email,
+        crate::routes::users::remove_contact_email,
         crate::routes::users::verify_contact_email,
         crate::routes::users::get_user_refresh_tokens,
         crate::routes::users::revoke_user_refresh_token,

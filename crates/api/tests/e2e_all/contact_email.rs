@@ -3,7 +3,7 @@
 
 use crate::admin_deprecate_model::{create_model, seed_recent_usage};
 use crate::common::*;
-use crate::user_erasure::{erase, new_user, personal_org_id};
+use crate::user_erasure::{erase, new_user, personal_org_id, signup};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use database::Database;
@@ -15,16 +15,23 @@ use services::email::{
     near_placeholder_email, ContactEmailVerificationEmail, EmailDeliveryOutcome, EmailError,
     EmailSender, InvitationEmail, ModelDeprecationEmail, PricingChangeEmail,
 };
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use uuid::Uuid;
 
 const VERIFY_PAGE: &str = "https://cloud.test/verify-contact-email";
+
+/// Far above anything the suite sends, so rows left by other tests and by
+/// earlier runs on the same database never reach the global cap.
+const NO_DAILY_CAP: i64 = i64::MAX;
 
 /// Records verification emails instead of sending them, so a test can read the
 /// token out of the link the way the recipient would.
 #[derive(Default)]
 struct RecordingEmailSender {
     sent: Mutex<Vec<ContactEmailVerificationEmail>>,
+    /// While set, every send fails the way a provider outage would.
+    failing: AtomicBool,
 }
 
 impl RecordingEmailSender {
@@ -48,8 +55,8 @@ impl RecordingEmailSender {
             .expect("a verification email for the account");
         email
             .verification_url
-            .strip_prefix(&format!("{VERIFY_PAGE}?token="))
-            .expect("the link goes to the frontend verification page")
+            .strip_prefix(&format!("{VERIFY_PAGE}#token="))
+            .expect("the link goes to the frontend page, with the token in the fragment")
             .to_string()
     }
 }
@@ -81,6 +88,9 @@ impl EmailSender for RecordingEmailSender {
         &self,
         email: &ContactEmailVerificationEmail,
     ) -> Result<EmailDeliveryOutcome, EmailError> {
+        if self.failing.load(Ordering::SeqCst) {
+            return Err(EmailError::new("provider unavailable"));
+        }
         self.sent.lock().unwrap().push(email.clone());
         Ok(EmailDeliveryOutcome::Sent { message_id: None })
     }
@@ -88,6 +98,16 @@ impl EmailSender for RecordingEmailSender {
 
 /// A server with contact email verification switched on and a recording sender.
 async fn setup() -> (
+    axum_test::TestServer,
+    Arc<Database>,
+    Arc<RecordingEmailSender>,
+) {
+    setup_with_daily_cap(NO_DAILY_CAP).await
+}
+
+async fn setup_with_daily_cap(
+    daily_cap: i64,
+) -> (
     axum_test::TestServer,
     Arc<Database>,
     Arc<RecordingEmailSender>,
@@ -102,6 +122,7 @@ async fn setup() -> (
             Arc::new(database::UserRepository::new(database.pool().clone())),
             recording,
             Some(VERIFY_PAGE.to_string()),
+            daily_cap,
         ));
     })
     .await;
@@ -161,6 +182,14 @@ async fn request(
         .add_header("Authorization", format!("Bearer {session}"))
         .add_header("User-Agent", MOCK_USER_AGENT)
         .json(&serde_json::json!({ "email": email }))
+        .await
+}
+
+async fn remove(server: &axum_test::TestServer, session: &str) -> axum_test::TestResponse {
+    server
+        .delete("/v1/users/me/contact-email")
+        .add_header("Authorization", format!("Bearer {session}"))
+        .add_header("User-Agent", MOCK_USER_AGENT)
         .await
 }
 
@@ -267,7 +296,7 @@ async fn wallet_user_requests_confirms_and_me_shows_the_contact_email() {
     // Only the hash of the token is stored, and nothing is on the user yet.
     let stored = client
         .query_one(
-            "SELECT email, token_hash, consumed_at, expires_at - created_at > INTERVAL '23 hours 59 minutes' \
+            "SELECT email, email_limit_key, token_hash, consumed_at, expires_at - created_at > INTERVAL '23 hours 59 minutes' \
                     AND expires_at - created_at < INTERVAL '24 hours 1 minute' AS valid_one_day \
              FROM user_contact_email_verifications WHERE user_id = $1",
             &[&user_id],
@@ -275,6 +304,7 @@ async fn wallet_user_requests_confirms_and_me_shows_the_contact_email() {
         .await
         .unwrap();
     assert_eq!(stored.get::<_, String>("email"), address);
+    assert_eq!(stored.get::<_, String>("email_limit_key"), address);
     assert_eq!(
         stored.get::<_, String>("token_hash"),
         hash_verification_token(&token)
@@ -606,64 +636,207 @@ async fn an_address_gets_three_verification_emails_per_day_across_users() {
     let client = database.pool().get().await.unwrap();
     let address = new_address();
 
+    let mut senders = Vec::new();
     for _ in 0..3 {
         let (session, _) = near_login(&auth, &new_account_id()).await;
         let response = request(&server, &session, &address).await;
         assert_eq!(response.status_code(), 200, "{}", response.text());
+        senders.push(session);
     }
 
-    // A fourth wallet account, which has sent nothing itself, is refused: the
-    // limit follows the address, in any letter case.
-    let (session, user_id) = near_login(&auth, &new_account_id()).await;
-    for target in [address.clone(), address.to_uppercase()] {
-        let limited = request(&server, &session, &target).await;
-        assert_eq!(limited.status_code(), 429, "{}", limited.text());
-        assert_eq!(error_type(&limited), "rate_limit_exceeded");
-        let wait = retry_after_secs(&limited);
-        assert!((85_000..=86_400).contains(&wait), "Retry-After was {wait}");
+    // A fourth wallet account, with one delivered link of its own.
+    let account_id = new_account_id();
+    let (session, user_id) = near_login(&auth, &account_id).await;
+    let ordinary = request(&server, &session, &new_address()).await;
+    assert_eq!(ordinary.status_code(), 200, "{}", ordinary.text());
+    let earlier_link = sender.latest_token(&account_id);
+
+    // Asking for the address that is at its limit gets the ordinary answer, so
+    // the caller learns nothing about it, but nothing is sent or stored. The
+    // limit follows the mailbox: letter case and a `+tag` make no difference.
+    let (local, domain) = address.split_once('@').unwrap();
+    let tagged = format!("{local}+news@{domain}");
+    for target in [address.clone(), address.to_uppercase(), tagged.clone()] {
+        let quiet = request(&server, &session, &target).await;
+        assert_eq!(quiet.status_code(), 200, "{}", quiet.text());
+        assert_eq!(quiet.text(), ordinary.text());
+        assert!(quiet
+            .headers()
+            .get(axum::http::header::RETRY_AFTER)
+            .is_none());
     }
     assert_eq!(sender.sent_to(&address).len(), 3);
-    assert_eq!(sender.sent_to(&address.to_uppercase()).len(), 0);
-    assert_eq!(verification_rows(&client, user_id).await, 0);
+    assert!(sender.sent_to(&address.to_uppercase()).is_empty());
+    assert!(sender.sent_to(&tagged).is_empty());
+    assert_eq!(verification_rows(&client, user_id).await, 1);
+    // No email went out, so the user's earlier link was not replaced.
+    assert_eq!(verify(&server, &earlier_link).await.status_code(), 200);
 
-    // That user can still add a different address.
-    let response = request(&server, &session, &new_address()).await;
-    assert_eq!(response.status_code(), 200, "{}", response.text());
+    // Gmail ignores dots too: three variants of one mailbox use up its sends.
+    let mailbox = format!("ce{}", Uuid::new_v4().simple());
+    let (head, tail) = mailbox.split_at(4);
+    let variants = [
+        format!("{mailbox}@gmail.com"),
+        format!("{head}.{tail}@Gmail.com"),
+        format!("{mailbox}+cloud@gmail.com"),
+    ];
+    for (variant, sender_session) in variants.iter().zip(&senders) {
+        let response = request(&server, sender_session, variant).await;
+        assert_eq!(response.status_code(), 200, "{}", response.text());
+        // Sent to the address exactly as typed.
+        assert_eq!(sender.sent_to(variant).len(), 1);
+    }
+    let fourth_variant = format!("c.e{}@gmail.com", &mailbox[2..]);
+    let quiet = request(&server, &session, &fourth_variant).await;
+    assert_eq!(quiet.status_code(), 200, "{}", quiet.text());
+    assert!(sender.sent_to(&fourth_variant).is_empty());
+    let stored: Vec<String> = client
+        .query(
+            "SELECT email FROM user_contact_email_verifications WHERE email_limit_key = $1 \
+             ORDER BY created_at",
+            &[&format!("{mailbox}@gmail.com")],
+        )
+        .await
+        .unwrap()
+        .iter()
+        .map(|row| row.get(0))
+        .collect();
+    assert_eq!(stored, variants);
 
-    // A day later the address can be mailed again.
+    // The limit is a rolling day. Just short of it the address is still closed.
     client
         .execute(
             "UPDATE user_contact_email_verifications \
              SET created_at = created_at - INTERVAL '23 hours 50 minutes' \
-             WHERE lower(email) = lower($1)",
+             WHERE email_limit_key = $1",
             &[&address],
         )
         .await
         .unwrap();
     assert_eq!(
         request(&server, &session, &address).await.status_code(),
-        429
+        200
     );
+    assert_eq!(sender.sent_to(&address).len(), 3);
+    // Past it, the address is mailed again.
     client
         .execute(
             "UPDATE user_contact_email_verifications SET created_at = created_at - INTERVAL '11 minutes' \
-             WHERE lower(email) = lower($1)",
+             WHERE email_limit_key = $1",
             &[&address],
         )
         .await
         .unwrap();
     let response = request(&server, &session, &address).await;
     assert_eq!(response.status_code(), 200, "{}", response.text());
+    assert_eq!(sender.sent_to(&address).len(), 4);
     // Rows older than a day are deleted when the next request comes in.
     let remaining: i64 = client
         .query_one(
-            "SELECT COUNT(*) FROM user_contact_email_verifications WHERE lower(email) = lower($1)",
+            "SELECT COUNT(*) FROM user_contact_email_verifications WHERE email_limit_key = $1",
             &[&address],
         )
         .await
         .unwrap()
         .get(0);
     assert_eq!(remaining, 1);
+}
+
+#[tokio::test]
+async fn a_failed_send_spends_no_limit_and_keeps_the_earlier_link() {
+    let (server, database, sender) = setup().await;
+    let auth = real_auth(&database);
+    let client = database.pool().get().await.unwrap();
+    let account_id = new_account_id();
+    let (session, user_id) = near_login(&auth, &account_id).await;
+
+    // One delivered link.
+    let response = request(&server, &session, &new_address()).await;
+    assert_eq!(response.status_code(), 200, "{}", response.text());
+    let earlier_link = sender.latest_token(&account_id);
+
+    // The provider now refuses every send. Four attempts: were they counted,
+    // the third would already be over the per-user limit of three an hour.
+    sender.failing.store(true, Ordering::SeqCst);
+    let address = new_address();
+    for _ in 0..4 {
+        let failed = request(&server, &session, &address).await;
+        assert_eq!(failed.status_code(), 502, "{}", failed.text());
+        assert_eq!(error_type(&failed), "email_delivery_failed");
+    }
+    // The unsent rows are gone, and the earlier link is still good.
+    assert_eq!(verification_rows(&client, user_id).await, 1);
+    let unsent: i64 = client
+        .query_one(
+            "SELECT COUNT(*) FROM user_contact_email_verifications WHERE email_limit_key = $1",
+            &[&address],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(unsent, 0);
+    assert_eq!(verify(&server, &earlier_link).await.status_code(), 200);
+
+    // Once the provider is back, the address gets its email: the failed
+    // attempts did not use up its sends either.
+    sender.failing.store(false, Ordering::SeqCst);
+    let response = request(&server, &session, &address).await;
+    assert_eq!(response.status_code(), 200, "{}", response.text());
+    assert_eq!(sender.sent_to(&address).len(), 1);
+    // Two sends counted so far: one more is allowed, the next is over the limit.
+    assert_eq!(
+        request(&server, &session, &new_address())
+            .await
+            .status_code(),
+        200
+    );
+    assert_eq!(
+        request(&server, &session, &new_address())
+            .await
+            .status_code(),
+        429
+    );
+}
+
+/// Runs alone (see `.config/nextest.toml`): the cap counts every verification
+/// row in the database, so a request from another test would move the count.
+#[tokio::test]
+async fn serial_daily_cap_limits_sends_across_all_users() {
+    let pool = db_setup::create_test_pool().await;
+    let already_sent: i64 = pool
+        .get()
+        .await
+        .unwrap()
+        .query_one(
+            "SELECT COUNT(*) FROM user_contact_email_verifications \
+             WHERE created_at > NOW() - INTERVAL '24 hours'",
+            &[],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    // Room for exactly two more sends today.
+    let (server, database, sender) = setup_with_daily_cap(already_sent + 2).await;
+    let auth = real_auth(&database);
+    let client = database.pool().get().await.unwrap();
+
+    for _ in 0..2 {
+        let (session, _) = near_login(&auth, &new_account_id()).await;
+        let response = request(&server, &session, &new_address()).await;
+        assert_eq!(response.status_code(), 200, "{}", response.text());
+    }
+
+    // A third user and a third address: neither has sent or received anything.
+    let (session, user_id) = near_login(&auth, &new_account_id()).await;
+    let address = new_address();
+    let limited = request(&server, &session, &address).await;
+    assert_eq!(limited.status_code(), 429, "{}", limited.text());
+    assert_eq!(error_type(&limited), "rate_limit_exceeded");
+    let wait = retry_after_secs(&limited);
+    assert!((1..=86_400).contains(&wait), "Retry-After was {wait}");
+    assert!(sender.sent_to(&address).is_empty());
+    assert_eq!(verification_rows(&client, user_id).await, 0);
+    assert_eq!(sender.sent.lock().unwrap().len(), 2);
 }
 
 #[tokio::test]
@@ -685,6 +858,24 @@ async fn only_placeholder_logins_can_add_a_contact_email() {
         (login_address, None, None, None)
     );
 
+    // Neither is an account from another provider whose login address merely
+    // looks like a placeholder: the wallet provider is required as well.
+    let unique = Uuid::new_v4().simple().to_string();
+    let (lookalike_session, lookalike_user, _) = signup(
+        &database,
+        "github",
+        &format!("gh-{unique}"),
+        &format!("gh-{unique}@near"),
+    )
+    .await;
+    assert_eq!(
+        me(&server, &lookalike_session).await["needs_contact_email"],
+        false
+    );
+    let refused = request(&server, &lookalike_session, &address).await;
+    assert_eq!(refused.status_code(), 403, "{}", refused.text());
+    assert_eq!(verification_rows(&client, lookalike_user).await, 0);
+
     // A wallet user must give a real address.
     let auth = real_auth(&database);
     let account_id = new_account_id();
@@ -695,6 +886,11 @@ async fn only_placeholder_logins_can_add_a_contact_email() {
         "someone@near",
         "a@b@example.com",
         "Someone <someone@example.com>",
+        "someone@mail.test",
+        "someone@example.invalid",
+        "someone@host.localhost",
+        "someone@printer.local",
+        "someone@mail.example",
     ] {
         let response = request(&server, &wallet_session, invalid).await;
         assert_eq!(
@@ -718,7 +914,7 @@ async fn only_placeholder_logins_can_add_a_contact_email() {
 }
 
 #[tokio::test]
-async fn switched_off_nothing_changes_and_requests_get_503() {
+async fn switched_off_the_endpoints_answer_404_and_an_address_can_still_be_removed() {
     // The default configuration: contact email verification is off.
     let (server, database) = setup_test_server_with_database().await;
     let auth = real_auth(&database);
@@ -731,26 +927,50 @@ async fn switched_off_nothing_changes_and_requests_get_503() {
     assert_eq!(profile["contact_email_verified"], false, "{profile}");
     assert!(profile["contact_email"].is_null(), "{profile}");
 
+    // Both endpoints answer as if they were not there: never a 5xx.
     let refused = request(&server, &session, &new_address()).await;
-    assert_eq!(refused.status_code(), 503, "{}", refused.text());
-    assert_eq!(error_type(&refused), "contact_email_verification_disabled");
+    assert_eq!(refused.status_code(), 404, "{}", refused.text());
+    assert_eq!(error_type(&refused), "not_found");
     assert_eq!(verification_rows(&client, user_id).await, 0);
 
     let refused = verify(&server, "any-token").await;
-    assert_eq!(refused.status_code(), 503, "{}", refused.text());
-    assert_eq!(error_type(&refused), "contact_email_verification_disabled");
+    assert_eq!(refused.status_code(), 404, "{}", refused.text());
+    assert_eq!(error_type(&refused), "not_found");
+
+    // An address confirmed while the feature was on can still be withdrawn.
+    let address = new_address();
+    client
+        .execute(
+            "UPDATE users SET contact_email = $2, contact_email_verified_at = NOW(), \
+             email_opt_in_at = NOW() WHERE id = $1",
+            &[&user_id, &address],
+        )
+        .await
+        .unwrap();
+    let profile = me(&server, &session).await;
+    assert_eq!(profile["contact_email"], address, "{profile}");
+    assert_eq!(profile["needs_contact_email"], false, "{profile}");
+
+    for _ in 0..2 {
+        let removed = remove(&server, &session).await;
+        assert_eq!(removed.status_code(), 204, "{}", removed.text());
+        assert_eq!(
+            contact_columns(&client, user_id).await,
+            (near_placeholder_email(&account_id), None, None, None)
+        );
+    }
+    assert_eq!(me(&server, &session).await["needs_contact_email"], false);
 }
 
 #[tokio::test]
 async fn switched_on_by_configuration_wallet_users_are_asked_for_an_email() {
     let (server, database) = setup_test_server_with_config_and_database(|config| {
         config.invitation_email = config::InvitationEmailConfig {
-            enabled: false,
             contact_email_verification_enabled: true,
             from_email: Some("NEAR AI Cloud <no-reply@example.com>".to_string()),
-            reply_to: None,
             resend_api_key: Some("re_test".to_string()),
             frontend_base_url: Some("https://cloud.test".to_string()),
+            ..Default::default()
         };
     })
     .await;
@@ -797,6 +1017,28 @@ async fn erasure_clears_the_contact_email_and_its_verifications() {
     );
     assert_eq!(verification_rows(&client, user_id).await, 2);
     assert_eq!(verification_rows(&client, other_user).await, 1);
+    // An organization invited the user at the contact address.
+    let org = create_org(&server).await;
+    let invited = server
+        .post(format!("/v1/organizations/{}/members/invite-by-email", org.id).as_str())
+        .add_header("Authorization", format!("Bearer {}", get_session_id()))
+        .add_header("User-Agent", MOCK_USER_AGENT)
+        .json(&serde_json::json!({
+            "invitations": [{ "email": address.to_uppercase(), "role": "member" }]
+        }))
+        .await;
+    assert_eq!(invited.status_code(), 200, "{}", invited.text());
+    let invitations = || async {
+        client
+            .query_one(
+                "SELECT COUNT(*) FROM organization_invitations WHERE lower(email) = lower($1)",
+                &[&address],
+            )
+            .await
+            .unwrap()
+            .get::<_, i64>(0)
+    };
+    assert_eq!(invitations().await, 1);
 
     let erased = erase(&server, user_id, &near_placeholder_email(&account_id)).await;
     assert_eq!(erased.status_code(), 200, "{}", erased.text());
@@ -818,6 +1060,7 @@ async fn erasure_clears_the_contact_email_and_its_verifications() {
         .unwrap()
         .get(0);
     assert_eq!(leftovers, 0);
+    assert_eq!(invitations().await, 0);
 
     // The erased user's pending link is dead, and the address is free again.
     assert_eq!(verify(&server, &pending_token).await.status_code(), 400);
@@ -825,6 +1068,218 @@ async fn erasure_clears_the_contact_email_and_its_verifications() {
     assert_eq!(
         contact_columns(&client, other_user).await.1.as_deref(),
         Some(address.as_str())
+    );
+}
+
+#[tokio::test]
+async fn a_user_can_remove_the_contact_email() {
+    let (server, database, sender) = setup().await;
+    let auth = real_auth(&database);
+    let client = database.pool().get().await.unwrap();
+    let account_id = new_account_id();
+    let address = new_address();
+    let (session, user_id) = near_login(&auth, &account_id).await;
+    add_contact_email(&server, &sender, &session, &account_id, &address).await;
+    // A link for a further address is still pending.
+    assert_eq!(
+        request(&server, &session, &new_address())
+            .await
+            .status_code(),
+        200
+    );
+    let pending_link = sender.latest_token(&account_id);
+
+    let removed = remove(&server, &session).await;
+    assert_eq!(removed.status_code(), 204, "{}", removed.text());
+    assert!(removed.text().is_empty());
+
+    // The address and both timestamps are gone, and the user is asked again.
+    assert_eq!(
+        contact_columns(&client, user_id).await,
+        (near_placeholder_email(&account_id), None, None, None)
+    );
+    let profile = me(&server, &session).await;
+    assert!(profile["contact_email"].is_null(), "{profile}");
+    assert_eq!(profile["contact_email_verified"], false, "{profile}");
+    assert_eq!(profile["needs_contact_email"], true, "{profile}");
+    // The pending link cannot bring an address back.
+    assert_eq!(verify(&server, &pending_link).await.status_code(), 400);
+    assert_eq!(contact_columns(&client, user_id).await.1, None);
+
+    // Removing again changes nothing and still succeeds.
+    let updated_at = || async {
+        client
+            .query_one("SELECT updated_at FROM users WHERE id = $1", &[&user_id])
+            .await
+            .unwrap()
+            .get::<_, DateTime<Utc>>(0)
+    };
+    let before = updated_at().await;
+    assert_eq!(remove(&server, &session).await.status_code(), 204);
+    assert_eq!(updated_at().await, before);
+
+    // The address is free for another account.
+    let other_account = new_account_id();
+    let (other_session, other_user) = near_login(&auth, &other_account).await;
+    add_contact_email(&server, &sender, &other_session, &other_account, &address).await;
+    // One user's removal does not touch another user.
+    assert_eq!(remove(&server, &session).await.status_code(), 204);
+    assert_eq!(
+        contact_columns(&client, other_user).await.1.as_deref(),
+        Some(address.as_str())
+    );
+
+    // It needs a session, and works for an account with nothing to remove.
+    let anonymous = server
+        .delete("/v1/users/me/contact-email")
+        .add_header("User-Agent", MOCK_USER_AGENT)
+        .await;
+    assert_eq!(anonymous.status_code(), 401, "{}", anonymous.text());
+    let (email_session, _, _) = new_user(&database).await;
+    assert_eq!(remove(&server, &email_session).await.status_code(), 204);
+}
+
+#[tokio::test]
+async fn confirming_a_new_address_replaces_the_old_one() {
+    let (server, database, sender) = setup().await;
+    let auth = real_auth(&database);
+    let client = database.pool().get().await.unwrap();
+    let account_id = new_account_id();
+    let first_address = new_address();
+    let second_address = new_address();
+    let (session, user_id) = near_login(&auth, &account_id).await;
+    add_contact_email(&server, &sender, &session, &account_id, &first_address).await;
+    let (_, _, first_verified_at, first_opt_in_at) = contact_columns(&client, user_id).await;
+
+    // Asking for another address changes nothing until its link is confirmed.
+    assert_eq!(
+        request(&server, &session, &second_address)
+            .await
+            .status_code(),
+        200
+    );
+    assert_eq!(
+        me(&server, &session).await["contact_email"],
+        first_address.as_str()
+    );
+    let confirmed = verify(&server, &sender.latest_token(&account_id)).await;
+    assert_eq!(confirmed.status_code(), 200, "{}", confirmed.text());
+
+    // The new address took the place of the old one, with a new opt-in time.
+    let (_, contact_email, verified_at, opt_in_at) = contact_columns(&client, user_id).await;
+    assert_eq!(contact_email.as_deref(), Some(second_address.as_str()));
+    assert!(verified_at > first_verified_at);
+    assert!(opt_in_at > first_opt_in_at);
+    let profile = me(&server, &session).await;
+    assert_eq!(profile["contact_email"], second_address.as_str());
+    assert_eq!(profile["needs_contact_email"], false, "{profile}");
+
+    // Nobody holds the old address any more: another account can confirm it.
+    let holders: i64 = client
+        .query_one(
+            "SELECT COUNT(*) FROM users WHERE lower(contact_email) = lower($1)",
+            &[&first_address],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(holders, 0);
+    let other_account = new_account_id();
+    let (other_session, _) = near_login(&auth, &other_account).await;
+    add_contact_email(
+        &server,
+        &sender,
+        &other_session,
+        &other_account,
+        &first_address,
+    )
+    .await;
+}
+
+/// Forces the branch that the application check cannot cover: another holder of
+/// the address exists but is not committed yet, so only the unique index sees it.
+#[tokio::test]
+async fn the_unique_index_refuses_an_address_another_transaction_is_taking() {
+    let (server, database, sender) = setup().await;
+    let auth = real_auth(&database);
+    let address = new_address();
+    let (_, holder_user) = near_login(&auth, &new_account_id()).await;
+    let account_id = new_account_id();
+    let (session, user_id) = near_login(&auth, &account_id).await;
+    assert_eq!(
+        request(&server, &session, &address).await.status_code(),
+        200
+    );
+    let token = sender.latest_token(&account_id);
+
+    // Another user's confirmation of the same address has written its row and
+    // not committed. A plain read, like the application check, does not see it.
+    let mut holder = database.pool().get().await.unwrap();
+    let uncommitted = holder.transaction().await.unwrap();
+    uncommitted
+        .execute(
+            "UPDATE users SET contact_email = upper($2), contact_email_verified_at = NOW(), \
+             email_opt_in_at = NOW() WHERE id = $1",
+            &[&holder_user, &address],
+        )
+        .await
+        .unwrap();
+    let holder_xid: String = uncommitted
+        .query_one(
+            "SELECT backend_xid::text FROM pg_stat_activity WHERE pid = pg_backend_pid()",
+            &[],
+        )
+        .await
+        .unwrap()
+        .get(0);
+
+    let observer = database.pool().get().await.unwrap();
+    let release_once_blocked = async {
+        // The confirmation can only wait on that transaction at the unique
+        // index: nothing before it in the confirmation takes a lock it holds.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let waiting: i64 = observer
+                .query_one(
+                    "SELECT COUNT(*) FROM pg_locks WHERE NOT granted \
+                       AND locktype = 'transactionid' AND transactionid::text = $1",
+                    &[&holder_xid],
+                )
+                .await
+                .unwrap()
+                .get(0);
+            if waiting > 0 {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the confirmation never waited on the unique index"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        uncommitted.commit().await.unwrap();
+    };
+    let (refused, ()) = tokio::join!(verify(&server, &token), release_once_blocked);
+
+    assert_eq!(refused.status_code(), 409, "{}", refused.text());
+    assert_eq!(error_type(&refused), "conflict");
+    // The loser's transaction was rolled back whole: no address, token unused.
+    assert_eq!(
+        contact_columns(&observer, user_id).await,
+        (near_placeholder_email(&account_id), None, None, None)
+    );
+    let consumed: Option<DateTime<Utc>> = observer
+        .query_one(
+            "SELECT consumed_at FROM user_contact_email_verifications WHERE token_hash = $1",
+            &[&hash_verification_token(&token)],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    assert!(consumed.is_none());
+    assert_eq!(
+        contact_columns(&observer, holder_user).await.1,
+        Some(address.to_uppercase())
     );
 }
 
@@ -928,13 +1383,12 @@ async fn admin_user_listing_includes_the_contact_email_fields() {
     let account_id = new_account_id();
     let (session, user_id) = near_login(&auth, &account_id).await;
 
-    let listed = |include_organizations: bool| {
+    let listed_by = |search: String, include_organizations: bool| {
         let server = &server;
-        let account_id = account_id.clone();
         async move {
             let response = server
                 .get("/v1/admin/users")
-                .add_query_param("search", &account_id)
+                .add_query_param("search", &search)
                 .add_query_param("include_organizations", include_organizations)
                 .add_header("Authorization", format!("Bearer {}", get_session_id()))
                 .add_header("User-Agent", MOCK_USER_AGENT)
@@ -947,6 +1401,7 @@ async fn admin_user_listing_includes_the_contact_email_fields() {
             users[0].clone()
         }
     };
+    let listed = |include_organizations: bool| listed_by(account_id.clone(), include_organizations);
 
     // The keys are always present, null until an address is verified.
     for include_organizations in [false, true] {
@@ -973,6 +1428,14 @@ async fn admin_user_listing_includes_the_contact_email_fields() {
         assert_eq!(user["contact_email"], address, "{user}");
         assert!(user["contact_email_verified_at"].is_string(), "{user}");
         assert!(user["email_opt_in_at"].is_string(), "{user}");
+
+        // Support can find the wallet user by the contact address, which is the
+        // only real address held for them. Partial and in any letter case.
+        let found = listed_by(address.to_uppercase(), include_organizations).await;
+        assert_eq!(found["contact_email"], address, "{found}");
+        let local_part = address.split('@').next().unwrap().to_string();
+        let found = listed_by(local_part, include_organizations).await;
+        assert_eq!(found["contact_email"], address, "{found}");
     }
 
     // The organization member listing for admins carries the same user fields.
@@ -995,6 +1458,7 @@ fn openapi_documents_the_contact_email_routes_and_fields() {
     let spec = serde_json::to_value(api::openapi::ApiDoc::openapi()).unwrap();
 
     assert!(spec["paths"]["/v1/users/me/contact-email"]["post"].is_object());
+    assert!(spec["paths"]["/v1/users/me/contact-email"]["delete"].is_object());
     assert!(spec["paths"]["/v1/users/contact-email/verify"]["post"].is_object());
     let schemas = &spec["components"]["schemas"];
     for (schema, fields) in [

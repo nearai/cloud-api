@@ -95,8 +95,9 @@ pub struct PricingChangeEmail {
 
 /// Asks the recipient to confirm an address a wallet user wants to add as their
 /// contact email. `account_id` names the wallet account so the recipient knows
-/// which account they are confirming.
-#[derive(Debug, Clone)]
+/// which account they are confirming. No `Debug`: it holds the recipient and the
+/// link, which carries the verification token.
+#[derive(Clone)]
 pub struct ContactEmailVerificationEmail {
     pub recipient_email: String,
     pub account_id: String,
@@ -1011,7 +1012,7 @@ mod tests {
         ContactEmailVerificationEmail {
             recipient_email: "alice@example.com".to_string(),
             account_id: "alice.near".to_string(),
-            verification_url: "https://cloud.example.com/verify-contact-email?token=abc_DEF-123"
+            verification_url: "https://cloud.example.com/verify-contact-email#token=abc_DEF-123"
                 .to_string(),
             expires_at: Utc.with_ymd_and_hms(2026, 5, 15, 12, 0, 0).unwrap(),
         }
@@ -1026,7 +1027,7 @@ mod tests {
         for body in [&rendered.html_body, &rendered.text_body] {
             assert!(body.contains("alice.near"));
             assert!(
-                body.contains("https://cloud.example.com/verify-contact-email?token=abc_DEF-123")
+                body.contains("https://cloud.example.com/verify-contact-email#token=abc_DEF-123")
             );
             assert!(body.contains("May 15, 2026 at 12:00 UTC"));
             assert!(body.contains("used once"));
@@ -1037,7 +1038,7 @@ mod tests {
     fn render_contact_email_verification_email_escapes_html() {
         let email = ContactEmailVerificationEmail {
             account_id: "<script>alert('x')</script>&".to_string(),
-            verification_url: "https://cloud.example.com/verify-contact-email?token=a\"><b>"
+            verification_url: "https://cloud.example.com/verify-contact-email#token=a\"><b>"
                 .to_string(),
             ..example_contact_email_verification_email()
         };
@@ -1255,6 +1256,7 @@ mod tests {
         let config = InvitationEmailConfig {
             enabled: true,
             contact_email_verification_enabled: false,
+            contact_email_verification_daily_cap: 500,
             from_email: Some("NEAR AI Cloud <no-reply@near.ai>".to_string()),
             reply_to: None,
             resend_api_key: None,

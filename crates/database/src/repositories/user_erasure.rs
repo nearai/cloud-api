@@ -463,8 +463,9 @@ impl UserErasureRepository for PostgresUserErasureRepository {
                 .map_err(map_db_error)?;
             transaction
                 .execute(
-                    "DELETE FROM organization_invitations WHERE organization_id = ANY($1) OR lower(email) = lower($2)",
-                    &[&erased, &user_email],
+                    "DELETE FROM organization_invitations WHERE organization_id = ANY($1) \
+                     OR lower(email) = lower($2) OR lower(email) = lower($3)",
+                    &[&erased, &user_email, &contact_email],
                 )
                 .await
                 .map_err(map_db_error)?;

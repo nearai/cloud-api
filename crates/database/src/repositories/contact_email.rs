@@ -23,26 +23,28 @@ impl PgContactEmailRepository {
 }
 
 /// Seconds to wait when `max` or more verification emails matching `filter` (a
-/// predicate over `user_contact_email_verifications` with `$1` as its only
-/// parameter) were sent in the last `window_secs`. `None` when under the limit.
+/// predicate over `user_contact_email_verifications`, with `key` as `$2` when it
+/// needs one) were sent in the last `window_secs`. `None` when under the limit.
 /// The wait ends when the oldest counted send leaves the window.
 async fn rate_limit_wait<C: GenericClient + Sync>(
     client: &C,
     filter: &str,
-    key: &(dyn tokio_postgres::types::ToSql + Sync),
+    key: Option<&(dyn tokio_postgres::types::ToSql + Sync)>,
     max: i64,
     window_secs: i64,
 ) -> Result<Option<u64>, RepositoryError> {
     let window_secs = window_secs as f64;
+    let mut params: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> = vec![&window_secs];
+    params.extend(key);
     let row = client
         .query_one(
             &format!(
                 "SELECT COUNT(*) AS sends, \
-                        EXTRACT(EPOCH FROM MIN(created_at) + make_interval(secs => $2) - NOW())::float8 AS wait_secs \
+                        EXTRACT(EPOCH FROM MIN(created_at) + make_interval(secs => $1) - NOW())::float8 AS wait_secs \
                  FROM user_contact_email_verifications \
-                 WHERE {filter} AND created_at > NOW() - make_interval(secs => $2)"
+                 WHERE {filter} AND created_at > NOW() - make_interval(secs => $1)"
             ),
-            &[key, &window_secs],
+            &params,
         )
         .await
         .map_err(map_db_error)?;
@@ -71,7 +73,10 @@ impl ContactEmailRepository for PgContactEmailRepository {
 
             // The user row lock makes this user's requests and confirmations run
             // one at a time. The advisory lock does the same for requests to one
-            // address across users. With both held, the counts below are exact.
+            // address (by its limit key) across users. With both held, the
+            // per-user and per-address counts below are exact. The global cap is
+            // a backstop and is not serialized: requests for different addresses
+            // running at the same moment can overshoot it by a few sends.
             if transaction
                 .query_opt(
                     "SELECT 1 FROM users WHERE id = $1 AND is_active = true FOR NO KEY UPDATE",
@@ -86,50 +91,58 @@ impl ContactEmailRepository for PgContactEmailRepository {
             }
             transaction
                 .query(
-                    "SELECT pg_advisory_xact_lock(hashtextextended(lower($1::text), 0))",
-                    &[&verification.email],
+                    "SELECT pg_advisory_xact_lock(hashtextextended($1::text, 0))",
+                    &[&verification.email_limit_key],
                 )
                 .await
                 .map_err(map_db_error)?;
 
             let per_user = rate_limit_wait(
                 &*transaction,
-                "user_id = $1",
-                &verification.user_id,
+                "user_id = $2",
+                Some(&verification.user_id),
                 limits.per_user,
                 limits.per_user_window_secs,
             )
             .await?;
+            let global = rate_limit_wait(
+                &*transaction,
+                "TRUE",
+                None,
+                limits.global,
+                limits.global_window_secs,
+            )
+            .await?;
+            if let Some(retry_after_secs) = per_user.max(global) {
+                transaction.rollback().await.map_err(map_db_error)?;
+                return Ok(CreateVerificationOutcome::RateLimited { retry_after_secs });
+            }
+            // Checked last and reported apart: the caller is not told about it.
             let per_address = rate_limit_wait(
                 &*transaction,
-                "lower(email) = lower($1::text)",
-                &verification.email,
+                "email_limit_key = $2",
+                Some(&verification.email_limit_key),
                 limits.per_address,
                 limits.per_address_window_secs,
             )
             .await?;
-            if let Some(retry_after_secs) = per_user.max(per_address) {
+            if per_address.is_some() {
                 transaction.rollback().await.map_err(map_db_error)?;
-                return Ok(CreateVerificationOutcome::RateLimited { retry_after_secs });
+                return Ok(CreateVerificationOutcome::AddressLimitReached);
             }
 
-            // A new link replaces the user's earlier unused ones. The rows stay,
-            // because the limits above count them.
-            transaction
-                .execute(
-                    "UPDATE user_contact_email_verifications SET expires_at = NOW() \
-                     WHERE user_id = $1 AND consumed_at IS NULL AND expires_at > NOW()",
-                    &[&verification.user_id],
-                )
-                .await
-                .map_err(map_db_error)?;
-            transaction
-                .execute(
-                    "INSERT INTO user_contact_email_verifications (user_id, email, token_hash, expires_at) \
-                     VALUES ($1, $2, $3, $4)",
+            // clock_timestamp(), not NOW(): rows of one user are inserted one at
+            // a time under the user row lock, and "earlier" must follow that
+            // order even when a transaction started before the one it waited for.
+            let row = transaction
+                .query_one(
+                    "INSERT INTO user_contact_email_verifications \
+                         (user_id, email, email_limit_key, token_hash, expires_at, created_at) \
+                     VALUES ($1, $2, $3, $4, $5, clock_timestamp()) RETURNING id",
                     &[
                         &verification.user_id,
                         &verification.email,
+                        &verification.email_limit_key,
                         &verification.token_hash,
                         &verification.expires_at,
                     ],
@@ -138,9 +151,69 @@ impl ContactEmailRepository for PgContactEmailRepository {
                 .map_err(map_db_error)?;
 
             transaction.commit().await.map_err(map_db_error)?;
-            Ok(CreateVerificationOutcome::Created)
+            Ok(CreateVerificationOutcome::Created {
+                verification_id: row.get("id"),
+            })
         })?;
         Ok(outcome)
+    }
+
+    async fn expire_earlier_verifications(
+        &self,
+        user_id: Uuid,
+        verification_id: Uuid,
+    ) -> Result<()> {
+        retry_db!("expire_earlier_contact_email_verifications", {
+            let mut client = self
+                .pool
+                .get()
+                .await
+                .context("Failed to get database connection")
+                .map_err(RepositoryError::PoolError)?;
+            let transaction = client.transaction().await.map_err(map_db_error)?;
+
+            // Same lock order as requests and confirmations: the user row first.
+            transaction
+                .query_opt(
+                    "SELECT 1 FROM users WHERE id = $1 FOR NO KEY UPDATE",
+                    &[&user_id],
+                )
+                .await
+                .map_err(map_db_error)?;
+            // The rows stay, because the send limits count them.
+            transaction
+                .execute(
+                    "UPDATE user_contact_email_verifications SET expires_at = NOW() \
+                     WHERE user_id = $1 AND id <> $2 AND consumed_at IS NULL AND expires_at > NOW() \
+                       AND created_at < (SELECT created_at FROM user_contact_email_verifications \
+                                         WHERE id = $2)",
+                    &[&user_id, &verification_id],
+                )
+                .await
+                .map_err(map_db_error)?;
+
+            transaction.commit().await.map_err(map_db_error)
+        })?;
+        Ok(())
+    }
+
+    async fn delete_verification(&self, verification_id: Uuid) -> Result<()> {
+        retry_db!("delete_contact_email_verification", {
+            let client = self
+                .pool
+                .get()
+                .await
+                .context("Failed to get database connection")
+                .map_err(RepositoryError::PoolError)?;
+            client
+                .execute(
+                    "DELETE FROM user_contact_email_verifications WHERE id = $1",
+                    &[&verification_id],
+                )
+                .await
+                .map_err(map_db_error)
+        })?;
+        Ok(())
     }
 
     async fn confirm(&self, token_hash: &str) -> Result<ConfirmOutcome> {
@@ -275,5 +348,55 @@ impl ContactEmailRepository for PgContactEmailRepository {
                 .map_err(map_db_error)
         })?;
         Ok(deleted)
+    }
+
+    async fn remove_contact_email(&self, user_id: Uuid) -> Result<bool> {
+        let removed = retry_db!("remove_contact_email", {
+            let mut client = self
+                .pool
+                .get()
+                .await
+                .context("Failed to get database connection")
+                .map_err(RepositoryError::PoolError)?;
+            let transaction = client.transaction().await.map_err(map_db_error)?;
+
+            if transaction
+                .query_opt(
+                    "SELECT 1 FROM users WHERE id = $1 AND is_active = true FOR NO KEY UPDATE",
+                    &[&user_id],
+                )
+                .await
+                .map_err(map_db_error)?
+                .is_none()
+            {
+                transaction.rollback().await.map_err(map_db_error)?;
+                return Ok(false);
+            }
+            // Leaves the row untouched when there is nothing to clear, so a
+            // repeated call does not move `updated_at`.
+            transaction
+                .execute(
+                    "UPDATE users SET contact_email = NULL, contact_email_verified_at = NULL, \
+                     email_opt_in_at = NULL, updated_at = NOW() \
+                     WHERE id = $1 AND (contact_email IS NOT NULL \
+                                        OR contact_email_verified_at IS NOT NULL \
+                                        OR email_opt_in_at IS NOT NULL)",
+                    &[&user_id],
+                )
+                .await
+                .map_err(map_db_error)?;
+            transaction
+                .execute(
+                    "UPDATE user_contact_email_verifications SET expires_at = NOW() \
+                     WHERE user_id = $1 AND consumed_at IS NULL AND expires_at > NOW()",
+                    &[&user_id],
+                )
+                .await
+                .map_err(map_db_error)?;
+
+            transaction.commit().await.map_err(map_db_error)?;
+            Ok(true)
+        })?;
+        Ok(removed)
     }
 }

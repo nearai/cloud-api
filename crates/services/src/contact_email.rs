@@ -5,8 +5,7 @@
 
 use crate::auth::{User, UserId, UserRepository};
 use crate::email::{
-    is_placeholder_email, placeholder_account_id, ContactEmailVerificationEmail,
-    EmailDeliveryOutcome, EmailSender,
+    placeholder_account_id, ContactEmailVerificationEmail, EmailDeliveryOutcome, EmailSender,
 };
 use async_trait::async_trait;
 use chrono::{DateTime, Duration, Utc};
@@ -17,18 +16,15 @@ use uuid::Uuid;
 /// How long a verification link stays valid.
 pub const VERIFICATION_TOKEN_TTL_HOURS: i64 = 24;
 
-/// Send limits, counted from the stored verification rows. The per-address limit
-/// applies across all users: wallet accounts are free to create, so a per-user
-/// limit alone would let anyone flood a mailbox.
-pub const SEND_LIMITS: SendLimits = SendLimits {
-    per_user: 3,
-    per_user_window_secs: 60 * 60,
-    per_address: 3,
-    per_address_window_secs: 24 * 60 * 60,
-};
+/// Verification emails one user may request per hour.
+const MAX_SENDS_PER_USER_PER_HOUR: i64 = 3;
+/// Verification emails sent to one address per 24 hours, across all users.
+const MAX_SENDS_PER_ADDRESS_PER_DAY: i64 = 3;
+const HOUR_SECS: i64 = 60 * 60;
+const DAY_SECS: i64 = 24 * HOUR_SECS;
 
 /// Rows older than this can neither be confirmed nor count toward a limit.
-const VERIFICATION_RETENTION_SECS: i64 = 24 * 60 * 60;
+const VERIFICATION_RETENTION_SECS: i64 = DAY_SECS;
 
 const NEAR_AUTH_PROVIDER: &str = "near";
 const TOKEN_BYTES: usize = 32;
@@ -36,18 +32,46 @@ const TOKEN_BYTES: usize = 32;
 const MAX_TOKEN_LENGTH: usize = 128;
 const MAX_EMAIL_LENGTH: usize = 254;
 const MAX_EMAIL_LOCAL_PART_LENGTH: usize = 64;
+/// Top-level domains reserved for testing and local use. Mail cannot be
+/// delivered to them.
+const UNDELIVERABLE_TLDS: [&str; 5] = ["invalid", "test", "localhost", "local", "example"];
+const GMAIL_DOMAINS: [&str; 2] = ["gmail.com", "googlemail.com"];
 
+/// Send limits, counted from the stored verification rows. The per-address limit
+/// applies across all users: wallet accounts are free to create, so a per-user
+/// limit alone would let anyone flood a mailbox. The global limit caps the total
+/// whatever the users and addresses.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SendLimits {
     pub per_user: i64,
     pub per_user_window_secs: i64,
     pub per_address: i64,
     pub per_address_window_secs: i64,
+    pub global: i64,
+    pub global_window_secs: i64,
+}
+
+impl SendLimits {
+    /// The fixed per-user and per-address limits, with `daily_cap` as the limit
+    /// across all users per 24 hours.
+    pub fn with_daily_cap(daily_cap: i64) -> Self {
+        Self {
+            per_user: MAX_SENDS_PER_USER_PER_HOUR,
+            per_user_window_secs: HOUR_SECS,
+            per_address: MAX_SENDS_PER_ADDRESS_PER_DAY,
+            per_address_window_secs: DAY_SECS,
+            global: daily_cap,
+            global_window_secs: DAY_SECS,
+        }
+    }
 }
 
 pub struct NewVerification<'a> {
     pub user_id: Uuid,
+    /// The address as the user typed it, trimmed.
     pub email: &'a str,
+    /// [`send_limit_key`] of `email`: what the per-address limit counts by.
+    pub email_limit_key: &'a str,
     /// SHA-256 of the token. The token itself is never stored.
     pub token_hash: &'a str,
     pub expires_at: DateTime<Utc>,
@@ -55,12 +79,17 @@ pub struct NewVerification<'a> {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CreateVerificationOutcome {
-    Created,
+    Created {
+        verification_id: Uuid,
+    },
     /// The user does not exist or is no longer active.
     UserNotFound,
+    /// The per-user or the global limit is reached. Nothing was stored.
     RateLimited {
         retry_after_secs: u64,
     },
+    /// The address already got its emails for the day. Nothing was stored.
+    AddressLimitReached,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -79,13 +108,25 @@ pub enum ConfirmOutcome {
 
 #[async_trait]
 pub trait ContactEmailRepository: Send + Sync {
-    /// One transaction: enforce `limits`, expire the user's earlier unused tokens,
-    /// store the new one.
+    /// One transaction: enforce `limits` and store the new verification. Earlier
+    /// links stay valid until [`Self::expire_earlier_verifications`].
     async fn create_verification(
         &self,
         verification: NewVerification<'_>,
         limits: SendLimits,
     ) -> anyhow::Result<CreateVerificationOutcome>;
+
+    /// Called once the email for `verification_id` was sent: expire the user's
+    /// unused links created before it.
+    async fn expire_earlier_verifications(
+        &self,
+        user_id: Uuid,
+        verification_id: Uuid,
+    ) -> anyhow::Result<()>;
+
+    /// Called when the email for `verification_id` could not be sent: remove the
+    /// row, so the attempt does not count toward any limit.
+    async fn delete_verification(&self, verification_id: Uuid) -> anyhow::Result<()>;
 
     /// One transaction: consume the token and set the user's contact email, its
     /// verification time and the opt-in time, or change nothing.
@@ -94,6 +135,11 @@ pub trait ContactEmailRepository: Send + Sync {
     /// Delete verification rows created more than `max_age_secs` ago. Returns
     /// how many.
     async fn delete_older_than(&self, max_age_secs: i64) -> anyhow::Result<u64>;
+
+    /// One transaction: clear the user's contact email, its verification time and
+    /// the opt-in time, and expire the user's unused links. Returns false when
+    /// there is no such active user.
+    async fn remove_contact_email(&self, user_id: Uuid) -> anyhow::Result<bool>;
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -146,9 +192,10 @@ fn generate_verification_token() -> String {
 }
 
 /// Trims an address a user typed and checks its shape: `local@domain` in plain
-/// ASCII, with a dotted domain. This rejects placeholder addresses, display names
-/// and anything with whitespace or control characters. Whether the mailbox exists
-/// is settled by the verification email, not here.
+/// ASCII, with a dotted domain outside the reserved test and local top-level
+/// domains. This rejects placeholder addresses, display names and anything with
+/// whitespace or control characters. Whether the mailbox exists is settled by
+/// the verification email, not here.
 pub fn normalize_contact_email(input: &str) -> Result<String, ContactEmailError> {
     let email = input.trim();
     if email.is_empty() {
@@ -170,7 +217,11 @@ pub fn normalize_contact_email(input: &str) -> Result<String, ContactEmailError>
         && !local.ends_with('.')
         && !local.contains("..");
     let labels: Vec<&str> = domain.split('.').collect();
+    let tld = labels.last().copied().unwrap_or_default();
     let domain_ok = labels.len() >= 2
+        && !UNDELIVERABLE_TLDS
+            .iter()
+            .any(|reserved| tld.eq_ignore_ascii_case(reserved))
         && labels.iter().all(|label| {
             !label.is_empty()
                 && label.len() <= 63
@@ -185,28 +236,57 @@ pub fn normalize_contact_email(input: &str) -> Result<String, ContactEmailError>
     Ok(email.to_string())
 }
 
+/// Canonical form of a validated address, used only to count sends per address,
+/// so that the variants reaching one mailbox count as one: lower case, any
+/// `+tag` dropped from the local part, and for Gmail the dots in the local part
+/// dropped too. The address stored and emailed stays what the user typed.
+pub fn send_limit_key(email: &str) -> String {
+    let email = email.trim().to_ascii_lowercase();
+    let Some((local, domain)) = email.rsplit_once('@') else {
+        return email;
+    };
+    let local = local.split('+').next().unwrap_or_default();
+    if GMAIL_DOMAINS.contains(&domain) {
+        format!("{}@{domain}", local.replace('.', ""))
+    } else {
+        format!("{local}@{domain}")
+    }
+}
+
+/// The wallet account id of a NEAR wallet login: the wallet provider with its
+/// placeholder login address. `None` for every other account.
+fn wallet_account_id(user: &User) -> Option<&str> {
+    (user.auth_provider == NEAR_AUTH_PROVIDER)
+        .then(|| placeholder_account_id(&user.email))
+        .flatten()
+}
+
 pub struct ContactEmailService {
     repository: Arc<dyn ContactEmailRepository>,
     user_repository: Arc<dyn UserRepository>,
     email_sender: Arc<dyn EmailSender>,
     /// Frontend page the emailed link points to. `None` switches the feature off.
     verification_url: Option<String>,
+    limits: SendLimits,
 }
 
 impl ContactEmailService {
     /// `verification_url` is the frontend page that confirms a token; pass `None`
-    /// to switch the feature off.
+    /// to switch the feature off. `daily_cap` is the most verification emails
+    /// sent per 24 hours across all users.
     pub fn new(
         repository: Arc<dyn ContactEmailRepository>,
         user_repository: Arc<dyn UserRepository>,
         email_sender: Arc<dyn EmailSender>,
         verification_url: Option<String>,
+        daily_cap: i64,
     ) -> Self {
         Self {
             repository,
             user_repository,
             email_sender,
             verification_url,
+            limits: SendLimits::with_daily_cap(daily_cap),
         }
     }
 
@@ -219,14 +299,14 @@ impl ContactEmailService {
     /// false while the feature is off.
     pub fn needs_contact_email(&self, user: &User) -> bool {
         self.is_enabled()
-            && user.auth_provider == NEAR_AUTH_PROVIDER
-            && is_placeholder_email(&user.email)
+            && wallet_account_id(user).is_some()
             && user.contact_email_verified_at.is_none()
     }
 
     /// Store a verification for `email` and send the link to it. The outcome is
-    /// the same whether or not the address already belongs to another account;
-    /// that is only reported when the link is opened.
+    /// the same whether or not the address already belongs to another account
+    /// (that is only reported when the link is opened), and whether or not the
+    /// address already got its emails for the day (then nothing is sent).
     pub async fn request_verification(
         &self,
         user_id: UserId,
@@ -243,7 +323,7 @@ impl ContactEmailService {
             .await
             .map_err(ContactEmailError::Internal)?
             .ok_or(ContactEmailError::UserNotFound)?;
-        let Some(account_id) = placeholder_account_id(&user.email) else {
+        let Some(account_id) = wallet_account_id(&user) else {
             return Err(ContactEmailError::NotSupported);
         };
 
@@ -264,43 +344,93 @@ impl ContactEmailService {
                 NewVerification {
                     user_id: user_id.0,
                     email: &email,
+                    email_limit_key: &send_limit_key(&email),
                     token_hash: &hash_verification_token(&token),
                     expires_at,
                 },
-                SEND_LIMITS,
+                self.limits,
             )
             .await
             .map_err(ContactEmailError::Internal)?;
-        match outcome {
-            CreateVerificationOutcome::Created => {}
+        let verification_id = match outcome {
+            CreateVerificationOutcome::Created { verification_id } => verification_id,
             CreateVerificationOutcome::UserNotFound => return Err(ContactEmailError::UserNotFound),
             CreateVerificationOutcome::RateLimited { retry_after_secs } => {
                 return Err(ContactEmailError::RateLimited { retry_after_secs })
             }
-        }
+            // Answered like a sent link, so the limit tells the caller nothing
+            // about the address.
+            CreateVerificationOutcome::AddressLimitReached => {
+                tracing::info!(user_id = %user_id.0, "Contact email verification not sent: address send limit reached");
+                return Ok(());
+            }
+        };
 
+        // The token goes in the URL fragment, which browsers keep to themselves:
+        // it does not reach the frontend's access logs or a Referer header.
         let message = ContactEmailVerificationEmail {
             recipient_email: email,
             account_id: account_id.to_string(),
-            verification_url: format!("{verification_url}?token={token}"),
+            verification_url: format!("{verification_url}#token={token}"),
             expires_at,
         };
         // The provider's error text can quote the recipient, so only the user id is logged.
-        match self
+        let sent = match self
             .email_sender
             .send_contact_email_verification(&message)
             .await
         {
-            Ok(EmailDeliveryOutcome::Sent { .. }) => Ok(()),
+            Ok(EmailDeliveryOutcome::Sent { .. }) => true,
             Ok(EmailDeliveryOutcome::Skipped) => {
                 tracing::warn!(user_id = %user_id.0, "Contact email verification not sent: no email sender configured");
-                Err(ContactEmailError::SendFailed)
+                false
             }
             Err(_) => {
                 tracing::warn!(user_id = %user_id.0, "Failed to send contact email verification");
-                Err(ContactEmailError::SendFailed)
+                false
             }
+        };
+
+        if !sent {
+            // Nothing reached the mailbox: the attempt must not count toward a
+            // limit, and the user's earlier links stay valid.
+            if self
+                .repository
+                .delete_verification(verification_id)
+                .await
+                .is_err()
+            {
+                tracing::warn!(user_id = %user_id.0, "Failed to remove an unsent contact email verification");
+            }
+            return Err(ContactEmailError::SendFailed);
         }
+
+        // Only now does the new link replace the earlier ones.
+        if self
+            .repository
+            .expire_earlier_verifications(user_id.0, verification_id)
+            .await
+            .is_err()
+        {
+            tracing::warn!(user_id = %user_id.0, "Failed to expire earlier contact email verifications");
+        }
+        Ok(())
+    }
+
+    /// Withdraw the user's contact email: clear it with its verification and
+    /// opt-in times, and expire the user's unused links. Works whether or not
+    /// the feature is on, and when there is nothing to clear.
+    pub async fn remove_contact_email(&self, user_id: UserId) -> Result<(), ContactEmailError> {
+        if !self
+            .repository
+            .remove_contact_email(user_id.0)
+            .await
+            .map_err(ContactEmailError::Internal)?
+        {
+            return Err(ContactEmailError::UserNotFound);
+        }
+        tracing::info!(user_id = %user_id.0, "Contact email removed");
+        Ok(())
     }
 
     /// Confirm the address behind `token`. The token is the only credential: the
@@ -344,6 +474,7 @@ mod tests {
     use std::sync::Mutex;
 
     const VERIFICATION_URL: &str = "https://cloud.example.com/verify-contact-email";
+    const DAILY_CAP: i64 = 500;
 
     fn user(email: &str, auth_provider: &str) -> User {
         User {
@@ -429,6 +560,7 @@ mod tests {
     struct StoredVerification {
         user_id: Uuid,
         email: String,
+        email_limit_key: String,
         token_hash: String,
         expires_at: DateTime<Utc>,
     }
@@ -439,6 +571,12 @@ mod tests {
         created: Mutex<Vec<StoredVerification>>,
         limits: Mutex<Option<SendLimits>>,
         confirmed_hashes: Mutex<Vec<String>>,
+        /// `(user_id, verification_id)` of each "expire earlier links" call.
+        expired_earlier: Mutex<Vec<(Uuid, Uuid)>>,
+        deleted: Mutex<Vec<Uuid>>,
+        removed: Mutex<Vec<Uuid>>,
+        /// What `remove_contact_email` reports: whether there is such a user.
+        user_exists: bool,
     }
 
     impl FakeRepository {
@@ -449,6 +587,10 @@ mod tests {
                 created: Mutex::new(Vec::new()),
                 limits: Mutex::new(None),
                 confirmed_hashes: Mutex::new(Vec::new()),
+                expired_earlier: Mutex::new(Vec::new()),
+                deleted: Mutex::new(Vec::new()),
+                removed: Mutex::new(Vec::new()),
+                user_exists: true,
             }
         }
     }
@@ -464,6 +606,7 @@ mod tests {
             self.created.lock().unwrap().push(StoredVerification {
                 user_id: verification.user_id,
                 email: verification.email.to_string(),
+                email_limit_key: verification.email_limit_key.to_string(),
                 token_hash: verification.token_hash.to_string(),
                 expires_at: verification.expires_at,
             });
@@ -478,8 +621,30 @@ mod tests {
             Ok(self.confirm_outcome.clone())
         }
 
+        async fn expire_earlier_verifications(
+            &self,
+            user_id: Uuid,
+            verification_id: Uuid,
+        ) -> anyhow::Result<()> {
+            self.expired_earlier
+                .lock()
+                .unwrap()
+                .push((user_id, verification_id));
+            Ok(())
+        }
+
+        async fn delete_verification(&self, verification_id: Uuid) -> anyhow::Result<()> {
+            self.deleted.lock().unwrap().push(verification_id);
+            Ok(())
+        }
+
         async fn delete_older_than(&self, _: i64) -> anyhow::Result<u64> {
             Ok(0)
+        }
+
+        async fn remove_contact_email(&self, user_id: Uuid) -> anyhow::Result<bool> {
+            self.removed.lock().unwrap().push(user_id);
+            Ok(self.user_exists)
         }
     }
 
@@ -536,12 +701,21 @@ mod tests {
             Arc::new(FakeUsers(Some(user.clone()))),
             sender,
             Some(VERIFICATION_URL.to_string()),
+            DAILY_CAP,
         )
+    }
+
+    const VERIFICATION_ID: Uuid = Uuid::from_u128(7);
+
+    fn created() -> CreateVerificationOutcome {
+        CreateVerificationOutcome::Created {
+            verification_id: VERIFICATION_ID,
+        }
     }
 
     fn happy_repository() -> Arc<FakeRepository> {
         Arc::new(FakeRepository::new(
-            CreateVerificationOutcome::Created,
+            created(),
             ConfirmOutcome::Verified {
                 user_id: Uuid::new_v4(),
             },
@@ -608,9 +782,52 @@ mod tests {
                 "a_b-c@sub-domain.example.org",
                 "a_b-c@sub-domain.example.org",
             ),
+            // Reserved words are only refused as the top-level domain.
+            ("alice@test.com", "alice@test.com"),
+            ("alice@local.example.net", "alice@local.example.net"),
         ] {
             assert_eq!(normalize_contact_email(input).unwrap(), expected);
         }
+    }
+
+    #[test]
+    fn send_limit_key_folds_the_variants_of_one_mailbox() {
+        // Letter case and `+tag` never matter.
+        for variant in [
+            "alice@example.com",
+            "Alice@Example.COM",
+            "alice+cloud@example.com",
+            "ALICE+a+b@example.com",
+            " alice+@example.com ",
+        ] {
+            assert_eq!(send_limit_key(variant), "alice@example.com", "{variant}");
+        }
+        // Gmail also ignores dots in the local part.
+        for variant in [
+            "alicesmith@gmail.com",
+            "alice.smith@gmail.com",
+            "A.l.i.c.e.Smith+news@GMAIL.com",
+        ] {
+            assert_eq!(send_limit_key(variant), "alicesmith@gmail.com", "{variant}");
+        }
+        assert_eq!(
+            send_limit_key("alice.smith+x@googlemail.com"),
+            "alicesmith@googlemail.com"
+        );
+
+        // Elsewhere a dot makes a different mailbox, and so does the domain.
+        assert_eq!(
+            send_limit_key("alice.smith@example.com"),
+            "alice.smith@example.com"
+        );
+        assert_ne!(
+            send_limit_key("alice@example.com"),
+            send_limit_key("alice@example.org")
+        );
+        assert_ne!(
+            send_limit_key("alice@example.com"),
+            send_limit_key("alicia@example.com")
+        );
     }
 
     #[test]
@@ -644,6 +861,13 @@ mod tests {
             "älice@example.com",
             // Placeholder login addresses are not mailboxes.
             "alice.near@near",
+            // Reserved top-level domains never receive mail.
+            "alice@example.invalid",
+            "alice@mail.test",
+            "alice@host.localhost",
+            "alice@printer.local",
+            "alice@mail.example",
+            "alice@MAIL.TEST",
             too_long.as_str(),
             long_local.as_str(),
         ] {
@@ -670,6 +894,7 @@ mod tests {
             Arc::new(FakeUsers(None)),
             Arc::new(NoopEmailSender),
             None,
+            DAILY_CAP,
         );
 
         assert!(on.needs_contact_email(&wallet));
@@ -706,7 +931,19 @@ mod tests {
         assert_eq!(sent.len(), 1);
         assert_eq!(created[0].user_id, wallet.id.0);
         assert_eq!(created[0].email, "alice@example.com");
-        assert_eq!(*repository.limits.lock().unwrap(), Some(SEND_LIMITS));
+        assert_eq!(created[0].email_limit_key, "alice@example.com");
+        // 3 per user per hour, 3 per address per day, and the configured daily cap.
+        assert_eq!(
+            *repository.limits.lock().unwrap(),
+            Some(SendLimits {
+                per_user: 3,
+                per_user_window_secs: 3600,
+                per_address: 3,
+                per_address_window_secs: 86_400,
+                global: DAILY_CAP,
+                global_window_secs: 86_400,
+            })
+        );
         // Valid for 24 hours.
         let ttl = created[0].expires_at - before;
         assert!(ttl >= Duration::hours(24) && ttl < Duration::hours(24) + Duration::minutes(1));
@@ -716,11 +953,60 @@ mod tests {
         assert_eq!(sent[0].expires_at, created[0].expires_at);
         let token = sent[0]
             .verification_url
-            .strip_prefix("https://cloud.example.com/verify-contact-email?token=")
-            .expect("link goes to the frontend verification page");
+            .strip_prefix("https://cloud.example.com/verify-contact-email#token=")
+            .expect("link goes to the frontend verification page, token in the fragment");
         // The repository got the hash; the token only went into the email.
         assert_eq!(created[0].token_hash, hash_verification_token(token));
         assert_ne!(created[0].token_hash, token);
+        // The email went out, so the new link now replaces the earlier ones.
+        assert_eq!(
+            *repository.expired_earlier.lock().unwrap(),
+            vec![(wallet.id.0, VERIFICATION_ID)]
+        );
+        assert!(repository.deleted.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn request_counts_address_variants_under_one_limit_key() {
+        let wallet = user("alice.near@near", "near");
+        let repository = happy_repository();
+        let sender = Arc::new(RecordingSender::sending());
+        let service = service(&wallet, repository.clone(), sender.clone());
+
+        service
+            .request_verification(wallet.id.clone(), "A.Smith+cloud@Gmail.com")
+            .await
+            .unwrap();
+
+        let created = repository.created.lock().unwrap();
+        // Stored and emailed as typed; counted by the canonical form.
+        assert_eq!(created[0].email, "A.Smith+cloud@Gmail.com");
+        assert_eq!(created[0].email_limit_key, "asmith@gmail.com");
+        assert_eq!(
+            sender.sent.lock().unwrap()[0].recipient_email,
+            "A.Smith+cloud@Gmail.com"
+        );
+    }
+
+    #[tokio::test]
+    async fn request_to_an_address_at_its_limit_answers_as_sent_without_sending() {
+        let wallet = user("alice.near@near", "near");
+        let repository = Arc::new(FakeRepository::new(
+            CreateVerificationOutcome::AddressLimitReached,
+            ConfirmOutcome::InvalidToken,
+        ));
+        let sender = Arc::new(RecordingSender::sending());
+        let service = service(&wallet, repository.clone(), sender.clone());
+
+        service
+            .request_verification(wallet.id.clone(), "alice@example.com")
+            .await
+            .expect("the caller is told nothing about the address");
+
+        assert!(sender.sent.lock().unwrap().is_empty());
+        // No email went out, so the user's earlier links are left alone.
+        assert!(repository.expired_earlier.lock().unwrap().is_empty());
+        assert!(repository.deleted.lock().unwrap().is_empty());
     }
 
     #[tokio::test]
@@ -732,6 +1018,7 @@ mod tests {
             Arc::new(FakeUsers(Some(wallet.clone()))),
             Arc::new(RecordingSender::sending()),
             None,
+            DAILY_CAP,
         );
 
         let error = service
@@ -749,20 +1036,27 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn request_is_only_for_placeholder_logins() {
-        let github = user("bob@example.com", "github");
-        let repository = happy_repository();
-        let sender = Arc::new(RecordingSender::sending());
-        let service = service(&github, repository.clone(), sender.clone());
+    async fn request_is_only_for_wallet_logins() {
+        // The same rule as `needs_contact_email`: the wallet provider and a
+        // placeholder login address, both.
+        for not_a_wallet_login in [
+            user("bob@example.com", "github"),
+            user("bob@near", "google"),
+            user("bob@example.com", "near"),
+        ] {
+            let repository = happy_repository();
+            let sender = Arc::new(RecordingSender::sending());
+            let service = service(&not_a_wallet_login, repository.clone(), sender.clone());
 
-        let error = service
-            .request_verification(github.id.clone(), "bob@work.example")
-            .await
-            .unwrap_err();
+            let error = service
+                .request_verification(not_a_wallet_login.id.clone(), "bob@example.org")
+                .await
+                .unwrap_err();
 
-        assert!(matches!(error, ContactEmailError::NotSupported));
-        assert!(repository.created.lock().unwrap().is_empty());
-        assert!(sender.sent.lock().unwrap().is_empty());
+            assert!(matches!(error, ContactEmailError::NotSupported));
+            assert!(repository.created.lock().unwrap().is_empty());
+            assert!(sender.sent.lock().unwrap().is_empty());
+        }
     }
 
     #[tokio::test]
@@ -821,7 +1115,8 @@ mod tests {
                 outcome,
                 sent: Mutex::new(Vec::new()),
             });
-            let service = service(&wallet, happy_repository(), sender);
+            let repository = happy_repository();
+            let service = service(&wallet, repository.clone(), sender);
 
             let error = service
                 .request_verification(wallet.id.clone(), "alice@example.com")
@@ -831,7 +1126,51 @@ mod tests {
             assert!(matches!(error, ContactEmailError::SendFailed));
             // The error shown to the caller never repeats the provider's text.
             assert!(!error.to_string().contains("alice@example.com"));
+            // The unsent row is removed, so it counts toward no limit, and the
+            // user's earlier links are not expired.
+            assert_eq!(*repository.deleted.lock().unwrap(), vec![VERIFICATION_ID]);
+            assert!(repository.expired_earlier.lock().unwrap().is_empty());
         }
+    }
+
+    #[tokio::test]
+    async fn remove_works_with_the_feature_off_and_reports_a_missing_user() {
+        let wallet = user("alice.near@near", "near");
+        let off = |repository: Arc<FakeRepository>| {
+            ContactEmailService::new(
+                repository,
+                Arc::new(FakeUsers(Some(wallet.clone()))),
+                Arc::new(NoopEmailSender),
+                None,
+                DAILY_CAP,
+            )
+        };
+
+        // Removing twice is fine: the second call has nothing left to clear.
+        let repository = happy_repository();
+        let service = off(repository.clone());
+        service
+            .remove_contact_email(wallet.id.clone())
+            .await
+            .unwrap();
+        service
+            .remove_contact_email(wallet.id.clone())
+            .await
+            .unwrap();
+        assert_eq!(
+            *repository.removed.lock().unwrap(),
+            vec![wallet.id.0, wallet.id.0]
+        );
+
+        let mut no_such_user = FakeRepository::new(created(), ConfirmOutcome::InvalidToken);
+        no_such_user.user_exists = false;
+        assert!(matches!(
+            off(Arc::new(no_such_user))
+                .remove_contact_email(wallet.id.clone())
+                .await
+                .unwrap_err(),
+            ContactEmailError::UserNotFound
+        ));
     }
 
     #[tokio::test]
@@ -856,15 +1195,12 @@ mod tests {
     async fn confirm_reports_a_duplicate_address_and_an_invalid_token_differently() {
         let wallet = user("alice.near@near", "near");
         let duplicate = Arc::new(FakeRepository::new(
-            CreateVerificationOutcome::Created,
+            created(),
             ConfirmOutcome::AddressInUse {
                 user_id: wallet.id.0,
             },
         ));
-        let invalid = Arc::new(FakeRepository::new(
-            CreateVerificationOutcome::Created,
-            ConfirmOutcome::InvalidToken,
-        ));
+        let invalid = Arc::new(FakeRepository::new(created(), ConfirmOutcome::InvalidToken));
 
         let duplicate_error = service(&wallet, duplicate, Arc::new(RecordingSender::sending()))
             .confirm("token")

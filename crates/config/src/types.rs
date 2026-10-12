@@ -1404,17 +1404,37 @@ impl PlacementEndpoint {
     }
 }
 
+/// Default for `CONTACT_EMAIL_VERIFICATION_DAILY_CAP`.
+pub const DEFAULT_CONTACT_EMAIL_VERIFICATION_DAILY_CAP: u32 = 500;
+
 /// Email notification configuration for organization invitations.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct InvitationEmailConfig {
     pub enabled: bool,
     /// Lets NEAR wallet users add and verify a contact email. Switched on its
     /// own, but uses the same sender address, Resend key and frontend URL.
     pub contact_email_verification_enabled: bool,
+    /// Most contact email verification emails sent per 24 hours, across all
+    /// users and addresses.
+    pub contact_email_verification_daily_cap: u32,
     pub from_email: Option<String>,
     pub reply_to: Option<String>,
     pub resend_api_key: Option<String>,
     pub frontend_base_url: Option<String>,
+}
+
+impl Default for InvitationEmailConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            contact_email_verification_enabled: false,
+            contact_email_verification_daily_cap: DEFAULT_CONTACT_EMAIL_VERIFICATION_DAILY_CAP,
+            from_email: None,
+            reply_to: None,
+            resend_api_key: None,
+            frontend_base_url: None,
+        }
+    }
 }
 
 impl InvitationEmailConfig {
@@ -1427,6 +1447,10 @@ impl InvitationEmailConfig {
             .ok()
             .and_then(|v| v.parse::<bool>().ok())
             .unwrap_or(false);
+        let contact_email_verification_daily_cap = parse_u32_env(
+            "CONTACT_EMAIL_VERIFICATION_DAILY_CAP",
+            DEFAULT_CONTACT_EMAIL_VERIFICATION_DAILY_CAP,
+        )?;
 
         let from_email = non_empty_env("INVITATION_EMAIL_FROM");
         let reply_to = non_empty_env("INVITATION_EMAIL_REPLY_TO");
@@ -1465,6 +1489,7 @@ impl InvitationEmailConfig {
         Ok(Self {
             enabled,
             contact_email_verification_enabled,
+            contact_email_verification_daily_cap,
             from_email,
             reply_to,
             resend_api_key,
@@ -1479,7 +1504,8 @@ impl InvitationEmailConfig {
     }
 
     /// Frontend page that confirms a contact email. The verification token is
-    /// appended as the `token` query parameter.
+    /// appended in the URL fragment (`#token=...`), which browsers do not send to
+    /// the server, so it stays out of access logs and referrers.
     pub fn contact_email_verification_url(&self) -> Option<String> {
         self.frontend_base_url
             .as_ref()
@@ -2653,8 +2679,36 @@ mod tests {
         let config = InvitationEmailConfig::from_env().unwrap();
 
         assert!(!config.contact_email_verification_enabled);
+        assert_eq!(config.contact_email_verification_daily_cap, 500);
+        assert_eq!(
+            InvitationEmailConfig::default().contact_email_verification_daily_cap,
+            500
+        );
         assert!(config.resend_api_key.is_none());
         assert!(config.contact_email_verification_url().is_none());
+        clear_invitation_email_env();
+    }
+
+    #[test]
+    #[serial]
+    fn test_contact_email_verification_daily_cap_is_read_and_validated() {
+        clear_invitation_email_env();
+        std::env::set_var("CONTACT_EMAIL_VERIFICATION_DAILY_CAP", " 50 ");
+        assert_eq!(
+            InvitationEmailConfig::from_env()
+                .unwrap()
+                .contact_email_verification_daily_cap,
+            50
+        );
+
+        for invalid in ["-1", "many", ""] {
+            std::env::set_var("CONTACT_EMAIL_VERIFICATION_DAILY_CAP", invalid);
+            let error = InvitationEmailConfig::from_env().unwrap_err();
+            assert!(
+                error.contains("CONTACT_EMAIL_VERIFICATION_DAILY_CAP"),
+                "{error}"
+            );
+        }
         clear_invitation_email_env();
     }
 
@@ -2724,6 +2778,7 @@ mod tests {
 
     fn clear_invitation_email_env() {
         std::env::remove_var("CONTACT_EMAIL_VERIFICATION_ENABLED");
+        std::env::remove_var("CONTACT_EMAIL_VERIFICATION_DAILY_CAP");
         std::env::remove_var("INVITATION_EMAIL_ENABLED");
         std::env::remove_var("INVITATION_EMAIL_FROM");
         std::env::remove_var("INVITATION_EMAIL_REPLY_TO");

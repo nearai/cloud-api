@@ -51,9 +51,9 @@ use crate::routes::{
     organizations::*,
     users::{
         accept_invitation, create_access_token, decline_invitation, get_current_user,
-        get_user_refresh_tokens, get_user_status, list_user_invitations, request_contact_email,
-        revoke_all_user_tokens, revoke_user_refresh_token, update_current_user_profile,
-        verify_contact_email,
+        get_user_refresh_tokens, get_user_status, list_user_invitations, remove_contact_email,
+        request_contact_email, revoke_all_user_tokens, revoke_user_refresh_token,
+        update_current_user_profile, verify_contact_email,
     },
 };
 
@@ -175,7 +175,7 @@ pub fn build_management_router(app_state: AppState, auth_state: AuthState) -> Ro
         .route("/me/profile", put(update_current_user_profile))
         .route(
             "/me/contact-email",
-            axum::routing::post(request_contact_email),
+            axum::routing::post(request_contact_email).delete(remove_contact_email),
         )
         .route("/me/invitations", get(list_user_invitations))
         .route(

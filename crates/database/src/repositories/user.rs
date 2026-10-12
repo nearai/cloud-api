@@ -254,6 +254,7 @@ impl UserRepository {
             WHERE ($1::BOOLEAN IS NULL OR is_active = $1)
               AND ($2::TEXT IS NULL
                    OR email ILIKE ('%' || $2 || '%') ESCAPE '\'
+                   OR contact_email ILIKE ('%' || $2 || '%') ESCAPE '\'
                    OR username ILIKE ('%' || $2 || '%') ESCAPE '\'
                    OR display_name ILIKE ('%' || $2 || '%') ESCAPE '\'
                    OR id::TEXT ILIKE ('%' || $2 || '%') ESCAPE '\'
@@ -284,6 +285,7 @@ impl UserRepository {
             WHERE ($3::BOOLEAN IS NULL OR is_active = $3)
               AND ($4::TEXT IS NULL
                    OR email ILIKE ('%' || $4 || '%') ESCAPE '\'
+                   OR contact_email ILIKE ('%' || $4 || '%') ESCAPE '\'
                    OR username ILIKE ('%' || $4 || '%') ESCAPE '\'
                    OR display_name ILIKE ('%' || $4 || '%') ESCAPE '\'
                    OR id::TEXT ILIKE ('%' || $4 || '%') ESCAPE '\'
@@ -344,6 +346,7 @@ impl UserRepository {
             WHERE ($1::BOOLEAN IS NULL OR u.is_active = $1)
               AND ($2::TEXT IS NULL
                    OR u.email ILIKE ('%' || $2 || '%') ESCAPE '\'
+                   OR u.contact_email ILIKE ('%' || $2 || '%') ESCAPE '\'
                    OR u.username ILIKE ('%' || $2 || '%') ESCAPE '\'
                    OR u.display_name ILIKE ('%' || $2 || '%') ESCAPE '\'
                    OR u.id::TEXT ILIKE ('%' || $2 || '%') ESCAPE '\'
@@ -395,6 +398,7 @@ impl UserRepository {
                 WHERE ($3::BOOLEAN IS NULL OR u.is_active = $3)
                   AND ($4::TEXT IS NULL
                        OR u.email ILIKE ('%' || $4 || '%') ESCAPE '\'
+                       OR u.contact_email ILIKE ('%' || $4 || '%') ESCAPE '\'
                        OR u.username ILIKE ('%' || $4 || '%') ESCAPE '\'
                        OR u.display_name ILIKE ('%' || $4 || '%') ESCAPE '\'
                        OR u.id::TEXT ILIKE ('%' || $4 || '%') ESCAPE '\'

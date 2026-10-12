@@ -22,10 +22,14 @@ CREATE UNIQUE INDEX idx_users_contact_email_verified
 
 -- One row per verification email sent. Only the SHA-256 hash of the token is
 -- stored, never the token. Rows are also what the send rate limits count.
+-- `email` is the address as the user typed it. `email_limit_key` is its
+-- canonical form, computed by the service, which the per-address limit counts
+-- by so that variants reaching one mailbox count as one address.
 CREATE TABLE user_contact_email_verifications (
     id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
     user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
     email VARCHAR(255) NOT NULL,
+    email_limit_key VARCHAR(255) NOT NULL,
     token_hash VARCHAR(64) NOT NULL UNIQUE,
     expires_at TIMESTAMPTZ NOT NULL,
     consumed_at TIMESTAMPTZ,
@@ -35,7 +39,7 @@ CREATE TABLE user_contact_email_verifications (
 -- Per-user and per-address send counts, and the purge of old rows.
 CREATE INDEX idx_user_contact_email_verifications_user
     ON user_contact_email_verifications (user_id, created_at);
-CREATE INDEX idx_user_contact_email_verifications_email
-    ON user_contact_email_verifications (lower(email), created_at);
+CREATE INDEX idx_user_contact_email_verifications_limit_key
+    ON user_contact_email_verifications (email_limit_key, created_at);
 CREATE INDEX idx_user_contact_email_verifications_created_at
     ON user_contact_email_verifications (created_at);

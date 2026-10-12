@@ -511,6 +511,7 @@ pub async fn init_domain_services_with_pool(
             .contact_email_verification_enabled
             .then(|| config.invitation_email.contact_email_verification_url())
             .flatten(),
+        i64::from(config.invitation_email.contact_email_verification_daily_cap),
     ));
 
     // Create user service

@@ -1,6 +1,16 @@
 {
   "router": [
     {
+      "measurement": "38d78f2dc338d57bb25ebdcf47be52e6e98da59ebc205bda6d82c60101ef8d2d893f6b0092e3b6bd7a6c683942a067e3",
+      "repo": "tinfoilsh/confidential-model-router",
+      "tag": "v0.0.156"
+    },
+    {
+      "measurement": "5a2f5576ff6b2850c8a7cc363bd22d164247bad743e6633f4637193251de2c8d717beb69bf7992df4ed35809694637f0",
+      "repo": "tinfoilsh/confidential-model-router",
+      "tag": "v0.0.157"
+    },
+    {
       "measurement": "b3be62c7199d8e4d24f130e5651bdc8a62a2532f72c7e87c986bec54bf5f90bab703ad4dbfc5e45bfd385f8972dfc66c",
       "repo": "tinfoilsh/confidential-model-router",
       "tag": "v0.0.155"
@@ -43,12 +53,30 @@
     "glm-5-3": [
       {
         "registers": [
+          "079abcb2cb10ac9da02178b8cb365537ecccbe9e18fb9d28746466b6ff4baef2688a909383483bfc87d294d1236f7160",
+          "7e57f9877b4533e7dcb8dd7419dfaf422f3c7cef6fd337a4eaf27ae90a751ff04945ef0d4fb6c3753285cb1f09ce048e",
+          "f4dd2dc66487b42cb0af736a290c2aa1a2554aa1a161b35409173541aa12d9ebcd6915de43cf5135eb44647fd5430b54"
+        ],
+        "repo": "tinfoilsh/confidential-glm5-3-nvfp4",
+        "tag": "v0.0.6"
+      },
+      {
+        "registers": [
           "29717ea101027e824b19fbf94da1b7a6404287016368de32c4aae13f5732566b8683f08211f1ade53ecc191e7909ad6c",
           "a787299fe2e84295a406dde367abac5b40128c1e13aa81dfde4a5c2e39682e45cde7bb84cefc7f33f25ac645fc265030",
           "024d442593b797df275b0a229df8f9cc3c3333345d59a0b95e7b0242a30a9d82b0a965ef4b0039ef0423e870c6828845"
         ],
         "repo": "tinfoilsh/confidential-glm5-3-nvfp4",
         "tag": "v0.0.3"
+      },
+      {
+        "registers": [
+          "b64eb23f1441a8f25e29d901782fbb82f894f434db70cb1658dd37c398715bfff070f3b732f2e623bf151e56d2699188",
+          "7e57f9877b4533e7dcb8dd7419dfaf422f3c7cef6fd337a4eaf27ae90a751ff04945ef0d4fb6c3753285cb1f09ce048e",
+          "affb1973ecb2abb9edfe87939de38030f1a38ce4de08966e3580721b41436409d6bc9ab8c6dbdbe7a4476d360b639721"
+        ],
+        "repo": "tinfoilsh/confidential-glm5-3-nvfp4",
+        "tag": "v0.0.7"
       }
     ],
     "glm-5-3-flash": [
@@ -60,6 +88,15 @@
         ],
         "repo": "tinfoilsh/confidential-glm5-3-flash",
         "tag": "v0.0.8"
+      },
+      {
+        "registers": [
+          "a030219c0df991705e9afc39409cd5dea94d11f049fd20f6c0d684c87d274a710c453d15929bb90a17fd208d89a83a58",
+          "7e57f9877b4533e7dcb8dd7419dfaf422f3c7cef6fd337a4eaf27ae90a751ff04945ef0d4fb6c3753285cb1f09ce048e",
+          "e3e6a2fe566c550b88a01d54bee8e8b50905345d5b09b2f3b2cd9a799803f1ef1ef51105ec01172fe805b148dc60e68d"
+        ],
+        "repo": "tinfoilsh/confidential-glm5-3-flash",
+        "tag": "v0.0.11"
       }
     ],
     "gpt-oss-120b": [

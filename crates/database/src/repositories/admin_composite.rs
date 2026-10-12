@@ -1934,19 +1934,27 @@ impl AdminRepository for AdminCompositeRepository {
         model_id: Uuid,
         organization_id: Uuid,
         granted_by_user_id: Option<Uuid>,
-    ) -> Result<ModelAccessGrant> {
+    ) -> Result<(ModelAccessGrant, bool)> {
         let client = self.pool.get().await?;
-        // An existing grant keeps its date and its author.
-        client
+        // One statement, so the grant and its audit row are written together
+        // or not at all. An existing grant keeps its date and its author, and
+        // then nothing is written to the audit log either.
+        let created = client
             .execute(
                 r#"
-                INSERT INTO organization_model_access (organization_id, model_id, created_by_user_id)
-                VALUES ($1, $2, $3)
-                ON CONFLICT (organization_id, model_id) DO NOTHING
+                WITH granted AS (
+                    INSERT INTO organization_model_access (organization_id, model_id, created_by_user_id)
+                    VALUES ($1, $2, $3)
+                    ON CONFLICT (organization_id, model_id) DO NOTHING
+                    RETURNING organization_id, model_id, created_by_user_id
+                )
+                INSERT INTO organization_model_access_log (organization_id, model_id, action, acting_user_id)
+                SELECT organization_id, model_id, 'grant', created_by_user_id FROM granted
                 "#,
                 &[&organization_id, &model_id, &granted_by_user_id],
             )
-            .await?;
+            .await?
+            > 0;
         let row = client
             .query_opt(
                 &format!(
@@ -1957,19 +1965,34 @@ impl AdminRepository for AdminCompositeRepository {
             .await?
             .context("the grant is gone: revoked or the organization was deleted meanwhile")?;
 
-        Ok(row_to_model_access_grant(&row))
+        Ok((row_to_model_access_grant(&row), created))
     }
 
-    async fn revoke_model_access(&self, model_id: Uuid, organization_id: Uuid) -> Result<bool> {
+    async fn revoke_model_access(
+        &self,
+        model_id: Uuid,
+        organization_id: Uuid,
+        revoked_by_user_id: Option<Uuid>,
+    ) -> Result<bool> {
         let client = self.pool.get().await?;
-        let deleted = client
+        // One statement, so the grant goes and its audit row is written
+        // together or not at all. No grant, no audit row.
+        let revoked = client
             .execute(
-                "DELETE FROM organization_model_access WHERE organization_id = $1 AND model_id = $2",
-                &[&organization_id, &model_id],
+                r#"
+                WITH revoked AS (
+                    DELETE FROM organization_model_access
+                    WHERE organization_id = $1 AND model_id = $2
+                    RETURNING organization_id, model_id
+                )
+                INSERT INTO organization_model_access_log (organization_id, model_id, action, acting_user_id)
+                SELECT organization_id, model_id, 'revoke', $3::UUID FROM revoked
+                "#,
+                &[&organization_id, &model_id, &revoked_by_user_id],
             )
             .await?;
 
-        Ok(deleted > 0)
+        Ok(revoked > 0)
     }
 
     async fn list_organization_model_access(

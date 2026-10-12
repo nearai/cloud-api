@@ -1444,9 +1444,13 @@ impl ModelRepository {
         Ok(row.is_some())
     }
 
-    /// Every active unlisted model with the active organizations that hold a
-    /// grant for it, ordered by model name. A model nobody may use is listed
-    /// with no organizations.
+    /// Every unlisted model, active or not, with the active organizations
+    /// that hold a grant for it, ordered by model name. A model nobody may
+    /// use is listed with no organizations.
+    ///
+    /// Inactive models are included on purpose. The reader takes a model that
+    /// is absent from the list to be unrestricted, and it may still be
+    /// serving a model that was deactivated here.
     pub async fn list_restricted_model_access(
         &self,
     ) -> Result<Vec<services::models::RestrictedModelAccess>> {
@@ -1472,8 +1476,7 @@ impl ModelRepository {
                     LEFT JOIN organizations o
                         ON o.id = a.organization_id
                         AND o.is_active = true
-                    WHERE m.is_active = true
-                      AND m.is_listed = false
+                    WHERE m.is_listed = false
                     GROUP BY m.id
                     ORDER BY m.model_name
                     "#,

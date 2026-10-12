@@ -1157,7 +1157,7 @@ pub struct ModelsResponse {
 pub struct ModelAccessDocument {
     /// Always `"model_access"`.
     pub object: String,
-    /// One entry per active unlisted model, ordered by model name.
+    /// One entry per unlisted model, active or not, ordered by model name.
     pub models: Vec<ModelAccessDocumentEntry>,
 }
 

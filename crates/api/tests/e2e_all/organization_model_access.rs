@@ -20,6 +20,13 @@ use uuid::Uuid;
 
 const INTERNAL_TOKEN: &str = "organization-model-access-internal-secret";
 const NONCE: &str = "0000000000000000000000000000000000000000000000000000000000000001";
+/// Every fixture model has a planned deprecation, so a served request carries
+/// the deprecation headers and a refused one must not. `2030-01-01` defaults
+/// to 13:00 UTC.
+const DEPRECATION_DATE: &str = "2030-01-01";
+const DEPRECATION_DATE_HEADER: &str = "2030-01-01T13:00:00Z";
+const HEADER_DEPRECATION_DATE: &str = "x-model-deprecation-date";
+const HEADER_SUCCESSOR: &str = "x-model-successor";
 
 /// The fixture models, one per kind of route.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -45,6 +52,8 @@ struct Fixture {
     decisions: String,
     anthropic: String,
     native: String,
+    /// The listed model every fixture model names as its successor.
+    successor: String,
 }
 
 impl Fixture {
@@ -96,7 +105,7 @@ async fn upsert_models(server: &axum_test::TestServer, models: Vec<(&str, Value)
 }
 
 /// A server with one unlisted model of each kind, all served by one mock
-/// provider.
+/// provider. Each has a planned deprecation and names a listed successor.
 async fn setup() -> Fixture {
     let suffix = Uuid::new_v4();
     let text = format!("access-text/model-{suffix}");
@@ -104,6 +113,7 @@ async fn setup() -> Fixture {
     let decisions = format!("access-decisions/model-{suffix}");
     let anthropic = format!("anthropic/access-model-{suffix}");
     let native = format!("access-native/model-{suffix}");
+    let successor = format!("access-successor/model-{suffix}");
 
     let native_allowlist = vec![native.clone()];
     let (server, pool, _shared_mock, database) =
@@ -114,17 +124,29 @@ async fn setup() -> Fixture {
         })
         .await;
 
+    // The successor first: a model can only name one that exists.
+    upsert_models(
+        &server,
+        vec![(&successor, model_fields(json!({ "isListed": true })))],
+    )
+    .await;
+    let deprecated = |extra: Value| {
+        let mut fields = model_fields(extra);
+        fields["deprecationDate"] = json!(DEPRECATION_DATE);
+        fields["successorModelId"] = json!(successor);
+        fields
+    };
     upsert_models(
         &server,
         vec![
-            (&text, model_fields(json!({ "aliases": [text_alias] }))),
+            (&text, deprecated(json!({ "aliases": [text_alias] }))),
             (
                 &decisions,
-                model_fields(json!({ "outputModalities": ["decisions"] })),
+                deprecated(json!({ "outputModalities": ["decisions"] })),
             ),
             (
                 &anthropic,
-                model_fields(json!({
+                deprecated(json!({
                     "providerType": "external",
                     "attestationSupported": false,
                     "providerConfig": {
@@ -133,7 +155,7 @@ async fn setup() -> Fixture {
                     }
                 })),
             ),
-            (&native, model_fields(json!({ "ownedBy": "openai" }))),
+            (&native, deprecated(json!({ "ownedBy": "openai" }))),
         ],
     )
     .await;
@@ -189,6 +211,7 @@ async fn setup() -> Fixture {
         decisions,
         anthropic,
         native,
+        successor,
     }
 }
 
@@ -334,6 +357,14 @@ impl Route {
         }
     }
 
+    /// The method the route is registered with.
+    fn method(self) -> &'static str {
+        match self {
+            Route::AttestationReport | Route::AttestationReportWithNonce => "GET",
+            _ => "POST",
+        }
+    }
+
     /// Whether the mock provider can serve the route, so an organization
     /// that holds a grant gets a 200. The native Anthropic routes need a
     /// provider that speaks that protocol, which the mock does not: there a
@@ -341,6 +372,41 @@ impl Route {
     fn mock_serves_it(self) -> bool {
         !matches!(self, Route::Messages | Route::MessagesCountTokens)
     }
+
+    /// Whether a served request on this route carries the deprecation
+    /// headers of its model. The attestation report is not an inference
+    /// route and has no such headers; the Anthropic routes are not served by
+    /// the mock.
+    fn announces_deprecation(self) -> bool {
+        self.mock_serves_it()
+            && !matches!(
+                self,
+                Route::AttestationReport | Route::AttestationReportWithNonce
+            )
+    }
+
+    /// Whether the route accepts an alias in place of the model's name. The
+    /// others look the model up by its canonical name only.
+    fn resolves_aliases(self) -> bool {
+        matches!(
+            self,
+            Route::ChatCompletions
+                | Route::ChatCompletionsStream
+                | Route::Completions
+                | Route::CompletionsStream
+                | Route::Responses
+                | Route::ResponsesStream
+                | Route::AudioTranscriptions
+                | Route::AttestationReport
+                | Route::AttestationReportWithNonce
+        )
+    }
+}
+
+/// The deprecation headers of a response: (date, successor).
+fn deprecation_headers(response: &Observed) -> (Option<&str>, Option<&str>) {
+    let header = |name: &str| response.headers.get(name).map(String::as_str);
+    (header(HEADER_DEPRECATION_DATE), header(HEADER_SUCCESSOR))
 }
 
 /// A minimal PNG image (1x1 pixel).
@@ -587,51 +653,258 @@ fn blank_generated_ids(body: &str) -> String {
     out
 }
 
-/// The tests below cover the routes in `ROUTES`. This one fails when a route
-/// is added to the inference routers without being added there (or to the
-/// list of routes that take no model name), so a new inference route cannot
-/// ship without an access test.
-#[test]
-fn every_inference_route_is_in_the_access_table() {
-    /// Routes of the inference routers that do not take a model name.
-    const NO_MODEL_NAME: &[&str] = &[
-        "/models",
-        "/responses/{response_id}",
-        "/responses/{response_id}/cancel",
-        "/responses/{response_id}/input_items",
+/// Every `.route("<path>", <method>(..))` call in a router source file, as
+/// (method, path) pairs. Comment lines and the unit-test module are left out.
+fn registered_routes(source: &str) -> Vec<(String, String)> {
+    const METHODS: &[&str] = &[
+        "get", "post", "put", "patch", "delete", "head", "options", "trace", "any",
     ];
-    let source = include_str!("../../src/lib.rs");
-    let mut registered = Vec::new();
-    for builder in ["build_completion_routes", "build_response_routes"] {
-        let start = source
-            .find(&format!("pub fn {builder}("))
-            .unwrap_or_else(|| panic!("{builder} is gone: update this test"));
-        let body = &source[start..];
-        let end = body[1..].find("\npub fn ").map_or(body.len(), |at| at + 1);
-        let mut body = &body[..end];
-        while let Some(at) = body.find(".route(") {
-            body = &body[at + ".route(".len()..];
-            let quoted = body.trim_start();
-            assert!(
-                quoted.starts_with('"'),
-                "{builder}: a route path that is not a string literal"
-            );
-            let path = &quoted[1..];
-            registered.push(&path[..path.find('"').expect("closing quote")]);
+    let production = source
+        .split("\n#[cfg(test)]\nmod tests")
+        .next()
+        .expect("split yields at least one part");
+    let code = production
+        .lines()
+        .filter(|line| !line.trim_start().starts_with("//"))
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    let mut routes = Vec::new();
+    let mut rest = code.as_str();
+    while let Some(at) = rest.find(".route(") {
+        rest = &rest[at + ".route(".len()..];
+        // The arguments of the call: up to the parenthesis that closes it.
+        let mut depth = 1usize;
+        let end = rest
+            .char_indices()
+            .find_map(|(index, c)| {
+                match c {
+                    '(' => depth += 1,
+                    ')' => depth -= 1,
+                    _ => {}
+                }
+                (depth == 0).then_some(index)
+            })
+            .expect("a `.route(` call that is never closed");
+        let call = &rest[..end];
+        let quoted = call.trim_start();
+        assert!(
+            quoted.starts_with('"'),
+            "a route path that is not a string literal: {call}"
+        );
+        let (path, handlers) = quoted[1..]
+            .split_once('"')
+            .expect("the path's closing quote");
+
+        let mut methods = Vec::new();
+        for method in METHODS {
+            let token = format!("{method}(");
+            let mut from = 0;
+            while let Some(found) = handlers[from..].find(&token) {
+                let at = from + found;
+                // `get(` is a method; `budget(` or `my_get(` is not.
+                let starts_a_word = handlers[..at]
+                    .chars()
+                    .next_back()
+                    .is_none_or(|c| !(c.is_ascii_alphanumeric() || c == '_'));
+                if starts_a_word {
+                    methods.push(method.to_uppercase());
+                }
+                from = at + token.len();
+            }
         }
+        assert!(
+            !methods.is_empty(),
+            "no method found for route {path}: {handlers}"
+        );
+        routes.extend(methods.into_iter().map(|method| (method, path.to_string())));
+        rest = &rest[end..];
     }
+    routes
+}
+
+/// The access tests cover the routes in `ROUTES`. This one fails when a route
+/// is registered in any router builder of `src/lib.rs` (or in the public
+/// attestation router it merges) without a decision on record here: either
+/// the route is in `ROUTES`, and so in the table test, or it is listed below
+/// with the reason it is not. A new route cannot ship without that decision.
+///
+/// Routes are matched by method and path, as they are registered.
+#[test]
+fn every_registered_route_has_a_model_access_decision() {
+    /// Routes that deal in model names without being inference for an
+    /// organization. Each has its own rule, tested elsewhere in this file or
+    /// in `unlisted_models.rs`.
+    const OTHER_MODEL_ROUTES: &[(&str, &str)] = &[
+        // Public catalogs: listed models only.
+        ("GET", "/models"),
+        ("GET", "/model/list"),
+        ("GET", "/model/{model_name}"),
+        // Public: resolves as an anonymous caller.
+        ("GET", "/attestation/ita-token"),
+        // Service token: usage is recorded for any model, and the two
+        // documents are for a gateway that enforces access itself.
+        ("POST", "/internal/usage"),
+        ("GET", "/internal/models"),
+        ("GET", "/internal/model-access"),
+    ];
+    /// Routes that take no model name from the caller.
+    const NO_MODEL_NAME: &[(&str, &str)] = &[
+        ("GET", "/health"),
+        ("POST", "/ohttp"),
+        ("GET", "/.well-known/ohttp-gateway"),
+        ("GET", "/ohttp/config"),
+        ("GET", "/docs"),
+        ("GET", "/api-docs/openapi.json"),
+        // Sign-in and invitations.
+        ("POST", "/auth/vpc/login"),
+        ("POST", "/near"),
+        ("GET", "/login"),
+        ("GET", "/github"),
+        ("GET", "/google"),
+        ("GET", "/callback"),
+        ("GET", "/user"),
+        ("POST", "/logout"),
+        ("GET", "/{token}"),
+        ("POST", "/{token}/accept"),
+        // Stored responses, by id.
+        ("GET", "/responses/{response_id}"),
+        ("DELETE", "/responses/{response_id}"),
+        ("POST", "/responses/{response_id}/cancel"),
+        ("GET", "/responses/{response_id}/input_items"),
+        // The MCP endpoint serves web search only.
+        ("POST", "/mcp"),
+        ("POST", "/conversations"),
+        ("POST", "/conversations/batch"),
+        ("GET", "/conversations/{conversation_id}"),
+        ("POST", "/conversations/{conversation_id}"),
+        ("DELETE", "/conversations/{conversation_id}"),
+        ("POST", "/conversations/{conversation_id}/pin"),
+        ("DELETE", "/conversations/{conversation_id}/pin"),
+        ("POST", "/conversations/{conversation_id}/archive"),
+        ("DELETE", "/conversations/{conversation_id}/archive"),
+        ("POST", "/conversations/{conversation_id}/clone"),
+        ("GET", "/conversations/{conversation_id}/items"),
+        ("POST", "/conversations/{conversation_id}/items"),
+        // Looked up by chat id. The `model` query parameter is not read.
+        ("GET", "/signature/{chat_id}"),
+        ("GET", "/organizations/{org_id}/workspaces"),
+        ("POST", "/organizations/{org_id}/workspaces"),
+        ("GET", "/workspaces/{workspace_id}"),
+        ("PUT", "/workspaces/{workspace_id}"),
+        ("DELETE", "/workspaces/{workspace_id}"),
+        ("GET", "/workspaces/{workspace_id}/api-keys"),
+        ("POST", "/workspaces/{workspace_id}/api-keys"),
+        ("DELETE", "/workspaces/{workspace_id}/api-keys/{key_id}"),
+        ("PATCH", "/workspaces/{workspace_id}/api-keys/{key_id}"),
+        (
+            "PATCH",
+            "/workspaces/{workspace_id}/api-keys/{key_id}/spend-limit",
+        ),
+        (
+            "GET",
+            "/workspaces/{workspace_id}/api-keys/{key_id}/usage/history",
+        ),
+        ("POST", "/files"),
+        ("GET", "/files"),
+        ("GET", "/files/{file_id}"),
+        ("DELETE", "/files/{file_id}"),
+        ("GET", "/files/{file_id}/content"),
+        ("POST", "/feature-requests"),
+        // An organization's own usage and costs.
+        ("POST", "/billing/costs"),
+        ("GET", "/organizations/{org_id}/usage/export"),
+        ("GET", "/organizations/{org_id}/usage/summary"),
+        (
+            "GET",
+            "/organizations/{org_id}/usage/reporting-token-auth-probe",
+        ),
+        ("POST", "/check_api_key"),
+        ("GET", "/services"),
+        ("GET", "/services/{service_name}"),
+    ];
+
+    let mut registered = registered_routes(include_str!("../../src/lib.rs"));
+    registered.extend(registered_routes(include_str!(
+        "../../src/routes/attestation.rs"
+    )));
     assert!(
-        registered.len() >= 15,
+        registered.len() >= 100,
         "found too few routes, the scan is broken: {registered:?}"
     );
+    let is_registered =
+        |method: &str, path: &str| registered.iter().any(|(m, p)| m == method && p == path);
 
-    for path in registered {
+    for (method, path) in &registered {
+        // Admin routes act as the platform: their model names are not
+        // subject to grants. Their own access rule is the admin permission
+        // policy.
+        let admin = path.starts_with("/admin/");
+        let in_table = ROUTES
+            .iter()
+            .any(|route| route.method() == method && route.path() == path);
+        let listed = [OTHER_MODEL_ROUTES, NO_MODEL_NAME]
+            .concat()
+            .contains(&(method.as_str(), path.as_str()));
         assert!(
-            NO_MODEL_NAME.contains(&path) || ROUTES.iter().any(|route| route.path() == path),
-            "route {path} is not covered by the model access tests: add it to ROUTES \
-             (and `send`) if it takes a model name, or to NO_MODEL_NAME if it does not"
+            admin || in_table || listed,
+            "{method} {path} has no model access decision. If it takes a model name from \
+             the caller, add it to ROUTES (and `send`) so the table test covers it. If not, \
+             add it to NO_MODEL_NAME or OTHER_MODEL_ROUTES."
         );
     }
+
+    // The lists must not rot: every entry is still a registered route, and
+    // the scan saw every route of the table.
+    for (method, path) in OTHER_MODEL_ROUTES.iter().chain(NO_MODEL_NAME) {
+        assert!(
+            is_registered(method, path),
+            "{method} {path} is listed here but no longer registered"
+        );
+    }
+    for route in ROUTES {
+        assert!(
+            is_registered(route.method(), route.path()),
+            "{route:?} is in the table but {} {} is not registered",
+            route.method(),
+            route.path()
+        );
+    }
+}
+
+/// The scanner itself: methods chained on one path, a layered handler, and
+/// names that only look like methods.
+#[test]
+fn registered_routes_reads_methods_and_paths() {
+    let source = r#"
+        Router::new()
+            .route("/a", get(get_a).delete(delete_a))
+            .route(
+                "/b/{id}",
+                post(budget(my_get)).layer(DefaultBodyLimit::max(LIMIT)),
+            )
+            // .route("/commented-out", get(gone))
+            .route("/c", axum::routing::patch(update_c))
+
+#[cfg(test)]
+mod tests {
+    fn app() -> Router { Router::new().route("/test-only", get(ok)) }
+}
+"#;
+    let routes = registered_routes(source);
+    let routes: Vec<(&str, &str)> = routes
+        .iter()
+        .map(|(method, path)| (method.as_str(), path.as_str()))
+        .collect();
+    assert_eq!(
+        routes,
+        vec![
+            ("GET", "/a"),
+            ("DELETE", "/a"),
+            ("POST", "/b/{id}"),
+            ("PATCH", "/c"),
+        ]
+    );
 }
 
 /// (a) For an unlisted model that has a provider, an organization without a
@@ -688,7 +961,140 @@ async fn unlisted_model_is_unknown_without_a_grant_on_every_inference_route() {
             !granted.body.contains("event: response.failed"),
             "{route:?}: the granted stream must not fail: {granted:?}"
         );
+
+        // The model has a planned deprecation. Its headers are part of what
+        // was compared above; spell the two cases out.
+        assert_eq!(deprecation_headers(&refused), (None, None), "{route:?}");
+        if route.announces_deprecation() {
+            assert_eq!(
+                deprecation_headers(&granted),
+                (
+                    Some(DEPRECATION_DATE_HEADER),
+                    Some(fixture.successor.as_str())
+                ),
+                "{route:?}"
+            );
+        }
+
+        // The same through the model's alias. A route that does not resolve
+        // aliases answers "unknown" to everyone.
+        if route.model_kind() != ModelKind::Text {
+            continue;
+        }
+        let alias = &fixture.text_alias;
+        let unknown_alias = unknown_twin(alias);
+        let missing = observe(
+            &send(server, route, &outsider.api_key, &unknown_alias).await,
+            &unknown_alias,
+        );
+        let refused = observe(&send(server, route, &outsider.api_key, alias).await, alias);
+        assert_eq!(
+            refused, missing,
+            "{route:?}: the alias of an unlisted model without a grant must look unknown"
+        );
+        assert!(
+            !refused.body.contains(model),
+            "{route:?}: the alias answer names the canonical model: {refused:?}"
+        );
+        let granted = observe(&send(server, route, &member.api_key, alias).await, alias);
+        if route.resolves_aliases() {
+            assert_ne!(granted, refused, "{route:?} by alias");
+            // The audio route resolves the alias but then hands the alias
+            // itself to the provider pool, which does not know it. That is
+            // how it behaves for a listed model too; the request is past
+            // the access check either way.
+            if route != Route::AudioTranscriptions {
+                assert_eq!(granted.status, 200, "{route:?} by alias: {granted:?}");
+            }
+        } else {
+            assert_eq!(granted, refused, "{route:?} does not resolve aliases");
+        }
     }
+}
+
+/// A planned deprecation is announced in response headers. For an unlisted
+/// model they would tell a caller without a grant that the model exists, on
+/// every route, and above all on the streaming Responses route, which
+/// answers 200 before the model is resolved.
+#[tokio::test]
+async fn deprecation_headers_are_only_added_for_a_caller_that_may_use_the_model() {
+    let fixture = setup().await;
+    let server = &fixture.server;
+    let outsider = organization(server).await;
+    let member = organization(server).await;
+    for kind in [
+        ModelKind::Text,
+        ModelKind::Decisions,
+        ModelKind::Anthropic,
+        ModelKind::NativeResponses,
+    ] {
+        grant(server, fixture.model(kind), &member.id).await;
+    }
+    let announced = (
+        Some(DEPRECATION_DATE_HEADER),
+        Some(fixture.successor.as_str()),
+    );
+
+    for &route in ROUTES {
+        let model = fixture.model(route.model_kind());
+
+        let refused = send(server, route, &outsider.api_key, model).await;
+        let refused = observe(&refused, model);
+        assert_eq!(
+            deprecation_headers(&refused),
+            (None, None),
+            "{route:?}: headers for a model the caller may not use: {refused:?}"
+        );
+        // The successor is not named anywhere else in the answer either.
+        assert!(
+            !refused.body.contains(&fixture.successor),
+            "{route:?}: {refused:?}"
+        );
+
+        let granted = observe(&send(server, route, &member.api_key, model).await, model);
+        if route.announces_deprecation() {
+            assert_eq!(deprecation_headers(&granted), announced, "{route:?}");
+        }
+    }
+
+    // The streaming Responses route is the one that answers 200 either way.
+    let refused = send(
+        server,
+        Route::ResponsesStream,
+        &outsider.api_key,
+        &fixture.text,
+    )
+    .await;
+    assert_eq!(refused.status_code(), 200);
+    assert!(refused.text().contains("event: response.failed"));
+    assert!(refused.maybe_header(HEADER_DEPRECATION_DATE).is_none());
+    assert!(refused.maybe_header(HEADER_SUCCESSOR).is_none());
+
+    // By alias: nothing without a grant, the canonical model's headers with
+    // one.
+    for (org, expected) in [(&outsider, (None, None)), (&member, announced)] {
+        let response = send(
+            server,
+            Route::ResponsesStream,
+            &org.api_key,
+            &fixture.text_alias,
+        )
+        .await;
+        let response = observe(&response, &fixture.text_alias);
+        assert_eq!(deprecation_headers(&response), expected);
+    }
+
+    // Revoking takes the headers away with the access.
+    revoke(server, &fixture.text, &member.id).await;
+    let revoked = send(
+        server,
+        Route::ResponsesStream,
+        &member.api_key,
+        &fixture.text,
+    )
+    .await;
+    assert!(revoked.maybe_header(HEADER_DEPRECATION_DATE).is_none());
+    assert!(revoked.maybe_header(HEADER_SUCCESSOR).is_none());
 }
 
 /// The pre-dispatch checks of the chat routes answer for the requested model
@@ -912,7 +1318,13 @@ async fn a_grant_on_an_inactive_model_has_no_effect() {
     .json();
     assert_eq!(access["isActive"], false);
     assert_eq!(access["organizations"][0]["organizationId"], org.id);
-    assert!(internal_entry(server, &fixture.text).await.is_none());
+    // The gateway document keeps the model, with its grants. A lane may
+    // still be serving it, and a model that is missing from the document is
+    // read as unrestricted.
+    assert_eq!(
+        internal_entry(server, &fixture.text).await,
+        Some(json!({ "id": fixture.text, "organization_ids": [org.id] }))
+    );
 
     // Grants on an inactive model can still be managed, so it can be
     // prepared before it is activated and cleaned up after.
@@ -937,6 +1349,116 @@ async fn a_grant_on_an_inactive_model_has_no_effect() {
             .status_code(),
         404
     );
+}
+
+/// The audit trail of one organization's access to one model, oldest first:
+/// (action, acting user).
+async fn audit_trail(
+    fixture: &Fixture,
+    model: &str,
+    organization_id: &str,
+) -> Vec<(String, Option<Uuid>)> {
+    fixture
+        .database
+        .pool()
+        .get()
+        .await
+        .expect("database connection")
+        .query(
+            "SELECT l.action, l.acting_user_id \
+             FROM organization_model_access_log l \
+             JOIN models m ON m.id = l.model_id \
+             WHERE m.model_name = $1 AND l.organization_id = $2 \
+             ORDER BY l.created_at, l.action",
+            &[
+                &model,
+                &Uuid::parse_str(organization_id).expect("organization id"),
+            ],
+        )
+        .await
+        .expect("read the audit trail")
+        .iter()
+        .map(|row| (row.get("action"), row.get("acting_user_id")))
+        .collect()
+}
+
+/// Every grant and every revocation leaves one audit row, with the admin who
+/// made it. A call that changes nothing leaves none.
+#[tokio::test]
+async fn grants_and_revocations_are_audited() {
+    let fixture = setup().await;
+    let server = &fixture.server;
+    let org = organization(server).await;
+    let other = organization(server).await;
+    let model = &fixture.text;
+    let admin = Some(Uuid::parse_str(MOCK_USER_ID).expect("mock user id"));
+    let granted = ("grant".to_string(), admin);
+    let revoked = ("revoke".to_string(), admin);
+
+    assert_eq!(audit_trail(&fixture, model, &org.id).await, vec![]);
+
+    // Revoking a grant that does not exist changes nothing.
+    revoke(server, model, &org.id).await;
+    assert_eq!(audit_trail(&fixture, model, &org.id).await, vec![]);
+
+    // One row for the grant, none for granting it again.
+    grant(server, model, &org.id).await;
+    grant(server, model, &org.id).await;
+    assert_eq!(
+        audit_trail(&fixture, model, &org.id).await,
+        vec![granted.clone()]
+    );
+
+    // One row for the revocation, none for revoking again. The grant row
+    // is gone from the grants table; the trail still tells the story.
+    revoke(server, model, &org.id).await;
+    revoke(server, model, &org.id).await;
+    assert_eq!(
+        audit_trail(&fixture, model, &org.id).await,
+        vec![granted.clone(), revoked.clone()]
+    );
+
+    // Granting again is a new event.
+    grant(server, model, &org.id).await;
+    assert_eq!(
+        audit_trail(&fixture, model, &org.id).await,
+        vec![granted.clone(), revoked, granted.clone()]
+    );
+
+    // The trail is per organization and per model.
+    assert_eq!(audit_trail(&fixture, model, &other.id).await, vec![]);
+    assert_eq!(
+        audit_trail(&fixture, &fixture.decisions, &org.id).await,
+        vec![]
+    );
+
+    // A request that is refused writes nothing.
+    let unknown_org = Uuid::new_v4().to_string();
+    let refused = admin_call(
+        server,
+        Method::PUT,
+        &grant_path(model, &unknown_org),
+        &get_session_id(),
+    )
+    .await;
+    assert_eq!(refused.status_code(), 404);
+    assert_eq!(audit_trail(&fixture, model, &unknown_org).await, vec![]);
+
+    // Deleting the organization removes its grant: a revocation by the
+    // platform, with no acting user.
+    let deleted = server
+        .delete(&format!("/v1/organizations/{}", org.id))
+        .add_header("Authorization", format!("Bearer {}", get_session_id()))
+        .add_header("User-Agent", MOCK_USER_AGENT)
+        .await;
+    assert!(
+        deleted.status_code().is_success(),
+        "deleting the organization failed: {}",
+        deleted.text()
+    );
+    let trail = audit_trail(&fixture, model, &org.id).await;
+    assert_eq!(trail.len(), 4, "{trail:?}");
+    assert_eq!(trail[3], ("revoke".to_string(), None));
 }
 
 /// (c) The admin routes: happy paths, idempotency and 404s.
@@ -1180,8 +1702,8 @@ fn sorted(mut ids: Vec<&str>) -> Vec<&str> {
     ids
 }
 
-/// (d) `GET /v1/internal/model-access`: every active unlisted model, with the
-/// active organizations that hold a grant.
+/// (d) `GET /v1/internal/model-access`: every unlisted model, active or not,
+/// with the active organizations that hold a grant.
 #[tokio::test]
 async fn internal_document_lists_restricted_models_and_their_organizations() {
     let fixture = setup().await;

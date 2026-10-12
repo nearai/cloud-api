@@ -12,10 +12,9 @@
 --   can be prepared before the model is unlisted.
 -- - A grant counts only while both the organization and the model are active.
 --
--- A grant is a relationship between two rows, written by admins and audited,
--- so it gets its own table. No existing column can carry it:
--- `organizations.settings` is customer-editable and must never hold access
--- state.
+-- A grant is a relationship between two rows, written by admins, so it gets
+-- its own table. No existing column can carry it: `organizations.settings` is
+-- customer-editable and must never hold access state.
 CREATE TABLE organization_model_access (
     organization_id UUID NOT NULL REFERENCES organizations(id) ON DELETE CASCADE,
     model_id UUID NOT NULL REFERENCES models(id) ON DELETE CASCADE,
@@ -32,3 +31,31 @@ CREATE TABLE organization_model_access (
 -- other direction: "which organizations may use this model".
 CREATE INDEX idx_organization_model_access_model_id
     ON organization_model_access (model_id);
+
+-- The audit trail of the table above. A revocation deletes its grant row, so
+-- the table alone cannot say who had access when, or who took it away.
+--
+-- Append-only: one row per grant and one per revocation, written in the same
+-- statement as the change, and only when the change happened (granting a
+-- grant that exists, or revoking one that does not, writes nothing).
+--
+-- The foreign keys carry no ON DELETE action, like the role audit log
+-- (V0077): an audit row keeps the rows it names from being hard deleted. User
+-- erasure rewrites the `users` row in place and keeps its id, and this table
+-- holds ids only, so there is nothing for it to scrub here.
+CREATE TABLE organization_model_access_log (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    organization_id UUID NOT NULL REFERENCES organizations(id),
+    model_id UUID NOT NULL REFERENCES models(id),
+    action VARCHAR(10) NOT NULL CHECK (action IN ('grant', 'revoke')),
+    -- The admin who made the change. NULL for a revocation made by the
+    -- platform: deleting an organization removes its grants.
+    acting_user_id UUID REFERENCES users(id),
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX idx_organization_model_access_log_model_created_at
+    ON organization_model_access_log (model_id, created_at DESC);
+
+CREATE INDEX idx_organization_model_access_log_org_created_at
+    ON organization_model_access_log (organization_id, created_at DESC);

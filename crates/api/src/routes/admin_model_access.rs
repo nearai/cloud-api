@@ -9,7 +9,8 @@
 //!
 //! A grant or a revocation applies at once on the instance that served the
 //! request. Other instances follow within the model-resolve cache TTL (30
-//! seconds).
+//! seconds). Each one that changes something is recorded in
+//! `organization_model_access_log`.
 use crate::{middleware::AdminUser, models::ErrorResponse, routes::admin::AdminAppState};
 use axum::{
     extract::{Extension, Path, State},

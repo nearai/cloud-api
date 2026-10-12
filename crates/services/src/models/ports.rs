@@ -117,13 +117,45 @@ pub enum ModelCaller {
     /// unlisted models the organization holds a grant for.
     Organization(Uuid),
     /// The platform itself: admin flows, usage recording, background jobs and
-    /// lookups of a model the platform chose. Every model. Not for a model
-    /// name taken from a request, unless that request has already been served
-    /// to its real caller (the deprecation-header middleware).
+    /// work on a model the platform chose (see [`PlatformModel`]). Every
+    /// model. Never for a model name taken from a request: a response can be
+    /// sent before its model is resolved, so "the request was served" proves
+    /// nothing about the caller's access.
     Trusted,
 }
 
-/// One unlisted model and the organizations that may use it.
+/// A model the platform chose for its own work, such as writing the title of
+/// a conversation. It is not a name from a request.
+///
+/// A completion that runs a `PlatformModel` resolves it as
+/// [`ModelCaller::Trusted`], so the work does not depend on the grants of the
+/// organization it is done for. That is safe only because a `PlatformModel`
+/// cannot be built from a string: the constructors below are the whole list,
+/// and each reads the platform's own configuration. Do not add one that takes
+/// a name from a caller.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlatformModel(String);
+
+impl PlatformModel {
+    /// Model used when `TITLE_GENERATION_MODEL` is not set.
+    const DEFAULT_TITLE_GENERATION_MODEL: &'static str = "Qwen/Qwen3-30B-A3B-Instruct-2507";
+
+    /// The model that writes conversation titles: `TITLE_GENERATION_MODEL`,
+    /// or the default.
+    pub fn title_generation() -> Self {
+        Self(
+            std::env::var("TITLE_GENERATION_MODEL")
+                .unwrap_or_else(|_| Self::DEFAULT_TITLE_GENERATION_MODEL.to_string()),
+        )
+    }
+
+    /// The model's name (canonical name or alias).
+    pub fn name(&self) -> &str {
+        &self.0
+    }
+}
+
+/// One unlisted model, active or not, and the organizations that may use it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RestrictedModelAccess {
     /// Canonical model name.
@@ -184,11 +216,13 @@ pub trait ModelsRepository: Send + Sync {
         Ok(false)
     }
 
-    /// Every active unlisted model with the active organizations that hold a
-    /// grant for it, ordered by model name.
+    /// Every unlisted model, active or not, with the active organizations
+    /// that hold a grant for it, ordered by model name.
     ///
-    /// The default fails instead of returning an empty list: a reader takes a
-    /// model that is absent from the list to be unrestricted.
+    /// A reader takes a model that is absent from the list to be
+    /// unrestricted. So an inactive model stays on it (the reader may still
+    /// be serving it), and the default fails instead of returning an empty
+    /// list.
     async fn list_restricted_model_access(
         &self,
     ) -> Result<Vec<RestrictedModelAccess>, anyhow::Error> {
@@ -299,9 +333,11 @@ pub trait ModelsServiceTrait: Send + Sync {
     /// Returns only active models that have been configured with pricing
     async fn get_configured_model_names(&self) -> Result<Vec<String>, ModelsError>;
 
-    /// Every active unlisted model with the active organizations that hold a
-    /// grant for it. Trusted services (a gateway that enforces access itself)
-    /// read this; a model that is absent from it is unrestricted.
+    /// Every unlisted model, active or not, with the active organizations
+    /// that hold a grant for it. Trusted services (a gateway that enforces
+    /// access itself) read this; a model that is absent from it is
+    /// unrestricted, which is why a model that was deactivated here stays on
+    /// it.
     ///
     /// The default fails instead of returning an empty list, which a reader
     /// would take to mean that no model is restricted.
@@ -312,7 +348,18 @@ pub trait ModelsServiceTrait: Send + Sync {
     }
 
     /// Invalidate any cached model list / metadata and cached access
-    /// decisions. Called by admin writes that mutate the `models`,
-    /// `model_aliases` or `organization_model_access` tables.
+    /// decisions. Called by admin writes that mutate the `models` or
+    /// `model_aliases` tables.
     async fn invalidate_models_cache(&self);
+
+    /// Forget the cached answer to "may this organization use this model",
+    /// and nothing else. Called when a grant is made or revoked: the model
+    /// list and the resolved models are not affected by a grant, and
+    /// reloading the list asks every backend for its metadata.
+    ///
+    /// The default clears everything, which is correct for an implementor
+    /// that does not keep access decisions apart.
+    async fn invalidate_model_access(&self, _organization_id: Uuid, _model_id: Uuid) {
+        self.invalidate_models_cache().await;
+    }
 }

@@ -1992,10 +1992,23 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
         Ok(event_stream)
     }
 
-    async fn create_chat_completion(
+    async fn run_chat_completion(
         &self,
-        request: ports::CompletionRequest,
+        mut request: ports::CompletionRequest,
+        platform_model: Option<crate::models::PlatformModel>,
     ) -> Result<inference_providers::ChatCompletionResponseWithBytes, ports::CompletionError> {
+        // Who the model is resolved for. A platform model replaces the
+        // request's model and is resolved as a trusted caller: the platform
+        // chose it, so it must not depend on the grants of the organization
+        // the work is done for. Its name comes from `PlatformModel`, never
+        // from the request.
+        let model_caller = match platform_model {
+            Some(platform_model) => {
+                request.model = platform_model.name().to_string();
+                crate::models::ModelCaller::Trusted
+            }
+            None => crate::models::ModelCaller::Organization(request.organization_id),
+        };
         let service_start_time = Instant::now();
         let organization_id = request.organization_id;
         let workspace_id = request.workspace_id;
@@ -2053,12 +2066,9 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
 
         // Resolve model name (could be an alias) and get model details in a single DB call
         // This also validates that the model exists, is active, and may be
-        // used by the request's organization
+        // used by whoever chose it (see `model_caller` above)
         let model = match self
-            .resolve_model_cached(
-                &request.model,
-                crate::models::ModelCaller::Organization(request.organization_id),
-            )
+            .resolve_model_cached(&request.model, model_caller)
             .await
         {
             Ok(Some(m)) => m,

@@ -821,6 +821,7 @@ pub async fn batch_upsert_models(
                         verifiable: request.verifiable,
                         is_active: request.is_active,
                         allow_free: request.allow_free,
+                        is_listed: request.is_listed,
                         aliases: request.aliases.clone(),
                         owned_by: request.owned_by.clone(),
                         provider_type: request.provider_type.clone(),
@@ -1146,6 +1147,7 @@ pub async fn batch_upsert_models(
                     .map(format_deprecation_date),
                 successor_model_id: updated_model.successor_model_name,
                 openrouter_slug: updated_model.openrouter_slug,
+                is_listed: Some(updated_model.is_listed),
             },
         })
         .collect();
@@ -1253,6 +1255,7 @@ pub async fn list_models(
                 deprecation_date: model.deprecation_date.as_ref().map(format_deprecation_date),
                 successor_model_id: model.successor_model_name,
                 openrouter_slug: model.openrouter_slug,
+                is_listed: Some(model.is_listed),
             },
             is_active: model.is_active,
             created_at: model.created_at,
@@ -1393,6 +1396,7 @@ pub async fn get_model_history(
             successor_model_id: h.successor_model_name,
             openrouter_slug: h.openrouter_slug,
             allow_free: h.allow_free,
+            is_listed: h.is_listed,
         })
         .collect();
 
@@ -1938,6 +1942,7 @@ pub async fn deprecate_model(
             deprecation_date: m.deprecation_date.as_ref().map(format_deprecation_date),
             successor_model_id: m.successor_model_name,
             openrouter_slug: m.openrouter_slug,
+            is_listed: Some(m.is_listed),
         },
     };
 

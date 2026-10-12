@@ -88,6 +88,11 @@ pub struct ModelWithPricing {
     /// OpenRouter `openrouter.slug` override. When set, the public API emits a
     /// nested `openrouter: { slug: <value> }` object; NULL = unset (omitted).
     pub openrouter_slug: Option<String>,
+    /// Whether the model appears in the public model catalogs
+    /// (`GET /v1/models`, `GET /v1/model/list`, `GET /v1/model/{name}`).
+    /// `false` keeps an active, billable row out of them; everything else
+    /// (resolution, routing, usage recording) treats the model as before.
+    pub is_listed: bool,
     /// When the model row was created — used as OpenRouter's `created` unix timestamp.
     pub created_at: chrono::DateTime<chrono::Utc>,
 }
@@ -138,6 +143,15 @@ pub trait ModelsServiceTrait: Send + Sync {
     /// this endpoint is publicly accessible and called frequently.
     async fn get_models_with_pricing(&self) -> Result<Vec<ModelWithPricing>, ModelsError>;
 
+    /// The models of [`Self::get_models_with_pricing`] that are listed in the
+    /// public catalogs (`is_listed`). Every unauthenticated catalog endpoint
+    /// must read this one, so an unlisted model never reaches them.
+    async fn get_public_models_with_pricing(&self) -> Result<Vec<ModelWithPricing>, ModelsError> {
+        let mut models = self.get_models_with_pricing().await?;
+        models.retain(|model| model.is_listed);
+        Ok(models)
+    }
+
     /// Get a specific model by name
     async fn get_model_by_name(&self, model_name: &str) -> Result<ModelWithPricing, ModelsError>;
 
@@ -148,7 +162,8 @@ pub trait ModelsServiceTrait: Send + Sync {
         identifier: &str,
     ) -> Result<ModelWithPricing, ModelsError>;
 
-    /// Resolve a model identifier for public model-detail reads.
+    /// Resolve a model identifier for public model-detail reads. An unlisted
+    /// model is answered like a model that does not exist.
     ///
     /// Production implementations should use the cached active public model
     /// list, preferring exact canonical model-name matches before alias matches.
@@ -158,7 +173,14 @@ pub trait ModelsServiceTrait: Send + Sync {
         &self,
         identifier: &str,
     ) -> Result<ModelWithPricing, ModelsError> {
-        self.resolve_and_get_model(identifier).await
+        let model = self.resolve_and_get_model(identifier).await?;
+        if model.is_listed {
+            Ok(model)
+        } else {
+            Err(ModelsError::NotFound(format!(
+                "Model '{identifier}' not found"
+            )))
+        }
     }
 
     /// Resolve `identifier` against the cached active-models alias map.

@@ -1195,11 +1195,12 @@ fn resolve_internal_usage_discount(
 }
 
 /// Validate the `Authorization: Bearer …` header against the configured
-/// `internal_usage_token` in constant time. Returns:
+/// `internal_usage_token` in constant time. Shared by every `/v1/internal/*`
+/// route. Returns:
 /// - `Ok(())` on match.
 /// - `Err(503)` if the endpoint is disabled (token not configured).
 /// - `Err(401)` if the header is missing or doesn't match.
-fn verify_internal_usage_token(
+pub(crate) fn verify_internal_usage_token(
     headers: &HeaderMap,
     expected: Option<&str>,
 ) -> Result<(), UsageError> {
@@ -1207,7 +1208,7 @@ fn verify_internal_usage_token(
         (
             StatusCode::SERVICE_UNAVAILABLE,
             ResponseJson(ErrorResponse::new(
-                "Internal usage endpoint is not configured on this deployment".to_string(),
+                "Internal endpoint is not configured on this deployment".to_string(),
                 "endpoint_disabled".to_string(),
             )),
         )

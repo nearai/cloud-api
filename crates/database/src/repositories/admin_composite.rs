@@ -187,6 +187,7 @@ impl AdminRepository for AdminCompositeRepository {
             verifiable: request.verifiable,
             is_active: request.is_active,
             allow_free: request.allow_free,
+            is_listed: request.is_listed,
             aliases: request.aliases.clone(),
             owned_by: request.owned_by,
             provider_type: request.provider_type,
@@ -252,6 +253,7 @@ impl AdminRepository for AdminCompositeRepository {
             deprecation_date: model.deprecation_date,
             successor_model_name: model.successor_model_name,
             openrouter_slug: model.openrouter_slug,
+            is_listed: model.is_listed,
         })
     }
 
@@ -321,6 +323,7 @@ impl AdminRepository for AdminCompositeRepository {
                     successor_model_name: h.successor_model_name,
                     openrouter_slug: h.openrouter_slug,
                     allow_free: h.allow_free,
+                    is_listed: h.is_listed,
                     effective_from: h.effective_from,
                     effective_until: h.effective_until,
                     changed_by_user_id: h.changed_by_user_id,
@@ -448,7 +451,7 @@ impl AdminRepository for AdminCompositeRepository {
                           datacenters, hugging_face_id, quantization, max_output_length,
                           supported_sampling_parameters, supported_features,
                           is_ready, deprecation_date, successor_model_name,
-                          openrouter_slug, allow_free
+                          openrouter_slug, allow_free, is_listed
                 "#,
                 &[&deprecated_id, &successor_model_name],
             )
@@ -484,14 +487,14 @@ impl AdminRepository for AdminCompositeRepository {
                 openrouter_slug, allow_free,
                 effective_from, effective_until, changed_by_user_id,
                 changed_by_user_email, change_reason, created_at, text_pricing,
-                successor_model_name
+                successor_model_name, is_listed
             ) VALUES (
                 $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19,
                 $20, $21, $22, $23,
                 COALESCE($24, ARRAY[]::TEXT[]),
                 COALESCE($25, ARRAY[]::TEXT[]),
                 $26, $27, $28, $29,
-                NOW(), NULL, $30, $31, $32, NOW(), $33, $34
+                NOW(), NULL, $30, $31, $32, NOW(), $33, $34, $35
             )
             "#,
             &[
@@ -577,6 +580,9 @@ impl AdminRepository for AdminCompositeRepository {
                     .try_get::<_, Option<String>>("successor_model_name")
                     .ok()
                     .flatten(),
+                &deprecated_row_after
+                    .try_get::<_, bool>("is_listed")
+                    .unwrap_or(true),
             ],
         )
         .await
@@ -637,6 +643,7 @@ impl AdminRepository for AdminCompositeRepository {
                 deprecation_date: row.try_get("deprecation_date").ok().flatten(),
                 successor_model_name: row.try_get("successor_model_name").ok().flatten(),
                 openrouter_slug: row.try_get("openrouter_slug").ok().flatten(),
+                is_listed: row.try_get("is_listed").unwrap_or(true),
             })
         };
 
@@ -651,6 +658,7 @@ impl AdminRepository for AdminCompositeRepository {
                 m.hugging_face_id, m.quantization, m.max_output_length,
                 m.supported_sampling_parameters, m.supported_features, m.datacenters,
                 m.is_ready, m.deprecation_date, m.successor_model_name, m.openrouter_slug,
+                m.is_listed,
                 COALESCE(
                     array_agg(ma.alias_name) FILTER (WHERE ma.alias_name IS NOT NULL),
                     '{}'
@@ -891,6 +899,7 @@ impl AdminRepository for AdminCompositeRepository {
                 deprecation_date: m.deprecation_date,
                 successor_model_name: m.successor_model_name,
                 openrouter_slug: m.openrouter_slug,
+                is_listed: m.is_listed,
             })
             .collect();
 

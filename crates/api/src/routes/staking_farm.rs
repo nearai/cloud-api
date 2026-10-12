@@ -531,7 +531,16 @@ async fn require_org_role(
         .organization_service
         .get_user_role(OrganizationId(org), UserId(user.0.id))
         .await
-        .map_err(internal_error)?;
+        .map_err(|error| match error {
+            services::organization::ports::OrganizationError::NotFound => (
+                StatusCode::NOT_FOUND,
+                ResponseJson(ErrorResponse::new(
+                    "Organization not found".into(),
+                    "not_found".into(),
+                )),
+            ),
+            error => internal_error(error),
+        })?;
     let role = role.ok_or_else(|| {
         (
             StatusCode::FORBIDDEN,
@@ -553,11 +562,22 @@ async fn require_org_role(
     Ok(role)
 }
 
-#[utoipa::path(post, path = "/v1/organizations/{org_id}/staking/farm/bind", tag = "Staking Farm",
-    params(("org_id" = String, Path)), request_body = BindRequest,
-    responses((status = 200, body = BindResponse), (status = 400, body = ErrorResponse),
-        (status = 403, body = ErrorResponse), (status = 409, body = ErrorResponse), (status = 429, body = ErrorResponse)),
-    security(("session_token" = [])))]
+#[utoipa::path(
+    post,
+    path = "/v1/organizations/{org_id}/staking/farm/bind",
+    tag = "Staking Farm",
+    params(("org_id" = String, Path)),
+    request_body = BindRequest,
+    responses(
+        (status = 200, body = BindResponse),
+        (status = 400, body = ErrorResponse),
+        (status = 403, body = ErrorResponse),
+        (status = 404, body = ErrorResponse),
+        (status = 409, body = ErrorResponse),
+        (status = 429, body = ErrorResponse)
+    ),
+    security(("session_token" = []))
+)]
 pub async fn bind_organization_staking_farm(
     State(app): State<AppState>,
     Extension(user): Extension<AuthenticatedUser>,

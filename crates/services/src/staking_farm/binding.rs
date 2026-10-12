@@ -270,7 +270,7 @@ impl StakingBindingService {
             .check_near_account(
                 Some(actor),
                 &challenge.near_account_id,
-                AmlFlow::StakingFarmSync,
+                AmlFlow::StakingWalletBinding,
             )
             .await?;
         let request = UpsertStakingFarmSourceRequest {
@@ -310,8 +310,9 @@ mod tests {
             &self,
             _: Option<Uuid>,
             account: &str,
-            _: AmlFlow,
+            flow: AmlFlow,
         ) -> Result<(), AmlError> {
+            assert_eq!(flow, AmlFlow::StakingWalletBinding);
             self.accounts.lock().unwrap().push(account.into());
             if self.blocked {
                 Err(AmlError::AccountBlocked)

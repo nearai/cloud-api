@@ -47,7 +47,14 @@ BEGIN
       JOIN organizations o ON o.id = m.organization_id AND o.is_active
       WHERE m.user_id = wallet_user_id AND m.role = 'owner'
       ORDER BY m.joined_at, m.organization_id LIMIT 1;
-    IF FOUND THEN RETURN personal_org; END IF;
+    IF FOUND THEN
+        -- Inactive workspaces retain their history. The active-only unique
+        -- index lets us provision a replacement without reviving deleted data.
+        INSERT INTO workspaces (name, organization_id, created_by_user_id)
+            VALUES ('default', personal_org, wallet_user_id)
+            ON CONFLICT (organization_id, name) WHERE is_active = true DO NOTHING;
+        RETURN personal_org;
+    END IF;
 
     personal_org := uuid_generate_v4();
     -- Defaults are inferred from the first membership. Also repair identities

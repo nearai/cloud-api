@@ -34,6 +34,7 @@ impl AmlRiskLevel {
 pub enum AmlFlow {
     UserStatus,
     StakingFarmSync,
+    StakingWalletBinding,
 }
 
 impl AmlFlow {
@@ -41,6 +42,7 @@ impl AmlFlow {
         match self {
             Self::UserStatus => "user_status",
             Self::StakingFarmSync => "staking_farm_sync",
+            Self::StakingWalletBinding => "staking_wallet_binding",
         }
     }
 }

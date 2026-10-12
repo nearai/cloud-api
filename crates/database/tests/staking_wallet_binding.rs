@@ -637,3 +637,68 @@ async fn prepare_rejects_wallet_already_used_by_another_organization() -> anyhow
         .await?;
     Ok(())
 }
+
+#[tokio::test]
+async fn binding_repairs_missing_active_default_workspace() -> anyhow::Result<()> {
+    for previous_state in ["deleted", "inactive", "renamed"] {
+        let (pool, org, actor) = fixture().await?;
+        let users = database::repositories::UserRepository::new(pool.clone());
+        let account = account();
+        let user = users
+            .create_from_oauth(
+                format!("{account}@near"),
+                account.clone(),
+                None,
+                None,
+                "near".into(),
+                account.clone(),
+            )
+            .await?;
+        let client = pool.get().await?;
+        let personal: Uuid = client.query_one(
+            "SELECT organization_id FROM organization_members WHERE user_id = $1 AND role = 'owner'",
+            &[&user.id],
+        ).await?.get(0);
+        let sql = match previous_state {
+            "deleted" => "DELETE FROM workspaces WHERE organization_id = $1 AND name = 'default'",
+            "inactive" => "UPDATE workspaces SET is_active = false WHERE organization_id = $1 AND name = 'default'",
+            "renamed" => "UPDATE workspaces SET name = 'custom' WHERE organization_id = $1 AND name = 'default'",
+            _ => unreachable!(),
+        };
+        client.execute(sql, &[&personal]).await?;
+        let repository = PostgresStakingBindingRepository::new(pool.clone());
+        let challenge = challenge(org, actor, account);
+        repository.prepare(&challenge).await?;
+        repository
+            .confirm(
+                &challenge,
+                request(&challenge),
+                Uuid::new_v4(),
+                "key",
+                "digest",
+            )
+            .await?;
+        // Repeat provisioning to ensure repairs are idempotent.
+        client
+            .query_one("SELECT ensure_near_personal_organization($1)", &[&user.id])
+            .await?;
+        let row = client.query_one(
+            "SELECT count(*) FROM workspaces WHERE organization_id = $1 AND name = 'default' AND is_active",
+            &[&personal],
+        ).await?;
+        assert_eq!(row.get::<_, i64>(0), 1, "{previous_state}");
+        let owned = client.query_one(
+            "SELECT organization_id FROM organization_members WHERE user_id = $1 AND role = 'owner'",
+            &[&user.id],
+        ).await?;
+        assert_eq!(owned.get::<_, Uuid>(0), personal);
+        if previous_state != "deleted" {
+            let preserved = client.query_one(
+                "SELECT count(*) FROM workspaces WHERE organization_id = $1 AND (NOT is_active OR name = 'custom')",
+                &[&personal],
+            ).await?;
+            assert_eq!(preserved.get::<_, i64>(0), 1);
+        }
+    }
+    Ok(())
+}

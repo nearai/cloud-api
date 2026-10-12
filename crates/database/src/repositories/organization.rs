@@ -717,6 +717,17 @@ where
         .await
         .map_err(map_db_error)?;
 
+    // A grant on an unlisted model counts only for an active organization,
+    // but remove the rows as well, for the reason given for reporting
+    // tokens above: a deleted org cannot regain access through a future path.
+    client
+        .execute(
+            "DELETE FROM organization_model_access WHERE organization_id = $1",
+            &[&organization_id],
+        )
+        .await
+        .map_err(map_db_error)?;
+
     Ok(())
 }
 

@@ -9,14 +9,14 @@ use anyhow::{Context, Result};
 use async_trait::async_trait;
 use services::admin::{
     AdminApiKeyFilters, AdminApiKeyInfo, AdminModelInfo, AdminOrganizationInfo,
-    AdminOrganizationMemberInfo, AdminRepository, DeprecateModelOutcome,
-    ModelDeprecationDeliveryRecord, ModelDeprecationEmailStatus, ModelDeprecationModel,
-    ModelDeprecationRecipient, ModelHistoryEntry, ModelPricing, ModelPricingSnapshot,
-    ModelValidationState, OrganizationLifecycleFilter, OrganizationLimits,
-    OrganizationLimitsHistoryEntry, OrganizationLimitsUpdate, PlatformServiceInfo,
-    PricingChangeDeliveryRecord, PricingChangeOpenConflictError, PricingChangeRecipientRow,
-    ScheduledPricingChange, ScheduledPricingChangeInsert, ScheduledPricingChangeStatus,
-    UpdateModelAdminRequest, UserInfo, UserOrganizationInfo,
+    AdminOrganizationMemberInfo, AdminRepository, DeprecateModelOutcome, ModelAccessGrant,
+    ModelAccessModel, ModelDeprecationDeliveryRecord, ModelDeprecationEmailStatus,
+    ModelDeprecationModel, ModelDeprecationRecipient, ModelHistoryEntry, ModelPricing,
+    ModelPricingSnapshot, ModelValidationState, OrganizationLifecycleFilter, OrganizationLimits,
+    OrganizationLimitsHistoryEntry, OrganizationLimitsUpdate, OrganizationModelAccessGrant,
+    PlatformServiceInfo, PricingChangeDeliveryRecord, PricingChangeOpenConflictError,
+    PricingChangeRecipientRow, ScheduledPricingChange, ScheduledPricingChangeInsert,
+    ScheduledPricingChangeStatus, UpdateModelAdminRequest, UserInfo, UserOrganizationInfo,
 };
 use services::lifecycle::OrganizationLifecycle;
 use services::service_usage::ports::ServiceUnit;
@@ -158,6 +158,41 @@ fn row_to_admin_api_key_info(row: &tokio_postgres::Row) -> AdminApiKeyInfo {
         is_active: row.get("is_active"),
         deleted_at: row.get("deleted_at"),
         is_managed_playground: row.get("is_managed_playground"),
+    }
+}
+
+/// One grant with its organization and the admin who made it. Only active
+/// organizations: a grant held by an inactive one has no effect. Callers add
+/// the `WHERE` clause.
+const MODEL_ACCESS_GRANT_SELECT: &str = r#"
+    SELECT
+        a.organization_id,
+        o.name AS organization_name,
+        a.created_at,
+        a.created_by_user_id,
+        u.email AS created_by_user_email
+    FROM organization_model_access a
+    JOIN organizations o ON o.id = a.organization_id AND o.is_active = true
+    LEFT JOIN users u ON u.id = a.created_by_user_id
+"#;
+
+fn row_to_model_access_grant(row: &tokio_postgres::Row) -> ModelAccessGrant {
+    ModelAccessGrant {
+        organization_id: row.get("organization_id"),
+        organization_name: row.get("organization_name"),
+        granted_at: row.get("created_at"),
+        granted_by_user_id: row.get("created_by_user_id"),
+        granted_by_user_email: row.get("created_by_user_email"),
+    }
+}
+
+/// The row must select `id, model_name, is_listed, is_active` of `models`.
+fn row_to_model_access_model(row: &tokio_postgres::Row) -> ModelAccessModel {
+    ModelAccessModel {
+        id: row.get("id"),
+        model_name: row.get("model_name"),
+        is_listed: row.get("is_listed"),
+        is_active: row.get("is_active"),
     }
 }
 
@@ -1906,6 +1941,114 @@ impl AdminRepository for AdminCompositeRepository {
             .await?;
 
         Ok(row.get::<_, bool>("exists"))
+    }
+
+    async fn get_model_for_access(&self, model_name: &str) -> Result<Option<ModelAccessModel>> {
+        let client = self.pool.get().await?;
+        let row = client
+            .query_opt(
+                r#"
+                SELECT id, model_name, is_listed, is_active
+                FROM models
+                WHERE model_name = $1
+                "#,
+                &[&model_name],
+            )
+            .await?;
+
+        Ok(row.as_ref().map(row_to_model_access_model))
+    }
+
+    async fn list_model_access_grants(&self, model_id: Uuid) -> Result<Vec<ModelAccessGrant>> {
+        let client = self.pool.get().await?;
+        let rows = client
+            .query(
+                &format!("{MODEL_ACCESS_GRANT_SELECT} WHERE a.model_id = $1 ORDER BY a.created_at, a.organization_id"),
+                &[&model_id],
+            )
+            .await?;
+
+        Ok(rows.iter().map(row_to_model_access_grant).collect())
+    }
+
+    async fn grant_model_access(
+        &self,
+        model_id: Uuid,
+        organization_id: Uuid,
+        granted_by_user_id: Option<Uuid>,
+    ) -> Result<ModelAccessGrant> {
+        let client = self.pool.get().await?;
+        // An existing grant keeps its date and its author.
+        client
+            .execute(
+                r#"
+                INSERT INTO organization_model_access (organization_id, model_id, created_by_user_id)
+                VALUES ($1, $2, $3)
+                ON CONFLICT (organization_id, model_id) DO NOTHING
+                "#,
+                &[&organization_id, &model_id, &granted_by_user_id],
+            )
+            .await?;
+        let row = client
+            .query_opt(
+                &format!(
+                    "{MODEL_ACCESS_GRANT_SELECT} WHERE a.model_id = $1 AND a.organization_id = $2"
+                ),
+                &[&model_id, &organization_id],
+            )
+            .await?
+            .context("the grant is gone: revoked or the organization was deleted meanwhile")?;
+
+        Ok(row_to_model_access_grant(&row))
+    }
+
+    async fn revoke_model_access(&self, model_id: Uuid, organization_id: Uuid) -> Result<bool> {
+        let client = self.pool.get().await?;
+        let deleted = client
+            .execute(
+                "DELETE FROM organization_model_access WHERE organization_id = $1 AND model_id = $2",
+                &[&organization_id, &model_id],
+            )
+            .await?;
+
+        Ok(deleted > 0)
+    }
+
+    async fn list_organization_model_access(
+        &self,
+        organization_id: Uuid,
+    ) -> Result<Vec<OrganizationModelAccessGrant>> {
+        let client = self.pool.get().await?;
+        let rows = client
+            .query(
+                r#"
+                SELECT
+                    m.id,
+                    m.model_name,
+                    m.is_listed,
+                    m.is_active,
+                    a.created_at,
+                    a.created_by_user_id,
+                    u.email AS created_by_user_email
+                FROM organization_model_access a
+                JOIN models m ON m.id = a.model_id
+                LEFT JOIN users u ON u.id = a.created_by_user_id
+                WHERE a.organization_id = $1
+                ORDER BY m.model_name
+                "#,
+                &[&organization_id],
+            )
+            .await?;
+
+        Ok(rows
+            .iter()
+            .map(|row| OrganizationModelAccessGrant {
+                model: row_to_model_access_model(row),
+                granted_at: row.get("created_at"),
+                granted_by_user_id: row.get("created_by_user_id"),
+                granted_by_user_email: row.get("created_by_user_email"),
+            })
+            .collect())
     }
 
     async fn list_services(

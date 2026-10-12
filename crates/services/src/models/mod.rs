@@ -244,11 +244,12 @@ impl ModelsServiceTrait for ModelsServiceImpl {
         identifier: &str,
     ) -> Result<ModelWithPricing, ModelsError> {
         let models = self.cached_models().await?;
-        if let Some(model) = models.iter().find(|model| model.model_name == identifier) {
+        // An unlisted model is answered like a model that does not exist.
+        let mut listed = models.iter().filter(|model| model.is_listed);
+        if let Some(model) = listed.clone().find(|model| model.model_name == identifier) {
             return Ok(model.clone());
         }
-        models
-            .iter()
+        listed
             .find(|model| model.aliases.iter().any(|alias| alias == identifier))
             .cloned()
             .ok_or_else(|| ModelsError::NotFound(format!("Model '{identifier}' not found")))
@@ -408,6 +409,7 @@ mod tests {
             deprecation_date: None,
             successor_model_name: None,
             openrouter_slug: None,
+            is_listed: true,
             created_at: chrono::Utc::now(),
         }
     }
@@ -621,6 +623,47 @@ mod tests {
         assert_eq!(canonical.max_output_length, Some(4_096));
         assert_eq!(alias.model_name, model_name);
         assert_eq!(alias.max_output_length, Some(4_096));
+    }
+
+    #[tokio::test]
+    async fn unlisted_models_stay_out_of_the_public_views() {
+        let listed_name = "test/listed";
+        let unlisted_name = "test/unlisted";
+        let mut unlisted = test_catalog_model(unlisted_name);
+        unlisted.is_listed = false;
+        unlisted.aliases = vec!["unlisted-alias".to_string()];
+        let service = service_with_backend_models(
+            StaticModelsRepository::with_active_models(vec![
+                test_catalog_model(listed_name),
+                unlisted,
+            ]),
+            listed_name,
+            vec![provider_model(listed_name, Some(32_768), Some(4_096))],
+        )
+        .await;
+
+        let all = service.get_models_with_pricing().await.unwrap();
+        assert_eq!(all.len(), 2);
+
+        let public = service.get_public_models_with_pricing().await.unwrap();
+        assert_eq!(public.len(), 1);
+        assert_eq!(public[0].model_name, listed_name);
+
+        assert!(service.resolve_public_model(listed_name).await.is_ok());
+        for identifier in [unlisted_name, "unlisted-alias"] {
+            assert!(matches!(
+                service.resolve_public_model(identifier).await,
+                Err(ModelsError::NotFound(_))
+            ));
+        }
+
+        // Resolution for serving and billing does not look at the switch.
+        let resolved = service.resolve_and_get_model(unlisted_name).await.unwrap();
+        assert_eq!(resolved.model_name, unlisted_name);
+        assert_eq!(
+            service.resolve_alias_cached("unlisted-alias").await,
+            Some(unlisted_name.to_string())
+        );
     }
 
     #[tokio::test]

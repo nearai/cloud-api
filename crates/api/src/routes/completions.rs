@@ -3274,7 +3274,7 @@ pub async fn models(
 
     let models = app_state
         .models_service
-        .get_models_with_pricing()
+        .get_public_models_with_pricing()
         .await
         .map_err(|e| {
             (
@@ -3291,6 +3291,45 @@ pub async fn models(
         data: models.into_iter().map(model_with_pricing_to_info).collect(),
     };
     Ok(ResponseJson(response))
+}
+
+/// List every active model for trusted services, unlisted models included.
+///
+/// The document has the shape of `GET /v1/models` and adds the models whose
+/// `is_listed` is false. A gateway lane reads its catalog here, so it can
+/// serve and advertise a model that this API keeps out of its own public
+/// catalog.
+///
+/// Auth: `Authorization: Bearer <CLOUD_API_USAGE_TOKEN>`, the service secret
+/// of `POST /v1/internal/usage`. The endpoint answers 503 until that token is
+/// configured. Not part of the public OpenAPI document.
+pub async fn models_internal(
+    State(app_state): State<AppState>,
+    headers: header::HeaderMap,
+) -> Result<ResponseJson<ModelsResponse>, (StatusCode, ResponseJson<ErrorResponse>)> {
+    crate::routes::usage::verify_internal_usage_token(
+        &headers,
+        app_state.config.internal_usage_token.as_deref(),
+    )?;
+
+    let models = app_state
+        .models_service
+        .get_models_with_pricing()
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                ResponseJson(ErrorResponse::new(
+                    e.to_string(),
+                    "internal_server_error".to_string(),
+                )),
+            )
+        })?;
+
+    Ok(ResponseJson(ModelsResponse {
+        object: "list".to_string(),
+        data: models.into_iter().map(model_with_pricing_to_info).collect(),
+    }))
 }
 
 /// Convert a nano-USD amount (DB scale 9 — used for per-token, per-image, and
@@ -3549,6 +3588,7 @@ mod tests {
             deprecation_date: None,
             successor_model_name: None,
             openrouter_slug: None,
+            is_listed: true,
             created_at: chrono::Utc::now(),
         }
     }

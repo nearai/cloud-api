@@ -83,10 +83,10 @@ pub async fn list_models(
         ));
     }
 
-    // Get all models from the service (served from in-process cache when warm).
+    // Get the listed models from the service (served from in-process cache when warm).
     let all_models = app_state
         .models_service
-        .get_models_with_pricing()
+        .get_public_models_with_pricing()
         .await
         .map_err(|_| {
             error!("Failed to get models");
@@ -165,6 +165,7 @@ pub async fn list_models(
                     .map(crate::routes::admin::format_deprecation_date),
                 successor_model_id: model.successor_model_name,
                 openrouter_slug: model.openrouter_slug,
+                is_listed: None,
             },
         })
         .collect();
@@ -285,6 +286,7 @@ pub async fn get_model_by_name(
                 .map(crate::routes::admin::format_deprecation_date),
             successor_model_id: model.successor_model_name,
             openrouter_slug: model.openrouter_slug,
+            is_listed: None,
         },
     };
 
@@ -340,6 +342,7 @@ mod tests {
             deprecation_date: None,
             successor_model_name: None,
             openrouter_slug: None,
+            is_listed: true,
             created_at: chrono::Utc::now(),
         }
     }

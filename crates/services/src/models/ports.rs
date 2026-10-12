@@ -88,6 +88,11 @@ pub struct ModelWithPricing {
     /// OpenRouter `openrouter.slug` override. When set, the public API emits a
     /// nested `openrouter: { slug: <value> }` object; NULL = unset (omitted).
     pub openrouter_slug: Option<String>,
+    /// Whether the model appears in the public model catalogs
+    /// (`GET /v1/models`, `GET /v1/model/list`, `GET /v1/model/{name}`).
+    /// `false` keeps an active, billable row out of them; everything else
+    /// (resolution, routing, usage recording) treats the model as before.
+    pub is_listed: bool,
     /// When the model row was created — used as OpenRouter's `created` unix timestamp.
     pub created_at: chrono::DateTime<chrono::Utc>,
 }
@@ -137,6 +142,15 @@ pub trait ModelsServiceTrait: Send + Sync {
     /// Implementations are expected to cache the result with a short TTL since
     /// this endpoint is publicly accessible and called frequently.
     async fn get_models_with_pricing(&self) -> Result<Vec<ModelWithPricing>, ModelsError>;
+
+    /// The models of [`Self::get_models_with_pricing`] that are listed in the
+    /// public catalogs (`is_listed`). Every unauthenticated catalog endpoint
+    /// must read this one, so an unlisted model never reaches them.
+    async fn get_public_models_with_pricing(&self) -> Result<Vec<ModelWithPricing>, ModelsError> {
+        let mut models = self.get_models_with_pricing().await?;
+        models.retain(|model| model.is_listed);
+        Ok(models)
+    }
 
     /// Get a specific model by name
     async fn get_model_by_name(&self, model_name: &str) -> Result<ModelWithPricing, ModelsError>;

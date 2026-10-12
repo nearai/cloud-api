@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use uuid::Uuid;
 
-pub const BINDING_TERMS_VERSION: &str = "org-staking-admin-v1";
+pub const BINDING_TERMS_VERSION: &str = "org-staking-binding-v1";
 
 #[derive(Debug, thiserror::Error)]
 pub enum BindingError {

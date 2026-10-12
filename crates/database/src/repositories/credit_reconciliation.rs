@@ -22,7 +22,8 @@ pub struct CreditPosition {
     /// Older snapshots contained only active types. New fields need serde defaults.
     #[serde(default = "active_snapshot_default")]
     pub active: bool,
-    pub ceiling: i64,
+    #[serde(alias = "ceiling")]
+    pub spend_limit: i64,
     pub consumed: i64,
     pub available: i64,
 }
@@ -295,16 +296,16 @@ async fn load_position(tx: &Transaction<'_>, org: Uuid) -> Result<AccountingPosi
                 .into());
             }
         }
-        let ceiling: i64 = row.get("spend_limit");
+        let spend_limit: i64 = row.get("spend_limit");
         let consumed: i64 = row.get("consumed");
         position.credits.insert(
             row.get("credit_type"),
             CreditPosition {
                 active,
-                ceiling,
+                spend_limit,
                 consumed,
                 available: if active {
-                    ceiling.saturating_sub(consumed).max(0)
+                    spend_limit.saturating_sub(consumed).max(0)
                 } else {
                     0
                 },
@@ -338,19 +339,20 @@ fn preview(
 
     let mut after = before.clone();
     for (kind, amount) in amounts {
-        let credit = after.credits.get_mut(kind).ok_or_else(|| {
-            conflict("Each selected credit type needs an active reviewed ceiling")
-        })?;
+        let credit = after
+            .credits
+            .get_mut(kind)
+            .ok_or_else(|| conflict("Each selected credit type needs an active reviewed limit"))?;
         if !credit.active {
             return Err(
-                conflict("Each selected credit type needs an active reviewed ceiling").into(),
+                conflict("Each selected credit type needs an active reviewed limit").into(),
             );
         }
         // Reclassification must remove the same capacity from the type as it
         // releases from the legacy deduction. Reject capped/disabled positions.
         if *amount > credit.available {
             return Err(conflict(
-                "Amount exceeds the selected type's remaining ceiling; review its opening position first",
+                "Amount exceeds the selected type's remaining limit; review its opening position first",
             )
             .into());
         }
@@ -398,6 +400,17 @@ mod tests {
 
         let result: ReconciliationResult = serde_json::from_value(original).unwrap();
         assert_eq!(result.schema_version, 1);
+        assert_eq!(result.before.credits["payment"].spend_limit, 100);
+
+        let serialized = serde_json::to_value(&result).unwrap();
+        assert_eq!(
+            serialized["before"]["credits"]["payment"]["spend_limit"],
+            100
+        );
+        assert!(serialized["before"]["credits"]["payment"]
+            .get("ceiling")
+            .is_none());
+
         assert!(result.before.credits["payment"].active);
         assert!(result.after.credits["payment"].active);
     }

@@ -30,9 +30,9 @@ pub struct CreditReconciliationRequest {
 
 #[derive(Debug, Serialize, ToSchema)]
 pub struct CreditPositionResponse {
-    /// False for consumption whose credit type has no active ceiling.
+    /// False for consumption whose credit type has no active limit.
     pub active: bool,
-    pub ceiling: i64,
+    pub spend_limit: i64,
     pub consumed: i64,
     pub available: i64,
 }
@@ -57,7 +57,7 @@ impl From<AccountingPosition> for AccountingPositionResponse {
                         kind,
                         CreditPositionResponse {
                             active: credit.active,
-                            ceiling: credit.ceiling,
+                            spend_limit: credit.spend_limit,
                             consumed: credit.consumed,
                             available: credit.available,
                         },
@@ -120,7 +120,7 @@ fn api_error(error: anyhow::Error) -> ApiError {
 }
 
 /// Reclassify reviewed legacy consumption. Does not rewrite usage logs, settle
-/// invoices, alter ceilings, or change allocation policy. Dry runs are point-in-time
+/// invoices, alter limits, or change allocation policy. Dry runs are point-in-time
 /// previews; commits revalidate under the organization accounting lock.
 #[utoipa::path(
     post,

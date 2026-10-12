@@ -1,7 +1,7 @@
 # Usage credit allocation
 
 Every newly posted inference or platform-service charge is split, in exact
-integer nano-USD, across the organization's active credit ceilings. The default
+integer nano-USD, across the organization's active credit limits. The default
 order is:
 
 `grant -> staking_farm -> payment -> postpay`
@@ -23,8 +23,8 @@ rather than inventing a funding history.
 
 The organization balance endpoint reports `amount`, lifetime `consumed`, and
 current `available` nano-USD for every active credit type. Postpay remains a
-cumulative contract ceiling and is kept separate from purchased payment
-credits. Replacing a ceiling does not reset consumption: changing 100 to 150
+cumulative contract limit and is kept separate from purchased payment
+credits. Replacing a limit does not reset consumption: changing 100 to 150
 adds 50 of capacity, while writing 150 again adds none.
 
 Both usage-history endpoints, the reporting export/summary, and admin organization
@@ -69,7 +69,7 @@ immediately available for new usage. No admin API call is required.
 - Existing unattributed usage remains unknown and continues reducing aggregate
   admission capacity. Its amount is snapshotted during the allocation-ledger
   migration so usage posting does not rescan lifetime history. Establish
-  reviewed starting ceilings rather than backfilling speculative per-type
+  reviewed starting limits rather than backfilling speculative per-type
   allocations.
 - Monitor allocation reconciliation and unfunded balances before expanding the
   rollout. Allocation rows and their parent usage/balance update commit in one
@@ -98,7 +98,7 @@ and a per-organization idempotency key (up to 100 characters) are required.
 The endpoint requires an admin session or read-write admin access token;
 read-only tokens cannot preview or commit this operation.
 
-A dry run returns before/after per-type ceilings, consumed and available amounts,
+A dry run returns before/after per-type `spend_limit`, consumed and available amounts,
 legacy unknown consumption, unresolved overage, and aggregate available capacity.
 It stores nothing and does not reserve the key. Set `dry_run` to `false` (or omit
 it) to commit; accounting is revalidated under the organization lock, so a
@@ -109,19 +109,20 @@ terms return HTTP 409. A preview using an already committed key also returns 409
 Keys are trimmed once before lookup and storage, so whitespace around the key
 cannot create a second adjustment. Snapshots include `schema_version`; additive
 changes to persisted snapshot structs must use serde defaults and incompatible
-versions need an explicit replay adapter. Consumption without an active ceiling
-is included with `active: false`, zero ceiling and zero available capacity.
+versions need an explicit replay adapter. Older snapshots using `ceiling` are
+still readable; new snapshots and API responses use `spend_limit`. Consumption without an active limit
+is included with `active: false`, zero limit and zero available capacity.
 
 The operation adds reviewed historical consumption to the existing per-type
 counters and removes exactly the same amount from the aggregate legacy
 consumption deduction. It preserves total spend, unresolved overage, current
-ceilings, and aggregate available capacity. Each selected type must have an
-active USD ceiling with enough remaining capacity; otherwise the operation
+limits, and aggregate available capacity. Each selected type must have an
+active USD limit with enough remaining capacity; otherwise the operation
 returns 409 and the opening position needs further review. Never increase a
-ceiling merely to bypass this validation. The supplied amounts are increments,
+limit merely to bypass this validation. The supplied amounts are increments,
 not absolute replacements for lifetime consumption.
 
-For example, with a payment ceiling of $100, postpay ceiling of $200 and $80 of
+For example, with a payment limit of $100, postpay limit of $200 and $80 of
 legacy unknown spend, reclassifying the $80 as payment-funded leaves payment
 capacity $20 and postpay capacity $200, with aggregate capacity unchanged at
 $220. New postings read the corrected counters using the configured priority.

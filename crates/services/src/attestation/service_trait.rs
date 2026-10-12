@@ -6,6 +6,7 @@ use super::{
     models::AttestationReport,
     ports, AttestationError, AttestationService, SignatureLookupResult,
 };
+use crate::models::ModelCaller;
 use inference_providers::ProviderFilter;
 
 #[async_trait]
@@ -80,6 +81,7 @@ impl ports::AttestationServiceTrait for AttestationService {
         signing_address: Option<String>,
         include_tls_fingerprint: bool,
         provider_filter: Option<ProviderFilter>,
+        caller: ModelCaller,
     ) -> Result<AttestationReport, AttestationError> {
         self.get_attestation_report_impl(
             model,
@@ -88,6 +90,7 @@ impl ports::AttestationServiceTrait for AttestationService {
             signing_address,
             include_tls_fingerprint,
             provider_filter,
+            caller,
         )
         .await
     }

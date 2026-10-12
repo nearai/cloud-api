@@ -406,12 +406,21 @@ pub async fn init_domain_services_with_pool(
         database::repositories::OrganizationUsageRepository::new(database.pool().clone()),
     ) as Arc<dyn services::usage::UsageRepository>;
 
+    // Create models service. It owns the model-resolve cache (models and
+    // access decisions on unlisted models) that the attestation and completion
+    // services below share, so its invalidation reaches all three.
+    let models_service = Arc::new(services::models::ModelsServiceImpl::new(
+        inference_provider_pool.clone(),
+        models_repo.clone(),
+    ));
+
     // Create attestation service
     let attestation_service = Arc::new(
         services::attestation::AttestationService::init(
             attestation_repo,
             inference_provider_pool.clone(),
             models_repo.clone(),
+            models_service.model_resolve_cache(),
             metrics_service.clone(),
             usage_repository_for_attestation,
             config.ita.clone(),
@@ -419,12 +428,6 @@ pub async fn init_domain_services_with_pool(
         .await
         .unwrap(),
     );
-
-    // Create models service
-    let models_service = Arc::new(services::models::ModelsServiceImpl::new(
-        inference_provider_pool.clone(),
-        models_repo.clone(),
-    ));
 
     // Prepare repositories for usage service (will be created after workspace service)
     let usage_repository = Arc::new(
@@ -1861,11 +1864,14 @@ pub fn build_conversation_routes(
 /// Route classification (nearai/infra#193) — see `routes/attestation.rs` for
 /// the full table:
 /// - `GET /v1/attestation/report` and `GET /v1/signature/{chat_id}` require an
-///   API key (`auth_middleware_with_api_key`). The middleware validates the key
-///   and confirms its workspace and organization remain active (rejecting
-///   missing/invalid/expired/deactivated credentials with 401); like
-///   the signature route, report retrieval is non-billable — no usage or
-///   billing records are created.
+///   API key (`auth_middleware_with_workspace_context`). The middleware
+///   validates the key and confirms its workspace and organization remain
+///   active (rejecting missing/invalid/expired/deactivated credentials with
+///   401); like the signature route, report retrieval is non-billable — no
+///   usage or billing records are created. It is the same check as
+///   `auth_middleware_with_api_key`, and it also hands the handler the key's
+///   organization: the report route needs it to decide whether the caller
+///   may ask about an unlisted model.
 /// - `GET /v1/attestation/ita-token` and `GET /v1/attestation/pins` are
 ///   deliberately public; the rationale is documented on
 ///   `build_public_attestation_routes`.
@@ -1881,7 +1887,7 @@ pub fn build_attestation_routes(
         .with_state(attestation_route_state.clone())
         .layer(from_fn_with_state(
             auth_state_middleware.clone(),
-            auth_middleware_with_api_key,
+            middleware::auth::auth_middleware_with_workspace_context,
         ));
 
     // One section per attested backup provider; add new providers here.

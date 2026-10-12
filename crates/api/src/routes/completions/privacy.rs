@@ -325,7 +325,10 @@ pub async fn privacy_classify(
 
     let model = match app_state
         .models_service
-        .get_model_by_name(&model_name)
+        .get_model_by_name(
+            &model_name,
+            ModelCaller::Organization(api_key.organization.id.0),
+        )
         .await
     {
         Ok(model) => model,
@@ -568,7 +571,10 @@ pub async fn privacy_redact(
 
     let model = match app_state
         .models_service
-        .get_model_by_name(&model_name)
+        .get_model_by_name(
+            &model_name,
+            ModelCaller::Organization(api_key.organization.id.0),
+        )
         .await
     {
         Ok(model) => model,

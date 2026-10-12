@@ -217,9 +217,17 @@ pub(super) async fn chat_completions_inner(
     let e2ee_active = e2ee_requested(&encryption_headers);
     let include_stream_usage_in_response = chat_stream_include_usage_requested(&request);
 
+    // The catalog reads below answer for the requested model before the
+    // completion service has resolved it, so each one states who is asking.
+    // For an unlisted model this organization may not use they find nothing,
+    // and the request reaches the completion service like one for an unknown
+    // model and gets its error.
+    let caller = ModelCaller::Organization(api_key.organization.id.0);
+
     // Strict alias mode: refuse to serve through an alias before any
     // inference happens (issue #573).
-    if let Err(resp) = reject_if_aliased(&app_state.models_service, &headers, &request.model).await
+    if let Err(resp) =
+        reject_if_aliased(&app_state.models_service, caller, &headers, &request.model).await
     {
         return resp;
     }
@@ -234,7 +242,7 @@ pub(super) async fn chat_completions_inner(
     // path); advisory only — strict mode above stays authoritative.
     let alias_canonical = app_state
         .models_service
-        .resolve_alias_cached(&request.model)
+        .resolve_alias_cached(&request.model, caller)
         .await;
     let resolved_model_name = alias_canonical.as_deref().unwrap_or(&request.model);
     let (model_attestation_supported, model_input_modalities) =
@@ -242,21 +250,41 @@ pub(super) async fn chat_completions_inner(
             // Exact catalog name first, then the alias target: a name that is
             // both a model and another model's alias must read its own
             // capabilities.
-            Ok(models) => models
-                .iter()
-                .find(|model| model.model_name == request.model)
-                .or_else(|| {
-                    models
-                        .iter()
-                        .find(|model| model.model_name == resolved_model_name)
-                })
-                .map(|model| {
-                    (
-                        Some(model.attestation_supported),
-                        model.input_modalities.clone(),
-                    )
-                })
-                .unwrap_or((None, None)),
+            Ok(models) => {
+                let model = models
+                    .iter()
+                    .find(|model| model.model_name == request.model)
+                    .or_else(|| {
+                        models
+                            .iter()
+                            .find(|model| model.model_name == resolved_model_name)
+                    });
+                // The list holds every active model. Read the row only if
+                // this organization may use the model (no cost for a listed
+                // one); a failed check hides it too. Otherwise the modality
+                // check below would answer for a model the caller must not
+                // learn about.
+                let model = match model {
+                    Some(model)
+                        if app_state
+                            .models_service
+                            .caller_can_use_model(caller, model)
+                            .await
+                            .unwrap_or(false) =>
+                    {
+                        Some(model)
+                    }
+                    _ => None,
+                };
+                model
+                    .map(|model| {
+                        (
+                            Some(model.attestation_supported),
+                            model.input_modalities.clone(),
+                        )
+                    })
+                    .unwrap_or((None, None))
+            }
             Err(error) => {
                 tracing::warn!(
                     model = %request.model,

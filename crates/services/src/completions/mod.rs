@@ -790,8 +790,9 @@ pub struct CompletionServiceImpl {
     concurrent_limit: u32,
     /// Cache for per-organization concurrent limits (5-minute TTL)
     org_concurrent_limits: Cache<Uuid, u32>,
-    /// Positive-only cache of model resolution (30 s TTL), shared with
-    /// `ModelsServiceImpl` so admin invalidation clears it.
+    /// Cache of model resolution and of access decisions on unlisted models
+    /// (30 s TTL), shared with `ModelsServiceImpl` so admin invalidation
+    /// clears it.
     model_resolve_cache: crate::models::ModelResolveCache,
     /// Repository for fetching organization concurrent limits
     organization_limit_repository: Arc<dyn ports::OrganizationConcurrentLimitRepository>,
@@ -934,14 +935,18 @@ impl CompletionServiceImpl {
         self
     }
 
+    /// Resolve a model for `caller`. `None` covers both an unknown name and an
+    /// unlisted model the caller may not use, so both get the same error.
     async fn resolve_model_cached(
         &self,
         identifier: &str,
+        caller: crate::models::ModelCaller,
     ) -> Result<Option<crate::models::ModelWithPricing>, anyhow::Error> {
         crate::models::resolve_model_cached(
             &self.model_resolve_cache,
             self.models_repository.as_ref(),
             identifier,
+            caller,
         )
         .await
     }
@@ -1845,8 +1850,15 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
         chat_params.placement = Default::default();
 
         // Resolve model name (could be an alias) and get model details in a single DB call
-        // This also validates that the model exists and is active
-        let model = match self.resolve_model_cached(&request.model).await {
+        // This also validates that the model exists, is active, and may be
+        // used by the request's organization
+        let model = match self
+            .resolve_model_cached(
+                &request.model,
+                crate::models::ModelCaller::Organization(request.organization_id),
+            )
+            .await
+        {
             Ok(Some(m)) => m,
             Ok(None) => {
                 let err = ports::CompletionError::InvalidModel(format!(
@@ -2042,8 +2054,15 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
         chat_params.placement = Default::default();
 
         // Resolve model name (could be an alias) and get model details in a single DB call
-        // This also validates that the model exists and is active
-        let model = match self.resolve_model_cached(&request.model).await {
+        // This also validates that the model exists, is active, and may be
+        // used by the request's organization
+        let model = match self
+            .resolve_model_cached(
+                &request.model,
+                crate::models::ModelCaller::Organization(request.organization_id),
+            )
+            .await
+        {
             Ok(Some(m)) => m,
             Ok(None) => {
                 let err = ports::CompletionError::InvalidModel(format!(
@@ -2560,8 +2579,9 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
     async fn get_model(
         &self,
         model_name: &str,
+        caller: crate::models::ModelCaller,
     ) -> Result<Option<crate::models::ModelWithPricing>, anyhow::Error> {
-        self.resolve_model_cached(model_name).await
+        self.resolve_model_cached(model_name, caller).await
     }
 
     fn get_inference_provider_pool(

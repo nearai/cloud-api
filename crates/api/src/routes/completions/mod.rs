@@ -26,6 +26,7 @@ use services::completions::{
     ports::{CompletionMessage, CompletionRequest as ServiceCompletionRequest},
     MAX_PROVIDER_DONE_EVENT_BYTES,
 };
+use services::models::ModelCaller;
 use sha2::{Digest, Sha256};
 use std::convert::Infallible;
 use std::sync::Arc;
@@ -155,16 +156,22 @@ fn e2ee_requested(encryption_headers: &crate::routes::common::EncryptionHeaders)
 /// clients, before a payload is bound to a different model TD's signing key.
 ///
 /// Unknown models fall through (`Ok`) so the completion service returns its
-/// canonical "not a valid model name or alias" error.
+/// canonical "not a valid model name or alias" error. So does an alias of a
+/// model `caller` may not use: naming its canonical model here would disclose
+/// it.
 async fn reject_if_aliased(
     models_service: &Arc<dyn services::models::ModelsServiceTrait>,
+    caller: ModelCaller,
     headers: &header::HeaderMap,
     requested_model: &str,
 ) -> Result<(), Response> {
     if !no_aliasing_requested(headers) {
         return Ok(());
     }
-    match models_service.resolve_and_get_model(requested_model).await {
+    match models_service
+        .resolve_and_get_model(requested_model, caller)
+        .await
+    {
         Ok(m) if m.model_name != requested_model => Err((
             StatusCode::BAD_REQUEST,
             ResponseJson(ErrorResponse::new(

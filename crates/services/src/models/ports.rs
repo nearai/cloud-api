@@ -91,13 +91,39 @@ pub struct ModelWithPricing {
     /// OpenRouter `openrouter.slug` override. When set, the public API emits a
     /// nested `openrouter: { slug: <value> }` object; NULL = unset (omitted).
     pub openrouter_slug: Option<String>,
-    /// Whether the model appears in the public model catalogs
-    /// (`GET /v1/models`, `GET /v1/model/list`, `GET /v1/model/{name}`).
-    /// `false` keeps an active, billable row out of them; everything else
-    /// (resolution, routing, usage recording) treats the model as before.
+    /// Whether the model is listed. A listed model appears in the public
+    /// model catalogs (`GET /v1/models`, `GET /v1/model/list`,
+    /// `GET /v1/model/{name}`) and every caller may use it. An unlisted model
+    /// is left out of them and is restricted: only an organization that holds
+    /// a grant may use it (see [`ModelCaller`]). Usage recording does not
+    /// look at this field.
     pub is_listed: bool,
     /// When the model row was created — used as OpenRouter's `created` unix timestamp.
     pub created_at: chrono::DateTime<chrono::Utc>,
+}
+
+/// Who is asking for a model. Every lookup of a model for a request states
+/// its caller, and the answer depends on it:
+///
+/// - a listed model resolves for every caller;
+/// - an unlisted model resolves only for [`ModelCaller::Trusted`] and for an
+///   [`ModelCaller::Organization`] that holds a grant for it.
+///
+/// A model that does not resolve for the caller is reported exactly like a
+/// model that does not exist, so the caller cannot learn that it is there.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ModelCaller {
+    /// No organization is known, as on an unauthenticated route. Listed
+    /// models only.
+    Anonymous,
+    /// A request made on behalf of this organization. Listed models, plus the
+    /// unlisted models the organization holds a grant for.
+    Organization(Uuid),
+    /// The platform itself: admin flows, usage recording, background jobs and
+    /// lookups of a model the platform chose. Every model. Not for a model
+    /// name taken from a request, unless that request has already been served
+    /// to its real caller (the deprecation-header middleware).
+    Trusted,
 }
 
 /// One unlisted model and the organizations that may use it.
@@ -121,6 +147,11 @@ pub enum ModelsError {
 }
 
 /// Repository trait for accessing model data
+///
+/// The lookups here return every active model, unlisted ones included, and
+/// apply no access rule. Code that looks a model up for a request must go
+/// through [`ModelsServiceTrait`] or `resolve_model_cached`, which take the
+/// [`ModelCaller`].
 #[async_trait]
 pub trait ModelsRepository: Send + Sync {
     /// Get all active models with pricing
@@ -178,6 +209,11 @@ pub trait ModelsServiceTrait: Send + Sync {
 
     /// Get models with pricing and metadata (from database).
     ///
+    /// Every active model, unlisted ones included: this is the trusted view.
+    /// Before answering a request from one of these rows, check it with
+    /// [`Self::caller_can_use_model`]; public catalogs read
+    /// [`Self::get_public_models_with_pricing`] instead.
+    ///
     /// Implementations are expected to cache the result with a short TTL since
     /// this endpoint is publicly accessible and called frequently.
     async fn get_models_with_pricing(&self) -> Result<Vec<ModelWithPricing>, ModelsError>;
@@ -191,15 +227,41 @@ pub trait ModelsServiceTrait: Send + Sync {
         Ok(models)
     }
 
-    /// Get a specific model by name
-    async fn get_model_by_name(&self, model_name: &str) -> Result<ModelWithPricing, ModelsError>;
+    /// Get a specific model by name, for `caller`.
+    ///
+    /// A model the caller may not use is `NotFound`, with the error an
+    /// unknown name gets.
+    async fn get_model_by_name(
+        &self,
+        model_name: &str,
+        caller: ModelCaller,
+    ) -> Result<ModelWithPricing, ModelsError>;
 
-    /// Resolve a model identifier (alias or canonical name) and return the full model details
-    /// Returns an error if the model is not found or not active
+    /// Resolve a model identifier (alias or canonical name) for `caller` and
+    /// return the full model details.
+    ///
+    /// Returns an error if the model is not found or not active. A model the
+    /// caller may not use is `NotFound`, with the error an unknown name gets.
     async fn resolve_and_get_model(
         &self,
         identifier: &str,
+        caller: ModelCaller,
     ) -> Result<ModelWithPricing, ModelsError>;
+
+    /// Whether `caller` may use `model`, a row this service returned.
+    ///
+    /// A listed model costs nothing to check. Only an unlisted model asked
+    /// for by an organization consults the grants.
+    ///
+    /// The default knows of no grants: it opens an unlisted model to
+    /// [`ModelCaller::Trusted`] only.
+    async fn caller_can_use_model(
+        &self,
+        caller: ModelCaller,
+        model: &ModelWithPricing,
+    ) -> Result<bool, ModelsError> {
+        Ok(model.is_listed || caller == ModelCaller::Trusted)
+    }
 
     /// Resolve a model identifier for public model-detail reads. An unlisted
     /// model is answered like a model that does not exist.
@@ -212,7 +274,9 @@ pub trait ModelsServiceTrait: Send + Sync {
         &self,
         identifier: &str,
     ) -> Result<ModelWithPricing, ModelsError> {
-        let model = self.resolve_and_get_model(identifier).await?;
+        let model = self
+            .resolve_and_get_model(identifier, ModelCaller::Anonymous)
+            .await?;
         if model.is_listed {
             Ok(model)
         } else {
@@ -224,20 +288,34 @@ pub trait ModelsServiceTrait: Send + Sync {
 
     /// Resolve `identifier` against the cached active-models alias map.
     /// Returns `Some(canonical_name)` when `identifier` is a registered
-    /// alias of an active model, `None` when it is a canonical name,
-    /// unknown, or the lookup fails.
+    /// alias of an active model that `caller` may use, `None` when it is a
+    /// canonical name, unknown, an alias of a model the caller may not use,
+    /// or the lookup fails.
     ///
     /// Unlike `resolve_and_get_model`, this never hits the DB on the hot
-    /// path (cache-backed, short TTL) and is intended for advisory
-    /// annotations such as alias-substitution warnings — authoritative
-    /// checks must use `resolve_and_get_model`.
-    async fn resolve_alias_cached(&self, identifier: &str) -> Option<String>;
+    /// path for a listed model (cache-backed, short TTL) and is intended for
+    /// advisory annotations such as alias-substitution warnings —
+    /// authoritative checks must use `resolve_and_get_model`.
+    async fn resolve_alias_cached(&self, identifier: &str, caller: ModelCaller) -> Option<String>;
 
     /// Get list of configured model names (canonical names) from database
     /// Returns only active models that have been configured with pricing
     async fn get_configured_model_names(&self) -> Result<Vec<String>, ModelsError>;
 
-    /// Invalidate any cached model list / metadata. Called by admin writes
-    /// that mutate the `models` or `model_aliases` tables.
+    /// Every active unlisted model with the active organizations that hold a
+    /// grant for it. Trusted services (a gateway that enforces access itself)
+    /// read this; a model that is absent from it is unrestricted.
+    ///
+    /// The default fails instead of returning an empty list, which a reader
+    /// would take to mean that no model is restricted.
+    async fn get_restricted_model_access(&self) -> Result<Vec<RestrictedModelAccess>, ModelsError> {
+        Err(ModelsError::InternalError(
+            "this models service does not list model access".to_string(),
+        ))
+    }
+
+    /// Invalidate any cached model list / metadata and cached access
+    /// decisions. Called by admin writes that mutate the `models`,
+    /// `model_aliases` or `organization_model_access` tables.
     async fn invalidate_models_cache(&self);
 }

@@ -136,7 +136,10 @@ pub async fn embeddings(
     // Resolve model to get UUID for usage tracking
     let model = match app_state
         .models_service
-        .get_model_by_name(&model_name)
+        .get_model_by_name(
+            &model_name,
+            ModelCaller::Organization(api_key.organization.id.0),
+        )
         .await
     {
         Ok(model) => model,

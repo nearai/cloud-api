@@ -23,8 +23,9 @@ pub struct UpdateModelAdminRequest {
     pub is_active: Option<bool>,
     /// If true, allows activation even with zero pricing.
     pub allow_free: Option<bool>,
-    /// `Some(false)` keeps the model out of the public model catalogs,
-    /// `Some(true)` lists it again, `None` leaves it unchanged.
+    /// `Some(false)` unlists the model: it leaves the public model catalogs
+    /// and only organizations that hold a grant may use it. `Some(true)`
+    /// lists it again, `None` leaves it unchanged.
     pub is_listed: Option<bool>,
     pub aliases: Option<Vec<String>>,
     pub owned_by: Option<String>,
@@ -131,8 +132,9 @@ pub struct ModelPricing {
     pub successor_model_name: Option<String>,
     /// OpenRouter `openrouter.slug` override. NULL = unset.
     pub openrouter_slug: Option<String>,
-    /// Whether the model appears in the public model catalogs. `false` keeps
-    /// an active, billable row out of them; it does not change routing.
+    /// Whether the model is listed. An unlisted model is left out of the
+    /// public model catalogs and only organizations that hold a grant may
+    /// use it.
     pub is_listed: bool,
 }
 
@@ -188,7 +190,8 @@ pub struct ModelHistoryEntry {
     pub openrouter_slug: Option<String>,
     /// If true, this model was allowed to serve without pricing at this point in time.
     pub allow_free: bool,
-    /// Whether the model was in the public model catalogs at this point in time.
+    /// Whether the model was listed (in the public model catalogs and open to
+    /// every caller) at this point in time.
     pub is_listed: bool,
     pub effective_from: chrono::DateTime<chrono::Utc>,
     pub effective_until: Option<chrono::DateTime<chrono::Utc>>,
@@ -322,8 +325,9 @@ pub struct AdminModelInfo {
     pub successor_model_name: Option<String>,
     /// OpenRouter `openrouter.slug` override. NULL = unset.
     pub openrouter_slug: Option<String>,
-    /// Whether the model appears in the public model catalogs. `false` keeps
-    /// an active, billable row out of them; it does not change routing.
+    /// Whether the model is listed. An unlisted model is left out of the
+    /// public model catalogs and only organizations that hold a grant may
+    /// use it.
     pub is_listed: bool,
 }
 

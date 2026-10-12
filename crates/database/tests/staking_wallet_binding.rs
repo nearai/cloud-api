@@ -602,3 +602,38 @@ async fn bound_wallet_cannot_be_removed_or_leave_but_other_members_can() -> anyh
     ));
     Ok(())
 }
+
+#[tokio::test]
+async fn prepare_rejects_wallet_already_used_by_another_organization() -> anyhow::Result<()> {
+    let (pool, org, actor) = fixture().await?;
+    let repo = PostgresStakingBindingRepository::new(pool.clone());
+    let original = challenge(org, actor, account());
+    repo.prepare(&original).await?;
+    repo.confirm(
+        &original,
+        request(&original),
+        Uuid::new_v4(),
+        "key",
+        "digest",
+    )
+    .await?;
+    let (_, other_org, other_actor) = fixture().await?;
+    let unavailable = challenge(other_org, other_actor, original.near_account_id.clone());
+    let error = repo.prepare(&unavailable).await.unwrap_err();
+    assert!(matches!(
+        error.downcast_ref::<BindingError>(),
+        Some(BindingError::Conflict)
+    ));
+    let client = pool.get().await?;
+    let count: i64 = client
+        .query_one(
+            "SELECT count(*) FROM staking_wallet_binding_challenges WHERE id=$1",
+            &[&unavailable.challenge_id],
+        )
+        .await?
+        .get(0);
+    assert_eq!(count, 0);
+    repo.prepare(&challenge(other_org, other_actor, account()))
+        .await?;
+    Ok(())
+}

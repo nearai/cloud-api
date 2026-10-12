@@ -66,8 +66,16 @@ impl BindingRepository for PostgresStakingBindingRepository {
         authorize(&tx, c.organization_id, c.actor_user_id, true).await?;
         if tx
             .query_opt(
-                "SELECT id FROM organization_staking_farm_sources WHERE organization_id=$1",
-                &[&c.organization_id],
+                "SELECT id FROM organization_staking_farm_sources
+                 WHERE organization_id=$1 OR
+                   (near_account_id=$2 AND network_id=$3 AND contract_id=$4)
+                 LIMIT 1",
+                &[
+                    &c.organization_id,
+                    &c.near_account_id,
+                    &c.network_id,
+                    &c.contract_id,
+                ],
             )
             .await?
             .is_some()

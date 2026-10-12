@@ -1406,6 +1406,95 @@ impl ModelRepository {
         Ok(row.map(|r| self.row_to_model(&r)))
     }
 
+    /// Whether the organization holds a grant for the model that is in
+    /// effect. A grant held by an inactive organization, or on an inactive
+    /// model, has no effect.
+    pub async fn organization_has_model_access(
+        &self,
+        organization_id: uuid::Uuid,
+        model_id: uuid::Uuid,
+    ) -> Result<bool> {
+        let row = retry_db!("organization_has_model_access", {
+            let client = self
+                .pool
+                .get()
+                .await
+                .context("Failed to get database connection")
+                .map_err(RepositoryError::PoolError)?;
+
+            // One-shot typed query: one round trip, see repositories/mod.rs.
+            client
+                .query_typed_opt(
+                    r#"
+                    SELECT 1
+                    FROM organization_model_access a
+                    JOIN organizations o ON o.id = a.organization_id
+                    JOIN models m ON m.id = a.model_id
+                    WHERE a.organization_id = $1
+                      AND a.model_id = $2
+                      AND o.is_active = true
+                      AND m.is_active = true
+                    "#,
+                    &[(&organization_id, Type::UUID), (&model_id, Type::UUID)],
+                )
+                .await
+                .map_err(map_db_error)
+        })?;
+
+        Ok(row.is_some())
+    }
+
+    /// Every unlisted model, active or not, with the active organizations
+    /// that hold a grant for it, ordered by model name. A model nobody may
+    /// use is listed with no organizations.
+    ///
+    /// Inactive models are included on purpose. The reader takes a model that
+    /// is absent from the list to be unrestricted, and it may still be
+    /// serving a model that was deactivated here.
+    pub async fn list_restricted_model_access(
+        &self,
+    ) -> Result<Vec<services::models::RestrictedModelAccess>> {
+        let rows = retry_db!("list_restricted_model_access", {
+            let client = self
+                .pool
+                .get()
+                .await
+                .context("Failed to get database connection")
+                .map_err(RepositoryError::PoolError)?;
+
+            client
+                .query(
+                    r#"
+                    SELECT
+                        m.model_name,
+                        COALESCE(
+                            array_agg(o.id ORDER BY o.id) FILTER (WHERE o.id IS NOT NULL),
+                            '{}'
+                        ) AS organization_ids
+                    FROM models m
+                    LEFT JOIN organization_model_access a ON a.model_id = m.id
+                    LEFT JOIN organizations o
+                        ON o.id = a.organization_id
+                        AND o.is_active = true
+                    WHERE m.is_listed = false
+                    GROUP BY m.id
+                    ORDER BY m.model_name
+                    "#,
+                    &[],
+                )
+                .await
+                .map_err(map_db_error)
+        })?;
+
+        Ok(rows
+            .iter()
+            .map(|row| services::models::RestrictedModelAccess {
+                model_name: row.get("model_name"),
+                organization_ids: row.get("organization_ids"),
+            })
+            .collect())
+    }
+
     /// Helper method to convert database row to Model
     fn row_to_model(&self, row: &Row) -> Model {
         let model_name: String = row.get("model_name");
@@ -1783,5 +1872,20 @@ impl services::models::ModelsRepository for ModelRepository {
 
     async fn get_configured_model_names(&self) -> Result<Vec<String>> {
         self.get_configured_model_names().await
+    }
+
+    async fn organization_has_model_access(
+        &self,
+        organization_id: uuid::Uuid,
+        model_id: uuid::Uuid,
+    ) -> Result<bool> {
+        self.organization_has_model_access(organization_id, model_id)
+            .await
+    }
+
+    async fn list_restricted_model_access(
+        &self,
+    ) -> Result<Vec<services::models::RestrictedModelAccess>> {
+        self.list_restricted_model_access().await
     }
 }

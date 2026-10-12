@@ -65,14 +65,20 @@ pub fn selected(models: &[String], canonical_model: &str, body: &Value) -> bool 
 
 impl NativeResponsesService {
     /// Resolve aliases before checking the canonical allowlist. Non-selected
-    /// requests retain legacy validation and error handling.
-    pub async fn selected_model(&self, body: &Value) -> Option<ModelWithPricing> {
+    /// requests retain legacy validation and error handling. A model the
+    /// caller may not use is never selected: the request takes the legacy
+    /// path and gets its unknown-model answer.
+    pub async fn selected_model(
+        &self,
+        body: &Value,
+        caller: crate::models::ModelCaller,
+    ) -> Option<ModelWithPricing> {
         if self.models.is_empty() || !inference_providers::responses_raw::is_stateless(body) {
             return None;
         }
         let model = self
             .models_service
-            .resolve_and_get_model(body["model"].as_str()?)
+            .resolve_and_get_model(body["model"].as_str()?, caller)
             .await
             .ok()?;
         selected(&self.models, &model.model_name, body).then_some(model)

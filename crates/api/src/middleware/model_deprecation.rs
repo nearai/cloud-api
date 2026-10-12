@@ -29,7 +29,9 @@ use axum::{
     response::Response,
 };
 use chrono::{DateTime, Utc};
-use services::models::{ModelWithPricing, ModelsServiceTrait};
+use services::models::{ModelCaller, ModelWithPricing, ModelsServiceTrait};
+
+use super::auth::AuthenticatedApiKey;
 
 pub const HEADER_MODEL_DEPRECATION_DATE: &str = "x-model-deprecation-date";
 pub const HEADER_MODEL_SUCCESSOR: &str = "x-model-successor";
@@ -117,6 +119,14 @@ pub async fn model_deprecation_middleware(
 ) -> Response {
     let requested = RequestedModel::default();
     request.extensions_mut().insert(requested.clone());
+    // Who is asking, read before the request moves on. The auth layer runs
+    // outside this one and has stored the API key's organization.
+    let caller = request
+        .extensions()
+        .get::<AuthenticatedApiKey>()
+        .map_or(ModelCaller::Anonymous, |api_key| {
+            ModelCaller::Organization(api_key.organization.id.0)
+        });
 
     let mut response = next.run(request).await;
 
@@ -130,7 +140,15 @@ pub async fn model_deprecation_middleware(
     // ago. An alias resolves to its canonical model. Advisory only: a failed
     // or slow lookup (cache miss while the database is struggling) leaves the
     // response as it is instead of holding it back.
-    let lookup = state.models_service.resolve_and_get_model(model_name);
+    //
+    // Resolved for the request's own caller, never as a trusted one. A
+    // successful status does not mean the handler resolved the model: a
+    // streaming Responses request answers 200 first and fails inside the
+    // stream. The headers of a model the caller may not use would tell it
+    // that the model exists.
+    let lookup = state
+        .models_service
+        .resolve_and_get_model(model_name, caller);
     let Ok(Ok(model)) = tokio::time::timeout(LOOKUP_TIMEOUT, lookup).await else {
         return response;
     };

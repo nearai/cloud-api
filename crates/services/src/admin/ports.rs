@@ -23,8 +23,9 @@ pub struct UpdateModelAdminRequest {
     pub is_active: Option<bool>,
     /// If true, allows activation even with zero pricing.
     pub allow_free: Option<bool>,
-    /// `Some(false)` keeps the model out of the public model catalogs,
-    /// `Some(true)` lists it again, `None` leaves it unchanged.
+    /// `Some(false)` unlists the model: it leaves the public model catalogs
+    /// and only organizations that hold a grant may use it. `Some(true)`
+    /// lists it again, `None` leaves it unchanged.
     pub is_listed: Option<bool>,
     pub aliases: Option<Vec<String>>,
     pub owned_by: Option<String>,
@@ -126,8 +127,9 @@ pub struct ModelPricing {
     pub successor_model_name: Option<String>,
     /// OpenRouter `openrouter.slug` override. NULL = unset.
     pub openrouter_slug: Option<String>,
-    /// Whether the model appears in the public model catalogs. `false` keeps
-    /// an active, billable row out of them; it does not change routing.
+    /// Whether the model is listed. An unlisted model is left out of the
+    /// public model catalogs and only organizations that hold a grant may
+    /// use it.
     pub is_listed: bool,
 }
 
@@ -183,7 +185,8 @@ pub struct ModelHistoryEntry {
     pub openrouter_slug: Option<String>,
     /// If true, this model was allowed to serve without pricing at this point in time.
     pub allow_free: bool,
-    /// Whether the model was in the public model catalogs at this point in time.
+    /// Whether the model was listed (in the public model catalogs and open to
+    /// every caller) at this point in time.
     pub is_listed: bool,
     pub effective_from: chrono::DateTime<chrono::Utc>,
     pub effective_until: Option<chrono::DateTime<chrono::Utc>>,
@@ -317,8 +320,9 @@ pub struct AdminModelInfo {
     pub successor_model_name: Option<String>,
     /// OpenRouter `openrouter.slug` override. NULL = unset.
     pub openrouter_slug: Option<String>,
-    /// Whether the model appears in the public model catalogs. `false` keeps
-    /// an active, billable row out of them; it does not change routing.
+    /// Whether the model is listed. An unlisted model is left out of the
+    /// public model catalogs and only organizations that hold a grant may
+    /// use it.
     pub is_listed: bool,
 }
 
@@ -650,6 +654,45 @@ pub struct AdminOrganizationMemberInfo {
     pub joined_at: chrono::DateTime<chrono::Utc>,
     pub invited_by: Option<uuid::Uuid>,
     pub user: UserInfo,
+}
+
+/// A model as the access-management operations see it. Looked up by
+/// canonical name, active or not, so a grant can be reviewed or revoked while
+/// its model is inactive.
+#[derive(Debug, Clone)]
+pub struct ModelAccessModel {
+    pub id: uuid::Uuid,
+    pub model_name: String,
+    pub is_listed: bool,
+    pub is_active: bool,
+}
+
+/// A grant: one organization that may use one unlisted model.
+#[derive(Debug, Clone)]
+pub struct ModelAccessGrant {
+    pub organization_id: uuid::Uuid,
+    pub organization_name: String,
+    pub granted_at: chrono::DateTime<chrono::Utc>,
+    /// The admin who made the grant. `None` if that user row is gone.
+    pub granted_by_user_id: Option<uuid::Uuid>,
+    pub granted_by_user_email: Option<String>,
+}
+
+/// A model and the active organizations that hold a grant for it.
+#[derive(Debug, Clone)]
+pub struct ModelAccess {
+    pub model: ModelAccessModel,
+    pub grants: Vec<ModelAccessGrant>,
+}
+
+/// One model an organization holds a grant for.
+#[derive(Debug, Clone)]
+pub struct OrganizationModelAccessGrant {
+    pub model: ModelAccessModel,
+    pub granted_at: chrono::DateTime<chrono::Utc>,
+    /// The admin who made the grant. `None` if that user row is gone.
+    pub granted_by_user_id: Option<uuid::Uuid>,
+    pub granted_by_user_email: Option<String>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -1015,6 +1058,47 @@ pub trait AdminRepository: Send + Sync {
     async fn organization_exists(&self, organization_id: uuid::Uuid)
         -> Result<bool, anyhow::Error>;
 
+    /// Look a model up by canonical name for access management, active or
+    /// not. `None` if no such model exists.
+    async fn get_model_for_access(
+        &self,
+        model_name: &str,
+    ) -> Result<Option<ModelAccessModel>, anyhow::Error>;
+
+    /// The active organizations that hold a grant for the model, oldest
+    /// grant first.
+    async fn list_model_access_grants(
+        &self,
+        model_id: uuid::Uuid,
+    ) -> Result<Vec<ModelAccessGrant>, anyhow::Error>;
+
+    /// Grant the organization access to the model. Returns the stored grant
+    /// and whether this call created it: a grant that already exists is
+    /// returned unchanged. A grant that is created gets its audit row in the
+    /// same statement.
+    async fn grant_model_access(
+        &self,
+        model_id: uuid::Uuid,
+        organization_id: uuid::Uuid,
+        granted_by_user_id: Option<uuid::Uuid>,
+    ) -> Result<(ModelAccessGrant, bool), anyhow::Error>;
+
+    /// Revoke the organization's grant for the model. Returns whether a
+    /// grant existed. A grant that is revoked gets its audit row in the same
+    /// statement.
+    async fn revoke_model_access(
+        &self,
+        model_id: uuid::Uuid,
+        organization_id: uuid::Uuid,
+        revoked_by_user_id: Option<uuid::Uuid>,
+    ) -> Result<bool, anyhow::Error>;
+
+    /// The models the organization holds a grant for, by model name.
+    async fn list_organization_model_access(
+        &self,
+        organization_id: uuid::Uuid,
+    ) -> Result<Vec<OrganizationModelAccessGrant>, anyhow::Error>;
+
     /// List platform services with pagination (admin only)
     async fn list_services(
         &self,
@@ -1281,6 +1365,41 @@ pub trait AdminService: Send + Sync {
         cost_per_unit: Option<i64>,
         is_active: Option<bool>,
     ) -> Result<PlatformServiceInfo, AdminError>;
+
+    /// A model and the organizations that hold a grant for it (admin only).
+    /// Returns `ModelNotFound` if no model has this canonical name.
+    async fn get_model_access(&self, model_name: &str) -> Result<ModelAccess, AdminError>;
+
+    /// Grant an organization access to a model (admin only). Idempotent: a
+    /// grant that already exists is returned unchanged. Returns
+    /// `ModelNotFound` or `OrganizationNotFound` if either is missing; the
+    /// organization must be active. A grant that is created is written to
+    /// the audit log with `granted_by_user_id`.
+    async fn grant_model_access(
+        &self,
+        model_name: &str,
+        organization_id: uuid::Uuid,
+        granted_by_user_id: Option<uuid::Uuid>,
+    ) -> Result<ModelAccessGrant, AdminError>;
+
+    /// Revoke an organization's access to a model (admin only). Idempotent:
+    /// revoking a grant that does not exist succeeds. Returns `ModelNotFound`
+    /// or `OrganizationNotFound` if either is missing. A grant that is
+    /// revoked is written to the audit log with `revoked_by_user_id`.
+    async fn revoke_model_access(
+        &self,
+        model_name: &str,
+        organization_id: uuid::Uuid,
+        revoked_by_user_id: Option<uuid::Uuid>,
+    ) -> Result<(), AdminError>;
+
+    /// The models an organization holds a grant for (admin only). Returns
+    /// `OrganizationNotFound` if the organization does not exist or is
+    /// inactive.
+    async fn list_organization_model_access(
+        &self,
+        organization_id: uuid::Uuid,
+    ) -> Result<Vec<OrganizationModelAccessGrant>, AdminError>;
 }
 
 #[cfg(test)]

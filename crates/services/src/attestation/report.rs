@@ -6,6 +6,7 @@ use super::{models::AttestationReport, AttestationError, AttestationService, Gat
 use crate::metrics::consts::{
     get_environment, METRIC_ATTESTATION_REPORT_CACHE, TAG_ENVIRONMENT, TAG_RESULT,
 };
+use crate::models::{resolve_model_cached, ModelCaller};
 use inference_providers::ProviderFilter;
 
 pub(in crate::attestation) fn generate_nonce_hex() -> String {
@@ -87,6 +88,7 @@ fn normalize_signing_algo(signing_algo: Option<&str>) -> Result<Option<String>, 
 }
 
 impl AttestationService {
+    #[allow(clippy::too_many_arguments)]
     pub(in crate::attestation) async fn get_attestation_report_impl(
         &self,
         model: Option<String>,
@@ -95,9 +97,37 @@ impl AttestationService {
         signing_address: Option<String>,
         include_tls_fingerprint: bool,
         provider_filter: Option<ProviderFilter>,
+        caller: ModelCaller,
     ) -> Result<AttestationReport, AttestationError> {
         let env_tag = format!("{TAG_ENVIRONMENT}:{}", get_environment());
         let signing_algo = normalize_signing_algo(signing_algo.as_deref())?;
+
+        // Resolve the model for the caller before the cache lookup below. A
+        // cache hit skips the build, so a check made inside the build would
+        // not run when another caller had already cached the report. A model
+        // the caller may not use fails here exactly like an unknown one.
+        let resolved_canonical = if let Some(ref m) = model {
+            let resolved_model = resolve_model_cached(
+                &self.model_resolve_cache,
+                self.models_repository.as_ref(),
+                m,
+                caller,
+            )
+            .await
+            .map_err(|e| AttestationError::ProviderError(format!("Failed to resolve model: {e}")))?
+            .ok_or_else(|| AttestationError::UnknownModel(m.clone()))?;
+            let canonical = resolved_model.model_name;
+            if &canonical != m {
+                tracing::debug!(
+                    requested_model = %m,
+                    canonical_model = %canonical,
+                    "Resolved alias to canonical model name for attestation report"
+                );
+            }
+            Some(canonical)
+        } else {
+            None
+        };
 
         // Precompute the no-nonce cache key BEFORE the params are moved into the
         // build closure below.
@@ -144,30 +174,6 @@ impl AttestationService {
                 .as_deref()
                 .unwrap_or(DEFAULT_GATEWAY_SIGNING_ALGO)
                 .to_string();
-
-            // Resolve model alias synchronously (fast DB lookup ~10 ms) before
-            // spawning the parallel futures below.
-            let resolved_canonical = if let Some(ref m) = model {
-                let resolved_model = self
-                    .models_repository
-                    .resolve_and_get_model(m)
-                    .await
-                    .map_err(|e| {
-                        AttestationError::ProviderError(format!("Failed to resolve model: {e}"))
-                    })?
-                    .ok_or_else(|| AttestationError::UnknownModel(m.clone()))?;
-                let canonical = resolved_model.model_name.clone();
-                if &canonical != m {
-                    tracing::debug!(
-                        requested_model = %m,
-                        canonical_model = %canonical,
-                        "Resolved alias to canonical model name for attestation report"
-                    );
-                }
-                Some(canonical)
-            } else {
-                None
-            };
 
             let signing_address_to_use = self.get_signing_address_hex(&algo)?;
             let signing_address_clean = signing_address_to_use

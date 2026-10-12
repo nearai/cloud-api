@@ -1151,6 +1151,26 @@ pub struct ModelsResponse {
     pub data: Vec<ModelInfo>,
 }
 
+/// `GET /v1/internal/model-access`: which organizations may use each
+/// restricted model. A model that is absent from `models` is unrestricted.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ModelAccessDocument {
+    /// Always `"model_access"`.
+    pub object: String,
+    /// One entry per unlisted model, active or not, ordered by model name.
+    pub models: Vec<ModelAccessDocumentEntry>,
+}
+
+/// One restricted model of [`ModelAccessDocument`].
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ModelAccessDocumentEntry {
+    /// Canonical model name, the `id` of `GET /v1/internal/models`.
+    pub id: String,
+    /// The active organizations that hold a grant. Empty when nobody may use
+    /// the model.
+    pub organization_ids: Vec<uuid::Uuid>,
+}
+
 /// Model pricing information.
 ///
 /// `input` / `output` are the legacy HuggingFace-style fields (USD per million
@@ -3993,8 +4013,9 @@ pub struct ModelMetadata {
     /// `openrouter: { slug }` object; the admin view exposes the raw value.
     #[serde(rename = "openrouterSlug", skip_serializing_if = "Option::is_none")]
     pub openrouter_slug: Option<String>,
-    /// Whether the model appears in the public model catalogs. Set on admin
-    /// views only; the public catalog endpoints omit it.
+    /// Whether the model is listed. An unlisted model is left out of the
+    /// public model catalogs and only organizations that hold a grant may
+    /// use it. Set on admin views only; the public catalog endpoints omit it.
     #[serde(rename = "isListed", skip_serializing_if = "Option::is_none")]
     pub is_listed: Option<bool>,
 }
@@ -4049,11 +4070,14 @@ pub struct UpdateModelApiRequest {
     /// Required to be set explicitly when activating a zero-price model.
     #[serde(rename = "allowFree", skip_serializing_if = "Option::is_none")]
     pub allow_free: Option<bool>,
-    /// `false` keeps the model out of the public model catalogs
-    /// (`GET /v1/models`, `GET /v1/model/list`, `GET /v1/model/{name}`) while
-    /// it stays active and billable; `true` lists it again. Omitted = leave
-    /// unchanged (new models are listed). It is a catalog switch only: a
-    /// model that has an inference URL can still be called by name.
+    /// `false` unlists the model. It stays active and billable, but it
+    /// leaves the public model catalogs (`GET /v1/models`,
+    /// `GET /v1/model/list`, `GET /v1/model/{name}`) and becomes restricted:
+    /// only organizations that hold a grant
+    /// (`PUT /v1/admin/models/{model_name}/access/{org_id}`) may use it, and
+    /// everyone else is answered as if the model did not exist. `true` lists
+    /// it again and opens it to every caller. Omitted = leave unchanged (new
+    /// models are listed).
     #[serde(rename = "isListed", skip_serializing_if = "Option::is_none")]
     pub is_listed: Option<bool>,
     pub aliases: Option<Vec<String>>,
@@ -4525,7 +4549,8 @@ pub struct ModelHistoryEntry {
     /// If true, this model was allowed to serve without pricing at this point in time.
     #[serde(rename = "allowFree")]
     pub allow_free: bool,
-    /// Whether the model was in the public model catalogs at this point in time.
+    /// Whether the model was listed (in the public model catalogs and open to
+    /// every caller) at this point in time.
     #[serde(rename = "isListed")]
     pub is_listed: bool,
 }

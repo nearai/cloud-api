@@ -1,5 +1,10 @@
-//! Unit tests for the email batch loops in `AdminServiceImpl`: the recipient
-//! activity lookup must only run immediately before a real send.
+//! Unit tests for `AdminServiceImpl` over a counting repository.
+//!
+//! Email batch loops: the recipient activity lookup must only run immediately
+//! before a real send.
+//!
+//! Model access: a grant or a revocation drops one cached access decision,
+//! and only when it changed something.
 
 use super::*;
 use crate::admin::{AdminService, AdminServiceImpl};
@@ -55,6 +60,12 @@ struct CountingRepo {
     deprecation_recipients: Vec<ModelDeprecationRecipient>,
     pricing_recipients: Vec<PricingChangeRecipientRow>,
     scheduled_rows: Vec<ScheduledPricingChange>,
+    /// The model the access operations find, if any.
+    access_model: Option<ModelAccessModel>,
+    /// Whether a grant creates a row (false: the grant already existed).
+    grant_creates: bool,
+    /// Whether a revocation finds a grant to delete.
+    revoke_finds: bool,
 }
 
 #[allow(unused_variables)]
@@ -370,7 +381,7 @@ impl AdminRepository for CountingRepo {
         &self,
         organization_id: uuid::Uuid,
     ) -> Result<bool, anyhow::Error> {
-        unimplemented!("not used by the email loop tests")
+        Ok(true)
     }
 
     async fn list_services(
@@ -415,7 +426,7 @@ impl AdminRepository for CountingRepo {
         &self,
         model_name: &str,
     ) -> Result<Option<ModelAccessModel>, anyhow::Error> {
-        unimplemented!("not used by the email loop tests")
+        Ok(self.access_model.clone())
     }
 
     async fn list_model_access_grants(
@@ -430,16 +441,26 @@ impl AdminRepository for CountingRepo {
         model_id: uuid::Uuid,
         organization_id: uuid::Uuid,
         granted_by_user_id: Option<uuid::Uuid>,
-    ) -> Result<ModelAccessGrant, anyhow::Error> {
-        unimplemented!("not used by the email loop tests")
+    ) -> Result<(ModelAccessGrant, bool), anyhow::Error> {
+        Ok((
+            ModelAccessGrant {
+                organization_id,
+                organization_name: "org".to_string(),
+                granted_at: chrono::Utc::now(),
+                granted_by_user_id,
+                granted_by_user_email: None,
+            },
+            self.grant_creates,
+        ))
     }
 
     async fn revoke_model_access(
         &self,
         model_id: uuid::Uuid,
         organization_id: uuid::Uuid,
+        revoked_by_user_id: Option<uuid::Uuid>,
     ) -> Result<bool, anyhow::Error> {
-        unimplemented!("not used by the email loop tests")
+        Ok(self.revoke_finds)
     }
 
     async fn list_organization_model_access(
@@ -688,4 +709,136 @@ async fn pricing_loop_looks_up_activity_once_before_a_real_send() {
 
     assert_eq!(repo.active_calls.load(Ordering::SeqCst), 1);
     assert_eq!(sender.sends.load(Ordering::SeqCst), 1);
+}
+
+/// A service whose models service accepts exactly `access_invalidations`
+/// calls to drop the access decision of (`organization_id`, the model), and
+/// no other invalidation. The mock checks the count when it is dropped.
+fn access_service(
+    repo: CountingRepo,
+    organization_id: Uuid,
+    access_invalidations: usize,
+) -> AdminServiceImpl {
+    let model_id = Uuid::new_v4();
+    let repo = CountingRepo {
+        access_model: Some(ModelAccessModel {
+            id: model_id,
+            model_name: "restricted/model".to_string(),
+            is_listed: false,
+            is_active: true,
+        }),
+        ..repo
+    };
+    let mut models = MockModelsServiceTrait::new();
+    // A grant changes neither the model list nor a resolved model, and
+    // reloading the list asks every backend.
+    models.expect_invalidate_models_cache().times(0);
+    models
+        .expect_invalidate_model_access()
+        .withf(move |organization, model| *organization == organization_id && *model == model_id)
+        .times(access_invalidations)
+        .returning(|_, _| ());
+    AdminServiceImpl::new(
+        Arc::new(repo),
+        Arc::new(models),
+        Arc::new(MockCompletionServiceTrait::new()),
+        Arc::new(CountingEmailSender {
+            sends: AtomicUsize::new(0),
+        }),
+    )
+}
+
+#[tokio::test]
+async fn a_new_grant_drops_only_that_access_decision() {
+    let organization_id = Uuid::new_v4();
+    let repo = CountingRepo {
+        grant_creates: true,
+        ..Default::default()
+    };
+    let service = access_service(repo, organization_id, 1);
+
+    let grant = service
+        .grant_model_access("restricted/model", organization_id, Some(Uuid::new_v4()))
+        .await
+        .unwrap();
+
+    assert_eq!(grant.organization_id, organization_id);
+}
+
+#[tokio::test]
+async fn a_grant_that_already_exists_invalidates_nothing() {
+    let organization_id = Uuid::new_v4();
+    let repo = CountingRepo {
+        grant_creates: false,
+        ..Default::default()
+    };
+    let service = access_service(repo, organization_id, 0);
+
+    service
+        .grant_model_access("restricted/model", organization_id, Some(Uuid::new_v4()))
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn a_revocation_drops_only_that_access_decision() {
+    let organization_id = Uuid::new_v4();
+    let repo = CountingRepo {
+        revoke_finds: true,
+        ..Default::default()
+    };
+    let service = access_service(repo, organization_id, 1);
+
+    service
+        .revoke_model_access("restricted/model", organization_id, Some(Uuid::new_v4()))
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn a_revocation_of_nothing_invalidates_nothing() {
+    let organization_id = Uuid::new_v4();
+    let repo = CountingRepo {
+        revoke_finds: false,
+        ..Default::default()
+    };
+    let service = access_service(repo, organization_id, 0);
+
+    service
+        .revoke_model_access("restricted/model", organization_id, Some(Uuid::new_v4()))
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn access_operations_on_an_unknown_model_change_nothing() {
+    let organization_id = Uuid::new_v4();
+    let mut models = MockModelsServiceTrait::new();
+    models.expect_invalidate_models_cache().times(0);
+    models.expect_invalidate_model_access().times(0);
+    let service = AdminServiceImpl::new(
+        Arc::new(CountingRepo {
+            grant_creates: true,
+            revoke_finds: true,
+            ..Default::default()
+        }),
+        Arc::new(models),
+        Arc::new(MockCompletionServiceTrait::new()),
+        Arc::new(CountingEmailSender {
+            sends: AtomicUsize::new(0),
+        }),
+    );
+
+    assert!(matches!(
+        service
+            .grant_model_access("no/such-model", organization_id, None)
+            .await,
+        Err(AdminError::ModelNotFound(_))
+    ));
+    assert!(matches!(
+        service
+            .revoke_model_access("no/such-model", organization_id, None)
+            .await,
+        Err(AdminError::ModelNotFound(_))
+    ));
 }

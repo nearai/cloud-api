@@ -13,7 +13,7 @@ use async_trait::async_trait;
 use moka::future::Cache;
 pub use ports::{
     ModelCaller, ModelInfo, ModelWithPricing, ModelsError, ModelsRepository, ModelsServiceTrait,
-    RestrictedModelAccess,
+    PlatformModel, RestrictedModelAccess,
 };
 use tracing::warn;
 use uuid::Uuid;
@@ -76,6 +76,12 @@ impl ModelResolveCache {
     pub fn invalidate_all(&self) {
         self.models.invalidate_all();
         self.access.invalidate_all();
+    }
+
+    /// Drop the cached access decision for one organization and one model.
+    /// The cached models are kept: a grant does not change a model.
+    pub async fn invalidate_access(&self, organization_id: Uuid, model_id: Uuid) {
+        self.access.invalidate(&(organization_id, model_id)).await;
     }
 }
 
@@ -400,6 +406,12 @@ impl ModelsServiceTrait for ModelsServiceImpl {
         self.models_list_cache.invalidate_all();
         self.model_resolve_cache.invalidate_all();
     }
+
+    async fn invalidate_model_access(&self, organization_id: Uuid, model_id: Uuid) {
+        self.model_resolve_cache
+            .invalidate_access(organization_id, model_id)
+            .await;
+    }
 }
 
 #[cfg(test)]
@@ -421,6 +433,10 @@ mod tests {
         /// Number of `organization_has_model_access` reads.
         access_lookups: AtomicUsize,
         fail_access_lookups: AtomicBool,
+        /// Number of `get_all_active_models` reads.
+        list_reads: AtomicUsize,
+        /// Number of `resolve_and_get_model` reads.
+        resolves: AtomicUsize,
     }
 
     impl StaticModelsRepository {
@@ -440,6 +456,8 @@ mod tests {
                 grants: Mutex::new(HashSet::new()),
                 access_lookups: AtomicUsize::new(0),
                 fail_access_lookups: AtomicBool::new(false),
+                list_reads: AtomicUsize::new(0),
+                resolves: AtomicUsize::new(0),
             }
         }
 
@@ -470,6 +488,7 @@ mod tests {
     #[async_trait]
     impl ModelsRepository for StaticModelsRepository {
         async fn get_all_active_models(&self) -> Result<Vec<ModelWithPricing>, anyhow::Error> {
+            self.list_reads.fetch_add(1, Ordering::SeqCst);
             Ok(self.active_models.clone())
         }
 
@@ -484,6 +503,7 @@ mod tests {
             &self,
             identifier: &str,
         ) -> Result<Option<ModelWithPricing>, anyhow::Error> {
+            self.resolves.fetch_add(1, Ordering::SeqCst);
             Ok(self.resolved_models.get(identifier).cloned())
         }
 
@@ -1157,6 +1177,61 @@ mod tests {
             .await
             .is_err());
         assert_eq!(repository.access_lookups(), 4);
+    }
+
+    /// A grant or a revocation changes one answer. Dropping it must not make
+    /// the service reload the model list (which asks every backend) or
+    /// resolve the model again, and must leave other organizations' answers
+    /// cached.
+    #[tokio::test]
+    async fn access_only_invalidation_drops_one_decision_and_keeps_the_model_caches() {
+        let (repository, service, unlisted_id) = access_fixture();
+        let organization = Uuid::new_v4();
+        let other = Uuid::new_v4();
+        let resolves_for = |organization: Uuid| {
+            let service = &service;
+            async move {
+                service
+                    .resolve_and_get_model(UNLISTED, ModelCaller::Organization(organization))
+                    .await
+                    .is_ok()
+            }
+        };
+
+        // Warm every cache: the list, the resolved model, both decisions.
+        service.get_models_with_pricing().await.unwrap();
+        assert!(!resolves_for(organization).await);
+        assert!(!resolves_for(other).await);
+        let reads = |repository: &StaticModelsRepository| {
+            (
+                repository.list_reads.load(Ordering::SeqCst),
+                repository.resolves.load(Ordering::SeqCst),
+                repository.access_lookups(),
+            )
+        };
+        assert_eq!(reads(&repository), (1, 1, 2));
+
+        // Both organizations get a grant, one decision is dropped.
+        repository.grant(organization, unlisted_id);
+        repository.grant(other, unlisted_id);
+        service
+            .invalidate_model_access(organization, unlisted_id)
+            .await;
+
+        // That organization's answer is read again...
+        assert!(resolves_for(organization).await);
+        // ...the other one's is still the cached refusal...
+        assert!(!resolves_for(other).await);
+        // ...and neither the list nor the model was read again.
+        service.get_models_with_pricing().await.unwrap();
+        assert_eq!(reads(&repository), (1, 1, 3));
+
+        // Dropping a decision that is not cached is harmless.
+        service
+            .invalidate_model_access(Uuid::new_v4(), unlisted_id)
+            .await;
+        assert!(resolves_for(organization).await);
+        assert_eq!(reads(&repository), (1, 1, 3));
     }
 
     #[tokio::test]

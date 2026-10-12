@@ -6,7 +6,7 @@ use crate::inference_provider_pool::InferenceProviderPool;
 use crate::metrics::capturing::CapturingMetricsService;
 use crate::models::{
     model_resolve_cache_with_ttl, ModelCaller, ModelWithPricing, ModelsServiceImpl,
-    ModelsServiceTrait,
+    ModelsServiceTrait, PlatformModel,
 };
 use crate::test_utils::{CapturingUsageService, MockAttestationService};
 use config::ExternalProvidersConfig;
@@ -473,4 +473,114 @@ async fn a_granted_organization_is_served_an_unlisted_model() {
         .create_chat_completion(request)
         .await
         .expect("the granted organization is served");
+}
+
+/// Unlisted models by name, and no grants (the trait default refuses).
+struct UnlistedModelsRepository(Vec<ModelWithPricing>);
+
+impl UnlistedModelsRepository {
+    fn named(names: &[&str]) -> Arc<Self> {
+        Arc::new(Self(
+            names
+                .iter()
+                .map(|name| {
+                    let mut model = test_model(name);
+                    model.is_listed = false;
+                    model
+                })
+                .collect(),
+        ))
+    }
+
+    fn find(&self, name: &str) -> Option<ModelWithPricing> {
+        self.0
+            .iter()
+            .find(|model| model.model_name == name)
+            .cloned()
+    }
+}
+
+#[async_trait::async_trait]
+impl ModelsRepository for UnlistedModelsRepository {
+    async fn get_all_active_models(&self) -> Result<Vec<ModelWithPricing>, anyhow::Error> {
+        Ok(self.0.clone())
+    }
+
+    async fn get_model_by_name(
+        &self,
+        name: &str,
+    ) -> Result<Option<ModelWithPricing>, anyhow::Error> {
+        Ok(self.find(name))
+    }
+
+    async fn resolve_and_get_model(
+        &self,
+        name: &str,
+    ) -> Result<Option<ModelWithPricing>, anyhow::Error> {
+        Ok(self.find(name))
+    }
+
+    async fn get_configured_model_names(&self) -> Result<Vec<String>, anyhow::Error> {
+        Ok(self
+            .0
+            .iter()
+            .map(|model| model.model_name.clone())
+            .collect())
+    }
+}
+
+/// A model the platform chose for its own work (the title model) must not
+/// depend on the grants of the organization the work is done for. And a
+/// model name from a request must not be able to take that path.
+#[tokio::test]
+async fn a_platform_model_is_resolved_as_a_trusted_caller() {
+    let platform_model = PlatformModel::title_generation();
+    let title_model = platform_model.name().to_string();
+    let request_model = "request/unlisted";
+    // Two unlisted models nobody holds a grant for: the platform's, and one
+    // a request could name.
+    let repo = UnlistedModelsRepository::named(&[&title_model, request_model]);
+    let provider = Arc::new(inference_providers::mock::MockProvider::new_accept_all());
+    let pool = pool();
+    for model in [title_model.as_str(), request_model] {
+        pool.register_provider(model.to_string(), provider.clone())
+            .await;
+    }
+    let service = CompletionServiceImpl::new(
+        pool,
+        Arc::new(MockAttestationService),
+        Arc::new(CapturingUsageService::new()),
+        Arc::new(CapturingMetricsService::new()),
+        repo,
+        Arc::new(StaticOrganizationLimitRepository),
+    );
+
+    // Named by a request, both are refused: the organization holds no grant.
+    for model in [title_model.as_str(), request_model] {
+        let Err(refused) = service
+            .create_chat_completion(completion_request(model))
+            .await
+        else {
+            panic!("{model} must be refused as a request's model");
+        };
+        assert!(matches!(refused, CompletionError::InvalidModel(_)));
+    }
+    assert!(provider.last_chat_params().await.is_none());
+
+    // Chosen by the platform, the title model is served.
+    service
+        .create_platform_chat_completion(platform_model.clone(), completion_request(&title_model))
+        .await
+        .expect("the platform's own model is served without a grant");
+    let served = provider.last_chat_params().await.expect("a served request");
+    assert_eq!(served.model, title_model);
+
+    // The platform model replaces the model the request names: that name
+    // is not resolved as trusted, and the other unlisted model is not served.
+    service
+        .create_platform_chat_completion(platform_model, completion_request(request_model))
+        .await
+        .expect("served on the platform model");
+    let served = provider.last_chat_params().await.expect("a served request");
+    assert_eq!(served.model, title_model);
 }

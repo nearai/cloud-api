@@ -95,12 +95,13 @@ pub async fn models_internal(
 /// List the restricted models and who may use them, for trusted services.
 ///
 /// An unlisted model is restricted: only organizations that hold a grant may
-/// use it. This document lists every active unlisted model with the ids of
-/// the active organizations that hold a grant for it (an empty list when
-/// there are none). A model that is absent from it is unrestricted. A
-/// gateway lane polls it and enforces access itself for the requests it
-/// serves. It is read from the database on every call, so a grant or a
-/// revocation shows up on the next poll of any instance.
+/// use it. This document lists every unlisted model with the ids of the
+/// active organizations that hold a grant for it (an empty list when there
+/// are none). A model that is absent from it is unrestricted, so a model
+/// that is inactive here is listed too: a lane may still be serving it. A
+/// gateway lane polls the document and enforces access itself for the
+/// requests it serves. It is read from the database on every call, so a
+/// grant or a revocation shows up on the next poll of any instance.
 ///
 /// Auth: `Authorization: Bearer <CLOUD_API_USAGE_TOKEN>`, the service secret
 /// of `POST /v1/internal/usage`. The endpoint answers 503 until that token is

@@ -3159,15 +3159,17 @@ impl ResponseServiceImpl {
         );
 
         // Generate title using completion service (names not included - tracked via database)
-        let title_model = std::env::var("TITLE_GENERATION_MODEL")
-            .unwrap_or_else(|_| "Qwen/Qwen3-30B-A3B-Instruct-2507".to_string());
+        // The platform chose this model, not the request: it is resolved as a
+        // trusted caller, so a title does not depend on the organization's
+        // grants.
+        let title_model = crate::models::PlatformModel::title_generation();
         // `session_hint: None` here too: this is the internal title-generation
         // request, issued by the deprecated /responses API, which does not forward
         // `x-session-id`. See the comment on the other CompletionRequest above.
         let completion_request = crate::completions::ports::CompletionRequest {
             request_id,
             session_hint: None,
-            model: title_model,
+            model: title_model.name().to_string(),
             messages: vec![crate::completions::ports::CompletionMessage {
                 reasoning_content: None,
                 role: "user".to_string(),
@@ -3202,7 +3204,7 @@ impl ResponseServiceImpl {
 
         // Call completion service to generate title
         let completion_result = completion_service
-            .create_chat_completion(completion_request)
+            .create_platform_chat_completion(title_model, completion_request)
             .await
             .map_err(|e| {
                 errors::ResponseError::InternalError(format!("Failed to generate title: {e}"))

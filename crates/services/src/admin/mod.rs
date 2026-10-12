@@ -1518,23 +1518,30 @@ impl AdminService for AdminServiceImpl {
         let model = self.model_for_access(model_name).await?;
         self.require_active_organization(organization_id).await?;
 
-        let grant = self
+        let (grant, created) = self
             .repository
             .grant_model_access(model.id, organization_id, granted_by_user_id)
             .await
             .map_err(|e| AdminError::InternalError(e.to_string()))?;
 
-        // Drop the cached access decisions so the grant applies to the next
-        // request on this instance. Other instances follow within the cache
-        // TTL.
-        self.models_service.invalidate_models_cache().await;
+        // A grant that already existed changed nothing: nothing to drop.
+        if created {
+            // Drop the one cached access decision, so the grant applies to
+            // this organization's next request on this instance. The model
+            // list and the resolved models stay cached: a grant changes
+            // neither, and reloading the list asks every backend. Other
+            // instances follow within the cache TTL.
+            self.models_service
+                .invalidate_model_access(organization_id, model.id)
+                .await;
 
-        tracing::info!(
-            model_id = %model.id,
-            organization_id = %organization_id,
-            admin_user_id = ?granted_by_user_id,
-            "Model access granted"
-        );
+            tracing::info!(
+                model_id = %model.id,
+                organization_id = %organization_id,
+                admin_user_id = ?granted_by_user_id,
+                "Model access granted"
+            );
+        }
 
         Ok(grant)
     }
@@ -1550,25 +1557,26 @@ impl AdminService for AdminServiceImpl {
 
         let revoked = self
             .repository
-            .revoke_model_access(model.id, organization_id)
+            .revoke_model_access(model.id, organization_id, revoked_by_user_id)
             .await
             .map_err(|e| AdminError::InternalError(e.to_string()))?;
 
-        // Drop the cached access decisions so the revocation applies to the
-        // next request on this instance. Other instances follow within the
-        // cache TTL. Done even when no grant existed, so a repeated revoke
-        // also clears an entry that a lookup in flight during the first one
-        // put back.
-        self.models_service.invalidate_models_cache().await;
+        // No grant existed: nothing changed, nothing to drop.
+        if revoked {
+            // Drop the one cached access decision, so the revocation applies
+            // to this organization's next request on this instance. Other
+            // instances follow within the cache TTL.
+            self.models_service
+                .invalidate_model_access(organization_id, model.id)
+                .await;
 
-        // The row is deleted, so this line is the record of who revoked it.
-        tracing::info!(
-            model_id = %model.id,
-            organization_id = %organization_id,
-            admin_user_id = ?revoked_by_user_id,
-            existed = revoked,
-            "Model access revoked"
-        );
+            tracing::info!(
+                model_id = %model.id,
+                organization_id = %organization_id,
+                admin_user_id = ?revoked_by_user_id,
+                "Model access revoked"
+            );
+        }
 
         Ok(())
     }

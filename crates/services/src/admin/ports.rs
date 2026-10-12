@@ -1080,21 +1080,25 @@ pub trait AdminRepository: Send + Sync {
         model_id: uuid::Uuid,
     ) -> Result<Vec<ModelAccessGrant>, anyhow::Error>;
 
-    /// Grant the organization access to the model and return the stored
-    /// grant. A grant that already exists is returned unchanged.
+    /// Grant the organization access to the model. Returns the stored grant
+    /// and whether this call created it: a grant that already exists is
+    /// returned unchanged. A grant that is created gets its audit row in the
+    /// same statement.
     async fn grant_model_access(
         &self,
         model_id: uuid::Uuid,
         organization_id: uuid::Uuid,
         granted_by_user_id: Option<uuid::Uuid>,
-    ) -> Result<ModelAccessGrant, anyhow::Error>;
+    ) -> Result<(ModelAccessGrant, bool), anyhow::Error>;
 
     /// Revoke the organization's grant for the model. Returns whether a
-    /// grant existed.
+    /// grant existed. A grant that is revoked gets its audit row in the same
+    /// statement.
     async fn revoke_model_access(
         &self,
         model_id: uuid::Uuid,
         organization_id: uuid::Uuid,
+        revoked_by_user_id: Option<uuid::Uuid>,
     ) -> Result<bool, anyhow::Error>;
 
     /// The models the organization holds a grant for, by model name.
@@ -1377,7 +1381,8 @@ pub trait AdminService: Send + Sync {
     /// Grant an organization access to a model (admin only). Idempotent: a
     /// grant that already exists is returned unchanged. Returns
     /// `ModelNotFound` or `OrganizationNotFound` if either is missing; the
-    /// organization must be active.
+    /// organization must be active. A grant that is created is written to
+    /// the audit log with `granted_by_user_id`.
     async fn grant_model_access(
         &self,
         model_name: &str,
@@ -1387,7 +1392,8 @@ pub trait AdminService: Send + Sync {
 
     /// Revoke an organization's access to a model (admin only). Idempotent:
     /// revoking a grant that does not exist succeeds. Returns `ModelNotFound`
-    /// or `OrganizationNotFound` if either is missing.
+    /// or `OrganizationNotFound` if either is missing. A grant that is
+    /// revoked is written to the audit log with `revoked_by_user_id`.
     async fn revoke_model_access(
         &self,
         model_name: &str,

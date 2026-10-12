@@ -1,4 +1,5 @@
 //! Audited opening-consumption reconciliation for existing organizations.
+
 use crate::{middleware::AdminUser, models::ErrorResponse};
 use axum::{
     extract::{Extension, Path},
@@ -92,6 +93,7 @@ impl From<ReconciliationResult> for CreditReconciliationResponse {
 }
 
 type ApiError = (StatusCode, Json<ErrorResponse>);
+
 fn api_error(error: anyhow::Error) -> ApiError {
     let (status, code, message) = match error.downcast_ref::<ReconciliationError>() {
         Some(ReconciliationError::Invalid(_)) => (
@@ -120,15 +122,22 @@ fn api_error(error: anyhow::Error) -> ApiError {
 /// Reclassify reviewed legacy consumption. Does not rewrite usage logs, settle
 /// invoices, alter ceilings, or change allocation policy. Dry runs are point-in-time
 /// previews; commits revalidate under the organization accounting lock.
-#[utoipa::path(post, path="/v1/admin/organizations/{org_id}/credit-reconciliations", tag="Admin",
-    params(("org_id" = Uuid, Path, description="Organization ID")), request_body=CreditReconciliationRequest,
-    responses((status=200, description="Saved reconciliation, idempotent replay, or dry-run preview", body=CreditReconciliationResponse),
-        (status=400, description="Invalid amounts, key or reason", body=ErrorResponse),
-        (status=401, description="Unauthorized", body=ErrorResponse),
-        (status=403, description="Admin write permission required", body=ErrorResponse),
-        (status=404, description="Organization not found or inactive", body=ErrorResponse),
-        (status=409, description="Conflicting key or unreviewed accounting position", body=ErrorResponse)),
-    security(("session_token"=[])))]
+#[utoipa::path(
+    post,
+    path = "/v1/admin/organizations/{org_id}/credit-reconciliations",
+    tag = "Admin",
+    params(("org_id" = Uuid, Path, description = "Organization ID")),
+    request_body = CreditReconciliationRequest,
+    responses(
+        (status = 200, description = "Saved reconciliation, idempotent replay, or dry-run preview", body = CreditReconciliationResponse),
+        (status = 400, description = "Invalid amounts, key or reason", body = ErrorResponse),
+        (status = 401, description = "Unauthorized", body = ErrorResponse),
+        (status = 403, description = "Admin write permission required", body = ErrorResponse),
+        (status = 404, description = "Organization not found or inactive", body = ErrorResponse),
+        (status = 409, description = "Conflicting key or unreviewed accounting position", body = ErrorResponse),
+    ),
+    security(("session_token" = [])),
+)]
 pub async fn reconcile_organization_credits(
     Extension(repository): Extension<CreditReconciliationRepository>,
     Extension(admin): Extension<AdminUser>,

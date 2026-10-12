@@ -31,8 +31,13 @@ async fn reconcile_requires_admin_write_and_preserves_audited_balances() {
     let client = db.pool().get().await.unwrap();
     client
         .execute(
-        "INSERT INTO organization_balance (organization_id,total_spent,legacy_unattributed_amount) VALUES ($1,80,80) ON CONFLICT (organization_id) DO UPDATE SET total_spent=80, legacy_unattributed_amount=80",
-        &[&org_id],
+            concat!(
+                "INSERT INTO organization_balance ",
+                "(organization_id,total_spent,legacy_unattributed_amount) VALUES ($1,80,80) ON ",
+                "CONFLICT (organization_id) DO UPDATE SET total_spent=80, ",
+                "legacy_unattributed_amount=80",
+            ),
+            &[&org_id],
         )
         .await
         .unwrap();

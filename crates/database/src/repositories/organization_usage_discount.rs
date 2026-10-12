@@ -198,17 +198,23 @@ impl OrganizationUsageDiscountRepository {
         // A concurrent save wins idempotently, even if its worker changed rows during
         // our preflight scan. Otherwise, fail closed on any historical validation error.
         preflight_result?;
+
         // Reconciliations classify aggregate legacy consumption, not specific
         // requests. A historical discount cannot safely reverse that split.
         if apply_since.is_some() {
-            let reconciled: bool = tx.query_one(
+            let reconciled: bool = tx
+                .query_one(
                 "SELECT EXISTS (SELECT 1 FROM organization_credit_reconciliations WHERE organization_id=$1)",
                 &[&organization_id],
-            ).await?.get(0);
+                )
+                .await?
+                .get(0);
+
             if reconciled {
                 return Err(DiscountError::ReconciledHistory.into());
             }
         }
+
         // Transaction-start now() can precede time spent waiting for the accounting lock.
         let saved_at: DateTime<Utc> = tx.query_one("SELECT clock_timestamp()", &[]).await?.get(0);
         if apply_since.is_some() {
@@ -403,7 +409,8 @@ impl OrganizationUsageDiscountRepository {
             SELECT 1 FROM organization_usage_log u
             WHERE u.id = ANY($1) AND u.funded_amount IS NOT NULL AND u.funded_amount <>
                 (SELECT COALESCE(SUM(a.amount),0) FROM effective_usage_credit_allocations a WHERE a.inference_usage_id=u.id)
-            )"#, &[&ids]).await?.get(0);
+            )"#, &[&ids]).await?
+.get(0);
         ensure!(consistent, "Discount allocation does not reconcile");
         let last = rows.last().expect("nonempty batch");
         let last_at: DateTime<Utc> = last.get("created_at");
@@ -449,7 +456,8 @@ impl OrganizationUsageDiscountRepository {
         let owned: bool = tx.query_one(
             "SELECT EXISTS (SELECT 1 FROM organization_usage_discounts WHERE id=$1 AND status='applying' AND ($2::UUID IS NULL OR worker_token=$2))",
             &[&rule_id, &token],
-        ).await?.get(0);
+        ).await?
+.get(0);
         if !owned {
             return Ok(false);
         }
@@ -476,7 +484,8 @@ impl OrganizationUsageDiscountRepository {
                 AND NOT EXISTS (SELECT 1 FROM counter_mismatch)
                 AND (SELECT COUNT(*) FROM usage_discount_adjustments WHERE rule_id=$2) =
                     (SELECT processed_count FROM organization_usage_discounts WHERE id=$2)
-            "#, &[&organization_id, &rule_id]).await?.get(0);
+            "#, &[&organization_id, &rule_id]).await?
+.get(0);
         if !consistent {
             return Err(WorkerError::Accounting.into());
         }
@@ -605,7 +614,8 @@ async fn validate_history(
                 OR (u.funded_amount IS NULL AND (u.unfunded_amount IS NOT NULL OR a.amount<>0))
                 OR (u.funded_amount IS NOT NULL AND (u.unfunded_amount IS DISTINCT FROM 0::BIGINT
                     OR u.funded_amount<>u.total_cost OR a.amount<>u.funded_amount)))
-        )"#, &[&organization_id, &since, &until]).await?.get(0);
+        )"#, &[&organization_id, &since, &until]).await?
+.get(0);
     if invalid {
         return Err(DiscountError::UnsupportedHistory.into());
     }

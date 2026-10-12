@@ -49,6 +49,7 @@ pub struct ReconciliationResult {
 fn active_snapshot_default() -> bool {
     true
 }
+
 fn snapshot_version() -> u32 {
     1
 }
@@ -92,23 +93,39 @@ impl CreditReconciliationRepository {
                 }
                 other => other.into(),
             })?;
+
         // Replay committed results before checking mutable accounting state.
-        if let Some(row) = tx.query_opt(
-            "SELECT amounts, reason, result FROM organization_credit_reconciliations WHERE organization_id=$1 AND idempotency_key=$2",
-            &[&organization_id, &idempotency_key],
-        ).await? {
+        if let Some(row) = tx
+            .query_opt(
+                concat!(
+                    "SELECT amounts, reason, result FROM organization_credit_reconciliations WHERE ",
+                    "organization_id=$1 AND idempotency_key=$2",
+                ),
+                &[&organization_id, &idempotency_key],
+            )
+            .await?
+        {
             let saved: BTreeMap<String, i64> = serde_json::from_value(row.get("amounts"))?;
             if saved != *amounts || row.get::<_, String>("reason") != reason {
-                return Err(ReconciliationError::Conflict("Idempotency key was already used with different terms".into()).into());
+                return Err(ReconciliationError::Conflict(
+                    "Idempotency key was already used with different terms".into(),
+                )
+                .into());
             }
             // A preview must never be mistaken for a new uncommitted adjustment.
             if dry_run {
-                return Err(ReconciliationError::Conflict("This key already identifies a committed reconciliation; use a new key for a preview".into()).into());
+                return Err(ReconciliationError::Conflict(
+    "This key already identifies a committed reconciliation; use a new key for a preview".into(),
+).into());
             }
             let result: ReconciliationResult = serde_json::from_value(row.get("result"))?;
-            anyhow::ensure!(result.schema_version == snapshot_version(), "Unsupported reconciliation snapshot version");
+            anyhow::ensure!(
+                result.schema_version == snapshot_version(),
+                "Unsupported reconciliation snapshot version"
+            );
             return Ok(result);
         }
+
         let active: bool = tx
             .query_one(
                 "SELECT is_active FROM organizations WHERE id=$1",
@@ -119,18 +136,26 @@ impl CreditReconciliationRepository {
         if !active {
             return Err(ReconciliationError::NotFound.into());
         }
+
         // Historical discount corrections also reduce legacy spend and verify
         // counters against usage. Never reconcile while their worker is active.
-        let applying: bool = tx.query_one(
-            "SELECT EXISTS (SELECT 1 FROM organization_usage_discounts WHERE organization_id=$1 AND status='applying')",
-            &[&organization_id],
-        ).await?.get(0);
+        let applying: bool = tx
+            .query_one(
+                concat!(
+                    "SELECT EXISTS (SELECT 1 FROM organization_usage_discounts WHERE organization_id=$1 ",
+                    "AND status='applying')",
+                ),
+                &[&organization_id],
+            )
+            .await?
+            .get(0);
         if applying {
             return Err(ReconciliationError::Conflict(
                 "Wait for historical usage discount correction to finish before reconciling".into(),
             )
             .into());
         }
+
         let before = load_position(&tx, organization_id).await?;
         let after = preview(&before, amounts, total)?;
         let id = (!dry_run).then(Uuid::new_v4);
@@ -141,29 +166,59 @@ impl CreditReconciliationRepository {
             before,
             after,
         };
+
         if dry_run {
             tx.rollback().await?;
             return Ok(result);
         }
+
         tx.execute(
-            "INSERT INTO organization_credit_reconciliations (id, organization_id, idempotency_key, amounts, reason, created_by, result) VALUES ($1,$2,$3,$4,$5,$6,$7)",
-            &[&id, &organization_id, &idempotency_key, &serde_json::to_value(amounts)?, &reason, &created_by, &serde_json::to_value(&result)?],
-        ).await?;
+            concat!(
+                "INSERT INTO organization_credit_reconciliations (id, organization_id, ",
+                "idempotency_key, amounts, reason, created_by, result) VALUES ($1,$2,$3,$4,$5,$6,$7)",
+            ),
+            &[
+                &id,
+                &organization_id,
+                &idempotency_key,
+                &serde_json::to_value(amounts)?,
+                &reason,
+                &created_by,
+                &serde_json::to_value(&result)?,
+            ],
+        )
+        .await?;
+
         for (credit_type, amount) in amounts {
             tx.execute(
-                "INSERT INTO organization_credit_consumption (organization_id, credit_type, amount) VALUES ($1,$2,$3) ON CONFLICT (organization_id, credit_type) DO UPDATE SET amount=organization_credit_consumption.amount+EXCLUDED.amount, updated_at=clock_timestamp()",
+                concat!(
+                    "INSERT INTO organization_credit_consumption (organization_id, credit_type, amount) ",
+                    "VALUES ($1,$2,$3) ON CONFLICT (organization_id, credit_type) DO UPDATE SET ",
+                    "amount=organization_credit_consumption.amount+EXCLUDED.amount, ",
+                    "updated_at=clock_timestamp()",
+                ),
                 &[&organization_id, &credit_type, &amount],
-            ).await?;
+            )
+            .await?;
         }
-        let updated = tx.execute(
-            "UPDATE organization_balance SET legacy_unattributed_amount=legacy_unattributed_amount-$2, updated_at=clock_timestamp() WHERE organization_id=$1 AND legacy_unattributed_amount >= $2",
-            &[&organization_id, &total],
-        ).await?;
+
+        let updated = tx
+            .execute(
+                concat!(
+                    "UPDATE organization_balance SET ",
+                    "legacy_unattributed_amount=legacy_unattributed_amount-$2, ",
+                    "updated_at=clock_timestamp() WHERE organization_id=$1 AND legacy_unattributed_amount ",
+                    ">= $2",
+                ),
+                &[&organization_id, &total],
+            )
+            .await?;
         anyhow::ensure!(updated == 1, "Legacy balance changed during reconciliation");
         anyhow::ensure!(
             load_position(&tx, organization_id).await? == result.after,
             "Reconciliation balances did not match preview"
         );
+
         tx.commit().await?;
         Ok(result)
     }
@@ -184,6 +239,7 @@ fn validate_request(amounts: &BTreeMap<String, i64>, key: &str, reason: &str) ->
     if amounts.is_empty() || amounts.len() > 4 {
         return Err(invalid("Specify one to four credit types").into());
     }
+
     amounts.iter().try_fold(0_i64, |sum, (kind, amount)| {
         if !matches!(kind.as_str(), "grant" | "payment" | "staking_farm" | "postpay") || *amount <= 0 {
             return Err(invalid("Amounts must be positive integer nano-USD for grant, payment, staking_farm or postpay").into());
@@ -193,11 +249,20 @@ fn validate_request(amounts: &BTreeMap<String, i64>, key: &str, reason: &str) ->
 }
 
 async fn load_position(tx: &Transaction<'_>, org: Uuid) -> Result<AccountingPosition> {
-    let balance = tx.query_opt(
-        "SELECT legacy_unattributed_amount, unresolved_unfunded_amount FROM organization_balance WHERE organization_id=$1",
-        &[&org],
-    ).await?.ok_or_else(|| ReconciliationError::Conflict("Organization accounting balance is missing".into()))?;
-    let rows = tx.query(
+    let balance = tx
+        .query_opt(
+            concat!(
+                "SELECT legacy_unattributed_amount, unresolved_unfunded_amount FROM ",
+                "organization_balance WHERE organization_id=$1",
+            ),
+            &[&org],
+        )
+        .await?
+        .ok_or_else(|| {
+            ReconciliationError::Conflict("Organization accounting balance is missing".into())
+        })?;
+    let rows = tx
+        .query(
         r#"WITH active AS (
             SELECT credit_type, spend_limit, currency FROM organization_limits_history
             WHERE organization_id=$1 AND effective_until IS NULL
@@ -208,13 +273,16 @@ async fn load_position(tx: &Transaction<'_>, org: Uuid) -> Result<AccountingPosi
                  l.currency, COALESCE(c.amount,0)::BIGINT AS consumed
           FROM active l FULL JOIN consumed c USING (credit_type)"#,
         &[&org],
-    ).await?;
+    )
+        .await?;
+
     let mut position = AccountingPosition {
         credits: BTreeMap::new(),
         legacy_unattributed_amount: balance.get("legacy_unattributed_amount"),
         unresolved_unfunded_amount: balance.get("unresolved_unfunded_amount"),
         aggregate_available: 0,
     };
+
     for row in rows {
         let active: bool = row.get("active");
         if let Some(currency) = row.get::<_, Option<String>>("currency") {
@@ -243,6 +311,7 @@ async fn load_position(tx: &Transaction<'_>, org: Uuid) -> Result<AccountingPosi
             },
         );
     }
+
     position.aggregate_available = aggregate_available(&position);
     Ok(position)
 }
@@ -266,6 +335,7 @@ fn preview(
     if total > before.legacy_unattributed_amount {
         return Err(conflict("Amount exceeds remaining legacy unattributed consumption").into());
     }
+
     let mut after = before.clone();
     for (kind, amount) in amounts {
         let credit = after.credits.get_mut(kind).ok_or_else(|| {
@@ -279,7 +349,10 @@ fn preview(
         // Reclassification must remove the same capacity from the type as it
         // releases from the legacy deduction. Reject capped/disabled positions.
         if *amount > credit.available {
-            return Err(conflict("Amount exceeds the selected type's remaining ceiling; review its opening position first").into());
+            return Err(conflict(
+                "Amount exceeds the selected type's remaining ceiling; review its opening position first",
+            )
+            .into());
         }
         credit.consumed = credit
             .consumed
@@ -287,6 +360,7 @@ fn preview(
             .ok_or_else(|| conflict("Consumption overflow"))?;
         credit.available -= amount;
     }
+
     after.legacy_unattributed_amount -= total;
     after.aggregate_available = aggregate_available(&after);
     if after.aggregate_available != before.aggregate_available {
@@ -302,12 +376,26 @@ mod tests {
     #[test]
     fn original_snapshot_shape_remains_readable() {
         let original = serde_json::json!({
-            "reconciliation_id": null, "dry_run": true,
-            "before": {"credits": {"payment": {"ceiling":100,"consumed":0,"available":100}},
-                "legacy_unattributed_amount":80,"unresolved_unfunded_amount":0,"aggregate_available":20},
-            "after": {"credits": {"payment": {"ceiling":100,"consumed":80,"available":20}},
-                "legacy_unattributed_amount":0,"unresolved_unfunded_amount":0,"aggregate_available":20}
+            "reconciliation_id": null,
+            "dry_run": true,
+            "before": {
+                "credits": {
+                    "payment": {"ceiling": 100, "consumed": 0, "available": 100},
+                },
+                "legacy_unattributed_amount": 80,
+                "unresolved_unfunded_amount": 0,
+                "aggregate_available": 20,
+            },
+            "after": {
+                "credits": {
+                    "payment": {"ceiling": 100, "consumed": 80, "available": 20},
+                },
+                "legacy_unattributed_amount": 0,
+                "unresolved_unfunded_amount": 0,
+                "aggregate_available": 20,
+            },
         });
+
         let result: ReconciliationResult = serde_json::from_value(original).unwrap();
         assert_eq!(result.schema_version, 1);
         assert!(result.before.credits["payment"].active);

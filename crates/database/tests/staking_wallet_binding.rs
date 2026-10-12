@@ -562,3 +562,43 @@ async fn binding_preserves_existing_personal_organization_and_workspace() -> any
     );
     Ok(())
 }
+
+#[tokio::test]
+async fn bound_wallet_cannot_be_removed_or_leave_but_other_members_can() -> anyhow::Result<()> {
+    use services::common::RepositoryError;
+    use services::organization::ports::OrganizationRepository;
+    let (pool, org, actor) = fixture().await?;
+    let binding = PostgresStakingBindingRepository::new(pool.clone());
+    let c = challenge(org, actor, account());
+    binding.prepare(&c).await?;
+    let wallet = binding
+        .confirm(&c, request(&c), Uuid::new_v4(), "key", "digest")
+        .await?;
+    let members = database::repositories::PgOrganizationRepository::new(pool.clone());
+    for requester in [actor, wallet.user_id] {
+        let result =
+            OrganizationRepository::remove_member(&members, org, wallet.user_id, requester).await;
+        assert!(
+            matches!(result, Err(RepositoryError::ValidationFailed(message)) if message.contains("permanently bound"))
+        );
+    }
+    assert!(
+        OrganizationRepository::get_member(&members, org, wallet.user_id)
+            .await?
+            .is_some()
+    );
+    let client = pool.get().await?;
+    let other = Uuid::new_v4();
+    client.execute("INSERT INTO users(id,email,username,auth_provider,provider_user_id) VALUES($1,$2,'other-member','google',$2)", &[&other, &format!("{other}@example.test")]).await?;
+    client
+        .execute(
+            "INSERT INTO organization_members(organization_id,user_id,role) VALUES($1,$2,'member')",
+            &[&org, &other],
+        )
+        .await?;
+    assert!(matches!(
+        OrganizationRepository::remove_member(&members, org, other, actor).await?,
+        services::organization::ports::RemoveOrganizationMemberResult::Removed
+    ));
+    Ok(())
+}

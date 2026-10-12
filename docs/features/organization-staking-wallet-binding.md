@@ -31,3 +31,5 @@ For wallet-action preflight the frontend can reuse the existing sync endpoint, w
 - `cargo test -p services --lib staking_farm`: tampered/expired/mis-scoped proof, Admin terms, full-access vs function-call key verification, source-wallet AML, and farm regressions.
 - `cargo test -p api --lib routes::staking_farm`: discriminated API request validation.
 - `PGHOST=... PGPORT=... PGUSER=... PGDATABASE=... cargo test -p database --test staking_wallet_binding`: migrated PostgreSQL, atomic membership/source creation, existing roles, disabled identities, concurrent/conflicting binding, postpay and role-revocation races, retry without access restoration.
+
+The bound NEAR provider identity has permanent organization membership: member removal and self-leave are rejected under the organization lock, including after unstaking. Other members can still be removed normally. Role changes do not unbind the staking source.

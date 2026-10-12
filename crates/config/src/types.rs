@@ -477,6 +477,8 @@ impl UsageReportingConfig {
 #[derive(Debug, Clone)]
 pub struct StakingFarmConfig {
     pub enabled: bool,
+    /// Enable explicit selected-organization binding; disables implicit source creation.
+    pub selected_org_binding_enabled: bool,
     pub network_id: String,
     pub contract_id: String,
     pub farm_product_id: String,
@@ -489,6 +491,7 @@ impl Default for StakingFarmConfig {
     fn default() -> Self {
         Self {
             enabled: false,
+            selected_org_binding_enabled: false,
             network_id: NEAR_DEFAULT_NETWORK_ID.to_string(),
             contract_id: String::new(),
             farm_product_id: String::new(),
@@ -503,6 +506,10 @@ impl StakingFarmConfig {
     pub fn from_env(near: &NearConfig) -> Self {
         let mut config = Self {
             enabled: env::var("STAKING_FARM_ENABLED")
+                .ok()
+                .and_then(|value| value.parse::<bool>().ok())
+                .unwrap_or(false),
+            selected_org_binding_enabled: env::var("STAKING_FARM_SELECTED_ORG_BINDING_ENABLED")
                 .ok()
                 .and_then(|value| value.parse::<bool>().ok())
                 .unwrap_or(false),
@@ -1898,6 +1905,7 @@ mod tests {
     fn clear_staking_farm_env() {
         for key in [
             "STAKING_FARM_ENABLED",
+            "STAKING_FARM_SELECTED_ORG_BINDING_ENABLED",
             "NEAR_STAKING_CONTRACT_ID",
             "STAKING_FARM_PRODUCT_ID",
             "STAKING_FARM_PRICE_ID",

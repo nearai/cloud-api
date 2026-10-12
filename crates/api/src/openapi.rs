@@ -134,6 +134,7 @@ use utoipa::{Modify, OpenApi};
         // Staking farm endpoints
         crate::routes::staking_farm::get_staking_farm_config,
         crate::routes::staking_farm::get_organization_staking_farm,
+        crate::routes::staking_farm::bind_organization_staking_farm,
         crate::routes::staking_farm::sync_organization_staking_farm,
         // Customer reporting endpoints
         crate::routes::reporting_tokens::create_reporting_token,
@@ -349,6 +350,9 @@ use utoipa::{Modify, OpenApi};
             // Staking farm models
             crate::routes::staking_farm::StakingFarmConfigResponse,
             crate::routes::staking_farm::StakingFarmStateResponse,
+            crate::routes::staking_farm::OrganizationStakingState,
+            crate::routes::staking_farm::BindRequest,
+            crate::routes::staking_farm::BindResponse,
             // Customer reporting models
             services::reporting_tokens::ReportingTokenScope,
             crate::routes::reporting_tokens::CreateReportingTokenRequest,

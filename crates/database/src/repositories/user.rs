@@ -31,14 +31,15 @@ impl UserRepository {
 
         let row = retry_db!("create_new_user", {
             let now = Utc::now();
-            let client = self
+            let mut client = self
                 .pool
                 .get()
                 .await
                 .context("Failed to get database connection")
                 .map_err(RepositoryError::PoolError)?;
 
-            client
+            let tx = client.transaction().await.map_err(map_db_error)?;
+            let row = tx
                 .query_one(
                     r#"
             INSERT INTO users (
@@ -62,7 +63,14 @@ impl UserRepository {
                     ],
                 )
                 .await
-                .map_err(map_db_error)
+                .map_err(map_db_error)?;
+            if auth_provider == "near" {
+                tx.query_one("SELECT ensure_near_personal_organization($1)", &[&id])
+                    .await
+                    .map_err(map_db_error)?;
+            }
+            tx.commit().await.map_err(map_db_error)?;
+            Ok(row)
         })?;
 
         debug!("Created/updated user: {}", id);

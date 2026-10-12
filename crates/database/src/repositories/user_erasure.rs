@@ -379,7 +379,7 @@ impl UserErasureRepository for PostgresUserErasureRepository {
 
             let Some(user) = transaction
                 .query_opt(
-                    "SELECT email, is_active, auth_provider FROM users WHERE id = $1 FOR UPDATE",
+                    "SELECT email, contact_email, is_active, auth_provider FROM users WHERE id = $1 FOR UPDATE",
                     &[&user_id],
                 )
                 .await
@@ -398,6 +398,7 @@ impl UserErasureRepository for PostgresUserErasureRepository {
                 return Ok(ExecuteOutcome::AlreadyErased);
             }
             let user_email: String = user.get("email");
+            let contact_email: Option<String> = user.get("contact_email");
             if user_email.to_lowercase() != confirm {
                 transaction.rollback().await.map_err(map_db_error)?;
                 return Ok(ExecuteOutcome::ConfirmEmailMismatch);
@@ -464,6 +465,16 @@ impl UserErasureRepository for PostgresUserErasureRepository {
                 .execute(
                     "DELETE FROM organization_invitations WHERE organization_id = ANY($1) OR lower(email) = lower($2)",
                     &[&erased, &user_email],
+                )
+                .await
+                .map_err(map_db_error)?;
+            // Contact email verifications U asked for, and any pending for U's
+            // addresses (as with invitations above).
+            transaction
+                .execute(
+                    "DELETE FROM user_contact_email_verifications \
+                     WHERE user_id = $1 OR lower(email) = lower($2) OR lower(email) = lower($3)",
+                    &[&user_id, &user_email, &contact_email],
                 )
                 .await
                 .map_err(map_db_error)?;
@@ -626,6 +637,7 @@ impl UserErasureRepository for PostgresUserErasureRepository {
                 .execute(
                     "UPDATE users SET email = $2, username = 'erased', display_name = NULL, avatar_url = NULL, \
                      auth_provider = $3, provider_user_id = $1::text, last_login_at = NULL, \
+                     contact_email = NULL, contact_email_verified_at = NULL, email_opt_in_at = NULL, \
                      is_active = false, tokens_revoked_at = NOW(), updated_at = NOW() WHERE id = $1",
                     &[&user_id, &tombstone, &services::lifecycle::ERASED_AUTH_PROVIDER],
                 )

@@ -23,6 +23,21 @@ use services::service_usage::ports::ServiceUnit;
 use std::sync::Arc;
 use uuid::Uuid;
 
+/// The address a notification recipient row can be emailed at, resolved from the
+/// user's `email`, `contact_email` and `contact_email_verified_at` columns. `None`
+/// when the user has no deliverable address (a wallet login with no verified
+/// contact email), in which case the row is not a recipient.
+fn recipient_email(row: &tokio_postgres::Row) -> Option<String> {
+    let login_email: String = row.get("email");
+    let contact_email: Option<String> = row.get("contact_email");
+    services::email::deliverable_email(
+        &login_email,
+        contact_email.as_deref(),
+        row.get("contact_email_verified_at"),
+    )
+    .map(str::to_owned)
+}
+
 fn parse_text_pricing(
     value: Option<serde_json::Value>,
 ) -> Result<Option<services::usage::TextPricingProfile>> {
@@ -798,6 +813,9 @@ impl AdminRepository for AdminCompositeRepository {
                 is_active: u.is_active,
                 auth_provider: u.auth_provider,
                 provider_user_id: u.provider_user_id,
+                contact_email: u.contact_email,
+                contact_email_verified_at: u.contact_email_verified_at,
+                email_opt_in_at: u.email_opt_in_at,
             })
             .collect();
 
@@ -831,6 +849,9 @@ impl AdminRepository for AdminCompositeRepository {
                     is_active: u.is_active,
                     auth_provider: u.auth_provider,
                     provider_user_id: u.provider_user_id,
+                    contact_email: u.contact_email,
+                    contact_email_verified_at: u.contact_email_verified_at,
+                    email_opt_in_at: u.email_opt_in_at,
                 };
                 (user_info, org_data)
             })
@@ -932,6 +953,8 @@ impl AdminRepository for AdminCompositeRepository {
                 SELECT DISTINCT
                     u.id AS user_id,
                     u.email AS email,
+                    u.contact_email AS contact_email,
+                    u.contact_email_verified_at AS contact_email_verified_at,
                     lower(u.email) AS email_sort,
                     o.id AS organization_id,
                     o.name AS organization_name
@@ -962,11 +985,13 @@ impl AdminRepository for AdminCompositeRepository {
 
         Ok(rows
             .into_iter()
-            .map(|row| ModelDeprecationRecipient {
-                user_id: row.get("user_id"),
-                email: row.get("email"),
-                organization_id: row.get("organization_id"),
-                organization_name: row.get("organization_name"),
+            .filter_map(|row| {
+                Some(ModelDeprecationRecipient {
+                    user_id: row.get("user_id"),
+                    email: recipient_email(&row)?,
+                    organization_id: row.get("organization_id"),
+                    organization_name: row.get("organization_name"),
+                })
             })
             .collect())
     }
@@ -1122,6 +1147,8 @@ impl AdminRepository for AdminCompositeRepository {
                 SELECT DISTINCT
                     u.id AS user_id,
                     u.email AS email,
+                    u.contact_email AS contact_email,
+                    u.contact_email_verified_at AS contact_email_verified_at,
                     o.id AS organization_id,
                     o.name AS organization_name,
                     names.canonical_name AS model_name
@@ -1152,12 +1179,14 @@ impl AdminRepository for AdminCompositeRepository {
 
         Ok(rows
             .into_iter()
-            .map(|row| PricingChangeRecipientRow {
-                user_id: row.get("user_id"),
-                email: row.get("email"),
-                organization_id: row.get("organization_id"),
-                organization_name: row.get("organization_name"),
-                model_name: row.get("model_name"),
+            .filter_map(|row| {
+                Some(PricingChangeRecipientRow {
+                    user_id: row.get("user_id"),
+                    email: recipient_email(&row)?,
+                    organization_id: row.get("organization_id"),
+                    organization_name: row.get("organization_name"),
+                    model_name: row.get("model_name"),
+                })
             })
             .collect())
     }
@@ -1782,7 +1811,10 @@ impl AdminRepository for AdminCompositeRepository {
                     u.last_login_at,
                     u.is_active,
                     u.auth_provider,
-                    u.provider_user_id
+                    u.provider_user_id,
+                    u.contact_email,
+                    u.contact_email_verified_at,
+                    u.email_opt_in_at
                 FROM organization_members m
                 JOIN users u ON u.id = m.user_id
                 JOIN organizations o ON o.id = m.organization_id AND o.is_active = true
@@ -1813,6 +1845,9 @@ impl AdminRepository for AdminCompositeRepository {
                     is_active: row.get("is_active"),
                     auth_provider: row.get("auth_provider"),
                     provider_user_id: row.get("provider_user_id"),
+                    contact_email: row.get("contact_email"),
+                    contact_email_verified_at: row.get("contact_email_verified_at"),
+                    email_opt_in_at: row.get("email_opt_in_at"),
                 },
             })
             .collect();

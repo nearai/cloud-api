@@ -1408,6 +1408,9 @@ impl PlacementEndpoint {
 #[derive(Debug, Clone, Default)]
 pub struct InvitationEmailConfig {
     pub enabled: bool,
+    /// Lets NEAR wallet users add and verify a contact email. Switched on its
+    /// own, but uses the same sender address, Resend key and frontend URL.
+    pub contact_email_verification_enabled: bool,
     pub from_email: Option<String>,
     pub reply_to: Option<String>,
     pub resend_api_key: Option<String>,
@@ -1420,38 +1423,48 @@ impl InvitationEmailConfig {
             .ok()
             .and_then(|v| v.parse::<bool>().ok())
             .unwrap_or(false);
+        let contact_email_verification_enabled = env::var("CONTACT_EMAIL_VERIFICATION_ENABLED")
+            .ok()
+            .and_then(|v| v.parse::<bool>().ok())
+            .unwrap_or(false);
 
         let from_email = non_empty_env("INVITATION_EMAIL_FROM");
         let reply_to = non_empty_env("INVITATION_EMAIL_REPLY_TO");
-        let resend_api_key = if enabled {
+        let resend_api_key = if enabled || contact_email_verification_enabled {
             read_optional_secret_env("RESEND_API_KEY_FILE", "RESEND_API_KEY")?
         } else {
             None
         };
         let frontend_base_url = non_empty_env("CLOUD_UI_BASE_URL");
 
-        if enabled {
+        for (switched_on, switch) in [
+            (enabled, "INVITATION_EMAIL_ENABLED"),
+            (
+                contact_email_verification_enabled,
+                "CONTACT_EMAIL_VERIFICATION_ENABLED",
+            ),
+        ] {
+            if !switched_on {
+                continue;
+            }
             if from_email.is_none() {
-                return Err(
-                    "INVITATION_EMAIL_FROM must be set when INVITATION_EMAIL_ENABLED=true"
-                        .to_string(),
-                );
+                return Err(format!(
+                    "INVITATION_EMAIL_FROM must be set when {switch}=true"
+                ));
             }
             if resend_api_key.is_none() {
-                return Err(
-                    "RESEND_API_KEY or RESEND_API_KEY_FILE must be set when INVITATION_EMAIL_ENABLED=true"
-                        .to_string(),
-                );
+                return Err(format!(
+                    "RESEND_API_KEY or RESEND_API_KEY_FILE must be set when {switch}=true"
+                ));
             }
             if frontend_base_url.is_none() {
-                return Err(
-                    "CLOUD_UI_BASE_URL must be set when INVITATION_EMAIL_ENABLED=true".to_string(),
-                );
+                return Err(format!("CLOUD_UI_BASE_URL must be set when {switch}=true"));
             }
         }
 
         Ok(Self {
             enabled,
+            contact_email_verification_enabled,
             from_email,
             reply_to,
             resend_api_key,
@@ -1463,6 +1476,14 @@ impl InvitationEmailConfig {
         self.frontend_base_url
             .as_ref()
             .map(|base_url| format!("{}/dashboard/invitations", base_url.trim_end_matches('/')))
+    }
+
+    /// Frontend page that confirms a contact email. The verification token is
+    /// appended as the `token` query parameter.
+    pub fn contact_email_verification_url(&self) -> Option<String> {
+        self.frontend_base_url
+            .as_ref()
+            .map(|base_url| format!("{}/verify-contact-email", base_url.trim_end_matches('/')))
     }
 }
 
@@ -2623,7 +2644,86 @@ mod tests {
         std::fs::remove_file(path).unwrap();
     }
 
+    #[test]
+    #[serial]
+    fn test_contact_email_verification_defaults_disabled() {
+        clear_invitation_email_env();
+        std::env::set_var("RESEND_API_KEY_FILE", "/missing/resend-api-key");
+
+        let config = InvitationEmailConfig::from_env().unwrap();
+
+        assert!(!config.contact_email_verification_enabled);
+        assert!(config.resend_api_key.is_none());
+        assert!(config.contact_email_verification_url().is_none());
+        clear_invitation_email_env();
+    }
+
+    #[test]
+    #[serial]
+    fn test_contact_email_verification_requires_sender_settings_when_enabled() {
+        for (missing, set) in [
+            (
+                "INVITATION_EMAIL_FROM",
+                vec![
+                    ("RESEND_API_KEY", "re_test"),
+                    ("CLOUD_UI_BASE_URL", "https://cloud.example.com"),
+                ],
+            ),
+            (
+                "RESEND_API_KEY",
+                vec![
+                    ("INVITATION_EMAIL_FROM", "no-reply@example.com"),
+                    ("CLOUD_UI_BASE_URL", "https://cloud.example.com"),
+                ],
+            ),
+            (
+                "CLOUD_UI_BASE_URL",
+                vec![
+                    ("INVITATION_EMAIL_FROM", "no-reply@example.com"),
+                    ("RESEND_API_KEY", "re_test"),
+                ],
+            ),
+        ] {
+            clear_invitation_email_env();
+            std::env::set_var("CONTACT_EMAIL_VERIFICATION_ENABLED", "true");
+            for (key, value) in set {
+                std::env::set_var(key, value);
+            }
+
+            let error = InvitationEmailConfig::from_env().unwrap_err();
+
+            assert!(error.contains(missing), "{error}");
+            assert!(
+                error.contains("CONTACT_EMAIL_VERIFICATION_ENABLED"),
+                "{error}"
+            );
+        }
+        clear_invitation_email_env();
+    }
+
+    #[test]
+    #[serial]
+    fn test_contact_email_verification_is_independent_of_invitation_emails() {
+        clear_invitation_email_env();
+        std::env::set_var("CONTACT_EMAIL_VERIFICATION_ENABLED", "true");
+        std::env::set_var("INVITATION_EMAIL_FROM", "no-reply@example.com");
+        std::env::set_var("RESEND_API_KEY", "re_test");
+        std::env::set_var("CLOUD_UI_BASE_URL", "https://cloud.example.com/");
+
+        let config = InvitationEmailConfig::from_env().unwrap();
+
+        assert!(config.contact_email_verification_enabled);
+        assert!(!config.enabled);
+        assert_eq!(config.resend_api_key.as_deref(), Some("re_test"));
+        assert_eq!(
+            config.contact_email_verification_url().as_deref(),
+            Some("https://cloud.example.com/verify-contact-email")
+        );
+        clear_invitation_email_env();
+    }
+
     fn clear_invitation_email_env() {
+        std::env::remove_var("CONTACT_EMAIL_VERIFICATION_ENABLED");
         std::env::remove_var("INVITATION_EMAIL_ENABLED");
         std::env::remove_var("INVITATION_EMAIL_FROM");
         std::env::remove_var("INVITATION_EMAIL_REPLY_TO");

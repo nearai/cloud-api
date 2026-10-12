@@ -2547,6 +2547,13 @@ mod tests {
         ) -> Result<EmailDeliveryOutcome, EmailError> {
             self.outcome.clone()
         }
+
+        async fn send_contact_email_verification(
+            &self,
+            _email: &crate::email::ContactEmailVerificationEmail,
+        ) -> Result<EmailDeliveryOutcome, EmailError> {
+            self.outcome.clone()
+        }
     }
 
     fn make_service(
@@ -2613,6 +2620,9 @@ mod tests {
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
             tokens_revoked_at: None,
+            contact_email: None,
+            contact_email_verified_at: None,
+            email_opt_in_at: None,
         };
         let invitation_repo = Arc::new(StubInvitationRepo {
             records: Mutex::new(Vec::new()),
@@ -2695,6 +2705,9 @@ mod tests {
                 created_at: now,
                 updated_at: now,
                 tokens_revoked_at: None,
+                contact_email: None,
+                contact_email_verified_at: None,
+                email_opt_in_at: None,
             },
             get_by_id_calls: Mutex::new(0),
         });
@@ -2907,6 +2920,9 @@ mod tests {
                 created_at: chrono::Utc::now(),
                 updated_at: chrono::Utc::now(),
                 tokens_revoked_at: None,
+                contact_email: None,
+                contact_email_verified_at: None,
+                email_opt_in_at: None,
             },
             get_by_id_calls: Mutex::new(0),
         });

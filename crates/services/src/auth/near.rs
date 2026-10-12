@@ -220,7 +220,7 @@ impl NearAuthService {
         let oauth_info = OAuthUserInfo {
             provider: "near".to_string(),
             provider_user_id: account_id.clone(),
-            email: format!("{account_id}@near"),
+            email: crate::email::near_placeholder_email(&account_id),
             username: account_id.clone(),
             display_name: Some(account_id.clone()),
             avatar_url: None,

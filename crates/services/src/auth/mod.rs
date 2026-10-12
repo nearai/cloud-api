@@ -678,6 +678,9 @@ mod tests {
             created_at: Utc::now(),
             updated_at: Utc::now(),
             tokens_revoked_at: None,
+            contact_email: None,
+            contact_email_verified_at: None,
+            email_opt_in_at: None,
         }
     }
 

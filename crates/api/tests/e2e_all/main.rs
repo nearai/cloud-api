@@ -47,6 +47,7 @@ mod check_api_key;
 mod chutes_catalog;
 mod client_disconnect;
 mod concurrent_limit;
+mod contact_email;
 mod conversations;
 mod credit_types;
 mod cross_workspace;

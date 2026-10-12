@@ -467,6 +467,41 @@ where
     (server, database)
 }
 
+/// Like `setup_test_server_with_database`, but lets a test replace domain
+/// services before the router is built, for example to inject an email sender
+/// that records messages instead of sending them.
+pub async fn setup_test_server_with_domain_services<F>(
+    mutate: F,
+) -> (axum_test::TestServer, Arc<Database>)
+where
+    F: FnOnce(&mut api::DomainServices, &Arc<Database>),
+{
+    let infra = setup_test_infrastructure().await;
+    assert_mock_user_in_db(&infra.database).await;
+
+    let auth_components = init_auth_services(infra.database.clone(), &infra.config);
+    let (inference_provider_pool, _mock_provider) =
+        api::init_inference_providers_with_mocks(&infra.config).await;
+    let mut domain_services = api::init_domain_services_with_pool(
+        infra.database.clone(),
+        &infra.config,
+        auth_components.organization_service.clone(),
+        inference_provider_pool,
+        Arc::new(services::metrics::MockMetricsService),
+    )
+    .await;
+    mutate(&mut domain_services, &infra.database);
+
+    let app = build_app_with_config_and_options(
+        infra.database.clone(),
+        auth_components,
+        domain_services,
+        Arc::new(infra.config),
+        E2E_APP_BUILD_OPTIONS,
+    );
+    (axum_test::TestServer::new(app), infra.database)
+}
+
 pub async fn setup_test_server_with_database() -> (axum_test::TestServer, Arc<Database>) {
     let (server, _, _, database) = setup_test_server_with_pool().await;
     (server, database)

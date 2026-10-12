@@ -2571,6 +2571,9 @@ pub async fn list_users(
                     ),
                     auth_provider: u.auth_provider,
                     provider_user_id: u.provider_user_id,
+                    contact_email: u.contact_email,
+                    contact_email_verified_at: u.contact_email_verified_at,
+                    email_opt_in_at: u.email_opt_in_at,
                     organizations,
                 }
             })
@@ -2623,6 +2626,9 @@ pub async fn list_users(
                 ),
                 auth_provider: u.auth_provider,
                 provider_user_id: u.provider_user_id,
+                contact_email: u.contact_email,
+                contact_email_verified_at: u.contact_email_verified_at,
+                email_opt_in_at: u.email_opt_in_at,
                 organizations: None,
             })
             .collect();
@@ -3167,6 +3173,9 @@ pub async fn list_organization_members(
                 ),
                 auth_provider: m.user.auth_provider,
                 provider_user_id: m.user.provider_user_id,
+                contact_email: m.user.contact_email,
+                contact_email_verified_at: m.user.contact_email_verified_at,
+                email_opt_in_at: m.user.email_opt_in_at,
                 organizations: None,
             },
         })

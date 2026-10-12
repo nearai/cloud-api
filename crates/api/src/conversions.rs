@@ -263,7 +263,19 @@ pub fn current_unix_timestamp() -> i64 {
 // User-related conversions helper functions
 
 /// Convert services User to API UserResponse (without organizations and workspaces)
-pub fn services_user_to_api_user(user: &services::auth::User) -> crate::models::UserResponse {
+///
+/// `needs_contact_email` comes from the contact email service, which knows
+/// whether the feature is switched on.
+pub fn services_user_to_api_user(
+    user: &services::auth::User,
+    needs_contact_email: bool,
+) -> crate::models::UserResponse {
+    // A contact email is only ever stored once verified; both columns are checked
+    // so a half-written row can never be reported as verified.
+    let contact_email = user
+        .contact_email
+        .clone()
+        .filter(|_| user.contact_email_verified_at.is_some());
     crate::models::UserResponse {
         id: user.id.0.to_string(),
         email: user.email.clone(),
@@ -275,6 +287,9 @@ pub fn services_user_to_api_user(user: &services::auth::User) -> crate::models::
         last_login_at: user.last_login,
         is_active: user.is_active,
         auth_provider: user.auth_provider.clone(),
+        contact_email_verified: contact_email.is_some(),
+        contact_email,
+        needs_contact_email,
         organizations: None,
         workspaces: None,
     }
@@ -283,22 +298,14 @@ pub fn services_user_to_api_user(user: &services::auth::User) -> crate::models::
 /// Convert services User to API UserResponse with organizations and workspaces
 pub fn services_user_to_api_user_with_relations(
     user: &services::auth::User,
+    needs_contact_email: bool,
     organizations: Vec<crate::models::UserOrganizationResponse>,
     workspaces: Vec<crate::models::UserWorkspaceResponse>,
 ) -> crate::models::UserResponse {
     crate::models::UserResponse {
-        id: user.id.0.to_string(),
-        email: user.email.clone(),
-        username: user.username.clone(),
-        display_name: user.display_name.clone(),
-        avatar_url: user.avatar_url.clone(),
-        created_at: user.created_at,
-        updated_at: user.updated_at,
-        last_login_at: user.last_login,
-        is_active: user.is_active,
-        auth_provider: user.auth_provider.clone(),
         organizations: Some(organizations),
         workspaces: Some(workspaces),
+        ..services_user_to_api_user(user, needs_contact_email)
     }
 }
 
@@ -763,6 +770,9 @@ pub fn db_user_to_admin_user(user: &database::User) -> AdminUserResponse {
         is_active: user.is_active,
         auth_provider: user.auth_provider.clone(),
         provider_user_id: user.provider_user_id.clone(),
+        contact_email: user.contact_email.clone(),
+        contact_email_verified_at: user.contact_email_verified_at,
+        email_opt_in_at: user.email_opt_in_at,
         lifecycle: admin_user_lifecycle(user.id, user.is_active, &user.auth_provider),
         organizations: None,
     }

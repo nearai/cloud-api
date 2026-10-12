@@ -243,6 +243,9 @@ pub struct UserInfo {
     pub is_active: bool,
     pub auth_provider: String,
     pub provider_user_id: String,
+    pub contact_email: Option<String>,
+    pub contact_email_verified_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub email_opt_in_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 /// Organization information for user listing (earliest organization with spend limit and usage)

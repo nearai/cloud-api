@@ -7,6 +7,45 @@ use std::{sync::Arc, time::Duration};
 const RESEND_EMAILS_URL: &str = "https://api.resend.com/emails";
 const RESEND_SEND_TIMEOUT: Duration = Duration::from_secs(15);
 
+/// Domain of the placeholder login address stored for NEAR wallet users. A wallet
+/// has no email, and `users.email` is required and unique, so the login identity
+/// is `{account_id}@near`. Nothing can be delivered to it.
+const NEAR_PLACEHOLDER_EMAIL_DOMAIN: &str = "near";
+
+/// The placeholder login address stored for a NEAR wallet account.
+pub fn near_placeholder_email(account_id: &str) -> String {
+    format!("{account_id}@{NEAR_PLACEHOLDER_EMAIL_DOMAIN}")
+}
+
+/// The wallet account id behind a placeholder login address, or `None` when the
+/// address is not a placeholder.
+pub fn placeholder_account_id(email: &str) -> Option<&str> {
+    let (account_id, domain) = email.trim().rsplit_once('@')?;
+    (!account_id.is_empty() && domain.eq_ignore_ascii_case(NEAR_PLACEHOLDER_EMAIL_DOMAIN))
+        .then_some(account_id)
+}
+
+/// Whether `email` is a placeholder login address rather than a real mailbox.
+/// Every email flow must use this (through [`deliverable_email`]) instead of
+/// matching on the address itself.
+pub fn is_placeholder_email(email: &str) -> bool {
+    placeholder_account_id(email).is_some()
+}
+
+/// The address a user can be reached at: the verified contact email when there is
+/// one, else the login email unless it is a placeholder, else `None`. A contact
+/// email without a verification timestamp is never used.
+pub fn deliverable_email<'a>(
+    login_email: &'a str,
+    contact_email: Option<&'a str>,
+    contact_email_verified_at: Option<DateTime<Utc>>,
+) -> Option<&'a str> {
+    match (contact_email, contact_email_verified_at) {
+        (Some(contact_email), Some(_)) => Some(contact_email),
+        _ => (!is_placeholder_email(login_email)).then_some(login_email),
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct InvitationEmail {
     pub recipient_email: String,
@@ -54,6 +93,17 @@ pub struct PricingChangeEmail {
     pub models: Vec<PricingChangeEmailModel>,
 }
 
+/// Asks the recipient to confirm an address a wallet user wants to add as their
+/// contact email. `account_id` names the wallet account so the recipient knows
+/// which account they are confirming.
+#[derive(Debug, Clone)]
+pub struct ContactEmailVerificationEmail {
+    pub recipient_email: String,
+    pub account_id: String,
+    pub verification_url: String,
+    pub expires_at: DateTime<Utc>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EmailDeliveryOutcome {
     Sent { message_id: Option<String> },
@@ -94,6 +144,11 @@ pub trait EmailSender: Send + Sync {
         &self,
         email: &PricingChangeEmail,
     ) -> Result<EmailDeliveryOutcome, EmailError>;
+
+    async fn send_contact_email_verification(
+        &self,
+        email: &ContactEmailVerificationEmail,
+    ) -> Result<EmailDeliveryOutcome, EmailError>;
 }
 
 pub struct NoopEmailSender;
@@ -117,6 +172,13 @@ impl EmailSender for NoopEmailSender {
     async fn send_pricing_change(
         &self,
         _email: &PricingChangeEmail,
+    ) -> Result<EmailDeliveryOutcome, EmailError> {
+        Ok(EmailDeliveryOutcome::Skipped)
+    }
+
+    async fn send_contact_email_verification(
+        &self,
+        _email: &ContactEmailVerificationEmail,
     ) -> Result<EmailDeliveryOutcome, EmailError> {
         Ok(EmailDeliveryOutcome::Skipped)
     }
@@ -300,12 +362,45 @@ impl EmailSender for ResendEmailSender {
             message_id: Some(response.id),
         })
     }
+
+    async fn send_contact_email_verification(
+        &self,
+        email: &ContactEmailVerificationEmail,
+    ) -> Result<EmailDeliveryOutcome, EmailError> {
+        let rendered = render_contact_email_verification_email(email);
+        let request = ResendSendEmailRequest {
+            from: self.from_email.clone(),
+            to: vec![email.recipient_email.clone()],
+            subject: rendered.subject,
+            html: rendered.html_body,
+            text: rendered.text_body,
+            reply_to: self.reply_to.clone(),
+        };
+        let response = self.transport.send_email(&self.api_key, request).await?;
+
+        Ok(EmailDeliveryOutcome::Sent {
+            message_id: Some(response.id),
+        })
+    }
 }
 
 pub fn sender_from_config(
     config: &InvitationEmailConfig,
 ) -> Result<Arc<dyn EmailSender>, EmailError> {
     if config.enabled {
+        Ok(Arc::new(ResendEmailSender::new(config)?))
+    } else {
+        Ok(Arc::new(NoopEmailSender))
+    }
+}
+
+/// Sender for contact email verification. It has its own switch, so it can be on
+/// while invitation emails are off (and the other way round); the sender address
+/// and Resend key are shared.
+pub fn contact_email_sender_from_config(
+    config: &InvitationEmailConfig,
+) -> Result<Arc<dyn EmailSender>, EmailError> {
+    if config.contact_email_verification_enabled {
         Ok(Arc::new(ResendEmailSender::new(config)?))
     } else {
         Ok(Arc::new(NoopEmailSender))
@@ -417,6 +512,46 @@ pub fn render_model_deprecation_email(email: &ModelDeprecationEmail) -> Rendered
         "NEAR AI Cloud model deprecation notice\n\nThe model {model_label} ({model_id}) is scheduled for deprecation on {deprecation_date}.\n\nWe recommend migrating affected workloads to {successor} before that date.\n\nNo traffic has been rerouted automatically. Existing calls continue to use the current model until it is removed in a later step.\n",
         model_id = email.model_id,
         successor = email.successor_model_id,
+    );
+
+    RenderedEmail {
+        subject,
+        html_body,
+        text_body,
+    }
+}
+
+pub fn render_contact_email_verification_email(
+    email: &ContactEmailVerificationEmail,
+) -> RenderedEmail {
+    let account_id = email.account_id.trim();
+    let expires_at = email.expires_at.format("%B %-d, %Y at %H:%M UTC");
+    let subject = "Confirm your email address for NEAR AI Cloud".to_string();
+
+    let html_body = format!(
+        r#"<!doctype html>
+<html lang="en">
+  <body style="font-family:Arial,sans-serif;line-height:1.5;color:#111827;">
+    <h1 style="font-size:20px;margin-bottom:16px;">Confirm your email address</h1>
+    <p>Someone asked to add this email address to the NEAR AI Cloud account <strong>{account_id}</strong>.</p>
+    <p>If that was you, confirm the address. We will then use it to contact you about that account, including billing, model changes and product updates.</p>
+    <p style="margin:24px 0;">
+      <a href="{url}" style="background:#111827;color:#ffffff;padding:12px 18px;text-decoration:none;border-radius:6px;display:inline-block;">Confirm email address</a>
+    </p>
+    <p>If the button does not work, open this link:</p>
+    <p><a href="{url}">{url}</a></p>
+    <p>The link can be used once and expires on {expires_at}.</p>
+    <p>If you did not ask for this, ignore this email. Nothing changes unless the link is opened.</p>
+  </body>
+</html>"#,
+        account_id = escape_html(account_id),
+        expires_at = escape_html(&expires_at.to_string()),
+        url = escape_html(&email.verification_url),
+    );
+
+    let text_body = format!(
+        "Confirm your email address\n\nSomeone asked to add this email address to the NEAR AI Cloud account {account_id}.\n\nIf that was you, confirm the address. We will then use it to contact you about that account, including billing, model changes and product updates.\n\nConfirm email address: {url}\n\nThe link can be used once and expires on {expires_at}.\n\nIf you did not ask for this, ignore this email. Nothing changes unless the link is opened.\n",
+        url = email.verification_url,
     );
 
     RenderedEmail {
@@ -809,6 +944,178 @@ mod tests {
     }
 
     #[test]
+    fn placeholder_detection_matches_only_wallet_login_addresses() {
+        assert!(is_placeholder_email("alice.near@near"));
+        assert!(is_placeholder_email(&near_placeholder_email("alice.near")));
+        assert!(is_placeholder_email(&near_placeholder_email(
+            "98793cd91a3f870fb126f66285808c7e094afcfc4eda8a970f6648cdf0dbd6de"
+        )));
+        assert!(is_placeholder_email("alice.testnet@NEAR"));
+        assert!(is_placeholder_email(" alice.near@near "));
+        assert_eq!(
+            placeholder_account_id("alice.near@near"),
+            Some("alice.near")
+        );
+
+        // Real mailboxes, including ones that merely mention "near".
+        assert!(!is_placeholder_email("alice@example.com"));
+        assert!(!is_placeholder_email("alice@near.org"));
+        assert!(!is_placeholder_email("alice@near.ai"));
+        assert!(!is_placeholder_email("near@example.com"));
+        assert!(!is_placeholder_email("alice@mail.near"));
+        // Not addresses at all.
+        assert!(!is_placeholder_email("@near"));
+        assert!(!is_placeholder_email("alice.near"));
+        assert!(!is_placeholder_email(""));
+        assert_eq!(placeholder_account_id("alice@example.com"), None);
+    }
+
+    #[test]
+    fn deliverable_email_prefers_verified_contact_email() {
+        let verified_at = Some(Utc.with_ymd_and_hms(2026, 5, 15, 12, 0, 0).unwrap());
+
+        // Wallet user with a verified contact email.
+        assert_eq!(
+            deliverable_email("alice.near@near", Some("alice@example.com"), verified_at),
+            Some("alice@example.com")
+        );
+        // Wallet user with nothing verified: no deliverable address.
+        assert_eq!(deliverable_email("alice.near@near", None, None), None);
+        // A contact email with no verification timestamp is ignored.
+        assert_eq!(
+            deliverable_email("alice.near@near", Some("alice@example.com"), None),
+            None
+        );
+        // A verification timestamp with no address changes nothing.
+        assert_eq!(
+            deliverable_email("alice.near@near", None, verified_at),
+            None
+        );
+        // A real login email is deliverable as it is.
+        assert_eq!(
+            deliverable_email("bob@example.com", None, None),
+            Some("bob@example.com")
+        );
+        // A verified contact email wins over a real login email.
+        assert_eq!(
+            deliverable_email("bob@example.com", Some("bob@work.example"), verified_at),
+            Some("bob@work.example")
+        );
+        assert_eq!(
+            deliverable_email("bob@example.com", Some("bob@work.example"), None),
+            Some("bob@example.com")
+        );
+    }
+
+    fn example_contact_email_verification_email() -> ContactEmailVerificationEmail {
+        ContactEmailVerificationEmail {
+            recipient_email: "alice@example.com".to_string(),
+            account_id: "alice.near".to_string(),
+            verification_url: "https://cloud.example.com/verify-contact-email?token=abc_DEF-123"
+                .to_string(),
+            expires_at: Utc.with_ymd_and_hms(2026, 5, 15, 12, 0, 0).unwrap(),
+        }
+    }
+
+    #[test]
+    fn render_contact_email_verification_email_names_the_account_and_links_to_the_frontend() {
+        let rendered =
+            render_contact_email_verification_email(&example_contact_email_verification_email());
+
+        assert!(rendered.subject.contains("Confirm your email address"));
+        for body in [&rendered.html_body, &rendered.text_body] {
+            assert!(body.contains("alice.near"));
+            assert!(
+                body.contains("https://cloud.example.com/verify-contact-email?token=abc_DEF-123")
+            );
+            assert!(body.contains("May 15, 2026 at 12:00 UTC"));
+            assert!(body.contains("used once"));
+        }
+    }
+
+    #[test]
+    fn render_contact_email_verification_email_escapes_html() {
+        let email = ContactEmailVerificationEmail {
+            account_id: "<script>alert('x')</script>&".to_string(),
+            verification_url: "https://cloud.example.com/verify-contact-email?token=a\"><b>"
+                .to_string(),
+            ..example_contact_email_verification_email()
+        };
+
+        let rendered = render_contact_email_verification_email(&email);
+
+        assert!(!rendered.html_body.contains("<script>"));
+        assert!(!rendered.html_body.contains("\"><b>"));
+        assert!(rendered
+            .html_body
+            .contains("&lt;script&gt;alert(&#39;x&#39;)&lt;/script&gt;&amp;"));
+        assert!(rendered.html_body.contains("token=a&quot;&gt;&lt;b&gt;"));
+    }
+
+    #[tokio::test]
+    async fn resend_sender_builds_contact_email_verification_payload() {
+        let transport = Arc::new(StubResendTransport {
+            outcome: Ok(ResendSendEmailResponse {
+                id: "verification-email-id".to_string(),
+            }),
+            requests: Mutex::new(Vec::new()),
+        });
+        let sender = ResendEmailSender::new_with_transport(
+            "NEAR AI Cloud <no-reply@near.ai>".to_string(),
+            Some("support@near.ai".to_string()),
+            "re_test".to_string(),
+            transport.clone(),
+        );
+
+        let result = sender
+            .send_contact_email_verification(&example_contact_email_verification_email())
+            .await
+            .unwrap();
+
+        assert_eq!(
+            result,
+            EmailDeliveryOutcome::Sent {
+                message_id: Some("verification-email-id".to_string())
+            }
+        );
+        let requests = transport.requests.lock().unwrap();
+        assert_eq!(requests.len(), 1);
+        let (_, request) = &requests[0];
+        assert_eq!(request.to, vec!["alice@example.com"]);
+        assert_eq!(request.reply_to.as_deref(), Some("support@near.ai"));
+        assert!(request.html.contains("Confirm email address"));
+        assert!(request.text.contains("alice.near"));
+    }
+
+    #[tokio::test]
+    async fn contact_email_sender_follows_its_own_switch() {
+        let disabled = contact_email_sender_from_config(&InvitationEmailConfig {
+            enabled: true,
+            from_email: Some("NEAR AI Cloud <no-reply@near.ai>".to_string()),
+            resend_api_key: Some("re_test".to_string()),
+            ..InvitationEmailConfig::default()
+        })
+        .unwrap();
+        assert_eq!(
+            disabled
+                .send_contact_email_verification(&example_contact_email_verification_email())
+                .await
+                .unwrap(),
+            EmailDeliveryOutcome::Skipped
+        );
+
+        // Enabled without the shared sender settings is a startup error, not a silent no-op.
+        let error = match contact_email_sender_from_config(&InvitationEmailConfig {
+            contact_email_verification_enabled: true,
+            ..InvitationEmailConfig::default()
+        }) {
+            Ok(_) => panic!("expected missing sender settings to fail"),
+            Err(error) => error,
+        };
+        assert!(error.sanitized_message().contains("INVITATION_EMAIL_FROM"));
+    }
+
+    #[test]
     fn sanitize_error_removes_newlines_and_truncates() {
         let message = format!("line one\n{}", "x".repeat(1100));
 
@@ -947,6 +1254,7 @@ mod tests {
     fn resend_sender_requires_api_key() {
         let config = InvitationEmailConfig {
             enabled: true,
+            contact_email_verification_enabled: false,
             from_email: Some("NEAR AI Cloud <no-reply@near.ai>".to_string()),
             reply_to: None,
             resend_api_key: None,

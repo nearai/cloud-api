@@ -39,6 +39,11 @@ pub struct User {
     pub provider_user_id: String,
     /// Timestamp when all tokens were revoked (for invalidating access tokens)
     pub tokens_revoked_at: Option<DateTime<Utc>>,
+    /// Verified contact address (set at confirmation, never by login)
+    pub contact_email: Option<String>,
+    pub contact_email_verified_at: Option<DateTime<Utc>>,
+    /// When the user agreed to be emailed at `contact_email`
+    pub email_opt_in_at: Option<DateTime<Utc>>,
 }
 
 /// Organization membership - many-to-many relationship between users and organizations

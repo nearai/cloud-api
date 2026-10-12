@@ -14,6 +14,7 @@ pub mod aml;
 pub mod analytics;
 pub mod api_key;
 pub mod attestation;
+pub mod contact_email;
 pub mod conversation;
 pub mod credit_allocation;
 pub mod feature_request;
@@ -59,6 +60,7 @@ pub use aml::PostgresAmlRepository;
 pub use analytics::PgAnalyticsRepository;
 pub use api_key::ApiKeyRepository;
 pub use attestation::PgAttestationRepository;
+pub use contact_email::PgContactEmailRepository;
 pub use conversation::PgConversationRepository;
 pub use credit_allocation::CreditAllocationPolicy;
 pub use feature_request::{

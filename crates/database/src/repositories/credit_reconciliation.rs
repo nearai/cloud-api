@@ -19,6 +19,9 @@ pub enum ReconciliationError {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct CreditPosition {
+    /// Older snapshots contained only active types. New fields need serde defaults.
+    #[serde(default = "active_snapshot_default")]
+    pub active: bool,
     pub ceiling: i64,
     pub consumed: i64,
     pub available: i64,
@@ -34,10 +37,20 @@ pub struct AccountingPosition {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ReconciliationResult {
+    /// Version of the persisted replay payload. Additive fields require serde defaults.
+    #[serde(default = "snapshot_version")]
+    pub schema_version: u32,
     pub reconciliation_id: Option<Uuid>,
     pub dry_run: bool,
     pub before: AccountingPosition,
     pub after: AccountingPosition,
+}
+
+fn active_snapshot_default() -> bool {
+    true
+}
+fn snapshot_version() -> u32 {
+    1
 }
 
 #[derive(Clone)]
@@ -59,6 +72,7 @@ impl CreditReconciliationRepository {
         created_by: Uuid,
         dry_run: bool,
     ) -> Result<ReconciliationResult> {
+        let idempotency_key = idempotency_key.trim();
         let total = validate_request(amounts, idempotency_key, reason)?;
         let mut client = self.pool.get().await?;
         let tx = client.transaction().await?;
@@ -69,6 +83,12 @@ impl CreditReconciliationRepository {
             .map_err(|error| match error {
                 services::common::RepositoryError::NotFound(_) => {
                     anyhow::Error::from(ReconciliationError::NotFound)
+                }
+                services::common::RepositoryError::TransactionConflict => {
+                    ReconciliationError::Conflict(
+                        "Organization accounting is busy; retry the reconciliation".into(),
+                    )
+                    .into()
                 }
                 other => other.into(),
             })?;
@@ -85,7 +105,9 @@ impl CreditReconciliationRepository {
             if dry_run {
                 return Err(ReconciliationError::Conflict("This key already identifies a committed reconciliation; use a new key for a preview".into()).into());
             }
-            return Ok(serde_json::from_value(row.get("result"))?);
+            let result: ReconciliationResult = serde_json::from_value(row.get("result"))?;
+            anyhow::ensure!(result.schema_version == snapshot_version(), "Unsupported reconciliation snapshot version");
+            return Ok(result);
         }
         let active: bool = tx
             .query_one(
@@ -113,6 +135,7 @@ impl CreditReconciliationRepository {
         let after = preview(&before, amounts, total)?;
         let id = (!dry_run).then(Uuid::new_v4);
         let result = ReconciliationResult {
+            schema_version: snapshot_version(),
             reconciliation_id: id,
             dry_run,
             before,
@@ -159,7 +182,7 @@ fn validate_request(amounts: &BTreeMap<String, i64>, key: &str, reason: &str) ->
         .into());
     }
     if amounts.is_empty() || amounts.len() > 4 {
-        return Err(invalid("Specify at least one credit type").into());
+        return Err(invalid("Specify one to four credit types").into());
     }
     amounts.iter().try_fold(0_i64, |sum, (kind, amount)| {
         if !matches!(kind.as_str(), "grant" | "payment" | "staking_farm" | "postpay") || *amount <= 0 {
@@ -175,7 +198,15 @@ async fn load_position(tx: &Transaction<'_>, org: Uuid) -> Result<AccountingPosi
         &[&org],
     ).await?.ok_or_else(|| ReconciliationError::Conflict("Organization accounting balance is missing".into()))?;
     let rows = tx.query(
-        "SELECT l.credit_type, l.spend_limit, l.currency, COALESCE(c.amount,0)::BIGINT AS consumed FROM organization_limits_history l LEFT JOIN organization_credit_consumption c ON c.organization_id=l.organization_id AND c.credit_type=l.credit_type WHERE l.organization_id=$1 AND l.effective_until IS NULL",
+        r#"WITH active AS (
+            SELECT credit_type, spend_limit, currency FROM organization_limits_history
+            WHERE organization_id=$1 AND effective_until IS NULL
+        ), consumed AS (
+            SELECT credit_type, amount FROM organization_credit_consumption WHERE organization_id=$1
+        ) SELECT COALESCE(l.credit_type,c.credit_type) AS credit_type,
+                 l.credit_type IS NOT NULL AS active, COALESCE(l.spend_limit,0)::BIGINT AS spend_limit,
+                 l.currency, COALESCE(c.amount,0)::BIGINT AS consumed
+          FROM active l FULL JOIN consumed c USING (credit_type)"#,
         &[&org],
     ).await?;
     let mut position = AccountingPosition {
@@ -185,20 +216,30 @@ async fn load_position(tx: &Transaction<'_>, org: Uuid) -> Result<AccountingPosi
         aggregate_available: 0,
     };
     for row in rows {
-        if row.get::<_, String>("currency") != "USD" {
-            return Err(ReconciliationError::Conflict(
-                "Only USD credit positions can be reconciled".into(),
-            )
-            .into());
+        let active: bool = row.get("active");
+        if let Some(currency) = row.get::<_, Option<String>>("currency") {
+            if currency != "USD" {
+                return Err(ReconciliationError::Conflict(format!(
+                    "Only USD credit positions can be reconciled; {} is {}",
+                    row.get::<_, String>("credit_type"),
+                    currency
+                ))
+                .into());
+            }
         }
         let ceiling: i64 = row.get("spend_limit");
         let consumed: i64 = row.get("consumed");
         position.credits.insert(
             row.get("credit_type"),
             CreditPosition {
+                active,
                 ceiling,
                 consumed,
-                available: ceiling.saturating_sub(consumed).max(0),
+                available: if active {
+                    ceiling.saturating_sub(consumed).max(0)
+                } else {
+                    0
+                },
             },
         );
     }
@@ -230,6 +271,11 @@ fn preview(
         let credit = after.credits.get_mut(kind).ok_or_else(|| {
             conflict("Each selected credit type needs an active reviewed ceiling")
         })?;
+        if !credit.active {
+            return Err(
+                conflict("Each selected credit type needs an active reviewed ceiling").into(),
+            );
+        }
         // Reclassification must remove the same capacity from the type as it
         // releases from the legacy deduction. Reject capped/disabled positions.
         if *amount > credit.available {
@@ -247,4 +293,38 @@ fn preview(
         return Err(conflict("Reconciliation would change aggregate available capacity").into());
     }
     Ok(after)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn original_snapshot_shape_remains_readable() {
+        let original = serde_json::json!({
+            "reconciliation_id": null, "dry_run": true,
+            "before": {"credits": {"payment": {"ceiling":100,"consumed":0,"available":100}},
+                "legacy_unattributed_amount":80,"unresolved_unfunded_amount":0,"aggregate_available":20},
+            "after": {"credits": {"payment": {"ceiling":100,"consumed":80,"available":20}},
+                "legacy_unattributed_amount":0,"unresolved_unfunded_amount":0,"aggregate_available":20}
+        });
+        let result: ReconciliationResult = serde_json::from_value(original).unwrap();
+        assert_eq!(result.schema_version, 1);
+        assert!(result.before.credits["payment"].active);
+        assert!(result.after.credits["payment"].active);
+    }
+
+    #[test]
+    fn too_many_types_reports_the_actual_constraint() {
+        let amounts = ["grant", "payment", "staking_farm", "postpay", "extra"]
+            .into_iter()
+            .map(|key| (key.to_string(), 1))
+            .collect();
+        assert_eq!(
+            validate_request(&amounts, "key", "reason")
+                .unwrap_err()
+                .to_string(),
+            "Specify one to four credit types"
+        );
+    }
 }

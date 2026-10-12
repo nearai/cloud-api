@@ -106,6 +106,11 @@ preview is not a reservation of its displayed position. Record the returned
 `reconciliation_id` with the reviewed evidence. Identical committed terms with
 an existing key return the original snapshots even after later usage; conflicting
 terms return HTTP 409. A preview using an already committed key also returns 409.
+Keys are trimmed once before lookup and storage, so whitespace around the key
+cannot create a second adjustment. Snapshots include `schema_version`; additive
+changes to persisted snapshot structs must use serde defaults and incompatible
+versions need an explicit replay adapter. Consumption without an active ceiling
+is included with `active: false`, zero ceiling and zero available capacity.
 
 The operation adds reviewed historical consumption to the existing per-type
 counters and removes exactly the same amount from the aggregate legacy
@@ -137,3 +142,11 @@ new historical discounts are rejected because aggregate opening classifications
 cannot safely be reversed against individual usage rows. Future-only discounts
 remain supported. Existing fully completed discount corrections can be followed
 by a reconciliation of their remaining legacy spend.
+
+Complete the rollout of every usage-discount/admin writer before performing any
+reconciliation. Old pods do not enforce the reconciliation guard and could
+still accept an incompatible historical discount during a rolling deployment.
+The audit retains the authenticated admin UUID without a users foreign key so
+account deletion does not erase or rewrite the original actor. Audit text and
+JSON fields are explicitly classified as restricted operational billing data,
+consistent with limit-change reasons and billing correction records.

@@ -2408,9 +2408,17 @@ fn build_admin_routes_with_options(
         .with_state(admin_app_state)
         .merge(
             Router::new()
-                .route("/admin/organizations/{org_id}/credit-reconciliations",
-                    axum::routing::post(crate::routes::admin_credit_reconciliation::reconcile_organization_credits))
-                .layer(axum::Extension(database::repositories::credit_reconciliation::CreditReconciliationRepository::new(database.pool().clone())))
+                .route(
+                    "/admin/organizations/{org_id}/credit-reconciliations",
+                    axum::routing::post(
+                        crate::routes::admin_credit_reconciliation::reconcile_organization_credits,
+                    ),
+                )
+                .layer(axum::Extension(
+                    database::repositories::credit_reconciliation::CreditReconciliationRepository::new(
+                        database.pool().clone(),
+                    ),
+                ))
         )
         .merge(
             Router::new()

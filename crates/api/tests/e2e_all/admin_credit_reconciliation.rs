@@ -58,6 +58,8 @@ async fn reconcile_requires_admin_write_and_preserves_audited_balances() {
         if expected == StatusCode::OK {
             let value = response.json::<Value>();
             assert_eq!(value["reconciliation_id"], Value::Null);
+            // Before (100 + 200) - 80 = 220; after (20 + 200) - 0 = 220.
+            // Reclassification must preserve aggregate available capacity.
             assert_eq!(value["before"]["aggregate_available"], 220);
             assert_eq!(value["after"]["aggregate_available"], 220);
             assert_eq!(value["after"]["credits"]["payment"]["consumed"], 80);

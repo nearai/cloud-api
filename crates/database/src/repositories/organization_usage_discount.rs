@@ -44,6 +44,8 @@ pub enum DiscountError {
     Conflict,
     #[error("Historical usage has unsupported or inconsistent funding; no discount was saved")]
     UnsupportedHistory,
+    #[error("Historical discounts cannot be applied after legacy credit reconciliation")]
+    ReconciledHistory,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -204,7 +206,7 @@ impl OrganizationUsageDiscountRepository {
                 &[&organization_id],
             ).await?.get(0);
             if reconciled {
-                return Err(DiscountError::UnsupportedHistory.into());
+                return Err(DiscountError::ReconciledHistory.into());
             }
         }
         // Transaction-start now() can precede time spent waiting for the accounting lock.

@@ -1637,7 +1637,7 @@ async fn reconciliation_rejects_invalid_positions_and_coordinates_discount_corre
         .unwrap_err();
     assert!(matches!(
         error.downcast_ref::<DiscountError>(),
-        Some(DiscountError::UnsupportedHistory)
+        Some(DiscountError::ReconciledHistory)
     ));
     // Future-only discounts remain supported.
     discounts.save(second_org.org_id, 1000, None, actor).await?;
@@ -1689,5 +1689,104 @@ async fn concurrent_reconciliations_and_new_usage_charge_once() -> anyhow::Resul
     );
     drop(client);
     cleanup_usage_fixtures(&pool, &[org.org_id], &[model.id]).await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn reconciliation_snapshot_retains_expired_credit_consumption() -> anyhow::Result<()> {
+    use database::repositories::credit_reconciliation::CreditReconciliationRepository;
+    let pool = test_pool().await?;
+    let org = insert_org_fixture(&pool).await?;
+    let model = insert_model(&pool, "reconciliation-retired").await?;
+    let limits = OrganizationLimitsRepository::new(pool.clone());
+    set_limit(&limits, org.org_id, "payment", 100).await?;
+    set_limit(&limits, org.org_id, "postpay", 200).await?;
+    seed_legacy_consumption(&pool, &org, &model, 80).await?;
+    set_limit(&limits, org.org_id, "grant", 5).await?;
+    OrganizationUsageRepository::new(pool.clone())
+        .record_usage(usage(&org, &model, Uuid::new_v4(), 5))
+        .await?;
+    let client = pool.get().await?;
+    client.execute("UPDATE organization_limits_history SET effective_until=clock_timestamp() WHERE organization_id=$1 AND credit_type='grant' AND effective_until IS NULL", &[&org.org_id]).await?;
+    let repository = CreditReconciliationRepository::new(pool.clone());
+    let amounts = [("payment".to_string(), 80)].into_iter().collect();
+    let result = repository
+        .reconcile(
+            org.org_id,
+            &amounts,
+            " opening ",
+            "review",
+            Uuid::new_v4(),
+            false,
+        )
+        .await?;
+    assert_eq!(result.schema_version, 1);
+    assert!(!result.before.credits["grant"].active);
+    assert_eq!(result.before.credits["grant"].consumed, 5);
+    assert_eq!(result.before.credits["grant"].available, 0);
+    assert_eq!(
+        result.after.credits["grant"],
+        result.before.credits["grant"]
+    );
+    assert_eq!(
+        repository
+            .reconcile(
+                org.org_id,
+                &amounts,
+                "opening",
+                "review",
+                Uuid::new_v4(),
+                false
+            )
+            .await?,
+        result
+    );
+    assert_eq!(client.query_one("SELECT idempotency_key FROM organization_credit_reconciliations WHERE organization_id=$1", &[&org.org_id]).await?.get::<_,String>(0), "opening");
+    // Currency diagnostics identify the offending position, even if not selected.
+    client.execute("UPDATE organization_limits_history SET currency='USDT' WHERE organization_id=$1 AND credit_type='postpay' AND effective_until IS NULL", &[&org.org_id]).await?;
+    let error = repository
+        .reconcile(org.org_id, &amounts, "next", "review", Uuid::new_v4(), true)
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("postpay is USDT"));
+    drop(client);
+    cleanup_usage_fixtures(&pool, &[org.org_id], &[model.id]).await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn reconciliation_lock_timeout_is_a_retryable_conflict() -> anyhow::Result<()> {
+    use database::repositories::credit_reconciliation::{
+        CreditReconciliationRepository, ReconciliationError,
+    };
+    let pool = test_pool().await?;
+    let org = insert_org_fixture(&pool).await?;
+    let mut client = pool.get().await?;
+    let tx = client.transaction().await?;
+    tx.query_one(
+        "SELECT id FROM organizations WHERE id=$1 FOR UPDATE",
+        &[&org.org_id],
+    )
+    .await?;
+    let repository = CreditReconciliationRepository::new(pool.clone());
+    let error = repository
+        .reconcile(
+            org.org_id,
+            &[("payment".into(), 1)].into_iter().collect(),
+            "busy",
+            "review",
+            Uuid::new_v4(),
+            false,
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        error.downcast_ref::<ReconciliationError>(),
+        Some(ReconciliationError::Conflict(_))
+    ));
+    assert!(error.to_string().contains("busy"));
+    tx.rollback().await?;
+    drop(client);
+    cleanup_usage_fixtures(&pool, &[org.org_id], &[]).await?;
     Ok(())
 }

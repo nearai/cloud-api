@@ -29,6 +29,8 @@ pub struct CreditReconciliationRequest {
 
 #[derive(Debug, Serialize, ToSchema)]
 pub struct CreditPositionResponse {
+    /// False for consumption whose credit type has no active ceiling.
+    pub active: bool,
     pub ceiling: i64,
     pub consumed: i64,
     pub available: i64,
@@ -53,6 +55,7 @@ impl From<AccountingPosition> for AccountingPositionResponse {
                     (
                         kind,
                         CreditPositionResponse {
+                            active: credit.active,
                             ceiling: credit.ceiling,
                             consumed: credit.consumed,
                             available: credit.available,
@@ -69,6 +72,7 @@ impl From<AccountingPosition> for AccountingPositionResponse {
 
 #[derive(Debug, Serialize, ToSchema)]
 pub struct CreditReconciliationResponse {
+    pub schema_version: u32,
     pub reconciliation_id: Option<Uuid>,
     pub dry_run: bool,
     pub before: AccountingPositionResponse,
@@ -78,6 +82,7 @@ pub struct CreditReconciliationResponse {
 impl From<ReconciliationResult> for CreditReconciliationResponse {
     fn from(value: ReconciliationResult) -> Self {
         Self {
+            schema_version: value.schema_version,
             reconciliation_id: value.reconciliation_id,
             dry_run: value.dry_run,
             before: value.before.into(),

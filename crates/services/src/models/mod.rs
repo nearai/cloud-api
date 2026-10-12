@@ -9,7 +9,10 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use moka::future::Cache;
-pub use ports::{ModelInfo, ModelWithPricing, ModelsError, ModelsRepository, ModelsServiceTrait};
+pub use ports::{
+    ModelInfo, ModelWithPricing, ModelsError, ModelsRepository, ModelsServiceTrait,
+    RestrictedModelAccess,
+};
 use tracing::warn;
 
 use crate::inference_provider_pool::{BackendModelMetadata, InferenceProviderPool};

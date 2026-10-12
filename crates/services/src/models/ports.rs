@@ -97,6 +97,16 @@ pub struct ModelWithPricing {
     pub created_at: chrono::DateTime<chrono::Utc>,
 }
 
+/// One unlisted model and the organizations that may use it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RestrictedModelAccess {
+    /// Canonical model name.
+    pub model_name: String,
+    /// Active organizations that hold a grant for the model. Empty when
+    /// nobody may use it.
+    pub organization_ids: Vec<Uuid>,
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum ModelsError {
     #[error("Internal error: {0}")]
@@ -129,6 +139,32 @@ pub trait ModelsRepository: Send + Sync {
     /// Get list of configured model names (canonical names) from database
     /// Returns only active models that have been configured with pricing
     async fn get_configured_model_names(&self) -> Result<Vec<String>, anyhow::Error>;
+
+    /// Whether the organization holds a grant for the model that is in
+    /// effect: the organization and the model must both be active.
+    ///
+    /// The default knows of no grants and refuses, so an implementor that
+    /// does not override it cannot open an unlisted model to anyone.
+    async fn organization_has_model_access(
+        &self,
+        _organization_id: Uuid,
+        _model_id: Uuid,
+    ) -> Result<bool, anyhow::Error> {
+        Ok(false)
+    }
+
+    /// Every active unlisted model with the active organizations that hold a
+    /// grant for it, ordered by model name.
+    ///
+    /// The default fails instead of returning an empty list: a reader takes a
+    /// model that is absent from the list to be unrestricted.
+    async fn list_restricted_model_access(
+        &self,
+    ) -> Result<Vec<RestrictedModelAccess>, anyhow::Error> {
+        Err(anyhow::anyhow!(
+            "this models repository does not list model access"
+        ))
+    }
 }
 
 #[cfg_attr(test, mockall::automock)]

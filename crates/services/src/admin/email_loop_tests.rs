@@ -410,6 +410,44 @@ impl AdminRepository for CountingRepo {
     ) -> Result<Option<PlatformServiceInfo>, anyhow::Error> {
         unimplemented!("not used by the email loop tests")
     }
+
+    async fn get_model_for_access(
+        &self,
+        model_name: &str,
+    ) -> Result<Option<ModelAccessModel>, anyhow::Error> {
+        unimplemented!("not used by the email loop tests")
+    }
+
+    async fn list_model_access_grants(
+        &self,
+        model_id: uuid::Uuid,
+    ) -> Result<Vec<ModelAccessGrant>, anyhow::Error> {
+        unimplemented!("not used by the email loop tests")
+    }
+
+    async fn grant_model_access(
+        &self,
+        model_id: uuid::Uuid,
+        organization_id: uuid::Uuid,
+        granted_by_user_id: Option<uuid::Uuid>,
+    ) -> Result<ModelAccessGrant, anyhow::Error> {
+        unimplemented!("not used by the email loop tests")
+    }
+
+    async fn revoke_model_access(
+        &self,
+        model_id: uuid::Uuid,
+        organization_id: uuid::Uuid,
+    ) -> Result<bool, anyhow::Error> {
+        unimplemented!("not used by the email loop tests")
+    }
+
+    async fn list_organization_model_access(
+        &self,
+        organization_id: uuid::Uuid,
+    ) -> Result<Vec<OrganizationModelAccessGrant>, anyhow::Error> {
+        unimplemented!("not used by the email loop tests")
+    }
 }
 
 struct CountingEmailSender {

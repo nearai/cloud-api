@@ -649,6 +649,45 @@ pub struct AdminOrganizationMemberInfo {
     pub user: UserInfo,
 }
 
+/// A model as the access-management operations see it. Looked up by
+/// canonical name, active or not, so a grant can be reviewed or revoked while
+/// its model is inactive.
+#[derive(Debug, Clone)]
+pub struct ModelAccessModel {
+    pub id: uuid::Uuid,
+    pub model_name: String,
+    pub is_listed: bool,
+    pub is_active: bool,
+}
+
+/// A grant: one organization that may use one unlisted model.
+#[derive(Debug, Clone)]
+pub struct ModelAccessGrant {
+    pub organization_id: uuid::Uuid,
+    pub organization_name: String,
+    pub granted_at: chrono::DateTime<chrono::Utc>,
+    /// The admin who made the grant. `None` if that user row is gone.
+    pub granted_by_user_id: Option<uuid::Uuid>,
+    pub granted_by_user_email: Option<String>,
+}
+
+/// A model and the active organizations that hold a grant for it.
+#[derive(Debug, Clone)]
+pub struct ModelAccess {
+    pub model: ModelAccessModel,
+    pub grants: Vec<ModelAccessGrant>,
+}
+
+/// One model an organization holds a grant for.
+#[derive(Debug, Clone)]
+pub struct OrganizationModelAccessGrant {
+    pub model: ModelAccessModel,
+    pub granted_at: chrono::DateTime<chrono::Utc>,
+    /// The admin who made the grant. `None` if that user row is gone.
+    pub granted_by_user_id: Option<uuid::Uuid>,
+    pub granted_by_user_email: Option<String>,
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum AdminError {
     #[error("Model not found: {0}")]
@@ -1011,6 +1050,43 @@ pub trait AdminRepository: Send + Sync {
     /// Whether an active organization with this id exists (admin only).
     async fn organization_exists(&self, organization_id: uuid::Uuid)
         -> Result<bool, anyhow::Error>;
+
+    /// Look a model up by canonical name for access management, active or
+    /// not. `None` if no such model exists.
+    async fn get_model_for_access(
+        &self,
+        model_name: &str,
+    ) -> Result<Option<ModelAccessModel>, anyhow::Error>;
+
+    /// The active organizations that hold a grant for the model, oldest
+    /// grant first.
+    async fn list_model_access_grants(
+        &self,
+        model_id: uuid::Uuid,
+    ) -> Result<Vec<ModelAccessGrant>, anyhow::Error>;
+
+    /// Grant the organization access to the model and return the stored
+    /// grant. A grant that already exists is returned unchanged.
+    async fn grant_model_access(
+        &self,
+        model_id: uuid::Uuid,
+        organization_id: uuid::Uuid,
+        granted_by_user_id: Option<uuid::Uuid>,
+    ) -> Result<ModelAccessGrant, anyhow::Error>;
+
+    /// Revoke the organization's grant for the model. Returns whether a
+    /// grant existed.
+    async fn revoke_model_access(
+        &self,
+        model_id: uuid::Uuid,
+        organization_id: uuid::Uuid,
+    ) -> Result<bool, anyhow::Error>;
+
+    /// The models the organization holds a grant for, by model name.
+    async fn list_organization_model_access(
+        &self,
+        organization_id: uuid::Uuid,
+    ) -> Result<Vec<OrganizationModelAccessGrant>, anyhow::Error>;
 
     /// List platform services with pagination (admin only)
     async fn list_services(

@@ -3145,6 +3145,8 @@ pub struct AdminUserResponse {
 /// User response model (full user profile)
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct UserResponse {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub staking_organization_id: Option<String>,
     pub id: String,
     pub email: String,
     pub username: String,
@@ -3991,6 +3993,10 @@ pub struct ModelMetadata {
     /// `openrouter: { slug }` object; the admin view exposes the raw value.
     #[serde(rename = "openrouterSlug", skip_serializing_if = "Option::is_none")]
     pub openrouter_slug: Option<String>,
+    /// Whether the model appears in the public model catalogs. Set on admin
+    /// views only; the public catalog endpoints omit it.
+    #[serde(rename = "isListed", skip_serializing_if = "Option::is_none")]
+    pub is_listed: Option<bool>,
 }
 
 /// Request to update model pricing (admin endpoint)
@@ -4043,6 +4049,13 @@ pub struct UpdateModelApiRequest {
     /// Required to be set explicitly when activating a zero-price model.
     #[serde(rename = "allowFree", skip_serializing_if = "Option::is_none")]
     pub allow_free: Option<bool>,
+    /// `false` keeps the model out of the public model catalogs
+    /// (`GET /v1/models`, `GET /v1/model/list`, `GET /v1/model/{name}`) while
+    /// it stays active and billable; `true` lists it again. Omitted = leave
+    /// unchanged (new models are listed). It is a catalog switch only: a
+    /// model that has an inference URL can still be called by name.
+    #[serde(rename = "isListed", skip_serializing_if = "Option::is_none")]
+    pub is_listed: Option<bool>,
     pub aliases: Option<Vec<String>>,
     #[serde(rename = "ownedBy")]
     pub owned_by: Option<String>,
@@ -4512,6 +4525,9 @@ pub struct ModelHistoryEntry {
     /// If true, this model was allowed to serve without pricing at this point in time.
     #[serde(rename = "allowFree")]
     pub allow_free: bool,
+    /// Whether the model was in the public model catalogs at this point in time.
+    #[serde(rename = "isListed")]
+    pub is_listed: bool,
 }
 
 /// Model history response - complete history of model changes

@@ -222,6 +222,7 @@ mod tests {
             deprecation_date,
             successor_model_name: Some("nearai/new-model".to_string()),
             openrouter_slug: None,
+            is_listed: true,
             created_at: Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap(),
         }
     }

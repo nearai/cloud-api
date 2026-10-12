@@ -277,6 +277,7 @@ pub fn services_user_to_api_user(
         .clone()
         .filter(|_| user.contact_email_verified_at.is_some());
     crate::models::UserResponse {
+        staking_organization_id: None,
         id: user.id.0.to_string(),
         email: user.email.clone(),
         username: user.username.clone(),

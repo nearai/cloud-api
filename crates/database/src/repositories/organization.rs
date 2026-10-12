@@ -1313,6 +1313,27 @@ impl OrganizationRepository for PgOrganizationRepository {
                 return Ok(RemoveOrganizationMemberResult::NotFound);
             };
 
+            let is_bound_wallet: bool = transaction
+                .query_one(
+                    "SELECT EXISTS (
+                        SELECT 1 FROM organization_staking_farm_sources s
+                        JOIN users u ON u.auth_provider = 'near'
+                          AND u.provider_user_id = s.near_account_id
+                        WHERE s.organization_id = $1 AND u.id = $2
+                    )",
+                    &[&org_id, &user_id],
+                )
+                .await
+                .map_err(map_db_error)?
+                .get(0);
+            if is_bound_wallet {
+                transaction.rollback().await.map_err(map_db_error)?;
+                return Err(RepositoryError::ValidationFailed(
+                    "The permanently bound NEAR wallet cannot be removed from this organization"
+                        .to_string(),
+                ));
+            }
+
             if member.get::<_, String>("role") == "owner" {
                 let owner_count = transaction
                     .query_one(

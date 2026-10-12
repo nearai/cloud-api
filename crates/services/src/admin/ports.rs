@@ -23,6 +23,9 @@ pub struct UpdateModelAdminRequest {
     pub is_active: Option<bool>,
     /// If true, allows activation even with zero pricing.
     pub allow_free: Option<bool>,
+    /// `Some(false)` keeps the model out of the public model catalogs,
+    /// `Some(true)` lists it again, `None` leaves it unchanged.
+    pub is_listed: Option<bool>,
     pub aliases: Option<Vec<String>>,
     pub owned_by: Option<String>,
     // Provider configuration
@@ -123,6 +126,9 @@ pub struct ModelPricing {
     pub successor_model_name: Option<String>,
     /// OpenRouter `openrouter.slug` override. NULL = unset.
     pub openrouter_slug: Option<String>,
+    /// Whether the model appears in the public model catalogs. `false` keeps
+    /// an active, billable row out of them; it does not change routing.
+    pub is_listed: bool,
 }
 
 /// Stored fields needed to validate a partial model update before persisting it.
@@ -177,6 +183,8 @@ pub struct ModelHistoryEntry {
     pub openrouter_slug: Option<String>,
     /// If true, this model was allowed to serve without pricing at this point in time.
     pub allow_free: bool,
+    /// Whether the model was in the public model catalogs at this point in time.
+    pub is_listed: bool,
     pub effective_from: chrono::DateTime<chrono::Utc>,
     pub effective_until: Option<chrono::DateTime<chrono::Utc>>,
     pub changed_by_user_id: Option<uuid::Uuid>,
@@ -309,6 +317,9 @@ pub struct AdminModelInfo {
     pub successor_model_name: Option<String>,
     /// OpenRouter `openrouter.slug` override. NULL = unset.
     pub openrouter_slug: Option<String>,
+    /// Whether the model appears in the public model catalogs. `false` keeps
+    /// an active, billable row out of them; it does not change routing.
+    pub is_listed: bool,
 }
 
 /// Active model summary used by the planned-deprecation notification workflow.

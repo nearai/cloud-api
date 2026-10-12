@@ -258,7 +258,7 @@ pub async fn get_current_user(
     };
 
     // Build response with all data
-    let response = crate::conversions::services_user_to_api_user_with_relations(
+    let mut response = crate::conversions::services_user_to_api_user_with_relations(
         &user_data,
         app_state
             .contact_email_service
@@ -267,7 +267,30 @@ pub async fn get_current_user(
         workspaces,
     );
 
+    populate_staking_organization(&app_state, &user_data, &mut response).await;
     Ok(Json(response))
+}
+
+async fn populate_staking_organization(
+    app: &AppState,
+    user: &services::auth::User,
+    response: &mut crate::models::UserResponse,
+) {
+    if user.auth_provider == "near" {
+        if let Some(binding) = app.staking_farm_service.binding() {
+            response.staking_organization_id = match binding
+                .wallet_organization(&user.provider_user_id, user.id.0)
+                .await
+            {
+                Ok(id) => id.map(|id| id.to_string()),
+                Err(_) => {
+                    // Repository errors can include customer identifiers; log the event, not raw SQL.
+                    error!(user_id = %user.id.0, error_category = "staking_binding_lookup_failed", "Failed to resolve staking wallet binding");
+                    None
+                }
+            };
+        }
+    }
 }
 
 /// Get current user's account eligibility status
@@ -363,12 +386,16 @@ pub async fn update_current_user_profile(
         .update_profile(user_id, request.display_name, request.avatar_url)
         .await
     {
-        Ok(updated_user) => Ok(Json(services_user_to_api_user(
-            &updated_user,
-            app_state
-                .contact_email_service
-                .needs_contact_email(&updated_user),
-        ))),
+        Ok(updated_user) => {
+            let mut response = services_user_to_api_user(
+                &updated_user,
+                app_state
+                    .contact_email_service
+                    .needs_contact_email(&updated_user),
+            );
+            populate_staking_organization(&app_state, &updated_user, &mut response).await;
+            Ok(Json(response))
+        }
         Err(UserServiceError::UserNotFound) => Err((
             StatusCode::NOT_FOUND,
             Json(ErrorResponse::new(

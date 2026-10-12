@@ -603,12 +603,27 @@ pub async fn init_domain_services_with_pool(
         .expect("Failed to initialize staking farm NEAR RPC client"),
     )
         as Arc<dyn services::staking_farm::StakingFarmContractClient>;
-    let staking_farm_service = Arc::new(services::staking_farm::StakingFarmService::new(
-        staking_farm_repository,
-        staking_farm_contract_client,
-        Some(aml_service.clone()),
+    let staking_binding = Arc::new(services::staking_farm::binding::StakingBindingService::new(
+        Arc::new(
+            database::repositories::PostgresStakingBindingRepository::new(database.pool().clone()),
+        ),
+        Arc::new(
+            services::staking_farm::binding::NearBindingVerifier::new(&config.auth.near)
+                .expect("Invalid binding RPC config"),
+        ),
+        aml_service.clone(),
         config.staking_farm.clone(),
+        config.auth.near.expected_recipient.clone(),
     ));
+    let staking_farm_service = Arc::new(
+        services::staking_farm::StakingFarmService::new(
+            staking_farm_repository,
+            staking_farm_contract_client,
+            Some(aml_service.clone()),
+            config.staking_farm.clone(),
+        )
+        .with_binding(staking_binding),
+    );
 
     // Admin settings (placement tuning today): load into the pool's tuning
     // handle now, then every 10 minutes. Placement off leaves it unused.
@@ -1972,14 +1987,19 @@ pub fn build_gateway_routes(
 /// Build internal-only routes authenticated by the shared
 /// `CLOUD_API_USAGE_TOKEN` service secret rather than the standard `sk-…`
 /// API-key middleware. Mounted under `/v1/internal/*` after the global
-/// `/v1` nest. Today's only route is `POST /internal/usage` (for
-/// inference-proxy's service-token reporter); future internal endpoints
-/// can be added here without touching the sk-auth stack.
+/// `/v1` nest. Routes: `POST /internal/usage` (inference-proxy's
+/// service-token usage reporter) and `GET /internal/models` (the model
+/// catalog including unlisted models, for a gateway lane). Further internal
+/// endpoints can be added here without touching the sk-auth stack.
 pub fn build_internal_routes(app_state: AppState) -> Router {
     Router::new()
         .route(
             "/internal/usage",
             post(crate::routes::usage::record_usage_internal),
+        )
+        .route(
+            "/internal/models",
+            get(crate::routes::completions::models_internal),
         )
         .with_state(app_state)
 }

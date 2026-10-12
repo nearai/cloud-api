@@ -43,6 +43,7 @@ fn test_model_pricing() -> ModelPricing {
         deprecation_date: None,
         successor_model_name: None,
         openrouter_slug: None,
+        is_listed: true,
     }
 }
 

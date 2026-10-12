@@ -230,7 +230,7 @@ impl StakingFarmRepository for OrganizationStakingFarmSourcesRepository {
                         last_synced_accumulated_reward_units_24 = $3::text::numeric,
                         last_synced_pending_reward_units_24 = $4::text::numeric,
                         last_synced_reward_units_24 = $5::text::numeric,
-                        last_synced_credit_nano_usd = $6,
+                        last_synced_credit_nano_usd = GREATEST(last_synced_credit_nano_usd, $6),
                         active_positions = $7,
                         updated_at = now()
                     WHERE id = $8 AND status = 'active'
@@ -322,6 +322,15 @@ impl StakingFarmRepository for OrganizationStakingFarmSourcesRepository {
             if still_active.is_none() {
                 transaction.rollback().await.map_err(map_db_error)?;
                 return Ok::<bool, RepositoryError>(false);
+            }
+
+            let current: i64 = transaction.query_one(
+                "SELECT COALESCE(MAX(spend_limit), 0) FROM organization_limits_history WHERE organization_id=$1 AND credit_type='staking_farm' AND effective_until IS NULL",
+                &[&organization_id],
+            ).await.map_err(map_db_error)?.get(0);
+            if credit_nano_usd <= current {
+                transaction.commit().await.map_err(map_db_error)?;
+                return Ok::<bool, RepositoryError>(true);
             }
 
             transaction

@@ -1363,9 +1363,123 @@ impl AdminService for AdminServiceImpl {
             .map_err(|e| AdminError::InternalError(e.to_string()))?
             .ok_or_else(|| AdminError::ServiceNotFound(format!("Service {id} not found")))
     }
+
+    async fn get_model_access(&self, model_name: &str) -> Result<ModelAccess, AdminError> {
+        let model = self.model_for_access(model_name).await?;
+        let grants = self
+            .repository
+            .list_model_access_grants(model.id)
+            .await
+            .map_err(|e| AdminError::InternalError(e.to_string()))?;
+
+        Ok(ModelAccess { model, grants })
+    }
+
+    async fn grant_model_access(
+        &self,
+        model_name: &str,
+        organization_id: uuid::Uuid,
+        granted_by_user_id: Option<uuid::Uuid>,
+    ) -> Result<ModelAccessGrant, AdminError> {
+        let model = self.model_for_access(model_name).await?;
+        self.require_active_organization(organization_id).await?;
+
+        let grant = self
+            .repository
+            .grant_model_access(model.id, organization_id, granted_by_user_id)
+            .await
+            .map_err(|e| AdminError::InternalError(e.to_string()))?;
+
+        // Drop the cached access decisions so the grant applies to the next
+        // request on this instance. Other instances follow within the cache
+        // TTL.
+        self.models_service.invalidate_models_cache().await;
+
+        tracing::info!(
+            model_id = %model.id,
+            organization_id = %organization_id,
+            admin_user_id = ?granted_by_user_id,
+            "Model access granted"
+        );
+
+        Ok(grant)
+    }
+
+    async fn revoke_model_access(
+        &self,
+        model_name: &str,
+        organization_id: uuid::Uuid,
+        revoked_by_user_id: Option<uuid::Uuid>,
+    ) -> Result<(), AdminError> {
+        let model = self.model_for_access(model_name).await?;
+        self.require_active_organization(organization_id).await?;
+
+        let revoked = self
+            .repository
+            .revoke_model_access(model.id, organization_id)
+            .await
+            .map_err(|e| AdminError::InternalError(e.to_string()))?;
+
+        // Drop the cached access decisions so the revocation applies to the
+        // next request on this instance. Other instances follow within the
+        // cache TTL. Done even when no grant existed, so a repeated revoke
+        // also clears an entry that a lookup in flight during the first one
+        // put back.
+        self.models_service.invalidate_models_cache().await;
+
+        // The row is deleted, so this line is the record of who revoked it.
+        tracing::info!(
+            model_id = %model.id,
+            organization_id = %organization_id,
+            admin_user_id = ?revoked_by_user_id,
+            existed = revoked,
+            "Model access revoked"
+        );
+
+        Ok(())
+    }
+
+    async fn list_organization_model_access(
+        &self,
+        organization_id: uuid::Uuid,
+    ) -> Result<Vec<OrganizationModelAccessGrant>, AdminError> {
+        self.require_active_organization(organization_id).await?;
+
+        self.repository
+            .list_organization_model_access(organization_id)
+            .await
+            .map_err(|e| AdminError::InternalError(e.to_string()))
+    }
 }
 
 impl AdminServiceImpl {
+    /// The model whose access is being managed, or `ModelNotFound`.
+    async fn model_for_access(&self, model_name: &str) -> Result<ModelAccessModel, AdminError> {
+        self.repository
+            .get_model_for_access(model_name)
+            .await
+            .map_err(|e| AdminError::InternalError(e.to_string()))?
+            .ok_or_else(|| AdminError::ModelNotFound(format!("Model '{model_name}' not found")))
+    }
+
+    async fn require_active_organization(
+        &self,
+        organization_id: uuid::Uuid,
+    ) -> Result<(), AdminError> {
+        let exists = self
+            .repository
+            .organization_exists(organization_id)
+            .await
+            .map_err(|e| AdminError::InternalError(e.to_string()))?;
+        if exists {
+            Ok(())
+        } else {
+            Err(AdminError::OrganizationNotFound(format!(
+                "Organization '{organization_id}' not found"
+            )))
+        }
+    }
+
     async fn validate_model_request(
         model_name: &str,
         request: &UpdateModelAdminRequest,

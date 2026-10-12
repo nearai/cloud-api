@@ -1151,6 +1151,26 @@ pub struct ModelsResponse {
     pub data: Vec<ModelInfo>,
 }
 
+/// `GET /v1/internal/model-access`: which organizations may use each
+/// restricted model. A model that is absent from `models` is unrestricted.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ModelAccessDocument {
+    /// Always `"model_access"`.
+    pub object: String,
+    /// One entry per active unlisted model, ordered by model name.
+    pub models: Vec<ModelAccessDocumentEntry>,
+}
+
+/// One restricted model of [`ModelAccessDocument`].
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ModelAccessDocumentEntry {
+    /// Canonical model name, the `id` of `GET /v1/internal/models`.
+    pub id: String,
+    /// The active organizations that hold a grant. Empty when nobody may use
+    /// the model.
+    pub organization_ids: Vec<uuid::Uuid>,
+}
+
 /// Model pricing information.
 ///
 /// `input` / `output` are the legacy HuggingFace-style fields (USD per million

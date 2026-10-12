@@ -239,7 +239,8 @@ pub fn normalize_contact_email(input: &str) -> Result<String, ContactEmailError>
 /// Canonical form of a validated address, used only to count sends per address,
 /// so that the variants reaching one mailbox count as one: lower case, any
 /// `+tag` dropped from the local part, and for Gmail the dots in the local part
-/// dropped too. The address stored and emailed stays what the user typed.
+/// dropped too, with both Gmail domains counted as one. The address stored and
+/// emailed stays what the user typed.
 pub fn send_limit_key(email: &str) -> String {
     let email = email.trim().to_ascii_lowercase();
     let Some((local, domain)) = email.rsplit_once('@') else {
@@ -247,7 +248,7 @@ pub fn send_limit_key(email: &str) -> String {
     };
     let local = local.split('+').next().unwrap_or_default();
     if GMAIL_DOMAINS.contains(&domain) {
-        format!("{}@{domain}", local.replace('.', ""))
+        format!("{}@{}", local.replace('.', ""), GMAIL_DOMAINS[0])
     } else {
         format!("{local}@{domain}")
     }
@@ -810,9 +811,10 @@ mod tests {
         ] {
             assert_eq!(send_limit_key(variant), "alicesmith@gmail.com", "{variant}");
         }
+        // Both Gmail domains deliver to the same mailbox.
         assert_eq!(
             send_limit_key("alice.smith+x@googlemail.com"),
-            "alicesmith@googlemail.com"
+            "alicesmith@gmail.com"
         );
 
         // Elsewhere a dot makes a different mailbox, and so does the domain.

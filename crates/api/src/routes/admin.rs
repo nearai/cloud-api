@@ -2469,7 +2469,7 @@ fn admin_error_to_response(
         ("limit" = Option<i64>, Query, description = "Maximum number of users to return (default: 100)"),
         ("offset" = Option<i64>, Query, description = "Number of users to skip (default: 0)"),
         ("include_organizations" = Option<bool>, Query, description = "Whether to include organization information and spend limits for the first organization owned by each user (default: false)"),
-        ("search" = Option<String>, Query, description = "Filter users by email, username, display name, user id, auth provider, or provider user id (case-insensitive partial match)."),
+        ("search" = Option<String>, Query, description = "Filter users by email, contact email, username, display name, user id, auth provider, or provider user id (case-insensitive partial match)."),
         ("is_active" = Option<bool>, Query, description = "Filter users by active status. Omit to include active and inactive users."),
         ("search_by_name" = Option<String>, Query, description = "Filter users by organization name (case-insensitive match). Only effective when include_organizations=true; separate from user search.")
     ),
@@ -2576,6 +2576,12 @@ pub async fn list_users(
                     ),
                     auth_provider: u.auth_provider,
                     provider_user_id: u.provider_user_id,
+                    contact_email: crate::conversions::verified_contact_email(
+                        u.contact_email.as_deref(),
+                        u.contact_email_verified_at,
+                    ),
+                    contact_email_verified_at: u.contact_email_verified_at,
+                    email_opt_in_at: u.email_opt_in_at,
                     organizations,
                 }
             })
@@ -2628,6 +2634,12 @@ pub async fn list_users(
                 ),
                 auth_provider: u.auth_provider,
                 provider_user_id: u.provider_user_id,
+                contact_email: crate::conversions::verified_contact_email(
+                    u.contact_email.as_deref(),
+                    u.contact_email_verified_at,
+                ),
+                contact_email_verified_at: u.contact_email_verified_at,
+                email_opt_in_at: u.email_opt_in_at,
                 organizations: None,
             })
             .collect();
@@ -3172,6 +3184,12 @@ pub async fn list_organization_members(
                 ),
                 auth_provider: m.user.auth_provider,
                 provider_user_id: m.user.provider_user_id,
+                contact_email: crate::conversions::verified_contact_email(
+                    m.user.contact_email.as_deref(),
+                    m.user.contact_email_verified_at,
+                ),
+                contact_email_verified_at: m.user.contact_email_verified_at,
+                email_opt_in_at: m.user.email_opt_in_at,
                 organizations: None,
             },
         })

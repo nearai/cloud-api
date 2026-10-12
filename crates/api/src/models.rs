@@ -3129,6 +3129,12 @@ pub struct AdminUserResponse {
     pub is_active: bool,
     pub auth_provider: String,
     pub provider_user_id: String,
+    /// Verified contact address. `email` is the login identity, which is a
+    /// placeholder for NEAR wallet users.
+    pub contact_email: Option<String>,
+    pub contact_email_verified_at: Option<DateTime<Utc>>,
+    /// When the user agreed to be emailed at `contact_email`.
+    pub email_opt_in_at: Option<DateTime<Utc>>,
     /// Omitted when the row's `is_active`/`auth_provider` columns are inconsistent.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub lifecycle: Option<services::lifecycle::UserLifecycle>,
@@ -3151,6 +3157,14 @@ pub struct UserResponse {
     pub last_login_at: Option<DateTime<Utc>>,
     pub is_active: bool,
     pub auth_provider: String,
+    /// Verified contact address. `email` is the login identity, which is a
+    /// placeholder (`{account_id}@near`) for NEAR wallet users.
+    pub contact_email: Option<String>,
+    pub contact_email_verified: bool,
+    /// True when the user signs in with a NEAR wallet and has no verified contact
+    /// email, so the frontend should ask for one. Always false while contact email
+    /// verification is switched off.
+    pub needs_contact_email: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub organizations: Option<Vec<UserOrganizationResponse>>,
     #[serde(skip_serializing_if = "Option::is_none")]

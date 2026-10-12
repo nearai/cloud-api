@@ -672,7 +672,7 @@ pub async fn near_login(
                 refresh_token_expiration: refresh_session.expires_at,
                 user: AuthResponse {
                     message: "Authenticated".to_string(),
-                    email: format!("{account_id_str}@near"),
+                    email: services::email::near_placeholder_email(&account_id_str),
                     provider: "near".to_string(),
                 },
             };

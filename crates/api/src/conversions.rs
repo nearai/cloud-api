@@ -262,8 +262,30 @@ pub fn current_unix_timestamp() -> i64 {
 
 // User-related conversions helper functions
 
+/// The contact email to show for a user: the stored address, but only with its
+/// verification time. The two columns are written together, so this only
+/// matters for a half-written row, which must never be reported as verified.
+pub fn verified_contact_email(
+    contact_email: Option<&str>,
+    contact_email_verified_at: Option<chrono::DateTime<chrono::Utc>>,
+) -> Option<String> {
+    contact_email
+        .filter(|_| contact_email_verified_at.is_some())
+        .map(str::to_owned)
+}
+
 /// Convert services User to API UserResponse (without organizations and workspaces)
-pub fn services_user_to_api_user(user: &services::auth::User) -> crate::models::UserResponse {
+///
+/// `needs_contact_email` comes from the contact email service, which knows
+/// whether the feature is switched on.
+pub fn services_user_to_api_user(
+    user: &services::auth::User,
+    needs_contact_email: bool,
+) -> crate::models::UserResponse {
+    let contact_email = verified_contact_email(
+        user.contact_email.as_deref(),
+        user.contact_email_verified_at,
+    );
     crate::models::UserResponse {
         staking_organization_id: None,
         id: user.id.0.to_string(),
@@ -276,6 +298,9 @@ pub fn services_user_to_api_user(user: &services::auth::User) -> crate::models::
         last_login_at: user.last_login,
         is_active: user.is_active,
         auth_provider: user.auth_provider.clone(),
+        contact_email_verified: contact_email.is_some(),
+        contact_email,
+        needs_contact_email,
         organizations: None,
         workspaces: None,
     }
@@ -284,23 +309,14 @@ pub fn services_user_to_api_user(user: &services::auth::User) -> crate::models::
 /// Convert services User to API UserResponse with organizations and workspaces
 pub fn services_user_to_api_user_with_relations(
     user: &services::auth::User,
+    needs_contact_email: bool,
     organizations: Vec<crate::models::UserOrganizationResponse>,
     workspaces: Vec<crate::models::UserWorkspaceResponse>,
 ) -> crate::models::UserResponse {
     crate::models::UserResponse {
-        staking_organization_id: None,
-        id: user.id.0.to_string(),
-        email: user.email.clone(),
-        username: user.username.clone(),
-        display_name: user.display_name.clone(),
-        avatar_url: user.avatar_url.clone(),
-        created_at: user.created_at,
-        updated_at: user.updated_at,
-        last_login_at: user.last_login,
-        is_active: user.is_active,
-        auth_provider: user.auth_provider.clone(),
         organizations: Some(organizations),
         workspaces: Some(workspaces),
+        ..services_user_to_api_user(user, needs_contact_email)
     }
 }
 
@@ -765,6 +781,12 @@ pub fn db_user_to_admin_user(user: &database::User) -> AdminUserResponse {
         is_active: user.is_active,
         auth_provider: user.auth_provider.clone(),
         provider_user_id: user.provider_user_id.clone(),
+        contact_email: verified_contact_email(
+            user.contact_email.as_deref(),
+            user.contact_email_verified_at,
+        ),
+        contact_email_verified_at: user.contact_email_verified_at,
+        email_opt_in_at: user.email_opt_in_at,
         lifecycle: admin_user_lifecycle(user.id, user.is_active, &user.auth_provider),
         organizations: None,
     }
@@ -775,6 +797,21 @@ mod tests {
     use std::collections::HashMap;
 
     use super::*;
+
+    #[test]
+    fn contact_email_is_only_shown_with_its_verification_time() {
+        let verified_at = Some(chrono::Utc::now());
+
+        assert_eq!(
+            verified_contact_email(Some("alice@example.com"), verified_at),
+            Some("alice@example.com".to_string())
+        );
+        assert_eq!(
+            verified_contact_email(Some("alice@example.com"), None),
+            None
+        );
+        assert_eq!(verified_contact_email(None, verified_at), None);
+    }
 
     #[test]
     fn test_message_conversion() {

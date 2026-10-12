@@ -111,6 +111,7 @@ pub struct DomainServices {
     pub workspace_service: Arc<dyn services::workspace::WorkspaceServiceTrait + Send + Sync>,
     pub usage_service: Arc<dyn services::usage::UsageServiceTrait + Send + Sync>,
     pub user_service: Arc<dyn services::user::UserServiceTrait + Send + Sync>,
+    pub contact_email_service: Arc<services::contact_email::ContactEmailService>,
     pub files_service: Arc<dyn services::files::FileServiceTrait + Send + Sync>,
     pub metrics_service: Arc<dyn services::metrics::MetricsServiceTrait>,
     pub staking_farm_service: Arc<services::staking_farm::StakingFarmService>,
@@ -495,6 +496,24 @@ pub async fn init_domain_services_with_pool(
     let session_repo = Arc::new(database::SessionRepository::new(database.pool().clone()))
         as Arc<dyn services::auth::SessionRepository>;
 
+    // Contact email verification for wallet users. Off unless
+    // CONTACT_EMAIL_VERIFICATION_ENABLED is set; it then shares the invitation
+    // email sender settings.
+    let contact_email_service = Arc::new(services::contact_email::ContactEmailService::new(
+        Arc::new(database::repositories::PgContactEmailRepository::new(
+            database.pool().clone(),
+        )),
+        user_repo.clone(),
+        services::email::contact_email_sender_from_config(&config.invitation_email)
+            .expect("Failed to initialize contact email sender"),
+        config
+            .invitation_email
+            .contact_email_verification_enabled
+            .then(|| config.invitation_email.contact_email_verification_url())
+            .flatten(),
+        i64::from(config.invitation_email.contact_email_verification_daily_cap),
+    ));
+
     // Create user service
     let user_service = Arc::new(services::user::UserService::new(user_repo, session_repo))
         as Arc<dyn services::user::UserServiceTrait + Send + Sync>;
@@ -629,6 +648,7 @@ pub async fn init_domain_services_with_pool(
         workspace_service,
         usage_service,
         user_service,
+        contact_email_service,
         files_service,
         metrics_service,
         staking_farm_service,
@@ -1089,6 +1109,7 @@ pub fn build_app_with_config_and_options(
         )
             as Arc<dyn services::reporting_tokens::OrganizationReportingTokenService>,
         user_service: domain_services.user_service.clone(),
+        contact_email_service: domain_services.contact_email_service.clone(),
         files_service: domain_services.files_service.clone(),
         inference_provider_pool: domain_services.inference_provider_pool.clone(),
         metrics_service: domain_services.metrics_service.clone(),

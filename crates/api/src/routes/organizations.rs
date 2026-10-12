@@ -1043,6 +1043,9 @@ mod tests {
             auth_provider: "test".to_string(),
             provider_user_id: id.to_string(),
             tokens_revoked_at: None,
+            contact_email: None,
+            contact_email_verified_at: None,
+            email_opt_in_at: None,
         })
     }
 

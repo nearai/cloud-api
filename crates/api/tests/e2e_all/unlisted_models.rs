@@ -99,6 +99,7 @@ async fn internal_models(server: &axum_test::TestServer) -> Vec<serde_json::Valu
         .add_header("Authorization", format!("Bearer {INTERNAL_TOKEN}"))
         .await;
     assert_eq!(response.status_code(), 200, "{}", response.text());
+    assert_eq!(response.header("cache-control"), "no-store");
     let body: serde_json::Value = response.json();
     assert_eq!(body["object"], "list");
     body["data"].as_array().expect("data is an array").clone()
@@ -106,6 +107,20 @@ async fn internal_models(server: &axum_test::TestServer) -> Vec<serde_json::Valu
 
 fn find_model<'a>(models: &'a [serde_json::Value], id: &str) -> Option<&'a serde_json::Value> {
     models.iter().find(|model| model["id"] == id)
+}
+
+/// `isListed` on the newest entry of the model's admin history.
+async fn latest_history_is_listed(server: &axum_test::TestServer, model_name: &str) -> bool {
+    let response = server
+        .get(&format!("/v1/admin/models/{model_name}/history"))
+        .add_header("Authorization", format!("Bearer {}", get_session_id()))
+        .add_header("User-Agent", MOCK_USER_AGENT)
+        .await;
+    assert_eq!(response.status_code(), 200, "{}", response.text());
+    let history: serde_json::Value = response.json();
+    history["history"][0]["isListed"]
+        .as_bool()
+        .expect("history entries carry isListed")
 }
 
 #[tokio::test]
@@ -140,19 +155,7 @@ async fn unlisted_model_is_left_out_of_the_public_catalogs() {
         .expect("unlisted model on the admin list");
     assert_eq!(admin_entry.metadata.is_listed, Some(false));
 
-    let history_response = server
-        .get(&format!("/v1/admin/models/{model_name}/history"))
-        .add_header("Authorization", format!("Bearer {}", get_session_id()))
-        .add_header("User-Agent", MOCK_USER_AGENT)
-        .await;
-    assert_eq!(
-        history_response.status_code(),
-        200,
-        "{}",
-        history_response.text()
-    );
-    let history: serde_json::Value = history_response.json();
-    assert_eq!(history["history"][0]["isListed"], false);
+    assert!(!latest_history_is_listed(&server, &model_name).await);
 }
 
 #[tokio::test]
@@ -190,6 +193,7 @@ async fn listing_state_changes_only_when_the_field_is_sent() {
     assert_eq!(repriced["metadata"]["isListed"], false);
     assert_eq!(repriced["outputCostPerToken"]["amount"], 600);
     assert!(!public_model_ids(&server).await.contains(&model_name));
+    assert!(!latest_history_is_listed(&server, &model_name).await);
 
     // Listing it publishes it at once on this instance.
     let listed = upsert_model(
@@ -199,6 +203,7 @@ async fn listing_state_changes_only_when_the_field_is_sent() {
     )
     .await;
     assert_eq!(listed["metadata"]["isListed"], true);
+    assert!(latest_history_is_listed(&server, &model_name).await);
     assert!(public_model_ids(&server).await.contains(&model_name));
     assert!(public_model_list_ids(&server).await.contains(&model_name));
     assert_eq!(public_model_detail_status(&server, &model_name).await, 200);

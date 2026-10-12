@@ -750,7 +750,7 @@ impl ModelRepository {
                         provider_type, provider_config, attestation_supported,
                         input_modalities, output_modalities, inference_url, hugging_face_id, quantization, max_output_length, supported_sampling_parameters, supported_features, datacenters,
                         is_ready, deprecation_date, openrouter_slug, allow_free, text_pricing,
-                        successor_model_name
+                        successor_model_name, is_listed
                     ) VALUES (
                         $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11,
                         COALESCE($12, $13),
@@ -763,7 +763,8 @@ impl ModelRepository {
                         COALESCE($24, ARRAY[]::TEXT[]),
                         $25, $26, $27, $28,
                         COALESCE($29, false), $30,
-                        $31
+                        $31,
+                        COALESCE($32, true)
                     )
                     ON CONFLICT (model_name) DO NOTHING
                     RETURNING id, model_name, model_display_name, model_description, model_icon,
@@ -804,6 +805,7 @@ impl ModelRepository {
                         &req.allow_free,
                         &text_pricing_value,
                         &successor_value,
+                        &req.is_listed,
                     ],
                 )
                 .await
@@ -1458,7 +1460,9 @@ impl ModelRepository {
             successor_model_name: row.try_get("successor_model_name").ok().flatten(),
             openrouter_slug: row.try_get("openrouter_slug").ok().flatten(),
             allow_free: row.try_get("allow_free").unwrap_or(false),
-            is_listed: row.try_get("is_listed").unwrap_or(true),
+            // A query that forgets the column must hide the model, not
+            // publish one that was unlisted.
+            is_listed: row.try_get("is_listed").unwrap_or(false),
         }
     }
 

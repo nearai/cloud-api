@@ -162,7 +162,8 @@ pub trait ModelsServiceTrait: Send + Sync {
         identifier: &str,
     ) -> Result<ModelWithPricing, ModelsError>;
 
-    /// Resolve a model identifier for public model-detail reads.
+    /// Resolve a model identifier for public model-detail reads. An unlisted
+    /// model is answered like a model that does not exist.
     ///
     /// Production implementations should use the cached active public model
     /// list, preferring exact canonical model-name matches before alias matches.
@@ -172,7 +173,14 @@ pub trait ModelsServiceTrait: Send + Sync {
         &self,
         identifier: &str,
     ) -> Result<ModelWithPricing, ModelsError> {
-        self.resolve_and_get_model(identifier).await
+        let model = self.resolve_and_get_model(identifier).await?;
+        if model.is_listed {
+            Ok(model)
+        } else {
+            Err(ModelsError::NotFound(format!(
+                "Model '{identifier}' not found"
+            )))
+        }
     }
 
     /// Resolve `identifier` against the cached active-models alias map.

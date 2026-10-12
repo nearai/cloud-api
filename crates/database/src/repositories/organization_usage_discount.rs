@@ -196,6 +196,17 @@ impl OrganizationUsageDiscountRepository {
         // A concurrent save wins idempotently, even if its worker changed rows during
         // our preflight scan. Otherwise, fail closed on any historical validation error.
         preflight_result?;
+        // Reconciliations classify aggregate legacy consumption, not specific
+        // requests. A historical discount cannot safely reverse that split.
+        if apply_since.is_some() {
+            let reconciled: bool = tx.query_one(
+                "SELECT EXISTS (SELECT 1 FROM organization_credit_reconciliations WHERE organization_id=$1)",
+                &[&organization_id],
+            ).await?.get(0);
+            if reconciled {
+                return Err(DiscountError::UnsupportedHistory.into());
+            }
+        }
         // Transaction-start now() can precede time spent waiting for the accounting lock.
         let saved_at: DateTime<Utc> = tx.query_one("SELECT clock_timestamp()", &[]).await?.get(0);
         if apply_since.is_some() {

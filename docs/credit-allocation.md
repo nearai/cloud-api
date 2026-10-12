@@ -74,3 +74,66 @@ immediately available for new usage. No admin API call is required.
 - Monitor allocation reconciliation and unfunded balances before expanding the
   rollout. Allocation rows and their parent usage/balance update commit in one
   transaction.
+
+## Reconciling legacy consumption before enabling postpay
+
+For an existing organization, review historical credit/payment/contract records
+before choosing a credit type for its pre-attribution consumption. Admins can
+reclassify a reviewed portion of `legacy_unattributed_amount` using:
+
+`POST /v1/admin/organizations/{org_id}/credit-reconciliations`
+
+```json
+{
+  "idempotency_key": "opening-review-2026-10",
+  "amounts": { "payment": 80000000000 },
+  "reason": "Verified $80 prepaid consumption against billing records",
+  "dry_run": true
+}
+```
+
+All amounts are positive integer nano-USD. Supported names are `grant`,
+`payment`, `staking_farm`, and `postpay`. A nonempty reason (up to 2000 characters)
+and a per-organization idempotency key (up to 100 characters) are required.
+The endpoint requires an admin session or read-write admin access token;
+read-only tokens cannot preview or commit this operation.
+
+A dry run returns before/after per-type ceilings, consumed and available amounts,
+legacy unknown consumption, unresolved overage, and aggregate available capacity.
+It stores nothing and does not reserve the key. Set `dry_run` to `false` (or omit
+it) to commit; accounting is revalidated under the organization lock, so a
+preview is not a reservation of its displayed position. Record the returned
+`reconciliation_id` with the reviewed evidence. Identical committed terms with
+an existing key return the original snapshots even after later usage; conflicting
+terms return HTTP 409. A preview using an already committed key also returns 409.
+
+The operation adds reviewed historical consumption to the existing per-type
+counters and removes exactly the same amount from the aggregate legacy
+consumption deduction. It preserves total spend, unresolved overage, current
+ceilings, and aggregate available capacity. Each selected type must have an
+active USD ceiling with enough remaining capacity; otherwise the operation
+returns 409 and the opening position needs further review. Never increase a
+ceiling merely to bypass this validation. The supplied amounts are increments,
+not absolute replacements for lifetime consumption.
+
+For example, with a payment ceiling of $100, postpay ceiling of $200 and $80 of
+legacy unknown spend, reclassifying the $80 as payment-funded leaves payment
+capacity $20 and postpay capacity $200, with aggregate capacity unchanged at
+$220. New postings read the corrected counters using the configured priority.
+The endpoint does not change that priority or a contract's effective date.
+
+Adjustments are stored in a separate append-only audit ledger with the actor,
+reason, amounts and original before/after result. They do **not** rewrite old
+usage logs, create per-request allocations, or make a postpay-filtered historical
+report complete. Unreviewed amounts remain unknown; invoice settlement and
+historical request-level attribution are separate operations.
+Partial reconciliation preserves the remaining unknown deduction but cannot
+establish a fully verified per-type opening position. Resolve all relevant
+legacy consumption before relying on future allocations as verified funding.
+
+Finish historical discount corrections before reconciling. A reconciliation is
+rejected while a discount worker is applying. After a reconciliation exists,
+new historical discounts are rejected because aggregate opening classifications
+cannot safely be reversed against individual usage rows. Future-only discounts
+remain supported. Existing fully completed discount corrections can be followed
+by a reconciliation of their remaining legacy spend.

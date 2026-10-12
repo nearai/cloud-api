@@ -111,6 +111,7 @@ fn catalog_model() -> ModelWithPricing {
         deprecation_date: None,
         successor_model_name: None,
         openrouter_slug: None,
+        is_listed: true,
         created_at: chrono::Utc::now(),
     }
 }

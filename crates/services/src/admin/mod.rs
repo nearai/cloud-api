@@ -685,6 +685,7 @@ impl AdminService for AdminServiceImpl {
             verifiable: None,
             is_active: None,
             allow_free: None,
+            is_listed: None,
             aliases: None,
             owned_by: None,
             provider_type: None,

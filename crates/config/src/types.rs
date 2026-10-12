@@ -1492,6 +1492,15 @@ impl InvitationEmailConfig {
                 return Err(format!("CLOUD_UI_BASE_URL must be set when {switch}=true"));
             }
         }
+        // A cap of zero would refuse every request while the feature looks on.
+        if contact_email_verification_enabled && contact_email_verification_daily_cap == 0 {
+            return Err(
+                "CONTACT_EMAIL_VERIFICATION_DAILY_CAP must be greater than 0 when \
+                 CONTACT_EMAIL_VERIFICATION_ENABLED=true; set \
+                 CONTACT_EMAIL_VERIFICATION_ENABLED=false to switch the feature off"
+                    .to_string(),
+            );
+        }
 
         Ok(Self {
             enabled,
@@ -2717,6 +2726,35 @@ mod tests {
                 "{error}"
             );
         }
+        clear_invitation_email_env();
+    }
+
+    #[test]
+    #[serial]
+    fn test_contact_email_verification_daily_cap_of_zero_fails_when_enabled() {
+        clear_invitation_email_env();
+        std::env::set_var("CONTACT_EMAIL_VERIFICATION_DAILY_CAP", "0");
+
+        // Off: the cap is not used, so zero is accepted.
+        assert_eq!(
+            InvitationEmailConfig::from_env()
+                .unwrap()
+                .contact_email_verification_daily_cap,
+            0
+        );
+
+        std::env::set_var("CONTACT_EMAIL_VERIFICATION_ENABLED", "true");
+        std::env::set_var("INVITATION_EMAIL_FROM", "no-reply@example.com");
+        std::env::set_var("RESEND_API_KEY", "re_test");
+        std::env::set_var("CLOUD_UI_BASE_URL", "https://cloud.example.com");
+        let error = InvitationEmailConfig::from_env().unwrap_err();
+        assert!(
+            error.contains("CONTACT_EMAIL_VERIFICATION_DAILY_CAP must be greater than 0"),
+            "{error}"
+        );
+
+        std::env::set_var("CONTACT_EMAIL_VERIFICATION_DAILY_CAP", "1");
+        assert!(InvitationEmailConfig::from_env().is_ok());
         clear_invitation_email_env();
     }
 

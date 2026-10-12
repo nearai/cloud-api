@@ -97,7 +97,7 @@ pub enum ConfirmOutcome {
     Verified {
         user_id: Uuid,
     },
-    /// Unknown, expired or already used token.
+    /// Unknown, expired or already used token, or not the user's newest link.
     InvalidToken,
     /// The address is another user's login email or verified contact email.
     /// Nothing was written and the token stays usable.
@@ -117,7 +117,8 @@ pub trait ContactEmailRepository: Send + Sync {
     ) -> anyhow::Result<CreateVerificationOutcome>;
 
     /// Called once the email for `verification_id` was sent: expire the user's
-    /// unused links created before it.
+    /// unused links created before it. This is housekeeping: [`Self::confirm`]
+    /// already refuses every link but the newest.
     async fn expire_earlier_verifications(
         &self,
         user_id: Uuid,
@@ -129,7 +130,8 @@ pub trait ContactEmailRepository: Send + Sync {
     async fn delete_verification(&self, verification_id: Uuid) -> anyhow::Result<()>;
 
     /// One transaction: consume the token and set the user's contact email, its
-    /// verification time and the opt-in time, or change nothing.
+    /// verification time and the opt-in time, or change nothing. Only the user's
+    /// newest verification can be confirmed.
     async fn confirm(&self, token_hash: &str) -> anyhow::Result<ConfirmOutcome>;
 
     /// Delete verification rows created more than `max_age_secs` ago. Returns
@@ -406,7 +408,8 @@ impl ContactEmailService {
             return Err(ContactEmailError::SendFailed);
         }
 
-        // Only now does the new link replace the earlier ones.
+        // Confirmation already accepts only the newest link. Expiring the earlier
+        // ones is tidying up, so a failure here does not fail the request.
         if self
             .repository
             .expire_earlier_verifications(user_id.0, verification_id)

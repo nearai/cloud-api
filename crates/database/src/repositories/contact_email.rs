@@ -12,6 +12,9 @@ use tokio_postgres::error::SqlState;
 use tokio_postgres::GenericClient;
 use uuid::Uuid;
 
+/// Unique index that keeps a verified contact address to one user.
+const VERIFIED_CONTACT_EMAIL_INDEX: &str = "idx_users_contact_email_verified";
+
 pub struct PgContactEmailRepository {
     pool: DbPool,
 }
@@ -23,9 +26,14 @@ impl PgContactEmailRepository {
 }
 
 /// Seconds to wait when `max` or more verification emails matching `filter` (a
-/// predicate over `user_contact_email_verifications`, with `key` as `$2` when it
+/// predicate over `user_contact_email_verifications`, with `key` as `$3` when it
 /// needs one) were sent in the last `window_secs`. `None` when under the limit.
-/// The wait ends when the oldest counted send leaves the window.
+///
+/// The wait ends when enough counted sends have left the window for the count
+/// to be under `max` again. With `count` sends that is when the
+/// `(count - max + 1)`-th oldest leaves: the oldest one when the limit is just
+/// reached, a later one when the count is over it (the global cap can be
+/// overshot, or lowered while sends are still in the window).
 async fn rate_limit_wait<C: GenericClient + Sync>(
     client: &C,
     filter: &str,
@@ -33,26 +41,30 @@ async fn rate_limit_wait<C: GenericClient + Sync>(
     max: i64,
     window_secs: i64,
 ) -> Result<Option<u64>, RepositoryError> {
-    let window_secs = window_secs as f64;
-    let mut params: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> = vec![&window_secs];
+    // A limit of zero is never under its maximum: no send leaving the window
+    // restores capacity, so the wait is the whole window.
+    if max <= 0 {
+        return Ok(Some(window_secs.max(1) as u64));
+    }
+    let window = window_secs as f64;
+    let mut params: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> = vec![&window, &max];
     params.extend(key);
     let row = client
-        .query_one(
+        .query_opt(
             &format!(
-                "SELECT COUNT(*) AS sends, \
-                        EXTRACT(EPOCH FROM MIN(created_at) + make_interval(secs => $1) - NOW())::float8 AS wait_secs \
-                 FROM user_contact_email_verifications \
-                 WHERE {filter} AND created_at > NOW() - make_interval(secs => $1)"
+                "SELECT EXTRACT(EPOCH FROM created_at + make_interval(secs => $1) - NOW())::float8 AS wait_secs \
+                 FROM (SELECT created_at, \
+                              COUNT(*) OVER () AS sends, \
+                              ROW_NUMBER() OVER (ORDER BY created_at) AS position \
+                       FROM user_contact_email_verifications \
+                       WHERE {filter} AND created_at > NOW() - make_interval(secs => $1)) counted \
+                 WHERE position = sends - $2 + 1"
             ),
             &params,
         )
         .await
         .map_err(map_db_error)?;
-    if row.get::<_, i64>("sends") < max {
-        return Ok(None);
-    }
-    let wait_secs: Option<f64> = row.get("wait_secs");
-    Ok(Some(wait_secs.unwrap_or(0.0).ceil().max(1.0) as u64))
+    Ok(row.map(|row| row.get::<_, f64>("wait_secs").ceil().max(1.0) as u64))
 }
 
 #[async_trait]
@@ -99,7 +111,7 @@ impl ContactEmailRepository for PgContactEmailRepository {
 
             let per_user = rate_limit_wait(
                 &*transaction,
-                "user_id = $2",
+                "user_id = $3",
                 Some(&verification.user_id),
                 limits.per_user,
                 limits.per_user_window_secs,
@@ -120,7 +132,7 @@ impl ContactEmailRepository for PgContactEmailRepository {
             // Checked last and reported apart: the caller is not told about it.
             let per_address = rate_limit_wait(
                 &*transaction,
-                "email_limit_key = $2",
+                "email_limit_key = $3",
                 Some(&verification.email_limit_key),
                 limits.per_address,
                 limits.per_address_window_secs,
@@ -258,8 +270,12 @@ impl ContactEmailRepository for PgContactEmailRepository {
             // before a newer request expired the token and then waited for it.
             let Some(stored) = transaction
                 .query_opt(
-                    "SELECT email, expires_at, consumed_at, clock_timestamp() AS now \
-                     FROM user_contact_email_verifications WHERE token_hash = $1 FOR UPDATE",
+                    "SELECT v.email, v.expires_at, v.consumed_at, clock_timestamp() AS now, \
+                            NOT EXISTS (SELECT 1 FROM user_contact_email_verifications newer \
+                                        WHERE newer.user_id = v.user_id \
+                                          AND newer.created_at > v.created_at) AS is_newest \
+                     FROM user_contact_email_verifications v \
+                     WHERE v.token_hash = $1 FOR UPDATE OF v",
                     &[&token_hash],
                 )
                 .await
@@ -268,11 +284,18 @@ impl ContactEmailRepository for PgContactEmailRepository {
                 transaction.rollback().await.map_err(map_db_error)?;
                 return Ok(ConfirmOutcome::InvalidToken);
             };
-            if !verification_is_usable(
-                stored.get("expires_at"),
-                stored.get("consumed_at"),
-                stored.get("now"),
-            ) {
+            // Only the user's newest link can confirm. Earlier ones are normally
+            // expired once the newer email is sent, but that step runs after the
+            // send and may not have happened; this check does not depend on it.
+            // A send that failed deleted its row, so the link before it is the
+            // newest again.
+            if !stored.get::<_, bool>("is_newest")
+                || !verification_is_usable(
+                    stored.get("expires_at"),
+                    stored.get("consumed_at"),
+                    stored.get("now"),
+                )
+            {
                 transaction.rollback().await.map_err(map_db_error)?;
                 return Ok(ConfirmOutcome::InvalidToken);
             }
@@ -316,7 +339,14 @@ impl ContactEmailRepository for PgContactEmailRepository {
                 .await
             {
                 Ok(_) => {}
-                Err(err) if err.code() == Some(&SqlState::UNIQUE_VIOLATION) => {
+                // Only that index means "address in use". Any other unique
+                // violation is a database error like any other.
+                Err(err)
+                    if err.as_db_error().is_some_and(|db| {
+                        db.code() == &SqlState::UNIQUE_VIOLATION
+                            && db.constraint() == Some(VERIFIED_CONTACT_EMAIL_INDEX)
+                    }) =>
+                {
                     transaction.rollback().await.map_err(map_db_error)?;
                     return Ok(ConfirmOutcome::AddressInUse { user_id });
                 }

@@ -470,12 +470,19 @@ impl UserErasureRepository for PostgresUserErasureRepository {
                 .await
                 .map_err(map_db_error)?;
             // Contact email verifications U asked for, and any pending for U's
-            // addresses (as with invitations above).
+            // addresses (as with invitations above). The limit key also catches
+            // the spellings other users may have typed for the same mailbox: a
+            // `+tag`, or dots in a Gmail address.
+            let address_keys: Vec<String> = std::iter::once(user_email.as_str())
+                .chain(contact_email.as_deref())
+                .map(services::contact_email::send_limit_key)
+                .collect();
             transaction
                 .execute(
                     "DELETE FROM user_contact_email_verifications \
-                     WHERE user_id = $1 OR lower(email) = lower($2) OR lower(email) = lower($3)",
-                    &[&user_id, &user_email, &contact_email],
+                     WHERE user_id = $1 OR lower(email) = lower($2) OR lower(email) = lower($3) \
+                        OR email_limit_key = ANY($4)",
+                    &[&user_id, &user_email, &contact_email, &address_keys],
                 )
                 .await
                 .map_err(map_db_error)?;

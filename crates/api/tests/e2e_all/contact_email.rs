@@ -10,7 +10,10 @@ use database::Database;
 use services::admin::AdminRepository;
 use services::auth::ports::OAuthUserInfo;
 use services::auth::AuthServiceTrait;
-use services::contact_email::{hash_verification_token, ContactEmailService};
+use services::contact_email::{
+    hash_verification_token, ConfirmOutcome, ContactEmailRepository, ContactEmailService,
+    CreateVerificationOutcome, NewVerification, SendLimits,
+};
 use services::email::{
     near_placeholder_email, ContactEmailVerificationEmail, EmailDeliveryOutcome, EmailError,
     EmailSender, InvitationEmail, ModelDeprecationEmail, PricingChangeEmail,
@@ -102,11 +105,47 @@ async fn setup() -> (
     Arc<Database>,
     Arc<RecordingEmailSender>,
 ) {
-    setup_with_daily_cap(NO_DAILY_CAP).await
+    setup_with(NO_DAILY_CAP, false).await
 }
 
-async fn setup_with_daily_cap(
+/// The real repository, except that expiring a user's earlier links always
+/// fails, as if the process had died between sending the email and that step.
+struct CleanupFails(database::repositories::PgContactEmailRepository);
+
+#[async_trait]
+impl ContactEmailRepository for CleanupFails {
+    async fn create_verification(
+        &self,
+        verification: NewVerification<'_>,
+        limits: SendLimits,
+    ) -> anyhow::Result<CreateVerificationOutcome> {
+        self.0.create_verification(verification, limits).await
+    }
+
+    async fn expire_earlier_verifications(&self, _: Uuid, _: Uuid) -> anyhow::Result<()> {
+        Err(anyhow::anyhow!("the cleanup step did not run"))
+    }
+
+    async fn delete_verification(&self, verification_id: Uuid) -> anyhow::Result<()> {
+        self.0.delete_verification(verification_id).await
+    }
+
+    async fn confirm(&self, token_hash: &str) -> anyhow::Result<ConfirmOutcome> {
+        self.0.confirm(token_hash).await
+    }
+
+    async fn delete_older_than(&self, max_age_secs: i64) -> anyhow::Result<u64> {
+        self.0.delete_older_than(max_age_secs).await
+    }
+
+    async fn remove_contact_email(&self, user_id: Uuid) -> anyhow::Result<bool> {
+        self.0.remove_contact_email(user_id).await
+    }
+}
+
+async fn setup_with(
     daily_cap: i64,
+    cleanup_fails: bool,
 ) -> (
     axum_test::TestServer,
     Arc<Database>,
@@ -115,10 +154,15 @@ async fn setup_with_daily_cap(
     let sender = Arc::new(RecordingEmailSender::default());
     let recording = sender.clone();
     let (server, database) = setup_test_server_with_domain_services(move |services, database| {
+        let repository =
+            database::repositories::PgContactEmailRepository::new(database.pool().clone());
+        let repository: Arc<dyn ContactEmailRepository> = if cleanup_fails {
+            Arc::new(CleanupFails(repository))
+        } else {
+            Arc::new(repository)
+        };
         services.contact_email_service = Arc::new(ContactEmailService::new(
-            Arc::new(database::repositories::PgContactEmailRepository::new(
-                database.pool().clone(),
-            )),
+            repository,
             Arc::new(database::UserRepository::new(database.pool().clone())),
             recording,
             Some(VERIFY_PAGE.to_string()),
@@ -743,6 +787,113 @@ async fn an_address_gets_three_verification_emails_per_day_across_users() {
 }
 
 #[tokio::test]
+async fn only_the_newest_link_confirms_even_when_expiring_the_older_one_failed() {
+    // On this server the step that expires earlier links never succeeds.
+    let (server, database, sender) = setup_with(NO_DAILY_CAP, true).await;
+    let auth = real_auth(&database);
+    let client = database.pool().get().await.unwrap();
+    let account_id = new_account_id();
+    let (session, user_id) = near_login(&auth, &account_id).await;
+
+    let older_address = new_address();
+    let newer_address = new_address();
+    assert_eq!(
+        request(&server, &session, &older_address)
+            .await
+            .status_code(),
+        200
+    );
+    let older_link = sender.latest_token(&account_id);
+    // The request still succeeds: the email went out, the cleanup is not part
+    // of the answer.
+    let response = request(&server, &session, &newer_address).await;
+    assert_eq!(response.status_code(), 200, "{}", response.text());
+    let newer_link = sender.latest_token(&account_id);
+
+    // The older link really was left unexpired and unused.
+    let left_usable: bool = client
+        .query_one(
+            "SELECT consumed_at IS NULL AND expires_at > NOW() + INTERVAL '23 hours' \
+             FROM user_contact_email_verifications WHERE token_hash = $1",
+            &[&hash_verification_token(&older_link)],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    assert!(left_usable);
+
+    // It is refused all the same, with the answer an unknown token gets.
+    let unknown = verify(&server, "not-a-token-we-issued").await;
+    let refused = verify(&server, &older_link).await;
+    assert_eq!(refused.status_code(), 400, "{}", refused.text());
+    assert_eq!(refused.text(), unknown.text());
+    assert_eq!(contact_columns(&client, user_id).await.1, None);
+
+    // A send that fails removes its row, so the newest delivered link is still
+    // the newest and confirms.
+    sender.failing.store(true, Ordering::SeqCst);
+    assert_eq!(
+        request(&server, &session, &new_address())
+            .await
+            .status_code(),
+        502
+    );
+    assert_eq!(verify(&server, &older_link).await.status_code(), 400);
+    let confirmed = verify(&server, &newer_link).await;
+    assert_eq!(confirmed.status_code(), 200, "{}", confirmed.text());
+    assert_eq!(
+        contact_columns(&client, user_id).await.1.as_deref(),
+        Some(newer_address.as_str())
+    );
+}
+
+#[tokio::test]
+async fn retry_after_waits_for_the_send_that_restores_capacity() {
+    let (server, database, _sender) = setup().await;
+    let auth = real_auth(&database);
+    let client = database.pool().get().await.unwrap();
+    let (session, user_id) = near_login(&auth, &new_account_id()).await;
+
+    // Five sends in the last hour against a limit of three: 50, 40, 30, 20 and
+    // 10 minutes ago. (The API never lets a user get there; a lowered limit or
+    // the overshoot the global cap allows does.)
+    client
+        .execute(
+            "INSERT INTO user_contact_email_verifications \
+                 (user_id, email, email_limit_key, token_hash, expires_at, created_at) \
+             SELECT $1, address, address, md5(random()::text) || md5(random()::text), \
+                    NOW() + INTERVAL '1 day', NOW() - make_interval(mins => minutes_ago) \
+             FROM (SELECT minutes_ago, 'ra-' || minutes_ago || '-' || $2 || '@example.com' AS address \
+                   FROM unnest(ARRAY[50, 40, 30, 20, 10]) AS minutes_ago) sends",
+            &[&user_id, &Uuid::new_v4().simple().to_string()],
+        )
+        .await
+        .unwrap();
+
+    // The user is under the limit again once three of the five have left the
+    // hour: when the send from 30 minutes ago does, not the oldest one.
+    let limited = request(&server, &session, &new_address()).await;
+    assert_eq!(limited.status_code(), 429, "{}", limited.text());
+    let wait = retry_after_secs(&limited);
+    assert!((1700..=1800).contains(&wait), "Retry-After was {wait}");
+
+    // Exactly at the limit it is the oldest send that matters. Left: 50, 40, 10.
+    client
+        .execute(
+            "DELETE FROM user_contact_email_verifications WHERE user_id = $1 \
+               AND created_at BETWEEN NOW() - INTERVAL '35 minutes' AND NOW() - INTERVAL '15 minutes'",
+            &[&user_id],
+        )
+        .await
+        .unwrap();
+    assert_eq!(verification_rows(&client, user_id).await, 3);
+    let limited = request(&server, &session, &new_address()).await;
+    assert_eq!(limited.status_code(), 429, "{}", limited.text());
+    let wait = retry_after_secs(&limited);
+    assert!((500..=600).contains(&wait), "Retry-After was {wait}");
+}
+
+#[tokio::test]
 async fn a_failed_send_spends_no_limit_and_keeps_the_earlier_link() {
     let (server, database, sender) = setup().await;
     let auth = real_auth(&database);
@@ -816,7 +967,7 @@ async fn serial_daily_cap_limits_sends_across_all_users() {
         .unwrap()
         .get(0);
     // Room for exactly two more sends today.
-    let (server, database, sender) = setup_with_daily_cap(already_sent + 2).await;
+    let (server, database, sender) = setup_with(already_sent + 2, false).await;
     let auth = real_auth(&database);
     let client = database.pool().get().await.unwrap();
 
@@ -1017,6 +1168,17 @@ async fn erasure_clears_the_contact_email_and_its_verifications() {
     );
     assert_eq!(verification_rows(&client, user_id).await, 2);
     assert_eq!(verification_rows(&client, other_user).await, 1);
+    // And a third account has one for the same mailbox, spelled with a `+tag`.
+    let (local, domain) = address.split_once('@').unwrap();
+    let tagged = format!("{}+Promo@{domain}", local.to_uppercase());
+    let (tagging_session, tagging_user) = near_login(&auth, &new_account_id()).await;
+    assert_eq!(
+        request(&server, &tagging_session, &tagged)
+            .await
+            .status_code(),
+        200
+    );
+    assert_eq!(sender.sent_to(&tagged).len(), 1);
     // An organization invited the user at the contact address.
     let org = create_org(&server).await;
     let invited = server
@@ -1061,6 +1223,17 @@ async fn erasure_clears_the_contact_email_and_its_verifications() {
         .get(0);
     assert_eq!(leftovers, 0);
     assert_eq!(invitations().await, 0);
+    // That includes the other spelling of the contact address.
+    assert_eq!(verification_rows(&client, tagging_user).await, 0);
+    let by_key: i64 = client
+        .query_one(
+            "SELECT COUNT(*) FROM user_contact_email_verifications WHERE email_limit_key = $1",
+            &[&address],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(by_key, 0);
 
     // The erased user's pending link is dead, and the address is free again.
     assert_eq!(verify(&server, &pending_token).await.status_code(), 400);
@@ -1403,6 +1576,19 @@ async fn admin_user_listing_includes_the_contact_email_fields() {
     };
     let listed = |include_organizations: bool| listed_by(account_id.clone(), include_organizations);
 
+    // An address without its verification time is not a verified address: it
+    // is shown neither to admins nor to the user. (The two columns are always
+    // written together; this row is made by hand.)
+    let client = database.pool().get().await.unwrap();
+    client
+        .execute(
+            "UPDATE users SET contact_email = $2 WHERE id = $1",
+            &[&user_id, &new_address()],
+        )
+        .await
+        .unwrap();
+    assert!(me(&server, &session).await["contact_email"].is_null());
+
     // The keys are always present, null until an address is verified.
     for include_organizations in [false, true] {
         let user = listed(include_organizations).await;
@@ -1418,6 +1604,8 @@ async fn admin_user_listing_includes_the_contact_email_fields() {
             );
         }
     }
+
+    drop(client);
 
     let address = new_address();
     add_contact_email(&server, &sender, &session, &account_id, &address).await;

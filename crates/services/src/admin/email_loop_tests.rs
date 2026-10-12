@@ -445,7 +445,7 @@ impl EmailSender for CountingEmailSender {
         &self,
         _email: &crate::email::ContactEmailVerificationEmail,
     ) -> Result<EmailDeliveryOutcome, EmailError> {
-        unimplemented!()
+        Ok(EmailDeliveryOutcome::Skipped)
     }
 }
 

@@ -29,7 +29,7 @@ use axum::{
     response::Response,
 };
 use chrono::{DateTime, Utc};
-use services::models::{ModelWithPricing, ModelsServiceTrait};
+use services::models::{ModelCaller, ModelWithPricing, ModelsServiceTrait};
 
 pub const HEADER_MODEL_DEPRECATION_DATE: &str = "x-model-deprecation-date";
 pub const HEADER_MODEL_SUCCESSOR: &str = "x-model-successor";
@@ -130,7 +130,13 @@ pub async fn model_deprecation_middleware(
     // ago. An alias resolves to its canonical model. Advisory only: a failed
     // or slow lookup (cache miss while the database is struggling) leaves the
     // response as it is instead of holding it back.
-    let lookup = state.models_service.resolve_and_get_model(model_name);
+    //
+    // A trusted lookup: only successful responses get here, and the handler
+    // that produced one has already checked that the caller may use the
+    // model.
+    let lookup = state
+        .models_service
+        .resolve_and_get_model(model_name, ModelCaller::Trusted);
     let Ok(Ok(model)) = tokio::time::timeout(LOOKUP_TIMEOUT, lookup).await else {
         return response;
     };

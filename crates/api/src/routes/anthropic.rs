@@ -32,7 +32,7 @@ use inference_providers::{
 };
 use services::completions::hash_inference_id_to_uuid;
 use services::completions::ports::{CompletionError, ConcurrentRequestGuard};
-use services::models::{ModelWithPricing, ModelsError, ModelsServiceTrait};
+use services::models::{ModelCaller, ModelWithPricing, ModelsError, ModelsServiceTrait};
 use services::usage::{
     five_minute_cache_write_rate, CacheWriteBilling, InferenceType, ProviderAttribution,
     RecordUsageServiceRequest, StopReason, UsageServiceTrait,
@@ -466,6 +466,7 @@ async fn handle_request(
 
     let (model, alias_from) = match resolve_model(
         app_state.models_service.as_ref(),
+        ModelCaller::Organization(api_key.organization.id.0),
         &headers,
         &prepared.requested_model,
     )
@@ -916,6 +917,7 @@ fn normalized_beta_header(
 
 async fn resolve_model(
     models_service: &dyn ModelsServiceTrait,
+    caller: ModelCaller,
     headers: &HeaderMap,
     requested: &str,
 ) -> Result<(ModelWithPricing, Option<String>), Response> {
@@ -925,10 +927,13 @@ async fn resolve_model(
         format!("anthropic/{requested}")
     };
 
-    let model = match models_service.resolve_and_get_model(&normalized).await {
+    let model = match models_service
+        .resolve_and_get_model(&normalized, caller)
+        .await
+    {
         Ok(model) => model,
         Err(ModelsError::NotFound(_)) if normalized != requested => models_service
-            .resolve_and_get_model(requested)
+            .resolve_and_get_model(requested, caller)
             .await
             .map_err(model_resolution_error)?,
         Err(error) => return Err(model_resolution_error(error)),

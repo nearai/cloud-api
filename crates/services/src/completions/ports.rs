@@ -256,10 +256,13 @@ pub trait CompletionServiceTrait: Send + Sync {
         params: inference_providers::ScoreParams,
     ) -> Result<inference_providers::ScoreResponse, CompletionError>;
 
-    /// Resolve an active model by canonical name or alias (for capability checks, etc.).
+    /// Resolve an active model by canonical name or alias, for `caller` (for
+    /// capability checks, etc.). `None` if the name is unknown or names an
+    /// unlisted model the caller may not use.
     async fn get_model(
         &self,
         model_name: &str,
+        caller: crate::models::ModelCaller,
     ) -> Result<Option<crate::models::ModelWithPricing>, anyhow::Error>;
 
     /// Get the inference provider pool for direct access

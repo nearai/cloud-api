@@ -17,6 +17,7 @@ use crate::{
         GatewayQuoteInput,
     },
     inference_provider_pool::InferenceProviderPool,
+    models::{resolve_model_cached, ModelCaller},
 };
 
 pub struct ModelAttestationInput {
@@ -212,12 +213,17 @@ impl AttestationService {
         let Some(requested_model) = query.model.as_ref() else {
             return Ok(None);
         };
-        let resolved_model = self
-            .models_repository
-            .resolve_and_get_model(requested_model)
-            .await
-            .map_err(|e| AttestationError::ProviderError(format!("Failed to resolve model: {e}")))?
-            .ok_or_else(|| AttestationError::UnknownModel(requested_model.clone()))?;
+        // This token is served to the public, so the model is resolved for an
+        // anonymous caller: an unlisted model is unknown here.
+        let resolved_model = resolve_model_cached(
+            &self.model_resolve_cache,
+            self.models_repository.as_ref(),
+            requested_model,
+            ModelCaller::Anonymous,
+        )
+        .await
+        .map_err(|e| AttestationError::ProviderError(format!("Failed to resolve model: {e}")))?
+        .ok_or_else(|| AttestationError::UnknownModel(requested_model.clone()))?;
         let canonical_model = resolved_model.model_name;
         let model_alias_resolved =
             (canonical_model != *requested_model).then(|| ItaModelAliasResolved {

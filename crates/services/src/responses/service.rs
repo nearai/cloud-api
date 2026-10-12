@@ -178,9 +178,15 @@ impl ports::ResponseServiceTrait for ResponseServiceImpl {
 
         // Reuse the lookup needed for image dispatch, but perform it before
         // starting the stream or tools so endpoint errors remain HTTP 400s.
+        // A model this organization may not use is `None`, like an unknown
+        // one: no endpoint check and no image dispatch for it, and the
+        // completion service answers the request as an unknown model.
         let model = self
             .completion_service
-            .get_model(&request.model)
+            .get_model(
+                &request.model,
+                crate::models::ModelCaller::Organization(organization_id),
+            )
             .await
             .ok()
             .flatten();

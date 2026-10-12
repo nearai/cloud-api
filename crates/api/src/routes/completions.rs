@@ -26,6 +26,7 @@ use services::completions::{
     ports::{CompletionMessage, CompletionRequest as ServiceCompletionRequest},
     MAX_PROVIDER_DONE_EVENT_BYTES,
 };
+use services::models::ModelCaller;
 use sha2::{Digest, Sha256};
 use std::convert::Infallible;
 use std::sync::Arc;
@@ -128,16 +129,22 @@ fn e2ee_requested(encryption_headers: &crate::routes::common::EncryptionHeaders)
 /// clients, before a payload is bound to a different model TD's signing key.
 ///
 /// Unknown models fall through (`Ok`) so the completion service returns its
-/// canonical "not a valid model name or alias" error.
+/// canonical "not a valid model name or alias" error. So does an alias of a
+/// model `caller` may not use: naming its canonical model here would disclose
+/// it.
 async fn reject_if_aliased(
     models_service: &Arc<dyn services::models::ModelsServiceTrait>,
+    caller: ModelCaller,
     headers: &header::HeaderMap,
     requested_model: &str,
 ) -> Result<(), Response> {
     if !no_aliasing_requested(headers) {
         return Ok(());
     }
-    match models_service.resolve_and_get_model(requested_model).await {
+    match models_service
+        .resolve_and_get_model(requested_model, caller)
+        .await
+    {
         Ok(m) if m.model_name != requested_model => Err((
             StatusCode::BAD_REQUEST,
             ResponseJson(ErrorResponse::new(
@@ -849,9 +856,11 @@ async fn bill_auto_redact_classify(
         classify_tokens as i32 // safe: 0 < classify_tokens <= 1_000_000
     };
 
+    // A trusted lookup: the platform chose this model and has already run the
+    // classify pass, so the usage is billed whoever the organization is.
     let model = match app_state
         .models_service
-        .get_model_by_name(auto_redact::DEFAULT_PII_MODEL)
+        .get_model_by_name(auto_redact::DEFAULT_PII_MODEL, ModelCaller::Trusted)
         .await
     {
         Ok(model) => model,
@@ -1502,9 +1511,17 @@ async fn chat_completions_inner(
     let e2ee_active = e2ee_requested(&encryption_headers);
     let include_stream_usage_in_response = chat_stream_include_usage_requested(&request);
 
+    // The catalog reads below answer for the requested model before the
+    // completion service has resolved it, so each one states who is asking.
+    // For an unlisted model this organization may not use they find nothing,
+    // and the request reaches the completion service like one for an unknown
+    // model and gets its error.
+    let caller = ModelCaller::Organization(api_key.organization.id.0);
+
     // Strict alias mode: refuse to serve through an alias before any
     // inference happens (issue #573).
-    if let Err(resp) = reject_if_aliased(&app_state.models_service, &headers, &request.model).await
+    if let Err(resp) =
+        reject_if_aliased(&app_state.models_service, caller, &headers, &request.model).await
     {
         return resp;
     }
@@ -1519,7 +1536,7 @@ async fn chat_completions_inner(
     // path); advisory only — strict mode above stays authoritative.
     let alias_canonical = app_state
         .models_service
-        .resolve_alias_cached(&request.model)
+        .resolve_alias_cached(&request.model, caller)
         .await;
     let resolved_model_name = alias_canonical.as_deref().unwrap_or(&request.model);
     let (model_attestation_supported, model_input_modalities) =
@@ -1527,21 +1544,41 @@ async fn chat_completions_inner(
             // Exact catalog name first, then the alias target: a name that is
             // both a model and another model's alias must read its own
             // capabilities.
-            Ok(models) => models
-                .iter()
-                .find(|model| model.model_name == request.model)
-                .or_else(|| {
-                    models
-                        .iter()
-                        .find(|model| model.model_name == resolved_model_name)
-                })
-                .map(|model| {
-                    (
-                        Some(model.attestation_supported),
-                        model.input_modalities.clone(),
-                    )
-                })
-                .unwrap_or((None, None)),
+            Ok(models) => {
+                let model = models
+                    .iter()
+                    .find(|model| model.model_name == request.model)
+                    .or_else(|| {
+                        models
+                            .iter()
+                            .find(|model| model.model_name == resolved_model_name)
+                    });
+                // The list holds every active model. Read the row only if
+                // this organization may use the model (no cost for a listed
+                // one); a failed check hides it too. Otherwise the modality
+                // check below would answer for a model the caller must not
+                // learn about.
+                let model = match model {
+                    Some(model)
+                        if app_state
+                            .models_service
+                            .caller_can_use_model(caller, model)
+                            .await
+                            .unwrap_or(false) =>
+                    {
+                        Some(model)
+                    }
+                    _ => None,
+                };
+                model
+                    .map(|model| {
+                        (
+                            Some(model.attestation_supported),
+                            model.input_modalities.clone(),
+                        )
+                    })
+                    .unwrap_or((None, None))
+            }
             Err(error) => {
                 tracing::warn!(
                     model = %request.model,
@@ -2788,13 +2825,15 @@ async fn completions_inner(
     // service resolves aliases for this endpoint exactly like chat, so it
     // gets the same contract: x-no-aliasing rejects, and aliased responses
     // carry the warning + x-model-alias-resolved header.
-    if let Err(resp) = reject_if_aliased(&app_state.models_service, &headers, &request.model).await
+    let caller = ModelCaller::Organization(api_key.organization.id.0);
+    if let Err(resp) =
+        reject_if_aliased(&app_state.models_service, caller, &headers, &request.model).await
     {
         return resp;
     }
     let alias_canonical = app_state
         .models_service
-        .resolve_alias_cached(&request.model)
+        .resolve_alias_cached(&request.model, caller)
         .await;
 
     let resolved_model_name = alias_canonical.as_deref().unwrap_or(&request.model);
@@ -5126,7 +5165,10 @@ pub async fn image_generations(
     // Resolve model to get UUID for usage tracking
     let model = match app_state
         .models_service
-        .get_model_by_name(&request.model)
+        .get_model_by_name(
+            &request.model,
+            ModelCaller::Organization(api_key.organization.id.0),
+        )
         .await
     {
         Ok(model) => model,
@@ -5476,7 +5518,10 @@ pub async fn audio_transcriptions(
     // Resolve model to get UUID for usage tracking (handles aliases like chat_completions)
     let model = match app_state
         .models_service
-        .resolve_and_get_model(&request.model)
+        .resolve_and_get_model(
+            &request.model,
+            ModelCaller::Organization(api_key.organization.id.0),
+        )
         .await
     {
         Ok(model) => model,
@@ -5932,7 +5977,10 @@ pub async fn image_edits(
     // Resolve model to get UUID for usage tracking
     let model = match app_state
         .models_service
-        .get_model_by_name(&request.model)
+        .get_model_by_name(
+            &request.model,
+            ModelCaller::Organization(api_key.organization.id.0),
+        )
         .await
     {
         Ok(model) => model,
@@ -6293,7 +6341,10 @@ pub async fn rerank(
     // Models must be registered in the database to be available for use
     let model = match app_state
         .models_service
-        .get_model_by_name(&request.model)
+        .get_model_by_name(
+            &request.model,
+            ModelCaller::Organization(api_key.organization.id.0),
+        )
         .await
     {
         Ok(model) => model,
@@ -6660,7 +6711,10 @@ pub async fn embeddings(
     // Resolve model to get UUID for usage tracking
     let model = match app_state
         .models_service
-        .get_model_by_name(&model_name)
+        .get_model_by_name(
+            &model_name,
+            ModelCaller::Organization(api_key.organization.id.0),
+        )
         .await
     {
         Ok(model) => model,
@@ -6984,7 +7038,10 @@ pub async fn privacy_classify(
 
     let model = match app_state
         .models_service
-        .get_model_by_name(&model_name)
+        .get_model_by_name(
+            &model_name,
+            ModelCaller::Organization(api_key.organization.id.0),
+        )
         .await
     {
         Ok(model) => model,
@@ -7397,7 +7454,10 @@ pub async fn privacy_redact(
 
     let model = match app_state
         .models_service
-        .get_model_by_name(&model_name)
+        .get_model_by_name(
+            &model_name,
+            ModelCaller::Organization(api_key.organization.id.0),
+        )
         .await
     {
         Ok(model) => model,
@@ -7793,7 +7853,10 @@ pub async fn score(
     // Models must be registered in the database to be available for use
     let model = match app_state
         .models_service
-        .get_model_by_name(&request.model)
+        .get_model_by_name(
+            &request.model,
+            ModelCaller::Organization(api_key.organization.id.0),
+        )
         .await
     {
         Ok(model) => model,

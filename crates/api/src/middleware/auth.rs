@@ -936,6 +936,9 @@ fn convert_user_to_db_user(user: services::auth::User) -> DbUser {
         auth_provider: user.auth_provider,
         provider_user_id: user.provider_user_id,
         tokens_revoked_at: user.tokens_revoked_at,
+        contact_email: user.contact_email,
+        contact_email_verified_at: user.contact_email_verified_at,
+        email_opt_in_at: user.email_opt_in_at,
     }
 }
 

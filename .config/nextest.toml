@@ -51,6 +51,13 @@ filter = 'package(api) & binary(e2e_all) & test(/^admin_pricing_changes::test_(r
 test-group = "e2e-db"
 threads-required = "num-test-threads"
 
+# The daily cap on contact email verification sends counts every row in the
+# table, so the test of it cannot overlap another test that sends one.
+[[profile.default.overrides]]
+filter = 'package(api) & binary(e2e_all) & test(/^contact_email::serial_/)'
+test-group = "e2e-db"
+threads-required = "num-test-threads"
+
 [[profile.default.overrides]]
 filter = "package(api) & binary(e2e_all)"
 test-group = "e2e-db"

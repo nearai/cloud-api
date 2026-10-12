@@ -165,12 +165,13 @@ const APPROVED: &[ApprovedGroup] = &[
     ApprovedGroup { table: "responses", columns: &["model", "status", "usage", "next_response_ids"], reason: "Queryable response lifecycle, routing, usage, and structural relationship data" },
     ApprovedGroup { table: "scheduled_model_pricing_changes", columns: &["model_name", "model_display_name", "status", "last_error", "cancelled_by_user_email", "created_by_user_email", "change_reason", "old_text_pricing", "new_text_pricing"], reason: "Restricted administrator pricing workflow and audit data" },
     ApprovedGroup { table: "services", columns: &["service_name", "display_name", "description", "unit"], reason: "Public service catalog" },
+    ApprovedGroup { table: "user_contact_email_verifications", columns: &["email", "email_limit_key", "token_hash"], reason: "Contact email verification workflow data required for indexed send limits and confirmation; the token is stored as a one-way hash, and rows older than 24 hours are deleted when the next verification request comes in" },
     ApprovedGroup { table: "user_erasure_log", columns: &["erased_organization_ids", "retained_organization_ids"], reason: "Restricted erasure audit: organization UUIDs only, no customer content; the email is stored as a one-way digest" },
     ApprovedGroup { table: "usage_credit_allocations", columns: &["credit_type", "source", "policy_version", "allocation_phase"], reason: "Immutable restricted billing attribution records" },
     ApprovedGroup { table: "organization_usage_discounts", columns: &["status", "last_error"], reason: "Restricted administrator billing correction state" },
     ApprovedGroup { table: "usage_discount_adjustments", columns: &["original_billing_details"], reason: "Restricted immutable billing correction audit" },
     ApprovedGroup { table: "usage_hourly", columns: &["model_name", "inference_type", "served_provider_type", "served_provider_tier"], reason: "Derived hourly metering aggregate; same restricted dimensions as organization_usage_log" },
-    ApprovedGroup { table: "users", columns: &["email", "username", "display_name", "avatar_url", "auth_provider", "provider_user_id"], reason: "Account identity fields required for login, uniqueness, and user-facing profiles" },
+    ApprovedGroup { table: "users", columns: &["email", "username", "display_name", "avatar_url", "auth_provider", "provider_user_id", "contact_email"], reason: "Account identity and contact fields required for login, uniqueness, email delivery, and user-facing profiles" },
     ApprovedGroup { table: "workspaces", columns: &["name", "description", "settings"], reason: "Workspace profile and administrator-managed settings" },
 ];
 

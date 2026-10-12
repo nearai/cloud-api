@@ -10,7 +10,8 @@ use crate::{
 };
 use axum::{
     extract::{Extension, Json, Path, State},
-    http::{HeaderMap, StatusCode},
+    http::{header::RETRY_AFTER, HeaderMap, HeaderValue, StatusCode},
+    response::{IntoResponse, Response},
 };
 use serde::Deserialize;
 use serde::Serialize;
@@ -18,6 +19,7 @@ use services::{
     aml::{AmlError, AmlFlow},
     auth::AuthError,
     auth::UserId,
+    contact_email::ContactEmailError,
     organization::OrganizationError,
     user::UserServiceError,
 };
@@ -49,6 +51,82 @@ pub struct UpdateUserProfileRequest {
 #[derive(Debug, Serialize, utoipa::ToSchema)]
 pub struct UserStatusResponse {
     pub status: String,
+}
+
+/// Request to add a contact email. No `Debug`: the body is personal data.
+#[derive(Deserialize, ToSchema)]
+pub struct RequestContactEmailRequest {
+    pub email: String,
+}
+
+/// Request to confirm a contact email. No `Debug`: the token is a credential.
+#[derive(Deserialize, ToSchema)]
+pub struct VerifyContactEmailRequest {
+    /// Token from the link in the verification email
+    pub token: String,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct ContactEmailStatusResponse {
+    /// `verification_sent` after a request, `verified` after a confirmation
+    pub status: String,
+}
+
+/// Map a contact email error to its HTTP response. A rate-limited request carries
+/// `Retry-After` with the seconds until the next send is allowed.
+fn contact_email_error_response(error: ContactEmailError) -> Response {
+    let (status, message, error_type) = match &error {
+        // While the feature is off the endpoints answer as if they were not
+        // there, so no caller can draw a 5xx from a deployment that has it off.
+        ContactEmailError::Disabled => (StatusCode::NOT_FOUND, "Not found", "not_found"),
+        ContactEmailError::UserNotFound => (StatusCode::NOT_FOUND, "User not found", "not_found"),
+        ContactEmailError::NotSupported => (
+            StatusCode::FORBIDDEN,
+            "A contact email can only be added to accounts that sign in with a NEAR wallet",
+            "forbidden",
+        ),
+        ContactEmailError::InvalidEmail(message) => {
+            (StatusCode::BAD_REQUEST, *message, "bad_request")
+        }
+        ContactEmailError::RateLimited { .. } => (
+            StatusCode::TOO_MANY_REQUESTS,
+            "Too many verification emails requested. Try again later.",
+            "rate_limit_exceeded",
+        ),
+        ContactEmailError::InvalidToken => (
+            StatusCode::BAD_REQUEST,
+            "This verification link is invalid or has expired",
+            "invalid_verification_token",
+        ),
+        ContactEmailError::AddressInUse => (
+            StatusCode::CONFLICT,
+            "This email address is already used by another account",
+            "conflict",
+        ),
+        ContactEmailError::SendFailed => (
+            StatusCode::BAD_GATEWAY,
+            "The verification email could not be sent. Try again later.",
+            "email_delivery_failed",
+        ),
+        ContactEmailError::Internal(_) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Failed to process the contact email request",
+            "internal_server_error",
+        ),
+    };
+    let body = Json(ErrorResponse::new(
+        message.to_string(),
+        error_type.to_string(),
+    ));
+    match error {
+        ContactEmailError::RateLimited { retry_after_secs } => (
+            status,
+            [(RETRY_AFTER, HeaderValue::from(retry_after_secs))],
+            body,
+        )
+            .into_response(),
+        _ => (status, body).into_response(),
+    }
 }
 
 impl UpdateUserProfileRequest {
@@ -182,6 +260,9 @@ pub async fn get_current_user(
     // Build response with all data
     let mut response = crate::conversions::services_user_to_api_user_with_relations(
         &user_data,
+        app_state
+            .contact_email_service
+            .needs_contact_email(&user_data),
         organizations,
         workspaces,
     );
@@ -306,7 +387,12 @@ pub async fn update_current_user_profile(
         .await
     {
         Ok(updated_user) => {
-            let mut response = services_user_to_api_user(&updated_user);
+            let mut response = services_user_to_api_user(
+                &updated_user,
+                app_state
+                    .contact_email_service
+                    .needs_contact_email(&updated_user),
+            );
             populate_staking_organization(&app_state, &updated_user, &mut response).await;
             Ok(Json(response))
         }
@@ -326,6 +412,141 @@ pub async fn update_current_user_profile(
                     "internal_server_error".to_string(),
                 )),
             ))
+        }
+    }
+}
+
+/// Add a contact email
+///
+/// For accounts that sign in with a NEAR wallet and so have no email address.
+/// Sends a single-use verification link, valid for 24 hours, to the given
+/// address. The address is only saved once the link is confirmed with
+/// `POST /v1/users/contact-email/verify`. The answer is the same whether or not
+/// the address belongs to another account (that is reported at confirmation),
+/// and whether or not the address already got its emails for the day (then
+/// nothing is sent).
+#[utoipa::path(
+    post,
+    path = "/v1/users/me/contact-email",
+    tag = "Users",
+    request_body = RequestContactEmailRequest,
+    responses(
+        (status = 200, description = "Verification email sent", body = ContactEmailStatusResponse),
+        (status = 400, description = "Invalid email address", body = ErrorResponse),
+        (status = 401, description = "Unauthorized", body = ErrorResponse),
+        (status = 403, description = "The account does not sign in with a NEAR wallet", body = ErrorResponse),
+        (status = 404, description = "Contact email verification is not enabled, or user not found", body = ErrorResponse),
+        (status = 429, description = "Too many verification emails for this user, or the daily limit across all users is reached; see the Retry-After header", body = ErrorResponse),
+        (status = 502, description = "The verification email could not be sent", body = ErrorResponse),
+        (status = 500, description = "Internal server error", body = ErrorResponse)
+    ),
+    security(
+        ("session_token" = [])
+    )
+)]
+pub async fn request_contact_email(
+    State(app_state): State<AppState>,
+    Extension(user): Extension<AuthenticatedUser>,
+    Json(request): Json<RequestContactEmailRequest>,
+) -> Result<Json<ContactEmailStatusResponse>, Response> {
+    debug!("Contact email requested by user: {}", user.0.id);
+
+    match app_state
+        .contact_email_service
+        .request_verification(UserId(user.0.id), &request.email)
+        .await
+    {
+        Ok(()) => Ok(Json(ContactEmailStatusResponse {
+            status: "verification_sent".to_string(),
+        })),
+        Err(e) => {
+            if matches!(e, ContactEmailError::Internal(_)) {
+                error!(user_id = %user.0.id, "Failed to request contact email verification");
+            }
+            Err(contact_email_error_response(e))
+        }
+    }
+}
+
+/// Remove the contact email
+///
+/// Clears the account's contact email, with its verification and opt-in times,
+/// and expires any verification link not yet used. Safe to repeat: it succeeds
+/// when there is nothing to remove. Available whether or not contact email
+/// verification is enabled, so an address can always be withdrawn.
+#[utoipa::path(
+    delete,
+    path = "/v1/users/me/contact-email",
+    tag = "Users",
+    responses(
+        (status = 204, description = "Contact email removed, or there was none"),
+        (status = 401, description = "Unauthorized", body = ErrorResponse),
+        (status = 404, description = "User not found", body = ErrorResponse),
+        (status = 500, description = "Internal server error", body = ErrorResponse)
+    ),
+    security(
+        ("session_token" = [])
+    )
+)]
+pub async fn remove_contact_email(
+    State(app_state): State<AppState>,
+    Extension(user): Extension<AuthenticatedUser>,
+) -> Result<StatusCode, Response> {
+    debug!("Contact email removal requested by user: {}", user.0.id);
+
+    match app_state
+        .contact_email_service
+        .remove_contact_email(UserId(user.0.id))
+        .await
+    {
+        Ok(()) => Ok(StatusCode::NO_CONTENT),
+        Err(e) => {
+            if matches!(e, ContactEmailError::Internal(_)) {
+                error!(user_id = %user.0.id, "Failed to remove contact email");
+            }
+            Err(contact_email_error_response(e))
+        }
+    }
+}
+
+/// Confirm a contact email (public endpoint)
+///
+/// Confirms the address behind a verification token and records the opt-in.
+/// No session is needed: the token from the emailed link is the credential, and
+/// it works once. Fails with 409, changing nothing, when the address is another
+/// account's login email or verified contact email.
+#[utoipa::path(
+    post,
+    path = "/v1/users/contact-email/verify",
+    tag = "Users",
+    request_body = VerifyContactEmailRequest,
+    responses(
+        (status = 200, description = "Contact email verified", body = ContactEmailStatusResponse),
+        (status = 400, description = "Unknown, expired or already used token", body = ErrorResponse),
+        (status = 404, description = "Contact email verification is not enabled", body = ErrorResponse),
+        (status = 409, description = "The address is already used by another account", body = ErrorResponse),
+        (status = 500, description = "Internal server error", body = ErrorResponse)
+    )
+)]
+pub async fn verify_contact_email(
+    State(app_state): State<AppState>,
+    Json(request): Json<VerifyContactEmailRequest>,
+) -> Result<Json<ContactEmailStatusResponse>, Response> {
+    debug!("Confirming contact email by token");
+
+    match app_state
+        .contact_email_service
+        .confirm(&request.token)
+        .await
+    {
+        Ok(()) => Ok(Json(ContactEmailStatusResponse {
+            status: "verified".to_string(),
+        })),
+        Err(e) => {
+            if matches!(e, ContactEmailError::Internal(_)) {
+                error!("Failed to confirm contact email");
+            }
+            Err(contact_email_error_response(e))
         }
     }
 }

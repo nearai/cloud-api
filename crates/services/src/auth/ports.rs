@@ -84,6 +84,12 @@ pub struct User {
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
     pub tokens_revoked_at: Option<DateTime<Utc>>,
+    /// Address the user asked to be contacted at. Set only once verified, and never
+    /// written by login. `email` stays the login identity.
+    pub contact_email: Option<String>,
+    pub contact_email_verified_at: Option<DateTime<Utc>>,
+    /// When the user agreed to be emailed at `contact_email`.
+    pub email_opt_in_at: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -406,6 +412,9 @@ impl MockAuthService {
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
             tokens_revoked_at: None,
+            contact_email: None,
+            contact_email_verified_at: None,
+            email_opt_in_at: None,
         }
     }
 

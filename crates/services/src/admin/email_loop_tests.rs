@@ -499,6 +499,13 @@ impl EmailSender for CountingEmailSender {
         self.sends.fetch_add(1, Ordering::SeqCst);
         Ok(EmailDeliveryOutcome::Sent { message_id: None })
     }
+
+    async fn send_contact_email_verification(
+        &self,
+        _email: &crate::email::ContactEmailVerificationEmail,
+    ) -> Result<EmailDeliveryOutcome, EmailError> {
+        Ok(EmailDeliveryOutcome::Skipped)
+    }
 }
 
 fn service(repo: Arc<CountingRepo>) -> (AdminServiceImpl, Arc<CountingEmailSender>) {

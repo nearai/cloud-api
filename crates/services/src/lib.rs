@@ -6,6 +6,7 @@ pub mod auth;
 pub mod auto_redact;
 pub mod common;
 pub mod completions;
+pub mod contact_email;
 pub mod conversations;
 pub mod email;
 pub mod files;

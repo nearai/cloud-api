@@ -2091,8 +2091,10 @@ pub fn build_gateway_routes(
 /// `CLOUD_API_USAGE_TOKEN` service secret rather than the standard `sk-…`
 /// API-key middleware. Mounted under `/v1/internal/*` after the global
 /// `/v1` nest. Routes: `POST /internal/usage` (inference-proxy's
-/// service-token usage reporter) and `GET /internal/models` (the model
-/// catalog including unlisted models, for a gateway lane). Further internal
+/// service-token usage reporter), `GET /internal/models` (the model
+/// catalog including unlisted models, for a gateway lane) and
+/// `GET /internal/model-access` (which organizations may use each unlisted
+/// model, for a gateway lane that enforces access itself). Further internal
 /// endpoints can be added here without touching the sk-auth stack.
 pub fn build_internal_routes(app_state: AppState) -> Router {
     Router::new()
@@ -2103,6 +2105,10 @@ pub fn build_internal_routes(app_state: AppState) -> Router {
         .route(
             "/internal/models",
             get(crate::routes::completions::models_internal),
+        )
+        .route(
+            "/internal/model-access",
+            get(crate::routes::completions::model_access_internal),
         )
         .with_state(app_state)
 }
@@ -2360,6 +2366,19 @@ fn build_admin_routes_with_options(
         .route(
             "/admin/models/{model_name}/deprecation/confirm",
             axum::routing::post(confirm_model_deprecation),
+        )
+        .route(
+            "/admin/models/{model_name}/access",
+            axum::routing::get(crate::routes::admin_model_access::get_model_access),
+        )
+        .route(
+            "/admin/models/{model_name}/access/{org_id}",
+            axum::routing::put(crate::routes::admin_model_access::grant_model_access)
+                .delete(crate::routes::admin_model_access::revoke_model_access),
+        )
+        .route(
+            "/admin/organizations/{org_id}/model-access",
+            axum::routing::get(crate::routes::admin_model_access::list_organization_model_access),
         )
         .route("/admin/services", axum::routing::post(create_service))
         .route("/admin/services/{id}", axum::routing::patch(update_service))

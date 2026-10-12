@@ -1369,6 +1369,39 @@ pub trait AdminService: Send + Sync {
         cost_per_unit: Option<i64>,
         is_active: Option<bool>,
     ) -> Result<PlatformServiceInfo, AdminError>;
+
+    /// A model and the organizations that hold a grant for it (admin only).
+    /// Returns `ModelNotFound` if no model has this canonical name.
+    async fn get_model_access(&self, model_name: &str) -> Result<ModelAccess, AdminError>;
+
+    /// Grant an organization access to a model (admin only). Idempotent: a
+    /// grant that already exists is returned unchanged. Returns
+    /// `ModelNotFound` or `OrganizationNotFound` if either is missing; the
+    /// organization must be active.
+    async fn grant_model_access(
+        &self,
+        model_name: &str,
+        organization_id: uuid::Uuid,
+        granted_by_user_id: Option<uuid::Uuid>,
+    ) -> Result<ModelAccessGrant, AdminError>;
+
+    /// Revoke an organization's access to a model (admin only). Idempotent:
+    /// revoking a grant that does not exist succeeds. Returns `ModelNotFound`
+    /// or `OrganizationNotFound` if either is missing.
+    async fn revoke_model_access(
+        &self,
+        model_name: &str,
+        organization_id: uuid::Uuid,
+        revoked_by_user_id: Option<uuid::Uuid>,
+    ) -> Result<(), AdminError>;
+
+    /// The models an organization holds a grant for (admin only). Returns
+    /// `OrganizationNotFound` if the organization does not exist or is
+    /// inactive.
+    async fn list_organization_model_access(
+        &self,
+        organization_id: uuid::Uuid,
+    ) -> Result<Vec<OrganizationModelAccessGrant>, AdminError>;
 }
 
 #[cfg(test)]

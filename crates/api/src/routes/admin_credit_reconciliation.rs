@@ -30,19 +30,33 @@ pub struct CreditReconciliationRequest {
 
 #[derive(Debug, Serialize, ToSchema)]
 pub struct CreditPositionResponse {
-    /// False for consumption whose credit type has no active limit.
+    /// Whether this credit type has a currently effective limit.
+    /// Inactive types are retained when they have recorded consumption.
     pub active: bool,
+    /// Sum of active limits for this type, in nano-USD; zero when inactive.
     pub spend_limit: i64,
+    /// Lifetime consumption assigned to this type, including reconciled history,
+    /// in nano-USD. This can remain nonzero after the type's limits expire.
     pub consumed: i64,
+    /// Remaining capacity in nano-USD: max(spend_limit - consumed, 0) for
+    /// active types, or zero for inactive types.
     pub available: i64,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
 pub struct AccountingPositionResponse {
+    /// Positions keyed by credit type (grant, payment, staking_farm, or postpay).
+    /// Includes active limits and recorded consumption for inactive types.
     pub credits: BTreeMap<String, CreditPositionResponse>,
+    /// Historical consumption still lacking a credit type, in nano-USD.
+    /// Reconciliation reduces this by the sum of the requested increments.
     pub legacy_unattributed_amount: i64,
+    /// Unresolved usage that exceeded available funding, in nano-USD.
+    /// This debt is separate from legacy consumption and is not reconciled here.
     pub unresolved_unfunded_amount: i64,
-    /// Before billing holds or the unresolved-debt admission gate.
+    /// Sum of per-type available capacity minus legacy unattributed consumption,
+    /// clamped to zero, in nano-USD. Reconciliation preserves this value.
+    /// It is measured before billing holds or the unresolved-debt admission gate.
     pub aggregate_available: i64,
 }
 
@@ -73,10 +87,17 @@ impl From<AccountingPosition> for AccountingPositionResponse {
 
 #[derive(Debug, Serialize, ToSchema)]
 pub struct CreditReconciliationResponse {
+    /// Version of the stored result schema, currently 1.
     pub schema_version: u32,
+    /// Audit ledger ID for a committed operation; null for an unsaved preview.
     pub reconciliation_id: Option<Uuid>,
+    /// True when this result is a preview and no adjustment was saved.
     pub dry_run: bool,
+    /// Accounting position immediately before this operation. Idempotent replays
+    /// return the original snapshot, not the organization's current balances.
     pub before: AccountingPositionResponse,
+    /// Projected position for a preview, or saved position for a commit.
+    /// Commits revalidate live balances, so they may differ from an earlier preview.
     pub after: AccountingPositionResponse,
 }
 

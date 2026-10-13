@@ -78,7 +78,7 @@ immediately available for new usage. No admin API call is required.
   rollout. Allocation rows and their parent usage/balance update commit in one
   transaction.
 
-## Reconciling legacy consumption before enabling postpay
+## Reconciling legacy consumption when moving to postpay
 
 For an existing organization, review historical credit/payment/contract records
 before choosing a credit type for its pre-attribution consumption. Admins can
@@ -112,8 +112,8 @@ terms return HTTP 409. A preview using an already committed key also returns 409
 Keys are trimmed once before lookup and storage, so whitespace around the key
 cannot create a second adjustment. Snapshots include `schema_version`; additive
 changes to persisted snapshot structs must use serde defaults and incompatible
-versions need an explicit replay adapter. Older snapshots using `ceiling` are
-still readable; new snapshots and API responses use `spend_limit`. Consumption without an active limit
+versions need an explicit replay adapter. Snapshots and API responses use
+`spend_limit`. Consumption without an active limit
 is included with `active: false`, zero limit and zero available capacity.
 
 The operation adds reviewed historical consumption to the existing per-type
@@ -124,6 +124,22 @@ active USD limit with enough remaining capacity; otherwise the operation
 returns 409 and the opening position needs further review. Never increase a
 limit merely to bypass this validation. The supplied amounts are increments,
 not absolute replacements for lifetime consumption.
+
+Use this order when moving an existing organization to postpay:
+
+1. Finish historical discount corrections and review which funding types paid
+   for the legacy consumption. Ensure the reconciliation-aware writers are deployed.
+2. Ensure every selected type has an active USD limit with enough remaining
+   capacity. If assigning history to `postpay`, create the approved postpay limit
+   first. Keep existing grant/payment limits in place until their history has
+   been reconciled; do not lower them first or inflate limits to bypass validation.
+3. Dry run the reviewed increments and inspect the before/after balances.
+4. Commit those same increments and reason with the same idempotency key, then
+   save the audit ID. If live usage causes a conflict, review fresh balances and
+   preview again before committing.
+5. Apply the remaining approved limit changes, including reducing old grant or
+   payment limits. Verify sufficient capacity remains for ongoing usage throughout
+   the transition; reconciliation itself neither creates nor removes capacity.
 
 For example, with a payment limit of $100, postpay limit of $200 and $80 of
 legacy unknown spend, reclassifying the $80 as payment-funded leaves payment
@@ -136,6 +152,13 @@ reason, amounts and original before/after result. They do **not** rewrite old
 usage logs, create per-request allocations, or make a postpay-filtered historical
 report complete. Unreviewed amounts remain unknown; invoice settlement and
 historical request-level attribution are separate operations.
+Usage already allocated per request since the allocation ledger was introduced
+keeps its recorded credit type. For example, usage allocated to `grant` while a
+credit line was booked as a grant remains grant consumption after switching to
+postpay. This is intentional for this endpoint: it only assigns currently
+unattributed legacy consumption. Correcting previously attributed grant usage
+would require a separate audited reclassification operation and is outside this PR.
+
 Partial reconciliation preserves the remaining unknown deduction but cannot
 establish a fully verified per-type opening position. Resolve all relevant
 legacy consumption before relying on future allocations as verified funding.

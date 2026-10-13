@@ -19,10 +19,7 @@ pub enum ReconciliationError {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct CreditPosition {
-    /// Older snapshots contained only active types. New fields need serde defaults.
-    #[serde(default = "active_snapshot_default")]
     pub active: bool,
-    #[serde(alias = "ceiling")]
     pub spend_limit: i64,
     pub consumed: i64,
     pub available: i64,
@@ -38,17 +35,12 @@ pub struct AccountingPosition {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ReconciliationResult {
-    /// Version of the persisted replay payload. Additive fields require serde defaults.
-    #[serde(default = "snapshot_version")]
+    /// Version of the persisted replay payload.
     pub schema_version: u32,
     pub reconciliation_id: Option<Uuid>,
     pub dry_run: bool,
     pub before: AccountingPosition,
     pub after: AccountingPosition,
-}
-
-fn active_snapshot_default() -> bool {
-    true
 }
 
 fn snapshot_version() -> u32 {
@@ -374,46 +366,6 @@ fn preview(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn original_snapshot_shape_remains_readable() {
-        let original = serde_json::json!({
-            "reconciliation_id": null,
-            "dry_run": true,
-            "before": {
-                "credits": {
-                    "payment": {"ceiling": 100, "consumed": 0, "available": 100},
-                },
-                "legacy_unattributed_amount": 80,
-                "unresolved_unfunded_amount": 0,
-                "aggregate_available": 20,
-            },
-            "after": {
-                "credits": {
-                    "payment": {"ceiling": 100, "consumed": 80, "available": 20},
-                },
-                "legacy_unattributed_amount": 0,
-                "unresolved_unfunded_amount": 0,
-                "aggregate_available": 20,
-            },
-        });
-
-        let result: ReconciliationResult = serde_json::from_value(original).unwrap();
-        assert_eq!(result.schema_version, 1);
-        assert_eq!(result.before.credits["payment"].spend_limit, 100);
-
-        let serialized = serde_json::to_value(&result).unwrap();
-        assert_eq!(
-            serialized["before"]["credits"]["payment"]["spend_limit"],
-            100
-        );
-        assert!(serialized["before"]["credits"]["payment"]
-            .get("ceiling")
-            .is_none());
-
-        assert!(result.before.credits["payment"].active);
-        assert!(result.after.credits["payment"].active);
-    }
 
     #[test]
     fn too_many_types_reports_the_actual_constraint() {

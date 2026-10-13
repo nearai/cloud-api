@@ -920,6 +920,8 @@ pub enum UsageCheckResult {
 #[derive(Debug, Clone)]
 pub struct OrganizationBalanceInfo {
     pub organization_id: Uuid,
+    /// Historical consumption not yet assigned to a credit type, in nano-USD.
+    pub legacy_unattributed_amount: i64,
     pub total_spent: i64,
     pub last_usage_at: Option<DateTime<Utc>>,
     pub total_requests: i64,

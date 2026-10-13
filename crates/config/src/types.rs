@@ -1,4 +1,5 @@
 use crate::ita::ItaAttestationConfig;
+use rustls_pki_types::{pem::PemObject, CertificateDer};
 use std::{collections::HashMap, env};
 
 #[derive(Debug, Clone)]
@@ -47,6 +48,7 @@ pub struct ApiConfig {
     /// every attributed usage charge, so changing it never rewrites history.
     pub credit_allocation: CreditAllocationConfig,
     pub ita: ItaAttestationConfig,
+    pub placement: PlacementConfig,
 }
 
 impl ApiConfig {
@@ -97,6 +99,7 @@ impl ApiConfig {
             ita: ItaAttestationConfig::from_env()?,
             usage_reporting: UsageReportingConfig::from_env()?,
             credit_allocation: CreditAllocationConfig::from_env()?,
+            placement: PlacementConfig::from_env()?,
         })
     }
 }
@@ -474,6 +477,8 @@ impl UsageReportingConfig {
 #[derive(Debug, Clone)]
 pub struct StakingFarmConfig {
     pub enabled: bool,
+    /// Enable explicit selected-organization binding; disables implicit source creation.
+    pub selected_org_binding_enabled: bool,
     pub network_id: String,
     pub contract_id: String,
     pub farm_product_id: String,
@@ -486,6 +491,7 @@ impl Default for StakingFarmConfig {
     fn default() -> Self {
         Self {
             enabled: false,
+            selected_org_binding_enabled: false,
             network_id: NEAR_DEFAULT_NETWORK_ID.to_string(),
             contract_id: String::new(),
             farm_product_id: String::new(),
@@ -500,6 +506,10 @@ impl StakingFarmConfig {
     pub fn from_env(near: &NearConfig) -> Self {
         let mut config = Self {
             enabled: env::var("STAKING_FARM_ENABLED")
+                .ok()
+                .and_then(|value| value.parse::<bool>().ok())
+                .unwrap_or(false),
+            selected_org_binding_enabled: env::var("STAKING_FARM_SELECTED_ORG_BINDING_ENABLED")
                 .ok()
                 .and_then(|value| value.parse::<bool>().ok())
                 .unwrap_or(false),
@@ -795,6 +805,25 @@ impl std::str::FromStr for DatabaseConnectionMode {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum DatabaseRecyclingMethod {
+    #[default]
+    Fast,
+    Verified,
+}
+
+impl std::str::FromStr for DatabaseRecyclingMethod {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "fast" => Ok(Self::Fast),
+            "verified" => Ok(Self::Verified),
+            _ => Err("DATABASE_RECYCLING_METHOD must be exactly 'fast' or 'verified' (lowercase, no surrounding whitespace)".into()),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct DatabaseConfig {
     pub connection_mode: DatabaseConnectionMode,
@@ -806,6 +835,7 @@ pub struct DatabaseConfig {
     pub username: String,
     pub password: String,
     pub max_connections: usize,
+    pub recycling_method: DatabaseRecyclingMethod,
     /// Enable TLS. Direct mode requires encryption and verifies certificates/hostname.
     /// Legacy Patroni/test mode retains its existing native-tls behavior.
     pub tls_enabled: bool,
@@ -870,6 +900,9 @@ impl DatabaseConfig {
                 .unwrap_or_else(|_| "16".to_string())
                 .parse()
                 .map_err(|_| "DATABASE_MAX_CONNECTIONS must be a valid number")?,
+            recycling_method: env::var("DATABASE_RECYCLING_METHOD")
+                .unwrap_or_else(|_| "fast".to_string())
+                .parse()?,
             tls_enabled: env::var("DATABASE_TLS_ENABLED")
                 .unwrap_or_else(|_| "true".to_string())
                 .parse()
@@ -1235,14 +1268,180 @@ impl S3Config {
     }
 }
 
+/// Smart placement. Its runtime inputs are the placement Valkey endpoint
+/// ([`PlacementEndpoint`]: host, port, TLS and CA, none of them secret) and
+/// the `router` password (`PLACEMENT_REDIS_PASSWORD`, or a file via
+/// `PLACEMENT_REDIS_PASSWORD_FILE` like every other secret); every tunable is
+/// a code constant. This is not a mode flag: without both there is simply no
+/// placement state, so every request takes the legacy routing path. A bad
+/// endpoint never fails startup: it disables placement (fail open).
+#[derive(Clone, Default)]
+pub struct PlacementConfig {
+    /// Password of the Valkey `router` ACL user, and the input key material
+    /// for the affinity and pin HMAC secrets. Never logged.
+    pub redis_password: Option<String>,
+    pub redis_endpoint: PlacementEndpoint,
+}
+
+impl std::fmt::Debug for PlacementConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PlacementConfig")
+            .field(
+                "redis_password",
+                &self.redis_password.as_ref().map(|_| "<redacted>"),
+            )
+            .field("redis_endpoint", &self.redis_endpoint)
+            .finish()
+    }
+}
+
+impl PlacementConfig {
+    pub fn from_env() -> Result<Self, String> {
+        Ok(Self {
+            redis_password: read_optional_secret_env(
+                "PLACEMENT_REDIS_PASSWORD_FILE",
+                "PLACEMENT_REDIS_PASSWORD",
+            )?,
+            redis_endpoint: PlacementEndpoint::from_env(),
+        })
+    }
+}
+
+/// The placement Valkey endpoint, read from `PLACEMENT_REDIS_HOST`,
+/// `PLACEMENT_REDIS_PORT` (default 6379), `PLACEMENT_REDIS_TLS_ENABLED`
+/// (default true) and, with TLS, the private CA's PEM from
+/// `PLACEMENT_REDIS_TLS_CA_CERT` or a file via
+/// `PLACEMENT_REDIS_TLS_CA_CERT_FILE`.
+#[derive(Clone, Debug, Default)]
+pub enum PlacementEndpoint {
+    /// `PLACEMENT_REDIS_HOST` is unset: placement is off.
+    #[default]
+    Missing,
+    /// Set but unusable; placement is off. The reason names the variable,
+    /// never its value.
+    Invalid(String),
+    Valid(PlacementRedisEndpoint),
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub struct PlacementRedisEndpoint {
+    /// Host or IP literal. With TLS it must match the server certificate's
+    /// SAN (for the placement Valkey, its Elastic IP).
+    pub host: String,
+    pub port: u16,
+    pub tls: bool,
+    /// The CA that signs the server certificate: present iff `tls`.
+    pub ca_pem: Option<String>,
+}
+
+impl std::fmt::Debug for PlacementRedisEndpoint {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PlacementRedisEndpoint")
+            .field("host", &self.host)
+            .field("port", &self.port)
+            .field("tls", &self.tls)
+            .field("ca_pem", &self.ca_pem.as_ref().map(|_| "<set>"))
+            .finish()
+    }
+}
+
+impl PlacementEndpoint {
+    const DEFAULT_PORT: u16 = 6379;
+
+    pub fn from_env() -> Self {
+        let Some(host) = non_empty_env("PLACEMENT_REDIS_HOST") else {
+            return Self::Missing;
+        };
+        match Self::parse(host) {
+            Ok(endpoint) => Self::Valid(endpoint),
+            Err(reason) => Self::Invalid(reason),
+        }
+    }
+
+    fn parse(host: String) -> Result<PlacementRedisEndpoint, String> {
+        let port = match non_empty_env("PLACEMENT_REDIS_PORT") {
+            None => Self::DEFAULT_PORT,
+            Some(port) => port
+                .parse::<u16>()
+                .ok()
+                .filter(|port| *port > 0)
+                .ok_or("PLACEMENT_REDIS_PORT must be a port number")?,
+        };
+        let tls = match non_empty_env("PLACEMENT_REDIS_TLS_ENABLED") {
+            None => true,
+            Some(tls) => tls
+                .parse::<bool>()
+                .map_err(|_| "PLACEMENT_REDIS_TLS_ENABLED must be true or false")?,
+        };
+        let ca_pem = if tls {
+            const CA_FILE: &str = "PLACEMENT_REDIS_TLS_CA_CERT_FILE";
+            const CA_INLINE: &str = "PLACEMENT_REDIS_TLS_CA_CERT";
+            // The variable actually read, so an error names the right one.
+            let var = if non_empty_env(CA_FILE).is_some() {
+                CA_FILE
+            } else {
+                CA_INLINE
+            };
+            let pem = read_optional_secret_env(CA_FILE, CA_INLINE)?
+                .ok_or(
+                    "PLACEMENT_REDIS_TLS_CA_CERT or PLACEMENT_REDIS_TLS_CA_CERT_FILE is required with TLS",
+                )?;
+            // A one-line value with literal `\n` escapes (a `.env` or docker
+            // env) is unescaped, as inference-proxy does.
+            let pem = pem.trim().replace("\\n", "\n");
+            // Parse it now so a corrupt block is invalid at startup, not a
+            // silently inert client later. Errors name the variable, never
+            // the contents.
+            let certs = CertificateDer::pem_slice_iter(pem.as_bytes())
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|_| format!("{var} holds an invalid PEM certificate"))?;
+            if certs.is_empty() {
+                return Err(format!("{var} holds no PEM certificate"));
+            }
+            Some(pem)
+        } else {
+            None
+        };
+        Ok(PlacementRedisEndpoint {
+            host,
+            port,
+            tls,
+            ca_pem,
+        })
+    }
+}
+
+/// Default for `CONTACT_EMAIL_VERIFICATION_DAILY_CAP`.
+pub const DEFAULT_CONTACT_EMAIL_VERIFICATION_DAILY_CAP: u32 = 500;
+
 /// Email notification configuration for organization invitations.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct InvitationEmailConfig {
     pub enabled: bool,
+    /// Lets NEAR wallet users add and verify a contact email. Switched on its
+    /// own, but uses the same sender address, Resend key and frontend URL.
+    pub contact_email_verification_enabled: bool,
+    /// Most contact email verification emails sent per 24 hours, across all
+    /// users and addresses.
+    pub contact_email_verification_daily_cap: u32,
     pub from_email: Option<String>,
     pub reply_to: Option<String>,
     pub resend_api_key: Option<String>,
     pub frontend_base_url: Option<String>,
+}
+
+impl Default for InvitationEmailConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            contact_email_verification_enabled: false,
+            contact_email_verification_daily_cap: DEFAULT_CONTACT_EMAIL_VERIFICATION_DAILY_CAP,
+            from_email: None,
+            reply_to: None,
+            resend_api_key: None,
+            frontend_base_url: None,
+        }
+    }
 }
 
 impl InvitationEmailConfig {
@@ -1251,38 +1450,62 @@ impl InvitationEmailConfig {
             .ok()
             .and_then(|v| v.parse::<bool>().ok())
             .unwrap_or(false);
+        let contact_email_verification_enabled = env::var("CONTACT_EMAIL_VERIFICATION_ENABLED")
+            .ok()
+            .and_then(|v| v.parse::<bool>().ok())
+            .unwrap_or(false);
+        let contact_email_verification_daily_cap = parse_u32_env(
+            "CONTACT_EMAIL_VERIFICATION_DAILY_CAP",
+            DEFAULT_CONTACT_EMAIL_VERIFICATION_DAILY_CAP,
+        )?;
 
         let from_email = non_empty_env("INVITATION_EMAIL_FROM");
         let reply_to = non_empty_env("INVITATION_EMAIL_REPLY_TO");
-        let resend_api_key = if enabled {
+        let resend_api_key = if enabled || contact_email_verification_enabled {
             read_optional_secret_env("RESEND_API_KEY_FILE", "RESEND_API_KEY")?
         } else {
             None
         };
         let frontend_base_url = non_empty_env("CLOUD_UI_BASE_URL");
 
-        if enabled {
+        for (switched_on, switch) in [
+            (enabled, "INVITATION_EMAIL_ENABLED"),
+            (
+                contact_email_verification_enabled,
+                "CONTACT_EMAIL_VERIFICATION_ENABLED",
+            ),
+        ] {
+            if !switched_on {
+                continue;
+            }
             if from_email.is_none() {
-                return Err(
-                    "INVITATION_EMAIL_FROM must be set when INVITATION_EMAIL_ENABLED=true"
-                        .to_string(),
-                );
+                return Err(format!(
+                    "INVITATION_EMAIL_FROM must be set when {switch}=true"
+                ));
             }
             if resend_api_key.is_none() {
-                return Err(
-                    "RESEND_API_KEY or RESEND_API_KEY_FILE must be set when INVITATION_EMAIL_ENABLED=true"
-                        .to_string(),
-                );
+                return Err(format!(
+                    "RESEND_API_KEY or RESEND_API_KEY_FILE must be set when {switch}=true"
+                ));
             }
             if frontend_base_url.is_none() {
-                return Err(
-                    "CLOUD_UI_BASE_URL must be set when INVITATION_EMAIL_ENABLED=true".to_string(),
-                );
+                return Err(format!("CLOUD_UI_BASE_URL must be set when {switch}=true"));
             }
+        }
+        // A cap of zero would refuse every request while the feature looks on.
+        if contact_email_verification_enabled && contact_email_verification_daily_cap == 0 {
+            return Err(
+                "CONTACT_EMAIL_VERIFICATION_DAILY_CAP must be greater than 0 when \
+                 CONTACT_EMAIL_VERIFICATION_ENABLED=true; set \
+                 CONTACT_EMAIL_VERIFICATION_ENABLED=false to switch the feature off"
+                    .to_string(),
+            );
         }
 
         Ok(Self {
             enabled,
+            contact_email_verification_enabled,
+            contact_email_verification_daily_cap,
             from_email,
             reply_to,
             resend_api_key,
@@ -1294,6 +1517,15 @@ impl InvitationEmailConfig {
         self.frontend_base_url
             .as_ref()
             .map(|base_url| format!("{}/dashboard/invitations", base_url.trim_end_matches('/')))
+    }
+
+    /// Frontend page that confirms a contact email. The verification token is
+    /// appended in the URL fragment (`#token=...`), which browsers do not send to
+    /// the server, so it stays out of access logs and referrers.
+    pub fn contact_email_verification_url(&self) -> Option<String> {
+        self.frontend_base_url
+            .as_ref()
+            .map(|base_url| format!("{}/verify-contact-email", base_url.trim_end_matches('/')))
     }
 }
 
@@ -1369,6 +1601,24 @@ mod tests {
     }
 
     #[test]
+    fn database_recycling_method_requires_exact_values() {
+        assert_eq!(
+            "fast".parse::<DatabaseRecyclingMethod>().unwrap(),
+            DatabaseRecyclingMethod::Fast
+        );
+        assert_eq!(
+            "verified".parse::<DatabaseRecyclingMethod>().unwrap(),
+            DatabaseRecyclingMethod::Verified
+        );
+        for value in ["FAST", "verified ", "", "clean"] {
+            assert!(value
+                .parse::<DatabaseRecyclingMethod>()
+                .unwrap_err()
+                .contains("DATABASE_RECYCLING_METHOD"));
+        }
+    }
+
+    #[test]
     #[serial]
     fn database_connection_mode_environment() {
         let keys = [
@@ -1380,6 +1630,7 @@ mod tests {
             "DATABASE_PASSWORD",
             "DATABASE_PASSWORD_FILE",
             "DATABASE_MAX_CONNECTIONS",
+            "DATABASE_RECYCLING_METHOD",
             "DATABASE_TLS_ENABLED",
             "DATABASE_TLS_CA_CERT_PATH",
             "DATABASE_REFRESH_INTERVAL",
@@ -1423,6 +1674,17 @@ mod tests {
         let config = DatabaseConfig::from_env().unwrap();
         assert_eq!(config.connection_mode, DatabaseConnectionMode::Direct);
         assert!(config.tls_enabled);
+        assert_eq!(config.recycling_method, DatabaseRecyclingMethod::Fast);
+        env::set_var("DATABASE_RECYCLING_METHOD", "verified");
+        assert_eq!(
+            DatabaseConfig::from_env().unwrap().recycling_method,
+            DatabaseRecyclingMethod::Verified
+        );
+        env::set_var("DATABASE_RECYCLING_METHOD", "VERIFIED");
+        assert!(DatabaseConfig::from_env()
+            .unwrap_err()
+            .contains("DATABASE_RECYCLING_METHOD"));
+        env::remove_var("DATABASE_RECYCLING_METHOD");
         env::set_var("DATABASE_CONNECTION_MODE", "typo");
         assert!(DatabaseConfig::from_env()
             .unwrap_err()
@@ -1699,6 +1961,7 @@ mod tests {
     fn clear_staking_farm_env() {
         for key in [
             "STAKING_FARM_ENABLED",
+            "STAKING_FARM_SELECTED_ORG_BINDING_ENABLED",
             "NEAR_STAKING_CONTRACT_ID",
             "STAKING_FARM_PRODUCT_ID",
             "STAKING_FARM_PRICE_ID",
@@ -1753,6 +2016,208 @@ mod tests {
         let debug = format!("{config:?}");
         assert!(debug.contains("<redacted>"));
         assert!(!debug.contains("grafana-secret-token"));
+    }
+
+    #[test]
+    fn placement_config_debug_redacts() {
+        let config = PlacementConfig {
+            redis_password: Some("valkey-router-secret".to_string()),
+            ..PlacementConfig::default()
+        };
+        let debug = format!("{config:?}");
+        assert!(debug.contains("<redacted>"));
+        assert!(!debug.contains("valkey-router-secret"));
+
+        let unset = format!("{:?}", PlacementConfig::default());
+        assert!(unset.contains("None"));
+    }
+
+    #[test]
+    #[serial]
+    fn placement_config_reads_the_password_secret() {
+        std::env::remove_var("PLACEMENT_REDIS_PASSWORD_FILE");
+        std::env::remove_var("PLACEMENT_REDIS_PASSWORD");
+        assert!(PlacementConfig::from_env()
+            .unwrap()
+            .redis_password
+            .is_none());
+
+        std::env::set_var("PLACEMENT_REDIS_PASSWORD", "  pw  ");
+        let config = PlacementConfig::from_env().unwrap();
+        std::env::remove_var("PLACEMENT_REDIS_PASSWORD");
+        assert_eq!(config.redis_password.as_deref(), Some("pw"));
+    }
+
+    const PLACEMENT_ENDPOINT_KEYS: [&str; 5] = [
+        "PLACEMENT_REDIS_HOST",
+        "PLACEMENT_REDIS_PORT",
+        "PLACEMENT_REDIS_TLS_ENABLED",
+        "PLACEMENT_REDIS_TLS_CA_CERT",
+        "PLACEMENT_REDIS_TLS_CA_CERT_FILE",
+    ];
+
+    fn clear_placement_endpoint_env() {
+        for key in PLACEMENT_ENDPOINT_KEYS {
+            std::env::remove_var(key);
+        }
+    }
+
+    const TEST_CA_PEM: &str = "-----BEGIN CERTIFICATE-----\nMIIB\n-----END CERTIFICATE-----\n";
+
+    fn invalid_endpoint() -> String {
+        match PlacementConfig::from_env().unwrap().redis_endpoint {
+            PlacementEndpoint::Invalid(reason) => reason,
+            other => panic!("expected an invalid endpoint, got {other:?}"),
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn placement_endpoint_missing_is_disabled() {
+        clear_placement_endpoint_env();
+        // No host: placement stays off, and startup does not fail.
+        std::env::set_var("PLACEMENT_REDIS_TLS_CA_CERT", TEST_CA_PEM);
+        let config = PlacementConfig::from_env().unwrap();
+        clear_placement_endpoint_env();
+        assert!(matches!(config.redis_endpoint, PlacementEndpoint::Missing));
+        assert!(matches!(
+            PlacementConfig::default().redis_endpoint,
+            PlacementEndpoint::Missing
+        ));
+    }
+
+    #[test]
+    #[serial]
+    fn placement_endpoint_reads_host_port_tls_and_ca() {
+        clear_placement_endpoint_env();
+        std::env::set_var("PLACEMENT_REDIS_HOST", " 203.0.113.7 ");
+        std::env::set_var("PLACEMENT_REDIS_TLS_CA_CERT", TEST_CA_PEM);
+        let config = PlacementConfig::from_env().unwrap();
+        let PlacementEndpoint::Valid(endpoint) = config.redis_endpoint else {
+            panic!("expected a valid endpoint");
+        };
+        // TLS by default, on the default port.
+        assert_eq!(endpoint.host, "203.0.113.7");
+        assert_eq!(endpoint.port, 6379);
+        assert!(endpoint.tls);
+        assert_eq!(endpoint.ca_pem.as_deref(), Some(TEST_CA_PEM.trim()));
+
+        // The CA from a file, on another port.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ca.pem");
+        std::fs::write(&path, TEST_CA_PEM).unwrap();
+        std::env::remove_var("PLACEMENT_REDIS_TLS_CA_CERT");
+        std::env::set_var("PLACEMENT_REDIS_TLS_CA_CERT_FILE", &path);
+        std::env::set_var("PLACEMENT_REDIS_PORT", "6380");
+        let PlacementEndpoint::Valid(endpoint) =
+            PlacementConfig::from_env().unwrap().redis_endpoint
+        else {
+            panic!("expected a valid endpoint");
+        };
+        assert_eq!(endpoint.port, 6380);
+        assert_eq!(endpoint.ca_pem.as_deref(), Some(TEST_CA_PEM.trim()));
+
+        // Plain TCP needs no CA.
+        clear_placement_endpoint_env();
+        std::env::set_var("PLACEMENT_REDIS_HOST", "127.0.0.1");
+        std::env::set_var("PLACEMENT_REDIS_TLS_ENABLED", "false");
+        let PlacementEndpoint::Valid(endpoint) =
+            PlacementConfig::from_env().unwrap().redis_endpoint
+        else {
+            panic!("expected a valid endpoint");
+        };
+        clear_placement_endpoint_env();
+        assert!(!endpoint.tls);
+        assert_eq!(endpoint.ca_pem, None);
+    }
+
+    #[test]
+    #[serial]
+    fn placement_endpoint_bad_ca_is_disabled_with_an_error() {
+        clear_placement_endpoint_env();
+        std::env::set_var("PLACEMENT_REDIS_HOST", "203.0.113.7");
+
+        // TLS without a CA.
+        assert!(invalid_endpoint().contains("PLACEMENT_REDIS_TLS_CA_CERT"));
+
+        // A CA that holds no certificate.
+        std::env::set_var("PLACEMENT_REDIS_TLS_CA_CERT", "not a certificate");
+        assert!(invalid_endpoint().contains("PLACEMENT_REDIS_TLS_CA_CERT"));
+
+        // A CA file that cannot be read.
+        std::env::remove_var("PLACEMENT_REDIS_TLS_CA_CERT");
+        std::env::set_var("PLACEMENT_REDIS_TLS_CA_CERT_FILE", "/nonexistent/ca.pem");
+        assert!(invalid_endpoint().contains("PLACEMENT_REDIS_TLS_CA_CERT_FILE"));
+
+        // Neither the port nor the TLS switch may be garbage.
+        std::env::set_var("PLACEMENT_REDIS_TLS_CA_CERT", TEST_CA_PEM);
+        std::env::remove_var("PLACEMENT_REDIS_TLS_CA_CERT_FILE");
+        std::env::set_var("PLACEMENT_REDIS_PORT", "not-a-port");
+        assert!(invalid_endpoint().contains("PLACEMENT_REDIS_PORT"));
+        std::env::remove_var("PLACEMENT_REDIS_PORT");
+        std::env::set_var("PLACEMENT_REDIS_TLS_ENABLED", "maybe");
+        assert!(invalid_endpoint().contains("PLACEMENT_REDIS_TLS_ENABLED"));
+        clear_placement_endpoint_env();
+    }
+
+    /// A one-line CA with literal `\n` escapes, as it arrives through a
+    /// `.env` or docker env, is unescaped like inference-proxy does; the
+    /// same from a file.
+    #[test]
+    #[serial]
+    fn escaped_newline_ca_is_accepted() {
+        clear_placement_endpoint_env();
+        std::env::set_var("PLACEMENT_REDIS_HOST", "203.0.113.7");
+        let escaped = TEST_CA_PEM.trim().replace('\n', "\\n");
+        assert!(!escaped.contains('\n'));
+        std::env::set_var("PLACEMENT_REDIS_TLS_CA_CERT", format!("  {escaped}  "));
+        let PlacementEndpoint::Valid(endpoint) =
+            PlacementConfig::from_env().unwrap().redis_endpoint
+        else {
+            panic!("expected a valid endpoint");
+        };
+        assert_eq!(endpoint.ca_pem.as_deref(), Some(TEST_CA_PEM.trim()));
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ca.pem");
+        std::fs::write(&path, format!("{escaped}\n")).unwrap();
+        std::env::remove_var("PLACEMENT_REDIS_TLS_CA_CERT");
+        std::env::set_var("PLACEMENT_REDIS_TLS_CA_CERT_FILE", &path);
+        let PlacementEndpoint::Valid(endpoint) =
+            PlacementConfig::from_env().unwrap().redis_endpoint
+        else {
+            panic!("expected a valid endpoint");
+        };
+        clear_placement_endpoint_env();
+        assert_eq!(endpoint.ca_pem.as_deref(), Some(TEST_CA_PEM.trim()));
+    }
+
+    /// A block that looks like a certificate but does not parse is invalid
+    /// at startup, named under the variable that was read, and its contents
+    /// are never in the reason.
+    #[test]
+    #[serial]
+    fn corrupt_pem_is_invalid() {
+        clear_placement_endpoint_env();
+        std::env::set_var("PLACEMENT_REDIS_HOST", "203.0.113.7");
+        let corrupt =
+            "-----BEGIN CERTIFICATE-----\n!!corrupt-secret-body!!\n-----END CERTIFICATE-----";
+        std::env::set_var("PLACEMENT_REDIS_TLS_CA_CERT", corrupt);
+        let reason = invalid_endpoint();
+        assert!(reason.contains("PLACEMENT_REDIS_TLS_CA_CERT"));
+        assert!(!reason.contains("_FILE"));
+        assert!(!reason.contains("corrupt-secret-body"));
+
+        // From a file the reason names the file variable.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ca.pem");
+        std::fs::write(&path, corrupt).unwrap();
+        std::env::remove_var("PLACEMENT_REDIS_TLS_CA_CERT");
+        std::env::set_var("PLACEMENT_REDIS_TLS_CA_CERT_FILE", &path);
+        let reason = invalid_endpoint();
+        clear_placement_endpoint_env();
+        assert!(reason.contains("PLACEMENT_REDIS_TLS_CA_CERT_FILE"));
+        assert!(!reason.contains("corrupt-secret-body"));
     }
 
     #[test]
@@ -2222,7 +2687,144 @@ mod tests {
         std::fs::remove_file(path).unwrap();
     }
 
+    #[test]
+    #[serial]
+    fn test_contact_email_verification_defaults_disabled() {
+        clear_invitation_email_env();
+        std::env::set_var("RESEND_API_KEY_FILE", "/missing/resend-api-key");
+
+        let config = InvitationEmailConfig::from_env().unwrap();
+
+        assert!(!config.contact_email_verification_enabled);
+        assert_eq!(config.contact_email_verification_daily_cap, 500);
+        assert_eq!(
+            InvitationEmailConfig::default().contact_email_verification_daily_cap,
+            500
+        );
+        assert!(config.resend_api_key.is_none());
+        assert!(config.contact_email_verification_url().is_none());
+        clear_invitation_email_env();
+    }
+
+    #[test]
+    #[serial]
+    fn test_contact_email_verification_daily_cap_is_read_and_validated() {
+        clear_invitation_email_env();
+        std::env::set_var("CONTACT_EMAIL_VERIFICATION_DAILY_CAP", " 50 ");
+        assert_eq!(
+            InvitationEmailConfig::from_env()
+                .unwrap()
+                .contact_email_verification_daily_cap,
+            50
+        );
+
+        for invalid in ["-1", "many", ""] {
+            std::env::set_var("CONTACT_EMAIL_VERIFICATION_DAILY_CAP", invalid);
+            let error = InvitationEmailConfig::from_env().unwrap_err();
+            assert!(
+                error.contains("CONTACT_EMAIL_VERIFICATION_DAILY_CAP"),
+                "{error}"
+            );
+        }
+        clear_invitation_email_env();
+    }
+
+    #[test]
+    #[serial]
+    fn test_contact_email_verification_daily_cap_of_zero_fails_when_enabled() {
+        clear_invitation_email_env();
+        std::env::set_var("CONTACT_EMAIL_VERIFICATION_DAILY_CAP", "0");
+
+        // Off: the cap is not used, so zero is accepted.
+        assert_eq!(
+            InvitationEmailConfig::from_env()
+                .unwrap()
+                .contact_email_verification_daily_cap,
+            0
+        );
+
+        std::env::set_var("CONTACT_EMAIL_VERIFICATION_ENABLED", "true");
+        std::env::set_var("INVITATION_EMAIL_FROM", "no-reply@example.com");
+        std::env::set_var("RESEND_API_KEY", "re_test");
+        std::env::set_var("CLOUD_UI_BASE_URL", "https://cloud.example.com");
+        let error = InvitationEmailConfig::from_env().unwrap_err();
+        assert!(
+            error.contains("CONTACT_EMAIL_VERIFICATION_DAILY_CAP must be greater than 0"),
+            "{error}"
+        );
+
+        std::env::set_var("CONTACT_EMAIL_VERIFICATION_DAILY_CAP", "1");
+        assert!(InvitationEmailConfig::from_env().is_ok());
+        clear_invitation_email_env();
+    }
+
+    #[test]
+    #[serial]
+    fn test_contact_email_verification_requires_sender_settings_when_enabled() {
+        for (missing, set) in [
+            (
+                "INVITATION_EMAIL_FROM",
+                vec![
+                    ("RESEND_API_KEY", "re_test"),
+                    ("CLOUD_UI_BASE_URL", "https://cloud.example.com"),
+                ],
+            ),
+            (
+                "RESEND_API_KEY",
+                vec![
+                    ("INVITATION_EMAIL_FROM", "no-reply@example.com"),
+                    ("CLOUD_UI_BASE_URL", "https://cloud.example.com"),
+                ],
+            ),
+            (
+                "CLOUD_UI_BASE_URL",
+                vec![
+                    ("INVITATION_EMAIL_FROM", "no-reply@example.com"),
+                    ("RESEND_API_KEY", "re_test"),
+                ],
+            ),
+        ] {
+            clear_invitation_email_env();
+            std::env::set_var("CONTACT_EMAIL_VERIFICATION_ENABLED", "true");
+            for (key, value) in set {
+                std::env::set_var(key, value);
+            }
+
+            let error = InvitationEmailConfig::from_env().unwrap_err();
+
+            assert!(error.contains(missing), "{error}");
+            assert!(
+                error.contains("CONTACT_EMAIL_VERIFICATION_ENABLED"),
+                "{error}"
+            );
+        }
+        clear_invitation_email_env();
+    }
+
+    #[test]
+    #[serial]
+    fn test_contact_email_verification_is_independent_of_invitation_emails() {
+        clear_invitation_email_env();
+        std::env::set_var("CONTACT_EMAIL_VERIFICATION_ENABLED", "true");
+        std::env::set_var("INVITATION_EMAIL_FROM", "no-reply@example.com");
+        std::env::set_var("RESEND_API_KEY", "re_test");
+        std::env::set_var("CLOUD_UI_BASE_URL", "https://cloud.example.com/");
+
+        let config = InvitationEmailConfig::from_env().unwrap();
+
+        assert!(config.contact_email_verification_enabled);
+        assert!(!config.enabled);
+        assert_eq!(config.resend_api_key.as_deref(), Some("re_test"));
+        assert_eq!(
+            config.contact_email_verification_url().as_deref(),
+            Some("https://cloud.example.com/verify-contact-email")
+        );
+        clear_invitation_email_env();
+    }
+
     fn clear_invitation_email_env() {
+        std::env::remove_var("CONTACT_EMAIL_VERIFICATION_ENABLED");
+        std::env::remove_var("CONTACT_EMAIL_VERIFICATION_DAILY_CAP");
         std::env::remove_var("INVITATION_EMAIL_ENABLED");
         std::env::remove_var("INVITATION_EMAIL_FROM");
         std::env::remove_var("INVITATION_EMAIL_REPLY_TO");
@@ -2234,27 +2836,25 @@ mod tests {
     #[test]
     #[serial]
     fn chutes_models_parses_canonical_slug_pairs_and_bare_entries() {
-        // `canonical=chute_slug` pairs; a bare entry means canonical == slug.
+        // `canonical=upstream_id` pairs; a bare entry means canonical == slug.
         // Surrounding whitespace is trimmed; empty/half-empty tokens dropped.
-        std::env::set_var(
+        let parsed = parse_attested_3p_models(
             "CHUTES_MODELS",
             "zai-org/GLM-5.1-FP8=zai-org/GLM-5.1-TEE , moonshotai/Kimi-K2.6-TEE ,, =bad, alsobad=",
         );
-        let cfg = ExternalProvidersConfig::from_env();
-        std::env::remove_var("CHUTES_MODELS");
 
         assert_eq!(
-            cfg.chutes_models,
+            parsed,
             vec![
-                ChutesModelEntry {
+                AttestedThirdPartyModelEntry {
                     canonical_id: "zai-org/GLM-5.1-FP8".to_string(),
-                    chute_slug: "zai-org/GLM-5.1-TEE".to_string(),
+                    upstream_id: "zai-org/GLM-5.1-TEE".to_string(),
                     max_context_tokens: None,
                 },
                 // Bare entry: canonical == slug.
-                ChutesModelEntry {
+                AttestedThirdPartyModelEntry {
                     canonical_id: "moonshotai/Kimi-K2.6-TEE".to_string(),
-                    chute_slug: "moonshotai/Kimi-K2.6-TEE".to_string(),
+                    upstream_id: "moonshotai/Kimi-K2.6-TEE".to_string(),
                     max_context_tokens: None,
                 },
             ],
@@ -2263,33 +2863,30 @@ mod tests {
     }
 
     #[test]
-    #[serial]
     fn chutes_models_parses_optional_max_context_suffix() {
-        std::env::set_var(
+        let parsed = parse_attested_3p_models(
             "CHUTES_MODELS",
             "z-ai/glm-5.2=zai-org/GLM-5.2-TEE@1048576, bare/model@131072, weird/slug@notanumber",
         );
-        let cfg = ExternalProvidersConfig::from_env();
-        std::env::remove_var("CHUTES_MODELS");
 
         assert_eq!(
-            cfg.chutes_models,
+            parsed,
             vec![
-                ChutesModelEntry {
+                AttestedThirdPartyModelEntry {
                     canonical_id: "z-ai/glm-5.2".to_string(),
-                    chute_slug: "zai-org/GLM-5.2-TEE".to_string(),
+                    upstream_id: "zai-org/GLM-5.2-TEE".to_string(),
                     max_context_tokens: Some(1_048_576),
                 },
                 // Bare entry: suffix stripped BEFORE canonical == slug.
-                ChutesModelEntry {
+                AttestedThirdPartyModelEntry {
                     canonical_id: "bare/model".to_string(),
-                    chute_slug: "bare/model".to_string(),
+                    upstream_id: "bare/model".to_string(),
                     max_context_tokens: Some(131_072),
                 },
                 // Unparseable suffix stays part of the slug (fail-open).
-                ChutesModelEntry {
+                AttestedThirdPartyModelEntry {
                     canonical_id: "weird/slug@notanumber".to_string(),
-                    chute_slug: "weird/slug@notanumber".to_string(),
+                    upstream_id: "weird/slug@notanumber".to_string(),
                     max_context_tokens: None,
                 },
             ],
@@ -2297,41 +2894,97 @@ mod tests {
     }
 
     #[test]
-    #[serial]
-    fn chutes_models_empty_when_unset() {
-        std::env::remove_var("CHUTES_MODELS");
-        let cfg = ExternalProvidersConfig::from_env();
-        assert!(cfg.chutes_models.is_empty());
+    fn chutes_models_empty_input_yields_no_entries() {
+        assert!(parse_attested_3p_models("CHUTES_MODELS", "").is_empty());
     }
 
     #[test]
     #[serial]
+    fn attested_3p_models_and_keys_are_read_from_env() {
+        let vars = [
+            "CHUTES_MODELS",
+            "CHUTES_API_KEY",
+            "CHUTES_API_KEY_FILE",
+            "TINFOIL_MODELS",
+            "TINFOIL_API_KEY",
+            "TINFOIL_API_KEY_FILE",
+        ];
+        let previous: Vec<_> = vars.iter().map(std::env::var_os).collect();
+        for v in vars {
+            std::env::remove_var(v);
+        }
+        std::env::set_var("CHUTES_MODELS", "z-ai/glm=zai-org/GLM-TEE@1048576");
+        std::env::set_var("CHUTES_API_KEY", "cpk_SECRET");
+        std::env::set_var("TINFOIL_MODELS", "gpt-oss-120b@131072");
+        std::env::set_var("TINFOIL_API_KEY", "tin-SECRET");
+
+        let cfg = ExternalProvidersConfig::from_env();
+        assert_eq!(cfg.chutes_models.len(), 1);
+        assert_eq!(cfg.chutes_models[0].canonical_id, "z-ai/glm");
+        assert_eq!(cfg.chutes_api_key.as_deref(), Some("cpk_SECRET"));
+        assert_eq!(cfg.tinfoil_models.len(), 1);
+        assert_eq!(cfg.tinfoil_models[0].canonical_id, "gpt-oss-120b");
+        assert_eq!(cfg.tinfoil_models[0].max_context_tokens, Some(131_072));
+        assert_eq!(cfg.tinfoil_api_key.as_deref(), Some("tin-SECRET"));
+
+        // Unset -> empty (the `unwrap_or_default` wiring) and empty key -> None.
+        std::env::remove_var("TINFOIL_MODELS");
+        std::env::set_var("TINFOIL_API_KEY", "");
+        let cfg = ExternalProvidersConfig::from_env();
+        assert!(cfg.tinfoil_models.is_empty());
+        assert_eq!(cfg.tinfoil_api_key, None);
+
+        for (v, prev) in vars.iter().zip(previous) {
+            match prev {
+                Some(value) => std::env::set_var(v, value),
+                None => std::env::remove_var(v),
+            }
+        }
+    }
+
+    #[test]
     fn chutes_models_dedup_duplicate_canonical_ids_first_wins() {
         // Duplicate canonical id (even with a different slug) is dropped so a
         // misconfig can't register redundant fallback providers — first wins.
-        std::env::set_var(
+        let parsed = parse_attested_3p_models(
             "CHUTES_MODELS",
             "zai-org/GLM-5.1-FP8=zai-org/GLM-5.1-TEE,zai-org/GLM-5.1-FP8=zai-org/GLM-5-TEE,other/model",
         );
-        let cfg = ExternalProvidersConfig::from_env();
-        std::env::remove_var("CHUTES_MODELS");
 
         assert_eq!(
-            cfg.chutes_models,
+            parsed,
             vec![
-                ChutesModelEntry {
+                AttestedThirdPartyModelEntry {
                     canonical_id: "zai-org/GLM-5.1-FP8".to_string(),
-                    chute_slug: "zai-org/GLM-5.1-TEE".to_string(),
+                    upstream_id: "zai-org/GLM-5.1-TEE".to_string(),
                     max_context_tokens: None,
                 },
-                ChutesModelEntry {
+                AttestedThirdPartyModelEntry {
                     canonical_id: "other/model".to_string(),
-                    chute_slug: "other/model".to_string(),
+                    upstream_id: "other/model".to_string(),
                     max_context_tokens: None,
                 },
             ],
             "duplicate canonical id dropped (first wins); the second slug is ignored"
         );
+    }
+
+    #[test]
+    fn parse_attested_3p_models_reads_ctx_and_bare_entries() {
+        let v = parse_attested_3p_models(
+            "TINFOIL_MODELS",
+            "z-ai/glm-5.3=glm-5-3@1048576, gpt-oss-120b@131072",
+        );
+        assert_eq!(
+            v[0],
+            AttestedThirdPartyModelEntry {
+                canonical_id: "z-ai/glm-5.3".into(),
+                upstream_id: "glm-5-3".into(),
+                max_context_tokens: Some(1_048_576),
+            }
+        );
+        assert_eq!(v[1].canonical_id, "gpt-oss-120b");
+        assert_eq!(v[1].max_context_tokens, Some(131_072));
     }
 
     #[test]
@@ -2348,6 +3001,25 @@ mod tests {
             Some(value) => std::env::set_var("ENABLE_ANTHROPIC_MESSAGES", value),
             None => std::env::remove_var("ENABLE_ANTHROPIC_MESSAGES"),
         }
+    }
+
+    #[test]
+    fn external_providers_debug_never_prints_api_keys() {
+        let cfg = ExternalProvidersConfig {
+            openai_api_key: Some("sk-openai-SECRET".into()),
+            anthropic_api_key: Some("sk-ant-SECRET".into()),
+            gemini_api_key: Some("gem-SECRET".into()),
+            typesafe_api_key: Some("ts-SECRET".into()),
+            chutes_api_key: Some("cpk_SECRET".into()),
+            tinfoil_api_key: Some("tin-SECRET".into()),
+            ..Default::default()
+        };
+        let out = format!("{cfg:?}");
+        assert!(!out.contains("SECRET"), "key leaked in Debug: {out}");
+        assert!(out.contains("<redacted>"));
+        assert!(
+            format!("{:?}", ExternalProvidersConfig::default()).contains("tinfoil_api_key: None")
+        );
     }
 
     #[test]
@@ -2393,33 +3065,100 @@ mod tests {
     }
 }
 
-/// One Chutes model to register, parsed from a single `CHUTES_MODELS` token.
+/// One attested third-party model to register, parsed from a single
+/// `CHUTES_MODELS` / `TINFOIL_MODELS` token.
 ///
-/// The token is `canonical_id=chute_slug` (e.g. `zai-org/GLM-5.1-FP8=zai-org/GLM-5.1-TEE`),
-/// or a bare `name` meaning `canonical_id == chute_slug`. We deliberately keep
+/// The token is `canonical_id=upstream_id` (e.g. `zai-org/GLM-5.1-FP8=zai-org/GLM-5.1-TEE`),
+/// or a bare `name` meaning `canonical_id == upstream_id`. We deliberately keep
 /// the two ids distinct: the **canonical id** is what we expose in `/v1/models`
 /// and route under (the NEAR-served id when NEAR also serves the model, else the
-/// OpenRouter id) — never the raw `-TEE` chute slug; the **chute slug** is the
-/// internal upstream identity we send to Chutes and resolve to a `chute_id`.
+/// OpenRouter id) — never the provider's internal id; the **upstream id** is the
+/// internal upstream identity we send to the provider (Chutes: the chute slug,
+/// resolved to a `chute_id`; Tinfoil: the upstream model name).
 ///
-/// The slug side takes an optional `@<max_context_tokens>` suffix (e.g.
-/// `z-ai/glm-5.2=zai-org/GLM-5.2-TEE@1048576`) declaring the chute's context
-/// window, so the pool's context-length routing knows whether Chutes can take
-/// a long request. Unset means "no declared limit" (today's behavior: Chutes
-/// is never filtered by size).
+/// The upstream side takes an optional `@<max_context_tokens>` suffix (e.g.
+/// `z-ai/glm-5.2=zai-org/GLM-5.2-TEE@1048576`) declaring the upstream model's
+/// context window, so the pool's context-length routing knows whether the
+/// provider can take a long request. Unset means "no declared limit" (today's
+/// behavior: the provider is never filtered by size).
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ChutesModelEntry {
+pub struct AttestedThirdPartyModelEntry {
     /// User-facing / catalog model id (e.g. `zai-org/GLM-5.1-FP8`).
     pub canonical_id: String,
-    /// Chutes chute slug sent upstream (e.g. `zai-org/GLM-5.1-TEE`).
-    pub chute_slug: String,
-    /// Declared context window of the chute (`@<n>` suffix), if any.
+    /// Upstream id sent to the provider (Chutes: chute slug, e.g.
+    /// `zai-org/GLM-5.1-TEE`; Tinfoil: upstream model name).
+    pub upstream_id: String,
+    /// Declared context window of the upstream model (`@<n>` suffix), if any.
     pub max_context_tokens: Option<u32>,
 }
 
+/// Parse a comma-separated `canonical_id=upstream_id[@ctx]` model list
+/// (`CHUTES_MODELS` / `TINFOIL_MODELS`); `var` is only used in warnings.
+///
+/// A bare token means `canonical_id == upstream_id`. Drop tokens missing either
+/// side, and dedup by canonical id (first wins) so a misconfig can't register
+/// duplicate fallback providers that every refresh would re-attach.
+pub fn parse_attested_3p_models(var: &str, raw: &str) -> Vec<AttestedThirdPartyModelEntry> {
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut entries: Vec<AttestedThirdPartyModelEntry> = Vec::new();
+    for tok in raw.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()) {
+        // Optional `@<max_context_tokens>` suffix on the upstream side. A
+        // suffix that doesn't parse as a number is treated as part of
+        // the id (fail-open: no declared limit) rather than dropped.
+        let split_ctx = |slug: &str| -> (String, Option<u32>) {
+            match slug.rsplit_once('@') {
+                Some((base, ctx)) => match ctx.trim().parse::<u32>() {
+                    Ok(n) if !base.trim().is_empty() => (base.trim().to_string(), Some(n)),
+                    _ => (slug.to_string(), None),
+                },
+                None => (slug.to_string(), None),
+            }
+        };
+        let entry = match tok.split_once('=') {
+            Some((canonical, slug)) => {
+                let (upstream_id, max_context_tokens) = split_ctx(slug.trim());
+                AttestedThirdPartyModelEntry {
+                    canonical_id: canonical.trim().to_string(),
+                    upstream_id,
+                    max_context_tokens,
+                }
+            }
+            None => {
+                let (upstream_id, max_context_tokens) = split_ctx(tok);
+                AttestedThirdPartyModelEntry {
+                    canonical_id: upstream_id.clone(),
+                    upstream_id,
+                    max_context_tokens,
+                }
+            }
+        };
+        if entry.canonical_id.is_empty() || entry.upstream_id.is_empty() {
+            continue;
+        }
+        if !seen.insert(entry.canonical_id.clone()) {
+            // `eprintln!` (not `tracing::warn!`) on purpose: the `config`
+            // crate has no `tracing` dependency, and `from_env` runs during
+            // startup config parsing — potentially before the tracing
+            // subscriber is installed, where a `tracing::warn!` would be
+            // dropped. stderr is always captured by the container log
+            // pipeline. Consistent with the sibling CHUTES_API_KEY_FILE warn.
+            eprintln!(
+                "WARN: duplicate {var} canonical id '{}' ignored (first wins)",
+                entry.canonical_id
+            );
+            continue;
+        }
+        entries.push(entry);
+    }
+    entries
+}
+
 /// External providers configuration for third-party AI providers
-/// API keys are loaded from environment variables or secret files
-#[derive(Debug, Clone, Default)]
+/// API keys are loaded from environment variables or secret files.
+///
+/// `Debug` is implemented by hand so no API key can ever reach a log line
+/// (the whole config is debug-printed at startup).
+#[derive(Clone, Default)]
 pub struct ExternalProvidersConfig {
     /// OpenAI API key (for OpenAI-compatible providers)
     pub openai_api_key: Option<String>,
@@ -2446,9 +3185,14 @@ pub struct ExternalProvidersConfig {
     /// Chutes API key (`cpk_...`), from `CHUTES_API_KEY[_FILE]`. A secret.
     pub chutes_api_key: Option<String>,
     /// Chutes models to register, from `CHUTES_MODELS` (comma-separated
-    /// `canonical_id=chute_slug` pairs; a bare entry means the two are equal).
-    /// See [`ChutesModelEntry`].
-    pub chutes_models: Vec<ChutesModelEntry>,
+    /// `canonical_id=upstream_id` pairs; a bare entry means the two are equal).
+    /// See [`AttestedThirdPartyModelEntry`].
+    pub chutes_models: Vec<AttestedThirdPartyModelEntry>,
+    /// Tinfoil API key, from `TINFOIL_API_KEY[_FILE]`. A secret.
+    pub tinfoil_api_key: Option<String>,
+    /// Tinfoil models, from `TINFOIL_MODELS` (same token grammar as
+    /// `CHUTES_MODELS`). Ids are reserved fail-closed whenever non-empty.
+    pub tinfoil_models: Vec<AttestedThirdPartyModelEntry>,
     /// Expose Chutes **streaming** as an attested path (`CHUTES_ENABLE_STREAMING`,
     /// default off). Off because Chutes' stream protocol has no authenticated
     /// frame sequence numbers, so an on-path gateway could drop/reorder frames
@@ -2458,6 +3202,70 @@ pub struct ExternalProvidersConfig {
     /// Intel PCCS URL for DCAP collateral (shared with the NEAR attestation
     /// verifier), from `PCCS_URL`. One source of truth instead of ad-hoc env reads.
     pub pccs_url: Option<String>,
+}
+
+impl std::fmt::Debug for ExternalProvidersConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        fn redact(k: &Option<String>) -> Option<&'static str> {
+            k.as_ref().map(|_| "<redacted>")
+        }
+        // Exhaustive destructure (no `..`): adding a field to the struct is a
+        // compile error here until it is listed (and, if a secret, redacted).
+        let Self {
+            openai_api_key,
+            anthropic_api_key,
+            enable_anthropic_messages,
+            anthropic_denied_betas,
+            gemini_api_key,
+            typesafe_api_key,
+            timeout_seconds,
+            refresh_interval_secs,
+            enable_chutes,
+            chutes_api_key,
+            chutes_models,
+            tinfoil_api_key,
+            tinfoil_models,
+            chutes_enable_streaming,
+            pccs_url,
+        } = self;
+        f.debug_struct("ExternalProvidersConfig")
+            .field("openai_api_key", &redact(openai_api_key))
+            .field("anthropic_api_key", &redact(anthropic_api_key))
+            .field("enable_anthropic_messages", enable_anthropic_messages)
+            .field("anthropic_denied_betas", anthropic_denied_betas)
+            .field("gemini_api_key", &redact(gemini_api_key))
+            .field("typesafe_api_key", &redact(typesafe_api_key))
+            .field("timeout_seconds", timeout_seconds)
+            .field("refresh_interval_secs", refresh_interval_secs)
+            .field("enable_chutes", enable_chutes)
+            .field("chutes_api_key", &redact(chutes_api_key))
+            .field("chutes_models", chutes_models)
+            .field("tinfoil_api_key", &redact(tinfoil_api_key))
+            .field("tinfoil_models", tinfoil_models)
+            .field("chutes_enable_streaming", chutes_enable_streaming)
+            .field("pccs_url", pccs_url)
+            .finish()
+    }
+}
+
+/// Read an attested-3P API key: `file_var` (path; contents trimmed) wins over
+/// `env_var` (used as-is). A failed file read warns with the PATH only — never
+/// the key — and yields `None`. An empty key is not a key: `""` is treated as
+/// absent so a misconfigured secret can't pass as `Some("")` and silently
+/// fail at request time.
+fn read_secret_env(file_var: &str, env_var: &str) -> Option<String> {
+    if let Ok(path) = env::var(file_var) {
+        match std::fs::read_to_string(&path) {
+            Ok(s) => Some(s.trim().to_string()),
+            Err(e) => {
+                eprintln!("WARN: failed to read {file_var} ({path}): {e}");
+                None
+            }
+        }
+    } else {
+        env::var(env_var).ok()
+    }
+    .filter(|s| !s.is_empty())
 }
 
 impl ExternalProvidersConfig {
@@ -2545,80 +3353,16 @@ impl ExternalProvidersConfig {
             .ok()
             .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
             .unwrap_or(false);
-        let chutes_api_key = if let Ok(path) = env::var("CHUTES_API_KEY_FILE") {
-            match std::fs::read_to_string(&path) {
-                Ok(s) => Some(s.trim().to_string()),
-                Err(e) => {
-                    // Path only — never the key contents.
-                    eprintln!("WARN: failed to read CHUTES_API_KEY_FILE ({path}): {e}");
-                    None
-                }
-            }
-        } else {
-            env::var("CHUTES_API_KEY").ok()
-        }
-        // An empty key is not a key — treat "" as absent so a misconfigured
-        // secret can't pass as Some("") and silently fail at request time.
-        .filter(|s| !s.is_empty());
-        // `canonical_id=chute_slug` per comma-separated token; a bare token means
-        // canonical_id == chute_slug. Drop tokens missing either side, and dedup by
-        // canonical id (first wins) so a misconfig can't register duplicate
-        // fallback providers that every refresh would re-attach.
-        let chutes_models = {
-            let raw = env::var("CHUTES_MODELS").unwrap_or_default();
-            let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
-            let mut entries: Vec<ChutesModelEntry> = Vec::new();
-            for tok in raw.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()) {
-                // Optional `@<max_context_tokens>` suffix on the slug side. A
-                // suffix that doesn't parse as a number is treated as part of
-                // the slug (fail-open: no declared limit) rather than dropped.
-                let split_ctx = |slug: &str| -> (String, Option<u32>) {
-                    match slug.rsplit_once('@') {
-                        Some((base, ctx)) => match ctx.trim().parse::<u32>() {
-                            Ok(n) if !base.trim().is_empty() => (base.trim().to_string(), Some(n)),
-                            _ => (slug.to_string(), None),
-                        },
-                        None => (slug.to_string(), None),
-                    }
-                };
-                let entry = match tok.split_once('=') {
-                    Some((canonical, slug)) => {
-                        let (chute_slug, max_context_tokens) = split_ctx(slug.trim());
-                        ChutesModelEntry {
-                            canonical_id: canonical.trim().to_string(),
-                            chute_slug,
-                            max_context_tokens,
-                        }
-                    }
-                    None => {
-                        let (chute_slug, max_context_tokens) = split_ctx(tok);
-                        ChutesModelEntry {
-                            canonical_id: chute_slug.clone(),
-                            chute_slug,
-                            max_context_tokens,
-                        }
-                    }
-                };
-                if entry.canonical_id.is_empty() || entry.chute_slug.is_empty() {
-                    continue;
-                }
-                if !seen.insert(entry.canonical_id.clone()) {
-                    // `eprintln!` (not `tracing::warn!`) on purpose: the `config`
-                    // crate has no `tracing` dependency, and `from_env` runs during
-                    // startup config parsing — potentially before the tracing
-                    // subscriber is installed, where a `tracing::warn!` would be
-                    // dropped. stderr is always captured by the container log
-                    // pipeline. Consistent with the sibling CHUTES_API_KEY_FILE warn.
-                    eprintln!(
-                        "WARN: duplicate CHUTES_MODELS canonical id '{}' ignored (first wins)",
-                        entry.canonical_id
-                    );
-                    continue;
-                }
-                entries.push(entry);
-            }
-            entries
-        };
+        let chutes_api_key = read_secret_env("CHUTES_API_KEY_FILE", "CHUTES_API_KEY");
+        let chutes_models = parse_attested_3p_models(
+            "CHUTES_MODELS",
+            &env::var("CHUTES_MODELS").unwrap_or_default(),
+        );
+        let tinfoil_api_key = read_secret_env("TINFOIL_API_KEY_FILE", "TINFOIL_API_KEY");
+        let tinfoil_models = parse_attested_3p_models(
+            "TINFOIL_MODELS",
+            &env::var("TINFOIL_MODELS").unwrap_or_default(),
+        );
         let chutes_enable_streaming = env::var("CHUTES_ENABLE_STREAMING")
             .ok()
             .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
@@ -2637,6 +3381,8 @@ impl ExternalProvidersConfig {
             enable_chutes,
             chutes_api_key,
             chutes_models,
+            tinfoil_api_key,
+            tinfoil_models,
             chutes_enable_streaming,
             pccs_url,
         }
@@ -2692,6 +3438,8 @@ pub struct CorsConfig {
 
 impl Default for CorsConfig {
     fn default() -> Self {
+        // CORS_ALLOWED_ORIGINS restricts admin HTTP and OAuth callback origins.
+        // Other API routes allow any origin without credentialed browser access.
         let raw_origins = env::var("CORS_ALLOWED_ORIGINS")
             .unwrap_or_else(|_| "http://localhost:3000,https://near.ai,*.near.ai".to_string());
 

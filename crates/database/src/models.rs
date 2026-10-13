@@ -39,6 +39,11 @@ pub struct User {
     pub provider_user_id: String,
     /// Timestamp when all tokens were revoked (for invalidating access tokens)
     pub tokens_revoked_at: Option<DateTime<Utc>>,
+    /// Verified contact address (set at confirmation, never by login)
+    pub contact_email: Option<String>,
+    pub contact_email_verified_at: Option<DateTime<Utc>>,
+    /// When the user agreed to be emailed at `contact_email`
+    pub email_opt_in_at: Option<DateTime<Utc>>,
 }
 
 /// Organization membership - many-to-many relationship between users and organizations
@@ -517,6 +522,9 @@ pub struct Model {
     pub is_ready: Option<bool>,
     /// Planned deprecation date (ISO 8601). NULL = no planned deprecation.
     pub deprecation_date: Option<DateTime<Utc>>,
+    /// Canonical name of the recommended replacement model. Cleared together
+    /// with `deprecation_date`.
+    pub successor_model_name: Option<String>,
     /// OpenRouter `openrouter.slug` override (lowercase `author/slug`). Set when
     /// our canonical `model_name` does not match OpenRouter's slug. NULL = unset;
     /// the public API then omits the nested `openrouter` object.
@@ -527,6 +535,11 @@ pub struct Model {
     /// If true, this model may be activated even when both cost fields are 0.
     /// Intended for intentionally-free models (e.g. community previews).
     pub allow_free: bool,
+    /// Whether the model appears in the public model catalogs
+    /// (`GET /v1/models`, `GET /v1/model/list`, `GET /v1/model/{name}`).
+    /// `false` keeps an active, billable row out of them. It is a catalog
+    /// switch only: it does not change routing or who may call the model.
+    pub is_listed: bool,
     pub owned_by: String,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
@@ -554,6 +567,10 @@ pub struct UpdateModelPricingRequest {
     pub is_active: Option<bool>,
     /// If true, allows activation even with zero pricing.
     pub allow_free: Option<bool>,
+    /// `Some(false)` keeps the model out of the public model catalogs,
+    /// `Some(true)` lists it again, `None` leaves the column unchanged
+    /// (new rows default to listed).
+    pub is_listed: Option<bool>,
     pub aliases: Option<Vec<String>>,
     pub owned_by: Option<String>,
     // Provider configuration
@@ -579,6 +596,10 @@ pub struct UpdateModelPricingRequest {
     /// Tri-state: `None` = leave unchanged, `Some(None)` = clear to NULL,
     /// `Some(Some(dt))` = set to `dt`.
     pub deprecation_date: Option<Option<DateTime<Utc>>>,
+    /// Recommended replacement model for a planned deprecation.
+    /// Tri-state: `None` = leave unchanged, `Some(None)` = clear to NULL,
+    /// `Some(Some(v))` = set to `v`. Also cleared when `deprecation_date` is.
+    pub successor_model_name: Option<Option<String>>,
     /// OpenRouter `openrouter.slug` override.
     /// Tri-state: `None` = leave unchanged, `Some(None)` = clear to NULL,
     /// `Some(Some(v))` = set to `v`.
@@ -637,6 +658,7 @@ pub struct ModelHistory {
     pub datacenters: Option<Vec<String>>,
     pub is_ready: Option<bool>,
     pub deprecation_date: Option<DateTime<Utc>>,
+    pub successor_model_name: Option<String>,
     /// OpenRouter `openrouter.slug` override the model carried at this point.
     pub openrouter_slug: Option<String>,
 
@@ -652,6 +674,8 @@ pub struct ModelHistory {
 
     /// If true, this model was allowed to serve without pricing at this point in time.
     pub allow_free: bool,
+    /// Whether the model was in the public model catalogs at this point in time.
+    pub is_listed: bool,
 }
 
 /// Model alias - maps client-facing alias names to canonical vLLM model names

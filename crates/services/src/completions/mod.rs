@@ -1,3 +1,4 @@
+pub mod affinity;
 pub mod ports;
 
 use crate::attestation::ports::AttestationServiceTrait;
@@ -72,6 +73,33 @@ fn cache_hit_rate_percent(cached_tokens: i32, prompt_tokens: i32) -> Option<f64>
     // clamps to this range, so this is belt-and-suspenders.
     let cached = cached_tokens.clamp(0, prompt_tokens);
     Some((cached as f64 / prompt_tokens as f64) * 100.0)
+}
+
+fn spawn_usage_write<F>(
+    handle: &tokio::runtime::Handle,
+    write: F,
+    inference_id: Uuid,
+    hard_cap: Duration,
+) -> tokio::task::JoinHandle<()>
+where
+    F: Future<Output = Result<(), crate::usage::UsageError>> + Send + 'static,
+{
+    handle.spawn(async move {
+        match tokio::time::timeout(hard_cap, write).await {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                tracing::error!(%inference_id, %error, "Failed to record usage");
+            }
+            Err(error) => {
+                tracing::error!(
+                    %inference_id,
+                    %error,
+                    timeout_seconds = hard_cap.as_secs_f64(),
+                    "Usage write exceeded hard cap"
+                );
+            }
+        }
+    })
 }
 
 fn get_input_bucket(token_count: i32) -> &'static str {
@@ -397,10 +425,11 @@ where
         let mut metric_tags = self.metric_tags.clone();
         metric_tags.push(format!("{TAG_INPUT_BUCKET}:{input_bucket}"));
 
-        // Spawn critical billing operations on blocking thread pool with timeout.
-        // The tokio runtime waits for blocking tasks during graceful shutdown,
-        // which helps prevent data loss compared to regular spawn.
+        // Keep metrics on the blocking thread and run the database write independently
+        // so the two-second wait cannot cancel an in-flight billing transaction.
         let handle_clone = handle.clone();
+        let write_handle = handle.clone();
+        let write_span = span.clone();
         handle.spawn_blocking(move || {
             // These streaming-only TTFT series require the final usage chunk so
             // the real input-token bucket is known. They intentionally exclude
@@ -428,96 +457,85 @@ where
 
             handle_clone.block_on(
                 async move {
-                    let result = tokio::time::timeout(Duration::from_secs(2), async move {
-                        let stop_reason = Some(crate::usage::StopReason::for_stream_outcome(
-                            last_error.as_ref(),
-                            stream_completed,
-                            last_finish_reason.as_ref(),
-                        ));
-
-                        if usage_service
-                            .record_usage(RecordUsageServiceRequest {
-                                discount: None,
-                                organization_id,
-                                workspace_id,
-                                api_key_id,
-                                model_id,
-                                input_tokens,
-                                output_tokens,
-                                cache_read_tokens,
-                                cache_write,
-                                profiled_cache_write_tokens,
-                                requested_service_tier,
-                                provider_service_tier,
-                                inference_type,
-                                ttft_ms,
-                                avg_itl_ms,
-                                inference_id: Some(inference_id),
-                                provider_request_id: Some(chat_id),
-                                stop_reason,
-                                response_id,
-                                image_count: None,
-                                provider_attribution,
-                            })
-                            .await
-                            .is_err()
-                        {
-                            tracing::error!("Failed to record usage");
+                    let stop_reason = Some(crate::usage::StopReason::for_stream_outcome(
+                        last_error.as_ref(),
+                        stream_completed,
+                        last_finish_reason.as_ref(),
+                    ));
+                    let usage_request = RecordUsageServiceRequest {
+                        discount: None,
+                        organization_id,
+                        workspace_id,
+                        api_key_id,
+                        model_id,
+                        input_tokens,
+                        output_tokens,
+                        cache_read_tokens,
+                        cache_write,
+                        profiled_cache_write_tokens,
+                        requested_service_tier,
+                        provider_service_tier,
+                        inference_type,
+                        ttft_ms,
+                        avg_itl_ms,
+                        inference_id: Some(inference_id),
+                        provider_request_id: Some(chat_id),
+                        stop_reason,
+                        response_id,
+                        image_count: None,
+                        provider_attribution,
+                    };
+                    let usage_write = spawn_usage_write(
+                        &write_handle,
+                        async move { usage_service.record_usage(usage_request).await.map(|_| ()) }
+                            .instrument(write_span),
+                        inference_id,
+                        Duration::from_secs(30),
+                    );
+                    match tokio::time::timeout(Duration::from_secs(2), usage_write).await {
+                        Ok(Ok(())) => {}
+                        Ok(Err(error)) => {
+                            tracing::error!(%inference_id, %error, "Usage write task failed");
                         }
-
-                        // Record metrics
-                        let tags: Vec<&str> = metric_tags.iter().map(|s| s.as_str()).collect();
-                        metrics_service.record_latency(METRIC_LATENCY_TOTAL, e2e_duration, &tags);
-
-                        if let Some(first_token_instant) = first_token_time {
-                            let decoding_duration = first_token_instant.elapsed();
-                            metrics_service.record_latency(
-                                METRIC_LATENCY_DECODING_TIME,
-                                decoding_duration,
-                                &tags,
+                        Err(_) => {
+                            tracing::warn!(
+                                %inference_id,
+                                "Usage write still in progress after 2s, continuing in background"
                             );
-
-                            let decode_secs = decoding_duration.as_secs_f64();
-                            if decode_secs > 0.0 {
-                                let tps = output_tokens as f64 / decode_secs;
-                                metrics_service.record_histogram(
-                                    METRIC_TOKENS_PER_SECOND,
-                                    tps,
-                                    &tags,
-                                );
-                            }
                         }
+                    }
 
-                        metrics_service.record_count(
-                            METRIC_TOKENS_INPUT,
-                            input_tokens as i64,
+                    // Record metrics
+                    let tags: Vec<&str> = metric_tags.iter().map(|s| s.as_str()).collect();
+                    metrics_service.record_latency(METRIC_LATENCY_TOTAL, e2e_duration, &tags);
+
+                    if let Some(first_token_instant) = first_token_time {
+                        let decoding_duration = first_token_instant.elapsed();
+                        metrics_service.record_latency(
+                            METRIC_LATENCY_DECODING_TIME,
+                            decoding_duration,
                             &tags,
                         );
-                        metrics_service.record_count(
-                            METRIC_TOKENS_OUTPUT,
-                            output_tokens as i64,
-                            &tags,
-                        );
-                        // Prefix-cache-hit observability: cache-read token count
-                        // (token-weighted hit rate = cached/input) + per-request
-                        // hit-rate distribution.
-                        metrics_service.record_count(
-                            METRIC_TOKENS_CACHED,
-                            cache_read_tokens as i64,
-                            &tags,
-                        );
-                        if let Some(rate) = cache_hit_rate_percent(cache_read_tokens, input_tokens)
-                        {
-                            metrics_service.record_histogram(METRIC_CACHE_HIT_RATE, rate, &tags);
+
+                        let decode_secs = decoding_duration.as_secs_f64();
+                        if decode_secs > 0.0 {
+                            let tps = output_tokens as f64 / decode_secs;
+                            metrics_service.record_histogram(METRIC_TOKENS_PER_SECOND, tps, &tags);
                         }
-                    })
-                    .await;
+                    }
 
-                    if result.is_err() {
-                        tracing::error!(
-                            "Timeout recording usage and metrics (2s exceeded), inference_id={}",
-                            inference_id
-                        );
+                    metrics_service.record_count(METRIC_TOKENS_INPUT, input_tokens as i64, &tags);
+                    metrics_service.record_count(METRIC_TOKENS_OUTPUT, output_tokens as i64, &tags);
+                    // Prefix-cache-hit observability: cache-read token count
+                    // (token-weighted hit rate = cached/input) + per-request
+                    // hit-rate distribution.
+                    metrics_service.record_count(
+                        METRIC_TOKENS_CACHED,
+                        cache_read_tokens as i64,
+                        &tags,
+                    );
+                    if let Some(rate) = cache_hit_rate_percent(cache_read_tokens, input_tokens) {
+                        metrics_service.record_histogram(METRIC_CACHE_HIT_RATE, rate, &tags);
                     }
                 }
                 .instrument(span),
@@ -770,8 +788,17 @@ pub struct CompletionServiceImpl {
     concurrent_limit: u32,
     /// Cache for per-organization concurrent limits (5-minute TTL)
     org_concurrent_limits: Cache<Uuid, u32>,
+    /// Positive-only cache of model resolution (30 s TTL), shared with
+    /// `ModelsServiceImpl` so admin invalidation clears it.
+    model_resolve_cache: crate::models::ModelResolveCache,
     /// Repository for fetching organization concurrent limits
     organization_limit_repository: Arc<dyn ports::OrganizationConcurrentLimitRepository>,
+    /// HMAC secret for deriving per-request placement affinity keys (see
+    /// `affinity::derive`). `None` when placement is off, in which case
+    /// affinity derivation is skipped — but the legacy client-supplied
+    /// `x_placement_affinity`/`x_placement_affinity_source` extra keys are
+    /// still stripped unconditionally (a deny-list). Never logged.
+    affinity_secret: Option<[u8; 32]>,
 }
 
 /// TTL for organization concurrent limit cache (5 minutes)
@@ -889,8 +916,40 @@ impl CompletionServiceImpl {
             concurrent_counts,
             concurrent_limit: DEFAULT_CONCURRENT_LIMIT,
             org_concurrent_limits,
+            // Private until `with_model_resolve_cache` shares the one owned by
+            // `ModelsServiceImpl`; a private cache is NOT cleared by
+            // `invalidate_models_cache`, so production wiring must call it.
+            model_resolve_cache: crate::models::new_model_resolve_cache(),
             organization_limit_repository,
+            affinity_secret: None,
         }
+    }
+
+    /// Share the model-resolve cache owned by `ModelsServiceImpl` so its
+    /// `invalidate_models_cache` also clears this service's cached models.
+    pub fn with_model_resolve_cache(mut self, cache: crate::models::ModelResolveCache) -> Self {
+        self.model_resolve_cache = cache;
+        self
+    }
+
+    async fn resolve_model_cached(
+        &self,
+        identifier: &str,
+    ) -> Result<Option<crate::models::ModelWithPricing>, anyhow::Error> {
+        crate::models::resolve_model_cached(
+            &self.model_resolve_cache,
+            self.models_repository.as_ref(),
+            identifier,
+        )
+        .await
+    }
+
+    /// Set the placement-affinity HMAC secret (HKDF from the Valkey
+    /// password). Until this is called, affinity derivation is skipped and
+    /// `params.extra` carries no affinity keys. Never logged.
+    pub fn with_affinity_secret(mut self, secret: [u8; 32]) -> Self {
+        self.affinity_secret = Some(secret);
+        self
     }
 
     /// Extract tools and tool_choice from the extra HashMap if present and
@@ -1088,6 +1147,71 @@ impl CompletionServiceImpl {
             }
         }
         Ok(())
+    }
+
+    /// Derive the per-request placement affinity key (if any) and record it
+    /// on the typed, never-serialized `chat_params.placement`. No-op while
+    /// `affinity_secret` is `None` (placement off). Never logs the key or its
+    /// inputs.
+    fn apply_placement_affinity(
+        chat_params: &mut inference_providers::ChatCompletionParams,
+        organization_id: Uuid,
+        session_hint: Option<&str>,
+        affinity_secret: Option<[u8; 32]>,
+    ) {
+        // The request body is flattened into `extra`, so a client can still
+        // send the legacy `x_placement_affinity*` keys. Nothing reads them any
+        // more; strip them unconditionally (every model, secret or not) so
+        // they never reach an upstream.
+        for key in
+            inference_providers::attested::nearai::placement_headers::LEGACY_DENIED_EXTRA_KEYS
+        {
+            chat_params.extra.remove(key);
+        }
+
+        let Some(secret) = affinity_secret else {
+            return;
+        };
+        // Every model: placement covers any model whose hosts publish
+        // frames, and the derivation is one HMAC. `chat_params.model` is
+        // already the canonical name here.
+        let is_e2ee = Self::extra_is_e2ee(&chat_params.extra);
+        let Some((key, source)) = affinity::derive(
+            &organization_id.to_string(),
+            &chat_params.model,
+            session_hint,
+            &chat_params.extra,
+            &chat_params.messages,
+            is_e2ee,
+            &secret,
+        ) else {
+            return;
+        };
+        chat_params.placement.affinity = Some(key);
+        chat_params.placement.affinity_source = source;
+    }
+
+    /// Whether `extra` carries any client-facing E2EE marker: the model
+    /// pub-key routing pin, or any of the four encryption headers. Mirrors
+    /// the route's `e2ee_requested` (`crates/api/src/routes/completions.rs`,
+    /// near line 126), which checks the same four encryption headers off
+    /// the validated `EncryptionHeaders` struct before they're written into
+    /// `extra`; this checks `extra` directly (plus `MODEL_PUB_KEY`, which
+    /// `e2ee_requested` doesn't cover but `reject_e2ee_if_unsupported`
+    /// above does) since that's what's available here. Any one of them
+    /// present means the plaintext-derived prefix affinity source must not
+    /// be used.
+    fn extra_is_e2ee(extra: &std::collections::HashMap<String, serde_json::Value>) -> bool {
+        use crate::common::encryption_headers as eh;
+        [
+            eh::MODEL_PUB_KEY,
+            eh::SIGNING_ALGO,
+            eh::CLIENT_PUB_KEY,
+            eh::ENCRYPTION_VERSION,
+            eh::ENCRYPT_ALL_FIELDS,
+        ]
+        .iter()
+        .any(|key| extra.get(*key).and_then(|v| v.as_str()).is_some())
     }
 
     /// Reject `n > 1` requests for models that don't support multiple completions
@@ -1679,6 +1803,7 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
         Self::inject_tracing_headers(&mut extra, request_id, organization_id, workspace_id);
 
         let mut chat_params = inference_providers::ChatCompletionParams {
+            placement: Default::default(),
             request_priority: request.request_priority,
             model: request.model.clone(),
             messages: chat_messages,
@@ -1713,14 +1838,13 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
             extra,
         };
         chat_params.strip_client_priority();
+        // Routing-only context is set in process below (affinity) and by the
+        // pool (size, class); never trust a value from anywhere else.
+        chat_params.placement = Default::default();
 
         // Resolve model name (could be an alias) and get model details in a single DB call
         // This also validates that the model exists and is active
-        let model = match self
-            .models_repository
-            .resolve_and_get_model(&request.model)
-            .await
-        {
+        let model = match self.resolve_model_cached(&request.model).await {
             Ok(Some(m)) => m,
             Ok(None) => {
                 let err = ports::CompletionError::InvalidModel(format!(
@@ -1774,6 +1898,13 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
         )?;
 
         Self::reject_n_gt_1_if_unsupported(model.attestation_supported, request.n, canonical_name)?;
+
+        Self::apply_placement_affinity(
+            &mut chat_params,
+            organization_id,
+            request.session_hint.as_deref(),
+            self.affinity_secret,
+        );
 
         let provider_start_time = Instant::now();
 
@@ -1869,6 +2000,7 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
         Self::inject_tracing_headers(&mut extra, request_id, organization_id, workspace_id);
 
         let mut chat_params = inference_providers::ChatCompletionParams {
+            placement: Default::default(),
             request_priority: request.request_priority,
             model: request.model.clone(),
             messages: chat_messages,
@@ -1903,14 +2035,13 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
             extra,
         };
         chat_params.strip_client_priority();
+        // Routing-only context is set in process below (affinity) and by the
+        // pool (size, class); never trust a value from anywhere else.
+        chat_params.placement = Default::default();
 
         // Resolve model name (could be an alias) and get model details in a single DB call
         // This also validates that the model exists and is active
-        let model = match self
-            .models_repository
-            .resolve_and_get_model(&request.model)
-            .await
-        {
+        let model = match self.resolve_model_cached(&request.model).await {
             Ok(Some(m)) => m,
             Ok(None) => {
                 let err = ports::CompletionError::InvalidModel(format!(
@@ -1973,6 +2104,13 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
         )?;
 
         Self::reject_n_gt_1_if_unsupported(model.attestation_supported, request.n, canonical_name)?;
+
+        Self::apply_placement_affinity(
+            &mut chat_params,
+            organization_id,
+            request.session_hint.as_deref(),
+            self.affinity_secret,
+        );
 
         let provider_start_time = Instant::now();
         // Read before `chat_params` moves into the call below.
@@ -2420,9 +2558,7 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
         &self,
         model_name: &str,
     ) -> Result<Option<crate::models::ModelWithPricing>, anyhow::Error> {
-        self.models_repository
-            .resolve_and_get_model(model_name)
-            .await
+        self.resolve_model_cached(model_name).await
     }
 
     fn get_inference_provider_pool(
@@ -2450,6 +2586,54 @@ mod tests {
     use futures::{stream, StreamExt};
     use inference_providers::models::{ChatChoice, ChatCompletionChunk, FinishReason, TokenUsage};
     use std::time::Duration;
+
+    #[tokio::test]
+    async fn background_usage_write_survives_wait_timeout() {
+        let (finished_tx, finished_rx) = tokio::sync::oneshot::channel();
+        let write = async move {
+            tokio::time::sleep(Duration::from_millis(80)).await;
+            let _ = finished_tx.send(());
+            Ok(())
+        };
+        let task = spawn_usage_write(
+            &tokio::runtime::Handle::current(),
+            write,
+            Uuid::new_v4(),
+            Duration::from_secs(1),
+        );
+
+        assert!(tokio::time::timeout(Duration::from_millis(10), task)
+            .await
+            .is_err());
+        assert!(
+            tokio::time::timeout(Duration::from_millis(300), finished_rx)
+                .await
+                .expect("background write should finish")
+                .is_ok()
+        );
+    }
+
+    #[tokio::test]
+    async fn background_usage_write_has_hard_cap() {
+        let (held_tx, held_rx) = tokio::sync::oneshot::channel::<()>();
+        let write = async move {
+            let _held_tx = held_tx;
+            std::future::pending::<()>().await;
+            Ok(())
+        };
+        let task = spawn_usage_write(
+            &tokio::runtime::Handle::current(),
+            write,
+            Uuid::new_v4(),
+            Duration::from_millis(30),
+        );
+
+        assert!(tokio::time::timeout(Duration::from_millis(300), task)
+            .await
+            .expect("hard cap should finish the task")
+            .is_ok());
+        assert!(held_rx.await.is_err(), "hard cap should cancel the write");
+    }
 
     fn terminal_test_stream(
         events: Vec<Result<SSEEvent, inference_providers::CompletionError>>,
@@ -3822,6 +4006,7 @@ mod tests {
 
     fn chat_params_for_compat_tests(model: &str) -> inference_providers::ChatCompletionParams {
         inference_providers::ChatCompletionParams {
+            placement: Default::default(),
             request_priority: 0,
             model: model.to_string(),
             messages: vec![inference_providers::ChatMessage {
@@ -3900,7 +4085,9 @@ mod tests {
             datacenters: None,
             is_ready: None,
             deprecation_date: None,
+            successor_model_name: None,
             openrouter_slug: None,
+            is_listed: true,
             created_at: chrono::Utc::now(),
         }
     }
@@ -4305,4 +4492,202 @@ mod tests {
             "n=5 on self-hosted model must be allowed, self-hosted supports n>1"
         );
     }
+
+    fn minimal_chat_params() -> inference_providers::ChatCompletionParams {
+        serde_json::from_value(serde_json::json!({
+            "model": "z-ai/glm-5.3-flash",
+            "messages": [
+                {"role": "system", "content": "you are helpful"},
+                {"role": "user", "content": "hello"},
+            ],
+        }))
+        .unwrap()
+    }
+
+    const APPLY_AFFINITY_SECRET: [u8; 32] = [9u8; 32];
+
+    const LEGACY_KEYS: [&str; 2] =
+        inference_providers::attested::nearai::placement_headers::LEGACY_DENIED_EXTRA_KEYS;
+
+    fn insert_legacy_keys(params: &mut inference_providers::ChatCompletionParams) {
+        for key in LEGACY_KEYS {
+            params.extra.insert(
+                key.to_string(),
+                serde_json::json!("ffffffffffffffffffffffffffffffff"),
+            );
+        }
+    }
+
+    fn assert_no_legacy_keys(params: &inference_providers::ChatCompletionParams) {
+        for key in LEGACY_KEYS {
+            assert!(!params.extra.contains_key(key), "{key} must be stripped");
+        }
+    }
+
+    #[test]
+    fn client_legacy_affinity_extra_is_stripped() {
+        for secret in [None, Some(APPLY_AFFINITY_SECRET)] {
+            let mut params = minimal_chat_params();
+            insert_legacy_keys(&mut params);
+
+            CompletionServiceImpl::apply_placement_affinity(
+                &mut params,
+                Uuid::new_v4(),
+                None,
+                secret,
+            );
+
+            assert_no_legacy_keys(&params);
+        }
+    }
+
+    #[test]
+    fn affinity_travels_typed_not_in_extra() {
+        let mut params = minimal_chat_params();
+        insert_legacy_keys(&mut params);
+
+        CompletionServiceImpl::apply_placement_affinity(
+            &mut params,
+            Uuid::new_v4(),
+            None,
+            Some(APPLY_AFFINITY_SECRET),
+        );
+
+        assert!(
+            params.placement.affinity.is_some(),
+            "a key must be derived from the message prefix"
+        );
+        assert_eq!(
+            params.placement.affinity_source,
+            placement::decision::AffinitySource::Prefix
+        );
+        assert_no_legacy_keys(&params);
+        let body = serde_json::to_value(&params).unwrap();
+        let body_text = body.to_string();
+        assert!(body.get("placement").is_none());
+        assert!(!body_text.contains("x_placement_affinity"));
+    }
+
+    #[test]
+    fn apply_placement_affinity_none_secret_leaves_params_otherwise_unchanged() {
+        let mut params = minimal_chat_params();
+        params
+            .extra
+            .insert("some_other_field".to_string(), serde_json::json!("kept"));
+
+        CompletionServiceImpl::apply_placement_affinity(&mut params, Uuid::new_v4(), None, None);
+
+        assert_eq!(
+            params.extra.get("some_other_field"),
+            Some(&serde_json::json!("kept"))
+        );
+        assert!(params.placement.affinity.is_none());
+        assert_eq!(
+            params.placement.affinity_source,
+            placement::decision::AffinitySource::None
+        );
+    }
+
+    #[test]
+    fn affinity_derived_for_any_model() {
+        // There is no model allow-list: any model gets its key (placement
+        // uses it wherever that model's hosts publish frames), and a
+        // client-forged key is stripped as always.
+        let mut params: inference_providers::ChatCompletionParams =
+            serde_json::from_value(serde_json::json!({
+                "model": "m",
+                "messages": [
+                    {"role": "system", "content": "you are helpful"},
+                    {"role": "user", "content": "hello"},
+                ],
+            }))
+            .unwrap();
+        insert_legacy_keys(&mut params);
+
+        CompletionServiceImpl::apply_placement_affinity(
+            &mut params,
+            Uuid::new_v4(),
+            None,
+            Some(APPLY_AFFINITY_SECRET),
+        );
+
+        assert!(
+            params.placement.affinity.is_some(),
+            "any model gets a derived key"
+        );
+        assert_eq!(
+            params.placement.affinity_source,
+            placement::decision::AffinitySource::Prefix
+        );
+        assert_no_legacy_keys(&params);
+    }
+
+    #[test]
+    fn apply_placement_affinity_e2ee_suppresses_prefix_affinity() {
+        let mut params = minimal_chat_params();
+        params.extra.insert(
+            crate::common::encryption_headers::MODEL_PUB_KEY.to_string(),
+            serde_json::json!("some-model-pub-key"),
+        );
+
+        CompletionServiceImpl::apply_placement_affinity(
+            &mut params,
+            Uuid::new_v4(),
+            None,
+            Some(APPLY_AFFINITY_SECRET),
+        );
+
+        assert!(
+            params.placement.affinity.is_none(),
+            "no session/cache hint and E2EE active must yield no affinity at all"
+        );
+    }
+
+    #[test]
+    fn apply_placement_affinity_client_pub_key_alone_gives_no_prefix_affinity() {
+        // client_pub_key is one of the four encryption headers e2ee_requested
+        // (routes/completions.rs) checks, distinct from model_pub_key. It must
+        // independently suppress the prefix source here too.
+        let mut params = minimal_chat_params();
+        params.extra.insert(
+            crate::common::encryption_headers::CLIENT_PUB_KEY.to_string(),
+            serde_json::json!("some-client-pub-key"),
+        );
+
+        CompletionServiceImpl::apply_placement_affinity(
+            &mut params,
+            Uuid::new_v4(),
+            None,
+            Some(APPLY_AFFINITY_SECRET),
+        );
+
+        assert!(
+            params.placement.affinity.is_none(),
+            "client_pub_key alone must be treated as E2EE, suppressing the prefix source"
+        );
+    }
+
+    #[test]
+    fn extra_is_e2ee_checks_all_five_markers() {
+        for key in [
+            crate::common::encryption_headers::MODEL_PUB_KEY,
+            crate::common::encryption_headers::SIGNING_ALGO,
+            crate::common::encryption_headers::CLIENT_PUB_KEY,
+            crate::common::encryption_headers::ENCRYPTION_VERSION,
+            crate::common::encryption_headers::ENCRYPT_ALL_FIELDS,
+        ] {
+            let mut extra = std::collections::HashMap::new();
+            extra.insert(key.to_string(), serde_json::json!("value"));
+            assert!(
+                CompletionServiceImpl::extra_is_e2ee(&extra),
+                "{key} alone must be detected as E2EE"
+            );
+        }
+
+        let empty = std::collections::HashMap::new();
+        assert!(!CompletionServiceImpl::extra_is_e2ee(&empty));
+    }
 }
+
+#[cfg(test)]
+mod model_resolve_cache_tests;

@@ -58,6 +58,18 @@ pub const METRIC_BACKEND_KEY_DIVERGENCE: &str = "cloud_api.backend.key_divergenc
 // (match|mismatch|unattested|missing).
 pub const METRIC_BACKEND_CHANNEL_BINDING: &str = "cloud_api.backend.channel_binding";
 
+// Tinfoil attested backup (polled by the API layer from the router session,
+// since `inference_providers` cannot depend on this crate).
+// `verification`: one router-level sample per poll, plus one per closed model
+// while the router is healthy (model-pin problems); tags `result` (ok|failed)
+// and `reason` (a `TinfoilVerifyError::reason()`, or `none`). `available`: per canonical
+// model, 1 = router verified and model pinned, 0 = fail-closed; recorded as a
+// 0/1 sample (the metrics service has no gauge instrument). `upstream_auth_failure`:
+// upstream 401/402/403 (key or billing problem); pages immediately.
+pub const METRIC_TINFOIL_VERIFICATION: &str = "cloud_api.tinfoil.verification";
+pub const METRIC_TINFOIL_AVAILABLE: &str = "cloud_api.tinfoil.available";
+pub const METRIC_TINFOIL_UPSTREAM_AUTH_FAILURE: &str = "cloud_api.tinfoil.upstream_auth_failure";
+
 // Error metrics
 pub const METRIC_REQUEST_ERRORS: &str = "cloud_api.request.errors";
 
@@ -82,6 +94,20 @@ pub const METRIC_BILLING_PRICING_FALLBACK: &str = "cloud_api.billing.pricing_fal
 // Provider data quality metrics
 pub const METRIC_PROVIDER_TOKEN_ANOMALIES: &str = "cloud_api.provider.token_anomalies";
 pub const METRIC_PROVIDER_ZERO_TOKENS: &str = "cloud_api.provider.zero_tokens";
+
+// Smart placement metrics. Emitted from `inference_providers` (which cannot
+// depend on this crate), so the names are defined once there and re-exported.
+pub use inference_providers::placement_io::{
+    METRIC_AFFINITY as METRIC_PLACEMENT_AFFINITY,
+    METRIC_CHOSEN_BACKLOG as METRIC_PLACEMENT_CHOSEN_BACKLOG,
+    METRIC_DECISIONS as METRIC_PLACEMENT_DECISIONS, METRIC_EXCLUDED as METRIC_PLACEMENT_EXCLUDED,
+    METRIC_FRAMES_REJECTED as METRIC_PLACEMENT_FRAMES_REJECTED,
+    METRIC_PINS_MALFORMED as METRIC_PLACEMENT_PINS_MALFORMED,
+    METRIC_READ_ERRORS as METRIC_PLACEMENT_READ_ERRORS,
+    METRIC_SNAPSHOT_AGE_MS as METRIC_PLACEMENT_SNAPSHOT_AGE_MS,
+    METRIC_WRITES_DROPPED as METRIC_PLACEMENT_WRITES_DROPPED,
+    METRIC_WRITE_ERRORS as METRIC_PLACEMENT_WRITE_ERRORS,
+};
 
 // HTTP metrics
 pub const METRIC_HTTP_REQUESTS: &str = "cloud_api.http.requests";

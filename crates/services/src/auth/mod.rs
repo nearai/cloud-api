@@ -13,7 +13,9 @@ use crate::workspace::{ApiKey, ApiKeyRepository, WorkspaceId, WorkspaceRepositor
 use async_trait::async_trait;
 use bloomfilter::Bloom;
 use chrono::Utc;
+use hmac::{Hmac, KeyInit, Mac};
 use moka::future::Cache;
+use sha2::Sha256;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -27,6 +29,14 @@ const BLOOM_FILTER_ITEMS: usize = 10_000_000;
 const BLOOM_FILTER_FP_RATE: f64 = 0.001;
 const BLOOM_FILTER_SYNC_INTERVAL_SECS: u64 = 10;
 const BLOOM_FILTER_FULL_REBUILD_INTERVAL_SECS: u64 = 60 * 60;
+
+fn refresh_token_successor(old_token: &str, encoding_key: &str) -> Result<String, AuthError> {
+    let mut mac = Hmac::<Sha256>::new_from_slice(encoding_key.as_bytes())
+        .map_err(|e| AuthError::InternalError(format!("Invalid refresh rotation key: {e}")))?;
+    mac.update(b"nearai-refresh-token-rotation-v1\0");
+    mac.update(old_token.as_bytes());
+    Ok(format!("rt_{}", hex::encode(mac.finalize().into_bytes())))
+}
 
 #[async_trait]
 impl AuthServiceTrait for AuthService {
@@ -246,17 +256,23 @@ impl AuthServiceTrait for AuthService {
         &self,
         user_id: UserId,
         session_id: SessionId,
-        old_token_hash: &str,
+        old_token: &str,
         encoding_key: String,
         access_token_expires_in_hours: i64,
         refresh_token_expires_in_hours: i64,
     ) -> Result<(String, Session, String), AuthError> {
+        let successor_token = refresh_token_successor(old_token, &encoding_key)?;
         // Rotate the refresh token first; only mint an access token for a
         // session that is confirmed live. Rotation keeps the session id, so
         // the new access token stays bound to the same session.
         let (rotated_session, new_refresh_token) = self
             .session_repository
-            .rotate(session_id, old_token_hash, refresh_token_expires_in_hours)
+            .rotate(
+                session_id,
+                old_token,
+                &successor_token,
+                refresh_token_expires_in_hours,
+            )
             .await
             .map_err(|e| {
                 let error_msg = e.to_string();
@@ -289,40 +305,11 @@ impl AuthServiceTrait for AuthService {
             .map_err(|e| AuthError::InternalError(format!("Failed to check existing user: {e}")))?;
 
         if let Some(user) = existing_user {
-            self.user_repository
-                .update_last_login(user.id.clone())
-                .await
-                .map_err(|e| {
-                    AuthError::InternalError(format!("Failed to update last login: {e}"))
-                })?;
-
-            if user.email != oauth_info.email {
-                self.user_repository
-                    .update_email(user.id.clone(), oauth_info.email)
-                    .await
-                    .map_err(|e| {
-                        AuthError::InternalError(format!("Failed to update user email: {e}"))
-                    })?;
-            }
-
-            if user.display_name != oauth_info.display_name
-                || user.avatar_url != oauth_info.avatar_url
-            {
-                self.user_repository
-                    .update(
-                        user.id.clone(),
-                        oauth_info.display_name,
-                        oauth_info.avatar_url,
-                    )
-                    .await
-                    .map_err(|e| AuthError::InternalError(format!("Failed to update user: {e}")))?;
-            }
-
-            return Ok(user);
+            return self.sync_existing_oauth_user(user, &oauth_info).await;
         }
 
         // Create new user
-        let new_user = self
+        let creation = self
             .user_repository
             .create_from_oauth(
                 oauth_info.email.clone(),
@@ -332,8 +319,33 @@ impl AuthServiceTrait for AuthService {
                 oauth_info.provider.clone(),
                 oauth_info.provider_user_id.clone(),
             )
-            .await
-            .map_err(|e| AuthError::InternalError(format!("Failed to create user: {e}")))?;
+            .await;
+        let new_user = match creation {
+            Ok(user) => user,
+            Err(error) => {
+                // Explicit binding may provision the provider identity concurrently
+                // with first login. Reuse it without creating another destination.
+                if let Some(user) = self
+                    .user_repository
+                    .get_by_provider(&oauth_info.provider, &oauth_info.provider_user_id)
+                    .await
+                    .map_err(|e| {
+                        AuthError::InternalError(format!("Failed to resolve user identity: {e}"))
+                    })?
+                {
+                    return self.sync_existing_oauth_user(user, &oauth_info).await;
+                }
+                return Err(AuthError::InternalError(format!(
+                    "Failed to create user: {error}"
+                )));
+            }
+        };
+
+        // NEAR identities are provisioned with their personal organization and
+        // workspace atomically by the repository, shared with wallet binding.
+        if oauth_info.provider == "near" {
+            return Ok(new_user);
+        }
 
         // Create default organization and workspace for new user
         debug!(
@@ -469,6 +481,40 @@ impl AuthServiceTrait for AuthService {
 }
 
 impl AuthService {
+    async fn sync_existing_oauth_user(
+        &self,
+        user: User,
+        oauth_info: &OAuthUserInfo,
+    ) -> Result<User, AuthError> {
+        self.user_repository
+            .update_last_login(user.id.clone())
+            .await
+            .map_err(|e| AuthError::InternalError(format!("Failed to update last login: {e}")))?;
+
+        if user.email != oauth_info.email {
+            self.user_repository
+                .update_email(user.id.clone(), oauth_info.email.clone())
+                .await
+                .map_err(|e| {
+                    AuthError::InternalError(format!("Failed to update user email: {e}"))
+                })?;
+        }
+
+        if user.display_name != oauth_info.display_name || user.avatar_url != oauth_info.avatar_url
+        {
+            self.user_repository
+                .update(
+                    user.id.clone(),
+                    oauth_info.display_name.clone(),
+                    oauth_info.avatar_url.clone(),
+                )
+                .await
+                .map_err(|e| AuthError::InternalError(format!("Failed to update user: {e}")))?;
+        }
+
+        Ok(user)
+    }
+
     pub fn new(
         user_repository: Arc<dyn UserRepository>,
         session_repository: Arc<dyn SessionRepository>,
@@ -629,6 +675,24 @@ mod tests {
     use tokio::sync::RwLock;
     use uuid::Uuid;
 
+    #[test]
+    fn refresh_successor_is_stable_and_keyed() {
+        let first = refresh_token_successor("rt_original", "signing-key").unwrap();
+        assert_eq!(
+            first,
+            refresh_token_successor("rt_original", "signing-key").unwrap()
+        );
+        assert!(first.starts_with("rt_"));
+        assert_ne!(
+            first,
+            refresh_token_successor("rt_other", "signing-key").unwrap()
+        );
+        assert_ne!(
+            first,
+            refresh_token_successor("rt_original", "other-key").unwrap()
+        );
+    }
+
     fn make_user(email: &str, provider: &str) -> User {
         User {
             id: UserId(Uuid::new_v4()),
@@ -644,6 +708,9 @@ mod tests {
             created_at: Utc::now(),
             updated_at: Utc::now(),
             tokens_revoked_at: None,
+            contact_email: None,
+            contact_email_verified_at: None,
+            email_opt_in_at: None,
         }
     }
 
@@ -652,6 +719,9 @@ mod tests {
         email_updated: Mutex<Option<String>>,
         last_login_updated: Mutex<bool>,
         profile_updated: Mutex<bool>,
+        provider_lookups: Mutex<usize>,
+        creation_race: bool,
+        fallback_lookup_fails: bool,
     }
 
     impl MockUserRepo {
@@ -661,7 +731,22 @@ mod tests {
                 email_updated: Mutex::new(None),
                 last_login_updated: Mutex::new(false),
                 profile_updated: Mutex::new(false),
+                provider_lookups: Mutex::new(0),
+                creation_race: false,
+                fallback_lookup_fails: false,
             }
+        }
+    }
+
+    impl MockUserRepo {
+        fn creation_failure(user: Option<User>) -> Self {
+            let mut repo = Self::with_user(
+                user.clone()
+                    .unwrap_or_else(|| make_user("unused@example.test", "near")),
+            );
+            repo.user = Mutex::new(user);
+            repo.creation_race = true;
+            repo
         }
     }
 
@@ -685,7 +770,7 @@ mod tests {
             _: String,
             _: String,
         ) -> anyhow::Result<User> {
-            unimplemented!()
+            Err(anyhow::anyhow!("test creation conflict"))
         }
         async fn get_by_id(&self, id: UserId) -> anyhow::Result<Option<User>> {
             let user = self.user.lock().unwrap();
@@ -699,6 +784,14 @@ mod tests {
             auth_provider: &str,
             _provider_user_id: &str,
         ) -> anyhow::Result<Option<User>> {
+            let mut calls = self.provider_lookups.lock().unwrap();
+            *calls += 1;
+            if self.creation_race && *calls == 1 {
+                return Ok(None);
+            }
+            if self.fallback_lookup_fails {
+                return Err(anyhow::anyhow!("test lookup unavailable"));
+            }
             let user = self.user.lock().unwrap();
             Ok(user
                 .as_ref()
@@ -758,7 +851,13 @@ mod tests {
         async fn extend(&self, _: SessionId, _: i64) -> anyhow::Result<bool> {
             unimplemented!()
         }
-        async fn rotate(&self, _: SessionId, _: &str, _: i64) -> anyhow::Result<(Session, String)> {
+        async fn rotate(
+            &self,
+            _: SessionId,
+            _: &str,
+            _: &str,
+            _: i64,
+        ) -> anyhow::Result<(Session, String)> {
             unimplemented!()
         }
         async fn revoke(&self, _: SessionId) -> anyhow::Result<bool> {
@@ -834,7 +933,13 @@ mod tests {
         async fn extend(&self, _: SessionId, _: i64) -> anyhow::Result<bool> {
             unimplemented!()
         }
-        async fn rotate(&self, _: SessionId, _: &str, _: i64) -> anyhow::Result<(Session, String)> {
+        async fn rotate(
+            &self,
+            _: SessionId,
+            _: &str,
+            _: &str,
+            _: i64,
+        ) -> anyhow::Result<(Session, String)> {
             unimplemented!()
         }
         async fn revoke(&self, session_id: SessionId) -> anyhow::Result<bool> {
@@ -1470,6 +1575,57 @@ mod tests {
             *repo.email_updated.lock().unwrap(),
             Some("new@example.com".to_string())
         );
+    }
+
+    fn race_oauth_info() -> OAuthUserInfo {
+        OAuthUserInfo {
+            provider: "near".into(),
+            provider_user_id: "alice.near".into(),
+            email: "alice.near@near".into(),
+            username: "alice.near".into(),
+            display_name: Some("Updated wallet profile".into()),
+            avatar_url: Some("https://example.test/avatar".into()),
+        }
+    }
+
+    #[tokio::test]
+    async fn creation_race_reuses_identity_and_syncs_last_login_and_profile() {
+        let existing = make_user("old@near", "near");
+        let repo = Arc::new(MockUserRepo::creation_failure(Some(existing.clone())));
+        let service = build_auth_service(repo.clone());
+        let result = service
+            .get_or_create_oauth_user(race_oauth_info())
+            .await
+            .unwrap();
+        assert_eq!(result.id, existing.id);
+        assert!(*repo.last_login_updated.lock().unwrap());
+        assert!(*repo.profile_updated.lock().unwrap());
+        assert_eq!(
+            *repo.email_updated.lock().unwrap(),
+            Some("alice.near@near".into())
+        );
+    }
+
+    #[tokio::test]
+    async fn creation_failure_without_matching_identity_preserves_original_error() {
+        let repo = Arc::new(MockUserRepo::creation_failure(None));
+        let error = build_auth_service(repo.clone())
+            .get_or_create_oauth_user(race_oauth_info())
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("test creation conflict"));
+        assert!(!*repo.last_login_updated.lock().unwrap());
+    }
+
+    #[tokio::test]
+    async fn creation_race_lookup_failure_preserves_lookup_cause() {
+        let mut repo = MockUserRepo::creation_failure(None);
+        repo.fallback_lookup_fails = true;
+        let error = build_auth_service(Arc::new(repo))
+            .get_or_create_oauth_user(race_oauth_info())
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("test lookup unavailable"));
     }
 
     const TEST_ENCODING_KEY: &str = "test_encoding_key";

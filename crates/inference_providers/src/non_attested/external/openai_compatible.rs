@@ -402,7 +402,7 @@ impl ExternalBackend for OpenAiCompatibleBackend {
         Ok(ChatCompletionResponseWithBytes {
             response: parsed,
             raw_bytes,
-            serving_tier: crate::ProviderTier::NonAttested,
+            serving: crate::ServingProvider::EXTERNAL,
         })
     }
 
@@ -888,6 +888,7 @@ mod tests {
             );
         }
         ChatCompletionParams {
+            placement: Default::default(),
             request_priority: 0,
             model: "gpt-5.5".to_string(),
             messages: vec![],

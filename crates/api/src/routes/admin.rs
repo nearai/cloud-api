@@ -6,27 +6,31 @@ use crate::conversions::{
 use crate::middleware::AdminUser;
 use crate::models::{
     AdminAccessTokenPermission, AdminAccessTokenResponse, AdminAmlAllowlistEntryResponse,
-    AdminAmlReportResponse, AdminInvitationEmailResendResultResponse, AdminModelListResponse,
-    AdminModelWithPricing, AdminOrganizationMemberResponse, AdminOrganizationResponse,
-    AdminServiceResponse, AdminUserOrganizationDetails, AdminUserResponse,
-    BatchUpdateModelApiRequest, CreateAdminAccessTokenRequest, CreateServiceRequest, CreditType,
-    DecimalPrice, DecimalPriceRequest, DeleteAdminAccessTokenRequest, DeleteModelRequest,
-    DeprecateModelRequest, DeprecateModelResponse, ErrorResponse,
-    GetOrganizationConcurrentLimitResponse, ListAdminAccessTokensResponse,
-    ListAdminAmlAllowlistResponse, ListAdminAmlReportsResponse,
-    ListAdminInvitationEmailDeliveriesResponse, ListAdminOrganizationMembersResponse,
-    ListOrganizationsAdminResponse, ListPricingChangesResponse, ListUsersResponse, MemberRole,
-    ModelArchitecture, ModelDeprecationConfirmResponse, ModelDeprecationPreviewResponse,
-    ModelDeprecationRequest, ModelHistoryEntry, ModelHistoryResponse, ModelMetadata,
-    ModelWithPricing, OrgLimitsHistoryEntry, OrgLimitsHistoryResponse,
-    OrganizationFallbackResponse, OrganizationMemberResponse, OrganizationPriorityResponse,
-    OrganizationUsage, PricingChangeBatchRequest, PricingChangeConfirmResponse,
-    PricingChangeModelPreviewDto, PricingChangePreviewResponse, PricingFieldUpdates, PricingFields,
-    ScheduledPricingChangeDto, SpendLimit, UpdateAmlReportStatusRequest,
-    UpdateOrganizationConcurrentLimitRequest, UpdateOrganizationConcurrentLimitResponse,
-    UpdateOrganizationFallbackRequest, UpdateOrganizationLimitsRequest,
-    UpdateOrganizationLimitsResponse, UpdateOrganizationMemberRequest,
-    UpdateOrganizationPriorityRequest, UpdateServiceRequest, UpsertAmlAllowlistEntryRequest,
+    AdminAmlReportResponse, AdminApiKeyResponse, AdminInvitationEmailResendResultResponse,
+    AdminModelListResponse, AdminModelWithPricing, AdminOrganizationMemberResponse,
+    AdminOrganizationResponse, AdminServiceResponse, AdminUserOrganizationDetails,
+    AdminUserResponse, BatchUpdateModelApiRequest, CreateAdminAccessTokenRequest,
+    CreateServiceRequest, CreditType, DecimalPrice, DecimalPriceRequest,
+    DeleteAdminAccessTokenRequest, DeleteModelRequest, DeprecateModelRequest,
+    DeprecateModelResponse, EraseUserRequest, EraseUserResponse, ErasedOrganizationResponse,
+    ErasureBlockedResponse, ErasureLogResponse, ErasureLookupOrganizationResponse,
+    ErasurePreviewResponse, ErrorResponse, GetOrganizationConcurrentLimitResponse,
+    ListAdminAccessTokensResponse, ListAdminAmlAllowlistResponse, ListAdminAmlReportsResponse,
+    ListAdminApiKeysResponse, ListAdminInvitationEmailDeliveriesResponse,
+    ListAdminOrganizationMembersResponse, ListOrganizationsAdminResponse,
+    ListPricingChangesResponse, ListUsersResponse, LookupUserErasuresRequest,
+    LookupUserErasuresResponse, MemberRole, ModelArchitecture, ModelDeprecationConfirmResponse,
+    ModelDeprecationPreviewResponse, ModelDeprecationRequest, ModelHistoryEntry,
+    ModelHistoryResponse, ModelMetadata, ModelWithPricing, OrgLimitsHistoryEntry,
+    OrgLimitsHistoryResponse, OrganizationFallbackResponse, OrganizationMemberResponse,
+    OrganizationPriorityResponse, OrganizationUsage, PricingChangeBatchRequest,
+    PricingChangeConfirmResponse, PricingChangeModelPreviewDto, PricingChangePreviewResponse,
+    PricingFieldUpdates, PricingFields, RetainedOrganizationResponse, ScheduledPricingChangeDto,
+    SpendLimit, UpdateAmlReportStatusRequest, UpdateOrganizationConcurrentLimitRequest,
+    UpdateOrganizationConcurrentLimitResponse, UpdateOrganizationFallbackRequest,
+    UpdateOrganizationLimitsRequest, UpdateOrganizationLimitsResponse,
+    UpdateOrganizationMemberRequest, UpdateOrganizationPriorityRequest, UpdateServiceRequest,
+    UpsertAmlAllowlistEntryRequest, UserErasureRecordResponse,
 };
 use crate::routes::common::{analytics_error_response, format_amount};
 use crate::routes::usage::{compute_organization_balance_response, OrganizationBalanceResponse};
@@ -194,6 +198,8 @@ pub struct AdminAppState {
     pub inference_provider_pool: Arc<services::inference_provider_pool::InferenceProviderPool>,
     pub github_dispatcher: Arc<dyn GitHubDispatcher>,
     pub infra_service: Arc<services::admin::InfraService>,
+    pub admin_settings_service: Arc<services::admin_settings::AdminSettingsService>,
+    pub user_erasure_service: Arc<services::user_erasure::UserErasureService>,
 }
 
 /// Small helper for 400 responses from analytics query-param validation.
@@ -815,6 +821,7 @@ pub async fn batch_upsert_models(
                         verifiable: request.verifiable,
                         is_active: request.is_active,
                         allow_free: request.allow_free,
+                        is_listed: request.is_listed,
                         aliases: request.aliases.clone(),
                         owned_by: request.owned_by.clone(),
                         provider_type: request.provider_type.clone(),
@@ -843,6 +850,12 @@ pub async fn batch_upsert_models(
                             .deprecation_date
                             .as_ref()
                             .map(|inner| inner.as_deref().and_then(parse_deprecation_date)),
+                        // Tri-state. The service layer checks that a set value
+                        // names an active model.
+                        successor_model_name: request
+                            .successor_model_id
+                            .as_ref()
+                            .map(|inner| inner.as_ref().map(|s| s.trim().to_string())),
                         // Tri-state passes straight through: outer None = leave
                         // unchanged, Some(None) = clear, Some(Some(v)) = set. The
                         // value was already shape-validated above.
@@ -870,6 +883,10 @@ pub async fn batch_upsert_models(
                 services::admin::AdminError::InvalidPricing(msg) => (
                     StatusCode::BAD_REQUEST,
                     ResponseJson(ErrorResponse::new(msg, "invalid_pricing".to_string())),
+                ),
+                services::admin::AdminError::InvalidDeprecation(msg) => (
+                    StatusCode::BAD_REQUEST,
+                    ResponseJson(ErrorResponse::new(msg, "invalid_request".to_string())),
                 ),
                 services::admin::AdminError::Unauthorized(msg) => (
                     StatusCode::UNAUTHORIZED,
@@ -1128,7 +1145,9 @@ pub async fn batch_upsert_models(
                     .deprecation_date
                     .as_ref()
                     .map(format_deprecation_date),
+                successor_model_id: updated_model.successor_model_name,
                 openrouter_slug: updated_model.openrouter_slug,
+                is_listed: Some(updated_model.is_listed),
             },
         })
         .collect();
@@ -1234,7 +1253,9 @@ pub async fn list_models(
                 datacenters: crate::models::Datacenter::from_codes(model.datacenters),
                 is_ready: model.is_ready,
                 deprecation_date: model.deprecation_date.as_ref().map(format_deprecation_date),
+                successor_model_id: model.successor_model_name,
                 openrouter_slug: model.openrouter_slug,
+                is_listed: Some(model.is_listed),
             },
             is_active: model.is_active,
             created_at: model.created_at,
@@ -1372,8 +1393,10 @@ pub async fn get_model_history(
             datacenters: crate::models::Datacenter::from_codes(h.datacenters),
             is_ready: h.is_ready,
             deprecation_date: h.deprecation_date.as_ref().map(format_deprecation_date),
+            successor_model_id: h.successor_model_name,
             openrouter_slug: h.openrouter_slug,
             allow_free: h.allow_free,
+            is_listed: h.is_listed,
         })
         .collect();
 
@@ -1917,7 +1940,9 @@ pub async fn deprecate_model(
             datacenters: crate::models::Datacenter::from_codes(m.datacenters),
             is_ready: m.is_ready,
             deprecation_date: m.deprecation_date.as_ref().map(format_deprecation_date),
+            successor_model_id: m.successor_model_name,
             openrouter_slug: m.openrouter_slug,
+            is_listed: Some(m.is_listed),
         },
     };
 
@@ -2400,7 +2425,8 @@ fn admin_error_to_response(
     match e {
         services::admin::AdminError::InvalidDeprecation(msg)
         | services::admin::AdminError::InvalidPricing(msg)
-        | services::admin::AdminError::InvalidLimits(msg) => (
+        | services::admin::AdminError::InvalidLimits(msg)
+        | services::admin::AdminError::InvalidParams(msg) => (
             StatusCode::BAD_REQUEST,
             ResponseJson(ErrorResponse::new(msg, "invalid_request".to_string())),
         ),
@@ -2443,7 +2469,7 @@ fn admin_error_to_response(
         ("limit" = Option<i64>, Query, description = "Maximum number of users to return (default: 100)"),
         ("offset" = Option<i64>, Query, description = "Number of users to skip (default: 0)"),
         ("include_organizations" = Option<bool>, Query, description = "Whether to include organization information and spend limits for the first organization owned by each user (default: false)"),
-        ("search" = Option<String>, Query, description = "Filter users by email, username, display name, user id, auth provider, or provider user id (case-insensitive partial match)."),
+        ("search" = Option<String>, Query, description = "Filter users by email, contact email, username, display name, user id, auth provider, or provider user id (case-insensitive partial match)."),
         ("is_active" = Option<bool>, Query, description = "Filter users by active status. Omit to include active and inactive users."),
         ("search_by_name" = Option<String>, Query, description = "Filter users by organization name (case-insensitive match). Only effective when include_organizations=true; separate from user search.")
     ),
@@ -2543,8 +2569,19 @@ pub async fn list_users(
                     created_at: u.created_at,
                     last_login_at: u.last_login_at,
                     is_active: u.is_active,
+                    lifecycle: crate::conversions::admin_user_lifecycle(
+                        u.id,
+                        u.is_active,
+                        &u.auth_provider,
+                    ),
                     auth_provider: u.auth_provider,
                     provider_user_id: u.provider_user_id,
+                    contact_email: crate::conversions::verified_contact_email(
+                        u.contact_email.as_deref(),
+                        u.contact_email_verified_at,
+                    ),
+                    contact_email_verified_at: u.contact_email_verified_at,
+                    email_opt_in_at: u.email_opt_in_at,
                     organizations,
                 }
             })
@@ -2590,8 +2627,19 @@ pub async fn list_users(
                 created_at: u.created_at,
                 last_login_at: u.last_login_at,
                 is_active: u.is_active,
+                lifecycle: crate::conversions::admin_user_lifecycle(
+                    u.id,
+                    u.is_active,
+                    &u.auth_provider,
+                ),
                 auth_provider: u.auth_provider,
                 provider_user_id: u.provider_user_id,
+                contact_email: crate::conversions::verified_contact_email(
+                    u.contact_email.as_deref(),
+                    u.contact_email_verified_at,
+                ),
+                contact_email_verified_at: u.contact_email_verified_at,
+                email_opt_in_at: u.email_opt_in_at,
                 organizations: None,
             })
             .collect();
@@ -2619,7 +2667,8 @@ pub async fn list_users(
     tag = "Admin",
     params(
         ("limit" = Option<i64>, Query, description = "Maximum number of organizations to return (default: 100)"),
-        ("offset" = Option<i64>, Query, description = "Number of organizations to skip (default: 0)")
+        ("offset" = Option<i64>, Query, description = "Number of organizations to skip (default: 0)"),
+        ("lifecycle" = Option<String>, Query, description = "Filter by lifecycle: active (default), deleted, erased or all")
     ),
     responses(
         (status = 200, description = "Organizations retrieved successfully", body = ListOrganizationsAdminResponse),
@@ -2645,7 +2694,7 @@ pub async fn list_organizations(
 
     let (organizations, total) = app_state
         .admin_service
-        .list_organizations(params.limit, params.offset)
+        .list_organizations(params.limit, params.offset, params.lifecycle)
         .await
         .map_err(|e| {
             error!("Failed to list organizations: {:?}", e);
@@ -2677,6 +2726,101 @@ pub async fn list_organizations(
     };
 
     Ok(ResponseJson(response))
+}
+
+/// List API keys across all organizations (Admin only)
+///
+/// Returns key metadata for activation reporting, newest first, including revoked and
+/// inactive keys. Never returns key material (raw key, hash, or prefix) or key names.
+#[utoipa::path(
+    get,
+    path = "/v1/admin/api-keys",
+    tag = "Admin",
+    params(
+        ("limit" = Option<i64>, Query, description = "Maximum number of API keys to return (default: 100)"),
+        ("offset" = Option<i64>, Query, description = "Number of API keys to skip (default: 0)"),
+        ("organization_id" = Option<Uuid>, Query, description = "Filter by organization ID"),
+        ("created_after" = Option<DateTime<Utc>>, Query, description = "Only keys created at or after this timestamp"),
+        ("created_before" = Option<DateTime<Utc>>, Query, description = "Only keys created at or before this timestamp")
+    ),
+    responses(
+        (status = 200, description = "API keys retrieved successfully", body = ListAdminApiKeysResponse),
+        (status = 400, description = "Invalid request", body = ErrorResponse),
+        (status = 401, description = "Unauthorized", body = ErrorResponse),
+        (status = 500, description = "Internal server error", body = ErrorResponse)
+    ),
+    security(
+        ("session_token" = [])
+    )
+)]
+pub async fn list_api_keys(
+    State(app_state): State<AdminAppState>,
+    Extension(_admin_user): Extension<AdminUser>,
+    axum::extract::Query(params): axum::extract::Query<ListAdminApiKeysQueryParams>,
+) -> Result<ResponseJson<ListAdminApiKeysResponse>, (StatusCode, ResponseJson<ErrorResponse>)> {
+    crate::routes::common::validate_limit_offset(params.limit, params.offset)?;
+
+    debug!(
+        "List API keys request with limit={}, offset={}",
+        params.limit, params.offset
+    );
+
+    let filters = services::admin::AdminApiKeyFilters {
+        organization_id: params.organization_id,
+        created_after: params.created_after,
+        created_before: params.created_before,
+    };
+
+    let (api_keys, total) = app_state
+        .admin_service
+        .list_api_keys(filters, params.limit, params.offset)
+        .await
+        .map_err(|e| match e {
+            services::admin::AdminError::InvalidParams(msg) => (
+                StatusCode::BAD_REQUEST,
+                ResponseJson(ErrorResponse::new(msg, "invalid_request".to_string())),
+            ),
+            services::admin::AdminError::Unauthorized(msg) => (
+                StatusCode::UNAUTHORIZED,
+                ResponseJson(ErrorResponse::new(msg, "unauthorized".to_string())),
+            ),
+            _ => {
+                error!("Failed to list API keys: {:?}", e);
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    ResponseJson(ErrorResponse::new(
+                        "Failed to retrieve API keys".to_string(),
+                        "internal_server_error".to_string(),
+                    )),
+                )
+            }
+        })?;
+
+    let response = ListAdminApiKeysResponse {
+        api_keys: api_keys
+            .into_iter()
+            .map(admin_api_key_info_to_response)
+            .collect(),
+        total,
+        limit: params.limit,
+        offset: params.offset,
+    };
+
+    Ok(ResponseJson(response))
+}
+
+fn admin_api_key_info_to_response(key: services::admin::AdminApiKeyInfo) -> AdminApiKeyResponse {
+    AdminApiKeyResponse {
+        id: key.id.to_string(),
+        organization_id: key.organization_id.to_string(),
+        organization_name: key.organization_name,
+        workspace_id: key.workspace_id.to_string(),
+        created_by_user_id: key.created_by_user_id.to_string(),
+        created_at: key.created_at,
+        is_active: key.is_active,
+        deleted_at: key.deleted_at,
+        is_managed_playground: key.is_managed_playground,
+    }
 }
 
 /// Get an organization's scheduler priority (platform admins only).
@@ -2912,6 +3056,7 @@ fn admin_org_info_to_response(
         }),
         current_usage,
         created_at: org.created_at,
+        lifecycle: org.lifecycle,
     }
 }
 
@@ -2967,7 +3112,7 @@ pub async fn list_organization_members(
     State(app_state): State<AdminAppState>,
     Extension(_admin_user): Extension<AdminUser>, // Require admin auth
     Path(org_id): Path<Uuid>,
-    Query(params): Query<ListOrganizationsQueryParams>,
+    Query(params): Query<ListOrganizationMembersQueryParams>,
 ) -> Result<
     ResponseJson<ListAdminOrganizationMembersResponse>,
     (StatusCode, ResponseJson<ErrorResponse>),
@@ -3032,8 +3177,19 @@ pub async fn list_organization_members(
                 created_at: m.user.created_at,
                 last_login_at: m.user.last_login_at,
                 is_active: m.user.is_active,
+                lifecycle: crate::conversions::admin_user_lifecycle(
+                    m.user.id,
+                    m.user.is_active,
+                    &m.user.auth_provider,
+                ),
                 auth_provider: m.user.auth_provider,
                 provider_user_id: m.user.provider_user_id,
+                contact_email: crate::conversions::verified_contact_email(
+                    m.user.contact_email.as_deref(),
+                    m.user.contact_email_verified_at,
+                ),
+                contact_email_verified_at: m.user.contact_email_verified_at,
+                email_opt_in_at: m.user.email_opt_in_at,
                 organizations: None,
             },
         })
@@ -3678,6 +3834,27 @@ pub struct ListOrganizationsQueryParams {
     pub limit: i64,
     #[serde(default)]
     pub offset: i64,
+    #[serde(default)]
+    pub lifecycle: services::admin::OrganizationLifecycleFilter,
+}
+
+#[derive(Debug, serde::Deserialize)]
+pub struct ListOrganizationMembersQueryParams {
+    #[serde(default = "crate::routes::common::default_limit")]
+    pub limit: i64,
+    #[serde(default)]
+    pub offset: i64,
+}
+
+#[derive(Debug, serde::Deserialize)]
+pub struct ListAdminApiKeysQueryParams {
+    #[serde(default = "crate::routes::common::default_limit")]
+    pub limit: i64,
+    #[serde(default)]
+    pub offset: i64,
+    pub organization_id: Option<Uuid>,
+    pub created_after: Option<DateTime<Utc>>,
+    pub created_before: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -4007,7 +4184,7 @@ pub struct ModelRevenueQueryParams {
     pub offset: i64,
     /// Filter by verifiable (TEE) models only / non-verifiable only.
     pub verifiable: Option<bool>,
-    /// Filter by provider type ("vllm", "external", or "chutes").
+    /// Filter by provider type ("vllm", "external", "chutes", or "tinfoil").
     pub provider_type: Option<String>,
     /// Case-insensitive substring match on model name.
     pub model_search: Option<String>,
@@ -4031,7 +4208,7 @@ pub struct ModelRevenueQueryParams {
         ("limit" = Option<i64>, Query, description = "Page size (1-1000, default 100)"),
         ("offset" = Option<i64>, Query, description = "Page offset (default 0)"),
         ("verifiable" = Option<bool>, Query, description = "Filter to verifiable (true) or non-verifiable (false) models"),
-        ("provider_type" = Option<String>, Query, description = "Filter by provider type (e.g. vllm, external, chutes)"),
+        ("provider_type" = Option<String>, Query, description = "Filter by provider type (e.g. vllm, external, chutes, tinfoil)"),
         ("sort" = Option<String>, Query, description = "Sort: revenue (default), requests, tokens")
     ),
     responses(
@@ -4068,9 +4245,9 @@ pub async fn get_model_revenue(
     let sort = services::admin::RevenueSort::from_query(params.sort.as_deref())
         .map_err(|m| bad_request(m, "invalid_parameter"))?;
     if let Some(pt) = params.provider_type.as_deref() {
-        if !matches!(pt, "vllm" | "external" | "chutes") {
+        if !matches!(pt, "vllm" | "external" | "chutes" | "tinfoil") {
             return Err(bad_request(
-                format!("invalid provider_type '{pt}'; expected one of: vllm, external, chutes"),
+                format!("invalid provider_type '{pt}'; expected one of: vllm, external, chutes, tinfoil"),
                 "invalid_parameter",
             ));
         }
@@ -4206,6 +4383,163 @@ pub async fn get_infra_summary(
     debug!("Get platform infra summary request");
     let summary = app_state.infra_service.get_infra_summary().await;
     Ok(ResponseJson(summary))
+}
+
+/// An admin setting: its effective value (stored fields over the defaults).
+#[derive(Debug, serde::Serialize, utoipa::ToSchema)]
+pub struct AdminSettingResponse {
+    pub key: String,
+    /// The effective value. For `placement`: affinity_abs_slack (0.0 - 4.0),
+    /// affinity_eps (0.0 - 2.0), kv_max (0.5 - 1.0), lane_load_tokens
+    /// (4000 - 1000000), pin_hold_factor (0.5 - 2.0) and pin_ttl_ms
+    /// (60000 - 3600000), and enabled (boolean, default true; false routes
+    /// every request through legacy routing).
+    #[schema(value_type = Object)]
+    pub value: serde_json::Value,
+    /// When it was last changed; absent until first changed.
+    pub updated_at: Option<DateTime<Utc>>,
+    /// The admin who last changed it.
+    pub updated_by_user_id: Option<Uuid>,
+}
+
+#[derive(Debug, serde::Serialize, utoipa::ToSchema)]
+pub struct ListAdminSettingsResponse {
+    pub settings: Vec<AdminSettingResponse>,
+}
+
+impl From<services::admin_settings::SettingView> for AdminSettingResponse {
+    fn from(v: services::admin_settings::SettingView) -> Self {
+        Self {
+            key: v.key.to_string(),
+            value: v.value,
+            updated_at: v.updated_at,
+            updated_by_user_id: v.updated_by_user_id,
+        }
+    }
+}
+
+fn admin_settings_error(
+    e: services::admin_settings::AdminSettingsError,
+) -> (StatusCode, ResponseJson<ErrorResponse>) {
+    use services::admin_settings::AdminSettingsError as E;
+    match e {
+        E::UnknownKey => not_found("Unknown setting", "not_found"),
+        E::Invalid(message) => bad_request(message, "invalid_request"),
+        E::Storage(_) => {
+            error!("Admin settings storage failed");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                ResponseJson(ErrorResponse::new(
+                    "Internal server error".to_string(),
+                    "internal_server_error".to_string(),
+                )),
+            )
+        }
+    }
+}
+
+/// List admin settings (Admin only)
+///
+/// Every known setting with its effective value: stored fields over the code defaults.
+#[utoipa::path(
+    get,
+    path = "/v1/admin/settings",
+    tag = "Admin",
+    responses(
+        (status = 200, description = "All settings", body = ListAdminSettingsResponse),
+        (status = 401, description = "Unauthorized", body = ErrorResponse),
+        (status = 500, description = "Internal server error", body = ErrorResponse)
+    ),
+    security(
+        ("session_token" = [])
+    )
+)]
+pub async fn list_admin_settings(
+    State(app_state): State<AdminAppState>,
+    Extension(_admin_user): Extension<AdminUser>,
+) -> Result<ResponseJson<ListAdminSettingsResponse>, (StatusCode, ResponseJson<ErrorResponse>)> {
+    let settings = app_state
+        .admin_settings_service
+        .get_all()
+        .await
+        .map_err(admin_settings_error)?;
+    Ok(ResponseJson(ListAdminSettingsResponse {
+        settings: settings.into_iter().map(Into::into).collect(),
+    }))
+}
+
+/// Get one admin setting (Admin only)
+#[utoipa::path(
+    get,
+    path = "/v1/admin/settings/{key}",
+    tag = "Admin",
+    params(
+        ("key" = String, Path, description = "Setting key, e.g. `placement`")
+    ),
+    responses(
+        (status = 200, description = "The setting", body = AdminSettingResponse),
+        (status = 401, description = "Unauthorized", body = ErrorResponse),
+        (status = 404, description = "Unknown setting", body = ErrorResponse),
+        (status = 500, description = "Internal server error", body = ErrorResponse)
+    ),
+    security(
+        ("session_token" = [])
+    )
+)]
+pub async fn get_admin_setting(
+    State(app_state): State<AdminAppState>,
+    Extension(_admin_user): Extension<AdminUser>,
+    Path(key): Path<String>,
+) -> Result<ResponseJson<AdminSettingResponse>, (StatusCode, ResponseJson<ErrorResponse>)> {
+    let setting = app_state
+        .admin_settings_service
+        .get(&key)
+        .await
+        .map_err(admin_settings_error)?;
+    Ok(ResponseJson(setting.into()))
+}
+
+/// Update one admin setting (Admin only)
+///
+/// Partial update: fields in the body are merged into the stored value, `null`
+/// resets a field to its default. The result is validated as a whole; an invalid
+/// value is rejected with 400 and nothing is stored. Takes effect immediately on the
+/// instance that handles it, and on the others within 10 minutes (there is no
+/// cross-instance push). For a faster stop of an attested third party on the
+/// other instances, redeploy; per-org `fallback_disabled` only excludes
+/// registered fallback providers for that organization and is not a
+/// source-wide stop.
+#[utoipa::path(
+    patch,
+    path = "/v1/admin/settings/{key}",
+    tag = "Admin",
+    params(
+        ("key" = String, Path, description = "Setting key, e.g. `placement`")
+    ),
+    request_body(content = Object, description = "Fields to change; null resets a field"),
+    responses(
+        (status = 200, description = "The updated setting", body = AdminSettingResponse),
+        (status = 400, description = "Invalid value", body = ErrorResponse),
+        (status = 401, description = "Unauthorized", body = ErrorResponse),
+        (status = 404, description = "Unknown setting", body = ErrorResponse),
+        (status = 500, description = "Internal server error", body = ErrorResponse)
+    ),
+    security(
+        ("session_token" = [])
+    )
+)]
+pub async fn update_admin_setting(
+    State(app_state): State<AdminAppState>,
+    Extension(admin_user): Extension<AdminUser>,
+    Path(key): Path<String>,
+    ResponseJson(patch): ResponseJson<serde_json::Value>,
+) -> Result<ResponseJson<AdminSettingResponse>, (StatusCode, ResponseJson<ErrorResponse>)> {
+    let setting = app_state
+        .admin_settings_service
+        .update(&key, patch, admin_user.0.id)
+        .await
+        .map_err(admin_settings_error)?;
+    Ok(ResponseJson(setting.into()))
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -4392,7 +4726,7 @@ pub async fn get_performance_timeseries(
 pub struct RevenueDensityParams {
     pub start: Option<String>,
     pub end: Option<String>,
-    /// Optional provider type filter (e.g. "vllm", "external", "chutes").
+    /// Optional provider type filter (e.g. "vllm", "external", "chutes", "tinfoil").
     pub provider_type: Option<String>,
 }
 
@@ -4412,7 +4746,7 @@ pub struct RevenueDensityParams {
     params(
         ("start" = Option<String>, Query, description = "Start of time range (ISO 8601). Defaults to 30 days ago. Window may not exceed 90 days."),
         ("end" = Option<String>, Query, description = "End of time range (ISO 8601). Defaults to now. Window may not exceed 90 days."),
-        ("provider_type" = Option<String>, Query, description = "Filter by provider type (vllm, external, or chutes)")
+        ("provider_type" = Option<String>, Query, description = "Filter by provider type (vllm, external, chutes, or tinfoil)")
     ),
     responses(
         (status = 200, description = "Revenue density retrieved successfully", body = services::admin::RevenueDensityReport),
@@ -4817,5 +5151,285 @@ mod openrouter_slug_tests {
                 "expected '{slug}' to be rejected"
             );
         }
+    }
+}
+
+/// Static category of a repository failure, safe to log: never the error text,
+/// which can carry row values.
+fn repository_error_kind(error: &anyhow::Error) -> &'static str {
+    use services::common::RepositoryError as R;
+    let Some(repo_error) = error.chain().find_map(|e| e.downcast_ref::<R>()) else {
+        return "other";
+    };
+    match repo_error {
+        R::NotFound(_) => "not_found",
+        R::AlreadyExists => "already_exists",
+        R::RequiredFieldMissing(_) => "required_field_missing",
+        R::ForeignKeyViolation(_) => "foreign_key_violation",
+        R::ValidationFailed(_) => "validation_failed",
+        R::DependencyExists(_) => "dependency_exists",
+        R::TransactionConflict => "transaction_conflict",
+        R::ConnectionFailed(_) => "connection_failed",
+        R::AuthenticationFailed => "authentication_failed",
+        R::QueryTimeout => "query_timeout",
+        R::PoolError(_) => "pool",
+        R::DatabaseError(_) => "database",
+        R::DataConversionError(_) => "data_conversion",
+    }
+}
+
+fn erasure_error_to_response(
+    user_id: Option<uuid::Uuid>,
+    err: services::user_erasure::UserErasureError,
+) -> axum::response::Response {
+    use axum::http::StatusCode;
+    use axum::response::IntoResponse;
+    use services::user_erasure::UserErasureError as E;
+    let (status, error_type, message) = match err {
+        E::NotFound => (StatusCode::NOT_FOUND, "not_found", "User not found"),
+        E::Blocked(blockers) => {
+            let ErrorResponse { error } =
+                ErrorResponse::new("Erasure blocked".to_string(), "erasure_blocked".to_string());
+            return (
+                StatusCode::CONFLICT,
+                ResponseJson(ErasureBlockedResponse { error, blockers }),
+            )
+                .into_response();
+        }
+        E::InvalidLookup => (
+            StatusCode::BAD_REQUEST,
+            "validation_error",
+            "Provide exactly one of email or user_id",
+        ),
+        E::InvalidUserId => (
+            StatusCode::BAD_REQUEST,
+            "validation_error",
+            "user_id must be a valid UUID",
+        ),
+        E::ConfirmEmailMismatch => (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "confirm_email_mismatch",
+            "confirm_email does not match the user's current email",
+        ),
+        E::Internal(e) => {
+            tracing::error!(
+                user_id = user_id.map(tracing::field::display),
+                error_kind = repository_error_kind(&e),
+                "User erasure failed"
+            );
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "internal_error",
+                "Internal server error",
+            )
+        }
+    };
+    (
+        status,
+        ResponseJson(ErrorResponse::new(
+            message.to_string(),
+            error_type.to_string(),
+        )),
+    )
+        .into_response()
+}
+
+/// Erase a user (GDPR Art. 17). Irreversible. Run the preview first. Admin session only.
+#[utoipa::path(
+    post,
+    path = "/v1/admin/users/{user_id}/erasure",
+    tag = "Admin",
+    params(("user_id" = String, Path, description = "User ID")),
+    request_body = EraseUserRequest,
+    responses(
+        (status = 200, description = "User erased (or already erased)", body = EraseUserResponse),
+        (status = 404, description = "User not found", body = ErrorResponse),
+        (status = 409, description = "Erasure blocked; body includes `blockers`", body = ErasureBlockedResponse),
+        (status = 422, description = "confirm_email mismatch", body = ErrorResponse),
+        (status = 401, description = "Unauthorized", body = ErrorResponse),
+        (status = 403, description = "Admin API tokens cannot erase", body = ErrorResponse),
+        (status = 500, description = "Internal server error", body = ErrorResponse)
+    ),
+    security(("session_token" = []))
+)]
+pub async fn erase_user(
+    State(app_state): State<AdminAppState>,
+    Path(user_id): Path<uuid::Uuid>,
+    Extension(admin_user): Extension<AdminUser>,
+    ResponseJson(req): ResponseJson<EraseUserRequest>,
+) -> Result<ResponseJson<EraseUserResponse>, axum::response::Response> {
+    let r = app_state
+        .user_erasure_service
+        .erase(
+            user_id,
+            admin_user.0.id,
+            &req.confirm_email,
+            req.requested_at,
+        )
+        .await
+        .map_err(|e| erasure_error_to_response(Some(user_id), e))?;
+
+    Ok(ResponseJson(EraseUserResponse {
+        user_id: r.user_id.to_string(),
+        lifecycle: services::lifecycle::UserLifecycle::Erased,
+        already_erased: r.already_erased,
+        erased_organization_ids: r
+            .erased_organization_ids
+            .iter()
+            .map(uuid::Uuid::to_string)
+            .collect(),
+    }))
+}
+
+/// Preview a user erasure: blockers and what would be erased (Admin only, read).
+#[utoipa::path(
+    post,
+    path = "/v1/admin/users/{user_id}/erasure/preview",
+    tag = "Admin",
+    params(("user_id" = String, Path, description = "User ID")),
+    responses(
+        (status = 200, description = "Erasure preview", body = ErasurePreviewResponse),
+        (status = 404, description = "User not found", body = ErrorResponse),
+        (status = 401, description = "Unauthorized", body = ErrorResponse),
+        (status = 500, description = "Internal server error", body = ErrorResponse)
+    ),
+    security(("session_token" = []))
+)]
+pub async fn preview_user_erasure(
+    State(app_state): State<AdminAppState>,
+    Path(user_id): Path<uuid::Uuid>,
+    Extension(_admin_user): Extension<AdminUser>,
+) -> Result<ResponseJson<ErasurePreviewResponse>, axum::response::Response> {
+    let plan = app_state
+        .user_erasure_service
+        .preview(user_id)
+        .await
+        .map_err(|e| erasure_error_to_response(Some(user_id), e))?;
+
+    Ok(ResponseJson(ErasurePreviewResponse {
+        user_id: plan.user_id.to_string(),
+        lifecycle: plan.lifecycle,
+        blockers: plan.blockers.clone(),
+        erased_organizations: plan
+            .erased_organizations
+            .iter()
+            .map(|o| ErasedOrganizationResponse {
+                id: o.id.to_string(),
+                lifecycle: o.lifecycle,
+                workspaces: o.workspaces,
+                api_keys: o.api_keys,
+                conversations: o.conversations,
+                files: o.files,
+            })
+            .collect(),
+        retained_organizations: plan
+            .retained_organizations
+            .iter()
+            .map(|o| RetainedOrganizationResponse {
+                id: o.id.to_string(),
+                role: o.role.clone(),
+            })
+            .collect(),
+        log: plan.log.map(|l| ErasureLogResponse {
+            requested_at: l.requested_at,
+            erased_at: l.erased_at,
+        }),
+    }))
+}
+
+/// Find erasure records by the erased person's email or user id (Admin session only).
+/// The email travels in the body, never the URL. No match is a 200 with an empty list.
+#[utoipa::path(
+    post,
+    path = "/v1/admin/user-erasures/lookup",
+    tag = "Admin",
+    request_body = LookupUserErasuresRequest,
+    responses(
+        (status = 200, description = "Matching erasure records, newest first (at most 100)", body = LookupUserErasuresResponse),
+        (status = 400, description = "Exactly one of a non-blank email or a valid user_id UUID is required", body = ErrorResponse),
+        (status = 401, description = "Unauthorized", body = ErrorResponse),
+        (status = 403, description = "Admin API tokens cannot look up erasures", body = ErrorResponse),
+        (status = 500, description = "Internal server error", body = ErrorResponse)
+    ),
+    security(("session_token" = []))
+)]
+pub async fn lookup_user_erasures(
+    State(app_state): State<AdminAppState>,
+    Extension(_admin_user): Extension<AdminUser>,
+    ResponseJson(req): ResponseJson<LookupUserErasuresRequest>,
+) -> Result<ResponseJson<LookupUserErasuresResponse>, axum::response::Response> {
+    let user_id = match req.user_id.as_deref() {
+        None => None,
+        Some(raw) => Some(raw.trim().parse::<uuid::Uuid>().map_err(|_| {
+            erasure_error_to_response(
+                None,
+                services::user_erasure::UserErasureError::InvalidUserId,
+            )
+        })?),
+    };
+    let records = app_state
+        .user_erasure_service
+        .lookup(req.email.as_deref(), user_id)
+        .await
+        .map_err(|e| erasure_error_to_response(user_id, e))?;
+
+    let orgs = |orgs: Vec<services::user_erasure::ErasureRecordOrg>| {
+        orgs.into_iter()
+            .map(|o| ErasureLookupOrganizationResponse {
+                organization_id: o.organization_id.to_string(),
+                lifecycle: o.lifecycle,
+            })
+            .collect::<Vec<_>>()
+    };
+    Ok(ResponseJson(LookupUserErasuresResponse {
+        erasures: records
+            .into_iter()
+            .map(|r| UserErasureRecordResponse {
+                user_id: r.user_id.to_string(),
+                user_lifecycle: r.user_lifecycle,
+                admin_user_id: r.admin_user_id.to_string(),
+                requested_at: r.requested_at,
+                erased_at: r.erased_at,
+                erased_organizations: orgs(r.erased_organizations),
+                retained_organizations: orgs(r.retained_organizations),
+            })
+            .collect(),
+    }))
+}
+
+#[cfg(test)]
+mod repository_error_kind_tests {
+    use super::repository_error_kind;
+    use services::common::RepositoryError as R;
+
+    #[test]
+    fn maps_repository_errors_to_static_kinds() {
+        let cases: Vec<(anyhow::Error, &str)> = vec![
+            (R::NotFound("x".into()).into(), "not_found"),
+            (R::TransactionConflict.into(), "transaction_conflict"),
+            (R::QueryTimeout.into(), "query_timeout"),
+            (R::PoolError(anyhow::anyhow!("secret")).into(), "pool"),
+            (
+                R::DatabaseError(anyhow::anyhow!("secret")).into(),
+                "database",
+            ),
+            (
+                R::DataConversionError(anyhow::anyhow!("secret")).into(),
+                "data_conversion",
+            ),
+        ];
+        for (error, expected) in cases {
+            assert_eq!(repository_error_kind(&error), expected);
+        }
+    }
+
+    #[test]
+    fn sees_through_context_and_defaults_to_other() {
+        use anyhow::Context;
+        let wrapped = Err::<(), _>(R::TransactionConflict)
+            .context("while erasing")
+            .unwrap_err();
+        assert_eq!(repository_error_kind(&wrapped), "transaction_conflict");
+        assert_eq!(repository_error_kind(&anyhow::anyhow!("boom")), "other");
     }
 }

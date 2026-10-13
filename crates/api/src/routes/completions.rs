@@ -1,5 +1,5 @@
 use crate::{
-    middleware::{auth::AuthenticatedApiKey, RequestBodyHash, RequestCorrelation},
+    middleware::{auth::AuthenticatedApiKey, RequestBodyHash, RequestCorrelation, RequestedModel},
     models::*,
     routes::{
         api::AppState,
@@ -106,19 +106,10 @@ fn insert_request_id_header(
 pub(crate) const HEADER_INFERENCE_ID: &str = "Inference-Id";
 
 // Custom header surfacing which trust tier served a completion.
-// Value is "near" for NEAR AI's own TEE fleet, "chutes" for the attested Chutes
-// fallback, or "non-attested" for external (non-TEE) providers.
+// Value is "near" for NEAR AI's own TEE fleet, "non-attested" for external
+// (non-TEE) providers, or the attested third party's source name ("chutes",
+// "tinfoil").
 const HEADER_SERVING_PROVIDER: &str = "x-serving-provider";
-
-/// Map a [`inference_providers::ProviderTier`] to the string value emitted in
-/// the `x-serving-provider` response header.
-pub(super) fn provider_tier_to_str(tier: inference_providers::ProviderTier) -> &'static str {
-    match tier {
-        inference_providers::ProviderTier::Near => "near",
-        inference_providers::ProviderTier::Attested3p => "chutes",
-        inference_providers::ProviderTier::NonAttested => "non-attested",
-    }
-}
 
 /// True when a client encryption header was supplied. `X-Model-Pub-Key` alone
 /// only pins routing and does not make the request or response encrypted.
@@ -639,6 +630,19 @@ fn message_content_to_value(content: &Option<MessageContent>) -> serde_json::Val
     }
 }
 
+/// Header carrying a client-supplied session identifier, used only to derive
+/// a placement affinity key (`services::completions::affinity::derive`).
+/// Never logged, never forwarded to a provider.
+const SESSION_ID_HEADER: &str = "x-session-id";
+
+/// Read the `x-session-id` header, if present and valid UTF-8.
+fn session_hint_from_headers(headers: &header::HeaderMap) -> Option<String> {
+    headers
+        .get(SESSION_ID_HEADER)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string)
+}
+
 // Convert HTTP ChatCompletionRequest to service CompletionRequest
 #[allow(clippy::too_many_arguments)]
 fn convert_chat_request_to_service(
@@ -677,6 +681,7 @@ fn convert_chat_request_to_service(
 
     ServiceCompletionRequest {
         request_priority,
+        session_hint: None,
         request_id,
         model: request.model.clone(),
         messages: request
@@ -1335,6 +1340,7 @@ fn convert_text_request_to_service(
 
     ServiceCompletionRequest {
         request_priority,
+        session_hint: None,
         request_id,
         model: request.model.clone(),
         messages: vec![CompletionMessage {
@@ -1416,8 +1422,10 @@ pub async fn chat_completions(
     Extension(body_hash): Extension<RequestBodyHash>,
     Extension(correlation): Extension<RequestCorrelation>,
     headers: header::HeaderMap,
+    requested_model: RequestedModel,
     OpenAiJson(request): OpenAiJson<ChatCompletionRequest>,
 ) -> axum::response::Response {
+    requested_model.set(&request.model);
     debug!(
         "Chat completions request from api key: {:?}",
         api_key.api_key.id
@@ -1482,6 +1490,7 @@ async fn chat_completions_inner(
         body_hash,
         request_id,
     );
+    service_request.session_hint = session_hint_from_headers(&headers);
 
     // Extract and validate encryption headers if present
     let encryption_headers = match crate::routes::common::validate_encryption_headers(&headers) {
@@ -2389,7 +2398,9 @@ async fn chat_completions_inner(
                         .filter_map(std::future::ready),
                     );
 
-                let serving_tier = serving_provider.as_ref().map(|provider| provider.tier());
+                let serving = serving_provider
+                    .as_ref()
+                    .map(|provider| inference_providers::ServingProvider::of(provider.as_ref()));
 
                 // Return raw streaming response with SSE headers
                 let mut response_builder = Response::builder()
@@ -2412,9 +2423,9 @@ async fn chat_completions_inner(
                 }
 
                 // Surface which provider tier served this streaming completion.
-                if let Some(tier) = serving_tier {
-                    response_builder = response_builder
-                        .header(HEADER_SERVING_PROVIDER, provider_tier_to_str(tier));
+                if let Some(serving) = serving {
+                    response_builder =
+                        response_builder.header(HEADER_SERVING_PROVIDER, serving.label());
                     exposed_headers.push(HEADER_SERVING_PROVIDER);
                 }
 
@@ -2574,10 +2585,8 @@ async fn chat_completions_inner(
                 }
 
                 // Surface which provider tier served this non-streaming completion.
-                response_builder = response_builder.header(
-                    HEADER_SERVING_PROVIDER,
-                    provider_tier_to_str(response_with_bytes.serving_tier),
-                );
+                response_builder = response_builder
+                    .header(HEADER_SERVING_PROVIDER, response_with_bytes.serving.label());
                 exposed_headers.push(HEADER_SERVING_PROVIDER);
 
                 // Announce alias substitution so it is never silent (issue #573).
@@ -2638,8 +2647,10 @@ pub async fn completions(
     Extension(body_hash): Extension<RequestBodyHash>,
     Extension(correlation): Extension<RequestCorrelation>,
     headers: header::HeaderMap,
+    requested_model: RequestedModel,
     OpenAiJson(request): OpenAiJson<CompletionRequest>,
 ) -> axum::response::Response {
+    requested_model.set(&request.model);
     debug!(
         "Text completions request from api key: {:?}",
         api_key.api_key.id
@@ -2816,6 +2827,7 @@ async fn completions_inner(
         body_hash,
         request_id,
     );
+    service_request.session_hint = session_hint_from_headers(&headers);
     // This endpoint always converts the provider's chat-completion payload
     // into the legacy completion format, so a provider signature cannot
     // verify the bytes returned to the client.
@@ -2870,10 +2882,10 @@ async fn completions_inner(
                     );
                 }
 
-                let serving_tier = if let Some(ref chat_id) = stream_chat_id {
+                let serving = if let Some(ref chat_id) = stream_chat_id {
                     app_state
                         .inference_provider_pool
-                        .get_provider_tier_for_chat_id(chat_id)
+                        .get_serving_provider_for_chat_id(chat_id)
                         .await
                 } else {
                     None
@@ -3042,9 +3054,9 @@ async fn completions_inner(
                         response_builder.header(HEADER_INFERENCE_ID, uuid.to_string());
                     exposed_headers.push(HEADER_INFERENCE_ID);
                 }
-                if let Some(tier) = serving_tier {
-                    response_builder = response_builder
-                        .header(HEADER_SERVING_PROVIDER, provider_tier_to_str(tier));
+                if let Some(serving) = serving {
+                    response_builder =
+                        response_builder.header(HEADER_SERVING_PROVIDER, serving.label());
                     exposed_headers.push(HEADER_SERVING_PROVIDER);
                 }
                 // Announce alias substitution so it is never silent (issue #573)
@@ -3144,10 +3156,8 @@ async fn completions_inner(
                     .header(HEADER_INFERENCE_ID, inference_id.to_string());
 
                 let mut exposed_headers: Vec<&str> = vec![HEADER_INFERENCE_ID];
-                response_builder = response_builder.header(
-                    HEADER_SERVING_PROVIDER,
-                    provider_tier_to_str(response_with_bytes.serving_tier),
-                );
+                response_builder = response_builder
+                    .header(HEADER_SERVING_PROVIDER, response_with_bytes.serving.label());
                 exposed_headers.push(HEADER_SERVING_PROVIDER);
                 // Announce alias substitution so it is never silent (issue #573)
                 if let Some(canonical) = &alias_canonical {
@@ -3265,7 +3275,7 @@ pub async fn models(
 
     let models = app_state
         .models_service
-        .get_models_with_pricing()
+        .get_public_models_with_pricing()
         .await
         .map_err(|e| {
             (
@@ -3282,6 +3292,56 @@ pub async fn models(
         data: models.into_iter().map(model_with_pricing_to_info).collect(),
     };
     Ok(ResponseJson(response))
+}
+
+/// List every active model for trusted services, unlisted models included.
+///
+/// The document has the shape of `GET /v1/models` and adds the models whose
+/// `is_listed` is false. A gateway lane reads its catalog here, so it can
+/// serve and advertise a model that this API keeps out of its own public
+/// catalog.
+///
+/// Auth: `Authorization: Bearer <CLOUD_API_USAGE_TOKEN>`, the service secret
+/// of `POST /v1/internal/usage`. The endpoint answers 503 until that token is
+/// configured. Not part of the public OpenAPI document. The answer is marked
+/// `no-store`: unlike the public document it must not sit in a shared cache.
+pub async fn models_internal(
+    State(app_state): State<AppState>,
+    headers: header::HeaderMap,
+) -> Result<
+    (
+        [(header::HeaderName, &'static str); 1],
+        ResponseJson<ModelsResponse>,
+    ),
+    (StatusCode, ResponseJson<ErrorResponse>),
+> {
+    crate::routes::usage::verify_internal_usage_token(
+        &headers,
+        app_state.config.internal_usage_token.as_deref(),
+    )?;
+
+    let models = app_state
+        .models_service
+        .get_models_with_pricing()
+        .await
+        .map_err(|e| {
+            tracing::error!(error = %e, "Failed to get models for the internal catalog");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                ResponseJson(ErrorResponse::new(
+                    "Failed to retrieve models".to_string(),
+                    "internal_server_error".to_string(),
+                )),
+            )
+        })?;
+
+    Ok((
+        [(header::CACHE_CONTROL, "no-store")],
+        ResponseJson(ModelsResponse {
+            object: "list".to_string(),
+            data: models.into_iter().map(model_with_pricing_to_info).collect(),
+        }),
+    ))
 }
 
 /// Convert a nano-USD amount (DB scale 9 — used for per-token, per-image, and
@@ -3381,6 +3441,7 @@ fn model_with_pricing_to_info(model: services::models::ModelWithPricing) -> Mode
             .deprecation_date
             .as_ref()
             .map(crate::routes::admin::format_deprecation_date),
+        successor_model_id: model.successor_model_name,
         description,
         top_provider: Some(TopProvider {
             context_length: Some(model.context_length),
@@ -3454,6 +3515,22 @@ mod tests {
             assert_eq!(provider.max_completion_tokens, None);
             assert!(!provider.extra.contains_key("max_completion_tokens"));
         }
+    }
+
+    #[test]
+    fn session_hint_is_read_from_x_session_id_header() {
+        let mut headers = header::HeaderMap::new();
+        assert_eq!(session_hint_from_headers(&headers), None);
+
+        headers.insert("X-Session-Id", header::HeaderValue::from_static("abc"));
+        assert_eq!(session_hint_from_headers(&headers).as_deref(), Some("abc"));
+
+        let mut bad = header::HeaderMap::new();
+        bad.insert(
+            SESSION_ID_HEADER,
+            header::HeaderValue::from_bytes(&[0xff, 0xfe]).unwrap(),
+        );
+        assert_eq!(session_hint_from_headers(&bad), None);
     }
 
     #[test]
@@ -3575,7 +3652,9 @@ mod tests {
             datacenters: None,
             is_ready: None,
             deprecation_date: None,
+            successor_model_name: None,
             openrouter_slug: None,
+            is_listed: true,
             created_at: chrono::Utc::now(),
         }
     }
@@ -5069,8 +5148,10 @@ pub async fn image_generations(
     Extension(body_hash): Extension<RequestBodyHash>,
     Extension(correlation): Extension<RequestCorrelation>,
     headers: header::HeaderMap,
+    requested_model: RequestedModel,
     OpenAiJson(request): OpenAiJson<crate::models::ImageGenerationRequest>,
 ) -> axum::response::Response {
+    requested_model.set(&request.model);
     debug!(
         "Image generation request from api key: {:?}",
         api_key.api_key.id
@@ -5328,6 +5409,7 @@ pub async fn audio_transcriptions(
     Extension(body_hash): Extension<RequestBodyHash>,
     Extension(correlation): Extension<RequestCorrelation>,
     headers: header::HeaderMap,
+    requested_model: RequestedModel,
     mut multipart: Multipart,
 ) -> axum::response::Response {
     debug!(
@@ -5424,6 +5506,7 @@ pub async fn audio_transcriptions(
         temperature,
         timestamp_granularities,
     };
+    requested_model.set(&request.model);
 
     debug!(
         "Audio transcription: model={}, filename={}, file_size_kb={}, org={}, workspace={}",
@@ -5731,6 +5814,7 @@ pub async fn image_edits(
     State(app_state): State<AppState>,
     Extension(api_key): Extension<AuthenticatedApiKey>,
     Extension(body_hash): Extension<RequestBodyHash>,
+    requested_model: RequestedModel,
     mut multipart: axum::extract::Multipart,
 ) -> axum::response::Response {
     debug!("Image edit request from api key: {:?}", api_key.api_key.id);
@@ -5882,6 +5966,7 @@ pub async fn image_edits(
         size,
         response_format,
     };
+    requested_model.set(&request.model);
 
     debug!(
         "Image edit request: model={}, org={}, workspace={}",
@@ -6239,8 +6324,10 @@ pub async fn rerank(
     Extension(_body_hash): Extension<RequestBodyHash>,
     Extension(correlation): Extension<RequestCorrelation>,
     headers: header::HeaderMap,
+    requested_model: RequestedModel,
     OpenAiJson(request): OpenAiJson<crate::models::RerankRequest>,
 ) -> axum::response::Response {
+    requested_model.set(&request.model);
     debug!(
         "Rerank request: model={}, org={}, workspace={}",
         request.model, api_key.organization.id, api_key.workspace.id.0
@@ -6597,6 +6684,7 @@ pub async fn embeddings(
     Extension(_body_hash): Extension<RequestBodyHash>,
     Extension(correlation): Extension<RequestCorrelation>,
     headers: header::HeaderMap,
+    requested_model: RequestedModel,
     body: Bytes,
 ) -> axum::response::Response {
     // Minimal deserialization: extract only the model name for routing
@@ -6618,6 +6706,7 @@ pub async fn embeddings(
                 .into_response();
         }
     };
+    requested_model.set(&model_name);
 
     debug!(
         "Embeddings request: model={}, org={}, workspace={}",
@@ -6920,6 +7009,7 @@ pub async fn privacy_classify(
     Extension(_body_hash): Extension<RequestBodyHash>,
     Extension(correlation): Extension<RequestCorrelation>,
     headers: header::HeaderMap,
+    requested_model: RequestedModel,
     body: Bytes,
 ) -> axum::response::Response {
     // Minimal deserialization: extract only the model name for routing
@@ -6941,6 +7031,7 @@ pub async fn privacy_classify(
                 .into_response();
         }
     };
+    requested_model.set(&model_name);
 
     debug!(
         "Privacy classify request: model={}, org={}, workspace={}",
@@ -7258,6 +7349,7 @@ pub async fn privacy_redact(
     Extension(_body_hash): Extension<RequestBodyHash>,
     Extension(correlation): Extension<RequestCorrelation>,
     headers: header::HeaderMap,
+    requested_model: RequestedModel,
     body: Bytes,
 ) -> axum::response::Response {
     #[derive(serde::Deserialize)]
@@ -7349,6 +7441,7 @@ pub async fn privacy_redact(
     }
 
     let model_name = parsed.model;
+    requested_model.set(&model_name);
 
     debug!(
         "Privacy redact request: model={}, org={}, workspace={}, n_inputs={}",
@@ -7731,8 +7824,10 @@ pub async fn score(
     Extension(body_hash): Extension<RequestBodyHash>,
     Extension(correlation): Extension<RequestCorrelation>,
     headers: header::HeaderMap,
+    requested_model: RequestedModel,
     OpenAiJson(request): OpenAiJson<crate::models::ScoreRequest>,
 ) -> axum::response::Response {
+    requested_model.set(&request.model);
     debug!(
         "Score request: model={}, org={}, workspace={}",
         request.model, api_key.organization.id, api_key.workspace.id.0

@@ -748,7 +748,8 @@ pub struct MockProvider {
     /// `NonAttested`. Set via [`MockProvider::with_tier`] to exercise tiered
     /// provider selection (e.g. a `Near` primary with an `Attested3p` fallback).
     tier: crate::ProviderTier,
-    provider_source: crate::ProviderSource,
+    /// Explicit source; `None` derives it from the tier (Attested3p => Chutes).
+    provider_source: Option<crate::ProviderSource>,
     /// Value reported by [`InferenceProvider::supports_streaming`]; defaults to
     /// `true`. Set via [`MockProvider::with_streaming_support`] to exercise the
     /// streaming-capability filter (e.g. a Chutes-like fallback with streaming off).
@@ -768,9 +769,21 @@ pub struct MockProvider {
     /// order. Lets lifecycle tests assert the signature-fetch routing pin was
     /// released. `std::sync::Mutex` because the trait method is synchronous.
     unpinned_chat_ids: Arc<std::sync::Mutex<Vec<String>>>,
+    /// `signing_algo` of every [`InferenceProvider::get_attestation_report`]
+    /// call, in call order, so tests can assert what the gateway forwarded.
+    attestation_signing_algos: Arc<std::sync::Mutex<Vec<Option<String>>>>,
+    /// What [`InferenceProvider::poll_backend_count`] reports; defaults to
+    /// `Skipped`. Set via [`MockProvider::with_count_poll`].
+    count_poll: crate::CountPoll,
 }
 
 impl MockProvider {
+    /// Set what this mock's backend-count poll reports.
+    pub fn with_count_poll(mut self, poll: crate::CountPoll) -> Self {
+        self.count_poll = poll;
+        self
+    }
+
     pub fn with_systemone_handler(
         mut self,
         handler: impl Fn(
@@ -823,12 +836,14 @@ impl MockProvider {
             chat_request_priorities: Arc::new(Mutex::new(Vec::new())),
             fail_attestation: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             tier: crate::ProviderTier::NonAttested,
-            provider_source: crate::ProviderSource::External,
+            provider_source: None,
             supports_streaming: true,
             supports_client_e2ee: true,
             supports_chat_signatures: true,
+            count_poll: crate::CountPoll::Skipped,
             per_request_public_key: None,
             unpinned_chat_ids: Arc::new(std::sync::Mutex::new(Vec::new())),
+            attestation_signing_algos: Arc::new(std::sync::Mutex::new(Vec::new())),
             responses_handler: None,
             systemone_handler: None,
         }
@@ -853,12 +868,14 @@ impl MockProvider {
             chat_request_priorities: Arc::new(Mutex::new(Vec::new())),
             fail_attestation: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             tier: crate::ProviderTier::NonAttested,
-            provider_source: crate::ProviderSource::External,
+            provider_source: None,
             supports_streaming: true,
             supports_client_e2ee: true,
             supports_chat_signatures: true,
+            count_poll: crate::CountPoll::Skipped,
             per_request_public_key: None,
             unpinned_chat_ids: Arc::new(std::sync::Mutex::new(Vec::new())),
+            attestation_signing_algos: Arc::new(std::sync::Mutex::new(Vec::new())),
             responses_handler: None,
             systemone_handler: None,
         }
@@ -881,12 +898,14 @@ impl MockProvider {
             chat_request_priorities: Arc::new(Mutex::new(Vec::new())),
             fail_attestation: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             tier: crate::ProviderTier::NonAttested,
-            provider_source: crate::ProviderSource::External,
+            provider_source: None,
             supports_streaming: true,
             supports_client_e2ee: true,
             supports_chat_signatures: true,
+            count_poll: crate::CountPoll::Skipped,
             per_request_public_key: None,
             unpinned_chat_ids: Arc::new(std::sync::Mutex::new(Vec::new())),
+            attestation_signing_algos: Arc::new(std::sync::Mutex::new(Vec::new())),
             responses_handler: None,
             systemone_handler: None,
         }
@@ -901,7 +920,7 @@ impl MockProvider {
     }
 
     pub fn with_provider_source(mut self, provider_source: crate::ProviderSource) -> Self {
-        self.provider_source = provider_source;
+        self.provider_source = Some(provider_source);
         self
     }
 
@@ -957,6 +976,15 @@ impl MockProvider {
         self.unpinned_chat_ids
             .lock()
             .map(|ids| ids.clone())
+            .unwrap_or_default()
+    }
+
+    /// `signing_algo` of every attestation-report call, in call order.
+    /// Includes the calls pool registration makes to fetch signing keys.
+    pub fn attestation_signing_algos(&self) -> Vec<Option<String>> {
+        self.attestation_signing_algos
+            .lock()
+            .map(|algos| algos.clone())
             .unwrap_or_default()
     }
 
@@ -1178,7 +1206,12 @@ impl crate::InferenceProvider for MockProvider {
     }
 
     fn provider_source(&self) -> crate::ProviderSource {
-        self.provider_source
+        self.provider_source.unwrap_or(match self.tier {
+            crate::ProviderTier::Attested3p => crate::ProviderSource::Chutes,
+            crate::ProviderTier::Near | crate::ProviderTier::NonAttested => {
+                crate::ProviderSource::External
+            }
+        })
     }
 
     fn supports_streaming(&self) -> bool {
@@ -1191,6 +1224,10 @@ impl crate::InferenceProvider for MockProvider {
 
     fn supports_chat_signatures(&self) -> bool {
         self.supports_chat_signatures
+    }
+
+    async fn poll_backend_count(&self, _client: &reqwest::Client) -> crate::CountPoll {
+        self.count_poll
     }
 
     fn supports_per_request_pubkey_routing(&self, public_key: &str) -> bool {
@@ -1422,7 +1459,7 @@ impl crate::InferenceProvider for MockProvider {
         Ok(ChatCompletionResponseWithBytes {
             response,
             raw_bytes,
-            serving_tier: self.tier(),
+            serving: crate::ServingProvider::of(self),
         })
     }
 
@@ -1730,12 +1767,22 @@ impl crate::InferenceProvider for MockProvider {
         _signing_address: Option<String>,
         _include_tls_fingerprint: bool,
     ) -> Result<serde_json::Map<String, serde_json::Value>, AttestationError> {
+        if let Ok(mut algos) = self.attestation_signing_algos.lock() {
+            algos.push(signing_algo.clone());
+        }
         if self
             .fail_attestation
             .load(std::sync::atomic::Ordering::Relaxed)
         {
             return Err(AttestationError::FetchError(
                 "Mock attestation failure (simulating blocked backend)".to_string(),
+            ));
+        }
+        // Same check as inference-proxy: only the exact lowercase names pass.
+        if !matches!(signing_algo.as_deref(), None | Some("ecdsa" | "ed25519")) {
+            return Err(AttestationError::FetchError(
+                "HTTP 400 Bad Request: Invalid signing algorithm. Must be 'ed25519' or 'ecdsa'"
+                    .to_string(),
             ));
         }
         let mut report = serde_json::Map::new();

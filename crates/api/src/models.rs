@@ -1231,6 +1231,10 @@ pub struct ModelInfo {
     /// string. Omitted when there is no planned deprecation.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub deprecation_date: Option<String>,
+    /// Recommended replacement for a model with a planned deprecation
+    /// (canonical model id). Omitted when none is set.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub successor_model_id: Option<String>,
     /// Human-readable description (OpenRouter `description`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
@@ -3025,6 +3029,93 @@ pub struct AdminUserOrganizationDetails {
     pub current_usage: Option<OrganizationUsage>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct ErasedOrganizationResponse {
+    pub id: String,
+    pub lifecycle: services::lifecycle::OrganizationLifecycle,
+    pub workspaces: i64,
+    pub api_keys: i64,
+    pub conversations: i64,
+    pub files: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct RetainedOrganizationResponse {
+    pub id: String,
+    pub role: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct ErasureLogResponse {
+    pub requested_at: DateTime<Utc>,
+    pub erased_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct ErasurePreviewResponse {
+    pub user_id: String,
+    pub lifecycle: services::lifecycle::UserLifecycle,
+    pub blockers: Vec<services::user_erasure::ErasureBlocker>,
+    pub erased_organizations: Vec<ErasedOrganizationResponse>,
+    pub retained_organizations: Vec<RetainedOrganizationResponse>,
+    pub log: Option<ErasureLogResponse>,
+}
+
+/// Body of the 409 returned when erasure is blocked: the usual error envelope plus the blockers.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct ErasureBlockedResponse {
+    pub error: ErrorDetail,
+    pub blockers: Vec<services::user_erasure::ErasureBlocker>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct EraseUserRequest {
+    /// Must match the user's current email, ignoring case and surrounding whitespace.
+    /// Typed by the operator as a guard against erasing the wrong id.
+    pub confirm_email: String,
+    /// When the person asked (starts the GDPR response clock). Defaults to now.
+    pub requested_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct EraseUserResponse {
+    pub user_id: String,
+    pub lifecycle: services::lifecycle::UserLifecycle,
+    pub already_erased: bool,
+    pub erased_organization_ids: Vec<String>,
+}
+
+/// Body of the erasure lookup: exactly one of `email` or `user_id`. The email is
+/// compared as a digest and must never appear in a URL or query string.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct LookupUserErasuresRequest {
+    pub email: Option<String>,
+    pub user_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct ErasureLookupOrganizationResponse {
+    pub organization_id: String,
+    pub lifecycle: services::lifecycle::OrganizationLifecycle,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct UserErasureRecordResponse {
+    pub user_id: String,
+    pub user_lifecycle: services::lifecycle::UserLifecycle,
+    pub admin_user_id: String,
+    pub requested_at: DateTime<Utc>,
+    pub erased_at: DateTime<Utc>,
+    pub erased_organizations: Vec<ErasureLookupOrganizationResponse>,
+    pub retained_organizations: Vec<ErasureLookupOrganizationResponse>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct LookupUserErasuresResponse {
+    /// Newest `erased_at` first; empty when nothing matches.
+    pub erasures: Vec<UserErasureRecordResponse>,
+}
+
 /// Admin user response model (for owners/admins)
 /// Contains sensitive information only visible to organization owners/admins
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -3039,6 +3130,15 @@ pub struct AdminUserResponse {
     pub is_active: bool,
     pub auth_provider: String,
     pub provider_user_id: String,
+    /// Verified contact address. `email` is the login identity, which is a
+    /// placeholder for NEAR wallet users.
+    pub contact_email: Option<String>,
+    pub contact_email_verified_at: Option<DateTime<Utc>>,
+    /// When the user agreed to be emailed at `contact_email`.
+    pub email_opt_in_at: Option<DateTime<Utc>>,
+    /// Omitted when the row's `is_active`/`auth_provider` columns are inconsistent.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lifecycle: Option<services::lifecycle::UserLifecycle>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub organizations: Option<Vec<AdminUserOrganizationDetails>>,
 }
@@ -3046,6 +3146,8 @@ pub struct AdminUserResponse {
 /// User response model (full user profile)
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct UserResponse {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub staking_organization_id: Option<String>,
     pub id: String,
     pub email: String,
     pub username: String,
@@ -3056,6 +3158,14 @@ pub struct UserResponse {
     pub last_login_at: Option<DateTime<Utc>>,
     pub is_active: bool,
     pub auth_provider: String,
+    /// Verified contact address. `email` is the login identity, which is a
+    /// placeholder (`{account_id}@near`) for NEAR wallet users.
+    pub contact_email: Option<String>,
+    pub contact_email_verified: bool,
+    /// True when the user signs in with a NEAR wallet and has no verified contact
+    /// email, so the frontend should ask for one. Always false while contact email
+    /// verification is switched off.
+    pub needs_contact_email: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub organizations: Option<Vec<UserOrganizationResponse>>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -3193,12 +3303,43 @@ pub struct AdminOrganizationResponse {
     #[serde(rename = "currentUsage", skip_serializing_if = "Option::is_none")]
     pub current_usage: Option<OrganizationUsage>,
     pub created_at: DateTime<Utc>,
+    /// Always `active` on org detail, which only returns active organizations.
+    pub lifecycle: services::lifecycle::OrganizationLifecycle,
 }
 
 /// List organizations response model (admin only)
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct ListOrganizationsAdminResponse {
     pub organizations: Vec<AdminOrganizationResponse>,
+    pub total: i64,
+    pub limit: i64,
+    pub offset: i64,
+}
+
+/// API key metadata for admin listing. Never includes key material (raw key,
+/// hash, or prefix) or the user-supplied key name.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct AdminApiKeyResponse {
+    pub id: String,
+    pub organization_id: String,
+    pub organization_name: String,
+    pub workspace_id: String,
+    /// User who created the key
+    pub created_by_user_id: String,
+    pub created_at: DateTime<Utc>,
+    pub is_active: bool,
+    /// Set when the key was revoked
+    pub deleted_at: Option<DateTime<Utc>>,
+    /// True when the key's name matches the Cloud UI's managed Playground key
+    /// naming (`Playground-<uuid>-g<generation>`). Best-effort: derived from the
+    /// user-editable key name, not stored provenance.
+    pub is_managed_playground: bool,
+}
+
+/// List API keys response model (admin only)
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct ListAdminApiKeysResponse {
+    pub api_keys: Vec<AdminApiKeyResponse>,
     pub total: i64,
     pub limit: i64,
     pub offset: i64,
@@ -3844,11 +3985,19 @@ pub struct ModelMetadata {
     /// string. Omitted when there is no planned deprecation.
     #[serde(rename = "deprecationDate", skip_serializing_if = "Option::is_none")]
     pub deprecation_date: Option<String>,
+    /// Recommended replacement for a model with a planned deprecation
+    /// (canonical model id). Omitted when none is set.
+    #[serde(rename = "successorModelId", skip_serializing_if = "Option::is_none")]
+    pub successor_model_id: Option<String>,
     /// OpenRouter `openrouter.slug` override (lowercase `author/slug`). Omitted
     /// when unset. On public `GET /v1/models` this surfaces as the nested
     /// `openrouter: { slug }` object; the admin view exposes the raw value.
     #[serde(rename = "openrouterSlug", skip_serializing_if = "Option::is_none")]
     pub openrouter_slug: Option<String>,
+    /// Whether the model appears in the public model catalogs. Set on admin
+    /// views only; the public catalog endpoints omit it.
+    #[serde(rename = "isListed", skip_serializing_if = "Option::is_none")]
+    pub is_listed: Option<bool>,
 }
 
 /// Request to update model pricing (admin endpoint)
@@ -3901,6 +4050,13 @@ pub struct UpdateModelApiRequest {
     /// Required to be set explicitly when activating a zero-price model.
     #[serde(rename = "allowFree", skip_serializing_if = "Option::is_none")]
     pub allow_free: Option<bool>,
+    /// `false` keeps the model out of the public model catalogs
+    /// (`GET /v1/models`, `GET /v1/model/list`, `GET /v1/model/{name}`) while
+    /// it stays active and billable; `true` lists it again. Omitted = leave
+    /// unchanged (new models are listed). It is a catalog switch only: a
+    /// model that has an inference URL can still be called by name.
+    #[serde(rename = "isListed", skip_serializing_if = "Option::is_none")]
+    pub is_listed: Option<bool>,
     pub aliases: Option<Vec<String>>,
     #[serde(rename = "ownedBy")]
     pub owned_by: Option<String>,
@@ -3978,6 +4134,25 @@ pub struct UpdateModelApiRequest {
     )]
     #[schema(value_type = Option<String>)]
     pub deprecation_date: Nullable<String>,
+    /// Recommended replacement for a model with a planned deprecation: the
+    /// canonical id of an active model (or of a model created in the same
+    /// request). Announced to API users in the `x-model-successor` response
+    /// header and on `GET /v1/models`.
+    ///
+    /// Tri-state PATCH semantics:
+    /// - omitted → leave unchanged
+    /// - `null` → clear
+    /// - a string → set
+    ///
+    /// Clearing `deprecationDate` also clears the successor.
+    #[serde(
+        rename = "successorModelId",
+        default,
+        deserialize_with = "deserialize_nullable",
+        skip_serializing_if = "Option::is_none"
+    )]
+    #[schema(value_type = Option<String>)]
+    pub successor_model_id: Nullable<String>,
     /// OpenRouter `openrouter.slug` override (lowercase `author/slug`, e.g.
     /// `z-ai/glm-5.1`). Set when our canonical `model_name` does not match
     /// OpenRouter's slug; surfaced as the nested `openrouter: { slug }` object
@@ -4343,12 +4518,17 @@ pub struct ModelHistoryEntry {
     pub is_ready: Option<bool>,
     #[serde(rename = "deprecationDate", skip_serializing_if = "Option::is_none")]
     pub deprecation_date: Option<String>,
+    #[serde(rename = "successorModelId", skip_serializing_if = "Option::is_none")]
+    pub successor_model_id: Option<String>,
     /// OpenRouter `openrouter.slug` override the model carried at this point.
     #[serde(rename = "openrouterSlug", skip_serializing_if = "Option::is_none")]
     pub openrouter_slug: Option<String>,
     /// If true, this model was allowed to serve without pricing at this point in time.
     #[serde(rename = "allowFree")]
     pub allow_free: bool,
+    /// Whether the model was in the public model catalogs at this point in time.
+    #[serde(rename = "isListed")]
+    pub is_listed: bool,
 }
 
 /// Model history response - complete history of model changes

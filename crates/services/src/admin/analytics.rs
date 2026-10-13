@@ -356,7 +356,7 @@ pub struct ModelRevenueQuery {
     pub start: DateTime<Utc>,
     pub end: DateTime<Utc>,
     pub verifiable: Option<bool>,
-    /// Allowlisted provider type ("vllm" | "external" | "chutes"); validated in the handler.
+    /// Allowlisted provider type ("vllm" | "external" | "chutes" | "tinfoil"); validated in the handler.
     pub provider_type: Option<String>,
     /// Case-insensitive substring match on model name.
     pub model_search: Option<String>,
@@ -548,7 +548,7 @@ pub struct RevenueDensityReport {
 pub struct RevenueDensityQuery {
     pub start: DateTime<Utc>,
     pub end: DateTime<Utc>,
-    /// Optional provider_type filter (e.g. "vllm", "external", "chutes").
+    /// Optional provider_type filter (e.g. "vllm", "external", "chutes", "tinfoil").
     pub provider_type: Option<String>,
 }
 

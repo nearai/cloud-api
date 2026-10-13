@@ -524,13 +524,13 @@ impl UsageServiceTrait for UsageServiceImpl {
                 cache_write_tokens as i64,
                 &tags_str,
             );
-            metrics.record_count(METRIC_BILLED_INPUT_COST_USD, input_cost, &tags_str);
-            metrics.record_count(METRIC_BILLED_OUTPUT_COST_USD, output_cost, &tags_str);
+            metrics.record_count(METRIC_BILLED_INPUT_COST_USD, log.input_cost, &tags_str);
+            metrics.record_count(METRIC_BILLED_OUTPUT_COST_USD, log.output_cost, &tags_str);
 
             // Existing total-cost metric, kept for backward compatibility with
             // dashboards; now also dimensioned by inference_type.
-            if total_cost > 0 {
-                metrics.record_count(METRIC_COST_USD, total_cost, &tags_str);
+            if log.total_cost > 0 {
+                metrics.record_count(METRIC_COST_USD, log.total_cost, &tags_str);
             }
         } else {
             // Log when we skip metrics for a duplicate (aids debugging)
@@ -851,7 +851,13 @@ impl UsageServiceTrait for UsageServiceImpl {
             .usage_repository
             .get_usage_history(organization_id, limit, offset)
             .await
-            .map_err(|e| UsageError::InternalError(format!("Failed to get usage history: {e}")))?;
+            .map_err(|e| {
+                if crate::common::is_query_timeout(&e) {
+                    UsageError::ReportingTimeout
+                } else {
+                    UsageError::InternalError(format!("Failed to get usage history: {e}"))
+                }
+            })?;
 
         Ok((logs, total))
     }
@@ -989,11 +995,18 @@ impl UsageServiceTrait for UsageServiceImpl {
         &self,
         organization_id: Uuid,
         start_date: chrono::DateTime<chrono::Utc>,
+        end_date: Option<chrono::DateTime<chrono::Utc>>,
     ) -> Result<Vec<UsageByModelEntry>, UsageError> {
         self.usage_repository
-            .get_usage_by_model(organization_id, start_date)
+            .get_usage_by_model(organization_id, start_date, end_date)
             .await
-            .map_err(|e| UsageError::InternalError(format!("Failed to get usage by model: {e}")))
+            .map_err(|e| {
+                if crate::common::is_query_timeout(&e) {
+                    UsageError::ReportingTimeout
+                } else {
+                    UsageError::InternalError(format!("Failed to get usage by model: {e}"))
+                }
+            })
     }
 
     async fn list_inference_usage_report(
@@ -1022,7 +1035,13 @@ impl UsageServiceTrait for UsageServiceImpl {
             .list_inference_usage_history(query)
             .await
             .map_err(|e| {
-                UsageError::InternalError(format!("Failed to list inference usage history: {e}"))
+                if crate::common::is_query_timeout(&e) {
+                    UsageError::ReportingTimeout
+                } else {
+                    UsageError::InternalError(format!(
+                        "Failed to list inference usage history: {e}"
+                    ))
+                }
             })
     }
 }

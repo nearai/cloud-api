@@ -22,6 +22,11 @@ pub(crate) fn admin_operation(method: &Method, matched_path: &str) -> AdminOpera
         matched_path
     };
 
+    // Confirms whether an email was ever a customer, so no admin tokens.
+    if path == "/admin/users/{user_id}/erasure" || path == "/admin/user-erasures/lookup" {
+        return AdminOperation::SessionOnly;
+    }
+
     if path == "/admin/access-tokens" || path.starts_with("/admin/access-tokens/") {
         return AdminOperation::SessionOnly;
     }
@@ -35,6 +40,7 @@ pub(crate) fn admin_operation(method: &Method, matched_path: &str) -> AdminOpera
                 | "/admin/models/{model_name}/history"
                 | "/admin/organizations/{org_id}/limits/history"
                 | "/admin/organizations/{org_id}/usage/balance"
+                | "/admin/organizations/{org_id}/usage-discount"
                 | "/admin/organizations/{org_id}/staking/farm"
                 | "/admin/aml/reports"
                 | "/admin/aml/allowlist"
@@ -49,11 +55,14 @@ pub(crate) fn admin_operation(method: &Method, matched_path: &str) -> AdminOpera
                 | "/admin/platform/model-revenue"
                 | "/admin/platform/org-revenue"
                 | "/admin/platform/infra-summary"
+                | "/admin/settings"
+                | "/admin/settings/{key}"
                 | "/admin/platform/model-consumption-timeseries"
                 | "/admin/platform/performance-timeseries"
                 | "/admin/platform/revenue-density"
                 | "/admin/invitation-email-deliveries"
                 | "/admin/users"
+                | "/admin/api-keys"
                 | "/admin/organizations"
                 | "/admin/organizations/{org_id}"
                 | "/admin/organizations/{org_id}/members"
@@ -73,10 +82,68 @@ pub(crate) fn admin_operation(method: &Method, matched_path: &str) -> AdminOpera
             "/admin/models/pricing-changes/preview"
                 | "/admin/models/{model_name}/deprecation/preview"
                 | "/admin/database-encryption/scan"
+                | "/admin/users/{user_id}/erasure/preview"
         )
     {
         return AdminOperation::Read;
     }
 
     AdminOperation::Write
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn user_erasure_preview_is_read_and_execute_is_session_only() {
+        for prefix in ["/v1", ""] {
+            let preview = format!("{prefix}/admin/users/{{user_id}}/erasure/preview");
+            let execute = format!("{prefix}/admin/users/{{user_id}}/erasure");
+            assert_eq!(
+                admin_operation(&Method::POST, &preview),
+                AdminOperation::Read
+            );
+            assert_eq!(
+                admin_operation(&Method::POST, &execute),
+                AdminOperation::SessionOnly
+            );
+        }
+    }
+
+    #[test]
+    fn user_erasure_lookup_is_session_only() {
+        for path in [
+            "/v1/admin/user-erasures/lookup",
+            "/admin/user-erasures/lookup",
+        ] {
+            assert_eq!(
+                admin_operation(&Method::POST, path),
+                AdminOperation::SessionOnly
+            );
+        }
+    }
+
+    #[test]
+    fn settings_get_is_read_and_patch_is_write() {
+        for path in [
+            "/v1/admin/settings",
+            "/admin/settings",
+            "/v1/admin/settings/{key}",
+            "/admin/settings/{key}",
+        ] {
+            assert_eq!(admin_operation(&Method::GET, path), AdminOperation::Read);
+            assert_eq!(admin_operation(&Method::PATCH, path), AdminOperation::Write);
+            assert_eq!(admin_operation(&Method::PUT, path), AdminOperation::Write);
+        }
+    }
+
+    #[test]
+    fn api_keys_get_is_read() {
+        for path in ["/v1/admin/api-keys", "/admin/api-keys"] {
+            assert_eq!(admin_operation(&Method::GET, path), AdminOperation::Read);
+            assert_eq!(admin_operation(&Method::HEAD, path), AdminOperation::Read);
+            assert_eq!(admin_operation(&Method::POST, path), AdminOperation::Write);
+        }
+    }
 }

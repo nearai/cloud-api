@@ -1,12 +1,6 @@
-use crate::models::{
-    OrganizationBalance, OrganizationUsageLog, RecordUsageRequest, ServedProviderTier,
-    ServedProviderType, StopReason,
-};
+use crate::models::{OrganizationBalance, OrganizationUsageLog, RecordUsageRequest, StopReason};
 use crate::pool::DbPool;
-use crate::repositories::credit_allocation::{
-    allocate_usage, load_allocations, lock_organization_accounting, CreditAllocationPolicy,
-    UsageAllocationParent,
-};
+use crate::repositories::credit_allocation::CreditAllocationPolicy;
 use crate::repositories::usage_hourly::with_usage_rows;
 use crate::repositories::utils::map_db_error;
 use crate::retry_db;
@@ -16,7 +10,8 @@ use services::common::RepositoryError;
 use services::responses::models::ResponseId;
 use std::collections::HashMap;
 use std::time::Duration;
-use tokio_postgres::Row;
+use tokio_postgres::types::Type;
+use tokio_postgres::{IsolationLevel, Row};
 use uuid::Uuid;
 
 #[derive(Debug, Clone)]
@@ -58,14 +53,15 @@ impl OrganizationUsageRepository {
                 .context("Failed to get database connection")
                 .map_err(RepositoryError::PoolError)?;
 
+            // One-shot typed query: one round trip, see repositories/mod.rs.
             client
-                .query_one(
+                .query_typed_one(
                     r#"
                     SELECT COALESCE(SUM(total_cost), 0)::BIGINT as total_spend
                     FROM organization_usage_log
                     WHERE api_key_id = $1
                     "#,
-                    &[&api_key_id],
+                    &[(&api_key_id, Type::UUID)],
                 )
                 .await
                 .map_err(map_db_error)
@@ -81,228 +77,90 @@ impl OrganizationUsageRepository {
     /// same `(organization_id, inference_id)` skip the INSERT and balance update,
     /// returning the existing record instead.
     pub async fn record_usage(&self, request: RecordUsageRequest) -> Result<OrganizationUsageLog> {
-        let result = retry_db!("record_organization_usage", {
-            let mut client = self
+        if request.total_cost < 0 {
+            return Err(RepositoryError::ValidationFailed(
+                "usage cost must be non-negative".to_string(),
+            )
+            .into());
+        }
+        let row = retry_db!("record_organization_usage", {
+            let client = self
                 .pool
                 .get()
                 .await
                 .context("Failed to get database connection")
                 .map_err(RepositoryError::PoolError)?;
-
-            let transaction = client.transaction().await.map_err(map_db_error)?;
-            // Take the exclusive accounting lock before inserting the child
-            // usage row. Otherwise concurrent inserts first acquire FK
-            // KEY SHARE locks and can deadlock when allocation upgrades them.
-            lock_organization_accounting(&transaction, request.organization_id).await?;
-
             let id = Uuid::new_v4();
-            let now = Utc::now();
-            let total_tokens = request.input_tokens + request.output_tokens;
-
-            // Insert usage log entry (model_name is denormalized for performance).
-            // ON CONFLICT DO NOTHING: if inference_id already exists for this org,
-            // the INSERT is skipped (no row returned) and we fetch the existing record.
-            let stop_reason_str = request.stop_reason.as_ref().map(|r| r.as_str());
-            let response_id_uuid = request.response_id.as_ref().map(|r| r.as_uuid());
+            let stop_reason = request.stop_reason.as_ref().map(|reason| reason.as_str());
+            let response_id = request.response_id.as_ref().map(|id| id.as_uuid());
             let served_provider_tier = request.served_provider_tier.map(|tier| tier.as_str());
             let served_provider_type = request
                 .served_provider_type
                 .map(|provider| provider.as_str());
-            let maybe_row = transaction
-                .query_opt(
+            client
+                .query_typed_one(
                     r#"
-                    INSERT INTO organization_usage_log (
-                        id, organization_id, workspace_id, api_key_id,
-                        model_id, model_name, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, total_tokens,
-                        input_cost, output_cost, total_cost,
-                        inference_type, created_at, ttft_ms, avg_itl_ms, inference_id,
-                        provider_request_id, stop_reason, response_id, image_count,
-                        served_provider_tier, served_provider_type, served_via_fallback,
-                        billing_details, service_tier, context_band
-                    ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29)
-                    ON CONFLICT (organization_id, inference_id) WHERE inference_id IS NOT NULL DO NOTHING
-                    RETURNING *
+                    SELECT (result.recorded_usage).*, result.was_inserted, result.credit_allocations
+                    FROM record_organization_usage(
+                        $1, $2, $3, $4, $5, $6, $7, $8, $9, $10,
+                        $11, $12, $13, $14, $15, $16, $17, $18, $19, $20,
+                        $21, $22, $23, $24, $25, $26, $27, $28, $29
+                    ) AS result
                     "#,
                     &[
-                        &id,
-                        &request.organization_id,
-                        &request.workspace_id,
-                        &request.api_key_id,
-                        &request.model_id,
-                        &request.model_name,
-                        &request.input_tokens,
-                        &request.output_tokens,
-                        &request.cache_read_tokens,
-                        &request.cache_write_tokens,
-                        &total_tokens,
-                        &request.input_cost,
-                        &request.output_cost,
-                        &request.total_cost,
-                        &request.inference_type,
-                        &now,
-                        &request.ttft_ms,
-                        &request.avg_itl_ms,
-                        &request.inference_id,
-                        &request.provider_request_id,
-                        &stop_reason_str,
-                        &response_id_uuid,
-                        &request.image_count,
-                        &served_provider_tier,
-                        &served_provider_type,
-                        &request.served_via_fallback,
-                        &request.billing_details,
-                        &request.service_tier,
-                        &request.context_band,
+                        (&id, Type::UUID),
+                        (&request.organization_id, Type::UUID),
+                        (&request.workspace_id, Type::UUID),
+                        (&request.api_key_id, Type::UUID),
+                        (&request.model_id, Type::UUID),
+                        (&request.model_name, Type::VARCHAR),
+                        (&request.input_tokens, Type::INT4),
+                        (&request.output_tokens, Type::INT4),
+                        (&request.cache_read_tokens, Type::INT4),
+                        (&request.cache_write_tokens, Type::INT4),
+                        (&request.input_cost, Type::INT8),
+                        (&request.output_cost, Type::INT8),
+                        (&request.total_cost, Type::INT8),
+                        (&request.inference_type, Type::VARCHAR),
+                        (&request.ttft_ms, Type::INT4),
+                        (&request.avg_itl_ms, Type::FLOAT8),
+                        (&request.inference_id, Type::UUID),
+                        (&request.provider_request_id, Type::VARCHAR),
+                        (&stop_reason, Type::VARCHAR),
+                        (&response_id, Type::UUID),
+                        (&request.image_count, Type::INT4),
+                        (&served_provider_tier, Type::TEXT),
+                        (&served_provider_type, Type::TEXT),
+                        (&request.served_via_fallback, Type::BOOL),
+                        (&request.billing_details, Type::JSONB),
+                        (&request.service_tier, Type::TEXT),
+                        (&request.context_band, Type::TEXT),
+                        (&self.allocation_policy.priority, Type::TEXT_ARRAY),
+                        (&self.allocation_policy.version, Type::VARCHAR),
                     ],
                 )
                 .await
-                .map_err(map_db_error)?;
-
-            let (row, was_inserted, allocations) = match maybe_row {
-                Some(_row) => {
-                    let allocation = allocate_usage(
-                        &transaction,
-                        request.organization_id,
-                        UsageAllocationParent::Inference(id),
-                        request.total_cost,
-                        &self.allocation_policy,
-                    )
-                    .await?;
-                    let row = transaction
-                        .query_one(
-                            r#"
-                            UPDATE organization_usage_log
-                            SET funded_amount = $2, unfunded_amount = $3,
-                                allocation_policy_version = $4
-                            WHERE id = $1
-                            RETURNING *
-                            "#,
-                            &[
-                                &id,
-                                &allocation.funded_amount,
-                                &allocation.unfunded_amount,
-                                &self.allocation_policy.version,
-                            ],
-                        )
-                        .await
-                        .map_err(map_db_error)?;
-                    // New insert succeeded — update organization balance
-                    transaction
-                        .execute(
-                            r#"
-                            INSERT INTO organization_balance (
-                                organization_id,
-                                total_spent,
-                                last_usage_at,
-                                total_requests,
-                                total_tokens,
-                                updated_at
-                            ) VALUES ($1, $2, $3, 1, $4, $5)
-                            ON CONFLICT (organization_id) DO UPDATE SET
-                                total_spent = organization_balance.total_spent + $2,
-                                total_requests = organization_balance.total_requests + 1,
-                                total_tokens = organization_balance.total_tokens + $4,
-                                last_usage_at = $3,
-                                updated_at = $5
-                            "#,
-                            &[
-                                &request.organization_id,
-                                &request.total_cost,
-                                &now,
-                                &(total_tokens as i64),
-                                &now,
-                            ],
-                        )
-                        .await
-                        .map_err(map_db_error)?;
-
-                    transaction.commit().await.map_err(map_db_error)?;
-                    (row, true, Some(allocation.allocations))
-                }
-                None => {
-                    // Duplicate — inference_id already exists for this org.
-                    // Roll back (nothing was written) and fetch the existing record.
-                    transaction.rollback().await.map_err(map_db_error)?;
-
-                    tracing::debug!(
-                        organization_id = %request.organization_id,
-                        "Duplicate usage recording detected, returning existing record"
-                    );
-
-                    let existing = client
-                        .query_one(
-                            r#"
-                            SELECT usage_log.*
-                            FROM organization_usage_log usage_log
-                            WHERE usage_log.organization_id = $1
-                              AND usage_log.inference_id = $2
-                            "#,
-                            &[&request.organization_id, &request.inference_id],
-                        )
-                        .await
-                        .map_err(map_db_error)?;
-                    let conflicts = existing.get::<_, Uuid>("workspace_id") != request.workspace_id
-                        || existing.get::<_, Uuid>("api_key_id") != request.api_key_id
-                        || existing.get::<_, Uuid>("model_id") != request.model_id
-                        || existing.get::<_, String>("model_name") != request.model_name
-                        || existing.get::<_, i32>("input_tokens") != request.input_tokens
-                        || existing.get::<_, i32>("output_tokens") != request.output_tokens
-                        || existing.get::<_, i32>("cache_read_tokens") != request.cache_read_tokens
-                        || existing.get::<_, i32>("cache_write_tokens")
-                            != request.cache_write_tokens
-                        || existing.get::<_, i64>("input_cost") != request.input_cost
-                        || existing.get::<_, i64>("output_cost") != request.output_cost
-                        || existing.get::<_, i64>("total_cost") != request.total_cost
-                        || existing
-                            .try_get::<_, Option<String>>("inference_type")
-                            .ok()
-                            .flatten()
-                            .as_deref()
-                            != Some(request.inference_type.as_str())
-                        || existing.get::<_, Option<i32>>("image_count") != request.image_count
-                        || existing.get::<_, Option<serde_json::Value>>("billing_details")
-                            != request.billing_details
-                        || existing.get::<_, Option<String>>("service_tier")
-                            != request.service_tier
-                        || existing.get::<_, Option<String>>("context_band")
-                            != request.context_band;
-                    if conflicts {
-                        return Err(RepositoryError::ValidationFailed(
-                            "usage id already exists with different billable data".to_string(),
-                        ));
-                    }
-                    let allocations = if existing
-                        .try_get::<_, Option<i64>>("funded_amount")
-                        .ok()
-                        .flatten()
-                        .is_some()
-                    {
-                        Some(
-                            load_allocations(
-                                &**client,
-                                UsageAllocationParent::Inference(existing.get("id")),
-                            )
-                            .await?,
-                        )
-                    } else {
-                        None
-                    };
-                    (existing, false, allocations)
-                }
-            };
-
-            Ok::<
-                (
-                    tokio_postgres::Row,
-                    bool,
-                    Option<Vec<services::usage::CreditAllocation>>,
-                ),
-                RepositoryError,
-            >((row, was_inserted, allocations))
+                .map_err(
+                    |error| match error.as_db_error().map(|db| db.code().code()) {
+                        Some("NAORG") => RepositoryError::NotFound(format!(
+                            "Organization not found: {}",
+                            request.organization_id
+                        )),
+                        Some("NABAL") => RepositoryError::ValidationFailed(
+                            "organization accounting balance is missing".to_string(),
+                        ),
+                        _ => map_db_error(error),
+                    },
+                )
         })?;
-
-        let (row, was_inserted, allocations) = result;
-        self.row_to_usage_log(&row, was_inserted, allocations)
+        let was_inserted: bool = row.get("was_inserted");
+        if !was_inserted {
+            tracing::debug!(
+                organization_id = %request.organization_id,
+                "Duplicate usage recording detected, returning existing record"
+            );
+        }
+        self.row_to_usage_log(&row, was_inserted, None)
     }
 
     /// Get current balance for an organization
@@ -315,15 +173,16 @@ impl OrganizationUsageRepository {
                 .context("Failed to get database connection")
                 .map_err(RepositoryError::PoolError)?;
 
+            // One-shot typed query: one round trip, see repositories/mod.rs.
             client
-                .query_opt(
+                .query_typed_opt(
                     r#"
                     SELECT organization_id, total_spent, last_usage_at,
                            total_requests, total_tokens, updated_at
                     FROM organization_balance
                     WHERE organization_id = $1
                     "#,
-                    &[&organization_id],
+                    &[(&organization_id, Type::UUID)],
                 )
                 .await
                 .map_err(map_db_error)
@@ -332,51 +191,51 @@ impl OrganizationUsageRepository {
         Ok(row_opt.map(|row| self.row_to_balance(&row)))
     }
 
-    /// Count total usage history records for an organization
-    pub async fn count_usage_history(&self, organization_id: Uuid) -> Result<i64> {
-        let row = retry_db!("count_organization_usage_history", {
-            let client = self
-                .pool
-                .get()
-                .await
-                .context("Failed to get database connection")
-                .map_err(RepositoryError::PoolError)?;
-
-            client
-                .query_one(
-                    r#"
-                    SELECT COUNT(*) as count
-                    FROM organization_usage_log
-                    WHERE organization_id = $1
-                    "#,
-                    &[&organization_id],
-                )
-                .await
-                .map_err(map_db_error)
-        })?;
-
-        Ok(row.get::<_, i64>("count"))
-    }
-
-    /// Get usage history for an organization
+    /// Get one page of an organization's usage history, newest first, with the
+    /// organization's total record count.
+    ///
+    /// The total is `organization_balance.total_requests`, which every inference
+    /// usage insert increments in the same transaction, rather than a `COUNT(*)`
+    /// over the organization's rows: that scan grows with the organization's whole
+    /// history and outlasts client timeouts for large organizations. The counter
+    /// can only over-count: the V0045 duplicate cleanup deleted rows without
+    /// decrementing it. The page query runs under the reporting statement timeout,
+    /// so a deep offset cannot keep scanning after the client has given up.
     pub async fn get_usage_history(
         &self,
         organization_id: Uuid,
         limit: Option<i64>,
         offset: Option<i64>,
-    ) -> Result<Vec<OrganizationUsageLog>> {
+    ) -> Result<(Vec<OrganizationUsageLog>, i64)> {
         let limit = limit.unwrap_or(100);
         let offset = offset.unwrap_or(0);
+        let deadline = crate::repositories::reporting_query::reporting_deadline(
+            self.reporting_statement_timeout,
+            None,
+        )?;
 
-        let rows = retry_db!("get_organization_usage_history", {
-            let client = self
+        let (rows, total) = retry_db!("get_organization_usage_history", {
+            let mut client = self
                 .pool
                 .get()
                 .await
                 .context("Failed to get database connection")
                 .map_err(RepositoryError::PoolError)?;
 
-            client
+            // One snapshot for the page and the total.
+            let transaction = client
+                .build_transaction()
+                .read_only(true)
+                .isolation_level(IsolationLevel::RepeatableRead)
+                .start()
+                .await
+                .map_err(map_db_error)?;
+            crate::repositories::reporting_query::configure_reporting_transaction(
+                &transaction,
+                crate::repositories::reporting_query::remaining_statement_timeout(deadline)?,
+            )
+            .await?;
+            let rows = transaction
                 .query(
                     r#"
                     SELECT ul.*,
@@ -386,7 +245,7 @@ impl OrganizationUsageRepository {
                                 'organization_limit_id', a.organization_limit_id,
                                 'policy_version', a.policy_version
                             ) ORDER BY a.created_at, a.priority_position, a.id)
-                            FROM usage_credit_allocations a
+                            FROM effective_usage_credit_allocations a
                             WHERE a.inference_usage_id = ul.id), '[]'::jsonb)
                         END AS credit_allocations
                     FROM organization_usage_log ul
@@ -397,12 +256,35 @@ impl OrganizationUsageRepository {
                     &[&organization_id, &limit, &offset],
                 )
                 .await
-                .map_err(map_db_error)
+                .map_err(map_db_error)?;
+            // The counter lookup shares the page query's remaining budget.
+            crate::repositories::reporting_query::configure_reporting_transaction(
+                &transaction,
+                crate::repositories::reporting_query::remaining_statement_timeout(deadline)?,
+            )
+            .await?;
+            let total: i64 = transaction
+                .query_one(
+                    r#"
+                    SELECT COALESCE(
+                        (SELECT total_requests FROM organization_balance WHERE organization_id = $1),
+                        0
+                    )::BIGINT
+                    "#,
+                    &[&organization_id],
+                )
+                .await
+                .map_err(map_db_error)?
+                .get(0);
+            transaction.commit().await.map_err(map_db_error)?;
+            Ok::<_, RepositoryError>((rows, total))
         })?;
 
-        rows.iter()
+        let logs = rows
+            .iter()
             .map(|row| self.row_to_usage_log(row, true, None))
-            .collect()
+            .collect::<Result<Vec<_>>>()?;
+        Ok((logs, total))
     }
 
     /// Count total usage history records for an API key
@@ -426,7 +308,7 @@ impl OrganizationUsageRepository {
                     FROM organization_usage_log
                     WHERE api_key_id = $1
                       AND ($2::TEXT IS NULL OR EXISTS (
-                          SELECT 1 FROM usage_credit_allocations a
+                          SELECT 1 FROM effective_usage_credit_allocations a
                           WHERE a.inference_usage_id = organization_usage_log.id
                             AND a.credit_type = $2))
                     "#,
@@ -464,7 +346,7 @@ impl OrganizationUsageRepository {
                     SELECT ul.*,
                         CASE WHEN $2::TEXT IS NULL THEN ul.total_cost ELSE
                             (SELECT COALESCE(SUM(a.amount), 0)::BIGINT
-                             FROM usage_credit_allocations a
+                             FROM effective_usage_credit_allocations a
                              WHERE a.inference_usage_id = ul.id AND a.credit_type = $2)
                         END AS filtered_total_cost,
                         CASE WHEN ul.funded_amount IS NULL THEN NULL ELSE
@@ -473,14 +355,14 @@ impl OrganizationUsageRepository {
                                 'organization_limit_id', a.organization_limit_id,
                                 'policy_version', a.policy_version
                             ) ORDER BY a.created_at, a.priority_position, a.id)
-                            FROM usage_credit_allocations a
+                            FROM effective_usage_credit_allocations a
                             WHERE a.inference_usage_id = ul.id
                               AND ($2::TEXT IS NULL OR a.credit_type = $2)), '[]'::jsonb)
                         END AS credit_allocations
                     FROM organization_usage_log ul
                     WHERE ul.api_key_id = $1
                       AND ($2::TEXT IS NULL OR EXISTS (
-                          SELECT 1 FROM usage_credit_allocations filter_allocation
+                          SELECT 1 FROM effective_usage_credit_allocations filter_allocation
                           WHERE filter_allocation.inference_usage_id = ul.id
                             AND filter_allocation.credit_type = $2))
                     ORDER BY ul.created_at DESC
@@ -497,25 +379,44 @@ impl OrganizationUsageRepository {
             .collect()
     }
 
-    /// Aggregate usage by model for an organization since `start_date` (exact, via `usage_rows`).
+    /// Aggregate usage by model for an organization over `[start_date, end_date)`; an absent
+    /// `end_date` leaves the window open-ended (exact, via `usage_rows`).
+    /// Runs under the reporting statement timeout, including the raw edge and recent rows.
     pub async fn get_usage_by_model_since(
         &self,
         organization_id: Uuid,
         start_date: chrono::DateTime<Utc>,
+        end_date: Option<chrono::DateTime<Utc>>,
     ) -> Result<Vec<UsageByModel>> {
+        let deadline = crate::repositories::reporting_query::reporting_deadline(
+            self.reporting_statement_timeout,
+            None,
+        )?;
+
         let rows = retry_db!("get_organization_usage_by_model", {
-            let client = self
+            let mut client = self
                 .pool
                 .get()
                 .await
                 .context("Failed to get database connection")
                 .map_err(RepositoryError::PoolError)?;
 
-            client
+            let transaction = client
+                .build_transaction()
+                .read_only(true)
+                .start()
+                .await
+                .map_err(map_db_error)?;
+            crate::repositories::reporting_query::configure_reporting_transaction(
+                &transaction,
+                crate::repositories::reporting_query::remaining_statement_timeout(deadline)?,
+            )
+            .await?;
+            let rows = transaction
                 .query(
                     &with_usage_rows(
                         "$2",
-                        "'infinity'::timestamptz",
+                        "COALESCE($3::timestamptz, 'infinity'::timestamptz)",
                         r#"
                     SELECT
                         model_name,
@@ -530,10 +431,12 @@ impl OrganizationUsageRepository {
                     ORDER BY total_cost DESC
                     "#,
                     ),
-                    &[&organization_id, &start_date],
+                    &[&organization_id, &start_date, &end_date],
                 )
                 .await
-                .map_err(map_db_error)
+                .map_err(map_db_error)?;
+            transaction.commit().await.map_err(map_db_error)?;
+            Ok::<_, RepositoryError>(rows)
         })?;
 
         Ok(rows
@@ -562,8 +465,10 @@ impl OrganizationUsageRepository {
         // Convert response_id from UUID to ResponseId
         let response_id_uuid: Option<Uuid> = row.get("response_id");
         let response_id = response_id_uuid.map(ResponseId::from);
-        let served_provider_tier = parse_served_provider_tier(row.get("served_provider_tier"))?;
-        let served_provider_type = parse_served_provider_type(row.get("served_provider_type"))?;
+        let served_provider_tier =
+            tolerant("served_provider_tier", row.get("served_provider_tier"));
+        let served_provider_type =
+            tolerant("served_provider_type", row.get("served_provider_type"));
 
         let credit_allocations = match allocations_override {
             Some(value) => Some(value),
@@ -765,18 +670,68 @@ pub struct UsageByModel {
     pub request_count: i64,
 }
 
-fn parse_served_provider_tier(value: Option<String>) -> Result<Option<ServedProviderTier>> {
-    value
-        .as_deref()
-        .map(str::parse)
-        .transpose()
-        .map_err(|message| anyhow::anyhow!("Invalid served_provider_tier in usage log: {message}"))
+/// Unknown stored values read as `None` so a binary never fails to read usage
+/// rows written by a newer binary that knows more provider types/tiers (spec
+/// section 3.7: tolerant readers before any writer). Each distinct unknown
+/// value warns at most once per process (values are enum-like system strings,
+/// never customer data), so a large listing cannot flood the logs.
+fn tolerant<T: std::str::FromStr>(column: &'static str, value: Option<String>) -> Option<T> {
+    use std::collections::HashSet;
+    use std::sync::{Mutex, OnceLock};
+    /// Bound on remembered distinct values, so a pathological column cannot grow it forever.
+    const MAX_REMEMBERED: usize = 64;
+    static WARNED: OnceLock<Mutex<HashSet<(&'static str, String)>>> = OnceLock::new();
+
+    let raw = value?;
+    match raw.parse() {
+        Ok(v) => Some(v),
+        Err(_) => {
+            let mut warned = WARNED
+                .get_or_init(Default::default)
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            if warned.len() < MAX_REMEMBERED && warned.insert((column, raw.clone())) {
+                tracing::warn!(
+                    column,
+                    value = %raw,
+                    "Unknown provider attribution value in usage log; treating as unattributed"
+                );
+            }
+            None
+        }
+    }
 }
 
-fn parse_served_provider_type(value: Option<String>) -> Result<Option<ServedProviderType>> {
-    value
-        .as_deref()
-        .map(str::parse)
-        .transpose()
-        .map_err(|message| anyhow::anyhow!("Invalid served_provider_type in usage log: {message}"))
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::models::{ServedProviderTier, ServedProviderType};
+
+    #[test]
+    fn unknown_served_provider_type_reads_as_none() {
+        assert!(tolerant::<ServedProviderType>(
+            "served_provider_type",
+            Some("some_future_provider".into())
+        )
+        .is_none());
+        // Repeated unknown values stay None (and warn only once).
+        assert!(tolerant::<ServedProviderType>(
+            "served_provider_type",
+            Some("some_future_provider".into())
+        )
+        .is_none());
+        assert_eq!(
+            tolerant::<ServedProviderType>("served_provider_type", Some("chutes".into())),
+            Some(ServedProviderType::Chutes)
+        );
+        assert!(tolerant::<ServedProviderType>("served_provider_type", None).is_none());
+        assert!(
+            tolerant::<ServedProviderTier>("served_provider_tier", Some("future_tier".into()))
+                .is_none()
+        );
+        assert_eq!(
+            tolerant::<ServedProviderTier>("served_provider_tier", Some("near".into())),
+            Some(ServedProviderTier::Near)
+        );
+    }
 }

@@ -127,7 +127,7 @@ pub struct NearAuthRequest {
 }
 
 /// Signed message from wallet (NEP-413 SignedMessage)
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, utoipa::ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct NearSignedMessageJson {
     /// NEAR account ID (e.g., "alice.near")
@@ -672,7 +672,7 @@ pub async fn near_login(
                 refresh_token_expiration: refresh_session.expires_at,
                 user: AuthResponse {
                     message: "Authenticated".to_string(),
-                    email: format!("{account_id_str}@near"),
+                    email: services::email::near_placeholder_email(&account_id_str),
                     provider: "near".to_string(),
                 },
             };

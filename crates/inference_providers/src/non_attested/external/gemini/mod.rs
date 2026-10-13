@@ -397,7 +397,7 @@ impl ExternalBackend for GeminiBackend {
         Ok(ChatCompletionResponseWithBytes {
             response: openai_response,
             raw_bytes: serialized_bytes,
-            serving_tier: crate::ProviderTier::NonAttested,
+            serving: crate::ServingProvider::EXTERNAL,
         })
     }
 
@@ -496,6 +496,7 @@ mod tests {
 
     fn base_params() -> ChatCompletionParams {
         ChatCompletionParams {
+            placement: Default::default(),
             request_priority: 0,
             model: "gemini-2.5-flash".to_string(),
             messages: vec![crate::ChatMessage {

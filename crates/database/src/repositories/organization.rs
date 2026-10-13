@@ -14,6 +14,7 @@ use chrono::Utc;
 use services::auth::ports::UserId;
 use services::common::RepositoryError;
 use services::organization::ports::*;
+use tokio_postgres::types::Type;
 use tracing::debug;
 use uuid::Uuid;
 
@@ -653,6 +654,72 @@ impl PgOrganizationRepository {
     }
 }
 
+/// Deactivate everything under an organization in the caller's transaction:
+/// API keys (inactive + `deleted_at`), reporting tokens (revoked), workspaces
+/// (inactive). Extracted from owner org deletion so the cascade has one
+/// definition; the user-erasure path in the stacked follow-up reuses it.
+///
+/// Deactivating only the organization row leaves its workspaces and
+/// API keys marked active while every lookup for them joins
+/// `organizations` with `is_active = true` and fails. Those rows are
+/// dead but still advertised: `/v1/users/me` kept listing the
+/// workspaces, so clients that pick the current org from that list
+/// pinned themselves to a deleted org. Cascade in the same
+/// transaction so the deletion is all-or-nothing and `is_active`
+/// stays truthful at every level.
+pub(crate) async fn deactivate_organization_children<C>(
+    client: &C,
+    organization_id: Uuid,
+) -> Result<(), RepositoryError>
+where
+    C: tokio_postgres::GenericClient + Sync,
+{
+    // `deleted_at` as well as `is_active`: a normal revoke sets
+    // `deleted_at` (see `ApiKeyRepository::revoke`) and the listing
+    // queries key off it, so setting only `is_active` would leave
+    // these rows reading as "not deleted, merely inactive".
+    client
+        .execute(
+            r#"
+            UPDATE api_keys
+            SET is_active = false,
+                deleted_at = COALESCE(deleted_at, NOW())
+            WHERE (is_active = true OR deleted_at IS NULL)
+              AND workspace_id IN (
+                  SELECT id FROM workspaces WHERE organization_id = $1
+              )
+            "#,
+            &[&organization_id],
+        )
+        .await
+        .map_err(map_db_error)?;
+
+    // Reporting-token validation also requires an active organization,
+    // but revoke the persisted rows so credential state remains truthful
+    // and a deleted org cannot regain access through a future validation
+    // path. No `revoked_by_user_id`: this is a system revocation, not a
+    // user's.
+    client
+        .execute(
+            "UPDATE organization_reporting_tokens SET revoked_at = NOW() \
+             WHERE organization_id = $1 AND revoked_at IS NULL",
+            &[&organization_id],
+        )
+        .await
+        .map_err(map_db_error)?;
+
+    client
+        .execute(
+            "UPDATE workspaces SET is_active = false, updated_at = NOW() \
+             WHERE organization_id = $1 AND is_active = true",
+            &[&organization_id],
+        )
+        .await
+        .map_err(map_db_error)?;
+
+    Ok(())
+}
+
 #[async_trait]
 impl OrganizationRepository for PgOrganizationRepository {
     async fn create(
@@ -960,56 +1027,7 @@ impl OrganizationRepository for PgOrganizationRepository {
                         .map_err(map_db_error)?;
 
                     if rows_affected > 0 {
-                        // Deactivating only the organization row leaves its workspaces and
-                        // API keys marked active while every lookup for them joins
-                        // `organizations` with `is_active = true` and fails. Those rows are
-                        // dead but still advertised: `/v1/users/me` kept listing the
-                        // workspaces, so clients that pick the current org from that list
-                        // pinned themselves to a deleted org. Cascade in the same
-                        // transaction so the deletion is all-or-nothing and `is_active`
-                        // stays truthful at every level.
-                        // `deleted_at` as well as `is_active`: a normal revoke sets
-                        // `deleted_at` (see `ApiKeyRepository::revoke`) and the listing
-                        // queries key off it, so setting only `is_active` would leave
-                        // these rows reading as "not deleted, merely inactive".
-                        transaction
-                            .execute(
-                                r#"
-                                UPDATE api_keys
-                                SET is_active = false,
-                                    deleted_at = COALESCE(deleted_at, NOW())
-                                WHERE (is_active = true OR deleted_at IS NULL)
-                                  AND workspace_id IN (
-                                      SELECT id FROM workspaces WHERE organization_id = $1
-                                  )
-                                "#,
-                                &[&id],
-                            )
-                            .await
-                            .map_err(map_db_error)?;
-
-                        // Reporting-token validation also requires an active organization,
-                        // but revoke the persisted rows so credential state remains truthful
-                        // and a deleted org cannot regain access through a future validation
-                        // path. No `revoked_by_user_id`: this is a system revocation, not a
-                        // user's.
-                        transaction
-                            .execute(
-                                "UPDATE organization_reporting_tokens SET revoked_at = NOW() \
-                                 WHERE organization_id = $1 AND revoked_at IS NULL",
-                                &[&id],
-                            )
-                            .await
-                            .map_err(map_db_error)?;
-
-                        transaction
-                            .execute(
-                                "UPDATE workspaces SET is_active = false, updated_at = NOW() \
-                                 WHERE organization_id = $1 AND is_active = true",
-                                &[&id],
-                            )
-                            .await
-                            .map_err(map_db_error)?;
+                        deactivate_organization_children(&*transaction, id).await?;
                     }
 
                     transaction.commit().await.map_err(map_db_error)?;
@@ -1295,6 +1313,27 @@ impl OrganizationRepository for PgOrganizationRepository {
                 return Ok(RemoveOrganizationMemberResult::NotFound);
             };
 
+            let is_bound_wallet: bool = transaction
+                .query_one(
+                    "SELECT EXISTS (
+                        SELECT 1 FROM organization_staking_farm_sources s
+                        JOIN users u ON u.auth_provider = 'near'
+                          AND u.provider_user_id = s.near_account_id
+                        WHERE s.organization_id = $1 AND u.id = $2
+                    )",
+                    &[&org_id, &user_id],
+                )
+                .await
+                .map_err(map_db_error)?
+                .get(0);
+            if is_bound_wallet {
+                transaction.rollback().await.map_err(map_db_error)?;
+                return Err(RepositoryError::ValidationFailed(
+                    "The permanently bound NEAR wallet cannot be removed from this organization"
+                        .to_string(),
+                ));
+            }
+
             if member.get::<_, String>("role") == "owner" {
                 let owner_count = transaction
                     .query_one(
@@ -1548,10 +1587,11 @@ impl services::completions::ports::OrganizationConcurrentLimitRepository
                 .context("Failed to get database connection")
                 .map_err(RepositoryError::PoolError)?;
 
+            // One-shot typed query: one round trip, see repositories/mod.rs.
             client
-                .query_opt(
+                .query_typed_opt(
                     "SELECT rate_limit FROM organizations WHERE id = $1 AND is_active = true",
-                    &[&org_id],
+                    &[(&org_id, Type::UUID)],
                 )
                 .await
                 .map_err(map_db_error)

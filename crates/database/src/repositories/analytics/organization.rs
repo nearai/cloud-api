@@ -23,7 +23,7 @@ const CREDIT_TYPE_USAGE_CTE: &str = r#"
         FROM organization_usage_log ul
         LEFT JOIN LATERAL (
             SELECT SUM(a.amount)::BIGINT AS amount
-            FROM usage_credit_allocations a
+            FROM effective_usage_credit_allocations a
             WHERE a.inference_usage_id = ul.id AND a.credit_type = $4
         ) allocation ON true
         WHERE ul.organization_id = $1 AND ul.created_at >= $2 AND ul.created_at < $3

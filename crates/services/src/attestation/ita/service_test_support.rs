@@ -290,7 +290,9 @@ fn canonical_model() -> ModelWithPricing {
         datacenters: None,
         is_ready: None,
         deprecation_date: None,
+        successor_model_name: None,
         openrouter_slug: None,
+        is_listed: true,
         created_at: chrono::Utc::now(),
     }
 }
@@ -388,6 +390,7 @@ impl UsageRepository for NoopUsageRepository {
         &self,
         _organization_id: Uuid,
         _start_date: chrono::DateTime<chrono::Utc>,
+        _end_date: Option<chrono::DateTime<chrono::Utc>>,
     ) -> anyhow::Result<Vec<UsageByModelEntry>> {
         Ok(Vec::new())
     }

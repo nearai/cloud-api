@@ -182,28 +182,36 @@ async fn pinned_chat(pool: &InferenceProviderPool, streaming: bool) -> Result<()
 #[tokio::test]
 async fn pinned_retries_refresh_matching_nonces_without_falling_back_to_near() {
     for streaming in [false, true] {
-        let server = MockServer::start().await;
-        let (pool, near, _) = pool_with_chutes(&server).await;
-        mount_discovery(&server, false, false).await;
-        let invokes = AtomicUsize::new(0);
-        Mock::given(method("POST"))
-            .and(path("/e2e/invoke"))
-            .respond_with(move |request: &Request| {
-                let attempt = invokes.fetch_add(1, Ordering::SeqCst);
-                assert_eq!(request.headers["X-Instance-Id"], "pinned");
-                assert_eq!(request.headers["X-E2E-Nonce"], format!("nonce-{attempt}"));
-                assert_eq!(request.headers["X-E2E-Stream"], streaming.to_string());
-                ResponseTemplate::new(if attempt == 0 { 503 } else { 400 })
-            })
-            .expect(2)
-            .mount(&server)
-            .await;
-        let error = pinned_chat(&pool, streaming).await.unwrap_err();
-        assert!(
-            matches!(&error, CompletionError::CompletionError(message) if message.contains("HTTP 400")),
-            "unexpected terminal error: {error:?}"
-        );
-        assert!(near.last_chat_params().await.is_none());
+        for initial_status in [503, 403] {
+            let server = MockServer::start().await;
+            let (pool, near, _) = pool_with_chutes(&server).await;
+            mount_discovery(&server, false, false).await;
+            let invokes = AtomicUsize::new(0);
+            Mock::given(method("POST"))
+                .and(path("/e2e/invoke"))
+                .respond_with(move |request: &Request| {
+                    let attempt = invokes.fetch_add(1, Ordering::SeqCst);
+                    assert_eq!(request.headers["X-Instance-Id"], "pinned");
+                    assert_eq!(request.headers["X-E2E-Nonce"], format!("nonce-{attempt}"));
+                    assert_eq!(request.headers["X-E2E-Stream"], streaming.to_string());
+                    if attempt == 0 {
+                        ResponseTemplate::new(initial_status).set_body_json(json!({
+                            "detail": "Invalid, expired, or already-used nonce"
+                        }))
+                    } else {
+                        ResponseTemplate::new(400)
+                    }
+                })
+                .expect(2)
+                .mount(&server)
+                .await;
+            let error = pinned_chat(&pool, streaming).await.unwrap_err();
+            assert!(
+                matches!(&error, CompletionError::CompletionError(message) if message.contains("HTTP 400")),
+                "unexpected terminal error: {error:?}"
+            );
+            assert!(near.last_chat_params().await.is_none());
+        }
     }
 }
 

@@ -329,7 +329,7 @@ pub async fn settle_unfunded_usage(
                        usage.created_at,
                        GREATEST(usage.unfunded_amount
                            - COALESCE((SELECT SUM(allocation.amount)::BIGINT
-                               FROM usage_credit_allocations allocation
+                               FROM effective_usage_credit_allocations allocation
                                WHERE allocation.inference_usage_id = usage.id
                                  AND allocation.allocation_phase = 'overage_settlement'), 0), 0)::BIGINT
                            AS outstanding
@@ -340,7 +340,7 @@ pub async fn settle_unfunded_usage(
                        usage.created_at,
                        GREATEST(usage.unfunded_amount
                            - COALESCE((SELECT SUM(allocation.amount)::BIGINT
-                               FROM usage_credit_allocations allocation
+                               FROM effective_usage_credit_allocations allocation
                                WHERE allocation.service_usage_id = usage.id
                                  AND allocation.allocation_phase = 'overage_settlement'), 0), 0)::BIGINT
                            AS outstanding
@@ -459,7 +459,7 @@ pub async fn load_allocations<C: GenericClient + Sync>(
                    allocation.amount AS amount,
                    allocation.source, allocation.organization_limit_id,
                    allocation.policy_version
-            FROM usage_credit_allocations allocation
+            FROM effective_usage_credit_allocations allocation
             WHERE (($1::UUID IS NOT NULL AND allocation.inference_usage_id = $1)
                 OR ($2::UUID IS NOT NULL AND allocation.service_usage_id = $2))
             ORDER BY allocation.created_at, allocation.priority_position, allocation.id

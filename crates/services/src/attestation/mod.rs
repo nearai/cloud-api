@@ -2,6 +2,8 @@
 mod chat_signature_lifecycle_tests;
 mod chat_signatures;
 pub mod chutes;
+pub mod chutes_observer;
+pub mod chutes_pins;
 mod environment;
 mod gateway_quote;
 mod gateway_signatures;
@@ -15,7 +17,15 @@ pub mod ports;
 mod provider_signature_tests;
 mod report;
 pub mod report_data;
+#[cfg(test)]
+mod report_tests;
 mod service_trait;
+pub mod snp;
+pub mod tinfoil;
+#[cfg(test)]
+mod tinfoil_live_tests;
+pub mod tinfoil_observer;
+pub mod tinfoil_pins;
 pub mod verification;
 
 use std::sync::Arc;
@@ -36,7 +46,7 @@ pub(in crate::attestation) use report::{decode_nonce_hex, generate_nonce_hex};
 pub use report_data::{ReportDataVerifier, StrictBoundReportDataVerifier};
 pub use verification::{
     AttestationVerificationError, AttestationVerifier, BackendAttestationVerifier,
-    VerifiedAttestation,
+    ReplicaReportKey, VerifiedAttestation,
 };
 
 use crate::{

@@ -60,11 +60,11 @@ impl ExpectedMeasurement {
         Self {
             name: name.into(),
             version: version.into(),
-            mrtd: norm(mrtd),
-            rtmr0: norm(rtmr0),
-            rtmr1: norm(rtmr1),
-            rtmr2: norm(rtmr2),
-            rtmr3: norm(rtmr3),
+            mrtd: normalize_register(mrtd),
+            rtmr0: normalize_register(rtmr0),
+            rtmr1: normalize_register(rtmr1),
+            rtmr2: normalize_register(rtmr2),
+            rtmr3: normalize_register(rtmr3),
         }
     }
 
@@ -79,9 +79,16 @@ impl ExpectedMeasurement {
     }
 }
 
-fn norm(s: &str) -> String {
-    let t = s.trim();
-    t.strip_prefix("0x").unwrap_or(t).to_ascii_lowercase()
+/// Canonical register form: trimmed, lowercase hex, no `0x` prefix. Shared with
+/// the measurement sync tooling so both compare registers the same way.
+pub fn normalize_register(s: &str) -> String {
+    let t = s.trim().to_ascii_lowercase();
+    t.strip_prefix("0x").unwrap_or(&t).to_string()
+}
+
+/// Whether `s` is exactly one 48-byte register in hex.
+pub fn is_register_hex(s: &str) -> bool {
+    hex::decode(s).is_ok_and(|b| b.len() == REGISTER_LEN)
 }
 
 /// Errors from register-pinning Chutes boot measurements. Every variant is fatal.
@@ -143,14 +150,11 @@ impl ChutesMeasurementPolicy {
         for cfg in &self.allowed {
             let label = format!("{} v{}", cfg.name, cfg.version);
             for (field, hexstr) in cfg.registers() {
-                match hex::decode(hexstr) {
-                    Ok(bytes) if bytes.len() == REGISTER_LEN => {}
-                    _ => {
-                        return Err(MeasurementError::InvalidGolden {
-                            config: label,
-                            field,
-                        })
-                    }
+                if !is_register_hex(hexstr) {
+                    return Err(MeasurementError::InvalidGolden {
+                        config: label,
+                        field,
+                    });
                 }
             }
         }
@@ -221,6 +225,15 @@ mod tests {
         ChutesMeasurementPolicy::new(vec![ExpectedMeasurement::new(
             "8xh200", "1.3.0", MRTD, RTMR0, RTMR1, RTMR2, RTMR3,
         )])
+    }
+
+    #[test]
+    fn register_helpers_normalize_and_check_length() {
+        assert_eq!(normalize_register(" 0xABcd "), "abcd");
+        assert_eq!(normalize_register("0XAB"), "ab");
+        assert!(is_register_hex(MRTD));
+        assert!(!is_register_hex(&MRTD[..94]));
+        assert!(!is_register_hex(&"zz".repeat(48)));
     }
 
     #[test]

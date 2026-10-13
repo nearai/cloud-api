@@ -10,8 +10,8 @@
 //! TLS-only.
 //!
 //! Routing arithmetic under test (see `refine_context_requirement`):
-//!   required = ceil(text_bytes/4 × 1.2) + 4/message + max_tokens
-//!   tokenize band = [0.7, 1.3] × capacity, on input estimate + reserve
+//!   prompt = ceil(text_bytes/4 × 1.2) + 4/message
+//!   (input only: `max_tokens` and any tokenizer never enter routing)
 
 use crate::common::*;
 use api::models::BatchUpdateModelApiRequest;
@@ -58,30 +58,23 @@ fn sse_body(model: &str, tag: &str) -> String {
 }
 
 /// Mount the standard backend surface on a tier mock: completions (200,
-/// tagged), the models list (discovery/catalog probes), and tokenize.
-async fn mount_tier(server: &MockServer, model: &str, tag: &str, tokenize_count: u64) {
+/// tagged) and the models list (discovery/catalog probes).
+async fn mount_tier(server: &MockServer, model: &str, tag: &str) {
     Mock::given(method("POST"))
         .and(path("/v1/chat/completions"))
         .respond_with(ResponseTemplate::new(200).set_body_json(completion_body(model, tag)))
         .mount(server)
         .await;
-    mount_models_and_tokenize(server, model, tokenize_count).await;
+    mount_models(server, model).await;
 }
 
-async fn mount_models_and_tokenize(server: &MockServer, model: &str, tokenize_count: u64) {
+async fn mount_models(server: &MockServer, model: &str) {
     Mock::given(method("GET"))
         .and(path("/v1/models"))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
             "object": "list",
             "data": [{"id": model, "object": "model", "owned_by": "nearai"}]
         })))
-        .mount(server)
-        .await;
-    Mock::given(method("POST"))
-        .and(path("/v1/tokenize"))
-        .respond_with(
-            ResponseTemplate::new(200).set_body_json(serde_json::json!({"count": tokenize_count})),
-        )
         .mount(server)
         .await;
 }
@@ -140,7 +133,7 @@ async fn tokenize_hits(server: &MockServer) -> usize {
         .await
         .unwrap_or_default()
         .iter()
-        .filter(|r| r.url.path() == "/v1/tokenize")
+        .filter(|r| r.url.path().contains("tokeniz"))
         .count()
 }
 
@@ -175,8 +168,8 @@ async fn e2e_small_request_served_by_base_tier() {
     let server = setup_test_server().await;
     let (base, long) = (MockServer::start().await, MockServer::start().await);
     let model = setup_tiered_model(&server, &base.uri(), &long.uri()).await;
-    mount_tier(&base, &model, "base", 5).await;
-    mount_tier(&long, &model, "long", 5).await;
+    mount_tier(&base, &model, "base").await;
+    mount_tier(&long, &model, "long").await;
     let api_key = org_key(&server).await;
 
     let resp = chat(&server, &api_key, &model, "Hi".into(), false).await;
@@ -200,8 +193,8 @@ async fn e2e_oversize_request_served_by_long_tier() {
     let server = setup_test_server().await;
     let (base, long) = (MockServer::start().await, MockServer::start().await);
     let model = setup_tiered_model(&server, &base.uri(), &long.uri()).await;
-    mount_tier(&base, &model, "base", 5).await;
-    mount_tier(&long, &model, "long", 5).await;
+    mount_tier(&base, &model, "base").await;
+    mount_tier(&long, &model, "long").await;
     let api_key = org_key(&server).await;
 
     let resp = chat(&server, &api_key, &model, "a".repeat(20_000), false).await;
@@ -218,56 +211,27 @@ async fn e2e_oversize_request_served_by_long_tier() {
     );
 }
 
-/// Near the boundary ([0.7, 1.3]×cap) the pool asks the backend for an EXACT
-/// count and it overrides the heuristic: a 4_000-byte prompt (heuristic ≈
-/// 1_214 > cap) with a real count of 100 stays on base.
+/// Routing never tokenizes: a boundary-sized prompt (4_000 bytes, estimate
+/// ~1_214 > the 1_000 base window) is decided on the byte estimate alone and
+/// goes to the long tier, with zero tokenizer calls on either fleet.
 #[tokio::test]
-async fn e2e_exact_tokenize_count_overrides_heuristic() {
+async fn e2e_boundary_request_routes_on_estimate_without_tokenize() {
     let server = setup_test_server().await;
     let (base, long) = (MockServer::start().await, MockServer::start().await);
     let model = setup_tiered_model(&server, &base.uri(), &long.uri()).await;
-    mount_tier(&base, &model, "base", 100).await;
-    mount_tier(&long, &model, "long", 100).await;
-    let api_key = org_key(&server).await;
-
-    let resp = chat(&server, &api_key, &model, "a".repeat(4_000), false).await;
-    assert_eq!(resp.status_code(), 200, "body: {}", resp.text());
-    assert!(
-        resp.text().contains("served-by-base"),
-        "exact count 100 must keep the request on base despite the ~1_214 heuristic, got: {}",
-        resp.text()
-    );
-    assert_eq!(
-        tokenize_hits(&base).await,
-        1,
-        "the boundary-band request must trigger exactly one tokenize call on the base fleet"
-    );
-    assert_eq!(
-        tokenize_hits(&long).await,
-        0,
-        "tokenize must run on the base fleet, not the long host"
-    );
-}
-
-/// Counter-case: same boundary prompt, but the exact count (2_000) confirms
-/// the request does NOT fit base → long serves.
-#[tokio::test]
-async fn e2e_exact_tokenize_count_confirms_long_tier() {
-    let server = setup_test_server().await;
-    let (base, long) = (MockServer::start().await, MockServer::start().await);
-    let model = setup_tiered_model(&server, &base.uri(), &long.uri()).await;
-    mount_tier(&base, &model, "base", 2_000).await;
-    mount_tier(&long, &model, "long", 2_000).await;
+    mount_tier(&base, &model, "base").await;
+    mount_tier(&long, &model, "long").await;
     let api_key = org_key(&server).await;
 
     let resp = chat(&server, &api_key, &model, "a".repeat(4_000), false).await;
     assert_eq!(resp.status_code(), 200, "body: {}", resp.text());
     assert!(
         resp.text().contains("served-by-long"),
-        "exact count 2_000 must send the boundary request to the long tier, got: {}",
+        "the ~1_214 estimate must send the boundary request to the long tier, got: {}",
         resp.text()
     );
-    assert_eq!(tokenize_hits(&base).await, 1);
+    assert_eq!(tokenize_hits(&base).await, 0, "routing must not tokenize");
+    assert_eq!(tokenize_hits(&long).await, 0, "routing must not tokenize");
 }
 
 /// Defense-in-depth: if an under-estimated request reaches the base fleet and
@@ -290,8 +254,8 @@ async fn e2e_context_length_400_falls_through_to_long_tier() {
         })))
         .mount(&base)
         .await;
-    mount_models_and_tokenize(&base, &model, 5).await;
-    mount_tier(&long, &model, "long", 5).await;
+    mount_models(&base, &model).await;
+    mount_tier(&long, &model, "long").await;
     let api_key = org_key(&server).await;
 
     // Small prompt → routed to base first → 400 → must fall through to long.
@@ -326,7 +290,7 @@ async fn e2e_saturated_long_tier_surfaces_retryable_error_not_context_400() {
         })))
         .mount(&base)
         .await;
-    mount_models_and_tokenize(&base, &model, 5_000).await;
+    mount_models(&base, &model).await;
     Mock::given(method("POST"))
         .and(path("/v1/chat/completions"))
         .respond_with(ResponseTemplate::new(503).set_body_json(serde_json::json!({
@@ -334,7 +298,7 @@ async fn e2e_saturated_long_tier_surfaces_retryable_error_not_context_400() {
         })))
         .mount(&long)
         .await;
-    mount_models_and_tokenize(&long, &model, 5_000).await;
+    mount_models(&long, &model).await;
     let api_key = org_key(&server).await;
 
     let resp = chat(&server, &api_key, &model, "a".repeat(20_000), false).await;
@@ -368,7 +332,7 @@ async fn e2e_streaming_oversize_request_served_by_long_tier() {
     let server = setup_test_server().await;
     let (base, long) = (MockServer::start().await, MockServer::start().await);
     let model = setup_tiered_model(&server, &base.uri(), &long.uri()).await;
-    mount_tier(&base, &model, "base", 5).await;
+    mount_tier(&base, &model, "base").await;
     Mock::given(method("POST"))
         .and(path("/v1/chat/completions"))
         .respond_with(
@@ -376,7 +340,7 @@ async fn e2e_streaming_oversize_request_served_by_long_tier() {
         )
         .mount(&long)
         .await;
-    mount_models_and_tokenize(&long, &model, 5).await;
+    mount_models(&long, &model).await;
     let api_key = org_key(&server).await;
 
     let resp = chat(&server, &api_key, &model, "a".repeat(20_000), true).await;
@@ -396,8 +360,8 @@ async fn e2e_catalog_shows_single_entry_with_full_context() {
     let server = setup_test_server().await;
     let (base, long) = (MockServer::start().await, MockServer::start().await);
     let model = setup_tiered_model(&server, &base.uri(), &long.uri()).await;
-    mount_tier(&base, &model, "base", 5).await;
-    mount_tier(&long, &model, "long", 5).await;
+    mount_tier(&base, &model, "base").await;
+    mount_tier(&long, &model, "long").await;
 
     let resp = server.get("/v1/models").await;
     assert_eq!(resp.status_code(), 200);
@@ -436,7 +400,7 @@ async fn e2e_saturated_long_tier_falls_back_to_pinned_attested_provider() {
     let (server, pool, _mock, _db) = setup_test_server_with_pool().await;
     let (base, long) = (MockServer::start().await, MockServer::start().await);
     let model = setup_tiered_model(&server, &base.uri(), &long.uri()).await;
-    mount_tier(&base, &model, "base", 5_000).await;
+    mount_tier(&base, &model, "base").await;
     Mock::given(method("POST"))
         .and(path("/v1/chat/completions"))
         .respond_with(ResponseTemplate::new(503).set_body_json(serde_json::json!({
@@ -444,7 +408,7 @@ async fn e2e_saturated_long_tier_falls_back_to_pinned_attested_provider() {
         })))
         .mount(&long)
         .await;
-    mount_models_and_tokenize(&long, &model, 5_000).await;
+    mount_models(&long, &model).await;
 
     let chutes = Arc::new(MockProvider::new_accept_all().with_tier(ProviderTier::Attested3p));
     chutes

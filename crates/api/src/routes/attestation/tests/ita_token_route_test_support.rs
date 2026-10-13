@@ -98,7 +98,7 @@ impl services::attestation::ports::AttestationServiceTrait for RecordingItaAttes
         _nonce: Option<String>,
         _signing_address: Option<String>,
         _include_tls_fingerprint: bool,
-        _provider_filter: Option<inference_providers::ProviderTier>,
+        _provider_filter: Option<inference_providers::ProviderFilter>,
     ) -> Result<services::attestation::models::AttestationReport, AttestationError> {
         Err(AttestationError::InternalError("unused".to_string()))
     }
@@ -255,7 +255,9 @@ fn model_with_name(model_name: &str) -> ModelWithPricing {
         datacenters: None,
         is_ready: None,
         deprecation_date: None,
+        successor_model_name: None,
         openrouter_slug: None,
+        is_listed: true,
         created_at: chrono::Utc::now(),
     }
 }

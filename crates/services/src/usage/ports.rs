@@ -268,7 +268,8 @@ pub trait UsageServiceTrait: Send + Sync {
     ) -> Result<Option<OrganizationBalanceInfo>, UsageError>;
 
     /// Get usage history for an organization
-    /// Returns a tuple of (entries, total_count)
+    /// Returns a tuple of (entries, total), where total is the organization's
+    /// recorded request count rather than a scan of its rows
     async fn get_usage_history(
         &self,
         organization_id: Uuid,
@@ -319,12 +320,14 @@ pub trait UsageServiceTrait: Send + Sync {
         inference_ids: Vec<Uuid>,
     ) -> Result<Vec<InferenceCost>, UsageError>;
 
-    /// Get per-model usage aggregation for an organization since `start_date`.
+    /// Get per-model usage aggregation for an organization from `start_date` up to
+    /// `end_date` (exclusive; open-ended when `None`).
     /// Returns one row per model: summed tokens, summed cost (nano-dollars), and request count.
     async fn get_usage_by_model(
         &self,
         organization_id: Uuid,
         start_date: DateTime<Utc>,
+        end_date: Option<DateTime<Utc>>,
     ) -> Result<Vec<UsageByModelEntry>, UsageError>;
 
     async fn list_inference_usage_report(
@@ -354,7 +357,8 @@ pub trait UsageRepository: Send + Sync {
     ) -> anyhow::Result<Option<OrganizationBalanceInfo>>;
 
     /// Get usage history for an organization
-    /// Returns a tuple of (entries, total_count)
+    /// Returns a tuple of (entries, total), where total is the organization's
+    /// recorded request count rather than a scan of its rows
     async fn get_usage_history(
         &self,
         organization_id: Uuid,
@@ -397,11 +401,13 @@ pub trait UsageRepository: Send + Sync {
         provider_request_id: &str,
     ) -> anyhow::Result<Option<StopReason>>;
 
-    /// Get per-model usage aggregation for an organization since `start_date`.
+    /// Get per-model usage aggregation for an organization from `start_date` up to
+    /// `end_date` (exclusive; open-ended when `None`).
     async fn get_usage_by_model(
         &self,
         organization_id: Uuid,
         start_date: DateTime<Utc>,
+        end_date: Option<DateTime<Utc>>,
     ) -> anyhow::Result<Vec<UsageByModelEntry>>;
 
     async fn list_inference_usage_report(
@@ -663,6 +669,16 @@ pub struct DiscountedCosts {
 }
 
 impl UsageDiscount {
+    /// Organization discounts accept whole basis points, including fully discounted usage.
+    pub fn from_basis_points(basis_points: u16) -> Result<Self, UsageError> {
+        if basis_points == 0 || basis_points > 10_000 {
+            return Err(UsageError::ValidationError(
+                "discount_basis_points must be between 1 and 10000".into(),
+            ));
+        }
+        Ok(Self { basis_points })
+    }
+
     /// Parse a fraction of the list price such as `0.2` (20% off).
     ///
     /// Returns `Ok(None)` for `0` (no discount). Rejects non-finite values,

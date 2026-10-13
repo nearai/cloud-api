@@ -19,6 +19,8 @@ anyhow = "1.0"
 tokio = { version = "1", features = ["full"] }
 tracing = "0.1"
 inference_providers = { path = "../inference_providers" }
+placement = { path = "../placement" }
+arc-swap = "1.9.1"
 futures = "0.3"
 futures-util = "0.3"
 thiserror = "2.0"
@@ -55,19 +57,28 @@ aws-sdk-s3 = { version = "1.134", default-features = false, features = ["sigv4a"
 aes-gcm = "0.10"
 # HMAC for VPC signature verification
 hmac = "0.13"
+# HKDF for deriving the placement affinity/pin secrets
+hkdf = "0.13"
 sha2 = "0.11"
-x509-parser = "0.18"
+# SEV-SNP report verification (attestation/snp.rs). x509-parser's `verify`
+# feature (ring) checks the AMD ARK/ASK/VCEK RSASSA-PSS-SHA384 and ECDSA-P384
+# certificate signatures (investigated: it supports both, so no second X.509
+# stack is needed); ring verifies the report's raw ECDSA-P384 signature.
+ring = "0.17"
+x509-parser = { version = "0.18", features = ["verify"] }
 dcap-qvl = "0.5"
 moka = { version = "0.12.15", features = ["future"] }
 bloomfilter = "3.0.1"
 mockall = { version = "0.14", optional = true }
 base64 = "0.22"
+flate2 = "1"
 
 [features]
 default = []
 test-mocks = ["mockall"]
 
 [dev-dependencies]
+tracing-subscriber = { version = "0.3", default-features = false, features = ["std", "fmt"] }
 tokio-test = "0.4"
 async-trait = "0.1"
 futures = "0.3"

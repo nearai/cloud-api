@@ -18,7 +18,37 @@ pub use stream::StreamState;
 
 const DEFAULT_MAX_TOKENS: i64 = 4096;
 const MAX_CACHE_BREAKPOINTS: usize = 4;
-const MODELS_REJECTING_SAMPLING: &[&str] = &["claude-opus-4-7"];
+
+/// Anthropic models that still accept `temperature` / `top_p`, as base ids
+/// without the snapshot date. Every other model gets both dropped: Opus 4.7+,
+/// Sonnet 5+ and Fable reject them with a 400 (Sonnet 5.5 rejects non-default
+/// values), and each release since Opus 4.7 has followed that rule. Listing
+/// the older models instead of the newer ones means a new release needs no
+/// code change here.
+const MODELS_ACCEPTING_SAMPLING: &[&str] = &[
+    "claude-opus-4-6",
+    "claude-opus-4-5",
+    "claude-opus-4-1",
+    "claude-opus-4-0",
+    "claude-opus-4",
+    "claude-sonnet-4-6",
+    "claude-sonnet-4-5",
+    "claude-sonnet-4-0",
+    "claude-sonnet-4",
+    "claude-haiku-4-5",
+];
+
+/// Whether the Anthropic Messages API accepts `temperature` / `top_p` for
+/// `model`. Matches the bare alias (`claude-sonnet-4-5`) and the dated
+/// snapshot (`claude-sonnet-4-5-20250929`), with or without a routing prefix.
+pub fn model_accepts_sampling_parameters(model: &str) -> bool {
+    let id = model.find("claude-").map_or(model, |start| &model[start..]);
+    let base = match id.rsplit_once('-') {
+        Some((base, date)) if date.len() == 8 && date.bytes().all(|b| b.is_ascii_digit()) => base,
+        _ => id,
+    };
+    MODELS_ACCEPTING_SAMPLING.contains(&base)
+}
 
 /// Options supplied by the routing layer after model/alias resolution.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -727,10 +757,7 @@ fn copy_sampling_parameters(
     output: &mut Map<String, Value>,
     warnings: &mut Vec<ConversionWarning>,
 ) -> Result<(), CompatError> {
-    if MODELS_REJECTING_SAMPLING
-        .iter()
-        .any(|fragment| model.contains(fragment))
-    {
+    if !model_accepts_sampling_parameters(model) {
         for parameter in ["temperature", "top_p"] {
             if request.get(parameter).is_some_and(|value| !value.is_null()) {
                 warnings.push(ConversionWarning {
@@ -933,7 +960,7 @@ mod tests {
 
     fn options() -> ConvertOptions {
         ConvertOptions {
-            model: "claude-sonnet-upstream".to_string(),
+            model: "claude-sonnet-4-6".to_string(),
             stream: false,
         }
     }
@@ -956,7 +983,7 @@ mod tests {
             "top_p": 0.5
         }));
 
-        assert_eq!(converted.body["model"], "claude-sonnet-upstream");
+        assert_eq!(converted.body["model"], "claude-sonnet-4-6");
         assert_eq!(converted.body["max_tokens"], 123);
         assert_eq!(converted.body["temperature"], 1.0);
         assert!(converted.body.get("top_p").is_none());
@@ -1230,23 +1257,62 @@ mod tests {
             "temperature":0.5,
             "top_p":0.9
         });
-        let converted = convert_openai_request(
-            &request,
-            &ConvertOptions {
-                model: "claude-opus-4-7".to_string(),
-                stream: false,
-            },
-        )
-        .unwrap();
-        assert!(converted.body.get("temperature").is_none());
-        assert!(converted.body.get("top_p").is_none());
-        let parameters = converted
-            .warnings
-            .iter()
-            .map(|warning| warning.parameter.as_str())
-            .collect::<Vec<_>>();
-        assert!(parameters.contains(&"temperature"));
-        assert!(parameters.contains(&"top_p"));
+        for model in [
+            "claude-opus-4-7",
+            "claude-opus-4-8",
+            "claude-opus-5",
+            "claude-opus-5-5",
+            "claude-sonnet-5",
+            "claude-sonnet-5-5",
+            "claude-fable-5",
+            "claude-fable-5-1",
+        ] {
+            let converted = convert_openai_request(
+                &request,
+                &ConvertOptions {
+                    model: model.to_string(),
+                    stream: false,
+                },
+            )
+            .unwrap();
+            assert!(converted.body.get("temperature").is_none(), "{model}");
+            assert!(converted.body.get("top_p").is_none(), "{model}");
+            let parameters = converted
+                .warnings
+                .iter()
+                .map(|warning| warning.parameter.as_str())
+                .collect::<Vec<_>>();
+            assert!(parameters.contains(&"temperature"), "{model}");
+            assert!(parameters.contains(&"top_p"), "{model}");
+        }
+    }
+
+    #[test]
+    fn older_models_keep_sampling_and_unknown_models_drop_it() {
+        for model in [
+            "claude-opus-4-6",
+            "claude-opus-4-5-20251101",
+            "claude-opus-4-20250514",
+            "claude-sonnet-4-6",
+            "claude-sonnet-4-5-20250929",
+            "claude-sonnet-4-0",
+            "claude-haiku-4-5",
+            "claude-haiku-4-5-20251001",
+            "anthropic/claude-sonnet-4-6",
+        ] {
+            assert!(model_accepts_sampling_parameters(model), "{model}");
+        }
+        // Newer releases, their dated snapshots, and names we have never seen
+        // (the next release) all drop sampling instead of risking a 400.
+        for model in [
+            "claude-opus-4-7-20991231",
+            "claude-opus-4-65",
+            "claude-sonnet-6",
+            "claude-haiku-5",
+            "m",
+        ] {
+            assert!(!model_accepts_sampling_parameters(model), "{model}");
+        }
     }
 
     #[test]

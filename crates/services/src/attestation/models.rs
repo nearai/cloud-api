@@ -17,6 +17,11 @@ pub enum AttestationError {
     #[error("Invalid parameter: {0}")]
     InvalidParameter(String),
 
+    /// The requested model is neither a catalog model name nor an alias. The
+    /// message matches the one `/v1/chat/completions` returns for this case.
+    #[error("Model '{0}' not found. It's not a valid model name or alias.")]
+    UnknownModel(String),
+
     #[error("Internal error: {0}")]
     InternalError(String),
 

@@ -114,6 +114,9 @@ use utoipa::{Modify, OpenApi};
         crate::routes::users::get_current_user,
         crate::routes::users::get_user_status,
         crate::routes::users::update_current_user_profile,
+        crate::routes::users::request_contact_email,
+        crate::routes::users::remove_contact_email,
+        crate::routes::users::verify_contact_email,
         crate::routes::users::get_user_refresh_tokens,
         crate::routes::users::revoke_user_refresh_token,
         crate::routes::users::revoke_all_user_tokens,
@@ -134,6 +137,7 @@ use utoipa::{Modify, OpenApi};
         // Staking farm endpoints
         crate::routes::staking_farm::get_staking_farm_config,
         crate::routes::staking_farm::get_organization_staking_farm,
+        crate::routes::staking_farm::bind_organization_staking_farm,
         crate::routes::staking_farm::sync_organization_staking_farm,
         // Customer reporting endpoints
         crate::routes::reporting_tokens::create_reporting_token,
@@ -156,6 +160,9 @@ use utoipa::{Modify, OpenApi};
         crate::routes::admin::preview_model_deprecation,
         crate::routes::admin::confirm_model_deprecation,
         crate::routes::admin::preview_model_pricing_changes,
+        crate::routes::admin::preview_user_erasure,
+        crate::routes::admin::erase_user,
+        crate::routes::admin::lookup_user_erasures,
         crate::routes::admin::confirm_model_pricing_changes,
         crate::routes::admin::list_model_pricing_changes,
         crate::routes::admin::cancel_model_pricing_change,
@@ -184,11 +191,17 @@ use utoipa::{Modify, OpenApi};
         crate::routes::admin::get_model_revenue,
         crate::routes::admin::get_revenue_density,
         crate::routes::admin_usage_hourly::recompute_usage_hourly,
+        crate::routes::admin_usage_discount::get_usage_discount,
+        crate::routes::admin_usage_discount::put_usage_discount,
         crate::routes::admin::get_org_revenue,
         crate::routes::admin::get_infra_summary,
+        crate::routes::admin::list_admin_settings,
+        crate::routes::admin::get_admin_setting,
+        crate::routes::admin::update_admin_setting,
         crate::routes::admin::list_invitation_email_deliveries,
         crate::routes::admin::resend_invitation_email,
         crate::routes::admin::list_users,
+        crate::routes::admin::list_api_keys,
         crate::routes::admin::get_organization,
         crate::routes::admin::list_organization_members,
         crate::routes::admin::update_organization_member_role,
@@ -229,6 +242,8 @@ use utoipa::{Modify, OpenApi};
             UpdateOrganizationRequest, CreateApiKeyRequest, ApiKeyResponse,
             UpdateApiKeySpendLimitRequest, UpdateApiKeyRequest,
             // usage_hourly repair models
+            crate::routes::admin_usage_discount::UsageDiscountRequest,
+            crate::routes::admin_usage_discount::UsageDiscountResponse,
             crate::routes::admin_usage_hourly::UsageHourlyRepairRequest,
             crate::routes::admin_usage_hourly::UsageHourlyRepairResponse,
             crate::routes::admin_usage_hourly::UsageHourlyDayParity,
@@ -248,6 +263,8 @@ use utoipa::{Modify, OpenApi};
             AdminOrganizationMemberResponse,
             ListAdminOrganizationMembersResponse,
             AdminOrganizationResponse,
+            AdminApiKeyResponse,
+            ListAdminApiKeysResponse,
             MemberRole,
             // Organization Invitation models
             InvitationStatus,
@@ -263,6 +280,9 @@ use utoipa::{Modify, OpenApi};
             AdminUserResponse,
             crate::routes::users::UpdateUserProfileRequest,
             crate::routes::users::UserStatusResponse,
+            crate::routes::users::RequestContactEmailRequest,
+            crate::routes::users::VerifyContactEmailRequest,
+            crate::routes::users::ContactEmailStatusResponse,
             // Conversation models
             CreateConversationRequest, ConversationObject,
             UpdateConversationRequest, ConversationDeleteResult, ConversationItemList,
@@ -303,6 +323,11 @@ use utoipa::{Modify, OpenApi};
             AdminInvitationEmailResendResultResponse,
             // User models (Admin)
             ListUsersResponse, AdminUserResponse,
+            ErasurePreviewResponse, ErasedOrganizationResponse, RetainedOrganizationResponse,
+            ErasureLogResponse, EraseUserRequest, EraseUserResponse, ErasureBlockedResponse,
+            LookupUserErasuresRequest, LookupUserErasuresResponse, UserErasureRecordResponse,
+            ErasureLookupOrganizationResponse,
+            services::user_erasure::ErasureBlocker,
             // AML models (Admin)
             AdminAmlReportResponse, ListAdminAmlReportsResponse, UpdateAmlReportStatusRequest,
             AdminAmlAllowlistEntryResponse, ListAdminAmlAllowlistResponse,
@@ -310,6 +335,9 @@ use utoipa::{Modify, OpenApi};
             // Admin access token models
             CreateAdminAccessTokenRequest, AdminAccessTokenResponse,
             AdminAccessTokenPermission, AdminAccessTokenListEntry, ListAdminAccessTokensResponse,
+            // Admin settings models
+            crate::routes::admin::AdminSettingResponse,
+            crate::routes::admin::ListAdminSettingsResponse,
             // Usage tracking models
             crate::routes::usage::OrganizationBalanceResponse,
             crate::routes::usage::UsageHistoryResponse,
@@ -328,6 +356,9 @@ use utoipa::{Modify, OpenApi};
             // Staking farm models
             crate::routes::staking_farm::StakingFarmConfigResponse,
             crate::routes::staking_farm::StakingFarmStateResponse,
+            crate::routes::staking_farm::OrganizationStakingState,
+            crate::routes::staking_farm::BindRequest,
+            crate::routes::staking_farm::BindResponse,
             // Customer reporting models
             services::reporting_tokens::ReportingTokenScope,
             crate::routes::reporting_tokens::CreateReportingTokenRequest,
@@ -601,6 +632,9 @@ mod admin_token_permission_tests {
             .contains(&json!("permission")));
         for model in ["AdminAccessTokenResponse", "AdminAccessTokenListEntry"] {
             assert!(schemas[model]["properties"].get("permission").is_some());
+        }
+        for model in ["AdminSettingResponse", "ListAdminSettingsResponse"] {
+            assert!(schemas.get(model).is_some(), "{model} is registered");
         }
         for (path, method, phrase, tokens_allowed) in [
             ("/v1/admin/models", "get", "read_only token", true),

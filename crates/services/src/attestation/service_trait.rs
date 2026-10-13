@@ -6,7 +6,7 @@ use super::{
     models::AttestationReport,
     ports, AttestationError, AttestationService, SignatureLookupResult,
 };
-use inference_providers::ProviderTier;
+use inference_providers::ProviderFilter;
 
 #[async_trait]
 impl ports::AttestationServiceTrait for AttestationService {
@@ -79,7 +79,7 @@ impl ports::AttestationServiceTrait for AttestationService {
         nonce: Option<String>,
         signing_address: Option<String>,
         include_tls_fingerprint: bool,
-        provider_filter: Option<ProviderTier>,
+        provider_filter: Option<ProviderFilter>,
     ) -> Result<AttestationReport, AttestationError> {
         self.get_attestation_report_impl(
             model,

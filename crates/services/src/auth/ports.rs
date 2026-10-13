@@ -84,6 +84,12 @@ pub struct User {
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
     pub tokens_revoked_at: Option<DateTime<Utc>>,
+    /// Address the user asked to be contacted at. Set only once verified, and never
+    /// written by login. `email` stays the login identity.
+    pub contact_email: Option<String>,
+    pub contact_email_verified_at: Option<DateTime<Utc>>,
+    /// When the user agreed to be emailed at `contact_email`.
+    pub email_opt_in_at: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -237,7 +243,8 @@ pub trait SessionRepository: Send + Sync {
     async fn rotate(
         &self,
         session_id: SessionId,
-        old_token_hash: &str,
+        old_token: &str,
+        successor_token: &str,
         expires_in_hours: i64,
     ) -> anyhow::Result<(Session, String)>;
 
@@ -318,13 +325,15 @@ pub trait AuthServiceTrait: Send + Sync {
     async fn logout(&self, session_id: SessionId) -> Result<bool, AuthError>;
 
     /// Rotate a refresh token session (refresh token rotation)
-    /// This atomically updates the token hash and expiration, ensuring only one valid token at a time.
-    /// The old_token_hash is used to prevent race conditions where multiple requests try to rotate the same token.
+    /// This atomically updates the token hash and expiration. The immediate
+    /// predecessor remains valid for a bounded concurrent-request grace window.
+    /// The presented token and its server-derived successor make a concurrent
+    /// retry return the same active successor instead of rotating twice.
     async fn rotate_session(
         &self,
         user_id: UserId,
         session_id: SessionId,
-        old_token_hash: &str,
+        old_token: &str,
         encoding_key: String,
         access_token_expires_in_hours: i64,
         refresh_token_expires_in_hours: i64,
@@ -403,6 +412,9 @@ impl MockAuthService {
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
             tokens_revoked_at: None,
+            contact_email: None,
+            contact_email_verified_at: None,
+            email_opt_in_at: None,
         }
     }
 
@@ -614,7 +626,7 @@ impl AuthServiceTrait for MockAuthService {
         &self,
         _user_id: UserId,
         _session_id: SessionId,
-        _old_token_hash: &str,
+        _old_token: &str,
         encoding_key: String,
         access_token_expires_in_hours: i64,
         refresh_token_expires_in_hours: i64,

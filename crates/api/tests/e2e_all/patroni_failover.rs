@@ -34,6 +34,7 @@ fn test_db_config() -> DatabaseConfig {
         password: std::env::var("DATABASE_PASSWORD").unwrap_or_else(|_| "postgres".to_string()),
         max_write_connections: 2,
         max_read_connections: 2,
+        recycling_method: config::DatabaseRecyclingMethod::Fast,
         tls_enabled: false,
         tls_ca_cert_path: None,
     }

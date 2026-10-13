@@ -1,5 +1,6 @@
 use crate::models::{UpdateModelPricingRequest, UpdateOrganizationLimitsDbRequest};
 use crate::pool::DbPool;
+use crate::repositories::lifecycle::{org_lifecycle_predicate, ORG_ALL_MEMBERS_ERASED_SQL};
 use crate::repositories::{
     ModelAliasRepository, ModelRepository, OrganizationLimitsRepository, ServiceRepository,
     UserRepository,
@@ -7,18 +8,35 @@ use crate::repositories::{
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use services::admin::{
-    AdminModelInfo, AdminOrganizationInfo, AdminOrganizationMemberInfo, AdminRepository,
-    DeprecateModelOutcome, ModelDeprecationDeliveryRecord, ModelDeprecationEmailStatus,
-    ModelDeprecationModel, ModelDeprecationRecipient, ModelHistoryEntry, ModelPricing,
-    ModelPricingSnapshot, ModelValidationState, OrganizationLimits, OrganizationLimitsHistoryEntry,
-    OrganizationLimitsUpdate, PlatformServiceInfo, PricingChangeDeliveryRecord,
-    PricingChangeOpenConflictError, PricingChangeRecipientRow, ScheduledPricingChange,
-    ScheduledPricingChangeInsert, ScheduledPricingChangeStatus, UpdateModelAdminRequest, UserInfo,
-    UserOrganizationInfo,
+    AdminApiKeyFilters, AdminApiKeyInfo, AdminModelInfo, AdminOrganizationInfo,
+    AdminOrganizationMemberInfo, AdminRepository, DeprecateModelOutcome,
+    ModelDeprecationDeliveryRecord, ModelDeprecationEmailStatus, ModelDeprecationModel,
+    ModelDeprecationRecipient, ModelHistoryEntry, ModelPricing, ModelPricingSnapshot,
+    ModelValidationState, OrganizationLifecycleFilter, OrganizationLimits,
+    OrganizationLimitsHistoryEntry, OrganizationLimitsUpdate, PlatformServiceInfo,
+    PricingChangeDeliveryRecord, PricingChangeOpenConflictError, PricingChangeRecipientRow,
+    ScheduledPricingChange, ScheduledPricingChangeInsert, ScheduledPricingChangeStatus,
+    UpdateModelAdminRequest, UserInfo, UserOrganizationInfo,
 };
+use services::lifecycle::OrganizationLifecycle;
 use services::service_usage::ports::ServiceUnit;
 use std::sync::Arc;
 use uuid::Uuid;
+
+/// The address a notification recipient row can be emailed at, resolved from the
+/// user's `email`, `contact_email` and `contact_email_verified_at` columns. `None`
+/// when the user has no deliverable address (a wallet login with no verified
+/// contact email), in which case the row is not a recipient.
+fn recipient_email(row: &tokio_postgres::Row) -> Option<String> {
+    let login_email: String = row.get("email");
+    let contact_email: Option<String> = row.get("contact_email");
+    services::email::deliverable_email(
+        &login_email,
+        contact_email.as_deref(),
+        row.get("contact_email_verified_at"),
+    )
+    .map(str::to_owned)
+}
 
 fn parse_text_pricing(
     value: Option<serde_json::Value>,
@@ -97,7 +115,7 @@ fn row_to_scheduled_pricing_change(
 /// Map a row from the admin organization SELECT (used by both the list and
 /// single-org queries) to `AdminOrganizationInfo`. The row must select
 /// `id, name, description, created_at, spend_limit, total_spent,
-/// total_requests, total_tokens`.
+/// total_requests, total_tokens, is_active, all_members_erased`.
 fn row_to_admin_org_info(row: &tokio_postgres::Row) -> AdminOrganizationInfo {
     AdminOrganizationInfo {
         id: row.get("id"),
@@ -108,6 +126,38 @@ fn row_to_admin_org_info(row: &tokio_postgres::Row) -> AdminOrganizationInfo {
         total_requests: row.get("total_requests"),
         total_tokens: row.get("total_tokens"),
         created_at: row.get("created_at"),
+        lifecycle: OrganizationLifecycle::from_columns(
+            row.get("is_active"),
+            row.get("all_members_erased"),
+        ),
+    }
+}
+
+/// Name pattern of API keys provisioned by the Cloud UI's managed Playground:
+/// `Playground-${credential.id}-g${generation}`, where `credential.id` is a
+/// Prisma `uuid()` (see nearai-cloud-ui `lib/playground/service.ts`). The UI
+/// rejects renames of managed keys, so the name is a stable marker. Keep this in
+/// sync with the UI if its naming changes.
+///
+/// Best-effort: key names are user-supplied and the API rename endpoint does not
+/// know about managed keys, so a regular key deliberately given a matching name
+/// is reported as managed, and a managed key renamed through the API directly
+/// (bypassing the UI) is not.
+const MANAGED_PLAYGROUND_KEY_NAME_PATTERN: &str =
+    "^Playground-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}-g[0-9]+$";
+
+/// Map a row from the admin API key SELECT to `AdminApiKeyInfo`.
+fn row_to_admin_api_key_info(row: &tokio_postgres::Row) -> AdminApiKeyInfo {
+    AdminApiKeyInfo {
+        id: row.get("id"),
+        organization_id: row.get("organization_id"),
+        organization_name: row.get("organization_name"),
+        workspace_id: row.get("workspace_id"),
+        created_by_user_id: row.get("created_by_user_id"),
+        created_at: row.get("created_at"),
+        is_active: row.get("is_active"),
+        deleted_at: row.get("deleted_at"),
+        is_managed_playground: row.get("is_managed_playground"),
     }
 }
 
@@ -152,6 +202,7 @@ impl AdminRepository for AdminCompositeRepository {
             verifiable: request.verifiable,
             is_active: request.is_active,
             allow_free: request.allow_free,
+            is_listed: request.is_listed,
             aliases: request.aliases.clone(),
             owned_by: request.owned_by,
             provider_type: request.provider_type,
@@ -168,6 +219,7 @@ impl AdminRepository for AdminCompositeRepository {
             datacenters: request.datacenters,
             is_ready: request.is_ready,
             deprecation_date: request.deprecation_date,
+            successor_model_name: request.successor_model_name,
             openrouter_slug: request.openrouter_slug,
             change_reason: request.change_reason,
             changed_by_user_id: request.changed_by_user_id,
@@ -214,7 +266,9 @@ impl AdminRepository for AdminCompositeRepository {
             datacenters: model.datacenters,
             is_ready: model.is_ready,
             deprecation_date: model.deprecation_date,
+            successor_model_name: model.successor_model_name,
             openrouter_slug: model.openrouter_slug,
+            is_listed: model.is_listed,
         })
     }
 
@@ -231,6 +285,7 @@ impl AdminRepository for AdminCompositeRepository {
             allow_free: m.allow_free,
             provider_type: m.provider_type,
             provider_config: m.provider_config,
+            deprecation_date: m.deprecation_date,
         }))
     }
 
@@ -280,8 +335,10 @@ impl AdminRepository for AdminCompositeRepository {
                     datacenters: h.datacenters,
                     is_ready: h.is_ready,
                     deprecation_date: h.deprecation_date,
+                    successor_model_name: h.successor_model_name,
                     openrouter_slug: h.openrouter_slug,
                     allow_free: h.allow_free,
+                    is_listed: h.is_listed,
                     effective_from: h.effective_from,
                     effective_until: h.effective_until,
                     changed_by_user_id: h.changed_by_user_id,
@@ -399,7 +456,7 @@ impl AdminRepository for AdminCompositeRepository {
             .query_opt(
                 r#"
                 UPDATE models
-                SET is_active = false, updated_at = NOW()
+                SET is_active = false, successor_model_name = $2, updated_at = NOW()
                 WHERE id = $1
                 RETURNING id, model_name, model_display_name, model_description, model_icon,
                           input_cost_per_token, output_cost_per_token, cost_per_image,
@@ -408,9 +465,10 @@ impl AdminRepository for AdminCompositeRepository {
                           attestation_supported, input_modalities, output_modalities, inference_url,
                           datacenters, hugging_face_id, quantization, max_output_length,
                           supported_sampling_parameters, supported_features,
-                          is_ready, deprecation_date, openrouter_slug, allow_free
+                          is_ready, deprecation_date, successor_model_name,
+                          openrouter_slug, allow_free, is_listed
                 "#,
-                &[&deprecated_id],
+                &[&deprecated_id, &successor_model_name],
             )
             .await
             .context("Failed to deactivate deprecated model")?;
@@ -443,14 +501,15 @@ impl AdminRepository for AdminCompositeRepository {
                 supported_sampling_parameters, supported_features, is_ready, deprecation_date,
                 openrouter_slug, allow_free,
                 effective_from, effective_until, changed_by_user_id,
-                changed_by_user_email, change_reason, created_at, text_pricing
+                changed_by_user_email, change_reason, created_at, text_pricing,
+                successor_model_name, is_listed
             ) VALUES (
                 $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19,
                 $20, $21, $22, $23,
                 COALESCE($24, ARRAY[]::TEXT[]),
                 COALESCE($25, ARRAY[]::TEXT[]),
                 $26, $27, $28, $29,
-                NOW(), NULL, $30, $31, $32, NOW(), $33
+                NOW(), NULL, $30, $31, $32, NOW(), $33, $34, $35
             )
             "#,
             &[
@@ -532,6 +591,13 @@ impl AdminRepository for AdminCompositeRepository {
                     .try_get::<_, Option<serde_json::Value>>("text_pricing")
                     .ok()
                     .flatten(),
+                &deprecated_row_after
+                    .try_get::<_, Option<String>>("successor_model_name")
+                    .ok()
+                    .flatten(),
+                &deprecated_row_after
+                    .try_get::<_, bool>("is_listed")
+                    .unwrap_or(true),
             ],
         )
         .await
@@ -590,7 +656,9 @@ impl AdminRepository for AdminCompositeRepository {
                 datacenters: row.try_get("datacenters").ok().flatten(),
                 is_ready: row.try_get("is_ready").ok().flatten(),
                 deprecation_date: row.try_get("deprecation_date").ok().flatten(),
+                successor_model_name: row.try_get("successor_model_name").ok().flatten(),
                 openrouter_slug: row.try_get("openrouter_slug").ok().flatten(),
+                is_listed: row.try_get("is_listed").unwrap_or(true),
             })
         };
 
@@ -604,7 +672,8 @@ impl AdminRepository for AdminCompositeRepository {
                 m.inference_url,
                 m.hugging_face_id, m.quantization, m.max_output_length,
                 m.supported_sampling_parameters, m.supported_features, m.datacenters,
-                m.is_ready, m.deprecation_date, m.openrouter_slug,
+                m.is_ready, m.deprecation_date, m.successor_model_name, m.openrouter_slug,
+                m.is_listed,
                 COALESCE(
                     array_agg(ma.alias_name) FILTER (WHERE ma.alias_name IS NOT NULL),
                     '{}'
@@ -752,6 +821,9 @@ impl AdminRepository for AdminCompositeRepository {
                 is_active: u.is_active,
                 auth_provider: u.auth_provider,
                 provider_user_id: u.provider_user_id,
+                contact_email: u.contact_email,
+                contact_email_verified_at: u.contact_email_verified_at,
+                email_opt_in_at: u.email_opt_in_at,
             })
             .collect();
 
@@ -785,6 +857,9 @@ impl AdminRepository for AdminCompositeRepository {
                     is_active: u.is_active,
                     auth_provider: u.auth_provider,
                     provider_user_id: u.provider_user_id,
+                    contact_email: u.contact_email,
+                    contact_email_verified_at: u.contact_email_verified_at,
+                    email_opt_in_at: u.email_opt_in_at,
                 };
                 (user_info, org_data)
             })
@@ -843,7 +918,9 @@ impl AdminRepository for AdminCompositeRepository {
                 datacenters: m.datacenters,
                 is_ready: m.is_ready,
                 deprecation_date: m.deprecation_date,
+                successor_model_name: m.successor_model_name,
                 openrouter_slug: m.openrouter_slug,
+                is_listed: m.is_listed,
             })
             .collect();
 
@@ -885,6 +962,8 @@ impl AdminRepository for AdminCompositeRepository {
                 SELECT DISTINCT
                     u.id AS user_id,
                     u.email AS email,
+                    u.contact_email AS contact_email,
+                    u.contact_email_verified_at AS contact_email_verified_at,
                     lower(u.email) AS email_sort,
                     o.id AS organization_id,
                     o.name AS organization_name
@@ -915,11 +994,13 @@ impl AdminRepository for AdminCompositeRepository {
 
         Ok(rows
             .into_iter()
-            .map(|row| ModelDeprecationRecipient {
-                user_id: row.get("user_id"),
-                email: row.get("email"),
-                organization_id: row.get("organization_id"),
-                organization_name: row.get("organization_name"),
+            .filter_map(|row| {
+                Some(ModelDeprecationRecipient {
+                    user_id: row.get("user_id"),
+                    email: recipient_email(&row)?,
+                    organization_id: row.get("organization_id"),
+                    organization_name: row.get("organization_name"),
+                })
             })
             .collect())
     }
@@ -951,6 +1032,17 @@ impl AdminRepository for AdminCompositeRepository {
             .collect())
     }
 
+    async fn is_user_active(&self, user_id: Uuid) -> Result<bool> {
+        let client = self.pool.get().await?;
+        let row = client
+            .query_one(
+                "SELECT EXISTS (SELECT 1 FROM users WHERE id = $1 AND is_active = true)",
+                &[&user_id],
+            )
+            .await?;
+        Ok(row.get(0))
+    }
+
     async fn record_model_deprecation_delivery(
         &self,
         record: ModelDeprecationDeliveryRecord,
@@ -972,9 +1064,13 @@ impl AdminRepository for AdminCompositeRepository {
                     organization_id, organization_name, status, email_sent_at,
                     email_message_id, email_last_error, initiated_by_user_id,
                     initiated_by_user_email
-                ) VALUES (
+                ) SELECT
                     $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13,
                     $14, $15
+                WHERE EXISTS (
+                    -- FOR SHARE blocks behind erasure's FOR UPDATE on the user
+                    -- row (same pattern as the refresh_tokens insert in session.rs).
+                    SELECT 1 FROM users WHERE id = $6 AND is_active = true FOR SHARE
                 )
                 ON CONFLICT (
                     model_id, successor_model_name, deprecation_date,
@@ -1060,6 +1156,8 @@ impl AdminRepository for AdminCompositeRepository {
                 SELECT DISTINCT
                     u.id AS user_id,
                     u.email AS email,
+                    u.contact_email AS contact_email,
+                    u.contact_email_verified_at AS contact_email_verified_at,
                     o.id AS organization_id,
                     o.name AS organization_name,
                     names.canonical_name AS model_name
@@ -1090,12 +1188,14 @@ impl AdminRepository for AdminCompositeRepository {
 
         Ok(rows
             .into_iter()
-            .map(|row| PricingChangeRecipientRow {
-                user_id: row.get("user_id"),
-                email: row.get("email"),
-                organization_id: row.get("organization_id"),
-                organization_name: row.get("organization_name"),
-                model_name: row.get("model_name"),
+            .filter_map(|row| {
+                Some(PricingChangeRecipientRow {
+                    user_id: row.get("user_id"),
+                    email: recipient_email(&row)?,
+                    organization_id: row.get("organization_id"),
+                    organization_name: row.get("organization_name"),
+                    model_name: row.get("model_name"),
+                })
             })
             .collect())
     }
@@ -1431,8 +1531,12 @@ impl AdminRepository for AdminCompositeRepository {
                     organization_id, organization_name, model_names, status,
                     email_sent_at, email_message_id, email_last_error,
                     initiated_by_user_id, initiated_by_user_email
-                ) VALUES (
+                ) SELECT
                     $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12
+                WHERE EXISTS (
+                    -- FOR SHARE blocks behind erasure's FOR UPDATE on the user
+                    -- row (same pattern as the refresh_tokens insert in session.rs).
+                    SELECT 1 FROM users WHERE id = $2 AND is_active = true FOR SHARE
                 )
                 ON CONFLICT (batch_id, recipient_user_id, organization_id)
                 DO UPDATE SET
@@ -1518,12 +1622,12 @@ impl AdminRepository for AdminCompositeRepository {
         &self,
         limit: i64,
         offset: i64,
+        lifecycle: OrganizationLifecycleFilter,
     ) -> Result<Vec<AdminOrganizationInfo>> {
         let client = self.pool.get().await?;
 
-        let rows = client
-            .query(
-                r#"
+        let sql = format!(
+            r#"
                 SELECT
                     o.id,
                     o.name,
@@ -1532,7 +1636,9 @@ impl AdminRepository for AdminCompositeRepository {
                     olh.spend_limit,
                     ob.total_spent,
                     ob.total_requests,
-                    ob.total_tokens
+                    ob.total_tokens,
+                    o.is_active,
+                    {all_erased} AS all_members_erased
                 FROM organizations o
                 LEFT JOIN LATERAL (
                     SELECT SUM(spend_limit)::BIGINT AS spend_limit
@@ -1541,13 +1647,14 @@ impl AdminRepository for AdminCompositeRepository {
                       AND effective_until IS NULL
                 ) olh ON true
                 LEFT JOIN organization_balance ob ON o.id = ob.organization_id
-                WHERE o.is_active = true
+                WHERE {predicate}
                 ORDER BY o.created_at DESC
                 LIMIT $1 OFFSET $2
                 "#,
-                &[&limit, &offset],
-            )
-            .await?;
+            all_erased = ORG_ALL_MEMBERS_ERASED_SQL,
+            predicate = org_lifecycle_predicate(lifecycle),
+        );
+        let rows = client.query(sql.as_str(), &[&limit, &offset]).await?;
 
         let organizations = rows.iter().map(row_to_admin_org_info).collect();
 
@@ -1560,9 +1667,8 @@ impl AdminRepository for AdminCompositeRepository {
     ) -> Result<Option<AdminOrganizationInfo>> {
         let client = self.pool.get().await?;
 
-        let row = client
-            .query_opt(
-                r#"
+        let sql = format!(
+            r#"
                 SELECT
                     o.id,
                     o.name,
@@ -1571,7 +1677,9 @@ impl AdminRepository for AdminCompositeRepository {
                     olh.spend_limit,
                     ob.total_spent,
                     ob.total_requests,
-                    ob.total_tokens
+                    ob.total_tokens,
+                    o.is_active,
+                    {all_erased} AS all_members_erased
                 FROM organizations o
                 LEFT JOIN LATERAL (
                     SELECT SUM(spend_limit)::BIGINT AS spend_limit
@@ -1583,24 +1691,87 @@ impl AdminRepository for AdminCompositeRepository {
                 WHERE o.id = $1
                   AND o.is_active = true
                 "#,
-                &[&organization_id],
-            )
-            .await?;
+            all_erased = ORG_ALL_MEMBERS_ERASED_SQL,
+        );
+        let row = client.query_opt(sql.as_str(), &[&organization_id]).await?;
 
         Ok(row.as_ref().map(row_to_admin_org_info))
     }
 
-    async fn count_all_organizations(&self) -> Result<i64> {
+    async fn count_all_organizations(&self, lifecycle: OrganizationLifecycleFilter) -> Result<i64> {
+        let client = self.pool.get().await?;
+
+        let sql = format!(
+            "SELECT COUNT(*) as count FROM organizations o WHERE {}",
+            org_lifecycle_predicate(lifecycle)
+        );
+        let row = client.query_one(sql.as_str(), &[]).await?;
+
+        Ok(row.get::<_, i64>("count"))
+    }
+
+    async fn list_all_api_keys(
+        &self,
+        filters: &AdminApiKeyFilters,
+        limit: i64,
+        offset: i64,
+    ) -> Result<Vec<AdminApiKeyInfo>> {
+        let client = self.pool.get().await?;
+
+        let rows = client
+            .query(
+                r#"
+                SELECT
+                    ak.id,
+                    w.organization_id,
+                    o.name AS organization_name,
+                    ak.workspace_id,
+                    ak.created_by_user_id,
+                    ak.created_at,
+                    ak.is_active,
+                    ak.deleted_at,
+                    ak.name ~ $1 AS is_managed_playground
+                FROM api_keys ak
+                JOIN workspaces w ON w.id = ak.workspace_id
+                JOIN organizations o ON o.id = w.organization_id
+                WHERE ($2::uuid IS NULL OR w.organization_id = $2)
+                  AND ($3::timestamptz IS NULL OR ak.created_at >= $3)
+                  AND ($4::timestamptz IS NULL OR ak.created_at <= $4)
+                ORDER BY ak.created_at DESC, ak.id DESC
+                LIMIT $5 OFFSET $6
+                "#,
+                &[
+                    &MANAGED_PLAYGROUND_KEY_NAME_PATTERN,
+                    &filters.organization_id,
+                    &filters.created_after,
+                    &filters.created_before,
+                    &limit,
+                    &offset,
+                ],
+            )
+            .await?;
+
+        Ok(rows.iter().map(row_to_admin_api_key_info).collect())
+    }
+
+    async fn count_all_api_keys(&self, filters: &AdminApiKeyFilters) -> Result<i64> {
         let client = self.pool.get().await?;
 
         let row = client
             .query_one(
                 r#"
-                SELECT COUNT(*) as count
-                FROM organizations
-                WHERE is_active = true
+                SELECT COUNT(*) AS count
+                FROM api_keys ak
+                JOIN workspaces w ON w.id = ak.workspace_id
+                WHERE ($1::uuid IS NULL OR w.organization_id = $1)
+                  AND ($2::timestamptz IS NULL OR ak.created_at >= $2)
+                  AND ($3::timestamptz IS NULL OR ak.created_at <= $3)
                 "#,
-                &[],
+                &[
+                    &filters.organization_id,
+                    &filters.created_after,
+                    &filters.created_before,
+                ],
             )
             .await?;
 
@@ -1649,7 +1820,10 @@ impl AdminRepository for AdminCompositeRepository {
                     u.last_login_at,
                     u.is_active,
                     u.auth_provider,
-                    u.provider_user_id
+                    u.provider_user_id,
+                    u.contact_email,
+                    u.contact_email_verified_at,
+                    u.email_opt_in_at
                 FROM organization_members m
                 JOIN users u ON u.id = m.user_id
                 JOIN organizations o ON o.id = m.organization_id AND o.is_active = true
@@ -1680,6 +1854,9 @@ impl AdminRepository for AdminCompositeRepository {
                     is_active: row.get("is_active"),
                     auth_provider: row.get("auth_provider"),
                     provider_user_id: row.get("provider_user_id"),
+                    contact_email: row.get("contact_email"),
+                    contact_email_verified_at: row.get("contact_email_verified_at"),
+                    email_opt_in_at: row.get("email_opt_in_at"),
                 },
             })
             .collect();

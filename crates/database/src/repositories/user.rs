@@ -31,14 +31,15 @@ impl UserRepository {
 
         let row = retry_db!("create_new_user", {
             let now = Utc::now();
-            let client = self
+            let mut client = self
                 .pool
                 .get()
                 .await
                 .context("Failed to get database connection")
                 .map_err(RepositoryError::PoolError)?;
 
-            client
+            let tx = client.transaction().await.map_err(map_db_error)?;
+            let row = tx
                 .query_one(
                     r#"
             INSERT INTO users (
@@ -62,7 +63,14 @@ impl UserRepository {
                     ],
                 )
                 .await
-                .map_err(map_db_error)
+                .map_err(map_db_error)?;
+            if auth_provider == "near" {
+                tx.query_one("SELECT ensure_near_personal_organization($1)", &[&id])
+                    .await
+                    .map_err(map_db_error)?;
+            }
+            tx.commit().await.map_err(map_db_error)?;
+            Ok(row)
         })?;
 
         debug!("Created/updated user: {}", id);
@@ -157,7 +165,7 @@ impl UserRepository {
 
             client
                 .execute(
-                    "UPDATE users SET last_login_at = NOW() WHERE id = $1",
+                    "UPDATE users SET last_login_at = NOW() WHERE id = $1 AND is_active = true",
                     &[&id],
                 )
                 .await
@@ -254,6 +262,7 @@ impl UserRepository {
             WHERE ($1::BOOLEAN IS NULL OR is_active = $1)
               AND ($2::TEXT IS NULL
                    OR email ILIKE ('%' || $2 || '%') ESCAPE '\'
+                   OR contact_email ILIKE ('%' || $2 || '%') ESCAPE '\'
                    OR username ILIKE ('%' || $2 || '%') ESCAPE '\'
                    OR display_name ILIKE ('%' || $2 || '%') ESCAPE '\'
                    OR id::TEXT ILIKE ('%' || $2 || '%') ESCAPE '\'
@@ -284,6 +293,7 @@ impl UserRepository {
             WHERE ($3::BOOLEAN IS NULL OR is_active = $3)
               AND ($4::TEXT IS NULL
                    OR email ILIKE ('%' || $4 || '%') ESCAPE '\'
+                   OR contact_email ILIKE ('%' || $4 || '%') ESCAPE '\'
                    OR username ILIKE ('%' || $4 || '%') ESCAPE '\'
                    OR display_name ILIKE ('%' || $4 || '%') ESCAPE '\'
                    OR id::TEXT ILIKE ('%' || $4 || '%') ESCAPE '\'
@@ -344,6 +354,7 @@ impl UserRepository {
             WHERE ($1::BOOLEAN IS NULL OR u.is_active = $1)
               AND ($2::TEXT IS NULL
                    OR u.email ILIKE ('%' || $2 || '%') ESCAPE '\'
+                   OR u.contact_email ILIKE ('%' || $2 || '%') ESCAPE '\'
                    OR u.username ILIKE ('%' || $2 || '%') ESCAPE '\'
                    OR u.display_name ILIKE ('%' || $2 || '%') ESCAPE '\'
                    OR u.id::TEXT ILIKE ('%' || $2 || '%') ESCAPE '\'
@@ -395,6 +406,7 @@ impl UserRepository {
                 WHERE ($3::BOOLEAN IS NULL OR u.is_active = $3)
                   AND ($4::TEXT IS NULL
                        OR u.email ILIKE ('%' || $4 || '%') ESCAPE '\'
+                       OR u.contact_email ILIKE ('%' || $4 || '%') ESCAPE '\'
                        OR u.username ILIKE ('%' || $4 || '%') ESCAPE '\'
                        OR u.display_name ILIKE ('%' || $4 || '%') ESCAPE '\'
                        OR u.id::TEXT ILIKE ('%' || $4 || '%') ESCAPE '\'
@@ -527,6 +539,9 @@ impl UserRepository {
             auth_provider: row.get("auth_provider"),
             provider_user_id: row.get("provider_user_id"),
             tokens_revoked_at: row.get("tokens_revoked_at"),
+            contact_email: row.get("contact_email"),
+            contact_email_verified_at: row.get("contact_email_verified_at"),
+            email_opt_in_at: row.get("email_opt_in_at"),
         })
     }
 }
@@ -547,6 +562,9 @@ fn db_user_to_service_user(db_user: User) -> services::auth::User {
         created_at: db_user.created_at,
         updated_at: db_user.updated_at,
         tokens_revoked_at: db_user.tokens_revoked_at,
+        contact_email: db_user.contact_email,
+        contact_email_verified_at: db_user.contact_email_verified_at,
+        email_opt_in_at: db_user.email_opt_in_at,
     }
 }
 
@@ -633,7 +651,7 @@ impl services::auth::UserRepository for UserRepository {
 
             client
                 .execute(
-                    "UPDATE users SET email = $2, updated_at = NOW() WHERE id = $1",
+                    "UPDATE users SET email = $2, updated_at = NOW() WHERE id = $1 AND is_active = true",
                     &[&id.0, &email],
                 )
                 .await

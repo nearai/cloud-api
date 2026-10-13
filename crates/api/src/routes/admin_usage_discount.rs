@@ -56,9 +56,11 @@ fn api_error(error: anyhow::Error) -> ApiError {
             error.to_string(),
         ),
         Some(DiscountError::NotFound) => (StatusCode::NOT_FOUND, "not_found", error.to_string()),
-        Some(DiscountError::Conflict | DiscountError::UnsupportedHistory) => {
-            (StatusCode::CONFLICT, "conflict", error.to_string())
-        }
+        Some(
+            DiscountError::Conflict
+            | DiscountError::UnsupportedHistory
+            | DiscountError::ReconciledHistory,
+        ) => (StatusCode::CONFLICT, "conflict", error.to_string()),
         None => {
             tracing::error!(error = %error, "Organization usage discount operation failed");
             (

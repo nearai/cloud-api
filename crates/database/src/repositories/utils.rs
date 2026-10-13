@@ -25,9 +25,9 @@ pub fn map_db_error(err: tokio_postgres::Error) -> RepositoryError {
             &SqlState::RESTRICT_VIOLATION => RepositoryError::DependencyExists(message.to_string()),
 
             // Transaction errors
-            &SqlState::T_R_SERIALIZATION_FAILURE | &SqlState::T_R_DEADLOCK_DETECTED => {
-                RepositoryError::TransactionConflict
-            }
+            &SqlState::T_R_SERIALIZATION_FAILURE
+            | &SqlState::T_R_DEADLOCK_DETECTED
+            | &SqlState::LOCK_NOT_AVAILABLE => RepositoryError::TransactionConflict,
 
             // Connection/auth errors
             &SqlState::INVALID_PASSWORD | &SqlState::INVALID_AUTHORIZATION_SPECIFICATION => {

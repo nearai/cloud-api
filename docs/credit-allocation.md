@@ -22,7 +22,10 @@ unfunded cost. Historical rows created before attribution omit these fields
 rather than inventing a funding history.
 
 The organization balance endpoint reports `amount`, lifetime `consumed`, and
-current `available` nano-USD for every active credit type. Postpay remains a
+current `available` nano-USD for every active credit type. It also returns
+`legacy_unattributed_amount` from the stored balance, including when no credit
+type is active. This is historical consumption still awaiting attribution,
+separate from `unfunded_amount` (usage exceeding capacity). Postpay remains a
 cumulative contract limit and is kept separate from purchased payment
 credits. Replacing a limit does not reset consumption: changing 100 to 150
 adds 50 of capacity, while writing 150 again adds none.

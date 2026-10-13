@@ -43,6 +43,18 @@ async fn reconcile_requires_admin_write_and_preserves_audited_balances() {
         .unwrap();
     drop(client);
 
+    let balance_path = format!("/v1/admin/organizations/{}/usage/balance", org.id);
+    let initial_balance = server
+        .get(&balance_path)
+        .add_header("Authorization", format!("Bearer {}", get_session_id()))
+        .add_header("User-Agent", MOCK_USER_AGENT)
+        .await;
+    assert_eq!(initial_balance.status_code(), StatusCode::OK);
+    assert_eq!(
+        initial_balance.json::<Value>()["legacy_unattributed_amount"],
+        80
+    );
+
     let path = format!("/v1/admin/organizations/{}/credit/reconciliations", org.id);
     let body = json!({
         "idempotency_key": "opening",
@@ -125,6 +137,17 @@ async fn reconcile_requires_admin_write_and_preserves_audited_balances() {
     assert_eq!(saved["dry_run"], false);
     assert!(saved["reconciliation_id"].is_string());
     assert_eq!(call(body.clone()).await.json::<Value>(), saved);
+
+    let reconciled_balance = server
+        .get(&balance_path)
+        .add_header("Authorization", format!("Bearer {}", get_session_id()))
+        .add_header("User-Agent", MOCK_USER_AGENT)
+        .await;
+    assert_eq!(reconciled_balance.status_code(), StatusCode::OK);
+    assert_eq!(
+        reconciled_balance.json::<Value>()["legacy_unattributed_amount"],
+        0
+    );
 
     let mut conflicting = body.clone();
     conflicting["amounts"] = json!({"postpay":80});

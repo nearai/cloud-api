@@ -342,6 +342,7 @@ pub trait OrganizationRepository: Send + Sync {
         creator_user_id: Uuid,
     ) -> Result<Organization, RepositoryError>;
 
+    /// Resolve a tenant by its ID. Names are non-unique display labels.
     async fn get_by_id(&self, id: Uuid) -> Result<Option<Organization>, RepositoryError>;
 
     /// Set operator policy without touching customer-editable settings.
@@ -350,8 +351,6 @@ pub trait OrganizationRepository: Send + Sync {
         id: Uuid,
         priority: i32,
     ) -> Result<Option<i32>, RepositoryError>;
-
-    async fn get_by_name(&self, name: &str) -> Result<Option<Organization>, RepositoryError>;
 
     async fn get_member(
         &self,
@@ -633,12 +632,6 @@ pub trait OrganizationServiceTrait: Send + Sync {
         organization_id: OrganizationId,
         requester_id: UserId,
     ) -> Result<i64, OrganizationError>;
-
-    /// Get organization by name
-    async fn get_organization_by_name(
-        &self,
-        name: &str,
-    ) -> Result<Option<Organization>, OrganizationError>;
 
     /// List organization members with full user information (paginated)
     async fn get_members_with_users_paginated(

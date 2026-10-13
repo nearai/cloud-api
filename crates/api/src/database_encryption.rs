@@ -129,6 +129,7 @@ struct ApprovedGroup {
 }
 
 const APPROVED: &[ApprovedGroup] = &[
+    ApprovedGroup { table: "organization_credit_reconciliations", columns: &["idempotency_key", "amounts", "reason", "result"], reason: "Restricted administrator accounting audit and idempotent replay data, consistent with organization limit change reasons and billing correction records; reasons may include billing/contract references" },
     ApprovedGroup { table: "admin_access_token", columns: &["token_hash", "name", "creation_reason", "revocation_reason", "user_agent", "permission"], reason: "Operational admin-token metadata; the credential itself is stored as a one-way hash" },
     ApprovedGroup { table: "admin_settings", columns: &["key", "value"], reason: "Operator-set runtime tuning knobs (numeric placement parameters); no customer data" },
     ApprovedGroup { table: "aml_allowlisted_accounts", columns: &["account_id", "address_type", "reason"], reason: "Queryable compliance allowlist and audit rationale" },
@@ -1183,6 +1184,10 @@ mod tests {
     #[test]
     fn credit_allocation_plaintext_fields_have_explicit_approval_reasons() {
         for (table, column) in [
+            ("organization_credit_reconciliations", "idempotency_key"),
+            ("organization_credit_reconciliations", "amounts"),
+            ("organization_credit_reconciliations", "reason"),
+            ("organization_credit_reconciliations", "result"),
             ("organization_usage_log", "allocation_policy_version"),
             (
                 "organization_service_usage_log",

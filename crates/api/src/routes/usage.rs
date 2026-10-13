@@ -85,6 +85,8 @@ async fn check_org_membership(
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub struct OrganizationBalanceResponse {
     pub organization_id: String,
+    /// Historical consumption not yet assigned to a credit type, in nano-USD.
+    pub legacy_unattributed_amount: i64,
     pub total_spent: i64,            // In nano-dollars (scale 9)
     pub total_spent_display: String, // Human readable, e.g., "$12.50"
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -169,6 +171,7 @@ pub async fn compute_organization_balance_response(
             Ok(OrganizationBalanceResponse {
                 organization_id: balance.organization_id.to_string(),
                 total_spent: balance.total_spent,
+                legacy_unattributed_amount: balance.legacy_unattributed_amount,
                 total_spent_display: format_amount(balance.total_spent),
                 spend_limit,
                 spend_limit_display,
@@ -187,6 +190,7 @@ pub async fn compute_organization_balance_response(
                 Ok(OrganizationBalanceResponse {
                     organization_id: organization_id.to_string(),
                     total_spent: 0,
+                    legacy_unattributed_amount: 0,
                     total_spent_display: format_amount(0),
                     spend_limit: Some(limit_info.spend_limit),
                     spend_limit_display: Some(format_amount(limit_info.spend_limit)),

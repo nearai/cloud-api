@@ -682,6 +682,216 @@ mod tests {
             .is_none());
     }
 
+    fn type_array_schema() -> serde_json::Value {
+        serde_json::json!({
+            "type": ["object"],
+            "additionalProperties": false,
+            "properties": {
+                "name": {
+                    "type": ["string", "null"],
+                    "description": "Optional display name"
+                },
+                "values": {
+                    "type": "array",
+                    "items": {
+                        "type": ["object"],
+                        "properties": {
+                            "value": {"type": ["null", "string", "number"]}
+                        },
+                        "required": ["value"]
+                    }
+                },
+                "status": {"type": ["string"], "enum": ["ready", "pending"]},
+                "details": {
+                    "type": ["object", "null"],
+                    "properties": {"label": {"type": "string"}},
+                    "required": ["label"],
+                    "propertyOrdering": ["label"]
+                },
+                "tags": {
+                    "type": ["null", "array"],
+                    "items": {"type": "string"},
+                    "minItems": 1
+                },
+                "enum_status": {
+                    "type": ["string", "null"],
+                    "nullable": true,
+                    "enum": ["ready", "pending"]
+                },
+                "choice": {
+                    "anyOf": [
+                        {"type": ["boolean", "null"]},
+                        {"type": ["integer"]}
+                    ]
+                }
+            },
+            "required": ["name", "values"]
+        })
+    }
+
+    fn normalized_type_array_schema() -> serde_json::Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "name": {
+                    "type": "string",
+                    "nullable": true,
+                    "description": "Optional display name"
+                },
+                "values": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "value": {
+                                "anyOf": [
+                                    {"type": "null"}, {"type": "string"}, {"type": "number"}
+                                ]
+                            }
+                        },
+                        "required": ["value"]
+                    }
+                },
+                "status": {"type": "string", "enum": ["ready", "pending"]},
+                "details": {
+                    "type": "object",
+                    "nullable": true,
+                    "properties": {"label": {"type": "string"}},
+                    "required": ["label"],
+                    "propertyOrdering": ["label"]
+                },
+                "tags": {
+                    "type": "array",
+                    "nullable": true,
+                    "items": {"type": "string"},
+                    "minItems": 1
+                },
+                "enum_status": {"type": "string", "enum": ["ready", "pending"]},
+                "choice": {
+                    "anyOf": [
+                        {"type": "boolean", "nullable": true},
+                        {"type": "integer"}
+                    ]
+                }
+            },
+            "required": ["name", "values"]
+        })
+    }
+
+    /// #1189: the serialized tool declaration must use scalar types, including
+    /// nullable properties and unions nested beneath items and anyOf.
+    /// FunctionDefinition does not retain tool strict; this covers schema conversion.
+    #[test]
+    fn test_build_request_normalizes_tool_parameter_type_arrays() {
+        let backend = GeminiBackend::new();
+        let tool = serde_json::json!({
+            "type": "function",
+            "function": {
+                "name": "save_record",
+                "description": "Save a record",
+                "parameters": type_array_schema()
+            }
+        });
+        let mut params = base_params();
+        params.tools = Some(vec![serde_json::from_value(tool).unwrap()]);
+
+        let body = serde_json::to_value(backend.build_request(&params)).unwrap();
+        let declaration = &body["tools"][0]["functionDeclarations"][0];
+        assert_eq!(declaration["name"], "save_record");
+        assert_eq!(declaration["description"], "Save a record");
+        assert_eq!(declaration["parameters"], normalized_type_array_schema());
+    }
+
+    #[test]
+    fn test_build_request_normalizes_non_strict_response_schema_type_arrays() {
+        let backend = GeminiBackend::new();
+        for strict in [None, Some(false)] {
+            let mut response_format = serde_json::json!({
+                "type": "json_schema",
+                "json_schema": {"name": "record", "schema": type_array_schema()}
+            });
+            if let Some(strict) = strict {
+                response_format["json_schema"]["strict"] = serde_json::json!(strict);
+            }
+            let mut params = base_params();
+            params
+                .extra
+                .insert("response_format".to_string(), response_format);
+
+            let body = serde_json::to_value(backend.build_request(&params)).unwrap();
+            let config = &body["generationConfig"];
+            assert_eq!(config["responseMimeType"], "application/json");
+            assert_eq!(config["responseSchema"], normalized_type_array_schema());
+            assert!(config.get("responseJsonSchema").is_none());
+        }
+    }
+
+    #[test]
+    fn test_build_request_preserves_strict_response_schema_type_arrays() {
+        let backend = GeminiBackend::new();
+        let original_schema = type_array_schema();
+        let mut params = base_params();
+        params.extra.insert(
+            "response_format".to_string(),
+            serde_json::json!({
+                "type": "json_schema",
+                "json_schema": {
+                    "name": "record",
+                    "strict": true,
+                    "schema": original_schema.clone()
+                }
+            }),
+        );
+
+        let body = serde_json::to_value(backend.build_request(&params)).unwrap();
+        let config = &body["generationConfig"];
+        assert_eq!(config["responseMimeType"], "application/json");
+        assert_eq!(config["responseJsonSchema"], original_schema);
+        assert!(config.get("responseSchema").is_none());
+    }
+
+    #[test]
+    fn test_build_request_type_intersection_does_not_restore_null() {
+        let backend = GeminiBackend::new();
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "value": {
+                    "type": ["string", "boolean"],
+                    "anyOf": [{"type": ["string", "null"]}]
+                }
+            },
+            "required": ["value"]
+        });
+        let expected = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "value": {"anyOf": [{"anyOf": [{"type": "string"}]}]}
+            },
+            "required": ["value"]
+        });
+        let mut params = base_params();
+        params.tools = Some(vec![serde_json::from_value(serde_json::json!({
+            "type": "function",
+            "function": {"name": "save_value", "parameters": schema.clone()}
+        }))
+        .unwrap()]);
+        params.extra.insert(
+            "response_format".to_string(),
+            serde_json::json!({
+                "type": "json_schema",
+                "json_schema": {"name": "value", "schema": schema}
+            }),
+        );
+
+        let body = serde_json::to_value(backend.build_request(&params)).unwrap();
+        assert_eq!(
+            body["tools"][0]["functionDeclarations"][0]["parameters"],
+            expected
+        );
+        assert_eq!(body["generationConfig"]["responseSchema"], expected);
+    }
+
     #[test]
     fn test_strip_vendor_prefix_google() {
         assert_eq!(

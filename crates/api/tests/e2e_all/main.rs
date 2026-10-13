@@ -14,6 +14,7 @@ mod admin_analytics_range_hygiene;
 mod admin_analytics_statement_budget;
 mod admin_api_keys;
 mod admin_consumption_hourly;
+mod admin_credit_reconciliation;
 mod admin_deprecate_model;
 mod admin_invitation_email_deliveries;
 mod admin_list_models;

@@ -685,6 +685,22 @@ mod tests {
                     }
                 },
                 "status": {"type": ["string"], "enum": ["ready", "pending"]},
+                "details": {
+                    "type": ["object", "null"],
+                    "properties": {"label": {"type": "string"}},
+                    "required": ["label"],
+                    "propertyOrdering": ["label"]
+                },
+                "tags": {
+                    "type": ["null", "array"],
+                    "items": {"type": "string"},
+                    "minItems": 1
+                },
+                "enum_status": {
+                    "type": ["string", "null"],
+                    "nullable": true,
+                    "enum": ["ready", "pending"]
+                },
                 "choice": {
                     "anyOf": [
                         {"type": ["boolean", "null"]},
@@ -701,7 +717,8 @@ mod tests {
             "type": "object",
             "properties": {
                 "name": {
-                    "anyOf": [{"type": "string"}, {"type": "null"}],
+                    "type": "string",
+                    "nullable": true,
                     "description": "Optional display name"
                 },
                 "values": {
@@ -719,9 +736,23 @@ mod tests {
                     }
                 },
                 "status": {"type": "string", "enum": ["ready", "pending"]},
+                "details": {
+                    "type": "object",
+                    "nullable": true,
+                    "properties": {"label": {"type": "string"}},
+                    "required": ["label"],
+                    "propertyOrdering": ["label"]
+                },
+                "tags": {
+                    "type": "array",
+                    "nullable": true,
+                    "items": {"type": "string"},
+                    "minItems": 1
+                },
+                "enum_status": {"type": "string", "enum": ["ready", "pending"]},
                 "choice": {
                     "anyOf": [
-                        {"anyOf": [{"type": "boolean"}, {"type": "null"}]},
+                        {"type": "boolean", "nullable": true},
                         {"type": "integer"}
                     ]
                 }
@@ -804,6 +835,48 @@ mod tests {
         assert_eq!(config["responseMimeType"], "application/json");
         assert_eq!(config["responseJsonSchema"], original_schema);
         assert!(config.get("responseSchema").is_none());
+    }
+
+    #[test]
+    fn test_build_request_type_intersection_does_not_restore_null() {
+        let backend = GeminiBackend::new();
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "value": {
+                    "type": ["string", "boolean"],
+                    "anyOf": [{"type": ["string", "null"]}]
+                }
+            },
+            "required": ["value"]
+        });
+        let expected = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "value": {"anyOf": [{"anyOf": [{"type": "string"}]}]}
+            },
+            "required": ["value"]
+        });
+        let mut params = base_params();
+        params.tools = Some(vec![serde_json::from_value(serde_json::json!({
+            "type": "function",
+            "function": {"name": "save_value", "parameters": schema.clone()}
+        }))
+        .unwrap()]);
+        params.extra.insert(
+            "response_format".to_string(),
+            serde_json::json!({
+                "type": "json_schema",
+                "json_schema": {"name": "value", "schema": schema}
+            }),
+        );
+
+        let body = serde_json::to_value(backend.build_request(&params)).unwrap();
+        assert_eq!(
+            body["tools"][0]["functionDeclarations"][0]["parameters"],
+            expected
+        );
+        assert_eq!(body["generationConfig"]["responseSchema"], expected);
     }
 
     #[test]

@@ -537,15 +537,26 @@ const GEMINI_UNSUPPORTED_SCHEMA_KEYS: &[&str] = &[
 /// `{"properties": {"const": {"type": "string"}}}` would lose the `const`
 /// parameter entirely. Reported by gemini-code-assist on PR #610.
 fn sanitize_schema_for_gemini(value: &mut serde_json::Value) {
+    visit_gemini_schema_nodes(value, |map| {
+        for key in GEMINI_UNSUPPORTED_SCHEMA_KEYS {
+            map.remove(*key);
+        }
+        normalize_gemini_type_array(map);
+    });
+    // Finish every type intersection before introducing Gemini's nullable
+    // representation; the intersection helpers operate on explicit types.
+    visit_gemini_schema_nodes(value, compact_gemini_nullable_union);
+}
+
+fn visit_gemini_schema_nodes(
+    value: &mut serde_json::Value,
+    transform: fn(&mut serde_json::Map<String, serde_json::Value>),
+) {
     // Maps whose keys are user-defined names (not schema keywords). For these,
     // we only sanitize the values, never the key set.
     //
-    // Note: only `properties` is currently functionally active here. The other
-    // four are themselves in `GEMINI_UNSUPPORTED_SCHEMA_KEYS` and get stripped
-    // before the iter_mut() loop below ever sees them. They are listed here
-    // defensively so that if a future Gemini revision starts accepting them
-    // and they are removed from the unsupported list, the user-name protection
-    // automatically applies without a separate code change.
+    // The sanitizer removes the other four maps after visiting their children.
+    // Keep their user-name protection if Gemini starts supporting them later.
     const USER_NAMED_KEY_MAPS: &[&str] = &[
         "properties",
         "$defs",
@@ -556,32 +567,82 @@ fn sanitize_schema_for_gemini(value: &mut serde_json::Value) {
 
     match value {
         serde_json::Value::Object(map) => {
-            for key in GEMINI_UNSUPPORTED_SCHEMA_KEYS {
-                map.remove(*key);
-            }
             for (k, v) in map.iter_mut() {
                 if USER_NAMED_KEY_MAPS.contains(&k.as_str()) {
                     // The map's keys are parameter names; only recurse into values.
                     if let Some(inner) = v.as_object_mut() {
                         for inner_v in inner.values_mut() {
-                            sanitize_schema_for_gemini(inner_v);
+                            visit_gemini_schema_nodes(inner_v, transform);
                         }
                     }
                 } else if matches!(
                     k.as_str(),
                     "items" | "prefixItems" | "anyOf" | "oneOf" | "allOf" | "not"
                 ) {
-                    sanitize_schema_for_gemini(v);
+                    // Add new schema-valued keywords here, never instance data.
+                    visit_gemini_schema_nodes(v, transform);
                 }
             }
-            normalize_gemini_type_array(map);
+            transform(map);
         }
         serde_json::Value::Array(arr) => {
             for v in arr.iter_mut() {
-                sanitize_schema_for_gemini(v);
+                visit_gemini_schema_nodes(v, transform);
             }
         }
         _ => {}
+    }
+}
+
+/// Keep type-specific fields such as properties and items on a typed node.
+/// Only fold unconstrained T/null alternatives; richer unions stay explicit.
+fn compact_gemini_nullable_union(map: &mut serde_json::Map<String, serde_json::Value>) {
+    if map.contains_key("type") {
+        return;
+    }
+    let Some(branches) = map.get("anyOf").and_then(serde_json::Value::as_array) else {
+        return;
+    };
+    if branches.len() != 2
+        || !branches.iter().all(|branch| {
+            branch.as_object().is_some_and(|branch| {
+                branch.len() == 1
+                    && branch
+                        .get("type")
+                        .and_then(serde_json::Value::as_str)
+                        .is_some_and(|kind| JSON_SCHEMA_TYPES.contains(&kind))
+            })
+        })
+    {
+        return;
+    }
+    let kind = match (branches[0]["type"].as_str(), branches[1]["type"].as_str()) {
+        (Some("null"), Some(kind)) | (Some(kind), Some("null")) if kind != "null" => {
+            kind.to_string()
+        }
+        _ => return,
+    };
+    let nullable = if let Some(values) = map.get("enum") {
+        // A string enum excluding null must not gain null as a valid value.
+        // Other enum forms have separate Gemini compatibility limitations;
+        // preserve them instead of dropping or coercing their values here.
+        if kind != "string"
+            || !values.as_array().is_some_and(|values| {
+                !values.is_empty() && values.iter().all(serde_json::Value::is_string)
+            })
+        {
+            return;
+        }
+        false
+    } else {
+        true
+    };
+    map.remove("anyOf");
+    map.insert("type".to_string(), serde_json::Value::String(kind));
+    if nullable {
+        map.insert("nullable".to_string(), serde_json::Value::Bool(true));
+    } else {
+        map.remove("nullable");
     }
 }
 
@@ -1615,9 +1676,9 @@ mod tests {
         assert_eq!(
             schema["properties"],
             serde_json::json!({
-                "type": {"anyOf": [{"type": "string"}, {"type": "null"}]},
+                "type": {"type": "string", "nullable": true},
                 "anyOf": {"type": "string"},
-                "nullable": {"anyOf": [{"type": "boolean"}, {"type": "null"}]}
+                "nullable": {"type": "boolean", "nullable": true}
             })
         );
         assert_eq!(schema["required"], serde_json::json!(["type", "anyOf"]));
@@ -1649,6 +1710,31 @@ mod tests {
     }
 
     #[test]
+    fn test_nullable_compaction_preserves_enum_values_and_branch_constraints() {
+        for original in [
+            serde_json::json!({
+                "anyOf": [{"type": "string", "minLength": 1}, {"type": "null"}]
+            }),
+            serde_json::json!({
+                "anyOf": [{"type": "string"}, {"type": "null"}],
+                "enum": ["ready", null]
+            }),
+            serde_json::json!({
+                "anyOf": [{"type": "object"}, {"type": "null"}],
+                "enum": [{"type": ["string", "null"]}, null]
+            }),
+            serde_json::json!({
+                "anyOf": [{"type": "string"}, {"type": "null"}],
+                "enum": []
+            }),
+        ] {
+            let mut schema = original.clone();
+            sanitize_schema_for_gemini(&mut schema);
+            assert_eq!(schema, original);
+        }
+    }
+
+    #[test]
     fn test_nested_type_array_intersections_do_not_duplicate_subtrees() {
         let mut schema = serde_json::json!({"description": "leaf"});
         for _ in 0..32 {
@@ -1660,7 +1746,7 @@ mod tests {
         assert!(serialized.len() < original_size);
         assert_eq!(serialized.matches("leaf").count(), 1);
         assert_eq!(serialized.matches("\"type\":\"string\"").count(), 1);
-        assert_eq!(serialized.matches("\"type\":\"null\"").count(), 1);
+        assert_eq!(serialized.matches("\"nullable\":true").count(), 1);
         let normalized = schema.clone();
         sanitize_schema_for_gemini(&mut schema);
         assert_eq!(schema, normalized);

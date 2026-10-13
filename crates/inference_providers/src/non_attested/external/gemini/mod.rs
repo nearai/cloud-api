@@ -763,30 +763,26 @@ mod tests {
 
     /// #1189: the serialized tool declaration must use scalar types, including
     /// nullable properties and unions nested beneath items and anyOf.
+    /// FunctionDefinition does not retain tool strict; this covers schema conversion.
     #[test]
     fn test_build_request_normalizes_tool_parameter_type_arrays() {
         let backend = GeminiBackend::new();
-        for strict in [None, Some(true)] {
-            let mut tool = serde_json::json!({
-                "type": "function",
-                "function": {
-                    "name": "save_record",
-                    "description": "Save a record",
-                    "parameters": type_array_schema()
-                }
-            });
-            if let Some(strict) = strict {
-                tool["function"]["strict"] = serde_json::json!(strict);
+        let tool = serde_json::json!({
+            "type": "function",
+            "function": {
+                "name": "save_record",
+                "description": "Save a record",
+                "parameters": type_array_schema()
             }
-            let mut params = base_params();
-            params.tools = Some(vec![serde_json::from_value(tool).unwrap()]);
+        });
+        let mut params = base_params();
+        params.tools = Some(vec![serde_json::from_value(tool).unwrap()]);
 
-            let body = serde_json::to_value(backend.build_request(&params)).unwrap();
-            let declaration = &body["tools"][0]["functionDeclarations"][0];
-            assert_eq!(declaration["name"], "save_record");
-            assert_eq!(declaration["description"], "Save a record");
-            assert_eq!(declaration["parameters"], normalized_type_array_schema());
-        }
+        let body = serde_json::to_value(backend.build_request(&params)).unwrap();
+        let declaration = &body["tools"][0]["functionDeclarations"][0];
+        assert_eq!(declaration["name"], "save_record");
+        assert_eq!(declaration["description"], "Save a record");
+        assert_eq!(declaration["parameters"], normalized_type_array_schema());
     }
 
     #[test]

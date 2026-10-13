@@ -488,9 +488,6 @@ fn contains_ref_key(value: &serde_json::Value) -> bool {
 //
 // TODO(follow-up): `{"const": X}` could be rewritten to `{"enum": [X]}` rather
 // than stripped — Gemini accepts `enum`, preserving the original constraint.
-// Same pattern would apply to `{"type": [..., "null"]}` unions which OpenAI
-// clients sometimes emit but Gemini's OpenAPI subset doesn't accept.
-// Both are out of scope for this PR (which just stops the 400s).
 const GEMINI_UNSUPPORTED_SCHEMA_KEYS: &[&str] = &[
     // OpenAPI / JSON Schema validation keywords Gemini does not implement
     // (alphabetized within group)
@@ -527,12 +524,10 @@ const GEMINI_UNSUPPORTED_SCHEMA_KEYS: &[&str] = &[
     "definitions",
 ];
 
-/// Recursively strip schema keywords that Gemini does not accept.
+/// Strip unsupported schema keywords and normalize JSON Schema type arrays.
 ///
-/// Walks `value` in-place. At each object, removes keys listed in
-/// `GEMINI_UNSUPPORTED_SCHEMA_KEYS`, then recurses into the surviving values
-/// and any array elements. This handles nested schemas (e.g. inside
-/// `properties`, `items`, `anyOf`) at arbitrary depth.
+/// Only descend through schema-valued keywords. Values of `default`, `example`,
+/// and `enum` are instance data, even when they contain keys such as `type`.
 ///
 /// Special case: keys inside `properties` (and equivalent maps like `$defs`,
 /// `definitions`, `patternProperties`, `dependentSchemas`) are **user-defined
@@ -571,14 +566,15 @@ fn sanitize_schema_for_gemini(value: &mut serde_json::Value) {
                         for inner_v in inner.values_mut() {
                             sanitize_schema_for_gemini(inner_v);
                         }
-                        continue;
                     }
-                    // Fall through to regular recursion if the value isn't an
-                    // object (malformed schema); the general path handles
-                    // non-objects safely via the `_ => {}` arm.
+                } else if matches!(
+                    k.as_str(),
+                    "items" | "prefixItems" | "anyOf" | "oneOf" | "allOf" | "not"
+                ) {
+                    sanitize_schema_for_gemini(v);
                 }
-                sanitize_schema_for_gemini(v);
             }
+            normalize_gemini_type_array(map);
         }
         serde_json::Value::Array(arr) => {
             for v in arr.iter_mut() {
@@ -587,6 +583,115 @@ fn sanitize_schema_for_gemini(value: &mut serde_json::Value) {
         }
         _ => {}
     }
+}
+
+const JSON_SCHEMA_TYPES: &[&str] = &[
+    "string", "number", "integer", "boolean", "object", "array", "null",
+];
+
+fn normalize_gemini_type_array(map: &mut serde_json::Map<String, serde_json::Value>) {
+    let Some(types) = map.get("type").and_then(serde_json::Value::as_array) else {
+        return;
+    };
+    // Leave malformed schemas for upstream validation; never turn an invalid
+    // type constraint into an unconstrained schema.
+    if types.is_empty()
+        || types.iter().enumerate().any(|(index, value)| {
+            !value
+                .as_str()
+                .is_some_and(|name| JSON_SCHEMA_TYPES.contains(&name))
+                || types[..index].contains(value)
+        })
+    {
+        return;
+    }
+    let types = types.clone();
+    if types.len() == 1 {
+        map.insert("type".to_string(), types[0].clone());
+        return;
+    }
+
+    if let Some(any_of) = map.get_mut("anyOf") {
+        let Some(branches) = any_of.as_array_mut() else {
+            return;
+        };
+        if !branches.iter().all(can_constrain_gemini_schema_type) {
+            return;
+        }
+        // `type` and an existing `anyOf` are an intersection. Push the type
+        // constraint into its branches instead of overwriting the alternatives
+        // or cloning their subtrees once per type (exponential when nested).
+        branches.retain_mut(|branch| constrain_gemini_schema_type(branch, &types));
+        if branches.is_empty() {
+            // An empty repeated protobuf field may be treated as absent. Keep
+            // the rejected type array instead of emitting an unconstrained
+            // Gemini schema for an impossible intersection.
+            return;
+        }
+    } else {
+        map.insert("anyOf".to_string(), gemini_type_alternatives(&types));
+    }
+    map.remove("type");
+}
+
+fn gemini_type_alternatives(types: &[serde_json::Value]) -> serde_json::Value {
+    serde_json::Value::Array(
+        types
+            .iter()
+            .map(|kind| serde_json::json!({"type": kind}))
+            .collect(),
+    )
+}
+
+/// Only distribute over object schemas with supported scalar types. Boolean
+/// schemas and malformed alternatives are already unsupported by Gemini's
+/// Schema message; preserve them along with the original type array.
+fn can_constrain_gemini_schema_type(schema: &serde_json::Value) -> bool {
+    let Some(map) = schema.as_object() else {
+        return false;
+    };
+    if map.get("type").is_some_and(|value| {
+        !value
+            .as_str()
+            .is_some_and(|name| JSON_SCHEMA_TYPES.contains(&name))
+    }) {
+        return false;
+    }
+    map.get("anyOf").is_none_or(|value| {
+        value
+            .as_array()
+            .is_some_and(|branches| branches.iter().all(can_constrain_gemini_schema_type))
+    })
+}
+
+/// Intersect an already-sanitized schema with the allowed types. False means
+/// the branch accepts no values and can be removed from its parent's anyOf.
+fn constrain_gemini_schema_type(
+    schema: &mut serde_json::Value,
+    types: &[serde_json::Value],
+) -> bool {
+    let map = schema.as_object_mut().expect("object schema checked above");
+    if let Some(kind) = map.get("type").and_then(serde_json::Value::as_str) {
+        if types.iter().any(|allowed| allowed == kind)
+            || (kind == "integer" && types.iter().any(|allowed| allowed == "number"))
+        {
+            return true;
+        }
+        if kind == "number" && types.iter().any(|allowed| allowed == "integer") {
+            map.insert("type".to_string(), serde_json::json!("integer"));
+            return true;
+        }
+        return false;
+    }
+    if let Some(branches) = map
+        .get_mut("anyOf")
+        .and_then(serde_json::Value::as_array_mut)
+    {
+        branches.retain_mut(|branch| constrain_gemini_schema_type(branch, types));
+        return !branches.is_empty();
+    }
+    map.insert("anyOf".to_string(), gemini_type_alternatives(types));
+    true
 }
 
 /// Outcome of translating an OpenAI `response_format` into Gemini's
@@ -1425,6 +1530,140 @@ mod tests {
         let before = schema.clone();
         sanitize_schema_for_gemini(&mut schema);
         assert_eq!(before, schema, "clean schema should pass through unchanged");
+    }
+
+    #[test]
+    fn test_type_arrays_preserve_existing_anyof_and_sibling_constraints() {
+        let mut schema = serde_json::json!({
+            "type": ["string", "number"],
+            "description": "A label or a non-negative count",
+            "enum": ["red", 2, -1, false],
+            "anyOf": [
+                {"type": ["string", "boolean"], "enum": ["red", false]},
+                {"type": "integer", "minimum": 0},
+                {"type": "boolean"}
+            ]
+        });
+        sanitize_schema_for_gemini(&mut schema);
+        assert_eq!(
+            schema,
+            serde_json::json!({
+                "description": "A label or a non-negative count",
+                "enum": ["red", 2, -1, false],
+                "anyOf": [
+                    {"anyOf": [{"type": "string"}], "enum": ["red", false]},
+                    {"type": "integer", "minimum": 0}
+                ]
+            })
+        );
+    }
+
+    #[test]
+    fn test_type_array_intersections_respect_integer_as_a_subset_of_number() {
+        for (outer_type, inner_type) in [("integer", "number"), ("number", "integer")] {
+            let mut schema = serde_json::json!({
+                "type": [outer_type, "null"],
+                "anyOf": [
+                    {"type": inner_type, "minimum": 0},
+                    {"type": "string"},
+                    {"type": "null"}
+                ]
+            });
+            sanitize_schema_for_gemini(&mut schema);
+            assert_eq!(
+                schema,
+                serde_json::json!({"anyOf": [
+                    {"type": "integer", "minimum": 0},
+                    {"type": "null"}
+                ]})
+            );
+        }
+
+        let mut impossible = serde_json::json!({
+            "type": ["string", "null"],
+            "anyOf": [{"type": "boolean"}]
+        });
+        sanitize_schema_for_gemini(&mut impossible);
+        // Keep the rejected type array: an empty protobuf anyOf alone cannot
+        // reliably represent an intersection that accepts no values.
+        assert_eq!(
+            impossible,
+            serde_json::json!({"type": ["string", "null"], "anyOf": []})
+        );
+    }
+
+    #[test]
+    fn test_type_array_normalization_preserves_property_names_and_instance_data() {
+        let data = serde_json::json!({
+            "type": ["string", "null"],
+            "const": "ordinary data",
+            "properties": {"type": ["number", "null"]}
+        });
+        let mut schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "type": {"type": ["string", "null"]},
+                "anyOf": {"type": ["string"]},
+                "nullable": {"type": ["boolean", "null"]}
+            },
+            "required": ["type", "anyOf"],
+            "default": data.clone(),
+            "example": data.clone(),
+            "enum": [data.clone()]
+        });
+        sanitize_schema_for_gemini(&mut schema);
+        assert_eq!(
+            schema["properties"],
+            serde_json::json!({
+                "type": {"anyOf": [{"type": "string"}, {"type": "null"}]},
+                "anyOf": {"type": "string"},
+                "nullable": {"anyOf": [{"type": "boolean"}, {"type": "null"}]}
+            })
+        );
+        assert_eq!(schema["required"], serde_json::json!(["type", "anyOf"]));
+        assert_eq!(schema["default"], data);
+        assert_eq!(schema["example"], data);
+        assert_eq!(schema["enum"], serde_json::json!([data]));
+    }
+
+    #[test]
+    fn test_type_array_normalization_leaves_malformed_constraints_unchanged() {
+        for original in [
+            serde_json::json!({"type": []}),
+            serde_json::json!({"type": ["string", 1]}),
+            serde_json::json!({"type": ["string", "unknown"]}),
+            serde_json::json!({"type": ["string", "string"]}),
+            serde_json::json!({"type": ["string", "null"], "anyOf": []}),
+            serde_json::json!({"type": ["string", "null"], "anyOf": {"type": "string"}}),
+            serde_json::json!({"type": ["string", "null"], "anyOf": [true]}),
+            serde_json::json!({"type": ["string", "null"], "anyOf": [{"type": []}]}),
+        ] {
+            let mut schema = original.clone();
+            sanitize_schema_for_gemini(&mut schema);
+            assert_eq!(schema, original);
+        }
+
+        let mut null_only = serde_json::json!({"type": ["null"]});
+        sanitize_schema_for_gemini(&mut null_only);
+        assert_eq!(null_only, serde_json::json!({"type": "null"}));
+    }
+
+    #[test]
+    fn test_nested_type_array_intersections_do_not_duplicate_subtrees() {
+        let mut schema = serde_json::json!({"description": "leaf"});
+        for _ in 0..32 {
+            schema = serde_json::json!({"type": ["string", "null"], "anyOf": [schema]});
+        }
+        let original_size = serde_json::to_vec(&schema).unwrap().len();
+        sanitize_schema_for_gemini(&mut schema);
+        let serialized = serde_json::to_string(&schema).unwrap();
+        assert!(serialized.len() < original_size);
+        assert_eq!(serialized.matches("leaf").count(), 1);
+        assert_eq!(serialized.matches("\"type\":\"string\"").count(), 1);
+        assert_eq!(serialized.matches("\"type\":\"null\"").count(), 1);
+        let normalized = schema.clone();
+        sanitize_schema_for_gemini(&mut schema);
+        assert_eq!(schema, normalized);
     }
 
     #[test]

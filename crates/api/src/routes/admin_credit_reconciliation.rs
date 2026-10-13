@@ -124,7 +124,7 @@ fn api_error(error: anyhow::Error) -> ApiError {
 /// previews; commits revalidate under the organization accounting lock.
 #[utoipa::path(
     post,
-    path = "/v1/admin/organizations/{org_id}/credit-reconciliations",
+    path = "/v1/admin/organizations/{org_id}/credit/reconciliations",
     tag = "Admin",
     params(("org_id" = Uuid, Path, description = "Organization ID")),
     request_body = CreditReconciliationRequest,

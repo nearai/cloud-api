@@ -43,7 +43,7 @@ async fn reconcile_requires_admin_write_and_preserves_audited_balances() {
         .unwrap();
     drop(client);
 
-    let path = format!("/v1/admin/organizations/{}/credit-reconciliations", org.id);
+    let path = format!("/v1/admin/organizations/{}/credit/reconciliations", org.id);
     let body = json!({
         "idempotency_key": "opening",
         "amounts": {"payment": 80},

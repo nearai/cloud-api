@@ -81,7 +81,7 @@ For an existing organization, review historical credit/payment/contract records
 before choosing a credit type for its pre-attribution consumption. Admins can
 reclassify a reviewed portion of `legacy_unattributed_amount` using:
 
-`POST /v1/admin/organizations/{org_id}/credit-reconciliations`
+`POST /v1/admin/organizations/{org_id}/credit/reconciliations`
 
 ```json
 {

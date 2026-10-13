@@ -2409,7 +2409,7 @@ fn build_admin_routes_with_options(
         .merge(
             Router::new()
                 .route(
-                    "/admin/organizations/{org_id}/credit-reconciliations",
+                    "/admin/organizations/{org_id}/credit/reconciliations",
                     axum::routing::post(
                         crate::routes::admin_credit_reconciliation::reconcile_organization_credits,
                     ),

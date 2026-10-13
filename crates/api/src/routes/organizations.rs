@@ -179,7 +179,6 @@ impl From<OrganizationOrderDirection> for services::organization::OrganizationOr
         (status = 200, description = "Organization created successfully", body = OrganizationResponse),
         (status = 400, description = "Bad request", body = ErrorResponse),
         (status = 401, description = "Unauthorized", body = ErrorResponse),
-        (status = 409, description = "Organization already exists", body = ErrorResponse),
         (status = 500, description = "Internal server error", body = ErrorResponse)
     ),
     security(

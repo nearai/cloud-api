@@ -120,6 +120,24 @@ async fn main() {
     // A durable per-org claim prevents replica duplication. Keep two jobs in
     // flight so a slow final verification does not stall every other organization.
     let discount_repository = database::repositories::organization_usage_discount::OrganizationUsageDiscountRepository::new(database.pool().clone());
+    let credit_email_thresholds = std::env::var("CREDIT_EMAIL_THRESHOLDS")
+        .ok()
+        .map(|value| {
+            value
+                .split(',')
+                .filter_map(|part| part.trim().parse::<i16>().ok())
+                .collect::<Vec<_>>()
+        })
+        .filter(|values| !values.is_empty())
+        .unwrap_or_else(|| vec![20, 10, 0]);
+    let credit_email_repository =
+        database::repositories::credit_email_notification::CreditEmailNotificationRepository::new(
+            database.pool().clone(),
+            credit_email_thresholds,
+        );
+    let credit_email_sender = services::email::sender_from_config(&config.invitation_email)
+        .expect("Failed to initialize credit alert email sender");
+    let credit_frontend_url = config.invitation_email.frontend_base_url.clone();
     let discount_worker = tokio::spawn(async move {
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -127,6 +145,31 @@ async fn main() {
         loop {
             tokio::select! {
                 _ = interval.tick() => {
+                    match credit_email_repository.claim_crossings().await {
+                        Ok(candidates) => for candidate in candidates {
+                            let mut failed = false;
+                            for recipient_email in &candidate.recipient_emails {
+                                let email = services::email::CreditBalanceAlertEmail {
+                                    recipient_email: recipient_email.clone(), organization_name: candidate.organization_name.clone(),
+                                    credit_type: candidate.credit_type.clone(), remaining: candidate.remaining, limit: candidate.limit,
+                                    threshold_percent: candidate.threshold_percent,
+                                    credits_url: format!("{}/dashboard/organizations/{}/credits", credit_frontend_url.as_deref().unwrap_or("").trim_end_matches('/'), candidate.organization_id),
+                                };
+                                match credit_email_sender.send_credit_balance_alert(&email).await {
+                                    Ok(services::email::EmailDeliveryOutcome::Sent { .. }) => {}
+                                    Ok(services::email::EmailDeliveryOutcome::Skipped) => failed = true,
+                                    Err(error) => {
+                                        failed = true;
+                                        tracing::warn!(organization_id = %candidate.organization_id, credit_type = %candidate.credit_type, error = %error.sanitized_message(), "Failed to send credit balance alert");
+                                    }
+                                }
+                            }
+                            if failed {
+                                let _ = credit_email_repository.release_claim(candidate.organization_id, &candidate.credit_type, candidate.threshold_percent).await;
+                            }
+                        },
+                        Err(error) => tracing::error!(%error, "Failed to scan credit alert thresholds"),
+                    }
                     while jobs.len() < 2 {
                         match discount_repository.claim_next().await {
                             Ok(Some(claim)) => {

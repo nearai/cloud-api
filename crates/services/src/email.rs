@@ -58,6 +58,17 @@ pub struct InvitationEmail {
 }
 
 #[derive(Debug, Clone)]
+pub struct CreditBalanceAlertEmail {
+    pub recipient_email: String,
+    pub organization_name: String,
+    pub credit_type: String,
+    pub remaining: i64,
+    pub limit: i64,
+    pub threshold_percent: i16,
+    pub credits_url: String,
+}
+
+#[derive(Debug, Clone)]
 pub struct ModelDeprecationEmail {
     pub recipient_email: String,
     pub model_id: String,
@@ -150,6 +161,13 @@ pub trait EmailSender: Send + Sync {
         &self,
         email: &ContactEmailVerificationEmail,
     ) -> Result<EmailDeliveryOutcome, EmailError>;
+
+    async fn send_credit_balance_alert(
+        &self,
+        _email: &CreditBalanceAlertEmail,
+    ) -> Result<EmailDeliveryOutcome, EmailError> {
+        Ok(EmailDeliveryOutcome::Skipped)
+    }
 }
 
 pub struct NoopEmailSender;
@@ -383,6 +401,30 @@ impl EmailSender for ResendEmailSender {
             message_id: Some(response.id),
         })
     }
+
+    async fn send_credit_balance_alert(
+        &self,
+        email: &CreditBalanceAlertEmail,
+    ) -> Result<EmailDeliveryOutcome, EmailError> {
+        let rendered = render_credit_balance_alert_email(email);
+        let response = self
+            .transport
+            .send_email(
+                &self.api_key,
+                ResendSendEmailRequest {
+                    from: self.from_email.clone(),
+                    to: vec![email.recipient_email.clone()],
+                    subject: rendered.subject,
+                    html: rendered.html_body,
+                    text: rendered.text_body,
+                    reply_to: self.reply_to.clone(),
+                },
+            )
+            .await?;
+        Ok(EmailDeliveryOutcome::Sent {
+            message_id: Some(response.id),
+        })
+    }
 }
 
 pub fn sender_from_config(
@@ -476,6 +518,36 @@ pub fn render_invitation_email(email: &InvitationEmail) -> RenderedEmail {
         url = email.invitations_url,
     );
 
+    RenderedEmail {
+        subject,
+        html_body,
+        text_body,
+    }
+}
+
+pub fn render_credit_balance_alert_email(email: &CreditBalanceAlertEmail) -> RenderedEmail {
+    let exhausted = email.remaining == 0;
+    let heading = if exhausted {
+        "Organization credits exhausted"
+    } else {
+        "Organization credits running low"
+    };
+    let subject = format!("{heading}: {}", email.organization_name);
+    let remaining = format!("${:.2}", email.remaining as f64 / 1_000_000_000.0);
+    let limit = format!("${:.2}", email.limit as f64 / 1_000_000_000.0);
+    let html_body = format!(
+        r#"<!doctype html><html lang="en"><body style="font-family:Arial,sans-serif;line-height:1.5;color:#111827;">
+<h1 style="font-size:20px;margin-bottom:16px;">{heading}</h1><p><strong>{organization}</strong> has {remaining} of {limit} {credit_type} credits remaining (the {threshold}% threshold).</p><p><a href="{url}">Review credits and billing</a></p></body></html>"#,
+        heading = escape_html(heading),
+        organization = escape_html(&email.organization_name),
+        remaining = escape_html(&remaining),
+        limit = escape_html(&limit),
+        credit_type = escape_html(&email.credit_type),
+        threshold = email.threshold_percent,
+        url = escape_html(&email.credits_url)
+    );
+    let text_body = format!("{heading}\n\n{organization} has {remaining} of {limit} {credit_type} credits remaining (the {threshold}% threshold).\n\nReview credits and billing: {url}\n",
+        organization = email.organization_name, credit_type = email.credit_type, threshold = email.threshold_percent, url = email.credits_url);
     RenderedEmail {
         subject,
         html_body,
@@ -1269,5 +1341,21 @@ mod tests {
         };
 
         assert!(error.sanitized_message().contains("RESEND_API_KEY"));
+    }
+
+    #[test]
+    fn exhausted_credit_email_names_source_and_zero_balance() {
+        let rendered = render_credit_balance_alert_email(&CreditBalanceAlertEmail {
+            recipient_email: "owner@example.com".into(),
+            organization_name: "Example".into(),
+            credit_type: "payment".into(),
+            remaining: 0,
+            limit: 10_000_000_000,
+            threshold_percent: 0,
+            credits_url: "https://cloud.example.com/credits".into(),
+        });
+        assert!(rendered.subject.contains("exhausted"));
+        assert!(rendered.text_body.contains("payment"));
+        assert!(rendered.text_body.contains("$0.00"));
     }
 }

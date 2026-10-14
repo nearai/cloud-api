@@ -1823,6 +1823,16 @@ impl OrganizationServiceTrait for OrganizationServiceImpl {
             .await
     }
 
+    async fn get_user_for_notification(
+        &self,
+        user_id: UserId,
+    ) -> Result<Option<crate::auth::ports::User>, OrganizationError> {
+        self.user_repository
+            .get_by_id(user_id)
+            .await
+            .map_err(|error| OrganizationError::InternalError(error.to_string()))
+    }
+
     async fn invite_members_by_email(
         &self,
         organization_id: OrganizationId,

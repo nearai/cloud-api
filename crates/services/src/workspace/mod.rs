@@ -60,12 +60,17 @@ impl WorkspaceServiceImpl {
         let Some(base_url) = self.frontend_base_url.as_deref() else {
             return;
         };
+        let member_count = self
+            .organization_service
+            .get_member_count(organization.id.clone(), requester_id.clone())
+            .await
+            .unwrap_or(1000);
         let Ok(members) = self
             .organization_service
             .get_members_with_users_paginated(
                 organization.id.clone(),
                 requester_id.clone(),
-                1000,
+                member_count.max(1),
                 0,
             )
             .await
@@ -82,14 +87,32 @@ impl WorkspaceServiceImpl {
                     .clone()
                     .unwrap_or_else(|| member.user.username.clone())
             });
-        for member in members.iter().filter(|member| {
-            member.user_id == key.created_by_user_id
-                || matches!(member.role, MemberRole::Owner | MemberRole::Admin)
-        }) {
+        let creator_is_member = members
+            .iter()
+            .any(|member| member.user_id == key.created_by_user_id);
+        let creator = if creator_is_member {
+            None
+        } else {
+            self.organization_service
+                .get_user_for_notification(key.created_by_user_id.clone())
+                .await
+                .ok()
+                .flatten()
+                .filter(|user| user.is_active)
+        };
+        let recipients = members
+            .iter()
+            .filter(|member| {
+                member.user_id == key.created_by_user_id
+                    || matches!(member.role, MemberRole::Owner | MemberRole::Admin)
+            })
+            .map(|member| &member.user)
+            .chain(creator.iter());
+        for user in recipients {
             let Some(recipient_email) = deliverable_email(
-                &member.user.email,
-                member.user.contact_email.as_deref(),
-                member.user.contact_email_verified_at,
+                &user.email,
+                user.contact_email.as_deref(),
+                user.contact_email_verified_at,
             ) else {
                 continue;
             };

@@ -821,9 +821,19 @@ impl OrganizationServiceImpl {
             member_id,
             updated.previous_role.clone(),
             updated.member.role.clone(),
-            changed_by_user_id,
+            changed_by_user_id.clone(),
         )
         .await;
+        for change in &updated.additional_changes {
+            self.send_member_permission_changed_email(
+                &org,
+                change.user_id.clone(),
+                change.previous_role.clone(),
+                change.new_role.clone(),
+                changed_by_user_id.clone(),
+            )
+            .await;
+        }
         Ok(updated)
     }
 

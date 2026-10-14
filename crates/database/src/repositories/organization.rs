@@ -1092,7 +1092,7 @@ impl OrganizationRepository for PgOrganizationRepository {
             .to_string()
             .to_lowercase();
 
-        let (row, previous_role) = retry_db!("update_member_role_with_audit", {
+        let update = retry_db!("update_member_role_with_audit", {
             let mut client = self
                 .pool
                 .get()
@@ -1129,6 +1129,7 @@ impl OrganizationRepository for PgOrganizationRepository {
                 ));
             }
 
+            let mut demoted_owner_ids = Vec::new();
             let row = if previous_role == new_role {
                 current
             } else if new_role == "owner" {
@@ -1153,6 +1154,7 @@ impl OrganizationRepository for PgOrganizationRepository {
                     .iter()
                     .map(|owner| owner.get::<_, Uuid>("user_id"))
                     .collect::<Vec<_>>();
+                demoted_owner_ids.clone_from(&current_owner_ids);
 
                 transaction
                     .execute(
@@ -1236,8 +1238,9 @@ impl OrganizationRepository for PgOrganizationRepository {
             };
 
             transaction.commit().await.map_err(map_db_error)?;
-            Ok((row, previous_role))
+            Ok((row, previous_role, demoted_owner_ids))
         })?;
+        let (row, previous_role, demoted_owner_ids) = update;
 
         let previous_role = self
             .role_str_to_domain_role(&previous_role)
@@ -1250,6 +1253,14 @@ impl OrganizationRepository for PgOrganizationRepository {
         Ok(OrganizationMemberRoleUpdate {
             member,
             previous_role,
+            additional_changes: demoted_owner_ids
+                .into_iter()
+                .map(|user_id| OrganizationMemberRoleChange {
+                    user_id: UserId(user_id),
+                    previous_role: MemberRole::Owner,
+                    new_role: MemberRole::Admin,
+                })
+                .collect(),
         })
     }
 

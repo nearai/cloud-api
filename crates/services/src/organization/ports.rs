@@ -79,6 +79,14 @@ pub struct OrganizationMember {
 pub struct OrganizationMemberRoleUpdate {
     pub member: OrganizationMember,
     pub previous_role: MemberRole,
+    pub additional_changes: Vec<OrganizationMemberRoleChange>,
+}
+
+#[derive(Debug, Clone)]
+pub struct OrganizationMemberRoleChange {
+    pub user_id: UserId,
+    pub previous_role: MemberRole,
+    pub new_role: MemberRole,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

@@ -57,6 +57,13 @@ pub struct InvitationEmail {
     pub invitations_url: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MembershipRemovalKind {
+    Voluntary,
+    OrganizationAdministrator,
+    PlatformAdministrator,
+}
+
 #[derive(Debug, Clone)]
 pub struct MembershipRemovedEmail {
     pub recipient_email: String,
@@ -64,7 +71,7 @@ pub struct MembershipRemovedEmail {
     pub previous_role: String,
     pub removed_at: DateTime<Utc>,
     pub actor_name: Option<String>,
-    pub voluntary: bool,
+    pub removal_kind: MembershipRemovalKind,
 }
 
 #[derive(Debug, Clone)]
@@ -526,18 +533,22 @@ pub fn render_invitation_email(email: &InvitationEmail) -> RenderedEmail {
 
 pub fn render_membership_removed_email(email: &MembershipRemovedEmail) -> RenderedEmail {
     let removed_at = email.removed_at.format("%B %-d, %Y at %H:%M UTC");
-    let (subject, heading, explanation) = if email.voluntary {
-        (
+    let (subject, heading, explanation) = match email.removal_kind {
+        MembershipRemovalKind::Voluntary => (
             format!("You left {}", email.organization_name),
             "Organization membership ended",
             "You left this organization.",
-        )
-    } else {
-        (
+        ),
+        MembershipRemovalKind::OrganizationAdministrator => (
             format!("Your access to {} was removed", email.organization_name),
             "Organization access removed",
-            "An administrator removed your access to this organization.",
-        )
+            "An organization administrator removed your access to this organization.",
+        ),
+        MembershipRemovalKind::PlatformAdministrator => (
+            format!("Your access to {} was removed", email.organization_name),
+            "Organization access removed",
+            "A NEAR AI Cloud administrator removed your access to this organization.",
+        ),
     };
     let actor = email.actor_name.as_deref().unwrap_or("an administrator");
     let html_body = format!(
@@ -552,7 +563,7 @@ pub fn render_membership_removed_email(email: &MembershipRemovedEmail) -> Render
         organization = escape_html(&email.organization_name),
         role = escape_html(&email.previous_role),
         removed_at = escape_html(&removed_at.to_string()),
-        actor_line = if email.voluntary {
+        actor_line = if matches!(email.removal_kind, MembershipRemovalKind::Voluntary) {
             String::new()
         } else {
             format!("Changed by: {}", escape_html(actor))
@@ -560,7 +571,7 @@ pub fn render_membership_removed_email(email: &MembershipRemovedEmail) -> Render
     );
     let text_body = format!("{heading}\n\n{explanation}\n\nOrganization: {organization}\nPrevious role: {role}\nTime: {removed_at}\n{actor_line}\n\nIf this was unexpected, contact your organization administrator or NEAR AI Cloud support.\n",
         organization = email.organization_name, role = email.previous_role,
-        actor_line = if email.voluntary { String::new() } else { format!("Changed by: {actor}") });
+        actor_line = if matches!(email.removal_kind, MembershipRemovalKind::Voluntary) { String::new() } else { format!("Changed by: {actor}") });
     RenderedEmail {
         subject,
         html_body,
@@ -1364,9 +1375,24 @@ mod tests {
             previous_role: "member".into(),
             removed_at: Utc::now(),
             actor_name: None,
-            voluntary: true,
+            removal_kind: MembershipRemovalKind::Voluntary,
         });
         assert!(rendered.text_body.contains("You left this organization"));
         assert!(!rendered.text_body.contains("administrator removed"));
+    }
+
+    #[test]
+    fn platform_admin_membership_email_names_platform_action() {
+        let rendered = render_membership_removed_email(&MembershipRemovedEmail {
+            recipient_email: "member@example.com".into(),
+            organization_name: "Example".into(),
+            previous_role: "member".into(),
+            removed_at: Utc::now(),
+            actor_name: Some("Support".into()),
+            removal_kind: MembershipRemovalKind::PlatformAdministrator,
+        });
+        assert!(rendered
+            .text_body
+            .contains("NEAR AI Cloud administrator removed your access"));
     }
 }

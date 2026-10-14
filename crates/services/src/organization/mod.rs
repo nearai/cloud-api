@@ -2,8 +2,8 @@ pub mod ports;
 use super::auth::ports::{UserId, UserRepository};
 use super::common::RepositoryError;
 use crate::email::{
-    deliverable_email, EmailDeliveryOutcome, EmailSender, InvitationEmail, MembershipRemovedEmail,
-    NoopEmailSender,
+    deliverable_email, EmailDeliveryOutcome, EmailSender, InvitationEmail, MembershipRemovalKind,
+    MembershipRemovedEmail, NoopEmailSender,
 };
 use anyhow::Result;
 use async_trait::async_trait;
@@ -398,7 +398,11 @@ impl OrganizationServiceImpl {
                     member_id.clone(),
                     member.role,
                     requester_id.clone(),
-                    requester_id == member_id,
+                    if requester_id == member_id {
+                        MembershipRemovalKind::Voluntary
+                    } else {
+                        MembershipRemovalKind::OrganizationAdministrator
+                    },
                 )
                 .await;
             }
@@ -412,7 +416,7 @@ impl OrganizationServiceImpl {
         member_id: UserId,
         previous_role: MemberRole,
         actor_id: UserId,
-        voluntary: bool,
+        removal_kind: MembershipRemovalKind,
     ) {
         let Ok(Some(user)) = self.user_repository.get_by_id(member_id.clone()).await else {
             return;
@@ -424,7 +428,7 @@ impl OrganizationServiceImpl {
         ) else {
             return;
         };
-        let actor_name = if voluntary {
+        let actor_name = if matches!(removal_kind, MembershipRemovalKind::Voluntary) {
             None
         } else {
             self.user_repository
@@ -440,7 +444,7 @@ impl OrganizationServiceImpl {
             previous_role: previous_role.to_string(),
             removed_at: chrono::Utc::now(),
             actor_name,
-            voluntary,
+            removal_kind,
         };
         if let Err(error) = self.email_sender.send_membership_removed(&email).await {
             tracing::warn!(organization_id = %org.id.0, member_id = %member_id.0, error = %error.sanitized_message(), "Failed to send membership removal email");

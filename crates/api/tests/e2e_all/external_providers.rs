@@ -1012,3 +1012,188 @@ async fn test_external_model_history_records_provider_config() {
         "Should have history entries for creation and update"
     );
 }
+
+/// Gemini usage as Google reports it for a thinking model with a cache hit:
+/// thinking sits outside `candidatesTokenCount`, and the cached part is
+/// inside `promptTokenCount`.
+fn gemini_thinking_usage_metadata(candidates: i32) -> serde_json::Value {
+    serde_json::json!({
+        "promptTokenCount": 5000,
+        "cachedContentTokenCount": 4096,
+        "candidatesTokenCount": candidates,
+        "thoughtsTokenCount": 2706,
+        "totalTokenCount": 5000 + candidates + 2706
+    })
+}
+
+/// Run one chat completion through the real Gemini backend against a stand-in
+/// for Google's API, and return the client-visible usage plus the recorded
+/// usage entry.
+async fn gemini_thinking_completion(
+    stream: bool,
+) -> (
+    serde_json::Value,
+    api::routes::usage::UsageHistoryEntryResponse,
+) {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let (server, _pool, _mock, _db) = setup_test_server_with_pool_and_config(|config| {
+        config.external_providers.timeout_seconds = 5;
+    })
+    .await;
+    let upstream = MockServer::start().await;
+    let upstream_model = format!("gemini-thinking-billing-{}", uuid::Uuid::new_v4());
+
+    Mock::given(method("POST"))
+        .and(path(format!("/models/{upstream_model}:generateContent")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "candidates": [{
+                "content": {"role": "model", "parts": [{"text": "42"}]},
+                "finishReason": "STOP"
+            }],
+            "usageMetadata": gemini_thinking_usage_metadata(26)
+        })))
+        .mount(&upstream)
+        .await;
+    let sse = format!(
+        "data: {}\n\ndata: {}\n\n",
+        serde_json::json!({
+            "candidates": [{"content": {"role": "model", "parts": [{"text": "4"}]}}],
+            "usageMetadata": gemini_thinking_usage_metadata(1)
+        }),
+        serde_json::json!({
+            "candidates": [{
+                "content": {"role": "model", "parts": [{"text": "2"}]},
+                "finishReason": "STOP"
+            }],
+            "usageMetadata": gemini_thinking_usage_metadata(26)
+        }),
+    );
+    Mock::given(method("POST"))
+        .and(path(format!(
+            "/models/{upstream_model}:streamGenerateContent"
+        )))
+        .respond_with(ResponseTemplate::new(200).set_body_raw(sse, "text/event-stream"))
+        .mount(&upstream)
+        .await;
+
+    // gemini-2.5-pro prices, in nano-USD per token.
+    let model_name = format!("google/{upstream_model}");
+    let mut batch = BatchUpdateModelApiRequest::new();
+    batch.insert(
+        model_name.clone(),
+        serde_json::from_value(serde_json::json!({
+            "inputCostPerToken": {"amount": 1250, "currency": "USD"},
+            "outputCostPerToken": {"amount": 10000, "currency": "USD"},
+            "cacheReadCostPerToken": {"amount": 125, "currency": "USD"},
+            "modelDisplayName": "Gemini thinking billing test",
+            "modelDescription": "Gemini thinking billing test",
+            "contextLength": 1000000,
+            "maxOutputLength": 65536,
+            "verifiable": false,
+            "isActive": true,
+            "providerType": "external",
+            "providerConfig": {
+                "backend": "gemini",
+                "base_url": upstream.uri(),
+                "api_key": "synthetic-test-key"
+            },
+            "attestationSupported": false
+        }))
+        .unwrap(),
+    );
+    admin_batch_upsert_models(&server, batch, get_session_id()).await;
+
+    let org = setup_org_with_credits(&server, 10_000_000_000i64).await;
+    let api_key = get_api_key_for_org(&server, org.id.clone()).await;
+
+    let response = server
+        .post("/v1/chat/completions")
+        .add_header("Authorization", format!("Bearer {api_key}"))
+        .json(&serde_json::json!({
+            "model": model_name,
+            "messages": [{"role": "user", "content": "What is 6 times 7?"}],
+            "stream": stream,
+            "stream_options": if stream {
+                serde_json::json!({"include_usage": true})
+            } else {
+                serde_json::Value::Null
+            }
+        }))
+        .await;
+    assert_eq!(
+        response.status_code(),
+        200,
+        "chat completion should succeed: {}",
+        response.text()
+    );
+
+    let client_usage = if stream {
+        response
+            .text()
+            .lines()
+            .filter_map(|line| line.strip_prefix("data: "))
+            .filter(|data| data.trim() != "[DONE]")
+            .filter_map(|data| serde_json::from_str::<serde_json::Value>(data).ok())
+            .filter_map(|chunk| chunk.get("usage").filter(|usage| !usage.is_null()).cloned())
+            .next_back()
+            .expect("stream should carry a usage chunk")
+    } else {
+        response.json::<serde_json::Value>()["usage"].clone()
+    };
+
+    // Usage is recorded asynchronously.
+    tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+    let history = server
+        .get(&format!(
+            "/v1/organizations/{}/usage/history?limit=1&offset=0",
+            org.id
+        ))
+        .add_header("Authorization", format!("Bearer {}", get_session_id()))
+        .add_header("User-Agent", MOCK_USER_AGENT)
+        .await;
+    assert_eq!(history.status_code(), 200, "usage history should succeed");
+    let history: api::routes::usage::UsageHistoryResponse = history.json();
+    let entry = history
+        .data
+        .into_iter()
+        .next()
+        .expect("should have a usage history entry");
+
+    (client_usage, entry)
+}
+
+/// Gemini thinking tokens are billed at the output rate and cached prompt
+/// tokens at the cache-read rate, on both the non-streaming and streaming
+/// paths. Before the fix the request below was billed for 26 output tokens
+/// instead of 2,732.
+#[tokio::test]
+async fn test_gemini_thinking_and_cached_tokens_are_billed() {
+    for stream in [false, true] {
+        let (client_usage, entry) = gemini_thinking_completion(stream).await;
+
+        assert_eq!(
+            client_usage,
+            serde_json::json!({
+                "prompt_tokens": 5000,
+                "completion_tokens": 2732,
+                "total_tokens": 7732,
+                "prompt_tokens_details": {"cached_tokens": 4096},
+                "completion_tokens_details": {"reasoning_tokens": 2706}
+            }),
+            "client-visible usage (stream={stream})"
+        );
+
+        assert_eq!(entry.input_tokens, 5000, "stream={stream}");
+        assert_eq!(entry.cache_read_tokens, 4096, "stream={stream}");
+        assert_eq!(entry.output_tokens, 2732, "stream={stream}");
+        assert_eq!(entry.total_tokens, 7732, "stream={stream}");
+        // 904 uncached input + 4,096 cached input + 2,732 output.
+        assert_eq!(
+            entry.total_cost,
+            904 * 1250 + 4096 * 125 + 2732 * 10000,
+            "stream={stream}"
+        );
+    }
+}

@@ -1,7 +1,127 @@
-// E2E tests for OAuth frontend_callback redirect logic
+// OAuth callback state and cross-provider account conflicts.
 
 use crate::common::*;
 use database::OAuthStateRepository;
+use services::auth::{AuthError, AuthServiceTrait, OAuthUserInfo};
+use std::sync::Arc;
+
+fn oauth_info(provider: &str, email: &str) -> OAuthUserInfo {
+    OAuthUserInfo {
+        provider: provider.into(),
+        provider_user_id: uuid::Uuid::new_v4().to_string(),
+        email: email.into(),
+        username: email.split('@').next().unwrap().into(),
+        display_name: Some(format!("{provider} profile")),
+        avatar_url: None,
+    }
+}
+
+fn real_auth(db: &Arc<database::Database>) -> Arc<dyn AuthServiceTrait> {
+    let mut config = test_config();
+    config.auth.mock = false;
+    api::init_auth_services(db.clone(), &config).auth_service
+}
+
+async fn assert_single_oauth_account(db: &database::Database, user_id: uuid::Uuid, email: &str) {
+    let client = db.pool().get().await.unwrap();
+    let row = client
+        .query_one(
+            "SELECT
+                (SELECT count(*) FROM users WHERE email = $2) AS users,
+                (SELECT count(*) FROM organization_members WHERE user_id = $1) AS organizations,
+                (SELECT count(*) FROM workspaces WHERE created_by_user_id = $1) AS workspaces,
+                (SELECT count(*) FROM refresh_tokens WHERE user_id = $1) AS sessions",
+            &[&user_id, &email],
+        )
+        .await
+        .unwrap();
+    assert_eq!(row.get::<_, i64>("users"), 1);
+    assert_eq!(row.get::<_, i64>("organizations"), 1);
+    assert_eq!(row.get::<_, i64>("workspaces"), 1);
+    assert_eq!(row.get::<_, i64>("sessions"), 0);
+}
+
+#[tokio::test]
+async fn oauth_email_conflict_preserves_original_account_in_both_directions() {
+    let (_server, db) = setup_test_server_with_database().await;
+    let auth = real_auth(&db);
+    let users = database::repositories::UserRepository::new(db.pool().clone());
+
+    for (original, incoming) in [("github", "google"), ("google", "github")] {
+        let email = format!("oauth-conflict-{}@example.test", uuid::Uuid::new_v4());
+        let original_info = oauth_info(original, &email);
+        let existing = auth
+            .get_or_create_oauth_user(original_info.clone())
+            .await
+            .unwrap();
+        let incoming_info = oauth_info(incoming, &email);
+
+        for _ in 0..2 {
+            let error = auth
+                .get_or_create_oauth_user(incoming_info.clone())
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(error, AuthError::OAuthProviderConflict { existing_provider }
+                if existing_provider == original)
+            );
+        }
+        assert!(users
+            .get_by_provider(incoming, &incoming_info.provider_user_id)
+            .await
+            .unwrap()
+            .is_none());
+        let stored = users.get_by_id(existing.id.0).await.unwrap().unwrap();
+        assert_eq!(stored.auth_provider, original);
+        assert_eq!(stored.provider_user_id, original_info.provider_user_id);
+        assert_eq!(stored.display_name, existing.display_name);
+        assert!(stored.last_login_at.is_none());
+        assert_single_oauth_account(&db, existing.id.0, &email).await;
+
+        // The original sign-in method remains usable after the rejected logins.
+        let signed_in = auth.get_or_create_oauth_user(original_info).await.unwrap();
+        assert_eq!(signed_in.id, existing.id);
+    }
+}
+
+#[tokio::test]
+async fn oauth_concurrent_cross_provider_signup_creates_only_one_account() {
+    let (_server, db) = setup_test_server_with_database().await;
+    let auth = real_auth(&db);
+    let email = format!("oauth-race-{}@example.test", uuid::Uuid::new_v4());
+    let github = oauth_info("github", &email);
+    let google = oauth_info("google", &email);
+    let (github_result, google_result) = tokio::join!(
+        auth.get_or_create_oauth_user(github),
+        auth.get_or_create_oauth_user(google),
+    );
+    let (winner, error) = match (github_result, google_result) {
+        (Ok(user), Err(error)) | (Err(error), Ok(user)) => (user, error),
+        results => panic!("expected one account and one conflict, got {results:?}"),
+    };
+    assert!(
+        matches!(error, AuthError::OAuthProviderConflict { existing_provider }
+        if existing_provider == winner.auth_provider)
+    );
+    assert_single_oauth_account(&db, winner.id.0, &email).await;
+}
+
+#[tokio::test]
+async fn oauth_concurrent_same_identity_signup_reuses_the_account() {
+    let (_server, db) = setup_test_server_with_database().await;
+    let auth = real_auth(&db);
+    for provider in ["github", "google"] {
+        let email = format!("oauth-identity-race-{}@example.test", uuid::Uuid::new_v4());
+        let info = oauth_info(provider, &email);
+        let (first, second) = tokio::join!(
+            auth.get_or_create_oauth_user(info.clone()),
+            auth.get_or_create_oauth_user(info),
+        );
+        let first = first.unwrap();
+        assert_eq!(first.id, second.unwrap().id);
+        assert_single_oauth_account(&db, first.id.0, &email).await;
+    }
+}
 
 // ============================================
 // OAuth Frontend Callback Tests

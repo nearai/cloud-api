@@ -132,6 +132,18 @@ against an OAuth app whose callback URL is
 `http://localhost:3000/v1/auth/callback`. Visit `/v1/auth/login` to start
 the flow.
 
+Accounts are identified by their OAuth provider and provider user ID. Signing in
+with another identity that has the same email does not link accounts. The API
+returns `409` with `error: "oauth_provider_conflict"`, `existing_provider`, and an
+`error_description` naming the original sign-in method.
+
+When the login request includes an allowed `frontend_callback`, this conflict
+instead redirects to that callback with the same three fields in the URL
+fragment. Frontend callbacks should check `error` before reading tokens, display
+the description, and offer sign-in with `existing_provider`. Conflict responses
+contain no tokens and do not create a session. Other callback errors retain their
+existing response handling.
+
 ## 4. End-to-end walkthrough
 
 This sequence creates an organization, workspace, and API key with

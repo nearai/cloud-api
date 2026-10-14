@@ -144,6 +144,9 @@ pub enum AuthError {
     #[error("User not found")]
     UserNotFound,
 
+    #[error("This email is already registered with {existing_provider}")]
+    OAuthProviderConflict { existing_provider: String },
+
     #[error("Internal error: {0}")]
     InternalError(String),
 

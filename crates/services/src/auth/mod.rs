@@ -308,6 +308,8 @@ impl AuthServiceTrait for AuthService {
             return self.sync_existing_oauth_user(user, &oauth_info).await;
         }
 
+        self.check_oauth_email_conflict(&oauth_info).await?;
+
         // Create new user
         let creation = self
             .user_repository
@@ -334,6 +336,15 @@ impl AuthServiceTrait for AuthService {
                     })?
                 {
                     return self.sync_existing_oauth_user(user, &oauth_info).await;
+                }
+                // The email may have been claimed after the preflight lookup.
+                // Only classify a uniqueness failure as a possible email conflict;
+                // infrastructure failures must remain internal errors.
+                if matches!(
+                    error.downcast_ref::<crate::common::RepositoryError>(),
+                    Some(crate::common::RepositoryError::AlreadyExists)
+                ) {
+                    self.check_oauth_email_conflict(&oauth_info).await?;
                 }
                 return Err(AuthError::InternalError(format!(
                     "Failed to create user: {error}"
@@ -481,6 +492,29 @@ impl AuthServiceTrait for AuthService {
 }
 
 impl AuthService {
+    async fn check_oauth_email_conflict(
+        &self,
+        oauth_info: &OAuthUserInfo,
+    ) -> Result<(), AuthError> {
+        let existing = self
+            .user_repository
+            .get_by_email(&oauth_info.email)
+            .await
+            .map_err(|e| AuthError::InternalError(format!("Failed to check user email: {e}")))?;
+        if let Some(user) = existing {
+            // A matching identity may have been created concurrently. Let the
+            // insert/re-read path reuse it. Email alone never authenticates a user.
+            if user.auth_provider != oauth_info.provider
+                || user.provider_user_id != oauth_info.provider_user_id
+            {
+                return Err(AuthError::OAuthProviderConflict {
+                    existing_provider: user.auth_provider,
+                });
+            }
+        }
+        Ok(())
+    }
+
     async fn sync_existing_oauth_user(
         &self,
         user: User,
@@ -720,8 +754,12 @@ mod tests {
         last_login_updated: Mutex<bool>,
         profile_updated: Mutex<bool>,
         provider_lookups: Mutex<usize>,
+        creation_calls: Mutex<usize>,
         creation_race: bool,
         fallback_lookup_fails: bool,
+        email_lookup_fails: bool,
+        fallback_email_lookup_fails: bool,
+        creation_unavailable: bool,
     }
 
     impl MockUserRepo {
@@ -732,8 +770,12 @@ mod tests {
                 last_login_updated: Mutex::new(false),
                 profile_updated: Mutex::new(false),
                 provider_lookups: Mutex::new(0),
+                creation_calls: Mutex::new(0),
                 creation_race: false,
                 fallback_lookup_fails: false,
+                email_lookup_fails: false,
+                fallback_email_lookup_fails: false,
+                creation_unavailable: false,
             }
         }
     }
@@ -770,19 +812,39 @@ mod tests {
             _: String,
             _: String,
         ) -> anyhow::Result<User> {
-            Err(anyhow::anyhow!("test creation conflict"))
+            *self.creation_calls.lock().unwrap() += 1;
+            if self.creation_unavailable {
+                return Err(
+                    RepositoryError::ConnectionFailed("test database unavailable".into()).into(),
+                );
+            }
+            Err(anyhow::Error::new(RepositoryError::AlreadyExists)
+                .context("test creation conflict"))
         }
         async fn get_by_id(&self, id: UserId) -> anyhow::Result<Option<User>> {
             let user = self.user.lock().unwrap();
             Ok(user.as_ref().filter(|u| u.id == id).cloned())
         }
-        async fn get_by_email(&self, _: &str) -> anyhow::Result<Option<User>> {
-            unimplemented!()
+        async fn get_by_email(&self, email: &str) -> anyhow::Result<Option<User>> {
+            let created = *self.creation_calls.lock().unwrap() > 0;
+            if self.email_lookup_fails || (created && self.fallback_email_lookup_fails) {
+                return Err(anyhow::anyhow!("test email lookup unavailable"));
+            }
+            if self.creation_race && !created {
+                return Ok(None);
+            }
+            Ok(self
+                .user
+                .lock()
+                .unwrap()
+                .as_ref()
+                .filter(|u| u.email == email && u.is_active)
+                .cloned())
         }
         async fn get_by_provider(
             &self,
             auth_provider: &str,
-            _provider_user_id: &str,
+            provider_user_id: &str,
         ) -> anyhow::Result<Option<User>> {
             let mut calls = self.provider_lookups.lock().unwrap();
             *calls += 1;
@@ -795,7 +857,11 @@ mod tests {
             let user = self.user.lock().unwrap();
             Ok(user
                 .as_ref()
-                .filter(|u| u.auth_provider == auth_provider)
+                .filter(|u| {
+                    u.auth_provider == auth_provider
+                        && u.provider_user_id == provider_user_id
+                        && u.is_active
+                })
                 .cloned())
         }
         async fn update(
@@ -1530,7 +1596,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_returning_user_matched_by_provider_identity() {
-        let existing = make_user("alice@example.com", "google");
+        let mut existing = make_user("alice@example.com", "google");
+        existing.provider_user_id = "google-sub-123".into();
         let repo = Arc::new(MockUserRepo::with_user(existing.clone()));
         let service = build_auth_service(repo.clone());
 
@@ -1553,7 +1620,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_returning_user_email_changed_updates_email() {
-        let existing = make_user("old@example.com", "google");
+        let mut existing = make_user("old@example.com", "google");
+        existing.provider_user_id = "google-sub-456".into();
         let repo = Arc::new(MockUserRepo::with_user(existing.clone()));
         let service = build_auth_service(repo.clone());
 
@@ -1590,7 +1658,8 @@ mod tests {
 
     #[tokio::test]
     async fn creation_race_reuses_identity_and_syncs_last_login_and_profile() {
-        let existing = make_user("old@near", "near");
+        let mut existing = make_user("old@near", "near");
+        existing.provider_user_id = "alice.near".into();
         let repo = Arc::new(MockUserRepo::creation_failure(Some(existing.clone())));
         let service = build_auth_service(repo.clone());
         let result = service
@@ -1626,6 +1695,146 @@ mod tests {
             .await
             .unwrap_err();
         assert!(error.to_string().contains("test lookup unavailable"));
+    }
+
+    fn oauth_info(provider: &str) -> OAuthUserInfo {
+        OAuthUserInfo {
+            provider: provider.into(),
+            provider_user_id: format!("{provider}-alice"),
+            email: "alice@example.com".into(),
+            username: "alice".into(),
+            display_name: Some("New profile".into()),
+            avatar_url: Some("https://example.test/new-avatar".into()),
+        }
+    }
+
+    #[tokio::test]
+    async fn oauth_email_conflict_rejects_both_providers_without_mutating_account() {
+        for (original, incoming) in [("github", "google"), ("google", "github")] {
+            let existing = make_user("alice@example.com", original);
+            let repo = Arc::new(MockUserRepo::with_user(existing.clone()));
+            let error = build_auth_service(repo.clone())
+                .get_or_create_oauth_user(oauth_info(incoming))
+                .await
+                .unwrap_err();
+
+            assert!(
+                matches!(error, AuthError::OAuthProviderConflict { existing_provider }
+                if existing_provider == original)
+            );
+            assert_eq!(*repo.creation_calls.lock().unwrap(), 0);
+            assert!(!*repo.last_login_updated.lock().unwrap());
+            assert!(!*repo.profile_updated.lock().unwrap());
+            assert!(repo.email_updated.lock().unwrap().is_none());
+            let stored = repo.user.lock().unwrap().clone().unwrap();
+            assert_eq!(stored.id, existing.id);
+            assert_eq!(stored.auth_provider, original);
+            assert_eq!(stored.provider_user_id, existing.provider_user_id);
+            // Organization/workspace/session stubs panic if provisioning is attempted.
+        }
+    }
+
+    #[tokio::test]
+    async fn oauth_email_claimed_concurrently_returns_conflict_in_both_directions() {
+        for (original, incoming) in [("github", "google"), ("google", "github")] {
+            let repo = Arc::new(MockUserRepo::creation_failure(Some(make_user(
+                "alice@example.com",
+                original,
+            ))));
+            let error = build_auth_service(repo.clone())
+                .get_or_create_oauth_user(oauth_info(incoming))
+                .await
+                .unwrap_err();
+
+            assert!(
+                matches!(error, AuthError::OAuthProviderConflict { existing_provider }
+                if existing_provider == original)
+            );
+            assert_eq!(*repo.creation_calls.lock().unwrap(), 1);
+            assert_eq!(*repo.provider_lookups.lock().unwrap(), 2);
+            assert!(!*repo.last_login_updated.lock().unwrap());
+            assert!(!*repo.profile_updated.lock().unwrap());
+        }
+    }
+
+    #[tokio::test]
+    async fn oauth_same_identity_created_concurrently_is_reused_for_both_providers() {
+        for provider in ["github", "google"] {
+            let info = oauth_info(provider);
+            let mut existing = make_user(&info.email, provider);
+            existing.provider_user_id = info.provider_user_id.clone();
+            let repo = Arc::new(MockUserRepo::creation_failure(Some(existing.clone())));
+            let user = build_auth_service(repo.clone())
+                .get_or_create_oauth_user(info)
+                .await
+                .unwrap();
+
+            assert_eq!(user.id, existing.id);
+            assert_eq!(*repo.creation_calls.lock().unwrap(), 1);
+            assert!(*repo.last_login_updated.lock().unwrap());
+        }
+    }
+
+    #[tokio::test]
+    async fn oauth_email_does_not_authenticate_another_identity_on_the_same_provider() {
+        let repo = Arc::new(MockUserRepo::with_user(make_user(
+            "alice@example.com",
+            "github",
+        )));
+        let error = build_auth_service(repo.clone())
+            .get_or_create_oauth_user(oauth_info("github"))
+            .await
+            .unwrap_err();
+        assert!(matches!(error, AuthError::OAuthProviderConflict { .. }));
+        assert_eq!(*repo.creation_calls.lock().unwrap(), 0);
+        assert!(!*repo.last_login_updated.lock().unwrap());
+    }
+
+    #[tokio::test]
+    async fn oauth_existing_identity_is_resolved_before_email_lookup() {
+        let info = oauth_info("github");
+        let mut existing = make_user(&info.email, "github");
+        existing.provider_user_id = info.provider_user_id.clone();
+        let mut repo = MockUserRepo::with_user(existing.clone());
+        repo.email_lookup_fails = true;
+        let user = build_auth_service(Arc::new(repo))
+            .get_or_create_oauth_user(info)
+            .await
+            .unwrap();
+        assert_eq!(user.id, existing.id);
+    }
+
+    #[tokio::test]
+    async fn oauth_database_failure_is_not_misclassified_as_email_conflict() {
+        let mut repo =
+            MockUserRepo::creation_failure(Some(make_user("alice@example.com", "google")));
+        repo.creation_unavailable = true;
+        let error = build_auth_service(Arc::new(repo))
+            .get_or_create_oauth_user(oauth_info("github"))
+            .await
+            .unwrap_err();
+        assert!(matches!(error, AuthError::InternalError(ref message)
+            if message.contains("test database unavailable")));
+    }
+
+    #[tokio::test]
+    async fn oauth_email_lookup_failure_remains_internal_before_and_after_creation() {
+        for after_creation in [false, true] {
+            let mut repo = MockUserRepo::creation_failure(None);
+            repo.email_lookup_fails = !after_creation;
+            repo.fallback_email_lookup_fails = after_creation;
+            let repo = Arc::new(repo);
+            let error = build_auth_service(repo.clone())
+                .get_or_create_oauth_user(oauth_info("github"))
+                .await
+                .unwrap_err();
+            assert!(matches!(error, AuthError::InternalError(ref message)
+                if message.contains("test email lookup unavailable")));
+            assert_eq!(
+                *repo.creation_calls.lock().unwrap(),
+                usize::from(after_creation)
+            );
+        }
     }
 
     const TEST_ENCODING_KEY: &str = "test_encoding_key";

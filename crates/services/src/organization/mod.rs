@@ -1,7 +1,10 @@
 pub mod ports;
 use super::auth::ports::{UserId, UserRepository};
 use super::common::RepositoryError;
-use crate::email::{EmailDeliveryOutcome, EmailSender, InvitationEmail, NoopEmailSender};
+use crate::email::{
+    deliverable_email, EmailDeliveryOutcome, EmailSender, InvitationEmail,
+    MemberPermissionChangedEmail, NoopEmailSender,
+};
 use anyhow::Result;
 use async_trait::async_trait;
 pub use ports::*;
@@ -456,12 +459,28 @@ impl OrganizationServiceImpl {
             ));
         }
 
+        let previous = self
+            .repository
+            .get_member(organization_id.0, member_id.0)
+            .await
+            .map_err(Self::map_repository_error)?
+            .ok_or(OrganizationError::NotFound)?;
         let request = UpdateOrganizationMemberRequest { role: new_role };
 
-        self.repository
+        let updated = self
+            .repository
             .update_member(organization_id.0, member_id.0, request, requester_id.0)
             .await
-            .map_err(Self::map_repository_error)
+            .map_err(Self::map_repository_error)?;
+        self.send_member_permission_changed_email(
+            &org,
+            member_id,
+            previous.role,
+            updated.role.clone(),
+            requester_id,
+        )
+        .await;
+        Ok(updated)
     }
 
     /// Check if a user is a member of an organization (private helper)
@@ -780,7 +799,9 @@ impl OrganizationServiceImpl {
         new_role: MemberRole,
         changed_by_user_id: UserId,
     ) -> Result<ports::OrganizationMemberRoleUpdate, OrganizationError> {
-        self.repository
+        let org = self.get_organization_impl(organization_id.clone()).await?;
+        let updated = self
+            .repository
             .update_member_role_with_audit(
                 organization_id.0,
                 member_id.0,
@@ -794,7 +815,70 @@ impl OrganizationServiceImpl {
                     OrganizationError::InvalidParams(message)
                 }
                 error => Self::map_repository_error(error),
-            })
+            })?;
+        self.send_member_permission_changed_email(
+            &org,
+            member_id,
+            updated.previous_role.clone(),
+            updated.member.role.clone(),
+            changed_by_user_id,
+        )
+        .await;
+        Ok(updated)
+    }
+
+    async fn send_member_permission_changed_email(
+        &self,
+        org: &Organization,
+        member_id: UserId,
+        previous_role: MemberRole,
+        new_role: MemberRole,
+        actor_id: UserId,
+    ) {
+        if previous_role == new_role {
+            return;
+        }
+        let Some(base_url) = self
+            .invitations_url
+            .as_deref()
+            .and_then(|url| url.strip_suffix("/dashboard/invitations"))
+        else {
+            return;
+        };
+        let Ok(Some(user)) = self.user_repository.get_by_id(member_id.clone()).await else {
+            tracing::warn!(organization_id = %org.id.0, member_id = %member_id.0, "Unable to load member for role-change email");
+            return;
+        };
+        let Some(recipient_email) = deliverable_email(
+            &user.email,
+            user.contact_email.as_deref(),
+            user.contact_email_verified_at,
+        ) else {
+            return;
+        };
+        let actor_name = self
+            .user_repository
+            .get_by_id(actor_id)
+            .await
+            .ok()
+            .flatten()
+            .map(|actor| actor.display_name.unwrap_or(actor.username));
+        let email = MemberPermissionChangedEmail {
+            recipient_email: recipient_email.to_string(),
+            organization_name: org.name.clone(),
+            previous_role: previous_role.to_string(),
+            new_role: new_role.to_string(),
+            changed_at: chrono::Utc::now(),
+            actor_name,
+            members_url: format!("{base_url}/dashboard/organizations/{}/members", org.id.0),
+        };
+        if let Err(error) = self
+            .email_sender
+            .send_member_permission_changed(&email)
+            .await
+        {
+            tracing::warn!(organization_id = %org.id.0, member_id = %member_id.0, error = %error.sanitized_message(), "Failed to send member role-change email");
+        }
     }
 
     /// Remove member with last owner protection (private helper)

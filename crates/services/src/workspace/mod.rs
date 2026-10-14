@@ -5,7 +5,8 @@ use std::sync::Arc;
 
 use crate::auth::ports::UserId;
 use crate::common::RepositoryError;
-use crate::organization::{OrganizationId, OrganizationServiceTrait};
+use crate::email::{deliverable_email, EmailSender, NoopEmailSender, ResourceDeletedEmail};
+use crate::organization::{MemberRole, OrganizationId, OrganizationServiceTrait};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 
@@ -13,6 +14,7 @@ pub struct WorkspaceServiceImpl {
     workspace_repository: Arc<dyn WorkspaceRepository>,
     api_key_repository: Arc<dyn ApiKeyRepository>,
     organization_service: Arc<dyn OrganizationServiceTrait>,
+    email_sender: Arc<dyn EmailSender>,
 }
 
 impl WorkspaceServiceImpl {
@@ -21,10 +23,25 @@ impl WorkspaceServiceImpl {
         api_key_repository: Arc<dyn ApiKeyRepository>,
         organization_service: Arc<dyn OrganizationServiceTrait>,
     ) -> Self {
+        Self::new_with_email_sender(
+            workspace_repository,
+            api_key_repository,
+            organization_service,
+            Arc::new(NoopEmailSender),
+        )
+    }
+
+    pub fn new_with_email_sender(
+        workspace_repository: Arc<dyn WorkspaceRepository>,
+        api_key_repository: Arc<dyn ApiKeyRepository>,
+        organization_service: Arc<dyn OrganizationServiceTrait>,
+        email_sender: Arc<dyn EmailSender>,
+    ) -> Self {
         Self {
             workspace_repository,
             api_key_repository,
             organization_service,
+            email_sender,
         }
     }
 
@@ -484,14 +501,61 @@ impl WorkspaceServiceTrait for WorkspaceServiceImpl {
         requester_id: UserId,
     ) -> Result<bool, WorkspaceError> {
         // Check permissions
-        self.check_workspace_permission(workspace_id.clone(), requester_id)
+        let (workspace, organization) = self
+            .check_workspace_permission(workspace_id.clone(), requester_id.clone())
             .await?;
+        let members = self
+            .organization_service
+            .get_members_with_users_paginated(
+                organization.id.clone(),
+                requester_id.clone(),
+                1000,
+                0,
+            )
+            .await
+            .unwrap_or_default();
+        let actor_name = members
+            .iter()
+            .find(|member| member.user_id == requester_id)
+            .map(|member| {
+                member
+                    .user
+                    .display_name
+                    .clone()
+                    .unwrap_or_else(|| member.user.username.clone())
+            });
 
         // Delete the workspace
-        self.workspace_repository
+        let deleted = self
+            .workspace_repository
             .delete(workspace_id)
             .await
-            .map_err(Self::map_repository_error)
+            .map_err(Self::map_repository_error)?;
+        if deleted {
+            for member in members
+                .iter()
+                .filter(|member| matches!(member.role, MemberRole::Owner | MemberRole::Admin))
+            {
+                let Some(recipient_email) = deliverable_email(
+                    &member.user.email,
+                    member.user.contact_email.as_deref(),
+                    member.user.contact_email_verified_at,
+                ) else {
+                    continue;
+                };
+                let email = ResourceDeletedEmail {
+                    recipient_email: recipient_email.to_string(),
+                    organization_name: organization.name.clone(),
+                    workspace_name: Some(workspace.name.clone()),
+                    deleted_at: Utc::now(),
+                    actor_name: actor_name.clone(),
+                };
+                if let Err(error) = self.email_sender.send_resource_deleted(&email).await {
+                    tracing::warn!(workspace_id = %workspace.id.0, error = %error.sanitized_message(), "Failed to send workspace deletion email");
+                }
+            }
+        }
+        Ok(deleted)
     }
 
     async fn list_workspaces_for_user(

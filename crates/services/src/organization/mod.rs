@@ -1,7 +1,10 @@
 pub mod ports;
 use super::auth::ports::{UserId, UserRepository};
 use super::common::RepositoryError;
-use crate::email::{EmailDeliveryOutcome, EmailSender, InvitationEmail, NoopEmailSender};
+use crate::email::{
+    deliverable_email, EmailDeliveryOutcome, EmailSender, InvitationEmail, NoopEmailSender,
+    ResourceDeletedEmail,
+};
 use anyhow::Result;
 use async_trait::async_trait;
 pub use ports::*;
@@ -255,7 +258,35 @@ impl OrganizationServiceImpl {
             ));
         }
 
-        match self
+        let count = self.repository.get_member_count(id.0).await.unwrap_or(0);
+        let members = self
+            .repository
+            .list_members_paginated(id.0, count.max(1), 0)
+            .await
+            .unwrap_or_default();
+        let mut recipients = Vec::new();
+        for member in members
+            .iter()
+            .filter(|member| matches!(member.role, MemberRole::Owner | MemberRole::Admin))
+        {
+            if let Ok(Some(user)) = self.user_repository.get_by_id(member.user_id.clone()).await {
+                if let Some(address) = deliverable_email(
+                    &user.email,
+                    user.contact_email.as_deref(),
+                    user.contact_email_verified_at,
+                ) {
+                    recipients.push(address.to_string());
+                }
+            }
+        }
+        let actor_name = self
+            .user_repository
+            .get_by_id(user_id.clone())
+            .await
+            .ok()
+            .flatten()
+            .map(|actor| actor.display_name.unwrap_or(actor.username));
+        let result = match self
             .repository
             .delete_if_no_staking_farm_source(id.0, user_id.0)
             .await
@@ -272,7 +303,22 @@ impl OrganizationServiceImpl {
             DeleteOrganizationResult::StakingWalletBound => {
                 Err(OrganizationError::StakingWalletBound)
             }
+        }?;
+        if result {
+            for recipient_email in recipients {
+                let email = ResourceDeletedEmail {
+                    recipient_email,
+                    organization_name: org.name.clone(),
+                    workspace_name: None,
+                    deleted_at: chrono::Utc::now(),
+                    actor_name: actor_name.clone(),
+                };
+                if let Err(error) = self.email_sender.send_resource_deleted(&email).await {
+                    tracing::warn!(organization_id = %id.0, error = %error.sanitized_message(), "Failed to send organization deletion email");
+                }
+            }
         }
+        Ok(result)
     }
 
     /// List organizations accessible to a user (where they are a member, private helper)

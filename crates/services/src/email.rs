@@ -58,6 +58,15 @@ pub struct InvitationEmail {
 }
 
 #[derive(Debug, Clone)]
+pub struct ResourceDeletedEmail {
+    pub recipient_email: String,
+    pub organization_name: String,
+    pub workspace_name: Option<String>,
+    pub deleted_at: DateTime<Utc>,
+    pub actor_name: Option<String>,
+}
+
+#[derive(Debug, Clone)]
 pub struct ModelDeprecationEmail {
     pub recipient_email: String,
     pub model_id: String,
@@ -150,6 +159,13 @@ pub trait EmailSender: Send + Sync {
         &self,
         email: &ContactEmailVerificationEmail,
     ) -> Result<EmailDeliveryOutcome, EmailError>;
+
+    async fn send_resource_deleted(
+        &self,
+        _email: &ResourceDeletedEmail,
+    ) -> Result<EmailDeliveryOutcome, EmailError> {
+        Ok(EmailDeliveryOutcome::Skipped)
+    }
 }
 
 pub struct NoopEmailSender;
@@ -383,6 +399,30 @@ impl EmailSender for ResendEmailSender {
             message_id: Some(response.id),
         })
     }
+
+    async fn send_resource_deleted(
+        &self,
+        email: &ResourceDeletedEmail,
+    ) -> Result<EmailDeliveryOutcome, EmailError> {
+        let rendered = render_resource_deleted_email(email);
+        let response = self
+            .transport
+            .send_email(
+                &self.api_key,
+                ResendSendEmailRequest {
+                    from: self.from_email.clone(),
+                    to: vec![email.recipient_email.clone()],
+                    subject: rendered.subject,
+                    html: rendered.html_body,
+                    text: rendered.text_body,
+                    reply_to: self.reply_to.clone(),
+                },
+            )
+            .await?;
+        Ok(EmailDeliveryOutcome::Sent {
+            message_id: Some(response.id),
+        })
+    }
 }
 
 pub fn sender_from_config(
@@ -476,6 +516,38 @@ pub fn render_invitation_email(email: &InvitationEmail) -> RenderedEmail {
         url = email.invitations_url,
     );
 
+    RenderedEmail {
+        subject,
+        html_body,
+        text_body,
+    }
+}
+
+pub fn render_resource_deleted_email(email: &ResourceDeletedEmail) -> RenderedEmail {
+    let deleted_at = email.deleted_at.format("%B %-d, %Y at %H:%M UTC");
+    let actor = email.actor_name.as_deref().unwrap_or("An administrator");
+    let (subject, resource, impact) = match email.workspace_name.as_deref() {
+        Some(workspace) => (
+            format!("Workspace deleted: {workspace}"),
+            format!("Workspace: {workspace}"),
+            "API keys and resources associated with this workspace are no longer active.",
+        ),
+        None => (
+            format!("Organization deleted: {}", email.organization_name),
+            format!("Organization: {}", email.organization_name),
+            "Associated workspaces, API keys, and reporting tokens are no longer active.",
+        ),
+    };
+    let html_body = format!(
+        r#"<!doctype html><html lang="en"><body style="font-family:Arial,sans-serif;line-height:1.5;color:#111827;">
+<h1 style="font-size:20px;margin-bottom:16px;">Cloud resource deleted</h1><p>{resource}</p><p>Organization: {organization}<br>Deleted by: {actor}<br>Time: {deleted_at}</p><p>{impact}</p><p>If this was unexpected, contact NEAR AI Cloud support.</p></body></html>"#,
+        resource = escape_html(&resource),
+        organization = escape_html(&email.organization_name),
+        actor = escape_html(actor),
+        deleted_at = escape_html(&deleted_at.to_string()),
+        impact = escape_html(impact)
+    );
+    let text_body = format!("Cloud resource deleted\n\n{resource}\nOrganization: {organization}\nDeleted by: {actor}\nTime: {deleted_at}\n\n{impact}\n\nIf this was unexpected, contact NEAR AI Cloud support.\n", organization = email.organization_name);
     RenderedEmail {
         subject,
         html_body,
@@ -1269,5 +1341,18 @@ mod tests {
         };
 
         assert!(error.sanitized_message().contains("RESEND_API_KEY"));
+    }
+
+    #[test]
+    fn organization_deletion_email_explains_credential_impact() {
+        let rendered = render_resource_deleted_email(&ResourceDeletedEmail {
+            recipient_email: "owner@example.com".into(),
+            organization_name: "Example".into(),
+            workspace_name: None,
+            deleted_at: Utc::now(),
+            actor_name: Some("Owner".into()),
+        });
+        assert!(rendered.text_body.contains("API keys"));
+        assert!(rendered.text_body.contains("reporting tokens"));
     }
 }

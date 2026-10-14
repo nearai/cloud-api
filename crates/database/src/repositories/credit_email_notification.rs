@@ -68,13 +68,6 @@ impl CreditEmailNotificationRepository {
             let resource_id = format!("{organization_id}:{credit_type}");
             transaction.execute("DELETE FROM email_notification_deliveries WHERE event_type = 'credit_balance' AND resource_id = $1 AND event_key::SMALLINT < $2", &[&resource_id, &threshold]).await?;
             let event_key = threshold.to_string();
-            let inserted = transaction.query_opt(
-                "INSERT INTO email_notification_deliveries (event_type, resource_id, event_key) VALUES ('credit_balance', $1, $2) ON CONFLICT DO NOTHING RETURNING resource_id",
-                &[&resource_id, &event_key],
-            ).await?;
-            if inserted.is_none() {
-                continue;
-            }
             let recipients = transaction.query(r#"
                 SELECT CASE WHEN u.contact_email_verified_at IS NOT NULL THEN u.contact_email ELSE u.email END AS email
                 FROM organization_members om JOIN users u ON u.id = om.user_id
@@ -82,6 +75,20 @@ impl CreditEmailNotificationRepository {
                   AND (u.contact_email_verified_at IS NOT NULL OR u.email NOT LIKE '%@near')
                 ORDER BY lower(CASE WHEN u.contact_email_verified_at IS NOT NULL THEN u.contact_email ELSE u.email END)
             "#, &[&organization_id]).await?;
+            let mut recipient_emails = Vec::new();
+            for recipient in recipients {
+                let recipient_email: String = recipient.get("email");
+                let inserted = transaction.query_opt(
+                    "INSERT INTO email_notification_deliveries (event_type, resource_id, event_key, recipient_email) VALUES ('credit_balance', $1, $2, $3) ON CONFLICT DO NOTHING RETURNING resource_id",
+                    &[&resource_id, &event_key, &recipient_email],
+                ).await?;
+                if inserted.is_some() {
+                    recipient_emails.push(recipient_email);
+                }
+            }
+            if recipient_emails.is_empty() {
+                continue;
+            }
             candidates.push(CreditEmailCandidate {
                 organization_id,
                 organization_name: row.get("name"),
@@ -89,7 +96,7 @@ impl CreditEmailNotificationRepository {
                 remaining,
                 limit,
                 threshold_percent: threshold,
-                recipient_emails: recipients.into_iter().map(|r| r.get("email")).collect(),
+                recipient_emails,
             });
         }
         transaction.commit().await?;
@@ -101,11 +108,12 @@ impl CreditEmailNotificationRepository {
         organization_id: Uuid,
         credit_type: &str,
         threshold: i16,
+        recipient_email: &str,
     ) -> Result<()> {
         let client = self.pool.get().await?;
         let resource_id = format!("{organization_id}:{credit_type}");
         let event_key = threshold.to_string();
-        client.execute("DELETE FROM email_notification_deliveries WHERE event_type = 'credit_balance' AND resource_id = $1 AND event_key = $2", &[&resource_id, &event_key]).await?;
+        client.execute("DELETE FROM email_notification_deliveries WHERE event_type = 'credit_balance' AND resource_id = $1 AND event_key = $2 AND recipient_email = $3", &[&resource_id, &event_key, &recipient_email]).await?;
         Ok(())
     }
 }

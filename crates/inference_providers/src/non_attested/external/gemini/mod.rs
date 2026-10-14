@@ -95,7 +95,10 @@ fn convert_to_openai_response(
         }],
         service_tier: None,
         system_fingerprint: None,
-        usage: gemini_response.usage_metadata.to_token_usage(),
+        usage: gemini_response
+            .usage_metadata
+            .unwrap_or_default()
+            .to_token_usage(),
         prompt_logprobs: None,
         prompt_token_ids: None,
         kv_transfer_params: None,

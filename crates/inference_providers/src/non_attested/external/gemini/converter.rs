@@ -288,20 +288,22 @@ impl GeminiUsageMetadata {
     ///
     /// Thinking is also exposed as `completion_tokens_details.reasoning_tokens`
     /// and cache hits as `prompt_tokens_details.cached_tokens`; both are
-    /// omitted when zero.
+    /// omitted when zero. A negative count is treated as zero.
     pub fn to_token_usage(&self) -> TokenUsage {
         let thoughts = self.thoughts_token_count.max(0);
+        let cached = self.cached_content_token_count.max(0);
         let prompt_tokens = self
             .prompt_token_count
+            .max(0)
             .saturating_add(self.tool_use_prompt_token_count.max(0));
-        let completion_tokens = self.candidates_token_count.saturating_add(thoughts);
+        let completion_tokens = self.candidates_token_count.max(0).saturating_add(thoughts);
 
         TokenUsage {
             prompt_tokens,
             completion_tokens,
             total_tokens: prompt_tokens.saturating_add(completion_tokens),
-            prompt_tokens_details: (self.cached_content_token_count > 0)
-                .then(|| serde_json::json!({ "cached_tokens": self.cached_content_token_count })),
+            prompt_tokens_details: (cached > 0)
+                .then(|| serde_json::json!({ "cached_tokens": cached })),
             completion_tokens_details: (thoughts > 0).then(|| CompletionTokensDetails {
                 reasoning_tokens: Some(thoughts),
                 ..Default::default()
@@ -316,8 +318,10 @@ impl GeminiUsageMetadata {
 #[serde(rename_all = "camelCase")]
 pub struct GeminiResponse {
     pub candidates: Vec<GeminiCandidate>,
+    /// `None` when the event carried no `usageMetadata`, which is not the
+    /// same as zero usage.
     #[serde(default)]
-    pub usage_metadata: GeminiUsageMetadata,
+    pub usage_metadata: Option<GeminiUsageMetadata>,
 }
 
 // =============================================================================
@@ -984,8 +988,8 @@ pub struct GeminiParserState {
     pub request_id: String,
     pub created: i64,
     pub chunk_index: i64,
-    /// Usage from the latest event. Gemini restates cumulative counts on
-    /// every event, so the last one is the total for the request.
+    /// Usage from the latest event that reported it. Gemini restates
+    /// cumulative counts, so the last report is the total for the request.
     pub usage: TokenUsage,
 }
 
@@ -1025,8 +1029,11 @@ impl SSEEventParser for GeminiEventParser {
         let candidate = &response.candidates[0];
         let ctx = state.chunk_context();
 
-        // Update token counts
-        state.usage = response.usage_metadata.to_token_usage();
+        // Update token counts. An event without `usageMetadata` keeps the last
+        // reported counts; resetting them would bill the request as 0 tokens.
+        if let Some(usage_metadata) = &response.usage_metadata {
+            state.usage = usage_metadata.to_token_usage();
+        }
 
         let is_first = state.chunk_index == 0;
         state.chunk_index += 1;
@@ -2217,6 +2224,23 @@ mod tests {
         assert_eq!(usage.reasoning_tokens(), Some(120));
     }
 
+    #[test]
+    fn test_usage_treats_negative_counts_as_zero() {
+        let usage = token_usage(serde_json::json!({
+            "promptTokenCount": -1,
+            "cachedContentTokenCount": -2,
+            "candidatesTokenCount": -3,
+            "thoughtsTokenCount": -4,
+            "toolUsePromptTokenCount": -5
+        }));
+
+        assert_eq!(usage.prompt_tokens, 0);
+        assert_eq!(usage.completion_tokens, 0);
+        assert_eq!(usage.total_tokens, 0);
+        assert!(usage.prompt_tokens_details.is_none());
+        assert!(usage.completion_tokens_details.is_none());
+    }
+
     /// Tool-use prompt tokens sit outside `promptTokenCount` and are billed
     /// as input. Counts from Google's URL-context example.
     #[test]
@@ -2313,6 +2337,38 @@ mod tests {
         assert_eq!(usage.total_tokens, 11);
         assert!(usage.prompt_tokens_details.is_none());
         assert!(usage.completion_tokens_details.is_none());
+    }
+
+    /// Billing records the usage on the last chunk, so an event that omits
+    /// `usageMetadata` must not reset the counts reported before it.
+    #[test]
+    fn test_streaming_event_without_usage_keeps_last_counts() {
+        let mut state = GeminiParserState::new("gemini-2.5-pro".to_string());
+        parse_usage(
+            &mut state,
+            serde_json::json!({
+                "candidates": [{"content": {"role": "model", "parts": [{"text": "4"}]}}],
+                "usageMetadata": {
+                    "promptTokenCount": 71,
+                    "candidatesTokenCount": 26,
+                    "thoughtsTokenCount": 2706,
+                    "totalTokenCount": 2803
+                }
+            }),
+        );
+
+        let last = parse_usage(
+            &mut state,
+            serde_json::json!({
+                "candidates": [{
+                    "content": {"role": "model", "parts": [{"text": "2"}]},
+                    "finishReason": "STOP"
+                }]
+            }),
+        );
+        assert_eq!(last.prompt_tokens, 71);
+        assert_eq!(last.completion_tokens, 2732);
+        assert_eq!(last.total_tokens, 2803);
     }
 
     /// Tool calls go out on their own chunk type; it must carry the same usage.

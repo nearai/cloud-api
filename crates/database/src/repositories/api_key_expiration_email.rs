@@ -44,7 +44,7 @@ impl ApiKeyExpirationEmailRepository {
             JOIN organizations o ON o.id = w.organization_id
             WHERE k.expires_at IS NOT NULL AND k.expires_at <= NOW() + make_interval(days => $1)
               AND k.is_active = true AND k.deleted_at IS NULL AND w.is_active = true AND o.is_active = true
-            ORDER BY k.expires_at LIMIT 500
+            ORDER BY k.expires_at
         "#, &[&max_days]).await?;
         let mut candidates = Vec::new();
         for row in rows {
@@ -62,10 +62,6 @@ impl ApiKeyExpirationEmailRepository {
             };
             let resource_id = key_id.to_string();
             let event_key = format!("{}:{interval_days}", expires_at.to_rfc3339());
-            let claimed = tx.query_opt("INSERT INTO email_notification_deliveries (event_type, resource_id, event_key) VALUES ('api_key_expiration', $1, $2) ON CONFLICT DO NOTHING RETURNING resource_id", &[&resource_id, &event_key]).await?;
-            if claimed.is_none() {
-                continue;
-            }
             let organization_id: Uuid = row.get("organization_id");
             let recipients = tx.query(r#"
                 SELECT DISTINCT CASE WHEN u.contact_email_verified_at IS NOT NULL THEN u.contact_email ELSE u.email END AS email
@@ -75,6 +71,17 @@ impl ApiKeyExpirationEmailRepository {
                   AND (u.contact_email_verified_at IS NOT NULL OR u.email NOT LIKE '%@near')
                 ORDER BY email
             "#, &[&organization_id, &key_id]).await?;
+            let mut recipient_emails = Vec::new();
+            for recipient in recipients {
+                let recipient_email: String = recipient.get("email");
+                let claimed = tx.query_opt("INSERT INTO email_notification_deliveries (event_type, resource_id, event_key, recipient_email) VALUES ('api_key_expiration', $1, $2, $3) ON CONFLICT DO NOTHING RETURNING resource_id", &[&resource_id, &event_key, &recipient_email]).await?;
+                if claimed.is_some() {
+                    recipient_emails.push(recipient_email);
+                }
+            }
+            if recipient_emails.is_empty() {
+                continue;
+            }
             candidates.push(ApiKeyExpirationEmailCandidate {
                 api_key_id: key_id,
                 key_name: row.get("name"),
@@ -84,7 +91,7 @@ impl ApiKeyExpirationEmailRepository {
                 organization_name: row.get("organization_name"),
                 expires_at,
                 interval_days,
-                recipient_emails: recipients.into_iter().map(|r| r.get("email")).collect(),
+                recipient_emails,
             });
         }
         tx.commit().await?;
@@ -96,11 +103,12 @@ impl ApiKeyExpirationEmailRepository {
         key_id: Uuid,
         expires_at: DateTime<Utc>,
         interval_days: i16,
+        recipient_email: &str,
     ) -> Result<()> {
         let client = self.pool.get().await?;
         let resource_id = key_id.to_string();
         let event_key = format!("{}:{interval_days}", expires_at.to_rfc3339());
-        client.execute("DELETE FROM email_notification_deliveries WHERE event_type = 'api_key_expiration' AND resource_id = $1 AND event_key = $2", &[&resource_id, &event_key]).await?;
+        client.execute("DELETE FROM email_notification_deliveries WHERE event_type = 'api_key_expiration' AND resource_id = $1 AND event_key = $2 AND recipient_email = $3", &[&resource_id, &event_key, &recipient_email]).await?;
         Ok(())
     }
 }

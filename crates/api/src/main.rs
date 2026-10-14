@@ -142,13 +142,13 @@ async fn main() {
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
         let mut expiration_interval = tokio::time::interval(std::time::Duration::from_secs(300));
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        expiration_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let mut jobs = tokio::task::JoinSet::new();
         loop {
             tokio::select! {
                 _ = expiration_interval.tick() => {
                     match expiration_repository.claim_due().await {
                         Ok(candidates) => for candidate in candidates {
-                            let mut failed = false;
                             for recipient_email in &candidate.recipient_emails {
                                 let email = services::email::ApiKeyExpirationEmail {
                                     recipient_email: recipient_email.clone(), organization_name: candidate.organization_name.clone(), workspace_name: candidate.workspace_name.clone(),
@@ -157,14 +157,15 @@ async fn main() {
                                 };
                                 match expiration_sender.send_api_key_expiration(&email).await {
                                     Ok(services::email::EmailDeliveryOutcome::Sent { .. }) => {}
-                                    Ok(services::email::EmailDeliveryOutcome::Skipped) => failed = true,
+                                    Ok(services::email::EmailDeliveryOutcome::Skipped) => {
+                                        let _ = expiration_repository.release_claim(candidate.api_key_id, candidate.expires_at, candidate.interval_days, recipient_email).await;
+                                    }
                                     Err(error) => {
-                                        failed = true;
                                         tracing::warn!(api_key_id = %candidate.api_key_id, error = %error.sanitized_message(), "Failed to send API key expiration email");
+                                        let _ = expiration_repository.release_claim(candidate.api_key_id, candidate.expires_at, candidate.interval_days, recipient_email).await;
                                     }
                                 }
                             }
-                            if failed { let _ = expiration_repository.release_claim(candidate.api_key_id, candidate.expires_at, candidate.interval_days).await; }
                         },
                         Err(error) => tracing::error!(%error, "Failed to scan API key expirations"),
                     }

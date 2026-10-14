@@ -178,6 +178,53 @@ fn service_to_info(s: &crate::models::Service) -> Result<PlatformServiceInfo, an
 
 #[async_trait]
 impl AdminRepository for AdminCompositeRepository {
+    async fn get_organization_credit_consumed(
+        &self,
+        organization_id: uuid::Uuid,
+        credit_type: &str,
+    ) -> Result<i64> {
+        let client = self.pool.get().await?;
+        let row = client
+            .query_opt(
+                "SELECT amount FROM organization_credit_consumption WHERE organization_id = $1 AND credit_type = $2",
+                &[&organization_id, &credit_type],
+            )
+            .await?;
+        Ok(row.map(|row| row.get("amount")).unwrap_or(0))
+    }
+
+    async fn list_organization_admin_recipients(
+        &self,
+        organization_id: uuid::Uuid,
+    ) -> Result<Vec<ModelDeprecationRecipient>> {
+        let client = self.pool.get().await?;
+        let rows = client
+            .query(
+                r#"
+            SELECT u.id AS user_id,
+                   CASE WHEN u.contact_email_verified_at IS NOT NULL THEN u.contact_email ELSE u.email END AS email,
+                   o.id AS organization_id, o.name AS organization_name
+            FROM organizations o
+            JOIN organization_members om ON om.organization_id = o.id
+            JOIN users u ON u.id = om.user_id
+            WHERE o.id = $1 AND o.is_active = true AND u.is_active = true
+              AND om.role IN ('owner', 'admin')
+              AND (u.contact_email_verified_at IS NOT NULL OR u.email NOT LIKE '%@near')
+            ORDER BY lower(CASE WHEN u.contact_email_verified_at IS NOT NULL THEN u.contact_email ELSE u.email END)
+        "#,
+                &[&organization_id],
+            )
+            .await?;
+        Ok(rows
+            .into_iter()
+            .map(|row| ModelDeprecationRecipient {
+                user_id: row.get("user_id"),
+                email: row.get("email"),
+                organization_id: row.get("organization_id"),
+                organization_name: row.get("organization_name"),
+            })
+            .collect())
+    }
     async fn upsert_model_pricing(
         &self,
         model_name: &str,

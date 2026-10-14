@@ -58,6 +58,21 @@ pub struct InvitationEmail {
 }
 
 #[derive(Debug, Clone)]
+pub struct OrganizationCreditChangedEmail {
+    pub recipient_email: String,
+    pub organization_name: String,
+    pub credit_type: String,
+    pub source: Option<String>,
+    pub previous_limit: Option<i64>,
+    pub new_limit: i64,
+    pub available: Option<i64>,
+    pub changed_at: DateTime<Utc>,
+    pub reason: Option<String>,
+    pub actor: Option<String>,
+    pub credits_url: String,
+}
+
+#[derive(Debug, Clone)]
 pub struct ModelDeprecationEmail {
     pub recipient_email: String,
     pub model_id: String,
@@ -150,6 +165,13 @@ pub trait EmailSender: Send + Sync {
         &self,
         email: &ContactEmailVerificationEmail,
     ) -> Result<EmailDeliveryOutcome, EmailError>;
+
+    async fn send_organization_credit_changed(
+        &self,
+        _email: &OrganizationCreditChangedEmail,
+    ) -> Result<EmailDeliveryOutcome, EmailError> {
+        Ok(EmailDeliveryOutcome::Skipped)
+    }
 }
 
 pub struct NoopEmailSender;
@@ -383,6 +405,30 @@ impl EmailSender for ResendEmailSender {
             message_id: Some(response.id),
         })
     }
+
+    async fn send_organization_credit_changed(
+        &self,
+        email: &OrganizationCreditChangedEmail,
+    ) -> Result<EmailDeliveryOutcome, EmailError> {
+        let rendered = render_organization_credit_changed_email(email);
+        let response = self
+            .transport
+            .send_email(
+                &self.api_key,
+                ResendSendEmailRequest {
+                    from: self.from_email.clone(),
+                    to: vec![email.recipient_email.clone()],
+                    subject: rendered.subject,
+                    html: rendered.html_body,
+                    text: rendered.text_body,
+                    reply_to: self.reply_to.clone(),
+                },
+            )
+            .await?;
+        Ok(EmailDeliveryOutcome::Sent {
+            message_id: Some(response.id),
+        })
+    }
 }
 
 pub fn sender_from_config(
@@ -481,6 +527,57 @@ pub fn render_invitation_email(email: &InvitationEmail) -> RenderedEmail {
         html_body,
         text_body,
     }
+}
+
+pub fn render_organization_credit_changed_email(
+    email: &OrganizationCreditChangedEmail,
+) -> RenderedEmail {
+    let changed_at = email.changed_at.format("%B %-d, %Y at %H:%M UTC");
+    let old = email
+        .previous_limit
+        .map(format_nano_usd)
+        .unwrap_or_else(|| "not set".to_string());
+    let new = format_nano_usd(email.new_limit);
+    let change = email
+        .previous_limit
+        .map(|previous| format_nano_usd(email.new_limit.saturating_sub(previous)))
+        .unwrap_or_else(|| format_nano_usd(email.new_limit));
+    let available = email
+        .available
+        .map(format_nano_usd)
+        .unwrap_or_else(|| "Unavailable".to_string());
+    let source = email.source.as_deref().unwrap_or("default");
+    let reason = email.reason.as_deref().unwrap_or("No reason provided");
+    let actor = email.actor.as_deref().unwrap_or("A platform administrator");
+    let subject = format!("Organization credits changed: {}", email.organization_name);
+    let html_body = format!(
+        r#"<!doctype html><html lang="en"><body style="font-family:Arial,sans-serif;line-height:1.5;color:#111827;">
+<h1 style="font-size:20px;margin-bottom:16px;">Organization credits changed</h1>
+<p>NEAR AI Cloud applied a credit limit change for <strong>{organization}</strong>.</p>
+<p>Type/source: {credit_type} / {source}<br>Change amount: {change}<br>Previous limit: {old}<br>New limit: <strong>{new}</strong><br>Available after change: <strong>{available}</strong><br>Time: {changed_at}<br>Reason: {reason}<br>Changed by: {actor}</p>
+<p><a href="{url}">View credits and usage</a></p></body></html>"#,
+        organization = escape_html(&email.organization_name),
+        credit_type = escape_html(&email.credit_type),
+        source = escape_html(source),
+        change = escape_html(&change),
+        old = escape_html(&old),
+        new = escape_html(&new),
+        available = escape_html(&available),
+        changed_at = escape_html(&changed_at.to_string()),
+        reason = escape_html(reason),
+        actor = escape_html(actor),
+        url = escape_html(&email.credits_url)
+    );
+    let text_body = format!("Organization credits changed\n\nNEAR AI Cloud applied a credit limit change for {organization}.\n\nType/source: {credit_type} / {source}\nChange amount: {change}\nPrevious limit: {old}\nNew limit: {new}\nAvailable after change: {available}\nTime: {changed_at}\nReason: {reason}\nChanged by: {actor}\n\nView credits and usage: {url}\n", organization = email.organization_name, credit_type = email.credit_type, url = email.credits_url);
+    RenderedEmail {
+        subject,
+        html_body,
+        text_body,
+    }
+}
+
+fn format_nano_usd(value: i64) -> String {
+    format!("${:.2}", value as f64 / 1_000_000_000.0)
 }
 
 pub fn render_model_deprecation_email(email: &ModelDeprecationEmail) -> RenderedEmail {
@@ -1269,5 +1366,24 @@ mod tests {
         };
 
         assert!(error.sanitized_message().contains("RESEND_API_KEY"));
+    }
+
+    #[test]
+    fn credit_change_email_contains_previous_and_new_limits() {
+        let rendered = render_organization_credit_changed_email(&OrganizationCreditChangedEmail {
+            recipient_email: "owner@example.com".into(),
+            organization_name: "Example".into(),
+            credit_type: "grant".into(),
+            source: Some("promotion".into()),
+            previous_limit: Some(1_000_000_000),
+            new_limit: 2_000_000_000,
+            available: Some(1_500_000_000),
+            changed_at: Utc::now(),
+            reason: Some("Renewal".into()),
+            actor: None,
+            credits_url: "https://cloud.example.com/credits".into(),
+        });
+        assert!(rendered.text_body.contains("$1.00"));
+        assert!(rendered.text_body.contains("$2.00"));
     }
 }

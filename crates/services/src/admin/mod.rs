@@ -21,8 +21,8 @@ use std::sync::Arc;
 
 use crate::completions::CompletionServiceTrait;
 use crate::email::{
-    EmailDeliveryOutcome, EmailSender, ModelDeprecationEmail, PricingChangeEmail,
-    PricingChangeEmailModel,
+    EmailDeliveryOutcome, EmailSender, ModelDeprecationEmail, OrganizationCreditChangedEmail,
+    PricingChangeEmail, PricingChangeEmailModel,
 };
 use crate::models::ModelsServiceTrait;
 
@@ -44,6 +44,7 @@ pub struct AdminServiceImpl {
     /// changes take effect immediately instead of waiting for the 5-minute TTL.
     completion_service: Arc<dyn CompletionServiceTrait>,
     email_sender: Arc<dyn EmailSender>,
+    frontend_base_url: Option<String>,
 }
 
 impl AdminServiceImpl {
@@ -53,11 +54,28 @@ impl AdminServiceImpl {
         completion_service: Arc<dyn CompletionServiceTrait>,
         email_sender: Arc<dyn EmailSender>,
     ) -> Self {
+        Self::new_with_frontend_url(
+            repository,
+            models_service,
+            completion_service,
+            email_sender,
+            None,
+        )
+    }
+
+    pub fn new_with_frontend_url(
+        repository: Arc<dyn AdminRepository>,
+        models_service: Arc<dyn ModelsServiceTrait>,
+        completion_service: Arc<dyn CompletionServiceTrait>,
+        email_sender: Arc<dyn EmailSender>,
+        frontend_base_url: Option<String>,
+    ) -> Self {
         Self {
             repository,
             models_service,
             completion_service,
             email_sender,
+            frontend_base_url,
         }
     }
 
@@ -551,6 +569,22 @@ impl AdminService for AdminServiceImpl {
         // Validate limits
         Self::validate_organization_limits(&limits)?;
 
+        let current = self
+            .repository
+            .get_current_organization_limits(organization_id)
+            .await
+            .map_err(|e| AdminError::InternalError(e.to_string()))?;
+        let previous_limit = current
+            .iter()
+            .find(|current| {
+                current.credit_type == limits.credit_type && current.source == limits.source
+            })
+            .map(|current| current.spend_limit);
+        let reason = limits.change_reason.clone();
+        let actor = limits
+            .changed_by
+            .clone()
+            .or_else(|| limits.changed_by_user_email.clone());
         let updated_limits = self
             .repository
             .update_organization_limits(organization_id, limits)
@@ -566,6 +600,58 @@ impl AdminService for AdminServiceImpl {
                 }
             })?;
 
+        if previous_limit != Some(updated_limits.spend_limit) {
+            let available = match self
+                .repository
+                .get_organization_credit_consumed(organization_id, &updated_limits.credit_type)
+                .await
+            {
+                Ok(consumed) => Some(updated_limits.spend_limit.saturating_sub(consumed).max(0)),
+                Err(error) => {
+                    tracing::warn!(%organization_id, %error, "Failed to calculate available credit for change email");
+                    None
+                }
+            };
+            let recipients = match self
+                .repository
+                .list_organization_admin_recipients(organization_id)
+                .await
+            {
+                Ok(recipients) => recipients,
+                Err(error) => {
+                    tracing::warn!(%organization_id, %error, "Failed to load credit change email recipients");
+                    Vec::new()
+                }
+            };
+            for recipient in recipients {
+                let email = OrganizationCreditChangedEmail {
+                    recipient_email: recipient.email,
+                    organization_name: recipient.organization_name,
+                    credit_type: updated_limits.credit_type.clone(),
+                    source: updated_limits.source.clone(),
+                    previous_limit,
+                    new_limit: updated_limits.spend_limit,
+                    available,
+                    changed_at: updated_limits.effective_from,
+                    reason: reason.clone(),
+                    actor: actor.clone(),
+                    credits_url: format!(
+                        "{}/dashboard/organizations/{organization_id}/credits",
+                        self.frontend_base_url
+                            .as_deref()
+                            .unwrap_or("")
+                            .trim_end_matches('/')
+                    ),
+                };
+                if let Err(error) = self
+                    .email_sender
+                    .send_organization_credit_changed(&email)
+                    .await
+                {
+                    tracing::warn!(%organization_id, error = %error.sanitized_message(), "Failed to send organization credit change email");
+                }
+            }
+        }
         Ok(updated_limits)
     }
 

@@ -697,6 +697,20 @@ pub struct DeprecateModelOutcome {
 /// Repository trait for admin operations on models and organizations
 #[async_trait]
 pub trait AdminRepository: Send + Sync {
+    async fn list_organization_admin_recipients(
+        &self,
+        _organization_id: uuid::Uuid,
+    ) -> Result<Vec<ModelDeprecationRecipient>, anyhow::Error> {
+        Ok(Vec::new())
+    }
+
+    async fn get_organization_credit_consumed(
+        &self,
+        _organization_id: uuid::Uuid,
+        _credit_type: &str,
+    ) -> Result<i64, anyhow::Error> {
+        Ok(0)
+    }
     /// Upsert model pricing and metadata (insert or update)
     async fn upsert_model_pricing(
         &self,

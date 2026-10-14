@@ -2165,13 +2165,14 @@ fn build_admin_routes_with_options(
     // `model_aliases` tables. It also holds the `completion_service` so it
     // can invalidate the per-org concurrent-limit cache after a PATCH to
     // `/v1/admin/organizations/{org_id}/concurrent-limit`.
-    let admin_service = Arc::new(AdminServiceImpl::new(
+    let admin_service = Arc::new(AdminServiceImpl::new_with_frontend_url(
         admin_repository as Arc<dyn services::admin::AdminRepository>,
         services.models_service as Arc<dyn services::models::ModelsServiceTrait>,
         services.completion_service.clone()
             as Arc<dyn services::completions::CompletionServiceTrait>,
         services::email::sender_from_config(&config.invitation_email)
             .expect("Failed to initialize admin email sender"),
+        config.invitation_email.frontend_base_url.clone(),
     )) as Arc<dyn services::admin::AdminService + Send + Sync>;
 
     let github_dispatcher =

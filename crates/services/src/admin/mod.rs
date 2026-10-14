@@ -1497,7 +1497,15 @@ impl AdminServiceImpl {
     fn validate_organization_limits(limits: &OrganizationLimitsUpdate) -> Result<(), AdminError> {
         // All amounts use fixed scale 9 (nano-dollars) and USD - no scale/currency validation needed
 
-        // With four API-supported credit types, this keeps every API-created
+        // trace_commons has a single, monotonic writer (the dedicated
+        // trace-commons/credit route); a generic limits write would break that.
+        if limits.credit_type == "trace_commons" {
+            return Err(AdminError::InvalidLimits(
+                "trace_commons credit is set only through its dedicated route".to_string(),
+            ));
+        }
+
+        // With five API-supported credit types, this keeps every API-created
         // aggregate below i64::MAX and prevents oversized values from breaking
         // BIGINT sums used by admin listings. $1B remains effectively unlimited
         // for the contract-customer workflow while retaining a safety boundary.

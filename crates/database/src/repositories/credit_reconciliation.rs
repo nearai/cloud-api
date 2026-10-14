@@ -234,7 +234,10 @@ fn validate_request(amounts: &BTreeMap<String, i64>, key: &str, reason: &str) ->
     }
 
     amounts.iter().try_fold(0_i64, |sum, (kind, amount)| {
-        if !matches!(kind.as_str(), "grant" | "payment" | "staking_farm" | "postpay") || *amount <= 0 {
+        if !matches!(
+            kind.as_str(),
+            "grant" | "payment" | "staking_farm" | "postpay" | "trace_commons"
+        ) || *amount <= 0 {
             return Err(invalid("Amounts must be positive integer nano-USD for grant, payment, staking_farm or postpay").into());
         }
         sum.checked_add(*amount).ok_or_else(|| invalid("Reconciliation amount overflow").into())

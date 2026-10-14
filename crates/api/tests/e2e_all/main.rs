@@ -104,6 +104,7 @@ mod signature_verification;
 mod staking_wallet_binding;
 mod systemone;
 mod tinfoil_provider;
+mod trace_commons_credit;
 mod unlisted_models;
 mod usage_chat_completions;
 mod usage_history_bounds;

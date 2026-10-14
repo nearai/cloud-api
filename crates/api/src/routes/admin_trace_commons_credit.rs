@@ -53,6 +53,9 @@ fn api_error(error: anyhow::Error) -> ApiError {
         Some(TraceCommonsCreditError::NotFound) => {
             (StatusCode::NOT_FOUND, "not_found", error.to_string())
         }
+        Some(TraceCommonsCreditError::Conflict) => {
+            (StatusCode::CONFLICT, "conflict", error.to_string())
+        }
         None => {
             tracing::error!(error = %error, "Trace Commons credit write failed");
             (
@@ -79,6 +82,7 @@ fn api_error(error: anyhow::Error) -> ApiError {
         (status = 401, description = "Unauthorized", body = ErrorResponse),
         (status = 403, description = "Admin write permission required", body = ErrorResponse),
         (status = 404, description = "Organization not found or inactive", body = ErrorResponse),
+        (status = 409, description = "Organization accounting is busy; retry", body = ErrorResponse),
     ),
     security(("session_token" = [])),
 )]

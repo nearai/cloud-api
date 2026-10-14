@@ -30,6 +30,8 @@ pub enum TraceCommonsCreditError {
     Invalid(&'static str),
     #[error("Organization not found or inactive")]
     NotFound,
+    #[error("Organization accounting is busy; retry the request")]
+    Conflict,
 }
 
 /// The outcome of a cumulative write.
@@ -121,6 +123,9 @@ impl TraceCommonsCreditRepository {
             .map_err(|error| match error {
                 services::common::RepositoryError::NotFound(_) => {
                     anyhow::Error::from(TraceCommonsCreditError::NotFound)
+                }
+                services::common::RepositoryError::TransactionConflict => {
+                    anyhow::Error::from(TraceCommonsCreditError::Conflict)
                 }
                 other => other.into(),
             })?;

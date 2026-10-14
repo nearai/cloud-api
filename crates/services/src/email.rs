@@ -58,6 +58,19 @@ pub struct InvitationEmail {
 }
 
 #[derive(Debug, Clone)]
+pub struct ApiKeyChangedEmail {
+    pub recipient_email: String,
+    pub organization_name: String,
+    pub workspace_name: String,
+    pub key_name: String,
+    pub key_prefix: String,
+    pub change: String,
+    pub changed_at: DateTime<Utc>,
+    pub actor_name: Option<String>,
+    pub keys_url: String,
+}
+
+#[derive(Debug, Clone)]
 pub struct ModelDeprecationEmail {
     pub recipient_email: String,
     pub model_id: String,
@@ -150,6 +163,13 @@ pub trait EmailSender: Send + Sync {
         &self,
         email: &ContactEmailVerificationEmail,
     ) -> Result<EmailDeliveryOutcome, EmailError>;
+
+    async fn send_api_key_changed(
+        &self,
+        _email: &ApiKeyChangedEmail,
+    ) -> Result<EmailDeliveryOutcome, EmailError> {
+        Ok(EmailDeliveryOutcome::Skipped)
+    }
 }
 
 pub struct NoopEmailSender;
@@ -383,6 +403,30 @@ impl EmailSender for ResendEmailSender {
             message_id: Some(response.id),
         })
     }
+
+    async fn send_api_key_changed(
+        &self,
+        email: &ApiKeyChangedEmail,
+    ) -> Result<EmailDeliveryOutcome, EmailError> {
+        let rendered = render_api_key_changed_email(email);
+        let response = self
+            .transport
+            .send_email(
+                &self.api_key,
+                ResendSendEmailRequest {
+                    from: self.from_email.clone(),
+                    to: vec![email.recipient_email.clone()],
+                    subject: rendered.subject,
+                    html: rendered.html_body,
+                    text: rendered.text_body,
+                    reply_to: self.reply_to.clone(),
+                },
+            )
+            .await?;
+        Ok(EmailDeliveryOutcome::Sent {
+            message_id: Some(response.id),
+        })
+    }
 }
 
 pub fn sender_from_config(
@@ -476,6 +520,37 @@ pub fn render_invitation_email(email: &InvitationEmail) -> RenderedEmail {
         url = email.invitations_url,
     );
 
+    RenderedEmail {
+        subject,
+        html_body,
+        text_body,
+    }
+}
+
+pub fn render_api_key_changed_email(email: &ApiKeyChangedEmail) -> RenderedEmail {
+    let changed_at = email.changed_at.format("%B %-d, %Y at %H:%M UTC");
+    let actor = email
+        .actor_name
+        .as_deref()
+        .unwrap_or("An organization member");
+    let subject = format!("API key changed: {}", email.key_name);
+    let html_body = format!(
+        r#"<!doctype html><html lang="en"><body style="font-family:Arial,sans-serif;line-height:1.5;color:#111827;">
+<h1 style="font-size:20px;margin-bottom:16px;">API key security update</h1>
+<p><strong>{change}</strong></p><p>Organization: {organization}<br>Workspace: {workspace}<br>Key: {name} ({prefix})<br>Changed by: {actor}<br>Time: {changed_at}</p>
+<p><a href="{url}">Review API keys</a></p></body></html>"#,
+        change = escape_html(&email.change),
+        organization = escape_html(&email.organization_name),
+        workspace = escape_html(&email.workspace_name),
+        name = escape_html(&email.key_name),
+        prefix = escape_html(&email.key_prefix),
+        actor = escape_html(actor),
+        changed_at = escape_html(&changed_at.to_string()),
+        url = escape_html(&email.keys_url)
+    );
+    let text_body = format!("API key security update\n\n{change}\n\nOrganization: {organization}\nWorkspace: {workspace}\nKey: {name} ({prefix})\nChanged by: {actor}\nTime: {changed_at}\n\nReview API keys: {url}\n",
+        change = email.change, organization = email.organization_name, workspace = email.workspace_name,
+        name = email.key_name, prefix = email.key_prefix, url = email.keys_url);
     RenderedEmail {
         subject,
         html_body,
@@ -1269,5 +1344,22 @@ mod tests {
         };
 
         assert!(error.sanitized_message().contains("RESEND_API_KEY"));
+    }
+
+    #[test]
+    fn api_key_change_email_escapes_user_controlled_values() {
+        let rendered = render_api_key_changed_email(&ApiKeyChangedEmail {
+            recipient_email: "owner@example.com".into(),
+            organization_name: "<Org>".into(),
+            workspace_name: "Prod".into(),
+            key_name: "deploy".into(),
+            key_prefix: "sk-safe".into(),
+            change: "API key disabled".into(),
+            changed_at: Utc::now(),
+            actor_name: None,
+            keys_url: "https://cloud.example.com/keys".into(),
+        });
+        assert!(rendered.html_body.contains("&lt;Org&gt;"));
+        assert!(rendered.text_body.contains("API key disabled"));
     }
 }

@@ -115,9 +115,20 @@ pub struct OAuthUserInfo {
     pub provider: String,
     pub provider_user_id: String,
     pub email: String,
+    #[serde(default)]
+    pub email_verified: bool,
     pub username: String,
     pub display_name: Option<String>,
     pub avatar_url: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OAuthIdentity {
+    pub provider: String,
+    pub provider_user_id: String,
+    pub email: Option<String>,
+    pub email_verified: bool,
+    pub linked_at: DateTime<Utc>,
 }
 
 // Error types
@@ -147,6 +158,15 @@ pub enum AuthError {
     #[error("This email is already registered with {existing_provider}")]
     OAuthProviderConflict { existing_provider: String },
 
+    #[error("This sign-in method is already linked to an account")]
+    OAuthLinkConflict,
+    #[error("The account link is invalid or expired. Please start again.")]
+    OAuthLinkInvalid,
+    #[error("Verify the email with your sign-in provider before linking it.")]
+    OAuthEmailUnverified,
+    #[error("Sign in with your original Google or GitHub account before linking.")]
+    OAuthLinkNotAllowed,
+
     #[error("Internal error: {0}")]
     InternalError(String),
 
@@ -163,6 +183,35 @@ pub enum AuthError {
 // Repository traits
 #[async_trait]
 pub trait UserRepository: Send + Sync {
+    async fn observe_oauth_identity(
+        &self,
+        _user_id: UserId,
+        _info: &OAuthUserInfo,
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
+    async fn list_oauth_identities(&self, _user_id: UserId) -> anyhow::Result<Vec<OAuthIdentity>> {
+        Err(anyhow::anyhow!("OAuth identity storage is unavailable"))
+    }
+    async fn store_oauth_link_request(
+        &self,
+        _user_id: UserId,
+        _session_id: SessionId,
+        _code_hash: &str,
+        _info: &OAuthUserInfo,
+    ) -> anyhow::Result<()> {
+        Err(anyhow::anyhow!("OAuth identity storage is unavailable"))
+    }
+    async fn complete_oauth_link_request(
+        &self,
+        _user_id: UserId,
+        _session_id: SessionId,
+        _code_hash: &str,
+    ) -> Result<OAuthIdentity, AuthError> {
+        Err(AuthError::InternalError(
+            "OAuth identity storage is unavailable".into(),
+        ))
+    }
     async fn create(
         &self,
         email: String,
@@ -273,6 +322,35 @@ pub trait NearNonceRepository: Send + Sync {
 // Service interfaces
 #[async_trait]
 pub trait AuthServiceTrait: Send + Sync {
+    async fn list_oauth_identities(
+        &self,
+        _user_id: UserId,
+    ) -> Result<Vec<OAuthIdentity>, AuthError> {
+        Err(AuthError::OAuthLinkNotAllowed)
+    }
+    async fn validate_oauth_link_session(
+        &self,
+        _user_id: UserId,
+        _session_id: SessionId,
+    ) -> Result<(), AuthError> {
+        Err(AuthError::OAuthLinkNotAllowed)
+    }
+    async fn prepare_oauth_link(
+        &self,
+        _user_id: UserId,
+        _session_id: SessionId,
+        _info: OAuthUserInfo,
+    ) -> Result<String, AuthError> {
+        Err(AuthError::OAuthLinkNotAllowed)
+    }
+    async fn complete_oauth_link(
+        &self,
+        _user_id: UserId,
+        _session_id: SessionId,
+        _code: &str,
+    ) -> Result<OAuthIdentity, AuthError> {
+        Err(AuthError::OAuthLinkNotAllowed)
+    }
     /// Create a new session for a user
     async fn create_session(
         &self,

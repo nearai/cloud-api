@@ -13,6 +13,8 @@ pub struct OAuthStateRow {
     pub provider: String,
     pub pkce_verifier: Option<String>,
     pub frontend_callback: Option<String>,
+    pub link_user_id: Option<uuid::Uuid>,
+    pub link_session_id: Option<uuid::Uuid>,
     pub created_at: DateTime<Utc>,
     pub expires_at: DateTime<Utc>,
 }
@@ -30,6 +32,37 @@ impl OAuthStateRepository {
         pkce_verifier: Option<String>,
         frontend_callback: Option<String>,
     ) -> Result<OAuthStateRow> {
+        self.create_context(state, provider, pkce_verifier, frontend_callback, None)
+            .await
+    }
+
+    pub async fn create_link(
+        &self,
+        state: String,
+        provider: String,
+        verifier: String,
+        callback: String,
+        user_id: uuid::Uuid,
+        session_id: uuid::Uuid,
+    ) -> Result<OAuthStateRow> {
+        self.create_context(
+            state,
+            provider,
+            Some(verifier),
+            Some(callback),
+            Some((user_id, session_id)),
+        )
+        .await
+    }
+
+    async fn create_context(
+        &self,
+        state: String,
+        provider: String,
+        pkce_verifier: Option<String>,
+        frontend_callback: Option<String>,
+        link: Option<(uuid::Uuid, uuid::Uuid)>,
+    ) -> Result<OAuthStateRow> {
         let client = self
             .pool
             .get()
@@ -38,15 +71,17 @@ impl OAuthStateRepository {
 
         let now = Utc::now();
         let expires_at = now + Duration::minutes(10);
+        let user_id = link.map(|(user, _)| user);
+        let session_id = link.map(|(_, session)| session);
 
         let row = client
             .query_one(
                 r#"
-                INSERT INTO oauth_states (state, provider, pkce_verifier, frontend_callback, created_at, expires_at)
-                VALUES ($1, $2, $3, $4, $5, $6)
-                RETURNING state, provider, pkce_verifier, frontend_callback, created_at, expires_at
+                INSERT INTO oauth_states (state, provider, pkce_verifier, frontend_callback, created_at, expires_at,link_user_id,link_session_id)
+                VALUES ($1, $2, $3, $4, $5, $6,$7,$8)
+                RETURNING state, provider, pkce_verifier, frontend_callback, created_at, expires_at,link_user_id,link_session_id
                 "#,
-                &[&state, &provider, &pkce_verifier, &frontend_callback, &now, &expires_at],
+                &[&state, &provider, &pkce_verifier, &frontend_callback, &now, &expires_at, &user_id, &session_id],
             )
             .await
             .context("Failed to create OAuth state")?;
@@ -75,7 +110,7 @@ impl OAuthStateRepository {
                 r#"
                 DELETE FROM oauth_states
                 WHERE state = $1 AND expires_at > $2
-                RETURNING state, provider, pkce_verifier, frontend_callback, created_at, expires_at
+                RETURNING state, provider, pkce_verifier, frontend_callback, created_at, expires_at,link_user_id,link_session_id
                 "#,
                 &[&state, &now],
             )
@@ -125,6 +160,8 @@ impl OAuthStateRepository {
             provider: row.get("provider"),
             pkce_verifier: row.get("pkce_verifier"),
             frontend_callback: row.get("frontend_callback"),
+            link_user_id: row.get("link_user_id"),
+            link_session_id: row.get("link_session_id"),
             created_at: row.get("created_at"),
             expires_at: row.get("expires_at"),
         }

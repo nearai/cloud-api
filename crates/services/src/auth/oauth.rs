@@ -27,6 +27,9 @@ pub struct OAuthManager {
     github_client: Option<ConfiguredClient>,
     google_client: Option<ConfiguredClient>,
     http_client: Client,
+    github_user_url: String,
+    github_emails_url: String,
+    google_user_url: String,
 }
 
 impl OAuthManager {
@@ -42,7 +45,33 @@ impl OAuthManager {
             github_client,
             google_client,
             http_client: Client::new(),
+            github_user_url: "https://api.github.com/user".into(),
+            github_emails_url: "https://api.github.com/user/emails".into(),
+            google_user_url: "https://www.googleapis.com/oauth2/v2/userinfo".into(),
         })
+    }
+
+    #[cfg(feature = "test-mocks")]
+    pub fn with_test_provider_endpoints(mut self, provider: &str, base_url: &str) -> Self {
+        let token_url = TokenUrl::new(format!("{base_url}/token")).unwrap();
+        let auth_url = AuthUrl::new(format!("{base_url}/authorize")).unwrap();
+        match provider {
+            "github" => {
+                self.github_client = self
+                    .github_client
+                    .map(|client| client.set_token_uri(token_url).set_auth_uri(auth_url));
+                self.github_user_url = format!("{base_url}/user");
+                self.github_emails_url = format!("{base_url}/emails");
+            }
+            "google" => {
+                self.google_client = self
+                    .google_client
+                    .map(|client| client.set_token_uri(token_url).set_auth_uri(auth_url));
+                self.google_user_url = format!("{base_url}/user");
+            }
+            _ => panic!("Unsupported test provider"),
+        }
+        self
     }
 
     fn create_github_client(config: OAuthProviderConfig) -> Result<ConfiguredClient, AuthError> {
@@ -98,6 +127,24 @@ impl OAuthManager {
         Ok((auth_url.to_string(), csrf_state.secret().to_string()))
     }
 
+    pub fn github_link_auth_url(&self) -> Result<(String, String, String), AuthError> {
+        let client = self
+            .github_client
+            .as_ref()
+            .ok_or_else(|| AuthError::ConfigError("GitHub OAuth not configured".into()))?;
+        let (challenge, verifier) = PkceCodeChallenge::new_random_sha256();
+        let (url, state) = client
+            .authorize_url(CsrfToken::new_random)
+            .add_scope(Scope::new("user:email".into()))
+            .set_pkce_challenge(challenge)
+            .url();
+        Ok((
+            url.to_string(),
+            state.secret().clone(),
+            verifier.secret().clone(),
+        ))
+    }
+
     /// Generate authorization URL for Google with PKCE
     pub fn google_auth_url(&self) -> Result<(String, String, String), AuthError> {
         let client = self
@@ -122,11 +169,28 @@ impl OAuthManager {
         ))
     }
 
+    pub fn google_link_auth_url(&self) -> Result<(String, String, String), AuthError> {
+        let (url, state, verifier) = self.google_auth_url()?;
+        let mut url = url::Url::parse(&url)
+            .map_err(|e| AuthError::ConfigError(format!("Invalid Google auth URL: {e}")))?;
+        url.query_pairs_mut()
+            .append_pair("prompt", "select_account");
+        Ok((url.to_string(), state, verifier))
+    }
+
     /// Handle GitHub OAuth callback
     pub async fn handle_github_callback(
         &self,
         code: String,
         _state: String,
+    ) -> Result<(OAuthUserInfo, String), AuthError> {
+        self.handle_github_callback_with_pkce(code, None).await
+    }
+
+    pub async fn handle_github_callback_with_pkce(
+        &self,
+        code: String,
+        verifier: Option<String>,
     ) -> Result<(OAuthUserInfo, String), AuthError> {
         let client = self
             .github_client
@@ -136,8 +200,11 @@ impl OAuthManager {
         debug!("Exchanging GitHub code for token");
 
         // Exchange code for token
-        let token = client
-            .exchange_code(AuthorizationCode::new(code))
+        let mut exchange = client.exchange_code(AuthorizationCode::new(code));
+        if let Some(verifier) = verifier {
+            exchange = exchange.set_pkce_verifier(PkceCodeVerifier::new(verifier));
+        }
+        let token = exchange
             .request_async(&self.http_client)
             .await
             .map_err(|e| AuthError::OAuthError(format!("Token exchange failed: {e}")))?;
@@ -148,6 +215,7 @@ impl OAuthManager {
         let user_info = self.fetch_github_user(access_token).await?;
 
         let oauth_info = OAuthUserInfo {
+            email_verified: user_info.email_verified,
             provider: "github".to_string(),
             provider_user_id: user_info.id.to_string(),
             email: user_info.email.ok_or_else(|| {
@@ -197,6 +265,7 @@ impl OAuthManager {
         let user_info = self.fetch_google_user(access_token).await?;
 
         let oauth_info = OAuthUserInfo {
+            email_verified: user_info.email_verified,
             provider: "google".to_string(),
             provider_user_id: user_info.sub.clone(),
             email: user_info.email.clone(),
@@ -222,7 +291,7 @@ impl OAuthManager {
     async fn fetch_github_user(&self, access_token: &str) -> Result<GitHubUser, AuthError> {
         let response = self
             .http_client
-            .get("https://api.github.com/user")
+            .get(&self.github_user_url)
             .header("Authorization", format!("Bearer {access_token}"))
             .header("User-Agent", "cloud-api")
             .send()
@@ -241,11 +310,12 @@ impl OAuthManager {
             .await
             .map_err(|e| AuthError::AuthFailed(format!("Failed to parse GitHub user: {e}")))?;
 
-        // If no public email, fetch from emails endpoint
-        if user.email.is_none() {
+        // The public profile has no email verification flag. Read /user/emails
+        // even for a public email before accepting it for account linking.
+        {
             let emails_response = self
                 .http_client
-                .get("https://api.github.com/user/emails")
+                .get(&self.github_emails_url)
                 .header("Authorization", format!("Bearer {access_token}"))
                 .header("User-Agent", "cloud-api")
                 .send()
@@ -259,11 +329,19 @@ impl OAuthManager {
                     AuthError::AuthFailed(format!("Failed to parse GitHub emails: {e}"))
                 })?;
 
-                // Get primary email
-                if let Some(primary) = emails.iter().find(|e| e.primary) {
-                    user.email = Some(primary.email.clone());
-                } else if let Some(first) = emails.first() {
-                    user.email = Some(first.email.clone());
+                let selected = if let Some(public_email) = user.email.as_ref() {
+                    emails.iter().find(|entry| &entry.email == public_email)
+                } else {
+                    emails
+                        .iter()
+                        .find(|e| e.primary && e.verified)
+                        .or_else(|| emails.iter().find(|e| e.verified))
+                        .or_else(|| emails.iter().find(|e| e.primary))
+                        .or_else(|| emails.first())
+                };
+                if let Some(selected) = selected {
+                    user.email = Some(selected.email.clone());
+                    user.email_verified = selected.verified;
                 }
             }
         }
@@ -277,7 +355,7 @@ impl OAuthManager {
 
         let response = self
             .http_client
-            .get("https://www.googleapis.com/oauth2/v2/userinfo")
+            .get(&self.google_user_url)
             .header("Authorization", format!("Bearer {access_token}"))
             .send()
             .await
@@ -307,6 +385,8 @@ impl OAuthManager {
 struct GitHubUser {
     id: i64,
     email: Option<String>,
+    #[serde(skip)]
+    email_verified: bool,
     #[serde(default)]
     login: String,
     #[serde(default)]
@@ -319,6 +399,8 @@ struct GitHubUser {
 struct GitHubEmail {
     email: String,
     primary: bool,
+    #[serde(default)]
+    verified: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -326,6 +408,8 @@ struct GoogleUser {
     #[serde(alias = "sub", alias = "id")]
     sub: String,
     email: String,
+    #[serde(default, alias = "verified_email")]
+    email_verified: bool,
     #[serde(default)]
     name: Option<String>,
     #[serde(default)]

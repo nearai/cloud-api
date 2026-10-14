@@ -1,6 +1,40 @@
 use super::*;
 
 #[tokio::test]
+async fn erasure_deletes_linked_identity_and_pending_oauth_handoffs() {
+    let (server, database) = setup_test_server_with_database().await;
+    let (_, user_id, email) = new_user(&database).await;
+    let client = database.pool().get().await.unwrap();
+    let session_id = uuid::Uuid::new_v4();
+    client.execute("INSERT INTO refresh_tokens (id,user_id,token_hash,expires_at,user_agent) VALUES ($1,$2,$3,NOW()+INTERVAL '1 day','link-test')",
+        &[&session_id,&user_id,&uuid::Uuid::new_v4().to_string()]).await.unwrap();
+    client.execute("INSERT INTO user_oauth_identities (user_id,provider,provider_user_id,email,email_verified) VALUES ($1,'google',$2,$3,true)",
+        &[&user_id,&uuid::Uuid::new_v4().to_string(),&email]).await.unwrap();
+    client.execute("INSERT INTO oauth_link_requests (code_hash,user_id,session_id,provider,provider_user_id,email,email_verified,expires_at) VALUES ($1,$2,$3,'google','pending',$4,true,NOW()+INTERVAL '5 minutes')",
+        &[&"a".repeat(64),&user_id,&session_id,&email]).await.unwrap();
+    client.execute("INSERT INTO oauth_states (state,provider,expires_at,link_user_id,link_session_id) VALUES ($1,'google',NOW()+INTERVAL '5 minutes',$2,$3)",
+        &[&uuid::Uuid::new_v4().to_string(),&user_id,&session_id]).await.unwrap();
+    assert_eq!(
+        count(
+            &client,
+            "SELECT COUNT(*) FROM user_oauth_identities WHERE user_id=$1",
+            &user_id
+        )
+        .await,
+        2
+    );
+    let response = erase(&server, user_id, &email).await;
+    assert_eq!(response.status_code(), 200, "{}", response.text());
+    for sql in [
+        "SELECT COUNT(*) FROM user_oauth_identities WHERE user_id=$1",
+        "SELECT COUNT(*) FROM oauth_link_requests WHERE user_id=$1",
+        "SELECT COUNT(*) FROM oauth_states WHERE link_user_id=$1",
+    ] {
+        assert_eq!(count(&client, sql, &user_id).await, 0);
+    }
+}
+
+#[tokio::test]
 async fn retry_sweeps_content_written_after_erasure() {
     let (server, database) = setup_test_server_with_database().await;
     let (session, user_id, email) = new_user(&database).await;

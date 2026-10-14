@@ -7,6 +7,7 @@ use std::sync::Arc;
 
 fn oauth_info(provider: &str, email: &str) -> OAuthUserInfo {
     OAuthUserInfo {
+        email_verified: true,
         provider: provider.into(),
         provider_user_id: uuid::Uuid::new_v4().to_string(),
         email: email.into(),

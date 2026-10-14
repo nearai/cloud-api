@@ -1,3 +1,4 @@
+mod linking;
 pub mod near;
 pub mod oauth;
 pub mod ports;
@@ -15,7 +16,7 @@ use bloomfilter::Bloom;
 use chrono::Utc;
 use hmac::{Hmac, KeyInit, Mac};
 use moka::future::Cache;
-use sha2::Sha256;
+use sha2::{Digest, Sha256};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -40,6 +41,50 @@ fn refresh_token_successor(old_token: &str, encoding_key: &str) -> Result<String
 
 #[async_trait]
 impl AuthServiceTrait for AuthService {
+    async fn list_oauth_identities(
+        &self,
+        user_id: UserId,
+    ) -> Result<Vec<OAuthIdentity>, AuthError> {
+        self.get_user_by_id(user_id.clone()).await?;
+        self.user_repository
+            .list_oauth_identities(user_id)
+            .await
+            .map_err(|e| AuthError::InternalError(format!("Failed to list sign-in methods: {e}")))
+    }
+    async fn validate_oauth_link_session(
+        &self,
+        user_id: UserId,
+        session_id: SessionId,
+    ) -> Result<(), AuthError> {
+        self.validate_link_session(user_id, session_id).await
+    }
+    async fn prepare_oauth_link(
+        &self,
+        user_id: UserId,
+        session_id: SessionId,
+        info: OAuthUserInfo,
+    ) -> Result<String, AuthError> {
+        self.prepare_link(user_id, session_id, info).await
+    }
+    async fn complete_oauth_link(
+        &self,
+        user_id: UserId,
+        session_id: SessionId,
+        code: &str,
+    ) -> Result<OAuthIdentity, AuthError> {
+        if code.len() != 64 || !code.bytes().all(|c| c.is_ascii_hexdigit()) {
+            return Err(AuthError::OAuthLinkInvalid);
+        }
+        self.validate_link_session(user_id.clone(), session_id.clone())
+            .await?;
+        self.user_repository
+            .complete_oauth_link_request(
+                user_id,
+                session_id,
+                &hex::encode(Sha256::digest(code.as_bytes())),
+            )
+            .await
+    }
     async fn create_session(
         &self,
         user_id: UserId,
@@ -358,6 +403,11 @@ impl AuthServiceTrait for AuthService {
             return Ok(new_user);
         }
 
+        self.user_repository
+            .observe_oauth_identity(new_user.id.clone(), &oauth_info)
+            .await
+            .map_err(|e| AuthError::InternalError(format!("Failed to update identity: {e}")))?;
+
         // Create default organization and workspace for new user
         debug!(
             user_id = %new_user.id.0,
@@ -520,6 +570,23 @@ impl AuthService {
         user: User,
         oauth_info: &OAuthUserInfo,
     ) -> Result<User, AuthError> {
+        // Linked identities authenticate the same account, but must not
+        // overwrite the original provider's account email or profile.
+        if user.auth_provider != oauth_info.provider
+            || user.provider_user_id != oauth_info.provider_user_id
+        {
+            self.user_repository
+                .observe_oauth_identity(user.id.clone(), oauth_info)
+                .await
+                .map_err(|e| AuthError::InternalError(format!("Failed to update identity: {e}")))?;
+            self.user_repository
+                .update_last_login(user.id.clone())
+                .await
+                .map_err(|e| {
+                    AuthError::InternalError(format!("Failed to update last login: {e}"))
+                })?;
+            return Ok(user);
+        }
         if user.email != oauth_info.email {
             self.check_oauth_email_conflict(oauth_info).await?;
             if let Err(error) = self
@@ -558,6 +625,10 @@ impl AuthService {
             .await
             .map_err(|e| AuthError::InternalError(format!("Failed to update last login: {e}")))?;
 
+        self.user_repository
+            .observe_oauth_identity(user.id.clone(), oauth_info)
+            .await
+            .map_err(|e| AuthError::InternalError(format!("Failed to update identity: {e}")))?;
         Ok(user)
     }
 
@@ -1651,6 +1722,7 @@ mod tests {
 
         let result = service
             .get_or_create_oauth_user(OAuthUserInfo {
+                email_verified: true,
                 provider: "google".to_string(),
                 provider_user_id: "google-sub-123".to_string(),
                 email: "alice@example.com".to_string(),
@@ -1675,6 +1747,7 @@ mod tests {
 
         let result = service
             .get_or_create_oauth_user(OAuthUserInfo {
+                email_verified: true,
                 provider: "google".to_string(),
                 provider_user_id: "google-sub-456".to_string(),
                 email: "new@example.com".to_string(),
@@ -1695,6 +1768,7 @@ mod tests {
 
     fn race_oauth_info() -> OAuthUserInfo {
         OAuthUserInfo {
+            email_verified: true,
             provider: "near".into(),
             provider_user_id: "alice.near".into(),
             email: "alice.near@near".into(),
@@ -1747,6 +1821,7 @@ mod tests {
 
     fn oauth_info(provider: &str) -> OAuthUserInfo {
         OAuthUserInfo {
+            email_verified: true,
             provider: provider.into(),
             provider_user_id: format!("{provider}-alice"),
             email: "alice@example.com".into(),

@@ -76,6 +76,7 @@ mod model_deprecation_headers;
 mod model_history_test;
 mod multiturn_tools;
 mod near_auth;
+mod oauth_account_linking;
 mod oauth_frontend_callback;
 mod openai_tiered_pricing;
 mod openrouter_compat;

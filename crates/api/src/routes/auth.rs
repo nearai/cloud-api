@@ -15,6 +15,9 @@ use std::sync::Arc;
 use tracing::{debug, error, info};
 use url::Url;
 
+mod linking;
+pub use linking::{complete_oauth_link, list_oauth_identities, start_oauth_link};
+
 /// OAuth state storage backed by PostgreSQL for multi-instance support
 pub type StateStore = Arc<OAuthStateRepository>;
 
@@ -162,8 +165,9 @@ fn oauth_user_error_response(
 
 #[derive(Deserialize)]
 pub struct OAuthCallback {
-    code: String,
+    code: Option<String>,
     state: String,
+    error: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -466,17 +470,76 @@ pub async fn oauth_callback(
 
     info!("Processing {} OAuth callback", oauth_state_row.provider);
 
+    let link_context = oauth_state_row
+        .link_user_id
+        .zip(oauth_state_row.link_session_id);
+    if let Some((user_id, session_id)) = link_context {
+        if let Err(error) = auth_service
+            .validate_oauth_link_session(
+                services::auth::UserId(user_id),
+                services::auth::SessionId(session_id),
+            )
+            .await
+        {
+            return linking::link_error_response(
+                error,
+                oauth_state_row.frontend_callback.as_deref(),
+                &config.cors,
+            );
+        }
+    }
+
     // Handle provider-specific callback to get OAuth user info
+    if params.error.is_some() || params.code.is_none() {
+        if link_context.is_some() {
+            return linking::link_error_response(
+                AuthError::AuthFailed("OAuth linking canceled".into()),
+                oauth_state_row.frontend_callback.as_deref(),
+                &config.cors,
+            );
+        }
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "access_denied",
+                "error_description": "Sign-in was not completed."
+            })),
+        )
+            .into_response();
+    }
+    let code = params.code.unwrap();
     let oauth_result = match oauth_state_row.provider.as_str() {
         "github" => {
-            oauth
-                .handle_github_callback(params.code, params.state)
-                .await
+            if link_context.is_some() {
+                match oauth_state_row.pkce_verifier {
+                    Some(verifier) => {
+                        oauth
+                            .handle_github_callback_with_pkce(code, Some(verifier))
+                            .await
+                    }
+                    None => {
+                        return linking::link_error_response(
+                            AuthError::OAuthLinkInvalid,
+                            oauth_state_row.frontend_callback.as_deref(),
+                            &config.cors,
+                        )
+                    }
+                }
+            } else {
+                oauth.handle_github_callback(code, params.state).await
+            }
         }
         "google" => {
             let verifier = match oauth_state_row.pkce_verifier {
                 Some(v) => v,
                 None => {
+                    if link_context.is_some() {
+                        return linking::link_error_response(
+                            AuthError::OAuthLinkInvalid,
+                            oauth_state_row.frontend_callback.as_deref(),
+                            &config.cors,
+                        );
+                    }
                     error!("Missing PKCE verifier for Google OAuth");
                     return (
                         StatusCode::INTERNAL_SERVER_ERROR,
@@ -489,7 +552,7 @@ pub async fn oauth_callback(
                 }
             };
             oauth
-                .handle_google_callback(params.code, params.state, verifier)
+                .handle_google_callback(code, params.state, verifier)
                 .await
         }
         _ => {
@@ -508,6 +571,13 @@ pub async fn oauth_callback(
     let (oauth_user_info, _access_token) = match oauth_result {
         Ok(result) => result,
         Err(e) => {
+            if link_context.is_some() {
+                return linking::link_error_response(
+                    AuthError::OAuthError("Provider authorization failed".into()),
+                    oauth_state_row.frontend_callback.as_deref(),
+                    &config.cors,
+                );
+            }
             error!("OAuth authentication failed");
             return (
                 StatusCode::UNAUTHORIZED,
@@ -519,6 +589,29 @@ pub async fn oauth_callback(
                 .into_response();
         }
     };
+
+    if let Some((user_id, session_id)) = link_context {
+        let result = auth_service
+            .prepare_oauth_link(
+                services::auth::UserId(user_id),
+                services::auth::SessionId(session_id),
+                oauth_user_info,
+            )
+            .await;
+        return match result {
+            Ok(code) => match oauth_state_row.frontend_callback.as_deref() {
+                Some(callback) => linking::link_ready_response(&code, callback, &config.cors),
+                None => {
+                    linking::link_error_response(AuthError::OAuthLinkInvalid, None, &config.cors)
+                }
+            },
+            Err(error) => linking::link_error_response(
+                error,
+                oauth_state_row.frontend_callback.as_deref(),
+                &config.cors,
+            ),
+        };
+    }
 
     // Get or create user from OAuth info
     let user = match auth_service.get_or_create_oauth_user(oauth_user_info).await {

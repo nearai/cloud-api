@@ -1244,10 +1244,15 @@ impl OrganizationServiceImpl {
             .await
         {
             // Mark invitation as accepted anyway
-            let _ = self
+            if self
                 .invitation_repository
                 .update_status(invitation_id, ports::InvitationStatus::Accepted)
-                .await;
+                .await
+                .is_ok()
+            {
+                self.send_invitation_status_email(&invitation, "accepted", false)
+                    .await;
+            }
             return Err(OrganizationError::AlreadyMember);
         }
 
@@ -2614,6 +2619,17 @@ mod tests {
         ) -> Result<EmailDeliveryOutcome, EmailError> {
             self.outcome.clone()
         }
+
+        async fn send_invitation_status(
+            &self,
+            email: &crate::email::InvitationStatusEmail,
+        ) -> Result<EmailDeliveryOutcome, EmailError> {
+            self.sent_to
+                .lock()
+                .unwrap()
+                .push(email.recipient_email.clone());
+            self.outcome.clone()
+        }
     }
 
     fn make_service(
@@ -3201,6 +3217,51 @@ mod tests {
             OrganizationError::InvalidParams(message)
                 if message == "Ownership can only be transferred to an existing organization member"
         ));
+    }
+
+    #[tokio::test]
+    async fn accept_invitation_notifies_inviter_when_user_is_already_a_member() {
+        let (service, invitation_repo, email_sender, user_repo) = make_service_with_requester_role(
+            Ok(EmailDeliveryOutcome::Sent {
+                message_id: Some("status-email-id".to_string()),
+            }),
+            Some("https://cloud.example.com/dashboard/invitations".to_string()),
+            MemberRole::Admin,
+        );
+        let org = service
+            .repository
+            .get_by_id(Uuid::nil())
+            .await
+            .unwrap()
+            .unwrap();
+        let invitation = invitation_repo
+            .create(
+                org.id.0,
+                CreateInvitationRequest {
+                    email: user_repo.inviter.email.clone(),
+                    role: MemberRole::Member,
+                    expires_in_hours: 168,
+                },
+                org.owner_id.0,
+            )
+            .await
+            .unwrap();
+
+        let error = service
+            .accept_invitation(
+                invitation.id,
+                user_repo.inviter.id.clone(),
+                &user_repo.inviter.email,
+            )
+            .await
+            .unwrap_err();
+
+        assert!(matches!(error, OrganizationError::AlreadyMember));
+        assert_eq!(
+            invitation_repo.records.lock().unwrap()[0].status,
+            InvitationStatus::Accepted
+        );
+        assert_eq!(email_sender.sent_to.lock().unwrap().len(), 1);
     }
 
     #[tokio::test]

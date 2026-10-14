@@ -58,6 +58,16 @@ pub struct InvitationEmail {
 }
 
 #[derive(Debug, Clone)]
+pub struct InvitationStatusEmail {
+    pub recipient_email: String,
+    pub organization_name: String,
+    pub role: String,
+    pub status: String,
+    pub changed_at: DateTime<Utc>,
+    pub invitations_url: String,
+}
+
+#[derive(Debug, Clone)]
 pub struct ModelDeprecationEmail {
     pub recipient_email: String,
     pub model_id: String,
@@ -150,6 +160,13 @@ pub trait EmailSender: Send + Sync {
         &self,
         email: &ContactEmailVerificationEmail,
     ) -> Result<EmailDeliveryOutcome, EmailError>;
+
+    async fn send_invitation_status(
+        &self,
+        _email: &InvitationStatusEmail,
+    ) -> Result<EmailDeliveryOutcome, EmailError> {
+        Ok(EmailDeliveryOutcome::Skipped)
+    }
 }
 
 pub struct NoopEmailSender;
@@ -383,6 +400,30 @@ impl EmailSender for ResendEmailSender {
             message_id: Some(response.id),
         })
     }
+
+    async fn send_invitation_status(
+        &self,
+        email: &InvitationStatusEmail,
+    ) -> Result<EmailDeliveryOutcome, EmailError> {
+        let rendered = render_invitation_status_email(email);
+        let response = self
+            .transport
+            .send_email(
+                &self.api_key,
+                ResendSendEmailRequest {
+                    from: self.from_email.clone(),
+                    to: vec![email.recipient_email.clone()],
+                    subject: rendered.subject,
+                    html: rendered.html_body,
+                    text: rendered.text_body,
+                    reply_to: self.reply_to.clone(),
+                },
+            )
+            .await?;
+        Ok(EmailDeliveryOutcome::Sent {
+            message_id: Some(response.id),
+        })
+    }
 }
 
 pub fn sender_from_config(
@@ -476,6 +517,29 @@ pub fn render_invitation_email(email: &InvitationEmail) -> RenderedEmail {
         url = email.invitations_url,
     );
 
+    RenderedEmail {
+        subject,
+        html_body,
+        text_body,
+    }
+}
+
+pub fn render_invitation_status_email(email: &InvitationStatusEmail) -> RenderedEmail {
+    let changed_at = email.changed_at.format("%B %-d, %Y at %H:%M UTC");
+    let subject = format!("Invitation {}: {}", email.status, email.organization_name);
+    let html_body = format!(
+        r#"<!doctype html><html lang="en"><body style="font-family:Arial,sans-serif;line-height:1.5;color:#111827;">
+<h1 style="font-size:20px;margin-bottom:16px;">Organization invitation {status}</h1>
+<p>The invitation to join <strong>{organization}</strong> as <strong>{role}</strong> was {status} on {changed_at}.</p>
+<p><a href="{url}">View invitations</a></p></body></html>"#,
+        status = escape_html(&email.status),
+        organization = escape_html(&email.organization_name),
+        role = escape_html(&email.role),
+        changed_at = escape_html(&changed_at.to_string()),
+        url = escape_html(&email.invitations_url)
+    );
+    let text_body = format!("Organization invitation {status}\n\nThe invitation to join {organization} as {role} was {status} on {changed_at}.\n\nView invitations: {url}\n",
+        status = email.status, organization = email.organization_name, role = email.role, url = email.invitations_url);
     RenderedEmail {
         subject,
         html_body,
@@ -1269,5 +1333,19 @@ mod tests {
         };
 
         assert!(error.sanitized_message().contains("RESEND_API_KEY"));
+    }
+
+    #[test]
+    fn invitation_status_email_names_terminal_status() {
+        let rendered = render_invitation_status_email(&InvitationStatusEmail {
+            recipient_email: "inviter@example.com".into(),
+            organization_name: "Example".into(),
+            role: "admin".into(),
+            status: "declined".into(),
+            changed_at: Utc::now(),
+            invitations_url: "https://cloud.example.com/invitations".into(),
+        });
+        assert!(rendered.subject.contains("declined"));
+        assert!(rendered.text_body.contains("as admin"));
     }
 }

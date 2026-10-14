@@ -1,7 +1,10 @@
 pub mod ports;
 use super::auth::ports::{UserId, UserRepository};
 use super::common::RepositoryError;
-use crate::email::{EmailDeliveryOutcome, EmailSender, InvitationEmail, NoopEmailSender};
+use crate::email::{
+    deliverable_email, EmailDeliveryOutcome, EmailSender, InvitationEmail, InvitationStatusEmail,
+    NoopEmailSender,
+};
 use anyhow::Result;
 use async_trait::async_trait;
 pub use ports::*;
@@ -1275,6 +1278,9 @@ impl OrganizationServiceImpl {
                 OrganizationError::InternalError(format!("Failed to update invitation: {e}"))
             })?;
 
+        self.send_invitation_status_email(&invitation, "accepted", false)
+            .await;
+
         Ok(member)
     }
 
@@ -1315,6 +1321,9 @@ impl OrganizationServiceImpl {
             .map_err(|e| {
                 OrganizationError::InternalError(format!("Failed to update invitation: {e}"))
             })?;
+
+        self.send_invitation_status_email(&invitation, "declined", false)
+            .await;
 
         Ok(())
     }
@@ -1399,7 +1408,58 @@ impl OrganizationServiceImpl {
             ));
         }
 
+        self.send_invitation_status_email(&invitation, "cancelled", true)
+            .await;
+
         Ok(())
+    }
+
+    async fn send_invitation_status_email(
+        &self,
+        invitation: &ports::OrganizationInvitation,
+        status: &str,
+        notify_invitee: bool,
+    ) {
+        let Some(invitations_url) = self.invitations_url.clone() else {
+            return;
+        };
+        let Ok(org) = self
+            .get_organization_impl(invitation.organization_id.clone())
+            .await
+        else {
+            return;
+        };
+        let recipient_email = if notify_invitee {
+            Some(invitation.email.clone())
+        } else {
+            self.user_repository
+                .get_by_id(invitation.invited_by_user_id.clone())
+                .await
+                .ok()
+                .flatten()
+                .and_then(|user| {
+                    deliverable_email(
+                        &user.email,
+                        user.contact_email.as_deref(),
+                        user.contact_email_verified_at,
+                    )
+                    .map(str::to_owned)
+                })
+        };
+        let Some(recipient_email) = recipient_email else {
+            return;
+        };
+        let email = InvitationStatusEmail {
+            recipient_email,
+            organization_name: org.name,
+            role: invitation.role.to_string(),
+            status: status.to_string(),
+            changed_at: chrono::Utc::now(),
+            invitations_url,
+        };
+        if let Err(error) = self.email_sender.send_invitation_status(&email).await {
+            tracing::warn!(invitation_id = %invitation.id, organization_id = %invitation.organization_id.0, error = %error.sanitized_message(), "Failed to send invitation status email");
+        }
     }
 
     /// List invitations for an organization (admin/owner only, private helper)

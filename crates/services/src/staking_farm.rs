@@ -11,6 +11,7 @@ use std::{
 use uuid::Uuid;
 
 use crate::aml::{AmlError, AmlFlow};
+use crate::email::{EmailSender, NoopEmailSender, OrganizationCreditChangedEmail};
 
 pub const CREDIT_TYPE_STAKING_FARM: &str = "staking_farm";
 pub const CREDIT_SOURCE_HOUSE_OF_STAKE: &str = "house-of-stake";
@@ -121,8 +122,24 @@ pub struct StakingFarmSourceSyncUpdate {
     pub active_positions: serde_json::Value,
 }
 
+#[derive(Debug, Clone)]
+pub struct StakingCreditNotificationContext {
+    pub organization_name: String,
+    pub recipient_emails: Vec<String>,
+    pub consumed: i64,
+    pub actor: Option<String>,
+}
+
 #[async_trait]
 pub trait StakingFarmRepository: Send + Sync {
+    async fn get_credit_notification_context(
+        &self,
+        _organization_id: Uuid,
+        _changed_by_user_id: Option<Uuid>,
+    ) -> anyhow::Result<Option<StakingCreditNotificationContext>> {
+        Ok(None)
+    }
+
     async fn upsert_source(
         &self,
         request: UpsertStakingFarmSourceRequest,
@@ -229,6 +246,8 @@ pub struct StakingFarmService {
     /// source is created or linked; the TTL covers links made by other instances.
     no_source_orgs: moka::future::Cache<Uuid, ()>,
     binding: Option<Arc<binding::StakingBindingService>>,
+    email_sender: Arc<dyn EmailSender>,
+    frontend_base_url: Option<String>,
 }
 
 impl StakingFarmService {
@@ -245,6 +264,8 @@ impl StakingFarmService {
             config,
             active_syncs: Arc::new(Mutex::new(HashSet::new())),
             binding: None,
+            email_sender: Arc::new(NoopEmailSender),
+            frontend_base_url: None,
             no_source_orgs: moka::future::Cache::builder()
                 .max_capacity(NO_SOURCE_CACHE_CAPACITY)
                 .time_to_live(std::time::Duration::from_secs(NO_SOURCE_CACHE_TTL_SECS))
@@ -264,6 +285,60 @@ impl StakingFarmService {
     pub fn with_binding(mut self, binding: Arc<binding::StakingBindingService>) -> Self {
         self.binding = Some(binding);
         self
+    }
+
+    pub fn with_credit_change_email(
+        mut self,
+        email_sender: Arc<dyn EmailSender>,
+        frontend_base_url: Option<String>,
+    ) -> Self {
+        self.email_sender = email_sender;
+        self.frontend_base_url = frontend_base_url;
+        self
+    }
+
+    async fn send_credit_change_email(
+        &self,
+        organization_id: Uuid,
+        previous_limit: Option<i64>,
+        new_limit: i64,
+        changed_by_user_id: Option<Uuid>,
+    ) {
+        let Some(base_url) = self.frontend_base_url.as_deref() else {
+            return;
+        };
+        let Ok(Some(context)) = self
+            .repository
+            .get_credit_notification_context(organization_id, changed_by_user_id)
+            .await
+        else {
+            return;
+        };
+        for recipient_email in context.recipient_emails {
+            let email = OrganizationCreditChangedEmail {
+                recipient_email,
+                organization_name: context.organization_name.clone(),
+                credit_type: CREDIT_TYPE_STAKING_FARM.to_string(),
+                source: Some(CREDIT_SOURCE_HOUSE_OF_STAKE.to_string()),
+                previous_limit,
+                new_limit,
+                available: Some(new_limit.saturating_sub(context.consumed).max(0)),
+                changed_at: Utc::now(),
+                reason: Some("Staking farm rewards synchronized".to_string()),
+                actor: context.actor.clone(),
+                credits_url: format!(
+                    "{}/dashboard/organizations/{organization_id}/credits",
+                    base_url.trim_end_matches('/')
+                ),
+            };
+            if let Err(error) = self
+                .email_sender
+                .send_organization_credit_changed(&email)
+                .await
+            {
+                tracing::warn!(%organization_id, error = %error.sanitized_message(), "Failed to send staking credit change email");
+            }
+        }
     }
 
     pub fn binding(&self) -> Option<&Arc<binding::StakingBindingService>> {
@@ -409,6 +484,13 @@ impl StakingFarmService {
                     .await?
                     .ok_or_else(|| anyhow::anyhow!("staking farm source no longer exists"));
             }
+            self.send_credit_change_email(
+                source.organization_id,
+                source.last_synced_credit_nano_usd,
+                next_credit,
+                changed_by_user_id,
+            )
+            .await;
         }
 
         self.repository

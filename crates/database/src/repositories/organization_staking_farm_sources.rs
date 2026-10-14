@@ -6,10 +6,10 @@ use async_trait::async_trait;
 use chrono::Utc;
 use services::common::RepositoryError;
 use services::staking_farm::{
-    OrganizationStakingFarmSource, StakingFarmOrganizationInactive, StakingFarmRepository,
-    StakingFarmSourceConflict, StakingFarmSourceStatus, StakingFarmSourceSyncUpdate,
-    StakingSyncStatus, UpsertStakingFarmSourceRequest, CREDIT_SOURCE_HOUSE_OF_STAKE,
-    CREDIT_TYPE_STAKING_FARM,
+    OrganizationStakingFarmSource, StakingCreditNotificationContext,
+    StakingFarmOrganizationInactive, StakingFarmRepository, StakingFarmSourceConflict,
+    StakingFarmSourceStatus, StakingFarmSourceSyncUpdate, StakingSyncStatus,
+    UpsertStakingFarmSourceRequest, CREDIT_SOURCE_HOUSE_OF_STAKE, CREDIT_TYPE_STAKING_FARM,
 };
 use tokio_postgres::types::Type;
 use tokio_postgres::Row;
@@ -68,6 +68,67 @@ impl OrganizationStakingFarmSourcesRepository {
 
 #[async_trait]
 impl StakingFarmRepository for OrganizationStakingFarmSourcesRepository {
+    async fn get_credit_notification_context(
+        &self,
+        organization_id: Uuid,
+        changed_by_user_id: Option<Uuid>,
+    ) -> Result<Option<StakingCreditNotificationContext>> {
+        let client = self.pool.get().await?;
+        let Some(organization) = client
+            .query_opt(
+                "SELECT name FROM organizations WHERE id = $1 AND is_active = true",
+                &[&organization_id],
+            )
+            .await?
+        else {
+            return Ok(None);
+        };
+        let recipient_rows = client
+            .query(
+                r#"
+                SELECT CASE WHEN u.contact_email_verified_at IS NOT NULL
+                            THEN u.contact_email ELSE u.email END AS email
+                FROM organization_members om
+                JOIN users u ON u.id = om.user_id
+                WHERE om.organization_id = $1
+                  AND om.role IN ('owner', 'admin')
+                  AND u.is_active = true
+                  AND (u.contact_email_verified_at IS NOT NULL OR u.email NOT LIKE '%@near')
+                ORDER BY lower(CASE WHEN u.contact_email_verified_at IS NOT NULL
+                                    THEN u.contact_email ELSE u.email END)
+                "#,
+                &[&organization_id],
+            )
+            .await?;
+        let consumed = client
+            .query_opt(
+                "SELECT amount FROM organization_credit_consumption WHERE organization_id = $1 AND credit_type = $2",
+                &[&organization_id, &CREDIT_TYPE_STAKING_FARM],
+            )
+            .await?
+            .map(|row| row.get("amount"))
+            .unwrap_or(0);
+        let actor = match changed_by_user_id {
+            Some(user_id) => client
+                .query_opt(
+                    "SELECT COALESCE(display_name, username) AS name FROM users WHERE id = $1",
+                    &[&user_id],
+                )
+                .await?
+                .map(|row| row.get("name")),
+            None => None,
+        };
+        Ok(Some(StakingCreditNotificationContext {
+            organization_name: organization.get("name"),
+            recipient_emails: recipient_rows
+                .into_iter()
+                .map(|row| row.get("email"))
+                .collect(),
+            consumed,
+            actor,
+        }))
+    }
+
     async fn upsert_source(
         &self,
         request: UpsertStakingFarmSourceRequest,

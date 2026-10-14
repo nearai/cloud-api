@@ -622,6 +622,11 @@ pub async fn init_domain_services_with_pool(
             Some(aml_service.clone()),
             config.staking_farm.clone(),
         )
+        .with_credit_change_email(
+            services::email::sender_from_config(&config.invitation_email)
+                .expect("Failed to initialize staking credit email sender"),
+            config.invitation_email.frontend_base_url.clone(),
+        )
         .with_binding(staking_binding),
     );
 

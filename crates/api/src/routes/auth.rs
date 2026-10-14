@@ -106,6 +106,11 @@ fn oauth_user_error_response(
             .into_response();
     };
 
+    info!(
+        existing_provider = %existing_provider,
+        "OAuth sign-in rejected: email already registered to another identity"
+    );
+
     let provider_name = match existing_provider.as_str() {
         "github" => "GitHub",
         "google" => "Google",
@@ -954,6 +959,35 @@ mod tests {
             assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{callback}");
             assert!(!response.headers().contains_key("location"));
             assert_eq!(json_body(response).await["error"], "invalid_request");
+        }
+    }
+
+    #[tokio::test]
+    async fn oauth_provider_conflict_redirect_respects_wildcard_domain_boundaries() {
+        for suffix in [".example.com", "example.com"] {
+            let cors = config::CorsConfig {
+                exact_matches: vec![],
+                wildcard_suffixes: vec![suffix.into()],
+            };
+            let response = oauth_user_error_response(
+                conflict("github"),
+                Some("https://sub.example.com/auth/callback"),
+                &cors,
+            );
+            assert_eq!(response.status(), StatusCode::TEMPORARY_REDIRECT);
+            let location = Url::parse(response.headers()["location"].to_str().unwrap()).unwrap();
+            assert_eq!(location.host_str(), Some("sub.example.com"));
+
+            for callback in [
+                "https://evilexample.com/auth/callback",
+                "https://example.com.evil.test/auth/callback",
+                "http://sub.example.com/auth/callback",
+            ] {
+                let response = oauth_user_error_response(conflict("github"), Some(callback), &cors);
+                assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{callback}");
+                assert!(!response.headers().contains_key("location"));
+                assert_eq!(json_body(response).await["error"], "invalid_request");
+            }
         }
     }
 

@@ -85,6 +85,110 @@ async fn oauth_email_conflict_preserves_original_account_in_both_directions() {
 }
 
 #[tokio::test]
+async fn oauth_returning_user_email_conflict_preserves_both_accounts() {
+    let (_server, db) = setup_test_server_with_database().await;
+    let auth = real_auth(&db);
+    let users = database::repositories::UserRepository::new(db.pool().clone());
+
+    for (provider, owner_provider) in [("github", "google"), ("google", "github")] {
+        let original_email = format!("oauth-original-{}@example.test", uuid::Uuid::new_v4());
+        let claimed_email = format!("oauth-claimed-{}@example.test", uuid::Uuid::new_v4());
+        let original_info = oauth_info(provider, &original_email);
+        let user = auth
+            .get_or_create_oauth_user(original_info.clone())
+            .await
+            .unwrap();
+        let owner = auth
+            .get_or_create_oauth_user(oauth_info(owner_provider, &claimed_email))
+            .await
+            .unwrap();
+        let mut changed_info = original_info.clone();
+        changed_info.email = claimed_email.clone();
+        changed_info.display_name = Some("Must not be applied".into());
+
+        let error = auth
+            .get_or_create_oauth_user(changed_info)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, AuthError::OAuthProviderConflict { existing_provider }
+            if existing_provider == owner_provider)
+        );
+        let stored = users.get_by_id(user.id.0).await.unwrap().unwrap();
+        assert_eq!(stored.email, original_email);
+        assert_eq!(stored.display_name, user.display_name);
+        assert!(stored.last_login_at.is_none());
+        let stored_owner = users.get_by_id(owner.id.0).await.unwrap().unwrap();
+        assert_eq!(stored_owner.email, claimed_email);
+        assert_eq!(stored_owner.auth_provider, owner_provider);
+        assert!(stored_owner.last_login_at.is_none());
+        assert_single_oauth_account(&db, user.id.0, &original_email).await;
+        assert_single_oauth_account(&db, owner.id.0, &claimed_email).await;
+
+        assert_eq!(
+            auth.get_or_create_oauth_user(original_info)
+                .await
+                .unwrap()
+                .id,
+            user.id
+        );
+    }
+}
+
+#[tokio::test]
+async fn oauth_concurrent_email_changes_return_one_conflict_without_mutating_loser() {
+    let (_server, db) = setup_test_server_with_database().await;
+    let auth = real_auth(&db);
+    let users = database::repositories::UserRepository::new(db.pool().clone());
+    let shared_email = format!("oauth-update-race-{}@example.test", uuid::Uuid::new_v4());
+    let github_info = oauth_info(
+        "github",
+        &format!("oauth-github-{}@example.test", uuid::Uuid::new_v4()),
+    );
+    let google_info = oauth_info(
+        "google",
+        &format!("oauth-google-{}@example.test", uuid::Uuid::new_v4()),
+    );
+    let github = auth
+        .get_or_create_oauth_user(github_info.clone())
+        .await
+        .unwrap();
+    let google = auth
+        .get_or_create_oauth_user(google_info.clone())
+        .await
+        .unwrap();
+    let mut github_change = github_info;
+    github_change.email = shared_email.clone();
+    github_change.display_name = Some("Changed GitHub profile".into());
+    let mut google_change = google_info;
+    google_change.email = shared_email.clone();
+    google_change.display_name = Some("Changed Google profile".into());
+
+    let (github_result, google_result) = tokio::join!(
+        auth.get_or_create_oauth_user(github_change),
+        auth.get_or_create_oauth_user(google_change),
+    );
+    let (winner, loser, error) = match (github_result, google_result) {
+        (Ok(_), Err(error)) => (github, google, error),
+        (Err(error), Ok(_)) => (google, github, error),
+        results => panic!("expected one email update and one conflict, got {results:?}"),
+    };
+    assert!(
+        matches!(error, AuthError::OAuthProviderConflict { existing_provider }
+        if existing_provider == winner.auth_provider)
+    );
+    let stored_winner = users.get_by_id(winner.id.0).await.unwrap().unwrap();
+    assert_eq!(stored_winner.email, shared_email);
+    assert!(stored_winner.last_login_at.is_some());
+    let stored_loser = users.get_by_id(loser.id.0).await.unwrap().unwrap();
+    assert_eq!(stored_loser.email, loser.email);
+    assert_eq!(stored_loser.display_name, loser.display_name);
+    assert!(stored_loser.last_login_at.is_none());
+    assert_single_oauth_account(&db, winner.id.0, &shared_email).await;
+    assert_single_oauth_account(&db, loser.id.0, &loser.email).await;
+}
+
+#[tokio::test]
 async fn oauth_concurrent_cross_provider_signup_creates_only_one_account() {
     let (_server, db) = setup_test_server_with_database().await;
     let auth = real_auth(&db);

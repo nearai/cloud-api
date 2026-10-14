@@ -1,7 +1,10 @@
 pub mod ports;
 use super::auth::ports::{UserId, UserRepository};
 use super::common::RepositoryError;
-use crate::email::{EmailDeliveryOutcome, EmailSender, InvitationEmail, NoopEmailSender};
+use crate::email::{
+    deliverable_email, EmailDeliveryOutcome, EmailSender, InvitationEmail, MembershipRemovedEmail,
+    NoopEmailSender,
+};
 use anyhow::Result;
 use async_trait::async_trait;
 pub use ports::*;
@@ -367,7 +370,13 @@ impl OrganizationServiceImpl {
         requester_id: UserId,
         member_id: UserId,
     ) -> Result<bool, OrganizationError> {
-        match self
+        let org = self.get_organization_impl(organization_id.clone()).await?;
+        let removed_member = self
+            .repository
+            .get_member(organization_id.0, member_id.0)
+            .await
+            .map_err(Self::map_repository_error)?;
+        let result = match self
             .repository
             .remove_member(organization_id.0, member_id.0, requester_id.0)
             .await
@@ -381,6 +390,60 @@ impl OrganizationServiceImpl {
             RemoveOrganizationMemberResult::LastOwner => Err(OrganizationError::InvalidParams(
                 "Cannot remove the last owner from organization".to_string(),
             )),
+        }?;
+        if result {
+            if let Some(member) = removed_member {
+                self.send_membership_removed_email(
+                    &org,
+                    member_id.clone(),
+                    member.role,
+                    requester_id.clone(),
+                    requester_id == member_id,
+                )
+                .await;
+            }
+        }
+        Ok(result)
+    }
+
+    async fn send_membership_removed_email(
+        &self,
+        org: &Organization,
+        member_id: UserId,
+        previous_role: MemberRole,
+        actor_id: UserId,
+        voluntary: bool,
+    ) {
+        let Ok(Some(user)) = self.user_repository.get_by_id(member_id.clone()).await else {
+            return;
+        };
+        let Some(recipient_email) = deliverable_email(
+            &user.email,
+            user.contact_email.as_deref(),
+            user.contact_email_verified_at,
+        ) else {
+            return;
+        };
+        let actor_name = if voluntary {
+            None
+        } else {
+            self.user_repository
+                .get_by_id(actor_id)
+                .await
+                .ok()
+                .flatten()
+                .map(|actor| actor.display_name.unwrap_or(actor.username))
+        };
+        let email = MembershipRemovedEmail {
+            recipient_email: recipient_email.to_string(),
+            organization_name: org.name.clone(),
+            previous_role: previous_role.to_string(),
+            removed_at: chrono::Utc::now(),
+            actor_name,
+            voluntary,
+        };
+        if let Err(error) = self.email_sender.send_membership_removed(&email).await {
+            tracing::warn!(organization_id = %org.id.0, member_id = %member_id.0, error = %error.sanitized_message(), "Failed to send membership removal email");
         }
     }
 

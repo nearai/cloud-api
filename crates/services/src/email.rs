@@ -58,6 +58,16 @@ pub struct InvitationEmail {
 }
 
 #[derive(Debug, Clone)]
+pub struct MembershipRemovedEmail {
+    pub recipient_email: String,
+    pub organization_name: String,
+    pub previous_role: String,
+    pub removed_at: DateTime<Utc>,
+    pub actor_name: Option<String>,
+    pub voluntary: bool,
+}
+
+#[derive(Debug, Clone)]
 pub struct ModelDeprecationEmail {
     pub recipient_email: String,
     pub model_id: String,
@@ -150,6 +160,13 @@ pub trait EmailSender: Send + Sync {
         &self,
         email: &ContactEmailVerificationEmail,
     ) -> Result<EmailDeliveryOutcome, EmailError>;
+
+    async fn send_membership_removed(
+        &self,
+        _email: &MembershipRemovedEmail,
+    ) -> Result<EmailDeliveryOutcome, EmailError> {
+        Ok(EmailDeliveryOutcome::Skipped)
+    }
 }
 
 pub struct NoopEmailSender;
@@ -383,6 +400,30 @@ impl EmailSender for ResendEmailSender {
             message_id: Some(response.id),
         })
     }
+
+    async fn send_membership_removed(
+        &self,
+        email: &MembershipRemovedEmail,
+    ) -> Result<EmailDeliveryOutcome, EmailError> {
+        let rendered = render_membership_removed_email(email);
+        let response = self
+            .transport
+            .send_email(
+                &self.api_key,
+                ResendSendEmailRequest {
+                    from: self.from_email.clone(),
+                    to: vec![email.recipient_email.clone()],
+                    subject: rendered.subject,
+                    html: rendered.html_body,
+                    text: rendered.text_body,
+                    reply_to: self.reply_to.clone(),
+                },
+            )
+            .await?;
+        Ok(EmailDeliveryOutcome::Sent {
+            message_id: Some(response.id),
+        })
+    }
 }
 
 pub fn sender_from_config(
@@ -476,6 +517,50 @@ pub fn render_invitation_email(email: &InvitationEmail) -> RenderedEmail {
         url = email.invitations_url,
     );
 
+    RenderedEmail {
+        subject,
+        html_body,
+        text_body,
+    }
+}
+
+pub fn render_membership_removed_email(email: &MembershipRemovedEmail) -> RenderedEmail {
+    let removed_at = email.removed_at.format("%B %-d, %Y at %H:%M UTC");
+    let (subject, heading, explanation) = if email.voluntary {
+        (
+            format!("You left {}", email.organization_name),
+            "Organization membership ended",
+            "You left this organization.",
+        )
+    } else {
+        (
+            format!("Your access to {} was removed", email.organization_name),
+            "Organization access removed",
+            "An administrator removed your access to this organization.",
+        )
+    };
+    let actor = email.actor_name.as_deref().unwrap_or("an administrator");
+    let html_body = format!(
+        r#"<!doctype html>
+<html lang="en"><body style="font-family:Arial,sans-serif;line-height:1.5;color:#111827;">
+<h1 style="font-size:20px;margin-bottom:16px;">{heading}</h1>
+<p>{explanation}</p><p>Organization: <strong>{organization}</strong><br>Previous role: <strong>{role}</strong><br>Time: {removed_at}<br>{actor_line}</p>
+<p>If this was unexpected, contact your organization administrator or NEAR AI Cloud support.</p>
+</body></html>"#,
+        heading = escape_html(heading),
+        explanation = escape_html(explanation),
+        organization = escape_html(&email.organization_name),
+        role = escape_html(&email.previous_role),
+        removed_at = escape_html(&removed_at.to_string()),
+        actor_line = if email.voluntary {
+            String::new()
+        } else {
+            format!("Changed by: {}", escape_html(actor))
+        }
+    );
+    let text_body = format!("{heading}\n\n{explanation}\n\nOrganization: {organization}\nPrevious role: {role}\nTime: {removed_at}\n{actor_line}\n\nIf this was unexpected, contact your organization administrator or NEAR AI Cloud support.\n",
+        organization = email.organization_name, role = email.previous_role,
+        actor_line = if email.voluntary { String::new() } else { format!("Changed by: {actor}") });
     RenderedEmail {
         subject,
         html_body,
@@ -1269,5 +1354,19 @@ mod tests {
         };
 
         assert!(error.sanitized_message().contains("RESEND_API_KEY"));
+    }
+
+    #[test]
+    fn voluntary_membership_email_is_not_described_as_revocation() {
+        let rendered = render_membership_removed_email(&MembershipRemovedEmail {
+            recipient_email: "member@example.com".into(),
+            organization_name: "Example".into(),
+            previous_role: "member".into(),
+            removed_at: Utc::now(),
+            actor_name: None,
+            voluntary: true,
+        });
+        assert!(rendered.text_body.contains("You left this organization"));
+        assert!(!rendered.text_body.contains("administrator removed"));
     }
 }

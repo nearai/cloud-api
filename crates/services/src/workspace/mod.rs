@@ -504,12 +504,17 @@ impl WorkspaceServiceTrait for WorkspaceServiceImpl {
         let (workspace, organization) = self
             .check_workspace_permission(workspace_id.clone(), requester_id.clone())
             .await?;
+        let member_count = self
+            .organization_service
+            .get_member_count(organization.id.clone(), requester_id.clone())
+            .await
+            .unwrap_or(1000);
         let members = self
             .organization_service
             .get_members_with_users_paginated(
                 organization.id.clone(),
                 requester_id.clone(),
-                1000,
+                member_count.max(1),
                 0,
             )
             .await

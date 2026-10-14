@@ -47,7 +47,7 @@ threads-required = "num-test-threads"
 # The scheduler claims from a database-global due queue rather than one batch,
 # so producers of due rows and scheduler passes cannot safely overlap.
 [[profile.default.overrides]]
-filter = 'package(api) & binary(e2e_all) & test(/^admin_pricing_changes::test_(retry_of_persisted_batch_skips_lead_time_validation|scheduler_applies_due_changes|concurrent_schedulers_apply_each_change_once)$/)'
+filter = 'package(api) & binary(e2e_all) & (test(/^admin_pricing_changes::test_(retry_of_persisted_batch_skips_lead_time_validation|scheduler_applies_due_changes|concurrent_schedulers_apply_each_change_once)$/) | test(/^model_pricing_notices::serial_/))'
 test-group = "e2e-db"
 threads-required = "num-test-threads"
 

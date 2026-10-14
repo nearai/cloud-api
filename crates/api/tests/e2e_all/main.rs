@@ -74,6 +74,7 @@ mod message_metadata;
 mod model_alias_transparency;
 mod model_deprecation_headers;
 mod model_history_test;
+mod model_pricing_notices;
 mod multiturn_tools;
 mod near_auth;
 mod oauth_frontend_callback;

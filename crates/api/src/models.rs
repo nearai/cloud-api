@@ -1200,6 +1200,9 @@ pub struct ModelInfo {
     /// Pricing information (HuggingFace + OpenRouter compatible).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pricing: Option<ModelPricing>,
+    /// Earliest pending change and complete prices after it is applied.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub upcoming_pricing: Option<UpcomingModelPricingInfo>,
     /// Exact, versioned USD-per-million text pricing. The legacy `pricing`
     /// projection remains Standard-short for compatibility.
     #[serde(rename = "textPricing", skip_serializing_if = "Option::is_none")]
@@ -3828,6 +3831,47 @@ pub struct AdminModelWithPricing {
     pub updated_at: DateTime<Utc>,
 }
 
+/// A scheduled change on the OpenAI-compatible model catalog. Prices use the
+/// same representation as the model's current `pricing` and `textPricing`.
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct UpcomingModelPricingInfo {
+    pub effective_at: String,
+    pub pricing: ModelPricing,
+    #[serde(rename = "textPricing", skip_serializing_if = "Option::is_none")]
+    pub text_pricing: Option<serde_json::Value>,
+}
+
+/// A scheduled change on the native model catalog, in nano-dollars like the
+/// current prices. Absent when no change is pending.
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct UpcomingPricing {
+    #[serde(rename = "effectiveAt")]
+    pub effective_at: String,
+    pub pricing: PricingFields,
+}
+
+impl From<services::models::UpcomingModelPricing> for UpcomingPricing {
+    fn from(pricing: services::models::UpcomingModelPricing) -> Self {
+        let decimal = |amount| DecimalPrice {
+            amount,
+            scale: 9,
+            currency: "USD".to_string(),
+        };
+        Self {
+            effective_at: crate::routes::admin::format_deprecation_date(&pricing.effective_at),
+            pricing: PricingFields {
+                input_cost_per_token: decimal(pricing.input_cost_per_token),
+                output_cost_per_token: decimal(pricing.output_cost_per_token),
+                cache_read_cost_per_token: pricing.cache_read_cost_per_token.map(decimal),
+                cost_per_image: decimal(pricing.cost_per_image),
+                text_pricing: pricing
+                    .text_pricing
+                    .map(|profile| serde_json::to_value(profile).expect("text pricing serializes")),
+            },
+        }
+    }
+}
+
 /// Model with pricing information
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub struct ModelWithPricing {
@@ -3848,6 +3892,9 @@ pub struct ModelWithPricing {
     pub cache_read_cost_per_token: Option<DecimalPrice>,
     #[serde(rename = "textPricing", skip_serializing_if = "Option::is_none")]
     pub text_pricing: Option<serde_json::Value>,
+    /// Complete future prices and date for the earliest pending change.
+    #[serde(rename = "upcomingPricing", skip_serializing_if = "Option::is_none")]
+    pub upcoming_pricing: Option<UpcomingPricing>,
     pub metadata: ModelMetadata,
 }
 

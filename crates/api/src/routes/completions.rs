@@ -3370,25 +3370,40 @@ fn nano_dollars_to_per_token_string(nano_dollars: i64) -> String {
     s
 }
 
-fn model_with_pricing_to_info(model: services::models::ModelWithPricing) -> ModelInfo {
-    // Legacy HuggingFace-style fields: USD per million tokens.
-    // nano_dollars_per_token * 0.001 = USD per million.
-    let input_per_million = (model.input_cost_per_token as f64) * 0.001;
-    let output_per_million = (model.output_cost_per_token as f64) * 0.001;
-
-    let pricing = ModelPricing {
-        input: input_per_million,
-        output: output_per_million,
-        prompt: nano_dollars_to_per_token_string(model.input_cost_per_token),
-        completion: nano_dollars_to_per_token_string(model.output_cost_per_token),
-        image: nano_dollars_to_per_token_string(model.cost_per_image),
+fn catalog_pricing(input: i64, output: i64, image: i64, cached: Option<i64>) -> ModelPricing {
+    ModelPricing {
+        // nano-dollars per token * 0.001 = USD per million tokens.
+        input: (input as f64) * 0.001,
+        output: (output as f64) * 0.001,
+        prompt: nano_dollars_to_per_token_string(input),
+        completion: nano_dollars_to_per_token_string(output),
+        image: nano_dollars_to_per_token_string(image),
         request: "0".to_string(),
-        // None = cache pricing disabled -> omit the field entirely.
-        // Some(0) is a real (genuinely free) price and renders as "0".
-        input_cache_read: model
-            .cache_read_cost_per_token
-            .map(nano_dollars_to_per_token_string),
-    };
+        input_cache_read: cached.map(nano_dollars_to_per_token_string),
+    }
+}
+
+fn model_with_pricing_to_info(model: services::models::ModelWithPricing) -> ModelInfo {
+    let pricing = catalog_pricing(
+        model.input_cost_per_token,
+        model.output_cost_per_token,
+        model.cost_per_image,
+        model.cache_read_cost_per_token,
+    );
+    let upcoming_pricing = model
+        .upcoming_pricing
+        .map(|future| UpcomingModelPricingInfo {
+            effective_at: crate::routes::admin::format_deprecation_date(&future.effective_at),
+            pricing: catalog_pricing(
+                future.input_cost_per_token,
+                future.output_cost_per_token,
+                future.cost_per_image,
+                future.cache_read_cost_per_token,
+            ),
+            text_pricing: future
+                .text_pricing
+                .map(|profile| serde_json::to_value(profile).expect("text pricing serializes")),
+        });
 
     // OpenRouter's provider spec marks `input_modalities` / `output_modalities`
     // as REQUIRED fields. They are derived from the nullable `architecture`
@@ -3426,6 +3441,7 @@ fn model_with_pricing_to_info(model: services::models::ModelWithPricing) -> Mode
         hugging_face_id: model.hugging_face_id,
         quantization: model.quantization,
         pricing: Some(pricing),
+        upcoming_pricing,
         text_pricing: model
             .text_pricing
             .map(|profile| serde_json::to_value(profile).unwrap_or(serde_json::Value::Null)),
@@ -3624,6 +3640,7 @@ mod tests {
         output_modalities: Option<Vec<String>>,
     ) -> services::models::ModelWithPricing {
         services::models::ModelWithPricing {
+            upcoming_pricing: None,
             id: uuid::Uuid::new_v4(),
             model_name: "test/model".to_string(),
             model_display_name: "Test Model".to_string(),

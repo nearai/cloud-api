@@ -120,12 +120,55 @@ async fn main() {
     // A durable per-org claim prevents replica duplication. Keep two jobs in
     // flight so a slow final verification does not stall every other organization.
     let discount_repository = database::repositories::organization_usage_discount::OrganizationUsageDiscountRepository::new(database.pool().clone());
+    let expiration_reminder_days = std::env::var("API_KEY_EXPIRATION_EMAIL_DAYS")
+        .ok()
+        .map(|value| {
+            value
+                .split(',')
+                .filter_map(|part| part.trim().parse::<i16>().ok())
+                .collect::<Vec<_>>()
+        })
+        .filter(|values| !values.is_empty())
+        .unwrap_or_else(|| vec![7, 1]);
+    let expiration_repository =
+        database::repositories::api_key_expiration_email::ApiKeyExpirationEmailRepository::new(
+            database.pool().clone(),
+            expiration_reminder_days,
+        );
+    let expiration_sender = services::email::sender_from_config(&config.invitation_email)
+        .expect("Failed to initialize API key expiration email sender");
+    let expiration_frontend_url = config.invitation_email.frontend_base_url.clone();
     let discount_worker = tokio::spawn(async move {
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
+        let mut expiration_interval = tokio::time::interval(std::time::Duration::from_secs(300));
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let mut jobs = tokio::task::JoinSet::new();
         loop {
             tokio::select! {
+                _ = expiration_interval.tick() => {
+                    match expiration_repository.claim_due().await {
+                        Ok(candidates) => for candidate in candidates {
+                            let mut failed = false;
+                            for recipient_email in &candidate.recipient_emails {
+                                let email = services::email::ApiKeyExpirationEmail {
+                                    recipient_email: recipient_email.clone(), organization_name: candidate.organization_name.clone(), workspace_name: candidate.workspace_name.clone(),
+                                    key_name: candidate.key_name.clone(), key_prefix: candidate.key_prefix.clone(), expires_at: candidate.expires_at,
+                                    interval_days: candidate.interval_days, keys_url: format!("{}/dashboard/organizations/{}/keys", expiration_frontend_url.as_deref().unwrap_or("").trim_end_matches('/'), candidate.organization_id),
+                                };
+                                match expiration_sender.send_api_key_expiration(&email).await {
+                                    Ok(services::email::EmailDeliveryOutcome::Sent { .. }) => {}
+                                    Ok(services::email::EmailDeliveryOutcome::Skipped) => failed = true,
+                                    Err(error) => {
+                                        failed = true;
+                                        tracing::warn!(api_key_id = %candidate.api_key_id, error = %error.sanitized_message(), "Failed to send API key expiration email");
+                                    }
+                                }
+                            }
+                            if failed { let _ = expiration_repository.release_claim(candidate.api_key_id, candidate.expires_at, candidate.interval_days).await; }
+                        },
+                        Err(error) => tracing::error!(%error, "Failed to scan API key expirations"),
+                    }
+                }
                 _ = interval.tick() => {
                     while jobs.len() < 2 {
                         match discount_repository.claim_next().await {

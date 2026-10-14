@@ -58,6 +58,18 @@ pub struct InvitationEmail {
 }
 
 #[derive(Debug, Clone)]
+pub struct ApiKeyExpirationEmail {
+    pub recipient_email: String,
+    pub organization_name: String,
+    pub workspace_name: String,
+    pub key_name: String,
+    pub key_prefix: String,
+    pub expires_at: DateTime<Utc>,
+    pub interval_days: i16,
+    pub keys_url: String,
+}
+
+#[derive(Debug, Clone)]
 pub struct ModelDeprecationEmail {
     pub recipient_email: String,
     pub model_id: String,
@@ -150,6 +162,13 @@ pub trait EmailSender: Send + Sync {
         &self,
         email: &ContactEmailVerificationEmail,
     ) -> Result<EmailDeliveryOutcome, EmailError>;
+
+    async fn send_api_key_expiration(
+        &self,
+        _email: &ApiKeyExpirationEmail,
+    ) -> Result<EmailDeliveryOutcome, EmailError> {
+        Ok(EmailDeliveryOutcome::Skipped)
+    }
 }
 
 pub struct NoopEmailSender;
@@ -383,6 +402,30 @@ impl EmailSender for ResendEmailSender {
             message_id: Some(response.id),
         })
     }
+
+    async fn send_api_key_expiration(
+        &self,
+        email: &ApiKeyExpirationEmail,
+    ) -> Result<EmailDeliveryOutcome, EmailError> {
+        let rendered = render_api_key_expiration_email(email);
+        let response = self
+            .transport
+            .send_email(
+                &self.api_key,
+                ResendSendEmailRequest {
+                    from: self.from_email.clone(),
+                    to: vec![email.recipient_email.clone()],
+                    subject: rendered.subject,
+                    html: rendered.html_body,
+                    text: rendered.text_body,
+                    reply_to: self.reply_to.clone(),
+                },
+            )
+            .await?;
+        Ok(EmailDeliveryOutcome::Sent {
+            message_id: Some(response.id),
+        })
+    }
 }
 
 pub fn sender_from_config(
@@ -476,6 +519,38 @@ pub fn render_invitation_email(email: &InvitationEmail) -> RenderedEmail {
         url = email.invitations_url,
     );
 
+    RenderedEmail {
+        subject,
+        html_body,
+        text_body,
+    }
+}
+
+pub fn render_api_key_expiration_email(email: &ApiKeyExpirationEmail) -> RenderedEmail {
+    let expired = email.interval_days == 0;
+    let state = if expired {
+        "has expired".to_string()
+    } else {
+        format!(
+            "expires in {} day{}",
+            email.interval_days,
+            if email.interval_days == 1 { "" } else { "s" }
+        )
+    };
+    let subject = format!("API key {state}: {}", email.key_name);
+    let expires_at = email.expires_at.format("%B %-d, %Y at %H:%M UTC");
+    let html_body = format!(
+        r#"<!doctype html><html lang="en"><body style="font-family:Arial,sans-serif;line-height:1.5;color:#111827;">
+<h1 style="font-size:20px;margin-bottom:16px;">API key {state}</h1><p>Organization: {organization}<br>Workspace: {workspace}<br>Key: <strong>{name}</strong> ({prefix})<br>Expiration: {expires_at}</p><p><a href="{url}">Review API keys</a></p></body></html>"#,
+        state = escape_html(&state),
+        organization = escape_html(&email.organization_name),
+        workspace = escape_html(&email.workspace_name),
+        name = escape_html(&email.key_name),
+        prefix = escape_html(&email.key_prefix),
+        expires_at = escape_html(&expires_at.to_string()),
+        url = escape_html(&email.keys_url)
+    );
+    let text_body = format!("API key {state}\n\nOrganization: {organization}\nWorkspace: {workspace}\nKey: {name} ({prefix})\nExpiration: {expires_at}\n\nReview API keys: {url}\n", organization = email.organization_name, workspace = email.workspace_name, name = email.key_name, prefix = email.key_prefix, url = email.keys_url);
     RenderedEmail {
         subject,
         html_body,
@@ -1269,5 +1344,21 @@ mod tests {
         };
 
         assert!(error.sanitized_message().contains("RESEND_API_KEY"));
+    }
+
+    #[test]
+    fn api_key_expiration_email_never_contains_a_secret() {
+        let rendered = render_api_key_expiration_email(&ApiKeyExpirationEmail {
+            recipient_email: "owner@example.com".into(),
+            organization_name: "Example".into(),
+            workspace_name: "Prod".into(),
+            key_name: "deploy".into(),
+            key_prefix: "sk-safe".into(),
+            expires_at: Utc::now(),
+            interval_days: 7,
+            keys_url: "https://cloud.example.com/keys".into(),
+        });
+        assert!(rendered.text_body.contains("sk-safe"));
+        assert!(rendered.subject.contains("7 days"));
     }
 }

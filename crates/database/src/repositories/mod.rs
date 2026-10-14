@@ -13,6 +13,7 @@ pub mod admin_settings;
 pub mod aml;
 pub mod analytics;
 pub mod api_key;
+pub mod api_key_expiration_email;
 pub mod attestation;
 pub mod contact_email;
 pub mod conversation;

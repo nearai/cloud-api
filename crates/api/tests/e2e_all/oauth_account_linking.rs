@@ -239,6 +239,64 @@ async fn oauth_link_provider_rejections_do_not_cancel_or_create_a_link() {
 }
 
 #[tokio::test]
+async fn oauth_verified_email_callback_auto_links_and_signs_into_original_account() {
+    for verified in [false, true] {
+        for (original, incoming) in [("github", "google"), ("google", "github")] {
+            let (server, db, auth, store, provider) = fixture().await;
+            let (user, original_info, _, _) = account(&auth, original).await;
+            let mut incoming_info = info(incoming, &original_info.email);
+            incoming_info.email_verified = verified;
+            mock_identity(&provider, &incoming_info).await;
+            let before = counts(&db, &user).await;
+            let state = uuid::Uuid::new_v4().to_string();
+            store
+                .create(
+                    state.clone(),
+                    incoming.into(),
+                    Some("local-verifier".into()),
+                    None,
+                )
+                .await
+                .unwrap();
+            let response = server
+                .get(&format!("/v1/auth/callback?state={state}&code=local-code"))
+                .add_header("User-Agent", UA)
+                .await;
+            let body = response.json::<serde_json::Value>();
+            if verified {
+                assert_eq!(response.status_code(), 200);
+                let token = body["access_token"].as_str().unwrap();
+                let signed_in = auth
+                    .validate_session_access(token.into(), test_config().auth.encoding_key)
+                    .await
+                    .unwrap();
+                assert_eq!(signed_in.id, user.id);
+            } else {
+                assert_eq!(response.status_code(), 409);
+                assert_eq!(body["error"], "oauth_provider_conflict");
+                assert!(body.get("access_token").is_none());
+            }
+            assert_eq!(counts(&db, &user).await, before);
+            assert_eq!(
+                auth.list_oauth_identities(user.id.clone())
+                    .await
+                    .unwrap()
+                    .len(),
+                if verified { 2 } else { 1 }
+            );
+            let stored = database::UserRepository::new(db.pool().clone())
+                .get_by_id(user.id.0)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(stored.auth_provider, original);
+            assert_eq!(stored.email, user.email);
+            assert_eq!(stored.display_name, user.display_name);
+        }
+    }
+}
+
+#[tokio::test]
 async fn explicit_link_callback_confirms_original_session_and_both_providers_sign_in() {
     for (original, incoming) in [("github", "google"), ("google", "github")] {
         let (server, db, auth, store, provider) = fixture().await;

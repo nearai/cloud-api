@@ -590,6 +590,34 @@ fn db_user_to_service_user(db_user: User) -> services::auth::User {
 // Implement the service trait
 #[async_trait]
 impl services::auth::UserRepository for UserRepository {
+    async fn try_link_oauth_identity_by_email(
+        &self,
+        info: &OAuthUserInfo,
+    ) -> anyhow::Result<Option<services::auth::User>> {
+        if !info.email_verified || !matches!(info.provider.as_str(), "google" | "github") {
+            return Ok(None);
+        }
+        let client = self.pool.get().await?;
+        // Lock the matching account while attaching the identity so its email
+        // cannot change between the match and insert. Never replace an identity.
+        client.execute(
+            "WITH existing_user AS (
+                SELECT id FROM users WHERE email=$1 AND is_active=true
+                AND auth_provider IN ('google','github') AND auth_provider<>$2 FOR UPDATE
+             )
+             INSERT INTO user_oauth_identities (user_id,provider,provider_user_id,email,email_verified)
+             SELECT id,$2,$3,$1,true FROM existing_user ON CONFLICT DO NOTHING",
+            &[&info.email, &info.provider, &info.provider_user_id],
+        ).await.map_err(map_db_error)?;
+        drop(client);
+        // A concurrent login/link may already own this stable provider identity.
+        // Resolve its actual owner rather than treating DO NOTHING as a bind.
+        Ok(self
+            .get_by_provider(&info.provider, &info.provider_user_id)
+            .await?
+            .map(db_user_to_service_user))
+    }
+
     async fn observe_oauth_identity(
         &self,
         user_id: UserId,

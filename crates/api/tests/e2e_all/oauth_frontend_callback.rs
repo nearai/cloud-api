@@ -43,45 +43,67 @@ async fn assert_single_oauth_account(db: &database::Database, user_id: uuid::Uui
 }
 
 #[tokio::test]
-async fn oauth_email_conflict_preserves_original_account_in_both_directions() {
+async fn oauth_matching_email_auto_links_only_verified_social_identities_in_both_directions() {
     let (_server, db) = setup_test_server_with_database().await;
     let auth = real_auth(&db);
     let users = database::repositories::UserRepository::new(db.pool().clone());
-
-    for (original, incoming) in [("github", "google"), ("google", "github")] {
-        let email = format!("oauth-conflict-{}@example.test", uuid::Uuid::new_v4());
-        let original_info = oauth_info(original, &email);
-        let existing = auth
-            .get_or_create_oauth_user(original_info.clone())
-            .await
-            .unwrap();
-        let incoming_info = oauth_info(incoming, &email);
-
-        for _ in 0..2 {
-            let error = auth
-                .get_or_create_oauth_user(incoming_info.clone())
+    for verified in [false, true] {
+        for (original, incoming) in [("github", "google"), ("google", "github")] {
+            let email = format!("oauth-auto-link-{}@example.test", uuid::Uuid::new_v4());
+            let original_info = oauth_info(original, &email);
+            let existing = auth
+                .get_or_create_oauth_user(original_info.clone())
                 .await
-                .unwrap_err();
-            assert!(
-                matches!(error, AuthError::OAuthProviderConflict { existing_provider }
-                if existing_provider == original)
+                .unwrap();
+            let mut incoming_info = oauth_info(incoming, &email);
+            incoming_info.email_verified = verified;
+            for _ in 0..2 {
+                let result = auth.get_or_create_oauth_user(incoming_info.clone()).await;
+                if verified {
+                    assert_eq!(result.unwrap().id, existing.id);
+                } else {
+                    assert!(
+                        matches!(result, Err(AuthError::OAuthProviderConflict { existing_provider }) if existing_provider == original)
+                    );
+                }
+            }
+            let linked = users
+                .get_by_provider(incoming, &incoming_info.provider_user_id)
+                .await
+                .unwrap();
+            assert_eq!(
+                linked.map(|user| user.id),
+                verified.then_some(existing.id.0)
             );
+            let stored = users.get_by_id(existing.id.0).await.unwrap().unwrap();
+            assert_eq!(stored.auth_provider, original);
+            assert_eq!(stored.provider_user_id, original_info.provider_user_id);
+            assert_eq!(stored.email, email);
+            assert_eq!(stored.display_name, existing.display_name);
+            assert_eq!(stored.last_login_at.is_some(), verified);
+            assert_single_oauth_account(&db, existing.id.0, &email).await;
+            assert_eq!(
+                auth.get_or_create_oauth_user(original_info)
+                    .await
+                    .unwrap()
+                    .id,
+                existing.id
+            );
+            if verified {
+                // Do not replace an already linked identity for the same provider.
+                let another_identity = oauth_info(incoming, &email);
+                assert!(matches!(
+                    auth.get_or_create_oauth_user(another_identity.clone())
+                        .await,
+                    Err(AuthError::OAuthProviderConflict { .. })
+                ));
+                assert!(users
+                    .get_by_provider(incoming, &another_identity.provider_user_id)
+                    .await
+                    .unwrap()
+                    .is_none());
+            }
         }
-        assert!(users
-            .get_by_provider(incoming, &incoming_info.provider_user_id)
-            .await
-            .unwrap()
-            .is_none());
-        let stored = users.get_by_id(existing.id.0).await.unwrap().unwrap();
-        assert_eq!(stored.auth_provider, original);
-        assert_eq!(stored.provider_user_id, original_info.provider_user_id);
-        assert_eq!(stored.display_name, existing.display_name);
-        assert!(stored.last_login_at.is_none());
-        assert_single_oauth_account(&db, existing.id.0, &email).await;
-
-        // The original sign-in method remains usable after the rejected logins.
-        let signed_in = auth.get_or_create_oauth_user(original_info).await.unwrap();
-        assert_eq!(signed_in.id, existing.id);
     }
 }
 
@@ -200,13 +222,14 @@ async fn oauth_concurrent_cross_provider_signup_creates_only_one_account() {
         auth.get_or_create_oauth_user(github),
         auth.get_or_create_oauth_user(google),
     );
-    let (winner, error) = match (github_result, google_result) {
-        (Ok(user), Err(error)) | (Err(error), Ok(user)) => (user, error),
-        results => panic!("expected one account and one conflict, got {results:?}"),
-    };
-    assert!(
-        matches!(error, AuthError::OAuthProviderConflict { existing_provider }
-        if existing_provider == winner.auth_provider)
+    let winner = github_result.unwrap();
+    assert_eq!(google_result.unwrap().id, winner.id);
+    assert_eq!(
+        auth.list_oauth_identities(winner.id.clone())
+            .await
+            .unwrap()
+            .len(),
+        2
     );
     assert_single_oauth_account(&db, winner.id.0, &email).await;
 }

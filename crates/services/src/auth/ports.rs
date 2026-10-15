@@ -183,6 +183,12 @@ pub enum AuthError {
 // Repository traits
 #[async_trait]
 pub trait UserRepository: Send + Sync {
+    async fn try_link_oauth_identity_by_email(
+        &self,
+        _info: &OAuthUserInfo,
+    ) -> anyhow::Result<Option<User>> {
+        Ok(None)
+    }
     async fn observe_oauth_identity(
         &self,
         _user_id: UserId,

@@ -353,7 +353,9 @@ impl AuthServiceTrait for AuthService {
             return self.sync_existing_oauth_user(user, &oauth_info).await;
         }
 
-        self.check_oauth_email_conflict(&oauth_info).await?;
+        if let Some(user) = self.find_or_link_oauth_user_by_email(&oauth_info).await? {
+            return Ok(user);
+        }
 
         // Create new user
         let creation = self
@@ -389,7 +391,9 @@ impl AuthServiceTrait for AuthService {
                     error.downcast_ref::<crate::common::RepositoryError>(),
                     Some(crate::common::RepositoryError::AlreadyExists)
                 ) {
-                    self.check_oauth_email_conflict(&oauth_info).await?;
+                    if let Some(user) = self.find_or_link_oauth_user_by_email(&oauth_info).await? {
+                        return Ok(user);
+                    }
                 }
                 return Err(AuthError::InternalError(format!(
                     "Failed to create user: {error}"
@@ -542,6 +546,30 @@ impl AuthServiceTrait for AuthService {
 }
 
 impl AuthService {
+    async fn find_or_link_oauth_user_by_email(
+        &self,
+        oauth_info: &OAuthUserInfo,
+    ) -> Result<Option<User>, AuthError> {
+        if oauth_info.email_verified && matches!(oauth_info.provider.as_str(), "google" | "github")
+        {
+            if let Some(user) = self
+                .user_repository
+                .try_link_oauth_identity_by_email(oauth_info)
+                .await
+                .map_err(|e| {
+                    AuthError::InternalError(format!("Failed to link OAuth identity: {e}"))
+                })?
+            {
+                return self
+                    .sync_existing_oauth_user(user, oauth_info)
+                    .await
+                    .map(Some);
+            }
+        }
+        self.check_oauth_email_conflict(oauth_info).await?;
+        Ok(None)
+    }
+
     async fn check_oauth_email_conflict(
         &self,
         oauth_info: &OAuthUserInfo,
@@ -553,7 +581,7 @@ impl AuthService {
             .map_err(|e| AuthError::InternalError(format!("Failed to check user email: {e}")))?;
         if let Some(user) = existing {
             // A matching identity may have been created concurrently. Let the
-            // insert/re-read path reuse it. Email alone never authenticates a user.
+            // insert/re-read path reuse it. Other matches remain conflicts.
             if user.auth_provider != oauth_info.provider
                 || user.provider_user_id != oauth_info.provider_user_id
             {
@@ -832,6 +860,7 @@ mod tests {
     }
 
     struct MockUserRepo {
+        linked_identities: Mutex<Vec<OAuthUserInfo>>,
         user: Mutex<Option<User>>,
         email_updated: Mutex<Option<String>>,
         last_login_updated: Mutex<bool>,
@@ -852,6 +881,7 @@ mod tests {
     impl MockUserRepo {
         fn with_user(user: User) -> Self {
             Self {
+                linked_identities: Mutex::new(Vec::new()),
                 user: Mutex::new(Some(user)),
                 email_updated: Mutex::new(None),
                 last_login_updated: Mutex::new(false),
@@ -885,6 +915,23 @@ mod tests {
 
     #[async_trait]
     impl UserRepository for MockUserRepo {
+        async fn try_link_oauth_identity_by_email(
+            &self,
+            info: &OAuthUserInfo,
+        ) -> anyhow::Result<Option<User>> {
+            let Some(user) = self.get_by_email(&info.email).await? else {
+                return Ok(None);
+            };
+            if info.email_verified
+                && matches!(info.provider.as_str(), "github" | "google")
+                && matches!(user.auth_provider.as_str(), "github" | "google")
+                && user.auth_provider != info.provider
+            {
+                self.linked_identities.lock().unwrap().push(info.clone());
+                return Ok(Some(user));
+            }
+            Ok(None)
+        }
         async fn create(
             &self,
             _: String,
@@ -959,9 +1006,13 @@ mod tests {
             Ok(user
                 .as_ref()
                 .filter(|u| {
-                    u.auth_provider == auth_provider
-                        && u.provider_user_id == provider_user_id
-                        && u.is_active
+                    u.is_active
+                        && ((u.auth_provider == auth_provider
+                            && u.provider_user_id == provider_user_id)
+                            || self.linked_identities.lock().unwrap().iter().any(|info| {
+                                info.provider == auth_provider
+                                    && info.provider_user_id == provider_user_id
+                            }))
                 })
                 .cloned())
         }
@@ -1832,21 +1883,19 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn oauth_email_conflict_rejects_both_providers_without_mutating_account() {
+    async fn oauth_verified_email_links_both_providers_without_reprovisioning_account() {
         for (original, incoming) in [("github", "google"), ("google", "github")] {
             let existing = make_user("alice@example.com", original);
             let repo = Arc::new(MockUserRepo::with_user(existing.clone()));
-            let error = build_auth_service(repo.clone())
+            let user = build_auth_service(repo.clone())
                 .get_or_create_oauth_user(oauth_info(incoming))
                 .await
-                .unwrap_err();
+                .unwrap();
 
-            assert!(
-                matches!(error, AuthError::OAuthProviderConflict { existing_provider }
-                if existing_provider == original)
-            );
+            assert_eq!(user.id, existing.id);
+            assert_eq!(repo.linked_identities.lock().unwrap().len(), 1);
             assert_eq!(*repo.creation_calls.lock().unwrap(), 0);
-            assert!(!*repo.last_login_updated.lock().unwrap());
+            assert!(*repo.last_login_updated.lock().unwrap());
             assert!(!*repo.profile_updated.lock().unwrap());
             assert!(repo.email_updated.lock().unwrap().is_none());
             let stored = repo.user.lock().unwrap().clone().unwrap();
@@ -1858,24 +1907,40 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn oauth_email_claimed_concurrently_returns_conflict_in_both_directions() {
+    async fn oauth_unverified_email_never_links_an_existing_account() {
+        for (original, incoming) in [("github", "google"), ("google", "github")] {
+            let existing = make_user("alice@example.com", original);
+            let repo = Arc::new(MockUserRepo::with_user(existing));
+            let mut info = oauth_info(incoming);
+            info.email_verified = false;
+            let error = build_auth_service(repo.clone())
+                .get_or_create_oauth_user(info)
+                .await
+                .unwrap_err();
+            assert!(matches!(error, AuthError::OAuthProviderConflict { .. }));
+            assert!(repo.linked_identities.lock().unwrap().is_empty());
+            assert_eq!(*repo.creation_calls.lock().unwrap(), 0);
+            assert!(!*repo.last_login_updated.lock().unwrap());
+        }
+    }
+
+    #[tokio::test]
+    async fn oauth_verified_email_claimed_concurrently_links_in_both_directions() {
         for (original, incoming) in [("github", "google"), ("google", "github")] {
             let repo = Arc::new(MockUserRepo::creation_failure(Some(make_user(
                 "alice@example.com",
                 original,
             ))));
-            let error = build_auth_service(repo.clone())
+            let user = build_auth_service(repo.clone())
                 .get_or_create_oauth_user(oauth_info(incoming))
                 .await
-                .unwrap_err();
+                .unwrap();
 
-            assert!(
-                matches!(error, AuthError::OAuthProviderConflict { existing_provider }
-                if existing_provider == original)
-            );
+            assert_eq!(user.auth_provider, original);
+            assert_eq!(repo.linked_identities.lock().unwrap().len(), 1);
             assert_eq!(*repo.creation_calls.lock().unwrap(), 1);
             assert_eq!(*repo.provider_lookups.lock().unwrap(), 2);
-            assert!(!*repo.last_login_updated.lock().unwrap());
+            assert!(*repo.last_login_updated.lock().unwrap());
             assert!(!*repo.profile_updated.lock().unwrap());
         }
     }

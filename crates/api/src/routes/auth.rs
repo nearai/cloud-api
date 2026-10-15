@@ -572,8 +572,25 @@ pub async fn oauth_callback(
         Ok(result) => result,
         Err(e) => {
             if link_context.is_some() {
+                let error_category = match &e {
+                    AuthError::OAuthError(_) => "authorization_rejected",
+                    AuthError::AuthFailed(_) => "user_info_rejected",
+                    AuthError::NetworkError(_) => "network",
+                    AuthError::ConfigError(_) => "configuration",
+                    _ => "internal",
+                };
+                error!(
+                    provider = %oauth_state_row.provider,
+                    error_category,
+                    "OAuth linking provider authorization failed"
+                );
                 return linking::link_error_response(
-                    AuthError::OAuthError("Provider authorization failed".into()),
+                    match e {
+                        AuthError::AuthFailed(_) => {
+                            AuthError::OAuthError("Provider authorization failed".into())
+                        }
+                        error => error,
+                    },
                     oauth_state_row.frontend_callback.as_deref(),
                     &config.cors,
                 );
@@ -991,6 +1008,35 @@ mod tests {
             .await
             .unwrap();
         serde_json::from_slice(&body).unwrap()
+    }
+
+    #[tokio::test]
+    async fn oauth_link_provider_rejection_is_400_and_server_failures_stay_500() {
+        for (error, expected) in [
+            (
+                AuthError::OAuthError("private provider response".into()),
+                StatusCode::BAD_REQUEST,
+            ),
+            (
+                AuthError::NetworkError("private network details".into()),
+                StatusCode::INTERNAL_SERVER_ERROR,
+            ),
+            (
+                AuthError::ConfigError("private client secret".into()),
+                StatusCode::INTERNAL_SERVER_ERROR,
+            ),
+            (
+                AuthError::InternalError("private response body".into()),
+                StatusCode::INTERNAL_SERVER_ERROR,
+            ),
+        ] {
+            let response = linking::link_error_response(error, None, &cors());
+            assert_eq!(response.status(), expected);
+            assert_eq!(
+                json_body(response).await,
+                serde_json::json!({"error":"oauth_link_failed"})
+            );
+        }
     }
 
     #[tokio::test]

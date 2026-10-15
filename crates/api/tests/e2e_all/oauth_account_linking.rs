@@ -124,6 +124,121 @@ async fn counts(db: &database::Database, user: &User) -> Vec<i64> {
 }
 
 #[tokio::test]
+async fn oauth_link_provider_rejections_do_not_cancel_or_create_a_link() {
+    use tracing::instrument::WithSubscriber;
+
+    #[derive(Clone, Default)]
+    struct Logs(Arc<std::sync::Mutex<Vec<u8>>>);
+    impl std::io::Write for Logs {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    for (original, incoming) in [("github", "google"), ("google", "github")] {
+        let (server, db, auth, store, provider) = fixture().await;
+        let (user, _, _, session) = account(&auth, original).await;
+        for token_rejected in [true, false] {
+            provider.reset().await;
+            let token_response = if token_rejected {
+                ResponseTemplate::new(400).set_body_json(serde_json::json!({
+                    "error":"invalid_grant", "error_description":"private-provider-details"
+                }))
+            } else {
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "access_token":"private-provider-token", "token_type":"Bearer"
+                }))
+            };
+            Mock::given(method("POST"))
+                .and(path("/token"))
+                .respond_with(token_response)
+                .mount(&provider)
+                .await;
+            Mock::given(method("GET"))
+                .and(path("/user"))
+                .respond_with(
+                    ResponseTemplate::new(401).set_body_string("private-provider-details"),
+                )
+                .mount(&provider)
+                .await;
+            let state = uuid::Uuid::new_v4().to_string();
+            store
+                .create_link(
+                    state.clone(),
+                    incoming.into(),
+                    "local-verifier".into(),
+                    CALLBACK.into(),
+                    user.id.0,
+                    session.id.0,
+                )
+                .await
+                .unwrap();
+            let logs = Logs::default();
+            let writer = logs.clone();
+            let subscriber = tracing_subscriber::fmt()
+                .with_ansi(false)
+                .with_max_level(tracing::Level::ERROR)
+                .with_writer(move || writer.clone())
+                .finish();
+            let response = async {
+                server
+                    .get(&format!(
+                        "/v1/auth/callback?state={state}&code=expired-code"
+                    ))
+                    .add_header("User-Agent", UA)
+                    .await
+            }
+            .with_subscriber(subscriber)
+            .await;
+            let logs = String::from_utf8(logs.0.lock().unwrap().clone()).unwrap();
+            assert!(logs.contains(incoming));
+            assert!(logs.contains(if token_rejected {
+                "authorization_rejected"
+            } else {
+                "user_info_rejected"
+            }));
+            for secret in [
+                "private-provider-details",
+                "private-provider-token",
+                "expired-code",
+            ] {
+                assert!(
+                    !logs.contains(secret),
+                    "provider secrets must not reach logs"
+                );
+            }
+            assert_eq!(response.status_code(), 307);
+            assert_eq!(
+                response.headers()["location"],
+                format!("{CALLBACK}#link_error=oauth_link_failed")
+            );
+            assert!(!response.headers().contains_key("set-cookie"));
+            assert!(store.get_and_delete(&state).await.unwrap().is_none());
+            assert_eq!(
+                auth.list_oauth_identities(user.id.clone())
+                    .await
+                    .unwrap()
+                    .len(),
+                1
+            );
+            let client = db.pool().get().await.unwrap();
+            let row = client
+                .query_one(
+                    "SELECT COUNT(*) FROM oauth_link_requests WHERE user_id=$1",
+                    &[&user.id.0],
+                )
+                .await
+                .unwrap();
+            assert_eq!(row.get::<_, i64>(0), 0);
+        }
+    }
+}
+
+#[tokio::test]
 async fn explicit_link_callback_confirms_original_session_and_both_providers_sign_in() {
     for (original, incoming) in [("github", "google"), ("google", "github")] {
         let (server, db, auth, store, provider) = fixture().await;

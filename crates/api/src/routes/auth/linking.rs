@@ -127,6 +127,7 @@ pub(super) fn link_error_response(
     cors: &config::CorsConfig,
 ) -> Response {
     let (status, code) = match error {
+        AuthError::OAuthError(_) => (StatusCode::BAD_REQUEST, "oauth_link_failed"),
         AuthError::AuthFailed(_) => (StatusCode::BAD_REQUEST, "oauth_link_canceled"),
         AuthError::OAuthLinkConflict => (StatusCode::CONFLICT, "oauth_link_conflict"),
         AuthError::OAuthEmailUnverified => (StatusCode::FORBIDDEN, "oauth_email_unverified"),

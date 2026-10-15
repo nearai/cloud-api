@@ -22,6 +22,24 @@ type ConfiguredClient = oauth2::Client<
     oauth2::EndpointSet,
 >;
 
+fn token_exchange_error<E: std::error::Error + 'static>(
+    error: oauth2::RequestTokenError<E, oauth2::basic::BasicErrorResponse>,
+) -> AuthError {
+    let message = format!("Token exchange failed: {error}");
+    match error {
+        oauth2::RequestTokenError::ServerResponse(response) => match response.error() {
+            oauth2::basic::BasicErrorResponseType::InvalidGrant => AuthError::OAuthError(message),
+            oauth2::basic::BasicErrorResponseType::InvalidClient
+            | oauth2::basic::BasicErrorResponseType::UnauthorizedClient => {
+                AuthError::ConfigError(message)
+            }
+            _ => AuthError::InternalError(message),
+        },
+        oauth2::RequestTokenError::Request(_) => AuthError::NetworkError(message),
+        _ => AuthError::InternalError(message),
+    }
+}
+
 /// OAuth2 authentication manager
 pub struct OAuthManager {
     github_client: Option<ConfiguredClient>,
@@ -207,7 +225,7 @@ impl OAuthManager {
         let token = exchange
             .request_async(&self.http_client)
             .await
-            .map_err(|e| AuthError::OAuthError(format!("Token exchange failed: {e}")))?;
+            .map_err(token_exchange_error)?;
 
         let access_token = token.access_token().secret();
 
@@ -257,7 +275,7 @@ impl OAuthManager {
             .set_pkce_verifier(pkce_verifier)
             .request_async(&self.http_client)
             .await
-            .map_err(|e| AuthError::OAuthError(format!("Token exchange failed: {e}")))?;
+            .map_err(token_exchange_error)?;
 
         let access_token = token.access_token().secret();
 
@@ -414,4 +432,68 @@ struct GoogleUser {
     name: Option<String>,
     #[serde(default)]
     picture: Option<String>,
+}
+
+#[cfg(test)]
+mod token_exchange_tests {
+    use super::*;
+    use oauth2::{basic::BasicErrorResponse, basic::BasicErrorResponseType, RequestTokenError};
+
+    #[test]
+    fn invalid_grant_is_an_authorization_failure() {
+        let error =
+            RequestTokenError::<std::io::Error, _>::ServerResponse(BasicErrorResponse::new(
+                BasicErrorResponseType::InvalidGrant,
+                Some("expired authorization code".into()),
+                None,
+            ));
+        assert!(matches!(
+            token_exchange_error(error),
+            AuthError::OAuthError(_)
+        ));
+    }
+
+    #[test]
+    fn configuration_and_provider_faults_are_not_authorization_failures() {
+        for kind in [
+            BasicErrorResponseType::InvalidClient,
+            BasicErrorResponseType::UnauthorizedClient,
+        ] {
+            let error = RequestTokenError::<std::io::Error, _>::ServerResponse(
+                BasicErrorResponse::new(kind, None, None),
+            );
+            assert!(matches!(
+                token_exchange_error(error),
+                AuthError::ConfigError(_)
+            ));
+        }
+        let error =
+            RequestTokenError::<std::io::Error, _>::ServerResponse(BasicErrorResponse::new(
+                BasicErrorResponseType::Extension("server_error".into()),
+                None,
+                None,
+            ));
+        assert!(matches!(
+            token_exchange_error(error),
+            AuthError::InternalError(_)
+        ));
+        let error = RequestTokenError::<std::io::Error, BasicErrorResponse>::Other(
+            "unexpected provider response".into(),
+        );
+        assert!(matches!(
+            token_exchange_error(error),
+            AuthError::InternalError(_)
+        ));
+    }
+
+    #[test]
+    fn transport_failure_stays_a_network_error() {
+        let error = RequestTokenError::<_, BasicErrorResponse>::Request(std::io::Error::other(
+            "connection failed",
+        ));
+        assert!(matches!(
+            token_exchange_error(error),
+            AuthError::NetworkError(_)
+        ));
+    }
 }

@@ -132,10 +132,18 @@ against an OAuth app whose callback URL is
 `http://localhost:3000/v1/auth/callback`. Visit `/v1/auth/login` to start
 the flow.
 
-Accounts are identified by their OAuth provider and provider user ID. Signing in
-with another identity that has the same email does not link accounts. The API
-returns `409` with `error: "oauth_provider_conflict"`, `existing_provider`, and an
+Accounts are identified by their OAuth provider and provider user ID. A new Google
+or GitHub identity automatically links to an existing active account on the other
+provider when both the incoming identity and the account's original identity
+verify the same email. Sign-in then uses the existing account and its resources.
+Existing identities remain authoritative; separately registered accounts are not
+merged. If automatic linking is not allowed, a conflicting email returns `409`
+with `error: "oauth_provider_conflict"`, `existing_provider`, and an
 `error_description` naming the original sign-in method.
+
+Migrated identities with unknown verification require a verified sign-in through
+the original provider before automatic linking is available. Alternatively, sign
+in through the original provider and explicitly link from Account settings.
 
 When the login request includes an allowed `frontend_callback`, this conflict
 instead redirects to that callback with the same three fields in the URL

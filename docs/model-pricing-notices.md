@@ -63,6 +63,12 @@ status changes; elapsed time alone does not establish that pricing was applied.
 When no change is pending, both the header and the optional catalog field are
 omitted.
 
+If any pending pricing record cannot be parsed or its text pricing profile
+fails validation, the model's entire notice is omitted and a warning is logged.
+Current prices, inference model resolution and the rest of the catalog remain
+available. This also covers pending profiles written by a newer server version.
+Validation of live pricing remains strict because it is used for billing.
+
 The pending metadata is selected in the same database query as the model and
 stored in the existing model caches. The middleware reuses the shared resolve
 cache, without a separate pricing lookup on each request. Confirm invalidates

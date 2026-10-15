@@ -3344,66 +3344,15 @@ pub async fn models_internal(
     ))
 }
 
-/// Convert a nano-USD amount (DB scale 9 — used for per-token, per-image, and
-/// per-request prices) to a USD string suitable for OpenRouter
-/// (e.g. 8_000 → "0.000008"). Strings are required by the OpenRouter provider
-/// spec to avoid float precision issues, so this uses pure integer arithmetic.
-/// Pricing is non-negative throughout the system; a defensive `abs()` keeps
-/// the formatter total in the unexpected case.
-fn nano_dollars_to_per_token_string(nano_dollars: i64) -> String {
-    if nano_dollars == 0 {
-        return "0".to_string();
-    }
-    let n = nano_dollars.unsigned_abs();
-    let dollars = n / 1_000_000_000;
-    let nanos = n % 1_000_000_000;
-    let mut s = if nanos == 0 {
-        format!("{dollars}")
-    } else {
-        let frac = format!("{nanos:09}");
-        let frac = frac.trim_end_matches('0');
-        format!("{dollars}.{frac}")
-    };
-    if nano_dollars < 0 {
-        s.insert(0, '-');
-    }
-    s
-}
-
-fn catalog_pricing(input: i64, output: i64, image: i64, cached: Option<i64>) -> ModelPricing {
-    ModelPricing {
-        // nano-dollars per token * 0.001 = USD per million tokens.
-        input: (input as f64) * 0.001,
-        output: (output as f64) * 0.001,
-        prompt: nano_dollars_to_per_token_string(input),
-        completion: nano_dollars_to_per_token_string(output),
-        image: nano_dollars_to_per_token_string(image),
-        request: "0".to_string(),
-        input_cache_read: cached.map(nano_dollars_to_per_token_string),
-    }
-}
-
 fn model_with_pricing_to_info(model: services::models::ModelWithPricing) -> ModelInfo {
-    let pricing = catalog_pricing(
-        model.input_cost_per_token,
-        model.output_cost_per_token,
-        model.cost_per_image,
-        model.cache_read_cost_per_token,
-    );
-    let upcoming_pricing = model
-        .upcoming_pricing
-        .map(|future| UpcomingModelPricingInfo {
-            effective_at: crate::routes::admin::format_deprecation_date(&future.effective_at),
-            pricing: catalog_pricing(
-                future.input_cost_per_token,
-                future.output_cost_per_token,
-                future.cost_per_image,
-                future.cache_read_cost_per_token,
-            ),
-            text_pricing: future
-                .text_pricing
-                .map(|profile| serde_json::to_value(profile).expect("text pricing serializes")),
-        });
+    let pricing = CatalogPricingAmounts {
+        input_cost_per_token: model.input_cost_per_token,
+        output_cost_per_token: model.output_cost_per_token,
+        cost_per_image: model.cost_per_image,
+        cache_read_cost_per_token: model.cache_read_cost_per_token,
+    }
+    .into();
+    let upcoming_pricing = model.upcoming_pricing.map(Into::into);
 
     // OpenRouter's provider spec marks `input_modalities` / `output_modalities`
     // as REQUIRED fields. They are derived from the nullable `architecture`
@@ -3584,55 +3533,6 @@ mod tests {
             }
             assert!(e2ee_requested(&headers), "{field}");
         }
-    }
-
-    #[test]
-    fn nano_dollars_zero_renders_as_bare_zero() {
-        assert_eq!(nano_dollars_to_per_token_string(0), "0");
-    }
-
-    #[test]
-    fn nano_dollars_one_keeps_full_nine_decimal_places() {
-        // 1 nano-USD = $0.000000001 — boundary for our scale.
-        assert_eq!(nano_dollars_to_per_token_string(1), "0.000000001");
-    }
-
-    #[test]
-    fn nano_dollars_typical_per_token_price_trims_trailing_zeros() {
-        // $0.000008 per token, e.g. Claude Sonnet input.
-        assert_eq!(nano_dollars_to_per_token_string(8_000), "0.000008");
-        // $0.000024 per token, e.g. Claude Sonnet output.
-        assert_eq!(nano_dollars_to_per_token_string(24_000), "0.000024");
-    }
-
-    #[test]
-    fn nano_dollars_whole_dollar_amount_omits_decimal_point() {
-        // 1_000_000_000 nano-USD = $1 exactly. Must NOT render as "1." or "1.0".
-        assert_eq!(nano_dollars_to_per_token_string(1_000_000_000), "1");
-        assert_eq!(nano_dollars_to_per_token_string(5_000_000_000), "5");
-    }
-
-    #[test]
-    fn nano_dollars_mixed_integer_and_fraction() {
-        // $1.500000000 → "1.5" after trim.
-        assert_eq!(nano_dollars_to_per_token_string(1_500_000_000), "1.5");
-        // $1.000000001 → all 9 frac digits preserved (no trailing zeros to trim).
-        assert_eq!(
-            nano_dollars_to_per_token_string(1_000_000_001),
-            "1.000000001"
-        );
-    }
-
-    #[test]
-    fn nano_dollars_max_i64_does_not_lose_precision() {
-        // Integer arithmetic must remain exact at the upper bound, unlike the
-        // previous f64-based implementation.
-        // i64::MAX = 9_223_372_036_854_775_807 nano-USD
-        //         = 9_223_372_036.854775807 USD
-        assert_eq!(
-            nano_dollars_to_per_token_string(i64::MAX),
-            "9223372036.854775807"
-        );
     }
 
     fn make_model_with_pricing(

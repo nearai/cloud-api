@@ -1,10 +1,32 @@
 use crate::common::*;
+use chrono::{Duration, Timelike, Utc};
+use futures::FutureExt;
 use serde_json::{json, Value};
 use services::models::ModelsServiceTrait;
-use std::sync::Arc;
+use std::{panic::AssertUnwindSafe, sync::Arc};
 
-const DATE: &str = "2030-01-01T00:00:00Z";
 const HEADER: &str = "x-model-pricing-change-date";
+
+fn future_notice_date(days: i64) -> String {
+    (Utc::now() + Duration::days(days))
+        .with_minute(0)
+        .and_then(|time| time.with_second(0))
+        .and_then(|time| time.with_nanosecond(0))
+        .unwrap()
+        .format("%Y-%m-%dT%H:%M:%SZ")
+        .to_string()
+}
+
+fn text_pricing_profile() -> Value {
+    json!({
+        "version": 1, "currency": "USD", "unit": "million_tokens",
+        "longContextThreshold": 1000,
+        "tiers": {"default": {
+            "short": {"uncachedInput": "1.5", "cachedInput": "0.25", "output": "4"},
+            "long": {"uncachedInput": "3", "cachedInput": "0.5", "output": "8"}
+        }}
+    })
+}
 
 struct Fixture {
     server: axum_test::TestServer,
@@ -13,6 +35,7 @@ struct Fixture {
     model: String,
     alias: String,
     api_key: String,
+    notice_date: String,
 }
 
 impl Fixture {
@@ -56,6 +79,7 @@ impl Fixture {
             model,
             alias,
             api_key,
+            notice_date: future_notice_date(90),
         }
     }
 
@@ -78,7 +102,7 @@ impl Fixture {
     async fn confirm(&self, mut fields: Value) -> Value {
         fields["modelId"] = json!(self.model);
         if fields.get("effectiveAt").is_none() {
-            fields["effectiveAt"] = json!(DATE);
+            fields["effectiveAt"] = json!(self.notice_date);
         }
         let response = self
             .server
@@ -153,20 +177,23 @@ async fn confirm_and_cancel_refresh_warm_canonical_alias_and_catalog_caches() {
     for alias in [false, true] {
         for stream in [false, true] {
             let response = fixture.chat(alias, stream).await;
-            assert_eq!(response.headers()[HEADER], DATE);
+            assert_eq!(response.headers()[HEADER], fixture.notice_date);
             // Pricing-only notices must work without any deprecation date.
             assert!(!response.headers().contains_key("x-model-deprecation-date"));
             assert_eq!(response.headers()["access-control-expose-headers"], "*");
             if !stream {
                 let body: Value = response.json();
                 assert!(body.get("upcoming_pricing").is_none());
-                assert!(body.get("warning").is_none() || alias);
+                assert_eq!(body.get("warning").is_some(), alias, "{body}");
             }
         }
     }
     let (openai, native) = fixture.catalogs().await;
     assert_eq!(openai["pricing"]["prompt"], "0.000001");
-    assert_eq!(openai["upcoming_pricing"]["effective_at"], DATE);
+    assert_eq!(
+        openai["upcoming_pricing"]["effective_at"],
+        fixture.notice_date
+    );
     assert_eq!(openai["upcoming_pricing"]["pricing"]["prompt"], "0.000003");
     assert_eq!(
         openai["upcoming_pricing"]["pricing"]["completion"],
@@ -177,7 +204,10 @@ async fn confirm_and_cancel_refresh_warm_canonical_alias_and_catalog_caches() {
         "0"
     );
     assert_eq!(native["inputCostPerToken"]["amount"], 1000);
-    assert_eq!(native["upcomingPricing"]["effectiveAt"], DATE);
+    assert_eq!(
+        native["upcomingPricing"]["effectiveAt"],
+        fixture.notice_date
+    );
     assert_eq!(
         native["upcomingPricing"]["pricing"]["inputCostPerToken"]["amount"],
         3000
@@ -190,15 +220,16 @@ async fn confirm_and_cancel_refresh_warm_canonical_alias_and_catalog_caches() {
     fixture.assert_absent().await;
 
     // The earlier cancelled row must not shadow a later pending change.
+    let later_date = future_notice_date(180);
     fixture
         .confirm(json!({
-            "effectiveAt": "2031-01-01T00:00:00Z",
+            "effectiveAt": later_date,
             "inputCostPerToken": {"amount": 4000, "currency": "USD"},
         }))
         .await;
     assert_eq!(
         fixture.chat(true, false).await.headers()[HEADER],
-        "2031-01-01T00:00:00Z"
+        later_date
     );
 }
 
@@ -215,7 +246,7 @@ async fn notices_cover_non_chat_successes_but_not_errors() {
         .json(&json!({"model": fixture.model, "input": "hello"}))
         .await;
     assert_eq!(response.status_code(), 200, "{}", response.text());
-    assert_eq!(response.headers()[HEADER], DATE);
+    assert_eq!(response.headers()[HEADER], fixture.notice_date);
     let error = fixture
         .server
         .post("/v1/chat/completions")
@@ -263,17 +294,13 @@ async fn future_prices_use_live_unchanged_fields_and_preserve_disabled_cache_pri
 #[tokio::test]
 async fn serial_scheduler_replaces_the_notice_with_the_announced_tiered_prices() {
     let fixture = Fixture::new().await;
-    let profile = json!({
-        "version": 1, "currency": "USD", "unit": "million_tokens",
-        "longContextThreshold": 1000,
-        "tiers": {"default": {
-            "short": {"uncachedInput": "1.5", "cachedInput": "0.25", "output": "4"},
-            "long": {"uncachedInput": "3", "cachedInput": "0.5", "output": "8"}
-        }}
-    });
+    let profile = text_pricing_profile();
     fixture.assert_absent().await;
     let change = fixture.confirm(json!({"textPricing": profile})).await;
-    assert_eq!(fixture.chat(true, false).await.headers()[HEADER], DATE);
+    assert_eq!(
+        fixture.chat(true, false).await.headers()[HEADER],
+        fixture.notice_date
+    );
     let (before_openai, before_native) = fixture.catalogs().await;
     assert_eq!(before_openai["upcoming_pricing"]["textPricing"], profile);
     assert_eq!(
@@ -281,8 +308,12 @@ async fn serial_scheduler_replaces_the_notice_with_the_announced_tiered_prices()
         profile
     );
     let id = uuid::Uuid::parse_str(change["id"].as_str().unwrap()).unwrap();
-    fixture.database.pool().get().await.unwrap()
-        .execute("UPDATE scheduled_model_pricing_changes SET effective_at = NOW() - interval '1 minute' WHERE id = $1", &[&id]).await.unwrap();
+    let updated = fixture.database.pool().get().await.unwrap()
+        .execute("UPDATE scheduled_model_pricing_changes SET effective_at = NOW() - interval '1 minute' WHERE id = $1 AND status = 'pending'", &[&id]).await.unwrap();
+    assert_eq!(
+        updated, 1,
+        "scheduled pricing change {id} was not backdated"
+    );
     let scheduler = services::admin::ModelPricingScheduler::new(
         Arc::new(database::repositories::AdminCompositeRepository::new(
             fixture.database.pool().clone(),
@@ -315,4 +346,98 @@ async fn serial_scheduler_replaces_the_notice_with_the_announced_tiered_prices()
         .await
         .unwrap();
     assert!(resolved.upcoming_pricing.is_none());
+}
+
+async fn assert_invalid_pending_profile_is_advisory(profile: Value) {
+    let fixture = Fixture::new().await;
+    let change = fixture
+        .confirm(json!({"textPricing": text_pricing_profile()}))
+        .await;
+    let id = uuid::Uuid::parse_str(change["id"].as_str().unwrap()).unwrap();
+    // Simulate a newer writer or an out-of-band edit, bypassing admin validation.
+    let updated = fixture.database.pool().get().await.unwrap()
+        .execute("UPDATE scheduled_model_pricing_changes SET new_text_pricing = $2 WHERE id = $1 AND status = 'pending'", &[&id, &profile]).await.unwrap();
+    assert_eq!(updated, 1, "scheduled pricing change {id} was not updated");
+    // These serial_ tests use the existing nextest exclusive group: malformed
+    // rows would otherwise also affect unrelated admin listing tests.
+    let result = AssertUnwindSafe(async {
+        fixture.models.invalidate_models_cache().await;
+
+        // Exercise the canonical-only repository path as well as alias resolution.
+        let model = fixture
+            .models
+            .get_model_by_name(&fixture.model)
+            .await
+            .unwrap();
+        assert!(model.upcoming_pricing.is_none());
+        assert_eq!(model.input_cost_per_token, 1000);
+        assert_eq!(model.output_cost_per_token, 2000);
+        for alias in [false, true] {
+            for stream in [false, true] {
+                assert!(!fixture
+                    .chat(alias, stream)
+                    .await
+                    .headers()
+                    .contains_key(HEADER));
+            }
+        }
+        let (openai, native) = fixture.catalogs().await;
+        assert!(openai.get("upcoming_pricing").is_none(), "{openai}");
+        assert!(native.get("upcomingPricing").is_none(), "{native}");
+        assert_eq!(openai["pricing"]["prompt"], "0.000001");
+        assert_eq!(openai["pricing"]["completion"], "0.000002");
+        assert_eq!(native["inputCostPerToken"]["amount"], 1000);
+        assert_eq!(native["outputCostPerToken"]["amount"], 2000);
+
+        let detail = fixture
+            .server
+            .get(&format!("/v1/model/{}", fixture.model))
+            .await;
+        assert_eq!(detail.status_code(), 200, "{}", detail.text());
+        assert!(detail.json::<Value>().get("upcomingPricing").is_none());
+    })
+    .catch_unwind()
+    .await;
+
+    // Restore the row even if an assertion panics, so later tests see valid data.
+    let restored = fixture
+        .database
+        .pool()
+        .get()
+        .await
+        .unwrap()
+        .execute(
+            "UPDATE scheduled_model_pricing_changes SET new_text_pricing = $2 WHERE id = $1",
+            &[&id, &text_pricing_profile()],
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        restored, 1,
+        "scheduled pricing change {id} was not restored"
+    );
+    if let Err(panic) = result {
+        std::panic::resume_unwind(panic);
+    }
+}
+
+#[tokio::test]
+async fn serial_unknown_pending_profile_fields_do_not_break_inference_or_catalogs() {
+    let mut profile = text_pricing_profile();
+    profile["futureField"] = json!(true);
+    assert_invalid_pending_profile_is_advisory(profile).await;
+}
+
+#[tokio::test]
+async fn serial_unsupported_pending_profile_versions_do_not_break_inference_or_catalogs() {
+    let mut profile = text_pricing_profile();
+    profile["version"] = json!(2);
+    assert_invalid_pending_profile_is_advisory(profile).await;
+}
+
+#[tokio::test]
+async fn serial_invalid_pending_profile_rates_do_not_break_inference_or_catalogs() {
+    let mut profile = text_pricing_profile();
+    profile["tiers"]["default"]["short"]["uncachedInput"] = json!("-1");
+    assert_invalid_pending_profile_is_advisory(profile).await;
 }

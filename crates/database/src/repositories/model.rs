@@ -22,6 +22,21 @@ fn parse_text_pricing(
         .map_err(|error| anyhow::anyhow!(error.to_string()))
 }
 
+fn parse_pending_pricing_changes(
+    value: Option<serde_json::Value>,
+) -> Result<Vec<services::models::ModelPricingChange>> {
+    let changes: Vec<services::models::ModelPricingChange> = value
+        .map(serde_json::from_value)
+        .transpose()?
+        .unwrap_or_default();
+    for change in &changes {
+        if let Some(profile) = &change.new_text_pricing {
+            profile.validate()?;
+        }
+    }
+    Ok(changes)
+}
+
 /// Serialize optional modalities to JSON value for database storage.
 /// Returns Ok(None) if input is None, Ok(Some(value)) if serialization succeeds,
 /// or an error if serialization fails.
@@ -73,15 +88,6 @@ impl ModelRepository {
     /// Returns every active model — the list is small (~tens of entries) and
     /// the result is cached in the service layer, so pagination is unused on
     /// the public `/v1/model/list` endpoint.
-    pub async fn get_all_active_models(&self) -> Result<Vec<Model>> {
-        Ok(self
-            .get_all_active_model_rows()
-            .await?
-            .iter()
-            .map(|row| self.row_to_model(row))
-            .collect())
-    }
-
     async fn get_all_active_model_rows(&self) -> Result<Vec<Row>> {
         let rows = retry_db!("get_all_active_models", {
             let client = self
@@ -316,7 +322,7 @@ impl ModelRepository {
     /// Searches model_name (canonical name) field only
     pub async fn get_active_model_by_name(&self, model_name: &str) -> Result<Option<Model>> {
         Ok(self
-            .get_active_model_row(model_name, false)
+            .get_active_model_row(model_name, false, "get_active_model_by_name")
             .await?
             .as_ref()
             .map(|row| self.row_to_model(row)))
@@ -1280,7 +1286,7 @@ impl ModelRepository {
     /// Returns None if the model is not found or not active
     pub async fn resolve_and_get_model(&self, identifier: &str) -> Result<Option<Model>> {
         Ok(self
-            .get_active_model_row(identifier, true)
+            .get_active_model_row(identifier, true, "resolve_and_get_model")
             .await?
             .as_ref()
             .map(|row| self.row_to_model(row)))
@@ -1290,8 +1296,9 @@ impl ModelRepository {
         &self,
         identifier: &str,
         resolve_alias: bool,
+        operation: &'static str,
     ) -> Result<Option<Row>> {
-        let row = retry_db!("resolve_and_get_model", {
+        let row = retry_db!(operation, {
             let client = self
                 .pool
                 .get()
@@ -1624,16 +1631,6 @@ impl services::inference_provider_pool::ExternalModelsSource for ModelRepository
 
 impl ModelRepository {
     fn model_with_pricing_from_row(&self, row: Row) -> Result<services::models::ModelWithPricing> {
-        let changes: Vec<services::models::ModelPricingChange> = row
-            .get::<_, Option<serde_json::Value>>("pricing_changes")
-            .map(serde_json::from_value)
-            .transpose()?
-            .unwrap_or_default();
-        for change in &changes {
-            if let Some(profile) = &change.new_text_pricing {
-                profile.validate()?;
-            }
-        }
         let m = self.row_to_model(&row);
         let mut model = services::models::ModelWithPricing {
             id: m.id,
@@ -1670,8 +1667,22 @@ impl ModelRepository {
             is_listed: m.is_listed,
             created_at: m.created_at,
         };
-        model.upcoming_pricing =
-            services::models::UpcomingModelPricing::earliest_pending(&model, &changes);
+        model.upcoming_pricing = match parse_pending_pricing_changes(row.get("pricing_changes")) {
+            Ok(changes) => {
+                services::models::UpcomingModelPricing::earliest_pending(&model, &changes)
+            }
+            Err(error) => {
+                // Notices are advisory. Drop the entire set rather than promoting
+                // a later valid row to the earliest notice. Live prices above
+                // still require strict validation because they drive billing.
+                tracing::warn!(
+                    model_id = %model.id,
+                    error = %error,
+                    "Ignoring invalid pending pricing notice metadata"
+                );
+                None
+            }
+        };
         Ok(model)
     }
 }
@@ -1691,7 +1702,7 @@ impl services::models::ModelsRepository for ModelRepository {
         &self,
         model_name: &str,
     ) -> Result<Option<services::models::ModelWithPricing>> {
-        self.get_active_model_row(model_name, false)
+        self.get_active_model_row(model_name, false, "get_model_by_name")
             .await?
             .map(|row| self.model_with_pricing_from_row(row))
             .transpose()
@@ -1701,7 +1712,7 @@ impl services::models::ModelsRepository for ModelRepository {
         &self,
         identifier: &str,
     ) -> Result<Option<services::models::ModelWithPricing>> {
-        self.get_active_model_row(identifier, true)
+        self.get_active_model_row(identifier, true, "resolve_and_get_model")
             .await?
             .map(|row| self.model_with_pricing_from_row(row))
             .transpose()

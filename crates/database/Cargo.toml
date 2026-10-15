@@ -22,7 +22,7 @@ deadpool = "0.12"
 # Documentation: https://docs.rs/tokio-postgres-rustls/latest/tokio_postgres_rustls/
 tokio-postgres-rustls = "0.14"
 # Rustls with ring crypto provider
-rustls = { version = "0.23", features = ["ring"] }
+rustls = { version = "0.23.46", features = ["ring"] }
 # Platform-native certificate verifier with OS integration and revocation support
 # Documentation: https://docs.rs/rustls-platform-verifier/latest/rustls_platform_verifier/
 rustls-platform-verifier = "0.7"

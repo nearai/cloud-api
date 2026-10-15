@@ -598,12 +598,16 @@ impl services::auth::UserRepository for UserRepository {
             return Ok(None);
         }
         let client = self.pool.get().await?;
-        // Lock the matching account while attaching the identity so its email
-        // cannot change between the match and insert. Never replace an identity.
+        // Require the original identity to verify this same email. Lock both
+        // records so neither the email nor its verification can change mid-link.
         client.execute(
             "WITH existing_user AS (
-                SELECT id FROM users WHERE email=$1 AND is_active=true
-                AND auth_provider IN ('google','github') AND auth_provider<>$2 FOR UPDATE
+                SELECT u.id FROM users u JOIN user_oauth_identities i
+                ON i.user_id=u.id AND i.provider=u.auth_provider
+                AND i.provider_user_id=u.provider_user_id
+                WHERE u.email=$1 AND u.is_active=true
+                AND u.auth_provider IN ('google','github') AND u.auth_provider<>$2
+                AND i.email=u.email AND i.email_verified=true FOR UPDATE OF u,i
              )
              INSERT INTO user_oauth_identities (user_id,provider,provider_user_id,email,email_verified)
              SELECT id,$2,$3,$1,true FROM existing_user ON CONFLICT DO NOTHING",

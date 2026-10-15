@@ -47,10 +47,12 @@ async fn oauth_matching_email_auto_links_only_verified_social_identities_in_both
     let (_server, db) = setup_test_server_with_database().await;
     let auth = real_auth(&db);
     let users = database::repositories::UserRepository::new(db.pool().clone());
-    for verified in [false, true] {
+    for (original_verified, verified) in [(false, true), (true, false), (true, true)] {
+        let can_auto_link = original_verified && verified;
         for (original, incoming) in [("github", "google"), ("google", "github")] {
             let email = format!("oauth-auto-link-{}@example.test", uuid::Uuid::new_v4());
-            let original_info = oauth_info(original, &email);
+            let mut original_info = oauth_info(original, &email);
+            original_info.email_verified = original_verified;
             let existing = auth
                 .get_or_create_oauth_user(original_info.clone())
                 .await
@@ -59,7 +61,7 @@ async fn oauth_matching_email_auto_links_only_verified_social_identities_in_both
             incoming_info.email_verified = verified;
             for _ in 0..2 {
                 let result = auth.get_or_create_oauth_user(incoming_info.clone()).await;
-                if verified {
+                if can_auto_link {
                     assert_eq!(result.unwrap().id, existing.id);
                 } else {
                     assert!(
@@ -73,23 +75,36 @@ async fn oauth_matching_email_auto_links_only_verified_social_identities_in_both
                 .unwrap();
             assert_eq!(
                 linked.map(|user| user.id),
-                verified.then_some(existing.id.0)
+                can_auto_link.then_some(existing.id.0)
             );
             let stored = users.get_by_id(existing.id.0).await.unwrap().unwrap();
             assert_eq!(stored.auth_provider, original);
             assert_eq!(stored.provider_user_id, original_info.provider_user_id);
             assert_eq!(stored.email, email);
             assert_eq!(stored.display_name, existing.display_name);
-            assert_eq!(stored.last_login_at.is_some(), verified);
+            assert_eq!(stored.last_login_at.is_some(), can_auto_link);
             assert_single_oauth_account(&db, existing.id.0, &email).await;
             assert_eq!(
-                auth.get_or_create_oauth_user(original_info)
+                auth.get_or_create_oauth_user(original_info.clone())
                     .await
                     .unwrap()
                     .id,
                 existing.id
             );
-            if verified {
+            if !original_verified {
+                // A verified original-provider login refreshes unknown/backfilled metadata.
+                original_info.email_verified = true;
+                auth.get_or_create_oauth_user(original_info).await.unwrap();
+                assert_eq!(
+                    auth.get_or_create_oauth_user(incoming_info)
+                        .await
+                        .unwrap()
+                        .id,
+                    existing.id
+                );
+                assert_single_oauth_account(&db, existing.id.0, &email).await;
+            }
+            if can_auto_link {
                 // Do not replace an already linked identity for the same provider.
                 let another_identity = oauth_info(incoming, &email);
                 assert!(matches!(
@@ -104,6 +119,84 @@ async fn oauth_matching_email_auto_links_only_verified_social_identities_in_both
                     .is_none());
             }
         }
+    }
+}
+
+#[tokio::test]
+async fn oauth_auto_link_rejects_missing_or_stale_primary_email_evidence() {
+    let (_server, db) = setup_test_server_with_database().await;
+    let auth = real_auth(&db);
+    let users = database::repositories::UserRepository::new(db.pool().clone());
+    for (original, incoming) in [("github", "google"), ("google", "github")] {
+        for mutation in [
+            "DELETE FROM user_oauth_identities WHERE user_id=$1",
+            "UPDATE user_oauth_identities SET email=NULL WHERE user_id=$1",
+            "UPDATE user_oauth_identities SET email='stale@example.test' WHERE user_id=$1",
+            "UPDATE user_oauth_identities SET provider_user_id='stale-' || provider_user_id WHERE user_id=$1",
+        ] {
+            let email = format!("oauth-primary-proof-{}@example.test", uuid::Uuid::new_v4());
+            let existing = auth.get_or_create_oauth_user(oauth_info(original, &email)).await.unwrap();
+            db.pool().get().await.unwrap().execute(mutation, &[&existing.id.0]).await.unwrap();
+            let incoming_info = oauth_info(incoming, &email);
+            let result = auth.get_or_create_oauth_user(incoming_info.clone()).await;
+            assert!(matches!(result, Err(AuthError::OAuthProviderConflict { .. })), "{mutation}");
+            assert!(users.get_by_provider(incoming, &incoming_info.provider_user_id).await.unwrap().is_none());
+            assert_single_oauth_account(&db, existing.id.0, &email).await;
+        }
+    }
+}
+
+#[tokio::test]
+async fn oauth_auto_link_rechecks_primary_verification_after_waiting_for_its_lock() {
+    let (_server, db) = setup_test_server_with_database().await;
+    let auth = real_auth(&db);
+    for (original, incoming) in [("github", "google"), ("google", "github")] {
+        let email = format!("oauth-primary-lock-{}@example.test", uuid::Uuid::new_v4());
+        let existing = auth
+            .get_or_create_oauth_user(oauth_info(original, &email))
+            .await
+            .unwrap();
+        let incoming_info = oauth_info(incoming, &email);
+        let mut writer = db.pool().get().await.unwrap();
+        let tx = writer.transaction().await.unwrap();
+        let writer_pid: i32 = tx
+            .query_one("SELECT pg_backend_pid()", &[])
+            .await
+            .unwrap()
+            .get(0);
+        tx.execute(
+            "UPDATE user_oauth_identities SET email_verified=false WHERE user_id=$1",
+            &[&existing.id.0],
+        )
+        .await
+        .unwrap();
+        let login_auth = auth.clone();
+        let login_info = incoming_info.clone();
+        let login =
+            tokio::spawn(async move { login_auth.get_or_create_oauth_user(login_info).await });
+        let observer = db.pool().get().await.unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                let waiting: bool = observer.query_one(
+                    "SELECT EXISTS (SELECT 1 FROM pg_stat_activity WHERE $1=ANY(pg_blocking_pids(pid)))",
+                    &[&writer_pid],
+                ).await.unwrap().get(0);
+                if waiting { break; }
+                assert!(!login.is_finished(), "automatic linking must wait for primary verification");
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        }).await.expect("automatic linking should block on the primary identity row");
+        tx.commit().await.unwrap();
+        assert!(matches!(
+            login.await.unwrap(),
+            Err(AuthError::OAuthProviderConflict { .. })
+        ));
+        assert!(database::UserRepository::new(db.pool().clone())
+            .get_by_provider(incoming, &incoming_info.provider_user_id)
+            .await
+            .unwrap()
+            .is_none());
+        assert_single_oauth_account(&db, existing.id.0, &email).await;
     }
 }
 
@@ -219,11 +312,32 @@ async fn oauth_concurrent_cross_provider_signup_creates_only_one_account() {
     let github = oauth_info("github", &email);
     let google = oauth_info("google", &email);
     let (github_result, google_result) = tokio::join!(
-        auth.get_or_create_oauth_user(github),
-        auth.get_or_create_oauth_user(google),
+        auth.get_or_create_oauth_user(github.clone()),
+        auth.get_or_create_oauth_user(google.clone()),
     );
-    let winner = github_result.unwrap();
-    assert_eq!(google_result.unwrap().id, winner.id);
+    // Until the first callback records its primary email verification, the
+    // concurrent callback must fail closed. A later login can then auto-link.
+    let winner = match (github_result, google_result) {
+        (Ok(first), Ok(second)) => {
+            assert_eq!(first.id, second.id);
+            first
+        }
+        (Ok(user), Err(AuthError::OAuthProviderConflict { .. })) => {
+            assert_eq!(
+                auth.get_or_create_oauth_user(google).await.unwrap().id,
+                user.id
+            );
+            user
+        }
+        (Err(AuthError::OAuthProviderConflict { .. }), Ok(user)) => {
+            assert_eq!(
+                auth.get_or_create_oauth_user(github).await.unwrap().id,
+                user.id
+            );
+            user
+        }
+        results => panic!("expected one account with verified identities, got {results:?}"),
+    };
     assert_eq!(
         auth.list_oauth_identities(winner.id.clone())
             .await

@@ -154,10 +154,12 @@ impl UserRepository {
 
             client
                 .query_opt(
-                    "SELECT u.* FROM users u WHERE u.is_active = true AND (
-              (u.auth_provider = $1 AND u.provider_user_id = $2) OR EXISTS (
-                SELECT 1 FROM user_oauth_identities i WHERE i.user_id = u.id
-                AND i.provider = $1 AND i.provider_user_id = $2))",
+                    "SELECT u.* FROM users u
+                     WHERE u.auth_provider = $1 AND u.provider_user_id = $2 AND u.is_active = true
+                     UNION ALL
+                     SELECT u.* FROM user_oauth_identities i JOIN users u ON u.id = i.user_id
+                     WHERE i.provider = $1 AND i.provider_user_id = $2 AND u.is_active = true
+                     LIMIT 1",
                     &[&auth_provider, &provider_user_id],
                 )
                 .await

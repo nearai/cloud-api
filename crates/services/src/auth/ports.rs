@@ -453,6 +453,7 @@ pub struct AuthService {
     pub api_key_cache: ApiKeyCache,
     pub api_key_bloom_filter: ApiKeyBloomFilter,
     pub bloom_filter_ready: BloomFilterReady,
+    pub oauth_auto_linking_enabled: bool,
     /// Reject access tokens without a `sid` claim (legacy tokens issued
     /// before session binding). See `AuthConfig::require_session_bound_access_tokens`.
     pub require_session_bound_access_tokens: bool,

@@ -49,7 +49,9 @@ async fn account(
     (user, info, token, session)
 }
 
-async fn fixture() -> (
+async fn fixture(
+    auto_linking_enabled: bool,
+) -> (
     axum_test::TestServer,
     Arc<database::Database>,
     Arc<dyn AuthServiceTrait>,
@@ -60,6 +62,7 @@ async fn fixture() -> (
     let provider = MockServer::start().await;
     let mut config = test_config();
     config.auth.mock = false;
+    config.auth.oauth_auto_linking_enabled = auto_linking_enabled;
     let oauth_config = config::OAuthProviderConfig {
         client_id: "local-test".into(),
         client_secret: "local-secret".into(),
@@ -140,7 +143,7 @@ async fn oauth_link_provider_rejections_do_not_cancel_or_create_a_link() {
     }
 
     for (original, incoming) in [("github", "google"), ("google", "github")] {
-        let (server, db, auth, store, provider) = fixture().await;
+        let (server, db, auth, store, provider) = fixture(true).await;
         let (user, _, _, session) = account(&auth, original).await;
         for token_rejected in [true, false] {
             provider.reset().await;
@@ -239,10 +242,79 @@ async fn oauth_link_provider_rejections_do_not_cancel_or_create_a_link() {
 }
 
 #[tokio::test]
+async fn oauth_disabled_auto_linking_returns_conflict_without_identity_or_session() {
+    for (original, incoming) in [("github", "google"), ("google", "github")] {
+        let (server, db, auth, store, provider) = fixture(false).await;
+        let (user, original_info, _, _) = account(&auth, original).await;
+        let incoming_info = info(incoming, &original_info.email);
+        mock_identity(&provider, &incoming_info).await;
+        let before = counts(&db, &user).await;
+        let sessions_before: i64 = db
+            .pool()
+            .get()
+            .await
+            .unwrap()
+            .query_one(
+                "SELECT count(*) FROM refresh_tokens WHERE user_id=$1",
+                &[&user.id.0],
+            )
+            .await
+            .unwrap()
+            .get(0);
+        let state = uuid::Uuid::new_v4().to_string();
+        store
+            .create(
+                state.clone(),
+                incoming.into(),
+                Some("local-verifier".into()),
+                None,
+            )
+            .await
+            .unwrap();
+        let response = server
+            .get(&format!("/v1/auth/callback?state={state}&code=local-code"))
+            .add_header("User-Agent", UA)
+            .await;
+        assert_eq!(response.status_code(), 409);
+        let body = response.json::<serde_json::Value>();
+        assert_eq!(body["error"], "oauth_provider_conflict");
+        assert_eq!(body["existing_provider"], original);
+        assert!(body.get("access_token").is_none());
+        assert!(body.get("refresh_token").is_none());
+        assert_eq!(
+            auth.list_oauth_identities(user.id.clone())
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(database::UserRepository::new(db.pool().clone())
+            .get_by_provider(incoming, &incoming_info.provider_user_id)
+            .await
+            .unwrap()
+            .is_none());
+        let sessions_after: i64 = db
+            .pool()
+            .get()
+            .await
+            .unwrap()
+            .query_one(
+                "SELECT count(*) FROM refresh_tokens WHERE user_id=$1",
+                &[&user.id.0],
+            )
+            .await
+            .unwrap()
+            .get(0);
+        assert_eq!(sessions_after, sessions_before);
+        assert_eq!(counts(&db, &user).await, before);
+    }
+}
+
+#[tokio::test]
 async fn oauth_verified_email_callback_auto_links_and_signs_into_original_account() {
     for verified in [false, true] {
         for (original, incoming) in [("github", "google"), ("google", "github")] {
-            let (server, db, auth, store, provider) = fixture().await;
+            let (server, db, auth, store, provider) = fixture(true).await;
             let (user, original_info, _, _) = account(&auth, original).await;
             let mut incoming_info = info(incoming, &original_info.email);
             incoming_info.email_verified = verified;
@@ -299,7 +371,7 @@ async fn oauth_verified_email_callback_auto_links_and_signs_into_original_accoun
 #[tokio::test]
 async fn explicit_link_callback_confirms_original_session_and_both_providers_sign_in() {
     for (original, incoming) in [("github", "google"), ("google", "github")] {
-        let (server, db, auth, store, provider) = fixture().await;
+        let (server, db, auth, store, provider) = fixture(false).await;
         let (user, original_info, token, session) = account(&auth, original).await;
         let incoming_info = info(incoming, &original_info.email);
         mock_identity(&provider, &incoming_info).await;
@@ -426,7 +498,7 @@ async fn explicit_link_callback_confirms_original_session_and_both_providers_sig
 
 #[tokio::test]
 async fn link_handoff_rejects_other_accounts_other_sessions_expiration_and_logout() {
-    let (_, db, auth, _, _) = fixture().await;
+    let (_, db, auth, _, _) = fixture(true).await;
     let (user, original, _, session) = account(&auth, "github").await;
     let (other, _, _, other_session) = account(&auth, "github").await;
     let incoming = info("google", &original.email);
@@ -489,7 +561,7 @@ async fn link_handoff_rejects_other_accounts_other_sessions_expiration_and_logou
 
 #[tokio::test]
 async fn linking_never_merges_accounts_or_overwrites_an_existing_provider() {
-    let (_, db, auth, _, _) = fixture().await;
+    let (_, db, auth, _, _) = fixture(true).await;
     let (user, original, _, session) = account(&auth, "github").await;
     let (other, other_info, _, _) = account(&auth, "google").await;
     let before = counts(&db, &other).await;
@@ -532,7 +604,7 @@ async fn linking_never_merges_accounts_or_overwrites_an_existing_provider() {
 
 #[tokio::test]
 async fn linked_provider_login_does_not_change_primary_email_or_profile() {
-    let (_, db, auth, _, _) = fixture().await;
+    let (_, db, auth, _, _) = fixture(true).await;
     let (user, _, _, session) = account(&auth, "github").await;
     let incoming = info(
         "google",
@@ -563,7 +635,7 @@ async fn linked_provider_login_does_not_change_primary_email_or_profile() {
 
 #[tokio::test]
 async fn concurrent_link_requests_cannot_assign_one_identity_to_two_accounts() {
-    let (_, db, auth, _, _) = fixture().await;
+    let (_, db, auth, _, _) = fixture(true).await;
     let (first, _, _, first_session) = account(&auth, "github").await;
     let (second, _, _, second_session) = account(&auth, "github").await;
     let incoming = info(
@@ -604,7 +676,7 @@ async fn concurrent_link_requests_cannot_assign_one_identity_to_two_accounts() {
 
 #[tokio::test]
 async fn oauth_link_initiation_and_cancel_validate_session_provider_and_callback() {
-    let (server, _, auth, store, _) = fixture().await;
+    let (server, _, auth, store, _) = fixture(true).await;
     let (user, _, token, _) = account(&auth, "github").await;
     for payload in [
         serde_json::json!({"provider":"near","frontend_callback":CALLBACK}),
@@ -667,7 +739,7 @@ async fn oauth_link_initiation_and_cancel_validate_session_provider_and_callback
 #[tokio::test]
 async fn provider_callback_rejects_unverified_email_and_revoked_original_session() {
     for incoming in ["google", "github"] {
-        let (server, db, auth, store, provider) = fixture().await;
+        let (server, db, auth, store, provider) = fixture(true).await;
         let original = if incoming == "google" {
             "github"
         } else {

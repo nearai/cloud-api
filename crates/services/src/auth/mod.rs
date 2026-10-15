@@ -550,7 +550,9 @@ impl AuthService {
         &self,
         oauth_info: &OAuthUserInfo,
     ) -> Result<Option<User>, AuthError> {
-        if oauth_info.email_verified && matches!(oauth_info.provider.as_str(), "google" | "github")
+        if self.oauth_auto_linking_enabled
+            && oauth_info.email_verified
+            && matches!(oauth_info.provider.as_str(), "google" | "github")
         {
             if let Some(user) = self
                 .user_repository
@@ -667,7 +669,7 @@ impl AuthService {
         organization_repository: Arc<dyn OrganizationRepository>,
         workspace_repository: Arc<dyn WorkspaceRepository>,
         organization_service: Arc<dyn crate::organization::OrganizationServiceTrait>,
-        require_session_bound_access_tokens: bool,
+        auth_config: &config::AuthConfig,
     ) -> Self {
         let api_key_cache: ApiKeyCache = Cache::builder()
             .max_capacity(API_KEY_CACHE_MAX_CAPACITY)
@@ -695,7 +697,8 @@ impl AuthService {
             api_key_cache,
             api_key_bloom_filter,
             bloom_filter_ready,
-            require_session_bound_access_tokens,
+            require_session_bound_access_tokens: auth_config.require_session_bound_access_tokens,
+            oauth_auto_linking_enabled: auth_config.oauth_auto_linking_enabled,
         }
     }
 
@@ -1761,6 +1764,7 @@ mod tests {
             api_key_bloom_filter: Arc::new(RwLock::new(bloom)),
             bloom_filter_ready: Arc::new(AtomicBool::new(false)),
             require_session_bound_access_tokens,
+            oauth_auto_linking_enabled: true,
         }
     }
 
@@ -1879,6 +1883,53 @@ mod tests {
             username: "alice".into(),
             display_name: Some("New profile".into()),
             avatar_url: Some("https://example.test/new-avatar".into()),
+        }
+    }
+
+    #[tokio::test]
+    async fn oauth_disabled_auto_linking_rejects_verified_emails_including_creation_races() {
+        for (original, incoming) in [("github", "google"), ("google", "github")] {
+            for creation_race in [false, true] {
+                let existing = make_user("alice@example.com", original);
+                let repo = Arc::new(if creation_race {
+                    MockUserRepo::creation_failure(Some(existing))
+                } else {
+                    MockUserRepo::with_user(existing)
+                });
+                let mut service = build_auth_service(repo.clone());
+                service.oauth_auto_linking_enabled = false;
+                let error = service
+                    .get_or_create_oauth_user(oauth_info(incoming))
+                    .await
+                    .unwrap_err();
+                assert!(matches!(
+                    error,
+                    AuthError::OAuthProviderConflict { existing_provider } if existing_provider == original
+                ));
+                assert!(repo.linked_identities.lock().unwrap().is_empty());
+                assert_eq!(
+                    *repo.creation_calls.lock().unwrap(),
+                    usize::from(creation_race)
+                );
+                assert!(!*repo.last_login_updated.lock().unwrap());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn oauth_disabled_auto_linking_preserves_linked_provider_login() {
+        for (original, incoming) in [("github", "google"), ("google", "github")] {
+            let existing = make_user("alice@example.com", original);
+            let repo = Arc::new(MockUserRepo::with_user(existing.clone()));
+            let info = oauth_info(incoming);
+            repo.linked_identities.lock().unwrap().push(info.clone());
+            let mut service = build_auth_service(repo.clone());
+            service.oauth_auto_linking_enabled = false;
+            let user = service.get_or_create_oauth_user(info).await.unwrap();
+            assert_eq!(user.id, existing.id);
+            assert_eq!(repo.linked_identities.lock().unwrap().len(), 1);
+            assert_eq!(*repo.creation_calls.lock().unwrap(), 0);
+            assert!(*repo.last_login_updated.lock().unwrap());
         }
     }
 

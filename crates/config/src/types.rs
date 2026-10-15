@@ -1040,6 +1040,9 @@ pub struct AuthConfig {
     /// Enable only after all API instances enforce admin token permissions.
     /// Disabling issuance does not disable enforcement for existing tokens.
     pub admin_read_only_tokens_enabled: bool,
+    /// Enable only after every API instance can resolve linked OAuth identities.
+    /// Defaults off to keep mixed-version rollouts from creating new identities.
+    pub oauth_auto_linking_enabled: bool,
     /// Reject session access tokens that carry no `sid` (session id) claim.
     ///
     /// Access tokens minted since session binding was introduced are tied to
@@ -1113,6 +1116,7 @@ impl AuthConfig {
                 "AUTH_ADMIN_READ_ONLY_TOKENS_ENABLED",
                 false,
             )?,
+            oauth_auto_linking_enabled: parse_bool_env("AUTH_OAUTH_AUTO_LINKING_ENABLED", false)?,
             require_session_bound_access_tokens: parse_bool_env(
                 "AUTH_REQUIRE_SESSION_BOUND_ACCESS_TOKENS",
                 false,
@@ -1905,6 +1909,34 @@ mod tests {
     }
 
     #[test]
+    #[serial]
+    fn oauth_auto_linking_defaults_off_and_requires_explicit_enable() {
+        let keys = ["AUTH_ENCODING_KEY", "AUTH_OAUTH_AUTO_LINKING_ENABLED"];
+        let previous = keys.map(|key| (key, env::var_os(key)));
+        env::set_var("AUTH_ENCODING_KEY", "test-key");
+        env::remove_var("AUTH_OAUTH_AUTO_LINKING_ENABLED");
+        assert!(!AuthConfig::default().oauth_auto_linking_enabled);
+        assert!(!AuthConfig::from_env().unwrap().oauth_auto_linking_enabled);
+        for (value, expected) in [("false", false), ("true", true)] {
+            env::set_var("AUTH_OAUTH_AUTO_LINKING_ENABLED", value);
+            assert_eq!(
+                AuthConfig::from_env().unwrap().oauth_auto_linking_enabled,
+                expected
+            );
+        }
+        env::set_var("AUTH_OAUTH_AUTO_LINKING_ENABLED", "invalid");
+        assert!(AuthConfig::from_env()
+            .unwrap_err()
+            .contains("AUTH_OAUTH_AUTO_LINKING_ENABLED"));
+        for (key, value) in previous {
+            match value {
+                Some(value) => env::set_var(key, value),
+                None => env::remove_var(key),
+            }
+        }
+    }
+
+    #[test]
     fn test_is_admin_email() {
         let config = AuthConfig {
             mock: false,
@@ -1914,6 +1946,7 @@ mod tests {
             near: NearConfig::default(),
             admin_domains: vec!["near.ai".to_string(), "near.org".to_string()],
             admin_read_only_tokens_enabled: false,
+            oauth_auto_linking_enabled: false,
             require_session_bound_access_tokens: false,
         };
 
@@ -1939,6 +1972,7 @@ mod tests {
             near: NearConfig::default(),
             admin_domains: vec![],
             admin_read_only_tokens_enabled: false,
+            oauth_auto_linking_enabled: false,
             require_session_bound_access_tokens: false,
         };
 

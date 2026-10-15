@@ -130,12 +130,16 @@ To test the OAuth flow locally, set `AUTH_MOCK=false` and configure
 `GITHUB_CLIENT_ID` / `GITHUB_CLIENT_SECRET` (or the Google equivalents)
 against an OAuth app whose callback URL is
 `http://localhost:3000/v1/auth/callback`. Visit `/v1/auth/login` to start
-the flow.
+the flow. Automatic email linking is disabled by default. Keep
+`AUTH_OAUTH_AUTO_LINKING_ENABLED=false` during the initial API rollout. Only after
+every API instance supports linked identities, set it to `true` and restart or
+redeploy the API to enable automatic linking. Deploy the linking UI afterward.
 
 Accounts are identified by their OAuth provider and provider user ID. A new Google
 or GitHub identity automatically links to an existing active account on the other
-provider when both the incoming identity and the account's original identity
-verify the same email. Sign-in then uses the existing account and its resources.
+provider when automatic linking is enabled and both the incoming identity and the
+account's original identity verify the same email. Sign-in then uses the existing
+account and its resources.
 Existing identities remain authoritative; separately registered accounts are not
 merged. If automatic linking is not allowed, a conflicting email returns `409`
 with `error: "oauth_provider_conflict"`, `existing_provider`, and an

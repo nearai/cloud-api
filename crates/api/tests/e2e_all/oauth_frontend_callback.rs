@@ -20,6 +20,7 @@ fn oauth_info(provider: &str, email: &str) -> OAuthUserInfo {
 fn real_auth(db: &Arc<database::Database>) -> Arc<dyn AuthServiceTrait> {
     let mut config = test_config();
     config.auth.mock = false;
+    config.auth.oauth_auto_linking_enabled = true;
     api::init_auth_services(db.clone(), &config).auth_service
 }
 

@@ -1,17 +1,28 @@
 //! Tinfoil router/model policy: SEV-SNP verification of the router attestation
 //! (ATC bundle) against compiled pins, binding the report to the router's TLS key.
 
+use std::collections::HashMap;
 use std::io::Read;
+use std::sync::Mutex;
 
 use base64::Engine;
 use inference_providers::attested::tinfoil::verifier_port::{
-    AtcBundle, PinnedModel, ProxyModelEntry, RouterTcb, TinfoilVerifier, TinfoilVerifyError,
-    VerifiedRouter,
+    AtcBundle, PinSource, PinnedModel, ProxyModelEntry, RouterTcb, TinfoilVerifier,
+    TinfoilVerifyError, VerifiedRouter,
 };
 use sha2::{Digest, Sha256};
+use tinfoil_provenance::Provenance;
+
+use super::tinfoil_trust::TinfoilTrustHandle;
 
 use super::snp::{self, SnpError, SnpEvidence, SnpPolicy, Tcb, VerifiedSnpReport};
 use super::tinfoil_pins::{TinfoilPins, COMPILED_PINS_JSON};
+
+/// The repository whose Sigstore-signed releases may vouch for a router.
+const ROUTER_REPO: &str = "tinfoilsh/confidential-model-router";
+
+/// Cap on cached Sigstore results; the cache is cleared when it grows past it.
+const SIGSTORE_CACHE_MAX: usize = 64;
 
 const SNP_FORMAT: &str = "https://tinfoil.sh/predicate/sev-snp-guest/v2";
 
@@ -121,17 +132,104 @@ fn registers_eq(a: &[String], b: &[String]) -> bool {
     a.len() == b.len() && a.iter().zip(b).all(|(x, y)| x.eq_ignore_ascii_case(y))
 }
 
+type SigstoreCache = HashMap<(String, [u8; 32]), Result<Provenance, TinfoilVerifyError>>;
+
 pub struct TinfoilPolicyVerifier {
     pins: TinfoilPins,
+    trust: TinfoilTrustHandle,
+    /// Sigstore verification results per (measurement, bundle hash). Only the
+    /// verification itself is cached: the runtime switch and the binding
+    /// checks run on every `verify_router`.
+    sigstore_cache: Mutex<SigstoreCache>,
+    router_repo: String,
+    #[cfg(test)]
+    sigstore_calls: std::sync::atomic::AtomicUsize,
 }
 
 impl TinfoilPolicyVerifier {
-    pub fn new(pins: TinfoilPins) -> Self {
-        Self { pins }
+    pub fn new(pins: TinfoilPins, trust: TinfoilTrustHandle) -> Self {
+        Self {
+            pins,
+            trust,
+            sigstore_cache: Mutex::new(HashMap::new()),
+            router_repo: ROUTER_REPO.to_string(),
+            #[cfg(test)]
+            sigstore_calls: std::sync::atomic::AtomicUsize::new(0),
+        }
+    }
+
+    /// Verify the ATC bundle's Sigstore release attestation (cached per
+    /// measurement and bundle content).
+    fn sigstore_provenance(
+        &self,
+        bundle: &AtcBundle,
+        measurement_hex: &str,
+    ) -> Result<Provenance, TinfoilVerifyError> {
+        let key = sigstore_cache_key(bundle, measurement_hex)?;
+        // The lock is not held while the (slow) verification runs.
+        if let Some(hit) = self
+            .sigstore_cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&key)
+        {
+            return hit.clone();
+        }
+        #[cfg(test)]
+        self.sigstore_calls
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let result = tinfoil_provenance::verify_release(&bundle.sigstore_bundle, &self.router_repo)
+            .map_err(|e| {
+                tracing::warn!(reason = %e, "Tinfoil router Sigstore attestation rejected");
+                TinfoilVerifyError::RouterSigstoreRejected { stage: "verify" }
+            });
+        let mut cache = self
+            .sigstore_cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if cache.len() >= SIGSTORE_CACHE_MAX {
+            cache.clear();
+        }
+        cache.insert(key, result.clone());
+        result
     }
 }
 
+/// The cache key for a bundle's Sigstore verification: the live measurement
+/// and the hash of the bundle body.
+fn sigstore_cache_key(
+    bundle: &AtcBundle,
+    measurement_hex: &str,
+) -> Result<(String, [u8; 32]), TinfoilVerifyError> {
+    let bundle_hash: [u8; 32] = Sha256::digest(
+        serde_json::to_vec(&bundle.sigstore_bundle)
+            .map_err(|_| TinfoilVerifyError::RouterSigstoreRejected { stage: "verify" })?,
+    )
+    .into();
+    Ok((measurement_hex.to_ascii_lowercase(), bundle_hash))
+}
+
+/// A verified release attestation vouches for this router only if it names the
+/// live SNP measurement and is a statement about the ATC document's digest.
+fn bind_router_provenance(
+    prov: &Provenance,
+    measurement_hex: &str,
+    digest: &str,
+) -> Result<(), TinfoilVerifyError> {
+    if !prov.snp_measurement.eq_ignore_ascii_case(measurement_hex) {
+        return Err(TinfoilVerifyError::RouterSigstoreMeasurementMismatch);
+    }
+    if !prov.subject_sha256.eq_ignore_ascii_case(digest) {
+        return Err(TinfoilVerifyError::RouterSigstoreRejected { stage: "digest" });
+    }
+    Ok(())
+}
+
 impl TinfoilVerifier for TinfoilPolicyVerifier {
+    fn trust_generation(&self) -> u64 {
+        self.trust.load().version
+    }
+
     fn verify_router(&self, bundle: &AtcBundle) -> Result<VerifiedRouter, TinfoilVerifyError> {
         let (report, spki_sha256) = observe_bound_router(bundle)?;
         let measurement_hex = hex::encode(report.measurement);
@@ -145,22 +243,46 @@ impl TinfoilVerifier for TinfoilPolicyVerifier {
                 stage: "domain_not_in_san",
             });
         }
-        let pin = self
+        let tcb = RouterTcb {
+            bootloader: report.reported_tcb.bootloader,
+            tee: report.reported_tcb.tee,
+            snp: report.reported_tcb.snp,
+            microcode: report.reported_tcb.microcode,
+        };
+        if let Some(pin) = self
             .pins
             .router
             .iter()
             .find(|p| p.measurement.eq_ignore_ascii_case(&measurement_hex))
-            .ok_or(TinfoilVerifyError::UnknownRouterMeasurement)?;
+        {
+            return Ok(VerifiedRouter {
+                spki_sha256,
+                measurement_hex,
+                tag: pin.tag.clone(),
+                source: PinSource::Compiled,
+                rekor_log_index: None,
+                tcb,
+            });
+        }
+        // Not compiled: admit it on Tinfoil's signed release attestation, if
+        // that path is enabled and the ATC served a bundle.
+        let bundle_absent = match &bundle.sigstore_bundle {
+            serde_json::Value::Null => true,
+            serde_json::Value::Object(o) => o.is_empty(),
+            _ => false,
+        };
+        if !self.trust.load().value.router_sigstore || bundle_absent {
+            return Err(TinfoilVerifyError::UnknownRouterMeasurement);
+        }
+        let prov = self.sigstore_provenance(bundle, &measurement_hex)?;
+        bind_router_provenance(&prov, &measurement_hex, &bundle.digest)?;
         Ok(VerifiedRouter {
             spki_sha256,
             measurement_hex,
-            tag: pin.tag.clone(),
-            tcb: RouterTcb {
-                bootloader: report.reported_tcb.bootloader,
-                tee: report.reported_tcb.tee,
-                snp: report.reported_tcb.snp,
-                microcode: report.reported_tcb.microcode,
-            },
+            tag: prov.tag,
+            source: PinSource::SigstoreAtc,
+            rekor_log_index: Some(prov.rekor_log_index),
+            tcb,
         })
     }
 
@@ -191,16 +313,44 @@ impl TinfoilVerifier for TinfoilPolicyVerifier {
 
 #[cfg(test)]
 mod tests {
+    use super::super::tinfoil_trust::TinfoilTrust;
     use super::*;
+    use crate::admin_settings::Versioned;
+    use arc_swap::ArcSwap;
     use inference_providers::attested::tinfoil::verifier_port::ProxyDoc;
+    use std::sync::Arc;
 
     fn bundle() -> AtcBundle {
         serde_json::from_str(include_str!("testdata/tinfoil/atc_bundle.json")).unwrap()
     }
+    fn trust_handle(router_sigstore: bool) -> TinfoilTrustHandle {
+        Arc::new(ArcSwap::from_pointee(Versioned {
+            version: 0,
+            value: TinfoilTrust { router_sigstore },
+        }))
+    }
     fn test_verifier() -> TinfoilPolicyVerifier {
         TinfoilPolicyVerifier::new(
             serde_json::from_str(include_str!("testdata/tinfoil/test_pins.json")).unwrap(),
+            trust_handle(true),
         )
+    }
+    /// No compiled router row: the router can only be admitted via Sigstore.
+    fn unpinned_verifier(router_sigstore: bool) -> TinfoilPolicyVerifier {
+        TinfoilPolicyVerifier::new(TinfoilPins::default(), trust_handle(router_sigstore))
+    }
+    fn hand_built_provenance(snp: &str, digest: &str) -> Provenance {
+        Provenance {
+            repo: ROUTER_REPO.into(),
+            tag: "v1.2.3".into(),
+            predicate_type: "p".into(),
+            subject_sha256: digest.into(),
+            snp_measurement: snp.into(),
+            rtmr1: None,
+            rtmr2: None,
+            rekor_log_index: 7,
+            integrated_time: chrono::DateTime::from_timestamp(0, 0).unwrap(),
+        }
     }
 
     /// The compiled pins come only from the sync bot's reviewed PRs, so their
@@ -301,7 +451,7 @@ mod tests {
     #[test]
     fn empty_router_pins_fail_closed() {
         assert_eq!(
-            TinfoilPolicyVerifier::new(TinfoilPins::default())
+            TinfoilPolicyVerifier::new(TinfoilPins::default(), trust_handle(false))
                 .verify_router(&bundle())
                 .unwrap_err(),
             TinfoilVerifyError::UnknownRouterMeasurement
@@ -464,7 +614,7 @@ mod tests {
             models: Default::default(),
         };
         assert_eq!(
-            TinfoilPolicyVerifier::new(pins)
+            TinfoilPolicyVerifier::new(pins, trust_handle(false))
                 .verify_router(&bundle())
                 .unwrap_err(),
             TinfoilVerifyError::UnknownRouterMeasurement
@@ -486,7 +636,7 @@ mod tests {
             }],
         );
         assert_eq!(
-            TinfoilPolicyVerifier::new(pins)
+            TinfoilPolicyVerifier::new(pins, trust_handle(true))
                 .check_model("glm-5-3", &proxy.models["glm-5-3"])
                 .unwrap_err(),
             TinfoilVerifyError::UnknownModelMeasurement
@@ -524,5 +674,227 @@ mod tests {
                 TinfoilVerifyError::UnknownModelMeasurement
             );
         }
+    }
+
+    // --- Sigstore router admission (Tasks 6) ---
+
+    #[test]
+    fn compiled_router_pin_is_admitted_as_compiled() {
+        let v = test_verifier().verify_router(&bundle()).unwrap();
+        assert_eq!(v.source, PinSource::Compiled);
+        assert_eq!(v.rekor_log_index, None);
+        assert_eq!(v.tag, "v0.0.0-test");
+    }
+
+    #[test]
+    fn unpinned_router_with_valid_atc_bundle_is_admitted_via_sigstore() {
+        let v = unpinned_verifier(true).verify_router(&bundle()).unwrap();
+        assert_eq!(v.source, PinSource::SigstoreAtc);
+        assert!(v.rekor_log_index.is_some());
+        assert!(!v.tag.is_empty());
+        assert_eq!(
+            hex::encode(v.spki_sha256),
+            "2ac79995464edfb139b34e4ee6269f38d0ab63da92b1a431170dec3bdd0c7c84"
+        );
+    }
+
+    #[test]
+    fn sigstore_bundle_for_other_release_is_rejected() {
+        // The signed statement names a different SNP measurement than the live
+        // report (the bundle itself verifies).
+        let live = "aa".repeat(48);
+        let prov = hand_built_provenance(&"bb".repeat(48), "d");
+        assert_eq!(
+            bind_router_provenance(&prov, &live, "d").unwrap_err(),
+            TinfoilVerifyError::RouterSigstoreMeasurementMismatch
+        );
+        // Case differences are not a mismatch.
+        let prov = hand_built_provenance(&live.to_uppercase(), "d");
+        assert!(bind_router_provenance(&prov, &live, "d").is_ok());
+    }
+
+    #[test]
+    fn verify_router_rejects_other_release_measurement() {
+        use std::sync::atomic::Ordering;
+        let v = unpinned_verifier(true);
+        let b = bundle();
+        let (report, _) = observe_bound_router(&b).unwrap();
+        let live = hex::encode(report.measurement);
+        // Cached verification of a bundle whose signed statement names a
+        // different release's measurement (the bundle itself verified).
+        let other = "bb".repeat(48);
+        assert_ne!(other, live);
+        let prov = hand_built_provenance(&other, &b.digest);
+        v.sigstore_cache
+            .lock()
+            .unwrap()
+            .insert(sigstore_cache_key(&b, &live).unwrap(), Ok(prov));
+        assert_eq!(
+            v.verify_router(&b).unwrap_err(),
+            TinfoilVerifyError::RouterSigstoreMeasurementMismatch
+        );
+        assert_eq!(v.sigstore_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn digest_mismatch_is_rejected() {
+        let m = "aa".repeat(48);
+        let prov = hand_built_provenance(&m, "d1");
+        assert_eq!(
+            bind_router_provenance(&prov, &m, "d2").unwrap_err(),
+            TinfoilVerifyError::RouterSigstoreRejected { stage: "digest" }
+        );
+        // Through the verifier: a different ATC digest breaks the binding.
+        let mut b = bundle();
+        b.digest = "00".repeat(32);
+        assert_eq!(
+            unpinned_verifier(true).verify_router(&b).unwrap_err(),
+            TinfoilVerifyError::RouterSigstoreRejected { stage: "digest" }
+        );
+    }
+
+    #[test]
+    fn other_repo_bundle_is_rejected() {
+        // A release signed for another repo fails the signer-identity check.
+        let mut v = unpinned_verifier(true);
+        v.router_repo = "tinfoilsh/confidential-other".into();
+        assert_eq!(
+            v.verify_router(&bundle()).unwrap_err(),
+            TinfoilVerifyError::RouterSigstoreRejected { stage: "verify" }
+        );
+    }
+
+    #[test]
+    fn missing_bundle_falls_back_to_unknown_router_measurement() {
+        for missing in [serde_json::Value::Null, serde_json::json!({})] {
+            let mut b = bundle();
+            b.sigstore_bundle = missing;
+            assert_eq!(
+                unpinned_verifier(true).verify_router(&b).unwrap_err(),
+                TinfoilVerifyError::UnknownRouterMeasurement
+            );
+        }
+        // A key absent from the ATC JSON deserializes to the same thing.
+        let mut json: serde_json::Value =
+            serde_json::from_str(include_str!("testdata/tinfoil/atc_bundle.json")).unwrap();
+        json.as_object_mut().unwrap().remove("sigstoreBundle");
+        let b: AtcBundle = serde_json::from_value(json).unwrap();
+        assert!(b.sigstore_bundle.is_null());
+    }
+
+    #[test]
+    fn router_sigstore_off_rejects_unpinned_router() {
+        assert_eq!(
+            unpinned_verifier(false)
+                .verify_router(&bundle())
+                .unwrap_err(),
+            TinfoilVerifyError::UnknownRouterMeasurement
+        );
+        // A compiled pin is unaffected by the switch.
+        let v = TinfoilPolicyVerifier::new(
+            serde_json::from_str(include_str!("testdata/tinfoil/test_pins.json")).unwrap(),
+            trust_handle(false),
+        );
+        assert_eq!(
+            v.verify_router(&bundle()).unwrap().source,
+            PinSource::Compiled
+        );
+    }
+
+    #[test]
+    fn switch_is_read_on_every_verify_and_version_is_the_generation() {
+        let trust = trust_handle(true);
+        let v = TinfoilPolicyVerifier::new(TinfoilPins::default(), trust.clone());
+        assert_eq!(v.trust_generation(), 0);
+        assert!(v.verify_router(&bundle()).is_ok());
+        trust.store(Arc::new(Versioned {
+            version: 3,
+            value: TinfoilTrust {
+                router_sigstore: false,
+            },
+        }));
+        assert_eq!(v.trust_generation(), 3);
+        // The cached provenance does not bypass the switch.
+        assert_eq!(
+            v.verify_router(&bundle()).unwrap_err(),
+            TinfoilVerifyError::UnknownRouterMeasurement
+        );
+    }
+
+    #[test]
+    fn sigstore_result_is_cached_per_bundle() {
+        use std::sync::atomic::Ordering;
+        let v = unpinned_verifier(true);
+        v.verify_router(&bundle()).unwrap();
+        v.verify_router(&bundle()).unwrap();
+        assert_eq!(v.sigstore_calls.load(Ordering::SeqCst), 1);
+        // A different bundle body is a different cache entry.
+        let mut b = bundle();
+        b.sigstore_bundle["extra"] = serde_json::json!(1);
+        let _ = v.verify_router(&b);
+        assert_eq!(v.sigstore_calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn snp_and_san_checks_still_gate_sigstore_path() {
+        use std::sync::atomic::Ordering;
+        let v = unpinned_verifier(true);
+        // Wrong SAN.
+        let mut b = bundle();
+        b.domain = "router-0.tinfoil.sh".into();
+        assert_eq!(
+            v.verify_router(&b).unwrap_err(),
+            TinfoilVerifyError::Malformed {
+                stage: "domain_not_in_san"
+            }
+        );
+        // Non-SNP platform.
+        let mut b = bundle();
+        b.report.format = "https://tinfoil.sh/predicate/tdx-guest/v2".into();
+        assert_eq!(
+            v.verify_router(&b).unwrap_err(),
+            TinfoilVerifyError::UnsupportedRouterPlatform
+        );
+        // Swapped certificate (TLS binding).
+        let mut b = bundle();
+        let der = base64::engine::general_purpose::STANDARD
+            .decode(&b.vcek)
+            .unwrap();
+        b.enclave_cert = format!(
+            "-----BEGIN CERTIFICATE-----\n{}\n-----END CERTIFICATE-----\n",
+            base64::engine::general_purpose::STANDARD.encode(der)
+        );
+        assert_eq!(
+            v.verify_router(&b).unwrap_err(),
+            TinfoilVerifyError::ReportDataMismatch
+        );
+        // Tampered report.
+        let mut b = bundle();
+        let gz = base64::engine::general_purpose::STANDARD
+            .decode(&b.report.body)
+            .unwrap();
+        let mut raw = Vec::new();
+        flate2::read::GzDecoder::new(&gz[..])
+            .read_to_end(&mut raw)
+            .unwrap();
+        raw[0x90] ^= 1;
+        let mut enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        std::io::Write::write_all(&mut enc, &raw).unwrap();
+        b.report.body = base64::engine::general_purpose::STANDARD.encode(enc.finish().unwrap());
+        assert_eq!(
+            v.verify_router(&b).unwrap_err(),
+            TinfoilVerifyError::BadSignature
+        );
+        assert_eq!(
+            v.sigstore_calls.load(Ordering::SeqCst),
+            0,
+            "Sigstore is never consulted before the SNP, TLS and SAN checks pass"
+        );
+    }
+
+    #[test]
+    fn pin_source_strings() {
+        assert_eq!(PinSource::Compiled.as_str(), "compiled");
+        assert_eq!(PinSource::SigstoreAtc.as_str(), "sigstore_atc");
     }
 }

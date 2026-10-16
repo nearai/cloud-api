@@ -83,7 +83,7 @@ jobs:
           # and none of it is Rust-relevant.
           RUST=true
           if [ -n "$CHANGED" ] && ! echo "$CHANGED" | grep -qE \
-            '(\.rs$|(^|/)Cargo\.(toml|lock)$|^crates/[^/]+/src/.*\.json$|^crates/database/src/migrations/|^\.github/workflows/test\.yml$|^\.github/actions/setup-rust-ci/|^\.config/nextest\.toml$|^rust-toolchain\.toml$|^\.cargo/config\.toml$)'; then
+            '(\.rs$|(^|/)Cargo\.(toml|lock)$|^crates/[^/]+/src/.*\.json$|^crates/database/src/migrations/|^\.github/workflows/test\.yml$|^\.github/actions/setup-rust-ci/|^\.config/nextest\.toml$|^rust-toolchain\.toml$|^\.cargo/config\.toml$|^scripts/check_dep_guards\.sh$)'; then
             RUST=false
           fi
           echo "rust=$RUST" >> "$GITHUB_OUTPUT"
@@ -111,6 +111,9 @@ jobs:
     # sccache + rust-cache for the parallel test jobs.
     - name: Run cargo clippy
       run: cargo clippy --all-targets --all-features -- -D warnings
+
+    - name: Dependency guards
+      run: bash scripts/check_dep_guards.sh
 
   # Unit tests (library + binary tests) run without PostgreSQL: the in-crate
   # #[test] functions use mocks and do not establish real DB connections.

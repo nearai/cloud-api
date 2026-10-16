@@ -32,7 +32,7 @@ use services::attestation::tinfoil_observer::observe;
 use crate::classify::{
     ModelObservation, Observations, RouterObservation, SigstoreResults, ROUTER_REPO,
 };
-use crate::sigstore_verify::verify_bundle;
+use tinfoil_provenance::verify_release;
 
 pub const ATC_URL: &str = "https://atc.tinfoil.sh/attestation";
 /// Path of the proxy document on the attested router's domain.
@@ -202,7 +202,7 @@ async fn fetch_release_attestation(
     cfg: &ProbeConfig,
     repo: &str,
     tag: &str,
-) -> Result<crate::sigstore_verify::SigstoreResult, String> {
+) -> Result<tinfoil_provenance::Provenance, String> {
     if !is_tinfoil_repo(repo) {
         return Err("repo outside tinfoilsh".into());
     }
@@ -235,7 +235,7 @@ async fn fetch_release_attestation(
         .as_array()
         .ok_or("attestations: no list")?;
     for a in bundles {
-        if let Ok(r) = verify_bundle(&a["bundle"], repo) {
+        if let Ok(r) = verify_release(&a["bundle"], repo) {
             if r.subject_sha256 == digest && r.tag == tag {
                 return Ok(r);
             }
@@ -312,7 +312,7 @@ pub async fn run(client: &reqwest::Client, cfg: &ProbeConfig) -> Result<ProbeOut
                 ),
                 format: o.format,
             });
-            match verify_bundle(&bundle.sigstore_bundle, ROUTER_REPO) {
+            match verify_release(&bundle.sigstore_bundle, ROUTER_REPO) {
                 Ok(r) if r.subject_sha256.eq_ignore_ascii_case(&bundle.digest) => {
                     sigstore.router = Some(r)
                 }
@@ -497,6 +497,8 @@ mod tests {
     #[test]
     fn services_and_sync_atc_captures_agree() {
         let a: AtcBundle = serde_json::from_str(ATC).unwrap();
+        // Deliberately reads the services crate's capture: this test exists to
+        // catch drift between the two crates' recorded router bundles.
         let b: AtcBundle = serde_json::from_str(include_str!(
             "../../services/src/attestation/testdata/tinfoil/atc_bundle.json"
         ))

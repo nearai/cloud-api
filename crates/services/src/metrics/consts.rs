@@ -68,6 +68,8 @@ pub const METRIC_BACKEND_CHANNEL_BINDING: &str = "cloud_api.backend.channel_bind
 // upstream 401/402/403 (key or billing problem); pages immediately.
 pub const METRIC_TINFOIL_VERIFICATION: &str = "cloud_api.tinfoil.verification";
 pub const METRIC_TINFOIL_AVAILABLE: &str = "cloud_api.tinfoil.available";
+/// Trust path that admitted the current Tinfoil router (`source:compiled|sigstore_atc`).
+pub const METRIC_TINFOIL_ROUTER_SOURCE: &str = "cloud_api.tinfoil.router_source";
 pub const METRIC_TINFOIL_UPSTREAM_AUTH_FAILURE: &str = "cloud_api.tinfoil.upstream_auth_failure";
 
 // Error metrics

@@ -404,24 +404,26 @@ impl InferenceProvider for Provider {
         m.insert("model".into(), json!(self.canonical_id));
         m.insert("verified".into(), json!(true));
         m.insert("trust".into(), json!("router_attested"));
-        m.insert(
-            "router".into(),
-            json!({
-                "format": state.bundle.report.format,
-                "report_b64": state.bundle.report.body,
-                "vcek_b64": state.bundle.vcek,
-                "cert_pem": state.bundle.enclave_cert,
-                "measurement": state.router.measurement_hex,
-                "tag": state.router.tag,
-                "spki_sha256": hex::encode(state.router.spki_sha256),
-                "tcb": {
-                    "bootloader": state.router.tcb.bootloader,
-                    "tee": state.router.tcb.tee,
-                    "snp": state.router.tcb.snp,
-                    "microcode": state.router.tcb.microcode,
-                },
-            }),
-        );
+        let mut router = json!({
+            "format": state.bundle.report.format,
+            "report_b64": state.bundle.report.body,
+            "vcek_b64": state.bundle.vcek,
+            "cert_pem": state.bundle.enclave_cert,
+            "measurement": state.router.measurement_hex,
+            "tag": state.router.tag,
+            "pin_source": state.router.source.as_str(),
+            "spki_sha256": hex::encode(state.router.spki_sha256),
+            "tcb": {
+                "bootloader": state.router.tcb.bootloader,
+                "tee": state.router.tcb.tee,
+                "snp": state.router.tcb.snp,
+                "microcode": state.router.tcb.microcode,
+            },
+        });
+        if let Some(index) = state.router.rekor_log_index {
+            router["rekor_log_index"] = json!(index);
+        }
+        m.insert("router".into(), router);
         m.insert(
             "model_entry".into(),
             json!({

@@ -292,6 +292,15 @@ Located in `crates/api/src/routes/`:
 - Config structs: `crates/config/src/types.rs`
 - YAML templates: `config/` directory
 
+### Runtime configuration (admin_settings KV store)
+- Runtime-changeable config or data goes into `admin_settings` as an owner-registered key (`SettingKey`); never add a table, migration or admin API for it
+- The owning module defines the key's type, defaults, parsing and size cap; `admin_settings` knows no key's type
+- Values are read through the published typed handle, never raw JSON
+- Plaintext table: never store secrets, credentials or customer data; signed public trust inputs are allowed because the owner verifies them
+- Consumers that need settings at startup register after the settings service loads
+
+See `crates/services/src/admin_settings/`. Keys implement the `SettingKey` trait and register via `AdminSettingsService::builder(..).register::<K>(handle)`.
+
 ### Architecture Documentation
 Comprehensive C4 diagrams and flows: `docs/architecture/c4-diagrams.md`
 

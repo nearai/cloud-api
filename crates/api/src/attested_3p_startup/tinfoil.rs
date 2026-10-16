@@ -4,10 +4,11 @@
 use super::ensure_attested_3p_catalog_row;
 use config::{AttestedThirdPartyModelEntry, ExternalProvidersConfig};
 use database::repositories::ModelRepository;
-use inference_providers::attested::tinfoil::verifier_port::TinfoilVerifyError;
+use inference_providers::attested::tinfoil::verifier_port::{PinSource, TinfoilVerifyError};
 use inference_providers::attested::tinfoil::{self as tinfoil_provider, TinfoilRouterSession};
 use inference_providers::ProviderSource;
 use services::attestation::tinfoil_pins::TinfoilPins;
+use services::attestation::tinfoil_trust::TinfoilTrustHandle;
 use services::inference_provider_pool::InferenceProviderPool;
 use services::metrics::{consts, MetricsServiceTrait};
 use std::sync::Arc;
@@ -20,8 +21,6 @@ enum TinfoilSkip {
     NoKey,
     /// The compiled pins failed to parse (reason is a config/parse error, not sensitive).
     PinsInvalid(String),
-    /// Pins parsed but list no router release.
-    PinsEmpty,
 }
 
 /// Decide whether Tinfoil can be registered at all. Pure so every skip branch
@@ -36,9 +35,10 @@ fn tinfoil_preflight(
     let Some(key) = cfg.tinfoil_api_key.clone() else {
         return Err(TinfoilSkip::NoKey);
     };
+    // Empty router pins are fine: a router can be admitted from its Sigstore
+    // release attestation.
     match pins {
-        Ok(p) if !p.router.is_empty() => Ok((key, p)),
-        Ok(_) => Err(TinfoilSkip::PinsEmpty),
+        Ok(p) => Ok((key, p)),
         Err(e) => Err(TinfoilSkip::PinsInvalid(e)),
     }
 }
@@ -106,6 +106,7 @@ pub(super) async fn register_tinfoil(
     pool: &Arc<InferenceProviderPool>,
     models_repo: &ModelRepository,
     cfg: &ExternalProvidersConfig,
+    trust: TinfoilTrustHandle,
     metrics: Arc<dyn MetricsServiceTrait>,
 ) {
     register_tinfoil_with(
@@ -113,6 +114,7 @@ pub(super) async fn register_tinfoil(
         models_repo,
         cfg,
         services::attestation::tinfoil::vetted_tinfoil_pins(),
+        trust,
         |pcfg, verifier| TinfoilRouterSession::new(pcfg, verifier),
         metrics,
     )
@@ -131,6 +133,7 @@ pub async fn register_tinfoil_with(
     models_repo: &ModelRepository,
     cfg: &ExternalProvidersConfig,
     pins: Result<TinfoilPins, String>,
+    trust: TinfoilTrustHandle,
     build_session: impl FnOnce(
         tinfoil_provider::Config,
         Arc<services::attestation::tinfoil::TinfoilPolicyVerifier>,
@@ -146,15 +149,16 @@ pub async fn register_tinfoil_with(
             );
             return;
         }
-        Err(TinfoilSkip::PinsEmpty) => {
-            tracing::warn!("Tinfoil router pins empty; not registering (fail-closed)");
-            return;
-        }
         Err(TinfoilSkip::PinsInvalid(e)) => {
             tracing::warn!(error = %e, "Tinfoil pins invalid; not registering (fail-closed)");
             return;
         }
     };
+    if pins.router.is_empty() && !trust.load().value.router_sigstore {
+        tracing::warn!(
+            "Tinfoil compiled router pins are empty and tinfoil_trust.router_sigstore is off; Tinfoil serves 503 until the switch is turned on or pins are compiled in"
+        );
+    }
     for entry in unpinned_models(&cfg.tinfoil_models, &pins) {
         tracing::warn!(
             canonical = %entry.canonical_id,
@@ -163,7 +167,7 @@ pub async fn register_tinfoil_with(
         );
     }
     let verifier = Arc::new(services::attestation::tinfoil::TinfoilPolicyVerifier::new(
-        pins,
+        pins, trust,
     ));
     let pcfg = tinfoil_provider::Config::new(api_key, cfg.timeout_seconds);
     let session = match build_session(pcfg.clone(), verifier) {
@@ -258,6 +262,7 @@ fn emit_tinfoil_metrics(
         session.last_verify_error(),
         &statuses,
         session.upstream_auth_failures(),
+        session.verified_router_source(),
         metrics,
         last_auth,
     );
@@ -268,6 +273,7 @@ fn emit_tinfoil_samples(
     router_error: Option<TinfoilVerifyError>,
     statuses: &[(String, Result<(), TinfoilVerifyError>)],
     auth_total: u64,
+    router_source: Option<PinSource>,
     metrics: &dyn MetricsServiceTrait,
     last_auth: &mut u64,
 ) {
@@ -302,6 +308,15 @@ fn emit_tinfoil_samples(
             consts::METRIC_TINFOIL_AVAILABLE,
             if status.is_ok() { 1.0 } else { 0.0 },
             &[&format!("{}:{canonical}", consts::TAG_MODEL)],
+        );
+    }
+    // Which trust path admitted the current router (a 0/1 sample per source,
+    // like `available`); nothing while the router is unverified.
+    if let Some(source) = router_source {
+        metrics.record_histogram(
+            consts::METRIC_TINFOIL_ROUTER_SOURCE,
+            1.0,
+            &[&format!("source:{}", source.as_str())],
         );
     }
     if auth_total > *last_auth {
@@ -344,7 +359,10 @@ fn spawn_tinfoil_metrics(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use arc_swap::ArcSwap;
     use config::parse_attested_3p_models;
+    use services::admin_settings::Versioned;
+    use services::attestation::tinfoil_trust::TinfoilTrust;
 
     fn tinfoil_cfg(key: Option<&str>, models: &str) -> ExternalProvidersConfig {
         ExternalProvidersConfig {
@@ -352,6 +370,13 @@ mod tests {
             tinfoil_models: parse_attested_3p_models("TINFOIL_MODELS", models),
             ..Default::default()
         }
+    }
+
+    fn default_trust() -> TinfoilTrustHandle {
+        Arc::new(ArcSwap::from_pointee(Versioned {
+            version: 0,
+            value: TinfoilTrust::default(),
+        }))
     }
 
     fn pins_with_router() -> TinfoilPins {
@@ -376,12 +401,10 @@ mod tests {
             tinfoil_preflight(&tinfoil_cfg(None, models), Ok(pins_with_router())).unwrap_err(),
             TinfoilSkip::NoKey
         );
-        // Empty router pins (the compiled state on this branch) and a parse
-        // failure both refuse to register, each carrying its own reason.
-        assert_eq!(
-            tinfoil_preflight(&tinfoil_cfg(Some("k"), models), Ok(TinfoilPins::default()))
-                .unwrap_err(),
-            TinfoilSkip::PinsEmpty
+        // Empty router pins now pass: routers can be admitted via their
+        // Sigstore release attestation. Only a parse failure refuses.
+        assert!(
+            tinfoil_preflight(&tinfoil_cfg(Some("k"), models), Ok(TinfoilPins::default())).is_ok()
         );
         assert_eq!(
             tinfoil_preflight(&tinfoil_cfg(Some("k"), models), Err("bad".into())).unwrap_err(),
@@ -429,6 +452,7 @@ mod tests {
         use services::metrics::capturing::{CapturingMetricsService, MetricValue};
         let verifier = Arc::new(services::attestation::tinfoil::TinfoilPolicyVerifier::new(
             TinfoilPins::default(),
+            default_trust(),
         ));
         let session =
             TinfoilRouterSession::new(tinfoil_provider::Config::new("k".to_string(), 30), verifier)
@@ -483,7 +507,7 @@ mod tests {
                 Err(TinfoilVerifyError::UnknownModelMeasurement),
             ),
         ];
-        emit_tinfoil_samples(None, &statuses, 0, &m, &mut last);
+        emit_tinfoil_samples(None, &statuses, 0, None, &m, &mut last);
         let v = |r: &str, why: &str| vec![format!("result:{r}"), format!("reason:{why}")];
         assert_eq!(
             counts(&m, consts::METRIC_TINFOIL_VERIFICATION),
@@ -512,6 +536,7 @@ mod tests {
             Some(TinfoilVerifyError::UnknownRouterMeasurement),
             &statuses,
             0,
+            None,
             &m,
             &mut last,
         );
@@ -525,11 +550,29 @@ mod tests {
     }
 
     #[test]
+    fn router_source_is_emitted_per_source_and_omitted_when_unverified() {
+        use services::metrics::capturing::CapturingMetricsService;
+        let m = CapturingMetricsService::new();
+        let mut last = 0u64;
+        emit_tinfoil_samples(None, &[], 0, None, &m, &mut last);
+        assert!(counts(&m, consts::METRIC_TINFOIL_ROUTER_SOURCE).is_empty());
+        emit_tinfoil_samples(None, &[], 0, Some(PinSource::Compiled), &m, &mut last);
+        emit_tinfoil_samples(None, &[], 0, Some(PinSource::SigstoreAtc), &m, &mut last);
+        assert_eq!(
+            counts(&m, consts::METRIC_TINFOIL_ROUTER_SOURCE),
+            vec![
+                vec!["source:compiled".to_string()],
+                vec!["source:sigstore_atc".to_string()]
+            ]
+        );
+    }
+
+    #[test]
     fn second_poll_emits_only_the_auth_failure_increment() {
         use services::metrics::capturing::{CapturingMetricsService, MetricValue};
         let m = CapturingMetricsService::new();
         let mut last = 0u64;
-        emit_tinfoil_samples(None, &[], 2, &m, &mut last);
+        emit_tinfoil_samples(None, &[], 2, None, &m, &mut last);
         assert_eq!(last, 2);
         assert_eq!(
             counts(&m, consts::METRIC_TINFOIL_VERIFICATION),
@@ -541,8 +584,8 @@ mod tests {
             "one verification + one auth delta"
         );
         // Same total: nothing for auth failures. Higher total: only the delta.
-        emit_tinfoil_samples(None, &[], 2, &m, &mut last);
-        emit_tinfoil_samples(None, &[], 5, &m, &mut last);
+        emit_tinfoil_samples(None, &[], 2, None, &m, &mut last);
+        emit_tinfoil_samples(None, &[], 5, None, &m, &mut last);
         let all = m.get_metrics();
         let auth: Vec<_> = all
             .iter()
@@ -560,6 +603,7 @@ mod tests {
     fn unverified_session() -> Arc<TinfoilRouterSession> {
         let verifier = Arc::new(services::attestation::tinfoil::TinfoilPolicyVerifier::new(
             TinfoilPins::default(),
+            default_trust(),
         ));
         TinfoilRouterSession::new(tinfoil_provider::Config::new("k".to_string(), 30), verifier)
             .unwrap()

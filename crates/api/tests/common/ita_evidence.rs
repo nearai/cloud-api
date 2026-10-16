@@ -48,6 +48,7 @@ where
         auth_components.organization_service.clone(),
         inference_provider_pool,
         metrics_service,
+        None,
     )
     .await;
     let app = build_app_with_config_and_options(

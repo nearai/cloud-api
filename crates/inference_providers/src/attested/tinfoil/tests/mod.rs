@@ -280,7 +280,7 @@ struct StubVerifier {
     spki: Mutex<[u8; 32]>,
     router_calls: AtomicUsize,
     deny_models: Mutex<Vec<String>>,
-    /// Reported through `pins_generation`.
+    /// Reported through `trust_generation`.
     generation: std::sync::atomic::AtomicU64,
     /// When set, `verify_router` rejects the router (a trust switch turned off).
     reject_router: std::sync::atomic::AtomicBool,
@@ -301,7 +301,7 @@ impl StubVerifier {
 }
 
 impl TinfoilVerifier for StubVerifier {
-    fn pins_generation(&self) -> u64 {
+    fn trust_generation(&self) -> u64 {
         self.generation.load(Ordering::SeqCst)
     }
     fn verify_router(&self, _b: &AtcBundle) -> Result<VerifiedRouter, TinfoilVerifyError> {

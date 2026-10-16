@@ -38,7 +38,7 @@ fn tinfoil_preflight(
         return Err(TinfoilSkip::NoKey);
     };
     // Empty router pins are fine: a router can be admitted from its Sigstore
-    // release attestation (R27).
+    // release attestation.
     match pins {
         Ok(p) => Ok((key, p)),
         Err(e) => Err(TinfoilSkip::PinsInvalid(e)),
@@ -156,6 +156,11 @@ pub async fn register_tinfoil_with(
             return;
         }
     };
+    if pins.router.is_empty() && !trust.load().value.router_sigstore {
+        tracing::warn!(
+            "Tinfoil compiled router pins are empty and tinfoil_trust.router_sigstore is off; Tinfoil serves 503 until the switch is turned on or pins are compiled in"
+        );
+    }
     for entry in unpinned_models(&cfg.tinfoil_models, &pins) {
         tracing::warn!(
             canonical = %entry.canonical_id,
@@ -396,7 +401,7 @@ mod tests {
             TinfoilSkip::NoKey
         );
         // Empty router pins now pass: routers can be admitted via their
-        // Sigstore release attestation (R27). Only a parse failure refuses.
+        // Sigstore release attestation. Only a parse failure refuses.
         assert!(
             tinfoil_preflight(&tinfoil_cfg(Some("k"), models), Ok(TinfoilPins::default())).is_ok()
         );

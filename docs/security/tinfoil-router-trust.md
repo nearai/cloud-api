@@ -23,8 +23,8 @@ The change takes effect immediately on the instance that handles the PATCH, and 
 
 ## Verifying a `sigstore_atc` router yourself
 
-The model attestation report (`GET /v1/attestation/report?model=<tinfoil-backed model>`) lists the router under the Tinfoil section, with `measurement`, `pin_source`, `pin_tag` and `rekor_log_index`.
+The model attestation report (`GET /v1/attestation/report?model=<tinfoil-backed model>`) lists the router under the Tinfoil section, with `measurement`, `pin_source`, `tag` and `rekor_log_index`.
 
-1. **Find the signed release in Rekor.** Look up the log entry: `rekor-cli get --log-index <rekor_log_index>` or `https://search.sigstore.dev/?logIndex=<rekor_log_index>`. Its signer identity must be `https://github.com/tinfoilsh/confidential-model-router/.github/workflows/tinfoil-release-publish.yml@refs/tags/<pin_tag>`, with the issuer `https://token.actions.githubusercontent.com`.
-2. **Check the release attestation.** Fetch it from `https://github.com/tinfoilsh/confidential-model-router/releases/tag/<pin_tag>`, or with `gh attestation verify --repo tinfoilsh/confidential-model-router`. Its `snp_measurement` predicate field must equal the report's router `measurement`.
+1. **Find the signed release in Rekor.** Look up the log entry: `rekor-cli get --log-index <rekor_log_index>` or `https://search.sigstore.dev/?logIndex=<rekor_log_index>`. Its signer identity must be `https://github.com/tinfoilsh/confidential-model-router/.github/workflows/tinfoil-release-publish.yml@refs/tags/<tag>`, with the issuer `https://token.actions.githubusercontent.com`.
+2. **Check the release attestation.** Fetch it from `https://github.com/tinfoilsh/confidential-model-router/releases/tag/<tag>`, or with `gh attestation verify --repo tinfoilsh/confidential-model-router`. Its `snp_measurement` predicate field must equal the report's router `measurement`.
 3. **Check the router's attestation.** Verify the router's SEV-SNP report independently, either with Tinfoil's verifier or by checking the AMD VCEK chain. Its measurement must be the same value.

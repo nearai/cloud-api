@@ -412,7 +412,6 @@ impl InferenceProvider for Provider {
             "measurement": state.router.measurement_hex,
             "tag": state.router.tag,
             "pin_source": state.router.source.as_str(),
-            "pin_tag": state.router.tag,
             "spki_sha256": hex::encode(state.router.spki_sha256),
             "tcb": {
                 "bootloader": state.router.tcb.bootloader,

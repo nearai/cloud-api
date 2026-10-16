@@ -184,7 +184,10 @@ impl TinfoilPolicyVerifier {
         self.sigstore_calls
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let result = tinfoil_provenance::verify_release(&bundle.sigstore_bundle, &self.router_repo)
-            .map_err(|_| TinfoilVerifyError::RouterSigstoreRejected { stage: "verify" });
+            .map_err(|e| {
+                tracing::warn!(reason = %e, "Tinfoil router Sigstore attestation rejected");
+                TinfoilVerifyError::RouterSigstoreRejected { stage: "verify" }
+            });
         if cache.len() >= SIGSTORE_CACHE_MAX {
             cache.clear();
         }
@@ -210,7 +213,7 @@ fn bind_router_provenance(
 }
 
 impl TinfoilVerifier for TinfoilPolicyVerifier {
-    fn pins_generation(&self) -> u64 {
+    fn trust_generation(&self) -> u64 {
         self.trust.load().version
     }
 
@@ -762,7 +765,7 @@ mod tests {
     fn switch_is_read_on_every_verify_and_version_is_the_generation() {
         let trust = trust_handle(true);
         let v = TinfoilPolicyVerifier::new(TinfoilPins::default(), trust.clone());
-        assert_eq!(v.pins_generation(), 0);
+        assert_eq!(v.trust_generation(), 0);
         assert!(v.verify_router(&bundle()).is_ok());
         trust.store(Arc::new(Versioned {
             version: 3,
@@ -770,7 +773,7 @@ mod tests {
                 router_sigstore: false,
             },
         }));
-        assert_eq!(v.pins_generation(), 3);
+        assert_eq!(v.trust_generation(), 3);
         // The cached provenance does not bypass the switch.
         assert_eq!(
             v.verify_router(&bundle()).unwrap_err(),

@@ -480,7 +480,7 @@ mod tests {
         assert!(CHUTES_SEED.supported_features.contains(&"tools"));
     }
 
-    // --- settings load before consumers register (R6) ---
+    // --- settings load before consumers register ---
 
     use inference_providers::attested::tinfoil::verifier_port::{
         AtcBundle, PinSource, TinfoilVerifier, TinfoilVerifyError,

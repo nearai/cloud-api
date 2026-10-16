@@ -325,7 +325,6 @@ async fn attestation_report_payload_shape() {
     assert_eq!(m["router"]["measurement"], "ab".repeat(48));
     assert_eq!(m["router"]["tag"], "r@v1");
     assert_eq!(m["router"]["pin_source"], "compiled");
-    assert_eq!(m["router"]["pin_tag"], "r@v1");
     assert!(m["router"].get("rekor_log_index").is_none());
     assert_eq!(
         m["router"]["tcb"],
@@ -348,7 +347,6 @@ async fn attestation_report_payload_shape() {
 async fn attestation_report_shows_sigstore_pin_source() {
     let m = report_for(PinSource::SigstoreAtc, Some(42)).await;
     assert_eq!(m["router"]["pin_source"], "sigstore_atc");
-    assert_eq!(m["router"]["pin_tag"], "r@v1");
     assert_eq!(m["router"]["rekor_log_index"], 42);
     assert_eq!(m["router"]["tag"], "r@v1", "existing field is unchanged");
 }

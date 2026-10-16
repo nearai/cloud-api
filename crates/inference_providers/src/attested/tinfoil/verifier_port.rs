@@ -193,10 +193,9 @@ pub fn validate_router_domain(domain: &str) -> Result<(), TinfoilVerifyError> {
 /// implementations MUST still enforce it, and MUST also check that the attested
 /// certificate's SAN names that domain, inside `verify_router`.
 pub trait TinfoilVerifier: Send + Sync {
-    /// Changes whenever the verifier's trust inputs change (a runtime setting
-    /// edit). The session re-verifies the router when it moves. Verifiers
-    /// with fixed inputs keep 0.
-    fn pins_generation(&self) -> u64 {
+    /// Version of the verifier's runtime trust inputs (the `tinfoil_trust`
+    /// setting); the session re-verifies when it changes. Fixed-input verifiers keep 0.
+    fn trust_generation(&self) -> u64 {
         0
     }
     fn verify_router(&self, bundle: &AtcBundle) -> Result<VerifiedRouter, TinfoilVerifyError>;

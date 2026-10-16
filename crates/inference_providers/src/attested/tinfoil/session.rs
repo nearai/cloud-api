@@ -112,9 +112,9 @@ pub struct TinfoilRouterSession {
     /// or none has run). Polled by the API layer for
     /// `cloud_api.tinfoil.verification`, which this crate cannot emit.
     last_error: std::sync::Mutex<Option<TinfoilVerifyError>>,
-    /// The verifier's `pins_generation` as of the last tick that looked. A
+    /// The verifier's `trust_generation` as of the last tick that looked. A
     /// change means its trust inputs moved, so the router is re-verified.
-    seen_pins_generation: AtomicU64,
+    seen_trust_generation: AtomicU64,
 }
 
 impl TinfoilRouterSession {
@@ -135,7 +135,7 @@ impl TinfoilRouterSession {
             .connect_timeout(CONNECT_TIMEOUT)
             .build()
             .map_err(|e| format!("build Tinfoil ATC client: {e}"))?;
-        let seen_pins_generation = AtomicU64::new(verifier.pins_generation());
+        let seen_trust_generation = AtomicU64::new(verifier.trust_generation());
         Ok(Arc::new(Self {
             atc_url: cfg.atc_url.clone(),
             verifier,
@@ -150,7 +150,7 @@ impl TinfoilRouterSession {
             redirect: cfg.redirect.clone(),
             auth_failures: AtomicU64::new(0),
             last_error: std::sync::Mutex::new(None),
-            seen_pins_generation,
+            seen_trust_generation,
         }))
     }
 
@@ -494,9 +494,9 @@ impl TinfoilRouterSession {
                         // A trust-setting change re-verifies the router now
                         // (which also re-reads the proxy document), so a
                         // switched-off path closes within one tick.
-                        let generation = session.verifier.pins_generation();
+                        let generation = session.verifier.trust_generation();
                         if session
-                            .seen_pins_generation
+                            .seen_trust_generation
                             .swap(generation, Ordering::SeqCst)
                             != generation
                         {

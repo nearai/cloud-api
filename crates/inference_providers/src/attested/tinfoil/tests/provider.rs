@@ -496,7 +496,7 @@ async fn trust_version_change_triggers_router_reverify() {
     paused_wait(|| server.hits(proxy_path) > proxy0).await;
     assert_eq!(verifier.router_calls.load(Ordering::SeqCst), 1);
 
-    // The trust setting changed (R11): the next 60 s tick re-verifies the
+    // The trust setting changed: the next 60 s tick re-verifies the
     // router, and a router that is no longer admitted closes the session.
     verifier.generation.store(1, Ordering::SeqCst);
     verifier.reject_router.store(true, Ordering::SeqCst);

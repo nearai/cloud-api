@@ -101,10 +101,14 @@ pub fn audit_json(
 /// replaces the whole list.
 pub const ADMIN_PINS_BYTE_BUDGET: usize = services::attestation::tinfoil_trust::TRUST_MAX_BYTES / 2;
 
+/// Model rows one artifact may carry: half of the setting's pin limit, so the
+/// merged PATCH keeps room for pins already stored, like the byte budget.
+pub const ADMIN_PINS_MAX_ROWS: usize = MAX_MODEL_PINS / 2;
+
 /// The rows of the `PATCH /v1/admin/settings/tinfoil_trust` body that trusts
 /// the model releases seen live and Sigstore-verified but not yet in the
 /// compiled pins, each with the release's raw Sigstore bundle. The rows stay
-/// within what one PATCH accepts (at most [`MAX_MODEL_PINS`] pins and
+/// within what one PATCH accepts (at most [`ADMIN_PINS_MAX_ROWS`] rows and
 /// [`ADMIN_PINS_BYTE_BUDGET`] bytes); the second value names the candidates
 /// left out (`slug repo@tag`, identifiers only) so they can be surfaced.
 pub fn admin_pin_rows(
@@ -125,7 +129,7 @@ pub fn admin_pin_rows(
             "sigstore_bundle": bundle,
         });
         let size = row.to_string().len();
-        if rows.len() >= MAX_MODEL_PINS || bytes + size > ADMIN_PINS_BYTE_BUDGET {
+        if rows.len() >= ADMIN_PINS_MAX_ROWS || bytes + size > ADMIN_PINS_BYTE_BUDGET {
             left_out.push(format!("{slug} {repo}@{tag}"));
         } else {
             bytes += size;
@@ -195,16 +199,17 @@ mod tests {
 
     #[test]
     fn admin_pin_rows_stop_at_the_pin_count_limit_and_name_the_rest() {
-        let (o, s, b) = candidates(MAX_MODEL_PINS + 3, 10);
+        // The cap is now ADMIN_PINS_MAX_ROWS (half the setting limit), so the
+        // left-out names start at that index instead of MAX_MODEL_PINS.
+        let n = ADMIN_PINS_MAX_ROWS;
+        let (o, s, b) = candidates(n + 3, 10);
         let (rows, left_out) = admin_pin_rows(&TinfoilPins::default(), &o, &s, &b);
-        assert_eq!(rows.len(), MAX_MODEL_PINS);
+        assert_eq!(rows.len(), n);
         assert_eq!(
             left_out,
-            vec![
-                "m032 tinfoilsh/m032@v1",
-                "m033 tinfoilsh/m033@v1",
-                "m034 tinfoilsh/m034@v1"
-            ]
+            (n..n + 3)
+                .map(|i| format!("m{i:03} tinfoilsh/m{i:03}@v1"))
+                .collect::<Vec<_>>()
         );
     }
 

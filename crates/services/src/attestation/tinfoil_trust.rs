@@ -216,6 +216,11 @@ impl SettingKey for TinfoilTrustKey {
 
     /// `model_pins` in the patch replaces the stored list, so every pin of
     /// the merged list is verified; a patch without it verifies nothing.
+    ///
+    /// The verification is offline Sigstore crypto (up to `MAX_MODEL_PINS`
+    /// bundles, a few ms each) and runs synchronously in the PATCH request.
+    /// That is acceptable for an admin-only write path, so it is deliberately
+    /// not moved to `spawn_blocking`.
     fn validate_patch(patch: &Value, merged: &TinfoilTrust) -> Result<(), String> {
         if patch.get("model_pins").is_some_and(Value::is_array) {
             let pins = &merged.model_pins;

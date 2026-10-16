@@ -9,7 +9,7 @@ const BODY_BUDGET: usize = 60_000;
 /// Shown when the run produced admin pins. Fixed text, so it is not sanitised.
 const APPLY_SECTION: &str = "\n## Apply without a deploy\n\n\
 `tinfoil-admin-pins.json` in this run's audit artifact is a ready-to-PATCH body \
-for the model releases above, each carrying its Sigstore bundle (cloud-api \
+for the model releases above that this run saw live, each carrying its Sigstore bundle (cloud-api \
 verifies every bundle at PATCH).\n\n\
 **The PATCH replaces the whole `model_pins` list.** Merge these rows with the \
 current value from `GET /v1/admin/settings/tinfoil_trust` first.\n\n\

@@ -62,15 +62,22 @@ pub async fn get_attested_pins(State(state): State<Arc<AttestedPinsState>>) -> R
                 memo.get_or_build(versions, || render_pins_view(&sources))
             })
             .await;
-            let Ok(body) = built else {
-                return (
-                    axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-                    ResponseJson(ErrorResponse::new(
-                        "Pins unavailable".to_string(),
-                        "internal_server_error".to_string(),
-                    )),
-                )
-                    .into_response();
+            let body = match built {
+                Ok(body) => body,
+                Err(e) => {
+                    tracing::error!(
+                        error = %e,
+                        "attested pins view build failed; the next request will rebuild"
+                    );
+                    return (
+                        axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                        ResponseJson(ErrorResponse::new(
+                            "Pins unavailable".to_string(),
+                            "internal_server_error".to_string(),
+                        )),
+                    )
+                        .into_response();
+                }
             };
             body
         }

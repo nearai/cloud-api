@@ -77,7 +77,7 @@ fn merge(
     stored: Option<&Value>,
     patch: &Value,
 ) -> Result<Value, AdminSettingsError> {
-    let Value::Object(patch) = patch else {
+    let Value::Object(patch_map) = patch else {
         return Err(AdminSettingsError::Invalid(
             "the body must be a JSON object".to_string(),
         ));
@@ -85,7 +85,7 @@ fn merge(
     // Checked before `null` resets are applied, so a field name outside the
     // schema never gets past here, and never reaches a log line.
     let known = key.fields();
-    if patch.keys().any(|f| !known.contains(&f.as_str())) {
+    if patch_map.keys().any(|f| !known.contains(&f.as_str())) {
         return Err(AdminSettingsError::Invalid(
             "the body has a field that is not a knob of this setting".to_string(),
         ));
@@ -94,7 +94,7 @@ fn merge(
         Some(Value::Object(m)) => m.clone(),
         _ => Map::new(),
     };
-    for (field, value) in patch {
+    for (field, value) in patch_map {
         if value.is_null() {
             merged.remove(field);
         } else {
@@ -102,13 +102,12 @@ fn merge(
         }
     }
     let merged = Value::Object(merged);
-    let patch = Value::Object(patch.clone());
     if serde_json::to_vec(&merged).map_or(true, |b| b.len() > key.max_bytes()) {
         return Err(AdminSettingsError::Invalid(
             "the setting value is too large".to_string(),
         ));
     }
-    key.check_patch(&patch, &merged)
+    key.check_patch(patch, &merged)
         .map_err(AdminSettingsError::Invalid)?;
     Ok(merged)
 }
@@ -195,8 +194,9 @@ impl AdminSettingsService {
         }
     }
 
-    /// The version of `K`'s effective value on this instance: 0 until a
-    /// change makes it differ, then incremented per change (0 when `K` is
+    /// The version of `K`'s effective value on this instance: 0 before the
+    /// first successful load, 1 right after it (even when the value equals
+    /// the default), then incremented per effective change (0 when `K` is
     /// not registered).
     pub fn version<K: SettingKey>(&self) -> u64 {
         self.key(K::NAME).map_or(0, |k| k.version())

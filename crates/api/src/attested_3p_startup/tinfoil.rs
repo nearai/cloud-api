@@ -277,14 +277,17 @@ fn emit_tinfoil_metrics(
 /// One histogram sample per measurement that went from rejected to admitted.
 fn emit_time_to_trust(
     provider: &str,
-    samples: Vec<(&'static str, f64)>,
+    samples: Vec<(tinfoil_provider::TrustKind, f64)>,
     metrics: &dyn MetricsServiceTrait,
 ) {
     for (kind, seconds) in samples {
         metrics.record_histogram(
             consts::METRIC_ATTESTED_3P_TIME_TO_TRUST,
             seconds,
-            &[&format!("provider:{provider}"), &format!("kind:{kind}")],
+            &[
+                &format!("provider:{provider}"),
+                &format!("kind:{}", kind.as_str()),
+            ],
         );
     }
 }
@@ -574,7 +577,14 @@ mod tests {
     fn time_to_trust_is_a_histogram_tagged_by_provider_and_kind() {
         use services::metrics::capturing::{CapturingMetricsService, MetricValue};
         let m = CapturingMetricsService::new();
-        emit_time_to_trust("tinfoil", vec![("router", 90.0), ("model", 12.5)], &m);
+        emit_time_to_trust(
+            "tinfoil",
+            vec![
+                (tinfoil_provider::TrustKind::Router, 90.0),
+                (tinfoil_provider::TrustKind::Model, 12.5),
+            ],
+            &m,
+        );
         emit_time_to_trust("tinfoil", vec![], &m);
         let got: Vec<_> = m
             .get_metrics()

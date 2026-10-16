@@ -147,13 +147,16 @@ type SigstoreCache = HashMap<(String, [u8; 32]), Result<Provenance, TinfoilVerif
 /// Admin pins whose Sigstore bundle verified here, with the verified provenance.
 type VerifiedAdminPins = Arc<Vec<(AdminModelPin, Provenance)>>;
 
-/// Per (repo, bundle hash) Sigstore result for admin pins; the error is the
+/// Per (slug, repo, tag, bundle hash) Sigstore result for admin pins; the error is the
 /// reason, which never contains bundle content.
 type AdminSigstoreCache = HashMap<[u8; 32], Result<Provenance, String>>;
 
-/// Cache key of one admin pin's check result: its repo, tag and bundle content.
+/// Cache key of one admin pin's check result: its slug, repo, tag and bundle
+/// content. The slug is included because a cached error reason names it.
 fn admin_pin_cache_key(pin: &AdminModelPin) -> Option<[u8; 32]> {
     let mut hasher = Sha256::new();
+    hasher.update(pin.slug.as_bytes());
+    hasher.update([0]);
     hasher.update(pin.repo.as_bytes());
     hasher.update([0]);
     hasher.update(pin.tag.as_bytes());
@@ -197,8 +200,8 @@ impl TinfoilPolicyVerifier {
         }
     }
 
-    /// Verify one stored admin pin with the shared check (cached per repo,
-    /// tag and bundle content).
+    /// Verify one stored admin pin with the shared check (cached per slug,
+    /// repo, tag and bundle content).
     fn verify_admin_pin(
         &self,
         cache: &mut AdminSigstoreCache,

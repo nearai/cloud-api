@@ -26,6 +26,7 @@ pub use self::availability::{
 };
 pub use self::config::{Config, ATC_URL, BASE_URL, PROXY_REREAD, ROUTER_REVERIFY};
 pub use self::session::{TinfoilRouterSession, VerifiedState};
+pub use self::trust_timer::TrustKind;
 pub use self::verifier_port::validate_router_domain;
 use crate::attested::openai_wire::request_body;
 use crate::{

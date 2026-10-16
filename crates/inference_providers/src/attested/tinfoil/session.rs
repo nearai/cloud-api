@@ -17,6 +17,7 @@ use std::time::{Duration, Instant};
 use arc_swap::ArcSwap;
 
 use super::config::{Config, Redirect, PROXY_REREAD, ROUTER_REVERIFY};
+use super::trust_timer::TrustKind;
 use super::verifier_port::{
     validate_router_domain, AtcBundle, PinnedModel, ProxyDoc, TinfoilVerifier, TinfoilVerifyError,
     VerifiedRouter,
@@ -235,10 +236,10 @@ impl TinfoilRouterSession {
             .clone()
     }
 
-    /// Drains `(kind, seconds)` samples (`kind` is `router` or `model`) for
+    /// Drains `(kind, seconds)` samples (`kind` is `Router` or `Model`) for
     /// measurements that were rejected as unknown and have since been admitted.
     /// Polled by the API layer for `cloud_api.attested_3p.time_to_trust_seconds` (`provider:tinfoil`).
-    pub fn take_time_to_trust(&self) -> Vec<(&'static str, f64)> {
+    pub fn take_time_to_trust(&self) -> Vec<(TrustKind, f64)> {
         self.trust_timer.take()
     }
 
@@ -313,7 +314,8 @@ impl TinfoilRouterSession {
                 .collect::<BTreeMap<_, _>>()
         })
         .await;
-        let checked = checked.unwrap_or_else(|_| {
+        let checked = checked.unwrap_or_else(|e| {
+            tracing::warn!(error = %e, "check_models task failed; closing all models");
             doc.models
                 .keys()
                 .map(|slug| {
@@ -328,12 +330,13 @@ impl TinfoilRouterSession {
         });
         for (slug, entry) in &doc.models {
             if self.served_slugs.as_ref().is_none_or(|s| s.contains(slug)) {
-                let key = format!("{slug}@{}", entry.tag);
                 match checked.get(slug) {
-                    Some(Ok(_)) => self.trust_timer.admitted("model", &key),
-                    Some(Err(TinfoilVerifyError::UnknownModelMeasurement)) => {
-                        self.trust_timer.rejected("model", &key)
-                    }
+                    Some(Ok(_)) => self
+                        .trust_timer
+                        .admitted(TrustKind::Model, &format!("{slug}@{}", entry.tag)),
+                    Some(Err(TinfoilVerifyError::UnknownModelMeasurement)) => self
+                        .trust_timer
+                        .rejected(TrustKind::Model, &format!("{slug}@{}", entry.tag)),
                     _ => {}
                 }
             }
@@ -379,18 +382,18 @@ impl TinfoilRouterSession {
             move || verifier.verify_router(&bundle)
         })
         .await
-        .map_err(|_| TinfoilVerifyError::Malformed {
-            stage: "verify_join",
+        .map_err(|e| {
+            tracing::warn!(error = %e, "verify_router task failed");
+            TinfoilVerifyError::Malformed {
+                stage: "verify_join",
+            }
         })?;
         // The release digest identifies the router release being judged.
         let router = match verified {
-            Ok(r) => {
-                self.trust_timer.admitted("router", &bundle.digest);
-                r
-            }
+            Ok(r) => r,
             Err(e) => {
                 if e == TinfoilVerifyError::UnknownRouterMeasurement {
-                    self.trust_timer.rejected("router", &bundle.digest);
+                    self.trust_timer.rejected(TrustKind::Router, &bundle.digest);
                 }
                 return Err(e);
             }
@@ -408,6 +411,7 @@ impl TinfoilRouterSession {
                     .map_err(|_| TinfoilVerifyError::Fetch)?,
             ),
         };
+        let router_digest = bundle.digest.clone();
         let doc: ProxyDoc = Self::fetch_json(
             &transport.client,
             &format!("{}{PROXY_PATH}", transport.base),
@@ -450,6 +454,8 @@ impl TinfoilRouterSession {
             bundle,
             transport,
         })));
+        // Admit only once the session actually published the router as trusted.
+        self.trust_timer.admitted(TrustKind::Router, &router_digest);
         Ok(())
     }
 

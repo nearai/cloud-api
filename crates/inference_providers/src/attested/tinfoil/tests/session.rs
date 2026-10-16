@@ -512,8 +512,8 @@ async fn jump_clock(secs: u64) {
     tokio::time::resume();
 }
 
-fn assert_elapsed(sample: (&'static str, f64), kind: &str, secs: f64) {
-    assert_eq!(sample.0, kind);
+fn assert_elapsed(sample: (crate::attested::tinfoil::TrustKind, f64), kind: &str, secs: f64) {
+    assert_eq!(sample.0.as_str(), kind);
     // The jump plus the real time of one local verification.
     assert!(
         sample.1 >= secs && sample.1 < secs + 5.0,

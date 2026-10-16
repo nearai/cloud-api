@@ -131,7 +131,8 @@ impl<K: SettingKey> ErasedKey for Registered<K> {
         // value (a kill-switch PATCH must work whatever else is stored).
         let mut checked = merged.clone();
         if let (Value::Object(checked), Value::Object(patch)) = (&mut checked, patch) {
-            let effective = serde_json::to_value(K::parse(merged, false)?).unwrap_or_default();
+            let effective = serde_json::to_value(K::parse(merged, false)?)
+                .map_err(|e| format!("re-serializing the effective value failed: {e}"))?;
             checked.retain(|f, _| K::FIELDS.contains(&f.as_str()));
             for field in K::FIELDS.iter().filter(|f| !patch.contains_key(**f)) {
                 match effective.get(*field) {

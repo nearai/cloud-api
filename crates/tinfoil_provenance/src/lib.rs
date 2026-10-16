@@ -1,5 +1,6 @@
 //! Offline Sigstore verification of a Tinfoil release attestation.
 
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -11,6 +12,10 @@ pub struct Provenance {
     pub snp_measurement: String,
     pub rtmr1: Option<String>,
     pub rtmr2: Option<String>,
+    /// Index of the release signature's entry in the Rekor transparency log.
+    pub rekor_log_index: u64,
+    /// When Rekor integrated that entry into the log.
+    pub integrated_time: DateTime<Utc>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -22,6 +27,7 @@ pub enum ProvenanceError {
 const OIDC_ISSUER: &str = "https://token.actions.githubusercontent.com";
 const WORKFLOW: &str = ".github/workflows/tinfoil-release-publish.yml";
 const SUBJECT_NAME: &str = "tinfoil-deployment.json";
+const PREDICATE_TYPE: &str = "https://tinfoil.sh/predicate/snp-tdx-multiplatform/v1";
 
 fn bad(msg: impl std::fmt::Display) -> ProvenanceError {
     ProvenanceError::Invalid(msg.to_string())
@@ -90,6 +96,12 @@ fn verify_bundle_for(
         .ok_or_else(|| bad("signer identity does not match repo"))?
         .to_string();
 
+    if stmt["predicateType"] != PREDICATE_TYPE {
+        return Err(bad("unexpected predicate type"));
+    }
+    // Read only after the signature and inclusion proof verified.
+    let (rekor_log_index, integrated_time) = rekor_entry(bundle)?;
+
     let predicate = &stmt["predicate"];
     let hex_field = |v: &serde_json::Value| v.as_str().map(str::to_string);
     let snp_measurement =
@@ -105,7 +117,24 @@ fn verify_bundle_for(
         snp_measurement,
         rtmr1: hex_field(&predicate["tdx_measurement"]["rtmr1"]),
         rtmr2: hex_field(&predicate["tdx_measurement"]["rtmr2"]),
+        rekor_log_index,
+        integrated_time,
     })
+}
+
+/// The log index and integration time of the bundle's first Rekor entry.
+fn rekor_entry(bundle: &serde_json::Value) -> Result<(u64, DateTime<Utc>), ProvenanceError> {
+    let entry = &bundle["verificationMaterial"]["tlogEntries"][0];
+    let log_index = entry["logIndex"]
+        .as_str()
+        .and_then(|v| v.parse::<u64>().ok())
+        .ok_or_else(|| bad("no rekor log index"))?;
+    let integrated_time = entry["integratedTime"]
+        .as_str()
+        .and_then(|v| v.parse::<i64>().ok())
+        .and_then(|secs| DateTime::from_timestamp(secs, 0))
+        .ok_or_else(|| bad("no rekor integrated time"))?;
+    Ok((log_index, integrated_time))
 }
 
 impl Provenance {
@@ -259,5 +288,54 @@ mod tests {
                 .to_string();
             assert!(err.contains(want), "want {want:?}, got {err:?}");
         }
+    }
+
+    #[test]
+    fn recorded_bundles_expose_rekor_entry() {
+        use chrono::Datelike;
+        let model: serde_json::Value =
+            serde_json::from_str(include_str!("../testdata/model_sigstore_bundle.json")).unwrap();
+        let router = atc();
+        for r in [
+            verify_release(
+                &router["sigstoreBundle"],
+                "tinfoilsh/confidential-model-router",
+            )
+            .unwrap(),
+            verify_release(&model, "tinfoilsh/confidential-deepseek-v4-1-flash").unwrap(),
+        ] {
+            assert!(r.rekor_log_index > 0);
+            assert!((2024..=2027).contains(&r.integrated_time.year()));
+        }
+    }
+
+    #[test]
+    fn missing_tlog_entry_is_rejected() {
+        let mut b = atc()["sigstoreBundle"].clone();
+        b["verificationMaterial"]
+            .as_object_mut()
+            .unwrap()
+            .remove("tlogEntries");
+        let err = verify_release(&b, "tinfoilsh/confidential-model-router").unwrap_err();
+        let ProvenanceError::Invalid(msg) = &err;
+        // Verification rejects the bundle before the Rekor fields are read.
+        assert!(!msg.contains("rekor"), "unexpected error: {msg}");
+    }
+
+    /// Run with `--run-ignored only`: median cost of one router verification.
+    #[test]
+    #[ignore]
+    fn verify_release_cost() {
+        let b = atc();
+        let mut times: Vec<_> = (0..20)
+            .map(|_| {
+                let t = std::time::Instant::now();
+                verify_release(&b["sigstoreBundle"], "tinfoilsh/confidential-model-router")
+                    .unwrap();
+                t.elapsed()
+            })
+            .collect();
+        times.sort();
+        println!("verify_release median of 20: {:?}", times[10]);
     }
 }

@@ -324,7 +324,7 @@ pub async fn init_domain_services(
     organization_service: Arc<dyn services::organization::OrganizationServiceTrait + Send + Sync>,
     metrics_service: Arc<dyn services::metrics::MetricsServiceTrait>,
 ) -> DomainServices {
-    let inference_provider_pool =
+    let (inference_provider_pool, admin_settings) =
         init_inference_providers(database.clone(), config, metrics_service.clone()).await;
     init_domain_services_with_pool(
         database,
@@ -332,18 +332,25 @@ pub async fn init_domain_services(
         organization_service,
         inference_provider_pool,
         metrics_service,
+        Some(admin_settings),
     )
     .await
 }
 
 /// Initialize domain services with a provided inference provider pool
-/// This allows tests to inject mock providers without changing core implementations
+/// This allows tests to inject mock providers without changing core implementations.
+///
+/// `admin_settings` is the already-started service from
+/// [`init_inference_providers`], whose consumers were registered after it
+/// loaded. `None` (the test harnesses, which have no such consumers) builds
+/// and starts an equivalent service here against the pool's handles.
 pub async fn init_domain_services_with_pool(
     database: Arc<Database>,
     config: &ApiConfig,
     organization_service: Arc<dyn services::organization::OrganizationServiceTrait + Send + Sync>,
     inference_provider_pool: Arc<services::inference_provider_pool::InferenceProviderPool>,
     metrics_service: Arc<dyn services::metrics::MetricsServiceTrait>,
+    admin_settings: Option<Arc<services::admin_settings::AdminSettingsService>>,
 ) -> DomainServices {
     let database_encryption_key = database::field_encryption::parse_key(
         &config.database_encryption_key,
@@ -625,16 +632,23 @@ pub async fn init_domain_services_with_pool(
         .with_binding(staking_binding),
     );
 
-    // Admin settings (placement tuning today): load into the pool's tuning
-    // handle now, then every 10 minutes. Placement off leaves it unused.
-    let admin_settings_service = Arc::new(services::admin_settings::AdminSettingsService::new(
-        Arc::new(
-            database::repositories::PostgresAdminSettingsRepository::new(database.pool().clone()),
-        ),
-        inference_provider_pool.placement_tuning(),
-        inference_provider_pool.attested_3p_disabled(),
-    ));
-    admin_settings_service.clone().start().await;
+    // Admin settings: the production path builds and starts them in
+    // `init_inference_providers`, before their consumers register.
+    let admin_settings_service = match admin_settings {
+        Some(service) => service,
+        None => {
+            build_admin_settings(
+                Arc::new(
+                    database::repositories::PostgresAdminSettingsRepository::new(
+                        database.pool().clone(),
+                    ),
+                ),
+                &inference_provider_pool,
+                new_tinfoil_trust_handle(),
+            )
+            .await
+        }
+    };
 
     DomainServices {
         conversation_service,
@@ -677,6 +691,7 @@ pub async fn init_domain_services_with_mcp_factory(
         organization_service.clone(),
         inference_provider_pool.clone(),
         metrics_service.clone(),
+        None,
     )
     .await;
 
@@ -755,6 +770,7 @@ pub async fn init_domain_services_with_pool_and_search_providers(
         organization_service.clone(),
         inference_provider_pool.clone(),
         metrics_service,
+        None,
     )
     .await;
 
@@ -846,7 +862,10 @@ pub async fn init_inference_providers(
     database: Arc<Database>,
     config: &ApiConfig,
     metrics_service: Arc<dyn services::metrics::MetricsServiceTrait>,
-) -> Arc<services::inference_provider_pool::InferenceProviderPool> {
+) -> (
+    Arc<services::inference_provider_pool::InferenceProviderPool>,
+    Arc<services::admin_settings::AdminSettingsService>,
+) {
     let api_key = config.inference_api_key.clone();
 
     let pool = Arc::new(
@@ -857,6 +876,19 @@ pub async fn init_inference_providers(
     );
     pool.set_metrics_service(metrics_service.clone());
     install_placement(&pool, &config.placement);
+
+    // Runtime settings load BEFORE their consumers register, so a stored
+    // setting (e.g. `tinfoil_trust.router_sigstore = false`) governs the very
+    // first verification. A store that is down leaves the defaults.
+    let tinfoil_trust = new_tinfoil_trust_handle();
+    let admin_settings = build_admin_settings(
+        Arc::new(
+            database::repositories::PostgresAdminSettingsRepository::new(database.pool().clone()),
+        ),
+        &pool,
+        tinfoil_trust.clone(),
+    )
+    .await;
 
     let models_repo = Arc::new(database::repositories::ModelRepository::new(
         database.pool().clone(),
@@ -907,17 +939,53 @@ pub async fn init_inference_providers(
         &pool,
         &models_repo,
         &config.external_providers,
-        Arc::new(arc_swap::ArcSwap::from_pointee(
-            services::admin_settings::Versioned {
-                version: 0,
-                value: Default::default(),
-            },
-        )),
+        tinfoil_trust,
         metrics_service,
     )
     .await;
 
-    pool
+    (pool, admin_settings)
+}
+
+/// The Tinfoil trust handle at its defaults (`router_sigstore` on, version 0),
+/// before any stored row is applied.
+fn new_tinfoil_trust_handle() -> Arc<
+    arc_swap::ArcSwap<
+        services::admin_settings::Versioned<services::attestation::tinfoil_trust::TinfoilTrust>,
+    >,
+> {
+    Arc::new(arc_swap::ArcSwap::from_pointee(
+        services::admin_settings::Versioned {
+            version: 0,
+            value: Default::default(),
+        },
+    ))
+}
+
+/// Builds the admin settings service with every key registered in listing
+/// order (`placement`, `attested_3p`, `tinfoil_trust`), each publishing into
+/// its owner's handle, then loads once and starts the periodic reload. A
+/// failing store keeps the defaults and never panics.
+pub(crate) async fn build_admin_settings(
+    repository: Arc<dyn services::admin_settings::AdminSettingsRepository>,
+    pool: &services::inference_provider_pool::InferenceProviderPool,
+    tinfoil_trust: Arc<
+        arc_swap::ArcSwap<
+            services::admin_settings::Versioned<services::attestation::tinfoil_trust::TinfoilTrust>,
+        >,
+    >,
+) -> Arc<services::admin_settings::AdminSettingsService> {
+    use services::admin_settings::{AdminSettingsService, Attested3pKey, PlacementKey};
+    use services::attestation::tinfoil_trust::TinfoilTrustKey;
+    let service = Arc::new(
+        AdminSettingsService::builder(repository)
+            .register::<PlacementKey>(pool.placement_tuning())
+            .register::<Attested3pKey>(pool.attested_3p_disabled())
+            .register::<TinfoilTrustKey>(tinfoil_trust)
+            .build(),
+    );
+    service.clone().start().await;
+    service
 }
 
 /// Initialize inference provider pool with mock providers for testing

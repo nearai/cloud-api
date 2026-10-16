@@ -479,4 +479,107 @@ mod tests {
         assert!(!CHUTES_SEED.supported_sampling_parameters.is_empty());
         assert!(CHUTES_SEED.supported_features.contains(&"tools"));
     }
+
+    // --- settings load before consumers register (R6) ---
+
+    use inference_providers::attested::tinfoil::verifier_port::{
+        AtcBundle, PinSource, TinfoilVerifier, TinfoilVerifyError,
+    };
+    use services::admin_settings::{AdminSettingsRepository, StoredSetting};
+    use services::attestation::tinfoil::TinfoilPolicyVerifier;
+    use services::attestation::tinfoil_pins::TinfoilPins;
+
+    /// A settings store: rows are served as stored, or every read fails.
+    struct FakeRepo {
+        rows: Vec<StoredSetting>,
+        fail: bool,
+    }
+
+    #[async_trait::async_trait]
+    impl AdminSettingsRepository for FakeRepo {
+        async fn get_all(&self) -> anyhow::Result<Vec<StoredSetting>> {
+            if self.fail {
+                anyhow::bail!("settings store is down");
+            }
+            Ok(self.rows.clone())
+        }
+        async fn get(&self, key: &str) -> anyhow::Result<Option<StoredSetting>> {
+            Ok(self.get_all().await?.into_iter().find(|r| r.key == key))
+        }
+        async fn upsert(
+            &self,
+            _key: &str,
+            _value: serde_json::Value,
+            _by_user: uuid::Uuid,
+        ) -> anyhow::Result<StoredSetting> {
+            anyhow::bail!("read-only fake")
+        }
+    }
+
+    fn router_bundle() -> AtcBundle {
+        serde_json::from_str(include_str!(
+            "../../services/src/attestation/testdata/tinfoil/atc_bundle.json"
+        ))
+        .unwrap()
+    }
+
+    /// Runs the production startup helper against `repo`, then verifies the
+    /// recorded router (no compiled router pin) through a verifier that shares
+    /// the handle, as `register_tinfoil_with` wires it.
+    async fn first_verify_with(repo: FakeRepo) -> Result<PinSource, TinfoilVerifyError> {
+        let fail = repo.fail;
+        let pool = InferenceProviderPool::new(None, ExternalProvidersConfig::default());
+        let trust = crate::new_tinfoil_trust_handle();
+        let settings = crate::build_admin_settings(Arc::new(repo), &pool, trust.clone()).await;
+        let verifier = TinfoilPolicyVerifier::new(TinfoilPins::default(), trust);
+        if !fail {
+            let keys: Vec<_> = settings
+                .get_all()
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|v| v.key)
+                .collect();
+            assert_eq!(keys, ["placement", "attested_3p", "tinfoil_trust"]);
+        }
+        verifier.verify_router(&router_bundle()).map(|r| r.source)
+    }
+
+    fn stored(key: &str, value: serde_json::Value) -> StoredSetting {
+        StoredSetting {
+            key: key.to_string(),
+            value,
+            updated_by_user_id: None,
+            updated_at: chrono::Utc::now(),
+        }
+    }
+
+    #[tokio::test]
+    async fn stored_router_sigstore_false_is_honoured_by_first_verify() {
+        let repo = FakeRepo {
+            rows: vec![stored(
+                "tinfoil_trust",
+                serde_json::json!({"router_sigstore": false}),
+            )],
+            fail: false,
+        };
+        assert_eq!(
+            first_verify_with(repo).await.unwrap_err(),
+            TinfoilVerifyError::UnknownRouterMeasurement
+        );
+    }
+
+    #[tokio::test]
+    async fn settings_store_down_at_startup_still_registers_tinfoil() {
+        // `get_all` fails: no panic, the defaults stand, so `router_sigstore`
+        // is on and the unpinned router is admitted via Sigstore.
+        let repo = FakeRepo {
+            rows: vec![],
+            fail: true,
+        };
+        assert_eq!(
+            first_verify_with(repo).await.unwrap(),
+            PinSource::SigstoreAtc
+        );
+    }
 }

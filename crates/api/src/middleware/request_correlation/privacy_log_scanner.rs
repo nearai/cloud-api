@@ -1,8 +1,8 @@
 pub(super) fn assert_production_logs_exclude_forbidden_expressions() {
     let sources = [
         (
-            "crates/api/src/routes/completions.rs",
-            include_str!("../../routes/completions.rs"),
+            "crates/api/src/routes/completions/mod.rs",
+            include_str!("../../routes/completions/mod.rs"),
         ),
         (
             "crates/api/src/routes/responses.rs",

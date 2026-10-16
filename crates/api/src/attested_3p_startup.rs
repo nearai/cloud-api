@@ -569,16 +569,62 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn settings_store_down_at_startup_still_registers_tinfoil() {
-        // `get_all` fails: no panic, the defaults stand, so `router_sigstore`
-        // is on and the unpinned router is admitted via Sigstore.
-        let repo = FakeRepo {
-            rows: vec![],
-            fail: true,
-        };
+    /// A settings store whose reads can be switched on after startup.
+    struct FlakyRepo {
+        up: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    #[async_trait::async_trait]
+    impl AdminSettingsRepository for FlakyRepo {
+        async fn get_all(&self) -> anyhow::Result<Vec<StoredSetting>> {
+            if self.up.load(std::sync::atomic::Ordering::SeqCst) {
+                Ok(vec![])
+            } else {
+                anyhow::bail!("settings store is down")
+            }
+        }
+        async fn get(&self, key: &str) -> anyhow::Result<Option<StoredSetting>> {
+            Ok(self.get_all().await?.into_iter().find(|r| r.key == key))
+        }
+        async fn upsert(
+            &self,
+            _key: &str,
+            _value: serde_json::Value,
+            _by_user: uuid::Uuid,
+        ) -> anyhow::Result<StoredSetting> {
+            anyhow::bail!("read-only fake")
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn settings_store_down_at_startup_fails_closed_then_recovers() {
+        let up = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let pool = InferenceProviderPool::new(None, ExternalProvidersConfig::default());
+        let trust = crate::new_tinfoil_trust_handle();
+        let _settings = crate::build_admin_settings(
+            Arc::new(FlakyRepo { up: up.clone() }),
+            &pool,
+            trust.clone(),
+        )
+        .await;
+        let verifier = TinfoilPolicyVerifier::new(TinfoilPins::default(), trust.clone());
+        // Store down: no panic, and the Sigstore path stays off.
         assert_eq!(
-            first_verify_with(repo).await.unwrap(),
+            verifier.verify_router(&router_bundle()).unwrap_err(),
+            TinfoilVerifyError::UnknownRouterMeasurement
+        );
+        assert_eq!(trust.load().version, 0);
+
+        // The store recovers; the startup retry loads it within 30 s.
+        up.store(true, std::sync::atomic::Ordering::SeqCst);
+        tokio::time::sleep(
+            services::admin_settings::INITIAL_LOAD_RETRY + std::time::Duration::from_secs(1),
+        )
+        .await;
+        assert_eq!(trust.load().version, 1);
+        assert!(trust.load().value.router_sigstore);
+        assert_eq!(
+            verifier.verify_router(&router_bundle()).unwrap().source,
             PinSource::SigstoreAtc
         );
     }

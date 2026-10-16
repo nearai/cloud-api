@@ -42,6 +42,10 @@ use registry::ErasedKey;
 /// How often each instance re-reads the stored settings.
 pub const RELOAD_INTERVAL: Duration = Duration::from_secs(10 * 60);
 
+/// How often [`AdminSettingsService::start`] retries while the very first
+/// read has not yet succeeded.
+pub const INITIAL_LOAD_RETRY: Duration = Duration::from_secs(30);
+
 pub const KEY_PLACEMENT: &str = PlacementKey::NAME;
 pub const KEY_ATTESTED_3P: &str = Attested3pKey::NAME;
 
@@ -245,30 +249,51 @@ impl AdminSettingsService {
         view(key, Some(&saved))
     }
 
-    /// Reads every stored setting into the live values. A read failure
-    /// keeps the last good values. A key with no row, or whose stored value
-    /// no longer passes its checks, uses its defaults; a row for an
-    /// unregistered key is ignored.
-    pub async fn reload(&self) {
+    /// Reads every stored setting into the live values and returns whether
+    /// the read succeeded. A read failure keeps the last good values. A key
+    /// with no row, or whose stored value no longer passes its checks, uses
+    /// its defaults; a row for an unregistered key is ignored.
+    pub async fn reload(&self) -> bool {
         let _refresh = self.refresh.lock().await;
         match self.repository.get_all().await {
             Ok(rows) => {
                 for key in &self.keys {
                     key.apply(rows.iter().find(|r| r.key == key.name()), true);
                 }
+                true
             }
-            Err(e) => tracing::warn!(
-                error = %e,
-                "Failed to read admin settings; keeping the current values"
-            ),
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "Failed to read admin settings; keeping the current values"
+                );
+                false
+            }
         }
     }
 
     /// Loads once, then reloads every [`RELOAD_INTERVAL`] on a background
-    /// task. Until the first successful read the values are the defaults.
+    /// task. If the first read fails, the task retries every
+    /// [`INITIAL_LOAD_RETRY`] until one succeeds. Until then the handles
+    /// keep the values their owners created them with (which fail closed for
+    /// kill switches).
     pub async fn start(self: Arc<Self>) {
-        self.reload().await;
+        let loaded = self.reload().await;
+        if !loaded {
+            tracing::warn!(
+                retry_secs = INITIAL_LOAD_RETRY.as_secs(),
+                "Initial admin settings load failed; retrying"
+            );
+        }
         tokio::spawn(async move {
+            if !loaded {
+                loop {
+                    tokio::time::sleep(INITIAL_LOAD_RETRY).await;
+                    if self.reload().await {
+                        break;
+                    }
+                }
+            }
             let mut interval = tokio::time::interval(RELOAD_INTERVAL);
             interval.tick().await;
             loop {
@@ -789,10 +814,11 @@ mod tests {
         let (svc, _, handle) = versioned_service::<VKey>();
         let admin = Uuid::new_v4();
         svc.update("vkey", json!({"n": 0}), admin).await.unwrap();
-        assert_eq!(handle.load().version, 0, "a field set to its default");
+        // The first apply of a key publishes version 1 (0 means "not loaded").
+        assert_eq!(handle.load().version, 1, "a field set to its default");
         svc.update("vkey", json!({"n": 0}), admin).await.unwrap();
         svc.update("vkey", json!({"s": null}), admin).await.unwrap();
-        assert_eq!(handle.load().version, 0);
+        assert_eq!(handle.load().version, 1);
     }
 
     #[tokio::test]
@@ -836,6 +862,21 @@ mod tests {
         svc.reload().await;
         assert_eq!(handle.load().value, TestVal::default());
         assert_eq!(handle.load().version, 3);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn failed_initial_load_retries_until_success() {
+        let (svc, repo, handle) = versioned_service::<VKey>();
+        repo.put("vkey", json!({"n": 7}));
+        *repo.fail_get_all.lock().unwrap() = true;
+        svc.clone().start().await;
+        assert_eq!(handle.load().version, 0, "not loaded yet");
+        tokio::time::sleep(INITIAL_LOAD_RETRY * 2 + Duration::from_secs(1)).await;
+        assert_eq!(handle.load().version, 0, "still failing");
+        *repo.fail_get_all.lock().unwrap() = false;
+        tokio::time::sleep(INITIAL_LOAD_RETRY + Duration::from_secs(1)).await;
+        assert_eq!(handle.load().version, 1);
+        assert_eq!(handle.load().value.n, 7);
     }
 
     #[tokio::test]

@@ -21,6 +21,8 @@ curl -X PATCH "$CLOUD_API/v1/admin/settings/tinfoil_trust" \
 
 The change takes effect immediately on the instance that handles the PATCH, and within 10 minutes on the others. Each Tinfoil session then re-verifies on its next 60-second tick, and a router admitted via `sigstore_atc` is dropped. To return to the default (on), send `{"router_sigstore": null}`.
 
+After a restart, the Sigstore path stays off (compiled pins only) until the stored value has loaded; a failed read is retried every 30 seconds, so a store outage cannot re-enable a router an operator disabled.
+
 ## Verifying a `sigstore_atc` router yourself
 
 The model attestation report (`GET /v1/attestation/report?model=<tinfoil-backed model>`) lists the router under the Tinfoil section, with `measurement`, `pin_source`, `tag` and `rekor_log_index`.

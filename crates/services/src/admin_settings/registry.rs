@@ -13,9 +13,12 @@ use serde_json::Value;
 use super::{AdminSettingsRepository, AdminSettingsService, StoredSetting};
 
 /// The conventional `Published` type for a new key: the effective value with
-/// a per-key version. The version starts at 0 and increments when a change
-/// makes the effective value differ from the current one, so a consumer can
-/// tell by comparing versions whether to redo work.
+/// a per-key version. Version 0 means "not loaded yet": the owner's initial
+/// value, before any read of the store succeeded. The first successful apply
+/// of the key always publishes version 1, even when the value equals the
+/// initial one; after that the version increments when a change makes the
+/// effective value differ from the current one. A consumer can tell by
+/// comparing versions whether to redo work.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Versioned<T> {
     pub version: u64,
@@ -134,7 +137,10 @@ impl<K: SettingKey> ErasedKey for Registered<K> {
         if !changed && !first {
             return;
         }
-        if changed {
+        // The first apply publishes version 1; later effective changes bump it.
+        if first {
+            state.version = 1;
+        } else {
             state.version += 1;
         }
         self.handle

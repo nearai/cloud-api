@@ -165,7 +165,7 @@ pub async fn register_tinfoil_with(
         tracing::warn!(
             canonical = %entry.canonical_id,
             slug = %entry.upstream_id,
-            "TINFOIL_MODELS entry has no row in the compiled model pins; it is registered closed and serves 503 until the pins include it"
+            "TINFOIL_MODELS entry has no row in the compiled model pins; it is registered closed and serves 503 until the pins include it; add an admin pin via tinfoil_trust or wait for the compiled pins"
         );
     }
     let verifier = Arc::new(services::attestation::tinfoil::TinfoilPolicyVerifier::new(

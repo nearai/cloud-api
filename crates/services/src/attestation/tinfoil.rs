@@ -14,7 +14,7 @@ use inference_providers::attested::tinfoil::verifier_port::{
 use sha2::{Digest, Sha256};
 use tinfoil_provenance::Provenance;
 
-use super::tinfoil_trust::TinfoilTrust;
+use super::tinfoil_trust::{AdminModelPin, TinfoilTrust};
 use crate::admin_settings::Versioned;
 
 use super::snp::{self, SnpError, SnpEvidence, SnpPolicy, Tcb, VerifiedSnpReport};
@@ -136,6 +136,13 @@ fn registers_eq(a: &[String], b: &[String]) -> bool {
 
 type SigstoreCache = HashMap<(String, [u8; 32]), Result<Provenance, TinfoilVerifyError>>;
 
+/// Admin pins whose Sigstore bundle verified here, with the verified provenance.
+type VerifiedAdminPins = Arc<Vec<(AdminModelPin, Provenance)>>;
+
+/// Per (repo, bundle hash) Sigstore result for admin pins; the error is the
+/// reason, which never contains bundle content.
+type AdminSigstoreCache = HashMap<[u8; 32], Result<Provenance, String>>;
+
 pub struct TinfoilPolicyVerifier {
     pins: TinfoilPins,
     trust: Arc<ArcSwap<Versioned<TinfoilTrust>>>,
@@ -144,8 +151,15 @@ pub struct TinfoilPolicyVerifier {
     /// checks run on every `verify_router`.
     sigstore_cache: Mutex<SigstoreCache>,
     router_repo: String,
+    /// The admin pins that verified for the `tinfoil_trust` version they were
+    /// computed at (`None`: not computed yet). `check_model` admits only from
+    /// this set, so a stored row is never trusted on its own say-so.
+    admin_pins: Mutex<(Option<u64>, VerifiedAdminPins)>,
+    admin_sigstore_cache: Mutex<AdminSigstoreCache>,
     #[cfg(test)]
     sigstore_calls: std::sync::atomic::AtomicUsize,
+    #[cfg(test)]
+    admin_sigstore_calls: std::sync::atomic::AtomicUsize,
 }
 
 impl TinfoilPolicyVerifier {
@@ -155,9 +169,83 @@ impl TinfoilPolicyVerifier {
             trust,
             sigstore_cache: Mutex::new(HashMap::new()),
             router_repo: ROUTER_REPO.to_string(),
+            admin_pins: Mutex::new((None, Arc::new(Vec::new()))),
+            admin_sigstore_cache: Mutex::new(HashMap::new()),
             #[cfg(test)]
             sigstore_calls: std::sync::atomic::AtomicUsize::new(0),
+            #[cfg(test)]
+            admin_sigstore_calls: std::sync::atomic::AtomicUsize::new(0),
         }
+    }
+
+    /// Verify one stored admin pin's bundle (cached per repo and bundle
+    /// content): `repo` must be a tinfoilsh repository, the bundle must verify
+    /// for it, and the signed tag must equal the pin's tag.
+    fn verify_admin_pin(
+        &self,
+        cache: &mut AdminSigstoreCache,
+        pin: &AdminModelPin,
+    ) -> Result<Provenance, String> {
+        if !pin.repo.starts_with("tinfoilsh/") {
+            return Err("repo is not a tinfoilsh repository".into());
+        }
+        let mut hasher = Sha256::new();
+        hasher.update(pin.repo.as_bytes());
+        hasher.update([0]);
+        hasher.update(serde_json::to_vec(&pin.sigstore_bundle).map_err(|_| "bundle shape")?);
+        let key: [u8; 32] = hasher.finalize().into();
+        let verified = match cache.get(&key) {
+            Some(hit) => hit.clone(),
+            None => {
+                #[cfg(test)]
+                self.admin_sigstore_calls
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let result = tinfoil_provenance::verify_release(&pin.sigstore_bundle, &pin.repo)
+                    .map_err(|e| e.to_string());
+                if cache.len() >= SIGSTORE_CACHE_MAX {
+                    cache.clear();
+                }
+                cache.insert(key, result.clone());
+                result
+            }
+        };
+        let prov = verified?;
+        if prov.tag != pin.tag {
+            return Err("tag does not match the signed release".into());
+        }
+        if prov.registers().is_none() {
+            return Err("signed release has no registers".into());
+        }
+        Ok(prov)
+    }
+
+    /// The verified admin pins for the current `tinfoil_trust` version,
+    /// recomputed (with a warning per dropped pin) only when the version
+    /// changed since the last call.
+    fn verified_admin_pins(&self, trust: &Versioned<TinfoilTrust>) -> VerifiedAdminPins {
+        let mut state = self.admin_pins.lock().unwrap_or_else(|e| e.into_inner());
+        if state.0 == Some(trust.version) {
+            return state.1.clone();
+        }
+        let mut cache = self
+            .admin_sigstore_cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let mut verified = Vec::new();
+        for pin in &trust.value.model_pins {
+            match self.verify_admin_pin(&mut cache, pin) {
+                Ok(prov) => verified.push((pin.clone(), prov)),
+                Err(reason) => tracing::warn!(
+                    slug = %pin.slug,
+                    repo = %pin.repo,
+                    tag = %pin.tag,
+                    reason = %reason,
+                    "Tinfoil admin model pin failed verification; ignoring it"
+                ),
+            }
+        }
+        *state = (Some(trust.version), Arc::new(verified));
+        state.1.clone()
     }
 
     /// Verify the ATC bundle's Sigstore release attestation (cached per
@@ -288,13 +376,38 @@ impl TinfoilVerifier for TinfoilPolicyVerifier {
                     && p.tag == entry.tag
             })
         });
-        if !pinned {
+        if pinned {
+            return Ok(PinnedModel {
+                slug: slug.to_string(),
+                entry: entry.clone(),
+                source: PinSource::Compiled,
+                rekor_log_index: None,
+            });
+        }
+        // Not compiled: an admin pin whose Sigstore bundle verified here for
+        // exactly this slug, repo, tag and registers.
+        let trust = self.trust.load();
+        if !trust.value.admin_model_pins {
             return Err(TinfoilVerifyError::UnknownModelMeasurement);
         }
-        Ok(PinnedModel {
-            slug: slug.to_string(),
-            entry: entry.clone(),
-        })
+        let admin = self.verified_admin_pins(&trust);
+        admin
+            .iter()
+            .find(|(pin, prov)| {
+                pin.slug == slug
+                    && pin.repo == entry.repo
+                    && pin.tag == entry.tag
+                    && prov
+                        .registers()
+                        .is_some_and(|r| registers_eq(&r, &entry.measurement.registers))
+            })
+            .map(|(_, prov)| PinnedModel {
+                slug: slug.to_string(),
+                entry: entry.clone(),
+                source: PinSource::Admin,
+                rekor_log_index: Some(prov.rekor_log_index),
+            })
+            .ok_or(TinfoilVerifyError::UnknownModelMeasurement)
     }
 }
 
@@ -860,5 +973,225 @@ mod tests {
     fn pin_source_strings() {
         assert_eq!(PinSource::Compiled.as_str(), "compiled");
         assert_eq!(PinSource::SigstoreAtc.as_str(), "sigstore_atc");
+        assert_eq!(PinSource::Admin.as_str(), "admin");
+    }
+
+    // --- Admin model pins (Task 10) ---
+
+    use super::super::tinfoil_trust::recorded_model_pin;
+    use inference_providers::attested::tinfoil::verifier_port::{
+        ProxyMeasurement, ProxyModelEntry,
+    };
+
+    const ADMIN_SLUG: &str = "deepseek-v4-1-flash";
+
+    fn trust_with(
+        version: u64,
+        admin_model_pins: bool,
+        pins: Vec<AdminModelPin>,
+    ) -> Arc<Versioned<TinfoilTrust>> {
+        Arc::new(Versioned {
+            version,
+            value: TinfoilTrust {
+                admin_model_pins,
+                model_pins: pins,
+                ..Default::default()
+            },
+        })
+    }
+
+    fn admin_verifier(
+        admin_model_pins: bool,
+        pins: Vec<AdminModelPin>,
+    ) -> (TinfoilPolicyVerifier, Arc<ArcSwap<Versioned<TinfoilTrust>>>) {
+        let handle = Arc::new(ArcSwap::new(trust_with(1, admin_model_pins, pins)));
+        (
+            TinfoilPolicyVerifier::new(TinfoilPins::default(), handle.clone()),
+            handle,
+        )
+    }
+
+    /// The proxy entry Tinfoil would publish for the recorded release.
+    fn recorded_entry() -> ProxyModelEntry {
+        let pin = recorded_model_pin(ADMIN_SLUG);
+        let prov = tinfoil_provenance::verify_release(&pin.sigstore_bundle, &pin.repo).unwrap();
+        ProxyModelEntry {
+            repo: pin.repo,
+            tag: pin.tag,
+            measurement: ProxyMeasurement {
+                kind: "snp-tdx-multiplatform".into(),
+                registers: prov.registers().unwrap(),
+            },
+            enclaves: Default::default(),
+        }
+    }
+
+    #[test]
+    fn admin_pin_matching_proxy_entry_is_admitted() {
+        let (v, _) = admin_verifier(true, vec![recorded_model_pin(ADMIN_SLUG)]);
+        let pinned = v.check_model(ADMIN_SLUG, &recorded_entry()).unwrap();
+        assert_eq!(pinned.source, PinSource::Admin);
+        assert!(pinned.rekor_log_index.is_some());
+        assert_eq!(pinned.slug, ADMIN_SLUG);
+        // Case-insensitive registers; a different slug is not admitted.
+        let mut upper = recorded_entry();
+        for r in &mut upper.measurement.registers {
+            *r = r.to_uppercase();
+        }
+        assert!(v.check_model(ADMIN_SLUG, &upper).is_ok());
+        assert_eq!(
+            v.check_model("other-slug", &recorded_entry()).unwrap_err(),
+            TinfoilVerifyError::UnknownModelMeasurement
+        );
+    }
+
+    #[test]
+    fn admin_pin_tag_mismatch_rejected() {
+        let (v, _) = admin_verifier(true, vec![recorded_model_pin(ADMIN_SLUG)]);
+        let mut e = recorded_entry();
+        e.tag = "v9.9.9".into();
+        assert_eq!(
+            v.check_model(ADMIN_SLUG, &e).unwrap_err(),
+            TinfoilVerifyError::UnknownModelMeasurement
+        );
+    }
+
+    #[test]
+    fn admin_pin_registers_mismatch_rejected() {
+        let (v, _) = admin_verifier(true, vec![recorded_model_pin(ADMIN_SLUG)]);
+        let mut e = recorded_entry();
+        e.measurement.registers[1] = "00".repeat(48);
+        assert_eq!(
+            v.check_model(ADMIN_SLUG, &e).unwrap_err(),
+            TinfoilVerifyError::UnknownModelMeasurement
+        );
+        e.measurement.registers.pop();
+        assert_eq!(
+            v.check_model(ADMIN_SLUG, &e).unwrap_err(),
+            TinfoilVerifyError::UnknownModelMeasurement
+        );
+    }
+
+    #[test]
+    fn admin_pin_repo_mismatch_rejected() {
+        let (v, _) = admin_verifier(true, vec![recorded_model_pin(ADMIN_SLUG)]);
+        let mut e = recorded_entry();
+        e.repo = "tinfoilsh/confidential-other".into();
+        assert_eq!(
+            v.check_model(ADMIN_SLUG, &e).unwrap_err(),
+            TinfoilVerifyError::UnknownModelMeasurement
+        );
+    }
+
+    #[test]
+    fn compiled_wins_over_admin() {
+        use super::super::tinfoil_pins::ModelPin;
+        let e = recorded_entry();
+        let mut pins = TinfoilPins::default();
+        pins.models.insert(
+            ADMIN_SLUG.into(),
+            vec![ModelPin {
+                registers: e.measurement.registers.clone(),
+                repo: e.repo.clone(),
+                tag: e.tag.clone(),
+            }],
+        );
+        let handle = Arc::new(ArcSwap::new(trust_with(
+            1,
+            true,
+            vec![recorded_model_pin(ADMIN_SLUG)],
+        )));
+        let v = TinfoilPolicyVerifier::new(pins, handle);
+        let pinned = v.check_model(ADMIN_SLUG, &e).unwrap();
+        assert_eq!(pinned.source, PinSource::Compiled);
+        assert_eq!(pinned.rekor_log_index, None);
+        assert_eq!(
+            v.admin_sigstore_calls
+                .load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "a compiled match never consults the admin pins"
+        );
+    }
+
+    #[test]
+    fn admin_model_pins_off_blocks_admission() {
+        let (v, handle) = admin_verifier(false, vec![recorded_model_pin(ADMIN_SLUG)]);
+        assert_eq!(
+            v.check_model(ADMIN_SLUG, &recorded_entry()).unwrap_err(),
+            TinfoilVerifyError::UnknownModelMeasurement
+        );
+        // Turning it back on (a new version) admits again.
+        handle.store(trust_with(2, true, vec![recorded_model_pin(ADMIN_SLUG)]));
+        assert_eq!(
+            v.check_model(ADMIN_SLUG, &recorded_entry()).unwrap().source,
+            PinSource::Admin
+        );
+    }
+
+    #[test]
+    fn directly_edited_row_reverified_and_dropped() {
+        let entry = recorded_entry();
+        // Bundle verifies, but the stored tag was edited to something else.
+        let mut wrong_tag = recorded_model_pin(ADMIN_SLUG);
+        wrong_tag.tag = "v9.9.9".into();
+        let mut e = entry.clone();
+        e.tag = "v9.9.9".into();
+        let (v, _) = admin_verifier(true, vec![wrong_tag]);
+        assert_eq!(
+            v.check_model(ADMIN_SLUG, &e).unwrap_err(),
+            TinfoilVerifyError::UnknownModelMeasurement
+        );
+        // Garbage bundle: rejected, no panic.
+        for bundle in [
+            serde_json::json!({"garbage": true}),
+            serde_json::json!("x"),
+            serde_json::Value::Null,
+        ] {
+            let mut bad = recorded_model_pin(ADMIN_SLUG);
+            bad.sigstore_bundle = bundle;
+            let (v, _) = admin_verifier(true, vec![bad]);
+            assert_eq!(
+                v.check_model(ADMIN_SLUG, &entry).unwrap_err(),
+                TinfoilVerifyError::UnknownModelMeasurement
+            );
+        }
+        // A non-tinfoilsh repo is dropped even when it names the entry.
+        let mut other_repo = recorded_model_pin(ADMIN_SLUG);
+        other_repo.repo = "evil/x".into();
+        let mut e = entry.clone();
+        e.repo = "evil/x".into();
+        let (v, _) = admin_verifier(true, vec![other_repo]);
+        assert_eq!(
+            v.check_model(ADMIN_SLUG, &e).unwrap_err(),
+            TinfoilVerifyError::UnknownModelMeasurement
+        );
+        // A bad pin does not stop a good one beside it.
+        let mut bad = recorded_model_pin("bad");
+        bad.sigstore_bundle = serde_json::json!({});
+        let (v, _) = admin_verifier(true, vec![bad, recorded_model_pin(ADMIN_SLUG)]);
+        assert!(v.check_model(ADMIN_SLUG, &entry).is_ok());
+    }
+
+    #[test]
+    fn reverify_once_per_version() {
+        use std::sync::atomic::Ordering;
+        let (v, handle) = admin_verifier(true, vec![recorded_model_pin(ADMIN_SLUG)]);
+        let e = recorded_entry();
+        for _ in 0..3 {
+            v.check_model(ADMIN_SLUG, &e).unwrap();
+            let _ = v.check_model("other", &e);
+        }
+        assert_eq!(v.admin_sigstore_calls.load(Ordering::SeqCst), 1);
+        // A new version recomputes the set, but the bundle result is cached.
+        handle.store(trust_with(2, true, vec![recorded_model_pin(ADMIN_SLUG)]));
+        v.check_model(ADMIN_SLUG, &e).unwrap();
+        v.check_model(ADMIN_SLUG, &e).unwrap();
+        assert_eq!(v.admin_sigstore_calls.load(Ordering::SeqCst), 1);
+        // A removed pin takes effect with the next version.
+        handle.store(trust_with(3, true, vec![]));
+        assert_eq!(
+            v.check_model(ADMIN_SLUG, &e).unwrap_err(),
+            TinfoilVerifyError::UnknownModelMeasurement
+        );
     }
 }

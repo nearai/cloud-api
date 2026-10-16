@@ -64,6 +64,9 @@ pub enum PinSource {
     /// The measurement is not compiled, but the ATC bundle's Sigstore release
     /// attestation verified and binds to the live measurement.
     SigstoreAtc,
+    /// A model pin an admin added through `tinfoil_trust`, backed by a
+    /// Sigstore release bundle the verifier checked itself.
+    Admin,
 }
 
 impl PinSource {
@@ -71,6 +74,7 @@ impl PinSource {
         match self {
             Self::Compiled => "compiled",
             Self::SigstoreAtc => "sigstore_atc",
+            Self::Admin => "admin",
         }
     }
 }
@@ -98,13 +102,17 @@ pub struct RouterTcb {
     pub microcode: u8,
 }
 
-/// A proxy model entry whose registers, repo and tag all matched one compiled
-/// pin for `slug`. `entry.repo` and `entry.tag` are therefore the pinned
-/// provenance.
+/// A proxy model entry whose registers, repo and tag all matched one pin
+/// (compiled, or admin-added and Sigstore-verified) for `slug`. `entry.repo`
+/// and `entry.tag` are therefore the pinned provenance.
 #[derive(Debug, Clone)]
 pub struct PinnedModel {
     pub slug: String,
     pub entry: ProxyModelEntry,
+    /// Which kind of pin admitted the model.
+    pub source: PinSource,
+    /// Rekor log index of the release signature (`Admin` only).
+    pub rekor_log_index: Option<u64>,
 }
 
 #[derive(Debug, Clone, thiserror::Error, PartialEq, Eq)]
@@ -199,7 +207,7 @@ pub trait TinfoilVerifier: Send + Sync {
         0
     }
     fn verify_router(&self, bundle: &AtcBundle) -> Result<VerifiedRouter, TinfoilVerifyError>;
-    /// Verifies that `entry` matches a compiled pin for `slug`: the measurement
+    /// Verifies that `entry` matches a pin (compiled or admin-added) for `slug`: the measurement
     /// registers, `repo` and `tag` must all equal one pinned row. Enclave
     /// metadata (`enclaves`) is passed through unverified. `entry` is
     /// caller-supplied, so callers must obtain it from a source whose

@@ -181,7 +181,7 @@ impl SettingKey for TinfoilTrustKey {
 
 /// A pin built from the recorded real model release bundle.
 #[cfg(test)]
-pub(crate) const RECORDED_MODEL_REPO: &str = "tinfoilsh/confidential-deepseek-v4-1-flash";
+const RECORDED_MODEL_REPO: &str = "tinfoilsh/confidential-deepseek-v4-1-flash";
 
 #[cfg(test)]
 pub(crate) fn recorded_model_pin(slug: &str) -> AdminModelPin {

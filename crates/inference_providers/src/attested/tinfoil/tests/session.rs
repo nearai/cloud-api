@@ -280,6 +280,8 @@ async fn report_for(
         Ok(PinnedModel {
             slug: SLUG.into(),
             entry: entry.clone(),
+            source: PinSource::Compiled,
+            rekor_log_index: None,
         }),
     );
     e.session.install_state(VerifiedState {

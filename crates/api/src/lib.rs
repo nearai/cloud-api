@@ -1857,7 +1857,7 @@ pub fn build_conversation_routes(
 ///   missing/invalid/expired/deactivated credentials with 401); like
 ///   the signature route, report retrieval is non-billable — no usage or
 ///   billing records are created.
-/// - `GET /v1/attestation/ita-token` and `GET /v1/attestation/tinfoil/pins` are
+/// - `GET /v1/attestation/ita-token` and `GET /v1/attestation/pins` are
 ///   deliberately public; the rationale is documented on
 ///   `build_public_attestation_routes`.
 pub fn build_attestation_routes(
@@ -1875,8 +1875,13 @@ pub fn build_attestation_routes(
             auth_middleware_with_api_key,
         ));
 
+    // One section per attested backup provider; add new providers here.
+    let pins_sources: Vec<Arc<dyn services::attestation::pins_view::ProviderPinsSource>> = vec![
+        Arc::new(services::attestation::tinfoil_pins_view::TinfoilPinsSource::new(admin_settings)),
+        Arc::new(services::attestation::chutes_pins_view::ChutesPinsSource),
+    ];
     let public_routes =
-        attestation::build_public_attestation_routes(attestation_route_state, admin_settings);
+        attestation::build_public_attestation_routes(attestation_route_state, pins_sources);
 
     Router::new()
         .merge(authenticated_routes)
@@ -2819,7 +2824,7 @@ mod tests {
 
     #[test]
     fn test_openapi_ita_token_endpoint_is_public() {
-        // /v1/attestation/ita-token and /v1/attestation/tinfoil/pins are the
+        // /v1/attestation/ita-token and /v1/attestation/pins are the
         // ONLY public attestation routes — explicit, documented decisions
         // (nearai/infra#193); see
         // `build_public_attestation_routes` in routes/attestation.rs.
@@ -2842,12 +2847,12 @@ mod tests {
     }
 
     #[test]
-    fn test_openapi_tinfoil_pins_endpoint_is_public() {
+    fn test_openapi_attested_pins_endpoint_is_public() {
         let spec = serde_json::to_value(ApiDoc::openapi()).unwrap();
         assert_eq!(
-            spec["paths"]["/v1/attestation/tinfoil/pins"]["get"]["security"],
+            spec["paths"]["/v1/attestation/pins"]["get"]["security"],
             serde_json::json!([{}]),
-            "/v1/attestation/tinfoil/pins must explicitly override global OpenAPI security"
+            "/v1/attestation/pins must explicitly override global OpenAPI security"
         );
     }
 

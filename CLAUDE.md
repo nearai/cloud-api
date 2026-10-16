@@ -299,6 +299,8 @@ Located in `crates/api/src/routes/`:
 - Plaintext table: never store secrets, credentials or customer data; signed public trust inputs are allowed because the owner verifies them
 - Consumers that need settings at startup register after the settings service loads
 
+Runtime trust pins for attested backup providers follow `docs/security/attested-provider-runtime-trust.md`.
+
 See `crates/services/src/admin_settings/`. Keys implement the `SettingKey` trait and register via `AdminSettingsService::builder(..).register::<K>(handle)`.
 
 ### Architecture Documentation

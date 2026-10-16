@@ -313,10 +313,10 @@ async fn tinfoil_trust_model_pin_patch_and_public_listing() {
     );
 
     // The public listing needs no auth and shows the verified provenance.
-    let listing = server.get("/v1/attestation/tinfoil/pins").await;
+    let listing = server.get("/v1/attestation/pins").await;
     assert_eq!(listing.status_code(), StatusCode::OK);
     let body = listing.json::<Value>();
-    let listed = body["admin"]["model_pins"]
+    let listed = body["tinfoil"]["admin"]["model_pins"]
         .as_array()
         .unwrap()
         .iter()

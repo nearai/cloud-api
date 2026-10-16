@@ -4,6 +4,7 @@ mod chat_signatures;
 pub mod chutes;
 pub mod chutes_observer;
 pub mod chutes_pins;
+pub mod chutes_pins_view;
 mod environment;
 mod gateway_quote;
 mod gateway_signatures;
@@ -12,6 +13,7 @@ mod keys;
 mod lifecycle;
 pub mod measurement;
 pub mod models;
+pub mod pins_view;
 pub mod ports;
 #[cfg(test)]
 mod provider_signature_tests;

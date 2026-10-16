@@ -50,10 +50,12 @@ The model's attestation report shows `pin_source: "admin"` and the release's `re
 
 ## Public pins listing
 
-`GET /v1/attestation/tinfoil/pins` needs no authentication. It returns three things:
+`GET /v1/attestation/pins` needs no authentication. It is provider-neutral: the body is keyed by provider, and the `tinfoil` section returns three things:
 
 - every compiled router and model pin;
 - both switches;
 - each admin model pin with its verified provenance: tag, Rekor log index, integrated time and measurements.
 
-Raw bundles are not served.
+The `chutes` section lists Chutes' compiled pins (`compiled`) and has `runtime: null`. Raw bundles are not served.
+
+This is the Tinfoil instance of a general pattern; see [Attested provider runtime trust](attested-provider-runtime-trust.md).

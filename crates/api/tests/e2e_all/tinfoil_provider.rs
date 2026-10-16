@@ -501,13 +501,13 @@ async fn session_build_failure_registers_nothing() {
     assert!(!pool.has_provider(&model).await);
 }
 
-/// `GET /v1/attestation/tinfoil/pins` is public, cached for 30s, and lists the
-/// compiled pins and the admin switches. A real Tinfoil session cannot be
+/// `GET /v1/attestation/pins` is public, cached for 30s, and lists, per backup
+/// provider, the compiled pins and (Tinfoil) the admin switches. A real Tinfoil session cannot be
 /// stubbed here, so the live router state is `null` in this endpoint.
 #[tokio::test]
 async fn serial_public_pins_endpoint() {
     let server = setup_test_server().await;
-    let response = server.get("/v1/attestation/tinfoil/pins").await;
+    let response = server.get("/v1/attestation/pins").await;
     assert_eq!(response.status_code(), 200, "{}", response.text());
     assert_eq!(
         response
@@ -517,11 +517,16 @@ async fn serial_public_pins_endpoint() {
         Some("max-age=30")
     );
     let body: Value = response.json();
-    assert!(body["compiled"]["routers"].is_array());
-    assert!(body["compiled"]["models"].is_object());
-    assert!(body["admin"]["router_sigstore"].is_boolean());
-    assert!(body["admin"]["admin_model_pins"].is_boolean());
-    assert!(body["admin"]["model_pins"].is_array());
+    let tinfoil = &body["tinfoil"];
+    assert!(tinfoil["compiled"]["routers"].is_array());
+    assert!(tinfoil["compiled"]["models"].is_object());
+    assert!(tinfoil["admin"]["router_sigstore"].is_boolean());
+    assert!(tinfoil["admin"]["admin_model_pins"].is_boolean());
+    assert!(tinfoil["admin"]["model_pins"].is_array());
+    let chutes_rows = body["chutes"]["compiled"].as_array().expect("chutes rows");
+    assert!(!chutes_rows.is_empty());
+    assert!(chutes_rows[0]["mrtd"].is_string() && chutes_rows[0]["rtmr3"].is_string());
+    assert!(body["chutes"]["runtime"].is_null());
     assert!(
         !body.to_string().contains("sigstore_bundle"),
         "raw bundles are never served"

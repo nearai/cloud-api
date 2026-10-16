@@ -217,6 +217,34 @@ mod tests {
     }
 
     #[test]
+    fn tag_mismatch_pin_is_unverified() {
+        let mut pin = recorded_pin();
+        pin.tag = "v9.9.9".into();
+        let trust = TinfoilTrust {
+            model_pins: vec![pin],
+            ..Default::default()
+        };
+        let v = tinfoil_pins_view(&TinfoilPins::default(), &trust);
+        let p = &v.admin.model_pins[0];
+        assert!(!p.verified);
+        assert!(p.rekor_log_index.is_none() && p.snp_measurement.is_none());
+    }
+
+    #[test]
+    fn non_tinfoilsh_repo_is_unverified() {
+        let mut pin = recorded_pin();
+        pin.repo = "evil/confidential-deepseek-v4-1-flash".into();
+        let trust = TinfoilTrust {
+            model_pins: vec![pin],
+            ..Default::default()
+        };
+        let v = tinfoil_pins_view(&TinfoilPins::default(), &trust);
+        let p = &v.admin.model_pins[0];
+        assert!(!p.verified);
+        assert!(p.rekor_log_index.is_none() && p.snp_measurement.is_none());
+    }
+
+    #[test]
     fn garbage_bundle_pin_is_unverified_without_provenance() {
         let trust = TinfoilTrust {
             model_pins: vec![AdminModelPin {

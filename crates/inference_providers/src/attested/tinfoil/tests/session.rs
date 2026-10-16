@@ -503,6 +503,25 @@ async fn failed_proxy_fetch_does_not_publish_the_new_pin() {
     assert!(matches!(before, FingerprintState::Pinned(_)));
 }
 
+/// Advances the clock by `secs` without a fully paused runtime: auto-advance
+/// under `start_paused` would expire the real-socket timeouts of the
+/// verification itself, so the clock is frozen only for the jump.
+async fn jump_clock(secs: u64) {
+    tokio::time::pause();
+    tokio::time::advance(std::time::Duration::from_secs(secs)).await;
+    tokio::time::resume();
+}
+
+fn assert_elapsed(sample: (&'static str, f64), kind: &str, secs: f64) {
+    assert_eq!(sample.0, kind);
+    // The jump plus the real time of one local verification.
+    assert!(
+        sample.1 >= secs && sample.1 < secs + 5.0,
+        "{kind}: {} s, expected about {secs}",
+        sample.1
+    );
+}
+
 #[tokio::test]
 async fn time_to_trust_is_sampled_once_when_a_rejected_measurement_is_admitted() {
     let e = env().await;
@@ -525,20 +544,19 @@ async fn time_to_trust_is_sampled_once_when_a_rejected_measurement_is_admitted()
         .lock()
         .unwrap()
         .push(SLUG.to_string());
+    jump_clock(40).await;
     e.session.verify_now().await.unwrap();
-    let kinds: Vec<_> = e
-        .session
-        .take_time_to_trust()
-        .into_iter()
-        .map(|s| s.0)
-        .collect();
-    assert_eq!(kinds, vec!["router"]);
-    e.verifier.deny_models.lock().unwrap().clear();
-    e.session.reread_proxy().await;
+    // The router was rejected 40 s before it was admitted.
     let samples = e.session.take_time_to_trust();
     assert_eq!(samples.len(), 1);
-    assert_eq!(samples[0].0, "model");
-    assert!(samples[0].1 >= 0.0);
+    assert_elapsed(samples[0], "router", 40.0);
+    e.verifier.deny_models.lock().unwrap().clear();
+    jump_clock(15).await;
+    e.session.reread_proxy().await;
+    // The model was first rejected at the verify above, 15 s ago.
+    let samples = e.session.take_time_to_trust();
+    assert_eq!(samples.len(), 1);
+    assert_elapsed(samples[0], "model", 15.0);
     // Already admitted: no further samples.
     e.session.reread_proxy().await;
     assert!(e.session.take_time_to_trust().is_empty());

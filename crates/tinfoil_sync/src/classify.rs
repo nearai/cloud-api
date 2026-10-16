@@ -506,4 +506,45 @@ mod tests {
         assert!(rejections(&model_obs(&["aa", "r1", "r2"]), &model_sig("aa")).is_empty());
         assert!(rejections(&model_obs(&["aa"]), &SigstoreResults::default()).is_empty());
     }
+
+    #[test]
+    fn admin_pin_candidates_skips_compiled_and_sorts() {
+        let regs = ["aa", "r1", "r2"];
+        let mut observed = Observations {
+            observed_at: "t".into(),
+            router: None,
+            models: vec![],
+        };
+        let mut sigstore = SigstoreResults::default();
+        for slug in ["zeta", "alpha", "compiled"] {
+            let repo = format!("tinfoilsh/{slug}");
+            observed.models.push(ModelObservation {
+                slug: slug.into(),
+                repo: repo.clone(),
+                tag: "v1".into(),
+                kind: "p".into(),
+                registers: regs.iter().map(|r| r.to_string()).collect(),
+            });
+            let mut prov = sig("aa");
+            prov.repo = repo.clone();
+            prov.predicate_type = "p".into();
+            sigstore.models.insert(format!("{repo}@v1"), prov);
+        }
+        let mut base = TinfoilPins::default();
+        base.models.insert(
+            "compiled".into(),
+            vec![ModelPin {
+                registers: regs.iter().map(|r| r.to_string()).collect(),
+                repo: "tinfoilsh/compiled".into(),
+                tag: "v1".into(),
+            }],
+        );
+        assert_eq!(
+            admin_pin_candidates(&base, &observed, &sigstore),
+            vec![
+                ("alpha".into(), "tinfoilsh/alpha".into(), "v1".into()),
+                ("zeta".into(), "tinfoilsh/zeta".into(), "v1".into()),
+            ]
+        );
+    }
 }

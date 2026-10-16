@@ -224,7 +224,7 @@ async fn admin_pins_artifact_has_only_live_verified_uncompiled_rows() {
 }
 
 #[tokio::test]
-async fn admin_pins_artifact_written_on_dry_run() {
+async fn admin_pins_artifact_empty_on_unchanged_and_failing_runs() {
     let (_s, cfg) = server().await;
     let dir = std::env::temp_dir().join(format!("tinfoil-sync-admin-dry-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);

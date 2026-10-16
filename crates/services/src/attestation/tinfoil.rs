@@ -975,7 +975,7 @@ mod tests {
         assert_eq!(PinSource::Admin.as_str(), "admin");
     }
 
-    // --- Admin model pins (Task 10) ---
+    // --- Admin model pins ---
 
     use super::super::tinfoil_trust::recorded_model_pin;
     use inference_providers::attested::tinfoil::verifier_port::{

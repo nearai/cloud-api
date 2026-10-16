@@ -277,6 +277,73 @@ async fn tinfoil_trust_round_trips_and_validates() {
     );
 }
 
+const MODEL_PIN_BUNDLE: &str =
+    include_str!("../../../tinfoil_provenance/testdata/model_sigstore_bundle.json");
+const MODEL_PIN_REPO: &str = "tinfoilsh/confidential-deepseek-v4-1-flash";
+const MODEL_PIN_TAG: &str = "v0.0.3";
+
+#[tokio::test]
+async fn tinfoil_trust_model_pin_patch_and_public_listing() {
+    let server = setup_test_server().await;
+    let token = get_session_id();
+    let path = "/v1/admin/settings/tinfoil_trust";
+    let slug = format!("test-{}", uuid::Uuid::new_v4());
+    let bundle: Value = serde_json::from_str(MODEL_PIN_BUNDLE).unwrap();
+    let pin = |tag: &str| {
+        json!({
+            "slug": slug,
+            "repo": MODEL_PIN_REPO,
+            "tag": tag,
+            "sigstore_bundle": bundle,
+        })
+    };
+
+    let response = patch_as(
+        &server,
+        &token,
+        path,
+        json!({"model_pins": [pin(MODEL_PIN_TAG)]}),
+    )
+    .await;
+    assert_eq!(
+        response.status_code(),
+        StatusCode::OK,
+        "{}",
+        response.text()
+    );
+
+    // The public listing needs no auth and shows the verified provenance.
+    let listing = server.get("/v1/attestation/tinfoil/pins").await;
+    assert_eq!(listing.status_code(), StatusCode::OK);
+    let body = listing.json::<Value>();
+    let listed = body["admin"]["model_pins"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|p| p["slug"] == slug.as_str())
+        .unwrap_or_else(|| panic!("pin {slug} not listed"));
+    assert_eq!(listed["verified"], json!(true));
+    assert!(listed["rekor_log_index"].is_u64(), "{listed}");
+    assert!(!listing.text().contains("dsseEnvelope"));
+
+    // A tag that does not match the signed release is refused, and the
+    // response never echoes the bundle.
+    let response = patch_as(
+        &server,
+        &token,
+        path,
+        json!({"model_pins": [pin("v9.9.9")]}),
+    )
+    .await;
+    assert_eq!(response.status_code(), StatusCode::BAD_REQUEST);
+    assert!(!response.text().contains("dsseEnvelope"));
+
+    // Restore the default (no pins).
+    let response = patch_as(&server, &token, path, json!({"model_pins": null})).await;
+    assert_eq!(response.status_code(), StatusCode::OK);
+    assert_eq!(response.json::<Value>()["value"]["model_pins"], json!([]));
+}
+
 /// With NEAR failing and Chutes as its fallback, switching the `chutes` source
 /// off stops traffic to it: the fallback is never invoked.
 #[tokio::test]

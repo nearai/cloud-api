@@ -98,12 +98,13 @@ fn merge(
         }
     }
     let merged = Value::Object(merged);
+    let patch = Value::Object(patch.clone());
     if serde_json::to_vec(&merged).map_or(true, |b| b.len() > key.max_bytes()) {
         return Err(AdminSettingsError::Invalid(
             "the setting value is too large".to_string(),
         ));
     }
-    key.parse_strict(&merged)
+    key.check_patch(&patch, &merged)
         .map_err(AdminSettingsError::Invalid)?;
     Ok(merged)
 }
@@ -177,6 +178,13 @@ impl AdminSettingsService {
             .and_then(|k| k.current_any().downcast::<K::Value>().ok())
             .map(|v| *v)
             .unwrap_or_else(K::default_value)
+    }
+
+    /// The version of `K`'s effective value on this instance: 0 until a
+    /// change makes it differ, then incremented per change (0 when `K` is
+    /// not registered).
+    pub fn version<K: SettingKey>(&self) -> u64 {
+        self.key(K::NAME).map_or(0, |k| k.version())
     }
 
     /// The effective placement tuning on this instance.
@@ -768,6 +776,34 @@ mod tests {
     test_key!(CountKey, "count_key", 64 * 1024, COUNT_PARSES);
     test_key!(TinyKey, "tiny_key", 16, TINY_PARSES);
 
+    static VALIDATE_CALLS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    struct ValidatedKey;
+    impl SettingKey for ValidatedKey {
+        const NAME: &'static str = "validated_key";
+        const FIELDS: &'static [&'static str] = &["n", "s"];
+        type Value = TestVal;
+        type Published = Versioned<TestVal>;
+        fn default_value() -> TestVal {
+            TestVal::default()
+        }
+        fn parse(value: &Value, _strict: bool) -> Result<TestVal, String> {
+            serde_json::from_value(value.clone()).map_err(|e| e.to_string())
+        }
+        fn validate_patch(patch: &Value, merged: &TestVal) -> Result<(), String> {
+            VALIDATE_CALLS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if patch.get("s").is_some() && merged.s == "bad" {
+                return Err("s must not be bad".to_string());
+            }
+            Ok(())
+        }
+        fn publish(value: &TestVal, version: u64) -> Versioned<TestVal> {
+            Versioned {
+                version,
+                value: value.clone(),
+            }
+        }
+    }
+
     fn versioned_service<K: SettingKey<Published = Versioned<TestVal>>>() -> (
         Arc<AdminSettingsService>,
         Arc<FakeRepo>,
@@ -900,5 +936,28 @@ mod tests {
             stored["n"],
             "the published value matches the latest committed row"
         );
+    }
+
+    #[tokio::test]
+    async fn validate_patch_runs_after_parse_and_failure_stores_nothing() {
+        use std::sync::atomic::Ordering;
+        let (svc, repo, _) = versioned_service::<ValidatedKey>();
+        let before = VALIDATE_CALLS.load(Ordering::SeqCst);
+        let r = svc
+            .update("validated_key", json!({"s": "bad"}), Uuid::new_v4())
+            .await;
+        assert!(matches!(&r, Err(AdminSettingsError::Invalid(m)) if m == "s must not be bad"));
+        assert_eq!(VALIDATE_CALLS.load(Ordering::SeqCst), before + 1);
+        assert!(repo.rows.lock().unwrap().is_empty(), "nothing stored");
+        // A parse failure never reaches validate_patch.
+        let r = svc
+            .update("validated_key", json!({"n": "x"}), Uuid::new_v4())
+            .await;
+        assert!(matches!(r, Err(AdminSettingsError::Invalid(_))));
+        assert_eq!(VALIDATE_CALLS.load(Ordering::SeqCst), before + 1);
+        svc.update("validated_key", json!({"s": "ok"}), Uuid::new_v4())
+            .await
+            .unwrap();
+        assert_eq!(repo.rows.lock().unwrap().len(), 1);
     }
 }

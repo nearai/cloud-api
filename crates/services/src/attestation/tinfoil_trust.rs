@@ -12,7 +12,7 @@ use crate::admin_settings::{SettingKey, Versioned};
 pub const MAX_MODEL_PINS: usize = 32;
 
 /// The only repository owner whose releases may vouch for a model.
-const MODEL_REPO_PREFIX: &str = "tinfoilsh/";
+pub(crate) const MODEL_REPO_PREFIX: &str = "tinfoilsh/";
 
 /// One admin-added model pin: Tinfoil's Sigstore release bundle for `repo` at
 /// `tag`, admitted for the router slug `slug`. The bundle is verified offline
@@ -51,9 +51,14 @@ impl Default for TinfoilTrust {
 
 pub struct TinfoilTrustKey;
 
-/// Strict (PATCH) checks of one pin. Messages carry the slug and the
-/// verifier's reason only, never bundle content.
-fn verify_pin_strict(pin: &AdminModelPin) -> Result<(), String> {
+/// The one admission check of an admin pin, shared by PATCH, the verifier of
+/// record and the public view: `repo` is a tinfoilsh repository, the bundle
+/// verifies offline for it, the signed tag equals the pin's tag, and the
+/// signed release carries measurement registers. Messages carry the slug and
+/// the verifier's reason only, never bundle content.
+pub(crate) fn verify_admin_pin_bundle(
+    pin: &AdminModelPin,
+) -> Result<tinfoil_provenance::Provenance, String> {
     if !pin.repo.starts_with(MODEL_REPO_PREFIX) {
         return Err(format!(
             "model pin {}: repo must be a tinfoilsh repository",
@@ -68,7 +73,13 @@ fn verify_pin_strict(pin: &AdminModelPin) -> Result<(), String> {
             pin.slug
         ));
     }
-    Ok(())
+    if prov.registers().is_none() {
+        return Err(format!(
+            "model pin {}: signed release has no measurement registers",
+            pin.slug
+        ));
+    }
+    Ok(prov)
 }
 
 fn str_field<'a>(v: &'a Value, name: &str) -> &'a str {
@@ -99,9 +110,11 @@ impl SettingKey for TinfoilTrustKey {
         TinfoilTrust::default()
     }
 
-    /// Strict (PATCH): unknown fields and wrong types are errors, at most 32
-    /// pins, and every pin's Sigstore bundle must verify for its repo at its
-    /// tag. Lenient (stored row): structural only, no crypto. Unknown fields
+    /// Strict (PATCH): shape only. Unknown fields and wrong types are errors,
+    /// at most 32 pins, no duplicates, tinfoilsh repos. The Sigstore bundles
+    /// are verified by [`Self::validate_patch`], and only when the PATCH sets
+    /// `model_pins`, so an unrelated PATCH never re-verifies stored pins.
+    /// Lenient (stored row): structural only, no crypto. Unknown fields
     /// (from a newer binary) are ignored, a switch of the wrong type falls
     /// back to its default, and a pin that does not deserialize is dropped
     /// (more than 32 keep the first 32). Only field names, slug, repo, tag
@@ -120,7 +133,12 @@ impl SettingKey for TinfoilTrustKey {
                 {
                     return Err(format!("model pin {}: duplicate pin", pin.slug));
                 }
-                verify_pin_strict(pin)?;
+                if !pin.repo.starts_with(MODEL_REPO_PREFIX) {
+                    return Err(format!(
+                        "model pin {}: repo must be a tinfoilsh repository",
+                        pin.slug
+                    ));
+                }
             }
             return Ok(trust);
         }
@@ -169,6 +187,18 @@ impl SettingKey for TinfoilTrustKey {
             None => {}
         }
         Ok(trust)
+    }
+
+    /// `model_pins` in the patch replaces the stored list, so every pin of
+    /// the merged list is verified; a patch without it verifies nothing.
+    fn validate_patch(patch: &Value, merged: &TinfoilTrust) -> Result<(), String> {
+        if patch.get("model_pins").is_some_and(Value::is_array) {
+            merged
+                .model_pins
+                .iter()
+                .try_for_each(|pin| verify_admin_pin_bundle(pin).map(|_| ()))?;
+        }
+        Ok(())
     }
 
     fn publish(value: &TinfoilTrust, version: u64) -> Versioned<TinfoilTrust> {
@@ -325,14 +355,22 @@ mod tests {
         serde_json::to_value(pin).unwrap()
     }
 
+    /// The error of a PATCH setting `model_pins`: strict parse, then
+    /// `validate_patch`.
     fn strict_err(pins: Vec<Value>) -> String {
-        TinfoilTrustKey::parse(&json!({"model_pins": pins}), true).unwrap_err()
+        let patch = json!({"model_pins": pins});
+        match TinfoilTrustKey::parse(&patch, true) {
+            Err(e) => e,
+            Ok(t) => TinfoilTrustKey::validate_patch(&patch, &t).unwrap_err(),
+        }
     }
 
     #[test]
     fn valid_recorded_model_bundle_accepted() {
         let pin = recorded_model_pin("deepseek-v4-1-flash");
-        let t = TinfoilTrustKey::parse(&json!({"model_pins": [pin_json(&pin)]}), true).unwrap();
+        let patch = json!({"model_pins": [pin_json(&pin)]});
+        let t = TinfoilTrustKey::parse(&patch, true).unwrap();
+        TinfoilTrustKey::validate_patch(&patch, &t).unwrap();
         assert_eq!(t.model_pins, vec![pin]);
         assert!(t.admin_model_pins);
     }
@@ -408,6 +446,73 @@ mod tests {
             strict_err(vec![ok.clone(), ok]),
             "model pin my-slug: duplicate pin"
         );
+    }
+
+    fn service_with(
+        stored: Option<Value>,
+    ) -> (
+        AdminSettingsService,
+        Arc<FakeRepo>,
+        Arc<ArcSwap<Versioned<TinfoilTrust>>>,
+    ) {
+        let repo = Arc::new(FakeRepo::default());
+        if let Some(value) = stored {
+            repo.rows.lock().unwrap().push(StoredSetting {
+                key: "tinfoil_trust".into(),
+                value,
+                updated_by_user_id: None,
+                updated_at: chrono::Utc::now(),
+            });
+        }
+        let handle = Arc::new(ArcSwap::from_pointee(Versioned {
+            version: 0,
+            value: TinfoilTrust::default(),
+        }));
+        let svc = AdminSettingsService::builder(repo.clone())
+            .register::<TinfoilTrustKey>(handle.clone())
+            .build();
+        (svc, repo, handle)
+    }
+
+    #[tokio::test]
+    async fn kill_switch_patch_succeeds_with_stale_stored_pin() {
+        let mut stale = pin_json(&recorded_model_pin("stale"));
+        stale["sigstore_bundle"] = json!({"garbage": true});
+        let (svc, repo, _) = service_with(Some(json!({"model_pins": [stale.clone()]})));
+        let v = svc
+            .update(
+                "tinfoil_trust",
+                json!({"admin_model_pins": false}),
+                Uuid::new_v4(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(v.value["admin_model_pins"], json!(false));
+        let rows = repo.rows.lock().unwrap();
+        assert_eq!(rows[0].value["model_pins"], json!([stale]));
+        assert_eq!(rows[0].value["admin_model_pins"], json!(false));
+    }
+
+    #[tokio::test]
+    async fn patch_with_model_pins_verifies_them() {
+        let (svc, repo, _) = service_with(None);
+        let mut bad = recorded_model_pin("bad");
+        bad.sigstore_bundle = json!({"secret_marker_xyz": 1});
+        let r = svc
+            .update(
+                "tinfoil_trust",
+                json!({"model_pins": [pin_json(&bad)]}),
+                Uuid::new_v4(),
+            )
+            .await;
+        match r {
+            Err(crate::admin_settings::AdminSettingsError::Invalid(m)) => {
+                assert!(m.starts_with("model pin bad: sigstore: "), "{m}");
+                assert!(!m.contains("secret_marker_xyz"), "{m}");
+            }
+            other => panic!("expected Invalid, got {other:?}"),
+        }
+        assert!(repo.rows.lock().unwrap().is_empty(), "nothing stored");
     }
 
     #[test]

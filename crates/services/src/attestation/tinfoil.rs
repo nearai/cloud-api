@@ -14,7 +14,7 @@ use inference_providers::attested::tinfoil::verifier_port::{
 use sha2::{Digest, Sha256};
 use tinfoil_provenance::Provenance;
 
-use super::tinfoil_trust::{AdminModelPin, TinfoilTrust};
+use super::tinfoil_trust::{verify_admin_pin_bundle, AdminModelPin, TinfoilTrust};
 use crate::admin_settings::Versioned;
 
 use super::snp::{self, SnpError, SnpEvidence, SnpPolicy, Tcb, VerifiedSnpReport};
@@ -24,7 +24,7 @@ use super::tinfoil_pins::{TinfoilPins, COMPILED_PINS_JSON};
 const ROUTER_REPO: &str = "tinfoilsh/confidential-model-router";
 
 /// Cap on cached Sigstore results; the cache is cleared when it grows past it.
-pub(crate) const SIGSTORE_CACHE_MAX: usize = 64;
+const SIGSTORE_CACHE_MAX: usize = 64;
 
 const SNP_FORMAT: &str = "https://tinfoil.sh/predicate/sev-snp-guest/v2";
 
@@ -143,10 +143,12 @@ type VerifiedAdminPins = Arc<Vec<(AdminModelPin, Provenance)>>;
 /// reason, which never contains bundle content.
 type AdminSigstoreCache = HashMap<[u8; 32], Result<Provenance, String>>;
 
-/// Cache key of one admin pin's Sigstore result: its repo and bundle content.
-pub(crate) fn admin_pin_cache_key(pin: &AdminModelPin) -> Option<[u8; 32]> {
+/// Cache key of one admin pin's check result: its repo, tag and bundle content.
+fn admin_pin_cache_key(pin: &AdminModelPin) -> Option<[u8; 32]> {
     let mut hasher = Sha256::new();
     hasher.update(pin.repo.as_bytes());
+    hasher.update([0]);
+    hasher.update(pin.tag.as_bytes());
     hasher.update([0]);
     hasher.update(serde_json::to_vec(&pin.sigstore_bundle).ok()?);
     Some(hasher.finalize().into())
@@ -187,41 +189,26 @@ impl TinfoilPolicyVerifier {
         }
     }
 
-    /// Verify one stored admin pin's bundle (cached per repo and bundle
-    /// content): `repo` must be a tinfoilsh repository, the bundle must verify
-    /// for it, and the signed tag must equal the pin's tag.
+    /// Verify one stored admin pin with the shared check (cached per repo,
+    /// tag and bundle content).
     fn verify_admin_pin(
         &self,
         cache: &mut AdminSigstoreCache,
         pin: &AdminModelPin,
     ) -> Result<Provenance, String> {
-        if !pin.repo.starts_with("tinfoilsh/") {
-            return Err("repo is not a tinfoilsh repository".into());
-        }
         let key = admin_pin_cache_key(pin).ok_or("bundle shape")?;
-        let verified = match cache.get(&key) {
-            Some(hit) => hit.clone(),
-            None => {
-                #[cfg(test)]
-                self.admin_sigstore_calls
-                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                let result = tinfoil_provenance::verify_release(&pin.sigstore_bundle, &pin.repo)
-                    .map_err(|e| e.to_string());
-                if cache.len() >= SIGSTORE_CACHE_MAX {
-                    cache.clear();
-                }
-                cache.insert(key, result.clone());
-                result
-            }
-        };
-        let prov = verified?;
-        if prov.tag != pin.tag {
-            return Err("tag does not match the signed release".into());
+        if let Some(hit) = cache.get(&key) {
+            return hit.clone();
         }
-        if prov.registers().is_none() {
-            return Err("signed release has no registers".into());
+        #[cfg(test)]
+        self.admin_sigstore_calls
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let result = verify_admin_pin_bundle(pin);
+        if cache.len() >= SIGSTORE_CACHE_MAX {
+            cache.clear();
         }
-        Ok(prov)
+        cache.insert(key, result.clone());
+        result
     }
 
     /// The verified admin pins for the current `tinfoil_trust` version,

@@ -3,15 +3,13 @@
 //! `GET /v1/attestation/tinfoil/pins`. Raw Sigstore bundles are never part of
 //! the view (size); only provenance fields are.
 
-use std::collections::{BTreeMap, HashMap};
-use std::sync::{Mutex, OnceLock};
+use std::collections::BTreeMap;
 
 use serde::Serialize;
 use tinfoil_provenance::Provenance;
 
-use super::tinfoil::{admin_pin_cache_key, SIGSTORE_CACHE_MAX};
 use super::tinfoil_pins::{ModelPin, RouterPin, TinfoilPins};
-use super::tinfoil_trust::{AdminModelPin, TinfoilTrust};
+use super::tinfoil_trust::{verify_admin_pin_bundle, AdminModelPin, TinfoilTrust};
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct CompiledRouterView {
@@ -59,35 +57,9 @@ pub struct TinfoilPinsView {
     pub admin: AdminPinsView,
 }
 
-type Cache = HashMap<[u8; 32], Result<Provenance, String>>;
-
-fn cache() -> &'static Mutex<Cache> {
-    static CACHE: OnceLock<Mutex<Cache>> = OnceLock::new();
-    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
-}
-
-/// Same checks as the verifier of record applies to an admin pin, cached per
-/// repo and bundle content.
+/// The shared admission check; an unverified pin carries no provenance.
 fn verify_pin(pin: &AdminModelPin) -> Option<Provenance> {
-    if !pin.repo.starts_with("tinfoilsh/") {
-        return None;
-    }
-    let key = admin_pin_cache_key(pin)?;
-    let mut cache = cache().lock().unwrap_or_else(|e| e.into_inner());
-    let result = match cache.get(&key) {
-        Some(hit) => hit.clone(),
-        None => {
-            let r = tinfoil_provenance::verify_release(&pin.sigstore_bundle, &pin.repo)
-                .map_err(|e| e.to_string());
-            if cache.len() >= SIGSTORE_CACHE_MAX {
-                cache.clear();
-            }
-            cache.insert(key, r.clone());
-            r
-        }
-    };
-    let prov = result.ok()?;
-    (prov.tag == pin.tag && prov.registers().is_some()).then_some(prov)
+    verify_admin_pin_bundle(pin).ok()
 }
 
 fn admin_pin_view(pin: &AdminModelPin) -> AdminPinView {

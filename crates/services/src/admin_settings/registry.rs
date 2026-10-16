@@ -37,6 +37,14 @@ pub trait SettingKey: Send + Sync + 'static {
     /// `strict`: PATCH input, unknown values are errors. Not strict: a stored row,
     /// read leniently so a newer binary's row cannot reset known values.
     fn parse(value: &Value, strict: bool) -> Result<Self::Value, String>;
+    /// Extra checks of a PATCH, run after the strict parse of the merged
+    /// value succeeds and before anything is stored. `patch` is the request
+    /// body, so a key can do costly checks only for the fields it sets. The
+    /// default accepts.
+    fn validate_patch(patch: &Value, merged: &Self::Value) -> Result<(), String> {
+        let _ = (patch, merged);
+        Ok(())
+    }
     /// Build the published form. `version` increments on every effective change.
     fn publish(value: &Self::Value, version: u64) -> Self::Published;
 }
@@ -46,8 +54,11 @@ pub(super) trait ErasedKey: Send + Sync {
     fn name(&self) -> &'static str;
     fn fields(&self) -> &'static [&'static str];
     fn max_bytes(&self) -> usize;
-    /// Strict parse of PATCH input.
-    fn parse_strict(&self, value: &Value) -> Result<(), String>;
+    /// Strict parse of the merged PATCH value, then the key's
+    /// [`SettingKey::validate_patch`].
+    fn check_patch(&self, patch: &Value, merged: &Value) -> Result<(), String>;
+    /// The per-key version `apply` last published.
+    fn version(&self) -> u64;
     /// The effective value as JSON: the lenient parse of a stored value, or
     /// the default when there is none.
     fn effective_json(&self, stored: Option<&Value>) -> Result<Value, String>;
@@ -99,8 +110,13 @@ impl<K: SettingKey> ErasedKey for Registered<K> {
         K::MAX_BYTES
     }
 
-    fn parse_strict(&self, value: &Value) -> Result<(), String> {
-        K::parse(value, true).map(|_| ())
+    fn check_patch(&self, patch: &Value, merged: &Value) -> Result<(), String> {
+        let typed = K::parse(merged, true)?;
+        K::validate_patch(patch, &typed)
+    }
+
+    fn version(&self) -> u64 {
+        self.state.lock().unwrap_or_else(|e| e.into_inner()).version
     }
 
     fn effective_json(&self, stored: Option<&Value>) -> Result<Value, String> {

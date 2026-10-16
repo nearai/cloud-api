@@ -39,8 +39,14 @@ pub trait SettingKey: Send + Sync + 'static {
     fn default_value() -> Self::Value;
     /// `strict`: PATCH input, unknown values are errors. Not strict: a stored row,
     /// read leniently so a newer binary's row cannot reset known values.
+    /// Runs under the per-key state lock: cheap, non-blocking, and must not
+    /// re-enter `AdminSettingsService`.
     fn parse(value: &Value, strict: bool) -> Result<Self::Value, String>;
     /// Build the published form. `version` increments on every effective change.
+    ///
+    /// `parse` and `publish` run while the key's per-key state lock is held.
+    /// They must be cheap and non-blocking, and must not re-enter
+    /// `AdminSettingsService`.
     fn publish(value: &Self::Value, version: u64) -> Self::Published;
 }
 
@@ -56,8 +62,8 @@ pub(super) trait ErasedKey: Send + Sync {
     fn effective_json(&self, stored: Option<&Value>) -> Result<Value, String>;
     /// Makes a stored row (or the default, when there is none) live. A
     /// stored value that no longer parses uses the default. With
-    /// `skip_unchanged`, a row whose `updated_at` is the one last applied is
-    /// not parsed again.
+    /// `skip_unchanged`, a row whose `updated_at` and stored value are both
+    /// the ones last applied is not parsed again.
     fn apply(&self, row: Option<&StoredSetting>, skip_unchanged: bool);
     fn current_any(&self) -> Box<dyn Any>;
 }
@@ -67,6 +73,9 @@ struct State {
     /// `None`: nothing applied yet. `Some(None)`: applied with no row.
     /// `Some(Some(t))`: applied the row last updated at `t`.
     applied: Option<Option<DateTime<Utc>>>,
+    /// The stored value last applied. `updated_at` alone is not enough to
+    /// skip a reload: two writes can share a timestamp.
+    last_raw: Option<Value>,
     version: u64,
 }
 
@@ -83,6 +92,7 @@ impl<K: SettingKey> Registered<K> {
             current: ArcSwap::from_pointee(K::default_value()),
             state: Mutex::new(State {
                 applied: None,
+                last_raw: None,
                 version: 0,
             }),
         }
@@ -111,13 +121,17 @@ impl<K: SettingKey> ErasedKey for Registered<K> {
             Some(v) => K::parse(v, false)?,
             None => K::default_value(),
         };
-        Ok(serde_json::to_value(&typed).unwrap_or(Value::Null))
+        serde_json::to_value(&typed)
+            .map_err(|e| format!("serializing the effective value failed: {e}"))
     }
 
     fn apply(&self, row: Option<&StoredSetting>, skip_unchanged: bool) {
         let at = row.map(|r| r.updated_at);
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        if skip_unchanged && state.applied == Some(at) {
+        if skip_unchanged
+            && state.applied == Some(at)
+            && state.last_raw.as_ref() == row.map(|r| &r.value)
+        {
             return;
         }
         let typed = match row.map(|r| K::parse(&r.value, false)) {
@@ -133,6 +147,7 @@ impl<K: SettingKey> ErasedKey for Registered<K> {
         };
         let first = state.applied.is_none();
         state.applied = Some(at);
+        state.last_raw = row.map(|r| r.value.clone());
         let changed = typed != **self.current.load();
         if !changed && !first {
             return;

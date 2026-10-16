@@ -176,11 +176,22 @@ impl AdminSettingsService {
     /// The effective value of `K` on this instance (its default when `K` is
     /// not registered).
     pub fn current<K: SettingKey>(&self) -> K::Value {
-        self.key(K::NAME)
-            .ok()
-            .and_then(|k| k.current_any().downcast::<K::Value>().ok())
-            .map(|v| *v)
-            .unwrap_or_else(K::default_value)
+        match self.key(K::NAME) {
+            Ok(key) => key
+                .current_any()
+                .downcast::<K::Value>()
+                .ok()
+                .map(|v| *v)
+                .unwrap_or_else(K::default_value),
+            Err(_) => {
+                // A wiring mistake: the owner reads defaults forever. Say so.
+                tracing::warn!(
+                    setting = K::NAME,
+                    "Setting key is not registered; returning its default"
+                );
+                K::default_value()
+            }
+        }
     }
 
     /// The effective placement tuning on this instance.
@@ -834,6 +845,36 @@ mod tests {
         svc.update("vkey", json!({"n": null}), admin).await.unwrap();
         assert_eq!(handle.load().version, 2);
         assert_eq!(svc.current::<VKey>(), TestVal::default());
+    }
+
+    #[tokio::test]
+    async fn reload_reparses_same_timestamp_different_value() {
+        let (svc, repo, handle) = versioned_service::<CountKey>();
+        let at = Utc::now();
+        let put_at = |n: i64| {
+            repo.rows.lock().unwrap().insert(
+                "count_key".to_string(),
+                StoredSetting {
+                    key: "count_key".to_string(),
+                    value: json!({"n": n}),
+                    updated_by_user_id: None,
+                    updated_at: at,
+                },
+            );
+        };
+        put_at(3);
+        let base = COUNT_PARSES.load(std::sync::atomic::Ordering::SeqCst);
+        svc.reload().await;
+        // Same updated_at, different stored value: must be read again.
+        put_at(4);
+        svc.reload().await;
+        assert_eq!(
+            COUNT_PARSES.load(std::sync::atomic::Ordering::SeqCst) - base,
+            2,
+            "a changed value under an unchanged timestamp is parsed"
+        );
+        assert_eq!(handle.load().value.n, 4);
+        assert_eq!(handle.load().version, 2);
     }
 
     #[tokio::test]

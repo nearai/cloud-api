@@ -25,5 +25,5 @@ sigstore-verify = { version = "0.14", default-features = false }
 [dev-dependencies]
 wiremock = "0.6"
 rcgen = "0.14"
-rustls = { version = "0.23.45", features = ["aws-lc-rs"] }
+rustls = { version = "0.23.46", features = ["aws-lc-rs"] }
 tokio-rustls = "0.26"

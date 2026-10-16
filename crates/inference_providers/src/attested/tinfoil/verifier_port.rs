@@ -14,11 +14,11 @@ pub struct AtcBundle {
     pub enclave_cert: String,
     pub digest: String,
     /// Sigstore (DSSE/Rekor) bundle over the ATC document. Intentionally an
-    /// opaque pass-through here: the runtime verifier does not read it (it
-    /// anchors on the SNP report chain plus the compiled pins). It is verified
-    /// only by the offline `tinfoil_sync` tooling, whose Sigstore dependencies
-    /// must stay out of this crate's (and `api`'s) dependency tree, so no typed
-    /// bundle lives in this port.
+    /// opaque pass-through in this port, so no typed bundle lives here. The
+    /// runtime verifies it through `tinfoil_provenance`, the only crate allowed
+    /// to depend on `sigstore-verify` (enforced by
+    /// `scripts/check_dep_guards.sh`). `tinfoil_sync` stays CI tooling and is
+    /// never a dependency of `api` or `services`.
     #[serde(rename = "sigstoreBundle")]
     pub sigstore_bundle: serde_json::Value,
 }

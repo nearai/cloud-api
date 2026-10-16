@@ -8,8 +8,11 @@
 //! ([`tinfoil_provenance`]). The classifier ([`classify`]) adds a row to the
 //! compiled pins file (`services::attestation::tinfoil_pins`) only if the row
 //! was seen live and equals the measurement in the Sigstore predicate. Rows are
-//! never removed. A person reviews and merges the resulting PR; this crate is
-//! tooling and is not part of the API image.
+//! never removed. A person reviews and merges the resulting PR. This crate is
+//! CI tooling, never a dependency of `api` or `services`, and is not part of
+//! the API image. The runtime verifies the ATC `sigstore_bundle` through
+//! `tinfoil_provenance`, the only crate allowed to depend on `sigstore-verify`
+//! (enforced by `scripts/check_dep_guards.sh`).
 
 pub mod classify;
 pub mod cli;

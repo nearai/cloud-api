@@ -269,6 +269,15 @@ async fn report_for(
     source: PinSource,
     rekor: Option<u64>,
 ) -> serde_json::Map<String, serde_json::Value> {
+    report_for_model(source, rekor, PinSource::Compiled, None).await
+}
+
+async fn report_for_model(
+    source: PinSource,
+    rekor: Option<u64>,
+    model_source: PinSource,
+    model_rekor: Option<u64>,
+) -> serde_json::Map<String, serde_json::Value> {
     let e = env().await;
     // No network: install a verified state directly.
     let bundle: AtcBundle = serde_json::from_slice(&atc_json("inference.tinfoil.sh")).unwrap();
@@ -280,8 +289,8 @@ async fn report_for(
         Ok(PinnedModel {
             slug: SLUG.into(),
             entry: entry.clone(),
-            source: PinSource::Compiled,
-            rekor_log_index: None,
+            source: model_source,
+            rekor_log_index: model_rekor,
         }),
     );
     e.session.install_state(VerifiedState {
@@ -334,6 +343,8 @@ async fn attestation_report_payload_shape() {
     );
     assert_eq!(m["router"]["report_b64"], "cmVwb3J0");
     assert_eq!(m["model_entry"]["slug"], SLUG);
+    assert_eq!(m["model_entry"]["pin_source"], "compiled");
+    assert!(m["model_entry"].get("rekor_log_index").is_none());
     assert_eq!(
         m["model_entry"]["registers"],
         serde_json::json!(["aa", "bb"])
@@ -351,6 +362,15 @@ async fn attestation_report_shows_sigstore_pin_source() {
     assert_eq!(m["router"]["pin_source"], "sigstore_atc");
     assert_eq!(m["router"]["rekor_log_index"], 42);
     assert_eq!(m["router"]["tag"], "r@v1", "existing field is unchanged");
+}
+
+#[tokio::test]
+async fn attestation_report_shows_admin_model_pin_source() {
+    let m = report_for_model(PinSource::Compiled, None, PinSource::Admin, Some(77)).await;
+    assert_eq!(m["model_entry"]["pin_source"], "admin");
+    assert_eq!(m["model_entry"]["rekor_log_index"], 77);
+    assert_eq!(m["model_entry"]["slug"], SLUG, "existing fields unchanged");
+    assert_eq!(m["router"]["pin_source"], "compiled");
 }
 
 #[tokio::test]

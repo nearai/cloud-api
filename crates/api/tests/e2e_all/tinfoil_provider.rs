@@ -500,3 +500,30 @@ async fn session_build_failure_registers_nothing() {
     .await;
     assert!(!pool.has_provider(&model).await);
 }
+
+/// `GET /v1/attestation/tinfoil/pins` is public, cached for 30s, and lists the
+/// compiled pins and the admin switches. A real Tinfoil session cannot be
+/// stubbed here, so the live router state is `null` in this endpoint.
+#[tokio::test]
+async fn serial_public_pins_endpoint() {
+    let server = setup_test_server().await;
+    let response = server.get("/v1/attestation/tinfoil/pins").await;
+    assert_eq!(response.status_code(), 200, "{}", response.text());
+    assert_eq!(
+        response
+            .headers()
+            .get("cache-control")
+            .and_then(|v| v.to_str().ok()),
+        Some("max-age=30")
+    );
+    let body: Value = response.json();
+    assert!(body["compiled"]["routers"].is_array());
+    assert!(body["compiled"]["models"].is_object());
+    assert!(body["admin"]["router_sigstore"].is_boolean());
+    assert!(body["admin"]["admin_model_pins"].is_boolean());
+    assert!(body["admin"]["model_pins"].is_array());
+    assert!(
+        !body.to_string().contains("sigstore_bundle"),
+        "raw bundles are never served"
+    );
+}

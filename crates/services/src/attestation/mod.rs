@@ -26,6 +26,7 @@ pub mod tinfoil;
 mod tinfoil_live_tests;
 pub mod tinfoil_observer;
 pub mod tinfoil_pins;
+pub mod tinfoil_pins_view;
 pub mod tinfoil_trust;
 pub mod verification;
 

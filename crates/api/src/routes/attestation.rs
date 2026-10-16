@@ -9,6 +9,7 @@
 //! | `GET /v1/attestation/report`    | API key | Data-plane endpoint, documented as key-protected. Key validation only — retrieval is not billed and never creates usage records. |
 //! | `GET /v1/signature/{chat_id}`   | API key | Returns per-completion signatures; completions are key-scoped, so lookups are too. |
 //! | `GET /v1/attestation/ita-token` | Public  | Deliberate exception — see `build_public_attestation_routes`. |
+//! | `GET /v1/attestation/tinfoil/pins` | Public | Deliberate exception — see `build_public_attestation_routes`. |
 
 use crate::{ohttp_gateway::OhttpAttestation, routes::api::AppState};
 use axum::{routing::get, Router};
@@ -21,6 +22,7 @@ pub(crate) mod ita_token;
 mod ita_token_models;
 pub(crate) mod report;
 pub(crate) mod signature;
+pub(crate) mod tinfoil_pins;
 
 pub use ita_token::get_ita_token;
 pub use ita_token_models::{
@@ -33,6 +35,7 @@ pub use report::{
 pub use signature::{
     get_signature, SignatureQuery, SignatureResponse, SignatureUnavailableResponse,
 };
+pub use tinfoil_pins::get_tinfoil_pins;
 
 #[derive(Clone)]
 pub struct AttestationRouteState {
@@ -53,8 +56,9 @@ impl From<AppState> for AttestationRouteState {
 
 /// Attestation routes that are served WITHOUT authentication.
 ///
-/// Only `GET /v1/attestation/ita-token` is public, and keeping it public is an
-/// explicit, documented decision (nearai/infra#193):
+/// Only `GET /v1/attestation/ita-token` and `GET /v1/attestation/tinfoil/pins`
+/// are public, and keeping them public is an explicit, documented decision
+/// (nearai/infra#193). For `ita-token`:
 ///
 /// - The response contains exclusively TEE attestation evidence signed by
 ///   Intel Trust Authority (gateway and model provider JWTs) — no customer
@@ -65,14 +69,27 @@ impl From<AppState> for AttestationRouteState {
 /// - Abuse is bounded upstream: Intel Trust Authority rate limits are
 ///   propagated to callers as 429 responses.
 ///
+/// `tinfoil/pins` is a transparency endpoint: it lists the compiled Tinfoil
+/// pins, the admin trust switches and the admin-added model pins with their
+/// Sigstore provenance (no raw bundles, no customer data), so anyone can see
+/// which trust inputs are live. It is cheap (results are cached per bundle)
+/// and sent with `Cache-Control: max-age=30`.
+///
 /// Any route added here must be justified the same way and reflected in the
 /// classification table in the module docs above. `GET /v1/attestation/report`
 /// deliberately does NOT belong here: it is an API-key-protected data-plane
 /// endpoint (see `build_attestation_routes` in the crate root).
-pub fn build_public_attestation_routes(state: AttestationRouteState) -> Router {
+pub fn build_public_attestation_routes(
+    state: AttestationRouteState,
+    admin_settings: Arc<services::admin_settings::AdminSettingsService>,
+) -> Router {
     Router::new()
         .route("/attestation/ita-token", get(get_ita_token))
         .with_state(state)
+        .route(
+            "/attestation/tinfoil/pins",
+            get(get_tinfoil_pins).with_state(admin_settings),
+        )
 }
 
 #[cfg(test)]

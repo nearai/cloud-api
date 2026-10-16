@@ -24,7 +24,7 @@ use super::tinfoil_pins::{TinfoilPins, COMPILED_PINS_JSON};
 const ROUTER_REPO: &str = "tinfoilsh/confidential-model-router";
 
 /// Cap on cached Sigstore results; the cache is cleared when it grows past it.
-const SIGSTORE_CACHE_MAX: usize = 64;
+pub(crate) const SIGSTORE_CACHE_MAX: usize = 64;
 
 const SNP_FORMAT: &str = "https://tinfoil.sh/predicate/sev-snp-guest/v2";
 
@@ -143,6 +143,15 @@ type VerifiedAdminPins = Arc<Vec<(AdminModelPin, Provenance)>>;
 /// reason, which never contains bundle content.
 type AdminSigstoreCache = HashMap<[u8; 32], Result<Provenance, String>>;
 
+/// Cache key of one admin pin's Sigstore result: its repo and bundle content.
+pub(crate) fn admin_pin_cache_key(pin: &AdminModelPin) -> Option<[u8; 32]> {
+    let mut hasher = Sha256::new();
+    hasher.update(pin.repo.as_bytes());
+    hasher.update([0]);
+    hasher.update(serde_json::to_vec(&pin.sigstore_bundle).ok()?);
+    Some(hasher.finalize().into())
+}
+
 pub struct TinfoilPolicyVerifier {
     pins: TinfoilPins,
     trust: Arc<ArcSwap<Versioned<TinfoilTrust>>>,
@@ -189,11 +198,7 @@ impl TinfoilPolicyVerifier {
         if !pin.repo.starts_with("tinfoilsh/") {
             return Err("repo is not a tinfoilsh repository".into());
         }
-        let mut hasher = Sha256::new();
-        hasher.update(pin.repo.as_bytes());
-        hasher.update([0]);
-        hasher.update(serde_json::to_vec(&pin.sigstore_bundle).map_err(|_| "bundle shape")?);
-        let key: [u8; 32] = hasher.finalize().into();
+        let key = admin_pin_cache_key(pin).ok_or("bundle shape")?;
         let verified = match cache.get(&key) {
             Some(hit) => hit.clone(),
             None => {

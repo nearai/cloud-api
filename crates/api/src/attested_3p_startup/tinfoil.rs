@@ -2,15 +2,13 @@
 //! metrics sampler. Shared ordering and reservation live in the parent module.
 
 use super::ensure_attested_3p_catalog_row;
-use arc_swap::ArcSwap;
 use config::{AttestedThirdPartyModelEntry, ExternalProvidersConfig};
 use database::repositories::ModelRepository;
 use inference_providers::attested::tinfoil::verifier_port::{PinSource, TinfoilVerifyError};
 use inference_providers::attested::tinfoil::{self as tinfoil_provider, TinfoilRouterSession};
 use inference_providers::ProviderSource;
-use services::admin_settings::Versioned;
 use services::attestation::tinfoil_pins::TinfoilPins;
-use services::attestation::tinfoil_trust::TinfoilTrust;
+use services::attestation::tinfoil_trust::TinfoilTrustHandle;
 use services::inference_provider_pool::InferenceProviderPool;
 use services::metrics::{consts, MetricsServiceTrait};
 use std::sync::Arc;
@@ -108,7 +106,7 @@ pub(super) async fn register_tinfoil(
     pool: &Arc<InferenceProviderPool>,
     models_repo: &ModelRepository,
     cfg: &ExternalProvidersConfig,
-    trust: Arc<ArcSwap<Versioned<TinfoilTrust>>>,
+    trust: TinfoilTrustHandle,
     metrics: Arc<dyn MetricsServiceTrait>,
 ) {
     register_tinfoil_with(
@@ -135,7 +133,7 @@ pub async fn register_tinfoil_with(
     models_repo: &ModelRepository,
     cfg: &ExternalProvidersConfig,
     pins: Result<TinfoilPins, String>,
-    trust: Arc<ArcSwap<Versioned<TinfoilTrust>>>,
+    trust: TinfoilTrustHandle,
     build_session: impl FnOnce(
         tinfoil_provider::Config,
         Arc<services::attestation::tinfoil::TinfoilPolicyVerifier>,
@@ -361,7 +359,10 @@ fn spawn_tinfoil_metrics(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use arc_swap::ArcSwap;
     use config::parse_attested_3p_models;
+    use services::admin_settings::Versioned;
+    use services::attestation::tinfoil_trust::TinfoilTrust;
 
     fn tinfoil_cfg(key: Option<&str>, models: &str) -> ExternalProvidersConfig {
         ExternalProvidersConfig {
@@ -371,7 +372,7 @@ mod tests {
         }
     }
 
-    fn default_trust() -> Arc<ArcSwap<Versioned<TinfoilTrust>>> {
+    fn default_trust() -> TinfoilTrustHandle {
         Arc::new(ArcSwap::from_pointee(Versioned {
             version: 0,
             value: TinfoilTrust::default(),

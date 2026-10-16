@@ -158,10 +158,7 @@ mod tests {
     use super::*;
 
     fn atc() -> serde_json::Value {
-        serde_json::from_str(include_str!(
-            "../../tinfoil_sync/testdata/atc_attestation.out"
-        ))
-        .unwrap()
+        serde_json::from_str(include_str!("../testdata/atc_attestation.out")).unwrap()
     }
 
     #[test]

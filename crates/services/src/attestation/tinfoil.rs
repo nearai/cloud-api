@@ -3,9 +3,8 @@
 
 use std::collections::HashMap;
 use std::io::Read;
-use std::sync::{Arc, Mutex};
+use std::sync::Mutex;
 
-use arc_swap::ArcSwap;
 use base64::Engine;
 use inference_providers::attested::tinfoil::verifier_port::{
     AtcBundle, PinSource, PinnedModel, ProxyModelEntry, RouterTcb, TinfoilVerifier,
@@ -14,8 +13,7 @@ use inference_providers::attested::tinfoil::verifier_port::{
 use sha2::{Digest, Sha256};
 use tinfoil_provenance::Provenance;
 
-use super::tinfoil_trust::TinfoilTrust;
-use crate::admin_settings::Versioned;
+use super::tinfoil_trust::TinfoilTrustHandle;
 
 use super::snp::{self, SnpError, SnpEvidence, SnpPolicy, Tcb, VerifiedSnpReport};
 use super::tinfoil_pins::{TinfoilPins, COMPILED_PINS_JSON};
@@ -138,7 +136,7 @@ type SigstoreCache = HashMap<(String, [u8; 32]), Result<Provenance, TinfoilVerif
 
 pub struct TinfoilPolicyVerifier {
     pins: TinfoilPins,
-    trust: Arc<ArcSwap<Versioned<TinfoilTrust>>>,
+    trust: TinfoilTrustHandle,
     /// Sigstore verification results per (measurement, bundle hash). Only the
     /// verification itself is cached: the runtime switch and the binding
     /// checks run on every `verify_router`.
@@ -149,7 +147,7 @@ pub struct TinfoilPolicyVerifier {
 }
 
 impl TinfoilPolicyVerifier {
-    pub fn new(pins: TinfoilPins, trust: Arc<ArcSwap<Versioned<TinfoilTrust>>>) -> Self {
+    pub fn new(pins: TinfoilPins, trust: TinfoilTrustHandle) -> Self {
         Self {
             pins,
             trust,
@@ -315,13 +313,17 @@ impl TinfoilVerifier for TinfoilPolicyVerifier {
 
 #[cfg(test)]
 mod tests {
+    use super::super::tinfoil_trust::TinfoilTrust;
     use super::*;
+    use crate::admin_settings::Versioned;
+    use arc_swap::ArcSwap;
     use inference_providers::attested::tinfoil::verifier_port::ProxyDoc;
+    use std::sync::Arc;
 
     fn bundle() -> AtcBundle {
         serde_json::from_str(include_str!("testdata/tinfoil/atc_bundle.json")).unwrap()
     }
-    fn trust_handle(router_sigstore: bool) -> Arc<ArcSwap<Versioned<TinfoilTrust>>> {
+    fn trust_handle(router_sigstore: bool) -> TinfoilTrustHandle {
         Arc::new(ArcSwap::from_pointee(Versioned {
             version: 0,
             value: TinfoilTrust { router_sigstore },

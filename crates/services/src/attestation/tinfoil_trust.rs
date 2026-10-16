@@ -3,6 +3,9 @@
 //! `PATCH /v1/admin/settings/tinfoil_trust`, and Tinfoil reads it through a
 //! [`Versioned`] handle.
 
+use std::sync::Arc;
+
+use arc_swap::ArcSwap;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -24,6 +27,9 @@ impl Default for TinfoilTrust {
         }
     }
 }
+
+/// The shared handle the Tinfoil attestation path reads the trust switches through.
+pub type TinfoilTrustHandle = Arc<ArcSwap<Versioned<TinfoilTrust>>>;
 
 pub struct TinfoilTrustKey;
 

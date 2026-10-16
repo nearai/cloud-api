@@ -497,8 +497,12 @@ mod tests {
     #[test]
     fn services_and_sync_atc_captures_agree() {
         let a: AtcBundle = serde_json::from_str(ATC).unwrap();
-        let b: AtcBundle =
-            serde_json::from_str(include_str!("../testdata/atc_bundle.json")).unwrap();
+        // Deliberately reads the services crate's capture: this test exists to
+        // catch drift between the two crates' recorded router bundles.
+        let b: AtcBundle = serde_json::from_str(include_str!(
+            "../../services/src/attestation/testdata/tinfoil/atc_bundle.json"
+        ))
+        .unwrap();
         let (oa, ob) = (observe(&a).unwrap(), observe(&b).unwrap());
         assert_eq!(oa.measurement_hex, ob.measurement_hex);
         assert_eq!(oa.spki_sha256_hex, ob.spki_sha256_hex);

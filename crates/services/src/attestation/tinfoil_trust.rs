@@ -38,9 +38,10 @@ impl SettingKey for TinfoilTrustKey {
     }
 
     /// Strict (PATCH): unknown fields and wrong types are errors. Lenient
-    /// (stored row): unknown fields (from a newer binary) are ignored, and a
-    /// field of the wrong type falls back to its default. Only the field
-    /// name is logged.
+    /// (stored row): unknown fields (from a newer binary) are ignored. An
+    /// absent `router_sigstore` uses its default (true); a wrong-typed one
+    /// fails closed (false), since it is a kill switch. Only the field name
+    /// is logged.
     fn parse(value: &Value, strict: bool) -> Result<TinfoilTrust, String> {
         if strict {
             return serde_json::from_value(value.clone()).map_err(|e| e.to_string());
@@ -49,11 +50,15 @@ impl SettingKey for TinfoilTrustKey {
         if let Some(v) = value.get("router_sigstore") {
             match v.as_bool() {
                 Some(b) => trust.router_sigstore = b,
-                None => tracing::warn!(
-                    setting = Self::NAME,
-                    field = "router_sigstore",
-                    "Stored admin setting field has the wrong type; using its default"
-                ),
+                None => {
+                    // Fail closed: a corrupt kill-switch row must not re-enable Sigstore.
+                    trust.router_sigstore = false;
+                    tracing::warn!(
+                        setting = Self::NAME,
+                        field = "router_sigstore",
+                        "Stored admin setting field has the wrong type; failing closed"
+                    );
+                }
             }
         }
         Ok(trust)
@@ -139,14 +144,16 @@ mod tests {
         let t =
             TinfoilTrustKey::parse(&json!({"router_sigstore": false, "future": 1}), false).unwrap();
         assert!(!t.router_sigstore);
-        // Absent or wrong-typed falls back to the default, never errors.
+        // Absent falls back to the default (true), never errors.
         assert!(
             TinfoilTrustKey::parse(&json!({"future": 1}), false)
                 .unwrap()
                 .router_sigstore
         );
+        // Wrong-typed fails closed: a kill-switch row we cannot read must not
+        // re-enable Sigstore admission.
         assert!(
-            TinfoilTrustKey::parse(&json!({"router_sigstore": "no"}), false)
+            !TinfoilTrustKey::parse(&json!({"router_sigstore": "no"}), false)
                 .unwrap()
                 .router_sigstore
         );

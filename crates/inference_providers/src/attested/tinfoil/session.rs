@@ -321,7 +321,19 @@ impl TinfoilRouterSession {
     /// each attesting its own key, so requests go to the attested domain.
     async fn do_verify(&self) -> Result<(), TinfoilVerifyError> {
         let bundle: AtcBundle = Self::fetch_json(&self.atc_client, &self.atc_url).await?;
-        let router = self.verifier.verify_router(&bundle)?;
+        // Sigstore and the AMD chain are CPU-bound; keep them off the async
+        // worker. A JoinError means the verifier panicked or was cancelled.
+        // It is reported as a malformed-evidence stage (not a fetch failure),
+        // and the session fails closed like any other verification error.
+        let verifier = Arc::clone(&self.verifier);
+        let router = tokio::task::spawn_blocking({
+            let bundle = bundle.clone();
+            move || verifier.verify_router(&bundle)
+        })
+        .await
+        .map_err(|_| TinfoilVerifyError::Malformed {
+            stage: "verify_join",
+        })??;
         validate_router_domain(&bundle.domain)?;
         let fp = hex::encode(router.spki_sha256);
 

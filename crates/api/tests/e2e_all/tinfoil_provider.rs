@@ -520,9 +520,9 @@ async fn serial_public_pins_endpoint() {
     let tinfoil = &body["tinfoil"];
     assert!(tinfoil["compiled"]["routers"].is_array());
     assert!(tinfoil["compiled"]["models"].is_object());
-    assert!(tinfoil["admin"]["router_sigstore"].is_boolean());
-    assert!(tinfoil["admin"]["admin_model_pins"].is_boolean());
-    assert!(tinfoil["admin"]["model_pins"].is_array());
+    assert!(tinfoil["runtime"]["router_sigstore"].is_boolean());
+    assert!(tinfoil["runtime"]["admin_model_pins"].is_boolean());
+    assert!(tinfoil["runtime"]["model_pins"].is_array());
     let chutes_rows = body["chutes"]["compiled"].as_array().expect("chutes rows");
     assert!(!chutes_rows.is_empty());
     assert!(chutes_rows[0]["mrtd"].is_string() && chutes_rows[0]["rtmr3"].is_string());

@@ -59,7 +59,7 @@ pub struct AdminPinsView {
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct TinfoilPinsView {
     pub compiled: CompiledPinsView,
-    pub admin: AdminPinsView,
+    pub runtime: AdminPinsView,
 }
 
 /// The shared admission check; an unverified pin carries no provenance.
@@ -121,7 +121,7 @@ pub fn tinfoil_pins_view(pins: &TinfoilPins, trust: &TinfoilTrust) -> TinfoilPin
                 })
                 .collect(),
         },
-        admin: AdminPinsView {
+        runtime: AdminPinsView {
             router_sigstore: trust.router_sigstore,
             admin_model_pins: trust.admin_model_pins,
             model_pins: trust.model_pins.iter().map(admin_pin_view).collect(),
@@ -187,8 +187,8 @@ mod tests {
         let v = tinfoil_pins_view(&pins, &TinfoilTrust::default());
         assert_eq!(v.compiled.routers.len(), pins.router.len());
         assert_eq!(v.compiled.models.len(), pins.models.len());
-        assert!(v.admin.router_sigstore && v.admin.admin_model_pins);
-        assert!(v.admin.model_pins.is_empty());
+        assert!(v.runtime.router_sigstore && v.runtime.admin_model_pins);
+        assert!(v.runtime.model_pins.is_empty());
     }
 
     #[test]
@@ -199,7 +199,7 @@ mod tests {
             ..Default::default()
         };
         let v = tinfoil_pins_view(&TinfoilPins::default(), &trust);
-        let p = &v.admin.model_pins[0];
+        let p = &v.runtime.model_pins[0];
         assert!(p.verified, "recorded bundle must verify");
         assert_eq!(p.tag, pin.tag);
         assert!(p.rekor_log_index.is_some());
@@ -218,7 +218,7 @@ mod tests {
             ..Default::default()
         };
         let v = tinfoil_pins_view(&TinfoilPins::default(), &trust);
-        let p = &v.admin.model_pins[0];
+        let p = &v.runtime.model_pins[0];
         assert!(!p.verified);
         assert!(p.rekor_log_index.is_none() && p.snp_measurement.is_none());
     }
@@ -232,7 +232,7 @@ mod tests {
             ..Default::default()
         };
         let v = tinfoil_pins_view(&TinfoilPins::default(), &trust);
-        let p = &v.admin.model_pins[0];
+        let p = &v.runtime.model_pins[0];
         assert!(!p.verified);
         assert!(p.rekor_log_index.is_none() && p.snp_measurement.is_none());
     }
@@ -249,7 +249,7 @@ mod tests {
             ..Default::default()
         };
         let v = tinfoil_pins_view(&TinfoilPins::default(), &trust);
-        let p = &v.admin.model_pins[0];
+        let p = &v.runtime.model_pins[0];
         assert!(!p.verified);
         assert!(p.rekor_log_index.is_none() && p.snp_measurement.is_none());
     }

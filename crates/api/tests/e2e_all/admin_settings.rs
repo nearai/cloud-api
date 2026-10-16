@@ -316,7 +316,7 @@ async fn tinfoil_trust_model_pin_patch_and_public_listing() {
     let listing = server.get("/v1/attestation/pins").await;
     assert_eq!(listing.status_code(), StatusCode::OK);
     let body = listing.json::<Value>();
-    let listed = body["tinfoil"]["admin"]["model_pins"]
+    let listed = body["tinfoil"]["runtime"]["model_pins"]
         .as_array()
         .unwrap()
         .iter()

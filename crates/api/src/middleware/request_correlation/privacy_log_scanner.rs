@@ -29,6 +29,30 @@ pub(super) fn assert_production_logs_exclude_forbidden_expressions() {
             include_str!("../../routes/completions/score.rs"),
         ),
         (
+            "crates/api/src/routes/completions/chat.rs",
+            include_str!("../../routes/completions/chat.rs"),
+        ),
+        (
+            "crates/api/src/routes/completions/chat_redact.rs",
+            include_str!("../../routes/completions/chat_redact.rs"),
+        ),
+        (
+            "crates/api/src/routes/completions/chat_stream.rs",
+            include_str!("../../routes/completions/chat_stream.rs"),
+        ),
+        (
+            "crates/api/src/routes/completions/models.rs",
+            include_str!("../../routes/completions/models.rs"),
+        ),
+        (
+            "crates/api/src/routes/completions/text.rs",
+            include_str!("../../routes/completions/text.rs"),
+        ),
+        (
+            "crates/api/src/routes/completions/tests.rs",
+            include_str!("../../routes/completions/tests.rs"),
+        ),
+        (
             "crates/api/src/routes/responses.rs",
             include_str!("../../routes/responses.rs"),
         ),

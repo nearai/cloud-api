@@ -275,7 +275,7 @@ Located in `crates/api/src/routes/`:
 - `organization_members.rs` - Member management, invitations
 - `workspaces.rs` - Workspace & API key management
 - `users.rs` - User profile, invitations, sessions
-- `completions.rs` - Chat & text completions
+- `completions/` - Chat, text, image, audio, rerank, embeddings, privacy and score endpoints (one file per endpoint family)
 - `conversations.rs` - Conversation management
 - `responses.rs` - AI response streaming
 - `models.rs` - Model catalog

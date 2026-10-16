@@ -14,12 +14,12 @@ pub struct AtcBundle {
     pub enclave_cert: String,
     pub digest: String,
     /// Sigstore (DSSE/Rekor) bundle over the ATC document. Intentionally an
-    /// opaque pass-through here: the runtime verifier does not read it (it
-    /// anchors on the SNP report chain plus the compiled pins). It is verified
-    /// only by the offline `tinfoil_sync` tooling, whose Sigstore dependencies
-    /// must stay out of this crate's (and `api`'s) dependency tree, so no typed
-    /// bundle lives in this port.
-    #[serde(rename = "sigstoreBundle")]
+    /// opaque pass-through in this port, so no typed bundle lives here. The
+    /// runtime verifies it through `tinfoil_provenance`, the only crate allowed
+    /// to depend on `sigstore-verify` (enforced by
+    /// `scripts/check_dep_guards.sh`). `tinfoil_sync` stays CI tooling and is
+    /// never a dependency of `api` or `services`.
+    #[serde(rename = "sigstoreBundle", default)]
     pub sigstore_bundle: serde_json::Value,
 }
 
@@ -56,12 +56,36 @@ pub struct ProxyEnclave {
     pub predicate: String,
 }
 
-/// A router whose attestation verified against pins and is bound to its TLS key.
+/// Where a verified router's trust came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PinSource {
+    /// The measurement is in the compiled pins.
+    Compiled,
+    /// The measurement is not compiled, but the ATC bundle's Sigstore release
+    /// attestation verified and binds to the live measurement.
+    SigstoreAtc,
+}
+
+impl PinSource {
+    pub const fn as_str(&self) -> &'static str {
+        match self {
+            Self::Compiled => "compiled",
+            Self::SigstoreAtc => "sigstore_atc",
+        }
+    }
+}
+
+/// A router whose attestation verified against pins (or its Sigstore release
+/// attestation) and is bound to its TLS key.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VerifiedRouter {
     pub spki_sha256: [u8; 32],
     pub measurement_hex: String,
+    /// The compiled pin's tag, or the Sigstore-verified release tag.
     pub tag: String,
+    pub source: PinSource,
+    /// Rekor log index of the release signature (`SigstoreAtc` only).
+    pub rekor_log_index: Option<u64>,
     /// Reported TCB from the verified SNP report.
     pub tcb: RouterTcb,
 }
@@ -95,6 +119,14 @@ pub enum TinfoilVerifyError {
     BadSignature,
     #[error("debug policy")]
     DebugPolicy,
+    /// The ATC's Sigstore bundle did not verify; `stage` is a fixed tag
+    /// (`verify` or `digest`) and is not part of [`Self::reason`].
+    #[error("router sigstore rejected ({stage})")]
+    RouterSigstoreRejected { stage: &'static str },
+    /// The Sigstore bundle verified but attests a different router release
+    /// than the live measurement.
+    #[error("router sigstore measurement mismatch")]
+    RouterSigstoreMeasurementMismatch,
     #[error("tcb too low")]
     TcbTooLow,
     #[error("report data mismatch")]
@@ -114,6 +146,8 @@ impl TinfoilVerifyError {
             Self::UnsupportedRouterPlatform => "unsupported_router_platform",
             Self::UnknownRouterMeasurement => "unknown_router_measurement",
             Self::UnknownModelMeasurement => "unknown_model_measurement",
+            Self::RouterSigstoreRejected { .. } => "router_sigstore_rejected",
+            Self::RouterSigstoreMeasurementMismatch => "router_sigstore_measurement_mismatch",
             Self::BadSignature => "bad_signature",
             Self::DebugPolicy => "debug_policy",
             Self::TcbTooLow => "tcb_too_low",
@@ -159,6 +193,11 @@ pub fn validate_router_domain(domain: &str) -> Result<(), TinfoilVerifyError> {
 /// implementations MUST still enforce it, and MUST also check that the attested
 /// certificate's SAN names that domain, inside `verify_router`.
 pub trait TinfoilVerifier: Send + Sync {
+    /// Version of the verifier's runtime trust inputs (the `tinfoil_trust`
+    /// setting); the session re-verifies when it changes. Fixed-input verifiers keep 0.
+    fn trust_generation(&self) -> u64 {
+        0
+    }
     fn verify_router(&self, bundle: &AtcBundle) -> Result<VerifiedRouter, TinfoilVerifyError>;
     /// Verifies that `entry` matches a compiled pin for `slug`: the measurement
     /// registers, `repo` and `tag` must all equal one pinned row. Enclave

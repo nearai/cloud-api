@@ -1,41 +1,53 @@
 //! Admin-changeable runtime settings. Each setting is a JSON value under a
-//! known key in one table, so adding a setting needs neither a migration nor
-//! an endpoint: a typed struct (defaults and range checks) and one arm in
-//! each of the `match`es on the key below.
+//! key in one table, so adding a setting needs neither a migration nor an
+//! endpoint: its owner implements [`SettingKey`] (typed value, defaults,
+//! range checks, the handle it publishes to) and registers it on
+//! [`AdminSettingsService::builder`]. This module knows no key's type.
 //!
 //! A stored value is sparse: it holds only the fields an admin set, and a
-//! field that is absent uses the code default. Each instance keeps a typed
-//! snapshot of the effective values, reloaded on a timer and refreshed
+//! field that is absent uses the code default. Each instance keeps the typed
+//! effective value of every key, reloaded on a timer and refreshed
 //! immediately after an update handled by this instance. Consumers read the
-//! typed snapshot, never the JSON.
+//! typed value, never the JSON.
+//!
+//! This is the runtime KV store for operator-set configuration: tuning knobs,
+//! kill switches and public signed trust inputs (which their owner verifies
+//! before use). Runtime-changeable config goes here as a registered key; never
+//! add a table, migration or admin API for it. Consumers that need a setting
+//! at startup register after this service has loaded.
 //!
 //! The table is stored in plaintext (approved in `database_encryption.rs`):
-//! settings here must be operational tuning values only. Never add a setting
-//! that holds secrets, credentials, or customer data.
+//! never add a setting that holds secrets, credentials, or customer data.
 
+mod keys;
 pub mod ports;
+pub mod registry;
 
 use std::sync::Arc;
 use std::time::Duration;
 
 use arc_swap::ArcSwap;
 use chrono::{DateTime, Utc};
-use inference_providers::{DisabledSources, ProviderSource};
+use inference_providers::DisabledSources;
 use placement::Tuning;
-use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use uuid::Uuid;
 
+pub use keys::{Attested3pKey, Attested3pSettings, PlacementKey, PlacementTuning};
 pub use ports::{AdminSettingsRepository, StoredSetting};
+pub use registry::{AdminSettingsBuilder, SettingKey, Versioned};
+
+use registry::ErasedKey;
 
 /// How often each instance re-reads the stored settings.
 pub const RELOAD_INTERVAL: Duration = Duration::from_secs(10 * 60);
 
-/// Every key a setting can be stored under.
-pub const KNOWN_KEYS: &[&str] = &[KEY_PLACEMENT, KEY_ATTESTED_3P];
+/// How often [`AdminSettingsService::start`] retries while the very first
+/// read has not yet succeeded.
+pub const INITIAL_LOAD_RETRY: Duration = Duration::from_secs(30);
 
-pub const KEY_PLACEMENT: &str = "placement";
-pub const KEY_ATTESTED_3P: &str = "attested_3p";
+pub const KEY_PLACEMENT: &str = PlacementKey::NAME;
+pub const KEY_ATTESTED_3P: &str = Attested3pKey::NAME;
 
 #[derive(Debug, thiserror::Error)]
 pub enum AdminSettingsError {
@@ -45,197 +57,6 @@ pub enum AdminSettingsError {
     Invalid(String),
     #[error("settings storage failed")]
     Storage(#[source] anyhow::Error),
-}
-
-/// The live-tunable placement knobs, in API units. Integer knobs are signed
-/// so a negative value reaches the range check instead of a parse error.
-/// `PlacementTuning`'s field names (a test keeps this in step with the struct).
-const PLACEMENT_FIELDS: &[&str] = &[
-    "affinity_abs_slack",
-    "affinity_eps",
-    "kv_max",
-    "lane_load_tokens",
-    "pin_hold_factor",
-    "pin_ttl_ms",
-    "enabled",
-];
-
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
-#[serde(default, deny_unknown_fields)]
-pub struct PlacementTuning {
-    /// Absolute slack of the affinity bound, in score units (0.0 - 4.0).
-    pub affinity_abs_slack: f64,
-    /// Relative tolerance of the affinity bound (0.0 - 2.0).
-    pub affinity_eps: f64,
-    /// KV usage at or above which a replica is excluded (0.5 - 1.0).
-    pub kv_max: f64,
-    /// Load at or above which a replica is a heavy-lane member
-    /// (4000 - 1000000).
-    pub lane_load_tokens: i64,
-    /// Scale on the prompt's cold-prefill cost in the pin-hold test
-    /// (0.5 - 2.0).
-    pub pin_hold_factor: f64,
-    /// How long a follow pin stays valid, in ms (60000 - 3600000).
-    pub pin_ttl_ms: i64,
-    /// Default true. False routes every request through legacy routing
-    /// (`LegacyReason::Disabled`). A PATCH applies immediately on the instance
-    /// that receives it and on other instances at the next reload
-    /// ([`RELOAD_INTERVAL`]). For an instant fleet-wide stop (affects every
-    /// environment sharing the Valkey) use the Valkey key
-    /// `routed:_placement_off`. Set it to false only after every instance runs
-    /// a build that knows this field (`deny_unknown_fields`).
-    pub enabled: bool,
-}
-
-impl Default for PlacementTuning {
-    fn default() -> Self {
-        Tuning::default().into()
-    }
-}
-
-impl From<Tuning> for PlacementTuning {
-    fn from(t: Tuning) -> Self {
-        Self {
-            affinity_abs_slack: t.affinity_abs_slack,
-            affinity_eps: t.affinity_eps,
-            kv_max: t.kv_max,
-            lane_load_tokens: t.lane_load_tokens as i64,
-            pin_hold_factor: t.pin_hold_factor,
-            pin_ttl_ms: t.pin_ttl_ms as i64,
-            enabled: t.enabled,
-        }
-    }
-}
-
-impl PlacementTuning {
-    /// The range checks. NaN fails them (every comparison with NaN is false).
-    pub fn validate(&self) -> Result<(), AdminSettingsError> {
-        fn float(name: &str, v: f64, lo: f64, hi: f64) -> Result<(), AdminSettingsError> {
-            if v >= lo && v <= hi {
-                Ok(())
-            } else {
-                Err(AdminSettingsError::Invalid(format!(
-                    "{name} must be between {lo} and {hi}"
-                )))
-            }
-        }
-        fn int(name: &str, v: i64, lo: i64, hi: i64) -> Result<(), AdminSettingsError> {
-            if (lo..=hi).contains(&v) {
-                Ok(())
-            } else {
-                Err(AdminSettingsError::Invalid(format!(
-                    "{name} must be between {lo} and {hi}"
-                )))
-            }
-        }
-        float("affinity_abs_slack", self.affinity_abs_slack, 0.0, 4.0)?;
-        float("affinity_eps", self.affinity_eps, 0.0, 2.0)?;
-        float("kv_max", self.kv_max, 0.5, 1.0)?;
-        int("lane_load_tokens", self.lane_load_tokens, 4_000, 1_000_000)?;
-        float("pin_hold_factor", self.pin_hold_factor, 0.5, 2.0)?;
-        int("pin_ttl_ms", self.pin_ttl_ms, 60_000, 3_600_000)?;
-        Ok(())
-    }
-
-    /// The placement crate's tuning. Only meaningful after `validate`.
-    pub fn to_tuning(self) -> Tuning {
-        Tuning {
-            affinity_abs_slack: self.affinity_abs_slack,
-            affinity_eps: self.affinity_eps,
-            kv_max: self.kv_max,
-            lane_load_tokens: self.lane_load_tokens as u64,
-            pin_hold_factor: self.pin_hold_factor,
-            pin_ttl_ms: self.pin_ttl_ms as u64,
-            enabled: self.enabled,
-        }
-    }
-}
-
-const ATTESTED_3P_FIELDS: &[&str] = &["disabled_sources"];
-
-/// The attested third-party kill switch: sources listed here are skipped by
-/// chat routing and attestation reports. Only attested third parties can be
-/// switched off.
-///
-/// Propagation: a PATCH applies immediately on the instance that handled it
-/// and within `RELOAD_INTERVAL` (10 min) on every other instance (there is no
-/// cross-instance push). For a faster stop on other instances, redeploy. Per-org
-/// `fallback_disabled` is NOT a substitute: it only excludes registered
-/// fallback providers for that organization, not standalone primaries or
-/// attestation reports.
-#[derive(Debug, Clone, Copy, Default, PartialEq)]
-pub struct Attested3pSettings {
-    pub disabled_sources: DisabledSources,
-}
-
-#[derive(Default, Serialize, Deserialize)]
-#[serde(default, deny_unknown_fields)]
-struct Attested3pWire {
-    disabled_sources: Vec<String>,
-}
-
-impl Serialize for Attested3pSettings {
-    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        Attested3pWire {
-            disabled_sources: self
-                .disabled_sources
-                .iter()
-                .map(|s| s.as_str().to_string())
-                .collect(),
-        }
-        .serialize(serializer)
-    }
-}
-
-impl<'de> Deserialize<'de> for Attested3pSettings {
-    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        let wire = Attested3pWire::deserialize(deserializer)?;
-        let mut disabled_sources = DisabledSources::default();
-        for name in &wire.disabled_sources {
-            match ProviderSource::parse(name) {
-                Some(s @ (ProviderSource::Chutes | ProviderSource::Tinfoil)) => {
-                    disabled_sources.insert(s)
-                }
-                _ => {
-                    return Err(serde::de::Error::custom(
-                        "disabled_sources accepts: chutes, tinfoil",
-                    ))
-                }
-            }
-        }
-        Ok(Self { disabled_sources })
-    }
-}
-
-impl Attested3pSettings {
-    /// Read a STORED row leniently: source names this binary does not know
-    /// (written by a newer binary) are ignored, never resetting the known ones
-    /// to empty, which would silently turn the kill switch off. Unknown names
-    /// are logged (names only). PATCH input goes through the strict
-    /// `Deserialize` instead.
-    fn from_stored(value: &Value) -> Self {
-        let mut disabled_sources = DisabledSources::default();
-        let names = value.get("disabled_sources").and_then(Value::as_array);
-        for name in names.into_iter().flatten().filter_map(Value::as_str) {
-            match ProviderSource::parse(name) {
-                Some(s @ (ProviderSource::Chutes | ProviderSource::Tinfoil)) => {
-                    disabled_sources.insert(s)
-                }
-                _ => tracing::warn!(
-                    source = %name,
-                    "Stored attested_3p setting names an unknown source; ignoring it"
-                ),
-            }
-        }
-        Self { disabled_sources }
-    }
-}
-
-/// The typed snapshot of every setting's effective value.
-#[derive(Debug, Clone, Copy, Default, PartialEq)]
-pub struct AdminSettings {
-    pub placement: PlacementTuning,
-    pub attested_3p: Attested3pSettings,
 }
 
 /// One setting as an admin sees it: the effective value, and when and by
@@ -248,85 +69,14 @@ pub struct SettingView {
     pub updated_by_user_id: Option<Uuid>,
 }
 
-/// Deserializes and validates a stored (sparse) value: stored fields over
-/// the defaults. The one place that knows each key's type.
-///
-/// `strict` is for input being validated (PATCH): unknown values are errors.
-/// Stored rows are read leniently so a row written by a newer binary cannot
-/// reset known values (see [`Attested3pSettings::from_stored`]).
-fn parse_with(
-    key: &str,
-    stored: Option<&Value>,
-    strict: bool,
-) -> Result<ParsedSetting, AdminSettingsError> {
-    match key {
-        KEY_PLACEMENT => {
-            let typed: PlacementTuning = match stored {
-                Some(v) => serde_json::from_value(v.clone())
-                    .map_err(|e| AdminSettingsError::Invalid(e.to_string()))?,
-                None => PlacementTuning::default(),
-            };
-            typed.validate()?;
-            Ok(ParsedSetting::Placement(typed))
-        }
-        KEY_ATTESTED_3P => {
-            let typed: Attested3pSettings = match stored {
-                Some(v) if strict => serde_json::from_value(v.clone())
-                    .map_err(|e| AdminSettingsError::Invalid(e.to_string()))?,
-                Some(v) => Attested3pSettings::from_stored(v),
-                None => Attested3pSettings::default(),
-            };
-            Ok(ParsedSetting::Attested3p(typed))
-        }
-        _ => Err(AdminSettingsError::UnknownKey),
-    }
-}
-
-/// Strict parse (validating input).
-fn parse(key: &str, stored: Option<&Value>) -> Result<ParsedSetting, AdminSettingsError> {
-    parse_with(key, stored, true)
-}
-
-/// Lenient parse of a value read back from storage.
-fn parse_stored(key: &str, stored: Option<&Value>) -> Result<ParsedSetting, AdminSettingsError> {
-    parse_with(key, stored, false)
-}
-
-enum ParsedSetting {
-    Placement(PlacementTuning),
-    Attested3p(Attested3pSettings),
-}
-
-impl ParsedSetting {
-    fn effective_json(&self) -> Value {
-        match self {
-            ParsedSetting::Placement(p) => serde_json::to_value(p).unwrap_or(Value::Null),
-            ParsedSetting::Attested3p(a) => serde_json::to_value(a).unwrap_or(Value::Null),
-        }
-    }
-}
-
-/// The field names a stored value can hold under `key`.
-fn known_fields(key: &str) -> &'static [&'static str] {
-    match key {
-        KEY_PLACEMENT => PLACEMENT_FIELDS,
-        KEY_ATTESTED_3P => ATTESTED_3P_FIELDS,
-        _ => &[],
-    }
-}
-
-fn known_key(key: &str) -> Result<&'static str, AdminSettingsError> {
-    KNOWN_KEYS
-        .iter()
-        .find(|k| **k == key)
-        .copied()
-        .ok_or(AdminSettingsError::UnknownKey)
-}
-
 /// The new sparse stored value: `stored` with `patch` applied field by
 /// field (`null` removes a field, so it falls back to its default), checked
 /// as a whole. Nothing is stored when it fails.
-fn merge(key: &str, stored: Option<&Value>, patch: &Value) -> Result<Value, AdminSettingsError> {
+fn merge(
+    key: &dyn ErasedKey,
+    stored: Option<&Value>,
+    patch: &Value,
+) -> Result<Value, AdminSettingsError> {
     let Value::Object(patch) = patch else {
         return Err(AdminSettingsError::Invalid(
             "the body must be a JSON object".to_string(),
@@ -334,7 +84,7 @@ fn merge(key: &str, stored: Option<&Value>, patch: &Value) -> Result<Value, Admi
     };
     // Checked before `null` resets are applied, so a field name outside the
     // schema never gets past here, and never reaches a log line.
-    let known = known_fields(key);
+    let known = key.fields();
     if patch.keys().any(|f| !known.contains(&f.as_str())) {
         return Err(AdminSettingsError::Invalid(
             "the body has a field that is not a knob of this setting".to_string(),
@@ -352,97 +102,121 @@ fn merge(key: &str, stored: Option<&Value>, patch: &Value) -> Result<Value, Admi
         }
     }
     let merged = Value::Object(merged);
-    parse(key, Some(&merged))?;
+    if serde_json::to_vec(&merged).map_or(true, |b| b.len() > key.max_bytes()) {
+        return Err(AdminSettingsError::Invalid(
+            "the setting value is too large".to_string(),
+        ));
+    }
+    key.parse_strict(&merged)
+        .map_err(AdminSettingsError::Invalid)?;
     Ok(merged)
 }
 
 fn view(
-    key: &'static str,
+    key: &dyn ErasedKey,
     stored: Option<&StoredSetting>,
 ) -> Result<SettingView, AdminSettingsError> {
     Ok(SettingView {
-        key,
-        value: parse_stored(key, stored.map(|s| &s.value))?.effective_json(),
+        key: key.name(),
+        value: key
+            .effective_json(stored.map(|s| &s.value))
+            .map_err(AdminSettingsError::Invalid)?,
         updated_at: stored.map(|s| s.updated_at),
         updated_by_user_id: stored.and_then(|s| s.updated_by_user_id),
     })
 }
 
-/// The typed snapshot from stored rows. A key with no row, or whose stored
-/// value no longer passes its checks, uses its defaults.
-fn snapshot(rows: &[StoredSetting]) -> AdminSettings {
-    let mut s = AdminSettings::default();
-    for row in rows {
-        match parse_stored(&row.key, Some(&row.value)) {
-            Ok(ParsedSetting::Placement(p)) => s.placement = p,
-            Ok(ParsedSetting::Attested3p(a)) => s.attested_3p = a,
-            Err(AdminSettingsError::UnknownKey) => {}
-            Err(_) => tracing::warn!(
-                setting = %row.key,
-                "Stored admin setting is invalid; using its defaults"
-            ),
-        }
-    }
-    s
-}
-
 pub struct AdminSettingsService {
     repository: Arc<dyn AdminSettingsRepository>,
-    current: ArcSwap<AdminSettings>,
-    /// The handle the placers read (`InferenceProviderPool::placement_tuning`).
-    placement: Arc<ArcSwap<Tuning>>,
-    /// The handle the pool reads (`InferenceProviderPool::attested_3p_disabled`).
-    attested_3p: Arc<ArcSwap<DisabledSources>>,
-    /// Held across every read-then-apply of the snapshot (`update` and
+    /// Registered keys, in registration order.
+    keys: Vec<Box<dyn ErasedKey>>,
+    /// Held across every read-then-apply of the typed values (`update` and
     /// `reload`), so an older read can never be applied after a newer one.
     refresh: tokio::sync::Mutex<()>,
 }
 
 impl AdminSettingsService {
+    pub fn builder(repository: Arc<dyn AdminSettingsRepository>) -> AdminSettingsBuilder {
+        AdminSettingsBuilder::new(repository)
+    }
+
+    /// The two built-in keys: `placement` (the handle the placers read,
+    /// `InferenceProviderPool::placement_tuning`) and `attested_3p` (the
+    /// handle the pool reads, `InferenceProviderPool::attested_3p_disabled`).
     pub fn new(
         repository: Arc<dyn AdminSettingsRepository>,
         placement: Arc<ArcSwap<Tuning>>,
         attested_3p: Arc<ArcSwap<DisabledSources>>,
     ) -> Self {
+        Self::builder(repository)
+            .register::<PlacementKey>(placement)
+            .register::<Attested3pKey>(attested_3p)
+            .build()
+    }
+
+    fn from_parts(
+        repository: Arc<dyn AdminSettingsRepository>,
+        keys: Vec<Box<dyn ErasedKey>>,
+    ) -> Self {
         Self {
             repository,
-            current: ArcSwap::from_pointee(AdminSettings::default()),
-            placement,
-            attested_3p,
+            keys,
             refresh: tokio::sync::Mutex::new(()),
+        }
+    }
+
+    fn key(&self, name: &str) -> Result<&dyn ErasedKey, AdminSettingsError> {
+        self.keys
+            .iter()
+            .find(|k| k.name() == name)
+            .map(|k| k.as_ref())
+            .ok_or(AdminSettingsError::UnknownKey)
+    }
+
+    /// The effective value of `K` on this instance (its default when `K` is
+    /// not registered).
+    pub fn current<K: SettingKey>(&self) -> K::Value {
+        match self.key(K::NAME) {
+            Ok(key) => key
+                .current_any()
+                .downcast::<K::Value>()
+                .ok()
+                .map(|v| *v)
+                .unwrap_or_else(K::default_value),
+            Err(_) => {
+                // A wiring mistake: the owner reads defaults forever. Say so.
+                tracing::warn!(
+                    setting = K::NAME,
+                    "Setting key is not registered; returning its default"
+                );
+                K::default_value()
+            }
         }
     }
 
     /// The effective placement tuning on this instance.
     pub fn placement(&self) -> PlacementTuning {
-        self.current.load().placement
+        self.current::<PlacementKey>()
     }
 
-    fn apply(&self, s: AdminSettings) {
-        self.placement.store(Arc::new(s.placement.to_tuning()));
-        self.attested_3p
-            .store(Arc::new(s.attested_3p.disabled_sources));
-        self.current.store(Arc::new(s));
-    }
-
-    /// Every known setting with its effective value, in key order.
+    /// Every known setting with its effective value, in registration order.
     pub async fn get_all(&self) -> Result<Vec<SettingView>, AdminSettingsError> {
         let rows = self
             .repository
             .get_all()
             .await
             .map_err(AdminSettingsError::Storage)?;
-        KNOWN_KEYS
+        self.keys
             .iter()
-            .map(|key| view(key, rows.iter().find(|r| r.key == *key)))
+            .map(|key| view(key.as_ref(), rows.iter().find(|r| r.key == key.name())))
             .collect()
     }
 
     pub async fn get(&self, key: &str) -> Result<SettingView, AdminSettingsError> {
-        let key = known_key(key)?;
+        let key = self.key(key)?;
         let stored = self
             .repository
-            .get(key)
+            .get(key.name())
             .await
             .map_err(AdminSettingsError::Storage)?;
         view(key, stored.as_ref())
@@ -457,65 +231,80 @@ impl AdminSettingsService {
         patch: Value,
         by_user: Uuid,
     ) -> Result<SettingView, AdminSettingsError> {
-        let key = known_key(key)?;
+        let key = self.key(key)?;
         let _refresh = self.refresh.lock().await;
         let stored = self
             .repository
-            .get(key)
+            .get(key.name())
             .await
             .map_err(AdminSettingsError::Storage)?;
         let merged = merge(key, stored.as_ref().map(|s| &s.value), &patch)?;
         let saved = self
             .repository
-            .upsert(key, merged, by_user)
+            .upsert(key.name(), merged, by_user)
             .await
             .map_err(AdminSettingsError::Storage)?;
         // Applied from the value just saved, not a re-read: the write has
         // committed, so nothing after it may fail the request.
-        match parse_stored(key, Some(&saved.value)) {
-            Ok(ParsedSetting::Placement(p)) => {
-                let mut s = **self.current.load();
-                s.placement = p;
-                self.apply(s);
-            }
-            Ok(ParsedSetting::Attested3p(a)) => {
-                let mut s = **self.current.load();
-                s.attested_3p = a;
-                self.apply(s);
-            }
-            Err(_) => {}
-        }
+        key.apply(Some(&saved), false);
         let names: Vec<&String> = patch
             .as_object()
             .map(|o| o.keys().collect())
             .unwrap_or_default();
         tracing::info!(
             admin_user_id = %by_user,
-            setting = key,
+            setting = key.name(),
             fields = ?names,
             "Admin setting updated"
         );
         view(key, Some(&saved))
     }
 
-    /// Reads every stored setting into the live snapshot. A read failure
-    /// keeps the last good values.
-    pub async fn reload(&self) {
+    /// Reads every stored setting into the live values and returns whether
+    /// the read succeeded. A read failure keeps the last good values. A key
+    /// with no row, or whose stored value no longer passes its checks, uses
+    /// its defaults; a row for an unregistered key is ignored.
+    pub async fn reload(&self) -> bool {
         let _refresh = self.refresh.lock().await;
         match self.repository.get_all().await {
-            Ok(rows) => self.apply(snapshot(&rows)),
-            Err(e) => tracing::warn!(
-                error = %e,
-                "Failed to read admin settings; keeping the current values"
-            ),
+            Ok(rows) => {
+                for key in &self.keys {
+                    key.apply(rows.iter().find(|r| r.key == key.name()), true);
+                }
+                true
+            }
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "Failed to read admin settings; keeping the current values"
+                );
+                false
+            }
         }
     }
 
     /// Loads once, then reloads every [`RELOAD_INTERVAL`] on a background
-    /// task. Until the first successful read the values are the defaults.
+    /// task. If the first read fails, the task retries every
+    /// [`INITIAL_LOAD_RETRY`] until one succeeds. Until then the handles
+    /// keep the values their owners created them with (which fail closed for
+    /// kill switches).
     pub async fn start(self: Arc<Self>) {
-        self.reload().await;
+        let loaded = self.reload().await;
+        if !loaded {
+            tracing::warn!(
+                retry_secs = INITIAL_LOAD_RETRY.as_secs(),
+                "Initial admin settings load failed; retrying"
+            );
+        }
         tokio::spawn(async move {
+            if !loaded {
+                loop {
+                    tokio::time::sleep(INITIAL_LOAD_RETRY).await;
+                    if self.reload().await {
+                        break;
+                    }
+                }
+            }
             let mut interval = tokio::time::interval(RELOAD_INTERVAL);
             interval.tick().await;
             loop {
@@ -531,6 +320,8 @@ mod tests {
     use super::*;
     use anyhow::anyhow;
     use async_trait::async_trait;
+    use inference_providers::ProviderSource;
+    use serde::{Deserialize, Serialize};
     use serde_json::json;
     use std::collections::BTreeMap;
     use std::sync::Mutex;
@@ -607,22 +398,12 @@ mod tests {
 
     #[test]
     fn attested_3p_parses_and_rejects_unknown_sources() {
-        let ok = parse(
-            KEY_ATTESTED_3P,
-            Some(&json!({"disabled_sources": ["tinfoil"]})),
-        )
-        .unwrap();
-        assert!(
-            matches!(ok, ParsedSetting::Attested3p(s) if s.disabled_sources.contains(ProviderSource::Tinfoil))
-        );
-        assert!(parse(
-            KEY_ATTESTED_3P,
-            Some(&json!({"disabled_sources": ["vllm"]}))
-        )
-        .is_err());
-        assert!(parse(KEY_ATTESTED_3P, Some(&json!({"other": 1}))).is_err());
+        let ok = Attested3pKey::parse(&json!({"disabled_sources": ["tinfoil"]}), true).unwrap();
+        assert!(ok.disabled_sources.contains(ProviderSource::Tinfoil));
+        assert!(Attested3pKey::parse(&json!({"disabled_sources": ["vllm"]}), true).is_err());
+        assert!(Attested3pKey::parse(&json!({"other": 1}), true).is_err());
         assert_eq!(
-            parse(KEY_ATTESTED_3P, None).unwrap().effective_json(),
+            serde_json::to_value(Attested3pKey::default_value()).unwrap(),
             json!({"disabled_sources": []})
         );
     }
@@ -766,7 +547,7 @@ mod tests {
         let v = serde_json::to_value(PlacementTuning::default()).unwrap();
         let mut keys: Vec<&str> = v.as_object().unwrap().keys().map(|k| k.as_str()).collect();
         keys.sort();
-        let mut want = PLACEMENT_FIELDS.to_vec();
+        let mut want = PlacementKey::FIELDS.to_vec();
         want.sort();
         assert_eq!(keys, want);
     }
@@ -944,7 +725,7 @@ mod tests {
             .await
             .unwrap();
         let all = svc.get_all().await.unwrap();
-        assert_eq!(all.len(), KNOWN_KEYS.len());
+        assert_eq!(all.len(), 2);
         assert!(all.iter().any(|v| v.key == KEY_ATTESTED_3P));
         assert_eq!(all[0].key, KEY_PLACEMENT);
         assert_eq!(all[0].value["affinity_eps"], json!(0.5));
@@ -982,5 +763,224 @@ mod tests {
         repo.rows.lock().unwrap().remove(KEY_PLACEMENT);
         svc.reload().await;
         assert_eq!(**handle.load(), Tuning::default());
+    }
+
+    // ---- registry behaviour: versions, size cap, cheap reload ----
+
+    #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+    #[serde(default, deny_unknown_fields)]
+    struct TestVal {
+        n: i64,
+        s: String,
+    }
+
+    macro_rules! test_key {
+        ($name:ident, $key:literal, $max:expr, $parses:ident) => {
+            static $parses: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+            struct $name;
+            impl SettingKey for $name {
+                const NAME: &'static str = $key;
+                const FIELDS: &'static [&'static str] = &["n", "s"];
+                const MAX_BYTES: usize = $max;
+                type Value = TestVal;
+                type Published = Versioned<TestVal>;
+                fn default_value() -> TestVal {
+                    TestVal::default()
+                }
+                fn parse(value: &Value, _strict: bool) -> Result<TestVal, String> {
+                    $parses.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    serde_json::from_value(value.clone()).map_err(|e| e.to_string())
+                }
+                fn publish(value: &TestVal, version: u64) -> Versioned<TestVal> {
+                    Versioned {
+                        version,
+                        value: value.clone(),
+                    }
+                }
+            }
+        };
+    }
+    test_key!(VKey, "vkey", 64 * 1024, VKEY_PARSES);
+    test_key!(CountKey, "count_key", 64 * 1024, COUNT_PARSES);
+    test_key!(TinyKey, "tiny_key", 16, TINY_PARSES);
+
+    fn versioned_service<K: SettingKey<Published = Versioned<TestVal>>>() -> (
+        Arc<AdminSettingsService>,
+        Arc<FakeRepo>,
+        Arc<ArcSwap<Versioned<TestVal>>>,
+    ) {
+        let repo = Arc::new(FakeRepo::default());
+        let handle = Arc::new(ArcSwap::from_pointee(Versioned {
+            version: 0,
+            value: TestVal::default(),
+        }));
+        let svc = AdminSettingsService::builder(repo.clone())
+            .register::<K>(handle.clone())
+            .build();
+        (Arc::new(svc), repo, handle)
+    }
+
+    #[tokio::test]
+    async fn noop_patch_does_not_bump_version() {
+        let (svc, _, handle) = versioned_service::<VKey>();
+        let admin = Uuid::new_v4();
+        svc.update("vkey", json!({"n": 0}), admin).await.unwrap();
+        // The first apply of a key publishes version 1 (0 means "not loaded").
+        assert_eq!(handle.load().version, 1, "a field set to its default");
+        svc.update("vkey", json!({"n": 0}), admin).await.unwrap();
+        svc.update("vkey", json!({"s": null}), admin).await.unwrap();
+        assert_eq!(handle.load().version, 1);
+    }
+
+    #[tokio::test]
+    async fn effective_change_bumps_version_once() {
+        let (svc, _, handle) = versioned_service::<VKey>();
+        let admin = Uuid::new_v4();
+        svc.update("vkey", json!({"n": 5}), admin).await.unwrap();
+        assert_eq!(handle.load().version, 1);
+        assert_eq!(handle.load().value.n, 5);
+        // Same value again: no bump.
+        svc.update("vkey", json!({"n": 5}), admin).await.unwrap();
+        assert_eq!(handle.load().version, 1);
+        svc.update("vkey", json!({"n": null}), admin).await.unwrap();
+        assert_eq!(handle.load().version, 2);
+        assert_eq!(svc.current::<VKey>(), TestVal::default());
+    }
+
+    #[tokio::test]
+    async fn reload_reparses_same_timestamp_different_value() {
+        let (svc, repo, handle) = versioned_service::<CountKey>();
+        let at = Utc::now();
+        let put_at = |n: i64| {
+            repo.rows.lock().unwrap().insert(
+                "count_key".to_string(),
+                StoredSetting {
+                    key: "count_key".to_string(),
+                    value: json!({"n": n}),
+                    updated_by_user_id: None,
+                    updated_at: at,
+                },
+            );
+        };
+        put_at(3);
+        let base = COUNT_PARSES.load(std::sync::atomic::Ordering::SeqCst);
+        svc.reload().await;
+        // Same updated_at, different stored value: must be read again.
+        put_at(4);
+        svc.reload().await;
+        assert_eq!(
+            COUNT_PARSES.load(std::sync::atomic::Ordering::SeqCst) - base,
+            2,
+            "a changed value under an unchanged timestamp is parsed"
+        );
+        assert_eq!(handle.load().value.n, 4);
+        assert_eq!(handle.load().version, 2);
+    }
+
+    #[tokio::test]
+    async fn reload_skips_unchanged_rows() {
+        let (svc, repo, handle) = versioned_service::<CountKey>();
+        repo.put("count_key", json!({"n": 3}));
+        let base = COUNT_PARSES.load(std::sync::atomic::Ordering::SeqCst);
+        svc.reload().await;
+        svc.reload().await;
+        assert_eq!(
+            COUNT_PARSES.load(std::sync::atomic::Ordering::SeqCst) - base,
+            1,
+            "an unchanged updated_at is parsed once"
+        );
+        assert_eq!(handle.load().value.n, 3);
+        assert_eq!(handle.load().version, 1);
+        repo.put("count_key", json!({"n": 4}));
+        svc.reload().await;
+        assert_eq!(
+            COUNT_PARSES.load(std::sync::atomic::Ordering::SeqCst) - base,
+            2
+        );
+        assert_eq!(handle.load().value.n, 4);
+        // A deleted row is back to the default.
+        repo.rows.lock().unwrap().remove("count_key");
+        svc.reload().await;
+        assert_eq!(handle.load().value, TestVal::default());
+        assert_eq!(handle.load().version, 3);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn failed_initial_load_retries_until_success() {
+        let (svc, repo, handle) = versioned_service::<VKey>();
+        repo.put("vkey", json!({"n": 7}));
+        *repo.fail_get_all.lock().unwrap() = true;
+        svc.clone().start().await;
+        assert_eq!(handle.load().version, 0, "not loaded yet");
+        tokio::time::sleep(INITIAL_LOAD_RETRY * 2 + Duration::from_secs(1)).await;
+        assert_eq!(handle.load().version, 0, "still failing");
+        *repo.fail_get_all.lock().unwrap() = false;
+        tokio::time::sleep(INITIAL_LOAD_RETRY + Duration::from_secs(1)).await;
+        assert_eq!(handle.load().version, 1);
+        assert_eq!(handle.load().value.n, 7);
+    }
+
+    #[tokio::test]
+    async fn patch_over_max_bytes_is_rejected() {
+        let (svc, repo, handle) = versioned_service::<TinyKey>();
+        svc.update("tiny_key", json!({"s": "abc"}), Uuid::new_v4())
+            .await
+            .unwrap();
+        let err = svc
+            .update(
+                "tiny_key",
+                json!({"s": "a string well over sixteen bytes"}),
+                Uuid::new_v4(),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, AdminSettingsError::Invalid(m) if m == "the setting value is too large")
+        );
+        assert_eq!(*repo.upserts.lock().unwrap(), 1, "nothing more stored");
+        assert_eq!(handle.load().value.s, "abc");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn version_monotonic_under_concurrent_patch_and_reload() {
+        let (svc, repo, handle) = versioned_service::<VKey>();
+        let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let watcher = {
+            let handle = handle.clone();
+            let done = done.clone();
+            tokio::spawn(async move {
+                let mut last = 0;
+                while !done.load(std::sync::atomic::Ordering::SeqCst) {
+                    let v = handle.load().version;
+                    assert!(v >= last, "version went backwards");
+                    last = v;
+                    tokio::task::yield_now().await;
+                }
+            })
+        };
+        let mut tasks = Vec::new();
+        for i in 0..50i64 {
+            let svc = svc.clone();
+            tasks.push(tokio::spawn(async move {
+                if i % 2 == 0 {
+                    svc.update("vkey", json!({"n": i + 1}), Uuid::new_v4())
+                        .await
+                        .unwrap();
+                } else {
+                    svc.reload().await;
+                }
+            }));
+        }
+        for t in tasks {
+            t.await.unwrap();
+        }
+        done.store(true, std::sync::atomic::Ordering::SeqCst);
+        watcher.await.unwrap();
+        let stored = repo.rows.lock().unwrap()["vkey"].value.clone();
+        assert_eq!(
+            json!(handle.load().value.n),
+            stored["n"],
+            "the published value matches the latest committed row"
+        );
     }
 }

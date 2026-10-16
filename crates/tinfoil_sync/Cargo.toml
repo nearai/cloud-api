@@ -15,12 +15,12 @@ tokio = { version = "1", features = ["full"] }
 reqwest = { version = "0.12", features = ["json", "rustls-tls-native-roots"] }
 thiserror = "2.0"
 anyhow = "1.0"
-hex = "0.4"
-base64 = "0.22"
 chrono = "0.4"
-# Sigstore bundle verification, offline against the crate's embedded
-# public-good trusted root. Tooling only: never a dependency of `api`.
-sigstore-verify = { version = "0.14", default-features = false }
+# Sigstore verification lives in `tinfoil_provenance`, the only crate allowed
+# to depend on `sigstore-verify` (enforced by scripts/check_dep_guards.sh); the
+# runtime uses it too. This crate is CI tooling and is never a dependency of
+# `api` or `services`.
+tinfoil_provenance = { path = "../tinfoil_provenance" }
 
 [dev-dependencies]
 wiremock = "0.6"

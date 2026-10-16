@@ -265,8 +265,10 @@ async fn published_context_window_reads_models() {
     assert_eq!(e.session.published_context_window("missing"), None);
 }
 
-#[tokio::test]
-async fn attestation_report_payload_shape() {
+async fn report_for(
+    source: PinSource,
+    rekor: Option<u64>,
+) -> serde_json::Map<String, serde_json::Value> {
     let e = env().await;
     // No network: install a verified state directly.
     let bundle: AtcBundle = serde_json::from_slice(&atc_json("inference.tinfoil.sh")).unwrap();
@@ -285,6 +287,8 @@ async fn attestation_report_payload_shape() {
             spki_sha256: [1; 32],
             measurement_hex: "ab".repeat(48),
             tag: "r@v1".into(),
+            source,
+            rekor_log_index: rekor,
             tcb: RouterTcb {
                 bootloader: 10,
                 tee: 0,
@@ -307,6 +311,12 @@ async fn attestation_report_payload_shape() {
         .get_attestation_report(CANON.into(), None, Some("ff".into()), None, false)
         .await
         .unwrap();
+    m
+}
+
+#[tokio::test]
+async fn attestation_report_payload_shape() {
+    let m = report_for(PinSource::Compiled, None).await;
     assert_eq!(m["provider"], "tinfoil");
     assert_eq!(m["trust"], "router_attested");
     assert_eq!(m["verified"], true);
@@ -314,6 +324,8 @@ async fn attestation_report_payload_shape() {
     assert_eq!(m["router"]["format"], "sev-snp-guest/v2");
     assert_eq!(m["router"]["measurement"], "ab".repeat(48));
     assert_eq!(m["router"]["tag"], "r@v1");
+    assert_eq!(m["router"]["pin_source"], "compiled");
+    assert!(m["router"].get("rekor_log_index").is_none());
     assert_eq!(
         m["router"]["tcb"],
         serde_json::json!({"bootloader": 10, "tee": 0, "snp": 23, "microcode": 84})
@@ -329,6 +341,14 @@ async fn attestation_report_payload_shape() {
         m.get("nonce").is_none(),
         "client nonce is not bound into the Tinfoil report"
     );
+}
+
+#[tokio::test]
+async fn attestation_report_shows_sigstore_pin_source() {
+    let m = report_for(PinSource::SigstoreAtc, Some(42)).await;
+    assert_eq!(m["router"]["pin_source"], "sigstore_atc");
+    assert_eq!(m["router"]["rekor_log_index"], 42);
+    assert_eq!(m["router"]["tag"], "r@v1", "existing field is unchanged");
 }
 
 #[tokio::test]

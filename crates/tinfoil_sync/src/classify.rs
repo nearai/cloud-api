@@ -5,7 +5,7 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 use services::attestation::tinfoil_pins::{ModelPin, RouterPin, TinfoilPins};
 
-use crate::sigstore_verify::SigstoreResult;
+use tinfoil_provenance::Provenance;
 
 pub const ROUTER_REPO: &str = "tinfoilsh/confidential-model-router";
 
@@ -44,8 +44,8 @@ pub struct Observations {
 /// `repo@tag`.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SigstoreResults {
-    pub router: Option<SigstoreResult>,
-    pub models: BTreeMap<String, SigstoreResult>,
+    pub router: Option<Provenance>,
+    pub models: BTreeMap<String, Provenance>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -259,8 +259,8 @@ mod tests {
     const M: &str = "aa";
     const M2: &str = "bb";
 
-    fn sig(m: &str) -> SigstoreResult {
-        SigstoreResult {
+    fn sig(m: &str) -> Provenance {
+        Provenance {
             repo: ROUTER_REPO.into(),
             tag: "v1".into(),
             predicate_type: ROUTER_PREDICATE_TYPE.into(),
@@ -268,6 +268,8 @@ mod tests {
             snp_measurement: m.into(),
             rtmr1: Some("r1".into()),
             rtmr2: Some("r2".into()),
+            rekor_log_index: 1,
+            integrated_time: chrono::DateTime::UNIX_EPOCH,
         }
     }
     fn obs_router(m: &str) -> Observations {

@@ -324,6 +324,19 @@ fn router_pins() -> services::attestation::tinfoil_pins::TinfoilPins {
     }
 }
 
+fn default_trust() -> Arc<
+    arc_swap::ArcSwap<
+        services::admin_settings::Versioned<services::attestation::tinfoil_trust::TinfoilTrust>,
+    >,
+> {
+    Arc::new(arc_swap::ArcSwap::from_pointee(
+        services::admin_settings::Versioned {
+            version: 0,
+            value: Default::default(),
+        },
+    ))
+}
+
 fn metrics() -> Arc<dyn services::metrics::MetricsServiceTrait> {
     Arc::new(services::metrics::MockMetricsService)
 }
@@ -344,6 +357,7 @@ async fn failed_first_verification_still_registers_and_answers_503() {
         &repo,
         &cfg,
         Ok(router_pins()),
+        default_trust(),
         |mut pcfg, verifier| {
             // Nothing listens on port 1: the first verify fails immediately.
             pcfg.atc_url = "https://127.0.0.1:1/attestation".to_string();
@@ -416,6 +430,7 @@ async fn startup_does_not_wait_for_a_hanging_first_verification() {
         &repo,
         &cfg,
         Ok(router_pins()),
+        default_trust(),
         move |mut pcfg, verifier| {
             pcfg.atc_url = format!("https://127.0.0.1:{port}/attestation");
             inference_providers::attested::tinfoil::TinfoilRouterSession::new(pcfg, verifier)
@@ -450,6 +465,7 @@ async fn entry_without_ctx_is_not_registered() {
     let pcfg = inference_providers::attested::tinfoil::Config::new("tk_test_key".into(), 5);
     let verifier = Arc::new(services::attestation::tinfoil::TinfoilPolicyVerifier::new(
         router_pins(),
+        default_trust(),
     ));
     let session =
         inference_providers::attested::tinfoil::TinfoilRouterSession::new(pcfg.clone(), verifier)
@@ -477,6 +493,7 @@ async fn session_build_failure_registers_nothing() {
         &repo,
         &tinfoil_cfg(&model, "@131072"),
         Ok(router_pins()),
+        default_trust(),
         |_, _| Err("cannot build".to_string()),
         metrics(),
     )

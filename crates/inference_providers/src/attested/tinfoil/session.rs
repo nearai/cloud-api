@@ -112,6 +112,9 @@ pub struct TinfoilRouterSession {
     /// or none has run). Polled by the API layer for
     /// `cloud_api.tinfoil.verification`, which this crate cannot emit.
     last_error: std::sync::Mutex<Option<TinfoilVerifyError>>,
+    /// The verifier's `trust_generation` as of the last tick that looked. A
+    /// change means its trust inputs moved, so the router is re-verified.
+    seen_trust_generation: AtomicU64,
 }
 
 impl TinfoilRouterSession {
@@ -132,6 +135,7 @@ impl TinfoilRouterSession {
             .connect_timeout(CONNECT_TIMEOUT)
             .build()
             .map_err(|e| format!("build Tinfoil ATC client: {e}"))?;
+        let seen_trust_generation = AtomicU64::new(verifier.trust_generation());
         Ok(Arc::new(Self {
             atc_url: cfg.atc_url.clone(),
             verifier,
@@ -146,6 +150,7 @@ impl TinfoilRouterSession {
             redirect: cfg.redirect.clone(),
             auth_failures: AtomicU64::new(0),
             last_error: std::sync::Mutex::new(None),
+            seen_trust_generation,
         }))
     }
 
@@ -203,6 +208,12 @@ impl TinfoilRouterSession {
     #[cfg(test)]
     pub(super) fn reverify_pending(&self) -> bool {
         self.reverify_pending.load(Ordering::SeqCst)
+    }
+
+    /// Where the current router's trust came from, or `None` when the router
+    /// is not verified.
+    pub fn verified_router_source(&self) -> Option<super::verifier_port::PinSource> {
+        self.state.load().as_ref().as_ref().map(|s| s.router.source)
     }
 
     /// Number of upstream 401/402/403 responses seen (key or billing problems).
@@ -310,7 +321,19 @@ impl TinfoilRouterSession {
     /// each attesting its own key, so requests go to the attested domain.
     async fn do_verify(&self) -> Result<(), TinfoilVerifyError> {
         let bundle: AtcBundle = Self::fetch_json(&self.atc_client, &self.atc_url).await?;
-        let router = self.verifier.verify_router(&bundle)?;
+        // Sigstore and the AMD chain are CPU-bound; keep them off the async
+        // worker. A JoinError means the verifier panicked or was cancelled.
+        // It is reported as a malformed-evidence stage (not a fetch failure),
+        // and the session fails closed like any other verification error.
+        let verifier = Arc::clone(&self.verifier);
+        let router = tokio::task::spawn_blocking({
+            let bundle = bundle.clone();
+            move || verifier.verify_router(&bundle)
+        })
+        .await
+        .map_err(|_| TinfoilVerifyError::Malformed {
+            stage: "verify_join",
+        })??;
         validate_router_domain(&bundle.domain)?;
         let fp = hex::encode(router.spki_sha256);
 
@@ -344,6 +367,7 @@ impl TinfoilRouterSession {
         };
         tracing::info!(
             router_tag = %router.tag,
+            router_pin_source = router.source.as_str(),
             router_measurement = %router.measurement_hex,
             pinned_models = models.values().filter(|m| m.is_ok()).count(),
             published_models = models.len(),
@@ -478,7 +502,21 @@ impl TinfoilRouterSession {
                 };
                 let Some(session) = weak.upgrade() else { break };
                 match which {
-                    Which::Proxy => session.reread_proxy().await,
+                    Which::Proxy => {
+                        // A trust-setting change re-verifies the router now
+                        // (which also re-reads the proxy document), so a
+                        // switched-off path closes within one tick.
+                        let generation = session.verifier.trust_generation();
+                        if session
+                            .seen_trust_generation
+                            .swap(generation, Ordering::SeqCst)
+                            != generation
+                        {
+                            let _ = session.verify_now().await;
+                        } else {
+                            session.reread_proxy().await;
+                        }
+                    }
                     Which::Router => {
                         let _ = session.verify_now().await;
                     }

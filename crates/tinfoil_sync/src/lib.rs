@@ -5,7 +5,7 @@
 //! router's ATC attestation bundle and `/.well-known/tinfoil-proxy`. The router
 //! is observed with the same SEV-SNP checks the serving verifier uses. Each
 //! release is then checked against its Sigstore attestation
-//! ([`sigstore_verify`]). The classifier ([`classify`]) adds a row to the
+//! ([`tinfoil_provenance`]). The classifier ([`classify`]) adds a row to the
 //! compiled pins file (`services::attestation::tinfoil_pins`) only if the row
 //! was seen live and equals the measurement in the Sigstore predicate. Rows are
 //! never removed. A person reviews and merges the resulting PR; this crate is
@@ -15,7 +15,6 @@ pub mod classify;
 pub mod cli;
 pub mod probe;
 pub mod report;
-pub mod sigstore_verify;
 
 use classify::{Earlier, Observations};
 use services::attestation::tinfoil_pins::TinfoilPins;

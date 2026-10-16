@@ -3,7 +3,7 @@
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct SigstoreResult {
+pub struct Provenance {
     pub repo: String,
     pub tag: String,
     pub predicate_type: String,
@@ -14,7 +14,7 @@ pub struct SigstoreResult {
 }
 
 #[derive(Debug, thiserror::Error)]
-pub enum SigstoreError {
+pub enum ProvenanceError {
     #[error("sigstore: {0}")]
     Invalid(String),
 }
@@ -23,8 +23,8 @@ const OIDC_ISSUER: &str = "https://token.actions.githubusercontent.com";
 const WORKFLOW: &str = ".github/workflows/tinfoil-release-publish.yml";
 const SUBJECT_NAME: &str = "tinfoil-deployment.json";
 
-fn bad(msg: impl std::fmt::Display) -> SigstoreError {
-    SigstoreError::Invalid(msg.to_string())
+fn bad(msg: impl std::fmt::Display) -> ProvenanceError {
+    ProvenanceError::Invalid(msg.to_string())
 }
 
 /// Verify a Sigstore bundle for a release of `repo` (`owner/name`): Fulcio
@@ -32,10 +32,10 @@ fn bad(msg: impl std::fmt::Display) -> SigstoreError {
 /// against the embedded public-good trusted root. The signer must be GitHub
 /// Actions running `tinfoil-release-publish.yml` in `repo` at a tag. Returns
 /// the tag and the measurements of the signed in-toto predicate.
-pub fn verify_bundle(
+pub fn verify_release(
     bundle: &serde_json::Value,
     repo: &str,
-) -> Result<SigstoreResult, SigstoreError> {
+) -> Result<Provenance, ProvenanceError> {
     verify_bundle_for(bundle, repo, WORKFLOW, OIDC_ISSUER)
 }
 
@@ -44,7 +44,7 @@ fn verify_bundle_for(
     repo: &str,
     workflow: &str,
     issuer: &str,
-) -> Result<SigstoreResult, SigstoreError> {
+) -> Result<Provenance, ProvenanceError> {
     use base64::Engine;
     use sigstore_verify::trust_root::{SigstoreInstance, TrustedRoot};
     use sigstore_verify::types::{Bundle, Sha256Hash};
@@ -94,7 +94,7 @@ fn verify_bundle_for(
     let hex_field = |v: &serde_json::Value| v.as_str().map(str::to_string);
     let snp_measurement =
         hex_field(&predicate["snp_measurement"]).ok_or_else(|| bad("no snp_measurement"))?;
-    Ok(SigstoreResult {
+    Ok(Provenance {
         repo: repo.to_string(),
         tag,
         predicate_type: stmt["predicateType"]
@@ -108,7 +108,7 @@ fn verify_bundle_for(
     })
 }
 
-impl SigstoreResult {
+impl Provenance {
     /// The registers `/.well-known/tinfoil-proxy` publishes for a
     /// `snp-tdx-multiplatform` release: SNP measurement, RTMR1, RTMR2.
     pub fn registers(&self) -> Option<Vec<String>> {
@@ -125,13 +125,17 @@ mod tests {
     use super::*;
 
     fn atc() -> serde_json::Value {
-        serde_json::from_str(include_str!("../testdata/atc_attestation.out")).unwrap()
+        serde_json::from_str(include_str!(
+            "../../tinfoil_sync/testdata/atc_attestation.out"
+        ))
+        .unwrap()
     }
 
     #[test]
     fn sigstore_bundle_from_probe_verifies_and_identity_matches() {
         let b = atc();
-        let r = verify_bundle(&b["sigstoreBundle"], "tinfoilsh/confidential-model-router").unwrap();
+        let r =
+            verify_release(&b["sigstoreBundle"], "tinfoilsh/confidential-model-router").unwrap();
         assert_eq!(r.tag, "v0.0.155");
         assert_eq!(r.snp_measurement, "b3be62c7199d8e4d24f130e5651bdc8a62a2532f72c7e87c986bec54bf5f90bab703ad4dbfc5e45bfd385f8972dfc66c");
         assert_eq!(
@@ -144,7 +148,7 @@ mod tests {
     fn model_bundle_verifies_with_registers() {
         let b: serde_json::Value =
             serde_json::from_str(include_str!("../testdata/model_sigstore_bundle.json")).unwrap();
-        let r = verify_bundle(&b, "tinfoilsh/confidential-deepseek-v4-1-flash").unwrap();
+        let r = verify_release(&b, "tinfoilsh/confidential-deepseek-v4-1-flash").unwrap();
         assert_eq!(r.tag, "v0.0.3");
         assert_eq!(
             r.subject_sha256,
@@ -156,7 +160,7 @@ mod tests {
     #[test]
     fn sigstore_rejects_wrong_repo_identity() {
         let b = atc();
-        assert!(verify_bundle(&b["sigstoreBundle"], "tinfoilsh/other").is_err());
+        assert!(verify_release(&b["sigstoreBundle"], "tinfoilsh/other").is_err());
     }
 
     #[test]
@@ -181,7 +185,7 @@ mod tests {
             + marker.len();
         payload[at] = if payload[at] == b'0' { b'1' } else { b'0' };
         b["sigstoreBundle"]["dsseEnvelope"]["payload"] = e.encode(payload).into();
-        let err = verify_bundle(&b["sigstoreBundle"], "tinfoilsh/confidential-model-router")
+        let err = verify_release(&b["sigstoreBundle"], "tinfoilsh/confidential-model-router")
             .unwrap_err()
             .to_string();
         assert!(err.contains("DSSE signature"), "unexpected error: {err}");
@@ -250,7 +254,7 @@ mod tests {
         ] {
             let mut b = original.clone();
             b["sigstoreBundle"]["dsseEnvelope"]["payload"] = e.encode(stmt.to_string()).into();
-            let err = verify_bundle(&b["sigstoreBundle"], "tinfoilsh/confidential-model-router")
+            let err = verify_release(&b["sigstoreBundle"], "tinfoilsh/confidential-model-router")
                 .unwrap_err()
                 .to_string();
             assert!(err.contains(want), "want {want:?}, got {err:?}");

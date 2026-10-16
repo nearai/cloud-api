@@ -309,7 +309,10 @@ mod tests {
     fn trust_handle(router_sigstore: bool) -> Arc<ArcSwap<Versioned<TinfoilTrust>>> {
         Arc::new(ArcSwap::from_pointee(Versioned {
             version: 0,
-            value: TinfoilTrust { router_sigstore },
+            value: TinfoilTrust {
+                router_sigstore,
+                ..Default::default()
+            },
         }))
     }
     fn test_verifier() -> TinfoilPolicyVerifier {
@@ -771,6 +774,7 @@ mod tests {
             version: 3,
             value: TinfoilTrust {
                 router_sigstore: false,
+                ..Default::default()
             },
         }));
         assert_eq!(v.trust_generation(), 3);

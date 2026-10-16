@@ -243,13 +243,13 @@ async fn tinfoil_trust_round_trips_and_validates() {
     assert_eq!(response.status_code(), StatusCode::OK);
     assert_eq!(
         response.json::<Value>()["value"],
-        json!({"router_sigstore": false})
+        json!({"router_sigstore": false, "admin_model_pins": true, "model_pins": []})
     );
     let got = get_as(&server, &token, path).await;
     assert_eq!(got.status_code(), StatusCode::OK);
     assert_eq!(
         got.json::<Value>()["value"],
-        json!({"router_sigstore": false})
+        json!({"router_sigstore": false, "admin_model_pins": true, "model_pins": []})
     );
 
     let all = get_as(&server, &token, "/v1/admin/settings")
@@ -273,7 +273,7 @@ async fn tinfoil_trust_round_trips_and_validates() {
     assert_eq!(response.status_code(), StatusCode::OK);
     assert_eq!(
         response.json::<Value>()["value"],
-        json!({"router_sigstore": true})
+        json!({"router_sigstore": true, "admin_model_pins": true, "model_pins": []})
     );
 }
 

@@ -233,6 +233,50 @@ async fn attested_3p_kill_switch_round_trips_and_validates() {
     );
 }
 
+#[tokio::test]
+async fn tinfoil_trust_round_trips_and_validates() {
+    let server = setup_test_server().await;
+    let token = get_session_id();
+    let path = "/v1/admin/settings/tinfoil_trust";
+
+    let response = patch_as(&server, &token, path, json!({"router_sigstore": false})).await;
+    assert_eq!(response.status_code(), StatusCode::OK);
+    assert_eq!(
+        response.json::<Value>()["value"],
+        json!({"router_sigstore": false})
+    );
+    let got = get_as(&server, &token, path).await;
+    assert_eq!(got.status_code(), StatusCode::OK);
+    assert_eq!(
+        got.json::<Value>()["value"],
+        json!({"router_sigstore": false})
+    );
+
+    let all = get_as(&server, &token, "/v1/admin/settings")
+        .await
+        .json::<Value>();
+    let keys: Vec<&str> = all["settings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|s| s["key"].as_str().unwrap())
+        .collect();
+    assert_eq!(keys, ["placement", "attested_3p", "tinfoil_trust"]);
+
+    for body in [json!({"future": 1}), json!({"router_sigstore": "no"})] {
+        let response = patch_as(&server, &token, path, body.clone()).await;
+        assert_eq!(response.status_code(), StatusCode::BAD_REQUEST, "{body}");
+    }
+
+    // Null restores the default (on).
+    let response = patch_as(&server, &token, path, json!({"router_sigstore": null})).await;
+    assert_eq!(response.status_code(), StatusCode::OK);
+    assert_eq!(
+        response.json::<Value>()["value"],
+        json!({"router_sigstore": true})
+    );
+}
+
 /// With NEAR failing and Chutes as its fallback, switching the `chutes` source
 /// off stops traffic to it: the fallback is never invoked.
 #[tokio::test]

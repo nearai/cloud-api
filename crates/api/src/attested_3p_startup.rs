@@ -582,4 +582,66 @@ mod tests {
             PinSource::SigstoreAtc
         );
     }
+
+    /// Drives `register_tinfoil_with` against a settings store and returns the
+    /// verifier it built (the session constructor refuses, so nothing is
+    /// registered and nothing touches the network or the database).
+    async fn verifier_from_register(repo: FakeRepo) -> Arc<TinfoilPolicyVerifier> {
+        let pool = Arc::new(InferenceProviderPool::new(
+            None,
+            ExternalProvidersConfig::default(),
+        ));
+        let trust = crate::new_tinfoil_trust_handle();
+        let _settings = crate::build_admin_settings(Arc::new(repo), &pool, trust.clone()).await;
+        let cfg = ExternalProvidersConfig {
+            tinfoil_api_key: Some("k".to_string()),
+            tinfoil_models: parse_attested_3p_models("TINFOIL_MODELS", "m-tf=glm-5-3@1048576"),
+            timeout_seconds: 5,
+            ..Default::default()
+        };
+        let models_repo =
+            database::repositories::ModelRepository::new(database::pool::DbPool::uninitialized());
+        let captured = std::sync::Mutex::new(None);
+        register_tinfoil_with(
+            &pool,
+            &models_repo,
+            &cfg,
+            Ok(TinfoilPins::default()),
+            trust,
+            |_, verifier| {
+                *captured.lock().unwrap() = Some(verifier);
+                Err("no session in unit tests".to_string())
+            },
+            Arc::new(services::metrics::MockMetricsService),
+        )
+        .await;
+        let verifier = captured.lock().unwrap().take();
+        verifier.expect("build_session was called")
+    }
+
+    #[tokio::test]
+    async fn register_tinfoil_with_uses_preloaded_trust_handle() {
+        let off = FakeRepo {
+            rows: vec![stored(
+                "tinfoil_trust",
+                serde_json::json!({"router_sigstore": false}),
+            )],
+            fail: false,
+        };
+        let verifier = verifier_from_register(off).await;
+        assert_eq!(
+            verifier.verify_router(&router_bundle()).unwrap_err(),
+            TinfoilVerifyError::UnknownRouterMeasurement
+        );
+
+        let unseeded = FakeRepo {
+            rows: vec![],
+            fail: false,
+        };
+        let verifier = verifier_from_register(unseeded).await;
+        assert_eq!(
+            verifier.verify_router(&router_bundle()).unwrap().source,
+            PinSource::SigstoreAtc
+        );
+    }
 }

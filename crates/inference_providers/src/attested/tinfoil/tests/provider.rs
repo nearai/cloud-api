@@ -507,5 +507,14 @@ async fn trust_version_change_triggers_router_reverify() {
         session.last_verify_error(),
         Some(TinfoilVerifyError::UnknownRouterMeasurement)
     );
+
+    // The switch is turned back on: the next generation change re-admits the
+    // router without a restart.
+    let calls = verifier.router_calls.load(Ordering::SeqCst);
+    verifier.reject_router.store(false, Ordering::SeqCst);
+    verifier.generation.store(2, Ordering::SeqCst);
+    tokio::time::advance(super::super::PROXY_REREAD).await;
+    paused_wait(|| verifier.router_calls.load(Ordering::SeqCst) > calls).await;
+    paused_wait(|| session.verified_router_source().is_some()).await;
     refresh.abort();
 }

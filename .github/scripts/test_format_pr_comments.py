@@ -11,6 +11,7 @@ import json
 from format_pr_comments import (
     get_author,
     truncate_diff_hunk,
+    truncate_output,
     format_pr_comments
 )
 
@@ -66,6 +67,40 @@ class TestTruncateDiffHunk(unittest.TestCase):
         diff = "a" * 1000
         result = truncate_diff_hunk(diff, max_length=500)
         self.assertIn("(truncated)", result)
+
+
+class TestTruncateOutput(unittest.TestCase):
+    """Test the overall context size cap."""
+
+    def test_short_output_unchanged(self):
+        self.assertEqual(truncate_output("a\nb", max_bytes=100), "a\nb")
+
+    def test_long_output_cut_at_line_boundary(self):
+        text = "\n".join(f"line {i}" for i in range(100))
+        kept = truncate_output(text, max_bytes=50).split("\n\n*Note")[0]
+        self.assertLessEqual(len(kept.encode("utf-8")), 50)
+        self.assertTrue(kept.endswith(("line 5", "line 6")))
+        self.assertIn("truncated", truncate_output(text, max_bytes=50))
+
+    def test_cap_counts_bytes_not_characters(self):
+        """Multibyte text must stay under the byte budget, the unit of the env limit."""
+        text = "\n".join("漢字" * 10 for _ in range(100))  # 3 bytes per character
+        kept = truncate_output(text, max_bytes=300).split("\n\n*Note")[0]
+        self.assertLessEqual(len(kept.encode("utf-8")), 300)
+        self.assertTrue(kept)
+
+
+class TestPaginationNote(unittest.TestCase):
+    """The thread pagination note is emitted once, not per thread section."""
+
+    def test_note_appears_once(self):
+        data = {'data': {'repository': {'pullRequest': {
+            'comments': {'nodes': [], 'totalCount': 0},
+            'reviews': {'nodes': []},
+            'reviewThreads': {'nodes': [], 'totalCount': 150},
+        }}}}
+        result = format_pr_comments(json.dumps(data))
+        self.assertEqual(result.count("review threads. Showing first 100"), 1)
 
 
 class TestFormatPRComments(unittest.TestCase):
@@ -199,6 +234,11 @@ class TestFormatPRComments(unittest.TestCase):
         }
         result = format_pr_comments(json.dumps(data))
         self.assertIn("Resolved Code Review Discussions", result)
+        # Resolved threads are lowest priority, so they come after general comments.
+        self.assertLess(result.index("General PR Comments"),
+                        result.index("## Resolved Code Review Discussions"))
+        self.assertLess(result.index("## Unresolved Code Review Discussions"),
+                        result.index("General PR Comments"))
         self.assertIn("src/lib.rs:L10", result)
         self.assertIn("RESOLVED", result)
 

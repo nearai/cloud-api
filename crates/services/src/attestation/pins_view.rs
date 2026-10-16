@@ -38,6 +38,9 @@ pub fn render_pins_view(sources: &[Arc<dyn ProviderPinsSource>]) -> serde_json::
 #[derive(Default)]
 pub struct PinsViewMemo {
     slot: Mutex<Option<(Vec<u64>, Arc<serde_json::Value>)>>,
+    /// Held while a body is built, so concurrent misses build once: later
+    /// callers wait, then find the body already memoized.
+    build_gate: Mutex<()>,
 }
 
 impl PinsViewMemo {
@@ -60,13 +63,19 @@ impl PinsViewMemo {
         }
     }
 
-    /// The memoized body for `versions`, or `build` it (outside the lock) and
-    /// memoize it.
+    /// The memoized body for `versions`, or `build` it and memoize it. Single
+    /// flight: concurrent misses serialize on a gate and re-check the memo,
+    /// so a burst after startup or a version change builds once. The build
+    /// runs outside the memo lock, so hits are never blocked by it.
     pub fn get_or_build(
         &self,
         versions: Vec<u64>,
         build: impl FnOnce() -> serde_json::Value,
     ) -> Arc<serde_json::Value> {
+        if let Some(hit) = self.get(&versions) {
+            return hit;
+        }
+        let _gate = self.build_gate.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(hit) = self.get(&versions) {
             return hit;
         }
@@ -133,6 +142,28 @@ mod tests {
         assert_eq!(a.builds.load(Ordering::SeqCst), 2, "whole body rebuilds");
         assert_eq!(b.builds.load(Ordering::SeqCst), 2);
         assert_eq!(third["b"]["v"], 1);
+    }
+
+    #[test]
+    fn concurrent_misses_build_once() {
+        let source = CountingSource::new("a");
+        let sources: Vec<Arc<dyn ProviderPinsSource>> = vec![source.clone()];
+        let memo = Arc::new(PinsViewMemo::default());
+        let handles: Vec<_> = (0..8)
+            .map(|_| {
+                let (memo, sources) = (memo.clone(), sources.clone());
+                std::thread::spawn(move || {
+                    memo.get_or_build(source_versions(&sources), || {
+                        std::thread::sleep(std::time::Duration::from_millis(50));
+                        render_pins_view(&sources)
+                    })
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().unwrap();
+        }
+        assert_eq!(source.builds.load(Ordering::SeqCst), 1);
     }
 
     #[test]

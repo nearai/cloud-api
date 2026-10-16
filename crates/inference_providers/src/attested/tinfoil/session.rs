@@ -296,27 +296,49 @@ impl TinfoilRouterSession {
         serde_json::from_slice(&bytes).map_err(|_| TinfoilVerifyError::Fetch)
     }
 
-    fn check_models(
+    /// `check_model` per published slug. A check may verify admin-pin Sigstore
+    /// bundles (CPU-bound, up to 32 on the first call after a trust change),
+    /// so the checks run off the async worker like `verify_router`. A
+    /// JoinError (the verifier panicked or was cancelled) closes every slug.
+    async fn check_models(
         &self,
         doc: &ProxyDoc,
     ) -> BTreeMap<String, Result<PinnedModel, TinfoilVerifyError>> {
-        doc.models
-            .iter()
-            .map(|(slug, entry)| {
-                let res = self.verifier.check_model(slug, entry);
-                if self.served_slugs.as_ref().is_none_or(|s| s.contains(slug)) {
-                    let key = format!("{slug}@{}", entry.tag);
-                    match &res {
-                        Ok(_) => self.trust_timer.admitted("model", &key),
-                        Err(TinfoilVerifyError::UnknownModelMeasurement) => {
-                            self.trust_timer.rejected("model", &key)
-                        }
-                        Err(_) => {}
+        let entries = doc.models.clone();
+        let verifier = Arc::clone(&self.verifier);
+        let checked = tokio::task::spawn_blocking(move || {
+            entries
+                .iter()
+                .map(|(slug, entry)| (slug.clone(), verifier.check_model(slug, entry)))
+                .collect::<BTreeMap<_, _>>()
+        })
+        .await;
+        let checked = checked.unwrap_or_else(|_| {
+            doc.models
+                .keys()
+                .map(|slug| {
+                    (
+                        slug.clone(),
+                        Err(TinfoilVerifyError::Malformed {
+                            stage: "check_models_join",
+                        }),
+                    )
+                })
+                .collect()
+        });
+        for (slug, entry) in &doc.models {
+            if self.served_slugs.as_ref().is_none_or(|s| s.contains(slug)) {
+                let key = format!("{slug}@{}", entry.tag);
+                match checked.get(slug) {
+                    Some(Ok(_)) => self.trust_timer.admitted("model", &key),
+                    Some(Err(TinfoilVerifyError::UnknownModelMeasurement)) => {
+                        self.trust_timer.rejected("model", &key)
                     }
+                    _ => {}
                 }
-                (slug.clone(), res)
-            })
-            .collect()
+            }
+        }
+        checked
     }
 
     /// ATC -> `verify_router` -> pin SPKI -> proxy document (over the pinned
@@ -391,7 +413,7 @@ impl TinfoilRouterSession {
             &format!("{}{PROXY_PATH}", transport.base),
         )
         .await?;
-        let models = self.check_models(&doc);
+        let models = self.check_models(&doc).await;
         // Published windows are best effort and never fail the verify. A failed
         // fetch keeps the last known windows so an oversized declared context
         // cannot start passing just because `/v1/models` is briefly down; only a
@@ -448,7 +470,7 @@ impl TinfoilRouterSession {
         .await;
         match doc {
             Ok(doc) => {
-                let models = self.check_models(&doc);
+                let models = self.check_models(&doc).await;
                 for (slug, m) in &models {
                     let was_ok = cur.models.get(slug).is_some_and(|p| p.is_ok());
                     if let (true, Err(e)) = (was_ok, m) {

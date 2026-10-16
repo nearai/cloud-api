@@ -68,6 +68,9 @@ pub async fn run_sync(
     .map_err(|e| bad(format!("parse {}: {e}", args.pins.display())))?;
     std::fs::create_dir_all(&args.out_dir)
         .map_err(|e| bad(format!("create {}: {e}", args.out_dir.display())))?;
+    // Written before probing, so the always-run artifact upload finds the file
+    // even when the probe fails before producing any output.
+    write(&args.out_dir.join(ADMIN_PINS_FILE), &admin_pins_json(&[]))?;
     let earlier = args
         .evidence_dir
         .as_deref()
@@ -85,7 +88,13 @@ pub async fn run_sync(
     notes.extend(rejections(&out.observations, &out.sigstore));
     let (verified, _) =
         crate::classify::classify(&TinfoilPins::default(), &out.observations, &out.sigstore);
-    let admin_rows = admin_pin_rows(&base, &out.observations, &out.sigstore, &out.model_bundles);
+    let (admin_rows, left_out) =
+        admin_pin_rows(&base, &out.observations, &out.sigstore, &out.model_bundles);
+    notes.extend(left_out.into_iter().map(|c| {
+        format!(
+            "admin pin candidate left out of {ADMIN_PINS_FILE} (more than one PATCH accepts): {c}"
+        )
+    }));
     let date = chrono::Utc::now().format("%Y-%m-%d").to_string();
     // Leave the file untouched when nothing was added, so an unchanged run
     // produces no diff (and so no PR).

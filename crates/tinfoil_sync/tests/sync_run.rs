@@ -251,3 +251,25 @@ async fn admin_pins_artifact_empty_on_unchanged_and_failing_runs() {
     assert_eq!(read_admin_pins(&dir), serde_json::json!({"model_pins": []}));
     std::fs::remove_dir_all(&dir).unwrap();
 }
+
+#[tokio::test]
+async fn admin_pins_artifact_is_written_even_when_the_probe_fails_fatally() {
+    let (_s, mut cfg) = server().await;
+    // The ATC fetch itself fails, so the probe errors before producing output.
+    cfg.atc_url = format!("{}/missing-atc", cfg.atc_url.trim_end_matches("/atc"));
+    let dir = std::env::temp_dir().join(format!("tinfoil-sync-fatal-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let pins_path = dir.join("pins.json");
+    std::fs::write(&pins_path, TinfoilPins::default().to_canonical_json()).unwrap();
+    let args = Args {
+        pins: pins_path,
+        out_dir: dir.join("out"),
+        evidence_dir: None,
+    };
+    run_sync(&args, &reqwest::Client::new(), &cfg)
+        .await
+        .unwrap_err();
+    assert_eq!(read_admin_pins(&dir), serde_json::json!({"model_pins": []}));
+    std::fs::remove_dir_all(&dir).unwrap();
+}

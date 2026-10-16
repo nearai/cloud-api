@@ -955,11 +955,7 @@ fn new_tinfoil_trust_handle() -> services::attestation::tinfoil_trust::TinfoilTr
     Arc::new(arc_swap::ArcSwap::from_pointee(
         services::admin_settings::Versioned {
             version: 0,
-            value: services::attestation::tinfoil_trust::TinfoilTrust {
-                router_sigstore: false,
-                admin_model_pins: false,
-                model_pins: Vec::new(),
-            },
+            value: services::attestation::tinfoil_trust::TinfoilTrust::fail_closed_initial(),
         },
     ))
 }

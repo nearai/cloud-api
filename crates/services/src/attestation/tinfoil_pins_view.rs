@@ -155,8 +155,15 @@ impl ProviderPinsSource for TinfoilPinsSource {
             tracing::error!("tinfoil compiled pins unavailable for the public pins view");
             return serde_json::json!({"error": "compiled pins unavailable"});
         };
-        // Read after `version()`, so the view is never older than its version.
-        let trust = self.settings.current::<TinfoilTrustKey>();
+        // Version 0 means no stored value has loaded yet: the serving
+        // verifier is on its fail-closed initial trust, so report that rather
+        // than the registry's defaults. Read after `version()`, so the view is
+        // never older than its version.
+        let trust = if self.version() == 0 {
+            TinfoilTrust::fail_closed_initial()
+        } else {
+            self.settings.current::<TinfoilTrustKey>()
+        };
         serde_json::to_value(tinfoil_pins_view(pins, &trust)).unwrap_or_default()
     }
 }
@@ -252,5 +259,53 @@ mod tests {
         let p = &v.runtime.model_pins[0];
         assert!(!p.verified);
         assert!(p.rekor_log_index.is_none() && p.snp_measurement.is_none());
+    }
+
+    #[tokio::test]
+    async fn runtime_switches_are_fail_closed_until_the_first_load() {
+        use crate::admin_settings::{AdminSettingsRepository, StoredSetting};
+        use arc_swap::ArcSwap;
+
+        struct EmptyRepo;
+        #[async_trait::async_trait]
+        impl AdminSettingsRepository for EmptyRepo {
+            async fn get_all(&self) -> anyhow::Result<Vec<StoredSetting>> {
+                Ok(Vec::new())
+            }
+            async fn get(&self, _key: &str) -> anyhow::Result<Option<StoredSetting>> {
+                Ok(None)
+            }
+            async fn upsert(
+                &self,
+                _key: &str,
+                _value: serde_json::Value,
+                _by_user: uuid::Uuid,
+            ) -> anyhow::Result<StoredSetting> {
+                Err(anyhow::anyhow!("read-only"))
+            }
+        }
+
+        let handle = Arc::new(ArcSwap::from_pointee(crate::admin_settings::Versioned {
+            version: 0,
+            value: TinfoilTrust::fail_closed_initial(),
+        }));
+        let settings = Arc::new(
+            AdminSettingsService::builder(Arc::new(EmptyRepo))
+                .register::<TinfoilTrustKey>(handle)
+                .build(),
+        );
+        let source = TinfoilPinsSource::new(settings.clone());
+        // Before any load the serving verifier has both paths off, and so
+        // must the public view.
+        assert_eq!(source.version(), 0);
+        let before = source.public_view();
+        assert_eq!(before["runtime"]["router_sigstore"], false);
+        assert_eq!(before["runtime"]["admin_model_pins"], false);
+        // After the first load the defaults (both on) are live.
+        assert!(settings.reload().await);
+        assert_eq!(source.version(), 1);
+        let after = source.public_view();
+        assert_eq!(after["runtime"]["router_sigstore"], true);
+        assert_eq!(after["runtime"]["admin_model_pins"], true);
     }
 }

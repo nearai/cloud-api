@@ -52,10 +52,25 @@ impl Default for TinfoilTrust {
     }
 }
 
+impl TinfoilTrust {
+    /// The value served before any stored row has loaded (settings version
+    /// 0): both trust paths off, so they fail closed until the first load.
+    pub fn fail_closed_initial() -> Self {
+        Self {
+            router_sigstore: false,
+            admin_model_pins: false,
+            model_pins: Vec::new(),
+        }
+    }
+}
+
 /// The shared handle the Tinfoil attestation path reads the trust switches through.
 pub type TinfoilTrustHandle = Arc<ArcSwap<Versioned<TinfoilTrust>>>;
 
 pub struct TinfoilTrustKey;
+
+/// Largest stored `tinfoil_trust` value, in bytes.
+pub const TRUST_MAX_BYTES: usize = 1 << 20;
 
 /// The one admission check of an admin pin, shared by PATCH, the verifier of
 /// record and the public view: `repo` is a tinfoilsh repository, the bundle
@@ -108,7 +123,7 @@ fn lenient_pin(raw: &Value) -> Option<AdminModelPin> {
 impl SettingKey for TinfoilTrustKey {
     const NAME: &'static str = "tinfoil_trust";
     const FIELDS: &'static [&'static str] = &["router_sigstore", "admin_model_pins", "model_pins"];
-    const MAX_BYTES: usize = 1 << 20;
+    const MAX_BYTES: usize = TRUST_MAX_BYTES;
     type Value = TinfoilTrust;
     type Published = Versioned<TinfoilTrust>;
 
@@ -526,6 +541,43 @@ mod tests {
         let rows = repo.rows.lock().unwrap();
         assert_eq!(rows[0].value["model_pins"], json!([stale]));
         assert_eq!(rows[0].value["admin_model_pins"], json!(false));
+    }
+
+    #[tokio::test]
+    async fn kill_switch_patch_succeeds_with_structurally_malformed_stored_pin() {
+        let good = pin_json(&recorded_model_pin("good"));
+        let malformed = json!({"slug": "x", "future_shape": [1, 2]});
+        let stored = json!({"model_pins": [good.clone(), malformed.clone()], "future": 1});
+        let (svc, repo, _) = service_with(Some(stored));
+        let v = svc
+            .update(
+                "tinfoil_trust",
+                json!({"admin_model_pins": false}),
+                Uuid::new_v4(),
+            )
+            .await
+            .unwrap();
+        // Served as the lenient read: the malformed pin is dropped.
+        assert_eq!(v.value["admin_model_pins"], json!(false));
+        assert_eq!(v.value["model_pins"].as_array().unwrap().len(), 1);
+        // Stored untouched apart from the patched field.
+        {
+            let rows = repo.rows.lock().unwrap();
+            assert_eq!(rows[0].value["model_pins"], json!([good, malformed]));
+            assert_eq!(rows[0].value["admin_model_pins"], json!(false));
+        }
+        // A patch that sets model_pins is still held to the strict shape.
+        let r = svc
+            .update(
+                "tinfoil_trust",
+                json!({"model_pins": [{"slug": "x"}]}),
+                Uuid::new_v4(),
+            )
+            .await;
+        assert!(matches!(
+            r,
+            Err(crate::admin_settings::AdminSettingsError::Invalid(_))
+        ));
     }
 
     #[tokio::test]

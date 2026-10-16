@@ -273,7 +273,7 @@ async fn tinfoil_trust_round_trips_and_validates() {
     assert_eq!(got.status_code(), StatusCode::OK);
     assert_eq!(
         got.json::<Value>()["value"],
-        json!({"router_sigstore": false})
+        json!({"router_sigstore": false, "admin_model_pins": true, "model_pins": []})
     );
 
     // Null restores the default (on).

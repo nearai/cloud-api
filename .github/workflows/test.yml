@@ -112,6 +112,9 @@ jobs:
     - name: Run cargo clippy
       run: cargo clippy --all-targets --all-features -- -D warnings
 
+    - name: Dependency guards
+      run: bash scripts/check_dep_guards.sh
+
   # Unit tests (library + binary tests) run without PostgreSQL: the in-crate
   # #[test] functions use mocks and do not establish real DB connections.
   unit-test:

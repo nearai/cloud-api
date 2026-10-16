@@ -466,3 +466,46 @@ async fn spawn_refresh_rereads_proxy_then_reverifies_and_stops_when_dropped() {
     paused_wait(|| refresh.is_finished()).await;
     assert!(refresh.await.is_ok(), "refresh task exits cleanly");
 }
+
+#[tokio::test]
+async fn trust_version_change_triggers_router_reverify() {
+    use std::time::Duration;
+    let Env {
+        session,
+        verifier,
+        server,
+        provider: _provider,
+        pki: _pki,
+    } = env().await;
+    session.verify_now().await.unwrap();
+    assert_eq!(
+        session.verified_router_source(),
+        Some(PinSource::Compiled),
+        "a verified router exposes its trust source"
+    );
+    tokio::time::pause();
+    let proxy_path = "/.well-known/tinfoil-proxy";
+    let refresh = session.spawn_refresh_task().unwrap();
+    for _ in 0..10 {
+        tokio::task::yield_now().await;
+    }
+
+    // Unchanged generation: the tick only re-reads the model document.
+    let proxy0 = server.hits(proxy_path);
+    tokio::time::advance(super::super::PROXY_REREAD + Duration::from_secs(1)).await;
+    paused_wait(|| server.hits(proxy_path) > proxy0).await;
+    assert_eq!(verifier.router_calls.load(Ordering::SeqCst), 1);
+
+    // The trust setting changed (R11): the next 60 s tick re-verifies the
+    // router, and a router that is no longer admitted closes the session.
+    verifier.generation.store(1, Ordering::SeqCst);
+    verifier.reject_router.store(true, Ordering::SeqCst);
+    tokio::time::advance(super::super::PROXY_REREAD).await;
+    paused_wait(|| verifier.router_calls.load(Ordering::SeqCst) >= 2).await;
+    paused_wait(|| session.verified_router_source().is_none()).await;
+    assert_eq!(
+        session.last_verify_error(),
+        Some(TinfoilVerifyError::UnknownRouterMeasurement)
+    );
+    refresh.abort();
+}

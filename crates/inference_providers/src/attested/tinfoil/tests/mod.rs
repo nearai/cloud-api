@@ -280,6 +280,10 @@ struct StubVerifier {
     spki: Mutex<[u8; 32]>,
     router_calls: AtomicUsize,
     deny_models: Mutex<Vec<String>>,
+    /// Reported through `pins_generation`.
+    generation: std::sync::atomic::AtomicU64,
+    /// When set, `verify_router` rejects the router (a trust switch turned off).
+    reject_router: std::sync::atomic::AtomicBool,
 }
 
 impl StubVerifier {
@@ -290,17 +294,27 @@ impl StubVerifier {
             spki: Mutex::new(a),
             router_calls: AtomicUsize::new(0),
             deny_models: Mutex::new(vec![]),
+            generation: std::sync::atomic::AtomicU64::new(0),
+            reject_router: std::sync::atomic::AtomicBool::new(false),
         })
     }
 }
 
 impl TinfoilVerifier for StubVerifier {
+    fn pins_generation(&self) -> u64 {
+        self.generation.load(Ordering::SeqCst)
+    }
     fn verify_router(&self, _b: &AtcBundle) -> Result<VerifiedRouter, TinfoilVerifyError> {
         self.router_calls.fetch_add(1, Ordering::SeqCst);
+        if self.reject_router.load(Ordering::SeqCst) {
+            return Err(TinfoilVerifyError::UnknownRouterMeasurement);
+        }
         Ok(VerifiedRouter {
             spki_sha256: *self.spki.lock().unwrap(),
             measurement_hex: "ab".repeat(48),
             tag: "tinfoilsh/confidential-model-router@v0.0.155".into(),
+            source: PinSource::Compiled,
+            rekor_log_index: None,
             tcb: RouterTcb {
                 bootloader: 10,
                 tee: 0,

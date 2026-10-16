@@ -517,6 +517,7 @@ name = "api"
 version = "0.0.0"
 dependencies = [
  "anyhow",
+ "arc-swap",
  "async-trait",
  "aws-config",
  "aws-sdk-s3",
@@ -6818,6 +6819,7 @@ dependencies = [
  "sha2 0.11.0",
  "sha3 0.12.0",
  "thiserror 2.0.18",
+ "tinfoil_provenance",
  "tokio",
  "tokio-rustls",
  "tokio-stream",

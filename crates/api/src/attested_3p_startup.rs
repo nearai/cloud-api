@@ -110,10 +110,15 @@ pub(crate) async fn register_attested_3p(
     pool: &Arc<InferenceProviderPool>,
     models_repo: &ModelRepository,
     cfg: &ExternalProvidersConfig,
+    tinfoil_trust: Arc<
+        arc_swap::ArcSwap<
+            services::admin_settings::Versioned<services::attestation::tinfoil_trust::TinfoilTrust>,
+        >,
+    >,
     metrics: Arc<dyn MetricsServiceTrait>,
 ) {
     let chutes_registered = register_chutes(pool, models_repo, cfg).await;
-    register_tinfoil(pool, models_repo, cfg, metrics).await;
+    register_tinfoil(pool, models_repo, cfg, tinfoil_trust, metrics).await;
     tracing::debug!(chutes_registered, "Attested 3P registration finished");
 }
 

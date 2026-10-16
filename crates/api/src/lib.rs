@@ -907,6 +907,12 @@ pub async fn init_inference_providers(
         &pool,
         &models_repo,
         &config.external_providers,
+        Arc::new(arc_swap::ArcSwap::from_pointee(
+            services::admin_settings::Versioned {
+                version: 0,
+                value: Default::default(),
+            },
+        )),
         metrics_service,
     )
     .await;

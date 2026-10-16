@@ -132,9 +132,10 @@ impl SettingKey for TinfoilTrustKey {
     }
 
     /// Strict (PATCH): shape only. Unknown fields and wrong types are errors,
-    /// at most 32 pins, no duplicates, tinfoilsh repos. The Sigstore bundles
-    /// are verified by [`Self::validate_patch`], and only when the PATCH sets
-    /// `model_pins`, so an unrelated PATCH never re-verifies stored pins.
+    /// and at most 32 pins. The per-pin checks (no duplicates, tinfoilsh
+    /// repos, the Sigstore bundle) are in [`Self::validate_patch`] and run
+    /// only when the PATCH sets `model_pins`, so an unrelated PATCH (such as
+    /// a kill switch) is never rejected for a pin already stored.
     /// Lenient (stored row): structural only, no crypto. Unknown fields
     /// (from a newer binary) are ignored. An absent switch uses its default;
     /// a wrong-typed switch fails closed (false), since both are kill
@@ -147,20 +148,6 @@ impl SettingKey for TinfoilTrustKey {
                 serde_json::from_value(value.clone()).map_err(|e| e.to_string())?;
             if trust.model_pins.len() > MAX_MODEL_PINS {
                 return Err(format!("model_pins accepts at most {MAX_MODEL_PINS} pins"));
-            }
-            for (i, pin) in trust.model_pins.iter().enumerate() {
-                if trust.model_pins[..i]
-                    .iter()
-                    .any(|p| p.slug == pin.slug && p.repo == pin.repo && p.tag == pin.tag)
-                {
-                    return Err(format!("model pin {}: duplicate pin", pin.slug));
-                }
-                if !pin.repo.starts_with(MODEL_REPO_PREFIX) {
-                    return Err(format!(
-                        "model pin {}: repo must be a tinfoilsh repository",
-                        pin.slug
-                    ));
-                }
             }
             return Ok(trust);
         }
@@ -231,9 +218,24 @@ impl SettingKey for TinfoilTrustKey {
     /// the merged list is verified; a patch without it verifies nothing.
     fn validate_patch(patch: &Value, merged: &TinfoilTrust) -> Result<(), String> {
         if patch.get("model_pins").is_some_and(Value::is_array) {
-            merged
-                .model_pins
-                .iter()
+            let pins = &merged.model_pins;
+            for (i, pin) in pins.iter().enumerate() {
+                if pins[..i]
+                    .iter()
+                    .any(|p| p.slug == pin.slug && p.repo == pin.repo && p.tag == pin.tag)
+                {
+                    return Err(format!("model pin {}: duplicate pin", pin.slug));
+                }
+                // Also checked inside `verify_admin_pin_bundle`; checked first
+                // here so a wrong repo is reported without a Sigstore run.
+                if !pin.repo.starts_with(MODEL_REPO_PREFIX) {
+                    return Err(format!(
+                        "model pin {}: repo must be a tinfoilsh repository",
+                        pin.slug
+                    ));
+                }
+            }
+            pins.iter()
                 .try_for_each(|pin| verify_admin_pin_bundle(pin).map(|_| ()))?;
         }
         Ok(())
@@ -541,6 +543,31 @@ mod tests {
         let rows = repo.rows.lock().unwrap();
         assert_eq!(rows[0].value["model_pins"], json!([stale]));
         assert_eq!(rows[0].value["admin_model_pins"], json!(false));
+    }
+
+    #[tokio::test]
+    async fn kill_switch_patch_succeeds_with_duplicate_or_foreign_stored_pins() {
+        let good = pin_json(&recorded_model_pin("good"));
+        let mut foreign = good.clone();
+        foreign["slug"] = json!("foreign");
+        foreign["repo"] = json!("someone-else/model");
+        let stored = json!({"model_pins": [good.clone(), good.clone(), foreign.clone()]});
+        let (svc, repo, _) = service_with(Some(stored));
+        for patch in [
+            json!({"admin_model_pins": false}),
+            json!({"router_sigstore": false}),
+        ] {
+            svc.update("tinfoil_trust", patch, Uuid::new_v4())
+                .await
+                .unwrap();
+        }
+        let rows = repo.rows.lock().unwrap();
+        assert_eq!(
+            rows[0].value["model_pins"],
+            json!([good.clone(), good, foreign])
+        );
+        assert_eq!(rows[0].value["admin_model_pins"], json!(false));
+        assert_eq!(rows[0].value["router_sigstore"], json!(false));
     }
 
     #[tokio::test]

@@ -150,6 +150,17 @@ impl SettingKey for TinfoilTrustKey {
             return Ok(trust);
         }
         let mut trust = TinfoilTrust::default();
+        if !value.is_object() {
+            // A stored row that is not an object is corrupt: fail closed on
+            // both kill switches rather than falling back to their defaults.
+            tracing::warn!(
+                setting = Self::NAME,
+                "Stored admin setting is not an object; failing closed"
+            );
+            trust.router_sigstore = false;
+            trust.admin_model_pins = false;
+            return Ok(trust);
+        }
         for (field, slot) in [
             ("router_sigstore", &mut trust.router_sigstore),
             ("admin_model_pins", &mut trust.admin_model_pins),
@@ -242,6 +253,16 @@ pub(crate) fn recorded_model_pin(slug: &str) -> AdminModelPin {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn non_object_stored_row_fails_closed() {
+        for v in [json!([]), json!("x"), json!(1), json!(null)] {
+            let t = TinfoilTrustKey::parse(&v, false).unwrap();
+            assert!(!t.router_sigstore, "{v}");
+            assert!(!t.admin_model_pins, "{v}");
+            assert!(t.model_pins.is_empty());
+        }
+    }
     use super::*;
     use crate::admin_settings::{AdminSettingsRepository, AdminSettingsService, StoredSetting};
     use arc_swap::ArcSwap;

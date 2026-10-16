@@ -35,13 +35,13 @@ use utoipa;
 use uuid::Uuid;
 
 mod chat;
-mod chat_redact;
+mod chat_auto_redact;
 mod chat_stream;
 mod models;
 mod text;
 
 pub use chat::*;
-use chat_redact::*;
+use chat_auto_redact::*;
 use chat_stream::*;
 pub use models::*;
 pub use text::*;

@@ -33,8 +33,8 @@ pub(super) fn assert_production_logs_exclude_forbidden_expressions() {
             include_str!("../../routes/completions/chat.rs"),
         ),
         (
-            "crates/api/src/routes/completions/chat_redact.rs",
-            include_str!("../../routes/completions/chat_redact.rs"),
+            "crates/api/src/routes/completions/chat_auto_redact.rs",
+            include_str!("../../routes/completions/chat_auto_redact.rs"),
         ),
         (
             "crates/api/src/routes/completions/chat_stream.rs",
@@ -96,11 +96,15 @@ pub(super) fn assert_production_logs_exclude_forbidden_expressions() {
     // Splitting a route file must not silently drop the new files from this scan.
     let completions_dir = concat!(env!("CARGO_MANIFEST_DIR"), "/src/routes/completions");
     for entry in std::fs::read_dir(completions_dir).expect("read routes/completions") {
-        let file_name = entry
-            .expect("routes/completions entry")
-            .file_name()
-            .into_string()
-            .expect("utf-8 file name");
+        let entry = entry.expect("routes/completions entry");
+        assert!(
+            !entry
+                .file_type()
+                .expect("routes/completions entry type")
+                .is_dir(),
+            "routes/completions has a subdirectory; extend this scan to cover it"
+        );
+        let file_name = entry.file_name().into_string().expect("utf-8 file name");
         if !file_name.ends_with(".rs") {
             continue;
         }

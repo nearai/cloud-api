@@ -167,17 +167,14 @@ impl TinfoilPolicyVerifier {
         bundle: &AtcBundle,
         measurement_hex: &str,
     ) -> Result<Provenance, TinfoilVerifyError> {
-        let bundle_hash: [u8; 32] = Sha256::digest(
-            serde_json::to_vec(&bundle.sigstore_bundle)
-                .map_err(|_| TinfoilVerifyError::RouterSigstoreRejected { stage: "verify" })?,
-        )
-        .into();
-        let key = (measurement_hex.to_ascii_lowercase(), bundle_hash);
-        let mut cache = self
+        let key = sigstore_cache_key(bundle, measurement_hex)?;
+        // The lock is not held while the (slow) verification runs.
+        if let Some(hit) = self
             .sigstore_cache
             .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        if let Some(hit) = cache.get(&key) {
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&key)
+        {
             return hit.clone();
         }
         #[cfg(test)]
@@ -188,12 +185,30 @@ impl TinfoilPolicyVerifier {
                 tracing::warn!(reason = %e, "Tinfoil router Sigstore attestation rejected");
                 TinfoilVerifyError::RouterSigstoreRejected { stage: "verify" }
             });
+        let mut cache = self
+            .sigstore_cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         if cache.len() >= SIGSTORE_CACHE_MAX {
             cache.clear();
         }
         cache.insert(key, result.clone());
         result
     }
+}
+
+/// The cache key for a bundle's Sigstore verification: the live measurement
+/// and the hash of the bundle body.
+fn sigstore_cache_key(
+    bundle: &AtcBundle,
+    measurement_hex: &str,
+) -> Result<(String, [u8; 32]), TinfoilVerifyError> {
+    let bundle_hash: [u8; 32] = Sha256::digest(
+        serde_json::to_vec(&bundle.sigstore_bundle)
+            .map_err(|_| TinfoilVerifyError::RouterSigstoreRejected { stage: "verify" })?,
+    )
+    .into();
+    Ok((measurement_hex.to_ascii_lowercase(), bundle_hash))
 }
 
 /// A verified release attestation vouches for this router only if it names the
@@ -694,6 +709,29 @@ mod tests {
         // Case differences are not a mismatch.
         let prov = hand_built_provenance(&live.to_uppercase(), "d");
         assert!(bind_router_provenance(&prov, &live, "d").is_ok());
+    }
+
+    #[test]
+    fn verify_router_rejects_other_release_measurement() {
+        use std::sync::atomic::Ordering;
+        let v = unpinned_verifier(true);
+        let b = bundle();
+        let (report, _) = observe_bound_router(&b).unwrap();
+        let live = hex::encode(report.measurement);
+        // Cached verification of a bundle whose signed statement names a
+        // different release's measurement (the bundle itself verified).
+        let other = "bb".repeat(48);
+        assert_ne!(other, live);
+        let prov = hand_built_provenance(&other, &b.digest);
+        v.sigstore_cache
+            .lock()
+            .unwrap()
+            .insert(sigstore_cache_key(&b, &live).unwrap(), Ok(prov));
+        assert_eq!(
+            v.verify_router(&b).unwrap_err(),
+            TinfoilVerifyError::RouterSigstoreMeasurementMismatch
+        );
+        assert_eq!(v.sigstore_calls.load(Ordering::SeqCst), 0);
     }
 
     #[test]

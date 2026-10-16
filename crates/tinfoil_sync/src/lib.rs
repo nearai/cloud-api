@@ -95,6 +95,35 @@ pub fn audit_json(
     .expect("audit serialises")
 }
 
+/// The rows of the `PATCH /v1/admin/settings/tinfoil_trust` body that trusts
+/// the model releases seen live and Sigstore-verified but not yet in the
+/// compiled pins, each with the release's raw Sigstore bundle.
+pub fn admin_pin_rows(
+    base: &TinfoilPins,
+    observations: &Observations,
+    sigstore: &classify::SigstoreResults,
+    bundles: &std::collections::BTreeMap<String, serde_json::Value>,
+) -> Vec<serde_json::Value> {
+    classify::admin_pin_candidates(base, observations, sigstore)
+        .into_iter()
+        .filter_map(|(slug, repo, tag)| {
+            let bundle = bundles.get(&format!("{repo}@{tag}"))?;
+            Some(serde_json::json!({
+                "slug": slug,
+                "repo": repo,
+                "tag": tag,
+                "sigstore_bundle": bundle,
+            }))
+        })
+        .collect()
+}
+
+/// The artifact body: `{"model_pins":[...]}`, empty when nothing is new.
+pub fn admin_pins_json(rows: &[serde_json::Value]) -> String {
+    serde_json::to_string_pretty(&serde_json::json!({ "model_pins": rows }))
+        .expect("admin pins serialise")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

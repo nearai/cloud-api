@@ -12,8 +12,7 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 
 const ATC: &str = include_str!("../testdata/atc_attestation.out");
 const PROXY: &str = include_str!("../testdata/proxy.json");
-const MODEL_BUNDLE: &str =
-    include_str!("../../tinfoil_provenance/testdata/model_sigstore_bundle.json");
+const MODEL_BUNDLE: &str = include_str!("../testdata/model_sigstore_bundle.json");
 const DIGEST: &str = "8448fed68f4ed10c829a6433bdf570fa12a7b0e6d589bf1a89a8e9a5ca37a3ac";
 const REPO: &str = "tinfoilsh/confidential-deepseek-v4-1-flash";
 

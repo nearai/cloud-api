@@ -15,8 +15,6 @@ tokio = { version = "1", features = ["full"] }
 reqwest = { version = "0.12", features = ["json", "rustls-tls-native-roots"] }
 thiserror = "2.0"
 anyhow = "1.0"
-hex = "0.4"
-base64 = "0.22"
 chrono = "0.4"
 # Sigstore verification lives in `tinfoil_provenance`, the only crate allowed
 # to depend on `sigstore-verify` (enforced by scripts/check_dep_guards.sh); the

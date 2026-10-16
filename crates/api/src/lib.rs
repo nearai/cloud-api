@@ -951,11 +951,7 @@ pub async fn init_inference_providers(
 /// The Tinfoil trust handle before any stored row is applied: version 0 with
 /// `router_sigstore` and admin model pins off, so both fail closed until the stored
 /// value has loaded.
-fn new_tinfoil_trust_handle() -> Arc<
-    arc_swap::ArcSwap<
-        services::admin_settings::Versioned<services::attestation::tinfoil_trust::TinfoilTrust>,
-    >,
-> {
+fn new_tinfoil_trust_handle() -> services::attestation::tinfoil_trust::TinfoilTrustHandle {
     Arc::new(arc_swap::ArcSwap::from_pointee(
         services::admin_settings::Versioned {
             version: 0,
@@ -975,11 +971,7 @@ fn new_tinfoil_trust_handle() -> Arc<
 pub(crate) async fn build_admin_settings(
     repository: Arc<dyn services::admin_settings::AdminSettingsRepository>,
     pool: &services::inference_provider_pool::InferenceProviderPool,
-    tinfoil_trust: Arc<
-        arc_swap::ArcSwap<
-            services::admin_settings::Versioned<services::attestation::tinfoil_trust::TinfoilTrust>,
-        >,
-    >,
+    tinfoil_trust: services::attestation::tinfoil_trust::TinfoilTrustHandle,
 ) -> Arc<services::admin_settings::AdminSettingsService> {
     use services::admin_settings::{AdminSettingsService, Attested3pKey, PlacementKey};
     use services::attestation::tinfoil_trust::TinfoilTrustKey;

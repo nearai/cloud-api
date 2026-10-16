@@ -2,11 +2,16 @@
 # Dependency guards, run in CI (lint job) and locally.
 #
 # 1. `sigstore-verify` may be a direct dependency of `tinfoil_provenance` only.
+#    Guard 1 reads every dependency kind (normal, dev and build), so a test-only
+#    dependency on it elsewhere also fails.
 # 2. The CI tooling crates `tinfoil_sync` and `chutes_sync` must never appear in
-#    the normal dependency tree of `api` or `services`.
+#    the normal dependency tree of `api` or `services`. Guard 2 reads the normal
+#    (runtime) tree only, because dev-dependencies never ship.
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
+
+command -v jq >/dev/null 2>&1 || { echo "ERROR: jq is required for the dependency guards" >&2; exit 1; }
 
 ALLOWED_SIGSTORE_DEPENDENTS=("tinfoil_provenance")
 TOOLING_CRATES=("tinfoil_sync" "chutes_sync")

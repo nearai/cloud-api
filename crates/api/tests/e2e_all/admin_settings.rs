@@ -267,6 +267,14 @@ async fn tinfoil_trust_round_trips_and_validates() {
         let response = patch_as(&server, &token, path, body.clone()).await;
         assert_eq!(response.status_code(), StatusCode::BAD_REQUEST, "{body}");
     }
+    // The rejected PATCHes must not have persisted anything: the last good
+    // value (false) still reads back.
+    let got = get_as(&server, &token, path).await;
+    assert_eq!(got.status_code(), StatusCode::OK);
+    assert_eq!(
+        got.json::<Value>()["value"],
+        json!({"router_sigstore": false})
+    );
 
     // Null restores the default (on).
     let response = patch_as(&server, &token, path, json!({"router_sigstore": null})).await;

@@ -3,6 +3,9 @@
 //! `PATCH /v1/admin/settings/tinfoil_trust`, and Tinfoil reads it through a
 //! [`Versioned`] handle.
 
+use std::sync::Arc;
+
+use arc_swap::ArcSwap;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -48,6 +51,9 @@ impl Default for TinfoilTrust {
         }
     }
 }
+
+/// The shared handle the Tinfoil attestation path reads the trust switches through.
+pub type TinfoilTrustHandle = Arc<ArcSwap<Versioned<TinfoilTrust>>>;
 
 pub struct TinfoilTrustKey;
 
@@ -115,10 +121,11 @@ impl SettingKey for TinfoilTrustKey {
     /// are verified by [`Self::validate_patch`], and only when the PATCH sets
     /// `model_pins`, so an unrelated PATCH never re-verifies stored pins.
     /// Lenient (stored row): structural only, no crypto. Unknown fields
-    /// (from a newer binary) are ignored, a switch of the wrong type falls
-    /// back to its default, and a pin that does not deserialize is dropped
-    /// (more than 32 keep the first 32). Only field names, slug, repo, tag
-    /// and counts are logged.
+    /// (from a newer binary) are ignored. An absent switch uses its default;
+    /// a wrong-typed switch fails closed (false), since both are kill
+    /// switches. A pin that does not deserialize is dropped (more than 32
+    /// keep the first 32). Only field names, slug, repo, tag and counts are
+    /// logged.
     fn parse(value: &Value, strict: bool) -> Result<TinfoilTrust, String> {
         if strict {
             let trust: TinfoilTrust =
@@ -150,11 +157,16 @@ impl SettingKey for TinfoilTrustKey {
             if let Some(v) = value.get(field) {
                 match v.as_bool() {
                     Some(b) => *slot = b,
-                    None => tracing::warn!(
-                        setting = Self::NAME,
-                        field,
-                        "Stored admin setting field has the wrong type; using its default"
-                    ),
+                    None => {
+                        // Fail closed: a corrupt kill-switch row must not
+                        // re-enable a trust path.
+                        *slot = false;
+                        tracing::warn!(
+                            setting = Self::NAME,
+                            field,
+                            "Stored admin setting field has the wrong type; failing closed"
+                        );
+                    }
                 }
             }
         }
@@ -300,14 +312,16 @@ mod tests {
         let t =
             TinfoilTrustKey::parse(&json!({"router_sigstore": false, "future": 1}), false).unwrap();
         assert!(!t.router_sigstore);
-        // Absent or wrong-typed falls back to the default, never errors.
+        // Absent falls back to the default (true), never errors.
         assert!(
             TinfoilTrustKey::parse(&json!({"future": 1}), false)
                 .unwrap()
                 .router_sigstore
         );
+        // Wrong-typed fails closed: a kill-switch row we cannot read must not
+        // re-enable Sigstore admission.
         assert!(
-            TinfoilTrustKey::parse(&json!({"router_sigstore": "no"}), false)
+            !TinfoilTrustKey::parse(&json!({"router_sigstore": "no"}), false)
                 .unwrap()
                 .router_sigstore
         );

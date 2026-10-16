@@ -409,8 +409,7 @@ mod tests {
 
     const ATC: &str = include_str!("../testdata/atc_attestation.out");
     const PROXY: &str = include_str!("../testdata/proxy.json");
-    const MODEL_BUNDLE: &str =
-        include_str!("../../tinfoil_provenance/testdata/model_sigstore_bundle.json");
+    const MODEL_BUNDLE: &str = include_str!("../testdata/model_sigstore_bundle.json");
     const DEEPSEEK_DIGEST: &str =
         "8448fed68f4ed10c829a6433bdf570fa12a7b0e6d589bf1a89a8e9a5ca37a3ac";
 
@@ -504,6 +503,8 @@ mod tests {
     #[test]
     fn services_and_sync_atc_captures_agree() {
         let a: AtcBundle = serde_json::from_str(ATC).unwrap();
+        // Deliberately reads the services crate's capture: this test exists to
+        // catch drift between the two crates' recorded router bundles.
         let b: AtcBundle = serde_json::from_str(include_str!(
             "../../services/src/attestation/testdata/tinfoil/atc_bundle.json"
         ))

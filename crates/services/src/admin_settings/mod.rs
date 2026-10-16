@@ -30,7 +30,7 @@ use uuid::Uuid;
 
 pub use keys::{Attested3pKey, Attested3pSettings, PlacementKey, PlacementTuning};
 pub use ports::{AdminSettingsRepository, StoredSetting};
-pub use registry::{AdminSettingsBuilder, SettingKey};
+pub use registry::{AdminSettingsBuilder, SettingKey, Versioned};
 
 use registry::ErasedKey;
 
@@ -93,6 +93,11 @@ fn merge(
         }
     }
     let merged = Value::Object(merged);
+    if serde_json::to_vec(&merged).map_or(true, |b| b.len() > key.max_bytes()) {
+        return Err(AdminSettingsError::Invalid(
+            "the setting value is too large".to_string(),
+        ));
+    }
     key.parse_strict(&merged)
         .map_err(AdminSettingsError::Invalid)?;
     Ok(merged)
@@ -221,7 +226,7 @@ impl AdminSettingsService {
             .map_err(AdminSettingsError::Storage)?;
         // Applied from the value just saved, not a re-read: the write has
         // committed, so nothing after it may fail the request.
-        key.apply(Some(&saved.value));
+        key.apply(Some(&saved), false);
         let names: Vec<&String> = patch
             .as_object()
             .map(|o| o.keys().collect())
@@ -244,7 +249,7 @@ impl AdminSettingsService {
         match self.repository.get_all().await {
             Ok(rows) => {
                 for key in &self.keys {
-                    key.apply(rows.iter().find(|r| r.key == key.name()).map(|r| &r.value));
+                    key.apply(rows.iter().find(|r| r.key == key.name()), true);
                 }
             }
             Err(e) => tracing::warn!(
@@ -275,6 +280,7 @@ mod tests {
     use anyhow::anyhow;
     use async_trait::async_trait;
     use inference_providers::ProviderSource;
+    use serde::{Deserialize, Serialize};
     use serde_json::json;
     use std::collections::BTreeMap;
     use std::sync::Mutex;
@@ -716,5 +722,178 @@ mod tests {
         repo.rows.lock().unwrap().remove(KEY_PLACEMENT);
         svc.reload().await;
         assert_eq!(**handle.load(), Tuning::default());
+    }
+
+    // ---- registry behaviour: versions, size cap, cheap reload ----
+
+    #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+    #[serde(default, deny_unknown_fields)]
+    struct TestVal {
+        n: i64,
+        s: String,
+    }
+
+    macro_rules! test_key {
+        ($name:ident, $key:literal, $max:expr, $parses:ident) => {
+            static $parses: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+            struct $name;
+            impl SettingKey for $name {
+                const NAME: &'static str = $key;
+                const FIELDS: &'static [&'static str] = &["n", "s"];
+                const MAX_BYTES: usize = $max;
+                type Value = TestVal;
+                type Published = Versioned<TestVal>;
+                fn default_value() -> TestVal {
+                    TestVal::default()
+                }
+                fn parse(value: &Value, _strict: bool) -> Result<TestVal, String> {
+                    $parses.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    serde_json::from_value(value.clone()).map_err(|e| e.to_string())
+                }
+                fn publish(value: &TestVal, version: u64) -> Versioned<TestVal> {
+                    Versioned {
+                        version,
+                        value: value.clone(),
+                    }
+                }
+            }
+        };
+    }
+    test_key!(VKey, "vkey", 64 * 1024, VKEY_PARSES);
+    test_key!(CountKey, "count_key", 64 * 1024, COUNT_PARSES);
+    test_key!(TinyKey, "tiny_key", 16, TINY_PARSES);
+
+    fn versioned_service<K: SettingKey<Published = Versioned<TestVal>>>() -> (
+        Arc<AdminSettingsService>,
+        Arc<FakeRepo>,
+        Arc<ArcSwap<Versioned<TestVal>>>,
+    ) {
+        let repo = Arc::new(FakeRepo::default());
+        let handle = Arc::new(ArcSwap::from_pointee(Versioned {
+            version: 0,
+            value: TestVal::default(),
+        }));
+        let svc = AdminSettingsService::builder(repo.clone())
+            .register::<K>(handle.clone())
+            .build();
+        (Arc::new(svc), repo, handle)
+    }
+
+    #[tokio::test]
+    async fn noop_patch_does_not_bump_version() {
+        let (svc, _, handle) = versioned_service::<VKey>();
+        let admin = Uuid::new_v4();
+        svc.update("vkey", json!({"n": 0}), admin).await.unwrap();
+        assert_eq!(handle.load().version, 0, "a field set to its default");
+        svc.update("vkey", json!({"n": 0}), admin).await.unwrap();
+        svc.update("vkey", json!({"s": null}), admin).await.unwrap();
+        assert_eq!(handle.load().version, 0);
+    }
+
+    #[tokio::test]
+    async fn effective_change_bumps_version_once() {
+        let (svc, _, handle) = versioned_service::<VKey>();
+        let admin = Uuid::new_v4();
+        svc.update("vkey", json!({"n": 5}), admin).await.unwrap();
+        assert_eq!(handle.load().version, 1);
+        assert_eq!(handle.load().value.n, 5);
+        // Same value again: no bump.
+        svc.update("vkey", json!({"n": 5}), admin).await.unwrap();
+        assert_eq!(handle.load().version, 1);
+        svc.update("vkey", json!({"n": null}), admin).await.unwrap();
+        assert_eq!(handle.load().version, 2);
+        assert_eq!(svc.current::<VKey>(), TestVal::default());
+    }
+
+    #[tokio::test]
+    async fn reload_skips_unchanged_rows() {
+        let (svc, repo, handle) = versioned_service::<CountKey>();
+        repo.put("count_key", json!({"n": 3}));
+        let base = COUNT_PARSES.load(std::sync::atomic::Ordering::SeqCst);
+        svc.reload().await;
+        svc.reload().await;
+        assert_eq!(
+            COUNT_PARSES.load(std::sync::atomic::Ordering::SeqCst) - base,
+            1,
+            "an unchanged updated_at is parsed once"
+        );
+        assert_eq!(handle.load().value.n, 3);
+        assert_eq!(handle.load().version, 1);
+        repo.put("count_key", json!({"n": 4}));
+        svc.reload().await;
+        assert_eq!(
+            COUNT_PARSES.load(std::sync::atomic::Ordering::SeqCst) - base,
+            2
+        );
+        assert_eq!(handle.load().value.n, 4);
+        // A deleted row is back to the default.
+        repo.rows.lock().unwrap().remove("count_key");
+        svc.reload().await;
+        assert_eq!(handle.load().value, TestVal::default());
+        assert_eq!(handle.load().version, 3);
+    }
+
+    #[tokio::test]
+    async fn patch_over_max_bytes_is_rejected() {
+        let (svc, repo, handle) = versioned_service::<TinyKey>();
+        svc.update("tiny_key", json!({"s": "abc"}), Uuid::new_v4())
+            .await
+            .unwrap();
+        let err = svc
+            .update(
+                "tiny_key",
+                json!({"s": "a string well over sixteen bytes"}),
+                Uuid::new_v4(),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, AdminSettingsError::Invalid(m) if m == "the setting value is too large")
+        );
+        assert_eq!(*repo.upserts.lock().unwrap(), 1, "nothing more stored");
+        assert_eq!(handle.load().value.s, "abc");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn version_monotonic_under_concurrent_patch_and_reload() {
+        let (svc, repo, handle) = versioned_service::<VKey>();
+        let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let watcher = {
+            let handle = handle.clone();
+            let done = done.clone();
+            tokio::spawn(async move {
+                let mut last = 0;
+                while !done.load(std::sync::atomic::Ordering::SeqCst) {
+                    let v = handle.load().version;
+                    assert!(v >= last, "version went backwards");
+                    last = v;
+                    tokio::task::yield_now().await;
+                }
+            })
+        };
+        let mut tasks = Vec::new();
+        for i in 0..50i64 {
+            let svc = svc.clone();
+            tasks.push(tokio::spawn(async move {
+                if i % 2 == 0 {
+                    svc.update("vkey", json!({"n": i + 1}), Uuid::new_v4())
+                        .await
+                        .unwrap();
+                } else {
+                    svc.reload().await;
+                }
+            }));
+        }
+        for t in tasks {
+            t.await.unwrap();
+        }
+        done.store(true, std::sync::atomic::Ordering::SeqCst);
+        watcher.await.unwrap();
+        let stored = repo.rows.lock().unwrap()["vkey"].value.clone();
+        assert_eq!(
+            json!(handle.load().value.n),
+            stored["n"],
+            "the published value matches the latest committed row"
+        );
     }
 }

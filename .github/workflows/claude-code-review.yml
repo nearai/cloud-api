@@ -13,7 +13,8 @@ concurrency:
   group: >-
     ${{ github.workflow }}-${{
       (github.event_name == 'pull_request' ||
-       (contains(fromJSON('["OWNER", "MEMBER", "COLLABORATOR"]'), github.event.comment.author_association) &&
+       (github.event.issue.pull_request &&
+        contains(fromJSON('["OWNER", "MEMBER", "COLLABORATOR"]'), github.event.comment.author_association) &&
         (contains(github.event.comment.body, '@claude review') ||
          contains(github.event.comment.body, '@claude code review'))))
       && format('pr-{0}', github.event.pull_request.number || github.event.issue.number)
@@ -141,7 +142,7 @@ jobs:
           anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
           prompt: |
             Review pull request #${{ github.event.pull_request.number || github.event.issue.number }} in ${{ github.repository }}, a Rust
-            multi-tenant AI inference API that runs in a TEE. ${{ github.event_name == 'issue_comment' && 'The working directory is the trusted default branch; the PR head is checked out under ./pr-head. Read changed files and their callers from ./pr-head, and CLAUDE.md from the working directory.' || 'The PR head is checked out in the working directory.' }} Deliver the review only as GitHub comments.
+            multi-tenant AI inference API that runs in a TEE. ${{ github.event_name == 'issue_comment' && 'The working directory is the trusted default branch; the PR head is checked out under ./pr-head. Read changed files and their callers from ./pr-head, and CLAUDE.md from the working directory.' || 'The working directory is the PR merge commit (the PR merged into the base), so trust `gh pr diff` over the working tree for what this PR changes.' }} Deliver the review only as GitHub comments.
 
             <existing_discussion>
             ${{ steps.fetch-comments.outputs.context }}

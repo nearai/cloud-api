@@ -113,14 +113,13 @@ def format_review_summaries(pr: Dict[str, Any], output: List[str]) -> None:
             output.append("")
 
 
-def format_review_thread(thread: Dict[str, Any], output: List[str], show_resolved: bool = False) -> None:
+def format_review_thread(thread: Dict[str, Any], output: List[str]) -> None:
     """
     Format a single review thread with its comments.
 
     Args:
         thread: Review thread data from GitHub API
         output: Output list to append formatted lines to
-        show_resolved: Whether this is a resolved thread (affects formatting)
     """
     path = thread.get('path', 'unknown')
     line = thread.get('line')
@@ -173,7 +172,7 @@ def format_review_threads(pr: Dict[str, Any], output: List[str], resolved: bool)
 
     if threads:
         for thread in threads:
-            format_review_thread(thread, output, show_resolved=resolved)
+            format_review_thread(thread, output)
     else:
         output.append(f"No {label.lower()} discussions.")
         output.append("")
@@ -220,7 +219,7 @@ def format_pr_comments(comments_json: str) -> str:
     format_review_threads(pr, output, resolved=False)
     total_threads = pr.get('reviewThreads', {}).get('totalCount', 0)
     if total_threads > 100:
-        output.append(f"*Note: This PR has {total_threads} review threads. Showing first 100.*")
+        output.append(f"*Note: This PR has {total_threads} review threads in total; the API returned the first 100 across both resolved and unresolved sections.*")
         output.append("")
     format_review_summaries(pr, output)
     format_general_comments(pr, output)

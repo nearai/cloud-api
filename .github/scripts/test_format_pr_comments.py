@@ -100,7 +100,7 @@ class TestPaginationNote(unittest.TestCase):
             'reviewThreads': {'nodes': [], 'totalCount': 150},
         }}}}
         result = format_pr_comments(json.dumps(data))
-        self.assertEqual(result.count("review threads. Showing first 100"), 1)
+        self.assertEqual(result.count("review threads in total"), 1)
 
 
 class TestFormatPRComments(unittest.TestCase):

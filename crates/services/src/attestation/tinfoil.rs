@@ -42,6 +42,13 @@ pub fn vetted_tinfoil_pins() -> Result<TinfoilPins, String> {
     serde_json::from_str(COMPILED_PINS_JSON).map_err(|e| format!("tinfoil pins: {e}"))
 }
 
+/// The compiled pins, parsed once per process.
+pub fn compiled_tinfoil_pins() -> Result<&'static TinfoilPins, &'static str> {
+    static PINS: std::sync::LazyLock<Result<TinfoilPins, String>> =
+        std::sync::LazyLock::new(vetted_tinfoil_pins);
+    PINS.as_ref().map_err(String::as_str)
+}
+
 /// SHA-256 of the DER SubjectPublicKeyInfo of a PEM certificate.
 pub fn spki_sha256_of_pem_cert(pem: &str) -> Result<[u8; 32], TinfoilVerifyError> {
     let (_, p) = x509_parser::pem::parse_x509_pem(pem.as_bytes())

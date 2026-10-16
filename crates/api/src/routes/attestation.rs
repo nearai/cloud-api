@@ -72,7 +72,7 @@ impl From<AppState> for AttestationRouteState {
 /// `tinfoil/pins` is a transparency endpoint: it lists the compiled Tinfoil
 /// pins, the admin trust switches and the admin-added model pins with their
 /// Sigstore provenance (no raw bundles, no customer data), so anyone can see
-/// which trust inputs are live. It is cheap (results are cached per bundle)
+/// which trust inputs are live. It is cheap (the body is rendered once per trust version)
 /// and sent with `Cache-Control: max-age=30`.
 ///
 /// Any route added here must be justified the same way and reflected in the
@@ -88,7 +88,7 @@ pub fn build_public_attestation_routes(
         .with_state(state)
         .route(
             "/attestation/tinfoil/pins",
-            get(get_tinfoil_pins).with_state(admin_settings),
+            get(get_tinfoil_pins).with_state(tinfoil_pins::TinfoilPinsState::new(admin_settings)),
         )
 }
 

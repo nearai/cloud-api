@@ -4,6 +4,7 @@
 //! the view (size); only provenance fields are.
 
 use std::collections::BTreeMap;
+use std::sync::{Arc, Mutex};
 
 use serde::Serialize;
 use tinfoil_provenance::Provenance;
@@ -124,6 +125,49 @@ pub fn tinfoil_pins_view(pins: &TinfoilPins, trust: &TinfoilTrust) -> TinfoilPin
     }
 }
 
+/// The rendered pins response body for the latest `tinfoil_trust` version
+/// seen. The anonymous route checks the version first, so a hit costs one
+/// atomic read and an `Arc` clone: no copy of the trust value, no hashing,
+/// no verification.
+#[derive(Default)]
+pub struct PinsViewMemo {
+    slot: Mutex<Option<(u64, Arc<serde_json::Value>)>>,
+}
+
+impl PinsViewMemo {
+    /// The body rendered for exactly `version`, if memoized.
+    pub fn get(&self, version: u64) -> Option<Arc<serde_json::Value>> {
+        let slot = self.slot.lock().unwrap_or_else(|e| e.into_inner());
+        slot.as_ref()
+            .filter(|(v, _)| *v == version)
+            .map(|(_, body)| body.clone())
+    }
+
+    /// Memoize `body` for `version`. A body for an older version never
+    /// replaces a newer one.
+    pub fn put(&self, version: u64, body: Arc<serde_json::Value>) {
+        let mut slot = self.slot.lock().unwrap_or_else(|e| e.into_inner());
+        if slot.as_ref().is_none_or(|(v, _)| *v <= version) {
+            *slot = Some((version, body));
+        }
+    }
+
+    /// The memoized body for `version`, or `build` it (outside the lock) and
+    /// memoize it.
+    pub fn get_or_build(
+        &self,
+        version: u64,
+        build: impl FnOnce() -> serde_json::Value,
+    ) -> Arc<serde_json::Value> {
+        if let Some(hit) = self.get(version) {
+            return hit;
+        }
+        let body = Arc::new(build());
+        self.put(version, body.clone());
+        body
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -187,5 +231,33 @@ mod tests {
         let p = &v.admin.model_pins[0];
         assert!(!p.verified);
         assert!(p.rekor_log_index.is_none() && p.snp_measurement.is_none());
+    }
+
+    #[test]
+    fn memo_builds_once_per_version() {
+        use std::cell::Cell;
+        let memo = PinsViewMemo::default();
+        let builds = Cell::new(0);
+        let build = || {
+            builds.set(builds.get() + 1);
+            let trust = TinfoilTrust {
+                model_pins: vec![recorded_pin()],
+                ..Default::default()
+            };
+            serde_json::to_value(tinfoil_pins_view(&TinfoilPins::default(), &trust)).unwrap()
+        };
+        let a = memo.get_or_build(1, build);
+        let b = memo.get_or_build(1, build);
+        assert_eq!(builds.get(), 1);
+        assert!(Arc::ptr_eq(&a, &b));
+        let c = memo.get_or_build(2, build);
+        assert_eq!(builds.get(), 2, "a version bump rebuilds");
+        assert!(!Arc::ptr_eq(&a, &c));
+        memo.put(1, a);
+        assert!(
+            memo.get(1).is_none(),
+            "an older body never replaces a newer one"
+        );
+        assert!(memo.get(2).is_some());
     }
 }

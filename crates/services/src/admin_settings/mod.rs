@@ -10,9 +10,14 @@
 //! immediately after an update handled by this instance. Consumers read the
 //! typed value, never the JSON.
 //!
+//! This is the runtime KV store for operator-set configuration: tuning knobs,
+//! kill switches and public signed trust inputs (which their owner verifies
+//! before use). Runtime-changeable config goes here as a registered key; never
+//! add a table, migration or admin API for it. Consumers that need a setting
+//! at startup register after this service has loaded.
+//!
 //! The table is stored in plaintext (approved in `database_encryption.rs`):
-//! settings here must be operational tuning values only. Never add a setting
-//! that holds secrets, credentials, or customer data.
+//! never add a setting that holds secrets, credentials, or customer data.
 
 mod keys;
 pub mod ports;

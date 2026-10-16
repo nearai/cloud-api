@@ -44,13 +44,24 @@ jobs:
       id-token: write
 
     steps:
+      # The workspace root is the trusted revision: the default branch for a
+      # comment trigger, the PR merge commit for pull_request. Everything
+      # executable (the formatter, repo rules, action config) comes from here.
       - name: Checkout repository
         uses: actions/checkout@v7
         with:
           fetch-depth: 1
-          # pull_request checks out the PR merge commit by default; a comment
-          # trigger would check out the default branch, so point it at the PR.
-          ref: ${{ github.event_name == 'issue_comment' && format('refs/pull/{0}/head', github.event.issue.number) || '' }}
+
+      # A comment can target a fork PR, so its code is review data only: it
+      # lives in pr-head/ with no credentials and is never executed.
+      - name: Checkout PR head as review data
+        if: github.event_name == 'issue_comment'
+        uses: actions/checkout@v7
+        with:
+          ref: refs/pull/${{ github.event.issue.number }}/head
+          path: pr-head
+          fetch-depth: 1
+          persist-credentials: false
 
       - name: Fetch PR Comments Context
         id: fetch-comments
@@ -130,8 +141,7 @@ jobs:
           anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
           prompt: |
             Review pull request #${{ github.event.pull_request.number || github.event.issue.number }} in ${{ github.repository }}, a Rust
-            multi-tenant AI inference API that runs in a TEE. The PR head is checked out
-            in the working directory. Deliver the review only as GitHub comments.
+            multi-tenant AI inference API that runs in a TEE. ${{ github.event_name == 'issue_comment' && 'The working directory is the trusted default branch; the PR head is checked out under ./pr-head. Read changed files and their callers from ./pr-head, and CLAUDE.md from the working directory.' || 'The PR head is checked out in the working directory.' }} Deliver the review only as GitHub comments.
 
             <existing_discussion>
             ${{ steps.fetch-comments.outputs.context }}

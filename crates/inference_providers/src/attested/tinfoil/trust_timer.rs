@@ -1,5 +1,5 @@
 //! Time from a measurement's first `unknown_*` rejection to its first
-//! admission (the `cloud_api.tinfoil.time_to_trust_seconds` metric).
+//! admission (the `cloud_api.attested_3p.time_to_trust_seconds` (`provider:tinfoil`) metric).
 //!
 //! Keys are router release digests and `slug@tag` strings, never customer data.
 

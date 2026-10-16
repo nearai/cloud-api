@@ -269,16 +269,24 @@ fn emit_tinfoil_metrics(
         metrics,
         last_auth,
     );
-    emit_time_to_trust(session.take_time_to_trust(), metrics);
+    emit_time_to_trust(
+        ProviderSource::Tinfoil.as_str(),
+        session.take_time_to_trust(),
+        metrics,
+    );
 }
 
 /// One histogram sample per measurement that went from rejected to admitted.
-fn emit_time_to_trust(samples: Vec<(&'static str, f64)>, metrics: &dyn MetricsServiceTrait) {
+fn emit_time_to_trust(
+    provider: &str,
+    samples: Vec<(&'static str, f64)>,
+    metrics: &dyn MetricsServiceTrait,
+) {
     for (kind, seconds) in samples {
         metrics.record_histogram(
-            consts::METRIC_TINFOIL_TIME_TO_TRUST,
+            consts::METRIC_ATTESTED_3P_TIME_TO_TRUST,
             seconds,
-            &[&format!("kind:{kind}")],
+            &[&format!("provider:{provider}"), &format!("kind:{kind}")],
         );
     }
 }
@@ -562,15 +570,15 @@ mod tests {
     }
 
     #[test]
-    fn time_to_trust_is_a_histogram_tagged_by_kind() {
+    fn time_to_trust_is_a_histogram_tagged_by_provider_and_kind() {
         use services::metrics::capturing::{CapturingMetricsService, MetricValue};
         let m = CapturingMetricsService::new();
-        emit_time_to_trust(vec![("router", 90.0), ("model", 12.5)], &m);
-        emit_time_to_trust(vec![], &m);
+        emit_time_to_trust("tinfoil", vec![("router", 90.0), ("model", 12.5)], &m);
+        emit_time_to_trust("tinfoil", vec![], &m);
         let got: Vec<_> = m
             .get_metrics()
             .into_iter()
-            .filter(|r| r.name == consts::METRIC_TINFOIL_TIME_TO_TRUST)
+            .filter(|r| r.name == consts::METRIC_ATTESTED_3P_TIME_TO_TRUST)
             .map(|r| match r.value {
                 MetricValue::Histogram(v) => (v, r.tags),
                 _ => (-1.0, r.tags),
@@ -579,8 +587,14 @@ mod tests {
         assert_eq!(
             got,
             vec![
-                (90.0, vec!["kind:router".to_string()]),
-                (12.5, vec!["kind:model".to_string()])
+                (
+                    90.0,
+                    vec!["provider:tinfoil".to_string(), "kind:router".to_string()]
+                ),
+                (
+                    12.5,
+                    vec!["provider:tinfoil".to_string(), "kind:model".to_string()]
+                )
             ]
         );
     }

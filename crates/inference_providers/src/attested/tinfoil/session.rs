@@ -237,7 +237,7 @@ impl TinfoilRouterSession {
 
     /// Drains `(kind, seconds)` samples (`kind` is `router` or `model`) for
     /// measurements that were rejected as unknown and have since been admitted.
-    /// Polled by the API layer for `cloud_api.tinfoil.time_to_trust_seconds`.
+    /// Polled by the API layer for `cloud_api.attested_3p.time_to_trust_seconds` (`provider:tinfoil`).
     pub fn take_time_to_trust(&self) -> Vec<(&'static str, f64)> {
         self.trust_timer.take()
     }

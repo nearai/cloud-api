@@ -5,6 +5,30 @@ pub(super) fn assert_production_logs_exclude_forbidden_expressions() {
             include_str!("../../routes/completions/mod.rs"),
         ),
         (
+            "crates/api/src/routes/completions/audio.rs",
+            include_str!("../../routes/completions/audio.rs"),
+        ),
+        (
+            "crates/api/src/routes/completions/embeddings.rs",
+            include_str!("../../routes/completions/embeddings.rs"),
+        ),
+        (
+            "crates/api/src/routes/completions/images.rs",
+            include_str!("../../routes/completions/images.rs"),
+        ),
+        (
+            "crates/api/src/routes/completions/privacy.rs",
+            include_str!("../../routes/completions/privacy.rs"),
+        ),
+        (
+            "crates/api/src/routes/completions/rerank.rs",
+            include_str!("../../routes/completions/rerank.rs"),
+        ),
+        (
+            "crates/api/src/routes/completions/score.rs",
+            include_str!("../../routes/completions/score.rs"),
+        ),
+        (
             "crates/api/src/routes/responses.rs",
             include_str!("../../routes/responses.rs"),
         ),
@@ -44,6 +68,24 @@ pub(super) fn assert_production_logs_exclude_forbidden_expressions() {
         "content_preview",
         "tool_arguments",
     ];
+
+    // Splitting a route file must not silently drop the new files from this scan.
+    let completions_dir = concat!(env!("CARGO_MANIFEST_DIR"), "/src/routes/completions");
+    for entry in std::fs::read_dir(completions_dir).expect("read routes/completions") {
+        let file_name = entry
+            .expect("routes/completions entry")
+            .file_name()
+            .into_string()
+            .expect("utf-8 file name");
+        if !file_name.ends_with(".rs") {
+            continue;
+        }
+        let label = format!("crates/api/src/routes/completions/{file_name}");
+        assert!(
+            sources.iter().any(|(path, _)| *path == label),
+            "{label} is not covered by the production log privacy scan; add it to `sources`"
+        );
+    }
 
     for (path, source) in sources {
         for (line, body) in logging_macro_bodies(source) {

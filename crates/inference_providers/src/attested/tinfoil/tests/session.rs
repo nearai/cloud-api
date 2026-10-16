@@ -482,3 +482,44 @@ async fn failed_proxy_fetch_does_not_publish_the_new_pin() {
     ));
     assert!(matches!(before, FingerprintState::Pinned(_)));
 }
+
+#[tokio::test]
+async fn time_to_trust_is_sampled_once_when_a_rejected_measurement_is_admitted() {
+    let e = env().await;
+    assert!(e.session.take_time_to_trust().is_empty());
+    // Router: rejected as unknown, then admitted.
+    e.verifier
+        .reject_router
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    assert_eq!(
+        e.session.verify_now().await.unwrap_err(),
+        TinfoilVerifyError::UnknownRouterMeasurement
+    );
+    assert!(e.session.take_time_to_trust().is_empty());
+    e.verifier
+        .reject_router
+        .store(false, std::sync::atomic::Ordering::SeqCst);
+    // Model: rejected as unknown on the first verify, then admitted.
+    e.verifier
+        .deny_models
+        .lock()
+        .unwrap()
+        .push(SLUG.to_string());
+    e.session.verify_now().await.unwrap();
+    let kinds: Vec<_> = e
+        .session
+        .take_time_to_trust()
+        .into_iter()
+        .map(|s| s.0)
+        .collect();
+    assert_eq!(kinds, vec!["router"]);
+    e.verifier.deny_models.lock().unwrap().clear();
+    e.session.reread_proxy().await;
+    let samples = e.session.take_time_to_trust();
+    assert_eq!(samples.len(), 1);
+    assert_eq!(samples[0].0, "model");
+    assert!(samples[0].1 >= 0.0);
+    // Already admitted: no further samples.
+    e.session.reread_proxy().await;
+    assert!(e.session.take_time_to_trust().is_empty());
+}

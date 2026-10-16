@@ -268,6 +268,18 @@ fn emit_tinfoil_metrics(
         metrics,
         last_auth,
     );
+    emit_time_to_trust(session.take_time_to_trust(), metrics);
+}
+
+/// One histogram sample per measurement that went from rejected to admitted.
+fn emit_time_to_trust(samples: Vec<(&'static str, f64)>, metrics: &dyn MetricsServiceTrait) {
+    for (kind, seconds) in samples {
+        metrics.record_histogram(
+            consts::METRIC_TINFOIL_TIME_TO_TRUST,
+            seconds,
+            &[&format!("kind:{kind}")],
+        );
+    }
 }
 
 /// The pure half of [`emit_tinfoil_metrics`], so every state can be tested.
@@ -545,6 +557,30 @@ mod tests {
                 "result:failed".to_string(),
                 "reason:unknown_router_measurement".to_string()
             ]]
+        );
+    }
+
+    #[test]
+    fn time_to_trust_is_a_histogram_tagged_by_kind() {
+        use services::metrics::capturing::{CapturingMetricsService, MetricValue};
+        let m = CapturingMetricsService::new();
+        emit_time_to_trust(vec![("router", 90.0), ("model", 12.5)], &m);
+        emit_time_to_trust(vec![], &m);
+        let got: Vec<_> = m
+            .get_metrics()
+            .into_iter()
+            .filter(|r| r.name == consts::METRIC_TINFOIL_TIME_TO_TRUST)
+            .map(|r| match r.value {
+                MetricValue::Histogram(v) => (v, r.tags),
+                _ => (-1.0, r.tags),
+            })
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                (90.0, vec!["kind:router".to_string()]),
+                (12.5, vec!["kind:model".to_string()])
+            ]
         );
     }
 

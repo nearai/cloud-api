@@ -115,6 +115,8 @@ pub struct TinfoilRouterSession {
     /// The verifier's `trust_generation` as of the last tick that looked. A
     /// change means its trust inputs moved, so the router is re-verified.
     seen_trust_generation: AtomicU64,
+    /// First-rejection to first-admission times, drained by the API layer.
+    trust_timer: super::trust_timer::TrustTimer,
 }
 
 impl TinfoilRouterSession {
@@ -151,6 +153,7 @@ impl TinfoilRouterSession {
             auth_failures: AtomicU64::new(0),
             last_error: std::sync::Mutex::new(None),
             seen_trust_generation,
+            trust_timer: Default::default(),
         }))
     }
 
@@ -229,6 +232,13 @@ impl TinfoilRouterSession {
             .clone()
     }
 
+    /// Drains `(kind, seconds)` samples (`kind` is `router` or `model`) for
+    /// measurements that were rejected as unknown and have since been admitted.
+    /// Polled by the API layer for `cloud_api.tinfoil.time_to_trust_seconds`.
+    pub fn take_time_to_trust(&self) -> Vec<(&'static str, f64)> {
+        self.trust_timer.take()
+    }
+
     pub(super) fn record_auth_failure(&self) {
         self.auth_failures.fetch_add(1, Ordering::Relaxed);
     }
@@ -289,7 +299,18 @@ impl TinfoilRouterSession {
     ) -> BTreeMap<String, Result<PinnedModel, TinfoilVerifyError>> {
         doc.models
             .iter()
-            .map(|(slug, entry)| (slug.clone(), self.verifier.check_model(slug, entry)))
+            .map(|(slug, entry)| {
+                let res = self.verifier.check_model(slug, entry);
+                let key = format!("{slug}@{}", entry.tag);
+                match &res {
+                    Ok(_) => self.trust_timer.admitted("model", &key),
+                    Err(TinfoilVerifyError::UnknownModelMeasurement) => {
+                        self.trust_timer.rejected("model", &key)
+                    }
+                    Err(_) => {}
+                }
+                (slug.clone(), res)
+            })
             .collect()
     }
 
@@ -321,7 +342,19 @@ impl TinfoilRouterSession {
     /// each attesting its own key, so requests go to the attested domain.
     async fn do_verify(&self) -> Result<(), TinfoilVerifyError> {
         let bundle: AtcBundle = Self::fetch_json(&self.atc_client, &self.atc_url).await?;
-        let router = self.verifier.verify_router(&bundle)?;
+        // The release digest identifies the router release being judged.
+        let router = match self.verifier.verify_router(&bundle) {
+            Ok(r) => {
+                self.trust_timer.admitted("router", &bundle.digest);
+                r
+            }
+            Err(e) => {
+                if e == TinfoilVerifyError::UnknownRouterMeasurement {
+                    self.trust_timer.rejected("router", &bundle.digest);
+                }
+                return Err(e);
+            }
+        };
         validate_router_domain(&bundle.domain)?;
         let fp = hex::encode(router.spki_sha256);
 

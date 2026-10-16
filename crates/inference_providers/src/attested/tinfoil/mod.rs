@@ -11,6 +11,7 @@ mod config;
 mod session;
 #[cfg(test)]
 mod tests;
+mod trust_timer;
 pub mod verifier_port;
 mod wire;
 

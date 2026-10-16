@@ -117,6 +117,8 @@ pub struct TinfoilRouterSession {
     seen_trust_generation: AtomicU64,
     /// First-rejection to first-admission times, drained by the API layer.
     trust_timer: super::trust_timer::TrustTimer,
+    /// Slugs whose time to trust is measured (`None`: every published slug).
+    served_slugs: Option<Arc<HashSet<String>>>,
 }
 
 impl TinfoilRouterSession {
@@ -154,6 +156,7 @@ impl TinfoilRouterSession {
             last_error: std::sync::Mutex::new(None),
             seen_trust_generation,
             trust_timer: Default::default(),
+            served_slugs: cfg.served_slugs.clone(),
         }))
     }
 
@@ -301,13 +304,15 @@ impl TinfoilRouterSession {
             .iter()
             .map(|(slug, entry)| {
                 let res = self.verifier.check_model(slug, entry);
-                let key = format!("{slug}@{}", entry.tag);
-                match &res {
-                    Ok(_) => self.trust_timer.admitted("model", &key),
-                    Err(TinfoilVerifyError::UnknownModelMeasurement) => {
-                        self.trust_timer.rejected("model", &key)
+                if self.served_slugs.as_ref().is_none_or(|s| s.contains(slug)) {
+                    let key = format!("{slug}@{}", entry.tag);
+                    match &res {
+                        Ok(_) => self.trust_timer.admitted("model", &key),
+                        Err(TinfoilVerifyError::UnknownModelMeasurement) => {
+                            self.trust_timer.rejected("model", &key)
+                        }
+                        Err(_) => {}
                     }
-                    Err(_) => {}
                 }
                 (slug.clone(), res)
             })

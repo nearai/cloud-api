@@ -171,7 +171,8 @@ pub async fn register_tinfoil_with(
     let verifier = Arc::new(services::attestation::tinfoil::TinfoilPolicyVerifier::new(
         pins, trust,
     ));
-    let pcfg = tinfoil_provider::Config::new(api_key, cfg.timeout_seconds);
+    let pcfg = tinfoil_provider::Config::new(api_key, cfg.timeout_seconds)
+        .with_served_slugs(cfg.tinfoil_models.iter().map(|e| e.upstream_id.clone()));
     let session = match build_session(pcfg.clone(), verifier) {
         Ok(s) => s,
         Err(e) => {

@@ -7,13 +7,14 @@ use std::sync::Mutex;
 
 use tokio::time::Instant;
 
-/// Rejected measurements remembered at once. At the bound the oldest is
-/// dropped, so a flapping router cannot grow the map without limit.
+/// Rejected measurements remembered at once. At the bound new keys are
+/// ignored, never evicting a measurement already being timed, so a flapping
+/// router cannot grow the set without limit or erase a clock in progress.
 const MAX_PENDING: usize = 64;
 
 #[derive(Default)]
 struct Inner {
-    /// `(kind, key, first rejected at)`, oldest first.
+    /// `(kind, key, first rejected at)`.
     pending: Vec<(&'static str, String, Instant)>,
     /// `(kind, seconds)` admitted since the last drain.
     done: Vec<(&'static str, f64)>,
@@ -34,7 +35,7 @@ impl TrustTimer {
             return;
         }
         if g.pending.len() >= MAX_PENDING {
-            g.pending.remove(0);
+            return;
         }
         g.pending.push((kind, key.to_string(), Instant::now()));
     }
@@ -81,7 +82,7 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn kinds_are_independent_and_the_map_is_bounded() {
+    async fn kinds_are_independent() {
         let t = TrustTimer::default();
         t.rejected("model", "m@v1");
         tokio::time::advance(Duration::from_secs(5)).await;
@@ -89,14 +90,25 @@ mod tests {
         assert!(t.take().is_empty());
         t.admitted("model", "m@v1");
         assert_eq!(t.take(), vec![("model", 5.0)]);
+    }
 
+    #[tokio::test(start_paused = true)]
+    async fn full_pending_set_ignores_new_keys() {
+        let t = TrustTimer::default();
         for i in 0..(MAX_PENDING + 10) {
             t.rejected("model", &format!("s{i}@v"));
         }
         assert_eq!(t.lock().pending.len(), MAX_PENDING);
-        t.admitted("model", "s0@v"); // dropped as the oldest
-        assert!(t.take().is_empty());
+        tokio::time::advance(Duration::from_secs(7)).await;
+        // The oldest is still being timed; keys past the bound never were.
+        t.admitted("model", "s0@v");
+        assert_eq!(t.take(), vec![("model", 7.0)]);
         t.admitted("model", &format!("s{}@v", MAX_PENDING + 9));
-        assert_eq!(t.take().len(), 1);
+        assert!(t.take().is_empty());
+        // A freed slot admits a new key again.
+        t.rejected("model", "late@v");
+        tokio::time::advance(Duration::from_secs(2)).await;
+        t.admitted("model", "late@v");
+        assert_eq!(t.take(), vec![("model", 2.0)]);
     }
 }

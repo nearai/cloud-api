@@ -123,6 +123,10 @@ fn verify_bundle_for(
 }
 
 /// The log index and integration time of the bundle's first Rekor entry.
+///
+/// Both are informational (reported so a reader can look the entry up). They
+/// are read from the first tlog entry of a bundle that sigstore-verify has
+/// already validated; they do not feed any trust decision.
 fn rekor_entry(bundle: &serde_json::Value) -> Result<(u64, DateTime<Utc>), ProvenanceError> {
     let entry = &bundle["verificationMaterial"]["tlogEntries"][0];
     let log_index = entry["logIndex"]

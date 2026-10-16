@@ -879,7 +879,8 @@ pub async fn init_inference_providers(
 
     // Runtime settings load BEFORE their consumers register, so a stored
     // setting (e.g. `tinfoil_trust.router_sigstore = false`) governs the very
-    // first verification. A store that is down leaves the defaults.
+    // first verification. A store that is down leaves the fail-closed initial
+    // value until the retried load succeeds.
     let tinfoil_trust = new_tinfoil_trust_handle();
     let admin_settings = build_admin_settings(
         Arc::new(
@@ -947,8 +948,9 @@ pub async fn init_inference_providers(
     (pool, admin_settings)
 }
 
-/// The Tinfoil trust handle at its defaults (`router_sigstore` on, version 0),
-/// before any stored row is applied.
+/// The Tinfoil trust handle before any stored row is applied: version 0 with
+/// `router_sigstore` and admin model pins off, so both fail closed until the stored
+/// value has loaded.
 fn new_tinfoil_trust_handle() -> Arc<
     arc_swap::ArcSwap<
         services::admin_settings::Versioned<services::attestation::tinfoil_trust::TinfoilTrust>,
@@ -957,7 +959,11 @@ fn new_tinfoil_trust_handle() -> Arc<
     Arc::new(arc_swap::ArcSwap::from_pointee(
         services::admin_settings::Versioned {
             version: 0,
-            value: Default::default(),
+            value: services::attestation::tinfoil_trust::TinfoilTrust {
+                router_sigstore: false,
+                admin_model_pins: false,
+                model_pins: Vec::new(),
+            },
         },
     ))
 }

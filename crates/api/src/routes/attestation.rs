@@ -73,8 +73,8 @@ impl From<AppState> for AttestationRouteState {
 /// provider (`tinfoil`, `chutes`) it lists the compiled pins and any runtime
 /// trust the provider accepts, such as Tinfoil's admin-added model pins with
 /// their Sigstore provenance (no raw bundles, no customer data), so anyone can
-/// see which trust inputs are live. It is cheap (the body is rendered once per
-/// set of trust versions) and sent with `Cache-Control: max-age=30`.
+/// see which trust inputs are live. It is cheap: the body is rendered once per
+/// set of trust versions.
 ///
 /// Any route added here must be justified the same way and reflected in the
 /// classification table in the module docs above. `GET /v1/attestation/report`

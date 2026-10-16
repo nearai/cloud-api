@@ -501,7 +501,7 @@ async fn session_build_failure_registers_nothing() {
     assert!(!pool.has_provider(&model).await);
 }
 
-/// `GET /v1/attestation/pins` is public, cached for 30s, and lists, per backup
+/// `GET /v1/attestation/pins` is public and lists, per backup
 /// provider, the compiled pins and (Tinfoil) the admin switches. A real Tinfoil session cannot be
 /// stubbed here, so the live router state is `null` in this endpoint.
 #[tokio::test]
@@ -509,12 +509,14 @@ async fn serial_public_pins_endpoint() {
     let server = setup_test_server().await;
     let response = server.get("/v1/attestation/pins").await;
     assert_eq!(response.status_code(), 200, "{}", response.text());
+    // Cache-Control is `no-store`, set for every response by the
+    // request-correlation middleware (per-request id); the route sets none.
     assert_eq!(
         response
             .headers()
             .get("cache-control")
             .and_then(|v| v.to_str().ok()),
-        Some("max-age=30")
+        Some("no-store")
     );
     let body: Value = response.json();
     let tinfoil = &body["tinfoil"];

@@ -1,6 +1,5 @@
 use axum::{
     extract::State,
-    http::{header, HeaderValue},
     response::{IntoResponse, Json as ResponseJson, Response},
 };
 use services::attestation::pins_view::{
@@ -76,10 +75,8 @@ pub async fn get_attested_pins(State(state): State<Arc<AttestedPinsState>>) -> R
             body
         }
     };
-    let mut response = ResponseJson(body).into_response();
-    response.headers_mut().insert(
-        header::CACHE_CONTROL,
-        HeaderValue::from_static("max-age=30"),
-    );
-    response
+    // No route-level Cache-Control: the request-correlation middleware sets
+    // `no-store` on every response (each carries a per-request id). The
+    // per-version memo above keeps repeated requests cheap instead.
+    ResponseJson(body).into_response()
 }

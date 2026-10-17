@@ -64,12 +64,23 @@ jobs:
           fetch-depth: 1
           persist-credentials: false
 
+      # Comment events carry no pull_request payload, so look up the PR's base
+      # commit for both triggers; it may be a non-default branch.
+      - name: Resolve PR base revision
+        id: pr-base
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number || github.event.issue.number }}
+        run: |
+          sha=$(gh pr view "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --json baseRefOid -q .baseRefOid)
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+
       # Review rules come from the base revision, so a PR that edits them is
       # still judged by the rules it is changing, not by its own edits.
       - name: Checkout review rules from the base revision
         uses: actions/checkout@v7
         with:
-          ref: ${{ github.event.pull_request.base.sha || github.event.repository.default_branch }}
+          ref: ${{ steps.pr-base.outputs.sha }}
           path: review-rules
           fetch-depth: 1
           persist-credentials: false

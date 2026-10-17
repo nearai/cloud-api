@@ -4509,6 +4509,10 @@ pub async fn get_admin_setting(
 /// other instances, redeploy; per-org `fallback_disabled` only excludes
 /// registered fallback providers for that organization and is not a
 /// source-wide stop.
+///
+/// A PATCH setting `tinfoil_trust.model_pins` verifies each pinned Sigstore
+/// bundle offline (up to 32, a few ms each) synchronously in the request,
+/// which is acceptable for an admin-only write path.
 #[utoipa::path(
     patch,
     path = "/v1/admin/settings/{key}",

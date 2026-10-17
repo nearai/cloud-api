@@ -18,6 +18,8 @@ use inference_providers::{ChatCompletionParams, InferenceProvider, StreamChunk};
 
 use super::tinfoil::TinfoilPolicyVerifier;
 use super::tinfoil_pins::TinfoilPins;
+use super::tinfoil_trust::TinfoilTrust;
+use crate::admin_settings::Versioned;
 
 /// The model the recorded test pins cover. `gpt-oss-120b` (the brief's choice)
 /// has no row in `test_pins.json` and pins must not be edited by hand, so the
@@ -34,7 +36,13 @@ async fn tinfoil_live_streaming_chat_smoke() {
         .to_string();
     let pins: TinfoilPins =
         serde_json::from_str(include_str!("testdata/tinfoil/test_pins.json")).unwrap();
-    let verifier = Arc::new(TinfoilPolicyVerifier::new(pins));
+    let verifier = Arc::new(TinfoilPolicyVerifier::new(
+        pins,
+        Arc::new(arc_swap::ArcSwap::from_pointee(Versioned {
+            version: 0,
+            value: TinfoilTrust::default(),
+        })),
+    ));
     let cfg = Config::new(key, 120);
     let session = TinfoilRouterSession::new(cfg.clone(), verifier).expect("session");
 

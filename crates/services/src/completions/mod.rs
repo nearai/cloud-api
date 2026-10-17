@@ -1193,8 +1193,8 @@ impl CompletionServiceImpl {
 
     /// Whether `extra` carries any client-facing E2EE marker: the model
     /// pub-key routing pin, or any of the four encryption headers. Mirrors
-    /// the route's `e2ee_requested` (`crates/api/src/routes/completions/mod.rs`,
-    /// near line 126), which checks the same four encryption headers off
+    /// the route's `e2ee_requested` (`crates/api/src/routes/completions/mod.rs`),
+    /// which checks the same four encryption headers off
     /// the validated `EncryptionHeaders` struct before they're written into
     /// `extra`; this checks `extra` directly (plus `MODEL_PUB_KEY`, which
     /// `e2ee_requested` doesn't cover but `reject_e2ee_if_unsupported`

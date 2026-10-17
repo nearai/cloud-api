@@ -664,26 +664,26 @@ pub async fn privacy_redact(
     let parsed_usage: UsageExtract =
         serde_json::from_slice(&response_bytes).unwrap_or(UsageExtract { data: Vec::new() });
 
-    // Dedupe by index *before* summing. A buggy provider that returns two
-    // entries with the same `index` would otherwise be billed twice while
-    // the client only sees the last entry's `usage` in the response —
-    // that's a billing/UI inconsistency. Last-write-wins keeps the bill
-    // and the surfaced per-entry usage in sync.
-    let mut per_index_usage: std::collections::HashMap<usize, UsageFields> =
+    // Accumulate per index. The detector may split one input's detections
+    // across several entries with the same `index` (see
+    // `auto_redact::detect::parse_response`); each entry's usage is real
+    // work, so sum them — as /privacy/classify does for this same upstream
+    // call — and surface the per-input total. Out-of-range indexes and
+    // negative counts are dropped.
+    let mut per_index_tokens: std::collections::HashMap<usize, i64> =
         std::collections::HashMap::new();
     for d in &parsed_usage.data {
         if d.index >= texts.len() {
             continue;
         }
-        if let Some(u) = d.usage {
-            per_index_usage.insert(d.index, u);
+        if let Some(t) = d.usage.and_then(|u| u.input_tokens).filter(|t| *t >= 0) {
+            let total = per_index_tokens.entry(d.index).or_insert(0);
+            *total = total.saturating_add(t as i64);
         }
     }
-    let token_sum_i64: i64 = per_index_usage
+    let token_sum_i64: i64 = per_index_tokens
         .values()
-        .filter_map(|u| u.input_tokens)
-        .filter(|t| *t >= 0)
-        .fold(0i64, |acc, t| acc.saturating_add(t as i64));
+        .fold(0i64, |acc, t| acc.saturating_add(*t));
     let mut token_count = token_sum_i64.clamp(0, i32::MAX as i64) as i32;
 
     const MAX_REASONABLE_TOKENS: i32 = 1_000_000;
@@ -796,9 +796,8 @@ pub async fn privacy_redact(
         .into_iter()
         .enumerate()
         .map(|(idx, redacted_text)| {
-            let usage_json = per_index_usage
+            let usage_json = per_index_tokens
                 .get(&idx)
-                .and_then(|u| u.input_tokens)
                 .map(|t| serde_json::json!({ "input_tokens": t }))
                 .unwrap_or_else(|| serde_json::json!({}));
             serde_json::json!({

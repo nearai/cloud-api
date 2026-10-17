@@ -179,8 +179,12 @@ async fn classify_sums_same_index_entries() {
     assert_eq!(recorded_input_tokens(&server, &org_id).await, vec![12]);
 }
 
+/// Redact used to keep only the last same-index entry (billing 7 here)
+/// while classify billed 12 for the identical upstream response. Same-index
+/// entries are legitimate splits of one input, so redact now sums them too
+/// and reports the summed per-input usage.
 #[tokio::test]
-async fn redact_same_index_entries_bill_last_entry_only() {
+async fn redact_sums_same_index_entries() {
     let (server, mock, org_id, api_key) = setup().await;
     upstream_body(
         &mock,
@@ -198,8 +202,8 @@ async fn redact_same_index_entries_bill_last_entry_only() {
 
     assert_eq!(resp.status_code(), 200, "{}", resp.text());
     let body: serde_json::Value = resp.json();
-    assert_eq!(body["data"][0]["usage"]["input_tokens"], 7);
-    assert_eq!(recorded_input_tokens(&server, &org_id).await, vec![7]);
+    assert_eq!(body["data"][0]["usage"]["input_tokens"], 12);
+    assert_eq!(recorded_input_tokens(&server, &org_id).await, vec![12]);
 }
 
 /// One entry's `input_tokens` does not fit i32; the whole usage parse fails.

@@ -102,18 +102,21 @@ Content-Type: application/json
     "billing": {"type": "noul", "instructions": "Is this about billing?"},
     "route": {
       "type": "choice",
+      "instructions": "Which team should handle this message?",
       "criteria": {"billing": "Billing issues", "other": null}
     },
     "urgency": {
       "type": "score",
+      "instructions": "How urgent is this message?",
       "criteria": ["Can wait", "Needs attention today"]
     }
   }
 }
 ```
 
-`state` and question instructions accept text, objects, or arrays. Instructions
-are optional; `noul` criteria are optional, choice criteria have 1–255 entries,
+`state` and question instructions accept text, objects, or arrays. Every question
+requires `instructions`; missing or null instructions return 400 before inference.
+`noul` criteria are optional, choice criteria have 1–255 entries,
 and score criteria have 1–10 levels. Score's lower bound follows the official
 OpenAPI (the prose guide recommends at least two). Unknown request fields,
 including `stream`, are rejected. The gateway validates answer types, keys,

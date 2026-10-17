@@ -206,18 +206,10 @@ async fn redact_sums_same_index_entries() {
     assert_eq!(recorded_input_tokens(&server, &org_id).await, vec![12]);
 }
 
-/// One entry's `input_tokens` does not fit i32; the whole usage parse fails.
-fn usage_with_one_oversized_entry() -> serde_json::Value {
-    serde_json::json!({
-        "model": E2E_PRIVACY_FILTER_MODEL_NAME,
-        "data": [
-            {"index": 0, "spans": [], "usage": {"input_tokens": 5}},
-            {"index": 1, "spans": [], "usage": {"input_tokens": 3_000_000_000i64}},
-        ]
-    })
-}
-
-/// One entry's `input_tokens` is not a number; the whole usage parse fails.
+/// One entry's `input_tokens` is not a number. It used to fail the whole
+/// typed usage parse, billing 0 for the call and firing a zero-token
+/// anomaly. Parsing is now lenient per entry (as `detect::parse_response`
+/// is), so only that entry is skipped and the other one bills.
 fn usage_with_one_non_numeric_entry() -> serde_json::Value {
     serde_json::json!({
         "model": E2E_PRIVACY_FILTER_MODEL_NAME,
@@ -228,39 +220,82 @@ fn usage_with_one_non_numeric_entry() -> serde_json::Value {
     })
 }
 
-#[tokio::test]
-async fn classify_malformed_usage_entry_bills_zero() {
-    for body in [
-        usage_with_one_oversized_entry(),
-        usage_with_one_non_numeric_entry(),
-    ] {
-        let (server, mock, org_id, api_key) = setup().await;
-        upstream_body(&mock, body).await;
-
-        let resp = post(&server, CLASSIFY, &api_key, serde_json::json!(["a", "b"])).await;
-
-        assert_eq!(resp.status_code(), 200, "{}", resp.text());
-        assert_eq!(recorded_input_tokens(&server, &org_id).await, vec![0]);
-    }
+/// One entry's `input_tokens` does not fit i32. It used to fail the whole
+/// parse (billing 0); it now counts as i64 and the total hits the
+/// MAX_REASONABLE_TOKENS cap like any other oversized report.
+fn usage_with_one_oversized_entry() -> serde_json::Value {
+    serde_json::json!({
+        "model": E2E_PRIVACY_FILTER_MODEL_NAME,
+        "data": [
+            {"index": 0, "spans": [], "usage": {"input_tokens": 5}},
+            {"index": 1, "spans": [], "usage": {"input_tokens": 3_000_000_000i64}},
+        ]
+    })
 }
 
 #[tokio::test]
-async fn redact_malformed_usage_entry_bills_zero() {
-    for body in [
-        usage_with_one_oversized_entry(),
-        usage_with_one_non_numeric_entry(),
-    ] {
-        let (server, mock, org_id, api_key) = setup().await;
-        upstream_body(&mock, body).await;
+async fn classify_malformed_usage_entry_skips_only_that_entry() {
+    let (server, mock, org_id, api_key) = setup().await;
+    upstream_body(&mock, usage_with_one_non_numeric_entry()).await;
 
-        let resp = post(&server, REDACT, &api_key, serde_json::json!(["a", "b"])).await;
+    let resp = post(&server, CLASSIFY, &api_key, serde_json::json!(["a", "b"])).await;
 
-        assert_eq!(resp.status_code(), 200, "{}", resp.text());
-        let body: serde_json::Value = resp.json();
-        assert_eq!(body["data"][0]["usage"], serde_json::json!({}));
-        assert_eq!(body["data"][1]["usage"], serde_json::json!({}));
-        assert_eq!(recorded_input_tokens(&server, &org_id).await, vec![0]);
-    }
+    assert_eq!(resp.status_code(), 200, "{}", resp.text());
+    assert_eq!(recorded_input_tokens(&server, &org_id).await, vec![5]);
+}
+
+#[tokio::test]
+async fn classify_oversized_usage_entry_is_capped() {
+    let (server, mock, org_id, api_key) = setup().await;
+    upstream_body(&mock, usage_with_one_oversized_entry()).await;
+
+    let resp = post(&server, CLASSIFY, &api_key, serde_json::json!(["a", "b"])).await;
+
+    assert_eq!(resp.status_code(), 200, "{}", resp.text());
+    assert_eq!(
+        recorded_input_tokens(&server, &org_id).await,
+        vec![1_000_000]
+    );
+}
+
+#[tokio::test]
+async fn redact_malformed_usage_entry_skips_only_that_entry() {
+    let (server, mock, org_id, api_key) = setup().await;
+    upstream_body(&mock, usage_with_one_non_numeric_entry()).await;
+
+    let resp = post(&server, REDACT, &api_key, serde_json::json!(["a", "b"])).await;
+
+    assert_eq!(resp.status_code(), 200, "{}", resp.text());
+    let body: serde_json::Value = resp.json();
+    assert_eq!(
+        body["data"][0]["usage"],
+        serde_json::json!({"input_tokens": 5})
+    );
+    assert_eq!(body["data"][1]["usage"], serde_json::json!({}));
+    assert_eq!(recorded_input_tokens(&server, &org_id).await, vec![5]);
+}
+
+#[tokio::test]
+async fn redact_oversized_usage_entry_is_capped() {
+    let (server, mock, org_id, api_key) = setup().await;
+    upstream_body(&mock, usage_with_one_oversized_entry()).await;
+
+    let resp = post(&server, REDACT, &api_key, serde_json::json!(["a", "b"])).await;
+
+    assert_eq!(resp.status_code(), 200, "{}", resp.text());
+    let body: serde_json::Value = resp.json();
+    assert_eq!(
+        body["data"][0]["usage"],
+        serde_json::json!({"input_tokens": 5})
+    );
+    assert_eq!(
+        body["data"][1]["usage"],
+        serde_json::json!({"input_tokens": 3_000_000_000i64})
+    );
+    assert_eq!(
+        recorded_input_tokens(&server, &org_id).await,
+        vec![1_000_000]
+    );
 }
 
 #[tokio::test]

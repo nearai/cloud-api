@@ -92,6 +92,54 @@ fn privacy_error_response(
         .into_response()
 }
 
+/// One privacy-filter data entry's billable usage.
+#[derive(Debug, PartialEq)]
+struct PrivacyUsageEntry {
+    /// The entry's `index`; `None` when present but not a valid index.
+    index: Option<usize>,
+    /// Non-negative `usage.input_tokens`.
+    input_tokens: i64,
+}
+
+/// Billable usage per data entry of a privacy-filter response:
+/// `{"data": [{"index": i, "spans": [...], "usage": {"input_tokens": N}}, ...]}`.
+///
+/// Lenient per entry, like `auto_redact::detect::parse_response`: an entry
+/// whose `input_tokens` is absent, negative or not an integer is skipped
+/// without voiding the others, so one malformed entry cannot zero the bill.
+/// A missing `index` defaults to 0. A body without a `data` array yields
+/// no entries.
+fn privacy_usage_entries(response_bytes: &[u8]) -> Vec<PrivacyUsageEntry> {
+    #[derive(serde::Deserialize)]
+    struct UsageExtract {
+        #[serde(default)]
+        data: Vec<serde_json::Value>,
+    }
+
+    let Ok(parsed) = serde_json::from_slice::<UsageExtract>(response_bytes) else {
+        return Vec::new();
+    };
+    parsed
+        .data
+        .iter()
+        .filter_map(|entry| {
+            let input_tokens = entry
+                .get("usage")?
+                .get("input_tokens")?
+                .as_i64()
+                .filter(|t| *t >= 0)?;
+            let index = match entry.get("index") {
+                None => Some(0),
+                Some(v) => v.as_u64().and_then(|i| usize::try_from(i).ok()),
+            };
+            Some(PrivacyUsageEntry {
+                index,
+                input_tokens,
+            })
+        })
+        .collect()
+}
+
 /// Privacy classification endpoint (passthrough)
 ///
 /// Proxies privacy classification requests to a token-classification model
@@ -220,38 +268,12 @@ pub async fn privacy_classify(
         .await
     {
         Ok(response_bytes) => {
-            // Privacy filter response shape:
-            //   { "model": "...", "data": [{ "index": i, "spans": [...], "usage": { "input_tokens": N } }, ...] }
-            // Sum per-item input_tokens for billing.
-            #[derive(serde::Deserialize)]
-            struct UsageExtract {
-                #[serde(default)]
-                data: Vec<DataEntry>,
-            }
-            #[derive(serde::Deserialize)]
-            struct DataEntry {
-                #[serde(default)]
-                usage: Option<UsageFields>,
-            }
-            #[derive(serde::Deserialize)]
-            struct UsageFields {
-                input_tokens: Option<i32>,
-            }
-
-            // Sum into i64 with saturating arithmetic and clamp to i32. The provider
-            // controls both the number of data entries and per-entry input_tokens, so a
-            // naive `sum::<i32>()` could wrap silently in release builds before the
-            // MAX_REASONABLE_TOKENS check, recording negative usage.
-            let token_sum_i64: i64 = serde_json::from_slice::<UsageExtract>(&response_bytes)
-                .ok()
-                .map(|u| {
-                    u.data
-                        .into_iter()
-                        .filter_map(|d| d.usage.and_then(|x| x.input_tokens))
-                        .filter(|t| *t >= 0)
-                        .fold(0i64, |acc, t| acc.saturating_add(t as i64))
-                })
-                .unwrap_or(0);
+            // Sum every entry's input_tokens for billing. Saturating so a
+            // provider returning huge or many counts cannot wrap before the
+            // MAX_REASONABLE_TOKENS check below.
+            let token_sum_i64: i64 = privacy_usage_entries(&response_bytes)
+                .iter()
+                .fold(0i64, |acc, e| acc.saturating_add(e.input_tokens));
             let mut token_count = token_sum_i64.clamp(0, i32::MAX as i64) as i32;
 
             const MAX_REASONABLE_TOKENS: i32 = 1_000_000;
@@ -644,26 +666,6 @@ pub async fn privacy_redact(
     // Pull per-entry usage from the upstream response (same shape as
     // classify) so we can both bill the org and surface per-entry
     // input_tokens to the client.
-    #[derive(serde::Deserialize)]
-    struct UsageExtract {
-        #[serde(default)]
-        data: Vec<DataEntry>,
-    }
-    #[derive(serde::Deserialize)]
-    struct DataEntry {
-        #[serde(default)]
-        index: usize,
-        #[serde(default)]
-        usage: Option<UsageFields>,
-    }
-    #[derive(serde::Deserialize, Clone, Copy)]
-    struct UsageFields {
-        input_tokens: Option<i32>,
-    }
-
-    let parsed_usage: UsageExtract =
-        serde_json::from_slice(&response_bytes).unwrap_or(UsageExtract { data: Vec::new() });
-
     // Accumulate per index. The detector may split one input's detections
     // across several entries with the same `index` (see
     // `auto_redact::detect::parse_response`); each entry's usage is real
@@ -672,14 +674,12 @@ pub async fn privacy_redact(
     // negative counts are dropped.
     let mut per_index_tokens: std::collections::HashMap<usize, i64> =
         std::collections::HashMap::new();
-    for d in &parsed_usage.data {
-        if d.index >= texts.len() {
+    for entry in privacy_usage_entries(&response_bytes) {
+        let Some(index) = entry.index.filter(|i| *i < texts.len()) else {
             continue;
-        }
-        if let Some(t) = d.usage.and_then(|u| u.input_tokens).filter(|t| *t >= 0) {
-            let total = per_index_tokens.entry(d.index).or_insert(0);
-            *total = total.saturating_add(t as i64);
-        }
+        };
+        let total = per_index_tokens.entry(index).or_insert(0);
+        *total = total.saturating_add(entry.input_tokens);
     }
     let token_sum_i64: i64 = per_index_tokens
         .values()
@@ -838,6 +838,44 @@ pub async fn privacy_redact(
 mod tests {
     use super::*;
     use services::completions::ports::CompletionError;
+
+    fn entry(index: Option<usize>, input_tokens: i64) -> PrivacyUsageEntry {
+        PrivacyUsageEntry {
+            index,
+            input_tokens,
+        }
+    }
+
+    #[test]
+    fn usage_entries_skip_only_the_malformed_entry() {
+        let body = br#"{"data": [
+            {"index": 0, "usage": {"input_tokens": 5}},
+            {"index": 1, "usage": {"input_tokens": "n/a"}},
+            {"index": 2, "usage": {"input_tokens": 3000000000}},
+            {"index": 3, "usage": {"input_tokens": -4}},
+            {"index": 4, "usage": {"input_tokens": 1.5}},
+            {"index": 5, "usage": {}},
+            {"index": 6},
+            {"usage": {"input_tokens": 2}},
+            {"index": "x", "usage": {"input_tokens": 3}}
+        ]}"#;
+        assert_eq!(
+            privacy_usage_entries(body),
+            vec![
+                entry(Some(0), 5),
+                entry(Some(2), 3_000_000_000),
+                entry(Some(0), 2),
+                entry(None, 3),
+            ]
+        );
+    }
+
+    #[test]
+    fn usage_entries_empty_for_unexpected_bodies() {
+        assert!(privacy_usage_entries(b"not json").is_empty());
+        assert!(privacy_usage_entries(br#"{"data": "nope"}"#).is_empty());
+        assert!(privacy_usage_entries(br#"{"model": "m"}"#).is_empty());
+    }
 
     fn parts(endpoint: PrivacyEndpoint, e: CompletionError) -> (u16, &'static str, String) {
         let (status, ty, msg) = privacy_error_parts(endpoint, e);

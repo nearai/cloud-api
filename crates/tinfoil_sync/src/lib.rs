@@ -21,6 +21,7 @@ pub mod report;
 
 use classify::{Earlier, Observations};
 use services::attestation::tinfoil_pins::TinfoilPins;
+use services::attestation::tinfoil_trust::MAX_MODEL_PINS;
 
 /// Rows that earlier runs verified: the `verified` field of every
 /// `observations.json` audit file below `dir` (the downloaded artifacts of
@@ -95,9 +96,132 @@ pub fn audit_json(
     .expect("audit serialises")
 }
 
+/// Bytes of `model_pins` rows one artifact may carry: half of the setting's
+/// size limit, leaving room for the pins already stored, since the PATCH
+/// replaces the whole list.
+pub const ADMIN_PINS_BYTE_BUDGET: usize = services::attestation::tinfoil_trust::TRUST_MAX_BYTES / 2;
+
+/// Model rows one artifact may carry: half of the setting's pin limit, so the
+/// merged PATCH keeps room for pins already stored, like the byte budget.
+pub const ADMIN_PINS_MAX_ROWS: usize = MAX_MODEL_PINS / 2;
+
+/// The rows of the `PATCH /v1/admin/settings/tinfoil_trust` body that trusts
+/// the model releases seen live and Sigstore-verified but not yet in the
+/// compiled pins, each with the release's raw Sigstore bundle. The rows stay
+/// within what one PATCH accepts (at most [`ADMIN_PINS_MAX_ROWS`] rows and
+/// [`ADMIN_PINS_BYTE_BUDGET`] bytes); the second value names the candidates
+/// left out (`slug repo@tag`, identifiers only) so they can be surfaced.
+pub fn admin_pin_rows(
+    base: &TinfoilPins,
+    observations: &Observations,
+    sigstore: &classify::SigstoreResults,
+    bundles: &std::collections::BTreeMap<String, serde_json::Value>,
+) -> (Vec<serde_json::Value>, Vec<String>) {
+    let (mut rows, mut left_out, mut bytes) = (Vec::new(), Vec::new(), 0usize);
+    for (slug, repo, tag) in classify::admin_pin_candidates(base, observations, sigstore) {
+        let Some(bundle) = bundles.get(&format!("{repo}@{tag}")) else {
+            continue;
+        };
+        let row = serde_json::json!({
+            "slug": slug,
+            "repo": repo,
+            "tag": tag,
+            "sigstore_bundle": bundle,
+        });
+        let size = row.to_string().len();
+        if rows.len() >= ADMIN_PINS_MAX_ROWS || bytes + size > ADMIN_PINS_BYTE_BUDGET {
+            left_out.push(format!("{slug} {repo}@{tag}"));
+        } else {
+            bytes += size;
+            rows.push(row);
+        }
+    }
+    (rows, left_out)
+}
+
+/// The artifact body: `{"model_pins":[...]}`, empty when nothing is new.
+pub fn admin_pins_json(rows: &[serde_json::Value]) -> String {
+    serde_json::to_string_pretty(&serde_json::json!({ "model_pins": rows }))
+        .expect("admin pins serialise")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `n` live, verified, uncompiled model releases with a bundle each.
+    fn candidates(
+        n: usize,
+        bundle_len: usize,
+    ) -> (
+        Observations,
+        classify::SigstoreResults,
+        std::collections::BTreeMap<String, serde_json::Value>,
+    ) {
+        let regs = ["aa", "r1", "r2"];
+        let mut observed = Observations {
+            observed_at: "t".into(),
+            router: None,
+            models: vec![],
+        };
+        let mut sigstore = classify::SigstoreResults::default();
+        let mut bundles = std::collections::BTreeMap::new();
+        for i in 0..n {
+            let (slug, repo) = (format!("m{i:03}"), format!("tinfoilsh/m{i:03}"));
+            observed.models.push(classify::ModelObservation {
+                slug: slug.clone(),
+                repo: repo.clone(),
+                tag: "v1".into(),
+                kind: "p".into(),
+                registers: regs.iter().map(|r| r.to_string()).collect(),
+            });
+            sigstore.models.insert(
+                format!("{repo}@v1"),
+                tinfoil_provenance::Provenance {
+                    repo: repo.clone(),
+                    tag: "v1".into(),
+                    predicate_type: "p".into(),
+                    subject_sha256: "d".into(),
+                    snp_measurement: "aa".into(),
+                    rtmr1: Some("r1".into()),
+                    rtmr2: Some("r2".into()),
+                    rekor_log_index: 1,
+                    integrated_time: chrono::DateTime::UNIX_EPOCH,
+                },
+            );
+            bundles.insert(
+                format!("{repo}@v1"),
+                serde_json::json!({ "pad": "x".repeat(bundle_len) }),
+            );
+        }
+        (observed, sigstore, bundles)
+    }
+
+    #[test]
+    fn admin_pin_rows_stop_at_the_pin_count_limit_and_name_the_rest() {
+        // The cap is now ADMIN_PINS_MAX_ROWS (half the setting limit), so the
+        // left-out names start at that index instead of MAX_MODEL_PINS.
+        let n = ADMIN_PINS_MAX_ROWS;
+        let (o, s, b) = candidates(n + 3, 10);
+        let (rows, left_out) = admin_pin_rows(&TinfoilPins::default(), &o, &s, &b);
+        assert_eq!(rows.len(), n);
+        assert_eq!(
+            left_out,
+            (n..n + 3)
+                .map(|i| format!("m{i:03} tinfoilsh/m{i:03}@v1"))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn admin_pin_rows_stop_at_the_byte_budget() {
+        let (o, s, b) = candidates(8, ADMIN_PINS_BYTE_BUDGET / 5);
+        let (rows, left_out) = admin_pin_rows(&TinfoilPins::default(), &o, &s, &b);
+        assert_eq!(rows.len(), 4);
+        assert_eq!(left_out.len(), 4);
+        let body = admin_pins_json(&rows);
+        assert!(body.len() <= services::attestation::tinfoil_trust::TRUST_MAX_BYTES);
+    }
 
     #[test]
     fn evidence_is_merged_from_every_observations_file_below_the_dir() {

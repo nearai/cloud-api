@@ -193,6 +193,30 @@ fn evaluate(observed: &Observations, sigstore: &SigstoreResults) -> (TinfoilPins
     (live, rejected)
 }
 
+/// One model row a runtime admin pin can add: seen live, equal to its verified
+/// Sigstore predicate, and not already in the compiled pins `base`. Sorted by
+/// slug, then tag. Returns `(slug, repo, tag)`.
+pub fn admin_pin_candidates(
+    base: &TinfoilPins,
+    observed: &Observations,
+    sigstore: &SigstoreResults,
+) -> Vec<(String, String, String)> {
+    let (live, _) = evaluate(observed, sigstore);
+    let mut out: Vec<(String, String, String)> = live
+        .models
+        .iter()
+        .flat_map(|(slug, ps)| {
+            ps.iter()
+                .filter(|m| !has(base, &Row::Model(slug.clone(), (*m).clone())))
+                .map(|m| (slug.clone(), m.repo.clone(), m.tag.clone()))
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    out.sort_by(|a, b| (&a.0, &a.2, &a.1).cmp(&(&b.0, &b.2, &b.1)));
+    out.dedup();
+    out
+}
+
 /// Why observed rows were not pinned although their release has a verified
 /// Sigstore attestation. Append to the run's notes.
 pub fn rejections(observed: &Observations, sigstore: &SigstoreResults) -> Vec<String> {
@@ -481,5 +505,46 @@ mod tests {
         assert!(rejections(&obs_router(M), &router_sig(M)).is_empty());
         assert!(rejections(&model_obs(&["aa", "r1", "r2"]), &model_sig("aa")).is_empty());
         assert!(rejections(&model_obs(&["aa"]), &SigstoreResults::default()).is_empty());
+    }
+
+    #[test]
+    fn admin_pin_candidates_skips_compiled_and_sorts() {
+        let regs = ["aa", "r1", "r2"];
+        let mut observed = Observations {
+            observed_at: "t".into(),
+            router: None,
+            models: vec![],
+        };
+        let mut sigstore = SigstoreResults::default();
+        for slug in ["zeta", "alpha", "compiled"] {
+            let repo = format!("tinfoilsh/{slug}");
+            observed.models.push(ModelObservation {
+                slug: slug.into(),
+                repo: repo.clone(),
+                tag: "v1".into(),
+                kind: "p".into(),
+                registers: regs.iter().map(|r| r.to_string()).collect(),
+            });
+            let mut prov = sig("aa");
+            prov.repo = repo.clone();
+            prov.predicate_type = "p".into();
+            sigstore.models.insert(format!("{repo}@v1"), prov);
+        }
+        let mut base = TinfoilPins::default();
+        base.models.insert(
+            "compiled".into(),
+            vec![ModelPin {
+                registers: regs.iter().map(|r| r.to_string()).collect(),
+                repo: "tinfoilsh/compiled".into(),
+                tag: "v1".into(),
+            }],
+        );
+        assert_eq!(
+            admin_pin_candidates(&base, &observed, &sigstore),
+            vec![
+                ("alpha".into(), "tinfoilsh/alpha".into(), "v1".into()),
+                ("zeta".into(), "tinfoilsh/zeta".into(), "v1".into()),
+            ]
+        );
     }
 }

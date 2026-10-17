@@ -163,13 +163,14 @@ pub async fn register_tinfoil_with(
         tracing::warn!(
             canonical = %entry.canonical_id,
             slug = %entry.upstream_id,
-            "TINFOIL_MODELS entry has no row in the compiled model pins; it is registered closed and serves 503 until the pins include it"
+            "TINFOIL_MODELS entry has no row in the compiled model pins; it is registered closed and serves 503 until the pins include it; add an admin pin via tinfoil_trust or wait for the compiled pins"
         );
     }
     let verifier = Arc::new(services::attestation::tinfoil::TinfoilPolicyVerifier::new(
         pins, trust,
     ));
-    let pcfg = tinfoil_provider::Config::new(api_key, cfg.timeout_seconds);
+    let pcfg = tinfoil_provider::Config::new(api_key, cfg.timeout_seconds)
+        .with_served_slugs(cfg.tinfoil_models.iter().map(|e| e.upstream_id.clone()));
     let session = match build_session(pcfg.clone(), verifier) {
         Ok(s) => s,
         Err(e) => {
@@ -266,6 +267,29 @@ fn emit_tinfoil_metrics(
         metrics,
         last_auth,
     );
+    emit_time_to_trust(
+        ProviderSource::Tinfoil.as_str(),
+        session.take_time_to_trust(),
+        metrics,
+    );
+}
+
+/// One histogram sample per measurement that went from rejected to admitted.
+fn emit_time_to_trust(
+    provider: &str,
+    samples: Vec<(tinfoil_provider::TrustKind, f64)>,
+    metrics: &dyn MetricsServiceTrait,
+) {
+    for (kind, seconds) in samples {
+        metrics.record_histogram(
+            consts::METRIC_ATTESTED_3P_TIME_TO_TRUST,
+            seconds,
+            &[
+                &format!("provider:{provider}"),
+                &format!("kind:{}", kind.as_str()),
+            ],
+        );
+    }
 }
 
 /// The pure half of [`emit_tinfoil_metrics`], so every state can be tested.
@@ -546,6 +570,43 @@ mod tests {
                 "result:failed".to_string(),
                 "reason:unknown_router_measurement".to_string()
             ]]
+        );
+    }
+
+    #[test]
+    fn time_to_trust_is_a_histogram_tagged_by_provider_and_kind() {
+        use services::metrics::capturing::{CapturingMetricsService, MetricValue};
+        let m = CapturingMetricsService::new();
+        emit_time_to_trust(
+            "tinfoil",
+            vec![
+                (tinfoil_provider::TrustKind::Router, 90.0),
+                (tinfoil_provider::TrustKind::Model, 12.5),
+            ],
+            &m,
+        );
+        emit_time_to_trust("tinfoil", vec![], &m);
+        let got: Vec<_> = m
+            .get_metrics()
+            .into_iter()
+            .filter(|r| r.name == consts::METRIC_ATTESTED_3P_TIME_TO_TRUST)
+            .map(|r| match r.value {
+                MetricValue::Histogram(v) => (v, r.tags),
+                _ => (-1.0, r.tags),
+            })
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                (
+                    90.0,
+                    vec!["provider:tinfoil".to_string(), "kind:router".to_string()]
+                ),
+                (
+                    12.5,
+                    vec!["provider:tinfoil".to_string(), "kind:model".to_string()]
+                )
+            ]
         );
     }
 

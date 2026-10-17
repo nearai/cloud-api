@@ -57,6 +57,10 @@ pub const METRIC_BACKEND_KEY_DIVERGENCE: &str = "cloud_api.backend.key_divergenc
 // Tagged `model`, `path` (inline_verify|discovery) and `result`
 // (match|mismatch|unattested|missing).
 pub const METRIC_BACKEND_CHANNEL_BINDING: &str = "cloud_api.backend.channel_binding";
+/// Seconds from an attested third-party measurement or release first being
+/// rejected as unknown to its first admission, emitted once each. Tagged
+/// `provider` (a `ProviderSource::as_str()` value) and `kind` (`router|model`).
+pub const METRIC_ATTESTED_3P_TIME_TO_TRUST: &str = "cloud_api.attested_3p.time_to_trust_seconds";
 
 // Tinfoil attested backup (polled by the API layer from the router session,
 // since `inference_providers` cannot depend on this crate).

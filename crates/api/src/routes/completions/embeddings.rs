@@ -210,10 +210,12 @@ pub async fn embeddings(
                 inference_id: Some(inference_id),
                 stop_reason: Some(services::usage::StopReason::Completed),
                 ..services::usage::RecordUsageServiceRequest::base(
-                    organization_id,
-                    workspace_id,
-                    api_key_id,
-                    model_id,
+                    services::usage::BillingIdentity {
+                        organization_id,
+                        workspace_id,
+                        api_key_id,
+                        model_id,
+                    },
                     services::usage::ports::InferenceType::Embedding,
                 )
             };

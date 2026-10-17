@@ -150,10 +150,12 @@ pub async fn systemone(
             stop_reason: Some(StopReason::Completed),
             provider_attribution: served.provider_attribution,
             ..RecordUsageServiceRequest::base(
-                api_key.organization.id.0,
-                api_key.workspace.id.0,
-                api_key_id,
-                model.id,
+                services::usage::BillingIdentity {
+                    organization_id: api_key.organization.id.0,
+                    workspace_id: api_key.workspace.id.0,
+                    api_key_id,
+                    model_id: model.id,
+                },
                 InferenceType::Decisions,
             )
         };

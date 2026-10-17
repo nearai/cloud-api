@@ -531,10 +531,12 @@ impl UsageServiceTrait for UsageServiceImpl {
             provider_attribution,
             discount,
             ..RecordUsageServiceRequest::base(
-                organization_id,
-                workspace_id,
-                api_key_id,
-                model.id,
+                crate::usage::BillingIdentity {
+                    organization_id,
+                    workspace_id,
+                    api_key_id,
+                    model_id: model.id,
+                },
                 inference_type,
             )
         };

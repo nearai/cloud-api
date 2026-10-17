@@ -573,7 +573,7 @@ pub enum RecordUsageApiRequest {
 }
 
 /// Request to record usage (service layer)
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CacheWriteBilling {
     /// Cache-write tokens, included in `input_tokens`.
     pub tokens: i32,
@@ -581,7 +581,7 @@ pub struct CacheWriteBilling {
     pub cost_per_token: i64,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct RecordUsageServiceRequest {
     pub organization_id: Uuid,
     pub workspace_id: Uuid,
@@ -622,27 +622,37 @@ pub struct RecordUsageServiceRequest {
     pub discount: Option<UsageDiscount>,
 }
 
+/// Who a usage row bills and for which catalog model. Named fields keep the
+/// four same-typed ids from being transposed at a call site.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BillingIdentity {
+    pub organization_id: Uuid,
+    pub workspace_id: Uuid,
+    pub api_key_id: Uuid,
+    pub model_id: Uuid,
+}
+
 impl RecordUsageServiceRequest {
-    /// A request carrying only who is billed, for which model and kind of
-    /// inference, with every measurement zero or absent. Callers fill in
-    /// what they measured with struct-update syntax:
+    /// A request carrying only who is billed and the kind of inference, with
+    /// every measurement zero or absent. Callers fill in what they measured
+    /// with struct-update syntax:
     ///
     /// ```ignore
     /// RecordUsageServiceRequest {
     ///     input_tokens,
     ///     stop_reason: Some(StopReason::Completed),
-    ///     ..RecordUsageServiceRequest::base(org, workspace, key, model, InferenceType::Embedding)
+    ///     ..RecordUsageServiceRequest::base(identity, InferenceType::Embedding)
     /// }
     /// ```
     ///
     /// A new billing field gets its neutral value here, once.
-    pub fn base(
-        organization_id: Uuid,
-        workspace_id: Uuid,
-        api_key_id: Uuid,
-        model_id: Uuid,
-        inference_type: InferenceType,
-    ) -> Self {
+    pub fn base(identity: BillingIdentity, inference_type: InferenceType) -> Self {
+        let BillingIdentity {
+            organization_id,
+            workspace_id,
+            api_key_id,
+            model_id,
+        } = identity;
         Self {
             organization_id,
             workspace_id,

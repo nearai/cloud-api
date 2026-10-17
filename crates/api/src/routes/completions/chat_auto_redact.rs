@@ -151,10 +151,12 @@ pub(super) async fn bill_auto_redact_classify(
         inference_id: Some(Uuid::new_v4()),
         stop_reason: Some(services::usage::StopReason::Completed),
         ..services::usage::RecordUsageServiceRequest::base(
-            api_key.organization.id.0,
-            api_key.workspace.id.0,
-            api_key_id,
-            model.id,
+            services::usage::BillingIdentity {
+                organization_id: api_key.organization.id.0,
+                workspace_id: api_key.workspace.id.0,
+                api_key_id,
+                model_id: model.id,
+            },
             services::usage::ports::InferenceType::PrivacyClassify,
         )
     };

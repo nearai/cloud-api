@@ -1135,10 +1135,12 @@ async fn record_native_usage(
         stop_reason: Some(stop_reason),
         provider_attribution: context.provider_attribution,
         ..RecordUsageServiceRequest::base(
-            context.organization_id,
-            context.workspace_id,
-            context.api_key_id,
-            context.model_id,
+            services::usage::BillingIdentity {
+                organization_id: context.organization_id,
+                workspace_id: context.workspace_id,
+                api_key_id: context.api_key_id,
+                model_id: context.model_id,
+            },
             context.inference_type,
         )
     };

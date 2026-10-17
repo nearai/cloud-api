@@ -132,10 +132,12 @@ pub async fn score(
                 inference_id: Some(inference_id),
                 stop_reason: Some(services::usage::StopReason::Completed),
                 ..services::usage::ports::RecordUsageServiceRequest::base(
-                    organization_id,
-                    workspace_id,
-                    api_key_id,
-                    model_id,
+                    services::usage::ports::BillingIdentity {
+                        organization_id,
+                        workspace_id,
+                        api_key_id,
+                        model_id,
+                    },
                     services::usage::ports::InferenceType::Score,
                 )
             };

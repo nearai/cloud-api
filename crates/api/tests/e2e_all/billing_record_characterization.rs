@@ -40,13 +40,16 @@ impl RecordingUsageService {
     /// Wait (bounded) until exactly `count` records were captured, then hold
     /// briefly to catch any unexpected extra recording.
     async fn wait_for(&self, count: usize) -> Vec<RecordUsageServiceRequest> {
-        for _ in 0..300 {
-            if self.records().len() >= count {
-                break;
-            }
+        // Async retries are spawned immediately on failure (no backoff), so
+        // the poll budget only covers task-scheduling jitter; the quiet period
+        // absorbs the same jitter before asserting no extra record arrived.
+        const POLL_BUDGET: Duration = Duration::from_secs(5);
+        const QUIET_PERIOD: Duration = Duration::from_millis(500);
+        let deadline = tokio::time::Instant::now() + POLL_BUDGET;
+        while self.records().len() < count && tokio::time::Instant::now() < deadline {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
-        tokio::time::sleep(Duration::from_millis(200)).await;
+        tokio::time::sleep(QUIET_PERIOD).await;
         let records = self.records();
         assert_eq!(records.len(), count, "unexpected record count: {records:?}");
         records
@@ -257,17 +260,13 @@ fn assert_random_v4(record: &RecordUsageServiceRequest) {
 
 fn assert_default_attribution(record: &RecordUsageServiceRequest) {
     assert_eq!(
-        format!("{:?}", record.provider_attribution),
-        format!("{:?}", services::usage::ProviderAttribution::default())
+        record.provider_attribution,
+        services::usage::ProviderAttribution::default()
     );
 }
 
 fn assert_same_request(a: &RecordUsageServiceRequest, b: &RecordUsageServiceRequest) {
-    assert_eq!(
-        format!("{a:?}"),
-        format!("{b:?}"),
-        "retry must resend the identical request"
-    );
+    assert_eq!(a, b, "retry must resend the identical request");
 }
 
 async fn post_image_generation(f: &Fixture) -> axum_test::TestResponse {
@@ -317,6 +316,7 @@ async fn post_audio(f: &Fixture, model: &str) -> axum_test::TestResponse {
     f.server
         .post("/v1/audio/transcriptions")
         .add_header("Authorization", format!("Bearer {}", f.api_key))
+        .add_header("User-Agent", MOCK_USER_AGENT)
         .multipart(
             axum_test::multipart::MultipartForm::new()
                 .add_part(
@@ -331,46 +331,40 @@ async fn post_audio(f: &Fixture, model: &str) -> axum_test::TestResponse {
         .await
 }
 
-async fn create_audio_model(f: &Fixture, model: &str) {
+/// Register a test-owned model billed per input unit at $0.001.
+async fn create_input_billed_model(
+    f: &Fixture,
+    model: &str,
+    label: &str,
+    context_length: u32,
+    text_modalities: bool,
+) {
+    let mut config = serde_json::json!({
+        "inputCostPerToken": {"amount": 1000000, "currency": "USD"},
+        "outputCostPerToken": {"amount": 0, "currency": "USD"},
+        "costPerImage": {"amount": 0, "currency": "USD"},
+        "modelDisplayName": label,
+        "modelDescription": label,
+        "contextLength": context_length,
+        "maxOutputLength": 1024,
+        "verifiable": false,
+        "isActive": true
+    });
+    if text_modalities {
+        config["inputModalities"] = serde_json::json!(["text"]);
+        config["outputModalities"] = serde_json::json!(["text"]);
+    }
     let mut batch = api::models::BatchUpdateModelApiRequest::new();
-    batch.insert(
-        model.to_string(),
-        serde_json::from_value(serde_json::json!({
-            "inputCostPerToken": {"amount": 1000000, "currency": "USD"},
-            "outputCostPerToken": {"amount": 0, "currency": "USD"},
-            "costPerImage": {"amount": 0, "currency": "USD"},
-            "modelDisplayName": "Billing characterization audio",
-            "modelDescription": "Billing characterization audio",
-            "contextLength": 4096,
-            "maxOutputLength": 1024,
-            "verifiable": false,
-            "isActive": true,
-            "inputModalities": ["text"],
-            "outputModalities": ["text"]
-        }))
-        .unwrap(),
-    );
+    batch.insert(model.to_string(), serde_json::from_value(config).unwrap());
     admin_batch_upsert_models(&f.server, batch, get_session_id()).await;
 }
 
+async fn create_audio_model(f: &Fixture, model: &str) {
+    create_input_billed_model(f, model, "Billing characterization audio", 4096, true).await;
+}
+
 async fn create_embedding_model(f: &Fixture, model: &str) {
-    let mut batch = api::models::BatchUpdateModelApiRequest::new();
-    batch.insert(
-        model.to_string(),
-        serde_json::from_value(serde_json::json!({
-            "inputCostPerToken": {"amount": 1000000, "currency": "USD"},
-            "outputCostPerToken": {"amount": 0, "currency": "USD"},
-            "costPerImage": {"amount": 0, "currency": "USD"},
-            "modelDisplayName": "Billing characterization embedding",
-            "modelDescription": "Billing characterization embedding",
-            "contextLength": 32768,
-            "maxOutputLength": 1024,
-            "verifiable": false,
-            "isActive": true
-        }))
-        .unwrap(),
-    );
-    admin_batch_upsert_models(&f.server, batch, get_session_id()).await;
+    create_input_billed_model(f, model, "Billing characterization embedding", 32768, false).await;
 }
 
 async fn post_json(f: &Fixture, path: &str, body: serde_json::Value) -> axum_test::TestResponse {
@@ -490,6 +484,8 @@ async fn audio_records_duration_seconds_with_random_id() {
 
     assert_common_shape(record, f.org_id);
     assert_eq!(record.inference_type, InferenceType::AudioTranscription);
+    // MockProvider reports duration as file_size_kb * 0.1 s
+    // (inference_providers/src/mock.rs): 100 KB → 10 s.
     assert_eq!(record.input_tokens, 10, "billed by ceil(duration seconds)");
     assert_eq!(record.output_tokens, 0);
     assert!(record.image_count.is_none());
@@ -518,6 +514,8 @@ async fn rerank_records_total_tokens_with_random_id() {
 
     assert_common_shape(record, f.org_id);
     assert_eq!(record.inference_type, InferenceType::Rerank);
+    // MockProvider hard-codes rerank usage at 50 tokens
+    // (inference_providers/src/mock.rs); update both together.
     assert_eq!(record.input_tokens, 50);
     assert_eq!(record.output_tokens, 0);
     assert!(record.image_count.is_none());
@@ -551,6 +549,8 @@ async fn embeddings_records_total_tokens_with_random_id() {
 
     assert_common_shape(record, f.org_id);
     assert_eq!(record.inference_type, InferenceType::Embedding);
+    // MockProvider always reports 10 embedding tokens
+    // (inference_providers/src/mock.rs); update both together.
     assert_eq!(record.input_tokens, 10);
     assert_eq!(record.output_tokens, 0);
     assert!(record.image_count.is_none());
@@ -618,7 +618,10 @@ async fn privacy_classify_records_summed_tokens_with_random_id() {
         .as_array()
         .expect("data array")
         .iter()
-        .map(|d| d["usage"]["input_tokens"].as_i64().unwrap_or(0))
+        // Mirror the route's summation rule (privacy.rs): skip entries without
+        // usage and drop negative token counts before summing.
+        .filter_map(|d| d["usage"]["input_tokens"].as_i64())
+        .filter(|t| *t >= 0)
         .sum();
     let record = &f.recorder.wait_for(1).await[0];
 

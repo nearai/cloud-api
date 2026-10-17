@@ -478,10 +478,12 @@ where
                         response_id,
                         provider_attribution,
                         ..RecordUsageServiceRequest::base(
-                            organization_id,
-                            workspace_id,
-                            api_key_id,
-                            model_id,
+                            crate::usage::BillingIdentity {
+                                organization_id,
+                                workspace_id,
+                                api_key_id,
+                                model_id,
+                            },
                             inference_type,
                         )
                     };
@@ -2258,10 +2260,12 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
                 response_id,
                 provider_attribution,
                 ..RecordUsageServiceRequest::base(
-                    organization_id,
-                    workspace_id,
-                    api_key_id,
-                    model_id,
+                    crate::usage::BillingIdentity {
+                        organization_id,
+                        workspace_id,
+                        api_key_id,
+                        model_id,
+                    },
                     crate::usage::ports::InferenceType::ChatCompletion,
                 )
             })

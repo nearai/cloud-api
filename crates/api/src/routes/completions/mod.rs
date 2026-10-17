@@ -216,10 +216,12 @@ fn build_image_usage_request(
         image_count: Some(record.image_count),
         provider_attribution: record.provider_attribution,
         ..services::usage::RecordUsageServiceRequest::base(
-            record.organization_id,
-            record.workspace_id,
-            record.api_key_id,
-            record.model_id,
+            services::usage::BillingIdentity {
+                organization_id: record.organization_id,
+                workspace_id: record.workspace_id,
+                api_key_id: record.api_key_id,
+                model_id: record.model_id,
+            },
             record.inference_type,
         )
     }

@@ -301,10 +301,12 @@ impl Billing {
                 stop_reason: Some(reason),
                 provider_attribution: self.attribution,
                 ..RecordUsageServiceRequest::base(
-                    self.organization_id,
-                    self.workspace_id,
-                    self.api_key_id,
-                    self.model_id,
+                    crate::usage::BillingIdentity {
+                        organization_id: self.organization_id,
+                        workspace_id: self.workspace_id,
+                        api_key_id: self.api_key_id,
+                        model_id: self.model_id,
+                    },
                     self.inference_type,
                 )
             };

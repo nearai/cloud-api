@@ -114,6 +114,17 @@ fn get_input_bucket(token_count: i32) -> &'static str {
     }
 }
 
+/// Cache-write tokens to price from a model's text pricing profile. A profile
+/// has one cache-write rate per context band, so it applies to the tokens
+/// whichever name the provider reports them under: `cache_write_tokens`
+/// (OpenAI) or `cache_creation_tokens` (Anthropic). Both names describe the
+/// same token class, so a response carrying both is counted once.
+fn cache_write_tokens_for_profile(usage: &inference_providers::TokenUsage) -> i32 {
+    usage
+        .cache_write_tokens()
+        .max(usage.cache_creation_tokens())
+}
+
 struct InterceptStream<S>
 where
     S: Stream<Item = Result<SSEEvent, inference_providers::CompletionError>> + Unpin,
@@ -309,7 +320,7 @@ where
                 usage.completion_tokens,
                 usage.cached_tokens(),
                 usage.cache_creation_tokens(),
-                usage.cache_write_tokens(),
+                cache_write_tokens_for_profile(usage),
                 chat_id.clone(),
             ),
             (None, None) => {
@@ -2186,7 +2197,8 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
         let cache_read_tokens = response_with_bytes.response.usage.cached_tokens();
         let anthropic_cache_write_tokens =
             response_with_bytes.response.usage.cache_creation_tokens();
-        let profiled_cache_write_tokens = response_with_bytes.response.usage.cache_write_tokens();
+        let profiled_cache_write_tokens =
+            cache_write_tokens_for_profile(&response_with_bytes.response.usage);
         let provider_service_tier = response_with_bytes.response.service_tier.clone();
         let model_name = model.model_name.clone();
 
@@ -3097,6 +3109,40 @@ mod tests {
             .expect("cache write should be billed");
         assert_eq!(cache_write.tokens, 2);
         assert_eq!(cache_write.cost_per_token, 125);
+        // The same tokens are reported for a model with a text pricing
+        // profile, which prices them from its own cache-write rate.
+        assert_eq!(requests[0].profiled_cache_write_tokens, 2);
+    }
+
+    #[test]
+    fn cache_write_tokens_for_profile_accepts_either_provider_name() {
+        let usage = |details: serde_json::Value| TokenUsage {
+            prompt_tokens: 100,
+            completion_tokens: 0,
+            total_tokens: 100,
+            prompt_tokens_details: Some(details),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            cache_write_tokens_for_profile(&usage(serde_json::json!({"cache_write_tokens": 30}))),
+            30
+        );
+        assert_eq!(
+            cache_write_tokens_for_profile(&usage(
+                serde_json::json!({"cache_creation_tokens": 40})
+            )),
+            40
+        );
+        // Both names for the same tokens are counted once.
+        assert_eq!(
+            cache_write_tokens_for_profile(&usage(serde_json::json!({
+                "cache_write_tokens": 40,
+                "cache_creation_tokens": 40,
+            }))),
+            40
+        );
+        assert_eq!(cache_write_tokens_for_profile(&TokenUsage::new(100, 0)), 0);
     }
 
     #[tokio::test]

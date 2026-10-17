@@ -610,9 +610,13 @@ pub struct RecordUsageServiceRequest {
     /// Number of prompt tokens that were cache hits (subset of input_tokens)
     pub cache_read_tokens: i32,
     /// Optional separately-priced cache writes (also a subset of input_tokens).
+    /// Applied only when the model has no text pricing profile.
     pub cache_write: Option<CacheWriteBilling>,
     /// Cache-write tokens for an exact text pricing profile. These are also a
     /// subset of input_tokens; the rate comes from the selected profile row.
+    /// Applied only when the model has a profile, so a caller that sets
+    /// `cache_write` must report the same tokens here as well: a model is
+    /// billed through one field or the other, never both.
     pub profiled_cache_write_tokens: i32,
     /// Explicit tier forwarded to the provider for profiled text models.
     pub requested_service_tier: Option<TextServiceTier>,

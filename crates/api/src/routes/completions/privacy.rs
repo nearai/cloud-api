@@ -36,21 +36,37 @@ fn privacy_error_parts(
             status_code,
             message,
         } => {
-            tracing::error!(
-                endpoint = label,
-                upstream_status = status_code,
-                detail = %message,
-                "Privacy provider error"
-            );
-            let http_status =
-                StatusCode::from_u16(status_code).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
-            let message = match endpoint {
+            // Upstream 4xx keeps its status (the client sent something the
+            // model rejected, so retrying will not help); auth failures and
+            // 5xx become a generic 500. `message` is the pool's sanitized
+            // "PII detector returned HTTP N", never the upstream body.
+            let failure_message = match endpoint {
                 PrivacyEndpoint::Classify => {
                     "Privacy classify request failed. Please try again later."
                 }
                 PrivacyEndpoint::Redact => "Privacy redact request failed. Please try again later.",
             };
-            (http_status, "server_error", message.to_string())
+            let classified = super::embeddings::classify_provider_error_with(
+                status_code,
+                message.clone(),
+                failure_message,
+            );
+            if classified.0.is_client_error() {
+                tracing::warn!(
+                    endpoint = label,
+                    upstream_status = status_code,
+                    detail = %message,
+                    "Privacy request rejected by upstream with client error"
+                );
+            } else {
+                tracing::error!(
+                    endpoint = label,
+                    upstream_status = status_code,
+                    detail = %message,
+                    "Privacy provider error"
+                );
+            }
+            classified
         }
         CompletionError::InvalidModel(msg) => {
             tracing::warn!(endpoint = label, "Privacy model not found");
@@ -926,43 +942,46 @@ mod tests {
         }
     }
 
+    /// Every ProviderError used to come back as `server_error` "try again
+    /// later", even for an upstream 4xx caused by the client's own payload
+    /// (classify forwards the body verbatim). It now goes through the same
+    /// classification as embeddings: 4xx keeps its status as
+    /// `invalid_request_error` (404 as `not_found_error`), while auth
+    /// failures and 5xx collapse to a generic 500.
     #[test]
-    fn provider_error_keeps_status_but_is_always_server_error() {
-        for (status, expected) in [
-            (400u16, 400u16),
-            (422, 422),
-            (500, 500),
-            (502, 502),
-            (1000, 500),
+    fn provider_error_keeps_client_status_and_masks_the_rest() {
+        let msg = |s: u16| format!("PII detector returned HTTP {s}");
+        for (endpoint, generic) in [
+            (
+                PrivacyEndpoint::Classify,
+                "Privacy classify request failed. Please try again later.",
+            ),
+            (
+                PrivacyEndpoint::Redact,
+                "Privacy redact request failed. Please try again later.",
+            ),
         ] {
-            assert_eq!(
-                parts(
-                    PrivacyEndpoint::Classify,
-                    CompletionError::ProviderError {
-                        status_code: status,
-                        message: "PII detector returned HTTP 400".into(),
-                    }
-                ),
-                (
+            for (status, expected) in [
+                (400u16, (400u16, "invalid_request_error", msg(400))),
+                (422, (422, "invalid_request_error", msg(422))),
+                (404, (404, "not_found_error", msg(404))),
+                (401, (500, "server_error", generic.to_string())),
+                (407, (500, "server_error", generic.to_string())),
+                (500, (500, "server_error", generic.to_string())),
+                (502, (500, "server_error", generic.to_string())),
+            ] {
+                assert_eq!(
+                    parts(
+                        endpoint,
+                        CompletionError::ProviderError {
+                            status_code: status,
+                            message: msg(status),
+                        }
+                    ),
                     expected,
-                    "server_error",
-                    "Privacy classify request failed. Please try again later.".to_string()
-                )
-            );
-            assert_eq!(
-                parts(
-                    PrivacyEndpoint::Redact,
-                    CompletionError::ProviderError {
-                        status_code: status,
-                        message: "PII detector returned HTTP 400".into(),
-                    }
-                ),
-                (
-                    expected,
-                    "server_error",
-                    "Privacy redact request failed. Please try again later.".to_string()
-                )
-            );
+                    "{endpoint:?} upstream {status}"
+                );
+            }
         }
     }
 

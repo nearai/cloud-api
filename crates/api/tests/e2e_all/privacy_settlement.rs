@@ -86,74 +86,64 @@ async fn upstream_body(mock: &inference_providers::mock::MockProvider, body: ser
 
 // ---- upstream HTTP errors ----
 
-#[tokio::test]
-async fn classify_upstream_400_is_502_server_error() {
+/// Client-visible `(status, error.type, error.message)` for each upstream
+/// HTTP status. These used to be uniformly 502 `server_error` "try again
+/// later": the pool collapsed every failure into `RequestFailed`, so a 4xx
+/// caused by the client's payload looked like an outage and invited retries.
+/// The pool now keeps the upstream status (with a sanitized message), and
+/// the handlers classify it as embeddings does.
+fn expected_for_upstream(status: u16, generic: &str) -> (u16, String, String) {
+    let detector = format!("PII detector returned HTTP {status}");
+    match status {
+        400 | 422 => (status, "invalid_request_error".into(), detector),
+        404 => (404, "not_found_error".into(), detector),
+        429 => (
+            429,
+            "rate_limit_error".into(),
+            "Rate limit exceeded by upstream provider. Please retry with exponential backoff."
+                .into(),
+        ),
+        503 => (
+            429,
+            "service_overloaded".into(),
+            "All inference backends are overloaded. Please retry with exponential backoff.".into(),
+        ),
+        _ => (500, "server_error".into(), generic.into()),
+    }
+}
+
+async fn assert_upstream_error_mapping(path: &str, generic: &str) {
     let (server, mock, org_id, api_key) = setup().await;
-    upstream_http_error(&mock, 400).await;
+    for status in [400u16, 401, 403, 404, 422, 429, 500, 502, 503] {
+        upstream_http_error(&mock, status).await;
 
-    let resp = post(&server, CLASSIFY, &api_key, serde_json::json!("hi")).await;
+        let resp = post(&server, path, &api_key, serde_json::json!("hi")).await;
 
-    assert_eq!(
-        error_parts(&resp),
-        (
-            502,
-            "server_error".to_string(),
-            "Privacy classify request failed. Please try again later.".to_string()
-        )
-    );
+        assert_eq!(
+            error_parts(&resp),
+            expected_for_upstream(status, generic),
+            "{path} upstream {status}"
+        );
+    }
     assert!(recorded_input_tokens(&server, &org_id).await.is_empty());
 }
 
 #[tokio::test]
-async fn redact_upstream_400_is_502_server_error() {
-    let (server, mock, org_id, api_key) = setup().await;
-    upstream_http_error(&mock, 400).await;
-
-    let resp = post(&server, REDACT, &api_key, serde_json::json!("hi")).await;
-
-    assert_eq!(
-        error_parts(&resp),
-        (
-            502,
-            "server_error".to_string(),
-            "Privacy redact request failed. Please try again later.".to_string()
-        )
-    );
-    assert!(recorded_input_tokens(&server, &org_id).await.is_empty());
+async fn classify_upstream_http_error_mapping() {
+    assert_upstream_error_mapping(
+        CLASSIFY,
+        "Privacy classify request failed. Please try again later.",
+    )
+    .await;
 }
 
 #[tokio::test]
-async fn classify_upstream_503_is_502_server_error() {
-    let (server, mock, _org_id, api_key) = setup().await;
-    upstream_http_error(&mock, 503).await;
-
-    let resp = post(&server, CLASSIFY, &api_key, serde_json::json!("hi")).await;
-
-    assert_eq!(
-        error_parts(&resp),
-        (
-            502,
-            "server_error".to_string(),
-            "Privacy classify request failed. Please try again later.".to_string()
-        )
-    );
-}
-
-#[tokio::test]
-async fn redact_upstream_503_is_502_server_error() {
-    let (server, mock, _org_id, api_key) = setup().await;
-    upstream_http_error(&mock, 503).await;
-
-    let resp = post(&server, REDACT, &api_key, serde_json::json!("hi")).await;
-
-    assert_eq!(
-        error_parts(&resp),
-        (
-            502,
-            "server_error".to_string(),
-            "Privacy redact request failed. Please try again later.".to_string()
-        )
-    );
+async fn redact_upstream_http_error_mapping() {
+    assert_upstream_error_mapping(
+        REDACT,
+        "Privacy redact request failed. Please try again later.",
+    )
+    .await;
 }
 
 // ---- usage settlement ----

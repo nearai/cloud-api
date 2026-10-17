@@ -58,20 +58,12 @@ fn privacy_error_parts(
         }
         CompletionError::ServiceOverloaded(_) => {
             tracing::warn!(endpoint = label, "Privacy service overloaded");
-            match endpoint {
-                PrivacyEndpoint::Classify => (
-                    crate::routes::common::status_overloaded(),
-                    "service_overloaded",
-                    "All inference backends are overloaded. Please retry with exponential backoff."
-                        .to_string(),
-                ),
-                PrivacyEndpoint::Redact => (
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    "service_overloaded",
-                    "The service is temporarily overloaded. Please retry with exponential backoff."
-                        .to_string(),
-                ),
-            }
+            (
+                crate::routes::common::status_overloaded(),
+                "service_overloaded",
+                "All inference backends are overloaded. Please retry with exponential backoff."
+                    .to_string(),
+            )
         }
         _ => {
             tracing::error!(endpoint = label, "Unexpected privacy endpoint error");
@@ -879,36 +871,22 @@ mod tests {
         }
     }
 
+    /// Redact used to answer 503 here, which its OpenAPI doc never declared
+    /// and which gateways count as downtime. Both endpoints now follow the
+    /// codebase convention (`status_overloaded()`, 429) with one message.
     #[test]
-    fn classify_overloaded_is_429() {
-        assert_eq!(
-            parts(
-                PrivacyEndpoint::Classify,
-                CompletionError::ServiceOverloaded("busy".into())
-            ),
-            (
-                429,
-                "service_overloaded",
-                "All inference backends are overloaded. Please retry with exponential backoff."
-                    .to_string()
-            )
-        );
-    }
-
-    #[test]
-    fn redact_overloaded_is_503() {
-        assert_eq!(
-            parts(
-                PrivacyEndpoint::Redact,
-                CompletionError::ServiceOverloaded("busy".into())
-            ),
-            (
-                503,
-                "service_overloaded",
-                "The service is temporarily overloaded. Please retry with exponential backoff."
-                    .to_string()
-            )
-        );
+    fn overloaded_is_429_for_both_endpoints() {
+        for endpoint in [PrivacyEndpoint::Classify, PrivacyEndpoint::Redact] {
+            assert_eq!(
+                parts(endpoint, CompletionError::ServiceOverloaded("busy".into())),
+                (
+                    429,
+                    "service_overloaded",
+                    "All inference backends are overloaded. Please retry with exponential backoff."
+                        .to_string()
+                )
+            );
+        }
     }
 
     #[test]

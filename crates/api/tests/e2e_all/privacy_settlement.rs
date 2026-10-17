@@ -248,6 +248,32 @@ async fn classify_oversized_usage_entry_is_capped() {
     );
 }
 
+/// A count above i64::MAX must not be dropped as malformed (which would
+/// bill only the other entry and skip the overflow anomaly); it saturates
+/// and hits the cap.
+#[tokio::test]
+async fn classify_usage_entry_above_i64_max_is_capped() {
+    let (server, mock, org_id, api_key) = setup().await;
+    upstream_body(
+        &mock,
+        serde_json::json!({
+            "data": [
+                {"index": 0, "spans": [], "usage": {"input_tokens": 5}},
+                {"index": 1, "spans": [], "usage": {"input_tokens": u64::MAX}},
+            ]
+        }),
+    )
+    .await;
+
+    let resp = post(&server, CLASSIFY, &api_key, serde_json::json!(["a", "b"])).await;
+
+    assert_eq!(resp.status_code(), 200, "{}", resp.text());
+    assert_eq!(
+        recorded_input_tokens(&server, &org_id).await,
+        vec![1_000_000]
+    );
+}
+
 #[tokio::test]
 async fn redact_malformed_usage_entry_skips_only_that_entry() {
     let (server, mock, org_id, api_key) = setup().await;

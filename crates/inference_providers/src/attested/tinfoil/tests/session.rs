@@ -561,3 +561,41 @@ async fn time_to_trust_is_sampled_once_when_a_rejected_measurement_is_admitted()
     e.session.reread_proxy().await;
     assert!(e.session.take_time_to_trust().is_empty());
 }
+
+#[tokio::test]
+async fn router_time_to_trust_waits_for_session_publication() {
+    use std::sync::atomic::Ordering;
+    let e = env().await;
+    let good_spki = *e.verifier.spki.lock().unwrap();
+    // Reject the router as unknown: this starts its clock.
+    e.verifier.reject_router.store(true, Ordering::SeqCst);
+    assert_eq!(
+        e.session.verify_now().await.unwrap_err(),
+        TinfoilVerifyError::UnknownRouterMeasurement
+    );
+    // The verifier now accepts the router, but the pinned proxy-document fetch
+    // fails, so the session never publishes it as trusted.
+    e.verifier.reject_router.store(false, Ordering::SeqCst);
+    *e.verifier.spki.lock().unwrap() = [7u8; 32];
+    jump_clock(40).await;
+    assert_eq!(e.session.verify_now().await, Err(TinfoilVerifyError::Fetch));
+    assert!(e.session.take_time_to_trust().is_empty());
+    assert!(e.session.model_status(SLUG).is_err());
+    assert!(matches!(
+        e.session.fingerprint_state(),
+        FingerprintState::Blocked
+    ));
+    // Restore the transport: the session publishes, and the one sample spans
+    // from the original rejection.
+    *e.verifier.spki.lock().unwrap() = good_spki;
+    jump_clock(20).await;
+    e.session.verify_now().await.unwrap();
+    let samples: Vec<_> = e
+        .session
+        .take_time_to_trust()
+        .into_iter()
+        .filter(|s| s.0.as_str() == "router")
+        .collect();
+    assert_eq!(samples.len(), 1);
+    assert_elapsed(samples[0], "router", 60.0);
+}

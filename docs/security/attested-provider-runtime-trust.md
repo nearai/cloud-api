@@ -13,7 +13,7 @@ Runtime pins are allowed only when Cloud API verifies signed release provenance 
 
 - **One `admin_settings` key per provider** (Tinfoil: `tinfoil_trust`). The owning module defines the type, defaults and size cap. `SettingKey::validate_patch` is the proof hook: it verifies every pin and rejects the PATCH if one fails, so nothing unverified is stored.
 - **An admission branch in the provider's verifier.** It consults the key's current value only after the provider's normal attestation checks, and re-verifies the pin's provenance.
-- **A `ProviderPinsSource`** (`crates/services/src/attestation/pins_view.rs`) feeds the public `GET /v1/attestation/pins`. The response is an object keyed by `ProviderSource::as_str()`. Each section holds the compiled pins and the runtime trust (`null` if the provider has none). Raw bundles are never served. The body is cached for 30 seconds and rebuilt only when a source's `version` changes.
+- **A `ProviderPinsSource`** (`crates/services/src/attestation/pins_view.rs`) feeds the public `GET /v1/attestation/pins`. The response is an object keyed by `ProviderSource::as_str()`. Each section holds the compiled pins and the runtime trust (`null` if the provider has none). Raw bundles are never served. It is served with `Cache-Control: no-store` over HTTP (set for every response by the request-correlation middleware) and memoized in process until a provider's trust version changes.
 - **A provider-tagged metric**, `cloud_api.attested_3p.time_to_trust_seconds{provider, kind}`: seconds from a measurement first being rejected to its first admission.
 
 ## Adding a provider

@@ -35,15 +35,23 @@ impl TrustKind {
 /// growing without limit.
 const MAX_PENDING: usize = 64;
 
-/// A clock older than this is dropped when a new key is inserted. Keys churn
-/// (superseded router releases, unpublished slugs), and without expiry stale
-/// keys would fill the set for the rest of the process lifetime.
+/// A key not rejected again for this long is dropped on the next `rejected`.
+/// Keys churn (superseded router releases, unpublished slugs), and without
+/// expiry stale keys would fill the set for the rest of the process lifetime.
+/// A key still being rejected keeps refreshing `last_seen`, so its clock
+/// survives however long the delay lasts.
 const PENDING_TTL: Duration = Duration::from_secs(24 * 60 * 60);
+
+struct Pending {
+    kind: TrustKind,
+    key: String,
+    first_rejected: Instant,
+    last_seen: Instant,
+}
 
 #[derive(Default)]
 struct Inner {
-    /// `(kind, key, first rejected at)`.
-    pending: Vec<(TrustKind, String, Instant)>,
+    pending: Vec<Pending>,
     /// `(kind, seconds)` admitted since the last drain.
     done: Vec<(TrustKind, f64)>,
     /// The "pending set full" warning was already emitted; reset once the set
@@ -59,15 +67,25 @@ impl TrustTimer {
         self.0.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    /// The first rejection of `key` starts its clock; repeats keep it. Clocks
-    /// older than `PENDING_TTL` are dropped first so their slots free up.
+    /// The first rejection of `key` starts its clock; repeats keep it and
+    /// refresh `last_seen`. Keys not seen for `PENDING_TTL` are dropped first
+    /// so their slots free up.
     pub(super) fn rejected(&self, kind: TrustKind, key: &str) {
         let mut g = self.lock();
-        g.pending.retain(|(_, _, at)| at.elapsed() < PENDING_TTL);
+        let now = Instant::now();
+        if let Some(p) = g
+            .pending
+            .iter_mut()
+            .find(|p| p.kind == kind && p.key == key)
+        {
+            p.last_seen = now;
+        }
+        g.pending
+            .retain(|p| now.duration_since(p.last_seen) < PENDING_TTL);
         if g.pending.len() < MAX_PENDING {
             g.pending_full_warned = false;
         }
-        if g.pending.iter().any(|(k, n, _)| *k == kind && n == key) {
+        if g.pending.iter().any(|p| p.kind == kind && p.key == key) {
             return;
         }
         if g.pending.len() >= MAX_PENDING {
@@ -77,7 +95,12 @@ impl TrustTimer {
             }
             return;
         }
-        g.pending.push((kind, key.to_string(), Instant::now()));
+        g.pending.push(Pending {
+            kind,
+            key: key.to_string(),
+            first_rejected: now,
+            last_seen: now,
+        });
     }
 
     /// The first admission of a previously rejected `key` records its
@@ -87,9 +110,9 @@ impl TrustTimer {
         if let Some(i) = g
             .pending
             .iter()
-            .position(|(k, n, _)| *k == kind && n == key)
+            .position(|p| p.kind == kind && p.key == key)
         {
-            let (_, _, at) = g.pending.remove(i);
+            let at = g.pending.remove(i).first_rejected;
             g.pending_full_warned = false;
             if g.done.len() < MAX_PENDING {
                 g.done.push((kind, at.elapsed().as_secs_f64()));
@@ -140,6 +163,20 @@ mod tests {
         assert!(t.take().is_empty());
         t.admitted(TrustKind::Model, "fresh@v");
         assert_eq!(t.take(), vec![(TrustKind::Model, 3.0)]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn continuously_rejected_key_keeps_its_first_clock() {
+        let t = TrustTimer::default();
+        t.rejected(TrustKind::Router, "d1");
+        for _ in 0..(25 * 60) {
+            tokio::time::advance(Duration::from_secs(60)).await;
+            t.rejected(TrustKind::Router, "d1");
+        }
+        t.admitted(TrustKind::Router, "d1");
+        let samples = t.take();
+        assert_eq!(samples.len(), 1);
+        assert!((samples[0].1 - 25.0 * 3600.0).abs() < 5.0, "{samples:?}");
     }
 
     #[tokio::test(start_paused = true)]

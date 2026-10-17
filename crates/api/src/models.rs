@@ -4551,6 +4551,8 @@ pub struct ModelHistoryResponse {
 /// - payment: Credits purchased by the organization
 /// - staking_farm: House of Stake farm reward units converted into credits
 /// - postpay: Contract billing safety ceiling; usage is invoiced separately
+/// - trace_commons: Trace Commons contributor credit; cumulative and monotonic,
+///   written only by `PUT /v1/admin/organizations/{org_id}/trace-commons/credit`
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, ToSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum CreditType {
@@ -4562,6 +4564,8 @@ pub enum CreditType {
     StakingFarm,
     #[serde(alias = "POSTPAY")]
     Postpay,
+    #[serde(rename = "trace_commons", alias = "TRACE_COMMONS")]
+    TraceCommons,
 }
 
 impl std::fmt::Display for CreditType {
@@ -4571,6 +4575,7 @@ impl std::fmt::Display for CreditType {
             CreditType::Payment => write!(f, "payment"),
             CreditType::StakingFarm => write!(f, "staking_farm"),
             CreditType::Postpay => write!(f, "postpay"),
+            CreditType::TraceCommons => write!(f, "trace_commons"),
         }
     }
 }
@@ -4583,6 +4588,7 @@ impl CreditType {
             CreditType::Payment => "payment",
             CreditType::StakingFarm => "staking_farm",
             CreditType::Postpay => "postpay",
+            CreditType::TraceCommons => "trace_commons",
         }
     }
 }
@@ -4600,6 +4606,7 @@ impl std::str::FromStr for CreditType {
             "payment" => Ok(Self::Payment),
             "staking_farm" => Ok(Self::StakingFarm),
             "postpay" => Ok(Self::Postpay),
+            "trace_commons" => Ok(Self::TraceCommons),
             _ => Err(ParseCreditTypeError),
         }
     }

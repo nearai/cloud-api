@@ -95,6 +95,7 @@ pub use workspace::WorkspaceRepository;
 
 pub mod credit_reconciliation;
 pub mod organization_usage_discount;
+pub mod trace_commons_credit;
 
 pub mod staking_wallet_binding;
 pub use staking_wallet_binding::PostgresStakingBindingRepository;

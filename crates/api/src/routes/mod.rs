@@ -1,5 +1,6 @@
 pub mod admin;
 pub mod admin_credit_reconciliation;
+pub mod admin_trace_commons_credit;
 pub mod admin_usage_hourly;
 pub mod anthropic;
 pub mod api;

@@ -3,6 +3,7 @@
 
 use super::*;
 use crate::metrics::capturing::CapturingMetricsService;
+use crate::metrics::consts::METRIC_BILLING_PRICING_FALLBACK;
 use crate::workspace::MockWorkspaceServiceTrait;
 use std::sync::Mutex;
 

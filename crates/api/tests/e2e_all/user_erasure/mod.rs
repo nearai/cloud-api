@@ -23,6 +23,7 @@ pub(crate) async fn signup(
     let user = auth
         .auth_service
         .get_or_create_oauth_user(OAuthUserInfo {
+            email_verified: true,
             provider: provider.to_string(),
             provider_user_id: provider_user_id.to_string(),
             email: email.to_string(),

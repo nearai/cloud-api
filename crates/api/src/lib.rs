@@ -227,7 +227,7 @@ pub fn init_auth_services(database: Arc<Database>, config: &ApiConfig) -> AuthCo
             organization_repo as Arc<dyn services::organization::ports::OrganizationRepository>,
             workspace_repository_for_auth,
             organization_service.clone(),
-            config.auth.require_session_bound_access_tokens,
+            &config.auth,
         ))
     };
 
@@ -1083,10 +1083,14 @@ pub fn is_origin_allowed(origin_str: &str, cors_config: &config::CorsConfig) -> 
     }
 
     if origin_str.starts_with("https://")
-        && cors_config
-            .wildcard_suffixes
-            .iter()
-            .any(|suffix| origin_str.ends_with(suffix))
+        && cors_config.wildcard_suffixes.iter().any(|suffix| {
+            // Config parsing adds a dot to bare domain suffixes. Enforce
+            // that boundary here too for callers constructing CorsConfig.
+            !suffix.is_empty()
+                && origin_str.strip_suffix(suffix).is_some_and(|prefix| {
+                    suffix.starts_with('.') || suffix.starts_with('-') || prefix.ends_with('.')
+                })
+        })
     {
         return true;
     }
@@ -1484,6 +1488,27 @@ pub fn build_auth_routes(
         .route("/github", get(github_login))
         .route("/google", get(google_login))
         .route("/callback", get(oauth_callback))
+        .route(
+            "/identities",
+            get(routes::auth::list_oauth_identities).layer(from_fn_with_state(
+                auth_state_middleware.clone(),
+                auth_middleware,
+            )),
+        )
+        .route(
+            "/identities/link",
+            post(routes::auth::start_oauth_link).layer(from_fn_with_state(
+                auth_state_middleware.clone(),
+                auth_middleware,
+            )),
+        )
+        .route(
+            "/identities/complete",
+            post(routes::auth::complete_oauth_link).layer(from_fn_with_state(
+                auth_state_middleware.clone(),
+                auth_middleware,
+            )),
+        )
         .route(
             "/user",
             get(current_user).layer(from_fn_with_state(
@@ -3063,6 +3088,7 @@ mod tests {
                 near: config::NearConfig::default(),
                 admin_domains: vec![],
                 admin_read_only_tokens_enabled: false,
+                oauth_auto_linking_enabled: false,
                 require_session_bound_access_tokens: false,
             },
             database: config::DatabaseConfig {
@@ -3187,6 +3213,7 @@ mod tests {
                 near: config::NearConfig::default(),
                 admin_domains: vec![],
                 admin_read_only_tokens_enabled: false,
+                oauth_auto_linking_enabled: false,
                 require_session_bound_access_tokens: false,
             },
             database: config::DatabaseConfig {
@@ -3338,6 +3365,19 @@ mod tests {
         let config = test_cors_config();
         assert!(is_origin_allowed("https://preview-example.com", &config));
         assert!(is_origin_allowed("https://staging-example.com", &config));
+    }
+
+    #[test]
+    fn test_cors_bare_wildcard_requires_a_domain_boundary() {
+        let config = config::CorsConfig {
+            exact_matches: vec![],
+            wildcard_suffixes: vec!["example.com".into()],
+        };
+        assert!(is_origin_allowed("https://sub.example.com", &config));
+        assert!(!is_origin_allowed("https://evilexample.com", &config));
+        assert!(!is_origin_allowed("https://example.com.evil.test", &config));
+        assert!(!is_origin_allowed("https://example.com", &config));
+        assert!(!is_origin_allowed("http://sub.example.com", &config));
     }
 
     #[tokio::test]

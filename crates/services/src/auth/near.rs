@@ -204,6 +204,7 @@ impl NearAuthService {
 
         // 7. Find or create user via AuthService
         let oauth_info = OAuthUserInfo {
+            email_verified: false,
             provider: "near".to_string(),
             provider_user_id: account_id.clone(),
             email: crate::email::near_placeholder_email(&account_id),

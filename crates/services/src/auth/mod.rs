@@ -1047,9 +1047,6 @@ mod tests {
         ) -> Result<Option<i32>, RepositoryError> {
             unimplemented!()
         }
-        async fn get_by_name(&self, _: &str) -> Result<Option<Organization>, RepositoryError> {
-            unimplemented!()
-        }
         async fn get_member(
             &self,
             _: Uuid,
@@ -1315,12 +1312,6 @@ mod tests {
             _: OrganizationId,
             _: UserId,
         ) -> Result<i64, OrganizationError> {
-            unimplemented!()
-        }
-        async fn get_organization_by_name(
-            &self,
-            _: &str,
-        ) -> Result<Option<Organization>, OrganizationError> {
             unimplemented!()
         }
         async fn get_members_with_users_paginated(

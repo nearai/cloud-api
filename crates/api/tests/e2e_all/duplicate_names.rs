@@ -1,104 +1,334 @@
-// E2E tests for duplicate organization and workspace name error handling
+// E2E tests for duplicate organization labels and scoped workspace names
 
 use crate::common::*;
 
-// ============================================
-// Organization Duplicate Name Tests
-// ============================================
-
-#[tokio::test]
-async fn test_duplicate_organization_name_returns_409() {
-    let server = setup_test_server().await;
-
-    let org_name = format!("test-org-{}", uuid::Uuid::new_v4());
-
-    // Create first organization with a specific name
-    let request = api::models::CreateOrganizationRequest {
-        name: org_name.clone(),
-        description: Some("First organization".to_string()),
-    };
-
+// Organization names are labels. UUIDs identify tenants even when names match.
+async fn create_named_organization(
+    server: &axum_test::TestServer,
+    session: &str,
+    name: &str,
+) -> api::models::OrganizationResponse {
     let response = server
         .post("/v1/organizations")
-        .add_header("Authorization", format!("Bearer {}", get_session_id()))
-        .json(&request)
+        .add_header("Authorization", format!("Bearer {session}"))
+        .json(&serde_json::json!({ "name": name }))
         .await;
-
-    assert_eq!(
-        response.status_code(),
-        200,
-        "First organization creation should succeed"
-    );
-
-    let first_org = response.json::<api::models::OrganizationResponse>();
-    assert_eq!(first_org.name, org_name);
-
-    // Try to create second organization with the same name
-    let duplicate_request = api::models::CreateOrganizationRequest {
-        name: org_name.clone(),
-        description: Some("Duplicate organization".to_string()),
-    };
-
-    let duplicate_response = server
-        .post("/v1/organizations")
-        .add_header("Authorization", format!("Bearer {}", get_session_id()))
-        .json(&duplicate_request)
-        .await;
-
-    // Should return 409 CONFLICT, not 400 or 500
-    assert_eq!(
-        duplicate_response.status_code(),
-        409,
-        "Duplicate organization name should return 409 CONFLICT"
-    );
-
-    println!("✓ Duplicate organization name correctly returns 409 CONFLICT");
+    assert_eq!(response.status_code(), 200, "{}", response.text());
+    let org = response.json::<api::models::OrganizationResponse>();
+    assert_eq!(org.name, name);
+    org
 }
 
 #[tokio::test]
-async fn test_duplicate_organization_name_case_sensitive() {
-    let server = setup_test_server().await;
+async fn test_near_personal_organization_with_non_unique_names() {
+    let (server, database) = setup_test_server_with_database().await;
+    let account = format!("duplicate-review-{}.testnet", uuid::Uuid::new_v4().simple());
+    let users = database::repositories::UserRepository::new(database.pool().clone());
+    // This path invokes the persisted provisioning function. Removing the name
+    // index without replacing its ON CONFLICT(name) clause breaks first login.
+    let user = users
+        .create_from_oauth(
+            format!("{account}@near"),
+            account.clone(),
+            None,
+            None,
+            "near".to_string(),
+            account,
+        )
+        .await
+        .expect("NEAR first login must still provision a personal organization");
+    let client = database.pool().get().await.unwrap();
+    let personal_id: uuid::Uuid = client
+        .query_one(
+            "SELECT organization_id FROM organization_members WHERE user_id = $1 AND role = 'owner'",
+            &[&user.id],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    let shared_name = format!("near-personal-{}", uuid::Uuid::new_v4());
+    let other = create_named_organization(&server, &get_session_id(), &shared_name).await;
+    client
+        .execute(
+            "UPDATE organizations SET name = $1 WHERE id = $2",
+            &[&shared_name, &personal_id],
+        )
+        .await
+        .unwrap();
+    let repeated_id: uuid::Uuid = client
+        .query_one("SELECT ensure_near_personal_organization($1)", &[&user.id])
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(repeated_id, personal_id);
+    assert_ne!(personal_id.to_string(), other.id);
+    let workspace_count: i64 = client
+        .query_one(
+            "SELECT count(*) FROM workspaces WHERE organization_id = $1 AND is_active = true",
+            &[&personal_id],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(workspace_count, 1);
+}
 
-    let org_name = format!("TestOrg-{}", uuid::Uuid::new_v4());
+#[tokio::test]
+async fn test_duplicate_organization_names_for_same_owner() {
+    let (server, database) = setup_test_server_with_database().await;
+    let (session, _) = setup_unique_test_session(&database).await;
+    let name = format!("same-owner-{}", uuid::Uuid::new_v4());
 
-    // Create first organization
-    let request = api::models::CreateOrganizationRequest {
-        name: org_name.clone(),
-        description: Some("First organization".to_string()),
-    };
+    // Concurrent creation must also produce independent organizations.
+    let (first, second) = tokio::join!(
+        create_named_organization(&server, &session, &name),
+        create_named_organization(&server, &session, &name),
+    );
+    assert_ne!(first.id, second.id);
+    assert_eq!(first.owner_id, second.owner_id);
 
     let response = server
-        .post("/v1/organizations")
-        .add_header("Authorization", format!("Bearer {}", get_session_id()))
-        .json(&request)
+        .get("/v1/organizations")
+        .add_header("Authorization", format!("Bearer {session}"))
         .await;
+    assert_eq!(response.status_code(), 200, "{}", response.text());
+    let organizations = response
+        .json::<api::models::ListOrganizationsResponse>()
+        .organizations;
+    assert_eq!(organizations.len(), 2);
+    assert!(organizations.iter().any(|org| org.id == first.id));
+    assert!(organizations.iter().any(|org| org.id == second.id));
+}
 
-    assert_eq!(response.status_code(), 200);
+#[tokio::test]
+async fn test_duplicate_organization_names_for_different_owners_and_rename() {
+    let (server, database) = setup_test_server_with_database().await;
+    let (session_a, _) = setup_unique_test_session(&database).await;
+    let (session_b, _) = setup_unique_test_session(&database).await;
+    let name = format!("different-owners-{}", uuid::Uuid::new_v4());
+    let first = create_named_organization(&server, &session_a, &name).await;
+    let second = create_named_organization(&server, &session_b, &name).await;
+    assert_ne!(first.id, second.id);
+    assert_ne!(first.owner_id, second.owner_id);
 
-    // Try to create with different case (should succeed if case-sensitive, or fail if case-insensitive)
-    // Based on PostgreSQL default behavior, this depends on collation
-    let different_case_request = api::models::CreateOrganizationRequest {
-        name: org_name.to_lowercase(),
-        description: Some("Different case organization".to_string()),
-    };
-
-    let case_response = server
-        .post("/v1/organizations")
-        .add_header("Authorization", format!("Bearer {}", get_session_id()))
-        .json(&different_case_request)
+    let renamed = create_named_organization(&server, &session_b, &format!("{name}-other")).await;
+    let response = server
+        .put(format!("/v1/organizations/{}", renamed.id).as_str())
+        .add_header("Authorization", format!("Bearer {session_b}"))
+        .json(&serde_json::json!({ "name": name }))
         .await;
+    assert_eq!(response.status_code(), 200, "{}", response.text());
+    let updated = response.json::<api::models::OrganizationResponse>();
+    assert_eq!(updated.id, renamed.id);
+    assert_eq!(updated.name, name);
 
-    // Document the behavior (case-sensitive by default in PostgreSQL)
-    if case_response.status_code() == 200 {
-        println!("✓ Organization names are case-sensitive (different case allowed)");
-    } else if case_response.status_code() == 409 {
-        println!("✓ Organization names are case-insensitive (different case blocked with 409)");
-    } else {
-        panic!(
-            "Unexpected status code {} for case variation",
-            case_response.status_code()
+    // Matching the name does not grant access to the other owner's tenant.
+    for (session, org_id) in [(&session_a, &second.id), (&session_b, &first.id)] {
+        for suffix in ["", "/members", "/usage/balance", "/workspaces"] {
+            let response = server
+                .get(format!("/v1/organizations/{org_id}{suffix}").as_str())
+                .add_header("Authorization", format!("Bearer {session}"))
+                .await;
+            assert_eq!(response.status_code(), 403, "{}", response.text());
+        }
+        let response = server
+            .put(format!("/v1/organizations/{org_id}").as_str())
+            .add_header("Authorization", format!("Bearer {session}"))
+            .json(&serde_json::json!({ "name": "unauthorized rename" }))
+            .await;
+        assert_eq!(response.status_code(), 403, "{}", response.text());
+        let response = server
+            .delete(format!("/v1/organizations/{org_id}").as_str())
+            .add_header("Authorization", format!("Bearer {session}"))
+            .await;
+        assert_eq!(response.status_code(), 403, "{}", response.text());
+    }
+}
+
+#[tokio::test]
+async fn test_duplicate_organization_resources_and_deletion_are_isolated() {
+    let (server, database) = setup_test_server_with_database().await;
+    let (owner, _) = setup_unique_test_session(&database).await;
+    let (member_session, _) = setup_unique_test_session(&database).await;
+    // Keep every member's default organization out of this deletion test.
+    let _default = create_org_with_session(&server, &owner).await;
+    let _member_default = create_org_with_session(&server, &member_session).await;
+    let name = format!("isolated-{}", uuid::Uuid::new_v4());
+    let first = create_named_organization(&server, &owner, &name).await;
+    let second = create_named_organization(&server, &owner, &format!("{name}-other")).await;
+    let response = server
+        .put(format!("/v1/organizations/{}", second.id).as_str())
+        .add_header("Authorization", format!("Bearer {owner}"))
+        .json(&serde_json::json!({ "name": name }))
+        .await;
+    assert_eq!(response.status_code(), 200, "{}", response.text());
+    assert_eq!(
+        response.json::<api::models::OrganizationResponse>().id,
+        second.id
+    );
+
+    let response = server
+        .post(format!("/v1/organizations/{}/members", first.id).as_str())
+        .add_header("Authorization", format!("Bearer {owner}"))
+        .json(&serde_json::json!({
+            "user_id": member_session.strip_prefix("rt_").unwrap(),
+            "role": "member"
+        }))
+        .await;
+    assert_eq!(response.status_code(), 200, "{}", response.text());
+
+    let mut credentials = Vec::new();
+    for (org, amount, expected_members) in [
+        (&first, 10_000_000_000_i64, 2),
+        (&second, 20_000_000_000, 1),
+    ] {
+        add_credits_with_type(
+            &server,
+            &org.id,
+            "payment",
+            None,
+            amount,
+            "USD",
+            &get_session_id(),
+        )
+        .await;
+        let response = server
+            .get(format!("/v1/organizations/{}/usage/balance", org.id).as_str())
+            .add_header("Authorization", format!("Bearer {owner}"))
+            .await;
+        assert_eq!(response.status_code(), 200, "{}", response.text());
+        let balance = response.json::<api::routes::usage::OrganizationBalanceResponse>();
+        assert_eq!(balance.organization_id, org.id);
+        assert_eq!(balance.remaining, Some(amount));
+
+        let response = server
+            .get(format!("/v1/organizations/{}/members", org.id).as_str())
+            .add_header("Authorization", format!("Bearer {owner}"))
+            .await;
+        assert_eq!(response.status_code(), 200, "{}", response.text());
+        let members = response.json::<serde_json::Value>();
+        assert_eq!(members["total"], expected_members);
+        assert!(members["members"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|m| m["organization_id"] == org.id));
+
+        let workspaces = list_workspaces_with_session(&server, org.id.clone(), &owner).await;
+        assert_eq!(workspaces.len(), 1);
+        assert_eq!(workspaces[0].name, "default");
+        assert_eq!(workspaces[0].organization_id, org.id);
+        let key = create_api_key_in_workspace_with_session(
+            &server,
+            workspaces[0].id.clone(),
+            "same-key-name".to_string(),
+            &owner,
+        )
+        .await;
+        let response = server
+            .get(format!("/v1/workspaces/{}/api-keys", workspaces[0].id).as_str())
+            .add_header("Authorization", format!("Bearer {owner}"))
+            .await;
+        assert_eq!(response.status_code(), 200, "{}", response.text());
+        let keys = response.json::<api::models::ListApiKeysResponse>().api_keys;
+        assert_eq!(keys.len(), 1);
+        assert_eq!(keys[0].id, key.id);
+        credentials.push((workspaces[0].id.clone(), key.key.unwrap()));
+    }
+    assert_ne!(credentials[0].0, credentials[1].0);
+    assert_ne!(credentials[0].1, credentials[1].1);
+
+    // A user joined to one same-named organization does not join the other.
+    for (org, expected_status) in [(&first, 200), (&second, 403)] {
+        let response = server
+            .get(format!("/v1/organizations/{}", org.id).as_str())
+            .add_header("Authorization", format!("Bearer {member_session}"))
+            .await;
+        assert_eq!(
+            response.status_code(),
+            expected_status,
+            "{}",
+            response.text()
         );
     }
+
+    let response = server
+        .get(format!("/v1/workspaces/{}/api-keys", credentials[1].0).as_str())
+        .add_header("Authorization", format!("Bearer {member_session}"))
+        .await;
+    assert_eq!(response.status_code(), 403, "{}", response.text());
+
+    // Joining both organizations with the same label preserves both memberships.
+    let response = server
+        .post(format!("/v1/organizations/{}/members", second.id).as_str())
+        .add_header("Authorization", format!("Bearer {owner}"))
+        .json(&serde_json::json!({
+            "user_id": member_session.strip_prefix("rt_").unwrap(),
+            "role": "member"
+        }))
+        .await;
+    assert_eq!(response.status_code(), 200, "{}", response.text());
+    let response = server
+        .get("/v1/users/me")
+        .add_header("Authorization", format!("Bearer {member_session}"))
+        .await;
+    assert_eq!(response.status_code(), 200, "{}", response.text());
+    let me = response.json::<serde_json::Value>();
+    let memberships = me["organizations"].as_array().unwrap();
+    assert_eq!(
+        memberships.iter().filter(|org| org["name"] == name).count(),
+        2
+    );
+    assert!(memberships
+        .iter()
+        .any(|org| org["id"] == first.id && org["name"] == name));
+    assert!(memberships
+        .iter()
+        .any(|org| org["id"] == second.id && org["name"] == name));
+
+    let response = server
+        .delete(format!("/v1/organizations/{}", first.id).as_str())
+        .add_header("Authorization", format!("Bearer {owner}"))
+        .await;
+    assert_eq!(response.status_code(), 200, "{}", response.text());
+
+    for (key, expected_status) in [(&credentials[0].1, 401), (&credentials[1].1, 200)] {
+        let response = server
+            .get("/v1/files?limit=1")
+            .add_header("Authorization", format!("Bearer {key}"))
+            .await;
+        assert_eq!(
+            response.status_code(),
+            expected_status,
+            "{}",
+            response.text()
+        );
+    }
+    let workspaces = list_workspaces_with_session(&server, second.id.clone(), &owner).await;
+    assert_eq!(workspaces.len(), 1);
+    assert_eq!(workspaces[0].id, credentials[1].0);
+    let response = server
+        .get(format!("/v1/organizations/{}/usage/balance", second.id).as_str())
+        .add_header("Authorization", format!("Bearer {owner}"))
+        .await;
+    assert_eq!(response.status_code(), 200, "{}", response.text());
+    assert_eq!(
+        response
+            .json::<api::routes::usage::OrganizationBalanceResponse>()
+            .remaining,
+        Some(20_000_000_000)
+    );
+    let response = server
+        .get("/v1/users/me")
+        .add_header("Authorization", format!("Bearer {owner}"))
+        .await;
+    assert_eq!(response.status_code(), 200, "{}", response.text());
+    let me = response.json::<serde_json::Value>();
+    let orgs = me["organizations"].as_array().unwrap();
+    assert!(!orgs.iter().any(|org| org["id"] == first.id));
+    assert!(orgs
+        .iter()
+        .any(|org| org["id"] == second.id && org["name"] == name));
 }
 
 // ============================================
@@ -838,25 +1068,14 @@ async fn test_same_api_key_name_different_workspaces_allowed() {
 #[tokio::test]
 async fn test_duplicate_errors_no_information_leakage() {
     let server = setup_test_server().await;
+    let org = create_org(&server).await;
 
-    // Create organization
-    let org_name = format!("secret-org-{}", uuid::Uuid::new_v4());
-    let request = api::models::CreateOrganizationRequest {
-        name: org_name.clone(),
-        description: Some("Secret organization".to_string()),
-    };
-
-    server
-        .post("/v1/organizations")
-        .add_header("Authorization", format!("Bearer {}", get_session_id()))
-        .json(&request)
-        .await;
-
-    // Try to create duplicate
+    // Workspace names remain unique within an organization. Their conflict
+    // responses must still hide database details after org labels become reusable.
     let duplicate_response = server
-        .post("/v1/organizations")
+        .post(format!("/v1/organizations/{}/workspaces", org.id).as_str())
         .add_header("Authorization", format!("Bearer {}", get_session_id()))
-        .json(&request)
+        .json(&serde_json::json!({ "name": "default" }))
         .await;
 
     assert_eq!(duplicate_response.status_code(), 409);

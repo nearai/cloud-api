@@ -168,7 +168,8 @@ impl From<OrganizationOrderDirection> for services::organization::OrganizationOr
 
 /// Create a new organization
 ///
-/// Creates a new organization with the authenticated user as owner.
+/// Creates a new organization with the authenticated user as owner. Names may
+/// repeat, including for the same owner; the organization ID is its identifier.
 #[utoipa::path(
     post,
     path = "/v1/organizations",
@@ -178,7 +179,6 @@ impl From<OrganizationOrderDirection> for services::organization::OrganizationOr
         (status = 200, description = "Organization created successfully", body = OrganizationResponse),
         (status = 400, description = "Bad request", body = ErrorResponse),
         (status = 401, description = "Unauthorized", body = ErrorResponse),
-        (status = 409, description = "Organization already exists", body = ErrorResponse),
         (status = 500, description = "Internal server error", body = ErrorResponse)
     ),
     security(
@@ -496,7 +496,8 @@ pub async fn patch_organization_settings(
 
 /// Update organization
 ///
-/// Updates organization details for a specific organization ID.
+/// Updates organization details for a specific organization ID. The new name
+/// may match another organization's name, including one with the same owner.
 #[utoipa::path(
     put,
     path = "/v1/organizations/{org_id}",
@@ -815,13 +816,6 @@ mod tests {
             _: OrganizationId,
             _: UserId,
         ) -> Result<i64, OrganizationError> {
-            unimplemented!()
-        }
-
-        async fn get_organization_by_name(
-            &self,
-            _: &str,
-        ) -> Result<Option<Organization>, OrganizationError> {
             unimplemented!()
         }
 

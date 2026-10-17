@@ -640,6 +640,53 @@ pub struct RecordUsageServiceRequest {
     pub discount: Option<UsageDiscount>,
 }
 
+impl RecordUsageServiceRequest {
+    /// A request carrying only who is billed, for which model and kind of
+    /// inference, with every measurement zero or absent. Callers fill in
+    /// what they measured with struct-update syntax:
+    ///
+    /// ```ignore
+    /// RecordUsageServiceRequest {
+    ///     input_tokens,
+    ///     stop_reason: Some(StopReason::Completed),
+    ///     ..RecordUsageServiceRequest::base(org, workspace, key, model, InferenceType::Embedding)
+    /// }
+    /// ```
+    ///
+    /// A new billing field gets its neutral value here, once.
+    pub fn base(
+        organization_id: Uuid,
+        workspace_id: Uuid,
+        api_key_id: Uuid,
+        model_id: Uuid,
+        inference_type: InferenceType,
+    ) -> Self {
+        Self {
+            organization_id,
+            workspace_id,
+            api_key_id,
+            model_id,
+            input_tokens: 0,
+            output_tokens: 0,
+            cache_read_tokens: 0,
+            cache_write: None,
+            profiled_cache_write_tokens: 0,
+            requested_service_tier: None,
+            provider_service_tier: None,
+            inference_type,
+            ttft_ms: None,
+            avg_itl_ms: None,
+            inference_id: None,
+            provider_request_id: None,
+            stop_reason: None,
+            response_id: None,
+            image_count: None,
+            provider_attribution: ProviderAttribution::default(),
+            discount: None,
+        }
+    }
+}
+
 /// Basis points in one whole (100%).
 const DISCOUNT_BASIS_POINTS_PER_UNIT: i128 = 10_000;
 

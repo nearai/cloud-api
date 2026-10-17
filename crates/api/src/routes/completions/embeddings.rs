@@ -257,27 +257,16 @@ pub async fn embeddings(
 
             let inference_id = uuid::Uuid::new_v4();
             let usage_request = services::usage::RecordUsageServiceRequest {
-                organization_id,
-                workspace_id,
-                api_key_id,
-                model_id,
                 input_tokens: token_count,
-                output_tokens: 0,
-                cache_read_tokens: 0,
-                cache_write: None,
-                profiled_cache_write_tokens: 0,
-                requested_service_tier: None,
-                provider_service_tier: None,
-                inference_type: services::usage::ports::InferenceType::Embedding,
-                ttft_ms: None,
-                avg_itl_ms: None,
                 inference_id: Some(inference_id),
-                provider_request_id: None,
                 stop_reason: Some(services::usage::StopReason::Completed),
-                response_id: None,
-                image_count: None,
-                discount: None,
-                provider_attribution: services::usage::ProviderAttribution::default(),
+                ..services::usage::RecordUsageServiceRequest::base(
+                    organization_id,
+                    workspace_id,
+                    api_key_id,
+                    model_id,
+                    services::usage::ports::InferenceType::Embedding,
+                )
             };
 
             if let Err(e) = app_state.usage_service.record_usage(usage_request).await {

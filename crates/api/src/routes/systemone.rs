@@ -143,27 +143,19 @@ pub async fn systemone(
         let inference_id = hash_inference_id_to_uuid(decision_id);
         let usage = &served.response.response.usage;
         let usage_request = RecordUsageServiceRequest {
-            organization_id: api_key.organization.id.0,
-            workspace_id: api_key.workspace.id.0,
-            api_key_id,
-            model_id: model.id,
             input_tokens: usage.input_tokens,
             output_tokens: usage.output_tokens,
-            cache_read_tokens: 0,
-            cache_write: None,
-            profiled_cache_write_tokens: 0,
-            requested_service_tier: None,
-            provider_service_tier: None,
-            inference_type: InferenceType::Decisions,
-            ttft_ms: None,
-            avg_itl_ms: None,
             inference_id: Some(inference_id),
             provider_request_id: Some(decision_id.clone()),
             stop_reason: Some(StopReason::Completed),
-            response_id: None,
-            image_count: None,
             provider_attribution: served.provider_attribution,
-            discount: None,
+            ..RecordUsageServiceRequest::base(
+                api_key.organization.id.0,
+                api_key.workspace.id.0,
+                api_key_id,
+                model.id,
+                InferenceType::Decisions,
+            )
         };
         let signature = async {
             let result = tokio::time::timeout(std::time::Duration::from_secs(5), async {

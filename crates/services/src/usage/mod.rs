@@ -736,27 +736,21 @@ impl UsageServiceTrait for UsageServiceImpl {
         // Internal metrics (ttft_ms, avg_itl_ms, stop_reason) are not exposed
         // via the public API — they are populated only by the inference pipeline.
         let service_request = RecordUsageServiceRequest {
-            organization_id,
-            workspace_id,
-            api_key_id,
-            model_id: model.id,
             input_tokens,
             output_tokens,
             cache_read_tokens,
-            cache_write: None,
-            profiled_cache_write_tokens: 0,
-            requested_service_tier: None,
-            provider_service_tier: None,
-            inference_type,
-            ttft_ms: None,
-            avg_itl_ms: None,
             inference_id,
             provider_request_id,
-            stop_reason: None,
-            response_id: None,
             image_count,
             provider_attribution,
             discount,
+            ..RecordUsageServiceRequest::base(
+                organization_id,
+                workspace_id,
+                api_key_id,
+                model.id,
+                inference_type,
+            )
         };
 
         self.record_usage(service_request).await

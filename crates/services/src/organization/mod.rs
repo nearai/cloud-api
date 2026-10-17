@@ -815,7 +815,7 @@ impl OrganizationServiceTrait for OrganizationServiceImpl {
         &self,
         organization_id: OrganizationId,
         requester_id: UserId,
-        invitations: Vec<(String, MemberRole)>,
+        invitations: Vec<(String, MemberRole)>, // (email, role) pairs
     ) -> Result<BatchInvitationResponse, OrganizationError> {
         // Check if requester has permission
         let org = self.get_organization(organization_id.clone()).await?;
@@ -1055,7 +1055,7 @@ impl OrganizationServiceTrait for OrganizationServiceImpl {
         &self,
         organization_id: OrganizationId,
         requester_id: UserId,
-        invitations: Vec<(String, MemberRole)>,
+        invitations: Vec<(String, MemberRole)>, // (email, role) pairs
         expires_in_hours: i64,
     ) -> Result<BatchInvitationResponse, OrganizationError> {
         let org = self.get_organization(organization_id.clone()).await?;

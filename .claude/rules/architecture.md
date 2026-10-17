@@ -46,6 +46,7 @@ Runtime-changeable config goes into `admin_settings` as an owner-registered key 
 - The table is plaintext: no secrets, credentials, or customer data. Signed public trust inputs are fine because the owner verifies them.
 - A key with `deny_unknown_fields` may only gain a field once every running instance has a build that knows it.
 - Consumers that need settings at startup register after the settings service loads.
+- Runtime trust pins for attested backup providers follow `docs/security/attested-provider-runtime-trust.md`.
 
 ## File size
 

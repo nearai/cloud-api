@@ -334,6 +334,8 @@ impl TinfoilVerifier for StubVerifier {
         Ok(PinnedModel {
             slug: slug.into(),
             entry: entry.clone(),
+            source: PinSource::Compiled,
+            rekor_log_index: None,
         })
     }
 }

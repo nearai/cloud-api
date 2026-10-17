@@ -6,6 +6,17 @@ use crate::classify::{Added, Source};
 /// that; the audit artifact (`observations.json`) always has the full set.
 const BODY_BUDGET: usize = 60_000;
 
+/// Shown when the run produced admin pins. Fixed text, so it is not sanitised.
+const APPLY_SECTION: &str = "\n## Apply without a deploy\n\n\
+`tinfoil-admin-pins.json` in this run's audit artifact is a ready-to-PATCH body \
+for the model releases above that this run saw live, each carrying its Sigstore bundle (cloud-api \
+verifies every bundle at PATCH).\n\n\
+**The PATCH replaces the whole `model_pins` list.** Merge these rows with the \
+current value from `GET /v1/admin/settings/tinfoil_trust` first.\n\n\
+```\n\
+curl -X PATCH \"$CLOUD_API/v1/admin/settings/tinfoil_trust\" -H \"Authorization: Bearer $ADMIN_TOKEN\" -H 'Content-Type: application/json' --data @tinfoil-admin-pins.json\n\
+```\n";
+
 /// Keep only characters that can appear in slugs, repos, tags and hex, so
 /// upstream-supplied text cannot inject markdown or mentions (`@` is not
 /// allowed) into the PR body.
@@ -31,7 +42,12 @@ fn push_within(out: &mut String, line: &str, limit: usize) -> bool {
     true
 }
 
-pub fn render_markdown(added: &[Added], notes: &[String], date: &str) -> String {
+pub fn render_markdown(
+    added: &[Added],
+    notes: &[String],
+    date: &str,
+    has_admin_pins: bool,
+) -> String {
     let mut out = format!("# Tinfoil measurement sync, {date}\n\n");
     if added.is_empty() {
         out.push_str(
@@ -82,6 +98,10 @@ pub fn render_markdown(added: &[Added], notes: &[String], date: &str) -> String 
             ));
         }
     }
+    if has_admin_pins {
+        // Small and fixed, so it fits within the budget the rows and notes leave.
+        out.push_str(APPLY_SECTION);
+    }
     if !notes.is_empty() {
         out.push_str("\n## Not pinned\n\n");
         let mut omitted = 0usize;
@@ -120,6 +140,7 @@ mod tests {
             &[added(None, "v1"), added(Some("m"), "v2")],
             &[],
             "2026-10-07",
+            false,
         );
         assert!(
             md.contains("| router |  | tinfoilsh/x | v1 | `ab,cd` | live | 2026-10-07T06:30:00Z |")
@@ -130,7 +151,12 @@ mod tests {
 
     #[test]
     fn empty_run_says_so_and_notes_are_sanitised() {
-        let md = render_markdown(&[], &["x: [evil](http://e) `a`".into()], "2026-10-07");
+        let md = render_markdown(
+            &[],
+            &["x: [evil](http://e) `a`".into()],
+            "2026-10-07",
+            false,
+        );
         assert!(md.contains("No new rows"));
         assert!(md.contains("- x: ?evil??http://e? ?a?"));
     }
@@ -141,7 +167,7 @@ mod tests {
             sanitize("@org/team and user@host"),
             "?org/team and user?host"
         );
-        let md = render_markdown(&[], &["see @org/team".into()], "2026-10-07");
+        let md = render_markdown(&[], &["see @org/team".into()], "2026-10-07", false);
         assert!(md.contains("- see ?org/team"));
         assert!(!md.contains('@'));
     }
@@ -158,13 +184,37 @@ mod tests {
         let notes: Vec<String> = (0..5_000)
             .map(|i| format!("note {i} {}", "x".repeat(150)))
             .collect();
-        let md = render_markdown(&many, &notes, "2026-10-07");
+        let md = render_markdown(&many, &notes, "2026-10-07", false);
         assert!(md.len() <= 65_000, "{} bytes", md.len());
         assert!(md.contains("more row(s) omitted"));
         assert!(md.contains("more note(s) omitted"));
         assert!(md.contains("| model | model-0 |"), "earliest rows are kept");
         // A small report is untouched.
-        let small = render_markdown(&many[..2], &notes[..2], "2026-10-07");
+        let small = render_markdown(&many[..2], &notes[..2], "2026-10-07", false);
         assert!(!small.contains("omitted"));
+    }
+
+    #[test]
+    fn pr_body_contains_apply_command() {
+        let md = render_markdown(&[added(Some("m"), "v2")], &[], "2026-10-07", true);
+        assert!(md.contains("## Apply without a deploy"));
+        assert!(md.contains("tinfoil-admin-pins.json"));
+        assert!(md.contains("replaces the whole `model_pins` list"));
+        assert!(md.contains("GET /v1/admin/settings/tinfoil_trust"));
+        assert!(md.contains(
+            "curl -X PATCH \"$CLOUD_API/v1/admin/settings/tinfoil_trust\" -H \"Authorization: Bearer $ADMIN_TOKEN\" -H 'Content-Type: application/json' --data @tinfoil-admin-pins.json"
+        ));
+        let none = render_markdown(&[added(Some("m"), "v2")], &[], "2026-10-07", false);
+        assert!(!none.contains("Apply without a deploy"));
+        // The section survives truncation of rows and notes.
+        let many: Vec<Added> = (0..2_000)
+            .map(|i| added(Some(&format!("model-{i}")), "v1"))
+            .collect();
+        let notes: Vec<String> = (0..5_000)
+            .map(|i| format!("note {i} {}", "x".repeat(150)))
+            .collect();
+        let big = render_markdown(&many, &notes, "2026-10-07", true);
+        assert!(big.len() <= 65_000, "{} bytes", big.len());
+        assert!(big.contains("--data @tinfoil-admin-pins.json"));
     }
 }

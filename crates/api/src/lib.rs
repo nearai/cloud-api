@@ -949,15 +949,13 @@ pub async fn init_inference_providers(
 }
 
 /// The Tinfoil trust handle before any stored row is applied: version 0 with
-/// `router_sigstore` off, so the Sigstore path fails closed until the stored
+/// `router_sigstore` and admin model pins off, so both fail closed until the stored
 /// value has loaded.
 fn new_tinfoil_trust_handle() -> services::attestation::tinfoil_trust::TinfoilTrustHandle {
     Arc::new(arc_swap::ArcSwap::from_pointee(
         services::admin_settings::Versioned {
             version: 0,
-            value: services::attestation::tinfoil_trust::TinfoilTrust {
-                router_sigstore: false,
-            },
+            value: services::attestation::tinfoil_trust::TinfoilTrust::fail_closed_initial(),
         },
     ))
 }
@@ -1265,8 +1263,11 @@ pub fn build_app_with_config_and_options(
     let workspace_routes =
         build_workspace_routes(app_state.clone(), &auth_components.auth_state_middleware);
 
-    let attestation_routes =
-        build_attestation_routes(app_state.clone(), &auth_components.auth_state_middleware);
+    let attestation_routes = build_attestation_routes(
+        app_state.clone(),
+        &auth_components.auth_state_middleware,
+        domain_services.admin_settings_service.clone(),
+    );
 
     let model_routes = build_model_routes(domain_services.models_service.clone());
 
@@ -1850,9 +1851,14 @@ pub fn build_conversation_routes(
 ///   missing/invalid/expired/deactivated credentials with 401); like
 ///   the signature route, report retrieval is non-billable — no usage or
 ///   billing records are created.
-/// - `GET /v1/attestation/ita-token` is deliberately public; the rationale is
-///   documented on `build_public_attestation_routes`.
-pub fn build_attestation_routes(app_state: AppState, auth_state_middleware: &AuthState) -> Router {
+/// - `GET /v1/attestation/ita-token` and `GET /v1/attestation/pins` are
+///   deliberately public; the rationale is documented on
+///   `build_public_attestation_routes`.
+pub fn build_attestation_routes(
+    app_state: AppState,
+    auth_state_middleware: &AuthState,
+    admin_settings: Arc<services::admin_settings::AdminSettingsService>,
+) -> Router {
     let attestation_route_state = attestation::AttestationRouteState::from(app_state);
     let authenticated_routes = Router::new()
         .route("/attestation/report", get(get_attestation_report))
@@ -1863,7 +1869,13 @@ pub fn build_attestation_routes(app_state: AppState, auth_state_middleware: &Aut
             auth_middleware_with_api_key,
         ));
 
-    let public_routes = attestation::build_public_attestation_routes(attestation_route_state);
+    // One section per attested backup provider; add new providers here.
+    let pins_sources: Vec<Arc<dyn services::attestation::pins_view::ProviderPinsSource>> = vec![
+        Arc::new(services::attestation::tinfoil_pins_view::TinfoilPinsSource::new(admin_settings)),
+        Arc::new(services::attestation::chutes_pins_view::ChutesPinsSource),
+    ];
+    let public_routes =
+        attestation::build_public_attestation_routes(attestation_route_state, pins_sources);
 
     Router::new()
         .merge(authenticated_routes)
@@ -2806,8 +2818,9 @@ mod tests {
 
     #[test]
     fn test_openapi_ita_token_endpoint_is_public() {
-        // /v1/attestation/ita-token is the ONLY public attestation route — an
-        // explicit, documented decision (nearai/infra#193); see
+        // /v1/attestation/ita-token and /v1/attestation/pins are the
+        // ONLY public attestation routes — explicit, documented decisions
+        // (nearai/infra#193); see
         // `build_public_attestation_routes` in routes/attestation.rs.
         let spec = match serde_json::to_value(ApiDoc::openapi()) {
             Ok(spec) => spec,
@@ -2825,6 +2838,16 @@ mod tests {
         assert!(spec["components"]["schemas"]
             .as_object()
             .is_some_and(|schemas| schemas.contains_key("ItaTokenResponse")));
+    }
+
+    #[test]
+    fn test_openapi_attested_pins_endpoint_is_public() {
+        let spec = serde_json::to_value(ApiDoc::openapi()).unwrap();
+        assert_eq!(
+            spec["paths"]["/v1/attestation/pins"]["get"]["security"],
+            serde_json::json!([{}]),
+            "/v1/attestation/pins must explicitly override global OpenAPI security"
+        );
     }
 
     #[test]

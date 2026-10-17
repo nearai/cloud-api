@@ -99,7 +99,7 @@ pub(super) async fn bill_auto_redact_classify(
     // metric — so x-auto-redact (which shares the privacy-filter classify
     // call) can't massively overcharge on a buggy/malicious provider response
     // instead of just clamping to i32::MAX. See nearai/cloud-api#602 review.
-    const MAX_REASONABLE_TOKENS: i32 = 1_000_000;
+    use super::billing::MAX_REASONABLE_TOKENS;
     let input_tokens = if classify_tokens > MAX_REASONABLE_TOKENS as i64 {
         tracing::error!(
             token_count = classify_tokens,

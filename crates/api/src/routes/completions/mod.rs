@@ -47,6 +47,7 @@ pub use models::*;
 pub use text::*;
 
 mod audio;
+mod billing;
 mod embeddings;
 mod images;
 mod privacy;

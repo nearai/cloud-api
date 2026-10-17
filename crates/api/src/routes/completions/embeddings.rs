@@ -178,81 +178,30 @@ pub async fn embeddings(
                 total_tokens: Option<i32>,
             }
 
-            let mut token_count = serde_json::from_slice::<UsageExtract>(&response_bytes)
+            let token_count = serde_json::from_slice::<UsageExtract>(&response_bytes)
                 .ok()
                 .and_then(|u| u.usage)
                 .and_then(|u| u.total_tokens.or(u.prompt_tokens))
                 .unwrap_or(0);
 
             // Token anomaly detection
-            const MAX_REASONABLE_TOKENS: i32 = 1_000_000;
-            let mut token_anomaly_detected = false;
-
-            if token_count > MAX_REASONABLE_TOKENS {
-                tracing::error!(
-                    token_count = token_count,
-                    max_expected = MAX_REASONABLE_TOKENS,
-                    model = %model_name,
-                    organization_id = %organization_id,
-                    "Provider returned unreasonable token count for embeddings - capping"
-                );
-                token_anomaly_detected = true;
-                let model_tag = format!("model:{}", model_name);
-                let reason_tag = format!(
-                    "reason:{}",
-                    services::metrics::consts::REASON_TOKEN_OVERFLOW
-                );
-                let anomaly_tags = [model_tag.as_str(), reason_tag.as_str()];
-                app_state.metrics_service.record_count(
-                    services::metrics::consts::METRIC_PROVIDER_TOKEN_ANOMALIES,
-                    1,
-                    &anomaly_tags,
-                );
-                token_count = MAX_REASONABLE_TOKENS;
-            }
-
-            if token_count == 0 {
-                tracing::warn!(
-                    model = %model_name,
-                    organization_id = %organization_id,
-                    "Provider returned zero tokens for embeddings"
-                );
-                token_anomaly_detected = true;
-                let model_tag = format!("model:{}", model_name);
-                let reason_tag =
-                    format!("reason:{}", services::metrics::consts::REASON_MISSING_USAGE);
-                let zero_tokens_tags = [model_tag.as_str(), reason_tag.as_str()];
-                app_state.metrics_service.record_count(
-                    services::metrics::consts::METRIC_PROVIDER_ZERO_TOKENS,
-                    1,
-                    &zero_tokens_tags,
-                );
-            }
-
-            if token_anomaly_detected {
-                tracing::info!(
-                    model = %model_name,
-                    organization_id = %organization_id,
-                    final_token_count = token_count,
-                    "Token count anomaly: Provider data quality issue detected. Recommendation: Check provider logs and configuration."
-                );
-            }
+            let token_count = billing::cap_reported_tokens(
+                app_state.metrics_service.as_ref(),
+                &model_name,
+                organization_id,
+                token_count,
+                &billing::TokenAnomalyMessages {
+                    overflow: "Provider returned unreasonable token count for embeddings - capping",
+                    zero: "Provider returned zero tokens for embeddings",
+                    anomaly: "Token count anomaly: Provider data quality issue detected. Recommendation: Check provider logs and configuration.",
+                },
+            );
 
             // Record usage synchronously
             let workspace_id = api_key.workspace.id.0;
-            let api_key_id = match Uuid::parse_str(&api_key.api_key.id.0) {
+            let api_key_id = match billing::billing_api_key_id(&api_key) {
                 Ok(id) => id,
-                Err(e) => {
-                    tracing::error!(error = %e, "Invalid API key ID for usage tracking");
-                    return (
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        ResponseJson(ErrorResponse::new(
-                            "Failed to record usage".to_string(),
-                            "server_error".to_string(),
-                        )),
-                    )
-                        .into_response();
-                }
+                Err(response) => return *response,
             };
 
             let inference_id = uuid::Uuid::new_v4();

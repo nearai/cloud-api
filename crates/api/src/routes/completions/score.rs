@@ -119,19 +119,9 @@ pub async fn score(
             let workspace_id = api_key.workspace.id.0;
 
             // Parse API key ID to UUID
-            let api_key_id = match Uuid::parse_str(&api_key.api_key.id.0) {
+            let api_key_id = match billing::billing_api_key_id(&api_key) {
                 Ok(id) => id,
-                Err(e) => {
-                    tracing::error!(error = %e, "Invalid API key ID for usage tracking");
-                    return (
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        ResponseJson(ErrorResponse::new(
-                            "Failed to record usage".to_string(),
-                            "server_error".to_string(),
-                        )),
-                    )
-                        .into_response();
-                }
+                Err(response) => return *response,
             };
 
             let inference_id = hash_inference_id_to_uuid(&response.id);

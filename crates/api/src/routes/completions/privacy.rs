@@ -156,6 +156,138 @@ fn privacy_usage_entries(response_bytes: &[u8]) -> Vec<PrivacyUsageEntry> {
         .collect()
 }
 
+/// Upper bound on input tokens billed for one privacy call; larger provider
+/// reports are treated as anomalies and capped.
+const MAX_REASONABLE_PRIVACY_TOKENS: i32 = 1_000_000;
+
+/// Bill one privacy call: clamp the provider-reported `token_sum` into
+/// `[0, MAX_REASONABLE_PRIVACY_TOKENS]`, flag zero or oversized counts as
+/// provider anomalies, and record the usage. Classify and redact share this
+/// so their thresholds, anomaly metrics and billing cannot drift apart.
+/// Returns the error response to send when recording fails (the call must
+/// not succeed unbilled).
+async fn settle_privacy_usage(
+    app_state: &AppState,
+    api_key: &AuthenticatedApiKey,
+    model_id: Uuid,
+    model_name: &str,
+    endpoint: PrivacyEndpoint,
+    token_sum: i64,
+) -> Result<(), axum::response::Response> {
+    let label = endpoint.label();
+    let organization_id = api_key.organization.id.0;
+    let mut token_count = token_sum.clamp(0, i32::MAX as i64) as i32;
+    let mut token_anomaly_detected = false;
+
+    if token_count > MAX_REASONABLE_PRIVACY_TOKENS {
+        tracing::error!(
+            endpoint = label,
+            token_count = token_count,
+            max_expected = MAX_REASONABLE_PRIVACY_TOKENS,
+            model = %model_name,
+            organization_id = %organization_id,
+            "Provider returned unreasonable token count for privacy endpoint - capping"
+        );
+        token_anomaly_detected = true;
+        let model_tag = format!("model:{}", model_name);
+        let reason_tag = format!(
+            "reason:{}",
+            services::metrics::consts::REASON_TOKEN_OVERFLOW
+        );
+        let anomaly_tags = [model_tag.as_str(), reason_tag.as_str()];
+        app_state.metrics_service.record_count(
+            services::metrics::consts::METRIC_PROVIDER_TOKEN_ANOMALIES,
+            1,
+            &anomaly_tags,
+        );
+        token_count = MAX_REASONABLE_PRIVACY_TOKENS;
+    }
+
+    if token_count == 0 {
+        tracing::warn!(
+            endpoint = label,
+            model = %model_name,
+            organization_id = %organization_id,
+            "Provider returned zero tokens for privacy endpoint"
+        );
+        token_anomaly_detected = true;
+        let model_tag = format!("model:{}", model_name);
+        let reason_tag = format!("reason:{}", services::metrics::consts::REASON_MISSING_USAGE);
+        let zero_tokens_tags = [model_tag.as_str(), reason_tag.as_str()];
+        app_state.metrics_service.record_count(
+            services::metrics::consts::METRIC_PROVIDER_ZERO_TOKENS,
+            1,
+            &zero_tokens_tags,
+        );
+    }
+
+    if token_anomaly_detected {
+        tracing::info!(
+            endpoint = label,
+            model = %model_name,
+            organization_id = %organization_id,
+            final_token_count = token_count,
+            "Token count anomaly: Provider data quality issue detected. Recommendation: Check provider logs and configuration."
+        );
+    }
+
+    let api_key_id = match Uuid::parse_str(&api_key.api_key.id.0) {
+        Ok(id) => id,
+        Err(e) => {
+            tracing::error!(error = %e, "Invalid API key ID for usage tracking");
+            return Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                ResponseJson(ErrorResponse::new(
+                    "Failed to record usage".to_string(),
+                    "server_error".to_string(),
+                )),
+            )
+                .into_response());
+        }
+    };
+
+    let usage_request = services::usage::RecordUsageServiceRequest {
+        organization_id,
+        workspace_id: api_key.workspace.id.0,
+        api_key_id,
+        model_id,
+        input_tokens: token_count,
+        output_tokens: 0,
+        cache_read_tokens: 0,
+        cache_write: None,
+        profiled_cache_write_tokens: 0,
+        requested_service_tier: None,
+        provider_service_tier: None,
+        // Redact reuses the privacy-filter classifier under the hood, so
+        // both endpoints bill as PrivacyClassify. Distinguishing them in
+        // analytics would need a separate InferenceType variant.
+        inference_type: services::usage::ports::InferenceType::PrivacyClassify,
+        ttft_ms: None,
+        avg_itl_ms: None,
+        inference_id: Some(uuid::Uuid::new_v4()),
+        provider_request_id: None,
+        stop_reason: Some(services::usage::StopReason::Completed),
+        response_id: None,
+        image_count: None,
+        discount: None,
+        provider_attribution: services::usage::ProviderAttribution::default(),
+    };
+
+    if let Err(e) = app_state.usage_service.record_usage(usage_request).await {
+        tracing::error!(endpoint = label, error = %e, "Failed to record privacy usage");
+        return Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            ResponseJson(ErrorResponse::new(
+                "Failed to record usage - please retry".to_string(),
+                "server_error".to_string(),
+            )),
+        )
+            .into_response());
+    }
+
+    Ok(())
+}
+
 /// Privacy classification endpoint (passthrough)
 ///
 /// Proxies privacy classification requests to a token-classification model
@@ -290,112 +422,17 @@ pub async fn privacy_classify(
             let token_sum_i64: i64 = privacy_usage_entries(&response_bytes)
                 .iter()
                 .fold(0i64, |acc, e| acc.saturating_add(e.input_tokens));
-            let mut token_count = token_sum_i64.clamp(0, i32::MAX as i64) as i32;
-
-            const MAX_REASONABLE_TOKENS: i32 = 1_000_000;
-            let mut token_anomaly_detected = false;
-
-            if token_count > MAX_REASONABLE_TOKENS {
-                tracing::error!(
-                    token_count = token_count,
-                    max_expected = MAX_REASONABLE_TOKENS,
-                    model = %model_name,
-                    organization_id = %organization_id,
-                    "Provider returned unreasonable token count for privacy classify - capping"
-                );
-                token_anomaly_detected = true;
-                let model_tag = format!("model:{}", model_name);
-                let reason_tag = format!(
-                    "reason:{}",
-                    services::metrics::consts::REASON_TOKEN_OVERFLOW
-                );
-                let anomaly_tags = [model_tag.as_str(), reason_tag.as_str()];
-                app_state.metrics_service.record_count(
-                    services::metrics::consts::METRIC_PROVIDER_TOKEN_ANOMALIES,
-                    1,
-                    &anomaly_tags,
-                );
-                token_count = MAX_REASONABLE_TOKENS;
-            }
-
-            if token_count == 0 {
-                tracing::warn!(
-                    model = %model_name,
-                    organization_id = %organization_id,
-                    "Provider returned zero tokens for privacy classify"
-                );
-                token_anomaly_detected = true;
-                let model_tag = format!("model:{}", model_name);
-                let reason_tag =
-                    format!("reason:{}", services::metrics::consts::REASON_MISSING_USAGE);
-                let zero_tokens_tags = [model_tag.as_str(), reason_tag.as_str()];
-                app_state.metrics_service.record_count(
-                    services::metrics::consts::METRIC_PROVIDER_ZERO_TOKENS,
-                    1,
-                    &zero_tokens_tags,
-                );
-            }
-
-            if token_anomaly_detected {
-                tracing::info!(
-                    model = %model_name,
-                    organization_id = %organization_id,
-                    final_token_count = token_count,
-                    "Token count anomaly: Provider data quality issue detected. Recommendation: Check provider logs and configuration."
-                );
-            }
-
-            let workspace_id = api_key.workspace.id.0;
-            let api_key_id = match Uuid::parse_str(&api_key.api_key.id.0) {
-                Ok(id) => id,
-                Err(e) => {
-                    tracing::error!(error = %e, "Invalid API key ID for usage tracking");
-                    return (
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        ResponseJson(ErrorResponse::new(
-                            "Failed to record usage".to_string(),
-                            "server_error".to_string(),
-                        )),
-                    )
-                        .into_response();
-                }
-            };
-
-            let inference_id = uuid::Uuid::new_v4();
-            let usage_request = services::usage::RecordUsageServiceRequest {
-                organization_id,
-                workspace_id,
-                api_key_id,
+            if let Err(response) = settle_privacy_usage(
+                &app_state,
+                &api_key,
                 model_id,
-                input_tokens: token_count,
-                output_tokens: 0,
-                cache_read_tokens: 0,
-                cache_write: None,
-                profiled_cache_write_tokens: 0,
-                requested_service_tier: None,
-                provider_service_tier: None,
-                inference_type: services::usage::ports::InferenceType::PrivacyClassify,
-                ttft_ms: None,
-                avg_itl_ms: None,
-                inference_id: Some(inference_id),
-                provider_request_id: None,
-                stop_reason: Some(services::usage::StopReason::Completed),
-                response_id: None,
-                image_count: None,
-                discount: None,
-                provider_attribution: services::usage::ProviderAttribution::default(),
-            };
-
-            if let Err(e) = app_state.usage_service.record_usage(usage_request).await {
-                tracing::error!(error = %e, "Failed to record privacy classify usage");
-                return (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    ResponseJson(ErrorResponse::new(
-                        "Failed to record usage - please retry".to_string(),
-                        "server_error".to_string(),
-                    )),
-                )
-                    .into_response();
+                &model_name,
+                PrivacyEndpoint::Classify,
+                token_sum_i64,
+            )
+            .await
+            {
+                return response;
             }
 
             Response::builder()
@@ -700,112 +737,17 @@ pub async fn privacy_redact(
     let token_sum_i64: i64 = per_index_tokens
         .values()
         .fold(0i64, |acc, t| acc.saturating_add(*t));
-    let mut token_count = token_sum_i64.clamp(0, i32::MAX as i64) as i32;
-
-    const MAX_REASONABLE_TOKENS: i32 = 1_000_000;
-    let mut token_anomaly_detected = false;
-    if token_count > MAX_REASONABLE_TOKENS {
-        tracing::error!(
-            token_count = token_count,
-            max_expected = MAX_REASONABLE_TOKENS,
-            model = %model_name,
-            organization_id = %organization_id,
-            "Provider returned unreasonable token count for privacy redact - capping"
-        );
-        token_anomaly_detected = true;
-        let model_tag = format!("model:{}", model_name);
-        let reason_tag = format!(
-            "reason:{}",
-            services::metrics::consts::REASON_TOKEN_OVERFLOW
-        );
-        let anomaly_tags = [model_tag.as_str(), reason_tag.as_str()];
-        app_state.metrics_service.record_count(
-            services::metrics::consts::METRIC_PROVIDER_TOKEN_ANOMALIES,
-            1,
-            &anomaly_tags,
-        );
-        token_count = MAX_REASONABLE_TOKENS;
-    }
-    if token_count == 0 {
-        tracing::warn!(
-            model = %model_name,
-            organization_id = %organization_id,
-            "Provider returned zero tokens for privacy redact"
-        );
-        token_anomaly_detected = true;
-        let model_tag = format!("model:{}", model_name);
-        let reason_tag = format!("reason:{}", services::metrics::consts::REASON_MISSING_USAGE);
-        let zero_tokens_tags = [model_tag.as_str(), reason_tag.as_str()];
-        app_state.metrics_service.record_count(
-            services::metrics::consts::METRIC_PROVIDER_ZERO_TOKENS,
-            1,
-            &zero_tokens_tags,
-        );
-    }
-    if token_anomaly_detected {
-        tracing::info!(
-            model = %model_name,
-            organization_id = %organization_id,
-            final_token_count = token_count,
-            "Token count anomaly: Provider data quality issue detected."
-        );
-    }
-
-    let workspace_id = api_key.workspace.id.0;
-    let api_key_id = match Uuid::parse_str(&api_key.api_key.id.0) {
-        Ok(id) => id,
-        Err(e) => {
-            tracing::error!(error = %e, "Invalid API key ID for usage tracking");
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                ResponseJson(ErrorResponse::new(
-                    "Failed to record usage".to_string(),
-                    "server_error".to_string(),
-                )),
-            )
-                .into_response();
-        }
-    };
-
-    let inference_id = uuid::Uuid::new_v4();
-    let usage_request = services::usage::RecordUsageServiceRequest {
-        organization_id,
-        workspace_id,
-        api_key_id,
+    if let Err(response) = settle_privacy_usage(
+        &app_state,
+        &api_key,
         model_id,
-        input_tokens: token_count,
-        output_tokens: 0,
-        cache_read_tokens: 0,
-        cache_write: None,
-        profiled_cache_write_tokens: 0,
-        requested_service_tier: None,
-        provider_service_tier: None,
-        // Redact reuses the privacy-filter classifier under the hood, so
-        // bill it the same way. If we ever want analytics to distinguish
-        // redact vs classify, add a separate InferenceType variant and a
-        // DB-schema-compatible migration.
-        inference_type: services::usage::ports::InferenceType::PrivacyClassify,
-        ttft_ms: None,
-        avg_itl_ms: None,
-        inference_id: Some(inference_id),
-        provider_request_id: None,
-        stop_reason: Some(services::usage::StopReason::Completed),
-        response_id: None,
-        image_count: None,
-        discount: None,
-        provider_attribution: services::usage::ProviderAttribution::default(),
-    };
-
-    if let Err(e) = app_state.usage_service.record_usage(usage_request).await {
-        tracing::error!(error = %e, "Failed to record privacy redact usage");
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            ResponseJson(ErrorResponse::new(
-                "Failed to record usage - please retry".to_string(),
-                "server_error".to_string(),
-            )),
-        )
-            .into_response();
+        &model_name,
+        PrivacyEndpoint::Redact,
+        token_sum_i64,
+    )
+    .await
+    {
+        return response;
     }
 
     let data: Vec<serde_json::Value> = redacted

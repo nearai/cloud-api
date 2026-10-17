@@ -36,9 +36,9 @@ pub(super) struct TokenAnomalyMessages {
     pub anomaly: &'static str,
 }
 
-/// Cap a provider-reported token count at [`MAX_REASONABLE_TOKENS`] and flag
-/// a zero count, logging and emitting the provider-anomaly metrics tagged
-/// with `model`. Returns the count to bill.
+/// Cap a provider-reported token count at [`MAX_REASONABLE_TOKENS`], bill a
+/// negative count as zero, and flag a zero count, logging and emitting the
+/// provider-anomaly metrics tagged with `model`. Returns the count to bill.
 pub(super) fn cap_reported_tokens(
     metrics: &dyn MetricsServiceTrait,
     model: &str,
@@ -63,9 +63,22 @@ pub(super) fn cap_reported_tokens(
         let anomaly_tags = [model_tag.as_str(), reason_tag.as_str()];
         metrics.record_count(consts::METRIC_PROVIDER_TOKEN_ANOMALIES, 1, &anomaly_tags);
         token_count = MAX_REASONABLE_TOKENS;
-    }
-
-    if token_count == 0 {
+    } else if token_count < 0 {
+        // A negative count would record a negative cost and lower the
+        // organization's spend; bill nothing and flag it instead.
+        tracing::error!(
+            token_count = token_count,
+            model = %model,
+            organization_id = %organization_id,
+            "Provider returned negative token count - billing zero"
+        );
+        token_anomaly_detected = true;
+        let model_tag = format!("model:{}", model);
+        let reason_tag = format!("reason:{}", consts::REASON_NEGATIVE_USAGE);
+        let anomaly_tags = [model_tag.as_str(), reason_tag.as_str()];
+        metrics.record_count(consts::METRIC_PROVIDER_TOKEN_ANOMALIES, 1, &anomaly_tags);
+        token_count = 0;
+    } else if token_count == 0 {
         tracing::warn!(
             model = %model,
             organization_id = %organization_id,
@@ -160,7 +173,20 @@ mod tests {
     }
 
     #[test]
-    fn negative_counts_pass_through_unflagged() {
-        assert_eq!(cap(-5), (-5, vec![]));
+    fn negative_counts_bill_zero_and_are_flagged() {
+        assert_eq!(
+            cap(-5),
+            (
+                0,
+                vec![(
+                    consts::METRIC_PROVIDER_TOKEN_ANOMALIES.to_string(),
+                    1,
+                    vec![
+                        "model:m/x".to_string(),
+                        format!("reason:{}", consts::REASON_NEGATIVE_USAGE)
+                    ],
+                )]
+            )
+        );
     }
 }

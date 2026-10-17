@@ -1,6 +1,8 @@
 pub mod hourly_scheduler;
 pub mod ports;
 pub mod provider_attribution;
+#[cfg(test)]
+mod record_usage_tests;
 pub mod reporting;
 pub mod text_pricing;
 

@@ -1,8 +1,56 @@
 pub(super) fn assert_production_logs_exclude_forbidden_expressions() {
     let sources = [
         (
-            "crates/api/src/routes/completions.rs",
-            include_str!("../../routes/completions.rs"),
+            "crates/api/src/routes/completions/mod.rs",
+            include_str!("../../routes/completions/mod.rs"),
+        ),
+        (
+            "crates/api/src/routes/completions/audio.rs",
+            include_str!("../../routes/completions/audio.rs"),
+        ),
+        (
+            "crates/api/src/routes/completions/embeddings.rs",
+            include_str!("../../routes/completions/embeddings.rs"),
+        ),
+        (
+            "crates/api/src/routes/completions/images.rs",
+            include_str!("../../routes/completions/images.rs"),
+        ),
+        (
+            "crates/api/src/routes/completions/privacy.rs",
+            include_str!("../../routes/completions/privacy.rs"),
+        ),
+        (
+            "crates/api/src/routes/completions/rerank.rs",
+            include_str!("../../routes/completions/rerank.rs"),
+        ),
+        (
+            "crates/api/src/routes/completions/score.rs",
+            include_str!("../../routes/completions/score.rs"),
+        ),
+        (
+            "crates/api/src/routes/completions/chat.rs",
+            include_str!("../../routes/completions/chat.rs"),
+        ),
+        (
+            "crates/api/src/routes/completions/chat_auto_redact.rs",
+            include_str!("../../routes/completions/chat_auto_redact.rs"),
+        ),
+        (
+            "crates/api/src/routes/completions/chat_stream.rs",
+            include_str!("../../routes/completions/chat_stream.rs"),
+        ),
+        (
+            "crates/api/src/routes/completions/models.rs",
+            include_str!("../../routes/completions/models.rs"),
+        ),
+        (
+            "crates/api/src/routes/completions/text.rs",
+            include_str!("../../routes/completions/text.rs"),
+        ),
+        (
+            "crates/api/src/routes/completions/tests.rs",
+            include_str!("../../routes/completions/tests.rs"),
         ),
         (
             "crates/api/src/routes/responses.rs",
@@ -44,6 +92,28 @@ pub(super) fn assert_production_logs_exclude_forbidden_expressions() {
         "content_preview",
         "tool_arguments",
     ];
+
+    // Splitting a route file must not silently drop the new files from this scan.
+    let completions_dir = concat!(env!("CARGO_MANIFEST_DIR"), "/src/routes/completions");
+    for entry in std::fs::read_dir(completions_dir).expect("read routes/completions") {
+        let entry = entry.expect("routes/completions entry");
+        assert!(
+            !entry
+                .file_type()
+                .expect("routes/completions entry type")
+                .is_dir(),
+            "routes/completions has a subdirectory; extend this scan to cover it"
+        );
+        let file_name = entry.file_name().into_string().expect("utf-8 file name");
+        if !file_name.ends_with(".rs") {
+            continue;
+        }
+        let label = format!("crates/api/src/routes/completions/{file_name}");
+        assert!(
+            sources.iter().any(|(path, _)| *path == label),
+            "{label} is not covered by the production log privacy scan; add it to `sources`"
+        );
+    }
 
     for (path, source) in sources {
         for (line, body) in logging_macro_bodies(source) {

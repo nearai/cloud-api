@@ -7,7 +7,7 @@
 use crate::common::*;
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Header name constant – mirrors the production constant in completions.rs.
+// Header name constant – mirrors the production constant in routes/completions/mod.rs.
 // ─────────────────────────────────────────────────────────────────────────────
 const X_SERVING_PROVIDER: &str = "x-serving-provider";
 

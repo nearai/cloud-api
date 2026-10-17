@@ -1,5 +1,105 @@
 use super::*;
 
+/// Which privacy endpoint an error response is built for.
+#[derive(Clone, Copy, Debug)]
+enum PrivacyEndpoint {
+    Classify,
+    Redact,
+}
+
+impl PrivacyEndpoint {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Classify => "classify",
+            Self::Redact => "redact",
+        }
+    }
+}
+
+/// Map a `try_privacy_classify` failure to the client-facing
+/// `(status, error.type, error.message)` for `endpoint`.
+fn privacy_error_parts(
+    endpoint: PrivacyEndpoint,
+    e: services::completions::ports::CompletionError,
+) -> (StatusCode, &'static str, String) {
+    use services::completions::ports::CompletionError;
+    let label = endpoint.label();
+    match e {
+        CompletionError::RateLimitExceeded(msg) => {
+            tracing::warn!(
+                endpoint = label,
+                "Concurrent request limit exceeded for privacy endpoint"
+            );
+            (StatusCode::TOO_MANY_REQUESTS, "rate_limit_error", msg)
+        }
+        CompletionError::ProviderError {
+            status_code,
+            message,
+        } => {
+            tracing::error!(
+                endpoint = label,
+                upstream_status = status_code,
+                detail = %message,
+                "Privacy provider error"
+            );
+            let http_status =
+                StatusCode::from_u16(status_code).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+            let message = match endpoint {
+                PrivacyEndpoint::Classify => {
+                    "Privacy classify request failed. Please try again later."
+                }
+                PrivacyEndpoint::Redact => "Privacy redact request failed. Please try again later.",
+            };
+            (http_status, "server_error", message.to_string())
+        }
+        CompletionError::InvalidModel(msg) => {
+            tracing::warn!(endpoint = label, "Privacy model not found");
+            (StatusCode::NOT_FOUND, "not_found_error", msg)
+        }
+        CompletionError::ServiceOverloaded(_) => {
+            tracing::warn!(endpoint = label, "Privacy service overloaded");
+            match endpoint {
+                PrivacyEndpoint::Classify => (
+                    crate::routes::common::status_overloaded(),
+                    "service_overloaded",
+                    "All inference backends are overloaded. Please retry with exponential backoff."
+                        .to_string(),
+                ),
+                PrivacyEndpoint::Redact => (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "service_overloaded",
+                    "The service is temporarily overloaded. Please retry with exponential backoff."
+                        .to_string(),
+                ),
+            }
+        }
+        _ => {
+            tracing::error!(endpoint = label, "Unexpected privacy endpoint error");
+            let message = match endpoint {
+                PrivacyEndpoint::Classify => "Privacy classify request failed",
+                PrivacyEndpoint::Redact => "Privacy redact request failed",
+            };
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "server_error",
+                message.to_string(),
+            )
+        }
+    }
+}
+
+fn privacy_error_response(
+    endpoint: PrivacyEndpoint,
+    e: services::completions::ports::CompletionError,
+) -> axum::response::Response {
+    let (status_code, error_type, message) = privacy_error_parts(endpoint, e);
+    (
+        status_code,
+        ResponseJson(ErrorResponse::new(message, error_type.to_string())),
+    )
+        .into_response()
+}
+
 /// Privacy classification endpoint (passthrough)
 ///
 /// Proxies privacy classification requests to a token-classification model
@@ -274,57 +374,7 @@ pub async fn privacy_classify(
                 .body(Body::from(response_bytes))
                 .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
         }
-        Err(e) => {
-            let (status_code, error_type, message) = match e {
-                services::completions::ports::CompletionError::RateLimitExceeded(msg) => {
-                    tracing::warn!("Concurrent request limit exceeded for privacy classify");
-                    (StatusCode::TOO_MANY_REQUESTS, "rate_limit_error", msg)
-                }
-                services::completions::ports::CompletionError::ProviderError {
-                    status_code,
-                    message,
-                } => {
-                    tracing::error!(
-                        upstream_status = status_code,
-                        detail = %message,
-                        "Privacy classify provider error"
-                    );
-                    let http_status = StatusCode::from_u16(status_code)
-                        .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
-                    (
-                        http_status,
-                        "server_error",
-                        "Privacy classify request failed. Please try again later.".to_string(),
-                    )
-                }
-                services::completions::ports::CompletionError::InvalidModel(msg) => {
-                    tracing::warn!("Privacy classify model not found");
-                    (StatusCode::NOT_FOUND, "not_found_error", msg)
-                }
-                services::completions::ports::CompletionError::ServiceOverloaded(_) => {
-                    tracing::warn!("Privacy classify service overloaded");
-                    (
-                        crate::routes::common::status_overloaded(),
-                        "service_overloaded",
-                        "All inference backends are overloaded. Please retry with exponential backoff.".to_string(),
-                    )
-                }
-                _ => {
-                    tracing::error!("Unexpected privacy classify error");
-                    (
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        "server_error",
-                        "Privacy classify request failed".to_string(),
-                    )
-                }
-            };
-
-            (
-                status_code,
-                ResponseJson(ErrorResponse::new(message, error_type.to_string())),
-            )
-                .into_response()
-        }
+        Err(e) => privacy_error_response(PrivacyEndpoint::Classify, e),
     }
 }
 
@@ -578,56 +628,7 @@ pub async fn privacy_redact(
         .await
     {
         Ok(b) => b,
-        Err(e) => {
-            let (status_code, error_type, message) = match e {
-                services::completions::ports::CompletionError::RateLimitExceeded(msg) => {
-                    tracing::warn!("Concurrent request limit exceeded for privacy redact");
-                    (StatusCode::TOO_MANY_REQUESTS, "rate_limit_error", msg)
-                }
-                services::completions::ports::CompletionError::ProviderError {
-                    status_code,
-                    message,
-                } => {
-                    tracing::error!(
-                        upstream_status = status_code,
-                        detail = %message,
-                        "Privacy redact provider error"
-                    );
-                    let http_status = StatusCode::from_u16(status_code)
-                        .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
-                    (
-                        http_status,
-                        "server_error",
-                        "Privacy redact request failed. Please try again later.".to_string(),
-                    )
-                }
-                services::completions::ports::CompletionError::InvalidModel(msg) => {
-                    tracing::warn!("Privacy redact model not found");
-                    (StatusCode::NOT_FOUND, "not_found_error", msg)
-                }
-                services::completions::ports::CompletionError::ServiceOverloaded(_) => {
-                    tracing::warn!("Privacy redact service overloaded");
-                    (
-                        StatusCode::SERVICE_UNAVAILABLE,
-                        "service_overloaded",
-                        "The service is temporarily overloaded. Please retry with exponential backoff.".to_string(),
-                    )
-                }
-                _ => {
-                    tracing::error!("Unexpected privacy redact error");
-                    (
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        "server_error",
-                        "Privacy redact request failed".to_string(),
-                    )
-                }
-            };
-            return (
-                status_code,
-                ResponseJson(ErrorResponse::new(message, error_type.to_string())),
-            )
-                .into_response();
-        }
+        Err(e) => return privacy_error_response(PrivacyEndpoint::Redact, e),
     };
 
     // Apply spans locally. `apply_detected_spans` only does in-process work
@@ -840,4 +841,139 @@ pub async fn privacy_redact(
         .header(header::CONTENT_TYPE, "application/json")
         .body(Body::from(body_bytes))
         .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use services::completions::ports::CompletionError;
+
+    fn parts(endpoint: PrivacyEndpoint, e: CompletionError) -> (u16, &'static str, String) {
+        let (status, ty, msg) = privacy_error_parts(endpoint, e);
+        (status.as_u16(), ty, msg)
+    }
+
+    #[test]
+    fn rate_limit_is_429_for_both_endpoints() {
+        for endpoint in [PrivacyEndpoint::Classify, PrivacyEndpoint::Redact] {
+            assert_eq!(
+                parts(
+                    endpoint,
+                    CompletionError::RateLimitExceeded("slow down".into())
+                ),
+                (429, "rate_limit_error", "slow down".to_string())
+            );
+        }
+    }
+
+    #[test]
+    fn invalid_model_is_404_for_both_endpoints() {
+        for endpoint in [PrivacyEndpoint::Classify, PrivacyEndpoint::Redact] {
+            assert_eq!(
+                parts(
+                    endpoint,
+                    CompletionError::InvalidModel("no such model".into())
+                ),
+                (404, "not_found_error", "no such model".to_string())
+            );
+        }
+    }
+
+    #[test]
+    fn classify_overloaded_is_429() {
+        assert_eq!(
+            parts(
+                PrivacyEndpoint::Classify,
+                CompletionError::ServiceOverloaded("busy".into())
+            ),
+            (
+                429,
+                "service_overloaded",
+                "All inference backends are overloaded. Please retry with exponential backoff."
+                    .to_string()
+            )
+        );
+    }
+
+    #[test]
+    fn redact_overloaded_is_503() {
+        assert_eq!(
+            parts(
+                PrivacyEndpoint::Redact,
+                CompletionError::ServiceOverloaded("busy".into())
+            ),
+            (
+                503,
+                "service_overloaded",
+                "The service is temporarily overloaded. Please retry with exponential backoff."
+                    .to_string()
+            )
+        );
+    }
+
+    #[test]
+    fn provider_error_keeps_status_but_is_always_server_error() {
+        for (status, expected) in [
+            (400u16, 400u16),
+            (422, 422),
+            (500, 500),
+            (502, 502),
+            (1000, 500),
+        ] {
+            assert_eq!(
+                parts(
+                    PrivacyEndpoint::Classify,
+                    CompletionError::ProviderError {
+                        status_code: status,
+                        message: "PII detector returned HTTP 400".into(),
+                    }
+                ),
+                (
+                    expected,
+                    "server_error",
+                    "Privacy classify request failed. Please try again later.".to_string()
+                )
+            );
+            assert_eq!(
+                parts(
+                    PrivacyEndpoint::Redact,
+                    CompletionError::ProviderError {
+                        status_code: status,
+                        message: "PII detector returned HTTP 400".into(),
+                    }
+                ),
+                (
+                    expected,
+                    "server_error",
+                    "Privacy redact request failed. Please try again later.".to_string()
+                )
+            );
+        }
+    }
+
+    #[test]
+    fn other_errors_are_500_server_error() {
+        assert_eq!(
+            parts(
+                PrivacyEndpoint::Classify,
+                CompletionError::InternalError("boom".into())
+            ),
+            (
+                500,
+                "server_error",
+                "Privacy classify request failed".to_string()
+            )
+        );
+        assert_eq!(
+            parts(
+                PrivacyEndpoint::Redact,
+                CompletionError::InvalidParams("bad".into())
+            ),
+            (
+                500,
+                "server_error",
+                "Privacy redact request failed".to_string()
+            )
+        );
+    }
 }

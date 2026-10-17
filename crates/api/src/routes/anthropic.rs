@@ -1759,16 +1759,6 @@ redact-thinking-2026-02-12";
 
     #[async_trait::async_trait]
     impl UsageServiceTrait for RecordingUsageService {
-        async fn calculate_cost(
-            &self,
-            _model_id: &str,
-            _input_tokens: i32,
-            _output_tokens: i32,
-            _cache_read_tokens: i32,
-        ) -> Result<services::usage::CostBreakdown, services::usage::UsageError> {
-            unimplemented!()
-        }
-
         async fn record_usage(
             &self,
             request: RecordUsageServiceRequest,

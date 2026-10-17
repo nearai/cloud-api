@@ -98,7 +98,7 @@ pub fn compute_token_cost_with_cache_write(
     pricing: &ModelPricing,
 ) -> Result<CostBreakdown, UsageError> {
     // Basic validation: token counts must be non-negative. This protects both direct callers
-    // (e.g., calculate_cost) and internal usage from accidentally computing negative costs.
+    // (e.g., e2e cost oracles) and internal usage from accidentally computing negative costs.
     if input_tokens < 0
         || output_tokens < 0
         || cache_read_tokens < 0
@@ -206,51 +206,6 @@ impl UsageServiceImpl {
 
 #[async_trait::async_trait]
 impl UsageServiceTrait for UsageServiceImpl {
-    /// Calculate cost for a given model and token usage.
-    ///
-    /// Uses the same semantics as `record_usage` / `compute_token_cost`:
-    /// - For token-based chat-style models, applies cache-aware pricing:
-    ///   `(input - cache_read) * input_rate + cache_read * cache_read_rate + output * output_rate`.
-    /// - When `cache_read_cost_per_token` is `None`, cache pricing is **disabled** and
-    ///   all input tokens (including cached ones) are billed at `input_cost_per_token`.
-    ///   `Some(0)` means cached tokens are genuinely free; `Some(x)` bills them at `x`.
-    /// - Non-token billing types (image, audio duration, rerank, etc.) have dedicated paths in
-    ///   `record_usage` and do not use this helper.
-    ///
-    /// All costs use fixed scale of 9 (nano-dollars) and USD currency.
-    async fn calculate_cost(
-        &self,
-        model_id: &str,
-        input_tokens: i32,
-        output_tokens: i32,
-        cache_read_tokens: i32,
-    ) -> Result<CostBreakdown, UsageError> {
-        let model = self
-            .model_repository
-            .get_model_by_name(model_id)
-            .await
-            .map_err(|e| UsageError::InternalError(format!("Failed to get model: {e}")))?
-            .ok_or_else(|| UsageError::ModelNotFound(format!("Model '{model_id}' not found")))?;
-
-        if let Some(profile) = &model.text_pricing {
-            Ok(compute_profiled_text_cost(
-                input_tokens,
-                output_tokens,
-                cache_read_tokens,
-                0,
-                TextServiceTier::Default,
-                // This API has no requested/actual tier parameter. Estimate
-                // conservatively instead of assuming Standard, so a preflight
-                // calculation cannot understate Flex/Priority catalog rates.
-                Some("unknown_preflight_tier"),
-                profile,
-            )?
-            .cost)
-        } else {
-            compute_token_cost(input_tokens, output_tokens, cache_read_tokens, &model)
-        }
-    }
-
     /// Record usage after an API call completes
     async fn record_usage(
         &self,

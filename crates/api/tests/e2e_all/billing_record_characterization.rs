@@ -55,18 +55,6 @@ impl RecordingUsageService {
 
 #[async_trait::async_trait]
 impl UsageServiceTrait for RecordingUsageService {
-    async fn calculate_cost(
-        &self,
-        model_id: &str,
-        input_tokens: i32,
-        output_tokens: i32,
-        cache_read_tokens: i32,
-    ) -> Result<services::usage::CostBreakdown, UsageError> {
-        self.inner
-            .calculate_cost(model_id, input_tokens, output_tokens, cache_read_tokens)
-            .await
-    }
-
     async fn record_usage(
         &self,
         request: RecordUsageServiceRequest,

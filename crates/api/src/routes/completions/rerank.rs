@@ -237,115 +237,43 @@ pub async fn rerank(
             // This is critical for revenue tracking and must complete before returning response
             let organization_id = api_key.organization.id.0;
             let workspace_id = api_key.workspace.id.0;
-            let mut token_count = response
+            let token_count = response
                 .usage
                 .as_ref()
                 .and_then(|u| u.total_tokens)
                 .unwrap_or(0);
 
             // Validate token count is reasonable (prevent provider misreporting)
-            const MAX_REASONABLE_TOKENS: i32 = 1_000_000; // 1M tokens max
-            let mut token_anomaly_detected = false;
-
-            if token_count > MAX_REASONABLE_TOKENS {
-                // Log at ERROR level with full context for monitoring/alerting
-                // This indicates a provider bug that needs investigation
-                tracing::error!(
-                    token_count = token_count,
-                    max_expected = MAX_REASONABLE_TOKENS,
-                    model = %request.model,
-                    organization_id = %organization_id,
-                    "Provider returned unreasonable token count - capping to prevent billing errors. This may indicate provider misconfiguration or a bug."
-                );
-                token_anomaly_detected = true;
-
-                // Record metrics for monitoring and alerting
-                let model_tag = format!("model:{}", request.model);
-                let reason_tag = format!(
-                    "reason:{}",
-                    services::metrics::consts::REASON_TOKEN_OVERFLOW
-                );
-                let anomaly_tags = [model_tag.as_str(), reason_tag.as_str()];
-                app_state.metrics_service.record_count(
-                    services::metrics::consts::METRIC_PROVIDER_TOKEN_ANOMALIES,
-                    1,
-                    &anomaly_tags,
-                );
-
-                // Cap to maximum to prevent billing errors
-                token_count = MAX_REASONABLE_TOKENS;
-            }
-
-            // Warn if provider didn't return usage data
-            if token_count == 0 {
-                tracing::warn!(
-                    model = %request.model,
-                    organization_id = %organization_id,
-                    "Provider returned zero tokens for rerank - no cost will be charged. This may indicate provider misconfiguration or incomplete response."
-                );
-                token_anomaly_detected = true;
-
-                // Record metrics for monitoring and alerting on missing usage data
-                let model_tag = format!("model:{}", request.model);
-                let reason_tag =
-                    format!("reason:{}", services::metrics::consts::REASON_MISSING_USAGE);
-                let zero_tokens_tags = [model_tag.as_str(), reason_tag.as_str()];
-                app_state.metrics_service.record_count(
-                    services::metrics::consts::METRIC_PROVIDER_ZERO_TOKENS,
-                    1,
-                    &zero_tokens_tags,
-                );
-            }
-
-            // If anomaly detected, log additional context for debugging
-            if token_anomaly_detected {
-                tracing::info!(
-                    model = %request.model,
-                    organization_id = %organization_id,
-                    final_token_count = token_count,
-                    "Token count anomaly: Provider data quality issue detected. Recommendation: Check provider logs and configuration."
-                );
-            }
+            let token_count = billing::cap_reported_tokens(
+                app_state.metrics_service.as_ref(),
+                &request.model,
+                organization_id,
+                token_count,
+                &billing::TokenAnomalyMessages {
+                    overflow: "Provider returned unreasonable token count - capping to prevent billing errors. This may indicate provider misconfiguration or a bug.",
+                    zero: "Provider returned zero tokens for rerank - no cost will be charged. This may indicate provider misconfiguration or incomplete response.",
+                    anomaly: "Token count anomaly: Provider data quality issue detected. Recommendation: Check provider logs and configuration.",
+                },
+            );
 
             // Parse API key ID to UUID
-            let api_key_id = match Uuid::parse_str(&api_key.api_key.id.0) {
+            let api_key_id = match billing::billing_api_key_id(&api_key) {
                 Ok(id) => id,
-                Err(e) => {
-                    tracing::error!(error = %e, "Invalid API key ID for usage tracking");
-                    return (
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        ResponseJson(ErrorResponse::new(
-                            "Failed to record usage".to_string(),
-                            "server_error".to_string(),
-                        )),
-                    )
-                        .into_response();
-                }
+                Err(response) => return *response,
             };
 
             let inference_id = uuid::Uuid::new_v4();
             let usage_request = services::usage::RecordUsageServiceRequest {
-                organization_id,
-                workspace_id,
-                api_key_id,
-                model_id,
                 input_tokens: token_count,
-                output_tokens: 0,
-                cache_read_tokens: 0,
-                cache_write: None,
-                profiled_cache_write_tokens: 0,
-                requested_service_tier: None,
-                provider_service_tier: None,
-                inference_type: services::usage::ports::InferenceType::Rerank,
-                ttft_ms: None,
-                avg_itl_ms: None,
                 inference_id: Some(inference_id),
-                provider_request_id: None,
                 stop_reason: Some(services::usage::StopReason::Completed),
-                response_id: None,
-                image_count: None,
-                discount: None,
-                provider_attribution: services::usage::ProviderAttribution::default(),
+                ..services::usage::RecordUsageServiceRequest::base(
+                    organization_id,
+                    workspace_id,
+                    api_key_id,
+                    model_id,
+                    services::usage::ports::InferenceType::Rerank,
+                )
             };
 
             // Record usage synchronously - this is billing-critical and must succeed

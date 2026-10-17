@@ -47,6 +47,7 @@ pub use models::*;
 pub use text::*;
 
 mod audio;
+mod billing;
 mod embeddings;
 mod images;
 mod privacy;
@@ -209,27 +210,18 @@ fn build_image_usage_request(
     record: ImageUsageRecord<'_>,
 ) -> services::usage::RecordUsageServiceRequest {
     services::usage::RecordUsageServiceRequest {
-        organization_id: record.organization_id,
-        workspace_id: record.workspace_id,
-        api_key_id: record.api_key_id,
-        model_id: record.model_id,
-        input_tokens: 0,
-        output_tokens: 0,
-        cache_read_tokens: 0,
-        cache_write: None,
-        profiled_cache_write_tokens: 0,
-        requested_service_tier: None,
-        provider_service_tier: None,
-        inference_type: record.inference_type,
-        ttft_ms: None,
-        avg_itl_ms: None,
         inference_id: Some(hash_inference_id_to_uuid(record.provider_request_id)),
         provider_request_id: Some(record.provider_request_id.to_string()),
         stop_reason: Some(services::usage::StopReason::Completed),
-        response_id: None,
         image_count: Some(record.image_count),
-        discount: None,
         provider_attribution: record.provider_attribution,
+        ..services::usage::RecordUsageServiceRequest::base(
+            record.organization_id,
+            record.workspace_id,
+            record.api_key_id,
+            record.model_id,
+            record.inference_type,
+        )
     }
 }
 

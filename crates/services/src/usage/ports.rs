@@ -222,24 +222,6 @@ impl std::fmt::Display for StopReason {
 
 #[async_trait::async_trait]
 pub trait UsageServiceTrait: Send + Sync {
-    /// Calculate cost for a given model and token usage.
-    ///
-    /// Uses the same semantics as `record_usage` and the internal `compute_token_cost` helper:
-    /// - Formula: `(input - cache_read) * input_rate + cache_read * cache_read_rate + output * output_rate`,
-    ///   where `cache_read` is the effective cached token count (see below).
-    /// - **Capping**: The provided `cached_tokens` (or `cache_read_tokens`) is treated as
-    ///   `min(cached_tokens, input_tokens).max(0)`; i.e. cached count is never negative and never exceeds input.
-    /// - **Cache pricing disabled**: When the model’s `cache_read_cost_per_token` is `None`, cache pricing is
-    ///   disabled and all input tokens (including cached) are billed at `input_cost_per_token` (cached tokens
-    ///   are not free). `Some(0)` means cached tokens are genuinely free; `Some(x)` bills them at `x`.
-    async fn calculate_cost(
-        &self,
-        model_id: &str,
-        input_tokens: i32,
-        output_tokens: i32,
-        cache_read_tokens: i32,
-    ) -> Result<CostBreakdown, UsageError>;
-
     /// Record usage after an API call completes
     async fn record_usage(
         &self,
@@ -638,6 +620,53 @@ pub struct RecordUsageServiceRequest {
     /// Provider-side discount applied after catalog pricing (see
     /// [`UsageDiscount`]). `None` records the row at list price.
     pub discount: Option<UsageDiscount>,
+}
+
+impl RecordUsageServiceRequest {
+    /// A request carrying only who is billed, for which model and kind of
+    /// inference, with every measurement zero or absent. Callers fill in
+    /// what they measured with struct-update syntax:
+    ///
+    /// ```ignore
+    /// RecordUsageServiceRequest {
+    ///     input_tokens,
+    ///     stop_reason: Some(StopReason::Completed),
+    ///     ..RecordUsageServiceRequest::base(org, workspace, key, model, InferenceType::Embedding)
+    /// }
+    /// ```
+    ///
+    /// A new billing field gets its neutral value here, once.
+    pub fn base(
+        organization_id: Uuid,
+        workspace_id: Uuid,
+        api_key_id: Uuid,
+        model_id: Uuid,
+        inference_type: InferenceType,
+    ) -> Self {
+        Self {
+            organization_id,
+            workspace_id,
+            api_key_id,
+            model_id,
+            input_tokens: 0,
+            output_tokens: 0,
+            cache_read_tokens: 0,
+            cache_write: None,
+            profiled_cache_write_tokens: 0,
+            requested_service_tier: None,
+            provider_service_tier: None,
+            inference_type,
+            ttft_ms: None,
+            avg_itl_ms: None,
+            inference_id: None,
+            provider_request_id: None,
+            stop_reason: None,
+            response_id: None,
+            image_count: None,
+            provider_attribution: ProviderAttribution::default(),
+            discount: None,
+        }
+    }
 }
 
 /// Basis points in one whole (100%).

@@ -99,7 +99,7 @@ pub(super) async fn bill_auto_redact_classify(
     // metric — so x-auto-redact (which shares the privacy-filter classify
     // call) can't massively overcharge on a buggy/malicious provider response
     // instead of just clamping to i32::MAX. See nearai/cloud-api#602 review.
-    const MAX_REASONABLE_TOKENS: i32 = 1_000_000;
+    use super::billing::MAX_REASONABLE_TOKENS;
     let input_tokens = if classify_tokens > MAX_REASONABLE_TOKENS as i64 {
         tracing::error!(
             token_count = classify_tokens,
@@ -147,27 +147,16 @@ pub(super) async fn bill_auto_redact_classify(
     };
 
     let usage_request = services::usage::RecordUsageServiceRequest {
-        organization_id: api_key.organization.id.0,
-        workspace_id: api_key.workspace.id.0,
-        api_key_id,
-        model_id: model.id,
         input_tokens,
-        output_tokens: 0,
-        cache_read_tokens: 0,
-        cache_write: None,
-        profiled_cache_write_tokens: 0,
-        requested_service_tier: None,
-        provider_service_tier: None,
-        inference_type: services::usage::ports::InferenceType::PrivacyClassify,
-        ttft_ms: None,
-        avg_itl_ms: None,
         inference_id: Some(Uuid::new_v4()),
-        provider_request_id: None,
         stop_reason: Some(services::usage::StopReason::Completed),
-        response_id: None,
-        image_count: None,
-        discount: None,
-        provider_attribution: services::usage::ProviderAttribution::default(),
+        ..services::usage::RecordUsageServiceRequest::base(
+            api_key.organization.id.0,
+            api_key.workspace.id.0,
+            api_key_id,
+            model.id,
+            services::usage::ports::InferenceType::PrivacyClassify,
+        )
     };
 
     if let Err(e) = app_state.usage_service.record_usage(usage_request).await {

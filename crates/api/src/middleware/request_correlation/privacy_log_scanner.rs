@@ -9,6 +9,10 @@ pub(super) fn assert_production_logs_exclude_forbidden_expressions() {
             include_str!("../../routes/completions/audio.rs"),
         ),
         (
+            "crates/api/src/routes/completions/billing.rs",
+            include_str!("../../routes/completions/billing.rs"),
+        ),
+        (
             "crates/api/src/routes/completions/embeddings.rs",
             include_str!("../../routes/completions/embeddings.rs"),
         ),

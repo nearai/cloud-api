@@ -20,6 +20,8 @@ pub struct OrganizationLimitsRepository {
 pub struct CurrentCreditStatus {
     pub limit: OrganizationLimitsHistory,
     pub consumed: i64,
+    pub transferred_out: i64,
+    pub effective_capacity: i64,
     pub available: i64,
 }
 
@@ -44,6 +46,10 @@ impl OrganizationLimitsRepository {
         organization_id: Uuid,
         request: &UpdateOrganizationLimitsDbRequest,
     ) -> Result<OrganizationLimitsHistory> {
+        anyhow::ensure!(
+            request.credit_type != "transfer",
+            "transfer credits are system-owned"
+        );
         let row = retry_db!("update_organization_limits", {
             let mut client = self
                 .pool
@@ -193,10 +199,11 @@ impl OrganizationLimitsRepository {
                        olh.source, olh.currency, olh.effective_from, olh.effective_until,
                        olh.changed_by, olh.change_reason, olh.changed_by_user_id,
                        olh.changed_by_user_email, olh.created_at,
+                       olh.transferred_out, olh.effective_capacity,
                        COALESCE(consumed.amount, 0)::BIGINT AS consumed,
                        COALESCE(balance.unresolved_unfunded_amount, 0)::BIGINT AS unfunded,
                        COALESCE(balance.legacy_unattributed_amount, 0)::BIGINT AS unattributed
-                FROM organization_limits_history olh
+                FROM organization_credit_capacities olh
                 LEFT JOIN organization_credit_consumption consumed
                   ON consumed.organization_id = olh.organization_id
                  AND consumed.credit_type = olh.credit_type
@@ -222,7 +229,12 @@ impl OrganizationLimitsRepository {
                 let limit = self.row_to_limits_history(row);
                 let consumed = row.get::<_, i64>("consumed");
                 CurrentCreditStatus {
-                    available: limit.spend_limit.saturating_sub(consumed).max(0),
+                    available: row
+                        .get::<_, i64>("effective_capacity")
+                        .saturating_sub(consumed)
+                        .max(0),
+                    transferred_out: row.get("transferred_out"),
+                    effective_capacity: row.get("effective_capacity"),
                     limit,
                     consumed,
                 }

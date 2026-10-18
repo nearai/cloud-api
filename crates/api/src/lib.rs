@@ -1255,6 +1255,13 @@ pub fn build_app_with_config_and_options(
         &auth_components.auth_state_middleware,
     );
 
+    let transfer_routes = crate::routes::credit_transfers::routes(
+        database::repositories::credit_transfers::CreditTransferRepository::new(
+            database.pool().clone(),
+            &config.credit_allocation,
+        ),
+        auth_components.auth_state_middleware.clone(),
+    );
     let management_routes = build_management_router(
         app_state.clone(),
         auth_components.auth_state_middleware.clone(),
@@ -1374,6 +1381,7 @@ pub fn build_app_with_config_and_options(
                 .merge(unsupported_openai_routes)
                 .merge(conversation_routes)
                 .merge(management_routes)
+                .merge(transfer_routes)
                 .merge(workspace_routes)
                 .merge(attestation_routes.clone())
                 .merge(model_routes)
@@ -2488,6 +2496,20 @@ fn build_admin_routes_with_options(
             axum::routing::delete(delete_admin_access_token),
         )
         .with_state(admin_app_state)
+        .merge(
+            Router::new()
+                .route(
+                    "/admin/organizations/{org_id}/credit/transfer-policy",
+                    get(crate::routes::credit_transfers::get_policy)
+                        .put(crate::routes::credit_transfers::put_policy),
+                )
+                .layer(axum::Extension(
+                    database::repositories::credit_transfers::CreditTransferRepository::new(
+                        database.pool().clone(),
+                        &config.credit_allocation,
+                    ),
+                ))
+        )
         .merge(
             Router::new()
                 .route(

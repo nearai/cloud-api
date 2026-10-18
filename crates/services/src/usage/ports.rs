@@ -870,6 +870,8 @@ pub struct OrganizationCreditLimit {
     pub credit_type: String,
     pub source: Option<String>,
     pub amount: i64,
+    pub transferred_out: i64,
+    pub effective_capacity: i64,
     pub consumed: i64,
     pub available: i64,
     pub currency: String,

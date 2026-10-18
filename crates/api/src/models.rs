@@ -4560,6 +4560,8 @@ pub enum CreditType {
     Payment,
     #[serde(rename = "staking_farm", alias = "STAKING_FARM")]
     StakingFarm,
+    #[serde(alias = "TRANSFER")]
+    Transfer,
     #[serde(alias = "POSTPAY")]
     Postpay,
 }
@@ -4570,6 +4572,7 @@ impl std::fmt::Display for CreditType {
             CreditType::Grant => write!(f, "grant"),
             CreditType::Payment => write!(f, "payment"),
             CreditType::StakingFarm => write!(f, "staking_farm"),
+            CreditType::Transfer => write!(f, "transfer"),
             CreditType::Postpay => write!(f, "postpay"),
         }
     }
@@ -4582,6 +4585,7 @@ impl CreditType {
             CreditType::Grant => "grant",
             CreditType::Payment => "payment",
             CreditType::StakingFarm => "staking_farm",
+            CreditType::Transfer => "transfer",
             CreditType::Postpay => "postpay",
         }
     }
@@ -4599,6 +4603,7 @@ impl std::str::FromStr for CreditType {
             "grant" => Ok(Self::Grant),
             "payment" => Ok(Self::Payment),
             "staking_farm" => Ok(Self::StakingFarm),
+            "transfer" => Ok(Self::Transfer),
             "postpay" => Ok(Self::Postpay),
             _ => Err(ParseCreditTypeError),
         }

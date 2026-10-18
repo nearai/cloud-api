@@ -193,6 +193,14 @@ use utoipa::{Modify, OpenApi};
         crate::routes::admin_usage_hourly::recompute_usage_hourly,
         crate::routes::admin_usage_discount::get_usage_discount,
         crate::routes::admin_credit_reconciliation::reconcile_organization_credits,
+        crate::routes::credit_transfers::create,
+        crate::routes::credit_transfers::history,
+        crate::routes::credit_transfers::detail,
+        crate::routes::credit_transfers::capacity,
+        crate::routes::credit_transfers::get_policy,
+        crate::routes::credit_transfers::put_policy,
+        crate::routes::credit_transfers::create_credential,
+        crate::routes::credit_transfers::revoke_credential,
         crate::routes::admin_usage_discount::put_usage_discount,
         crate::routes::admin::get_org_revenue,
         crate::routes::admin::get_infra_summary,
@@ -563,6 +571,16 @@ impl Modify for SecurityAddon {
                         .description(Some(
                             "API key for programmatic access (Authorization: Bearer sk-<api_key>)",
                         ))
+                        .build(),
+                ),
+            );
+            components.add_security_scheme(
+                "transfer_credential",
+                SecurityScheme::Http(
+                    HttpBuilder::new()
+                        .scheme(HttpAuthScheme::Bearer)
+                        .bearer_format("ct_")
+                        .description(Some("Organization-bound credits:transfer credential; never valid for inference"))
                         .build(),
                 ),
             );

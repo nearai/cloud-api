@@ -4,9 +4,9 @@ Every newly posted inference or platform-service charge is split, in exact
 integer nano-USD, across the organization's active credit limits. The default
 order is:
 
-`grant -> staking_farm -> payment -> postpay`
+`grant -> staking_farm -> transfer -> payment -> postpay`
 
-Set `CREDIT_USAGE_ORDER` to a comma-separated permutation of those four
+Set `CREDIT_USAGE_ORDER` to a comma-separated permutation of those five
 API/database names to change the order. Set
 `CREDIT_ALLOCATION_POLICY_VERSION` to a new non-empty identifier whenever the
 policy meaning changes. The configured version and the active limit/source are
@@ -177,3 +177,120 @@ The audit retains the authenticated admin UUID without a users foreign key so
 account deletion does not erase or rewrite the original actor. Audit text and
 JSON fields are explicitly classified as restricted operational billing data,
 consistent with limit-change reasons and billing correction records.
+
+
+## Reseller credit transfers
+
+An administrator explicitly enables each reseller with
+`PUT /v1/admin/organizations/{org_id}/credit/transfer-policy`, sending
+`{"enabled": true, "reason": "Reviewed opening accounting"}`. GET returns the
+current policy and append-only audit. Read-only admin credentials cannot change
+policies. No organization is enabled by migration. Disabling a policy stops new
+sends but retains authorized history and exact replay access.
+
+An owner session can create an organization-bound `credits:transfer` credential
+with `POST /v1/organizations/{org_id}/credit/transfer-credentials`, passing an
+`expires_at` timestamp in the next 366 days. The secret is returned once; only its
+SHA-256 hash is stored. Rotate by issuing a replacement and deleting the old
+`/credit/transfer-credentials/{id}`. These credentials cannot manage policies,
+issue credentials, run inference, or read another organization's finances.
+Ordinary inference API keys and reporting tokens cannot transfer credits.
+
+Send `POST /v1/organizations/{sender_org_id}/credit/transfer` with an owner session
+or `Authorization: Bearer ct_...`, plus a required `Idempotency-Key` header:
+
+```json
+{
+  "recipient_organization_id": "explicit-recipient-organization-uuid",
+  "source_credit_type": "payment",
+  "amount": 30000000000,
+  "memo": "Order reference",
+  "metadata": {"order_id": "opaque-reference"}
+}
+```
+
+Amounts are positive integer nano-USD. Only the explicitly chosen `payment` or
+already-posted `staking_farm` source can fund a send. Grants, postpay, future
+staking rewards, and received `transfer` capacity cannot fund it. Staking source
+limits must come from `house-of-stake`. Sync externally accrued rewards separately
+and retry if posted capacity is insufficient. Network operations never run inside
+the transfer transaction. Evidence reports the sync observation time separately
+from the chain accrual cutoff (currently unknown/null).
+
+Creation returns 201; an exact replay returns 200 with the original result even
+if balances or sender policy have since changed. Keys are trimmed, nonempty,
+and at most 100 characters, scoped to the sender and retained with the ledger.
+Failures before commit, including unavailable recipients, do not reserve keys or
+debit either organization. Use one stable key per intended transfer and reuse the
+original terms after a timeout. Changes to any business field return 409.
+
+Memo defaults to the empty string, preserves whitespace, and permits at most
+2,000 UTF-8 bytes. Metadata defaults to an object and permits at most 16 KiB of
+compact UTF-8 JSON and 16 nesting levels. Explicit nulls and non-object metadata
+are rejected. Object keys are sorted recursively for storage; arrays retain order.
+Idempotency uses PostgreSQL JSONB structural equality, including numeric value
+equality, so object key order and whitespace do not cause conflicts. Both parties
+can read memo and metadata; do not put secrets in them, and render memo as plain
+text. Billing retention applies to these immutable records and actor IDs, including
+after account erasure or organization deactivation.
+
+`GET /v1/organizations/{org_id}/credit/transfers` lists authorized incoming and
+outgoing transfers, newest first, with a maximum page size of 100. Select
+`?direction=outgoing` or `?direction=incoming` to restrict the list. Pass both
+`before_time` and `before_id` from `next_cursor` for the next page. Use
+`?idempotency_key=...` for an outgoing lookup, or `/credit/transfers/{id}` for a
+single record. Sender responses contain its original snapshot and delivery
+confirmation; only recipient views contain its snapshot and debt settlement.
+`GET /credit/transfer-capacity` returns the organization's own credit positions,
+`own_staking_earned_total` from posted issuance history, and reconciliation status.
+Source availability is transferable only while the sender is enabled and reconciled.
+
+Balance breakdowns retain gross `amount` semantics and add `transferred_out` and
+`effective_capacity`. Availability is `max(gross - outgoing - consumed, 0)` for
+active sources. Aggregate legacy deductions still apply, and unreconciled or
+indebted senders cannot send. Transfers do not increase lifetime consumption,
+usage counts, gross own staking earnings, payment limits, or cash receipts.
+Received credits are system-owned and cannot be created by general limit updates
+or historical reconciliation. Consumption and reporting use type `transfer`.
+
+Each transaction locks both organizations in UUID order. Current membership or
+credential authority is checked under a row lock; membership changes and
+credential revocation serialize against that check. Session authentication occurs
+at HTTP admission. Policy and organization lifecycle updates use the same durable
+organization locks. Existing inference admission does not reserve capacity: work
+admitted before distribution can finish afterwards with overage. Further sends
+are blocked once overage is posted. Prefer a dedicated distribution organization.
+
+409 codes distinguish `insufficient_posted_capacity`, `sender_not_reconciled`,
+`idempotency_conflict`, and `capacity_overflow`. 403 distinguishes
+`credential_refused` and `sender_not_enabled`. 404 `organization_unavailable`
+debits nothing; recipient availability is checked only after sender authorization
+and policy. At most 60 new successful sends per sender per rolling minute are
+allowed; exact replays do not consume that quota. 429 uses `transfer_rate_limited`.
+Transient database/lock errors return 503; retry with the original key.
+`credit_transfer_operations` records bounded outcome labels, never user metadata.
+
+### Deployment and reconciliation
+
+1. Deploy migration V0095 and every transfer-aware accounting binary before
+   enabling a reseller. Migration introduces new operator-owned ledger, policy,
+   credential, and projection data that cannot be represented by existing columns.
+2. Explicitly migrate configured `CREDIT_USAGE_ORDER` from four to five types.
+   Existing four-type overrides fail validation instead of being silently reordered.
+   Choose the transfer position deliberately and bump the policy version (default
+   `v2`). Historical allocation versions remain unchanged.
+3. Drain incompatible workers and update clients that assume four types. Frontend
+   balance rendering should show gross, distributed, consumed, effective, and
+   available amounts separately; this server PR does not deploy those clients.
+4. Run `scripts/reconcile-credit-transfers.sql`. It verifies ledger/projection
+   agreement, incoming system limits, and global conservation. Investigate any row
+   or nonzero difference before enablement. Projections can be rebuilt from the
+   grouped ledger sums under accounting locks in a reviewed maintenance operation;
+   never rewrite completed transfers or historical usage allocations.
+5. Enable one reviewed, fully reconciled, debt-free reseller and check end-to-end
+   delivery, consumption attribution, and staking sync before broadening access.
+6. Emergency rollback disables policies but retains transfer-aware accounting.
+   Never roll back to binaries that ignore outgoing deductions or transfer credits.
+
+Reversals, chargebacks, fees, expiry, claims by email, bulk sends, automatic
+recipient selection, and per-reseller attribution of recipient usage are excluded.

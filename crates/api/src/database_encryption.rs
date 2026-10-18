@@ -129,6 +129,11 @@ struct ApprovedGroup {
 }
 
 const APPROVED: &[ApprovedGroup] = &[
+    ApprovedGroup { table: "organization_credit_transfers", columns: &["source_credit_type", "idempotency_key", "terms", "actor_kind", "staking_evidence", "result", "recipient_snapshot"], reason: "Immutable billing ledger, canonical retry terms and restricted accounting snapshots; memo and metadata are visible to both parties and must not contain secrets" },
+    ApprovedGroup { table: "organization_credit_transfer_policies", columns: &["change_reason"], reason: "Administrator billing authorization audit" },
+    ApprovedGroup { table: "organization_credit_transfer_policy_audit", columns: &["change_reason"], reason: "Immutable administrator billing authorization audit" },
+    ApprovedGroup { table: "organization_credit_transfer_credentials", columns: &["token_hash"], reason: "Dedicated transfer credential stored only as a one-way hash" },
+    ApprovedGroup { table: "organization_credit_transfer_totals", columns: &["credit_type"], reason: "Queryable billing projection type" },
     ApprovedGroup { table: "organization_credit_reconciliations", columns: &["idempotency_key", "amounts", "reason", "result"], reason: "Restricted administrator accounting audit and idempotent replay data, consistent with organization limit change reasons and billing correction records; reasons may include billing/contract references" },
     ApprovedGroup { table: "admin_access_token", columns: &["token_hash", "name", "creation_reason", "revocation_reason", "user_agent", "permission"], reason: "Operational admin-token metadata; the credential itself is stored as a one-way hash" },
     ApprovedGroup { table: "admin_settings", columns: &["key", "value"], reason: "Operator-set runtime settings (tuning knobs, kill switches, public signed trust inputs); no secrets or customer data" },

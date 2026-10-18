@@ -354,12 +354,13 @@ async fn systemone_rejects_invalid_requests_before_inference() {
         json!({"model":model,"state":"x","questions":{"q":{"type":"score","instructions":"Rate urgency.","criteria":[]}}}),
         request("unknown-model"),
     ];
-    for mut question in [
+    for question in [
         json!({"type":"noul"}),
         json!({"type":"choice","criteria":{"billing":null,"other":null}}),
         json!({"type":"score","criteria":["low","high"]}),
     ] {
         for instructions in [None, Some(Value::Null)] {
+            let mut question = question.clone();
             if let Some(value) = instructions {
                 question["instructions"] = value;
             }
@@ -379,7 +380,12 @@ async fn systemone_rejects_invalid_requests_before_inference() {
             .add_header("Authorization", format!("Bearer {key}"))
             .json(&body)
             .await;
-        response.assert_status_bad_request();
+        assert_eq!(
+            response.status_code(),
+            400,
+            "request: {body}; response: {}",
+            response.text()
+        );
     }
     for identifier in [&model, &alias] {
         for stream in [false, true] {

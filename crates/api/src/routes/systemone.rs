@@ -387,12 +387,13 @@ mod tests {
         use axum::extract::FromRequest;
         use serde_json::{json, Value};
 
-        for mut question in [
+        for question in [
             json!({"type":"noul"}),
             json!({"type":"choice","criteria":{"billing":null,"other":null}}),
             json!({"type":"score","criteria":["low","high"]}),
         ] {
-            for instructions in [None, Some(Value::Null)] {
+            for (case, instructions) in [("missing", None), ("null", Some(Value::Null))] {
+                let mut question = question.clone();
                 let missing = instructions.is_none();
                 if let Some(value) = instructions {
                     question["instructions"] = value;
@@ -404,23 +405,34 @@ mod tests {
                             .to_string(),
                     ))
                     .unwrap();
-                let rejection =
-                    match OpenAiJson::<SystemOneRequest>::from_request(request, &()).await {
-                        Ok(_) => panic!("instructions must be required and non-null"),
-                        Err(rejection) => rejection,
-                    };
+                let rejection = match OpenAiJson::<SystemOneRequest>::from_request(request, &())
+                    .await
+                {
+                    Ok(_) => panic!("{case} instructions must be rejected; question: {question}"),
+                    Err(rejection) => rejection,
+                };
                 let response = rejection.into_response();
-                assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+                let status = response.status();
                 let bytes = axum::body::to_bytes(response.into_body(), 4096)
                     .await
                     .unwrap();
                 let error: Value = serde_json::from_slice(&bytes).unwrap();
-                assert_eq!(error["error"]["type"], "invalid_request_error");
+                assert_eq!(
+                    status,
+                    StatusCode::BAD_REQUEST,
+                    "{case} instructions; question: {question}; error: {error}"
+                );
+                assert_eq!(
+                    error["error"]["type"], "invalid_request_error",
+                    "{case} instructions; question: {question}; error: {error}"
+                );
                 if missing {
-                    assert!(error["error"]["message"]
-                        .as_str()
-                        .unwrap()
-                        .contains("missing field `instructions`"));
+                    assert!(
+                        error["error"]["message"]
+                            .as_str()
+                            .is_some_and(|message| message.contains("missing field `instructions`")),
+                        "{case} instructions; question: {question}; error: {error}"
+                    );
                 }
             }
         }

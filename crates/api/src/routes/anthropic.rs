@@ -13,6 +13,8 @@
 //! work. `ANTHROPIC_DENIED_BETAS` is the global operator kill-switch for these
 //! cases; model-specific pricing restrictions need separate policy.
 
+mod signatures;
+
 use crate::middleware::auth::AuthenticatedApiKey;
 use crate::middleware::RequestedModel;
 use crate::models::AnthropicErrorResponse;
@@ -43,6 +45,8 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::Duration;
 use uuid::Uuid;
+
+use signatures::{valid_message_id, MessageSigningContext};
 
 const MAX_SSE_USAGE_LINE_BYTES: usize = 256 * 1024;
 /// Cap on bytes buffered while waiting for `message_start` to reveal the
@@ -182,12 +186,17 @@ struct NativeBillingSeed {
 #[derive(Default)]
 struct SseUsageParser {
     line_buffer: Vec<u8>,
+    data_buffer: Vec<u8>,
     usage: NativeUsage,
     discarding_oversized_line: bool,
+    finished: bool,
 }
 
 impl SseUsageParser {
     fn push(&mut self, bytes: &[u8]) {
+        if self.finished {
+            return;
+        }
         let mut bytes = bytes;
         if self.discarding_oversized_line {
             let Some(newline) = bytes.iter().position(|byte| *byte == b'\n') else {
@@ -222,6 +231,13 @@ impl SseUsageParser {
     }
 
     fn process_line(&mut self, line: &[u8]) {
+        if self.finished {
+            return;
+        }
+        if line.is_empty() {
+            self.data_buffer.clear();
+            return;
+        }
         let Some(data) = line.strip_prefix(b"data:") else {
             return;
         };
@@ -229,10 +245,24 @@ impl SseUsageParser {
         if data == b"[DONE]" {
             return;
         }
-        let Ok(event) = serde_json::from_slice::<serde_json::Value>(data) else {
+        if self.data_buffer.len() + data.len() + 1 > MAX_SSE_USAGE_LINE_BYTES {
+            self.data_buffer.clear();
             return;
-        };
-        self.apply_event(&event);
+        }
+        if !self.data_buffer.is_empty() {
+            self.data_buffer.push(b'\n');
+        }
+        self.data_buffer.extend_from_slice(data);
+        match serde_json::from_slice::<serde_json::Value>(&self.data_buffer) {
+            Ok(event) => {
+                self.data_buffer.clear();
+                self.apply_event(&event);
+            }
+            // SSE joins data lines with newlines. Retain incomplete JSON so
+            // billing and signature lookup agree on a multiline message ID.
+            Err(error) if error.is_eof() => {}
+            Err(_) => self.data_buffer.clear(),
+        }
     }
 
     fn apply_event(&mut self, event: &serde_json::Value) {
@@ -241,10 +271,13 @@ impl SseUsageParser {
                 let Some(message) = event.get("message") else {
                     return;
                 };
-                self.usage.provider_request_id = message
-                    .get("id")
-                    .and_then(serde_json::Value::as_str)
-                    .map(str::to_string);
+                if self.usage.provider_request_id.is_none() {
+                    self.usage.provider_request_id = message
+                        .get("id")
+                        .and_then(serde_json::Value::as_str)
+                        .filter(|id| valid_message_id(id))
+                        .map(str::to_string);
+                }
                 if let Some(usage) = message.get("usage") {
                     self.usage.apply_usage(usage);
                 }
@@ -262,6 +295,10 @@ impl SseUsageParser {
                 }
             }
             Some("error") => self.usage.stop_reason = Some(StopReason::ProviderError),
+            Some("message_stop") => {
+                self.usage.stop_reason.get_or_insert(StopReason::Completed);
+                self.finished = true;
+            }
             _ => {}
         }
     }
@@ -453,6 +490,10 @@ async fn handle_request(
     endpoint: AnthropicRawEndpoint,
     requested_model: RequestedModel,
 ) -> Response {
+    // Capture the client's bytes before parsing or provider model rewriting.
+    // Count-tokens is a separate, unsigned operation.
+    let signing = (endpoint == AnthropicRawEndpoint::Messages)
+        .then(|| MessageSigningContext::new(app_state.attestation_service.clone(), &body));
     let prepared = match prepare_request(
         &headers,
         query.as_deref(),
@@ -567,6 +608,7 @@ async fn handle_request(
         billing,
         concurrent_slot,
         alias_from,
+        signing,
     )
     .await
 }
@@ -990,6 +1032,7 @@ async fn build_upstream_response(
     billing: Option<NativeBillingContext>,
     concurrent_slot: Option<ConcurrentRequestGuard>,
     alias_from: Option<String>,
+    signing: Option<MessageSigningContext>,
 ) -> Response {
     let status = upstream.status;
     if status.is_success() && endpoint == AnthropicRawEndpoint::Messages && !stream {
@@ -1017,15 +1060,27 @@ async fn build_upstream_response(
         };
         let reason = usage.stop_reason.clone().unwrap_or(StopReason::Incomplete);
         let inference_id = usage.inference_id();
-        if let Some(billing) = billing {
-            if let Err(error) = record_native_usage(billing, usage, reason).await {
-                tracing::error!(error = %error, "Failed to record native Anthropic usage");
-                return anthropic_error(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "api_error",
-                    "Failed to record usage",
-                );
+        let message_id = usage.provider_request_id.clone();
+        let response_hash = signatures::body_hash(&bytes);
+        // Once a full response has arrived, cancellation must not interrupt
+        // billing or receipt storage. Only hashes/IDs enter the signing task.
+        let finalized = tokio::spawn(async move {
+            if let Some(billing) = billing {
+                record_native_usage(billing, usage, reason).await?;
             }
+            if let (Some(signing), Some(id)) = (signing, message_id) {
+                signing.store(id, response_hash).await;
+            }
+            Ok::<_, services::usage::UsageError>(())
+        })
+        .await;
+        if !matches!(finalized, Ok(Ok(()))) {
+            tracing::error!("Failed to finalize native Anthropic usage");
+            return anthropic_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "api_error",
+                "Failed to record usage",
+            );
         }
         return response_from_bytes(status, upstream.headers, bytes, alias_from, inference_id);
     }
@@ -1036,6 +1091,8 @@ async fn build_upstream_response(
         // client disconnect (or the peek timeout) during the peek still runs
         // its Drop and records whatever usage the parser has seen.
         let mut usage_stream = NativeUsageStream {
+            // Observe usage before signature framing so cancellation cannot
+            // lose usage in an upstream chunk or an incomplete SSE frame.
             inner: upstream.body,
             parser: SseUsageParser::default(),
             prelude: VecDeque::new(),
@@ -1051,7 +1108,11 @@ async fn build_upstream_response(
                 "Native Anthropic stream did not reveal a message id before response start"
             );
         }
-        Body::from_stream(usage_stream)
+        let usage_stream: AnthropicRawBody = Box::pin(usage_stream);
+        Body::from_stream(match signing {
+            Some(signing) => signatures::signed_stream(usage_stream, signing),
+            None => usage_stream,
+        })
     } else {
         Body::from_stream(upstream.body)
     };
@@ -1080,6 +1141,7 @@ fn parse_non_stream_usage(body: &[u8]) -> Result<NativeUsage, &'static str> {
         provider_request_id: response
             .get("id")
             .and_then(serde_json::Value::as_str)
+            .filter(|id| valid_message_id(id))
             .map(str::to_string),
         input_tokens,
         output_tokens,
@@ -1759,8 +1821,8 @@ redact-thinking-2026-02-12";
     /// Returning Err spares constructing a full UsageLogEntry — the request
     /// is captured before the result is inspected.
     #[derive(Default)]
-    struct RecordingUsageService {
-        records: std::sync::Mutex<Vec<RecordUsageServiceRequest>>,
+    pub(super) struct RecordingUsageService {
+        pub(super) records: std::sync::Mutex<Vec<RecordUsageServiceRequest>>,
     }
 
     #[async_trait::async_trait]
@@ -1898,7 +1960,9 @@ redact-thinking-2026-02-12";
         }
     }
 
-    fn billing_context(usage_service: Arc<RecordingUsageService>) -> NativeBillingContext {
+    pub(super) fn billing_context(
+        usage_service: Arc<RecordingUsageService>,
+    ) -> NativeBillingContext {
         NativeBillingContext {
             usage_service,
             organization_id: Uuid::new_v4(),
@@ -1913,7 +1977,7 @@ redact-thinking-2026-02-12";
 
     /// Billing runs on a spawned blocking task after the stream finishes;
     /// poll briefly instead of racing it.
-    async fn wait_for_recorded_usage(
+    pub(super) async fn wait_for_recorded_usage(
         usage_service: &RecordingUsageService,
     ) -> RecordUsageServiceRequest {
         for _ in 0..200 {

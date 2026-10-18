@@ -334,6 +334,7 @@ pub enum OrganizationOrderDirection {
     Desc,
 }
 
+#[cfg_attr(any(test, feature = "test-mocks"), mockall::automock)]
 #[async_trait]
 pub trait OrganizationRepository: Send + Sync {
     async fn create(
@@ -532,6 +533,7 @@ pub trait OrganizationInvitationRepository: Send + Sync {
 }
 
 /// Service trait for organization operations
+#[cfg_attr(any(test, feature = "test-mocks"), mockall::automock)]
 #[async_trait]
 pub trait OrganizationServiceTrait: Send + Sync {
     /// Create a new organization

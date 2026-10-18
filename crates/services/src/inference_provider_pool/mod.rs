@@ -5212,23 +5212,25 @@ impl InferenceProviderPool {
         }
 
         // Final user-facing error: only the status code escapes; no
-        // upstream response body. (`sanitize_error_message` would still
-        // include the body via Display, so we route around it.)
-        let error_msg = last_error
-            .as_ref()
-            .map(|e| match e {
-                inference_providers::PrivacyClassifyError::HttpError { status_code, .. } => {
-                    format!("PII detector returned HTTP {status_code}")
+        // upstream response body (a filter that echoes its input would leak
+        // customer PII). The status is kept as `HttpError` so callers can
+        // tell a client 4xx from an upstream outage.
+        Err(match last_error {
+            Some(inference_providers::PrivacyClassifyError::HttpError { status_code, .. }) => {
+                inference_providers::PrivacyClassifyError::HttpError {
+                    status_code,
+                    message: format!("PII detector returned HTTP {status_code}"),
                 }
-                inference_providers::PrivacyClassifyError::RequestFailed(_) => {
-                    "PII detector unreachable".to_string()
-                }
-            })
-            .unwrap_or_else(|| "No providers available for privacy classify".to_string());
-
-        Err(inference_providers::PrivacyClassifyError::RequestFailed(
-            error_msg,
-        ))
+            }
+            Some(inference_providers::PrivacyClassifyError::RequestFailed(_)) => {
+                inference_providers::PrivacyClassifyError::RequestFailed(
+                    "PII detector unreachable".to_string(),
+                )
+            }
+            None => inference_providers::PrivacyClassifyError::RequestFailed(
+                "No providers available for privacy classify".to_string(),
+            ),
+        })
     }
 
     pub async fn score(

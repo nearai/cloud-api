@@ -324,6 +324,19 @@ fn router_pins() -> services::attestation::tinfoil_pins::TinfoilPins {
     }
 }
 
+fn default_trust() -> Arc<
+    arc_swap::ArcSwap<
+        services::admin_settings::Versioned<services::attestation::tinfoil_trust::TinfoilTrust>,
+    >,
+> {
+    Arc::new(arc_swap::ArcSwap::from_pointee(
+        services::admin_settings::Versioned {
+            version: 0,
+            value: Default::default(),
+        },
+    ))
+}
+
 fn metrics() -> Arc<dyn services::metrics::MetricsServiceTrait> {
     Arc::new(services::metrics::MockMetricsService)
 }
@@ -344,6 +357,7 @@ async fn failed_first_verification_still_registers_and_answers_503() {
         &repo,
         &cfg,
         Ok(router_pins()),
+        default_trust(),
         |mut pcfg, verifier| {
             // Nothing listens on port 1: the first verify fails immediately.
             pcfg.atc_url = "https://127.0.0.1:1/attestation".to_string();
@@ -416,6 +430,7 @@ async fn startup_does_not_wait_for_a_hanging_first_verification() {
         &repo,
         &cfg,
         Ok(router_pins()),
+        default_trust(),
         move |mut pcfg, verifier| {
             pcfg.atc_url = format!("https://127.0.0.1:{port}/attestation");
             inference_providers::attested::tinfoil::TinfoilRouterSession::new(pcfg, verifier)
@@ -450,6 +465,7 @@ async fn entry_without_ctx_is_not_registered() {
     let pcfg = inference_providers::attested::tinfoil::Config::new("tk_test_key".into(), 5);
     let verifier = Arc::new(services::attestation::tinfoil::TinfoilPolicyVerifier::new(
         router_pins(),
+        default_trust(),
     ));
     let session =
         inference_providers::attested::tinfoil::TinfoilRouterSession::new(pcfg.clone(), verifier)
@@ -477,9 +493,44 @@ async fn session_build_failure_registers_nothing() {
         &repo,
         &tinfoil_cfg(&model, "@131072"),
         Ok(router_pins()),
+        default_trust(),
         |_, _| Err("cannot build".to_string()),
         metrics(),
     )
     .await;
     assert!(!pool.has_provider(&model).await);
+}
+
+/// `GET /v1/attestation/pins` is public and lists, per backup
+/// provider, the compiled pins and (Tinfoil) the admin switches. A real Tinfoil session cannot be
+/// stubbed here, so the live router state is `null` in this endpoint.
+#[tokio::test]
+async fn serial_public_pins_endpoint() {
+    let server = setup_test_server().await;
+    let response = server.get("/v1/attestation/pins").await;
+    assert_eq!(response.status_code(), 200, "{}", response.text());
+    // Cache-Control is `no-store`, set for every response by the
+    // request-correlation middleware (per-request id); the route sets none.
+    assert_eq!(
+        response
+            .headers()
+            .get("cache-control")
+            .and_then(|v| v.to_str().ok()),
+        Some("no-store")
+    );
+    let body: Value = response.json();
+    let tinfoil = &body["tinfoil"];
+    assert!(tinfoil["compiled"]["routers"].is_array());
+    assert!(tinfoil["compiled"]["models"].is_object());
+    assert!(tinfoil["runtime"]["router_sigstore"].is_boolean());
+    assert!(tinfoil["runtime"]["admin_model_pins"].is_boolean());
+    assert!(tinfoil["runtime"]["model_pins"].is_array());
+    let chutes_rows = body["chutes"]["compiled"].as_array().expect("chutes rows");
+    assert!(!chutes_rows.is_empty());
+    assert!(chutes_rows[0]["mrtd"].is_string() && chutes_rows[0]["rtmr3"].is_string());
+    assert!(body["chutes"]["runtime"].is_null());
+    assert!(
+        !body.to_string().contains("sigstore_bundle"),
+        "raw bundles are never served"
+    );
 }

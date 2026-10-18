@@ -89,6 +89,7 @@ mod pagination_validation;
 mod patroni_failover;
 mod privacy_classify;
 mod privacy_redact;
+mod privacy_settlement;
 mod provider_errors;
 mod reasoning;
 mod reporting_usage;

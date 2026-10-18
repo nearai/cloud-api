@@ -11,6 +11,11 @@
       "tag": "v0.0.157"
     },
     {
+      "measurement": "9b5493714af482656d43d963774da1185a611dac14a46a03cfbde5a2984201a9d41fc2b6a5f81b806e58acae104226a6",
+      "repo": "tinfoilsh/confidential-model-router",
+      "tag": "v0.0.158"
+    },
+    {
       "measurement": "b3be62c7199d8e4d24f130e5651bdc8a62a2532f72c7e87c986bec54bf5f90bab703ad4dbfc5e45bfd385f8972dfc66c",
       "repo": "tinfoilsh/confidential-model-router",
       "tag": "v0.0.155"
@@ -37,6 +42,15 @@
         ],
         "repo": "tinfoilsh/confidential-doc-upload",
         "tag": "v0.0.36"
+      },
+      {
+        "registers": [
+          "5f796a5b6cee04f80f45cfabc512ef5160d70237847d22f294c43f95cb68c3ece18958324a975abe5a82dc8ae2fba661",
+          "a787299fe2e84295a406dde367abac5b40128c1e13aa81dfde4a5c2e39682e45cde7bb84cefc7f33f25ac645fc265030",
+          "7cf45ba2b4f33acd104019425f32d5b37c31384b9d95ef5be6256200d31ff56b1428e23616e28305f87092702f3d7d8a"
+        ],
+        "repo": "tinfoilsh/confidential-doc-upload",
+        "tag": "v0.0.37"
       }
     ],
     "gemma4-31b": [
@@ -218,6 +232,15 @@
         ],
         "repo": "tinfoilsh/confidential-websearch",
         "tag": "v0.5.13"
+      },
+      {
+        "registers": [
+          "c0c2831d6e7db17441524394f5ac273cac6db441e911fc51e9900e51e4afe6dc272968b0b861339797046889924b1b50",
+          "a787299fe2e84295a406dde367abac5b40128c1e13aa81dfde4a5c2e39682e45cde7bb84cefc7f33f25ac645fc265030",
+          "6e728698bdddfadfe16235ec507ca08a181964f94ccb02039339f8da8813059d03c71d08edcb5edc38dfa68e8fc1adad"
+        ],
+        "repo": "tinfoilsh/confidential-websearch",
+        "tag": "v0.5.14"
       }
     ],
     "whisper-large-v3-turbo": [

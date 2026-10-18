@@ -251,6 +251,7 @@ pub trait ApiKeyRepository: Send + Sync {
 
 // Service trait
 #[allow(clippy::too_many_arguments)]
+#[cfg_attr(test, mockall::automock)]
 #[async_trait]
 pub trait WorkspaceServiceTrait: Send + Sync {
     /// Get a workspace by ID

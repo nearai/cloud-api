@@ -148,6 +148,7 @@ pub const REASON_REPOSITORY_ERROR: &str = "repository_error";
 // Provider token anomaly reasons
 pub const REASON_TOKEN_OVERFLOW: &str = "overflow";
 pub const REASON_MISSING_USAGE: &str = "missing_usage";
+pub const REASON_NEGATIVE_USAGE: &str = "negative_usage";
 
 /// Get the current environment from the ENVIRONMENT env var, defaulting to "local"
 pub fn get_environment() -> String {

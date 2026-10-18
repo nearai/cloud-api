@@ -39,19 +39,16 @@ pub struct SystemOneRequest {
 #[cfg_attr(feature = "openapi", schema(as = SystemOneQuestion))]
 pub enum Question {
     Noul {
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        instructions: Option<Content>,
+        instructions: Content,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         criteria: Option<NoulCriteria>,
     },
     Choice {
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        instructions: Option<Content>,
+        instructions: Content,
         criteria: BTreeMap<String, ChoiceCriterion>,
     },
     Score {
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        instructions: Option<Content>,
+        instructions: Content,
         criteria: Vec<Content>,
     },
 }

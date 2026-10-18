@@ -106,7 +106,7 @@ async fn fleet_case(status: u16, malformed: bool, timeout: bool) {
             .await;
     }
     let request: SystemOneRequest = serde_json::from_value(json!({"model":"jev","state":"x",
-        "questions":{"q":{"type":"noul"}}}))
+        "questions":{"q":{"type":"noul","instructions":"Is this about billing?"}}}))
     .unwrap();
     let response = provider.systemone(request, "original-hash".into()).await;
     if retry {

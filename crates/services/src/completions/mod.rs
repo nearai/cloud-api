@@ -1193,8 +1193,8 @@ impl CompletionServiceImpl {
 
     /// Whether `extra` carries any client-facing E2EE marker: the model
     /// pub-key routing pin, or any of the four encryption headers. Mirrors
-    /// the route's `e2ee_requested` (`crates/api/src/routes/completions.rs`,
-    /// near line 126), which checks the same four encryption headers off
+    /// the route's `e2ee_requested` (`crates/api/src/routes/completions/mod.rs`),
+    /// which checks the same four encryption headers off
     /// the validated `EncryptionHeaders` struct before they're written into
     /// `extra`; this checks `extra` directly (plus `MODEL_PUB_KEY`, which
     /// `e2ee_requested` doesn't cover but `reject_e2ee_if_unsupported`
@@ -4647,7 +4647,7 @@ mod tests {
     #[test]
     fn apply_placement_affinity_client_pub_key_alone_gives_no_prefix_affinity() {
         // client_pub_key is one of the four encryption headers e2ee_requested
-        // (routes/completions.rs) checks, distinct from model_pub_key. It must
+        // (routes/completions/mod.rs) checks, distinct from model_pub_key. It must
         // independently suppress the prefix source here too.
         let mut params = minimal_chat_params();
         params.extra.insert(

@@ -45,11 +45,24 @@ pub(super) fn classify_provider_error(
     upstream_status: u16,
     upstream_message: String,
 ) -> (StatusCode, &'static str, String) {
+    classify_provider_error_with(
+        upstream_status,
+        upstream_message,
+        "Embeddings request failed. Please try again later.",
+    )
+}
+
+/// [`classify_provider_error`] with the endpoint's own generic 5xx message.
+pub(super) fn classify_provider_error_with(
+    upstream_status: u16,
+    upstream_message: String,
+    failure_message: &'static str,
+) -> (StatusCode, &'static str, String) {
     let generic = || {
         (
             StatusCode::INTERNAL_SERVER_ERROR,
             "server_error",
-            "Embeddings request failed. Please try again later.".to_string(),
+            failure_message.to_string(),
         )
     };
     match upstream_status {

@@ -324,7 +324,7 @@ pub async fn init_domain_services(
     organization_service: Arc<dyn services::organization::OrganizationServiceTrait + Send + Sync>,
     metrics_service: Arc<dyn services::metrics::MetricsServiceTrait>,
 ) -> DomainServices {
-    let inference_provider_pool =
+    let (inference_provider_pool, admin_settings) =
         init_inference_providers(database.clone(), config, metrics_service.clone()).await;
     init_domain_services_with_pool(
         database,
@@ -332,18 +332,25 @@ pub async fn init_domain_services(
         organization_service,
         inference_provider_pool,
         metrics_service,
+        Some(admin_settings),
     )
     .await
 }
 
 /// Initialize domain services with a provided inference provider pool
-/// This allows tests to inject mock providers without changing core implementations
+/// This allows tests to inject mock providers without changing core implementations.
+///
+/// `admin_settings` is the already-started service from
+/// [`init_inference_providers`], whose consumers were registered after it
+/// loaded. `None` (the test harnesses, which have no such consumers) builds
+/// and starts an equivalent service here against the pool's handles.
 pub async fn init_domain_services_with_pool(
     database: Arc<Database>,
     config: &ApiConfig,
     organization_service: Arc<dyn services::organization::OrganizationServiceTrait + Send + Sync>,
     inference_provider_pool: Arc<services::inference_provider_pool::InferenceProviderPool>,
     metrics_service: Arc<dyn services::metrics::MetricsServiceTrait>,
+    admin_settings: Option<Arc<services::admin_settings::AdminSettingsService>>,
 ) -> DomainServices {
     let database_encryption_key = database::field_encryption::parse_key(
         &config.database_encryption_key,
@@ -625,16 +632,23 @@ pub async fn init_domain_services_with_pool(
         .with_binding(staking_binding),
     );
 
-    // Admin settings (placement tuning today): load into the pool's tuning
-    // handle now, then every 10 minutes. Placement off leaves it unused.
-    let admin_settings_service = Arc::new(services::admin_settings::AdminSettingsService::new(
-        Arc::new(
-            database::repositories::PostgresAdminSettingsRepository::new(database.pool().clone()),
-        ),
-        inference_provider_pool.placement_tuning(),
-        inference_provider_pool.attested_3p_disabled(),
-    ));
-    admin_settings_service.clone().start().await;
+    // Admin settings: the production path builds and starts them in
+    // `init_inference_providers`, before their consumers register.
+    let admin_settings_service = match admin_settings {
+        Some(service) => service,
+        None => {
+            build_admin_settings(
+                Arc::new(
+                    database::repositories::PostgresAdminSettingsRepository::new(
+                        database.pool().clone(),
+                    ),
+                ),
+                &inference_provider_pool,
+                new_tinfoil_trust_handle(),
+            )
+            .await
+        }
+    };
 
     DomainServices {
         conversation_service,
@@ -677,6 +691,7 @@ pub async fn init_domain_services_with_mcp_factory(
         organization_service.clone(),
         inference_provider_pool.clone(),
         metrics_service.clone(),
+        None,
     )
     .await;
 
@@ -755,6 +770,7 @@ pub async fn init_domain_services_with_pool_and_search_providers(
         organization_service.clone(),
         inference_provider_pool.clone(),
         metrics_service,
+        None,
     )
     .await;
 
@@ -846,7 +862,10 @@ pub async fn init_inference_providers(
     database: Arc<Database>,
     config: &ApiConfig,
     metrics_service: Arc<dyn services::metrics::MetricsServiceTrait>,
-) -> Arc<services::inference_provider_pool::InferenceProviderPool> {
+) -> (
+    Arc<services::inference_provider_pool::InferenceProviderPool>,
+    Arc<services::admin_settings::AdminSettingsService>,
+) {
     let api_key = config.inference_api_key.clone();
 
     let pool = Arc::new(
@@ -857,6 +876,20 @@ pub async fn init_inference_providers(
     );
     pool.set_metrics_service(metrics_service.clone());
     install_placement(&pool, &config.placement);
+
+    // Runtime settings load BEFORE their consumers register, so a stored
+    // setting (e.g. `tinfoil_trust.router_sigstore = false`) governs the very
+    // first verification. A store that is down leaves the fail-closed initial
+    // value until the retried load succeeds.
+    let tinfoil_trust = new_tinfoil_trust_handle();
+    let admin_settings = build_admin_settings(
+        Arc::new(
+            database::repositories::PostgresAdminSettingsRepository::new(database.pool().clone()),
+        ),
+        &pool,
+        tinfoil_trust.clone(),
+    )
+    .await;
 
     let models_repo = Arc::new(database::repositories::ModelRepository::new(
         database.pool().clone(),
@@ -907,11 +940,46 @@ pub async fn init_inference_providers(
         &pool,
         &models_repo,
         &config.external_providers,
+        tinfoil_trust,
         metrics_service,
     )
     .await;
 
-    pool
+    (pool, admin_settings)
+}
+
+/// The Tinfoil trust handle before any stored row is applied: version 0 with
+/// `router_sigstore` and admin model pins off, so both fail closed until the stored
+/// value has loaded.
+fn new_tinfoil_trust_handle() -> services::attestation::tinfoil_trust::TinfoilTrustHandle {
+    Arc::new(arc_swap::ArcSwap::from_pointee(
+        services::admin_settings::Versioned {
+            version: 0,
+            value: services::attestation::tinfoil_trust::TinfoilTrust::fail_closed_initial(),
+        },
+    ))
+}
+
+/// Builds the admin settings service with every key registered in listing
+/// order (`placement`, `attested_3p`, `tinfoil_trust`), each publishing into
+/// its owner's handle, then loads once and starts the periodic reload. A
+/// failing store keeps the defaults and never panics.
+pub(crate) async fn build_admin_settings(
+    repository: Arc<dyn services::admin_settings::AdminSettingsRepository>,
+    pool: &services::inference_provider_pool::InferenceProviderPool,
+    tinfoil_trust: services::attestation::tinfoil_trust::TinfoilTrustHandle,
+) -> Arc<services::admin_settings::AdminSettingsService> {
+    use services::admin_settings::{AdminSettingsService, Attested3pKey, PlacementKey};
+    use services::attestation::tinfoil_trust::TinfoilTrustKey;
+    let service = Arc::new(
+        AdminSettingsService::builder(repository)
+            .register::<PlacementKey>(pool.placement_tuning())
+            .register::<Attested3pKey>(pool.attested_3p_disabled())
+            .register::<TinfoilTrustKey>(tinfoil_trust)
+            .build(),
+    );
+    service.clone().start().await;
+    service
 }
 
 /// Initialize inference provider pool with mock providers for testing
@@ -1199,8 +1267,11 @@ pub fn build_app_with_config_and_options(
     let workspace_routes =
         build_workspace_routes(app_state.clone(), &auth_components.auth_state_middleware);
 
-    let attestation_routes =
-        build_attestation_routes(app_state.clone(), &auth_components.auth_state_middleware);
+    let attestation_routes = build_attestation_routes(
+        app_state.clone(),
+        &auth_components.auth_state_middleware,
+        domain_services.admin_settings_service.clone(),
+    );
 
     let model_routes = build_model_routes(domain_services.models_service.clone());
 
@@ -1805,9 +1876,14 @@ pub fn build_conversation_routes(
 ///   missing/invalid/expired/deactivated credentials with 401); like
 ///   the signature route, report retrieval is non-billable — no usage or
 ///   billing records are created.
-/// - `GET /v1/attestation/ita-token` is deliberately public; the rationale is
-///   documented on `build_public_attestation_routes`.
-pub fn build_attestation_routes(app_state: AppState, auth_state_middleware: &AuthState) -> Router {
+/// - `GET /v1/attestation/ita-token` and `GET /v1/attestation/pins` are
+///   deliberately public; the rationale is documented on
+///   `build_public_attestation_routes`.
+pub fn build_attestation_routes(
+    app_state: AppState,
+    auth_state_middleware: &AuthState,
+    admin_settings: Arc<services::admin_settings::AdminSettingsService>,
+) -> Router {
     let attestation_route_state = attestation::AttestationRouteState::from(app_state);
     let authenticated_routes = Router::new()
         .route("/attestation/report", get(get_attestation_report))
@@ -1818,7 +1894,13 @@ pub fn build_attestation_routes(app_state: AppState, auth_state_middleware: &Aut
             auth_middleware_with_api_key,
         ));
 
-    let public_routes = attestation::build_public_attestation_routes(attestation_route_state);
+    // One section per attested backup provider; add new providers here.
+    let pins_sources: Vec<Arc<dyn services::attestation::pins_view::ProviderPinsSource>> = vec![
+        Arc::new(services::attestation::tinfoil_pins_view::TinfoilPinsSource::new(admin_settings)),
+        Arc::new(services::attestation::chutes_pins_view::ChutesPinsSource),
+    ];
+    let public_routes =
+        attestation::build_public_attestation_routes(attestation_route_state, pins_sources);
 
     Router::new()
         .merge(authenticated_routes)
@@ -2761,8 +2843,9 @@ mod tests {
 
     #[test]
     fn test_openapi_ita_token_endpoint_is_public() {
-        // /v1/attestation/ita-token is the ONLY public attestation route — an
-        // explicit, documented decision (nearai/infra#193); see
+        // /v1/attestation/ita-token and /v1/attestation/pins are the
+        // ONLY public attestation routes — explicit, documented decisions
+        // (nearai/infra#193); see
         // `build_public_attestation_routes` in routes/attestation.rs.
         let spec = match serde_json::to_value(ApiDoc::openapi()) {
             Ok(spec) => spec,
@@ -2780,6 +2863,16 @@ mod tests {
         assert!(spec["components"]["schemas"]
             .as_object()
             .is_some_and(|schemas| schemas.contains_key("ItaTokenResponse")));
+    }
+
+    #[test]
+    fn test_openapi_attested_pins_endpoint_is_public() {
+        let spec = serde_json::to_value(ApiDoc::openapi()).unwrap();
+        assert_eq!(
+            spec["paths"]["/v1/attestation/pins"]["get"]["security"],
+            serde_json::json!([{}]),
+            "/v1/attestation/pins must explicitly override global OpenAPI security"
+        );
     }
 
     #[test]

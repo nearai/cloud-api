@@ -219,6 +219,7 @@ use utoipa::{Modify, OpenApi};
         crate::routes::attestation::signature::get_signature,
         crate::routes::attestation::report::get_attestation_report,
         crate::routes::attestation::ita_token::get_ita_token,
+        crate::routes::attestation::pins::get_attested_pins,
     ),
     components(
         schemas(

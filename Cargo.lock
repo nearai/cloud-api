@@ -517,6 +517,7 @@ name = "api"
 version = "0.0.0"
 dependencies = [
  "anyhow",
+ "arc-swap",
  "async-trait",
  "aws-config",
  "aws-sdk-s3",
@@ -6818,6 +6819,7 @@ dependencies = [
  "sha2 0.11.0",
  "sha3 0.12.0",
  "thiserror 2.0.18",
+ "tinfoil_provenance",
  "tokio",
  "tokio-rustls",
  "tokio-stream",
@@ -7468,13 +7470,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "tinfoil_provenance"
+version = "0.0.0"
+dependencies = [
+ "base64 0.22.1",
+ "chrono",
+ "serde",
+ "serde_json",
+ "sigstore-verify",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "tinfoil_sync"
 version = "0.0.0"
 dependencies = [
  "anyhow",
- "base64 0.22.1",
  "chrono",
- "hex",
  "inference_providers",
  "rcgen",
  "reqwest 0.12.28",
@@ -7482,8 +7494,8 @@ dependencies = [
  "serde",
  "serde_json",
  "services",
- "sigstore-verify",
  "thiserror 2.0.18",
+ "tinfoil_provenance",
  "tokio",
  "tokio-rustls",
  "wiremock",

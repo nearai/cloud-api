@@ -701,6 +701,19 @@ struct MockConfig {
     embedding_error_override: Option<EmbeddingError>,
     /// When set, all audio transcription calls return this error instead of a response.
     audio_transcription_error_override: Option<AudioTranscriptionError>,
+    /// When set, privacy classify calls return this instead of running the
+    /// built-in shape-based detector.
+    privacy_classify_override: Option<PrivacyClassifyOverride>,
+}
+
+/// Scripted privacy-classify outcome for [`MockProvider::set_privacy_classify_override`].
+/// Lets tests drive unusual upstream usage shapes and upstream HTTP failures.
+#[derive(Clone, Debug)]
+pub enum PrivacyClassifyOverride {
+    /// Return this JSON body verbatim as the upstream response.
+    Body(serde_json::Value),
+    /// Fail as if the upstream returned this HTTP status.
+    HttpError { status_code: u16, message: String },
 }
 
 /// Builder for configuring a single expectation
@@ -831,6 +844,7 @@ impl MockProvider {
                 stream_error_override: None,
                 embedding_error_override: None,
                 audio_transcription_error_override: None,
+                privacy_classify_override: None,
             })),
             last_chat_params: Arc::new(Mutex::new(None)),
             chat_request_priorities: Arc::new(Mutex::new(Vec::new())),
@@ -863,6 +877,7 @@ impl MockProvider {
                 stream_error_override: None,
                 embedding_error_override: None,
                 audio_transcription_error_override: None,
+                privacy_classify_override: None,
             })),
             last_chat_params: Arc::new(Mutex::new(None)),
             chat_request_priorities: Arc::new(Mutex::new(Vec::new())),
@@ -893,6 +908,7 @@ impl MockProvider {
                 stream_error_override: None,
                 embedding_error_override: None,
                 audio_transcription_error_override: None,
+                privacy_classify_override: None,
             })),
             last_chat_params: Arc::new(Mutex::new(None)),
             chat_request_priorities: Arc::new(Mutex::new(Vec::new())),
@@ -1050,6 +1066,13 @@ impl MockProvider {
     ) {
         let mut config = self.config.lock().await;
         config.audio_transcription_error_override = error;
+    }
+
+    /// Override privacy classify responses (body or HTTP error). Pass `None`
+    /// to restore the built-in detector.
+    pub async fn set_privacy_classify_override(&self, outcome: Option<PrivacyClassifyOverride>) {
+        let mut config = self.config.lock().await;
+        config.privacy_classify_override = outcome;
     }
 
     /// Generate a completion ID
@@ -1674,6 +1697,21 @@ impl crate::InferenceProvider for MockProvider {
         body: bytes::Bytes,
         _extra: std::collections::HashMap<String, serde_json::Value>,
     ) -> Result<bytes::Bytes, PrivacyClassifyError> {
+        if let Some(outcome) = self.config.lock().await.privacy_classify_override.clone() {
+            return match outcome {
+                PrivacyClassifyOverride::Body(json) => serde_json::to_vec(&json)
+                    .map(bytes::Bytes::from)
+                    .map_err(|e| PrivacyClassifyError::RequestFailed(e.to_string())),
+                PrivacyClassifyOverride::HttpError {
+                    status_code,
+                    message,
+                } => Err(PrivacyClassifyError::HttpError {
+                    status_code,
+                    message,
+                }),
+            };
+        }
+
         // Echo the requested model so round-trip assertions in tests are meaningful.
         let parsed: serde_json::Value =
             serde_json::from_slice(&body).unwrap_or(serde_json::Value::Null);

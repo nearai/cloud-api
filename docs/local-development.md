@@ -6,8 +6,8 @@ top-level [`README.md`](../README.md) by covering the mock-auth flow, the
 full org → workspace → API key path, and how to point local cloud-api at
 real inference backends.
 
-> **Privacy note**: cloud-api runs in a TEE in production. The rules in
-> [`CLAUDE.md`](../CLAUDE.md#-privacy--data-security---critical) apply
+> **Privacy note**: cloud-api runs in a TEE in production. The
+> [privacy and logging rules](../.claude/rules/privacy-logging.md) apply
 > locally too — don't paste customer prompts/completions into bug reports.
 
 ## 1. Prerequisites

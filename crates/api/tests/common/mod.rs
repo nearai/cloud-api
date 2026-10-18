@@ -218,6 +218,7 @@ async fn build_test_server_components(
         auth_components.organization_service.clone(),
         inference_provider_pool.clone(),
         metrics_service,
+        None,
     )
     .await;
 
@@ -247,7 +248,7 @@ async fn build_test_server_components_with_real_providers(
 
     // Use real inference providers from database
     let metrics_service = Arc::new(services::metrics::MockMetricsService);
-    let inference_provider_pool =
+    let (inference_provider_pool, admin_settings) =
         api::init_inference_providers(database.clone(), &config, metrics_service.clone()).await;
     let domain_services = api::init_domain_services_with_pool(
         database.clone(),
@@ -255,6 +256,7 @@ async fn build_test_server_components_with_real_providers(
         auth_components.organization_service.clone(),
         inference_provider_pool.clone(),
         metrics_service,
+        Some(admin_settings),
     )
     .await;
 
@@ -489,6 +491,7 @@ where
         auth_components.organization_service.clone(),
         inference_provider_pool,
         Arc::new(services::metrics::MockMetricsService),
+        None,
     )
     .await;
     mutate(&mut domain_services, &infra.database);

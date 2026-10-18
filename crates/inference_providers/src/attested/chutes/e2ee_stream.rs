@@ -241,7 +241,7 @@ where
         // Reached only on EOF *without* an authenticated inner `[DONE]` (or with a
         // dangling partial line) — a truncated/interrupted encrypted stream. We
         // yield an error here; the route layer does append its own gateway-minted
-        // `[DONE]` after the stream (completions.rs), but that's emitted *after*
+        // `[DONE]` after the stream (routes/completions/chat.rs), but that's emitted *after*
         // this error frame, so the client still sees the failure first and the
         // truncated content is not presented as a clean success.
         Err(CompletionError::CompletionError(

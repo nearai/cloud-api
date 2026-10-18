@@ -10,6 +10,12 @@ import json
 import sys
 from typing import Dict, List, Optional, Any
 
+# The formatted text is passed to the review action as an input, which GitHub
+# delivers through an environment variable. Linux caps a single environment
+# string at 128 KiB (bytes, not characters), so keep the rendered context
+# well under that, leaving room for the surrounding prompt.
+MAX_OUTPUT_BYTES = 60_000
+
 
 def get_author(node: Dict[str, Any]) -> str:
     """
@@ -107,14 +113,13 @@ def format_review_summaries(pr: Dict[str, Any], output: List[str]) -> None:
             output.append("")
 
 
-def format_review_thread(thread: Dict[str, Any], output: List[str], show_resolved: bool = False) -> None:
+def format_review_thread(thread: Dict[str, Any], output: List[str]) -> None:
     """
     Format a single review thread with its comments.
 
     Args:
         thread: Review thread data from GitHub API
         output: Output list to append formatted lines to
-        show_resolved: Whether this is a resolved thread (affects formatting)
     """
     path = thread.get('path', 'unknown')
     line = thread.get('line')
@@ -155,41 +160,21 @@ def format_review_thread(thread: Dict[str, Any], output: List[str], show_resolve
     output.append("")
 
 
-def format_review_threads(pr: Dict[str, Any], output: List[str]) -> None:
-    """Format all review threads (unresolved and resolved)."""
-    threads_data = pr.get('reviewThreads', {})
-    review_threads = threads_data.get('nodes', [])
-    total_threads = threads_data.get('totalCount', 0)
+def format_review_threads(pr: Dict[str, Any], output: List[str], resolved: bool) -> None:
+    """Format the resolved or the unresolved review threads."""
+    review_threads = pr.get('reviewThreads', {}).get('nodes', [])
 
-    # Separate unresolved and resolved threads
-    unresolved = [t for t in review_threads if not t.get('isResolved', False)]
-    resolved = [t for t in review_threads if t.get('isResolved', False)]
+    label = "Resolved" if resolved else "Unresolved"
+    threads = [t for t in review_threads if t.get('isResolved', False) == resolved]
 
-    # Unresolved threads (higher priority)
-    output.append("## Unresolved Code Review Discussions")
+    output.append(f"## {label} Code Review Discussions")
     output.append("")
 
-    if unresolved:
-        for thread in unresolved:
-            format_review_thread(thread, output, show_resolved=False)
+    if threads:
+        for thread in threads:
+            format_review_thread(thread, output)
     else:
-        output.append("No unresolved discussions.")
-        output.append("")
-
-    # Resolved threads (for context)
-    output.append("## Resolved Code Review Discussions")
-    output.append("")
-
-    if resolved:
-        for thread in resolved:
-            format_review_thread(thread, output, show_resolved=True)
-    else:
-        output.append("No resolved discussions.")
-        output.append("")
-
-    # Pagination warning
-    if total_threads > 100:
-        output.append(f"*Note: This PR has {total_threads} review threads. Showing first 100.*")
+        output.append(f"No {label.lower()} discussions.")
         output.append("")
 
 
@@ -230,15 +215,33 @@ def format_pr_comments(comments_json: str) -> str:
     output.append("=" * 80)
     output.append("")
 
-    format_general_comments(pr, output)
+    # Highest-signal sections first so truncation drops the least useful text.
+    format_review_threads(pr, output, resolved=False)
+    total_threads = pr.get('reviewThreads', {}).get('totalCount', 0)
+    if total_threads > 100:
+        output.append(f"*Note: This PR has {total_threads} review threads in total; the API returned the first 100 across both resolved and unresolved sections.*")
+        output.append("")
     format_review_summaries(pr, output)
-    format_review_threads(pr, output)
+    format_general_comments(pr, output)
+    format_review_threads(pr, output, resolved=True)
 
     output.append("=" * 80)
     output.append("END OF EXISTING COMMENTS")
     output.append("=" * 80)
 
-    return "\n".join(output)
+    return truncate_output("\n".join(output))
+
+
+def truncate_output(text: str, max_bytes: int = MAX_OUTPUT_BYTES) -> str:
+    """Cap the rendered context's UTF-8 size at a line boundary, noting the truncation."""
+    encoded = text.encode("utf-8")
+    if len(encoded) <= max_bytes:
+        return text
+    head = encoded[:max_bytes].decode("utf-8", errors="ignore")
+    cut = head.rfind("\n")
+    if cut > 0:
+        head = head[:cut]
+    return head + "\n\n*Note: existing discussion truncated to fit the review prompt.*"
 
 
 def main() -> int:

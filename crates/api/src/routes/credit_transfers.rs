@@ -355,8 +355,10 @@ pub async fn put_policy(
     Extension(repository): Extension<CreditTransferRepository>,
     Extension(admin): Extension<AdminUser>,
     Path(org): Path<Uuid>,
-    Json(request): Json<PolicyRequest>,
+    request: Result<Json<PolicyRequest>, axum::extract::rejection::JsonRejection>,
 ) -> Result<Json<Value>, ApiError> {
+    let Json(request) =
+        request.map_err(|_| error(TransferError("invalid_policy_configuration").into()))?;
     repository
         .configure_policy(org, Some((request.policy, admin.0.id, &request.reason)))
         .await

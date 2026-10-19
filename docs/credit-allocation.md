@@ -47,7 +47,7 @@ outstanding unfunded usage is settled; these are not frozen invoice totals.
 Filtered admin metrics share a 10-second database-query budget across their
 statements, using transaction-local timeouts. Unfiltered requests keep their
 existing timeout behavior.
-The optional filter accepts `grant`, `staking_farm`, `payment`, and `postpay`
+The optional filter accepts `grant`, `staking_farm`, `transfer`, `payment`, and `postpay`
 (case-insensitively, like reporting); unsupported values return HTTP 400.
 For example, September postpay consumption can be queried with
 `/v1/admin/organizations/{org_id}/metrics?start=2026-09-01T00:00:00Z&end=2026-10-01T00:00:00Z&credit_type=postpay`.
@@ -66,7 +66,7 @@ immediately available for new usage. No admin API call is required.
 
 - Deploy every inference, service, limit, and staking writer together. They
   coordinate through the same per-organization database lock.
-- Inference usage posts through `record_organization_usage` (V0088) in one database
+- Inference usage posts through `record_organization_usage` (V0096) in one database
   statement; the organization lock is held only during server-side accounting.
   Platform-service usage still uses the Rust transaction path and the same lock.
 - Existing unattributed usage remains unknown and continues reducing aggregate
@@ -448,3 +448,10 @@ from that source. Reducing available capacity must retain that backing; external
 manual corruption is still detected by reconciliation. When setting a custom
 `CREDIT_ALLOCATION_POLICY_VERSION`, explicitly set `CREDIT_USAGE_ORDER` too so an
 old policy version cannot silently acquire the new five-type default order.
+
+Exact amount replays require current transfer authorization and either the original
+credential identity or `credits:read` permission (owners have both permissions).
+Rotation preserves credential identity. A transfer-only credential cannot retrieve
+another actor's stored response. Organization-wide idempotency keys still reveal
+key existence through `idempotency_conflict` when terms differ. Valid replays do
+not require transfers to remain enabled or the original budgets to remain available.

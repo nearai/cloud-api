@@ -320,3 +320,42 @@ async fn cumulative_program_payouts_apply_credential_limits_to_delta() {
         .text()
         .contains("credential_transfer_limit_exceeded"));
 }
+
+#[tokio::test]
+async fn policy_put_requires_both_sections_without_changing_policy_or_audit() {
+    let server = setup_test_server().await;
+    let sender = create_org(&server).await;
+    let path = format!("/v1/admin/organizations/{}/policy", sender.id);
+    let authorization = format!("Bearer {}", get_session_id());
+    let initial = server
+        .put(&path)
+        .add_header("Authorization", authorization.clone())
+        .add_header("User-Agent", MOCK_USER_AGENT)
+        .json(&json!({
+            "policy": {"credentials": {"enabled": true}, "credits_transfer": {"enabled": true}},
+            "reason": "Enable both sections"
+        }))
+        .await;
+    assert_eq!(initial.status_code(), StatusCode::OK);
+    let saved = initial.json::<Value>();
+
+    for policy in [
+        json!({"credits_transfer": {"enabled": true}}),
+        json!({"credentials": {"enabled": true}}),
+    ] {
+        let rejected = server
+            .put(&path)
+            .add_header("Authorization", authorization.clone())
+            .add_header("User-Agent", MOCK_USER_AGENT)
+            .json(&json!({"policy": policy, "reason": "Incomplete replacement"}))
+            .await;
+        assert_eq!(rejected.status_code(), StatusCode::BAD_REQUEST);
+
+        let current = server
+            .get(&path)
+            .add_header("Authorization", authorization.clone())
+            .add_header("User-Agent", MOCK_USER_AGENT)
+            .await;
+        assert_eq!(current.json::<Value>(), saved);
+    }
+}

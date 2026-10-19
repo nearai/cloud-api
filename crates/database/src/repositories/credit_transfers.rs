@@ -107,9 +107,7 @@ impl TransferRequest {
 #[derive(Clone, Default, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct OrganizationPolicy {
-    #[serde(default)]
     pub credentials: CredentialPolicy,
-    #[serde(default)]
     pub credits_transfer: TransferPolicy,
 }
 
@@ -212,7 +210,16 @@ impl CreditTransferRepository {
         tx.batch_execute("SET LOCAL statement_timeout = '5s'; SET LOCAL lock_timeout = '2s'")
             .await?;
 
-        preauthorize(&tx, sender, actor, TRANSFER_CREDITS).await?;
+        let preliminary = preauthorize(&tx, sender, actor, TRANSFER_CREDITS).await?;
+
+        // Completed operations need no recipient accounting lock. Recheck the
+        // caller's current authority before exposing their immutable result.
+        if let Some(result) = replay(&tx, sender, actor, key, &terms).await? {
+            return Ok((result, true));
+        }
+
+        let preliminary_policy = load_policy(&tx, sender).await?;
+        check_send_policy(&preliminary_policy.credits_transfer, &preliminary, request)?;
 
         let mut recipient_active = false;
         for org in [sender.min(recipient), sender.max(recipient)] {
@@ -230,22 +237,9 @@ impl CreditTransferRepository {
         let authorization = authorize(&tx, sender, actor, TRANSFER_CREDITS).await?;
         let actor_id = authorization.actor_id;
         let credential_id = authorization.credential_id;
-        if let Some(row) = tx
-            .query_opt(
-                r#"
-                SELECT terms = $3::JSONB AS matches, result
-                FROM organization_credit_transfers
-                WHERE sender_organization_id = $1
-                AND idempotency_key = $2
-                "#,
-                &[&sender, &key, &terms],
-            )
-            .await?
-        {
-            if !row.get::<_, bool>("matches") {
-                return reject("idempotency_conflict");
-            }
-            return Ok((row.get("result"), true));
+        // Another send may have committed while this request waited for locks.
+        if let Some(result) = replay(&tx, sender, actor, key, &terms).await? {
+            return Ok((result, true));
         }
 
         let policy = tx
@@ -262,28 +256,9 @@ impl CreditTransferRepository {
         let policy_version: i64 = policy.get(0);
         let organization_policy: OrganizationPolicy = serde_json::from_value(policy.get(1))?;
         let transfer_policy = organization_policy.credits_transfer;
-        if !transfer_policy.enabled {
-            return reject("sender_not_enabled");
-        }
-        // Even a no-op must respect source and recipient restrictions before
-        // revealing the current program total. Monetary ceilings apply to delta.
-        if !transfer_policy.allows_source(&request.source_credit_type)
-            || !transfer_policy
-                .constraints
-                .allows(0, &request.source_credit_type, recipient, 0)
-        {
-            return reject("organization_transfer_limit_exceeded");
-        }
+        check_send_policy(&transfer_policy, &authorization, request)?;
         if !recipient_active {
             return reject("organization_unavailable");
-        }
-
-        if credential_id.is_some()
-            && !authorization
-                .constraints
-                .allows(0, &request.source_credit_type, recipient, 0)
-        {
-            return reject("credential_transfer_limit_exceeded");
         }
 
         // Organization locks serialize every source and credential in a program.
@@ -821,6 +796,77 @@ impl CreditTransferRepository {
             .await?
             .get(0))
     }
+}
+
+// This early rejection is advisory; repeat it after accounting locks. Budget
+// usage and cumulative deltas are checked only against the locked position.
+fn check_send_policy(
+    policy: &TransferPolicy,
+    authorization: &super::organization_credentials::Authorization,
+    request: &TransferRequest,
+) -> anyhow::Result<()> {
+    if !policy.enabled {
+        return reject("sender_not_enabled");
+    }
+    let amount = request.amount.unwrap_or(0);
+    if !policy.allows_source(&request.source_credit_type)
+        || !policy.constraints.allows(
+            amount,
+            &request.source_credit_type,
+            request.recipient_organization_id,
+            0,
+        )
+    {
+        return reject("organization_transfer_limit_exceeded");
+    }
+    if authorization.credential_id.is_some()
+        && !authorization.constraints.allows(
+            amount,
+            &request.source_credit_type,
+            request.recipient_organization_id,
+            0,
+        )
+    {
+        return reject("credential_transfer_limit_exceeded");
+    }
+    Ok(())
+}
+
+async fn replay(
+    tx: &Transaction<'_>,
+    sender: Uuid,
+    actor: &TransferActor,
+    key: &str,
+    terms: &Value,
+) -> anyhow::Result<Option<Value>> {
+    if key.is_empty() {
+        return Ok(None);
+    }
+    let Some(row) = tx
+        .query_opt(
+            r#"
+        SELECT terms = $3::JSONB AS matches, credential_id, result
+        FROM organization_credit_transfers
+        WHERE sender_organization_id = $1 AND idempotency_key = $2
+        "#,
+            &[&sender, &key, &terms],
+        )
+        .await?
+    else {
+        return Ok(None);
+    };
+
+    let authorization = authorize(tx, sender, actor, TRANSFER_CREDITS).await?;
+    if !row.get::<_, bool>("matches") {
+        return reject("idempotency_conflict");
+    }
+    let original_credential: Option<Uuid> = row.get("credential_id");
+    let same_credential =
+        authorization.credential_id.is_some() && authorization.credential_id == original_credential;
+    if !same_credential && !authorization.permissions.iter().any(|p| p == READ_CREDITS) {
+        return reject("credential_refused");
+    }
+    Ok(Some(row.get("result")))
 }
 
 async fn load_policy(tx: &Transaction<'_>, org: Uuid) -> anyhow::Result<OrganizationPolicy> {

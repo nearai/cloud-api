@@ -1796,3 +1796,169 @@ async fn history_cursor_ties_and_direction_filters_do_not_skip_rows() -> anyhow:
 
     Ok(())
 }
+
+#[tokio::test]
+async fn preflight_rejects_disabled_or_restricted_senders_without_recipient_locks(
+) -> anyhow::Result<()> {
+    use database::repositories::credit_transfers::OrganizationPolicy;
+    use database::repositories::organization_credentials::OrganizationCredentialRepository;
+
+    let pool = test_pool().await?;
+    let (sender, owner) = organization(&pool).await?;
+    let (recipient, _) = organization(&pool).await?;
+    let repository = CreditTransferRepository::new(pool.clone(), &Default::default());
+    let credentials = OrganizationCredentialRepository::new(pool.clone());
+    let actor = TransferActor::Owner(owner);
+    let terms = request(recipient.org_id, "payment", 1);
+    let mut blocker = pool.get().await?;
+    let held = blocker.transaction().await?;
+    held.query_one(
+        "SELECT id FROM organizations WHERE id = $1 FOR UPDATE",
+        &[&recipient.org_id],
+    )
+    .await?;
+
+    let refused = tokio::time::timeout(
+        std::time::Duration::from_millis(500),
+        repository.transfer(sender.org_id, &actor, "disabled", &terms),
+    )
+    .await?;
+    assert_eq!(code(refused), "sender_not_enabled");
+
+    repository
+        .policy(sender.org_id, Some((true, owner, "test preflight")))
+        .await?;
+    let mut configuration = credential_request(10, 100);
+    configuration.constraints.transfer.allowed_recipient_ids = Some(vec![]);
+    let created = credentials
+        .save(sender.org_id, owner, None, &configuration)
+        .await?;
+    let credential_actor =
+        TransferActor::Credential(database::repositories::credit_transfers::hash_credential(
+            created["token"].as_str().unwrap(),
+        ));
+    let refused = tokio::time::timeout(
+        std::time::Duration::from_millis(500),
+        repository.transfer(sender.org_id, &credential_actor, "restricted", &terms),
+    )
+    .await?;
+    assert_eq!(code(refused), "credential_transfer_limit_exceeded");
+
+    let mut policy = OrganizationPolicy::default();
+    policy.credits_transfer.enabled = true;
+    policy.credits_transfer.constraints.allowed_source_types = Some(vec!["grant".into()]);
+    repository
+        .configure_policy(sender.org_id, Some((policy, owner, "restrict source")))
+        .await?;
+    let refused = tokio::time::timeout(
+        std::time::Duration::from_millis(500),
+        repository.transfer(sender.org_id, &actor, "source", &terms),
+    )
+    .await?;
+    assert_eq!(code(refused), "organization_transfer_limit_exceeded");
+    held.rollback().await?;
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn replays_require_original_credential_or_read_permission() -> anyhow::Result<()> {
+    use database::repositories::organization_credentials::OrganizationCredentialRepository;
+
+    let pool = test_pool().await?;
+    let (sender, owner) = organization(&pool).await?;
+    let (recipient, _) = organization(&pool).await?;
+    fund(&pool, sender.org_id, "payment", 100).await?;
+    let repository = CreditTransferRepository::new(pool.clone(), &Default::default());
+    let credentials = OrganizationCredentialRepository::new(pool.clone());
+    repository
+        .policy(sender.org_id, Some((true, owner, "replay isolation")))
+        .await?;
+    let mut configuration = credential_request(10, 100);
+    configuration.permissions = vec!["credits:transfer".into()];
+    let original = credentials
+        .save(sender.org_id, owner, None, &configuration)
+        .await?;
+    let other = credentials
+        .save(sender.org_id, owner, None, &configuration)
+        .await?;
+    let actor = |value: &Value| {
+        TransferActor::Credential(database::repositories::credit_transfers::hash_credential(
+            value["token"].as_str().unwrap(),
+        ))
+    };
+    let terms = request(recipient.org_id, "payment", 5);
+    let committed = repository
+        .transfer(sender.org_id, &actor(&original), "retry", &terms)
+        .await?
+        .0;
+
+    assert_eq!(
+        code(
+            repository
+                .transfer(sender.org_id, &actor(&other), "retry", &terms)
+                .await
+        ),
+        "credential_refused"
+    );
+    let mut different = terms.clone();
+    different.amount = Some(6);
+    assert_eq!(
+        code(
+            repository
+                .transfer(sender.org_id, &actor(&other), "retry", &different)
+                .await
+        ),
+        "idempotency_conflict"
+    );
+
+    let id = serde_json::from_value(original["id"].clone())?;
+    let rotated = credentials.rotate(sender.org_id, owner, id).await?;
+    configuration.constraints.transfer.allowed_recipient_ids = Some(vec![]);
+    configuration.constraints.transfer.max_total_amount = Some(0);
+    credentials
+        .save(sender.org_id, owner, Some(id), &configuration)
+        .await?;
+    configuration.permissions.push("credits:read".into());
+    credentials
+        .save(
+            sender.org_id,
+            owner,
+            Some(serde_json::from_value(other["id"].clone())?),
+            &configuration,
+        )
+        .await?;
+    repository
+        .policy(sender.org_id, Some((false, owner, "stop new sends")))
+        .await?;
+
+    // A completed-operation replay must not wait for recipient accounting.
+    let mut blocker = pool.get().await?;
+    let held = blocker.transaction().await?;
+    held.query_one(
+        "SELECT id FROM organizations WHERE id = $1 FOR UPDATE",
+        &[&recipient.org_id],
+    )
+    .await?;
+    for allowed in [actor(&rotated), actor(&other), TransferActor::Owner(owner)] {
+        let replayed = tokio::time::timeout(
+            std::time::Duration::from_millis(500),
+            repository.transfer(sender.org_id, &allowed, "retry", &terms),
+        )
+        .await??;
+        assert!(replayed.1);
+        assert_eq!(replayed.0, committed);
+    }
+    held.rollback().await?;
+
+    credentials.revoke(sender.org_id, owner, id).await?;
+    assert_eq!(
+        code(
+            repository
+                .transfer(sender.org_id, &actor(&rotated), "retry", &terms)
+                .await
+        ),
+        "credential_refused"
+    );
+    Ok(())
+}

@@ -8,6 +8,7 @@ use std::sync::Arc;
 fn oauth_info(provider: &str, email: &str) -> OAuthUserInfo {
     OAuthUserInfo {
         email_verified: true,
+        email_authoritative: true,
         provider: provider.into(),
         provider_user_id: uuid::Uuid::new_v4().to_string(),
         email: email.into(),
@@ -20,7 +21,6 @@ fn oauth_info(provider: &str, email: &str) -> OAuthUserInfo {
 fn real_auth(db: &Arc<database::Database>) -> Arc<dyn AuthServiceTrait> {
     let mut config = test_config();
     config.auth.mock = false;
-    config.auth.oauth_auto_linking_enabled = true;
     api::init_auth_services(db.clone(), &config).auth_service
 }
 
@@ -131,6 +131,7 @@ async fn oauth_auto_link_rejects_missing_or_stale_primary_email_evidence() {
     for (original, incoming) in [("github", "google"), ("google", "github")] {
         for mutation in [
             "DELETE FROM user_oauth_identities WHERE user_id=$1",
+            "UPDATE user_oauth_identities SET email_authoritative=false WHERE user_id=$1",
             "UPDATE user_oauth_identities SET email=NULL WHERE user_id=$1",
             "UPDATE user_oauth_identities SET email='stale@example.test' WHERE user_id=$1",
             "UPDATE user_oauth_identities SET provider_user_id='stale-' || provider_user_id WHERE user_id=$1",
@@ -148,10 +149,64 @@ async fn oauth_auto_link_rejects_missing_or_stale_primary_email_evidence() {
 }
 
 #[tokio::test]
+async fn oauth_original_google_authority_refreshes_and_clears_on_subject_login() {
+    let (_server, db) = setup_test_server_with_database().await;
+    let auth = real_auth(&db);
+    let email = format!("oauth-google-proof-{}@example.test", uuid::Uuid::new_v4());
+    let mut original = oauth_info("google", &email);
+    let user = auth
+        .get_or_create_oauth_user(original.clone())
+        .await
+        .unwrap();
+    let incoming = oauth_info("github", &email);
+    original.email_authoritative = false;
+    // A returning subject still logs in, but cannot provide email proof for another provider.
+    assert_eq!(
+        auth.get_or_create_oauth_user(original.clone())
+            .await
+            .unwrap()
+            .id,
+        user.id
+    );
+    assert!(matches!(
+        auth.get_or_create_oauth_user(incoming.clone()).await,
+        Err(AuthError::OAuthProviderConflict { .. })
+    ));
+    let proof = db
+        .pool()
+        .get()
+        .await
+        .unwrap()
+        .query_one(
+            "SELECT email_verified,email_authoritative FROM user_oauth_identities WHERE user_id=$1",
+            &[&user.id.0],
+        )
+        .await
+        .unwrap();
+    assert!(proof.get::<_, bool>("email_verified"));
+    assert!(!proof.get::<_, bool>("email_authoritative"));
+    original.email_authoritative = true;
+    assert_eq!(
+        auth.get_or_create_oauth_user(original).await.unwrap().id,
+        user.id
+    );
+    assert_eq!(
+        auth.get_or_create_oauth_user(incoming).await.unwrap().id,
+        user.id
+    );
+    assert_single_oauth_account(&db, user.id.0, &email).await;
+}
+
+#[tokio::test]
 async fn oauth_auto_link_rechecks_primary_verification_after_waiting_for_its_lock() {
     let (_server, db) = setup_test_server_with_database().await;
     let auth = real_auth(&db);
-    for (original, incoming) in [("github", "google"), ("google", "github")] {
+    for (original, incoming, field) in [
+        ("github", "google", "email_verified"),
+        ("google", "github", "email_verified"),
+        ("github", "google", "email_authoritative"),
+        ("google", "github", "email_authoritative"),
+    ] {
         let email = format!("oauth-primary-lock-{}@example.test", uuid::Uuid::new_v4());
         let existing = auth
             .get_or_create_oauth_user(oauth_info(original, &email))
@@ -166,7 +221,7 @@ async fn oauth_auto_link_rechecks_primary_verification_after_waiting_for_its_loc
             .unwrap()
             .get(0);
         tx.execute(
-            "UPDATE user_oauth_identities SET email_verified=false WHERE user_id=$1",
+            &format!("UPDATE user_oauth_identities SET {field}=false WHERE user_id=$1"),
             &[&existing.id.0],
         )
         .await

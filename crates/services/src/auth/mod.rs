@@ -550,10 +550,7 @@ impl AuthService {
         &self,
         oauth_info: &OAuthUserInfo,
     ) -> Result<Option<User>, AuthError> {
-        if self.oauth_auto_linking_enabled
-            && oauth_info.email_verified
-            && matches!(oauth_info.provider.as_str(), "google" | "github")
-        {
+        if oauth_info.can_auto_link_by_email() {
             if let Some(user) = self
                 .user_repository
                 .try_link_oauth_identity_by_email(oauth_info)
@@ -698,7 +695,6 @@ impl AuthService {
             api_key_bloom_filter,
             bloom_filter_ready,
             require_session_bound_access_tokens: auth_config.require_session_bound_access_tokens,
-            oauth_auto_linking_enabled: auth_config.oauth_auto_linking_enabled,
         }
     }
 
@@ -916,8 +912,7 @@ mod tests {
             let Some(user) = self.get_by_email(&info.email).await? else {
                 return Ok(None);
             };
-            if info.email_verified
-                && matches!(info.provider.as_str(), "github" | "google")
+            if info.can_auto_link_by_email()
                 && matches!(user.auth_provider.as_str(), "github" | "google")
                 && user.auth_provider != info.provider
             {
@@ -1344,7 +1339,6 @@ mod tests {
             api_key_bloom_filter: Arc::new(RwLock::new(bloom)),
             bloom_filter_ready: Arc::new(AtomicBool::new(false)),
             require_session_bound_access_tokens,
-            oauth_auto_linking_enabled: true,
         }
     }
 
@@ -1358,6 +1352,7 @@ mod tests {
         let result = service
             .get_or_create_oauth_user(OAuthUserInfo {
                 email_verified: true,
+                email_authoritative: true,
                 provider: "google".to_string(),
                 provider_user_id: "google-sub-123".to_string(),
                 email: "alice@example.com".to_string(),
@@ -1383,6 +1378,7 @@ mod tests {
         let result = service
             .get_or_create_oauth_user(OAuthUserInfo {
                 email_verified: true,
+                email_authoritative: true,
                 provider: "google".to_string(),
                 provider_user_id: "google-sub-456".to_string(),
                 email: "new@example.com".to_string(),
@@ -1404,6 +1400,7 @@ mod tests {
     fn race_oauth_info() -> OAuthUserInfo {
         OAuthUserInfo {
             email_verified: true,
+            email_authoritative: true,
             provider: "near".into(),
             provider_user_id: "alice.near".into(),
             email: "alice.near@near".into(),
@@ -1457,6 +1454,7 @@ mod tests {
     fn oauth_info(provider: &str) -> OAuthUserInfo {
         OAuthUserInfo {
             email_verified: true,
+            email_authoritative: true,
             provider: provider.into(),
             provider_user_id: format!("{provider}-alice"),
             email: "alice@example.com".into(),
@@ -1467,7 +1465,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn oauth_disabled_auto_linking_rejects_verified_emails_including_creation_races() {
+    async fn oauth_non_authoritative_email_rejects_linking_including_creation_races() {
         for (original, incoming) in [("github", "google"), ("google", "github")] {
             for creation_race in [false, true] {
                 let existing = make_user("alice@example.com", original);
@@ -1476,12 +1474,10 @@ mod tests {
                 } else {
                     MockUserRepo::with_user(existing)
                 });
-                let mut service = build_auth_service(repo.clone());
-                service.oauth_auto_linking_enabled = false;
-                let error = service
-                    .get_or_create_oauth_user(oauth_info(incoming))
-                    .await
-                    .unwrap_err();
+                let service = build_auth_service(repo.clone());
+                let mut info = oauth_info(incoming);
+                info.email_authoritative = false;
+                let error = service.get_or_create_oauth_user(info).await.unwrap_err();
                 assert!(matches!(
                     error,
                     AuthError::OAuthProviderConflict { existing_provider } if existing_provider == original
@@ -1497,14 +1493,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn oauth_disabled_auto_linking_preserves_linked_provider_login() {
+    async fn oauth_non_authoritative_email_preserves_linked_provider_login() {
         for (original, incoming) in [("github", "google"), ("google", "github")] {
             let existing = make_user("alice@example.com", original);
             let repo = Arc::new(MockUserRepo::with_user(existing.clone()));
-            let info = oauth_info(incoming);
+            let mut info = oauth_info(incoming);
+            info.email_authoritative = false;
             repo.linked_identities.lock().unwrap().push(info.clone());
-            let mut service = build_auth_service(repo.clone());
-            service.oauth_auto_linking_enabled = false;
+            let service = build_auth_service(repo.clone());
             let user = service.get_or_create_oauth_user(info).await.unwrap();
             assert_eq!(user.id, existing.id);
             assert_eq!(repo.linked_identities.lock().unwrap().len(), 1);

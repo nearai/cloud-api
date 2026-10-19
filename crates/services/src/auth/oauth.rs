@@ -234,6 +234,7 @@ impl OAuthManager {
 
         let oauth_info = OAuthUserInfo {
             email_verified: user_info.email_verified,
+            email_authoritative: user_info.email_verified,
             provider: "github".to_string(),
             provider_user_id: user_info.id.to_string(),
             email: user_info.email.ok_or_else(|| {
@@ -284,6 +285,7 @@ impl OAuthManager {
 
         let oauth_info = OAuthUserInfo {
             email_verified: user_info.email_verified,
+            email_authoritative: user_info.email_is_authoritative(),
             provider: "google".to_string(),
             provider_user_id: user_info.sub.clone(),
             email: user_info.email.clone(),
@@ -431,13 +433,67 @@ struct GoogleUser {
     #[serde(default)]
     name: Option<String>,
     #[serde(default)]
+    hd: Option<String>,
+    #[serde(default)]
     picture: Option<String>,
+}
+
+impl GoogleUser {
+    // hd comes from the server-fetched userinfo response, never the authorization URL hint.
+    // https://developers.google.com/identity/sign-in/web/backend-auth
+    fn email_is_authoritative(&self) -> bool {
+        self.email_verified
+            && (self
+                .email
+                .rsplit_once('@')
+                .is_some_and(|(_, domain)| domain.eq_ignore_ascii_case("gmail.com"))
+                || self
+                    .hd
+                    .as_deref()
+                    .is_some_and(|domain| !domain.trim().is_empty()))
+    }
 }
 
 #[cfg(test)]
 mod token_exchange_tests {
     use super::*;
     use oauth2::{basic::BasicErrorResponse, basic::BasicErrorResponseType, RequestTokenError};
+
+    #[test]
+    fn google_email_authority_requires_verified_gmail_or_hosted_domain() {
+        for (email, hd, verified, expected) in [
+            ("alice@gmail.com", None, true, true),
+            ("alice@GMAIL.COM", None, true, true),
+            ("alice@example.test", Some("example.test"), true, true),
+            ("alice@example.test", None, true, false),
+            ("alice@example.test", Some(""), true, false),
+            ("alice@example.test", Some("  "), true, false),
+            ("alice@gmail.com.evil.test", None, true, false),
+            ("alice@notgmail.com", None, true, false),
+            ("alice@gmail.com", None, false, false),
+            ("alice@example.test", Some("example.test"), false, false),
+        ] {
+            for (subject_key, verified_key) in [("sub", "email_verified"), ("id", "verified_email")]
+            {
+                let user: GoogleUser = serde_json::from_value(serde_json::json!({
+                    subject_key: "subject", "email": email, verified_key: verified, "hd": hd,
+                }))
+                .unwrap();
+                assert_eq!(user.sub, "subject");
+                assert_eq!(user.email_verified, verified);
+                assert_eq!(
+                    user.email_is_authoritative(),
+                    expected,
+                    "{email} {hd:?} {verified_key}"
+                );
+            }
+        }
+        let missing: GoogleUser = serde_json::from_value(serde_json::json!({
+            "id":"subject", "email":"alice@gmail.com", "hd":"example.test"
+        }))
+        .unwrap();
+        assert!(!missing.email_is_authoritative());
+    }
 
     #[test]
     fn invalid_grant_is_an_authorization_failure() {

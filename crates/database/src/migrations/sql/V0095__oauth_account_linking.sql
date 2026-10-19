@@ -1,11 +1,12 @@
 -- Keep users.id and the original provider authoritative for account resources.
--- Additional sign-in identities are linked only by an authenticated user.
+-- Additional identities require an authenticated user or authoritative, verified emails.
 CREATE TABLE user_oauth_identities (
     user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
     provider VARCHAR(20) NOT NULL CHECK (provider IN ('google', 'github')),
     provider_user_id TEXT NOT NULL,
     email TEXT,
     email_verified BOOLEAN NOT NULL DEFAULT false,
+    email_authoritative BOOLEAN NOT NULL DEFAULT false,
     linked_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     PRIMARY KEY (provider, provider_user_id),
     UNIQUE (user_id, provider)
@@ -44,6 +45,10 @@ CREATE TABLE oauth_link_requests (
     provider_user_id TEXT NOT NULL,
     email TEXT NOT NULL,
     email_verified BOOLEAN NOT NULL CHECK (email_verified),
+    email_authoritative BOOLEAN NOT NULL DEFAULT false,
     expires_at TIMESTAMPTZ NOT NULL
 );
 CREATE INDEX oauth_link_requests_expiration ON oauth_link_requests(expires_at);
+
+CREATE INDEX oauth_link_requests_session ON oauth_link_requests(session_id);
+CREATE INDEX oauth_states_link_session ON oauth_states(link_session_id) WHERE link_session_id IS NOT NULL;

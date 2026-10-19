@@ -117,9 +117,21 @@ pub struct OAuthUserInfo {
     pub email: String,
     #[serde(default)]
     pub email_verified: bool,
+    /// Trusted provider evidence that it is authoritative for this mailbox.
+    /// Historical verification alone is insufficient for Google third-party emails.
+    #[serde(default)]
+    pub email_authoritative: bool,
     pub username: String,
     pub display_name: Option<String>,
     pub avatar_url: Option<String>,
+}
+
+impl OAuthUserInfo {
+    pub fn can_auto_link_by_email(&self) -> bool {
+        self.email_verified
+            && self.email_authoritative
+            && matches!(self.provider.as_str(), "google" | "github")
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -453,7 +465,6 @@ pub struct AuthService {
     pub api_key_cache: ApiKeyCache,
     pub api_key_bloom_filter: ApiKeyBloomFilter,
     pub bloom_filter_ready: BloomFilterReady,
-    pub oauth_auto_linking_enabled: bool,
     /// Reject access tokens without a `sid` claim (legacy tokens issued
     /// before session binding). See `AuthConfig::require_session_bound_access_tokens`.
     pub require_session_bound_access_tokens: bool,

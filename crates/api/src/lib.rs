@@ -3088,7 +3088,6 @@ mod tests {
                 near: config::NearConfig::default(),
                 admin_domains: vec![],
                 admin_read_only_tokens_enabled: false,
-                oauth_auto_linking_enabled: false,
                 require_session_bound_access_tokens: false,
             },
             database: config::DatabaseConfig {
@@ -3213,7 +3212,6 @@ mod tests {
                 near: config::NearConfig::default(),
                 admin_domains: vec![],
                 admin_read_only_tokens_enabled: false,
-                oauth_auto_linking_enabled: false,
                 require_session_bound_access_tokens: false,
             },
             database: config::DatabaseConfig {

@@ -187,6 +187,7 @@ async fn near_login(auth: &Arc<dyn AuthServiceTrait>, account_id: &str) -> (Stri
     let user = auth
         .get_or_create_oauth_user(OAuthUserInfo {
             email_verified: true,
+            email_authoritative: true,
             provider: "near".to_string(),
             provider_user_id: account_id.to_string(),
             email: near_placeholder_email(account_id),

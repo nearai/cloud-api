@@ -130,24 +130,38 @@ To test the OAuth flow locally, set `AUTH_MOCK=false` and configure
 `GITHUB_CLIENT_ID` / `GITHUB_CLIENT_SECRET` (or the Google equivalents)
 against an OAuth app whose callback URL is
 `http://localhost:3000/v1/auth/callback`. Visit `/v1/auth/login` to start
-the flow. Automatic email linking is disabled by default. Keep
-`AUTH_OAUTH_AUTO_LINKING_ENABLED=false` during the initial API rollout. Only after
-every API instance supports linked identities, set it to `true` and restart or
-redeploy the API to enable automatic linking. Deploy the linking UI afterward.
+the flow.
+
+### OAuth account-linking deployment
+
+This release enables automatic linking without an environment or runtime switch.
+For the initial deployment, stop routing OAuth requests to every old API instance
+before any new instance serves them: pause sign-in briefly, upgrade all instances
+and apply `V0095__oauth_account_linking.sql`, then restore traffic. Do not use a
+mixed-version rolling deployment for this release. An old instance cannot resolve
+secondary identities created by a new instance and can return a login error.
+Deploy the linking UI after all API instances have been upgraded. Once secondary
+identities exist, rolling back to an API without identity lookup support is unsafe;
+keep that support in any rollback build.
 
 Accounts are identified by their OAuth provider and provider user ID. A new Google
 or GitHub identity automatically links to an existing active account on the other
-provider when automatic linking is enabled and both the incoming identity and the
-account's original identity verify the same email. Sign-in then uses the existing
-account and its resources.
+provider only when both the incoming identity and the account's original identity
+verify the same email and are authoritative for it. For Google this requires a
+Gmail address or a nonempty `hd` returned by Google's userinfo endpoint for a
+verified Google Workspace account. A verified third-party Google email without
+`hd` requires explicit linking from an existing signed-in session instead.
+See [Google's email-authority rules](https://developers.google.com/identity/sign-in/web/backend-auth).
+Sign-in then uses the existing account and its resources.
 Existing identities remain authoritative; separately registered accounts are not
 merged. If automatic linking is not allowed, a conflicting email returns `409`
 with `error: "oauth_provider_conflict"`, `existing_provider`, and an
 `error_description` naming the original sign-in method.
 
-Migrated identities with unknown verification require a verified sign-in through
-the original provider before automatic linking is available. Alternatively, sign
-in through the original provider and explicitly link from Account settings.
+Migrated identities with unknown verification or authority require an authoritative,
+verified sign-in through the original provider before automatic linking is available.
+Alternatively, sign in through the original provider and explicitly link from
+Account settings.
 
 When the login request includes an allowed `frontend_callback`, this conflict
 instead redirects to that callback with the same three fields in the URL

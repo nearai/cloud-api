@@ -82,6 +82,7 @@ pub async fn vpc_login(
 
     let user_info = OAuthUserInfo {
         email_verified: false,
+        email_authoritative: false,
         provider: "vpc".to_string(),
         provider_user_id,
         email,

@@ -4,23 +4,13 @@ use crate::{models::User, retry_db};
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use chrono::Utc;
-use services::auth::{AuthError, OAuthIdentity, OAuthUserInfo, SessionId, UserId};
+use services::auth::{OAuthUserInfo, UserId};
 use services::common::RepositoryError;
 use tracing::debug;
 use uuid::Uuid;
 
 pub struct UserRepository {
     pool: DbPool,
-}
-
-fn oauth_identity_from_row(row: &tokio_postgres::Row) -> OAuthIdentity {
-    OAuthIdentity {
-        provider: row.get("provider"),
-        provider_user_id: row.get("provider_user_id"),
-        email: row.get("email"),
-        email_verified: row.get("email_verified"),
-        linked_at: row.get("linked_at"),
-    }
 }
 
 impl UserRepository {
@@ -651,130 +641,6 @@ impl services::auth::UserRepository for UserRepository {
         Ok(())
     }
 
-    async fn list_oauth_identities(&self, user_id: UserId) -> anyhow::Result<Vec<OAuthIdentity>> {
-        let client = self.pool.get().await?;
-        let rows = client.query("SELECT provider, provider_user_id, email, email_verified, linked_at FROM user_oauth_identities WHERE user_id=$1 ORDER BY provider", &[&user_id.0]).await?;
-        Ok(rows.iter().map(oauth_identity_from_row).collect())
-    }
-
-    async fn store_oauth_link_request(
-        &self,
-        user_id: UserId,
-        session_id: SessionId,
-        code_hash: &str,
-        info: &OAuthUserInfo,
-    ) -> anyhow::Result<()> {
-        let client = self.pool.get().await?;
-        client
-            .execute(
-                "DELETE FROM oauth_link_requests WHERE expires_at <= NOW()",
-                &[],
-            )
-            .await?;
-        client.execute("INSERT INTO oauth_link_requests (code_hash,user_id,session_id,provider,provider_user_id,email,email_verified,email_authoritative,expires_at)
-            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,NOW()+INTERVAL '5 minutes')",
-            &[&code_hash,&user_id.0,&session_id.0,&info.provider,&info.provider_user_id,&info.email,&info.email_verified,&info.email_authoritative]).await?;
-        Ok(())
-    }
-
-    async fn complete_oauth_link_request(
-        &self,
-        user_id: UserId,
-        session_id: SessionId,
-        code_hash: &str,
-    ) -> Result<OAuthIdentity, AuthError> {
-        async fn complete(
-            repo: &UserRepository,
-            user_id: Uuid,
-            session_id: Uuid,
-            code_hash: &str,
-        ) -> anyhow::Result<OAuthIdentity> {
-            let mut client = repo.pool.get().await?;
-            let tx = client.transaction().await?;
-            // Lock the account and original session so logout/account revocation
-            // cannot interleave with the final identity mutation.
-            let active = tx
-                .query_opt(
-                    "SELECT u.id FROM users u JOIN refresh_tokens r ON r.user_id=u.id
-                WHERE u.id=$1 AND r.id=$2 AND u.is_active=true
-                AND u.auth_provider IN ('google','github') AND r.expires_at>NOW()
-                AND (u.tokens_revoked_at IS NULL OR r.created_at>u.tokens_revoked_at)
-                FOR UPDATE OF u,r",
-                    &[&user_id, &session_id],
-                )
-                .await?;
-            if active.is_none() {
-                return Err(AuthError::OAuthLinkInvalid.into());
-            }
-            let request = tx
-                .query_opt(
-                    "DELETE FROM oauth_link_requests
-                WHERE code_hash=$1 AND user_id=$2 AND session_id=$3 AND expires_at>NOW()
-                RETURNING provider,provider_user_id,email,email_verified,email_authoritative",
-                    &[&code_hash, &user_id, &session_id],
-                )
-                .await?
-                .ok_or(AuthError::OAuthLinkInvalid)?;
-            let provider: String = request.get("provider");
-            let provider_user_id: String = request.get("provider_user_id");
-            let email: String = request.get("email");
-            let verified: bool = request.get("email_verified");
-            let authoritative: bool = request.get("email_authoritative");
-            if !verified {
-                return Err(AuthError::OAuthEmailUnverified.into());
-            }
-            let existing = tx
-                .query_opt(
-                    "SELECT user_id,provider_user_id FROM user_oauth_identities
-                WHERE (provider=$1 AND provider_user_id=$2) OR (user_id=$3 AND provider=$1)
-                LIMIT 1",
-                    &[&provider, &provider_user_id, &user_id],
-                )
-                .await?;
-            if let Some(existing) = existing {
-                if existing.get::<_, Uuid>("user_id") != user_id
-                    || existing.get::<_, String>("provider_user_id") != provider_user_id
-                {
-                    return Err(AuthError::OAuthLinkConflict.into());
-                }
-            }
-            tx.execute("INSERT INTO user_oauth_identities (user_id,provider,provider_user_id,email,email_verified,email_authoritative)
-                VALUES ($1,$2,$3,$4,$5,$6) ON CONFLICT (provider,provider_user_id) DO NOTHING",
-                &[&user_id,&provider,&provider_user_id,&email,&verified,&authoritative]).await.map_err(map_db_error)?;
-            // A concurrent account may have inserted this provider identity.
-            // Never treat DO NOTHING as a successful bind without checking owner.
-            let row = tx
-                .query_one(
-                    "SELECT user_id,provider,provider_user_id,email,email_verified,linked_at
-                FROM user_oauth_identities WHERE provider=$1 AND provider_user_id=$2",
-                    &[&provider, &provider_user_id],
-                )
-                .await?;
-            if row.get::<_, Uuid>("user_id") != user_id {
-                return Err(AuthError::OAuthLinkConflict.into());
-            }
-            let identity = oauth_identity_from_row(&row);
-            tx.commit().await?;
-            Ok(identity)
-        }
-        complete(self, user_id.0, session_id.0, code_hash)
-            .await
-            .map_err(|e| {
-                if matches!(
-                    e.downcast_ref::<RepositoryError>(),
-                    Some(RepositoryError::AlreadyExists)
-                ) {
-                    AuthError::OAuthLinkConflict
-                } else {
-                    match e.downcast::<AuthError>() {
-                        Ok(error) => error,
-                        Err(error) => {
-                            AuthError::InternalError(format!("Failed to link account: {error}"))
-                        }
-                    }
-                }
-            })
-    }
     async fn create(
         &self,
         email: String,

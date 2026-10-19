@@ -140,8 +140,8 @@ before any new instance serves them: pause sign-in briefly, upgrade all instance
 and apply `V0095__oauth_account_linking.sql`, then restore traffic. Do not use a
 mixed-version rolling deployment for this release. An old instance cannot resolve
 secondary identities created by a new instance and can return a login error.
-Deploy the linking UI after all API instances have been upgraded. Once secondary
-identities exist, rolling back to an API without identity lookup support is unsafe;
+Deploy the conflict-message UI after all API instances have been upgraded. Once
+secondary identities exist, rolling back to an API without identity lookup support is unsafe;
 keep that support in any rollback build.
 
 Accounts are identified by their OAuth provider and provider user ID. A new Google
@@ -149,8 +149,8 @@ or GitHub identity automatically links to an existing active account on the othe
 provider only when both the incoming identity and the account's original identity
 verify the same email and are authoritative for it. For Google this requires a
 Gmail address or a nonempty `hd` returned by Google's userinfo endpoint for a
-verified Google Workspace account. A verified third-party Google email without
-`hd` requires explicit linking from an existing signed-in session instead.
+verified Google Workspace account. For a verified third-party Google email without
+`hd`, sign-in returns a conflict with guidance to use the original provider.
 See [Google's email-authority rules](https://developers.google.com/identity/sign-in/web/backend-auth).
 Sign-in then uses the existing account and its resources.
 Existing identities remain authoritative; separately registered accounts are not
@@ -160,8 +160,8 @@ with `error: "oauth_provider_conflict"`, `existing_provider`, and an
 
 Migrated identities with unknown verification or authority require an authoritative,
 verified sign-in through the original provider before automatic linking is available.
-Alternatively, sign in through the original provider and explicitly link from
-Account settings.
+When that evidence is unavailable, continue signing in through the original
+provider. Different-email identities are not linked.
 
 When the login request includes an allowed `frontend_callback`, this conflict
 instead redirects to that callback with the same three fields in the URL

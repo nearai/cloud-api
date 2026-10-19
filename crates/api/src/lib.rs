@@ -1489,27 +1489,6 @@ pub fn build_auth_routes(
         .route("/google", get(google_login))
         .route("/callback", get(oauth_callback))
         .route(
-            "/identities",
-            get(routes::auth::list_oauth_identities).layer(from_fn_with_state(
-                auth_state_middleware.clone(),
-                auth_middleware,
-            )),
-        )
-        .route(
-            "/identities/link",
-            post(routes::auth::start_oauth_link).layer(from_fn_with_state(
-                auth_state_middleware.clone(),
-                auth_middleware,
-            )),
-        )
-        .route(
-            "/identities/complete",
-            post(routes::auth::complete_oauth_link).layer(from_fn_with_state(
-                auth_state_middleware.clone(),
-                auth_middleware,
-            )),
-        )
-        .route(
             "/user",
             get(current_user).layer(from_fn_with_state(
                 auth_state_middleware.clone(),

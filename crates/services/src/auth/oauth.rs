@@ -145,24 +145,6 @@ impl OAuthManager {
         Ok((auth_url.to_string(), csrf_state.secret().to_string()))
     }
 
-    pub fn github_link_auth_url(&self) -> Result<(String, String, String), AuthError> {
-        let client = self
-            .github_client
-            .as_ref()
-            .ok_or_else(|| AuthError::ConfigError("GitHub OAuth not configured".into()))?;
-        let (challenge, verifier) = PkceCodeChallenge::new_random_sha256();
-        let (url, state) = client
-            .authorize_url(CsrfToken::new_random)
-            .add_scope(Scope::new("user:email".into()))
-            .set_pkce_challenge(challenge)
-            .url();
-        Ok((
-            url.to_string(),
-            state.secret().clone(),
-            verifier.secret().clone(),
-        ))
-    }
-
     /// Generate authorization URL for Google with PKCE
     pub fn google_auth_url(&self) -> Result<(String, String, String), AuthError> {
         let client = self
@@ -187,28 +169,11 @@ impl OAuthManager {
         ))
     }
 
-    pub fn google_link_auth_url(&self) -> Result<(String, String, String), AuthError> {
-        let (url, state, verifier) = self.google_auth_url()?;
-        let mut url = url::Url::parse(&url)
-            .map_err(|e| AuthError::ConfigError(format!("Invalid Google auth URL: {e}")))?;
-        url.query_pairs_mut()
-            .append_pair("prompt", "select_account");
-        Ok((url.to_string(), state, verifier))
-    }
-
     /// Handle GitHub OAuth callback
     pub async fn handle_github_callback(
         &self,
         code: String,
         _state: String,
-    ) -> Result<(OAuthUserInfo, String), AuthError> {
-        self.handle_github_callback_with_pkce(code, None).await
-    }
-
-    pub async fn handle_github_callback_with_pkce(
-        &self,
-        code: String,
-        verifier: Option<String>,
     ) -> Result<(OAuthUserInfo, String), AuthError> {
         let client = self
             .github_client
@@ -218,11 +183,8 @@ impl OAuthManager {
         debug!("Exchanging GitHub code for token");
 
         // Exchange code for token
-        let mut exchange = client.exchange_code(AuthorizationCode::new(code));
-        if let Some(verifier) = verifier {
-            exchange = exchange.set_pkce_verifier(PkceCodeVerifier::new(verifier));
-        }
-        let token = exchange
+        let token = client
+            .exchange_code(AuthorizationCode::new(code))
             .request_async(&self.http_client)
             .await
             .map_err(token_exchange_error)?;

@@ -1,4 +1,3 @@
-mod linking;
 pub mod near;
 pub mod oauth;
 pub mod ports;
@@ -16,7 +15,7 @@ use bloomfilter::Bloom;
 use chrono::Utc;
 use hmac::{Hmac, KeyInit, Mac};
 use moka::future::Cache;
-use sha2::{Digest, Sha256};
+use sha2::Sha256;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -41,50 +40,6 @@ fn refresh_token_successor(old_token: &str, encoding_key: &str) -> Result<String
 
 #[async_trait]
 impl AuthServiceTrait for AuthService {
-    async fn list_oauth_identities(
-        &self,
-        user_id: UserId,
-    ) -> Result<Vec<OAuthIdentity>, AuthError> {
-        self.get_user_by_id(user_id.clone()).await?;
-        self.user_repository
-            .list_oauth_identities(user_id)
-            .await
-            .map_err(|e| AuthError::InternalError(format!("Failed to list sign-in methods: {e}")))
-    }
-    async fn validate_oauth_link_session(
-        &self,
-        user_id: UserId,
-        session_id: SessionId,
-    ) -> Result<(), AuthError> {
-        self.validate_link_session(user_id, session_id).await
-    }
-    async fn prepare_oauth_link(
-        &self,
-        user_id: UserId,
-        session_id: SessionId,
-        info: OAuthUserInfo,
-    ) -> Result<String, AuthError> {
-        self.prepare_link(user_id, session_id, info).await
-    }
-    async fn complete_oauth_link(
-        &self,
-        user_id: UserId,
-        session_id: SessionId,
-        code: &str,
-    ) -> Result<OAuthIdentity, AuthError> {
-        if code.len() != 64 || !code.bytes().all(|c| c.is_ascii_hexdigit()) {
-            return Err(AuthError::OAuthLinkInvalid);
-        }
-        self.validate_link_session(user_id.clone(), session_id.clone())
-            .await?;
-        self.user_repository
-            .complete_oauth_link_request(
-                user_id,
-                session_id,
-                &hex::encode(Sha256::digest(code.as_bytes())),
-            )
-            .await
-    }
     async fn create_session(
         &self,
         user_id: UserId,

@@ -1,5 +1,5 @@
 -- Keep users.id and the original provider authoritative for account resources.
--- Additional identities require an authenticated user or authoritative, verified emails.
+-- Additional identities require authoritative, verified evidence for the same email.
 CREATE TABLE user_oauth_identities (
     user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
     provider VARCHAR(20) NOT NULL CHECK (provider IN ('google', 'github')),
@@ -28,27 +28,3 @@ END;
 $$ LANGUAGE plpgsql;
 CREATE TRIGGER users_register_primary_oauth_identity
 AFTER INSERT ON users FOR EACH ROW EXECUTE FUNCTION register_primary_oauth_identity();
-
-ALTER TABLE oauth_states
-    ADD COLUMN link_user_id UUID REFERENCES users(id) ON DELETE CASCADE,
-    ADD COLUMN link_session_id UUID REFERENCES refresh_tokens(id) ON DELETE CASCADE,
-    ADD CONSTRAINT oauth_link_context_pair CHECK
-        ((link_user_id IS NULL) = (link_session_id IS NULL));
-
--- An OAuth callback prepares a one-use handoff. The original browser session
--- must confirm it before any identity is attached; callbacks never create sessions.
-CREATE TABLE oauth_link_requests (
-    code_hash CHAR(64) PRIMARY KEY,
-    user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-    session_id UUID NOT NULL REFERENCES refresh_tokens(id) ON DELETE CASCADE,
-    provider VARCHAR(20) NOT NULL CHECK (provider IN ('google', 'github')),
-    provider_user_id TEXT NOT NULL,
-    email TEXT NOT NULL,
-    email_verified BOOLEAN NOT NULL CHECK (email_verified),
-    email_authoritative BOOLEAN NOT NULL DEFAULT false,
-    expires_at TIMESTAMPTZ NOT NULL
-);
-CREATE INDEX oauth_link_requests_expiration ON oauth_link_requests(expires_at);
-
-CREATE INDEX oauth_link_requests_session ON oauth_link_requests(session_id);
-CREATE INDEX oauth_states_link_session ON oauth_states(link_session_id) WHERE link_session_id IS NOT NULL;

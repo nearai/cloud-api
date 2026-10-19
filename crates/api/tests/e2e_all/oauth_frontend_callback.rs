@@ -257,6 +257,97 @@ async fn oauth_auto_link_rechecks_primary_verification_after_waiting_for_its_loc
 }
 
 #[tokio::test]
+async fn oauth_different_email_identities_remain_separate_accounts() {
+    let (_server, db) = setup_test_server_with_database().await;
+    let auth = real_auth(&db);
+    for (original, incoming) in [("github", "google"), ("google", "github")] {
+        let first = oauth_info(
+            original,
+            &format!("oauth-first-{}@example.test", uuid::Uuid::new_v4()),
+        );
+        let second = oauth_info(
+            incoming,
+            &format!("oauth-second-{}@example.test", uuid::Uuid::new_v4()),
+        );
+        let first_user = auth.get_or_create_oauth_user(first.clone()).await.unwrap();
+        let second_user = auth.get_or_create_oauth_user(second.clone()).await.unwrap();
+        assert_ne!(first_user.id, second_user.id);
+        assert_eq!(
+            auth.get_or_create_oauth_user(first.clone())
+                .await
+                .unwrap()
+                .id,
+            first_user.id
+        );
+        assert_eq!(
+            auth.get_or_create_oauth_user(second.clone())
+                .await
+                .unwrap()
+                .id,
+            second_user.id
+        );
+        assert_single_oauth_account(&db, first_user.id.0, &first.email).await;
+        assert_single_oauth_account(&db, second_user.id.0, &second.email).await;
+    }
+}
+
+#[tokio::test]
+async fn oauth_secondary_subject_login_preserves_primary_email_and_profile() {
+    let (_server, db) = setup_test_server_with_database().await;
+    let auth = real_auth(&db);
+    for (original, incoming) in [("github", "google"), ("google", "github")] {
+        let email = format!(
+            "oauth-primary-profile-{}@example.test",
+            uuid::Uuid::new_v4()
+        );
+        let original_info = oauth_info(original, &email);
+        let user = auth
+            .get_or_create_oauth_user(original_info.clone())
+            .await
+            .unwrap();
+        let mut secondary = oauth_info(incoming, &email);
+        assert_eq!(
+            auth.get_or_create_oauth_user(secondary.clone())
+                .await
+                .unwrap()
+                .id,
+            user.id
+        );
+        secondary.email = format!(
+            "oauth-secondary-changed-{}@example.test",
+            uuid::Uuid::new_v4()
+        );
+        secondary.display_name = Some("Changed secondary profile".into());
+        secondary.avatar_url = Some("https://example.test/secondary.png".into());
+        secondary.email_authoritative = false;
+        let returning = auth
+            .get_or_create_oauth_user(secondary.clone())
+            .await
+            .unwrap();
+        assert_eq!(returning.id, user.id);
+        assert_eq!(returning.email, user.email);
+        assert_eq!(returning.display_name, user.display_name);
+        let stored = database::UserRepository::new(db.pool().clone())
+            .get_by_id(user.id.0)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.auth_provider, original);
+        assert_eq!(stored.provider_user_id, original_info.provider_user_id);
+        assert_eq!(stored.email, user.email);
+        assert_eq!(stored.display_name, user.display_name);
+        assert_eq!(stored.avatar_url, user.avatar_url);
+        let proof = db.pool().get().await.unwrap().query_one(
+            "SELECT email,email_authoritative FROM user_oauth_identities WHERE provider=$1 AND provider_user_id=$2",
+            &[&incoming, &secondary.provider_user_id],
+        ).await.unwrap();
+        assert_eq!(proof.get::<_, String>("email"), secondary.email);
+        assert!(!proof.get::<_, bool>("email_authoritative"));
+        assert_single_oauth_account(&db, user.id.0, &email).await;
+    }
+}
+
+#[tokio::test]
 async fn oauth_returning_user_email_conflict_preserves_both_accounts() {
     let (_server, db) = setup_test_server_with_database().await;
     let auth = real_auth(&db);
@@ -395,10 +486,17 @@ async fn oauth_concurrent_cross_provider_signup_creates_only_one_account() {
         results => panic!("expected one account with verified identities, got {results:?}"),
     };
     assert_eq!(
-        auth.list_oauth_identities(winner.id.clone())
+        db.pool()
+            .get()
             .await
             .unwrap()
-            .len(),
+            .query_one(
+                "SELECT count(*) FROM user_oauth_identities WHERE user_id=$1",
+                &[&winner.id.0]
+            )
+            .await
+            .unwrap()
+            .get::<_, i64>(0),
         2
     );
     assert_single_oauth_account(&db, winner.id.0, &email).await;

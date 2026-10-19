@@ -400,7 +400,8 @@ pub struct ModelDeprecationConfirmResult {
 }
 
 /// Lifecycle status of a scheduled model pricing change.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum ScheduledPricingChangeStatus {
     Pending,
     Applying,

@@ -1095,6 +1095,7 @@ pub async fn batch_upsert_models(
     let api_models: Vec<ModelWithPricing> = updated_models
         .into_iter()
         .map(|(model_name, updated_model)| ModelWithPricing {
+            upcoming_pricing: None,
             model_id: model_name,
             input_cost_per_token: DecimalPrice {
                 amount: updated_model.input_cost_per_token,
@@ -1898,6 +1899,7 @@ pub async fn deprecate_model(
     }
 
     let to_api = |model_name: String, m: services::admin::ModelPricing| ModelWithPricing {
+        upcoming_pricing: None,
         model_id: model_name,
         input_cost_per_token: DecimalPrice {
             amount: m.input_cost_per_token,

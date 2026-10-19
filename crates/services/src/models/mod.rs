@@ -1,6 +1,8 @@
 mod capabilities;
 pub mod ports;
+mod pricing;
 pub use capabilities::InferenceEndpoint;
+pub use pricing::{ModelPricingChange, UpcomingModelPricing};
 
 use std::collections::HashMap;
 use std::future::Future;
@@ -341,6 +343,82 @@ mod tests {
         test_catalog_model_with_output(model_name, Some(1024))
     }
 
+    fn pricing_change(date: &str, status: &str, input: i64) -> ModelPricingChange {
+        serde_json::from_value(serde_json::json!({
+            "effective_at": date,
+            "status": status,
+            "new_input_cost_per_token": input,
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn upcoming_pricing_selects_the_earliest_pending_change() {
+        let model = test_catalog_model("pricing");
+        let changes = [
+            pricing_change("2030-03-01T00:00:00Z", "pending", 300),
+            pricing_change("2030-01-01T00:00:00Z", "cancelled", 100),
+            pricing_change("2030-02-01T00:00:00Z", "pending", 200),
+            pricing_change("2029-01-01T00:00:00Z", "applied", 50),
+        ];
+        let notice = UpcomingModelPricing::earliest_pending(&model, &changes).unwrap();
+        assert_eq!(notice.effective_at, changes[2].effective_at);
+        assert_eq!(notice.input_cost_per_token, 200);
+    }
+
+    #[test]
+    fn upcoming_pricing_excludes_every_non_pending_state() {
+        let model = test_catalog_model("pricing");
+        for status in ["cancelled", "applied", "failed", "applying"] {
+            let change = pricing_change("2030-01-01T00:00:00Z", status, 100);
+            assert_eq!(
+                UpcomingModelPricing::earliest_pending(&model, &[change]),
+                None
+            );
+        }
+        assert_eq!(UpcomingModelPricing::earliest_pending(&model, &[]), None);
+    }
+
+    #[test]
+    fn upcoming_pricing_preserves_live_unspecified_prices_and_free_cache_reads() {
+        let mut model = test_catalog_model("pricing");
+        model.output_cost_per_token = 987;
+        model.cost_per_image = 456;
+        let mut change = pricing_change("2020-01-01T00:00:00Z", "pending", 123);
+        // An overdue pending row remains a notice until its status changes.
+        let notice = UpcomingModelPricing::earliest_pending(&model, &[change]).unwrap();
+        assert_eq!(notice.output_cost_per_token, 987);
+        assert_eq!(notice.cost_per_image, 456);
+        assert_eq!(notice.cache_read_cost_per_token, None);
+
+        change = pricing_change("2030-01-01T00:00:00Z", "pending", 123);
+        change.new_cache_read_cost_per_token = Some(0);
+        let notice = UpcomingModelPricing::earliest_pending(&model, &[change]).unwrap();
+        assert_eq!(notice.cache_read_cost_per_token, Some(0));
+    }
+
+    #[test]
+    fn upcoming_pricing_preserves_or_replaces_the_entire_text_profile() {
+        let mut model = test_catalog_model("pricing");
+        let profile = crate::usage::TextPricingProfile::from_json(serde_json::json!({
+            "version": 1, "currency": "USD", "unit": "million_tokens",
+            "tiers": { "default": { "short": {
+                "uncachedInput": "1.50", "cachedInput": "0.25", "output": "4.00"
+            } } }
+        }))
+        .unwrap();
+        model.text_pricing = Some(profile.clone());
+        let change = pricing_change("2030-01-01T00:00:00Z", "pending", 100);
+        let notice = UpcomingModelPricing::earliest_pending(&model, &[change]).unwrap();
+        assert_eq!(notice.text_pricing, model.text_pricing);
+        let mut change = pricing_change("2030-01-01T00:00:00Z", "pending", 200);
+        let mut next_profile = profile;
+        next_profile.tiers.default.short.output = "8.00".to_string();
+        change.new_text_pricing = Some(next_profile.clone());
+        let notice = UpcomingModelPricing::earliest_pending(&model, &[change]).unwrap();
+        assert_eq!(notice.text_pricing, Some(next_profile));
+    }
+
     #[test]
     fn systemone_endpoint_compatibility_preserves_other_modalities() {
         let mut model = test_catalog_model("fixture");
@@ -379,6 +457,7 @@ mod tests {
         max_output_length: Option<i32>,
     ) -> ModelWithPricing {
         ModelWithPricing {
+            upcoming_pricing: None,
             id: Uuid::new_v4(),
             model_name: model_name.to_string(),
             model_display_name: model_name.to_string(),

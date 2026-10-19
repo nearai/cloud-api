@@ -92,6 +92,7 @@ impl ModelPricingScheduler {
             )
             .await?;
         if recovered > 0 {
+            self.models_service.invalidate_models_cache().await;
             warn!(
                 count = recovered,
                 "Recovered stale 'applying' pricing changes"
@@ -102,6 +103,11 @@ impl ModelPricingScheduler {
             .repository
             .claim_due_pricing_changes(CLAIM_BATCH_LIMIT)
             .await?;
+        // Notices describe pending rows only. Recovery and claims change
+        // membership even before the price itself is written.
+        if !claimed.is_empty() {
+            self.models_service.invalidate_models_cache().await;
+        }
         for change in claimed {
             self.apply_change(change).await;
         }
@@ -237,6 +243,7 @@ impl ModelPricingScheduler {
                         error = %e,
                         "Applied pricing change but failed to mark it applied"
                     );
+                    self.models_service.invalidate_models_cache().await;
                     return;
                 }
                 self.models_service.invalidate_models_cache().await;
@@ -269,6 +276,7 @@ impl ModelPricingScheduler {
                         "Failed to record pricing change failure"
                     );
                 }
+                self.models_service.invalidate_models_cache().await;
             }
         }
     }

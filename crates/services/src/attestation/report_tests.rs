@@ -81,6 +81,7 @@ impl ModelsRepository for SingleModelRepository {
 
 fn catalog_model() -> ModelWithPricing {
     ModelWithPricing {
+        upcoming_pricing: None,
         id: Uuid::nil(),
         model_name: MODEL.to_string(),
         model_display_name: "Attested".to_string(),

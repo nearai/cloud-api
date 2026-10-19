@@ -314,6 +314,7 @@ async fn concurrent_retries_distinct_keys_and_credentials_serialize() -> anyhow:
     let (first, second) = contended_transfers(
         &pool,
         sender.org_id.min(recipient.org_id),
+        sender.org_id.max(recipient.org_id),
         repository.transfer(sender.org_id, &actor, "same", &terms),
         repository.transfer(sender.org_id, &actor, "same", &terms),
     )
@@ -746,6 +747,7 @@ async fn opposite_transfers_and_concurrent_usage_keep_conservation() -> anyhow::
     let (a_result, b_result) = contended_transfers(
         &pool,
         a.org_id.min(b.org_id),
+        a.org_id.max(b.org_id),
         repository.transfer(a.org_id, &a_actor, "opposite-a", &to_b),
         repository.transfer(b.org_id, &b_actor, "opposite-b", &to_a),
     )
@@ -1400,11 +1402,12 @@ async fn unauthorized_calls_and_snapshot_reads_do_not_wait_for_accounting_locks(
 type TransferResult = anyhow::Result<(Value, bool)>;
 
 /// Both sends must actually join the PostgreSQL lock wait graph before release.
-/// With reversed organization lock ordering, this interleaving creates a cycle
-/// when one sender holds the larger organization while waiting on the smaller.
+/// Probe the higher UUID while both sends wait on the lower UUID. A sender-first
+/// ordering regression holds the higher row and fails this probe deterministically.
 async fn contended_transfers(
     pool: &DbPool,
     locked_org: Uuid,
+    unlocked_org: Uuid,
     first: impl std::future::Future<Output = TransferResult>,
     second: impl std::future::Future<Output = TransferResult>,
 ) -> anyhow::Result<(TransferResult, TransferResult)> {
@@ -1424,14 +1427,14 @@ async fn contended_transfers(
                 let waiting: i64 = observer
                     .query_one(
                         r#"
-                    WITH RECURSIVE waiting(pid) AS (
-                        SELECT $1::INTEGER
-                        UNION
-                        SELECT a.pid FROM pg_stat_activity a
-                        JOIN waiting w ON w.pid = ANY(pg_blocking_pids(a.pid))
-                    )
-                    SELECT COUNT(*) - 1 FROM waiting
-                    "#,
+                        WITH RECURSIVE waiting(pid) AS (
+                            SELECT $1::INTEGER
+                            UNION
+                            SELECT a.pid FROM pg_stat_activity a
+                            JOIN waiting w ON w.pid = ANY(pg_blocking_pids(a.pid))
+                        )
+                        SELECT COUNT(*) - 1 FROM waiting
+                        "#,
                         &[&blocker_pid],
                     )
                     .await?
@@ -1444,6 +1447,14 @@ async fn contended_transfers(
             Ok::<_, anyhow::Error>(())
         })
         .await??;
+
+        // This autocommit statement releases the probe lock before the blocker.
+        observer
+            .query_one(
+                "SELECT id FROM organizations WHERE id = $1 FOR UPDATE NOWAIT",
+                &[&unlocked_org],
+            )
+            .await?;
         held.commit().await?;
         Ok::<_, anyhow::Error>(())
     };
@@ -1520,6 +1531,7 @@ async fn payout_program_targets_are_atomic_and_count_only_tagged_sends() -> anyh
     let (first, second) = contended_transfers(
         &pool,
         sender.org_id.min(recipient.org_id),
+        sender.org_id.max(recipient.org_id),
         repository.transfer(sender.org_id, &actor, "", &target),
         repository.transfer(sender.org_id, &actor, "", &higher),
     )

@@ -63,7 +63,7 @@ async fn test_list_organizations_missing_authorization_message() {
 }
 
 #[tokio::test]
-async fn test_organizations_duplicate_name_conflict_message() {
+async fn test_organizations_duplicate_name_preserves_response_contract() {
     let server = setup_test_server().await;
 
     let org_name = format!("test-org-{}", uuid::Uuid::new_v4());
@@ -86,10 +86,14 @@ async fn test_organizations_duplicate_name_conflict_message() {
         .json(&req)
         .await;
 
-    assert_eq!(resp2.status_code(), 409);
-    let err = resp2.json::<api::models::ErrorResponse>();
-    assert_eq!(err.error.r#type, "conflict");
-    assert_eq!(err.error.message, "Organization already exists");
+    assert_eq!(resp2.status_code(), 200, "{}", resp2.text());
+    let first = resp1.json::<api::models::OrganizationResponse>();
+    let second = resp2.json::<api::models::OrganizationResponse>();
+    assert_ne!(first.id, second.id);
+    assert_eq!(first.name, second.name);
+    assert_eq!(first.owner_id, second.owner_id);
+    assert_eq!(first.role, second.role);
+    assert_eq!(first.is_active, second.is_active);
 }
 
 #[tokio::test]

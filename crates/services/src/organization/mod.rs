@@ -751,17 +751,6 @@ impl OrganizationServiceTrait for OrganizationServiceImpl {
             .map_err(Self::map_repository_error)
     }
 
-    /// Get organization by name (private helper)
-    async fn get_organization_by_name(
-        &self,
-        name: &str,
-    ) -> Result<Option<Organization>, OrganizationError> {
-        self.repository
-            .get_by_name(name)
-            .await
-            .map_err(Self::map_repository_error)
-    }
-
     /// List organization members with full user information (paginated, private helper)
     async fn get_members_with_users_paginated(
         &self,
@@ -1778,10 +1767,6 @@ mod tests {
         ) -> Result<Option<i32>, RepositoryError> {
             unimplemented!()
         }
-        async fn get_by_name(&self, _: &str) -> Result<Option<Organization>, RepositoryError> {
-            unimplemented!()
-        }
-
         async fn get_member(
             &self,
             organization_id: Uuid,

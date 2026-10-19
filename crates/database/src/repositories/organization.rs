@@ -206,37 +206,6 @@ impl PgOrganizationRepository {
         }
     }
 
-    /// Get an organization by name - internal method
-    async fn get_by_name_internal(
-        &self,
-        name: &str,
-    ) -> Result<Option<DbOrganization>, RepositoryError> {
-        let row = retry_db!("get_organization_by_name", {
-            let client = self
-                .pool
-                .get()
-                .await
-                .context("Failed to get database connection")
-                .map_err(RepositoryError::PoolError)?;
-
-            client
-                .query_opt(
-                    "SELECT * FROM organizations WHERE name = $1 AND is_active = true",
-                    &[&name],
-                )
-                .await
-                .map_err(map_db_error)
-        })?;
-
-        match row {
-            Some(row) => Ok(Some(
-                self.row_to_db_organization(row)
-                    .map_err(RepositoryError::DataConversionError)?,
-            )),
-            None => Ok(None),
-        }
-    }
-
     /// Get organization member by user ID - internal method
     async fn get_member_internal(
         &self,
@@ -767,17 +736,6 @@ impl OrganizationRepository for PgOrganizationRepository {
             ).await.map_err(map_db_error)
         })?;
         Ok(row.map(|row| row.get("request_priority")))
-    }
-
-    async fn get_by_name(&self, name: &str) -> Result<Option<Organization>, RepositoryError> {
-        match self.get_by_name_internal(name).await? {
-            Some(db_org) => Ok(Some(
-                self.db_to_domain_organization(db_org)
-                    .await
-                    .map_err(RepositoryError::DataConversionError)?,
-            )),
-            None => Ok(None),
-        }
     }
 
     async fn get_member(
